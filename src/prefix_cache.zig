@@ -42,42 +42,29 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 /// (client disconnect mid-prefill). Below this an entry is LRU pollution —
 /// chat-template prologues (Gemma=12, Qwen=8, Llama=4 tokens) are identical
 /// across every request and "reusable" only in a worthless sense. Same
-/// rationale as the llama session pool's `min_prefix_to_claim`, applied at
+/// rationale as an engine session pool's `min_prefix_to_claim`, applied at
 /// commit time instead of claim time.
 pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 
-/// One media item's rows in a prompt: its first placeholder row and its
-/// pixel/PCM hash. Placeholder ids are identical across items, so state at and
-/// after `start` is keyed on `key`.
-pub const MediaSpan = struct { start: u32, key: u64 };
+/// Shortest prefix a ring-checkpoint restore reuses; below it the request cold-prefills.
+pub const RING_RESTORE_MIN_TOKENS: usize = 64;
 
-/// First position where state under two span lists can differ; maxInt when
-/// they agree. Rows before the first span that differs are text.
-pub fn mediaSharedBound(a: []const MediaSpan, b: []const MediaSpan) usize {
-    const n = @min(a.len, b.len);
-    for (a[0..n], b[0..n]) |x, y| {
-        if (x.start != y.start or x.key != y.key) return @min(x.start, y.start);
-    }
-    if (a.len > n) return a[n].start;
-    if (b.len > n) return b[n].start;
-    return std.math.maxInt(usize);
-}
+/// Ring checkpoints one entry keeps, thinned so the lowest (a shared preamble) and the newest
+/// (where the conversation goes on) stay (`thinRingCps`). One is ~16 MiB on MiMo at kv8.
+pub const RING_CHECKPOINT_MAX: usize = 8;
 
-/// The spans whose rows lie inside `[0, len)`.
-fn spansBelow(spans: []const MediaSpan, len: usize) []const MediaSpan {
-    var n: usize = 0;
-    while (n < spans.len and spans[n].start < len) n += 1;
-    return spans[0..n];
-}
+/// Message starts one prefill takes a ring checkpoint at (`ringMarkPositions`).
+pub const RING_MARKS_MAX: usize = 4;
 
-fn firstSpanStart(spans: []const MediaSpan) ?usize {
-    return if (spans.len > 0) spans[0].start else null;
-}
+/// The special token that opens a message in the served chat templates: where the marks sit.
+pub const RING_MARK_TOKEN = "<|im_start|>";
 
-fn dupeEntryKeys(allocator: std.mem.Allocator, tokens: []const u32, media: []const MediaSpan) !struct { []u32, []MediaSpan } {
-    const t = try allocator.dupe(u32, tokens);
-    errdefer allocator.free(t);
-    return .{ t, try allocator.dupe(MediaSpan, media) };
+/// Ring checkpoints one slot holds at once: its restore, its marks and its prompt end
+/// (`server.slotRingBytes` bills them).
+pub const SLOT_RING_CHECKPOINTS: usize = 2 + RING_MARKS_MAX;
+
+comptime {
+    std.debug.assert(SLOT_RING_CHECKPOINTS <= RING_CHECKPOINT_MAX);
 }
 
 /// Why a lookup that found a real raw token match still restored nothing.
@@ -125,7 +112,7 @@ pub const TrimDecline = enum {
 };
 
 /// Outcome of a cache commit, so callers can log the truth. A budget
-/// decline used to exit `commitWithMediaState` via plain return and the
+/// decline used to exit `commitWithMediaStateSource` via plain return and the
 /// scheduler logged "committed N/M" for it (live 2026-09-07: a 122k agent
 /// session cold-prefilled ~95k tokens per retry while the log claimed
 /// cancelled-prefill commits every time).
@@ -166,12 +153,117 @@ pub const LookupResult = struct {
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
     checked_out: bool = false,
-    /// Did a disk restore hand the slot rows it owns outright? The restore copies its chunks
-    /// into slot-held arrays, so those rows are the slot's own without a RAM entry moving.
+    /// Did an SSD restore fill buffers the slot owns outright (`restoreKvInto`)?
     slot_owned: bool = false,
     /// `Entry.id` of the RAM entry restored from; 0 = none.
     entry_id: u64 = 0,
+
+    /// Are the restored rows the slot's own? Only those the admission bill credits (`WarmPrefix.will_donate`).
+    pub fn ownsRestoredRows(self: LookupResult) bool {
+        return self.checked_out or self.slot_owned;
+    }
 };
+
+/// A ringed slot's restore points (`KVCache.ringCheckpoint`), handed to the commit that owns
+/// them from then on: where the request restored to, taken before its tail was forwarded (the
+/// fork off another entry, which may be evicted before this commit), the message starts its
+/// prefill crossed (`marks`, filled by the forward through `KVCache.ring_marks`), and its prompt end.
+pub const SlotRingCps = struct {
+    fork: ?KVCacheSnapshot = null,
+    prompt_end: ?KVCacheSnapshot = null,
+    marks: [RING_MARKS_MAX]KVCacheSnapshot = undefined,
+    n_marks: usize = 0,
+
+    pub fn deinit(self: *SlotRingCps) void {
+        if (self.fork) |*r| r.deinit();
+        if (self.prompt_end) |*r| r.deinit();
+        self.dropMarks();
+        self.* = .{};
+    }
+
+    fn dropMarks(self: *SlotRingCps) void {
+        for (self.marks[0..self.n_marks]) |*m| m.deinit();
+        self.n_marks = 0;
+    }
+
+    /// Empty marks at `positions` for the prefill to fill, replacing any left from an earlier
+    /// attempt. Best effort: an allocation failure keeps the ones made so far.
+    pub fn armMarks(self: *SlotRingCps, cache: *const KVCache, positions: []const usize) void {
+        self.dropMarks();
+        for (positions[0..@min(positions.len, RING_MARKS_MAX)]) |p| {
+            self.marks[self.n_marks] = cache.ringMark(p) catch return;
+            self.n_marks += 1;
+        }
+    }
+
+    pub fn markSlice(self: *SlotRingCps) []KVCacheSnapshot {
+        return self.marks[0..self.n_marks];
+    }
+
+    /// Free the marks the prefill did not fill on every ringed layer; only a whole one restores.
+    pub fn keepCompleteMarks(self: *SlotRingCps, cache: *const KVCache) void {
+        var kept: usize = 0;
+        for (self.marks[0..self.n_marks]) |*m| {
+            if (cache.ringMarkComplete(m)) {
+                self.marks[kept] = m.*;
+                kept += 1;
+            } else m.deinit();
+        }
+        self.n_marks = kept;
+    }
+
+    pub fn bytes(self: *const SlotRingCps) u64 {
+        var total: u64 = 0;
+        if (self.fork) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
+        if (self.prompt_end) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
+        for (self.marks[0..self.n_marks]) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
+        return total;
+    }
+};
+
+/// Where a prefill takes ring checkpoints: the message starts (`mark_id`) it forwards past the
+/// `restored` prefix, from the restore floor up to where the prompt-end checkpoint reaches;
+/// thinned to `RING_MARKS_MAX` keeping the first (a shared preamble's end) and the last.
+pub fn ringMarkPositions(prompt: []const u32, restored: usize, mark_id: u32, out: *[RING_MARKS_MAX]usize) []usize {
+    var buf: [RING_MARKS_MAX + 1]usize = undefined;
+    var n: usize = 0;
+    var p = @max(restored + 1, RING_RESTORE_MIN_TOKENS);
+    while (p + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF < prompt.len) : (p += 1) {
+        if (prompt[p] != mark_id) continue;
+        buf[n] = p;
+        n += 1;
+        if (n > RING_MARKS_MAX) {
+            const k = transformer_mod.positionDropIndexUsize(buf[0..n], .min_span);
+            for (k..n - 1) |i| buf[i] = buf[i + 1];
+            n -= 1;
+        }
+    }
+    @memcpy(out[0..n], buf[0..n]);
+    return out[0..n];
+}
+
+/// One media block of a prompt: where its placeholder rows start, and a key
+/// over that block and every block before it (pixels and positions).
+pub const MediaSpan = struct { start: usize, key: u64 };
+
+/// The key of a whole media chain: its last block's (0 = no media).
+pub fn chainKey(chain: []const MediaSpan) u64 {
+    return if (chain.len == 0) 0 else chain[chain.len - 1].key;
+}
+
+/// Rows an entry keyed `entry_key` may share with a request under a different
+/// key. An entry whose media is the request's first k blocks shares up to the
+/// request's block k+1; any other pair shares only the text before either
+/// side's first media row. Null = nothing is provably shared.
+fn crossKeyBoundary(entry_key: u64, entry_start: ?usize, request_start: ?usize, chain: []const MediaSpan) ?usize {
+    if (entry_key != 0 and chain.len > 1) {
+        for (chain[0 .. chain.len - 1], chain[1..]) |span, next| {
+            if (span.key == entry_key) return next.start;
+        }
+    }
+    const es = entry_start orelse return request_start;
+    return if (request_start) |rs| @min(es, rs) else es;
+}
 
 const Entry = struct {
     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
@@ -180,9 +272,14 @@ const Entry = struct {
     /// Whether the request had tools enabled (different chat template, can't
     /// share cache across).
     has_tools: bool,
-    /// Media items inside `tokens`, ascending, owned. Entries with media stay in
-    /// RAM (never spilled to the SSD tier).
-    media: []MediaSpan = &.{},
+    /// Hash of the request's media pixels (0 = text only). Image placeholder
+    /// tokens are identical across images, so the KV under them is keyed on
+    /// the pixels. Non-zero entries stay in RAM (never spilled to the SSD tier).
+    vision_key: u64 = 0,
+    /// Position of the first dynamic media placeholder in `tokens`. Prefix
+    /// state strictly before this boundary is independent of the media pixels
+    /// and can be shared across different `vision_key` values.
+    media_start: ?usize = null,
     /// Workload the request belonged to (`server.requestCacheKey`, 0 = anonymous).
     /// Eviction is fair across keys: the key holding the most entries pays first.
     cache_key: u64 = 0,
@@ -242,6 +339,10 @@ const Entry = struct {
     mtp: ?DflashSnap = null,
     /// Bytes resident in `mtp`, folded into `kv_bytes` like `ssm_bytes`.
     mtp_bytes: u64 = 0,
+    /// Ringed caches only: restore points below the entry's END (`KVCache.ringCheckpoint`),
+    /// ascending by `step`, billed in `kv_bytes`: the prompt end, which a long reply carries the
+    /// ring past, and those inherited from the entry this prompt forked off (`bestRingDonor`).
+    ring_cps: ?[]KVCacheSnapshot = null,
     /// Restore by move: the slot that took ownership of this entry's KV buffers (`KVCache.adopt`).
     /// While set the snapshot holds empty handles and the entry is invisible to every other
     /// reader. Cleared by the commit that replaces it; dropped at slot end otherwise.
@@ -249,6 +350,8 @@ const Entry = struct {
     /// Has the slot's append donated these buffers in place (`donateCheckout`)? Until then the
     /// entry's handles are live and a slot that ends hands the entry back; only a donated checkout is dropped.
     checkout_donated: bool = false,
+    /// Snapshot bytes the donation handed the slot; `kv_bytes` keeps billing them until release.
+    donated_bytes: u64 = 0,
 };
 
 /// What a spec-snap adoption may do, decided before any mlx call.
@@ -366,7 +469,7 @@ pub const DflashSnap = struct {
     }
 };
 
-/// What `commitWithState` reads to build a `DflashSnap`. `head` is set only by the qwen4_exp MTP head.
+/// What `commitWithStateSource` reads to build a `DflashSnap`. `head` is set only by the qwen4_exp MTP head.
 pub const DflashCommit = struct {
     cache: *const KVCache,
     base_pos: usize,
@@ -375,7 +478,7 @@ pub const DflashCommit = struct {
     head_marks: []const transformer_mod.QsaHeadMark = &.{},
 };
 
-/// Where `lookupAndRestore` puts a restored assistant context. `base_pos` is
+/// Where `lookupAndRestoreSource` puts a restored assistant context. `base_pos` is
 /// written on every path so the caller can build `DflashCtx` from it. `head` is the qwen4_exp
 /// Transformer owning the in-checkpoint MTP head; the adoption then goes through `qwen4MtpAdopt`.
 pub const DflashTarget = struct {
@@ -398,6 +501,126 @@ pub const EvictionReport = struct {
 };
 
 pub const HotPrefixCache = struct {
+    pub fn lookupAndRestore(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        target_ssm_entries: ?[]SSMCacheEntry,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        media: []const MediaSpan,
+        dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
+    ) !LookupResult {
+        return self.lookupAndRestoreWithMedia(
+            target_cache,
+            target_moe_seq_offset,
+            target_ssm_entries,
+            s,
+            prompt_ids,
+            has_tools,
+            media,
+            dflash_target,
+            mtp_target,
+            null,
+            false,
+        );
+    }
+
+    pub fn lookupAndRestoreForSlot(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        target_ssm_entries: ?[]SSMCacheEntry,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        media: []const MediaSpan,
+        dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
+        slot_id: usize,
+    ) !LookupResult {
+        return self.lookupAndRestoreWithMedia(
+            target_cache,
+            target_moe_seq_offset,
+            target_ssm_entries,
+            s,
+            prompt_ids,
+            has_tools,
+            media,
+            dflash_target,
+            mtp_target,
+            slot_id,
+            false,
+        );
+    }
+
+    pub fn lookupAndRestoreWithMedia(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        target_ssm_entries: ?[]SSMCacheEntry,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        media: []const MediaSpan,
+        dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
+        /// Restore by move: non-null opts this request into the checkout (the caller promises
+        /// `releaseCheckout` on every path that ends the slot).
+        slot_id: ?usize,
+        skip: bool,
+    ) !LookupResult {
+        const chain = try cumulativeMedia(self.allocator, media);
+        defer self.allocator.free(chain);
+        return self.lookupAndRestoreWithMediaSource(target_cache, target_moe_seq_offset, target_ssm_entries, s,
+            prompt_ids, has_tools, chainKey(chain), if (chain.len == 0) null else chain[0].start,
+            chain, dflash_target, mtp_target, slot_id, skip);
+    }
+
+    pub fn commitWithState(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        media: []const MediaSpan,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+    ) !CommitStatus {
+        return self.commitWithMediaState(source_cache, tokens, has_tools, media, 0, ssm_cps, dflash, mtp, tokens.len);
+    }
+
+    pub fn commitWithMediaState(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        media: []const MediaSpan,
+        cache_key: u64,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+        prompt_len: usize,
+    ) !CommitStatus {
+        return self.commitWithRingMedia(source_cache, tokens, has_tools, media, cache_key, ssm_cps, dflash, mtp, prompt_len, .{});
+    }
+
+    pub fn commitWithRingMedia(self: *HotPrefixCache, source_cache: *const KVCache, tokens: []const u32,
+        has_tools: bool, media: []const MediaSpan, cache_key: u64, ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit, mtp: ?DflashCommit, prompt_len: usize, ring_cps: SlotRingCps) !CommitStatus {
+        const chain = cumulativeMedia(self.allocator, media) catch |err| {
+            if (ssm_cps) |cps| { for (cps) |*cp| cp.deinit(self.allocator); self.allocator.free(cps); }
+            var owned = ring_cps;
+            owned.deinit();
+            return err;
+        };
+        defer self.allocator.free(chain);
+        return self.commitWithRing(source_cache, tokens, has_tools, chainKey(chain), cache_key,
+            if (chain.len == 0) null else chain[0].start, ssm_cps, dflash, mtp, prompt_len, ring_cps);
+    }
+
     entries: std.ArrayList(Entry),
     max_entries: u32,
     /// Wave 1.B: total KV bytes the cache is allowed to keep resident across
@@ -481,7 +704,6 @@ pub const HotPrefixCache = struct {
     /// they don't drift apart.
     fn freeEntryOwnedState(allocator: std.mem.Allocator, e: *Entry) void {
         allocator.free(e.tokens);
-        allocator.free(e.media);
         e.snapshot.deinit();
         if (e.ssm_checkpoints) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
@@ -495,6 +717,10 @@ pub const HotPrefixCache = struct {
         if (e.mtp) |*m| {
             m.deinit();
             e.mtp = null;
+        }
+        if (e.ring_cps) |r| {
+            freeRingCps(allocator, r);
+            e.ring_cps = null;
         }
     }
 
@@ -733,11 +959,12 @@ pub const HotPrefixCache = struct {
     /// Issue #330: per-token bytes of a snapshot — what one retained token
     /// costs after a `trimmedCopy` materializes exactly `len` rows. Derived
     /// from each array's own shape (bytes / capacity rows), so it prices
-    /// quantized triples correctly too.
+    /// quantized triples correctly too. A ringed layer holds a window at any
+    /// length (`ringedBytes`), so it has no per-token price.
     fn snapshotRowBytes(snap: *const KVCacheSnapshot) u64 {
         var total: u64 = 0;
         for (snap.entries) |e| {
-            if (!e.initialized) continue;
+            if (!e.initialized or e.ringed) continue;
             inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
                 // A dense snapshot leaves the quant handles as empty 0-dim arrays; the ndim check makes axis 2 a fact.
                 if (arr.ctx != null and mlx.mlx_array_ndim(arr) > 2) {
@@ -749,6 +976,42 @@ pub const HotPrefixCache = struct {
             }
         }
         return total;
+    }
+
+    /// Bytes of a snapshot's ringed layers: the window they keep whatever the length.
+    fn ringedBytes(snap: *const KVCacheSnapshot) u64 {
+        var total: u64 = 0;
+        for (snap.entries) |e| {
+            if (!e.initialized or !e.ringed) continue;
+            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+                if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+            }
+        }
+        return total;
+    }
+
+    /// Where a ringed candidate trims to: its end, or ring checkpoint `cp`, whose rows become its ring.
+    const RingTrim = struct { len: usize, cp: ?usize = null };
+
+    /// A ringed candidate restores only where its sliding layers hold the window: at its `end`, or
+    /// at one of its ring checkpoints (ascending). The longest that fits `budget`: the rows below it
+    /// at `row_bytes`, the ring it keeps and the checkpoints below it. Null = none above the floor.
+    fn ringTrimLen(budget: u64, limit: usize, row_bytes: u64, end: usize, ring_bytes: u64, cps: []const KVCacheSnapshot) ?RingTrim {
+        var below: u64 = 0;
+        for (cps) |*c| below += snapshotBytes(c);
+        if (end <= limit and end >= MIN_CANCELLED_COMMIT_TOKENS and
+            @as(u64, end) * row_bytes + ring_bytes + below <= budget) return .{ .len = end };
+        var k = cps.len;
+        while (k > 0) {
+            k -= 1;
+            const cp_bytes = snapshotBytes(&cps[k]);
+            below -= cp_bytes;
+            const p = cps[k].step;
+            if (p > limit or p >= end) continue;
+            if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
+            if (@as(u64, p) * row_bytes + cp_bytes + below <= budget) return .{ .len = p, .cp = k };
+        }
+        return null;
     }
 
     /// Positions printed by the trim-inputs line before it elides; the count is always exact.
@@ -976,14 +1239,17 @@ pub const HotPrefixCache = struct {
     /// (scheme + bits + group_size) is compared because `Scheme.affine`
     /// covers BOTH 4-bit and 8-bit packings: filtering on `Scheme` alone
     /// would let a 4-bit entry alias to an 8-bit slot and crash SDPA on
-    /// restore. The match stops at the first media item whose position or
-    /// pixels differ (`mediaSharedBound`). See
+    /// restore. Different media keys may share only the text state before
+    /// the earliest known media-placeholder boundary; without a boundary the
+    /// lookup stays conservative and rejects the entry. See
     /// `tests/test_kv_quant_per_request.sh`.
     fn findBestRestorableMatch(
         self: *const HotPrefixCache,
         prompt_ids: []const u32,
         has_tools: bool,
-        media: []const MediaSpan,
+        vision_key: u64,
+        media_start: ?usize,
+        media_chain: []const MediaSpan,
         quant_config: kv_quant.KVQuantConfig,
         require_ssm_checkpoint: bool,
         probe: ?*MatchProbe,
@@ -997,7 +1263,15 @@ pub const HotPrefixCache = struct {
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
 
-            const max_shared = @min(e.tokens.len, prompt_ids.len, mediaSharedBound(e.media, media));
+            var max_shared = @min(e.tokens.len, prompt_ids.len);
+            if (e.vision_key != vision_key) {
+                // Placeholder token IDs do not encode media pixels. Once an
+                // image/audio/video row is forwarded, model state depends on
+                // the media and cannot cross keys past the first block the
+                // two prompts do not share.
+                const safe_boundary = crossKeyBoundary(e.vision_key, e.media_start, media_start, media_chain) orelse continue;
+                max_shared = @min(max_shared, safe_boundary);
+            }
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
 
@@ -1009,11 +1283,13 @@ pub const HotPrefixCache = struct {
                 if (shared > p.best_raw) p.best_raw = shared;
             }
 
+            // An un-restorable ringed candidate stays eligible at 0, so a lookup with nothing
+            // better still lands on it and declines by name.
             const effective = if (require_ssm_checkpoint) blk: {
                 const cps = e.ssm_checkpoints orelse continue;
                 const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
                 break :blk cp.pos;
-            } else shared;
+            } else if (ringRestore(e, shared, prompt_ids.len)) |rr| rr.len else 0;
             if (effective > best_effective or
                 (effective == best_effective and shared > best_shared))
             {
@@ -1026,8 +1302,30 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
-    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, media: []const MediaSpan, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
-        const match = self.findBestRestorableMatch(prompt_ids, has_tools, media, quant_config, false, null) orelse return null;
+    const RingRestore = struct { len: usize, cp: ?*const KVCacheSnapshot };
+
+    /// Where an entry restores a match of `shared` tokens. A ringed entry's own ring holds the
+    /// window at its END; below that only a ring checkpoint (`cp`) can serve, the one reaching
+    /// highest at its position or the match, whichever is lower. Null = un-restorable. Any
+    /// other entry holds a prefix and restores at `shared`.
+    fn ringRestore(e: *const Entry, shared: usize, prompt_len: usize) ?RingRestore {
+        if (e.snapshot.ringServes(clampLen(shared, prompt_len))) return .{ .len = shared, .cp = null };
+        var best: ?RingRestore = null;
+        for (e.ring_cps orelse return null) |*cp| {
+            const at = @min(shared, cp.step);
+            if (at < RING_RESTORE_MIN_TOKENS or !cp.ringServes(clampLen(at, prompt_len))) continue;
+            if (best == null or at > best.?.len) best = .{ .len = at, .cp = cp };
+        }
+        return best;
+    }
+
+    /// The length a restore of `len` matched tokens clamps to: a full match re-forwards its last token.
+    fn clampLen(len: usize, prompt_len: usize) usize {
+        return if (len == prompt_len and len > 1) len - 1 else len;
+    }
+
+    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
+        const match = self.findBestRestorableMatch(prompt_ids, has_tools, vision_key, null, &.{}, quant_config, false, null) orelse return null;
         return .{ .idx = match.idx, .shared = match.shared };
     }
 
@@ -1038,7 +1336,7 @@ pub const HotPrefixCache = struct {
     /// The `target_*` parameters generalize the legacy single-slot path
     /// (`xfm.cache`, `xfm.moe_seq_offset`, `xfm.ssm_entries`) so Phase 2
     /// per-slot caches can reuse the same restore machinery.
-    pub fn lookupAndRestore(
+    pub fn lookupAndRestoreSource(
         self: *HotPrefixCache,
         target_cache: *KVCache,
         target_moe_seq_offset: *usize,
@@ -1046,18 +1344,20 @@ pub const HotPrefixCache = struct {
         s: mlx.mlx_stream,
         prompt_ids: []const u32,
         has_tools: bool,
-        media: []const MediaSpan,
+        vision_key: u64,
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
     ) !LookupResult {
-        return self.lookupAndRestoreWithMedia(
+        return self.lookupAndRestoreWithMediaSource(
             target_cache,
             target_moe_seq_offset,
             target_ssm_entries,
             s,
             prompt_ids,
             has_tools,
-            media,
+            vision_key,
+            null,
+            &.{},
             dflash_target,
             mtp_target,
             null,
@@ -1066,7 +1366,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// The checkout-capable entry point: `slot_id` names the slot that will own the restored buffers.
-    pub fn lookupAndRestoreForSlot(
+    pub fn lookupAndRestoreForSlotSource(
         self: *HotPrefixCache,
         target_cache: *KVCache,
         target_moe_seq_offset: *usize,
@@ -1074,19 +1374,22 @@ pub const HotPrefixCache = struct {
         s: mlx.mlx_stream,
         prompt_ids: []const u32,
         has_tools: bool,
-        media: []const MediaSpan,
+        vision_key: u64,
+        media_start: ?usize,
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
         slot_id: usize,
     ) !LookupResult {
-        return self.lookupAndRestoreWithMedia(
+        return self.lookupAndRestoreWithMediaSource(
             target_cache,
             target_moe_seq_offset,
             target_ssm_entries,
             s,
             prompt_ids,
             has_tools,
-            media,
+            vision_key,
+            media_start,
+            &.{},
             dflash_target,
             mtp_target,
             slot_id,
@@ -1094,7 +1397,7 @@ pub const HotPrefixCache = struct {
         );
     }
 
-    pub fn lookupAndRestoreWithMedia(
+    pub fn lookupAndRestoreWithMediaSource(
         self: *HotPrefixCache,
         target_cache: *KVCache,
         target_moe_seq_offset: *usize,
@@ -1102,7 +1405,11 @@ pub const HotPrefixCache = struct {
         s: mlx.mlx_stream,
         prompt_ids: []const u32,
         has_tools: bool,
-        media: []const MediaSpan,
+        vision_key: u64,
+        media_start: ?usize,
+        /// The request's media blocks (`MediaSpan`); an entry holding a prefix
+        /// of them restores up to the first block it lacks.
+        media_chain: []const MediaSpan,
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
         /// Restore by move: non-null opts this request into the checkout (the caller promises
@@ -1122,7 +1429,9 @@ pub const HotPrefixCache = struct {
         const match = self.findBestRestorableMatch(
             prompt_ids,
             has_tools,
-            media,
+            vision_key,
+            media_start,
+            media_chain,
             target_cache.config,
             target_ssm_entries != null,
             &probe,
@@ -1134,11 +1443,45 @@ pub const HotPrefixCache = struct {
         // and restores both.
         if (self.disk) |*d| disk: {
             // A media-carrying request still restores the pure-text prefix
-            // before its first media row: disk entries are text-only by
-            // construction (the flush refuses entries with media). The cap is
-            // load-bearing even when tokens match past it: a restored row at a
-            // placeholder must come from the vision splice, never from disk.
-            const disk_limit: u32 = @intCast(@min(firstSpanStart(media) orelse prompt_ids.len, prompt_ids.len));
+            // before its earliest media row: disk entries are text-only by
+            // construction (the flush refuses vision-keyed entries), and
+            // state below the boundary is pixel-independent — the RAM path's
+            // exact cross-key semantics. The old blanket `vision_key != 0`
+            // skip starved image-bearing agent turns of the whole SSD tier
+            // (live 2026-09-07: one screenshot in the last turn of a 122k
+            // session disabled 40 GB of persisted prefixes). The cap is
+            // load-bearing even when tokens match past it: placeholder ids
+            // only ever legitimately appear at/after the media position, and
+            // a restored row there must come from the vision splice, never
+            // from a text prefix.
+            const disk_limit: u32 = if (media_start) |ms| @intCast(@min(ms, prompt_ids.len)) else @intCast(prompt_ids.len);
+            // A ringed cache restores only at a ring file: the chunks hold its other layers alone.
+            if (target_cache.swa_ring_window > 0) {
+                const ram_eff: usize = if (match) |m| blk: {
+                    const rr = ringRestore(&self.entries.items[m.idx], m.shared, prompt_ids.len) orelse break :blk 0;
+                    break :blk rr.len;
+                } else 0;
+                const rm = d.bestRingMatch(prompt_ids, has_tools, target_cache.config, disk_limit, target_cache.swa_ring_window) orelse break :disk;
+                if (@as(usize, rm.at) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
+                const full_match = rm.at == prompt_ids.len;
+                const final_len: u32 = if (full_match and rm.at > 1) rm.at - 1 else rm.at;
+                const sw = io_util.Stopwatch.init(d.io);
+                d.restoreIntoRinged(target_cache, rm.idx, rm.pos, final_len, s) catch |err| {
+                    log.warn("  [disk-cache] ring restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                    target_cache.truncate(0, s) catch {};
+                    break :disk;
+                };
+                target_moe_seq_offset.* = final_len;
+                self.last_restored_disk_id = d.entries.items[rm.idx].id;
+                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ring@{d})\n", .{ final_len, prompt_ids.len, sw.read() / std.time.ns_per_ms, rm.pos });
+                const disk_mtp = diskRestoreSpec(d, rm.idx, mtp_target, final_len, s, .mtp);
+                return .{
+                    .matched = final_len,
+                    .full_match = full_match,
+                    .dflash_base = diskRestoreSpec(d, rm.idx, dflash_target, final_len, s, .dflash),
+                    .mtp_base = disk_mtp,
+                };
+            }
             const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse {
                 // Silent no-entry misses are why a 40 GB disk tier looked
                 // dead in a live post-mortem (2026-09-07): nothing in the
@@ -1228,7 +1571,6 @@ pub const HotPrefixCache = struct {
                 .full_match = full_match,
                 .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, final_len, s, .dflash),
                 .mtp_base = disk_mtp,
-                .slot_owned = true,
             };
         }
 
@@ -1300,6 +1642,7 @@ pub const HotPrefixCache = struct {
             if (target_ssm_entries) |entries| resetSsmEntries(entries);
             target_moe_seq_offset.* = 0;
             self.last_restored_used = null;
+            e.last_used = used_before_restore;
         }
         try target_cache.restore(&e.snapshot);
 
@@ -1356,6 +1699,12 @@ pub const HotPrefixCache = struct {
                 resetSsmEntries(entries);
                 effective_matched = 0;
             }
+        } else if (ringRestore(e, restore_cap, prompt_ids.len)) |rr| {
+            if (rr.cp) |cp| {
+                try target_cache.restoreRing(cp);
+                effective_matched = rr.len;
+                log.info("  [hot-cache] ring checkpoint @{d} serves the match of {d} (the entry's ring ends at {d})\n", .{ cp.step, m.shared, e.snapshot.step });
+            }
         }
         target_moe_seq_offset.* = effective_matched;
 
@@ -1365,9 +1714,9 @@ pub const HotPrefixCache = struct {
             try target_cache.truncate(0, s);
             // A 0-token outcome is not a restore: the marker was set above the restore (the hybrid
             // clamp needs the entry live) and would otherwise shield a fully reclaimable entry from
-            // the admission pass. The LRU hand-back takes the same `ssd_first` gate as the lien decline.
+            // the admission pass. Promoted, the entry would make a usable one the next eviction victim.
             self.last_restored_used = null;
-            if (self.ssd_first) e.last_used = used_before_restore;
+            e.last_used = used_before_restore;
             log.info("  [hot-cache] hybrid miss (no checkpoint ≤ {d} of {d}); cold prefill\n", .{ m.shared, prompt_ids.len });
             return .{ .matched = 0, .full_match = false };
         }
@@ -1388,7 +1737,19 @@ pub const HotPrefixCache = struct {
         // already `final_len`, so unconditional clamping is safe and restores the
         // invariant cache.offset == matched. The stale KV tail has no matching
         // token id, so the match can never reach into it — discarding it is correct.
-        try target_cache.truncate(final_len, s);
+        target_cache.truncate(final_len, s) catch |err| {
+            // A ringed sliding layer holds a window, not a prefix: a clamp below
+            // the rows it kept cannot be served, so this match is not restorable
+            // and the request cold-prefills.
+            log.warn("  [hot-cache] clamp to {d} declined: {s}; cold prefill\n", .{ final_len, @errorName(err) });
+            try target_cache.truncate(0, s);
+            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            target_moe_seq_offset.* = 0;
+            self.last_restored_used = null;
+            // Nothing was restored: promoted, this entry made a usable one the next eviction victim.
+            e.last_used = used_before_restore;
+            return .{ .matched = 0, .full_match = false };
+        };
 
         const full_reuse = full_match and effective_matched > 1;
         const matched = if (full_reuse) effective_matched - 1 else effective_matched;
@@ -1454,8 +1815,8 @@ pub const HotPrefixCache = struct {
     }
 
     /// Restore by move on demand: the admission pass found this slot's share does not fit (its first
-    /// append would copy the whole prefix). Takes the checkout `checkoutIfEligible` takes up front in
-    /// SSD-first mode, on the entry the slot just restored.
+    /// append copies the prefix). Takes, on the entry the slot just restored, the checkout
+    /// `checkoutIfEligible` takes up front in SSD-first mode.
     pub fn checkoutRestored(self: *HotPrefixCache, slot_id: usize, prompt_len: usize) bool {
         const used = self.last_restored_used orelse return false;
         for (self.entries.items) |*e| {
@@ -1477,9 +1838,19 @@ pub const HotPrefixCache = struct {
         for (self.entries.items) |*e| {
             if (e.checked_out_by != slot_id) continue;
             if (e.checkout_donated) continue;
+            e.donated_bytes = snapshotBytes(&e.snapshot);
             e.snapshot.releaseHandles();
             e.checkout_donated = true;
         }
+    }
+
+    /// Bytes this cache still bills that `slot_id` now owns (its donated checkout). Inference thread only.
+    pub fn donatedBytes(self: *const HotPrefixCache, slot_id: usize) u64 {
+        var total: u64 = 0;
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by == slot_id and e.checkout_donated) total += e.donated_bytes;
+        }
+        return total;
     }
 
     /// End of a slot's life. Not donated: the entry never gave its handles up, hand it back
@@ -1532,48 +1903,69 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !CommitStatus {
-        return self.commitWithState(source_cache, tokens, has_tools, &.{}, ssm_cps, dflash, mtp);
+        return self.commitWithStateSource(source_cache, tokens, has_tools, 0, ssm_cps, dflash, mtp);
     }
 
     /// Commit with SSM checkpoints; ownership of the payload transfers to
     /// the entry.
-    pub fn commitWithState(
+    pub fn commitWithStateSource(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
         tokens: []const u32,
         has_tools: bool,
-        media: []const MediaSpan,
+        vision_key: u64,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !CommitStatus {
-        return self.commitWithMediaState(source_cache, tokens, has_tools, media, 0, ssm_cps, dflash, mtp, tokens.len);
+        return self.commitWithMediaStateSource(source_cache, tokens, has_tools, vision_key, 0, null, ssm_cps, dflash, mtp, tokens.len);
     }
 
     /// `prompt_len` is the committing request's PROMPT length inside `tokens`
     /// (which may carry the generated tail too): inherited checkpoints are capped
     /// at it, because a donor's checkpoints past the prompt hold the donor's own
     /// generation and a greedy continuation can match those tokens verbatim.
-    /// `commitWithState` passes `tokens.len`, right only for a prompt-only array.
-    pub fn commitWithMediaState(
+    /// `commitWithStateSource` passes `tokens.len`, right only for a prompt-only array.
+    pub fn commitWithMediaStateSource(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
         tokens: []const u32,
         has_tools: bool,
-        media: []const MediaSpan,
+        vision_key: u64,
         cache_key: u64,
+        media_start: ?usize,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
         prompt_len: usize,
     ) !CommitStatus {
+        return self.commitWithRing(source_cache, tokens, has_tools, vision_key, cache_key, media_start, ssm_cps, dflash, mtp, prompt_len, .{});
+    }
+
+    /// `ring_cps` are a ringed slot's restore points (`SlotRingCps`); ownership transfers to
+    /// the cache like `ssm_cps`.
+    pub fn commitWithRing(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        cache_key: u64,
+        media_start: ?usize,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+        prompt_len: usize,
+        ring_cps: SlotRingCps,
+    ) !CommitStatus {
+        // Freed on every path that does not move it into an entry.
+        var new_rings = ownRingCps(self.allocator, ring_cps);
+        defer if (new_rings) |r| freeRingCps(self.allocator, r);
+        var new_ring_bytes = ringCpsBytes(new_rings);
         const quant_config = source_cache.config;
-        // An item's key applies only to rows the entry covers: a cancelled
-        // prefill that stopped before an item commits without it.
-        var eff_media = spansBelow(media, tokens.len);
 
         // Record what the live cache holds now, before any byte-budget trim.
-        if (self.ssd_first and self.disk != null and eff_media.len == 0) {
+        if (self.ssd_first and self.disk != null and vision_key == 0) {
             self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp);
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
@@ -1583,10 +1975,28 @@ pub const HotPrefixCache = struct {
             self.pending_disk = null;
         };
 
+        // An entry's pixel key applies only to rows it actually covers. When
+        // the committed range ends before the request's first media row — a
+        // cancelled prefill that forwarded less than the media position —
+        // the entry is pure text and must carry the NULL key, or the
+        // boundary-less cross-key entry gets conservatively rejected by the
+        // lookup (live 2026-09-07: the with-image and no-image retry shapes
+        // of one 122k session locked each other out of a shared 121819-token
+        // text prefix). A null `media_start` keeps the caller's key as-is
+        // (commitWithStateSource's pixel-keyed, boundary-less contract).
+        var eff_media_start = media_start;
+        var eff_vision_key = vision_key;
+        if (media_start) |ms| {
+            if (ms >= tokens.len) {
+                eff_media_start = null;
+                eff_vision_key = 0;
+            }
+        }
+
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
-            if (mediaSharedBound(e.media, eff_media) < e.tokens.len) continue;
+            if (e.vision_key != eff_vision_key) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             if (e.tokens.len <= tokens.len) {
                 var shared: usize = 0;
@@ -1598,7 +2008,7 @@ pub const HotPrefixCache = struct {
             }
         }
 
-        var new_snap = try source_cache.snapshot();
+        var new_snap = try source_cache.snapshotRetained(mlx.gpuStream());
         // The speculative-side payloads are best-effort: a snapshot failure
         // must not cost the trunk KV entry they ride on.
         var new_dflash: ?DflashSnap = null;
@@ -1632,7 +2042,7 @@ pub const HotPrefixCache = struct {
         if (ssm_cps) |cps| {
             for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
         }
-        var new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
+        var new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes + new_ring_bytes;
         // Effective candidate: a byte-budget trim below shortens these.
         var eff_tokens = tokens;
         var eff_cps = ssm_cps;
@@ -1648,11 +2058,17 @@ pub const HotPrefixCache = struct {
             var trimmed_ok = false;
             var decline: TrimDecline = .no_restorable_prefix;
             var decline_err: ?anyerror = null;
-            var limit = tokens.len;
+            var limit = if (eff_media_start) |ms| @min(tokens.len, ms) else tokens.len;
             var inputs_logged = false;
             trim_blk: while (true) {
                 const row_bytes = snapshotRowBytes(&new_snap);
-                const tl_opt = self.trimLenForBudget(self.max_kv_bytes, limit, row_bytes, eff_cps);
+                const ring_bytes = ringedBytes(&new_snap);
+                var ring_cp: ?*const KVCacheSnapshot = null;
+                const tl_opt = if (ring_bytes > 0) blk: {
+                    const rt = ringTrimLen(self.max_kv_bytes, limit, row_bytes, tokens.len, ring_bytes, new_rings orelse &.{}) orelse break :blk null;
+                    if (rt.cp) |k| ring_cp = &new_rings.?[k];
+                    break :blk rt.len;
+                } else self.trimLenForBudget(self.max_kv_bytes, limit, row_bytes, eff_cps);
                 if (!inputs_logged) {
                     inputs_logged = true;
                     logTrimInputs(tokens.len, row_bytes, self.max_kv_bytes, eff_cps, tl_opt, self.cp_thin != .min_span);
@@ -1669,7 +2085,7 @@ pub const HotPrefixCache = struct {
                     {
                         // The resident entry already covers the trim target;
                         // the candidate's EXTRA tokens still belong on disk.
-                        if (eff_media.len == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps);
+                        if (eff_vision_key == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps, new_rings);
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -1687,7 +2103,7 @@ pub const HotPrefixCache = struct {
                         return .{ .kept_resident = self.entries.items[idx].tokens.len };
                     }
                 }
-                const trimmed = new_snap.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
+                const trimmed = new_snap.trimmedCopy(tl, ring_cp, mlx.gpuStream()) catch |err| {
                     // A copy that failed at this width is not a verdict on the entry: retry at the next-lower checkpoint.
                     decline = .snapshot_copy_failed;
                     decline_err = err;
@@ -1739,14 +2155,30 @@ pub const HotPrefixCache = struct {
                     }
                 }
                 eff_tokens = tokens[0..tl];
-                // The entry keeps only the items whose rows it still holds.
-                eff_media = spansBelow(eff_media, tl);
+                if (eff_media_start) |ms| {
+                    if (ms >= tl) {
+                        // The trim cut below the media boundary: the entry
+                        // is pure text now — re-key it, and drop the replace
+                        // target (it was scanned under the pixel key, a
+                        // different keyspace; the image-keyed entry stays
+                        // behind for its own requests).
+                        eff_media_start = null;
+                        eff_vision_key = 0;
+                        replace_idx = null;
+                    }
+                }
                 new_kv_bytes = snapshotBytes(&new_snap);
                 new_ssm_bytes = 0;
                 if (eff_cps) |cps| {
                     for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
                 }
-                new_bytes = new_kv_bytes + new_ssm_bytes;
+                // Only this slot's own checkpoints so far; inheritance runs below. A checkpoint
+                // the trim landed on is the entry's ring now.
+                if (new_rings) |r| {
+                    new_rings = ringCpsUpTo(self.allocator, r, if (ring_cp != null) tl - 1 else tl);
+                    new_ring_bytes = ringCpsBytes(new_rings);
+                }
+                new_bytes = new_kv_bytes + new_ssm_bytes + new_ring_bytes;
                 log.info("  [hot-cache] trimmed oversized entry to {d}/{d} tokens ({d:.2} MB before checkpoint shedding; {d:.2} MB budget)\n", .{
                     tl,
                     tokens.len,
@@ -1759,7 +2191,7 @@ pub const HotPrefixCache = struct {
             if (!trimmed_ok) {
                 // RAM decline is not a value verdict: offer the candidate to
                 // the SSD tier before discarding it.
-                if (eff_media.len == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps);
+                if (eff_vision_key == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps, new_rings);
                 var discarded_snap = new_snap;
                 discarded_snap.deinit();
                 if (new_dflash) |*d| d.deinit();
@@ -1787,7 +2219,7 @@ pub const HotPrefixCache = struct {
         // a double free, with a different allocator). After a trim `eff_cps`
         // may be a cache-allocated replacement of the caller's slice, so the
         // cache is the only party that can still free correctly.
-        const tokens_owned, const media_owned = dupeEntryKeys(self.allocator, eff_tokens, eff_media) catch |err| {
+        const tokens_owned = self.allocator.dupe(u32, eff_tokens) catch |err| {
             var snap = new_snap;
             snap.deinit();
             if (new_dflash) |*d| d.deinit();
@@ -1814,7 +2246,7 @@ pub const HotPrefixCache = struct {
         // resident, so this costs GPU memory only in the accounting, and only
         // until the donor is evicted.
         if (replace_idx == null) inherit: {
-            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, eff_media, quant_config) orelse
+            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, eff_vision_key, eff_media_start, quant_config) orelse
                 break :inherit;
             const budget: ?u64 = if (self.max_kv_bytes == 0)
                 null
@@ -1845,7 +2277,7 @@ pub const HotPrefixCache = struct {
             }
             if (eff_cps) |own| {
                 // Consumes both on every path; on error neither survives.
-                const merged = self.mergeCheckpointLists(cloned, own, firstSpanStart(eff_media)) catch |err| {
+                const merged = self.mergeCheckpointLists(cloned, own, eff_media_start) catch |err| {
                     log.warn("  [hot-cache] checkpoint merge failed: {s}\n", .{@errorName(err)});
                     eff_cps = null;
                     new_bytes -= new_ssm_bytes;
@@ -1883,6 +2315,34 @@ pub const HotPrefixCache = struct {
             });
         }
 
+        // The ring's twin of the checkpoint inheritance above: a request that restored off a
+        // donor and appended its own tail keeps the donor's restore points below the fork, so a
+        // later request diverging there restores after the donor is gone.
+        if (replace_idx == null) ring_inherit: {
+            const cap = @min(if (prompt_len == 0) eff_tokens.len else prompt_len, eff_tokens.len);
+            const donor = self.bestRingDonor(eff_tokens, has_tools, eff_vision_key, eff_media_start, quant_config, cap) orelse
+                break :ring_inherit;
+            const budget: ?u64 = if (self.max_kv_bytes == 0)
+                null
+            else if (new_bytes >= self.max_kv_bytes)
+                break :ring_inherit
+            else
+                self.max_kv_bytes - new_bytes;
+            const inherited = (shareRingCpsUpTo(self.allocator, self.entries.items[donor.idx].ring_cps.?, donor.limit, budget) catch |err| {
+                log.warn("  [hot-cache] ring checkpoint inheritance failed: {s}\n", .{@errorName(err)});
+                break :ring_inherit;
+            }) orelse break :ring_inherit;
+            const merged = mergeRingCps(self.allocator, inherited, new_rings);
+            new_rings = merged catch |err| blk: {
+                log.warn("  [hot-cache] ring checkpoint merge failed: {s}\n", .{@errorName(err)});
+                break :blk null;
+            };
+            const merged_bytes = ringCpsBytes(new_rings);
+            new_bytes = new_bytes - new_ring_bytes + merged_bytes;
+            new_ring_bytes = merged_bytes;
+            log.info("  [hot-cache] inherited ring checkpoints (<= {d} tokens) from a shared prefix\n", .{donor.limit});
+        }
+
         if (replace_idx) |idx| {
             const e = &self.entries.items[idx];
 
@@ -1906,13 +2366,12 @@ pub const HotPrefixCache = struct {
                 // not touch it.
                 e.ssm_checkpoints = null;
                 const new = eff_cps orelse break :blk old;
-                break :blk try self.mergeCheckpointLists(old, new, firstSpanStart(eff_media));
+                break :blk try self.mergeCheckpointLists(old, new, eff_media_start);
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
             // ssm_checkpoints, which were moved above.
             self.allocator.free(e.tokens);
-            self.allocator.free(e.media);
             e.snapshot.deinit();
             // The old speculative payloads describe a strict PREFIX of the
             // new tokens, but they are keyed to their own base_pos and
@@ -1922,6 +2381,16 @@ pub const HotPrefixCache = struct {
             e.dflash = null;
             if (e.mtp) |*m4| m4.deinit();
             e.mtp = null;
+            // The old restore points sit inside the new tokens too; at a tie the newer wins.
+            const old_rings = e.ring_cps;
+            e.ring_cps = null;
+            const merged_rings = mergeRingCps(self.allocator, old_rings, new_rings);
+            new_rings = null;
+            e.ring_cps = merged_rings catch |err| blk: {
+                log.warn("  [hot-cache] ring checkpoint merge failed: {s}\n", .{@errorName(err)});
+                break :blk null;
+            };
+            const ring_bytes = ringCpsBytes(e.ring_cps);
             self.current_kv_bytes -|= e.kv_bytes;
 
             // Recompute ssm bytes from the merged list.
@@ -1932,10 +2401,11 @@ pub const HotPrefixCache = struct {
             e.tokens = tokens_owned;
             e.snapshot = new_snap;
             e.has_tools = has_tools;
-            e.media = media_owned;
+            e.vision_key = eff_vision_key;
             e.cache_key = cache_key;
+            e.media_start = eff_media_start;
             e.quant_config = quant_config;
-            e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
+            e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes + ring_bytes;
             e.ssm_checkpoints = merged_cps;
             e.ssm_bytes = merged_ssm_bytes;
             e.dflash = new_dflash;
@@ -1972,29 +2442,12 @@ pub const HotPrefixCache = struct {
             return .{ .ok = eff_tokens.len };
         }
 
-        while (self.entries.items.len >= self.max_entries) {
-            if (!self.evictOneLruProgress("count cap", cache_key)) break;
-        }
-        if (self.max_kv_bytes > 0) {
-            while (self.current_kv_bytes + new_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
-                if (!self.evictOneLruProgress("byte budget", cache_key)) break;
-            }
-        }
-
-        if (eff_cps) |cps| {
-            if (self.takeCpsIfQsaBank(cps)) |kept| {
-                eff_cps = kept;
-            } else {
-                new_bytes -= new_ssm_bytes;
-                new_ssm_bytes = 0;
-                eff_cps = null;
-            }
-        }
-        self.entries.append(self.allocator, .{
+        const incoming: Entry = .{
             .tokens = tokens_owned,
             .has_tools = has_tools,
-            .media = media_owned,
+            .vision_key = eff_vision_key,
             .cache_key = cache_key,
+            .media_start = eff_media_start,
             .snapshot = new_snap,
             .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
@@ -2006,25 +2459,56 @@ pub const HotPrefixCache = struct {
             .dflash_bytes = new_dflash_bytes,
             .mtp = new_mtp,
             .mtp_bytes = new_mtp_bytes,
-        }) catch |err| {
-            self.allocator.free(tokens_owned);
-            self.allocator.free(media_owned);
-            var snap = new_snap;
-            snap.deinit();
-            if (new_dflash) |*d| d.deinit();
-            if (new_mtp) |*m5| m5.deinit();
-            if (eff_cps) |cps| {
-                for (cps) |*cp| cp.deinit(self.allocator);
-                self.allocator.free(cps);
-            }
-            return err;
+            .ring_cps = new_rings,
         };
-        self.current_kv_bytes += new_bytes;
+        new_rings = null;
+        if (!try self.retainNewEntry(incoming)) return .declined;
         // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
         if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
         if (self.disk != null) self.disk_dirty = true;
         self.logResident();
         return .{ .ok = eff_tokens.len };
+    }
+
+    fn retainNewEntry(self: *HotPrefixCache, entry: Entry) !bool {
+        var incoming = entry;
+        errdefer freeEntryOwnedState(self.allocator, &incoming);
+        while (self.entries.items.len >= self.max_entries) {
+            if (!self.evictOneLruProgress("count cap", incoming.cache_key)) break;
+        }
+        if (self.max_kv_bytes > 0) {
+            while (self.current_kv_bytes + incoming.kv_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
+                if (!self.evictOneLruProgress("byte budget", incoming.cache_key)) break;
+            }
+        }
+        if (self.entries.items.len >= self.max_entries) return self.declineIncoming(&incoming, "count cap");
+        if (incoming.ssm_checkpoints) |cps| {
+            if (self.takeCpsIfQsaBank(cps)) |kept| {
+                incoming.ssm_checkpoints = kept;
+            } else {
+                incoming.kv_bytes -= incoming.ssm_bytes;
+                incoming.ssm_bytes = 0;
+                incoming.ssm_checkpoints = null;
+            }
+        }
+        try self.entries.append(self.allocator, incoming);
+        self.current_kv_bytes += incoming.kv_bytes;
+        // A trim is priced against the checkpoints that survive the shed, so shed before judging.
+        if (self.max_kv_bytes > 0 and self.current_kv_bytes > self.max_kv_bytes) {
+            self.shedCheckpointsToFit();
+            if (self.current_kv_bytes > self.max_kv_bytes) {
+                var last = self.entries.pop().?;
+                self.current_kv_bytes -|= last.kv_bytes;
+                return self.declineIncoming(&last, "byte budget");
+            }
+        }
+        return true;
+    }
+
+    fn declineIncoming(self: *HotPrefixCache, incoming: *Entry, cap: []const u8) bool {
+        freeEntryOwnedState(self.allocator, incoming);
+        log.info("  [hot-cache] skipped incoming snapshot: {s} full; checked-out entries prevent eviction\n", .{cap});
+        return false;
     }
 
     /// Offer a budget-declined candidate to the SSD tier before discarding
@@ -2042,6 +2526,7 @@ pub const HotPrefixCache = struct {
         tokens: []const u32,
         has_tools: bool,
         cps: ?[]SSMCheckpoint,
+        ring_cps: ?[]const KVCacheSnapshot,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
         // SSD-first captured the live state as `pending_disk` before the trim; the
@@ -2060,7 +2545,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = d.appendCommit(snap.entries, snap.step, snap.config, tokens, has_tools, cps, mlx.gpuStream()) catch |err| {
+        const outcome = d.appendCommitWithRing(snap.entries, snap.step, snap.config, tokens, has_tools, cps, null, null, ringCommitOf(snap, ring_cps), mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2072,7 +2557,7 @@ pub const HotPrefixCache = struct {
         log.info("  [disk-cache] declined RAM candidate spilled to SSD ({d} tokens, {s})\n", .{ tokens.len, note });
     }
 
-    /// Snapshot the live cache (refcount-shared) plus the full token record and this turn's
+    /// Snapshot the live cache (refcount-shared but for a ring's retained rows) plus the full token record and this turn's
     /// checkpoints. Best effort; the caller still owns `ssm_cps`/`dflash`/`mtp`.
     fn capturePendingDisk(
         self: *HotPrefixCache,
@@ -2087,7 +2572,7 @@ pub const HotPrefixCache = struct {
             old.deinit(self.allocator);
             self.pending_disk = null;
         }
-        var snap = source_cache.snapshot() catch |err| {
+        var snap = source_cache.snapshotRetained(mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] live snapshot failed: {s} — flushing the RAM entry instead\n", .{@errorName(err)});
             return;
         };
@@ -2119,6 +2604,12 @@ pub const HotPrefixCache = struct {
             } else |_| {}
         }
         self.pending_disk = rec;
+    }
+
+    /// A ringed snapshot's restore points for the disk tier; null for a cache that does not ring.
+    fn ringCommitOf(snap: *const KVCacheSnapshot, cps: ?[]const KVCacheSnapshot) ?kv_disk_cache.RingCommit {
+        if (snap.swa_ring_window == 0) return null;
+        return .{ .window = snap.swa_ring_window, .cps = cps orelse &.{} };
     }
 
     const EntrySpecs = struct {
@@ -2173,8 +2664,8 @@ pub const HotPrefixCache = struct {
             if (e.checked_out_by != null) continue;
             // Counted against the allowance before the vision skip: it occupies RAM either way.
             idle_bytes +|= e.kv_bytes;
-            // Media entries never spill: a token-only disk key is ambiguous.
-            if (e.media.len != 0) continue;
+            // Vision entries never spill: a token-only disk key is ambiguous.
+            if (e.vision_key != 0) continue;
             const specs = entrySpecCommits(e);
             const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
@@ -2249,7 +2740,7 @@ pub const HotPrefixCache = struct {
         var best_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
             if (e.last_used == newest_used) continue;
-            if (e.media.len != 0) continue;
+            if (e.vision_key != 0) continue;
             if (e.checked_out_by != null) continue;
             if (durable_only and !e.spill_durable) continue;
             if (e.last_used < best_used) {
@@ -2324,18 +2815,18 @@ pub const HotPrefixCache = struct {
         for (self.entries.items[1..]) |*e| {
             if (e.last_used > newest.last_used) newest = e;
         }
-        if (newest.media.len != 0) return;
+        if (newest.vision_key != 0) return;
         // Phase 3: hybrid entries persist their SSM checkpoints alongside the
         // KV chunks (immutable per-position s*.safetensors). The snapshot
         // arrays are refcount-shared with the RAM entry, so `appendCommit`
         // reads the same buffers the commit captured.
         // v4: the spec snapshots (dflash context / MTP history) ride along —
-        // eligibility was enforced at commitWithState, so the disk tier
+        // eligibility was enforced at commitWithStateSource, so the disk tier
         // persists exactly what the RAM entry holds.
         const specs = entrySpecCommits(newest);
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
-        const complete = d.appendCommitWithSpec(
+        const complete = d.appendCommitWithRing(
             newest.snapshot.entries,
             newest.snapshot.step,
             newest.snapshot.config,
@@ -2344,6 +2835,7 @@ pub const HotPrefixCache = struct {
             newest.ssm_checkpoints,
             dflash_spec,
             mtp_spec,
+            ringCommitOf(&newest.snapshot, newest.ring_cps),
             s,
         ) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
@@ -2479,19 +2971,16 @@ pub const HotPrefixCache = struct {
         self: *const HotPrefixCache,
         tokens: []const u32,
         has_tools: bool,
-        media: []const MediaSpan,
+        vision_key: u64,
+        media_start: ?usize,
         quant_config: kv_quant.KVQuantConfig,
     ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         var best_pos: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
-            if (e.has_tools != has_tools) continue;
-            if (!std.meta.eql(e.quant_config, quant_config)) continue;
             const cps = e.ssm_checkpoints orelse continue;
-            const max_shared = @min(e.tokens.len, tokens.len, mediaSharedBound(e.media, media));
-            var shared: usize = 0;
-            while (shared < max_shared and e.tokens[shared] == tokens[shared]) shared += 1;
+            const shared = donorShared(e, tokens, has_tools, vision_key, media_start, quant_config) orelse continue;
             const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
             if (cp.pos > best_pos) {
                 best_pos = cp.pos;
@@ -2501,6 +2990,216 @@ pub const HotPrefixCache = struct {
         }
         if (best_idx) |idx| return .{ .idx = idx, .shared = best_shared };
         return null;
+    }
+
+    /// Tokens a key-compatible entry provably shares with `tokens`; null = another key.
+    fn donorShared(
+        e: *const Entry,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        quant_config: kv_quant.KVQuantConfig,
+    ) ?usize {
+        if (e.has_tools != has_tools) return null;
+        if (!std.meta.eql(e.quant_config, quant_config)) return null;
+        var max_shared = @min(e.tokens.len, tokens.len);
+        if (e.vision_key != vision_key) {
+            // Same rule as `findBestRestorableMatch`: rows before the
+            // earliest media placeholder are ordinary text and cross keys.
+            const safe_boundary = crossKeyBoundary(e.vision_key, e.media_start, media_start, &.{}) orelse return null;
+            max_shared = @min(max_shared, safe_boundary);
+        }
+        var shared: usize = 0;
+        while (shared < max_shared and e.tokens[shared] == tokens[shared]) shared += 1;
+        return shared;
+    }
+
+    const RingDonor = struct { idx: usize, limit: usize };
+
+    /// The resident entry holding the highest ring checkpoint a commit of `tokens` may inherit:
+    /// one whose rows are all shared tokens, at or below `cap` (the committing prompt's length).
+    /// Returns that entry's index and the bound.
+    fn bestRingDonor(
+        self: *const HotPrefixCache,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        quant_config: kv_quant.KVQuantConfig,
+        cap: usize,
+    ) ?RingDonor {
+        var best: ?RingDonor = null;
+        var best_step: usize = 0;
+        for (self.entries.items, 0..) |*e, i| {
+            const cps = e.ring_cps orelse continue;
+            const shared = donorShared(e, tokens, has_tools, vision_key, media_start, quant_config) orelse continue;
+            const limit = @min(shared, cap);
+            for (cps) |*cp| {
+                if (cp.step < RING_RESTORE_MIN_TOKENS or cp.step > limit or cp.step <= best_step) continue;
+                best_step = cp.step;
+                best = .{ .idx = i, .limit = limit };
+            }
+        }
+        return best;
+    }
+
+    /// Refcount-share `src`'s ring checkpoints with `step <= limit` into an ascending slice the
+    /// caller owns, thinned to `RING_CHECKPOINT_MAX` and to `budget` (null = unbounded). Null
+    /// when none qualifies. Billed again per entry, as `cloneCheckpointsUpTo` explains.
+    fn shareRingCpsUpTo(allocator: std.mem.Allocator, src: []const KVCacheSnapshot, limit: usize, budget: ?u64) !?[]KVCacheSnapshot {
+        var n: usize = 0;
+        for (src) |*cp| n += @intFromBool(cp.step <= limit);
+        if (n == 0) return null;
+        const out = try allocator.alloc(KVCacheSnapshot, n);
+        var total: u64 = 0;
+        {
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |*c| c.deinit();
+                allocator.free(out);
+            }
+            for (src) |*cp| {
+                if (cp.step > limit) continue;
+                out[filled] = try cp.share();
+                total += snapshotBytes(cp);
+                filled += 1;
+            }
+        }
+        return thinRingCps(allocator, out, RING_CHECKPOINT_MAX, if (budget) |b| total -| b else 0);
+    }
+
+    fn ringStepOf(cp: *const KVCacheSnapshot) usize {
+        return cp.step;
+    }
+
+    /// Thin an owned ascending list to `max_len` checkpoints and by at least `need_free` bytes,
+    /// dropping where coverage loses least: the lowest (a shared preamble) and the newest stay
+    /// longest. Consumes `cps` on every path; null when none survives.
+    fn thinRingCps(allocator: std.mem.Allocator, cps: []KVCacheSnapshot, max_len: usize, need_free: u64) !?[]KVCacheSnapshot {
+        errdefer freeRingCps(allocator, cps);
+        var live = try std.ArrayList(KVCacheSnapshot).initCapacity(allocator, cps.len);
+        defer live.deinit(allocator);
+        live.appendSliceAssumeCapacity(cps);
+        var freed: u64 = 0;
+        while (live.items.len > 0 and (live.items.len > max_len or freed < need_free)) {
+            const k = transformer_mod.spanPreservingDropIndex(KVCacheSnapshot, live.items, ringStepOf, .min_span_recency, null);
+            freed += snapshotBytes(&live.items[k]);
+            _ = live.orderedRemove(k);
+        }
+        if (live.items.len == cps.len) return cps;
+        const kept: ?[]KVCacheSnapshot = if (live.items.len == 0) null else try allocator.dupe(KVCacheSnapshot, live.items);
+        for (cps) |*c| {
+            const survives = for (live.items) |l| {
+                if (l.entries.ptr == c.entries.ptr) break true;
+            } else false;
+            if (!survives) c.deinit();
+        }
+        allocator.free(cps);
+        return kept;
+    }
+
+    /// One ascending list from two owned ones (a tie keeps `new`'s), thinned to
+    /// `RING_CHECKPOINT_MAX` (`thinRingCps`). Consumes both on every path.
+    fn mergeRingCps(allocator: std.mem.Allocator, old: ?[]KVCacheSnapshot, new: ?[]KVCacheSnapshot) !?[]KVCacheSnapshot {
+        var none = [_]KVCacheSnapshot{};
+        const a: []KVCacheSnapshot = old orelse &none;
+        const b: []KVCacheSnapshot = new orelse &none;
+        defer {
+            if (old) |o| allocator.free(o);
+            if (new) |n| allocator.free(n);
+        }
+        var ties: usize = 0;
+        for (a) |x| {
+            for (b) |y| ties += @intFromBool(x.step == y.step);
+        }
+        const n = a.len + b.len - ties;
+        if (n == 0) return null;
+        const out = allocator.alloc(KVCacheSnapshot, n) catch |err| {
+            for (a) |*c| c.deinit();
+            for (b) |*c| c.deinit();
+            return err;
+        };
+        var i: usize = 0;
+        var j: usize = 0;
+        for (out) |*o| {
+            if (j == b.len or (i < a.len and a[i].step < b[j].step)) {
+                o.* = a[i];
+                i += 1;
+                continue;
+            }
+            if (i < a.len and a[i].step == b[j].step) {
+                a[i].deinit();
+                i += 1;
+            }
+            o.* = b[j];
+            j += 1;
+        }
+        return thinRingCps(allocator, out, RING_CHECKPOINT_MAX, 0);
+    }
+
+    /// The slot's own checkpoints as an ascending owned list (a tie keeps the later one, so the
+    /// prompt end beats the fork); best effort, like their capture.
+    fn ownRingCps(allocator: std.mem.Allocator, cps: SlotRingCps) ?[]KVCacheSnapshot {
+        var all: [SLOT_RING_CHECKPOINTS]KVCacheSnapshot = undefined;
+        var n: usize = 0;
+        if (cps.fork) |f| {
+            all[n] = f;
+            n += 1;
+        }
+        for (cps.marks[0..cps.n_marks]) |m| {
+            all[n] = m;
+            n += 1;
+        }
+        if (cps.prompt_end) |e| {
+            all[n] = e;
+            n += 1;
+        }
+        if (n == 0) return null;
+        std.sort.insertion(KVCacheSnapshot, all[0..n], {}, struct {
+            fn lt(_: void, x: KVCacheSnapshot, y: KVCacheSnapshot) bool {
+                return x.step < y.step;
+            }
+        }.lt);
+        var kept: usize = 0;
+        for (all[0..n]) |cp| {
+            if (kept > 0 and all[kept - 1].step == cp.step) {
+                all[kept - 1].deinit();
+                all[kept - 1] = cp;
+            } else {
+                all[kept] = cp;
+                kept += 1;
+            }
+        }
+        return allocator.dupe(KVCacheSnapshot, all[0..kept]) catch {
+            for (all[0..kept]) |*c| c.deinit();
+            return null;
+        };
+    }
+
+    /// The checkpoints at or below `limit`, as an owned list; consumes `cps`.
+    fn ringCpsUpTo(allocator: std.mem.Allocator, cps: []KVCacheSnapshot, limit: usize) ?[]KVCacheSnapshot {
+        var kept: usize = 0;
+        while (kept < cps.len and cps[kept].step <= limit) kept += 1;
+        if (kept == cps.len) return cps;
+        for (cps[kept..]) |*c| c.deinit();
+        defer allocator.free(cps);
+        if (kept == 0) return null;
+        return allocator.dupe(KVCacheSnapshot, cps[0..kept]) catch {
+            for (cps[0..kept]) |*c| c.deinit();
+            return null;
+        };
+    }
+
+    fn freeRingCps(allocator: std.mem.Allocator, cps: []KVCacheSnapshot) void {
+        for (cps) |*c| c.deinit();
+        allocator.free(cps);
+    }
+
+    fn ringCpsBytes(cps: ?[]const KVCacheSnapshot) u64 {
+        var total: u64 = 0;
+        for (cps orelse return 0) |*c| total += snapshotBytes(c);
+        return total;
     }
 
     /// Refcount-share `src`'s checkpoints with `pos <= limit` into a fresh
@@ -2537,7 +3236,8 @@ pub const HotPrefixCache = struct {
                 if (spent + cost > b) break;
             }
             spent += cost;
-            try out.append(allocator, try transformer_mod.shareSsmCheckpoint(allocator, cp));
+            try out.ensureUnusedCapacity(allocator, 1);
+            out.appendAssumeCapacity(try transformer_mod.shareSsmCheckpoint(allocator, cp));
         }
         if (out.items.len == 0) {
             out.deinit(allocator);
@@ -2555,6 +3255,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items[1..]) |*e| {
             if (e.last_used > newest.last_used) newest = e;
         }
+        self.shedRingCheckpoints(newest);
         const cps = newest.ssm_checkpoints orelse return;
         var n = cps.len;
         var shed: usize = 0;
@@ -2562,7 +3263,7 @@ pub const HotPrefixCache = struct {
             const drop = transformer_mod.ssmCheckpointDropIndex(
                 cps[0..n],
                 self.cp_thin,
-                boundaryCheckpointIndex(cps[0..n], firstSpanStart(newest.media)),
+                boundaryCheckpointIndex(cps[0..n], newest.media_start),
             );
             const freed = ssmCheckpointBytes(&cps[drop]);
             if (checkpointHasQsaPooled(&cps[drop])) {
@@ -2599,6 +3300,22 @@ pub const HotPrefixCache = struct {
             n = 0;
         }
         log.info("  [hot-cache] shed {d} checkpoints to fit the byte budget ({d} kept)\n", .{ shed, n });
+    }
+
+    /// While the cache is over its budget, the way `thinRingCps` drops them.
+    fn shedRingCheckpoints(self: *HotPrefixCache, e: *Entry) void {
+        const cps = e.ring_cps orelse return;
+        const over = self.current_kv_bytes -| self.max_kv_bytes;
+        if (over == 0) return;
+        const before_n = cps.len;
+        const before = ringCpsBytes(cps);
+        e.ring_cps = null;
+        e.ring_cps = thinRingCps(self.allocator, cps, RING_CHECKPOINT_MAX, over) catch null;
+        const freed = before - ringCpsBytes(e.ring_cps);
+        e.kv_bytes -|= freed;
+        self.current_kv_bytes -|= freed;
+        const kept = if (e.ring_cps) |r| r.len else 0;
+        log.info("  [hot-cache] shed {d} ring checkpoints to fit the byte budget ({d} kept)\n", .{ before_n - kept, kept });
     }
 
     /// Re-clamp the byte budget after the machine's residency changed (a model loaded
@@ -2810,6 +3527,9 @@ pub const HotPrefixCache = struct {
         protect_restored: bool,
     ) EvictionReport {
         var report = EvictionReport{};
+        // A command buffer in flight keeps its inputs' buffers until it completes: drain the
+        // stream so `fits` and every live delta below read settled memory.
+        _ = mlx.mlx_synchronize(mlx.gpuStream());
         while (!fits(ctx)) {
             const idx = self.lruIndexExcluding(if (protect_restored) self.last_restored_used else null, null) orelse break;
             // Accounting bytes are what the entry was billed; live bytes are what the allocator got back.
@@ -3005,29 +3725,65 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
 
     // Looking up [1,2,3,4,5,6] should match entry A (5 shared tokens).
     const lookup_ids = [_]u32{ 1, 2, 3, 4, 5, 6 };
-    const m = cache.findBestMatch(&lookup_ids, false, &.{}, kv_quant.KVQuantConfig.dense).?;
+    const m = cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(usize, 0), m.idx);
     try testing.expectEqual(@as(usize, 5), m.shared);
 
     // Looking up [1,2,3,9,9,9,7] should match entry B (6 shared).
     const lookup_ids2 = [_]u32{ 1, 2, 3, 9, 9, 9, 7 };
-    const m2 = cache.findBestMatch(&lookup_ids2, false, &.{}, kv_quant.KVQuantConfig.dense).?;
+    const m2 = cache.findBestMatch(&lookup_ids2, false, 0, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(usize, 1), m2.idx);
     try testing.expectEqual(@as(usize, 6), m2.shared);
 
     // has_tools mismatch returns null.
-    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, true, &.{}, kv_quant.KVQuantConfig.dense));
-    // A media item at row 0 matches only the same pixels, both ways.
-    var k7 = [_]MediaSpan{.{ .start = 0, .key = 7 }};
-    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, &k7, kv_quant.KVQuantConfig.dense));
-    cache.entries.items[0].media = &k7;
+    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, true, 0, kv_quant.KVQuantConfig.dense));
+    // vision_key mismatch returns null both ways: a text entry never serves an
+    // image request and an image entry only serves the same pixels.
+    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, 7, kv_quant.KVQuantConfig.dense));
+    cache.entries.items[0].vision_key = 7;
     // Text lookup falls through to entry B (3 shared); the keyed lookup gets A.
-    try testing.expectEqual(@as(usize, 1), cache.findBestMatch(&lookup_ids, false, &.{}, kv_quant.KVQuantConfig.dense).?.idx);
-    try testing.expectEqual(@as(usize, 0), cache.findBestMatch(&lookup_ids, false, &k7, kv_quant.KVQuantConfig.dense).?.idx);
-    cache.entries.items[0].media = &.{};
+    try testing.expectEqual(@as(usize, 1), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense).?.idx);
+    try testing.expectEqual(@as(usize, 0), cache.findBestMatch(&lookup_ids, false, 7, kv_quant.KVQuantConfig.dense).?.idx);
+    cache.entries.items[0].vision_key = 0;
     // Scheme mismatch returns null — entries are dense, a query for affine
     // 4-bit cannot match (Wave 1.A: cross-scheme cache hits never happen).
-    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, &.{}, kv_quant.KVQuantConfig.affine(4)));
+    try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(4)));
+}
+
+test "HotPrefixCache: an entry holding the request's first images restores up to the new one" {
+    // An agent turn appends a screenshot to a conversation that already holds
+    // one: the previous turn's entry carries the first image's rows, keyed by
+    // that image alone, and serves everything before the new image.
+    var cache = HotPrefixCache.init(testing.allocator, 4);
+    defer cache.deinit();
+    const P = 99;
+    const chain = [_]MediaSpan{ .{ .start = 3, .key = 0xA1 }, .{ .start = 8, .key = 0xB3 } };
+    const request = [_]u32{ 1, 2, 3, P, P, 5, 6, 7, P, P, 9 };
+    for ([_]u64{ 0xA1, 0xF0 }, 0..) |key, i| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, &[_]u32{ 1, 2, 3, P, P, 5, 6, 7, 4 }),
+            .has_tools = false,
+            .vision_key = key,
+            .media_start = 3,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = i,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+            .ssm_checkpoints = null,
+            .ssm_bytes = 0,
+        });
+    }
+    const dense = kv_quant.KVQuantConfig.dense;
+    const m = cache.findBestRestorableMatch(&request, false, chainKey(&chain), 3, &chain, dense, false, null).?;
+    try testing.expectEqual(@as(usize, 0), m.idx);
+    try testing.expectEqual(@as(usize, 8), m.shared);
+
+    // Foreign pixels under the first placeholder share only the text before it.
+    cache.entries.items[0].vision_key = 0xA2;
+    try testing.expectEqual(@as(usize, 3), cache.findBestRestorableMatch(&request, false, chainKey(&chain), 3, &chain, dense, false, null).?.shared);
+    // Without the chain the old rule holds: the first media row bounds it.
+    cache.entries.items[0].vision_key = 0xA1;
+    try testing.expectEqual(@as(usize, 3), cache.findBestRestorableMatch(&request, false, chainKey(&chain), 3, &.{}, dense, false, null).?.shared);
 }
 
 test "HotPrefixCache: restore clamps an inflated snapshot to the matched length (gemma mask crash)" {
@@ -3064,7 +3820,7 @@ test "HotPrefixCache: restore clamps an inflated snapshot to the matched length 
     var dst = try KVCache.init(testing.allocator, 2);
     defer dst.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, &toks, false, &.{}, null, null);
+    const res = try hc.lookupAndRestoreSource(&dst, &moe_off, null, s, &toks, false, 0, null, null);
 
     try testing.expect(!res.full_match);
     try testing.expectEqual(@as(usize, 64), res.matched);
@@ -3108,14 +3864,14 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
     defer dfl.deinit();
     var moe_off: usize = 0;
     var base: usize = 0;
-    const res = try hc.lookupAndRestore(
+    const res = try hc.lookupAndRestoreSource(
         &dst,
         &moe_off,
         null,
         s,
         toks[0..32],
         false,
-        &.{},
+        0,
         .{ .cache = &dfl, .base_pos = &base },
         null,
     );
@@ -3137,14 +3893,14 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
     defer dfl2.deinit();
     var moe_off2: usize = 0;
     var base2: usize = 7;
-    const res2 = try hc2.lookupAndRestore(
+    const res2 = try hc2.lookupAndRestoreSource(
         &dst2,
         &moe_off2,
         null,
         s,
         toks[0..32],
         false,
-        &.{},
+        0,
         .{ .cache = &dfl2, .base_pos = &base2 },
         null,
     );
@@ -3188,7 +3944,7 @@ test "prefix cache: MTP committed history round-trips, clamped; a history ending
     defer mtp_dst.deinit();
     var moe_off: usize = 0;
     var base: usize = 99;
-    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, toks[0..32], false, &.{}, null, .{ .cache = &mtp_dst, .base_pos = &base });
+    const res = try hc.lookupAndRestoreSource(&dst, &moe_off, null, s, toks[0..32], false, 0, null, .{ .cache = &mtp_dst, .base_pos = &base });
     try testing.expect(res.full_match);
     try testing.expectEqual(@as(usize, 31), res.matched);
     try testing.expectEqual(@as(?usize, 0), res.mtp_base);
@@ -3204,7 +3960,7 @@ test "prefix cache: MTP committed history round-trips, clamped; a history ending
     defer mtp2.deinit();
     var moe2: usize = 0;
     var base2: usize = 7;
-    const res2 = try hc.lookupAndRestore(&dst2, &moe2, null, s, &toks, false, &.{}, null, .{ .cache = &mtp2, .base_pos = &base2 });
+    const res2 = try hc.lookupAndRestoreSource(&dst2, &moe2, null, s, &toks, false, 0, null, .{ .cache = &mtp2, .base_pos = &base2 });
     try testing.expectEqual(@as(usize, 63), res2.matched);
     try testing.expectEqual(@as(?usize, null), res2.mtp_base);
     try testing.expectEqual(@as(usize, 0), mtp2.step);
@@ -3245,6 +4001,1034 @@ fn testFillHeadCache(cache: *KVCache, s: mlx.mlx_stream, layer: u32, tokens: u32
         transformer_mod.Transformer.qwen4MtpAdvance(cache, seq_offset, @intCast(step));
         written += step;
     }
+}
+
+/// One layer's chunk at absolute rows `[written, written+step)`, handed the
+/// `max_seq` its attention would ask for: non-zero IS the ring predicate.
+fn ringWriteLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, step: u32, window: u32) !transformer_mod.DenseKVView {
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const count: f64 = @floatFromInt(step * 8);
+    const base: f64 = @floatFromInt(written * 8 + layer * 1_000_000);
+    try mlx.check(mlx.mlx_arange(&flat, base, base + count, 1.0, .float32, s));
+    var k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k);
+    const shape = [_]c_int{ 1, 1, @intCast(step), 8 };
+    try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s));
+    const span: u32 = if (layer == 0) 0 else transformer_mod.slidingTailSpan(window, step, transformer_mod.SLIDING_TRIM_UNBOUNDED);
+    return cache.update(layer, k, k, s, span);
+}
+
+/// MiMo shape: layer 0 global, every other layer sliding.
+fn ringFill(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, from: u32, to: u32, chunk: u32) !void {
+    var written: u32 = from;
+    while (written < to) {
+        const step: u32 = @min(chunk, to - written);
+        var li: u32 = 0;
+        while (li < n_layers) : (li += 1) {
+            var view = try ringWriteLayer(cache, s, li, written, step, window);
+            view.deinit();
+        }
+        written += step;
+    }
+}
+
+/// Bytes one sequence row of `arr` bills, from its own shape.
+fn ringRowBytes(arr: mlx.mlx_array) u64 {
+    const rows: u64 = @intCast(mlx.getShape(arr)[2]);
+    return (@as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr))) / rows;
+}
+
+test "a hot entry holds a ringed layer's retained rows, not the ring buffer's capacity" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
+    const prompt_len: u32 = 700; // past the ring cap, so a compaction has run
+    const chunk: u32 = 64;
+
+    var toks: [prompt_len]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    live.setSwaRing(window);
+    try ringFill(&live, s, n_layers, window, 0, prompt_len, chunk);
+
+    // The ring buffer is allocated at its cap from the first token, so the
+    // rows past `offset` are rows no restore can ever read.
+    var want_bytes: u64 = 0;
+    var ring_rows: usize = 0;
+    var ring_cap: usize = 0;
+    for (live.entries) |*e| {
+        if (!e.initialized) continue;
+        const cap: usize = @intCast(mlx.getShape(e.keys)[2]);
+        if (e.ringed) {
+            ring_rows = e.offset;
+            ring_cap = cap;
+        }
+        const rows: u64 = if (e.ringed) @intCast(e.offset) else @intCast(cap);
+        want_bytes += rows * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+    }
+    try testing.expect(ring_rows > 0 and ring_rows < ring_cap);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    _ = try hc.commitWithStateSource(&live, &toks, false, 0, null, null, null);
+    try testing.expectEqual(want_bytes, hc.current_kv_bytes);
+
+    // A restore off that entry must still rebuild a ring and keep appending:
+    // the reference cache walks the same absolute rows and never snapshots.
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &toks, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt_len - 1), hit.matched);
+
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, prompt_len + chunk, chunk);
+    try ringFill(&restored, s, n_layers, window, @intCast(hit.matched), prompt_len + chunk, prompt_len + chunk);
+
+    var li: u32 = 0;
+    while (li < n_layers) : (li += 1) {
+        var rv = try ringWriteLayer(&ref, s, li, prompt_len + chunk, 1, window);
+        defer rv.deinit();
+        var sv = try ringWriteLayer(&restored, s, li, prompt_len + chunk, 1, window);
+        defer sv.deinit();
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
+    }
+}
+
+/// A MiMo-shaped turn: `prompt` rows, a ring checkpoint at the prompt end, then a reply long
+/// enough that the ring compacts past the prompt. The caller owns the checkpoint.
+fn ringTurn(live: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, prompt: u32, reply: u32) !?KVCacheSnapshot {
+    live.setSwaRing(window);
+    try ringFill(live, s, n_layers, window, 0, prompt, 64);
+    var cp = try live.ringCheckpoint(prompt, s);
+    errdefer if (cp) |*c| c.deinit();
+    try ringFill(live, s, n_layers, window, prompt, prompt + reply, 16);
+    return cp;
+}
+
+test "a ringed entry restores at its prompt-end checkpoint when the next turn diverges past the ring" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+
+    var toks: [prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cp = try ringTurn(&live, s, n_layers, window, prompt, reply);
+
+    var end = try live.snapshotRetained(s);
+    const end_bytes = HotPrefixCache.snapshotBytes(&end);
+    end.deinit();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+    // The bill: the window plus the backoff, per sliding layer, at the entry's KV width.
+    var cp_bytes: u64 = 0;
+    for (live.entries) |*e| {
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+    }
+    try testing.expectEqual(end_bytes + cp_bytes, hc.current_kv_bytes);
+
+    // The next turn keeps the prompt and its first generated token, then diverges (the
+    // template re-renders the reply), far below what the ring kept at the entry's end.
+    var next: [prompt + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + 1], toks[0 .. prompt + 1]);
+    for (next[prompt + 1 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), hit.matched);
+
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, prompt + 40, 64);
+    try ringFill(&restored, s, n_layers, window, prompt, prompt + 40, 40);
+    var li: u32 = 0;
+    while (li < n_layers) : (li += 1) {
+        var rv = try ringWriteLayer(&ref, s, li, prompt + 40, 1, window);
+        defer rv.deinit();
+        var sv = try ringWriteLayer(&restored, s, li, prompt + 40, 1, window);
+        defer sv.deinit();
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
+    }
+
+    // A divergence below the checkpoint's rows is still un-restorable and cold-prefills.
+    var edited: [prompt]u32 = undefined;
+    @memcpy(edited[0 .. prompt - 40], toks[0 .. prompt - 40]);
+    for (edited[prompt - 40 ..], 0..) |*t, i| t.* = @intCast(800_000 + i);
+    var cold = try KVCache.init(testing.allocator, n_layers);
+    defer cold.deinit();
+    cold.setSwaRing(window);
+    const miss = try hc.lookupAndRestoreSource(&cold, &moe_off, null, s, &edited, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), miss.matched);
+}
+
+test "a ring checkpoint restore below the floor cold-prefills" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const reply: u32 = 600;
+    const cases = [_]struct { prompt: u32, shared: u32, want: usize }{
+        // A short prompt's checkpoint covers it from row 0, so a shared chat header is servable.
+        .{ .prompt = 24, .shared = 3, .want = 0 },
+        .{ .prompt = RING_RESTORE_MIN_TOKENS + 20, .shared = RING_RESTORE_MIN_TOKENS + 21, .want = RING_RESTORE_MIN_TOKENS + 20 },
+    };
+    for (cases) |c| {
+        var toks: [RING_RESTORE_MIN_TOKENS + 20 + reply]u32 = undefined;
+        for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+        var live = try KVCache.init(testing.allocator, n_layers);
+        defer live.deinit();
+        const cp = try ringTurn(&live, s, n_layers, window, c.prompt, reply);
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        _ = try hc.commitWithRing(&live, toks[0 .. c.prompt + reply], false, 0, 0, null, null, null, null, c.prompt, .{ .prompt_end = cp });
+
+        var next: [RING_RESTORE_MIN_TOKENS + 60]u32 = undefined;
+        @memcpy(next[0..c.shared], toks[0..c.shared]);
+        for (next[c.shared..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+        var restored = try KVCache.init(testing.allocator, n_layers);
+        defer restored.deinit();
+        restored.setSwaRing(window);
+        var moe_off: usize = 0;
+        const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &next, false, 0, null, null);
+        try testing.expectEqual(c.want, hit.matched);
+    }
+}
+
+test "a restore declined at the ring clamp leaves its entry's recency alone" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    // Two sessions that share only a chat header, the older one committed first.
+    for ([_]u32{ 0, 500_000 }) |offset| {
+        var toks: [prompt + reply]u32 = undefined;
+        for (&toks, 0..) |*t, i| t.* = if (i < 3) @intCast(i + 1) else @intCast(offset + i + 1);
+        var live = try KVCache.init(testing.allocator, n_layers);
+        defer live.deinit();
+        const cp = try ringTurn(&live, s, n_layers, window, prompt, reply);
+        _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+    }
+    const before = [_]u64{ hc.entries.items[0].last_used, hc.entries.items[1].last_used };
+    try testing.expect(before[0] < before[1]);
+
+    // A request sharing only the header lands on one of them and declines at the clamp.
+    var header_only: [prompt]u32 = undefined;
+    for (&header_only, 0..) |*t, i| t.* = if (i < 3) @intCast(i + 1) else @intCast(900_000 + i);
+    var cold = try KVCache.init(testing.allocator, n_layers);
+    defer cold.deinit();
+    cold.setSwaRing(window);
+    var moe_off: usize = 0;
+    const miss = try hc.lookupAndRestoreSource(&cold, &moe_off, null, s, &header_only, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), miss.matched);
+    // A restore that did not happen is not a use: promoted, the older entry made the newer one the eviction victim.
+    try testing.expectEqual(before[0], hc.entries.items[0].last_used);
+    try testing.expectEqual(before[1], hc.entries.items[1].last_used);
+}
+
+test "ringed candidates rank by restorable position, not raw match" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    const short: u32 = 400;
+
+    var toks: [prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    // The longer raw match carries no checkpoint, so its ring cannot reach the divergence.
+    var long = try KVCache.init(testing.allocator, n_layers);
+    defer long.deinit();
+    if (try ringTurn(&long, s, n_layers, window, prompt, reply)) |cp| {
+        var doomed = cp;
+        doomed.deinit();
+    }
+    _ = try hc.commitWithStateSource(&long, &toks, false, 0, null, null, null);
+    var shorter = try KVCache.init(testing.allocator, n_layers);
+    defer shorter.deinit();
+    shorter.setSwaRing(window);
+    try ringFill(&shorter, s, n_layers, window, 0, short, 64);
+    _ = try hc.commitWithStateSource(&shorter, toks[0..short], false, 0, null, null, null);
+
+    var next: [prompt + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + 1], toks[0 .. prompt + 1]);
+    for (next[prompt + 1 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, short), hit.matched);
+}
+
+/// A ring checkpoint with no rows; `mark` tells two at one position apart.
+fn stubRingCp(step: usize, mark: usize) !KVCacheSnapshot {
+    const entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 1);
+    entries[0] = transformer_mod.newEmptyKVEntry();
+    entries[0].offset = mark;
+    return .{ .entries = entries, .step = step, .allocator = testing.allocator, .config = kv_quant.KVQuantConfig.dense };
+}
+
+fn stubRingCps(steps: []const usize, mark: usize) ![]KVCacheSnapshot {
+    const out = try testing.allocator.alloc(KVCacheSnapshot, steps.len);
+    for (out, steps) |*o, st| o.* = try stubRingCp(st, mark);
+    return out;
+}
+
+test "ring checkpoints merge ascending, a tie keeps the newer, and past RING_CHECKPOINT_MAX the interior thins: the lowest and the newest stay" {
+    const merged = (try HotPrefixCache.mergeRingCps(
+        testing.allocator,
+        try stubRingCps(&.{ 100, 300, 500, 1100, 1300, 1500 }, 1),
+        try stubRingCps(&.{ 300, 1700, 1900, 2100, 2300 }, 2),
+    )).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, merged);
+    try testing.expectEqual(RING_CHECKPOINT_MAX, merged.len);
+    try testing.expectEqual(@as(usize, 100), merged[0].step);
+    try testing.expectEqual(@as(usize, 2100), merged[merged.len - 2].step);
+    try testing.expectEqual(@as(usize, 2300), merged[merged.len - 1].step);
+    for (merged[0 .. merged.len - 1], merged[1..]) |a, b| try testing.expect(a.step < b.step);
+    for (merged) |cp| {
+        if (cp.step == 300) try testing.expectEqual(@as(usize, 2), cp.entries[0].offset);
+    }
+
+    const small = (try HotPrefixCache.mergeRingCps(testing.allocator, try stubRingCps(&.{ 100, 500 }, 1), try stubRingCps(&.{ 300, 500 }, 2))).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, small);
+    try testing.expectEqual(@as(usize, 3), small.len);
+    for (small, [_]usize{ 100, 300, 500 }, [_]usize{ 1, 2, 2 }) |cp, step, mark| {
+        try testing.expectEqual(step, cp.step);
+        try testing.expectEqual(mark, cp.entries[0].offset);
+    }
+    try testing.expectEqual(@as(?[]KVCacheSnapshot, null), try HotPrefixCache.mergeRingCps(testing.allocator, null, null));
+
+    // An inheritance shares what lies at or below the fork, thinned the same way.
+    const src = try stubRingCps(&.{ 100, 300, 500, 700, 900, 1100, 1300, 1500, 1700, 1900 }, 1);
+    defer HotPrefixCache.freeRingCps(testing.allocator, src);
+    const shared = (try HotPrefixCache.shareRingCpsUpTo(testing.allocator, src, 1800, null)).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, shared);
+    try testing.expectEqual(RING_CHECKPOINT_MAX, shared.len);
+    try testing.expectEqual(@as(usize, 100), shared[0].step);
+    try testing.expectEqual(@as(usize, 1700), shared[shared.len - 1].step);
+}
+
+/// A ring checkpoint whose one entry holds 4 bf16 rows of 8 in K and in V.
+fn sizedRingCp(step: usize) !KVCacheSnapshot {
+    var cp = try stubRingCp(step, 0);
+    errdefer cp.deinit();
+    const e = &cp.entries[0];
+    try mlx.check(mlx.mlx_zeros(&e.keys, &[_]c_int{ 1, 1, 4, 8 }, 4, .bfloat16, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_zeros(&e.values, &[_]c_int{ 1, 1, 4, 8 }, 4, .bfloat16, mlx.gpuStream()));
+    e.initialized = true;
+    return cp;
+}
+
+test "a ring checkpoint list sheds bytes toward its lowest and its newest" {
+    const bytes_each: u64 = 2 * 4 * 8 * 2;
+    const cps = try testing.allocator.alloc(KVCacheSnapshot, 5);
+    var made: usize = 0;
+    errdefer {
+        for (cps[0..made]) |*c| c.deinit();
+        testing.allocator.free(cps);
+    }
+    for (cps, [_]usize{ 100, 300, 500, 700, 900 }) |*c, step| {
+        c.* = try sizedRingCp(step);
+        made += 1;
+    }
+    const kept = (try HotPrefixCache.thinRingCps(testing.allocator, cps, RING_CHECKPOINT_MAX, 3 * bytes_each)).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, kept);
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqual(@as(usize, 100), kept[0].step);
+    try testing.expectEqual(@as(usize, 900), kept[1].step);
+}
+
+test "ring marks sit at the message starts a prefill forwards, thinned to RING_MARKS_MAX keeping the first and the last" {
+    const im: u32 = 7;
+    var prompt: [2000]u32 = @splat(1);
+    for ([_]usize{ 0, 40, 300, 500, 900, 1100, 1300, 1985 }) |p| prompt[p] = im;
+    var buf: [RING_MARKS_MAX]usize = undefined;
+    // Under the restore floor and inside the prompt end's own reach are skipped.
+    try testing.expectEqualSlices(usize, &.{ 300, 500, 900, 1300 }, ringMarkPositions(&prompt, 0, im, &buf));
+    // A restored prefix is already in the cache: only the tail past it is marked.
+    try testing.expectEqualSlices(usize, &.{ 900, 1100, 1300 }, ringMarkPositions(&prompt, 500, im, &buf));
+    try testing.expectEqual(@as(usize, 0), ringMarkPositions(&prompt, 0, 99, &buf).len);
+    try testing.expectEqual(@as(usize, 0), ringMarkPositions(prompt[0..60], 0, im, &buf).len);
+}
+
+test "a slot's ring restore points are freed by the slot and by a commit that cannot take them" {
+    var held: SlotRingCps = .{ .fork = try stubRingCp(10, 0), .prompt_end = try stubRingCp(90, 0) };
+    held.marks[0] = try stubRingCp(50, 0);
+    held.n_marks = 1;
+    held.deinit();
+    try testing.expectEqual(@as(usize, 0), held.n_marks);
+
+    var cps: SlotRingCps = .{ .fork = try stubRingCp(10, 0), .prompt_end = try stubRingCp(90, 0) };
+    cps.marks[0] = try stubRingCp(50, 0);
+    cps.marks[1] = try stubRingCp(70, 0);
+    cps.n_marks = 2;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectEqual(@as(?[]KVCacheSnapshot, null), HotPrefixCache.ownRingCps(failing.allocator(), cps));
+
+    var ok: SlotRingCps = .{ .fork = try stubRingCp(10, 0), .prompt_end = try stubRingCp(90, 0) };
+    ok.marks[0] = try stubRingCp(50, 0);
+    ok.n_marks = 1;
+    const owned = HotPrefixCache.ownRingCps(testing.allocator, ok).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, owned);
+    try testing.expectEqual(@as(usize, 3), owned.len);
+    for (owned, [_]usize{ 10, 50, 90 }) |cp, step| try testing.expectEqual(step, cp.step);
+}
+
+test "a new session sharing only another's preamble restores at the message mark that prefill took" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const preamble: u32 = 500;
+    const prompt: u32 = 800;
+    const reply: u32 = 600;
+
+    var toks: [prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    live.setSwaRing(window);
+    var cps: SlotRingCps = .{};
+    defer cps.deinit();
+    // The second mark lies past what this prefill forwards, so it never fills.
+    cps.armMarks(&live, &.{ preamble, prompt + 10 });
+    try testing.expectEqual(@as(usize, 2), cps.n_marks);
+    live.ring_marks = cps.markSlice();
+    // 300-row writes: the one that crosses the mark also compacts the ring past it.
+    try ringFill(&live, s, n_layers, window, 0, prompt, 300);
+    live.ring_marks = &.{};
+    cps.keepCompleteMarks(&live);
+    try testing.expectEqual(@as(usize, 1), cps.n_marks);
+    cps.prompt_end = try live.ringCheckpoint(prompt, s);
+    try ringFill(&live, s, n_layers, window, prompt, prompt + reply, 16);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    const moved = cps;
+    cps = .{};
+    _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, prompt, moved);
+    try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ring_cps.?.len);
+
+    // Same preamble and message header, then another task.
+    var next: [prompt]u32 = undefined;
+    @memcpy(next[0 .. preamble + 3], toks[0 .. preamble + 3]);
+    for (next[preamble + 3 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, preamble), hit.matched);
+
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, prompt, 64);
+    try ringFill(&restored, s, n_layers, window, preamble, prompt, 64);
+    var li: u32 = 0;
+    while (li < n_layers) : (li += 1) {
+        var rv = try ringWriteLayer(&ref, s, li, prompt, 1, window);
+        defer rv.deinit();
+        var sv = try ringWriteLayer(&restored, s, li, prompt, 1, window);
+        defer sv.deinit();
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
+    }
+}
+
+test "a slot holding every ring restore point it may bills SLOT_RING_CHECKPOINTS checkpoints" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    live.setSwaRing(window);
+    var cps: SlotRingCps = .{};
+    defer cps.deinit();
+    try ringFill(&live, s, n_layers, window, 0, 400, 64);
+    cps.fork = try live.ringCheckpoint(400, s);
+    cps.armMarks(&live, &.{ 700, 1000, 1300, 1600, 1700 });
+    try testing.expectEqual(RING_MARKS_MAX, cps.n_marks);
+    live.ring_marks = cps.markSlice();
+    try ringFill(&live, s, n_layers, window, 400, 1900, 256);
+    live.ring_marks = &.{};
+    cps.keepCompleteMarks(&live);
+    cps.prompt_end = try live.ringCheckpoint(1900, s);
+    try testing.expectEqual(RING_MARKS_MAX, cps.n_marks);
+
+    var cp_bytes: u64 = 0;
+    for (live.entries) |*e| {
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+    }
+    try testing.expectEqual(@as(u64, SLOT_RING_CHECKPOINTS) * cp_bytes, cps.bytes());
+}
+
+test "an entry extended in place keeps its older ring checkpoints" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    const turn2 = prompt + reply + 100;
+
+    var toks: [turn2 + 300]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cp = try ringTurn(&live, s, n_layers, window, prompt, reply);
+    _ = try hc.commitWithRing(&live, toks[0 .. prompt + reply], false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+
+    // A client that sends the whole reply back extends the entry, which the commit replaces.
+    var ext = try KVCache.init(testing.allocator, n_layers);
+    defer ext.deinit();
+    ext.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestoreSource(&ext, &moe_off, null, s, toks[0..turn2], false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt + reply), hit.matched);
+    try ringFill(&ext, s, n_layers, window, prompt + reply, turn2, 64);
+    var cp2 = try ext.ringCheckpoint(turn2, s);
+    errdefer if (cp2) |*c| c.deinit();
+    try ringFill(&ext, s, n_layers, window, turn2, toks.len, 16);
+    const moved = cp2;
+    cp2 = null;
+    _ = try hc.commitWithRing(&ext, &toks, false, 0, 0, null, null, null, null, turn2, .{ .prompt_end = moved });
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ring_cps.?.len);
+
+    // A turn diverging right after the first prompt still restores there.
+    var next: [prompt + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + 1], toks[0 .. prompt + 1]);
+    for (next[prompt + 1 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    const again = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), again.matched);
+}
+
+/// Bytes one row of `e`'s K and V bill, from their own shapes.
+fn ringEntryRowBytes(e: *const transformer_mod.KVCacheEntry) u64 {
+    return ringRowBytes(e.keys) + ringRowBytes(e.values);
+}
+
+/// The next turn's first write through both caches: identical views prove the restore.
+fn ringExpectSameNext(ref: *KVCache, restored: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, at: u32) !void {
+    var li: u32 = 0;
+    while (li < n_layers) : (li += 1) {
+        var rv = try ringWriteLayer(ref, s, li, at, 1, window);
+        defer rv.deinit();
+        var sv = try ringWriteLayer(restored, s, li, at, 1, window);
+        defer sv.deinit();
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
+    }
+}
+
+test "an oversized ringed entry trims to its end: the ring is a constant, not a per-token price" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
+    const prompt: u32 = 2000;
+
+    var toks: [prompt]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    live.setSwaRing(window);
+    try ringFill(&live, s, n_layers, window, 0, prompt, 64);
+
+    // The global layer's buffer holds spare capacity past its rows, as a reservation does.
+    var probe = try live.snapshotRetained(s);
+    const cap: u64 = @intCast(mlx.getShape(probe.entries[0].keys)[2]);
+    const rows_bytes = HotPrefixCache.snapshotBytes(&probe) - (cap - prompt) * ringEntryRowBytes(&probe.entries[0]);
+    probe.deinit();
+    try testing.expect(cap > prompt);
+
+    // Room for the rows, not the capacity they sit in.
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, rows_bytes);
+    defer hc.deinit();
+    const status = try hc.commitWithStateSource(&live, &toks, false, 0, null, null, null);
+    try testing.expectEqual(std.meta.Tag(CommitStatus).ok, std.meta.activeTag(status));
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(usize, prompt), hc.entries.items[0].tokens.len);
+    try testing.expectEqual(rows_bytes, hc.current_kv_bytes);
+
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &toks, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt - 1), hit.matched);
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, prompt + 64, 64);
+    try ringFill(&restored, s, n_layers, window, @intCast(hit.matched), prompt + 64, prompt + 64);
+    try ringExpectSameNext(&ref, &restored, s, n_layers, window, prompt + 64);
+}
+
+test "an oversized ringed entry trims to the highest ring checkpoint that fits, and declines below every one" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 2000;
+    const reply: u32 = 600;
+
+    var toks: [prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cp = try ringTurn(&live, s, n_layers, window, prompt, reply);
+    const cp_bytes = HotPrefixCache.snapshotBytes(&cp.?);
+    var probe = try live.snapshotRetained(s);
+    const global_row = ringEntryRowBytes(&probe.entries[0]);
+    probe.deinit();
+
+    // The prompt's global rows plus the checkpoint's window: the entry ends where the checkpoint is.
+    const budget = prompt * global_row + cp_bytes;
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+    defer hc.deinit();
+    const status = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+    try testing.expectEqual(std.meta.Tag(CommitStatus).ok, std.meta.activeTag(status));
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(usize, prompt), hc.entries.items[0].tokens.len);
+    try testing.expect(hc.entries.items[0].ring_cps == null);
+    try testing.expectEqual(budget, hc.current_kv_bytes);
+
+    // The next turn keeps the prompt and diverges after it.
+    var next: [prompt + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + 1], toks[0 .. prompt + 1]);
+    for (next[prompt + 1 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), hit.matched);
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, prompt + 40, 64);
+    try ringFill(&restored, s, n_layers, window, prompt, prompt + 40, 40);
+    try ringExpectSameNext(&ref, &restored, s, n_layers, window, prompt + 40);
+
+    // No room for the checkpoint's window: nothing restorable fits.
+    var live2 = try KVCache.init(testing.allocator, n_layers);
+    defer live2.deinit();
+    const cp2 = try ringTurn(&live2, s, n_layers, window, prompt, reply);
+    var tight = HotPrefixCache.initWithMem(testing.allocator, 4, prompt * global_row);
+    defer tight.deinit();
+    const declined = try tight.commitWithRing(&live2, &toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp2 });
+    try testing.expectEqual(std.meta.Tag(CommitStatus).declined, std.meta.activeTag(declined));
+    try testing.expectEqual(@as(usize, 0), tight.entries.items.len);
+}
+
+test "a replacement over the budget sheds its lowest ring checkpoints before the entry" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    const turn2 = prompt + reply + 100;
+
+    var toks: [turn2 + 300]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // Turn 2's cache first, to price a budget that holds it and its own checkpoint.
+    var ext = try KVCache.init(testing.allocator, n_layers);
+    defer ext.deinit();
+    ext.setSwaRing(window);
+    try ringFill(&ext, s, n_layers, window, 0, turn2, 64);
+    var cp2 = try ext.ringCheckpoint(turn2, s);
+    errdefer if (cp2) |*c| c.deinit();
+    try ringFill(&ext, s, n_layers, window, turn2, toks.len, 16);
+    var probe = try ext.snapshotRetained(s);
+    const alone = HotPrefixCache.snapshotBytes(&probe) + HotPrefixCache.snapshotBytes(&cp2.?);
+    probe.deinit();
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, alone);
+    defer hc.deinit();
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cp = try ringTurn(&live, s, n_layers, window, prompt, reply);
+    _ = try hc.commitWithRing(&live, toks[0 .. prompt + reply], false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+
+    // Turn 2 extends the entry, and the merge brings turn 1's checkpoint along: one too many.
+    const moved = cp2;
+    cp2 = null;
+    const status = try hc.commitWithRing(&ext, &toks, false, 0, 0, null, null, null, null, turn2, .{ .prompt_end = moved });
+    try testing.expectEqual(std.meta.Tag(CommitStatus).ok, std.meta.activeTag(status));
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(usize, toks.len), hc.entries.items[0].tokens.len);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items[0].ring_cps.?.len);
+    try testing.expectEqual(@as(usize, turn2), hc.entries.items[0].ring_cps.?[0].step);
+    try testing.expectEqual(alone, hc.current_kv_bytes);
+}
+
+test "a ring checkpoint taken at the restore keeps the fork when the donor is evicted before the commit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    const fork_prompt = prompt + 100 + 330;
+
+    var toks: [fork_prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 1, 0);
+    defer hc.deinit();
+    var donor = try KVCache.init(testing.allocator, n_layers);
+    defer donor.deinit();
+    const donor_cp = try ringTurn(&donor, s, n_layers, window, prompt, reply);
+    var donor_toks: [prompt + reply]u32 = undefined;
+    @memcpy(donor_toks[0..prompt], toks[0..prompt]);
+    for (donor_toks[prompt..], 0..) |*t, i| t.* = @intCast(700_000 + i);
+    _ = try hc.commitWithRing(&donor, &donor_toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = donor_cp });
+
+    var fork = try KVCache.init(testing.allocator, n_layers);
+    defer fork.deinit();
+    fork.setSwaRing(window);
+    var moe_off: usize = 0;
+    const fork_hit = try hc.lookupAndRestoreSource(&fork, &moe_off, null, s, toks[0..fork_prompt], false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), fork_hit.matched);
+    var at_restore = try fork.ringCheckpoint(fork_hit.matched, s);
+    errdefer if (at_restore) |*c| c.deinit();
+    try ringFill(&fork, s, n_layers, window, prompt, fork_prompt, 64);
+    var at_end = try fork.ringCheckpoint(fork_prompt, s);
+    errdefer if (at_end) |*c| c.deinit();
+    try ringFill(&fork, s, n_layers, window, fork_prompt, fork_prompt + reply, 16);
+
+    // Another slot commits first and the count cap evicts the donor: nothing is left to inherit.
+    var other = try KVCache.init(testing.allocator, n_layers);
+    defer other.deinit();
+    other.setSwaRing(window);
+    try ringFill(&other, s, n_layers, window, 0, 300, 64);
+    var other_toks: [300]u32 = undefined;
+    for (&other_toks, 0..) |*t, i| t.* = @intCast(500_000 + i);
+    _ = try hc.commitWithStateSource(&other, &other_toks, false, 0, null, null, null);
+    const cps: SlotRingCps = .{ .fork = at_restore, .prompt_end = at_end };
+    at_restore = null;
+    at_end = null;
+    _ = try hc.commitWithRing(&fork, &toks, false, 0, 0, null, null, null, null, fork_prompt, cps);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ring_cps.?.len);
+
+    var next: [prompt + 100 + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + 100], toks[0 .. prompt + 100]);
+    for (next[prompt + 100 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), hit.matched);
+    try expectRingContinuesCold(&restored, s, n_layers, window, prompt, next.len);
+}
+
+test "a fork entry keeps its donor's ring checkpoint, so evicting the donor still restores at the fork" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    const tail: u32 = 100; // the conversation past the donor's prompt (its reply, re-rendered)
+    const reminder: u32 = 330;
+    const fork_prompt = prompt + tail + reminder;
+
+    var toks: [fork_prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc.deinit();
+
+    var donor = try KVCache.init(testing.allocator, n_layers);
+    defer donor.deinit();
+    const donor_cp = try ringTurn(&donor, s, n_layers, window, prompt, reply);
+    var donor_toks: [prompt + reply]u32 = undefined;
+    @memcpy(donor_toks[0..prompt], toks[0..prompt]);
+    for (donor_toks[prompt..], 0..) |*t, i| t.* = @intCast(700_000 + i);
+    _ = try hc.commitWithRing(&donor, &donor_toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = donor_cp });
+
+    // The side request: the conversation plus an appended reminder, restored off the donor.
+    var fork = try KVCache.init(testing.allocator, n_layers);
+    defer fork.deinit();
+    fork.setSwaRing(window);
+    var moe_off: usize = 0;
+    const fork_hit = try hc.lookupAndRestoreSource(&fork, &moe_off, null, s, toks[0..fork_prompt], false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), fork_hit.matched);
+    try ringFill(&fork, s, n_layers, window, prompt, fork_prompt, 64);
+    var fork_cp = try fork.ringCheckpoint(fork_prompt, s);
+    errdefer if (fork_cp) |*c| c.deinit();
+    try ringFill(&fork, s, n_layers, window, fork_prompt, fork_prompt + reply, 16);
+    const moved_cp = fork_cp;
+    fork_cp = null;
+    _ = try hc.commitWithRing(&fork, &toks, false, 0, 0, null, null, null, null, fork_prompt, .{ .prompt_end = moved_cp });
+
+    // The fork entry bills its own end, its own checkpoint and the inherited one.
+    var end = try fork.snapshotRetained(s);
+    const end_bytes = HotPrefixCache.snapshotBytes(&end);
+    end.deinit();
+    var cp_bytes: u64 = 0;
+    for (fork.entries) |*e| {
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+    }
+    for (hc.entries.items) |*e| {
+        if (e.tokens.len == toks.len) try testing.expectEqual(end_bytes + 2 * cp_bytes, e.kv_bytes);
+    }
+
+    // An unrelated request under the count cap evicts the donor, the LRU entry.
+    var other = try KVCache.init(testing.allocator, n_layers);
+    defer other.deinit();
+    other.setSwaRing(window);
+    try ringFill(&other, s, n_layers, window, 0, 300, 64);
+    var other_toks: [300]u32 = undefined;
+    for (&other_toks, 0..) |*t, i| t.* = @intCast(500_000 + i);
+    _ = try hc.commitWithStateSource(&other, &other_toks, false, 0, null, null, null);
+    for (hc.entries.items) |*e| try testing.expect(e.tokens.len != donor_toks.len);
+
+    // The next main turn shares the conversation and diverges where the reminder was appended.
+    var next: [prompt + tail + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + tail], toks[0 .. prompt + tail]);
+    for (next[prompt + tail ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    const hit = try hc.lookupAndRestoreSource(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), hit.matched);
+    try expectRingContinuesCold(&restored, s, n_layers, window, prompt, next.len);
+}
+
+/// Feed `restored` from `from` to `to`, then one more row: every layer must read exactly what
+/// a cache fed from row 0 reads.
+fn expectRingContinuesCold(restored: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, from: u32, to: u32) !void {
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, to, 64);
+    try ringFill(restored, s, n_layers, window, from, to, 40);
+    var li: u32 = 0;
+    while (li < n_layers) : (li += 1) {
+        var rv = try ringWriteLayer(&ref, s, li, to, 1, window);
+        defer rv.deinit();
+        var sv = try ringWriteLayer(restored, s, li, to, 1, window);
+        defer sv.deinit();
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
+    }
+}
+
+test "a ringed entry persists to the SSD tier and restores only at a ring checkpoint after a restart" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+
+    var toks: [prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    try persistRingTurn(io, base, "fp-ring", &toks, prompt, window, n_layers);
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring", 0, 128);
+    defer hc2.deinit();
+    var moe_off: usize = 0;
+
+    // The next turn diverges right after the prompt: the prompt-end checkpoint serves it.
+    var next: [prompt + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + 1], toks[0 .. prompt + 1]);
+    for (next[prompt + 1 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var a = try KVCache.init(testing.allocator, n_layers);
+    defer a.deinit();
+    a.setSwaRing(window);
+    const hit = try hc2.lookupAndRestoreSource(&a, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), hit.matched);
+    // A ring restore's bill was never measured, so admission credits none of its rows.
+    try testing.expect(!hit.ownsRestoredRows());
+    try expectRingContinuesCold(&a, s, n_layers, window, prompt, next.len);
+
+    // A verbatim re-send restores at its last token off the ring the entry ended with.
+    var b = try KVCache.init(testing.allocator, n_layers);
+    defer b.deinit();
+    b.setSwaRing(window);
+    const full = try hc2.lookupAndRestoreSource(&b, &moe_off, null, s, &toks, false, 0, null, null);
+    try testing.expect(full.full_match);
+    try testing.expectEqual(@as(usize, toks.len - 1), full.matched);
+    try testing.expect(!full.ownsRestoredRows());
+    try expectRingContinuesCold(&b, s, n_layers, window, toks.len - 1, toks.len);
+
+    // A divergence no ring checkpoint reaches cold-prefills.
+    var early: [prompt]u32 = undefined;
+    @memcpy(early[0..400], toks[0..400]);
+    for (early[400..], 0..) |*t, i| t.* = @intCast(800_000 + i);
+    var c = try KVCache.init(testing.allocator, n_layers);
+    defer c.deinit();
+    c.setSwaRing(window);
+    const miss = try hc2.lookupAndRestoreSource(&c, &moe_off, null, s, &early, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), miss.matched);
+}
+
+/// One MiMo-shaped turn (`ringTurn`) committed and flushed to a fresh SSD tier at `base/fp`.
+fn persistRingTurn(io: std.Io, base: []const u8, fp: []const u8, toks: []const u32, prompt: u32, window: u32, n_layers: u32) !void {
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+    defer hc.deinit();
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cp = try ringTurn(&live, s, n_layers, window, prompt, @intCast(toks.len - prompt));
+    // Without its restore points a ringed cache is not persistable.
+    try testing.expectEqual(kv_disk_cache.PersistOutcome.skipped, try hc.disk.?.appendCommit(live.entries, live.step, live.config, toks, false, null, s));
+    _ = try hc.commitWithRing(&live, toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+    hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+}
+
+test "a ringed SSD entry bills its ring files, and a truncated one is salvaged away at scan" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+
+    var toks: [prompt + 600]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    try persistRingTurn(io, base, "fp-ring-salvage", &toks, prompt, window, n_layers);
+
+    {
+        // The tier bills exactly the files it wrote: chunks, the token record and both ring files.
+        var d = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-salvage", 0, 128);
+        defer d.deinit();
+        const e = &d.entries.items[0];
+        try testing.expectEqual(@as(usize, 2), e.rings.len);
+        try testing.expectEqual(@as(u32, prompt), e.rings[0].pos);
+        try testing.expectEqual(@as(u32, toks.len), e.rings[1].pos);
+        var on_disk: u64 = 0;
+        var dir = try tmp.dir.openDir(io, "fp-ring-salvage/e1", .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |f| {
+            if (std.mem.eql(u8, f.name, "meta.json")) continue;
+            on_disk += (try dir.statFile(io, f.name, .{})).size;
+        }
+        try testing.expectEqual(on_disk, d.total_bytes);
+    }
+
+    // kill -9 mid-write: the prompt-end file no longer matches its record.
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-ring-salvage/e1/r0000700.safetensors", .data = "trunc" });
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-salvage", 0, 128);
+        defer hc.deinit();
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entries.items[0].rings.len);
+        var next: [prompt + 40]u32 = undefined;
+        @memcpy(next[0 .. prompt + 1], toks[0 .. prompt + 1]);
+        for (next[prompt + 1 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+        var a = try KVCache.init(testing.allocator, n_layers);
+        defer a.deinit();
+        a.setSwaRing(window);
+        var moe_off: usize = 0;
+        try testing.expectEqual(@as(usize, 0), (try hc.lookupAndRestoreSource(&a, &moe_off, null, s, &next, false, 0, null, null)).matched);
+        var b = try KVCache.init(testing.allocator, n_layers);
+        defer b.deinit();
+        b.setSwaRing(window);
+        try testing.expectEqual(@as(usize, toks.len - 1), (try hc.lookupAndRestoreSource(&b, &moe_off, null, s, &toks, false, 0, null, null)).matched);
+    }
+
+    // With no ring file left the chunks restore nothing: the entry goes.
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-ring-salvage/e1/r0001300.safetensors", .data = "trunc" });
+    var d = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-salvage", 0, 128);
+    defer d.deinit();
+    try testing.expectEqual(@as(usize, 0), d.entryCount());
+}
+
+test "an SSD entry without ring rows is never restored into a ringed cache" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+
+    var toks: [700]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    {
+        // Every layer holds the whole prefix (no ring), as a pre-ring manifest describes it.
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-old", 0, 128);
+        defer hc.deinit();
+        var plain = try KVCache.init(testing.allocator, n_layers);
+        defer plain.deinit();
+        try testFillCache(&plain, s, n_layers, toks.len);
+        _ = try hc.commit(&plain, &toks, false);
+        hc.flushPendingDisk(s);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-old", 0, 128);
+    defer hc2.deinit();
+    var next: [800]u32 = undefined;
+    @memcpy(next[0..toks.len], &toks);
+    for (next[toks.len..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var ringed = try KVCache.init(testing.allocator, n_layers);
+    defer ringed.deinit();
+    ringed.setSwaRing(window);
+    var moe_off: usize = 0;
+    const miss = try hc2.lookupAndRestoreSource(&ringed, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), miss.matched);
+    for (ringed.entries) |*e| try testing.expect(!e.initialized);
 }
 
 test "HotPrefixCache: disk tier restores across a fresh cache instance (restart shape)" {
@@ -3288,11 +5072,10 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe_off: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, &.{}, null, null);
+        const res = try hc2.lookupAndRestoreSource(&cache2, &moe_off, null, s, &tokens, false, 0, null, null);
         // Full match: identical re-issue semantics — truncate to len-1 and
         // re-forward the last token, exactly like a RAM full-match hit.
         try testing.expect(res.full_match);
-        try testing.expect(res.slot_owned); // a disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 599), res.matched);
         try testing.expectEqual(@as(usize, 599), cache2.step);
         try testing.expectEqual(@as(usize, 599), moe_off);
@@ -3308,9 +5091,8 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         var cache3 = try KVCache.init(testing.allocator, 2);
         defer cache3.deinit();
         var moe_off3: usize = 0;
-        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false, &.{}, null, null);
+        const res3 = try hc2.lookupAndRestoreSource(&cache3, &moe_off3, null, s, &tokens_div, false, 0, null, null);
         try testing.expect(!res3.full_match);
-        try testing.expect(res3.slot_owned); // a disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 400), res3.matched);
         try testing.expectEqual(@as(usize, 400), cache3.step);
         // A diverged short prefix must read ONLY the chunks covering the
@@ -3324,7 +5106,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
 test "HotPrefixCache: budget decline reports a status, not a silent success" {
     // Live 2026-09-07: every oversized decline from a cancelled prefill
     // logged "[hot-cache] committed N/M" at the scheduler because the
-    // decline exits commitWithMediaState via plain return — a 122k agent
+    // decline exits commitWithMediaStateSource via plain return — a 122k agent
     // session looked cached while it cold-prefilled ~95k tokens per retry.
     // The commit contract must be observable: ok / kept_resident / declined.
     const s = mlx.gpuStream();
@@ -3355,7 +5137,14 @@ test "HotPrefixCache: budget decline reports a status, not a silent success" {
     try testing.expectEqual(@as(usize, 600), st2.ok);
 }
 
-test "HotPrefixCache: media spans bound the reusable prefix at the first differing item" {
+test "HotPrefixCache: an entry shorter than its media boundary is pure text" {
+    // Live 2026-09-07: a cancelled prefill that forwarded fewer tokens than
+    // the request's first media position kept the PIXEL vision_key while
+    // the boundary was dropped (scheduler shape: media_start=null, key kept)
+    // — a boundary-less cross-key entry the lookup conservatively rejects.
+    // The with-image and no-image retry shapes of one conversation locked
+    // each other out of their shared 121819-token text prefix. An entry
+    // whose [0, len) covers no media rows is text: key it as text.
     const s = mlx.gpuStream();
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer hc.deinit();
@@ -3366,38 +5155,53 @@ test "HotPrefixCache: media spans bound the reusable prefix at the first differi
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
 
-    const a = MediaSpan{ .start = 100, .key = 0xA };
-    const b = MediaSpan{ .start = 300, .key = 0xB };
-    // An item past the committed rows (a cancelled prefill) is not the entry's.
-    _ = try hc.commitWithMediaState(&cache, tokens[0..400], false, &.{ a, b, .{ .start = 450, .key = 0xC } }, 0, null, null, null, 400);
-    try testing.expectEqualSlices(MediaSpan, &.{ a, b }, hc.entries.items[0].media);
+    // Cancel shape (the scheduler passes the boundary raw): media declared
+    // at 500, entry covers [0, 400) — no media rows inside, so the entry
+    // must be text-keyed.
+    const st = try hc.commitWithMediaStateSource(&cache, tokens[0..400], false, 0xABCD, 0, 500, null, null, null, 400);
+    try testing.expect(st == .ok);
+    try testing.expectEqual(@as(u64, 0), hc.entries.items[0].vision_key);
+    try testing.expect(hc.entries.items[0].media_start == null);
 
-    const Case = struct { media: []const MediaSpan, want: usize };
-    const cases = [_]Case{
-        .{ .media = &.{ a, b }, .want = 400 },
-        .{ .media = &.{ a, b, .{ .start = 500, .key = 0xD } }, .want = 400 }, // new item past the entry
-        .{ .media = &.{ a, .{ .start = 300, .key = 0xE } }, .want = 300 }, // later item changed
-        .{ .media = &.{ .{ .start = 100, .key = 0xE }, b }, .want = 100 }, // earlier item changed
-        .{ .media = &.{a}, .want = 300 }, // entry's second item missing
-        .{ .media = &.{}, .want = 100 },
-    };
-    for (cases) |c| {
-        var dst = try KVCache.init(testing.allocator, 2);
-        defer dst.deinit();
+    // Legacy shape (commitWithStateSource's contract): a null boundary KEEPS the
+    // caller's pixel key — boundary-less keyed entries stay possible for
+    // callers that model their own media state.
+    var cache_b = try KVCache.init(testing.allocator, 2);
+    defer cache_b.deinit();
+    try testFillCache(&cache_b, s, 2, 600);
+    _ = try hc.commitWithStateSource(&cache_b, tokens[0..400], false, 0xBEEF, null, null, null);
+    try testing.expectEqual(@as(u64, 0xBEEF), hc.entries.items[1].vision_key);
+
+    // The no-image retry shape (vision_key 0, no media) must restore it.
+    {
+        var c2 = try KVCache.init(testing.allocator, 2);
+        defer c2.deinit();
         var moe: usize = 0;
-        const res = try hc.lookupAndRestoreWithMedia(&dst, &moe, null, s, &tokens, false, c.media, null, null, null, false);
-        try testing.expectEqual(c.want, res.matched);
+        const res = try hc.lookupAndRestoreWithMediaSource(&c2, &moe, null, s, &tokens, false, 0, null, &.{}, null, null, null, false);
+        try testing.expectEqual(@as(usize, 400), res.matched);
+    }
+    // A different-image request caps at ITS media boundary (500 > 400 here,
+    // so the whole text entry is reusable through it).
+    {
+        var c3 = try KVCache.init(testing.allocator, 2);
+        defer c3.deinit();
+        var moe: usize = 0;
+        const res = try hc.lookupAndRestoreWithMediaSource(&c3, &moe, null, s, &tokens, false, 0xFFFF, 500, &.{}, null, null, null, false);
+        try testing.expectEqual(@as(usize, 400), res.matched);
     }
 
-    // A budget trim keeps the items below the cut.
+    // Trim shape: media INSIDE the candidate, budget forces a trim below the
+    // boundary — the trimmed entry is text and must re-key to 0.
     var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 32 * 1024);
     defer hc2.deinit();
     var cache2 = try KVCache.init(testing.allocator, 2);
     defer cache2.deinit();
     try testFillCache(&cache2, s, 2, 600);
-    const st2 = try hc2.commitWithMediaState(&cache2, &tokens, false, &.{ a, b }, 0, null, null, null, tokens.len);
+    const st2 = try hc2.commitWithMediaStateSource(&cache2, &tokens, false, 0xABCD, 0, 300, null, null, null, tokens.len);
+    try testing.expect(st2 == .ok);
     try testing.expectEqual(@as(usize, 256), st2.ok); // 32 KB / 128 B rows
-    try testing.expectEqualSlices(MediaSpan, &.{a}, hc2.entries.items[0].media);
+    try testing.expectEqual(@as(u64, 0), hc2.entries.items[0].vision_key);
+    try testing.expect(hc2.entries.items[0].media_start == null);
 }
 
 test "HotPrefixCache: media request restores the pre-media text prefix from SSD" {
@@ -3406,8 +5210,8 @@ test "HotPrefixCache: media request restores the pre-media text prefix from SSD"
     // session whose LAST turn carries one screenshot never touched the
     // 40 GB of persisted text prefixes, though 99.8% of the prompt is
     // pixel-independent text. Disk entries are text-only by construction
-    // (the flush refuses entries with media), so the restore caps at the
-    // request's first media row.
+    // (the flush refuses vision-keyed entries), so the restore is exactly
+    // the RAM path's pre-media semantics: cap at the request's media_start.
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -3443,7 +5247,7 @@ test "HotPrefixCache: media request restores the pre-media text prefix from SSD"
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe: usize = 0;
-        const res = try hc2.lookupAndRestoreWithMedia(&cache2, &moe, null, s, &tokens, false, &.{.{ .start = 400, .key = 0xDEAD }}, null, null, null, false);
+        const res = try hc2.lookupAndRestoreWithMediaSource(&cache2, &moe, null, s, &tokens, false, 0xDEAD, 400, &.{}, null, null, null, false);
         try testing.expect(!res.full_match);
         try testing.expectEqual(@as(usize, 400), res.matched);
         try testing.expectEqual(@as(usize, 400), cache2.step);
@@ -3510,14 +5314,14 @@ test "HotPrefixCache: dflash + mtp snapshots survive the SSD tier across a resta
         var moe_off: usize = 0;
         var dbase: usize = 99;
         var mbase: usize = 99;
-        const res = try hc2.lookupAndRestore(
+        const res = try hc2.lookupAndRestoreSource(
             &trunk2,
             &moe_off,
             null,
             s,
             &tokens,
             false,
-            &.{},
+            0,
             .{ .cache = &dfl, .base_pos = &dbase },
             .{ .cache = &mtp_dst, .base_pos = &mbase },
         );
@@ -3539,14 +5343,14 @@ test "HotPrefixCache: dflash + mtp snapshots survive the SSD tier across a resta
         defer dfl3.deinit();
         var moe3: usize = 0;
         var dbase3: usize = 42;
-        const res3 = try hc2.lookupAndRestore(
+        const res3 = try hc2.lookupAndRestoreSource(
             &trunk3,
             &moe3,
             null,
             s,
             &tokens,
             false,
-            &.{},
+            0,
             .{ .cache = &dfl3, .base_pos = &dbase3 },
             null,
         );
@@ -3585,7 +5389,7 @@ test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {
     var cache2 = try KVCache.init(testing.allocator, 1);
     defer cache2.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, &.{}, null, null);
+    const res = try hc.lookupAndRestoreSource(&cache2, &moe_off, null, s, &tokens, false, 0, null, null);
     try testing.expect(res.full_match);
     try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
 }
@@ -3644,14 +5448,14 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
 
     const lookup_ids = [_]u32{ 1, 2, 3, 4, 5, 6 };
     // Matching config (affine 4) hits the entry.
-    const hit = cache.findBestMatch(&lookup_ids, false, &.{}, kv_quant.KVQuantConfig.affine(4)).?;
+    const hit = cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(4)).?;
     try testing.expectEqual(@as(usize, 0), hit.idx);
     try testing.expectEqual(@as(usize, 5), hit.shared);
     // Same Scheme (.affine) but different bits MUST NOT hit — that's the
     // cross-scheme buffer-layout crash this filter guards against.
-    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, &.{}, kv_quant.KVQuantConfig.affine(8)));
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.affine(8)));
     // Dense query against an affine entry: also null (existing guarantee).
-    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, &.{}, kv_quant.KVQuantConfig.dense));
+    try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense));
 }
 
 // ── Phase 3: two-tier hybrid restore (Qwen 3.5/3.6 GatedDeltaNet) ──
@@ -3724,12 +5528,13 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
     const checkpoints = try testing.allocator.alloc(SSMCheckpoint, 2);
     checkpoints[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source_ssm, media_start, s);
     checkpoints[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source_ssm, media_start + 2, s);
-    _ = try hc.commitWithMediaState(
+    _ = try hc.commitWithMediaStateSource(
         &source_cache,
         &cached_tokens,
         false,
-        &.{.{ .start = media_start, .key = 0x1111 }},
+        0x1111,
         0,
+        media_start,
         checkpoints,
         null,
         null,
@@ -3741,14 +5546,16 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
     var target_ssm = pcEmptySsm();
     defer pcFreeHybrid(&target_ssm);
     var moe_off: usize = 0;
-    const result = try hc.lookupAndRestoreWithMedia(
+    const result = try hc.lookupAndRestoreWithMediaSource(
         &target_cache,
         &moe_off,
         &target_ssm,
         s,
         &lookup_tokens,
         false,
-        &.{.{ .start = media_start, .key = 0x2222 }},
+        0x2222,
+        media_start,
+        &.{},
         null,
         null,
         null,
@@ -3769,7 +5576,7 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
 // match alone turns that recoverable case into a full cold prefill.
 test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry" {
     const s = mlx.gpuStream();
-    const media = [_]MediaSpan{.{ .start = 0, .key = 0xdecaf }};
+    const vision_key: u64 = 0xdecaf;
     const older_tokens = [_]u32{ 1, 2, 3, 4, 5, 90, 91, 92, 93, 94 };
     const newer_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 80, 81, 82 };
     const lookup_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 70, 71, 72 };
@@ -3784,7 +5591,7 @@ test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry"
     defer pcFreeHybrid(&older_ssm);
     const older_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     older_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &older_ssm, 4, s);
-    _ = try hc.commitWithState(&older_cache, &older_tokens, false, &media, older_cps, null, null);
+    _ = try hc.commitWithStateSource(&older_cache, &older_tokens, false, vision_key, older_cps, null, null);
 
     var newer_cache = try KVCache.init(testing.allocator, 3);
     defer newer_cache.deinit();
@@ -3794,21 +5601,21 @@ test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry"
     const newer_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     // The raw match with this entry is 7, so this checkpoint cannot restore it.
     newer_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &newer_ssm, 8, s);
-    _ = try hc.commitWithState(&newer_cache, &newer_tokens, false, &media, newer_cps, null, null);
+    _ = try hc.commitWithStateSource(&newer_cache, &newer_tokens, false, vision_key, newer_cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target_ssm = pcEmptySsm();
     defer pcFreeHybrid(&target_ssm);
     var moe_off: usize = 0;
-    const result = try hc.lookupAndRestore(
+    const result = try hc.lookupAndRestoreSource(
         &target_cache,
         &moe_off,
         &target_ssm,
         s,
         &lookup_tokens,
         false,
-        &media,
+        vision_key,
         null,
         null,
     );
@@ -3826,14 +5633,15 @@ test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry"
 test "HotPrefixCache: a text turn after image turns restores the pre-media prefix" {
     const s = mlx.gpuStream();
     const media_start: usize = 12;
-    const image_media = [_]MediaSpan{.{ .start = media_start, .key = 0xF00D }};
+    const image_key: u64 = 0xF00D;
 
     // Turn N: the text conversation, with checkpoints spanning the prefix.
     const text_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     // Turn N+1: the same conversation plus an image at `media_start`.
     const image_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 900, 900, 900, 900, 61, 62, 63, 64 };
-    // Turn N+2: the image is gone. The token stream still agrees far past the
-    // boundary; only the missing item caps the reusable prefix at `media_start`.
+    // Turn N+2: a text-only turn. The image message is history now, so the
+    // token stream still agrees far past the boundary; only the pixel key
+    // caps the reusable prefix at `media_start`.
     const later_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 900, 900, 900, 900, 61, 62, 71, 72 };
 
     var hc = HotPrefixCache.initWithMem(testing.allocator, 1, 0);
@@ -3848,7 +5656,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     text_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 4, s);
     text_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 8, s);
     text_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 10, s);
-    _ = try hc.commitWithMediaState(&text_cache, &text_tokens, false, &.{}, 0, text_cps, null, null, text_tokens.len);
+    _ = try hc.commitWithMediaStateSource(&text_cache, &text_tokens, false, 0, 0, null, text_cps, null, null, text_tokens.len);
 
     // The image turn restores the pre-media text prefix (cross-key, capped
     // at the boundary) and prefills the rest.
@@ -3857,14 +5665,16 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     var image_ssm = pcEmptySsm();
     defer pcFreeHybrid(&image_ssm);
     var image_off: usize = 0;
-    const restored = try hc.lookupAndRestoreWithMedia(
+    const restored = try hc.lookupAndRestoreWithMediaSource(
         &image_cache,
         &image_off,
         &image_ssm,
         s,
         &image_tokens,
         false,
-        &image_media,
+        image_key,
+        media_start,
+        &.{},
         null,
         null,
         null,
@@ -3881,7 +5691,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     const image_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
     image_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &image_state, 16, s);
     image_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &image_state, 18, s);
-    _ = try hc.commitWithMediaState(&image_cache, &image_tokens, false, &image_media, 0, image_cps, null, null, image_tokens.len);
+    _ = try hc.commitWithMediaStateSource(&image_cache, &image_tokens, false, image_key, 0, media_start, image_cps, null, null, image_tokens.len);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
 
     // The next text-only turn must still restore the pre-media prefix: the
@@ -3891,13 +5701,15 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     var later_ssm = pcEmptySsm();
     defer pcFreeHybrid(&later_ssm);
     var later_off: usize = 0;
-    const result = try hc.lookupAndRestoreWithMedia(
+    const result = try hc.lookupAndRestoreWithMediaSource(
         &later_cache,
         &later_off,
         &later_ssm,
         s,
         &later_tokens,
         false,
+        0,
+        null,
         &.{},
         null,
         null,
@@ -3931,7 +5743,7 @@ test "HotPrefixCache: thinning keeps the highest checkpoint below the media boun
     try testFillCache(&c1, s, 3, 16);
     const first = try testing.allocator.alloc(SSMCheckpoint, 3);
     for (first, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 2 + i * 2, s);
-    _ = try hc.commitWithMediaState(&c1, tokens[0..16], false, &.{.{ .start = media_start, .key = 0xF00D }}, 0, first, null, null, 16);
+    _ = try hc.commitWithMediaStateSource(&c1, tokens[0..16], false, 0xF00D, 0, media_start, first, null, null, 16);
 
     // The next turn extends the same conversation, so the commit replaces the
     // entry and merges: seven checkpoints thinned down to the cap of three.
@@ -3940,7 +5752,7 @@ test "HotPrefixCache: thinning keeps the highest checkpoint below the media boun
     try testFillCache(&c2, s, 3, 24);
     const second = try testing.allocator.alloc(SSMCheckpoint, 4);
     for (second, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 12 + i * 2, s);
-    _ = try hc.commitWithMediaState(&c2, &tokens, false, &.{.{ .start = media_start, .key = 0xF00D }}, 0, second, null, null, tokens.len);
+    _ = try hc.commitWithMediaStateSource(&c2, &tokens, false, 0xF00D, 0, media_start, second, null, null, tokens.len);
 
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     const kept = hc.entries.items[0].ssm_checkpoints.?;
@@ -4003,7 +5815,7 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         var ssm2 = pcEmptySsm();
         defer pcFreeHybrid(&ssm2);
         var moe_off: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, null);
+        const res = try hc2.lookupAndRestoreSource(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
         // Highest checkpoint ≤ 600 is 512 — never a full match on hybrid.
         try testing.expect(!res.full_match);
         try testing.expectEqual(@as(usize, 512), res.matched);
@@ -4025,7 +5837,7 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
         var ssm3 = pcEmptySsm();
         defer pcFreeHybrid(&ssm3);
         var moe_off3: usize = 0;
-        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, &ssm3, s, &tokens_div, false, &.{}, null, null);
+        const res3 = try hc2.lookupAndRestoreSource(&cache3, &moe_off3, &ssm3, s, &tokens_div, false, 0, null, null);
         try testing.expect(!res3.full_match);
         try testing.expectEqual(@as(usize, 256), res3.matched);
         try testing.expectEqual(@as(usize, 256), cache3.step);
@@ -4088,7 +5900,7 @@ test "HotPrefixCache: chunk-heavy hybrid flush still lands its SSM checkpoints" 
         var ssm2 = pcEmptySsm();
         defer pcFreeHybrid(&ssm2);
         var moe_off: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, null);
+        const res = try hc2.lookupAndRestoreSource(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
         try testing.expect(!res.full_match);
         try testing.expectEqual(@as(usize, 256), res.matched);
         try testing.expectEqual(@as(usize, 256), cache2.step);
@@ -4169,7 +5981,7 @@ test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe, null, s, &tokens, false, &.{}, null, null);
+        const res = try hc2.lookupAndRestoreSource(&cache2, &moe, null, s, &tokens, false, 0, null, null);
         try testing.expect(res.full_match);
         try testing.expectEqual(@as(usize, 599), res.matched);
     }
@@ -4216,7 +6028,7 @@ test "HotPrefixCache: a decline-spill is not bounded by the per-flush byte cap" 
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe, null, s, &tokens, false, &.{}, null, null);
+        const res = try hc2.lookupAndRestoreSource(&cache2, &moe, null, s, &tokens, false, 0, null, null);
         try testing.expect(res.full_match);
         try testing.expectEqual(@as(usize, 599), res.matched);
     }
@@ -4285,12 +6097,62 @@ test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint
         var ssm2 = pcEmptySsm();
         defer pcFreeHybrid(&ssm2);
         var moe_off: usize = 0;
-        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, null);
+        const res = try hc2.lookupAndRestoreSource(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
         try testing.expect(!res.full_match);
-        try testing.expect(res.slot_owned); // a hybrid disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 512), res.matched);
         try testing.expectEqual(@as(usize, 512), cache2.step);
     }
+}
+
+test "HotPrefixCache: a hybrid SSD restore hands the slot rows it owns, a RAM share does not" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var entry_tokens: [520]u32 = undefined;
+    for (&entry_tokens, 0..) |*t, i| t.* = if (i < 512) @intCast(i + 7) else @intCast(i + 900);
+    var src = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&src);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-own", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 520);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        _ = try hc.commitWithSsm(&cache, &entry_tokens, false, cps, null, null);
+        hc.flushPendingDisk(s);
+
+        var slot = try KVCache.init(testing.allocator, 3);
+        defer slot.deinit();
+        var ssm = pcEmptySsm();
+        defer pcFreeHybrid(&ssm);
+        var moe_off: usize = 0;
+        const ram = try hc.lookupAndRestoreSource(&slot, &moe_off, &ssm, s, &tokens, false, 0, null, null);
+        try testing.expectEqual(@as(usize, 512), ram.matched);
+        // The entry keeps the buffers: the first append copies them, so nothing is credited.
+        try testing.expect(!ram.ownsRestoredRows());
+    }
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-own", 0, 128);
+    defer hc2.deinit();
+    var slot2 = try KVCache.init(testing.allocator, 3);
+    defer slot2.deinit();
+    var ssm2 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm2);
+    var moe_off2: usize = 0;
+    const disk = try hc2.lookupAndRestoreSource(&slot2, &moe_off2, &ssm2, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 512), disk.matched);
+    try testing.expect(disk.ownsRestoredRows());
 }
 
 test "HotPrefixCache: a hybrid disk restore adopts the spec sidecar of the entry it restored" {
@@ -4353,7 +6215,7 @@ test "HotPrefixCache: a hybrid disk restore adopts the spec sidecar of the entry
     defer mtp_dst.deinit();
     var moe_off: usize = 0;
     var mbase: usize = 99;
-    const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, .{ .cache = &mtp_dst, .base_pos = &mbase });
+    const res = try hc2.lookupAndRestoreSource(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, .{ .cache = &mtp_dst, .base_pos = &mbase });
     try testing.expectEqual(@as(usize, 512), res.matched);
     // B's history, not A's (which would adopt at base 100 for 412 rows).
     try testing.expectEqual(@as(?usize, 0), res.mtp_base);
@@ -4396,7 +6258,7 @@ test "HotPrefixCache: hybrid RAM match at least as good as disk skips the SSD re
     var ssm2 = pcEmptySsm();
     defer pcFreeHybrid(&ssm2);
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, null);
+    const res = try hc.lookupAndRestoreSource(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
     try testing.expectEqual(@as(usize, 512), res.matched);
     try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
     // RAM restore installed the SSM state just the same.
@@ -4625,7 +6487,7 @@ test "HotPrefixCache: oversized entry trims to the longest prefix that fits (#33
     var dst = try KVCache.init(testing.allocator, 2);
     defer dst.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, &toks, false, &.{}, null, null);
+    const res = try hc.lookupAndRestoreSource(&dst, &moe_off, null, s, &toks, false, 0, null, null);
     try testing.expect(!res.full_match);
     try testing.expectEqual(@as(usize, 400), res.matched);
     try testing.expectEqual(@as(usize, 400), dst.step);
@@ -4715,6 +6577,48 @@ test "HotPrefixCache: oversized hybrid entry trims to the highest checkpoint tha
     const kept = e.ssm_checkpoints.?;
     try testing.expectEqual(@as(usize, 5), kept.len);
     try testing.expectEqual(@as(usize, 500), kept[kept.len - 1].pos);
+}
+
+test "HotPrefixCache: a trim priced after its checkpoint shed is retained, then shed" {
+    // qwen4_exp prices a trim against the checkpoints that survive the shed; retaining the new
+    // entry declined it on its unshed size, so a session past the budget was never cached.
+    const s = mlx.gpuStream();
+    var toks: [900]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 3);
+    var srcs: [8][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*e, i| {
+        const f: f64 = @floatFromInt(i + 1);
+        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
+    }
+    defer {
+        for (&srcs) |*e| pcFreeHybrid(e);
+    }
+    var c1 = try KVCache.init(testing.allocator, 3);
+    defer c1.deinit();
+    try testFillCache(&c1, s, 3, 900);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 8);
+    for (cps, 0..) |*c, i| {
+        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
+    }
+    var probe = try c1.snapshot();
+    defer probe.deinit();
+    const cp_bytes = transformer_mod.ssmCheckpointBytes(&cps[0]);
+    // Room for a 500-token prefix and three of its five checkpoints.
+    const budget = pcRowBytes(&probe) * 500 + 3 * cp_bytes;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+    hc.ssm_checkpoint_max = 8;
+    hc.cp_thin = .min_span_recency;
+    defer hc.deinit();
+    const status = try hc.commitWithSsm(&c1, &toks, false, cps, null, null);
+    try testing.expectEqual(std.meta.Tag(CommitStatus).ok, std.meta.activeTag(status));
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    const e = &hc.entries.items[0];
+    try testing.expect(e.tokens.len >= 500);
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+    const kept = e.ssm_checkpoints.?;
+    try testing.expect(kept.len < 5);
+    try testing.expectEqual(e.tokens.len, kept[kept.len - 1].pos);
 }
 
 /// A two-layer QSA hybrid: the layer counts differ from `pcBuildQsaHybrid`'s, which is how a
@@ -4906,14 +6810,14 @@ test "HotPrefixCache: a QSA arch restore with no indexer history is a miss, neve
         const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
         cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
         if (with_history) try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-        _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+        _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
 
         var target_cache = try KVCache.init(testing.allocator, 3);
         defer target_cache.deinit();
         var target = pcEmptySsm();
         defer pcFreeQsaHybrid(&target);
         var moe_off: usize = 0;
-        const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup_tokens, false, &.{}, null, null);
+        const r = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &lookup_tokens, false, 0, null, null);
         if (with_history) {
             try testing.expectEqual(@as(usize, 4), r.matched);
             try testing.expect(target[0].aux_state.ctx == null);
@@ -4949,7 +6853,7 @@ test "HotPrefixCache: a history tensor shorter than the checkpoint is a miss, no
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
     try testing.expect(cps[1].layers[0].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 64), cps[1].layers[0].qsa_rows);
-    _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
 
     for ([_][]const u32{ &lookup_latest, &lookup_interior }) |lookup| {
         var target_cache = try KVCache.init(testing.allocator, 3);
@@ -4957,7 +6861,7 @@ test "HotPrefixCache: a history tensor shorter than the checkpoint is a miss, no
         var target = pcEmptySsm();
         defer pcFreeQsaHybrid(&target);
         var moe_off: usize = 0;
-        try testing.expectError(error.QsaHistoryGap, hc.lookupAndRestore(&target_cache, &moe_off, &target, s, lookup, false, &.{}, null, null));
+        try testing.expectError(error.QsaHistoryGap, hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, lookup, false, 0, null, null));
         try testing.expectEqual(@as(usize, 0), target_cache.step);
         try testing.expect(target[0].aux_state.ctx == null);
     }
@@ -4997,14 +6901,14 @@ test "HotPrefixCache: a lookup that fails after binding the KV leaves nothing be
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 12, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 7;
-    try testing.expectError(error.QsaHistoryGap, hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup, false, &.{}, null, null));
+    try testing.expectError(error.QsaHistoryGap, hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &lookup, false, 0, null, null));
     try testing.expectEqual(@as(usize, 0), target_cache.step);
     try testing.expectEqual(@as(usize, 0), moe_off);
     for (&target) |*e| {
@@ -5033,7 +6937,7 @@ test "HotPrefixCache: prefix-extend keeps ONE QSA history across turns" {
     const cps1 = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps1[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &l1, 4, s);
     try transformer_mod.attachQsaHistoryToLatest(cps1, &l1, s);
-    _ = try hc.commitWithState(&c1, &t1, false, &.{}, cps1, null, null);
+    _ = try hc.commitWithStateSource(&c1, &t1, false, 0, cps1, null, null);
 
     var c2 = try KVCache.init(testing.allocator, 3);
     defer c2.deinit();
@@ -5043,7 +6947,7 @@ test "HotPrefixCache: prefix-extend keeps ONE QSA history across turns" {
     const cps2 = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps2[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &l2, 8, s);
     try transformer_mod.attachQsaHistoryToLatest(cps2, &l2, s);
-    _ = try hc.commitWithState(&c2, &t2, false, &.{}, cps2, null, null);
+    _ = try hc.commitWithStateSource(&c2, &t2, false, 0, cps2, null, null);
 
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     const merged = hc.entries.items[0].ssm_checkpoints.?;
@@ -5077,7 +6981,7 @@ test "HotPrefixCache: a handed-off QSA history commits, restores and bills exact
         } else {
             try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
         }
-        _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+        _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
         pcFreeQsaHybrid(&live);
         billed[arm] = hc.entries.items[0].ssm_bytes;
 
@@ -5086,7 +6990,7 @@ test "HotPrefixCache: a handed-off QSA history commits, restores and bills exact
         var target = pcEmptySsm();
         defer pcFreeQsaHybrid(&target);
         var moe_off: usize = 0;
-        const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup_tokens, false, &.{}, null, null);
+        const r = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &lookup_tokens, false, 0, null, null);
         try testing.expectEqual(@as(usize, 4), r.matched);
         try testing.expect(target[0].aux_state.ctx == null);
         try testing.expectEqual(@as(c_int, 4), target[0].qsa_hist_rows);
@@ -5179,7 +7083,7 @@ test "HotPrefixCache: a failed commit still frees the checkpoints it was handed 
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = .{ .pos = 4, .layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
     var toks = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    try testing.expectError(error.OutOfMemory, hc.commitWithMediaState(&src, &toks, false, &.{}, 0, cps, null, null, toks.len));
+    try testing.expectError(error.OutOfMemory, hc.commitWithMediaStateSource(&src, &toks, false, 0, 0, null, cps, null, null, toks.len));
     // No frees here: the cache owns the checkpoints on every outcome.
 }
 
@@ -5226,7 +7130,7 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     a_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[0], 8, s);
     a_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[1], 16, s);
     a_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[2], 21, s);
-    _ = try hc.commitWithState(&a_cache, &a_tokens, false, &.{}, a_cps, null, null);
+    _ = try hc.commitWithStateSource(&a_cache, &a_tokens, false, 0, a_cps, null, null);
 
     // Entry B: the serial arm. It restored from A and prefilled a tail too
     // short for a backoff, so its only checkpoint sits at the prompt end.
@@ -5235,7 +7139,7 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     try testFillCache(&b_cache, s, 3, b_tokens.len);
     const b_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     b_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[3], 20, s);
-    _ = try hc.commitWithState(&b_cache, &b_tokens, false, &.{}, b_cps, null, null);
+    _ = try hc.commitWithStateSource(&b_cache, &b_tokens, false, 0, b_cps, null, null);
 
     try testing.expectEqual(@as(usize, 2), hc.entryCount());
     // B carries A's in-prompt checkpoints, and NOT the one at 21 (a position
@@ -5252,7 +7156,7 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     defer c_cache.deinit();
     try testFillCache(&c_cache, s, 3, 4);
     const c_tokens = [_]u32{ 90, 91, 92, 93 };
-    _ = try hc.commitWithState(&c_cache, &c_tokens, true, &.{}, null, null, null);
+    _ = try hc.commitWithStateSource(&c_cache, &c_tokens, true, 0, null, null, null);
     try testing.expectEqual(@as(usize, 2), hc.entryCount());
     for (hc.entries.items) |*e| {
         try testing.expect(e.tokens.len != a_tokens.len or e.tokens[20] != 200);
@@ -5268,7 +7172,7 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     var target_ssm = pcEmptySsm();
     defer pcFreeHybrid(&target_ssm);
     var moe_off: usize = 0;
-    const result = try hc.lookupAndRestore(&target_cache, &moe_off, &target_ssm, s, &next, false, &.{}, null, null);
+    const result = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target_ssm, s, &next, false, 0, null, null);
 
     try testing.expectEqual(@as(usize, 16), result.matched);
     try testing.expectEqual(@as(usize, 16), target_cache.step);
@@ -5300,12 +7204,12 @@ test "HotPrefixCache: inheriting a 1-token-tail commit cannot restore a bank-les
     donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
     donor_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
     try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+    _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_cache = try KVCache.init(testing.allocator, 3);
     defer heir_cache.deinit();
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, &.{}, null, null, null);
+    _ = try hc.commitWithStateSource(&heir_cache, &heir_toks, false, 0, null, null, null);
 
     var lookup = heir_toks;
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -5313,7 +7217,7 @@ test "HotPrefixCache: inheriting a 1-token-tail commit cannot restore a bank-les
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup, false, &.{}, null, null);
+    const r = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &lookup, false, 0, null, null);
     const pos: c_int = @intCast(r.matched);
     const ratio: c_int = if (target[0].qsa_ratio > 0) target[0].qsa_ratio else 4;
     const blocks: c_int = if (target[0].qsa_pooled.ctx != null) mlx.getShape(target[0].qsa_pooled)[1] else 0;
@@ -5341,7 +7245,7 @@ test "HotPrefixCache: a 1-token-tail heir restores a bank that sits at prompt_en
     donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
     try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+    _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_live = pcBuildQsaHybrid(s, 21, 100.0);
     defer pcFreeQsaHybrid(&heir_live);
@@ -5350,7 +7254,7 @@ test "HotPrefixCache: a 1-token-tail heir restores a bank that sits at prompt_en
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
     const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
     heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 21, s);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, &.{}, heir_own, null, null);
+    _ = try hc.commitWithStateSource(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
 
     var lookup = heir_toks ++ [_]u32{ 300, 301 };
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -5358,7 +7262,7 @@ test "HotPrefixCache: a 1-token-tail heir restores a bank that sits at prompt_en
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup, false, &.{}, null, null);
+    const r = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &lookup, false, 0, null, null);
     try testing.expectEqual(@as(usize, 18), r.matched);
     try testing.expectEqual(@as(c_int, 18), target[0].qsa_hist_rows);
     try testing.expect(target[0].qsa_pooled.ctx != null);
@@ -5383,14 +7287,14 @@ test "HotPrefixCache: a leftover-only checkpoint list is a lookup miss" {
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
-    _ = try hc.commitWithState(&cache, &toks, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &toks, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const r = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, &.{}, null, null) catch |err| blk: {
+    const r = hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null) catch |err| blk: {
         try testing.expectEqual(error.QsaHistoryGap, err);
         break :blk LookupResult{ .matched = 0, .full_match = false };
     };
@@ -5419,7 +7323,7 @@ test "HotPrefixCache: v3 heir full-reuse clamp satisfies QSA at the restored pos
     donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 16, s);
     donor_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 25, s);
     try transformer_mod.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+    _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_live = pcBuildQsaHybrid(s, 21, 200.0);
     defer pcFreeQsaHybrid(&heir_live);
@@ -5429,7 +7333,7 @@ test "HotPrefixCache: v3 heir full-reuse clamp satisfies QSA at the restored pos
     const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
     heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 20, s);
     try transformer_mod.attachQsaHistoryToLatest(heir_own, &heir_live, s);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, &.{}, heir_own, null, null);
+    _ = try hc.commitWithStateSource(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
 
     var n: usize = 17;
     var hits: usize = 0;
@@ -5439,7 +7343,7 @@ test "HotPrefixCache: v3 heir full-reuse clamp satisfies QSA at the restored pos
         var target = pcEmptySsm();
         defer pcFreeQsaHybrid(&target);
         var moe_off: usize = 0;
-        const r = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, heir_toks[0..n], false, &.{}, null, null) catch |err| blk: {
+        const r = hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, heir_toks[0..n], false, 0, null, null) catch |err| blk: {
             try testing.expectEqual(error.QsaHistoryGap, err);
             break :blk LookupResult{ .matched = 0, .full_match = false };
         };
@@ -5536,7 +7440,6 @@ fn pcQsaFeed(xfm: *transformer_mod.Transformer, entry: *SSMCacheEntry, keys: mlx
 
 fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: usize, hi: usize, s: mlx.mlx_stream) !void {
     var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     var r = lo;
@@ -5546,7 +7449,7 @@ fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: u
         var target = pcEmptySsm();
         defer pcFreeQsaHybrid(&target);
         var moe_off: usize = 0;
-        const got = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, toks[0..r], false, &.{}, null, null) catch |err| {
+        const got = hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, toks[0..r], false, 0, null, null) catch |err| {
             log.warn("qsa value sweep lookup at r={d}: {s}\n", .{ r, @errorName(err) });
             return err;
         };
@@ -5574,8 +7477,6 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
     for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
 
     var xfm: transformer_mod.Transformer = undefined;
-
-    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -5606,7 +7507,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
         var cache = try KVCache.init(testing.allocator, 3);
         defer cache.deinit();
         try testFillCache(&cache, s, 3, toks.len);
-        _ = try hc.commitWithState(&cache, &toks, false, &.{}, cps, null, null);
+        _ = try hc.commitWithStateSource(&cache, &toks, false, 0, cps, null, null);
         try pcQsaSweep(&hc, &toks, keys, P - 39, P, s);
     }
 
@@ -5645,7 +7546,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
         var donor_cache = try KVCache.init(testing.allocator, 3);
         defer donor_cache.deinit();
         try testFillCache(&donor_cache, s, 3, donor_toks.len);
-        _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+        _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
         var heir_live: [3]SSMCacheEntry = .{
             .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
@@ -5663,7 +7564,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
         var heir_cache = try KVCache.init(testing.allocator, 3);
         defer heir_cache.deinit();
         try testFillCache(&heir_cache, s, 3, heir_toks.len);
-        _ = try hc.commitWithState(&heir_cache, &heir_toks, false, &.{}, heir_own, null, null);
+        _ = try hc.commitWithStateSource(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
 
         try pcQsaSweep(&hc, heir_toks[0..shared], donor_keys, 17, shared, s);
     }
@@ -5717,10 +7618,10 @@ test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays re
                 const seed_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
                 seed_cps[0] = try transformer_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
                 try sliceQsaHistoryOntoCheckpoint(&seed_cps[0], &cps[3], 256, s);
-                _ = try hc.commitWithState(&seed, toks[0..256], false, &.{}, seed_cps, null, null);
+                _ = try hc.commitWithStateSource(&seed, toks[0..256], false, 0, seed_cps, null, null);
             }
             const chosen = hc.trimLenForBudget(budget, toks.len, HotPrefixCache.snapshotRowBytes(&snap), cps);
-            _ = try hc.commitWithState(&cache, &toks, false, &.{}, cps, null, null);
+            _ = try hc.commitWithStateSource(&cache, &toks, false, 0, cps, null, null);
             try testing.expectEqual(@as(?usize, 512), chosen);
             try testing.expectEqual(@as(usize, 1), hc.entryCount());
             try testing.expect(hc.current_kv_bytes <= budget);
@@ -5730,7 +7631,7 @@ test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays re
             var target = try KVCache.init(testing.allocator, 3);
             defer target.deinit();
             var moe_off: usize = 0;
-            const hit = try hc.lookupAndRestore(&target, &moe_off, &restored, s, &toks, false, &.{}, null, null);
+            const hit = try hc.lookupAndRestoreSource(&target, &moe_off, &restored, s, &toks, false, 0, null, null);
             try testing.expectEqual(@as(usize, 512), hit.matched);
         }
     }
@@ -5759,7 +7660,7 @@ test "HotPrefixCache: shed rescues an interior QSA bank" {
         if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
         l.qsa_pooled = .{ .ctx = null };
     }
-    _ = try hc.commitWithState(&probe, &toks, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&probe, &toks, false, 0, cps, null, null);
     const before = hc.current_kv_bytes;
     const listed = hc.entries.items[0].ssm_checkpoints.?;
     hc.max_kv_bytes = before - ssmCheckpointBytes(&listed[1]) + 1;
@@ -5784,14 +7685,14 @@ test "HotPrefixCache: dropLastRestored removes the restored entry so the next lo
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const first = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &tokens, false, &.{}, null, null);
+    const first = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null);
     try testing.expect(first.matched > 0);
     try testing.expect(hc.dropLastRestored());
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
@@ -5800,7 +7701,7 @@ test "HotPrefixCache: dropLastRestored removes the restored entry so the next lo
     var moe2: usize = 0;
     var cache2 = try KVCache.init(testing.allocator, 3);
     defer cache2.deinit();
-    const second = try hc.lookupAndRestore(&cache2, &moe2, &target2, s, &tokens, false, &.{}, null, null);
+    const second = try hc.lookupAndRestoreSource(&cache2, &moe2, &target2, s, &tokens, false, 0, null, null);
     try testing.expectEqual(@as(usize, 0), second.matched);
 }
 
@@ -5820,7 +7721,7 @@ test "HotPrefixCache: QSA self-heal drops the slot model cache and leaves a sibl
     const cps_a = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps_a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_a, 8, s);
     try transformer_mod.attachQsaHistoryToLatest(cps_a, &live_a, s);
-    _ = try last_loaded.commitWithState(&cache_a, &tokens_a, false, &.{}, cps_a, null, null);
+    _ = try last_loaded.commitWithStateSource(&cache_a, &tokens_a, false, 0, cps_a, null, null);
 
     var slot_hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer slot_hc.deinit();
@@ -5833,14 +7734,14 @@ test "HotPrefixCache: QSA self-heal drops the slot model cache and leaves a sibl
     const cps_b = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps_b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_b, 8, s);
     try transformer_mod.attachQsaHistoryToLatest(cps_b, &live_b, s);
-    _ = try slot_hc.commitWithState(&cache_b, &tokens_b, false, &.{}, cps_b, null, null);
+    _ = try slot_hc.commitWithStateSource(&cache_b, &tokens_b, false, 0, cps_b, null, null);
 
     var tgt_a = try KVCache.init(testing.allocator, 3);
     defer tgt_a.deinit();
     var ssm_a = pcEmptySsm();
     defer pcFreeQsaHybrid(&ssm_a);
     var moe_a: usize = 0;
-    const ra = try last_loaded.lookupAndRestore(&tgt_a, &moe_a, &ssm_a, s, &tokens_a, false, &.{}, null, null);
+    const ra = try last_loaded.lookupAndRestoreSource(&tgt_a, &moe_a, &ssm_a, s, &tokens_a, false, 0, null, null);
     try testing.expect(ra.matched > 0);
 
     var tgt_b = try KVCache.init(testing.allocator, 3);
@@ -5848,7 +7749,7 @@ test "HotPrefixCache: QSA self-heal drops the slot model cache and leaves a sibl
     var ssm_b = pcEmptySsm();
     defer pcFreeQsaHybrid(&ssm_b);
     var moe_b: usize = 0;
-    const rb = try slot_hc.lookupAndRestore(&tgt_b, &moe_b, &ssm_b, s, &tokens_b, false, &.{}, null, null);
+    const rb = try slot_hc.lookupAndRestoreSource(&tgt_b, &moe_b, &ssm_b, s, &tokens_b, false, 0, null, null);
     try testing.expect(rb.matched > 0);
 
     try testing.expect(HotPrefixCache.dropQsaGapEntry(&slot_hc));
@@ -5876,12 +7777,12 @@ test "HotPrefixCache: inherited checkpoints never exceed the shared prefix" {
     donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
     try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+    _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_cache = try KVCache.init(testing.allocator, 3);
     defer heir_cache.deinit();
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, &.{}, null, null, null);
+    _ = try hc.commitWithStateSource(&heir_cache, &heir_toks, false, 0, null, null, null);
 
     var found = false;
     for (hc.entries.items) |*e| {
@@ -5952,7 +7853,6 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
     const P: usize = 20;
     const hd: c_int = 8;
     var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 40, hd);
@@ -5989,12 +7889,12 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
         try pcQsaFeed(&xfm, &live[0], keys, 40, s);
         try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
     }
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+    _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_cache = try KVCache.init(testing.allocator, 3);
     defer heir_cache.deinit();
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, &.{}, null, null, null);
+    _ = try hc.commitWithStateSource(&heir_cache, &heir_toks, false, 0, null, null, null);
 
     var found = false;
     for (hc.entries.items) |*e| {
@@ -6012,7 +7912,7 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
         var target = pcEmptySsm();
         defer pcFreeQsaHybrid(&target);
         var moe_off: usize = 0;
-        const got = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, heir_toks[0..rpos], false, &.{}, null, null);
+        const got = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, heir_toks[0..rpos], false, 0, null, null);
         try testing.expect(got.matched > 0);
         try testing.expect(got.matched <= P);
         var cold = pcEmptySsm();
@@ -6033,7 +7933,6 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
     const prompt_len: usize = P - 1;
     const hd: c_int = 8;
     var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 80, hd);
@@ -6065,12 +7964,12 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
         try pcQsaFeed(&xfm, &live[0], keys, 64, s);
         try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
     }
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+    _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var heir_cache = try KVCache.init(testing.allocator, 3);
     defer heir_cache.deinit();
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithMediaState(&heir_cache, &heir_toks, false, &.{}, 0, null, null, null, prompt_len);
+    _ = try hc.commitWithMediaStateSource(&heir_cache, &heir_toks, false, 0, 0, null, null, null, null, prompt_len);
 
     var found = false;
     for (hc.entries.items) |*e| {
@@ -6090,7 +7989,6 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
     const B: usize = 19;
     const H: usize = 80;
     var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, @intCast(H), hd);
@@ -6186,7 +8084,6 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
     const heir_gen: usize = 12;
     const a2_extra: usize = 8;
     var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -6226,7 +8123,7 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
         try pcQsaFeed(&xfm, &live[0], keys, @intCast(donor_len), s);
         try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
     }
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+    _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     var a2_cache = try KVCache.init(testing.allocator, 3);
     defer a2_cache.deinit();
@@ -6243,14 +8140,14 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
         try pcQsaFeed(&xfm, &live[0], keys, @intCast(a2_len), s);
         try transformer_mod.attachQsaHistoryToLatest(a2_own, &live, s);
     }
-    _ = try hc.commitWithState(&a2_cache, &a2_toks, false, &.{}, a2_own, null, null);
+    _ = try hc.commitWithStateSource(&a2_cache, &a2_toks, false, 0, a2_own, null, null);
 
     var donor_restored = pcEmptySsm();
     defer pcFreeQsaHybrid(&donor_restored);
     var donor_kv = try KVCache.init(testing.allocator, 3);
     defer donor_kv.deinit();
     var donor_moe: usize = 0;
-    const donor_hit = try hc.lookupAndRestore(&donor_kv, &donor_moe, &donor_restored, s, a2_toks[0..P], false, &.{}, null, null);
+    const donor_hit = try hc.lookupAndRestoreSource(&donor_kv, &donor_moe, &donor_restored, s, a2_toks[0..P], false, 0, null, null);
     try testing.expectEqual(backoff, donor_hit.matched);
 
     var heir_cache = try KVCache.init(testing.allocator, 3);
@@ -6258,14 +8155,14 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
     const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
     heir_own[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 44, 440.0, 44);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, &.{}, heir_own, null, null);
+    _ = try hc.commitWithStateSource(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
 
     var heir_restored = pcEmptySsm();
     defer pcFreeQsaHybrid(&heir_restored);
     var heir_kv = try KVCache.init(testing.allocator, 3);
     defer heir_kv.deinit();
     var heir_moe: usize = 0;
-    const heir_hit = try hc.lookupAndRestore(&heir_kv, &heir_moe, &heir_restored, s, &heir_toks, false, &.{}, null, null);
+    const heir_hit = try hc.lookupAndRestoreSource(&heir_kv, &heir_moe, &heir_restored, s, &heir_toks, false, 0, null, null);
     try testing.expectEqual(backoff, heir_hit.matched);
 
     const field = try pcSsmDiffField(s, &donor_restored, &heir_restored);
@@ -6300,14 +8197,14 @@ test "HotPrefixCache: a verbatim re-send restores at prompt_len-1" {
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, toks.len - 1, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &toks, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &toks, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, &.{}, null, null);
+    const r = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null);
     try testing.expectEqual(toks.len - 1, r.matched);
     try testing.expect(!r.full_match);
     try testing.expect(transformer_mod.qsaRestoreSatisfiesForward(&target, r.matched));
@@ -6334,14 +8231,14 @@ test "HotPrefixCache: a hybrid full-prefix extend checks out under SSD-first" {
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &toks, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &toks, false, 0, cps, null, null);
 
     var slot = try KVCache.init(testing.allocator, 3);
     defer slot.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const r = try hc.lookupAndRestoreForSlot(&slot, &moe_off, &target, s, &prompt, false, &.{}, null, null, 0xA11CE);
+    const r = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, &target, s, &prompt, false, 0, null, null, null, 0xA11CE);
     try testing.expect(r.matched > 0);
     try testing.expect(r.checked_out);
     try testing.expectEqual(@as(?usize, 0xA11CE), hc.entries.items[0].checked_out_by);
@@ -6363,14 +8260,14 @@ test "HotPrefixCache: walk-down restores the higher covering checkpoint, not a l
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &toks, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &toks, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, &.{}, null, null);
+    const r = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null);
     try testing.expectEqual(@as(usize, 16), r.matched);
     try testing.expect(target[0].qsa_pooled.ctx != null);
 }
@@ -6389,21 +8286,21 @@ test "HotPrefixCache: skip set on the cache without a lookup does not poison the
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const skipped = try hc.lookupAndRestoreWithMedia(&target_cache, &moe_off, &target, s, &tokens, false, &.{}, null, null, null, true);
+    const skipped = try hc.lookupAndRestoreWithMediaSource(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, &.{}, null, null, null, true);
     try testing.expectEqual(@as(usize, 0), skipped.matched);
     var cache2 = try KVCache.init(testing.allocator, 3);
     defer cache2.deinit();
     var target2 = pcEmptySsm();
     defer pcFreeQsaHybrid(&target2);
     var moe2: usize = 0;
-    const leaked = try hc.lookupAndRestoreWithMedia(&cache2, &moe2, &target2, s, &tokens, false, &.{}, null, null, null, false);
+    const leaked = try hc.lookupAndRestoreWithMediaSource(&cache2, &moe2, &target2, s, &tokens, false, 0, null, &.{}, null, null, null, false);
     try testing.expect(leaked.matched > 0);
 }
 
@@ -6421,14 +8318,14 @@ test "HotPrefixCache: skip_prefix_cache lookup is cold even when a covering entr
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
 
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const skipped = try hc.lookupAndRestoreWithMedia(&target_cache, &moe_off, &target, s, &tokens, false, &.{}, null, null, null, true);
+    const skipped = try hc.lookupAndRestoreWithMediaSource(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, &.{}, null, null, null, true);
     try testing.expectEqual(@as(usize, 0), skipped.matched);
 
     var target2 = pcEmptySsm();
@@ -6436,7 +8333,7 @@ test "HotPrefixCache: skip_prefix_cache lookup is cold even when a covering entr
     var moe2: usize = 0;
     var cache2 = try KVCache.init(testing.allocator, 3);
     defer cache2.deinit();
-    const second = try hc.lookupAndRestore(&cache2, &moe2, &target2, s, &tokens, false, &.{}, null, null);
+    const second = try hc.lookupAndRestoreSource(&cache2, &moe2, &target2, s, &tokens, false, 0, null, null);
     try testing.expect(second.matched > 0);
 }
 
@@ -6454,14 +8351,14 @@ test "HotPrefixCache: a skipped lookup of a covering prompt matches a cold cache
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
 
     var skipped_cache = try KVCache.init(testing.allocator, 3);
     defer skipped_cache.deinit();
     var skipped_ssm = pcEmptySsm();
     defer pcFreeQsaHybrid(&skipped_ssm);
     var skip_off: usize = 7;
-    const skipped = try hc.lookupAndRestoreWithMedia(&skipped_cache, &skip_off, &skipped_ssm, s, &tokens, false, &.{}, null, null, null, true);
+    const skipped = try hc.lookupAndRestoreWithMediaSource(&skipped_cache, &skip_off, &skipped_ssm, s, &tokens, false, 0, null, &.{}, null, null, null, true);
 
     var cold = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer cold.deinit();
@@ -6471,7 +8368,7 @@ test "HotPrefixCache: a skipped lookup of a covering prompt matches a cold cache
     var cold_ssm = pcEmptySsm();
     defer pcFreeQsaHybrid(&cold_ssm);
     var cold_off: usize = 7;
-    const cold_r = try cold.lookupAndRestore(&cold_cache, &cold_off, &cold_ssm, s, &tokens, false, &.{}, null, null);
+    const cold_r = try cold.lookupAndRestoreSource(&cold_cache, &cold_off, &cold_ssm, s, &tokens, false, 0, null, null);
     try testing.expectEqual(cold_r.matched, skipped.matched);
     try testing.expectEqual(cold_off, skip_off);
     try testing.expectEqual(@as(usize, 0), skipped.matched);
@@ -6520,7 +8417,7 @@ test "HotPrefixCache: dropping a disk hybrid restore poisons that disk entry" {
     var ssm2 = pcEmptySsm();
     defer pcFreeHybrid(&ssm2);
     var moe_off: usize = 0;
-    const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, null);
+    const res = try hc2.lookupAndRestoreSource(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
     try testing.expect(res.matched > 0);
     try testing.expect(hc2.dropLastRestored());
     try testing.expect(hc2.disk.?.entryPoisoned(disk_id));
@@ -6530,7 +8427,7 @@ test "HotPrefixCache: dropping a disk hybrid restore poisons that disk entry" {
     var ssm3 = pcEmptySsm();
     defer pcFreeHybrid(&ssm3);
     var moe3: usize = 0;
-    const res3 = try hc2.lookupAndRestore(&cache3, &moe3, &ssm3, s, &tokens, false, &.{}, null, null);
+    const res3 = try hc2.lookupAndRestoreSource(&cache3, &moe3, &ssm3, s, &tokens, false, 0, null, null);
     try testing.expectEqual(@as(usize, 0), res3.matched);
 }
 
@@ -6550,7 +8447,7 @@ test "HotPrefixCache: inherit-branch QSA invariant drop unbills the dropped SSM 
     var ctrl_cache = try KVCache.init(testing.allocator, 3);
     defer ctrl_cache.deinit();
     try testFillCache(&ctrl_cache, s, 3, heir_toks.len);
-    _ = try ctrl.commitWithState(&ctrl_cache, &heir_toks, false, &.{}, null, null, null);
+    _ = try ctrl.commitWithStateSource(&ctrl_cache, &heir_toks, false, 0, null, null, null);
     const snap_only = ctrl.entries.items[0].kv_bytes;
 
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
@@ -6564,7 +8461,7 @@ test "HotPrefixCache: inherit-branch QSA invariant drop unbills the dropped SSM 
         if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
         l.qsa_pooled = .{ .ctx = null };
     }
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, &.{}, donor_cps, null, null);
+    _ = try hc.commitWithStateSource(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
 
     hc.qsa_history_required = true;
     var heir_live = pcBuildQsaHybrid(s, 19, 100.0);
@@ -6578,7 +8475,7 @@ test "HotPrefixCache: inherit-branch QSA invariant drop unbills the dropped SSM 
         if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
         l.qsa_pooled = .{ .ctx = null };
     }
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, &.{}, heir_own, null, null);
+    _ = try hc.commitWithStateSource(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
 
     var found = false;
     for (hc.entries.items) |*e| {
@@ -6614,7 +8511,7 @@ test "HotPrefixCache: shedding the oldest QSA bank with no lower destination dro
         if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
         l.qsa_pooled = .{ .ctx = null };
     }
-    _ = try hc.commitWithState(&probe, &toks, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&probe, &toks, false, 0, cps, null, null);
     hc.max_kv_bytes = 1;
     hc.shedCheckpointsToFit();
     try testing.expect(hc.entryCount() == 1);
@@ -6633,7 +8530,7 @@ test "HotPrefixCache: a QSA-required restore without indexer history is a miss e
     defer pcFreeHybrid(&live);
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, &.{}, cps, null, null);
+    _ = try hc.commitWithStateSource(&cache, &tokens, false, 0, cps, null, null);
     hc.qsa_history_required = true;
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -6641,7 +8538,7 @@ test "HotPrefixCache: a QSA-required restore without indexer history is a miss e
     var target = pcEmptySsm();
     defer pcFreeHybrid(&target);
     var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &tokens, false, &.{}, null, null);
+    const r = try hc.lookupAndRestoreSource(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null);
     try testing.expectEqual(@as(usize, 0), r.matched);
 }
 
@@ -6798,7 +8695,7 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
     var live_b = try KVCache.init(testing.allocator, 8);
     defer live_b.deinit();
     var moe_off: usize = 0;
-    const hit = try hc.lookupAndRestore(&live_b, &moe_off, null, s, &toks_b, false, &.{}, null, null);
+    const hit = try hc.lookupAndRestoreSource(&live_b, &moe_off, null, s, &toks_b, false, 0, null, null);
     try testing.expect(hit.full_match);
     try testing.expect(hc.last_restored_used != null);
 
@@ -6815,7 +8712,7 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
     var probe_cache = try KVCache.init(testing.allocator, 8);
     defer probe_cache.deinit();
     var off2: usize = 0;
-    const still_b = try hc.lookupAndRestore(&probe_cache, &off2, null, s, &toks_b, false, &.{}, null, null);
+    const still_b = try hc.lookupAndRestoreSource(&probe_cache, &off2, null, s, &toks_b, false, 0, null, null);
     try testing.expect(still_b.full_match);
     // An exclusive eviction may return MORE than it was billed (capacity rounding).
     try testing.expect(rep.bytes > 0);
@@ -6868,7 +8765,7 @@ test "a trivial share of a whole session is a LIEN, and the admission pass gets 
     try t.expect(hc.entries.items[0].kv_bytes > hc.restore_pin_min_bytes);
 
     var moe_off: usize = 0;
-    const hit = try hc.lookupAndRestore(&slot_cache, &moe_off, null, s, &cold, false, &.{}, null, null);
+    const hit = try hc.lookupAndRestoreSource(&slot_cache, &moe_off, null, s, &cold, false, 0, null, null);
 
     // Declined: eleven rows are not worth a lien on the session.
     try t.expectEqual(@as(usize, 0), hit.matched);
@@ -6917,7 +8814,7 @@ test "a PROPORTIONATE share still restores, and is still protected" {
     var slot_cache = try KVCache.init(testing.allocator, 8);
     defer slot_cache.deinit();
     var moe_off: usize = 0;
-    const hit = try hc.lookupAndRestore(&slot_cache, &moe_off, null, s, &warm, false, &.{}, null, null);
+    const hit = try hc.lookupAndRestoreSource(&slot_cache, &moe_off, null, s, &warm, false, 0, null, null);
     try t.expectEqual(@as(usize, 2048), hit.matched);
     try t.expect(hc.last_restored_used != null);
 
@@ -6944,7 +8841,7 @@ test "a PROPORTIONATE share still restores, and is still protected" {
     var slot2 = try KVCache.init(testing.allocator, 8);
     defer slot2.deinit();
     var off2: usize = 0;
-    const hit2 = try hc2.lookupAndRestore(&slot2, &off2, null, s, &cold, false, &.{}, null, null);
+    const hit2 = try hc2.lookupAndRestoreSource(&slot2, &off2, null, s, &cold, false, 0, null, null);
     try t.expectEqual(@as(usize, 11), hit2.matched);
 }
 
@@ -6989,7 +8886,7 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     var ssm = pcEmptySsm();
     defer pcFreeHybrid(&ssm);
     var moe_off: usize = 0;
-    const hit = try hc.lookupAndRestoreWithMedia(&slot_cache, &moe_off, &ssm, s, &tokens, false, &.{}, null, null, 0xF5, false);
+    const hit = try hc.lookupAndRestoreWithMediaSource(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, &.{}, null, null, 0xF5, false);
 
     // The outcome: nothing delivered.
     try t.expectEqual(@as(usize, 0), hit.matched);
@@ -7014,6 +8911,54 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     const rep = hc.evictLruToAdmit(600_000, &hc, Fits.call, true);
     try t.expect(rep.admitted);
     try t.expectEqual(@as(usize, 2), rep.entries);
+}
+
+test "off SSD-first too, a 0-token hybrid outcome keeps its entry's recency: the count cap takes it, not another session" {
+    const t = testing;
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc.deinit();
+    try t.expect(!hc.ssd_first);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*x, i| x.* = @intCast(i + 7);
+    // The entry the lookup lands on, committed first: a checkpoint but no QSA history, so on a
+    // QSA arch it matches and then restores nothing.
+    var src = try KVCache.init(testing.allocator, 3);
+    defer src.deinit();
+    try testFillCache(&src, s, 3, 600);
+    var src512 = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&src512);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+    _ = try hc.commitWithSsm(&src, &tokens, false, cps, null, null);
+    // Another session's entry, committed after it.
+    var other_ids: [600]u32 = undefined;
+    for (&other_ids, 0..) |*x, i| x.* = @intCast(i + 900_007);
+    var other = try KVCache.init(testing.allocator, 3);
+    defer other.deinit();
+    try testFillCache(&other, s, 3, 600);
+    _ = try hc.commit(&other, &other_ids, false);
+    hc.qsa_history_required = true;
+    const used_before = hc.entries.items[0].last_used;
+
+    var slot_cache = try KVCache.init(testing.allocator, 3);
+    defer slot_cache.deinit();
+    var ssm = pcEmptySsm();
+    defer pcFreeHybrid(&ssm);
+    var moe_off: usize = 0;
+    const miss = try hc.lookupAndRestoreWithMediaSource(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, &.{}, null, null, 0xF5, false);
+    try t.expectEqual(@as(usize, 0), miss.matched);
+    try t.expectEqual(used_before, hc.entries.items[0].last_used);
+
+    var third_ids: [600]u32 = undefined;
+    for (&third_ids, 0..) |*x, i| x.* = @intCast(i + 500_007);
+    var third = try KVCache.init(testing.allocator, 3);
+    defer third.deinit();
+    try testFillCache(&third, s, 3, 600);
+    _ = try hc.commit(&third, &third_ids, false);
+    try t.expectEqual(@as(usize, 2), hc.entryCount());
+    for (hc.entries.items) |e| try t.expect(e.tokens[0] != tokens[0]);
 }
 
 test "the lien weighs the share a restore DELIVERS, not the one it matched" {
@@ -7080,7 +9025,7 @@ test "the lien weighs the share a restore DELIVERS, not the one it matched" {
     var ssm = pcEmptySsm();
     defer pcFreeHybrid(&ssm);
     var moe_off: usize = 0;
-    const hit = try hc.lookupAndRestore(&slot_cache, &moe_off, &ssm, s, &diverged, false, &.{}, null, null);
+    const hit = try hc.lookupAndRestoreSource(&slot_cache, &moe_off, &ssm, s, &diverged, false, 0, null, null);
 
     // Declined at the gate, before the bump — eight rows are not worth a lien
     // on the session.
@@ -7100,8 +9045,61 @@ test "the lien weighs the share a restore DELIVERS, not the one it matched" {
     const rep = hc.evictLruToAdmit(600_000, &hc, Fits.call, true);
     try t.expect(rep.admitted);
     try t.expectEqual(@as(usize, 1), rep.entries);
-    // Billed bytes: the live allocator delta is not deterministic on the CI runner.
-    try t.expect(rep.accounted_bytes > 0);
+    try t.expect(rep.bytes > 0);
+}
+test "the admission pass weighs an eviction after the GPU work still reading the entry drains" {
+    // A command buffer in flight keeps its inputs' buffers until it completes: read before the
+    // stream drains, the eviction returns nothing live and the pass stops as if it were shared.
+    const t = testing;
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    var tokens: [4096]u32 = undefined;
+    for (&tokens, 0..) |*x, i| x.* = @intCast(i + 7);
+    var src = try KVCache.init(testing.allocator, 8);
+    var src_live = true;
+    defer if (src_live) src.deinit();
+    try testFillCache(&src, s, 8, 4096);
+    _ = try hc.commit(&src, &tokens, false);
+    try t.expect(hc.entries.items[0].kv_bytes >= HotPrefixCache.SHARED_RATIO_MIN_BYTES);
+
+    // A matmul chain queued ahead of a read of every buffer the entry shares.
+    const pending = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(pending);
+    const dim = [_]c_int{ 1024, 1024 };
+    var chain = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chain);
+    try mlx.check(mlx.mlx_ones(&chain, &dim, 2, .float32, s));
+    for (0..64) |_| {
+        var next = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&next, chain, chain, s));
+        _ = mlx.mlx_array_free(chain);
+        chain = next;
+    }
+    _ = mlx.mlx_vector_array_append_value(pending, chain);
+    for (src.entries) |*e| for ([_]mlx.mlx_array{ e.keys, e.values }) |buf| {
+        if (buf.ctx == null) continue;
+        var total = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(total);
+        try mlx.check(mlx.mlx_sum(&total, buf, false, s));
+        _ = mlx.mlx_vector_array_append_value(pending, total);
+    };
+    _ = mlx.mlx_async_eval(pending);
+    // The entry is now the buffers' only owner.
+    src.deinit();
+    src_live = false;
+
+    const Fits = struct {
+        fn call(ctx: ?*anyopaque) bool {
+            const cache: *HotPrefixCache = @ptrCast(@alignCast(ctx.?));
+            return cache.entryCount() == 0;
+        }
+    };
+    const rep = hc.evictLruToAdmit(600_000, &hc, Fits.call, true);
+    try t.expect(rep.admitted);
+    try t.expect(!rep.shared_stop);
+    try t.expect(rep.bytes * HotPrefixCache.SHARED_RETURN_DIVISOR >= rep.accounted_bytes);
 }
 test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-only targets are unaffected" {
     // The qwen4_exp head's KV is meaningless without its index-key history, so the two halves
@@ -7267,7 +9265,7 @@ test "SSD-first companion: a restore adopts the entry's buffer when its capacity
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&slot, &moe_off, null, s, &tokens, false, &.{}, null, null);
+    const res = try hc.lookupAndRestoreSource(&slot, &moe_off, null, s, &tokens, false, 0, null, null);
     try testing.expect(res.full_match);
     slot.reserve(4096);
     const g1 = Grows.*;
@@ -7278,7 +9276,7 @@ test "SSD-first companion: a restore adopts the entry's buffer when its capacity
     var slot2 = try KVCache.init(testing.allocator, 1);
     defer slot2.deinit();
     var moe_off2: usize = 0;
-    _ = try hc.lookupAndRestore(&slot2, &moe_off2, null, s, &tokens, false, &.{}, null, null);
+    _ = try hc.lookupAndRestoreSource(&slot2, &moe_off2, null, s, &tokens, false, 0, null, null);
     slot2.reserve(65536);
     const g2 = Grows.*;
     try testFillCache(&slot2, s, 1, 8);
@@ -7332,7 +9330,7 @@ test "SSD-first: an idle entry spills to disk and leaves RAM; the active session
         var back = try KVCache.init(testing.allocator, 1);
         defer back.deinit();
         var moe_off: usize = 0;
-        const res = try hc.lookupAndRestore(&back, &moe_off, null, s, &tokens_a, false, &.{}, null, null);
+        const res = try hc.lookupAndRestoreSource(&back, &moe_off, null, s, &tokens_a, false, 0, null, null);
         // A restore always leaves the last token to forward.
         try testing.expectEqual(@as(usize, 599), res.matched);
     }
@@ -8221,11 +10219,14 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         var slot = try KVCache.init(testing.allocator, 1);
         defer slot.deinit();
         var moe_off: usize = 0;
-        const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 0xA11CE);
+        const res = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
         try testing.expectEqual(@as(usize, 600), res.matched);
         // The transfer is the scheduler's second step, taken at the last point
-        // before the first write (see `donateCheckout`).
+        // before the first write (see `donateCheckout`), and the slot adopts the buffers.
         hc.donateCheckout(0xA11CE);
+        slot.adoptRestored();
+        // A share would size its copy by this reservation; the move ignores it.
+        slot.reserve(reserve / 4);
 
         // The entry gave the buffers up: its handles are empty and it names the slot.
         const e = &hc.entries.items[0];
@@ -8254,7 +10255,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         var slot = try KVCache.init(testing.allocator, 1);
         defer slot.deinit();
         var moe_off: usize = 0;
-        const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 0xA11CE);
+        const res = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
         try testing.expectEqual(@as(usize, 600), res.matched);
         const e = &hc.entries.items[0];
         try testing.expectEqual(@as(?usize, null), e.checked_out_by);
@@ -8262,6 +10263,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
 
         slot.evalState();
         try testing.expectEqual(buf_bytes, testKeyBufferBytes(&slot, 0));
+        slot.reserve(reserve / 4);
         const before = testLiveBytes(s);
         try testWriteCacheLayer(&slot, s, 0, 600, 8);
         slot.evalState();
@@ -8269,8 +10271,8 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         try testReadKeyRows(&slot, 0, 596, &copied_bytes);
     }
 
-    // The share arm had to copy a second capacity-shaped buffer.
-    try testing.expect(copied_delta > buf_bytes);
+    // The share arm copied into a buffer the request's reservation sizes, not the donor's capacity.
+    try testing.expect(copied_delta * 4 > buf_bytes and copied_delta < buf_bytes);
     // The move arm allocated nothing beyond the tail; a quarter of one buffer is a loose ceiling.
     try testing.expect(moved_delta * 4 < buf_bytes);
     try testing.expectEqualSlices(f32, &copied_bytes, &moved_bytes);
@@ -8283,6 +10285,7 @@ fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void 
 }
 
 test "a one-token prompt that hits its own entry prefills cold: a restore leaves a token to forward" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const tokens = [_]u32{42};
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
@@ -8291,14 +10294,16 @@ test "a one-token prompt that hits its own entry prefills cold: a restore leaves
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &tokens, false, &.{}, null, null, 7);
+    const res = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &tokens, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 0), res.matched);
     try testing.expectEqual(@as(usize, 0), moe_off);
+    try testing.expectEqual(@as(usize, 0), slot.step);
     try testing.expect(hc.last_restored_used == null);
 }
 
 test "restore by move ON DEMAND: a share that does not fit is taken over, off SSD-first" {
     // The admission pass converts a full-entry hit into a checkout; a partial hit and a second call decline.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     restore_move_override = true;
     defer restore_move_override = null;
@@ -8316,11 +10321,11 @@ test "restore by move ON DEMAND: a share that does not fit is taken over, off SS
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
-    const partial = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &diverged, false, &.{}, null, null, 7);
+    const partial = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &diverged, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 500), partial.matched);
     try testing.expect(!hc.checkoutRestored(7, diverged.len));
 
-    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 7);
+    const res = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 600), res.matched);
     try testing.expect(!res.checked_out);
     try testing.expect(hc.checkoutRestored(7, prompt.len));
@@ -8352,7 +10357,7 @@ test "restore by move: a partial-prefix hit keeps the refcount-share" {
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 7);
+    const res = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 500), res.matched);
     try testing.expectEqual(@as(?usize, null), hc.entries.items[0].checked_out_by);
     try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
@@ -8380,7 +10385,7 @@ test "restore by move: a refusal BEFORE the append hands the entry back INTACT" 
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 42);
+    const res = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
     try testing.expect(res.checked_out);
     const lru_before = hc.entries.items[0].last_used;
 
@@ -8403,7 +10408,7 @@ test "restore by move: a refusal BEFORE the append hands the entry back INTACT" 
     var slot2 = try KVCache.init(testing.allocator, 1);
     defer slot2.deinit();
     var moe_off2: usize = 0;
-    const again = try hc.lookupAndRestoreForSlot(&slot2, &moe_off2, null, s, &prompt, false, &.{}, null, null, 43);
+    const again = try hc.lookupAndRestoreForSlotSource(&slot2, &moe_off2, null, s, &prompt, false, 0, null, null, null, 43);
     try testing.expectEqual(@as(usize, 600), again.matched);
     hc.releaseCheckout(43, "second slot ended");
 }
@@ -8427,7 +10432,7 @@ test "restore by move: a slot that ends without committing DROPS its checked-out
 
     var slot = try KVCache.init(testing.allocator, 1);
     var moe_off: usize = 0;
-    _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 42);
+    _ = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
 
     // Admitted and about to write: the handles go over.
@@ -8462,7 +10467,7 @@ test "restore by move: a commit RECLAIMS the checked-out entry with the grown bu
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
-    _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 42);
+    _ = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
     try testing.expect(hc.entries.items[0].checked_out_by != null);
     try testWriteCacheLayer(&slot, s, 0, 600, 8);
 
@@ -8478,7 +10483,7 @@ test "restore by move: a commit RECLAIMS the checked-out entry with the grown bu
     var slot2 = try KVCache.init(testing.allocator, 1);
     defer slot2.deinit();
     var moe_off2: usize = 0;
-    const res2 = try hc.lookupAndRestore(&slot2, &moe_off2, null, s, &prompt, false, &.{}, null, null);
+    const res2 = try hc.lookupAndRestoreSource(&slot2, &moe_off2, null, s, &prompt, false, 0, null, null);
     try testing.expectEqual(@as(usize, 607), res2.matched);
 }
 
@@ -8500,7 +10505,7 @@ test "restore by move: a checked-out entry is invisible to a second slot, to evi
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
-    _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 42);
+    _ = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
     const billed = hc.entries.items[0].kv_bytes;
     try testing.expect(billed > 0);
 
@@ -8508,7 +10513,7 @@ test "restore by move: a checked-out entry is invisible to a second slot, to evi
     var slot2 = try KVCache.init(testing.allocator, 1);
     defer slot2.deinit();
     var moe_off2: usize = 0;
-    const res2 = try hc.lookupAndRestoreForSlot(&slot2, &moe_off2, null, s, &prompt, false, &.{}, null, null, 43);
+    const res2 = try hc.lookupAndRestoreForSlotSource(&slot2, &moe_off2, null, s, &prompt, false, 0, null, null, null, 43);
     try testing.expectEqual(@as(usize, 0), res2.matched);
     try testing.expect(!res2.full_match);
     try testing.expectEqual(@as(usize, 0), slot2.step);
@@ -8634,7 +10639,7 @@ test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry �
     var back = try KVCache.init(testing.allocator, 1);
     defer back.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestore(&back, &moe_off, null, s, &tok_a, false, &.{}, null, null);
+    const res = try hc.lookupAndRestoreSource(&back, &moe_off, null, s, &tok_a, false, 0, null, null);
     try testing.expectEqual(@as(usize, 599), res.matched);
 }
 
@@ -8831,6 +10836,49 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
 }
 
+test "HotPrefixCache: checkpoint clone allocation failure releases owned layers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var accounting = testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = 1 });
+    var layers = [_]transformer_mod.SSMCacheEntrySnapshot{.{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = false,
+    }};
+    const checkpoints = [_]SSMCheckpoint{.{ .pos = 512, .layers = &layers }};
+
+    try testing.expectError(error.OutOfMemory, HotPrefixCache.cloneCheckpointsUpTo(accounting.allocator(), &checkpoints, 512, null));
+    try testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+}
+
+test "hot cache declines when checked out entries fill count cap" {
+    try testCheckedOutRetentionCap(1, 0);
+}
+
+test "hot cache declines when checked out entries fill byte cap" {
+    try testCheckedOutRetentionCap(8, 4096);
+}
+
+fn testCheckedOutRetentionCap(max_entries: u32, max_bytes: u64) !void {
+    var hc = HotPrefixCache.initWithMem(testing.allocator, max_entries, max_bytes);
+    defer hc.deinit();
+    try pcAppendCheckedOut(&hc, &.{ 1, 2 }, max_bytes, 1);
+    const retained = try hc.retainNewEntry(.{
+        .tokens = try testing.allocator.dupe(u32, &.{ 90, 91, 92, 93 }),
+        .has_tools = false,
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 4, .allocator = testing.allocator, .config = kv_quant.KVQuantConfig.dense },
+        .last_used = 2,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .kv_bytes = 128,
+        .ssm_checkpoints = try testing.allocator.alloc(SSMCheckpoint, 0),
+        .ssm_bytes = 0,
+    });
+    try testing.expect(!retained);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(max_bytes, hc.current_kv_bytes);
+    try testing.expect(hc.entries.items[0].checked_out_by != null);
+}
+
 test "a restore names its entry, and a commit that extends it in place keeps the id" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -8847,11 +10895,67 @@ test "a restore names its entry, and a commit that extends it in place keeps the
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
-    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &longer, false, &.{}, null, null, 0);
+    const res = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &longer, false, 0, null, null, null, 0);
     try testing.expectEqual(id, res.entry_id);
 
     try testFillCache(&slot, s, 1, longer.len);
     _ = try hc.commit(&slot, &longer, false);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     try testing.expectEqual(id, hc.entries.items[0].id);
+}
+
+test "a donated checkout names the bytes its slot now holds; a share names none" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 1024);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlotSource(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
+    try testing.expect(res.checked_out);
+    // Until the transfer the slot shares the entry's buffers, which the entry bills.
+    try testing.expectEqual(@as(u64, 0), slot.residentBytes());
+    try testing.expectEqual(@as(u64, 0), hc.donatedBytes(0xA11CE));
+
+    const billed = hc.residentBytes();
+    hc.donateCheckout(0xA11CE);
+    slot.adoptRestored();
+    // The entry keeps billing what the slot now owns, so a live count subtracts it.
+    try testing.expectEqual(billed, hc.residentBytes());
+    try testing.expect(slot.residentBytes() > 0);
+    try testing.expectEqual(slot.residentBytes(), hc.donatedBytes(0xA11CE));
+    try testing.expectEqual(@as(u64, 0), hc.donatedBytes(0xB0B));
+
+    hc.releaseCheckout(0xA11CE, "test");
+    try testing.expectEqual(@as(u64, 0), hc.donatedBytes(0xA11CE));
+}
+
+pub fn mediaSharedBound(a: []const MediaSpan, b: []const MediaSpan) usize {
+    const n = @min(a.len, b.len);
+    for (a[0..n], b[0..n]) |x, y| {
+        if (x.start != y.start or x.key != y.key) return @min(x.start, y.start);
+    }
+    if (a.len > n) return a[n].start;
+    if (b.len > n) return b[n].start;
+    return std.math.maxInt(usize);
+}
+fn cumulativeMedia(allocator: std.mem.Allocator, media: []const MediaSpan) ![]MediaSpan {
+    const out = try allocator.alloc(MediaSpan, media.len);
+    var hash = std.hash.Wyhash.init(0);
+    for (media, out) |span, *dst| {
+        hash.update(std.mem.asBytes(&span.start));
+        hash.update(std.mem.asBytes(&span.key));
+        dst.* = .{ .start = span.start, .key = hash.final() | 1 };
+    }
+    return out;
 }

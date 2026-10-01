@@ -146,7 +146,8 @@ pub const Writer = struct {
             .path = path,
             .bytes = bytes,
             .epoch = self.epoch,
-        }) catch {
+        }) catch |err| {
+            self.noteFailureLocked(path, @errorName(err));
             self.allocator.free(path);
             self.allocator.free(bytes);
             self.files_dropped += 1;
@@ -391,6 +392,7 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
 
     const fd = std.c.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.OpenFailed;
+    errdefer _ = std.c.unlink(tmp.ptr);
     defer _ = std.c.close(fd);
     var off: usize = 0;
     while (off < bytes.len) {
@@ -513,4 +515,32 @@ test "kv_disk_writer: a PAUSED writer deinits without blocking" {
     w.deinit();
     try testing.expect(w.thread == null);
     w.deinit();
+}
+
+test "kv_disk_writer: failed publication removes staged temporary bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "blocked", .default_dir);
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/blocked", .{root});
+    defer testing.allocator.free(path);
+
+    try testing.expectError(error.RenameFailed, writeAtomic(path, "unpublished bytes"));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "blocked.tmp", .{}));
+}
+
+test "kv_disk_writer: queue allocation failure invalidates persistence" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var writer = Writer.init(failing.allocator(), testing.io);
+    defer writer.deinit();
+    writer.running = true;
+    const path = try testing.allocator.dupe(u8, "e1/c000000.safetensors");
+    const bytes = try testing.allocator.dupe(u8, "chunk bytes");
+
+    writer.submit(path, bytes);
+
+    try testing.expectEqual(@as(u64, 1), writer.writeErrorCount());
+    try testing.expect(writer.takeUnattributed());
+    try testing.expectEqual(@as(u64, 0), writer.pendingBytes());
 }

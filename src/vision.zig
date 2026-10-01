@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
+const mimo_vision = @import("mimo_vision.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -197,12 +198,14 @@ pub const VisionEncoder = struct {
     // sentinels. See src/qwen_vision.zig / src/muse_vision.zig.
     qwen: ?qwen_vision.QwenVision = null,
     muse: ?muse_vision.MuseVision = null,
+    mimo: ?mimo_vision.MimoVision = null,
     lfm2: ?lfm2_vision.Lfm2Vision = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
         if (config.qwen_vision) return initQwen(allocator, config, weights);
         if (config.muse_vision) return initMuse(allocator, config, weights);
+        if (config.mimo_vision) return initMimo(allocator, config, weights);
         if (config.lfm2_vision) return initLfm2(allocator, config, weights);
         const s = mlx.mlx_default_gpu_stream_new();
 
@@ -328,6 +331,7 @@ pub const VisionEncoder = struct {
         _ = mlx.mlx_array_free(self.one);
         if (self.qwen) |*q| q.deinit();
         if (self.muse) |*m| m.deinit();
+        if (self.mimo) |*m| m.deinit();
         if (self.lfm2) |*l| l.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
@@ -446,6 +450,31 @@ pub const VisionEncoder = struct {
 
     /// Build a VisionEncoder wrapping the Muse-Glimmer ViT. Same sentinel shape
     /// as `initQwen`; `muse` drives `forwardPatches`.
+    fn initMimo(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const s = mlx.mlx_default_gpu_stream_new();
+        errdefer _ = mlx.mlx_stream_free(s);
+        const mv = try mimo_vision.MimoVision.init(allocator, config, weights);
+        return .{
+            .config = config,
+            .s = s,
+            .allocator = allocator,
+            .patch_proj_w = mlx.mlx_array_new(),
+            .position_embedding = mlx.mlx_array_new(),
+            .layers = &.{},
+            .proj_w = mlx.mlx_array_new(),
+            .proj_s = mlx.mlx_array_new(),
+            .proj_b = mlx.mlx_array_new(),
+            .proj_quant_bits = 4,
+            .proj_quant_group_size = config.quant_group_size,
+            .std_scale = null,
+            .std_bias = null,
+            .rms_eps = 1e-6,
+            .half = bf16Scalar(0.5, s),
+            .one = bf16Scalar(1.0, s),
+            .mimo = mv,
+        };
+    }
+
     fn initMuse(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         const s = mlx.mlx_default_gpu_stream_new();
         const mv = try muse_vision.MuseVision.init(allocator, config, weights);
@@ -501,6 +530,7 @@ pub const VisionEncoder = struct {
     /// Returns [1, N/merge², out_hidden].
     pub fn forwardPatches(self: *VisionEncoder, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         if (self.muse) |*mv| return mv.forward(patches, grid_h, grid_w);
+        if (self.mimo) |*mv| return mv.forward(patches, grid_h, grid_w);
         if (self.qwen) |*qv| return qv.forward(patches, grid_h, grid_w);
         if (self.lfm2) |*lv| return lv.forward(patches, grid_h, grid_w);
         return error.NoPatchGridEncoder;
@@ -698,7 +728,7 @@ pub const VisionEncoder = struct {
         // (Gemma-shaped) buffer reaching here is a client/preprocessing
         // mismatch, not something to dereference. Backstop for the parse-level
         // refusal in `parseImageUrlContent`.
-        if (self.qwen != null or self.muse != null or self.lfm2 != null) return error.PixelsMissingPatchGrid;
+        if (self.qwen != null or self.muse != null or self.lfm2 != null or self.mimo != null) return error.PixelsMissingPatchGrid;
         const cfg = &self.config;
         const ps: c_int = @intCast(cfg.vision_patch_size);
         const hidden: c_int = @intCast(cfg.vision_hidden_size);

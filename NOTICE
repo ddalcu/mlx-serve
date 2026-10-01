@@ -14,6 +14,34 @@ Apache License, Version 2.0
 ================================================================================
 
 --------------------------------------------------------------------------------
+MiMo V2 reference implementation
+https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL
+Copyright 2026 Xiaomi Corporation.
+Copyright 2026 The HuggingFace Inc. team.
+Licensed under the Apache License, Version 2.0.
+
+The MiMo attention and routing implementation in src/transformer.zig follows
+the reference's partial rotary embedding, asymmetric K/V, attention-sink,
+value-scaling and sigmoid-routing contracts. It is implemented in Zig against
+mlx-c with resident native MXFP4 expert banks. tests/dump_mimo_v2_fixtures.py loads the
+unmodified reference externally to generate independent numerical fixtures.
+
+The TP-aware FP8 QKV reconstruction in `src/mimo_source.zig` follows
+`conversion/mimo.py`, reimplemented in Zig.
+
+The MiMo-ViT vision tower in `src/mimo_vision.zig` is a port of the
+reference's `MiMoVisionTransformer` (`modeling_mimo_v2.py`), and its image
+preprocessing follows the vendor serving processors (`smart_resize`, bilinear
+resampling, ImageNet normalization). The three MTP heads in `src/mimo_mtp.zig`
+follow the MiMo-V2 MTP layer as XiaomiMiMo's vLLM and SGLang integrations
+compose it (Apache-2.0). Both are reimplemented in Zig against mlx-c;
+tests/dump_mimo_vision_fixtures.py and tests/dump_mimo_v2_mtp_fixtures.py
+render their fixtures from the unmodified reference modules.
+
+`src/fixtures/mimo_v26_chat_template.jinja` is the checkpoint's unmodified
+chat template, used for tests; its model repository declares the MIT License.
+
+--------------------------------------------------------------------------------
 MTPLX
 https://github.com/youssofal/mtplx
 Copyright 2026 Youssof Altoukhi
@@ -530,3 +558,23 @@ and they are listed because they made that work possible.
 
 Model weights downloaded at runtime carry their own licenses from their
 publishers. mlx-serve does not redistribute them.
+
+--------------------------------------------------------------------------------
+Sushi — MiMo-V2.6 engine
+https://github.com/beamivalice/sushi
+Copyright (c) 2026 Theinruj Toranavikrai
+Copyright (c) 2026 David Dalcu
+Licensed under the MIT License (permission terms in LICENSE).
+
+The MiMo configuration, source safetensors reader, FP8 block kernels, attention
+and routing math, vision tower, MTP heads, and reference-fixture tests derive
+from Sushi commit 3e700850. Adapted to mlx-serve's loading, cache, generation,
+and model lifecycle interfaces; a resident MXFP4 bank loader replaces Sushi's
+original-checkpoint expert streaming adapter. No expert codec was ported.
+
+The MiMo KV port also incorporates Sushi's bounded sliding cache, ring
+checkpoints, prefix and SSD persistence, packed KV attention, QKV preparation,
+and memory-accounting code. The asymmetric prefill shaders in
+`src/kernels/attn_pd_nax*.metal` retain the MLX/MTPLX-derived attention machinery
+covered by the upstream notices above. Adaptations preserve mlx-serve's media
+interfaces, layout fingerprints, and non-MiMo batching interfaces.

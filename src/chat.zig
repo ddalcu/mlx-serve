@@ -42,7 +42,7 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, mimo } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -150,6 +150,8 @@ pub const ChatConfig = struct {
     chat_template_kwargs: ?[]const u8 = null,
     /// The model's `enable_thinking` / `reasoning_effort` kwargs, typed: used
     /// only when a request names neither (`server.resolveChatThinking`).
+    /// MiMo permits generic role headers; probe them before rewriting tool results.
+    probe_generic_tool_role: bool = false,
     default_enable_thinking: ?bool = null,
     default_reasoning_effort: ?[]const u8 = null,
 
@@ -364,6 +366,7 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         .eos_token = eos_token,
         .add_bos_token = add_bos_token,
         .allocator = allocator,
+        .probe_generic_tool_role = dirModelTypeIs(io, allocator, model_dir, "mimo_v2"),
     };
 }
 
@@ -580,7 +583,7 @@ pub fn decodeViaLlama(
 }
 
 /// Render the Jinja chat template with the given messages.
-fn renderChatTemplate(
+pub fn renderChatTemplate(
     allocator: std.mem.Allocator,
     messages: []const Message,
     chat_config: *const ChatConfig,
@@ -614,9 +617,13 @@ fn renderChatTemplate(
     // form so the model still sees the tool context.
     const tpl = chat_config.chat_template;
     const tpl_has_tools = std.mem.indexOf(u8, tpl, "tools") != null;
-    const tpl_has_tool_role = templateReferencesToolRole(tpl);
+    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
+    defer allocator.free(extra_json);
+    const messages_have_tools = messagesHaveToolContent(msgs);
+    const tpl_has_tool_role = !messages_have_tools or templateReferencesToolRole(tpl) or
+        (chat_config.probe_generic_tool_role and try templateProbePreservesToolContent(allocator, tpl, extra_json));
     const needs_inject_tools = tools_json != null and !tpl_has_tools;
-    const needs_rewrite_tool_role = !tpl_has_tool_role and messagesHaveToolContent(msgs);
+    const needs_rewrite_tool_role = !tpl_has_tool_role and messages_have_tools;
 
     var fallback_arena: ?std.heap.ArenaAllocator = null;
     defer if (fallback_arena) |*a| a.deinit();
@@ -681,8 +688,7 @@ fn renderChatTemplate(
     defer allocator.free(messages_json);
 
     // Build extra context (bos_token, eos_token, enable_thinking, effort)
-    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
-    defer allocator.free(extra_json);
+
 
     // Null-terminate strings for C
     const tmpl_z = try allocator.dupeSentinel(u8, chat_config.chat_template, 0);
@@ -14781,4 +14787,144 @@ test "answerStopIndex: a stop after trailing whitespace in the answer still cuts
     try t.expectEqual(@as(?usize, std.mem.indexOf(u8, hard_break, "  \n").? + 2), answerStopIndex(hard_break, 0, "\n", true));
     // Whitespace leading the answer is never delivered, so it never matches.
     try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
+}
+
+fn mimoTemplateConfig(allocator: std.mem.Allocator) ChatConfig {
+    return .{
+        .chat_template = @embedFile("fixtures/mimo_v26_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+        .probe_generic_tool_role = true,
+    };
+}
+
+test "real mimo_v2 template is the committed fixture" {
+    const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
+    var config = try loadChatConfig(testing.io, testing.allocator, std.mem.span(raw));
+    defer config.deinit();
+    try testing.expectEqualStrings(@embedFile("fixtures/mimo_v26_chat_template.jinja"), config.chat_template);
+}
+
+test "mimo_v2 template preserves reasoning and XML tool history" {
+    const a = testing.allocator;
+    var config = mimoTemplateConfig(a);
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "sum", .arguments = "{\"x\":2}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Compute." },
+        .{ .role = "assistant", .content = "", .reasoning_content = "Use sum.", .tool_calls = &calls },
+        .{ .role = "tool", .content = "2" },
+        .{ .role = "user", .content = "Continue." },
+    };
+    const expected = "<|im_start|>user\nCompute.<|im_end|>" ++
+        "<|im_start|>assistant\n<think>Use sum.</think>" ++
+        "<tool_call><function=sum><parameter=x>2</parameter></function></tool_call><|im_end|>" ++
+        "<|im_start|>tool\n2<|im_end|>" ++
+        "<|im_start|>user\nContinue.<|im_end|><|im_start|>assistant\n";
+    const thinking = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(thinking);
+    try testing.expectEqualStrings(expected, thinking);
+    try testing.expect(!promptTailOpensThink(thinking));
+    const plain = try renderChatTemplate(a, &messages, &config, null, null, false, null, false);
+    defer a.free(plain);
+    try testing.expectEqualStrings(expected ++ "<think></think>", plain);
+}
+
+test "mimo_v2 template renders a late system turn in place" {
+    const a = testing.allocator;
+    var config = mimoTemplateConfig(a);
+    const messages = [_]Message{
+        .{ .role = "system", .content = "S" },
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "system", .content = "late" },
+        .{ .role = "user", .content = "again" },
+    };
+    const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(rendered);
+    try testing.expectEqualStrings("<|im_start|>system\nS<|im_end|><|im_start|>user\nhi<|im_end|>" ++
+        "<|im_start|>system\nlate<|im_end|><|im_start|>user\nagain<|im_end|><|im_start|>assistant\n", rendered);
+}
+
+test "mimo_v2 template renders a tools request as the reference does" {
+    // Expected bytes: transformers' apply_chat_template environment (jinja2, its
+    // json.dumps tojson) over the same template and request.
+    const a = testing.allocator;
+    var config = mimoTemplateConfig(a);
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_weather","description":"Current weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
+    ;
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "S" },
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "Need weather.", .tool_calls = &calls },
+        .{ .role = "tool", .content = "18C", .tool_call_id = "call_1" },
+        .{ .role = "user", .content = "Thanks." },
+    };
+    const expected = "<|im_start|>system\nYou are provided with the following tools:\n\n<tools>\n" ++
+        "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather\", " ++
+        "\"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}" ++
+        "\n</tools><|im_end|><|im_start|>system\nS<|im_end|><|im_start|>user\nWeather in Paris?<|im_end|>" ++
+        "<|im_start|>assistant\n<think>Need weather.</think><tool_call><function=get_weather><parameter=city>Paris</parameter>" ++
+        "</function></tool_call><|im_end|><|im_start|>tool\n18C<|im_end|><|im_start|>user\nThanks.<|im_end|>" ++
+        "<|im_start|>assistant\n";
+    const thinking = try renderChatTemplate(a, &messages, &config, tools_json, null, true, null, false);
+    defer a.free(thinking);
+    try testing.expectEqualStrings(expected, thinking);
+    const plain = try renderChatTemplate(a, &messages, &config, tools_json, null, false, null, false);
+    defer a.free(plain);
+    try testing.expectEqualStrings(expected ++ "<think></think>", plain);
+}
+
+fn templateProbePreservesToolContent(
+    allocator: std.mem.Allocator,
+    tpl: []const u8,
+    extra_json: []const u8,
+) !bool {
+    const marker = "__mlx_tool_role_probe__";
+    return templateProbeRendersMarker(allocator, tpl, extra_json, &.{
+        .{ .role = "tool", .content = marker },
+    }, marker);
+}
+
+fn templateProbeRendersMarker(
+    allocator: std.mem.Allocator,
+    tpl: []const u8,
+    extra_json: []const u8,
+    probe_messages: []const Message,
+    marker: []const u8,
+) !bool {
+    const rendered = (try templateProbeRender(allocator, tpl, extra_json, probe_messages)) orelse return false;
+    defer allocator.free(rendered);
+    return std.mem.indexOf(u8, rendered, marker) != null;
+}
+
+fn templateProbeRender(
+    allocator: std.mem.Allocator,
+    tpl: []const u8,
+    extra_json: []const u8,
+    probe_messages: []const Message,
+) !?[]u8 {
+    const messages_json = try serializeMessagesJson(allocator, probe_messages);
+    defer allocator.free(messages_json);
+
+    const tmpl_z = try allocator.dupeSentinel(u8, tpl, 0);
+    defer allocator.free(tmpl_z);
+    const msgs_z = try allocator.dupeSentinel(u8, messages_json, 0);
+    defer allocator.free(msgs_z);
+    const extra_z = try allocator.dupeSentinel(u8, extra_json, 0);
+    defer allocator.free(extra_z);
+
+    var rendered_len: usize = 0;
+    const result_ptr = jinja_c.jinja_render_chat(
+        tmpl_z.ptr,
+        msgs_z.ptr,
+        null,
+        extra_z.ptr,
+        0,
+        &rendered_len,
+    ) orelse return null;
+    defer jinja_c.jinja_str_free(result_ptr);
+    return try allocator.dupe(u8, result_ptr[0..rendered_len]);
 }

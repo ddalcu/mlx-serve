@@ -8,6 +8,7 @@
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
 | **DiffusionGemma** | `diffusion_gemma` | `diffusiongemma-26B-A4B-it-4bit` | Gemma turns (block diffusion) | -- |
 | **Qwen 2 / 3 / 3.5 / 3.6 / 3.8** | `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-27B`, `Qwen3.6-35B-A3B`, [`Qwen3.8-27B`](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit) (18.2 GB, draft head baked in, effort levels `xhigh`/`medium`/`low`) | ChatML | Qwen3-VL |
+| **MiMo V2.6 Flash (WIP)** | `mimo_v2` | Original `MiMo-V2.6-Flash-MOPD` (resident MXFP4 experts, FP8 trunk; full-model validation pending on 256 GB) | Checkpoint Jinja template | MiMo-ViT images |
 | **Muse-Glimmer** | `muse_glimmer` | Meta's Muse-Glimmer-30B ([4-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit) / [8-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit), DFlash draft companion built in, up to 75 tok/s on M4 Max) | Harmony channels + ATEM tools | Muse ViT (images) |
 | **Ling 3.0** | `bailing_hybrid` | inclusionAI Ling 3.0, e.g. `rapid-mlx/Ling-3.0-tiny-MLX-4bit` (4.2 GB, KDA + MLA hybrid MoE) | GLM tags, thinking default on | -- |
 | **DeepSeek V4 Flash** | `deepseek_v4` | DeepSeek-V4-Flash-0731 (284B-A13B, 1M ctx) — **native MLX** for safetensors builds, embedded [ds4](https://github.com/antirez/ds4) for `.gguf` | DSV4 + DSML tools | -- |
@@ -26,3 +27,5 @@
 Media models live in the same registry and are classified the same way: FLUX.2, Krea-2, Mage-Flow and Qwen-Image-2.1 (image), Qwen3-TTS, Kokoro, ACE-Step and MiniMax Music 3 (speech + music), LTX-Video 2.3 / 2.5 and MiniMax-H3 (video), Hunyuan3D-2.1 (3D). A chat request naming one of them gets a 400 that names the endpoint to use instead.
 
 Any quantized MLX model using one of the above architectures works natively. Anything else can be served as GGUF through the embedded llama.cpp engine — just pick the `.gguf` file in the Model Browser and the server auto-routes by format. Models with unsupported architectures are flagged in the Model Browser but can still be downloaded.
+
+MiMo loads the original checkpoint directly; no weight conversion is required. Text, image input, and the three native MTP heads are wired. See [MiMo bring-up and validation](reference.md#mimo-v26-flash-wip) for the current limits and reproducible fixture checks.

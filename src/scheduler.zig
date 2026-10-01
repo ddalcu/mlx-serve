@@ -41,6 +41,7 @@ const gen_mod = @import("gen.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
 const mtp_mod = @import("mtp.zig");
+const mimo_mtp = @import("mimo_mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
@@ -426,6 +427,8 @@ pub const NextResult = union(enum) {
 
 /// Per-request state. Owned by the Scheduler from `submit` until `complete`.
 pub const Slot = struct {
+    ring_cps: prefix_cache_mod.SlotRingCps = .{},
+
     allocator: std.mem.Allocator,
     /// io reference for Stopwatch / async-eval (captured from Scheduler).
     io: std.Io,
@@ -633,6 +636,7 @@ pub const Slot = struct {
         // zero-layer shell so `Slot.deinit` is symmetric with the MLX path.
         const slot_kv_layers: u32 = if (is_embedded) 0 else config.num_hidden_layers;
         var cache = try KVCache.initWithConfig(allocator, slot_kv_layers, kv_quant_config);
+        if (config.swaRingTokens() > 0) cache.setSwaRing(config.sliding_window);
         errdefer cache.deinit();
 
         // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
@@ -800,6 +804,7 @@ pub const Slot = struct {
         }
         // Salvaged-but-never-consumed cancelled-prefill checkpoints.
         self.cancelled_prefill.deinit();
+        self.ring_cps.deinit();
         self.cache.deinit();
         if (self.ssm_entries) |entries| {
             if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
@@ -1785,7 +1790,7 @@ pub const Scheduler = struct {
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
-        const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
+        const eff_kv_quant = params.kv_quant_config orelse slot_config.effectiveKvQuant(self.kv_quant_config);
         const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
         errdefer slot.deinit();
 
@@ -2376,7 +2381,7 @@ pub const Scheduler = struct {
         // a hybrid), but has its own batched kernel. Ask the transformer, never
         // name the arch here — same rule as `modelExclusiveDecode`.
         const t = slot.model.transformer orelse return .arch;
-        return if (t.supportsBatchedGdnDecode()) .ok else .arch;
+        return if (t.supportsBatchedGdnDecode() or t.supportsBatchedMimoDecode()) .ok else .arch;
     }
 };
 
@@ -2397,7 +2402,7 @@ pub const BatchVerdict = enum {
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.
 pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
-    return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode();
+    return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode() or cfg.supportsBatchedMimoDecode();
 }
 
 /// One line per slot the first time it decodes serial beside live company;
@@ -3868,7 +3873,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
     // Per-model settings (stamped on the config at BOTH construction sites) outrank the flags.
-    const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
+    const kv_quant_config = params.config.effectiveKvQuant(params.kv_quant_config);
     const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
     const tail_override = params.config.mtp_greedy_tail_override;
     if (mtp_enabled and (tail_override != null or generate_mod.mtp_greedy_tail_default)) log.info("[mtp] greedy tail {s} ({s})\n", .{
@@ -4268,10 +4273,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // one — an `mtp/weights.safetensors`-class sidecar file OR in-checkpoint
     // `[language_model.]mtp.*` tensors in the trunk shards; a failed load or
     // bind only disables the head — the model still serves.
+    var mimo_head: ?*mimo_mtp.Head = null;
+    if (mtp_enabled and params.config.isMimo())
+        mimo_head = try loadMimoHeads(sch, params.model_dir, params.config, xfm_ptr);
+    errdefer if (mimo_head) |h| {
+        h.deinit();
+        sch.allocator.destroy(h);
+    };
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
     if (mtp_enabled) mtp_graft.ensure(sch.allocator, sch.io, params.model_dir, params.config);
-    if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
+    if (mtp_enabled and !params.config.isMimo() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;
@@ -4301,7 +4313,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 sch.allocator.destroy(h);
             }
         } else |_| {}
-    } else if (mtp_enabled) {
+    } else if (mtp_enabled and mimo_head == null) {
         // A quiet fallback to mode=pld cost a tester a day: nothing logged
         // when the probe finds no head. Debug-level — most checkpoints have
         // no MTP head and an info line per load would be noise.
@@ -4406,8 +4418,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.dflash = dflash_ptr;
     if (entry.config) |c| c.drafter_ctx_bytes_per_token = if (dflash_ptr) |d| dflash_mod.ctxBytesPerToken(&d.config) else 0;
     entry.drafter_block_size = sch.drafter_block_size;
+    if (params.config.isMimo()) mimoSpecWarmup(sch.io, xfm_ptr, mimo_head, kv_quant_config);
     entry.mtp = if (mtp_ptr) |h|
         generate_mod.MtpHeadRef{ .qwen = h }
+    else if (mimo_head) |h|
+        generate_mod.MtpHeadRef{ .mimo = h }
     else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
     else
@@ -4417,6 +4432,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp_depth_cfg = params.config.mtpDepth(params.mtp_depth);
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(mtp_depth_cfg, mtp_cost_profile);
     xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(mtp_depth_cfg);
+    if (mimo_head) |h| {
+        entry.mtp_depth = @min(entry.mtp_depth, @as(u32, @intCast(h.heads)));
+        xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, @as(u32, @intCast(h.heads)));
+    }
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
     // must not disagree about the same sidecar.
@@ -5066,7 +5085,7 @@ fn slotStateBytes(s: *const Slot) u64 {
     if (s.ssm_entries) |ents| for (ents) |*e| {
         bytes += transformer_mod.ssmEntryBytes(e);
     };
-    return bytes;
+    return bytes + s.ring_cps.bytes();
 }
 
 /// Phase A4: encode one or more images on the inference thread. Mirrors the
@@ -5523,7 +5542,9 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .head_marks = if (head) |t| t.qwen4MtpMarks() else &.{},
         };
     };
-    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.media, slot.cache_key, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len) catch |err| {
+    const ring_cps = slot.ring_cps;
+    slot.ring_cps = .{};
+    const finish_st = hc.commitWithRingMedia(&slot.cache, total_tokens, slot.has_tools, slot.media, slot.cache_key, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len, ring_cps) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
         // here too was a double free, with a different allocator).
@@ -6683,6 +6704,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 hot_checked_out = lookup.checked_out or lookup.slot_owned;
                 slot.restored_entry = lookup.entry_id;
             }
+            if (hot_matched >= prefix_cache_mod.RING_RESTORE_MIN_TOKENS and !lookup.full_match and slot.ring_cps.fork == null) {
+                slot.ring_cps.fork = slot.cache.ringCheckpoint(hot_matched, xfm_ptr.s) catch null;
+            }
             if (dfl_target) |*dc| {
                 // Adopt only a context that lines up EXACTLY with the trunk
                 // cursor — `nextDflash` asserts `absLen() == cache.step`, and
@@ -6845,6 +6869,19 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // error.Cancelled from its chunk loop). MtpCacheRef/DflashCtx hold the
     // KVCache BY VALUE, so a second deinit from our errdefers walked freed
     // mlx handles — SIGSEGV in freeKVEntry (issue #266). Clear FIRST.
+    // A ringed cache keeps restore points only where its prefill passes: mark the message starts,
+    // where a new session sharing this one's preamble diverges.
+    if (slot.model.prefix_cache != null and slot.cache.swa_ring_window > 0) {
+        var at: [prefix_cache_mod.RING_MARKS_MAX]usize = undefined;
+        const positions = if (slot.model.tokenizer.?.specialTokenId(prefix_cache_mod.RING_MARK_TOKEN)) |im_start|
+            prefix_cache_mod.ringMarkPositions(slot.full_prompt, hot_matched, im_start, &at)
+        else
+            at[0..0];
+        slot.ring_cps.armMarks(&slot.cache, positions);
+    }
+    slot.cache.ring_marks = slot.ring_cps.markSlice();
+    errdefer slot.cache.ring_marks = &.{};
+
     const dflash_pass = dflash_restored;
     dflash_restored = null;
     const mtp_pass = mtp_restored;
@@ -6937,11 +6974,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .logprobs_n = slot.logprobs_n,
         },
     );
+    slot.cache.ring_marks = &.{};
+    slot.ring_cps.keepCompleteMarks(&slot.cache);
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
+    if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null)
+        slot.ring_cps.prompt_end = slot.cache.ringCheckpoint(slot.full_prompt.len, xfm_ptr.s) catch null;
+
     // The last chunks' transient is freed AFTER the loop's own per-chunk clear, so it
     // parks in MLX's pool up to the cap and the first decode tick allocates on top of
     // it. Returned once here, at the handover — long-context gate only.
@@ -7109,12 +7151,19 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
         var group = batchable_buf[start..end];
+        const row_cap = if (group[0].model.config) |c| batchGroupCap(c) else MAX_BATCH_GROUP;
+        if (group.len > row_cap) {
+            for (group[row_cap..]) |tail| try runSingleDecodeTick(sch, tail);
+            group = group[0..row_cap];
+        }
+        const pads = if (group[0].model.transformer) |xfm| !xfm.supportsBatchedMimoDecode() else true;
+
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than
         // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
         // how many still fit; the tail decodes serially this tick.
-        if (group.len >= 2) {
+        if (pads and group.len >= 2) {
             var kv_lens: [32]u32 = undefined;
             {
                 var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
@@ -8317,6 +8366,8 @@ var merged_verify_decline_logged: bool = false;
 
 fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
+    // A MiMo verify keeps each row's decode arithmetic only in its own solo forward.
+    if (t.config.isMimo()) return true;
     return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
 }
 
@@ -8949,12 +9000,13 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // hybrid trunks (qwen3_5 family). `batchedGdnReady` is the runtime half of
     // the gate — a slot that has not prefilled yet carries no recurrent state
     // to merge, so that tick stays serial rather than merging a wrong width.
+    const use_mimo = xfm_ptr.supportsBatchedMimoDecode();
     const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
     // Position source is per PATH: a GDN trunk positions from the slot's
     // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
     // linear layer there, so it reads 0 forever and every batched token was
     // roped at position 0 (qwen3_5 batched diverged from serial at token 14).
-    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn) slot.moe_seq_offset else slot.cache.step);
+    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn or use_mimo) slot.moe_seq_offset else slot.cache.step);
     if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
         // A slot with no recurrent state yet cannot join the merge. Decode the
         // group serially this tick instead of skipping it — skipping advances
@@ -8978,7 +9030,9 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (rows) |a| _ = mlx.mlx_array_free(a);
         allocator.free(rows);
     };
-    const logits_arr = if (use_gdn)
+    const logits_arr = if (use_mimo)
+        try xfm_ptr.forwardMimoBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
+    else if (use_gdn)
         try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
     else
         try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
@@ -10692,4 +10746,41 @@ test "applyModelSettings: --no-mtp stamps the head off unless the model's own se
         applyModelSettings(&cfg, &cc, &o, c.flag);
         try testing.expectEqual(c.want, cfg.mtp_override);
     }
+}
+
+fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelConfig, xfm: *Transformer) !?*mimo_mtp.Head {
+    var weights = try @import("mimo_source.zig").loadMtpWeights(sch.io, sch.allocator, model_dir);
+    defer weights.deinit();
+    var head = (try mimo_mtp.Head.load(sch.allocator, mlx.gpuStream(), config, &weights)) orelse return null;
+    errdefer head.deinit();
+    head.target = xfm;
+    const ptr = try sch.allocator.create(mimo_mtp.Head);
+    ptr.* = head;
+    // The coarse lm_head copy is a load cost, never the first draft's.
+    const rerank = ptr.canRerankDrafts();
+    log.info("[mimo-mtp] {d} heads loaded ({d:.2} GB resident); draft rerank {s}\n", .{ head.heads, @as(f64, @floatFromInt(head.residentBytes())) / 1e9, if (rerank) "on" else "off" });
+    return ptr;
+}
+
+pub fn batchGroupCap(cfg: *const model_mod.ModelConfig) usize {
+    return if (cfg.supportsBatchedMimoDecode()) 4 else MAX_BATCH_GROUP;
+}
+
+pub fn admissionPassArmed(cfg: ?*const ModelConfig) bool {
+    const c = cfg orelse return false;
+    return c.admissionEvictsHotCache();
+}
+
+fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: ?*mimo_mtp.Head, kv_config: transformer_mod.KVQuantConfig) void {
+    const start = std.Io.Timestamp.now(io, .awake);
+    const rows = xfm.warmupMimoVerify(kv_config) catch |err| {
+        log.warn("[spec-warmup] MiMo verify failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
+        return;
+    };
+    const steps = if (head) |h| h.warmup(xfm) catch |err| {
+        log.warn("[spec-warmup] MiMo heads failed ({s}); the first round pays their kernel compile inside the round.\n", .{@errorName(err)});
+        return;
+    } else 0;
+    const ms: u64 = @as(u64, @intCast(start.untilNow(io, .awake).nanoseconds)) / std.time.ns_per_ms;
+    log.info("[spec-warmup] MiMo verify rows 0x{x}, {d} head steps ({d} ms).\n", .{ rows, steps, ms });
 }

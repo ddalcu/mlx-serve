@@ -19,6 +19,11 @@ test {
     _ = @import("model.zig");
     _ = @import("generate.zig");
     _ = @import("transformer.zig");
+    _ = @import("fp8_block.zig");
+    _ = @import("mimo_source.zig");
+    _ = @import("mimo_mtp.zig");
+    _ = @import("mimo_quant_test.zig");
+    _ = @import("mimo_vision.zig");
     _ = @import("vision.zig");
     _ = @import("qwen_vision.zig");
     _ = @import("muse_vision.zig");

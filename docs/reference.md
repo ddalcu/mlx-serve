@@ -606,3 +606,84 @@ H3 864x480/22f, per denoise step, M4 Max: 0.25 1.09x | 0.35 1.14x | **0.45 1.22x
 Setting the share wrong costs speed AND memory (Krea on the Max: 0.75 is 1.08x for 6 GB against 1.30x for 3.6 GB at 0.45). Memory per share on ACE-Step: 0.45 1.0 GB int8, 0.60 1.35 GB, 0.75 1.7 GB — the GPU's `down`/`fc2` complement slices sit beside it.
 
 Fidelity (vs the GPU arm, every arm bit-exact across requests): image cos ≥ 0.9991 at every share, same fox, a ≤0.6% background tone shift at 0.75; audio +1.9%/+2.8% robust energy (0.45/0.75, 3 seeds), log-STFT cos ≥ 0.994. Raw RMS and crest factor are NOT valid measures for ACE-Step — peak-normalization trap, `docs/gotchas/models-media.md`.
+
+
+### MiMo V2.6 Flash (WIP)
+
+`mimo_v2` ports Sushi's MiMo math to the resident MLX engine. The original
+MOPD checkpoint uses per-expert U8 MXFP4 weights and E8M0 group-32 scales;
+`mimo_source.zig` validates the shard headers and packs these bytes into U32
+expert banks one projection at a time. The FP8 E4M3 trunk stays in its source
+format, including TP-local QKV scale tiles (`fp8_block.zig`). Routing uses
+FP32 sigmoid scores with selection-only correction bias. Dense fixture/BF16
+experts can also be stacked by the loader.
+
+The 48 layers have nine global and 39 sliding attention layers, K/V widths
+192/128, four/eight KV heads, a 128-token window, partial RoPE, and sliding
+sinks. The KV path includes Sushi's bounded sliding rings (absolute `base +
+offset` positions), quantized views, global-layer capacity reservation, packed
+prefill slices, fused band/sink prefill, M5 matmul2d and SIMD split-K decode,
+and row-exact speculative attention. MiMo defaults to KV8; `--kv-quant off`
+and per-model/request settings can select another scheme.
+
+Prefix reuse retains prompt-end, fork and message-boundary ring checkpoints.
+The SSD tier persists global chunks plus ring files in manifest format v9;
+restore, trimming, checkout, rollback and memory bills carry those windows.
+MiMo's ordinary decode can batch up to four independent slots; speculative
+rounds retain per-slot state. The reservation and admission paths bill only
+global layers per token, plus bounded rings, checkpoint copies and scratch.
+
+This expanded WIP has not been validated end to end. Full-checkpoint output
+quality, MTP equivalence, image quality, load peak, cache restore, and throughput
+remain for the maintainer's 256 GB Mac. The earlier limited port's test results
+do not validate these cache changes.
+
+Header-only inspection of the supplied checkpoint measured 158.10 GiB for
+text plus experts, before caches and scratch; vision adds 1.36 GiB and MTP
+1.11 GiB. The 128 GB development machine cannot run that resident model.
+Begin full-model bring-up at a small context:
+
+```sh
+./zig-out/bin/mlx-serve --model /absolute/path/MiMo-V2.6-Flash-MOPD \
+  --serve --ctx-size 4096 --no-vision --no-mtp --no-drafter
+```
+
+Then enable vision and MTP separately. The original checkpoint's three MTP
+heads load by default; `--no-mtp` disables them. Their state is per request,
+with head-specific sliding history and rollback; draft depth is capped by
+the number of loaded heads. Audio, video, EXL3 packs, expert streaming, and
+the separate DFlash checkpoint are outside this port.
+
+Small independent fixtures exercise the same architecture without loading
+the 158 GiB model. The reference scripts need torch, numpy, safetensors, and
+transformers 5.3.0; `--offline` requires the cached Xiaomi reference files
+(or pass `--ref /path/to/reference`). TF32 is disabled for the FP32 oracle:
+
+```sh
+python tests/dump_mimo_v2_fixtures.py /tmp/mimo-ref --offline
+python tests/dump_mimo_v2_mtp_fixtures.py /tmp/mimo-ref --offline
+MLX_ENABLE_TF32=0 MIMO_V2_MODEL=/tmp/mimo-ref \
+  MIMO_V2_FIXTURE=/tmp/mimo-ref/fixture.safetensors \
+  MIMO_V2_MTP_FIXTURE=/tmp/mimo-ref/mtp_fixture.safetensors \
+  .zig-toolchain/zig build test -Dtest-filter=mimo
+```
+
+The hermetic native-loader test creates a small mixed FP8/MXFP4 checkpoint,
+checks exact packed expert bytes, and runs a forward. The committed tiny
+vision fixture checks the tower and its sink semantics. The optional
+`MIMO_V2_SOURCE` test reads the real model's headers only. Run the full suite
+with `.zig-toolchain/zig build test`; no real model is required.
+`python tests/test_mimo_resident.py /tmp/mimo-ref` checks HTTP generation,
+forced three-head MTP equivalence, warm-cache reuse, and unload/reload on that
+tiny model; add `--kv-quant 8` to exercise the quantized cache.
+
+The real-model ring scenarios are included for later bring-up (not run here):
+
+```sh
+MIMO_MODEL=/absolute/path/MiMo-V2.6-Flash-MOPD bash tests/test_mimo_ring_reuse.sh
+MIMO_MODEL=/absolute/path/MiMo-V2.6-Flash-MOPD bash tests/test_mimo_ring_fork_ssd.sh
+```
+
+`MLX_SERVE_KV_CACHE_DIR` overrides the SSD cache directory, allowing the restart
+scenario to use its own temporary directory. The default remains
+`~/.mlx-serve/kv-cache`.

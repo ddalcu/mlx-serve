@@ -33,6 +33,7 @@ const mtp = @import("mtp.zig");
 /// drafters can't decode on their own, and users shouldn't see them in
 /// `/v1/models`.
 const supported_model_types = [_][]const u8{
+    "mimo_v2", // MiMo-V2.6-Flash: resident MXFP4 experts + source FP8 trunk
     "gemma3",           "gemma3_text",
     "gemma4",           "gemma4_text",
     "gemma4_unified",   "gemma4_unified_text",
@@ -1203,7 +1204,15 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
-    meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0;
+    meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0 and
+        !std.mem.eql(u8, mt, "mimo_v2");
+    if (std.mem.eql(u8, mt, "mimo_v2")) {
+        if (root.get("quantization_config")) |q| if (q == .object) {
+            if (q.object.get("store_dtype")) |v| if (v == .string and std.mem.eql(u8, v.string, "mxfp4")) {
+                meta.quant_bits = 4;
+            };
+        };
+    }
     const bidirectional = blk: {
         const cfgBool = struct {
             fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) bool {
@@ -2287,4 +2296,28 @@ test "resolveGgufFile: an embedding GGUF is never the chat model, and says so by
     defer res.deinit();
     try testing.expectEqual(@as(usize, 1), res.models.len);
     try testing.expectEqualStrings("mixed", res.models[0].id);
+}
+
+pub fn denseMoePrefix(freq: std.json.Value, layers: u32) !u32 {
+    if (freq != .array or freq.array.items.len != layers) return error.UnsupportedMimoV2Config;
+    var dense: u32 = 0;
+    var seen_moe = false;
+    for (freq.array.items) |v| {
+        if (v != .integer or (v.integer != 0 and v.integer != 1)) return error.UnsupportedMimoV2Config;
+        if (v.integer == 1) {
+            seen_moe = true;
+        } else {
+            if (seen_moe) return error.UnsupportedMimoV2Config;
+            dense += 1;
+        }
+    }
+    return dense;
+}
+
+
+test "mimo discovery reports native MXFP4 and image support without advertising video" {
+    const c = parseStubMeta(std.testing.allocator, @embedFile("fixtures/model-configs/mimo-v2.6-flash-mopd.json"), true);
+    try std.testing.expect(c.found and c.is_moe and c.has_vision and !c.has_video);
+    try std.testing.expectEqual(@as(u32, 4), c.quant_bits);
+    try std.testing.expect(isSupportedModelType("mimo_v2"));
 }

@@ -42,16 +42,21 @@
 //! [0, cp_pos) AND the SSM state at cp_pos (`restoreIntoHybrid`) — mirroring
 //! the RAM tier's rewind-both semantics.
 //!
+//! Ringed sliding layers (MiMo) hold a window, not a prefix, so the chunks carry only the other
+//! layers; each ring restore point persists as
+//!   <base>/<fingerprint>/e<id>/r0000700.safetensors   ringed layers' rows below pos 700
+//! and a ringed entry restores only at one of them (`restoreIntoRinged`).
+//!
 //! Scope: B==1 slot caches. All mlx work runs on the
 //! inference thread; safetensors loads use a private CPU stream
 //! (`Load::eval_gpu` is Not Implemented — the lora.zig/model.zig precedent).
 
 const std = @import("std");
-const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const transformer_mod = @import("transformer.zig");
 const model = @import("model.zig");
+const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
 const log = @import("log.zig");
@@ -86,6 +91,9 @@ pub const SSM_DISK_MAX_PER_ENTRY: usize = 16;
 /// The cap every arch outside the long-context gate keeps.
 pub const SSM_DISK_MAX_PER_ENTRY_LEGACY: usize = 8;
 
+/// Ring restore points one entry keeps on disk (~16 MiB each on MiMo at kv8), thinned (`thinRingPositions`).
+pub const RING_DISK_MAX_PER_ENTRY: usize = 8;
+
 /// SSD-first per-flush readback bound: only the device->host copy on the inference thread; the file write is off thread.
 pub const SSD_FIRST_READBACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -115,25 +123,7 @@ const DarwinStatfs = extern struct {
     f_ffree: u64,
     tail: [4096]u8,
 };
-
-/// Linux glibc `struct statfs` (LP64: __fsword_t = long, fsblkcnt_t = unsigned long).
-const LinuxStatfs = extern struct {
-    f_type: i64,
-    f_bsize: i64,
-    f_blocks: u64,
-    f_bfree: u64,
-    f_bavail: u64,
-    f_files: u64,
-    f_ffree: u64,
-    f_fsid: extern struct { val: [2]i32 },
-    f_namelen: i64,
-    f_frsize: i64,
-    f_flags: i64,
-    f_spare: [4]i64,
-};
-
-const StatfsBuf = if (builtin.os.tag.isDarwin()) DarwinStatfs else LinuxStatfs;
-extern "c" fn statfs(path: [*:0]const u8, buf: *StatfsBuf) c_int;
+extern "c" fn statfs(path: [*:0]const u8, buf: *DarwinStatfs) c_int;
 extern fn msv_volume_free_for_use(path: [*:0]const u8) u64;
 
 pub const VolumeSpace = struct { free: u64, total: u64 };
@@ -145,16 +135,21 @@ pub fn volumeSpace(path: []const u8) ?VolumeSpace {
     if (path.len >= buf.len) return null;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    var st: StatfsBuf = undefined;
+    var st: DarwinStatfs = undefined;
     if (statfs(buf[0..path.len :0].ptr, &st) != 0) return null;
-    const bsize: u64 = @intCast(@max(st.f_bsize, 0));
+    const bsize: u64 = st.f_bsize;
     if (bsize < 512 or bsize > (1 << 20) or !std.math.isPowerOfTwo(bsize)) return null;
     if (st.f_blocks == 0 or st.f_bavail > st.f_blocks) return null;
     const total = bsize *| st.f_blocks;
     // statfs excludes purgeable space the OS releases on demand; ask what a write really gets.
     const granted = msv_volume_free_for_use(buf[0..path.len :0].ptr);
-    const free = if (granted > 0 and granted <= total) granted else bsize *| st.f_bavail;
-    return .{ .free = free, .total = total };
+    return .{ .free = freeForUse(granted, total, bsize *| st.f_bavail), .total = total };
+}
+
+/// Which of the two answers a write really gets: the OS grant when it is one, else statfs.
+fn freeForUse(granted: u64, total: u64, statfs_free: u64) u64 {
+    if (granted > 0 and granted <= total) return granted;
+    return statfs_free;
 }
 
 /// How a `DiskTier` asks what the volume has left. Injectable: with the live probe hard-wired
@@ -212,9 +207,26 @@ pub const IndexEntry = struct {
     qsa_history_bytes: u64 = 0,
     qsa_history_rows: u32 = 0,
     inherited_qsa: bool = false,
+    /// v9: the ringed layers' restore points (`r{pos}.safetensors`), ascending; empty for an
+    /// entry whose layers all hold the prefix. A ringed entry restores only at one of them. Owned.
+    rings: []RingFile = &.{},
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
     last_used: u64,
 };
+
+/// One persisted ring restore point: the ringed layers' rows `[pos - rows, pos)`.
+pub const RingFile = struct { pos: u32, rows: u32, bytes: u64 };
+
+/// What a commit of a ringed cache adds: its sliding layers hold only a window, so the entry
+/// persists restore points instead, at the persisted length off the cache's own ring and at
+/// each checkpoint's `step`.
+pub const RingCommit = struct {
+    window: u32,
+    cps: []const transformer_mod.KVCacheSnapshot = &.{},
+};
+
+/// `bestRingMatch`'s result: the entry, the ring file, and the length it restores to.
+pub const RingMatch = struct { idx: usize, pos: u32, at: u32 };
 
 /// v4 spec-snapshot metadata for one speculative-side cache (dflash assistant
 /// context or MTP committed history). The tensors live in the entry's ONE
@@ -287,7 +299,7 @@ pub fn persistTargetLen(
 ) usize {
     var max_off: usize = 0;
     for (kv_entries) |*entry| {
-        if (entry.initialized and entry.offset > max_off) max_off = entry.offset;
+        if (entry.initialized and !entry.ringed and entry.offset > max_off) max_off = entry.offset;
     }
     return @min(@max(step, max_off), tokens_len);
 }
@@ -611,6 +623,7 @@ pub const DiskTier = struct {
         self.allocator.free(e.chunk_bytes);
         self.allocator.free(e.ssm_positions);
         self.allocator.free(e.ssm_bytes);
+        self.allocator.free(e.rings);
     }
 
     /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a budget
@@ -665,6 +678,7 @@ pub const DiskTier = struct {
         var best_usable: u32 = 0;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
+            if (e.rings.len > 0) continue; // its chunks lack the ringed layers: `bestRingMatch`
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
             const max_shared = @min(e.tokens.len, prompt_ids.len);
@@ -702,10 +716,122 @@ pub const DiskTier = struct {
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
             const usable: u32 = @intCast(@min(@min(shared, e.kv_len), @as(usize, limit)));
-            const cp = self.highestSsmPosAtOrBelow(i, usable) orelse continue;
+            const cp_limit: u32 = @intCast(@min(usable, prompt_ids.len -| 1));
+            const cp = self.highestSsmPosAtOrBelow(i, cp_limit) orelse continue;
             if (best == null or cp > best.?.cp) best = .{ .idx = i, .usable = usable, .cp = cp };
         }
         return best;
+    }
+
+    /// A ringed target's lookup: the entry and ring file restoring the most of `prompt_ids`
+    /// within `limit`. A ring file at `pos` holding `rows` serves a clamp to `at <= pos` while
+    /// its rows still reach a window below `at` (a full match re-forwards its last token).
+    pub fn bestRingMatch(
+        self: *const DiskTier,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        quant: kv_quant.KVQuantConfig,
+        limit: u32,
+        window: u32,
+    ) ?RingMatch {
+        var best: ?RingMatch = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.poisoned or e.rings.len == 0) continue;
+            if (e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant, quant)) continue;
+            const usable: u32 = @intCast(@min(@min(commonPrefixLen(e.tokens, prompt_ids), e.kv_len), @as(usize, limit)));
+            for (e.rings) |r| {
+                const at = @min(usable, r.pos);
+                const clamp: u32 = if (at == prompt_ids.len and at > 1) at - 1 else at;
+                const low = r.pos - r.rows;
+                if (clamp < low or clamp - low < @min(clamp, window)) continue;
+                if (best == null or at > best.?.at) best = .{ .idx = i, .pos = r.pos, .at = at };
+            }
+        }
+        return best;
+    }
+
+    /// Rebuild `entries[idx]` at `len` into a ringed cache: the chunked layers up to `len`, then
+    /// ring file `pos` (>= len) under the ringed layers (`KVCache.restoreRing`), clamped to
+    /// `len`. On error the cache may be half-rebuilt; the caller resets it.
+    pub fn restoreIntoRinged(self: *DiskTier, cache: *KVCache, idx: usize, pos: u32, len: u32, s: mlx.mlx_stream) !void {
+        // Callers swallow a restore failure and prefill cold; the latch it raised must not fail that prefill.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
+        self.drainEntry(self.entries.items[idx].id);
+        const e = &self.entries.items[idx];
+        if (len == 0 or len > pos) return error.DiskCacheNoCheckpoint;
+        const known = for (e.rings) |r| {
+            if (r.pos == pos) break true;
+        } else false;
+        if (!known) return error.DiskCacheNoCheckpoint;
+        // Loaded FIRST, so a corrupt file fails before the cache is touched.
+        var cp = try self.loadRingFile(e.id, pos, cache.entries.len, e.quant, cache.swa_ring_window);
+        defer cp.deinit();
+        try self.restoreKvInto(cache, e, len, s);
+        for (cache.entries, cp.entries) |*dst, *src| {
+            if (src.initialized and dst.initialized) return error.DiskCacheCorruptRing;
+        }
+        try cache.restoreRing(&cp);
+        try cache.truncate(len, s);
+        e.last_used = self.bump();
+        self.writeMeta(e.*) catch {};
+    }
+
+    /// Load ring file `pos` as a checkpoint snapshot (`KVCache.ringCheckpoint`'s shape): each
+    /// ringed layer's rows `[pos - rows, pos)`, every other layer empty.
+    fn loadRingFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize, quant: kv_quant.KVQuantConfig, window: u32) !transformer_mod.KVCacheSnapshot {
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/r{d:0>7}.safetensors\x00", .{ self.root, id, pos });
+        defer self.allocator.free(path);
+        if (fileSize(self.io, path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
+        var tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        var meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+        var layers_c: [*:0]const u8 = undefined;
+        if (mlx.mlx_map_string_to_string_get(&layers_c, meta_map, "layers") != 0) return error.DiskCacheCorruptRing;
+        const recorded = std.fmt.parseInt(usize, std.mem.span(layers_c), 10) catch return error.DiskCacheCorruptRing;
+        if (recorded != n_layers) return error.DiskCacheCorruptRing;
+
+        const entries = try self.allocator.alloc(transformer_mod.KVCacheEntry, n_layers);
+        for (entries) |*en| en.* = transformer_mod.newEmptyKVEntry();
+        var cp: transformer_mod.KVCacheSnapshot = .{ .entries = entries, .step = pos, .allocator = self.allocator, .config = quant, .swa_ring_window = window };
+        errdefer cp.deinit();
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        const kinds: []const []const u8 = if (quant.scheme == .off) &.{ "k", "v" } else &.{ "k", "v", "ks", "kb", "vs", "vb" };
+        for (entries, 0..) |*en, li| {
+            const slots = [_]*mlx.mlx_array{ &en.keys, &en.values, &en.keys_scales, &en.keys_biases, &en.values_scales, &en.values_biases };
+            for (kinds, 0..) |kind, ki| {
+                const key = try std.fmt.allocPrint(self.allocator, "l{d}.{s}\x00", .{ li, kind });
+                defer self.allocator.free(key);
+                var arr = mlx.mlx_array_new();
+                if (mlx.mlx_map_string_to_array_get(&arr, tensor_map, @ptrCast(key.ptr)) != 0) {
+                    _ = mlx.mlx_array_free(arr);
+                    if (ki == 0) break; // not a ringed layer
+                    return error.DiskCacheCorruptRing;
+                }
+                _ = mlx.mlx_array_free(slots[ki].*);
+                slots[ki].* = arr;
+                const shape = mlx.getShape(arr);
+                if (shape.len != 4 or shape[2] <= 0 or shape[2] > pos) return error.DiskCacheCorruptRing;
+                const rows: usize = @intCast(shape[2]);
+                if (ki == 0) {
+                    en.initialized = true;
+                    en.ringed = true;
+                    en.offset = rows;
+                    en.base = pos - rows;
+                } else if (rows != en.offset) return error.DiskCacheCorruptRing;
+                _ = mlx.mlx_vector_array_append_value(vec, arr);
+            }
+        }
+        if (mlx.mlx_vector_array_size(vec) == 0) return error.DiskCacheCorruptRing;
+        // A CHECKED eval: lazy Load reads the file here, so corruption surfaces before install.
+        try mlx.check(mlx.mlx_eval(vec));
+        return cp;
     }
 
     /// Rebuild the persisted KV state of `entries[idx]` into `cache`:
@@ -752,6 +878,7 @@ pub const DiskTier = struct {
         cp_pos: u32,
         s: mlx.mlx_stream,
     ) !u32 {
+        // Callers swallow a restore failure and prefill cold; the latch it raised must not fail that prefill.
         const had_error = mlx.errorPending();
         errdefer mlx.dropLatchedErrorUnless(had_error);
         self.drainEntry(self.entries.items[idx].id);
@@ -850,16 +977,16 @@ pub const DiskTier = struct {
         else
             &.{ "k", "v", "ks", "kb", "vs", "vb" };
 
-        // Per-layer per-kind accumulation vectors. Layers absent from chunk 0
-        // stay uninitialized — the GatedDeltaNet layers of a hybrid arch have
-        // no KV (their state rides the SSM checkpoints), so only the
-        // full-attention layers appear in the chunks.
+        // Per-layer per-kind buffers at `limit` rows, filled chunk by chunk: the restore runs before
+        // any admission bill sees it, and a concatenation at the end held every chunk beside the
+        // result (twice the restored KV). Layers absent from chunk 0 stay uninitialized: the
+        // GatedDeltaNet layers of a hybrid arch have no KV (their state rides the SSM checkpoints).
         const n_layers = cache.entries.len;
-        const vecs = try self.allocator.alloc(mlx.mlx_vector_array, n_layers * kinds.len);
-        for (vecs) |*v| v.* = mlx.mlx_vector_array_new();
+        const dsts = try self.allocator.alloc(mlx.mlx_array, n_layers * kinds.len);
+        for (dsts) |*d| d.* = mlx.mlx_array_new();
         defer {
-            for (vecs) |v| _ = mlx.mlx_vector_array_free(v);
-            self.allocator.free(vecs);
+            for (dsts) |d| _ = mlx.mlx_array_free(d);
+            self.allocator.free(dsts);
         }
         const present = try self.allocator.alloc(bool, n_layers);
         defer self.allocator.free(present);
@@ -878,7 +1005,7 @@ pub const DiskTier = struct {
             defer _ = mlx.mlx_map_string_to_string_free(meta_map);
             try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
             // A lazy load holds its file open until eval, so each chunk is evaluated before the
-            // next opens; one eval at the end needed a descriptor per chunk.
+            // next opens: one eval at the end held a descriptor per chunk (256 = ~256k tokens).
             const chunk_arrays = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(chunk_arrays);
 
@@ -889,10 +1016,17 @@ pub const DiskTier = struct {
                     var arr = mlx.mlx_array_new();
                     if (mlx.mlx_map_string_to_array_get(&arr, tensor_map, @ptrCast(key.ptr)) != 0) {
                         _ = mlx.mlx_array_free(arr);
-                        if (ki == 0) break; // layer absent from this chunk
+                        // A layer holds KV in every chunk or in none.
+                        if (ki == 0 and !present[li]) break;
                         return error.DiskCacheCorruptChunk;
                     }
-                    if (ki == 0) present[li] = true;
+                    if (ki == 0) {
+                        if (chunk_i == 0) present[li] = true;
+                        if (!present[li]) {
+                            _ = mlx.mlx_array_free(arr);
+                            return error.DiskCacheCorruptChunk;
+                        }
+                    }
                     // Crash-tolerance: a chunk file may hold MORE positions
                     // than meta.json committed to (rewrite raced a crash).
                     // Slice down to the committed range; never trust the file.
@@ -916,53 +1050,53 @@ pub const DiskTier = struct {
                         try mlx.check(rc);
                         arr = sliced;
                     }
-                    _ = mlx.mlx_vector_array_append_value(vecs[li * kinds.len + ki], arr);
-                    _ = mlx.mlx_vector_array_append_value(chunk_arrays, arr);
-                    _ = mlx.mlx_array_free(arr);
+                    defer _ = mlx.mlx_array_free(arr);
+                    const dst = &dsts[li * kinds.len + ki];
+                    const rows = mlx.getShape(arr);
+                    if (chunk_i == 0) {
+                        const full = [_]c_int{ rows[0], rows[1], @intCast(limit), rows[3] };
+                        try mlx.check(mlx.mlx_zeros(dst, &full, 4, mlx.mlx_array_dtype(arr), s));
+                    }
+                    const dshape = mlx.getShape(dst.*);
+                    if (dshape.len != 4 or dshape[0] != rows[0] or dshape[1] != rows[1] or dshape[3] != rows[3])
+                        return error.DiskCacheCorruptChunk;
+                    var updated = mlx.mlx_array_new();
+                    const st = [_]c_int{ 0, 0, @intCast(c0), 0 };
+                    const sp = [_]c_int{ rows[0], rows[1], @intCast(c0 + need), rows[3] };
+                    const sd = [_]c_int{ 1, 1, 1, 1 };
+                    const rc = mlx.mlx_slice_update(&updated, dst.*, arr, &st, 4, &sp, 4, &sd, 4, s);
+                    if (rc != 0) {
+                        _ = mlx.mlx_array_free(updated);
+                        try mlx.check(rc);
+                    }
+                    _ = mlx.mlx_array_free(dst.*);
+                    dst.* = updated;
+                    _ = mlx.mlx_vector_array_append_value(chunk_arrays, updated);
                 }
             }
+            // A CHECKED eval: lazy Load reads the file here, so a corrupt chunk surfaces its MLX
+            // error before install and the caller falls back to cold prefill.
             try mlx.check(mlx.mlx_eval(chunk_arrays));
+            // An eval returns before its command buffer lets go of the filled buffers; the next write
+            // into a still-held buffer copies all of it instead of donating, so drain the stream first.
+            _ = mlx.mlx_synchronize(s);
         }
 
-        // Install per-layer concatenations as the cache's storage buffers.
-        // Mirrors `KVCache.restore`: views stay empty, offset/initialized set,
-        // step = kv_len.
+        // Install the filled buffers as the cache's storage. Mirrors `KVCache.restore`: views stay
+        // empty, offset/initialized set, step = kv_len.
         for (cache.entries, 0..) |*dst, li| {
             transformer_mod.resetKVEntry(dst);
             if (!present[li]) continue;
-            const base = li * kinds.len;
-            try concatInto(&dst.keys, vecs[base + 0], s);
-            try concatInto(&dst.values, vecs[base + 1], s);
-            if (quant.scheme != .off) {
-                try concatInto(&dst.keys_scales, vecs[base + 2], s);
-                try concatInto(&dst.keys_biases, vecs[base + 3], s);
-                try concatInto(&dst.values_scales, vecs[base + 4], s);
-                try concatInto(&dst.values_biases, vecs[base + 5], s);
+            const slots = [_]*mlx.mlx_array{ &dst.keys, &dst.values, &dst.keys_scales, &dst.keys_biases, &dst.values_scales, &dst.values_biases };
+            for (slots[0..kinds.len], dsts[li * kinds.len ..][0..kinds.len]) |slot, *filled| {
+                _ = mlx.mlx_array_free(slot.*);
+                slot.* = filled.*;
+                filled.* = mlx.mlx_array_new();
             }
             dst.offset = limit;
             dst.initialized = true;
         }
         cache.step = limit;
-        // Materialize with a CHECKED eval: a corrupt chunk surfaces its MLX
-        // error HERE (lazy Load reads data at eval), so the caller's catch
-        // resets the cache and falls back to cold prefill instead of running
-        // a forward over poisoned buffers.
-        {
-            const vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(vec);
-            for (cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.values);
-                if (quant.scheme != .off) {
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.keys_scales);
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.keys_biases);
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.values_scales);
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.values_biases);
-                }
-            }
-            try mlx.check(mlx.mlx_eval(vec));
-        }
     }
 
     /// Load a persisted SSM checkpoint file into a transient `SSMCheckpoint`
@@ -1093,13 +1227,6 @@ pub const DiskTier = struct {
         return cp;
     }
 
-    fn concatInto(dst: *mlx.mlx_array, vec: mlx.mlx_vector_array, s: mlx.mlx_stream) !void {
-        var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
-        _ = mlx.mlx_array_free(dst.*);
-        dst.* = out;
-    }
-
     // ── Commit ──
 
     /// Persist a cache state under `tokens`. Called on the inference thread
@@ -1135,7 +1262,7 @@ pub const DiskTier = struct {
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
-        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s, flush_bound);
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, null, s, flush_bound);
     }
 
     /// `appendCommit` plus the v4 spec snapshots (dflash assistant context /
@@ -1153,7 +1280,25 @@ pub const DiskTier = struct {
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
     ) !PersistOutcome {
-        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, s, self.max_flush_bytes);
+        return self.appendCommitWithRing(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, null, s);
+    }
+
+    /// `appendCommitWithSpec` for a cache whose sliding layers ring: without `ring` such a
+    /// cache is skipped, since its chunks alone restore nothing.
+    pub fn appendCommitWithRing(
+        self: *DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        step: usize,
+        config: kv_quant.KVQuantConfig,
+        tokens: []const u32,
+        has_tools: bool,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        dflash_snap: ?SpecCommit,
+        mtp_snap: ?SpecCommit,
+        ring: ?RingCommit,
+        s: mlx.mlx_stream,
+    ) !PersistOutcome {
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, ring, s, self.max_flush_bytes);
     }
 
     fn appendCommitWithSpecBounded(
@@ -1166,6 +1311,7 @@ pub const DiskTier = struct {
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
+        ring: ?RingCommit,
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
@@ -1195,9 +1341,14 @@ pub const DiskTier = struct {
         const kv_target: u32 = @intCast(kv_target_u);
         // Every initialized layer must cover the persisted range with B == 1
         // — anything else (mid-spec-decode state, batched cache) is not a
-        // persistable snapshot.
+        // persistable snapshot. A ringed layer covers it through ring files instead.
+        var ringed = false;
         for (kv_entries) |*entry| {
             if (!entry.initialized) continue;
+            if (entry.ringed) {
+                ringed = true;
+                continue;
+            }
             if (entry.offset < kv_target_u) {
                 log.debug("  [disk-cache] skip: layer offset {d} < kv_len {d}\n", .{ entry.offset, kv_target_u });
                 return .skipped;
@@ -1207,6 +1358,16 @@ pub const DiskTier = struct {
                 log.debug("  [disk-cache] skip: non-B1 cache shape\n", .{});
                 return .skipped;
             }
+        }
+
+        const ring_srcs: []const RingSource = if (ringed) blk: {
+            const rc = ring orelse return .skipped;
+            break :blk try self.ringSources(kv_entries, kv_target, rc);
+        } else &.{};
+        defer self.allocator.free(ring_srcs);
+        if (ringed and ring_srcs.len == 0) {
+            log.debug("  [disk-cache] skip: no ring restore point at or below {d}\n", .{kv_target});
+            return .skipped;
         }
 
         // Re-derive the budget from free space before every store.
@@ -1230,7 +1391,8 @@ pub const DiskTier = struct {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
                     if (e.kv_len >= kv_target) {
                         if (!self.ssmWorkPending(e, ssm_checkpoints, @intCast(e.tokens.len)) and
-                            !specWorkPending(e, dflash_snap, mtp_snap))
+                            !specWorkPending(e, dflash_snap, mtp_snap) and
+                            !self.ringWorkPending(e, ring_srcs))
                         {
                             // Superseded: the tier already holds this prefix in full.
                             e.last_used = self.bump();
@@ -1248,7 +1410,7 @@ pub const DiskTier = struct {
                 extend_idx = i;
             }
         }
-        if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, dflash_snap, mtp_snap, s);
+        if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs, s);
 
         const sw = io_util.Stopwatch.init(self.io);
 
@@ -1328,6 +1490,10 @@ pub const DiskTier = struct {
             return err;
         };
         errdefer ssm_res.deinit(self.allocator);
+        // Ring files are a few MB each and the only way the entry restores: outside the bound.
+        const old_rings: []const RingFile = if (extend_idx) |i| self.entries.items[i].rings else &.{};
+        const rings = try self.persistRings(id, dir_rel, config, old_rings, ring_srcs, &written_bytes, s);
+        errdefer self.allocator.free(rings);
 
         // Chunks [0, keep) are full chunks already on disk (see above); the
         // rewrite runs from `keep` up to the REMAINDER of the flush bound —
@@ -1344,11 +1510,12 @@ pub const DiskTier = struct {
         const chunks_done: u32 = chunk_i;
         const chunk_complete = chunks_done == n_chunks;
         const kv_len: u32 = if (chunk_complete) kv_target else chunks_done * self.chunk_tokens;
-        if (kv_len <= old_kv and ssm_res.positions.len == old_ssm_pos.len) {
+        if (kv_len <= old_kv and ssm_res.positions.len == old_ssm_pos.len and ringsEqual(rings, old_rings)) {
             // Cap so tight nothing new landed — nothing to commit (a
             // checkpoint-only write still counts as progress).
             chunk_sizes.deinit(self.allocator);
             ssm_res.deinit(self.allocator);
+            self.allocator.free(rings);
             return if (chunk_complete) .persisted else .partial;
         }
 
@@ -1391,6 +1558,7 @@ pub const DiskTier = struct {
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
         var non_chunk: u64 = @as(u64, record.len) * 4 + spec_res.bytes;
         for (ssm_res.bytes) |b| non_chunk += b;
+        for (rings) |r| non_chunk += r.bytes;
         if (!qsa_res.inherited) non_chunk += qsa_res.bytes;
         var bytes: u64 = non_chunk;
         for (chunk_sizes.items[@min(inherited, chunk_sizes.items.len)..]) |b| bytes += b;
@@ -1412,6 +1580,7 @@ pub const DiskTier = struct {
             .qsa_history_bytes = if (qsa_res.inherited) inherited_qsa_bytes else qsa_res.bytes,
             .qsa_history_rows = if (qsa_res.inherited) inherited_qsa_rows else qsa_res.rows,
             .inherited_qsa = qsa_res.inherited,
+            .rings = rings,
             .last_used = self.bump(),
         };
         errdefer {
@@ -1436,6 +1605,7 @@ pub const DiskTier = struct {
             self.allocator.free(e.chunk_bytes);
             self.allocator.free(e.ssm_positions);
             self.allocator.free(e.ssm_bytes);
+            self.allocator.free(e.rings);
             e.* = new_entry;
         } else {
             // meta.json is the commit point: written last, atomically.
@@ -1520,12 +1690,14 @@ pub const DiskTier = struct {
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
+        ring_srcs: []const RingSource,
         s: mlx.mlx_stream,
     ) !PersistOutcome {
         const dir_rel = try std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, self.entries.items[idx].id });
         defer self.allocator.free(dir_rel);
-        const e = &self.entries.items[idx];
-        // Chunks and the token record are untouched here, so the bill moves by the non-chunk files.
+        const live = &self.entries.items[idx];
+        var updated = live.*;
+        const e = &updated;
         const old_non_chunk = nonChunkBytes(e);
         var written_bytes: u64 = 0;
         // Write-ahead bound: the token record, not the flushed kv_len — a
@@ -1533,6 +1705,8 @@ pub const DiskTier = struct {
         // restorable when a later extend raises kv_len past it.
         var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
         errdefer ssm_res.deinit(self.allocator);
+        const rings = try self.persistRings(e.id, dir_rel, e.quant, e.rings, ring_srcs, &written_bytes, s);
+        errdefer self.allocator.free(rings);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.qsa_history_bytes, e.kv_len, s);
 
         if (specWorkPending(e, dflash_snap, mtp_snap)) {
@@ -1545,10 +1719,9 @@ pub const DiskTier = struct {
             e.spec_mtp = spec_res.mtp;
         }
 
-        self.allocator.free(e.ssm_positions);
-        self.allocator.free(e.ssm_bytes);
         e.ssm_positions = ssm_res.positions;
         e.ssm_bytes = ssm_res.bytes;
+        e.rings = rings;
         if (qsa_res.inherited) {
             e.inherited_qsa = true;
         } else if (qsa_res.bytes > 0) {
@@ -1556,11 +1729,16 @@ pub const DiskTier = struct {
             e.qsa_history_rows = qsa_res.rows;
             e.inherited_qsa = false;
         }
+        // KV chunks and tokens did not change; bill the retained sidecars.
         const delta: i64 = @as(i64, @intCast(nonChunkBytes(e))) - @as(i64, @intCast(old_non_chunk));
         e.bytes = clampAdd(e.bytes, delta);
-        self.total_bytes = clampAdd(self.total_bytes, delta);
         e.last_used = self.bump();
         try self.writeMeta(e.*);
+        self.allocator.free(live.ssm_positions);
+        self.allocator.free(live.ssm_bytes);
+        self.allocator.free(live.rings);
+        live.* = updated;
+        self.total_bytes = clampAdd(self.total_bytes, delta);
         self.gcToBudget();
         return if (ssm_res.complete) .persisted else .partial;
     }
@@ -1916,23 +2094,42 @@ pub const DiskTier = struct {
         var list = std.ArrayList(NamedTensor).empty;
         defer self.freeNamed(&list);
 
-        const affine = config.scheme != .off;
         for (kv_entries, 0..) |*entry, li| {
-            if (!entry.initialized) continue;
-            try self.appendSlice(&list, li, "k", entry.keys, c0, c1, s);
-            try self.appendSlice(&list, li, "v", entry.values, c0, c1, s);
-            if (affine) {
-                try self.appendSlice(&list, li, "ks", entry.keys_scales, c0, c1, s);
-                try self.appendSlice(&list, li, "kb", entry.keys_biases, c0, c1, s);
-                try self.appendSlice(&list, li, "vs", entry.values_scales, c0, c1, s);
-                try self.appendSlice(&list, li, "vb", entry.values_biases, c0, c1, s);
-            }
+            // A ringed layer holds a window, never these rows: its restore points are ring files.
+            if (!entry.initialized or entry.ringed) continue;
+            try self.appendLayerSlices(&list, li, entry, config, c0, c1, s);
         }
-
         const path = try std.fmt.allocPrint(self.allocator, "{s}/c{d:0>6}.safetensors", .{ dir_abs, chunk_idx });
+        return self.saveNamed(path, list.items, no_meta, s);
+    }
+
+    /// One layer's K/V rows `[r0, r1)` of its own buffers, every stored kind.
+    fn appendLayerSlices(
+        self: *DiskTier,
+        list: *std.ArrayList(NamedTensor),
+        li: usize,
+        entry: *const transformer_mod.KVCacheEntry,
+        config: kv_quant.KVQuantConfig,
+        r0: u32,
+        r1: u32,
+        s: mlx.mlx_stream,
+    ) !void {
+        try self.appendSlice(list, li, "k", entry.keys, r0, r1, s);
+        try self.appendSlice(list, li, "v", entry.values, r0, r1, s);
+        if (config.scheme != .off) {
+            try self.appendSlice(list, li, "ks", entry.keys_scales, r0, r1, s);
+            try self.appendSlice(list, li, "kb", entry.keys_biases, r0, r1, s);
+            try self.appendSlice(list, li, "vs", entry.values_scales, r0, r1, s);
+            try self.appendSlice(list, li, "vb", entry.values_biases, r0, r1, s);
+        }
+    }
+
+    /// Write (or, under SSD-first, stage) one safetensors file at `path`, which it takes.
+    /// Returns the file's byte size.
+    fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
         if (self.writer) |w| {
             // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
-            const bytes = self.serializeSafetensors(list.items, no_meta, s) catch |err| {
+            const bytes = self.serializeSafetensors(list, meta, s) catch |err| {
                 self.allocator.free(path);
                 return err;
             };
@@ -1945,7 +2142,14 @@ pub const DiskTier = struct {
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
         const meta_map = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-        for (list.items) |*t| {
+        for (meta) |m| {
+            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.key});
+            defer self.allocator.free(kz);
+            const vz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.value});
+            defer self.allocator.free(vz);
+            try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(kz.ptr), @ptrCast(vz.ptr)));
+        }
+        for (list) |*t| {
             const key_z = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{t.key});
             defer self.allocator.free(key_z);
             try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key_z.ptr), t.arr));
@@ -2288,37 +2492,8 @@ pub const DiskTier = struct {
             }
         }
 
-        if (self.writer) |w| {
-            const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
-            const bytes = self.serializeSafetensors(list.items, meta.items, s) catch |err| {
-                self.allocator.free(path);
-                return err;
-            };
-            const n = bytes.len;
-            w.submit(path, bytes); // takes both buffers
-            return n;
-        }
-
-        const tensor_map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-        const meta_map = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-        for (meta.items) |m| {
-            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.key});
-            defer self.allocator.free(kz);
-            const vz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.value});
-            defer self.allocator.free(vz);
-            try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(kz.ptr), @ptrCast(vz.ptr)));
-        }
-        for (list.items) |*t| {
-            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{t.key});
-            defer self.allocator.free(kz);
-            try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(kz.ptr), t.arr));
-        }
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors\x00", .{ dir_rel, cp.pos });
-        defer self.allocator.free(path);
-        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
-        return fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
+        return self.saveNamed(path, list.items, meta.items, s);
     }
 
     fn qsaHistoryRowsOf(cp: *const transformer_mod.SSMCheckpoint) c_int {
@@ -2501,7 +2676,7 @@ pub const DiskTier = struct {
         prefix_rows: u32,
         s: mlx.mlx_stream,
     ) !QsaHistoryResult {
-        // A commit with no QSA checkpoint leaves the entry's own file on disk, so it keeps its bill.
+        // No new checkpoint leaves the owned QSA file, and its bill, intact.
         const kept: QsaHistoryResult = .{ .inherited = inherited, .rows = inherited_rows, .bytes = if (inherited) 0 else held_bytes };
         const cps = cps_opt orelse return kept;
         const src = DiskTier.newestQsaCheckpoint(cps) orelse return kept;
@@ -2524,6 +2699,149 @@ pub const DiskTier = struct {
         defer self.allocator.free(path);
         // A staged checkpoint may still be in the writer's queue; fence it before deleting, or
         // the write lands a file no index names.
+        if (self.writer) |w| w.fence(path);
+        std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+    }
+
+    // ── Ring restore points (ringed sliding layers) ──
+
+    /// Where a commit can write a ring file: `rows` below `pos` of `entries`' ringed layers.
+    const RingSource = struct { pos: u32, rows: u32, entries: []const transformer_mod.KVCacheEntry };
+
+    /// Rows every ringed layer of `entries` can give a restore point at `pos`: window + backoff at
+    /// most, at least the window (or every row from 0). Null when one cannot, or none rings.
+    fn ringRowsAt(entries: []const transformer_mod.KVCacheEntry, pos: usize, window: u32) ?u32 {
+        const want: usize = @as(usize, window) + model.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF;
+        var rows: ?usize = null;
+        for (entries) |*e| {
+            if (!e.initialized or !e.ringed) continue;
+            if (pos < e.base or pos > e.base + e.offset) return null;
+            const n = @min(pos - e.base, want);
+            if (n < @min(pos, @as(usize, window))) return null;
+            rows = @min(rows orelse n, n);
+        }
+        return if (rows) |r| @intCast(r) else null;
+    }
+
+    /// The cache's own ring at the persisted length, then each checkpoint at its `step`; a
+    /// restore below `MIN_DISK_ADVANTAGE_TOKENS` never beats the RAM tier. Caller frees.
+    fn ringSources(self: *DiskTier, kv_entries: []const transformer_mod.KVCacheEntry, kv_target: u32, ring: RingCommit) ![]RingSource {
+        var out = std.ArrayList(RingSource).empty;
+        errdefer out.deinit(self.allocator);
+        if (kv_target >= MIN_DISK_ADVANTAGE_TOKENS) {
+            if (ringRowsAt(kv_entries, kv_target, ring.window)) |rows|
+                try out.append(self.allocator, .{ .pos = kv_target, .rows = rows, .entries = kv_entries });
+        }
+        for (ring.cps) |*cp| {
+            if (cp.step < MIN_DISK_ADVANTAGE_TOKENS or cp.step > kv_target) continue;
+            const pos: u32 = @intCast(cp.step);
+            if (ringSourceAt(out.items, pos) != null) continue;
+            const rows = ringRowsAt(cp.entries, pos, ring.window) orelse continue;
+            try out.append(self.allocator, .{ .pos = pos, .rows = rows, .entries = cp.entries });
+        }
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn ringSourceAt(srcs: []const RingSource, pos: u32) ?RingSource {
+        for (srcs) |src| if (src.pos == pos) return src;
+        return null;
+    }
+
+    /// The positions an entry holding `old` keeps after a commit offering `srcs`, ascending
+    /// (`thinRingPositions`). Caller frees.
+    fn ringTargetPositions(self: *DiskTier, old: []const RingFile, srcs: []const RingSource) ![]u32 {
+        var set = std.ArrayList(u32).empty;
+        defer set.deinit(self.allocator);
+        for (old) |r| try set.append(self.allocator, r.pos);
+        for (srcs) |src| {
+            if (std.mem.indexOfScalar(u32, set.items, src.pos) == null) try set.append(self.allocator, src.pos);
+        }
+        std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
+        return self.allocator.dupe(u32, thinRingPositions(set.items));
+    }
+
+    /// Thin ascending `positions` in place to `RING_DISK_MAX_PER_ENTRY` the way the RAM entry
+    /// thins its ring checkpoints: the lowest (a shared preamble) and the newest stay.
+    fn thinRingPositions(positions: []u32) []u32 {
+        var n = positions.len;
+        while (n > RING_DISK_MAX_PER_ENTRY) : (n -= 1) {
+            const k = transformer_mod.positionDropIndex(positions[0..n], .min_span_recency);
+            for (k..n - 1) |i| positions[i] = positions[i + 1];
+        }
+        return positions[0..n];
+    }
+
+    /// Would `srcs` add or drop a ring file of `e`? False on alloc failure (a harmless no-op).
+    fn ringWorkPending(self: *DiskTier, e: *const IndexEntry, srcs: []const RingSource) bool {
+        if (srcs.len == 0) return false;
+        const target = self.ringTargetPositions(e.rings, srcs) catch return false;
+        defer self.allocator.free(target);
+        if (target.len != e.rings.len) return true;
+        for (target, e.rings) |pos, r| {
+            if (pos != r.pos) return true;
+        }
+        return false;
+    }
+
+    fn ringsEqual(a: []const RingFile, b: []const RingFile) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (x.pos != y.pos) return false;
+        }
+        return true;
+    }
+
+    /// Write the ring files `srcs` adds, delete the ones retention drops, and return the entry's
+    /// resulting set (owned). A file is immutable once written, keyed by its position.
+    fn persistRings(
+        self: *DiskTier,
+        id: u64,
+        dir_rel: []const u8,
+        config: kv_quant.KVQuantConfig,
+        old: []const RingFile,
+        srcs: []const RingSource,
+        written_bytes: *u64,
+        s: mlx.mlx_stream,
+    ) ![]RingFile {
+        const target = try self.ringTargetPositions(old, srcs);
+        defer self.allocator.free(target);
+        for (old) |r| {
+            if (std.mem.indexOfScalar(u32, target, r.pos) == null) self.deleteRingFile(id, r.pos);
+        }
+        const out = try self.allocator.alloc(RingFile, target.len);
+        errdefer self.allocator.free(out);
+        for (target, out) |pos, *o| {
+            o.* = for (old) |r| {
+                if (r.pos == pos) break r;
+            } else blk: {
+                const src = ringSourceAt(srcs, pos).?;
+                const bytes = try self.writeRingFile(dir_rel, src, config, s);
+                written_bytes.* += bytes;
+                break :blk .{ .pos = pos, .rows = src.rows, .bytes = bytes };
+            };
+        }
+        return out;
+    }
+
+    /// Write (or, under SSD-first, stage) the ringed layers' rows `[pos - rows, pos)` of `src`
+    /// as `r{pos:0>7}.safetensors`; every other layer is in the chunks.
+    fn writeRingFile(self: *DiskTier, dir_rel: []const u8, src: RingSource, config: kv_quant.KVQuantConfig, s: mlx.mlx_stream) !u64 {
+        var list = std.ArrayList(NamedTensor).empty;
+        defer self.freeNamed(&list);
+        for (src.entries, 0..) |*entry, li| {
+            if (!entry.initialized or !entry.ringed) continue;
+            const hi: u32 = @intCast(src.pos - entry.base);
+            try self.appendLayerSlices(&list, li, entry, config, hi - src.rows, hi, s);
+        }
+        var lc_buf: [24]u8 = undefined;
+        const lc = try std.fmt.bufPrint(&lc_buf, "{d}", .{src.entries.len});
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/r{d:0>7}.safetensors", .{ dir_rel, src.pos });
+        return self.saveNamed(path, list.items, &.{.{ .key = "layers", .value = lc }}, s);
+    }
+
+    fn deleteRingFile(self: *DiskTier, id: u64, pos: u32) void {
+        const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/r{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
+        defer self.allocator.free(path);
         if (self.writer) |w| w.fence(path);
         std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
     }
@@ -2574,6 +2892,7 @@ pub const DiskTier = struct {
         if (self.writer) |w| w.fence(dir_abs);
         var freed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
         for (e.ssm_bytes) |b| freed += b;
+        for (e.rings) |r| freed += r.bytes;
         if (e.qsa_history_bytes > 0) {
             if (std.fmt.allocPrint(self.allocator, "{s}qsa.safetensors", .{dir_abs})) |qp| {
                 defer self.allocator.free(qp);
@@ -2756,6 +3075,8 @@ pub const DiskTier = struct {
     /// claim: an older reader accepts only 2..4, so stamping v6 unconditionally made a binary
     /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
     fn metaVersionFor(e: IndexEntry) u8 {
+        // v9: an older reader would restore the chunks alone, leaving the ringed layers empty.
+        if (e.rings.len > 0) return 9;
         if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) return 8;
         if (e.inherited_chunks > 0) return 6;
         if (e.spec_mtp) |m| if (m.head) |h| return if (h.mark_count > 0) 8 else 5;
@@ -2792,6 +3113,14 @@ pub const DiskTier = struct {
             try out.print(a, "{{\"pos\":{d},\"bytes\":{d}}}", .{ pos, sz });
         }
         try out.appendSlice(a, "]");
+        if (e.rings.len > 0) {
+            try out.appendSlice(a, ",\"ring\":[");
+            for (e.rings, 0..) |r, i| {
+                if (i > 0) try out.appendSlice(a, ",");
+                try out.print(a, "{{\"pos\":{d},\"rows\":{d},\"bytes\":{d}}}", .{ r.pos, r.rows, r.bytes });
+            }
+            try out.appendSlice(a, "]");
+        }
         if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) {
             try out.print(a, ",\"qsa_history\":{{\"bytes\":{d},\"rows\":{d},\"inherited\":{}}}", .{
                 e.qsa_history_bytes,
@@ -2871,6 +3200,7 @@ pub const DiskTier = struct {
     fn billChunksOnce(self: *DiskTier, e: *IndexEntry, seen: *std.AutoHashMap(u64, void)) void {
         var billed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
         for (e.ssm_bytes) |b| billed += b;
+        for (e.rings) |r| billed += r.bytes;
         if (e.qsa_history_bytes > 0) {
             if (std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id })) |qp| {
                 defer self.allocator.free(qp);
@@ -2932,8 +3262,9 @@ pub const DiskTier = struct {
         const version = jsonU64(obj, "v") orelse return null;
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
         // adds optional spec snapshots; v5 the qwen4_exp MTP head's QSA half; v6 inherited
-        // chunks. All restore; a lower-version entry just carries none of the newer state.
-        if (version < 2 or version > 8) return null;
+        // chunks; v9 ring restore points. All restore; a lower-version entry just carries none of
+        // the newer state.
+        if (version < 2 or version > 9) return null;
         // v6: the leading `inherited_chunks` chunk files are hard links into a donor's.
         const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
@@ -3084,6 +3415,42 @@ pub const DiskTier = struct {
             return null;
         }
 
+        // v9 ring restore points, salvaged per file like the SSM checkpoints. A ringed entry whose
+        // files all fail restores nothing (its chunks lack the ringed layers): dropped wholesale.
+        var rings: []RingFile = &.{};
+        if (obj.get("ring")) |ring_v| ring_blk: {
+            if (ring_v != .array or ring_v.array.items.len == 0) break :ring_blk;
+            var list = std.ArrayList(RingFile).empty;
+            defer list.deinit(self.allocator);
+            for (ring_v.array.items) |it_v| {
+                if (it_v != .object) continue;
+                const pos = jsonInt(u32, it_v.object, "pos") orelse continue;
+                const rows = jsonInt(u32, it_v.object, "rows") orelse continue;
+                const szrec = jsonU64(it_v.object, "bytes") orelse continue;
+                if (pos > kv_len or rows == 0 or rows > pos) continue;
+                const rp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/r{d:0>7}.safetensors", .{ self.root, id, pos }) catch continue;
+                defer self.allocator.free(rp);
+                const have = fileSize(self.io, rp) orelse continue;
+                if (have != szrec) continue; // truncated mid-flush — drop this position
+                list.append(self.allocator, .{ .pos = pos, .rows = rows, .bytes = szrec }) catch continue;
+            }
+            std.mem.sort(RingFile, list.items, {}, struct {
+                fn lt(_: void, a: RingFile, b: RingFile) bool {
+                    return a.pos < b.pos;
+                }
+            }.lt);
+            rings = if (list.items.len == 0) &.{} else list.toOwnedSlice(self.allocator) catch &.{};
+            if (rings.len == 0) {
+                log.info("  [disk-cache] e{d}: no valid ring file — dropping ringed entry\n", .{id});
+                self.allocator.free(tokens);
+                self.allocator.free(chunk_bytes);
+                self.allocator.free(ssm_positions);
+                self.allocator.free(ssm_bytes);
+                return null;
+            }
+            for (rings) |r| total += r.bytes;
+        }
+
         var qsa_history_bytes: u64 = 0;
         var qsa_history_rows: u32 = 0;
         var inherited_qsa = false;
@@ -3148,6 +3515,7 @@ pub const DiskTier = struct {
                 .qsa_history_bytes = qsa_history_bytes,
                 .qsa_history_rows = qsa_history_rows,
                 .inherited_qsa = inherited_qsa,
+                .rings = rings,
                 .last_used = 0,
             },
             .mtime = stat.mtime.nanoseconds,
@@ -3302,22 +3670,20 @@ fn deleteTreeAbsolute(io: std.Io, dir_abs: []const u8) void {
     pd.deleteTree(io, name) catch {};
 }
 
-/// Historical fingerprint for the default cache layout. Kept as a wrapper so
-/// existing callers and existing SSD roots remain stable.
-pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
-    return modelFingerprintWithLayout(allocator, io, model_dir, null);
+fn fingerprintFile(h: *std.hash.XxHash64, io: std.Io, dir: std.Io.Dir, name: []const u8) void {
+    h.update(name);
+    h.update(&[_]u8{0});
+    const st = dir.statFile(io, name, .{}) catch {
+        h.update(&[_]u8{0});
+        return;
+    };
+    h.update(&[_]u8{1});
+    h.update(std.mem.asBytes(&st.size));
+    const mt: i128 = st.mtime.nanoseconds;
+    h.update(std.mem.asBytes(&mt));
 }
 
-/// Fingerprint a model plus an optional cache-layout namespace
-/// (`ModelConfig.cacheLayoutNamespace`). A layout that changes what the stored
-/// K/V mean gets a versioned marker, so an old SSD root is never restored into
-/// it; null keeps the historical fingerprint.
-pub fn modelFingerprintWithLayout(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model_dir: []const u8,
-    layout_namespace: ?[]const u8,
-) ![]u8 {
+pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
     h.update(model_dir);
@@ -3328,16 +3694,50 @@ pub fn modelFingerprintWithLayout(
         const mt: i128 = st.mtime.nanoseconds;
         h.update(std.mem.asBytes(&mt));
     }
-    if (model.getConfigOverrides()) |raw| h.update(raw);
-    if (layout_namespace) |layout| {
-        h.update("\x00mlx-serve-kv-layout\x00");
-        h.update(layout);
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var referenced = model_discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| model_discovery.freeShardSet(r);
+    var names = std.ArrayList([]const u8).empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
     }
+    if (referenced) |r| {
+        var it = r.keyIterator();
+        while (it.next()) |name| {
+            const owned = try allocator.dupe(u8, name.*);
+            errdefer allocator.free(owned);
+            try names.append(allocator, owned);
+        }
+    } else {
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+            const owned = try allocator.dupe(u8, entry.name);
+            errdefer allocator.free(owned);
+            try names.append(allocator, owned);
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    for (names.items) |name| fingerprintFile(&h, io, dir, name);
+    fingerprintFile(&h, io, dir, "ngram_table.bin");
+    if (model.getConfigOverrides()) |raw| h.update(raw);
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
 /// Default persistence root: `~/.mlx-serve/kv-cache`.
 pub fn defaultBaseDir(allocator: std.mem.Allocator) ![]u8 {
+    if (std.c.getenv("MLX_SERVE_KV_CACHE_DIR")) |raw| {
+        const dir = std.mem.span(raw);
+        if (!std.fs.path.isAbsolute(dir)) return error.BadCacheDir;
+        return allocator.dupe(u8, dir);
+    }
     const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoHome);
     return std.fmt.allocPrint(allocator, "{s}/.mlx-serve/kv-cache", .{home});
 }
@@ -3348,6 +3748,7 @@ pub fn defaultBaseDir(allocator: std.mem.Allocator) ![]u8 {
 fn nonChunkBytes(e: *const IndexEntry) u64 {
     var n: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
     for (e.ssm_bytes) |b| n += b;
+    for (e.rings) |r| n += r.bytes;
     if (!e.inherited_qsa) n += e.qsa_history_bytes;
     return n;
 }
@@ -3550,6 +3951,48 @@ fn cacheBufValueAt(cache: *KVCache, layer: u32, pos: u32, d: u32, s: mlx.mlx_str
 fn tmpRoot(tmp: *std.testing.TmpDir, io: std.Io, buf: []u8) ![]const u8 {
     const n = try tmp.dir.realPath(io, buf);
     return buf[0..n];
+}
+
+test "DiskTier: failed checkpoint manifest keeps index ownership" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var accounting = testing.FailingAllocator.init(arena.allocator(), .{});
+    const allocator = accounting.allocator();
+    var tier = try DiskTier.init(allocator, io, base, "fp-owned", 0, 128);
+    defer tier.deinit();
+    try tmp.dir.createDirPath(io, "fp-owned/e1/meta.json.tmp");
+    const tokens = try allocator.alloc(u32, 600);
+    @memset(tokens, 7);
+    const positions = try allocator.dupe(u32, &.{512});
+    const sizes = try allocator.dupe(u64, &.{64});
+    try tier.entries.append(allocator, .{
+        .id = 1,
+        .tokens = tokens,
+        .kv_len = 600,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 2464,
+        .chunk_bytes = try allocator.alloc(u64, 0),
+        .ssm_positions = positions,
+        .ssm_bytes = sizes,
+        .last_used = 1,
+    });
+    tier.total_bytes = 2464;
+    const owned_before = accounting.allocated_bytes - accounting.freed_bytes;
+
+    if (tier.appendSsmOnly(0, null, null, null, &.{}, .{ .ctx = null })) |_| {
+        return error.TestExpectedError;
+    } else |_| {}
+
+    try testing.expectEqual(owned_before, accounting.allocated_bytes - accounting.freed_bytes);
+    try testing.expect(tier.entries.items[0].ssm_positions.ptr == positions.ptr);
+    try testing.expect(tier.entries.items[0].ssm_bytes.ptr == sizes.ptr);
+    try testing.expectEqual(@as(u64, 2464), tier.total_bytes);
 }
 
 test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
@@ -5309,38 +5752,6 @@ test "modelFingerprint: stable per path, rolls with config.json changes" {
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
 }
 
-// Bar: a Nemotron-H SSD root written before its keys became NoPE is never
-// restored, and every other arch keeps its existing root.
-test "modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    try tmp.dir.createDirPath(io, "m");
-    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" });
-    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/m", .{base});
-    defer testing.allocator.free(dir);
-
-    const nemo = try model.parseConfigFromJson(testing.allocator,
-        \\{"model_type": "nemotron_h", "hidden_size": 64, "num_hidden_layers": 2,
-        \\ "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
-        \\ "vocab_size": 16, "layers_block_type": ["mamba", "attention"]}
-    );
-    const qwen = try model.parseConfigFromJson(testing.allocator,
-        \\{"model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": 2,
-        \\ "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32, "vocab_size": 16}
-    );
-    const old = try modelFingerprint(testing.allocator, io, dir);
-    defer testing.allocator.free(old);
-    const fp_nemo = try modelFingerprintWithLayout(testing.allocator, io, dir, nemo.cacheLayoutNamespace());
-    defer testing.allocator.free(fp_nemo);
-    const fp_qwen = try modelFingerprintWithLayout(testing.allocator, io, dir, qwen.cacheLayoutNamespace());
-    defer testing.allocator.free(fp_qwen);
-    try testing.expect(!std.mem.eql(u8, old, fp_nemo));
-    try testing.expectEqualStrings(old, fp_qwen);
-}
-
 test "modelFingerprint: rolls with --config-overrides" {
     defer model.setConfigOverrides(null);
     const io = std.testing.io;
@@ -5658,6 +6069,17 @@ test "DiskTier: a raise anywhere in appendCommit frees its owned results exactly
         tier.invalidateAll();
     }
     try testing.expect(k > 1);
+}
+
+test "DiskTier: an entry's ring files thin as its RAM checkpoints do: the lowest and the newest stay" {
+    var positions = [_]u32{ 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 };
+    const kept = DiskTier.thinRingPositions(&positions);
+    try std.testing.expectEqual(RING_DISK_MAX_PER_ENTRY, kept.len);
+    try std.testing.expectEqual(@as(u32, 100), kept[0]);
+    try std.testing.expectEqual(@as(u32, 900), kept[kept.len - 2]);
+    try std.testing.expectEqual(@as(u32, 1000), kept[kept.len - 1]);
+    var few = [_]u32{ 100, 1000 };
+    try std.testing.expectEqualSlices(u32, &.{ 100, 1000 }, DiskTier.thinRingPositions(&few));
 }
 
 test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
@@ -6208,17 +6630,14 @@ test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
     try testing.expect(vs.total > 1024 * 1024 * 1024); // a macOS root volume
 }
 
-test "volumeSpace: free is what the OS grants, never less than statfs' f_bavail" {
-    // Purgeable space is not in f_bavail; the tier used to refuse a volume with 117 GB usable.
-    // Three separate live probes: other writers move free space between them, hence the slack.
-    const slack: u64 = 1 << 30;
-    var st: StatfsBuf = undefined;
-    try testing.expect(statfs("/", &st) == 0);
-    const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
-    const granted = msv_volume_free_for_use("/");
-    try testing.expect(granted > 0);
-    try testing.expect(vs.free + slack >= @as(u64, st.f_bsize) * st.f_bavail);
-    if (granted <= vs.total) try testing.expect(@max(granted, vs.free) - @min(granted, vs.free) < slack);
+test "volumeSpace: free is what the OS grants, never statfs' f_bavail" {
+    // The choice, not the live numbers: two samples of free disk space are never equal under a suite that writes.
+    const GB: u64 = 1024 * 1024 * 1024;
+    try testing.expectEqual(@as(u64, 117 * GB), freeForUse(117 * GB, 500 * GB, 36 * GB));
+    try testing.expectEqual(@as(u64, 36 * GB), freeForUse(0, 500 * GB, 36 * GB));
+    try testing.expectEqual(@as(u64, 36 * GB), freeForUse(500 * GB + 1, 500 * GB, 36 * GB));
+    // The grant probe is wired: absent it, every volume would fall back to f_bavail.
+    try testing.expect(msv_volume_free_for_use("/") > 0);
 }
 
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {
@@ -7329,6 +7748,10 @@ test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable 
     const N = 8;
     var tokens: [N * 128]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    // One token past the stored prefix, so the full-length checkpoint still leaves a token to compute logits.
+    var prompt: [N * 128 + 1]u32 = undefined;
+    @memcpy(prompt[0 .. N * 128], &tokens);
+    prompt[N * 128] = 1;
 
     {
         var tier = try DiskTier.init(testing.allocator, io, base, "fp-coldrank", 0, 128);
@@ -7344,7 +7767,7 @@ test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable 
         defer for (&cps) |*cp| cp.deinit(testing.allocator);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
         try testing.expectEqual(@as(usize, N), tier.entries.items[0].ssm_positions.len);
-        const warm = tier.bestHybridMatch(&tokens, false, cache.config, tokens.len).?;
+        const warm = tier.bestHybridMatch(&prompt, false, cache.config, prompt.len).?;
         try testing.expectEqual(@as(u32, N * 128), warm.cp);
     }
 
@@ -7352,13 +7775,98 @@ test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable 
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
     try testing.expectEqual(@as(usize, N), tier2.entries.items[0].ssm_positions.len);
-    const cold = tier2.bestHybridMatch(&tokens, false, kv_quant.KVQuantConfig.dense, tokens.len).?;
+    const cold = tier2.bestHybridMatch(&prompt, false, kv_quant.KVQuantConfig.dense, prompt.len).?;
     try testing.expectEqual(@as(u32, N * 128), cold.cp);
     try testing.expectEqual(@as(u32, N * 128), cold.usable);
 }
 
+test "DiskTier hybrid lookup leaves a prompt token to compute logits" {
+    var tokens: [513]u32 = undefined;
+    for (&tokens, 0..) |*tok, i| tok.* = @intCast(i);
+    var positions = [_]u32{ 256, 512 };
+    var entries = [_]IndexEntry{.{
+        .id = 1,
+        .tokens = &tokens,
+        .kv_len = tokens.len,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 0,
+        .chunk_bytes = &.{},
+        .ssm_positions = &positions,
+        .ssm_bytes = &.{},
+        .last_used = 0,
+    }};
+    var entry_list: std.ArrayList(IndexEntry) = .empty;
+    defer entry_list.deinit(testing.allocator);
+    try entry_list.appendSlice(testing.allocator, &entries);
+    const tier = DiskTier{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .root = &.{},
+        .max_bytes = 0,
+        .chunk_tokens = 128,
+        .entries = entry_list,
+        .next_id = 2,
+        .total_bytes = 0,
+        .counter = 0,
+    };
+    const quant = kv_quant.KVQuantConfig.dense;
+    try testing.expectEqual(@as(u32, 256), tier.bestHybridMatch(tokens[0..512], false, quant, 512).?.cp);
+    try testing.expectEqual(@as(u32, 512), tier.bestHybridMatch(&tokens, false, quant, 513).?.cp);
+    try testing.expectEqual(@as(u32, 512), tier.bestHybridMatch(&tokens, false, quant, 512).?.cp);
+    try testing.expect(tier.bestHybridMatch(tokens[0..256], false, quant, 256) == null);
+    try testing.expect(tier.bestHybridMatch(&.{}, false, quant, 0) == null);
+}
+
+fn testFingerprintPayloadChange(indexed: bool, mtime_only: bool) !void {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    const files: []const []const u8 = if (indexed) &.{ "trunk.safetensors", "experts.safetensors", "ngram_table.bin" } else &.{ "model.safetensors", "ngram_table.bin" };
+    if (indexed) try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"a\":\"trunk.safetensors\",\"b\":\"experts.safetensors\",\"c\":\"trunk.safetensors\"}}" });
+    for (files) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "old" });
+    for (files) |name| {
+        const before = try modelFingerprint(testing.allocator, io, base);
+        defer testing.allocator.free(before);
+        const unchanged = try modelFingerprint(testing.allocator, io, base);
+        defer testing.allocator.free(unchanged);
+        try testing.expectEqualStrings(before, unchanged);
+        const f = try tmp.dir.openFile(io, name, .{ .mode = .read_write });
+        defer f.close(io);
+        const st = try f.stat(io);
+        if (mtime_only) {
+            try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = st.mtime.nanoseconds + 2_000_000_000 } } });
+        } else {
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "replacement" });
+            try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = st.mtime } });
+        }
+        const changed = try modelFingerprint(testing.allocator, io, base);
+        defer testing.allocator.free(changed);
+        try testing.expect(!std.mem.eql(u8, before, changed));
+    }
+}
+
+test "fingerprint indexed shards and ngram size" {
+    try testFingerprintPayloadChange(true, false);
+}
+
+test "fingerprint indexed shards and ngram mtime" {
+    try testFingerprintPayloadChange(true, true);
+}
+
+test "fingerprint single shard and ngram size" {
+    try testFingerprintPayloadChange(false, false);
+}
+
+test "fingerprint single shard and ngram mtime" {
+    try testFingerprintPayloadChange(false, true);
+}
+
 test "DiskTier: a restore wider than the fd limit closes each chunk as it goes" {
-    // Bar: restoring more chunk files than the soft RLIMIT_NOFILE allows open at once succeeds.
+    // Restoring more chunk files than the soft RLIMIT_NOFILE allows open at once succeeds.
     mlx.installErrorHandler();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -7398,7 +7906,7 @@ test "DiskTier: a restore wider than the fd limit closes each chunk as it goes" 
 }
 
 test "DiskTier: a failed restore drops the latch it raised and keeps a foreign one" {
-    // Bar: the caller's cold-prefill fallback must not inherit this restore's MLX error.
+    // The caller's cold-prefill fallback must not inherit this restore's MLX error.
     mlx.installErrorHandler();
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -7433,7 +7941,60 @@ test "DiskTier: a failed restore drops the latch it raised and keeps a foreign o
     try testing.expectEqualStrings("foreign pre-existing error", mlx.takeError(&msg).?);
 }
 
-test "DiskTier: in-place commits keep an entry's bytes equal to the files it owns" {
+test "DiskTier: a restore fills its buffers chunk by chunk, never holding every chunk beside the result" {
+    // The restore runs before the inference thread's admission bill sees it; a concatenation at
+    // the end held every loaded chunk beside the result, twice the restored KV.
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-restore-peak", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 4096, 256, 0.0, .float32);
+    var tokens: [4096]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 17);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    tier.drainEntry(tier.entries.items[m.idx].id);
+
+    // Two layers of K and V, 4096 rows of 256 f32: 16 MiB restored.
+    const restored_bytes: u64 = 2 * 2 * 4096 * 256 * 4;
+    // The stream is drained around each restore and the tier writes on this thread, so the process-wide
+    // peak is the restore's own: every restore must stay under the bound.
+    var excess: usize = 0;
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    for (0..4) |_| {
+        cache2.deinit();
+        cache2 = try KVCache.init(testing.allocator, 2);
+        _ = mlx.mlx_synchronize(s);
+        _ = mlx.mlx_clear_cache();
+        var before: usize = 0;
+        _ = mlx.mlx_get_active_memory(&before);
+        _ = mlx.mlx_reset_peak_memory();
+        try testing.expectEqual(@as(u32, 4096), try tier.restoreInto(&cache2, m.idx, s));
+        _ = mlx.mlx_synchronize(s);
+        var peak: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&peak);
+        excess = @max(excess, peak -| before);
+    }
+    if (excess >= restored_bytes * 3 / 2) {
+        std.debug.print("restore peak excess {d} B, restored {d} B\n", .{ excess, restored_bytes });
+        return error.TestUnexpectedResult;
+    }
+    for ([_]u32{ 0, 127, 128, 2049, 4095 }) |pos| {
+        try testing.expectEqual(try cacheValueAt(&cache, 1, pos, 5, s), try cacheValueAt(&cache2, 1, pos, 5, s));
+        try testing.expectEqual(try cacheBufValueAt(&cache, 1, pos, 5, s, true), try cacheBufValueAt(&cache2, 1, pos, 5, s, true));
+    }
+}
+
+test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to the files it owns" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7505,4 +8066,28 @@ test "DiskTier: in-place commits keep an entry's bytes equal to the files it own
     try testing.expect(e.qsa_history_bytes > 0);
     try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
     try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
+pub fn modelFingerprintWithLayout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_dir: []const u8,
+    layout_namespace: ?[]const u8,
+) ![]u8 {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
+    var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
+    h.update(model_dir);
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
+    defer allocator.free(cfg_path);
+    if (statFile(io, cfg_path)) |st| {
+        h.update(std.mem.asBytes(&st.size));
+        const mt: i128 = st.mtime.nanoseconds;
+        h.update(std.mem.asBytes(&mt));
+    }
+    if (model.getConfigOverrides()) |raw| h.update(raw);
+    if (layout_namespace) |layout| {
+        h.update("\x00mlx-serve-kv-layout\x00");
+        h.update(layout);
+    }
+    return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }

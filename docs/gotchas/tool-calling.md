@@ -848,3 +848,16 @@ has tools and otherwise pass the text through.
 Fix: the non-stream split keeps markup when the request has no tools (chat,
 messages, responses), matching the stream and the other engines.
 Guard: `tests/test_no_tools_markup_passthrough.sh`.
+
+
+### Generic role headers preserve native tool results
+
+MiMo renders any message role through a generic header, so its template never
+names a literal `tool` branch. The old source-text check rewrote its native tool
+turns into user turns containing `<tool_response>`. A small render probe now
+checks that the template retains tool content before applying that fallback.
+MiMo enables this capability in its chat config; other families retain their
+existing role-format contracts.
+Explicit tool branches skip the probe. The format corpus covers both a generic
+role header and a template that filters tool turns; MiMo's template fixtures
+pin the vendor's complete rendered history.

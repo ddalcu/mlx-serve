@@ -1,6 +1,6 @@
 # mlx-serve — project context for AI
 
-Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Ollama-compatible HTTP APIs + native media generation. No Python. This file is the COMPRESSED layer; detail lives one hop away.
+Native Zig/MLX on Apple Silicon: OpenAI/Anthropic/Ollama APIs and media generation, without a Python runtime.
 
 ## Detail map (read on demand)
 
@@ -196,6 +196,8 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 ## Rules (distilled gotchas — stories in docs/gotchas/; every bullet ≤ 3 lines)
 
 ### Tool calling & formats (→ docs/gotchas/tool-calling.md)
+
+- **MiMo tool roles**: probe generic headers before rewriting (`templateProbePreservesToolContent`); covered by the format corpus.
 
 - **Control bytes**: ONE raw byte <0x20 in history kills the strict render → SILENT `fallbackFormatChat` (model loses its stop token). Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first.
 - **A NUL byte in any message TRUNCATED the rendered prompt** (`grep -a` output pasted into an agent turn): the `\u0000` escape decodes back to a real NUL inside jinja and the shim's bare `char*` was read with `std.mem.span`, so the prompt ended mid-user-turn with no assistant header and the model answered with an immediate EOS (`P+0 tokens … [stop]`, empty agent turn). `jinja_render_chat` returns its LENGTH; byte-level BPE round-trips 0x00. Tell: the same `prompt=` count on consecutive turns.
@@ -413,13 +415,12 @@ Kernels + numerics:
 - **A grid narrower than the rows it commits writes none of the rest** (the GDN tree prework copies the conv window's 3 state rows striding by `TL`): a 1- or 2-node tree committed an unwritten row, drafts != off. Guard: `gdnDecodeTreeCase` at 1, 2 and 8 nodes.
 - **Prefill fusions take the chunk WIDTH as a scalar INPUT, never a template** (`hc_prefill.zig`, `MLX_SERVE_HC_PREFILL=0` / `MLX_SERVE_GDN_PREFILL_FUSED=0`); a per-token-varying template value is a fresh JIT per value. Every `metal_kernel` helper owes a `streamIsGpu` guard.
 - **GDN decode is three fused dispatches per layer** (`gdnPreworkFused`, `gdnNormGateFused`, `MLX_SERVE_GDN_DECODE_FUSED=0`); a greedy byte flip there is legit.
-- **A host read inside a graph build or layer loop is a GPU BARRIER**: qwen4 PLE defers (`ple_defer` + `flushDeferredPle`, claims its spec slot at BUILD time via `pleClaimSpecCapture`); batch non-consumed reads into ONE eval. A rollback that re-forwards is a SECOND forward (`DsparkAnchors`).
+- **Host reads and per-layer evals during graph construction synchronize the GPU.** Defer Qwen4 PLE reads (`ple_defer` + `flushDeferredPle`), reserving slots at build time (`pleClaimSpecCapture`). Re-forwarding on rollback costs another forward (`DsparkAnchors`).
 - **A 30 GB no-copy table is made resident by the FIRST GPU forward** (`--ple-gpu`, opt-in): a static working-set gate passed on a 128 GB Mac with ~10 GB free and the first 13-token prefill took 19-106 s; the host gather faults in only the rows it reads.
 - **A no-copy MLX wrap COPIES silently when Metal refuses it** (`mlx_array_new_data_managed*`: base not page-aligned or length past `maxBufferLength`, then malloc + copy + deleter NOW). Gate BEFORE wrapping (`ple_gpu.chooseArm`); the buffer counts in MLX active memory.
 - **Mamba2 decode is ONE dispatch per layer** (`mamba2_decode.zig`: conv + dt + SSM + gate, the group norm a second; the op chain serves prefill and any geometry it declines). Nemotron MoE decode reads its experts in place (`nemotronMoeDecodeExperts`: `gatherQmv` fc1 with ReLU² fused → `gatherQmv` fc2), never the sort machinery. Bar: fused single-token steps == the chain's prefill, host reference at one token.
 - **A decode-width residual add and the NEXT block's norm are one dispatch** (`add_norm.zig`, BIT-EQUAL to `add -> fast::rms_norm`; the MoE arm folds the K-sum AND the shared expert): a fused path that replaces a chain must carry EVERY term of it — the kernel tests passed while the forward dropped the shared expert. Bar: `hybrid decode: the fused add+norm path equals the unfused blocks`.
 - **A single routing group is the UNGROUPED fused router** (`groupLimitedRouting` → `.sigmoid_bias` when `n_group <= 1`): the grouped kernel declines `n_group 1` and Nemotron-H ran the ~15-op chain per MoE layer.
-- **A host read inside a graph build or layer loop is a GPU BARRIER** (a per-layer `mlx_array_eval` inside a decode recurrence is one too): qwen4 PLE defers (`ple_defer` + `flushDeferredPle`, claims its spec slot at BUILD time via `pleClaimSpecCapture`); batch non-consumed reads into ONE eval. A rollback that re-forwards is a SECOND forward (`DsparkAnchors`).
 - **A cold 32 GB mmap read is a serial SSD fault** (`NgramTable.gather` → `PrefetchPool`, `QWEN4_PLE_PREFETCH=0`; `startWarm`, `MLX_SERVE_NGRAM_WARM=0`).
 - **A chain the GPU already OVERLAPS is not a dispatch to fuse**; a fusion pays only if it shortens the DEPENDENCY CHAIN; a weight-layout fusion is not output-preserving. Measure the marginal in-situ; "duplicate and read the marginal" is unsound for anything that MUTATES state.
 - **Reproducing an MLX op means its REDUCTION TREE and ACCUMULATOR**; `mlx_compile` is not output-preserving; JIT vs metallib transcendentals disagree — sweep the 16-bit domain (`swigluSigTable`).

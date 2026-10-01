@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+pub var launch_explicit: bool = false;
 
 /// KV-cache storage scheme.
 ///   * `off`      — dense bf16.
@@ -34,6 +35,7 @@ pub const KVQuantConfig = struct {
     /// 4-bit and 8-bit weights; we match that.
     group_size: u32,
 
+    pub const engine_default: KVQuantConfig = .{ .scheme = .affine, .bits = 8, .group_size = 64 };
     pub const dense: KVQuantConfig = .{ .scheme = .off, .bits = 0, .group_size = 0 };
 
     pub fn affine(bits: u8) KVQuantConfig {

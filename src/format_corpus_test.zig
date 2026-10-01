@@ -2694,3 +2694,16 @@ test "format corpus: constrained JSON marker strings are data on every protocol"
         try testing.expectEqualStrings(json, output.items);
     }
 }
+
+test "format corpus: generic role headers retain tool turns and filtered roles use fallback" {
+    const cases = [_]struct { tpl: []const u8, expected: []const u8 }{
+        .{ .tpl = "{% for m in messages %}{{ m.role }}:{{ m.content }}{% endfor %}", .expected = "tool:answer" },
+        .{ .tpl = "{% for m in messages %}{% if m.role == 'user' %}user:{{ m.content }}{% endif %}{% endfor %}", .expected = "user:<tool_response>\nanswer\n</tool_response>" },
+    };
+    for (cases) |c| {
+        var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator, .probe_generic_tool_role = true };
+        const rendered = try chat.renderChatTemplate(testing.allocator, &.{.{ .role = "tool", .content = "answer" }}, &config, null, null, true, null, false);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings(c.expected, rendered);
+    }
+}

@@ -961,6 +961,7 @@ pub fn main(init: std.process.Init) !void {
             const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
             idle_evict_secs = if (n > 0) n else null;
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
+            @import("kv_quant.zig").launch_explicit = true;
             i += 1;
             if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
                 kv_quant_config = transformer_mod.KVQuantConfig.dense;
@@ -1503,10 +1504,11 @@ pub fn main(init: std.process.Init) !void {
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
-        if (kv_quant_config.scheme != .off) {
-            try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config);
+        const model_kv_quant = config.effectiveKvQuant(kv_quant_config);
+        if (model_kv_quant.scheme != .off) {
+            try xfm.cache.reinit(config.num_hidden_layers, model_kv_quant);
         }
-        try xfm.qwen4MtpApplyKvQuant(kv_quant_config);
+        try xfm.qwen4MtpApplyKvQuant(model_kv_quant);
 
         // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
         {

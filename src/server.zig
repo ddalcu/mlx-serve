@@ -1,4 +1,5 @@
 const std = @import("std");
+const fp8_block = @import("fp8_block.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
@@ -15,6 +16,7 @@ const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
+const mimo_vision = @import("mimo_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
@@ -652,7 +654,7 @@ fn configuredKvQuant() transformer_mod.KVQuantConfig {
 
 /// The width THIS model stores at: its `model-settings.json` override, else the process default.
 pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
-    return config.kv_quant_override orelse configuredKvQuant();
+    return config.effectiveKvQuant(configuredKvQuant());
 }
 
 /// The explicit context for THIS model: its `model-settings.json` `ctx_size`, else `--ctx-size`.
@@ -896,8 +898,9 @@ pub var prefix_cache_mem_explicit = false;
 /// Bytes one cached session at `ctx_tokens` holds: its KV and state, plus the SSM checkpoints
 /// a cold prefill of that length retains, which the commit path bills to the entry.
 pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
-        retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
+    const ring = config.swaRingBytes() +| @as(u64, prefix_cache_mod.RING_CHECKPOINT_MAX) *| config.swaRingCheckpointBytes();
+    return sessionBytesPerToken(config, kv_bits) *| (ctx_tokens +| @as(u64, PREFILL_CHUNK_LADDER[0])) +|
+        config.qsaRingBytes() +| kvBytesPerTokenAtBits(ring, kv_bits) +| retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
 }
 
 pub fn defaultPrefixCacheAsk(requested: u64, explicit: bool, session_kv: u64) u64 {
@@ -3337,7 +3340,8 @@ fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
 /// PURE: the floor for a machine with `total_ram` bytes; the wrapper above reads the machine.
 fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
     const c = config orelse return 0;
-    if (!c.longCtxGated()) return 0;
+    // Resident MiMo fills a 128 GB Mac, so its ceiling is the declared limit, not what other apps leave free.
+    if (!c.longCtxGated() and !c.isMimo()) return 0;
     const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, wired_limit_margin_bytes);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
         log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
@@ -3582,8 +3586,8 @@ pub fn prefillTransientReserveAtKv(
         config.prefillAttnKeys(seq),
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
-        .{ .qsa_ring_bytes = config.qsaRingBytes(), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits) },
-    ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+        .{ .qsa_ring_bytes = slotRingBytes(config, kv_bits), .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits) },
+    ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) + slidingBandScoreBytes(config, @min(chunk, seq)) + fp8DequantScratchBytes(config, @min(chunk, seq));
 }
 
 /// Bytes per (query, key) the QSA prefill holds for ONE live layer past the
@@ -3752,7 +3756,7 @@ pub fn billedPrefillChunk(
 /// explicit `--ctx-size`, 0 while the context is auto (the auto sizer adapts to the rung).
 pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     if (manualContext(config) == 0) return 0;
-    return sessionBytesPerToken(config, kv_bits) *| manualContext(config) +| config.qsaRingBytes();
+    return sessionBytesPerToken(config, kv_bits) *| manualContext(config) +| slotRingBytes(config, kv_bits);
 }
 
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
@@ -3839,9 +3843,7 @@ pub const HotCachePlan = struct {
 /// ceiling bought a wider rung and a smaller cache: 3873 vs 1076 MB). An explicit
 /// `--prefill-chunk` is billed as-is; ungated archs keep the sizer's rung.
 pub fn clampReserveWidth(config: *const model_mod.ModelConfig, pinned_width: u32) u32 {
-    if (explicitPrefillChunk() > 0) return pinned_width;
-    if (!perRequestPrefillChunkEnabled(config)) return pinned_width;
-    return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+    return perRequestFloorWidth(config) orelse pinned_width;
 }
 
 pub fn planHotCache(
@@ -3857,7 +3859,7 @@ pub fn planHotCache(
     const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, requested, chunk_override);
     const reserve_chunk = clampReserveWidth(config, chunk);
     const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
-    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes();
+    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| slotRingBytes(config, kv_bits);
     return .{
         .chunk = chunk,
         .reserve_chunk = reserve_chunk,
@@ -3930,7 +3932,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
 /// The bytes the SSD-first budget floors at: one session at the working context, at the width the cache stores.
 fn ssdFirstSessionKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u64 {
     return sessionBytesPerToken(config, kv_bits) *|
-        ssdFirstSessionTokensNow(config, kv_bits, ceiling, active_mem, chunk) +| config.qsaRingBytes();
+        ssdFirstSessionTokensNow(config, kv_bits, ceiling, active_mem, chunk) +| slotRingBytes(config, kv_bits);
 }
 
 /// The SSD-first arm of `prefixCacheMemForLoad`, gate and log included. Null when the arch
@@ -4018,7 +4020,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const chunk: u64 = pinPrefillChunk(config);
         // `statePerTokenBilled` is 0 off qwen4_exp.
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
-            getEffectiveContextLength(config) +| config.qsaRingBytes();
+            getEffectiveContextLength(config) +| slotRingBytes(config, kv_bits);
         const clamped = clampedPrefixCacheMem(
             requested,
             currentGpuMemoryCeiling(config, active_mem),
@@ -5180,6 +5182,11 @@ pub const WarmPrefix = struct {
         if (!self.will_donate or self.matched_tokens == 0) return false;
         return seq > self.capacity_tokens;
     }
+    pub fn decodeOutgrows(self: WarmPrefix, seq: u64, reserved: u64) bool {
+        if (self.matched_tokens == 0) return false;
+        return seq <= self.capacity_tokens and reserved > self.capacity_tokens;
+    }
+
 };
 
 /// PURE: the most KV-caching layers that fall inside one window of `window` consecutive layers,
@@ -5222,6 +5229,8 @@ fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq:
 
 /// Per-request bytes that scale with the prompt rather than the chunk.
 pub const PrefillRequestTerms = struct {
+    dequant_scratch_bytes: u64 = 0,
+
     /// Cache capacity reserved at admission beyond `seq * kv_per_tok`: the generation headroom
     /// plus a chunk of slack, so no buffer grows during the prefill (#353).
     reserved_kv_bytes: u64 = 0,
@@ -5251,7 +5260,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
     const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
-    const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
+    const dequant: u64 = if (kv_bits >= 16) 0 else if (req.dequant_scratch_bytes > 0) req.dequant_scratch_bytes else 2 * seq * kv_heads * hdim * 2;
     const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
     // The MLP envelope alone is not the whole per-token working set: an arch
     // with its own prefill streams (linear-attention layers, MoE gather-sort
@@ -5336,6 +5345,14 @@ fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
         per_tok += MOE_PREFILL_COEXIST * top_k * 2 *
             (@as(u64, config.hidden_size) + config.moe_intermediate_size) * 2;
     }
+    // A ringed sliding layer stages the WHOLE chunk before it compacts back to
+    // its window, so the rows exist for the width of the forward and the
+    // per-token KV term (global layers only) does not carry them. Bounded by
+    // the same eval-cadence window as the linear term above: older layers'
+    // staging is released inside the loop, so five coexist, not thirty-nine.
+    per_tok += config.swaStreamBytesPerToken(
+        @as(u64, transformer_mod.Transformer.PREFILL_EVAL_CADENCE_DEFAULT) + 1,
+    );
     return per_tok;
 }
 
@@ -5465,11 +5482,12 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // Arch gate for the reservation and state terms (measured on qwen4_exp alone; the
     // reservation's allocator twin is gated too, so an ungated guard billed memory never reserved).
     const dq_min_rows: u64 = transformer_mod.prefillDqGemmMinRows(config.quant_bits);
-    if (!config.longCtxGated()) {
+    if (!config.reservesKvCapacity()) {
         // A checked-out entry is the slot's own buffer on every arch; both terms are zero for a share.
         const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
         return .{
             .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
+            .state_bytes = if (config.isMimo() and warm.mtp_on) @import("mimo_mtp.zig").State.billedBytes(config) else 0,
             .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
             .dq_min_rows = dq_min_rows,
         };
@@ -5487,12 +5505,14 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     const credited = warm.creditedRows(reserved);
     return .{
         .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
-        .state_bytes = reserved * (statePerTokenBilled(config) +| head_state_per_tok),
+        .state_bytes = reserved * (statePerTokenBilled(config) +| head_state_per_tok) +
+            (if (config.isMimo() and mtp_on) @import("mimo_mtp.zig").State.billedBytes(config) else 0),
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
-        .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
-        .qsa_ring_bytes = config.qsaRingBytes() +| head_qsa_ring,
+        .grow_coexist_bytes = if (config.isMimo()) mimoGrowCoexistBytes(config, warm, seq, reserved, kv_per_tok) else growCoexistBytes(config, warm, seq, kv_per_tok),
+        .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
+        .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dq_min_rows = dq_min_rows,
     };
@@ -5727,6 +5747,7 @@ pub fn prefillNeededAtChunk(
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
+        slidingBandScoreBytes(config, @min(chunk, seq)) + fp8DequantScratchBytes(config, @min(chunk, seq)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         (seq +| @min(@as(u64, max_tokens), transformer_mod.KVCache.RESERVE_GEN_HEADROOM)) *| config.drafter_ctx_bytes_per_token;
 }
@@ -5764,8 +5785,10 @@ pub fn chooseRequestPrefillChunk(
 ) u32 {
     // The arch gate first: an ungated arch's answer is the load-time pin, as before.
     if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
-    if (chunk_override > 0) return chunk_override;
-    for (PREFILL_CHUNK_LADDER) |rung| {
+    // `MLX_SERVE_PREFILL_CHUNK` is a tuning pin, forwarded verbatim.
+    if (generate_mod.envPrefillChunk() > 0) return explicitPrefillChunk();
+    for (PREFILL_CHUNK_LADDER) |r| {
+        const rung = cappedRung(r, chunk_override);
         const width: u64 = rungWidth(config, seq, rung, config.longCtxGated());
         const bill = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm);
         const needed = if (width > rungWidth(config, seq, rung, false))
@@ -5774,7 +5797,7 @@ pub fn chooseRequestPrefillChunk(
             bill;
         if (needed <= available) return @intCast(width);
     }
-    return @intCast(rungWidth(config, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], config.longCtxGated()));
+    return @intCast(rungWidth(config, seq, cappedRung(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], chunk_override), config.longCtxGated()));
 }
 
 /// The width one ladder rung forwards at. `long_ctx_gated = false` asks what the rung would be
@@ -5809,20 +5832,14 @@ pub fn requestPrefillChunkNow(
     enable_mtp: bool,
 ) u32 {
     const pin: u32 = config.pinned_prefill_chunk;
-    const explicit: u32 = explicitPrefillChunk();
-    if (explicit > 0) return explicit;
-    // The vision kill switch forwards the whole prompt; there is no chunk to choose.
-    if (unchunked_prefill) return pin;
-    if (!perRequestPrefillChunkEnabled(config)) return pin;
-
     const seq: u64 = @intCast(prompt_len);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const available: u64 = currentGpuMemoryCeiling(config, active_mem) -| active_mem;
     const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity, .will_donate = warm_will_donate, .mtp_on = enable_mtp };
-    const chosen = chooseRequestPrefillChunk(config, seq, max_tokens, kv_bits, available, pin, 0, warm);
-    if (chosen != pin) {
+    const chosen = requestPrefillPick(config, seq, max_tokens, kv_bits, available, unchunked_prefill, warm);
+    if (chosen != pin and !unchunked_prefill and perRequestPrefillChunkEnabled(config)) {
         const width: u64 = chosen;
         const terms = prefillRequestTerms(config, seq, max_tokens, kv_bits, width, warm);
         const kv_bytes: u64 = seq *| kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| terms.reserved_kv_bytes;
@@ -5837,8 +5854,9 @@ pub var adaptive_chunk_override: ?bool = null;
 /// The per-chunk adaptive width: subordinate to the per-request gate, plus
 /// `MLX_SERVE_PREFILL_CHUNK_ADAPTIVE=0`, plus "no operator pinned a width".
 pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
-    // Arch first: the cheapest and most selective, and this runs once per chunk boundary.
-    if (!config.perRequestPrefillChunk()) return false;
+    // Arch first: the cheapest and most selective, and this runs once per chunk boundary. The
+    // per-chunk cost estimator is calibrated on qwen4_exp; a ringed arch runs its admitted width.
+    if (!config.longCtxGated()) return false;
     if (explicitPrefillChunk() > 0) return false;
     if (generate_mod.envPrefillChunk() > 0) return false;
     if (!perRequestPrefillChunkEnabled(config)) return false;
@@ -13625,7 +13643,7 @@ fn piecesOf(item: MediaItem) usize {
 }
 
 fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
-    var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(piece)));
+    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(piece)));
     switch (piece) {
         .image => |im| {
             h.update(std.mem.asBytes(&[_]u32{ im.width, im.height, im.grid_h, im.grid_w }));
@@ -13822,6 +13840,14 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
             .pixels_tolerance = config.lv_pixels_tolerance,
         };
     }
+    if (config.mimo_vision) return .{
+        .mode = .mimo,
+        .patch = config.qv_patch,
+        .tps = config.qv_temporal_patch,
+        .merge = config.qv_merge,
+        .min_pixels = config.qv_min_pixels,
+        .max_pixels = config.qv_max_pixels,
+    };
     if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
         .mode = if (config.muse_vision) .muse else .qwen,
@@ -14322,6 +14348,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const max_pixels = bounds.max;
         if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
         const rs = switch (vp.mode) {
+            .mimo => mimo_vision.smartResize(src_h, src_w, factor, min_pixels, max_pixels),
             .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
             .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
             else => qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels),
@@ -14338,16 +14365,20 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
         defer allocator.free(chw);
         const source_len: usize = @as(usize, src_h) * src_w * C;
-        qwen_vision.resizeRgbNormalizedChw(
-            allocator,
-            chw,
-            px[0..source_len],
-            src_h,
-            src_w,
-            rh,
-            rw,
-            resampleFilterFor(vp),
-        ) catch return null;
+        if (vp.mode == .mimo) {
+            mimo_vision.resizeNormalizedChw(chw, px[0..source_len], src_h, src_w, rh, rw) catch return null;
+        } else {
+            qwen_vision.resizeRgbNormalizedChw(
+                allocator,
+                chw,
+                px[0..source_len],
+                src_h,
+                src_w,
+                rh,
+                rw,
+                resampleFilterFor(vp),
+            ) catch return null;
+        }
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
@@ -24050,4 +24081,118 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
     // The defaulted ask covers the whole entry, so the commit path never trims it.
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
+}
+
+pub fn slidingBandScoreBytes(config: *const model_mod.ModelConfig, fwd: u64) u64 {
+    if (config.swaRingTokens() == 0) return 0;
+    if (transformer_mod.slidingPrefillFused(config, fwd)) return 0;
+    const keys: u64 = @as(u64, config.sliding_window) +| fwd -| 1;
+    return MOE_PREFILL_COEXIST *| @as(u64, config.num_attention_heads) *| fwd *| keys *| 2;
+}
+
+pub fn fp8DequantScratchBytes(config: *const model_mod.ModelConfig, fwd: u64) u64 {
+    if (!config.usesMimoSourceTrunk() or fwd <= @as(u64, @intCast(fp8_block.gemv_max_rows))) return 0;
+    var widest: u64 = config.intermediate_size;
+    for (0..config.num_hidden_layers) |i| {
+        const l: u32 = @intCast(i);
+        const qkv: u64 = @as(u64, config.layerNumHeads(l)) * config.layerHeadDim(l) +
+            @as(u64, config.layerKVHeads(l)) * (config.layerHeadDim(l) + config.layerVHeadDim(l));
+        widest = @max(widest, qkv);
+    }
+    return 2 *| widest *| config.hidden_size *| 2;
+}
+
+pub fn kvDequantScratchBytes(config: *const model_mod.ModelConfig, seq: u64, _: u64) u64 {
+    // A QSA layer rebuilds only what a forward of this width cannot gather in place.
+    if (config.swaRingTokens() == 0) return 0;
+    // A layer whose prefill attention reads the PACKED cache one dispatch at a
+    // time (`transformer.fusedSdpaPrefillKv`) never rebuilds more than a
+    // dispatch's keys, at `MOE_PREFILL_COEXIST` of them — the dispatches are
+    // serially dependent through the softmax carry, so this is the ceiling.
+    // The kill switch takes the width off `prefillHeadDimFused` and the whole
+    // rebuild comes back with it. A decode rebuilds whole below the packed arms' floor.
+    const seq_rows: u64 = if (transformer_mod.prefillHeadDimFused(config.prefillScoreHeadDim()))
+        @max(MOE_PREFILL_COEXIST *| @as(u64, @intCast(transformer_mod.PACKED_KV_SLICE_MAX)), transformer_mod.mimoGlobalDecodeRebuildMaxKeys())
+    else
+        seq;
+    var widest: u64 = 0;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        const rows: u64 = if (config.isKvPerTokenLayer(li)) @min(seq, seq_rows) else @min(seq, config.swaRingTokens());
+        widest = @max(widest, rows *| config.layerKvBytes(li));
+    }
+    return widest;
+}
+
+pub fn batchedDecodeRowsBytes(config: *const model_mod.ModelConfig) u64 {
+    if (!config.supportsBatchedMimoDecode()) return 0;
+    const keys = transformer_mod.mimoGlobalDecodeRebuildMaxKeys();
+    if (keys == std.math.maxInt(u64)) return 0;
+    var widest: u64 = 0;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        if (config.isKvPerTokenLayer(li)) widest = @max(widest, config.layerKvBytes(li));
+    }
+    return @as(u64, scheduler_mod.batchGroupCap(config) - 1) *| keys *| widest;
+}
+
+pub fn slotRingBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    const swa = config.swaRingBytes() +| prefix_cache_mod.SLOT_RING_CHECKPOINTS *| config.swaRingCheckpointBytes();
+    return config.qsaRingBytes() +| kvBytesPerTokenAtBits(swa, kv_bits) +| batchedDecodeRowsBytes(config);
+}
+
+fn perRequestFloorWidth(config: *const model_mod.ModelConfig) ?u32 {
+    if (!perRequestPrefillChunkEnabled(config) or generate_mod.envPrefillChunk() > 0) return null;
+    return cappedRung(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], explicitPrefillChunk());
+}
+
+pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pinned: u32, launch: usize) ?[]const u8 {
+    if (perRequestPrefillChunkEnabled(config) and generate_mod.envPrefillChunk() == 0) {
+        const widest = rungWidth(config, 1, PREFILL_CHUNK_LADDER[0], config.longCtxGated());
+        return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d} (MLX_SERVE_PREFILL_CHUNK_PER_REQUEST=0)\n", .{ widest, pinned }) catch null;
+    }
+    if (pinned >= launch) return null;
+    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ pinned, launch }) catch null;
+}
+
+pub fn requestPrefillPick(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, available: u64, unchunked_prefill: bool, warm: WarmPrefix) u32 {
+    const explicit = explicitPrefillChunk();
+    if (unchunked_prefill or !perRequestPrefillChunkEnabled(config))
+        return if (explicit > 0) explicit else config.pinned_prefill_chunk;
+    return chooseRequestPrefillChunk(config, seq, max_tokens, kv_bits, available, config.pinned_prefill_chunk, explicit, warm);
+}
+
+fn cappedRung(rung: u32, cap: u32) u32 {
+    return if (cap == 0) rung else @min(rung, cap);
+}
+
+fn mimoGrowCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, reserved: u64, kv_per_tok: u64) u64 {
+    if (warm.grows(seq)) return oldBuffersInEvalWindow(config, warm.capacity_tokens, seq -| warm.matched_tokens, kv_per_tok);
+    if (warm.decodeOutgrows(seq, reserved)) {
+        // Unreserved, the first decode step past C grows every layer inside one forward.
+        if (!transformer_mod.KVCache.kvReservationEnabled()) return warm.capacity_tokens *| kv_per_tok;
+        // Reserved, the prefill grows each layer first (`KVCache.growToReservation`), one eval at a
+        // time; a share's old rows stay the entry's.
+        return if (warm.will_donate) oldBuffersInEvalWindow(config, warm.capacity_tokens, 1 << 20, kv_per_tok) else 0;
+    }
+    // An SSD restore installs each layer at exactly its restored rows, so the first append grows
+    // it beside the restored buffer. A ringed arch's admission never sees the restore (it bills a
+    // warm request cold), so with a disk tier it bills that coexistence at the prompt's length.
+    if (prefix_cache_disk_bytes > 0 and config.swaRingTokens() > 0 and !config.longCtxGated())
+        return oldBuffersInEvalWindow(config, seq, seq, kv_per_tok);
+    return 0;
+}
+
+fn oldBuffersInEvalWindow(config: *const model_mod.ModelConfig, tokens: u64, span: u64, kv_per_tok: u64) u64 {
+    // The layers `kv_per_tok` is the sum over, not every caching layer: on a
+    // ringed arch those are nine of forty-eight.
+    const attn = config.kvPerTokenLayerCount();
+    if (attn == 0) return 0;
+    const window: u32 = if (transformer_mod.Transformer.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
+        attnLayersPerEvalWindow(config, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS)
+    else
+        attn;
+    if (window == 0) return 0;
+    // The old buffer's own size, spread over the layers that cache.
+    return tokens *| kv_per_tok / attn *| window;
 }
