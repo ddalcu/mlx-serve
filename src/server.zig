@@ -607,7 +607,15 @@ fn parseJsonFloatOpt(root: std.json.ObjectMap, key: []const u8, min: f32, max: f
         .integer => |i| @floatFromInt(i),
         else => return null,
     };
-    return std.math.clamp(raw, min, max);
+    return if (std.math.isFinite(raw)) std.math.clamp(raw, min, max) else null;
+}
+
+fn resolveRepeatPenalty(root: std.json.ObjectMap, model_default: ?f32) f32 {
+    if (parseJsonFloatOpt(root, "repeat_penalty", 0.0, 10.0)) |repeat| {
+        if (repeat > 0.0) return repeat;
+    }
+    if (parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0)) |frequency| return 1.0 + frequency;
+    return model_default orelse 1.0;
 }
 
 /// Optional top_k body-field parse (positive integer, capped at 1000).
@@ -8579,16 +8587,9 @@ fn handleChatCompletions(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-
-    const repeat_penalty: f32 = blk: {
-        const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-        if (rp > 0.0) break :blk rp;
-        // Also check frequency_penalty (OpenAI format: 0-2 range, mapped to 1.0 + fp)
-        const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-        break :blk if (fp > 0.0) 1.0 + fp else 1.0;
-    };
-
-    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const repeat_penalty = resolveRepeatPenalty(root, config.gen_repeat_penalty);
+    const presence_penalty = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), null, config.gen_presence_penalty, 0.0);
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -9048,6 +9049,7 @@ fn handleChatCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
@@ -9175,24 +9177,9 @@ fn handleCompletions(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-
-    const repeat_penalty: f32 = if (root.get("repeat_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => blk: {
-            break :blk if (root.get("frequency_penalty")) |fp| switch (fp) {
-                .float => |f| 1.0 + @as(f32, @floatCast(f)),
-                .integer => |i| 1.0 + @as(f32, @floatFromInt(i)),
-                else => 1.0,
-            } else 1.0;
-        },
-    } else 1.0;
-
-    const presence_penalty_c: f32 = if (root.get("presence_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(@min(@max(f, 0.0), 2.0)),
-        .integer => |i| @floatFromInt(@min(@max(i, 0), 2)),
-        else => 0.0,
-    } else 0.0;
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const repeat_penalty = resolveRepeatPenalty(root, config.gen_repeat_penalty);
+    const presence_penalty_c = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), null, config.gen_presence_penalty, 0.0);
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -9308,6 +9295,7 @@ fn handleCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
         .seed = seed,
@@ -15027,6 +15015,9 @@ fn handleAnthropicMessages(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const repeat_penalty = resolveRepeatPenalty(root, config.gen_repeat_penalty);
+    const presence_penalty = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), null, config.gen_presence_penalty, 0.0);
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Tools
@@ -15330,8 +15321,9 @@ fn handleAnthropicMessages(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
-        .repeat_penalty = 1.0,
-        .presence_penalty = 0.0,
+        .min_p = min_p,
+        .repeat_penalty = repeat_penalty,
+        .presence_penalty = presence_penalty,
         .seed = seed,
     };
 
@@ -16833,9 +16825,10 @@ fn handleResponsesInner(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-    const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
-    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const frequency_penalty = parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0) orelse 0.0;
+    const repeat_penalty = resolveRepeatPenalty(root, config.gen_repeat_penalty);
+    const presence_penalty = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), null, config.gen_presence_penalty, 0.0);
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
@@ -17095,6 +17088,7 @@ fn handleResponsesInner(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
@@ -20032,8 +20026,22 @@ test "expandMediaPlaceholders: an LFM2-VL tiled source is one item, every tile l
     // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
     const want = [_]u32{
         1,
-        125009, 124908, 124907, 124909, 124907, 124918, 124907, 124919, 124907, 125008, 124907, 125010,
-        125009, 124907, 124907, 125010,
+        125009,
+        124908,
+        124907,
+        124909,
+        124907,
+        124918,
+        124907,
+        124919,
+        124907,
+        125008,
+        124907,
+        125010,
+        125009,
+        124907,
+        124907,
+        125010,
         2,
     };
     try testing.expectEqualSlices(u32, &want, out.ids);
@@ -21138,6 +21146,23 @@ test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
     try std.testing.expectEqual(@as(f32, 1.0), resolveSamplingDefault(f32, null, null, null, 1.0));
     // Explicit request 0 (greedy) must not be treated as omitted.
     try std.testing.expectEqual(@as(f32, 0.0), resolveSamplingDefault(f32, 0.0, 0.7, 1.0, 1.0));
+}
+
+test "sampling penalties preserve explicit zero and frequency precedence" {
+    const cases = [_]struct { json: []const u8, want_repeat: f32, want_presence: f32, want_min_p: ?f32 }{
+        .{ .json = "{}", .want_repeat = 1.4, .want_presence = 0.5, .want_min_p = 0.05 },
+        .{ .json = "{\"frequency_penalty\":0,\"presence_penalty\":0,\"min_p\":0}", .want_repeat = 1.0, .want_presence = 0.0, .want_min_p = 0.0 },
+        .{ .json = "{\"repeat_penalty\":1.8,\"frequency_penalty\":0.4}", .want_repeat = 1.8, .want_presence = 0.5, .want_min_p = 0.05 },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.json, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqual(case.want_repeat, resolveRepeatPenalty(root, 1.4));
+        try std.testing.expectEqual(case.want_presence, resolveSamplingDefault(f32, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), null, 0.5, 0.0));
+        const min_p: ?f32 = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse 0.05;
+        try std.testing.expectEqual(case.want_min_p, min_p);
+    }
 }
 
 test "detokenizeResponseJson escapes arbitrary token bytes (control-byte class)" {

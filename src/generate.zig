@@ -781,6 +781,7 @@ pub const SamplingParams = struct {
     temperature: f32 = 1.0,
     top_p: f32 = 1.0,
     top_k: u32 = 0, // 0 = disabled
+    min_p: ?f32 = null,
     repeat_penalty: f32 = 1.0,
     presence_penalty: f32 = 0.0, // 0.0 = disabled
     seed: ?u64 = null,
@@ -12106,6 +12107,14 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
+    const min_p = sampling.min_p orelse 0;
+    if (min_p > 0) {
+        var masked = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(masked);
+        try applyMinP(&masked, current, min_p, s);
+        _ = mlx.mlx_array_free(current);
+        current = masked;
+    }
 
     var probs = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(probs);
@@ -12259,6 +12268,14 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
     if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
         filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        _ = mlx.mlx_array_free(current);
+        current = masked;
+    }
+    const min_p = sampling.min_p orelse 0;
+    if (min_p > 0) {
+        var masked = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(masked);
+        try applyMinP(&masked, current, min_p, s);
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -12692,7 +12709,7 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
 
     if (sampling.keyed and sampling.seed != null) {
         defer _ = mlx.mlx_array_free(current);
-        const p: keyed_sample.Params = .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k };
+        const p: keyed_sample.Params = .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k, .min_p = sampling.min_p orelse 0 };
         const pos = [_]u32{@intCast(sampling.position_base + sampling.draw)};
         return keyed_sample.sample(current, p, &pos, s) catch mlx.mlx_array_new();
     }
@@ -12711,6 +12728,12 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var next = mlx.mlx_array_new();
         filterTopKTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
+        _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+    if ((sampling.min_p orelse 0) > 0) {
+        var next = mlx.mlx_array_new();
+        applyMinP(&next, current, sampling.min_p.?, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = next;
     }
@@ -12755,7 +12778,7 @@ pub fn sampleRows(out: []i32, row_logits: []const mlx.mlx_array, params: []Sampl
 fn sampleRowsHomogeneous(params: []const SamplingParams) bool {
     const p0 = params[0];
     for (params[1..]) |p| {
-        if (p.temperature != p0.temperature or p.top_k != p0.top_k or p.top_p != p0.top_p) return false;
+        if (p.temperature != p0.temperature or p.top_k != p0.top_k or p.top_p != p0.top_p or (p.min_p orelse 0) != (p0.min_p orelse 0)) return false;
         const m0 = p0.suppress_mask;
         const m1 = p.suppress_mask;
         if (m0 == null and m1 == null) continue;
@@ -12897,6 +12920,13 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
             current = mlx.mlx_array_new();
         };
         if (current.ctx != null) _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+    if ((p0.min_p orelse 0) > 0) {
+        var next = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(next);
+        try applyMinP(&next, current, p0.min_p.?, s);
+        _ = mlx.mlx_array_free(current);
         current = next;
     }
 
@@ -14045,7 +14075,7 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
 
     if (sampling.keyed and sampling.seed != null) {
         const pos = [_]u32{@intCast(sampling.position_base + sampling.draw)};
-        const tok = try keyed_sample.sample(current, .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k }, &pos, s);
+        const tok = try keyed_sample.sample(current, .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k, .min_p = sampling.min_p orelse 0 }, &pos, s);
         defer _ = mlx.mlx_array_free(tok);
         try mlx.check(mlx.mlx_array_eval(tok));
         const token_id = (mlx.mlx_array_data_uint32(tok) orelse return error.MlxArrayDataNull)[0];
@@ -14085,6 +14115,15 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         try filterTopKTopP(&filtered, current, sampling.top_p, sampling.top_k, s);
         current = filtered;
         filtered_owned = true;
+    }
+    var min_filtered: mlx.mlx_array = .{ .ctx = null };
+    defer if (min_filtered.ctx != null) {
+        _ = mlx.mlx_array_free(min_filtered);
+    };
+    if ((sampling.min_p orelse 0) > 0) {
+        min_filtered = mlx.mlx_array_new();
+        try applyMinP(&min_filtered, current, sampling.min_p.?, s);
+        current = min_filtered;
     }
 
     // Sample from categorical distribution
@@ -14503,6 +14542,23 @@ fn keepByIndex(res: *mlx.mlx_array, logits: mlx.mlx_array, keep_idx: mlx.mlx_arr
 fn filterTopKTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, top_k: u32, s: mlx.mlx_stream) !void {
     if (top_p >= 1.0) return applyTopK(res, logits, top_k, s);
     return applyTopP(res, logits, top_p, top_k, s);
+}
+
+fn applyMinP(res: *mlx.mlx_array, logits: mlx.mlx_array, min_p: f32, s: mlx.mlx_stream) !void {
+    var max_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(max_logits);
+    try mlx.check(mlx.mlx_max_axis(&max_logits, logits, -1, true, s));
+    const log_min_p = mlx.mlx_array_new_float(@log(min_p));
+    defer _ = mlx.mlx_array_free(log_min_p);
+    var threshold = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(threshold);
+    try mlx.check(mlx.mlx_add(&threshold, max_logits, log_min_p, s));
+    var keep = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(keep);
+    try mlx.check(mlx.mlx_greater_equal(&keep, logits, threshold, s));
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    try mlx.check(mlx.mlx_where(res, keep, logits, neg_inf, s));
 }
 
 /// Apply top-p (nucleus) sampling: mask logits outside the top-p probability
@@ -14940,6 +14996,120 @@ test "sampleToken with temperature produces valid token" {
     const result = try sampleToken(allocator, logits, params, null, 0, s);
     // Token should be in valid range
     try testing.expect(result.token_id < 3);
+}
+
+test "min_p filters each row after temperature and preserves tied maxima" {
+    const s = mlx.gpuStream();
+    const raw = [_]f32{ 0, 0, -1, -2, 3, 2, 0, -3 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 2, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    var tied = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tied);
+    try applyMinP(&tied, logits, 1, s);
+    const got = try samplerTestReadFlat(testing.allocator, tied, 8, s);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(f32, 0), got[0]);
+    try testing.expectEqual(@as(f32, 0), got[1]);
+    try testing.expectEqual(@as(f32, 3), got[4]);
+    for ([_]usize{ 2, 3, 5, 6, 7 }) |i| try testing.expectEqual(-std.math.inf(f32), got[i]);
+
+    const scaled = mlx.mlx_array_new_data(&[_]f32{ 0, -0.5, -1 }, &[_]c_int{ 1, 3 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(scaled);
+    var half = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(half);
+    try applyMinP(&half, scaled, 0.5, s);
+    const half_data = try samplerTestReadFlat(testing.allocator, half, 3, s);
+    defer testing.allocator.free(half_data);
+    try testing.expectEqual(@as(f32, -0.5), half_data[1]);
+    try testing.expectEqual(-std.math.inf(f32), half_data[2]);
+}
+
+test "min_p proposal density matches post top_k and top_p filtering" {
+    const s = mlx.gpuStream();
+    const raw = [_]f32{ 3, 2, 1, -5, -5, 1, 2, 3 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 2, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var base_rows = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&base_rows, logits));
+    const base = try filteredProbsRows(base_rows, .{ .top_k = 2 }, s);
+    defer _ = mlx.mlx_array_free(base);
+    var zero_rows = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&zero_rows, logits));
+    const zero = try filteredProbsRows(zero_rows, .{ .top_k = 2, .min_p = 0 }, s);
+    defer _ = mlx.mlx_array_free(zero);
+    try samplerTestExpectSameBits(base, zero, 8, s);
+
+    var filtered_rows = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&filtered_rows, logits));
+    const filtered = try filteredProbsRows(filtered_rows, .{ .top_k = 2, .min_p = 0.5 }, s);
+    defer _ = mlx.mlx_array_free(filtered);
+    const p = try samplerTestReadFlat(testing.allocator, filtered, 8, s);
+    defer testing.allocator.free(p);
+    try testing.expectEqual(@as(f32, 1), p[0]);
+    try testing.expectEqual(@as(f32, 1), p[7]);
+    for ([_]usize{ 1, 2, 3, 4, 5, 6 }) |i| try testing.expectEqual(@as(f32, 0), p[i]);
+
+    var nucleus_rows = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&nucleus_rows, logits));
+    const nucleus = try filteredProbsRows(nucleus_rows, .{ .top_p = 0.6, .min_p = 0.5 }, s);
+    defer _ = mlx.mlx_array_free(nucleus);
+    const np = try samplerTestReadFlat(testing.allocator, nucleus, 8, s);
+    defer testing.allocator.free(np);
+    try testing.expectEqual(@as(f32, 1), np[0]);
+    try testing.expectEqual(@as(f32, 1), np[7]);
+}
+
+test "min_p scalar and batch sampling follow each row policy" {
+    const s = mlx.gpuStream();
+    const raw = [_]f32{ 3, 2, 1, -5, -5, 1, 2, 3 };
+    const r0 = mlx.mlx_array_new_data(&raw[0], &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&raw[4], &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+    const strict = SamplingParams{ .temperature = 1, .min_p = 0.5, .top_k = 2 };
+    try testing.expectEqual(@as(u32, 0), try evalLazyToken(sampleTokenLazy(r0, strict, s)));
+    const sync = try sampleToken(testing.allocator, r0, strict, null, 0, s);
+    try testing.expectEqual(@as(u32, 0), sync.token_id);
+
+    var same = [_]SamplingParams{ strict, strict };
+    var ids: [2]i32 = undefined;
+    try sampleRows(&ids, &.{ r0, r1 }, &same, s);
+    try testing.expectEqualSlices(i32, &.{ 0, 3 }, &ids);
+
+    const open = SamplingParams{ .temperature = 1, .min_p = 0 };
+    try testing.expect(!sampleRowsHomogeneous(&.{ strict, open }));
+    try testing.expect(sampleRowsHomogeneous(&.{ SamplingParams{}, open }));
+    var mixed = [_]SamplingParams{ strict, SamplingParams{ .temperature = 1, .min_p = 1 } };
+    try sampleRows(&ids, &.{ r0, r1 }, &mixed, s);
+    try testing.expectEqualSlices(i32, &.{ 0, 3 }, &ids);
+
+    const tied = mlx.mlx_array_new_data(&[_]f32{ 0, 0, -2, -3 }, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(tied);
+    for (0..8) |draw| {
+        const p = SamplingParams{ .seed = 17, .draw = draw, .temperature = 1 };
+        try testing.expectEqual(try evalLazyToken(sampleTokenLazy(tied, p, s)), try evalLazyToken(sampleTokenLazy(tied, .{ .seed = 17, .draw = draw, .temperature = 1, .min_p = 0 }, s)));
+    }
+}
+
+test "min_p speculative target and draft densities match after temperature and nucleus" {
+    const s = mlx.gpuStream();
+    const raw = [_]f32{ 3, 2.8, 0, -5, -5, 0, 2.8, 3 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 2, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const p = SamplingParams{ .temperature = 2, .top_k = 3, .top_p = 0.9, .min_p = 0.5 };
+    const target = try probsAllPositions(logits, p, s);
+    defer _ = mlx.mlx_array_free(target);
+    const group = try groupProbsBlock(logits, p, s);
+    defer _ = mlx.mlx_array_free(group);
+    const draft = try filteredProbsBlock(logits, p, s);
+    defer _ = mlx.mlx_array_free(draft);
+    try samplerTestExpectSameBits(target, group, 8, s);
+    try samplerTestExpectSameBits(target, draft, 8, s);
+    const v = try samplerTestReadFlat(testing.allocator, target, 8, s);
+    defer testing.allocator.free(v);
+    try testing.expect(v[0] > 0 and v[1] > 0 and v[6] > 0 and v[7] > 0);
+    for ([_]usize{ 2, 3, 4, 5 }) |i| try testing.expectEqual(@as(f32, 0), v[i]);
 }
 
 test "seeded lazy sampling replays the same draws and advances per draw" {

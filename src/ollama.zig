@@ -305,6 +305,7 @@ fn writeCommonFields(w: *std.Io.Writer, root: std.json.ObjectMap) !void {
             try passNumberOpt(w, opts, "temperature", "temperature");
             try passNumberOpt(w, opts, "top_p", "top_p");
             try passNumberOpt(w, opts, "top_k", "top_k");
+            try passNumberOpt(w, opts, "min_p", "min_p");
             try passNumberOpt(w, opts, "repeat_penalty", "repeat_penalty");
             try passNumberOpt(w, opts, "presence_penalty", "presence_penalty");
             try passNumberOpt(w, opts, "frequency_penalty", "frequency_penalty");
@@ -891,8 +892,7 @@ pub const Sink = struct {
     fn ensureStreamHeaders(self: *Sink) !void {
         if (self.started) return;
         self.started = true;
-        try self.outFn(self.out_impl,
-            "HTTP/1.1 200 OK\r\n" ++
+        try self.outFn(self.out_impl, "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: application/x-ndjson\r\n" ++
             "Cache-Control: no-cache\r\n" ++
             "Connection: close\r\n" ++
@@ -1098,7 +1098,7 @@ test "ollama: chat request honors stream:false and maps options" {
     const allocator = testing.allocator;
     var tr = try translateChatRequest(allocator,
         \\{"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}],
-        \\ "options":{"num_predict":64,"temperature":0.5,"top_p":0.25,"top_k":40,"seed":7,
+        \\ "options":{"num_predict":64,"temperature":0.5,"top_p":0.25,"top_k":40,"min_p":0,"seed":7,
         \\            "repeat_penalty":1.5,"stop":["END"],"num_ctx":4096}}
     );
     defer tr.deinit(allocator);
@@ -1113,6 +1113,7 @@ test "ollama: chat request honors stream:false and maps options" {
     try testing.expectEqual(@as(f64, 0.5), root.get("temperature").?.float);
     try testing.expectEqual(@as(f64, 0.25), root.get("top_p").?.float);
     try testing.expectEqual(@as(i64, 40), root.get("top_k").?.integer);
+    try testing.expectEqual(@as(i64, 0), root.get("min_p").?.integer);
     try testing.expectEqual(@as(i64, 7), root.get("seed").?.integer);
     try testing.expectEqual(@as(f64, 1.5), root.get("repeat_penalty").?.float);
     try testing.expectEqualStrings("END", root.get("stop").?.array.items[0].string);
