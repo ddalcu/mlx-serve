@@ -172,8 +172,9 @@ for path in sorted(Path(sys.argv[1]).glob("*.json")):
     if decode is None:
         print(f"| {path.stem} | · |  (no bench block)")
         continue
+    pf = "n/a" if prefill is None else f"{prefill:.0f}"
     print(f"| {path.stem} | {decode:.0f}{mode} |"
-          f"  (prefill {prefill:.0f}, {tps:.2f} tok/step)")
+          f"  (prefill {pf}, {tps:.2f} tok/step)")
 PY
 echo
 echo "=== reports $OUT"
