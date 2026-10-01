@@ -327,7 +327,7 @@ final class VoiceModeController: ObservableObject {
     /// still exists, otherwise the highest-quality voice for the user's language
     /// (so we don't default to the robotic compact voice).
     private func setUpVoices(_ all: [VoiceOption]) {
-        let prefix = Locale.current.language.languageCode?.identifier ?? "en"
+        let prefix = SpeechLocale.resolvedRecognitionLocale().language.languageCode?.identifier ?? "en"
         availableVoices = VoiceCatalog.options(from: all, preferredLanguagePrefix: prefix)
         let saved = UserDefaults.standard.string(forKey: Self.voiceDefaultsKey)
         let chosen = (saved != nil && availableVoices.contains { $0.id == saved }) ? saved
@@ -418,7 +418,7 @@ final class VoiceModeController: ObservableObject {
         unrecognizedSpeechStreak += 1
         guard unrecognizedSpeechStreak >= Self.unrecognizedSpeechLimit else { return }
         end()
-        setupIssue = .dictationUnavailable(locale: Locale.current.identifier)
+        setupIssue = .dictationUnavailable(locale: SpeechLocale.resolvedRecognitionLocale().identifier)
     }
 
     /// Close voice mode and release all audio resources.

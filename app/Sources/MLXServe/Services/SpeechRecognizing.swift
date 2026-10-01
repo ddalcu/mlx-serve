@@ -43,7 +43,7 @@ extension SpeechRecognizing {
     func preflight() async -> VoicePreflight.Snapshot {
         let ok = await requestAuthorization()
         return VoicePreflight.Snapshot(micAuthorized: ok, speechAuthorized: ok,
-                                       onDeviceAvailable: true, locale: Locale.current.identifier)
+                                       onDeviceAvailable: true, locale: SpeechLocale.resolvedRecognitionLocale().identifier)
     }
 }
 
@@ -132,9 +132,10 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
         let speech = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0 == .authorized) }
         }
-        let onDevice = SFSpeechRecognizer(locale: Locale.current)?.supportsOnDeviceRecognition ?? false
+        let locale = SpeechLocale.resolvedRecognitionLocale()
+        let onDevice = SFSpeechRecognizer(locale: locale)?.supportsOnDeviceRecognition ?? false
         return VoicePreflight.Snapshot(micAuthorized: mic, speechAuthorized: speech,
-                                       onDeviceAvailable: onDevice, locale: Locale.current.identifier)
+                                       onDeviceAvailable: onDevice, locale: locale.identifier)
     }
 
     func start() throws {
@@ -244,7 +245,7 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
 
 @MainActor
 final class LegacySpeechRecognizer: BaseSpeechRecognizer {
-    private let recognizer = SFSpeechRecognizer(locale: Locale.current)
+    private let recognizer = SFSpeechRecognizer(locale: SpeechLocale.resolvedRecognitionLocale())
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
 
@@ -258,7 +259,7 @@ final class LegacySpeechRecognizer: BaseSpeechRecognizer {
         // stream audio to Apple's servers (its default fallback).
         if let msg = OnDeviceSpeech.unavailableMessage(
             supportsOnDevice: recognizer.supportsOnDeviceRecognition,
-            locale: Locale.current.identifier) {
+            locale: recognizer.locale.identifier) {
             throw NSError(domain: "SpeechRecognizer", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: msg])
         }
@@ -310,7 +311,7 @@ final class LegacySpeechRecognizer: BaseSpeechRecognizer {
 @available(macOS 26, *)
 @MainActor
 final class ModernSpeechRecognizer: BaseSpeechRecognizer {
-    private let transcriber = SpeechTranscriber(locale: Locale.current,
+    private let transcriber = SpeechTranscriber(locale: SpeechLocale.resolvedRecognitionLocale(),
                                                 preset: .progressiveTranscription)
     private var analyzer: SpeechAnalyzer?
     private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
@@ -416,5 +417,17 @@ final class ModernSpeechRecognizer: BaseSpeechRecognizer {
         self.analyzer = nil
         converter = nil
         Task { try? await analyzer?.finalizeAndFinishThroughEndOfInput() }
+    }
+}
+
+// MARK: - Live locale probe
+
+extension SpeechLocale {
+    /// Live probe behind every recognition site: picks the first preferred
+    /// language whose on-device model is installed (see `SpeechLocale.resolve`).
+    static func resolvedRecognitionLocale() -> Locale {
+        resolve(preferredLanguages: Locale.preferredLanguages,
+                supportsOnDevice: { SFSpeechRecognizer(locale: $0)?.supportsOnDeviceRecognition ?? false },
+                fallback: .current)
     }
 }

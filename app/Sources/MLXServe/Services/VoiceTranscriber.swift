@@ -21,7 +21,7 @@ enum VoiceTranscriber {
         case failed(String)
     }
 
-    static func transcribe(fileURL: URL, locale: Locale = .current) async -> Result<String, Failure> {
+    static func transcribe(fileURL: URL, locale: Locale = SpeechLocale.resolvedRecognitionLocale()) async -> Result<String, Failure> {
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
             return .failure(.unavailable("Speech recognition isn't available for \(locale.identifier)."))
         }
