@@ -21,14 +21,33 @@ enum VoiceTranscriber {
         case failed(String)
     }
 
-    static func transcribe(fileURL: URL, locale: Locale = SpeechLocale.resolvedRecognitionLocale()) async -> Result<String, Failure> {
-        guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
-            return .failure(.unavailable("Speech recognition isn't available for \(locale.identifier)."))
+    static func transcribe(fileURL: URL, locale: Locale? = nil) async -> Result<String, Failure> {
+        let resolvedLocale: Locale
+        if let locale {
+            resolvedLocale = locale
+        } else {
+            let resolution = SpeechLocale.resolve(
+                preferredLanguages: Locale.preferredLanguages,
+                supportedLocales: Array(SFSpeechRecognizer.supportedLocales()),
+                isAvailable: {
+                    SFSpeechRecognizer(locale: $0)?.supportsOnDeviceRecognition ?? false
+                },
+                fallback: .current)
+            switch resolution {
+            case .available(let locale), .unavailable(let locale):
+                resolvedLocale = locale
+            case .unsupported(let fallback):
+                return .failure(.unavailable(
+                    "Speech recognition isn't available for \(fallback.identifier)."))
+            }
         }
-        // On-device-only gate (reused pure helper, already unit-tested).
+
+        guard let recognizer = SFSpeechRecognizer(locale: resolvedLocale), recognizer.isAvailable else {
+            return .failure(.unavailable("Speech recognition isn't available for \(resolvedLocale.identifier)."))
+        }
         if let message = OnDeviceSpeech.unavailableMessage(
             supportsOnDevice: recognizer.supportsOnDeviceRecognition,
-            locale: locale.identifier) {
+            locale: resolvedLocale.identifier) {
             return .failure(.unavailable(message))
         }
 

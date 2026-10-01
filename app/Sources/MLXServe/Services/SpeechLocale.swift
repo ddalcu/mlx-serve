@@ -1,52 +1,58 @@
 import Foundation
 
-/// Resolves the locale voice mode recognizes against: the user's own speech
-/// language, taken from `Locale.preferredLanguages` (the user's ordered speech
-/// languages, bundle-independent). `Locale.current` is unsuitable here because
-/// macOS derives it from the bundle's shipped localizations, which can resolve
-/// to a pseudo-locale (e.g. `en_JP`) with no on-device dictation model.
-///
-/// Pure → unit-testable without the Speech framework; the live
-/// `SFSpeechRecognizer` probe lives in `SpeechRecognizing.swift`.
 enum SpeechLocale {
-    /// Canonical Apple speech-recognizer key from a BCP-47 tag.
-    ///
-    /// Two steps, both required: `-`→`_` so `Locale(identifier:)` parses the
-    /// region (`ja-JP` is otherwise left un-canonicalized), then read
-    /// `Locale(identifier:).identifier`, which collapses a script+region tag to
-    /// Apple's key (`zh-Hans-CN` → `zh_CN`). A naive `-`→`_` alone leaves the
-    /// non-key `zh_Hans_CN`. A script-only tag (`zh-Hans`) has no region to key
-    /// on and stays as-is, then gets filtered out because no recognizer binds.
-    static func canonicalKey(from bcp47: String) -> String {
-        Locale(identifier: bcp47.replacingOccurrences(of: "-", with: "_")).identifier
-    }
+    enum Resolution: Equatable {
+        case available(Locale)
+        case unavailable(Locale)
+        case unsupported(Locale)
 
-    /// Ordered, de-duplicated canonical candidate keys for the user's preferred
-    /// languages, highest priority first. Empty input yields an empty list.
-    static func candidateKeys(preferredLanguages: [String]) -> [String] {
-        var seen = Set<String>()
-        var keys: [String] = []
-        for lang in preferredLanguages {
-            let key = canonicalKey(from: lang)
-            if !key.isEmpty, seen.insert(key).inserted { keys.append(key) }
+        var locale: Locale {
+            switch self {
+            case .available(let locale), .unavailable(let locale), .unsupported(let locale):
+                return locale
+            }
         }
-        return keys
+
+        var isAvailable: Bool {
+            if case .available = self { return true }
+            return false
+        }
     }
 
-    /// The locale to recognize against: the first candidate whose on-device model
-    /// is installed (`supportsOnDevice` returns true). If none is installed, the
-    /// first candidate anyway — so the caller's "dictation unavailable" card names
-    /// the user's own language. If there are no candidates, `fallback` (the caller
-    /// passes `Locale.current`). `supportsOnDevice` is injected so this stays pure.
     static func resolve(preferredLanguages: [String],
-                        supportsOnDevice: (Locale) -> Bool,
-                        fallback: Locale) -> Locale {
-        let keys = candidateKeys(preferredLanguages: preferredLanguages)
-        for key in keys {
-            let locale = Locale(identifier: key)
-            if supportsOnDevice(locale) { return locale }
+                        supportedLocales: [Locale],
+                        isAvailable: (Locale) -> Bool,
+                        fallback: Locale) -> Resolution {
+        let supported = supportedLocales.sorted { $0.identifier < $1.identifier }
+        var firstMatch: Locale?
+
+        for identifier in preferredLanguages {
+            let preferred = Locale(identifier: identifier)
+            let matches = supported
+                .filter { sameLanguage(preferred, $0) }
+                .sorted { rank($0, for: preferred) < rank($1, for: preferred) }
+            if firstMatch == nil { firstMatch = matches.first }
+            if let available = matches.first(where: isAvailable) {
+                return .available(available)
+            }
         }
-        if let first = keys.first { return Locale(identifier: first) }
-        return fallback
+
+        if let firstMatch { return .unavailable(firstMatch) }
+        return .unsupported(fallback)
+    }
+
+    private static func sameLanguage(_ lhs: Locale, _ rhs: Locale) -> Bool {
+        guard let lhsCode = lhs.language.languageCode,
+              let rhsCode = rhs.language.languageCode else { return false }
+        return lhsCode == rhsCode
+    }
+
+    private static func rank(_ candidate: Locale, for preferred: Locale) -> (Int, Int, Int, String) {
+        let equivalent = preferred.language.isEquivalent(to: candidate.language) ? 0 : 1
+        let script = preferred.language.script
+        let scriptRank = script == nil || script == candidate.language.script ? 0 : 1
+        let region = preferred.region
+        let regionRank = region == nil || region == candidate.region ? 0 : 1
+        return (equivalent, scriptRank, regionRank, candidate.identifier)
     }
 }
