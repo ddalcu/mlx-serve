@@ -38,7 +38,15 @@ enum SpeechLocale {
         }
 
         if let firstMatch { return .unavailable(firstMatch) }
-        return .unsupported(fallback)
+        return .unsupported(reportingLocale(preferredLanguages: preferredLanguages, fallback: fallback))
+    }
+
+    /// Report-only locale when nothing matched: the language the user is
+    /// trying to speak. `fallback` (bundle-mangled `Locale.current`) stands in
+    /// only for empty preferences — never build a recognizer from the result.
+    static func reportingLocale(preferredLanguages: [String], fallback: Locale) -> Locale {
+        guard let first = preferredLanguages.first else { return fallback }
+        return Locale(identifier: first)
     }
 
     private static func sameLanguage(_ lhs: Locale, _ rhs: Locale) -> Bool {

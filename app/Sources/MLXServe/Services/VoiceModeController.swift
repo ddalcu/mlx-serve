@@ -152,7 +152,8 @@ final class VoiceModeController: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var isBound = false
     private let voiceOptions: [VoiceOption]
-    private var recognitionLocaleIdentifier = Locale.current.identifier
+    private var recognitionLocaleIdentifier = SpeechLocale.reportingLocale(
+        preferredLanguages: Locale.preferredLanguages, fallback: .current).identifier
 
     private static let voiceDefaultsKey = "voiceModeVoiceId"
     /// Which assistant message we're currently voicing — when it changes (e.g. a
@@ -184,7 +185,8 @@ final class VoiceModeController: ObservableObject {
         // write on launch.
         self.requireWakeWord = (UserDefaults.standard.object(forKey: Self.wakeWordDefaultsKey) as? Bool) ?? true
         wire()
-        let initialLocale = Locale(identifier: Locale.preferredLanguages.first ?? Locale.current.identifier)
+        let initialLocale = SpeechLocale.reportingLocale(
+            preferredLanguages: Locale.preferredLanguages, fallback: .current)
         setUpVoices(locale: initialLocale)
     }
 

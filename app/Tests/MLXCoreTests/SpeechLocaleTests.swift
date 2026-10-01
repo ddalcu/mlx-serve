@@ -74,14 +74,13 @@ final class SpeechLocaleTests: XCTestCase {
         XCTAssertEqual(result, .unavailable(Locale(identifier: "ja_JP")))
     }
 
-    func testUnsupportedResultUsesFallbackOnlyForReporting() {
-        let fallback = Locale(identifier: "en_JP")
+    func testUnsupportedResultReportsFirstPreferredLanguage() {
         let result = SpeechLocale.resolve(
-            preferredLanguages: ["fr-FR"],
+            preferredLanguages: ["xx-YY"],
             supportedLocales: [Locale(identifier: "ja_JP")],
             isAvailable: { _ in true },
-            fallback: fallback)
-        XCTAssertEqual(result, .unsupported(fallback))
+            fallback: Locale(identifier: "en_JP"))
+        XCTAssertEqual(result, .unsupported(Locale(identifier: "xx-YY")))
         XCTAssertFalse(result.isAvailable)
     }
 

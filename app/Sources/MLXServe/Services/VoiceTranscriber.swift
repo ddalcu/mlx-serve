@@ -26,19 +26,12 @@ enum VoiceTranscriber {
         if let locale {
             resolvedLocale = locale
         } else {
-            let resolution = SpeechLocale.resolve(
-                preferredLanguages: Locale.preferredLanguages,
-                supportedLocales: Array(SFSpeechRecognizer.supportedLocales()),
-                isAvailable: {
-                    SFSpeechRecognizer(locale: $0)?.supportsOnDeviceRecognition ?? false
-                },
-                fallback: .current)
-            switch resolution {
+            switch SpeechLocale.legacyResolution() {
             case .available(let locale), .unavailable(let locale):
                 resolvedLocale = locale
-            case .unsupported(let fallback):
+            case .unsupported(let reported):
                 return .failure(.unavailable(
-                    "Speech recognition isn't available for \(fallback.identifier)."))
+                    "Speech recognition isn't available for \(reported.identifier)."))
             }
         }
 

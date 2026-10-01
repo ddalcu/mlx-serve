@@ -37,13 +37,28 @@ protocol SpeechRecognizing: AnyObject {
 }
 
 extension SpeechRecognizing {
-    /// Default: derive from the combined `requestAuthorization()` and assume the
-    /// on-device model is present. The real `BaseSpeechRecognizer` overrides this
-    /// with per-prerequisite truth; test fakes inherit this and stay green.
+    /// Default for test fakes only: derive from the combined
+    /// `requestAuthorization()` and assume the on-device model is present.
+    /// Each concrete backend implements its own per-prerequisite read.
     func preflight() async -> VoicePreflight.Snapshot {
         let ok = await requestAuthorization()
         return VoicePreflight.Snapshot(micAuthorized: ok, speechAuthorized: ok,
                                        onDeviceAvailable: true, locale: Locale.current.identifier)
+    }
+}
+
+extension SpeechLocale {
+    /// The ONE legacy-engine probe: preferred languages against the Speech
+    /// framework's own supported/installed set. Both call sites (voice mode and
+    /// file transcription) resolve through here so they can't drift.
+    static func legacyResolution() -> Resolution {
+        resolve(
+            preferredLanguages: Locale.preferredLanguages,
+            supportedLocales: Array(SFSpeechRecognizer.supportedLocales()),
+            isAvailable: {
+                SFSpeechRecognizer(locale: $0)?.supportsOnDeviceRecognition ?? false
+            },
+            fallback: .current)
     }
 }
 
@@ -66,12 +81,11 @@ func makeSpeechRecognizer() -> any SpeechRecognizing {
 
 // MARK: - Shared mic tap + silence endpointing
 
-/// Owns the `AVAudioEngine` input tap, RMS level metering and the silence timer
-/// that turns continuous recognition into discrete conversational turns.
-/// Subclasses plug in a concrete recognizer via the `feed`/`reset`/`teardown`
-/// hooks and keep `currentTranscript` up to date.
+/// Owns the mic input tap, RMS metering and silence endpointing; subclasses
+/// plug in a concrete recognizer via the `feed`/`reset`/`teardown` hooks.
+/// Only the concrete backends conform to `SpeechRecognizing` themselves.
 @MainActor
-class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
+class BaseSpeechRecognizer: NSObject {
     let engine = AVAudioEngine()
 
     private(set) var partialTranscript = ""
@@ -119,12 +133,6 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
     func requestAuthorization() async -> Bool {
         let (mic, speech) = await permissions()
         return mic && speech
-    }
-
-    func preflight() async -> VoicePreflight.Snapshot {
-        let (mic, speech) = await permissions()
-        return VoicePreflight.Snapshot(micAuthorized: mic, speechAuthorized: speech,
-                                       onDeviceAvailable: true, locale: Locale.current.identifier)
     }
 
     func permissions() async -> (mic: Bool, speech: Bool) {
@@ -241,20 +249,14 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
 // MARK: - Legacy backend (SFSpeechRecognizer, macOS 14+)
 
 @MainActor
-final class LegacySpeechRecognizer: BaseSpeechRecognizer {
+final class LegacySpeechRecognizer: BaseSpeechRecognizer, SpeechRecognizing {
     private let localeResolution: SpeechLocale.Resolution
     private let recognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
 
     override init() {
-        let resolution = SpeechLocale.resolve(
-            preferredLanguages: Locale.preferredLanguages,
-            supportedLocales: Array(SFSpeechRecognizer.supportedLocales()),
-            isAvailable: {
-                SFSpeechRecognizer(locale: $0)?.supportsOnDeviceRecognition ?? false
-            },
-            fallback: .current)
+        let resolution = SpeechLocale.legacyResolution()
         localeResolution = resolution
         switch resolution {
         case .available(let locale), .unavailable(let locale):
@@ -265,7 +267,7 @@ final class LegacySpeechRecognizer: BaseSpeechRecognizer {
         super.init()
     }
 
-    override func preflight() async -> VoicePreflight.Snapshot {
+    func preflight() async -> VoicePreflight.Snapshot {
         let (mic, speech) = await permissions()
         // Re-probe the model on the held locale (not the init-time verdict) so
         // installing the dictation dictionary clears the card without a relaunch.
@@ -337,9 +339,10 @@ final class LegacySpeechRecognizer: BaseSpeechRecognizer {
 
 @available(macOS 26, *)
 @MainActor
-final class ModernSpeechRecognizer: BaseSpeechRecognizer {
+final class ModernSpeechRecognizer: BaseSpeechRecognizer, SpeechRecognizing {
     private var transcriber: SpeechTranscriber?
-    private var localeResolution: SpeechLocale.Resolution = .unsupported(.current)
+    private var localeResolution: SpeechLocale.Resolution = .unsupported(
+        SpeechLocale.reportingLocale(preferredLanguages: Locale.preferredLanguages, fallback: .current))
     private var preparationTask: Task<Bool, Never>?
     private var analyzer: SpeechAnalyzer?
     private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
@@ -347,7 +350,6 @@ final class ModernSpeechRecognizer: BaseSpeechRecognizer {
     private var converter: AVAudioConverter?
     private var resultsTask: Task<Void, Never>?
     private var runTask: Task<Void, Never>?
-    private var formatTask: Task<Void, Never>?
 
     private var finalizedText = ""
     private var volatileText = ""
@@ -357,7 +359,7 @@ final class ModernSpeechRecognizer: BaseSpeechRecognizer {
         return await prepareTranscriber()
     }
 
-    override func preflight() async -> VoicePreflight.Snapshot {
+    func preflight() async -> VoicePreflight.Snapshot {
         let (mic, speech) = await permissions()
         let available = mic && speech ? await prepareTranscriber() : false
         return VoicePreflight.Snapshot(
@@ -418,7 +420,6 @@ final class ModernSpeechRecognizer: BaseSpeechRecognizer {
             guard let self else { return }
             do {
                 for try await result in transcriber.results {
-                    if Task.isCancelled { break }
                     let piece = String(result.text.characters)
                     if result.isFinal {
                         self.finalizedText = (self.finalizedText + " " + piece)
@@ -432,23 +433,19 @@ final class ModernSpeechRecognizer: BaseSpeechRecognizer {
                     self.publishPartial(combined)
                 }
             } catch {
-                if !Task.isCancelled { self.onError?(error.localizedDescription) }
+                self.onError?(error.localizedDescription)
             }
         }
 
         runTask = Task { [weak self] in
             do { try await analyzer.start(inputSequence: stream) }
-            catch {
-                guard !Task.isCancelled else { return }
-                await MainActor.run { self?.onError?(error.localizedDescription) }
-            }
+            catch { await MainActor.run { self?.onError?(error.localizedDescription) } }
         }
 
         // Resolve the format the analyzer wants and build a converter if needed.
-        formatTask = Task { @MainActor [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
             let best = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
-            guard !Task.isCancelled else { return }
             self.analyzerFormat = best
             if let best, best != inputFormat {
                 self.converter = AVAudioConverter(from: inputFormat, to: best)
@@ -484,10 +481,8 @@ final class ModernSpeechRecognizer: BaseSpeechRecognizer {
         inputContinuation?.finish()
         inputContinuation = nil
         resultsTask?.cancel(); resultsTask = nil
-        runTask?.cancel()
         let analyzer = self.analyzer
         runTask = nil
-        formatTask?.cancel(); formatTask = nil
         self.analyzer = nil
         converter = nil
         Task { try? await analyzer?.finalizeAndFinishThroughEndOfInput() }
