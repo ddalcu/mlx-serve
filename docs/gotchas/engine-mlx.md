@@ -5380,3 +5380,15 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
   unmeasured is unknown`.
 
+## An oMLX oQ Flash-Next pack loaded clean and decoded noise (2026-09-30)
+
+- Defect: Swift1.5-Qwen3.8-Flash-Next-oQ4e-mtp (oMLX oQ, `qwen4_exp`) booted, loaded the MTP head and the n-gram table, then
+  answered with repeated junk tokens and 0 accepted drafts. Switching off every fused kernel changed nothing.
+- Cause: the oQ layout stores the `(1 + w)` RMSNorms zero-centered; this loader expects the `+1` folded in, so every norm in
+  `NORM_FOLD_SUFFIXES` was off by exactly 1.0 (`q_norm` mean 0.28 where the folded pack reads 1.28). The mixed per-path
+  bits and group sizes were not the problem: `computeQuantParams` solves them from tensor shapes.
+- Fix: `tests/convert_oq_flash_next.py` renames `mtp.*` and `vision_tower.*`, folds the `+1`, concatenates the 128 in-trunk
+  n-gram shards into `ngram_table.bin` and adds the `ngram_table` config block. It refuses a pack whose `q_norm` already reads
+  as folded.
+- Guard: `tests/test_convert_oq_flash_next.py` on a synthetic pack. Dequantized weights of a correct conversion match the
+  reference pack at cosine 0.98-1.0, while plain norms differ by 1.000; that comparison finds this class in minutes.
