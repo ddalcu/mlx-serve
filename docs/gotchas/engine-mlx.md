@@ -5380,3 +5380,15 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
   unmeasured is unknown`.
 
+
+## A short MoE prefill re-read every expert per row (2026-10-01)
+
+- Defect: Nemotron-3 Nano took 113 ms to the first token on llmprobe's 79-token prompt
+  (TensorFold 95). An 80-row forward spent 80 ms in the MoE; a 160-row one spent 46 ms.
+- Cause: MLX's `GatherQMM` takes its expert-streaming kernel (`gather_qmm_rhs`) only when
+  `B / E >= 4` sorted rows per expert. 79 tokens x 6 picks over 128 experts is 3, so every
+  row ran a `gather_qmv` that re-reads its expert's weights.
+- Fix: `nemotronMoeExperts` pads the sorted rows to 4 per expert (pad rows spread over the
+  experts, reading x row 0, dropped after the unsort) once there are 2+ rows per expert;
+  below 2 the re-reads stay cheaper. TTFT 113 -> 77 ms.
+- Guard: `nemotronMoe matches a host reference of NemotronHMoE` (padded arm).
