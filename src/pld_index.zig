@@ -311,6 +311,27 @@ pub fn backedCopy(committed: []const u32, max_draft: usize, min_match: usize) ?C
 const COPY_KEY = 3;
 const COPY_MAX_MATCH = 64;
 
+/// The last `buf.len` tokens of `prompt ++ gen ++ {next}`, oldest first.
+pub fn tailWindow(buf: []u32, prompt: []const u32, gen: []const u32, next: u32) void {
+    const total = prompt.len + gen.len + 1;
+    std.debug.assert(buf.len <= total);
+    for (buf, total - buf.len..) |*c, i| c.* = if (i < prompt.len) prompt[i] else if (i < prompt.len + gen.len) gen[i - prompt.len] else next;
+}
+
+test "tailWindow: the stream's tail across the prompt, the generation and the next token" {
+    const prompt = [_]u32{ 1, 2, 3 };
+    const gen = [_]u32{ 4, 5 };
+    var buf: [6]u32 = undefined;
+    tailWindow(&buf, &prompt, &gen, 9);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 9 }, &buf);
+    tailWindow(buf[0..3], &prompt, &gen, 9);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5, 9 }, buf[0..3]);
+    tailWindow(buf[0..1], &prompt, &gen, 9);
+    try std.testing.expectEqualSlices(u32, &.{9}, buf[0..1]);
+    tailWindow(buf[0..2], &prompt, &.{}, 9);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 9 }, buf[0..2]);
+}
+
 test "backedCopy: the longest-backed site wins, the most recent on a tie" {
     // "1 2 3 4 5" then "9 2 3 4 6", tail "... 1 2 3 4": the first site is backed by 4 tokens.
     const s = [_]u32{ 1, 2, 3, 4, 5, 7, 9, 2, 3, 4, 6, 8, 1, 2, 3, 4 };

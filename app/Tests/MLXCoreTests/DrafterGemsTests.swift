@@ -161,6 +161,7 @@ final class DrafterGemsTests: XCTestCase {
                        "the whole pack, as mlx-serve pull fetches it")
         XCTAssertEqual(DownloadManager.selectNeededFiles(from: entries, selection: .chatWithoutDrafter).map(\.0),
                        ["config.json", "model.safetensors", "mtp/weights.safetensors"])
+        XCTAssertEqual(DownloadManager.packBytesWithoutDrafter(entries), 35, "the socket fit bills the gem once")
         let selection = FileSelection.packFolder("drafter")
         let drafter = DownloadManager.selectNeededFiles(from: entries, selection: selection)
         XCTAssertEqual(drafter.map(\.0), ["drafter/config.json", "drafter/model.safetensors"])

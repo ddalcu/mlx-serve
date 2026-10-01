@@ -311,7 +311,7 @@ const K1P_SOURCE =
     \\  float v = float(act[i]);
     \\  sumsq += v * v;
     \\  conv_in[(3 + t) * C + ch] = qkv[t * QS + ch];
-    \\  if (t < 3) conv_in[t * C + ch] = conv_state[t * C + ch];
+    \\  for (int r = t; r < 3; r += TL) conv_in[r * C + ch] = conv_state[r * C + ch];
     \\}
     \\if (comp < 2) {
     \\  sumsq = simd_sum(sumsq);
@@ -404,9 +404,13 @@ const K1R_SOURCE =
 
 const SPLIT: c_int = 4;
 const NT: c_int = 256; // 4 dv rows per simdgroup
-/// Multi-token rows run one dv row per simdgroup: a token's rows then take one
-/// reduction pair in sequence, not four (a row's arithmetic is the same).
-const SEQ_NT: c_int = 1024;
+/// Multi-token rows run one dv row per simdgroup on NAX: a token's rows then
+/// take one reduction pair in sequence, not four (a row's arithmetic is the
+/// same, so the rows are bit-identical either way). Other GPUs cap this
+/// kernel's threadgroup below 1024 and keep K1's 256.
+fn seqNt() c_int {
+    return if (@import("transformer.zig").naxAvailable()) 1024 else NT;
+}
 
 var k1_cache: ?mlx.mlx_fast_metal_kernel = null;
 var k2_cache: ?mlx.mlx_fast_metal_kernel = null;
@@ -581,11 +585,11 @@ fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, st));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * SPLIT * SEQ_NT, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, SEQ_NT, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * SPLIT * seqNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, seqNt(), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
-    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", SEQ_NT }, .{ "SPLIT", SPLIT } }) |kv|
+    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", seqNt() }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TL", t_len));
     return cfg;

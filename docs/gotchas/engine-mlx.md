@@ -5349,3 +5349,34 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Fix: lookup rounds verify with exact acceptance whatever the installed mode
   (`acceptGraphFor` / `acceptPrefixFor`), keeping a copy with probability p. MTP drafts keep typical.
 - Guard: `a prompt-lookup draft is kept only as often as sampling would keep it under typical acceptance`.
+
+## A 1- or 2-node draft tree committed an unwritten conv row (2026-09-30)
+
+- Defect: with a DFlash tree drafter bound, a round whose tree has fewer than 3 nodes
+  (`--draft-block-size 2`, the width chooser at width 1, any off-NAX lattice of one node)
+  gave different bytes from the same request with the drafter off.
+- Cause: the tree prework kernel's grid runs one threadgroup per window row (`t < TL`) and
+  copied the conv window's three state rows from those same threadgroups (`if (t < 3)`), so
+  at TL = 1 rows 1 and 2 of the conv input were never written, and the commit read them.
+- Fix: each threadgroup copies the state rows `t, t + TL, ...` below 3, whatever TL is.
+- Guard: `gdn_decode.recurTree: every node of a draft tree equals a chain over its own
+  path` runs the 1-, 2- and 8-node prefixes of the same tree (the conv input is compared
+  whole against `[conv_state; window rows]`).
+
+## The DFlash yield gate sent a winning drafter to plain decode (2026-09-30)
+
+- Defect: 27B 4-bit with its tree drafter at block 16, a sampled prose request at temp 1.0
+  decoded at 48 tok/s, below the 86-123 tok/s the same request gets serial with MTP, while
+  the same prompt at `--draft-block-size 8` ran 108-133.
+- Cause: the runtime gate's bar (2.0 accepted/round, scaled by width) was calibrated when a
+  block-16 round cost about two serial steps; this branch's rounds cost 1.3 (28 ms against a
+  21 ms step), so a request accepting 1.9/round was still emitting tokens at 7.9 ms each
+  (`[spec-stats] table=<2k:w0:21.74,w15:7.93`) when the gate disabled it, and the sticky
+  fallback is the plain decoder, not MTP.
+- Fix: `checkDflashRuntimeGate` asks the round-cost table first (`roundBeatsSerial`): a width
+  measured cheaper per emitted token than the bucket's serial step stays on whatever its
+  acceptance. The constant still decides until both cells have samples, so the first such
+  request on a cold table still falls to plain (which is what measures the plain cell).
+- Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
+  unmeasured is unknown`.
+

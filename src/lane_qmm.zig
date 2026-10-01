@@ -370,14 +370,18 @@ fn tmrFor(rows: c_int) c_int {
 }
 var kernels: std.AutoHashMapUnmanaged(KernelKey, mlx.mlx_fast_metal_kernel) = .{};
 const PlanKey = struct { kind: Kind, rows: c_int, n: c_int, k: c_int };
+/// Launch plans and row counts at lane widths (rows <= MAX_ROWS). A
+/// prompt-width call builds its own and frees it: a long session's chunk
+/// tails take every row count there is.
 var plans: std.AutoHashMapUnmanaged(PlanKey, mlx.mlx_fast_metal_kernel_config) = .{};
 var mdims_cache: std.AutoHashMapUnmanaged(c_int, mlx.mlx_array) = .{};
 
 /// (s, b) pairs group-major per (scales, biases) of a weight read in MLX's
-/// layout, built on first use. Keyed by the data the handles point at (a
-/// handle's address is reused once its caller frees it) plus the shape (a
-/// joined weight and its first part start at the same address); an entry holds
-/// its sources alive, so no key is reused.
+/// layout, built on first use (an eighth of the weight's bytes: the lm_head
+/// and the ragged GDN gates on a tiled trunk). Keyed by the data the handles
+/// point at (a handle's address is reused once its caller frees it) plus the
+/// shape (a joined weight and its first part start at the same address); an
+/// entry holds its sources alive, so no key is reused.
 const DerivedKey = struct { a: usize, b: usize, n: c_int, w: c_int };
 const Derived = struct { src_a: mlx.mlx_array, src_b: mlx.mlx_array, out: mlx.mlx_array };
 var packed_scales: std.AutoHashMapUnmanaged(DerivedKey, Derived) = .{};
@@ -388,9 +392,27 @@ var packed_scales: std.AutoHashMapUnmanaged(DerivedKey, Derived) = .{};
 const Tiled = struct { owner: usize, w: mlx.mlx_array, st: mlx.mlx_array, bt: mlx.mlx_array, ntot: c_int, r0: c_int, nt: c_int, bits: c_int };
 const TiledKey = struct { ptr: usize, n: c_int, kw: c_int };
 var tiled: std.AutoHashMapUnmanaged(TiledKey, Tiled) = .{};
+/// Registered weights per shape: a weight of any other shape is answered
+/// without a data read (a lazy weight's eval mid-graph).
+const TiledShape = struct { n: c_int, kw: c_int };
+var tiled_shapes: std.AutoHashMapUnmanaged(TiledShape, u32) = .{};
 
-/// Frees the derived (s, b) copies and `owner`'s tiled entries (a model
-/// unload); another model's tiled weights stay registered.
+fn shapeRegistered(key: TiledKey) !void {
+    const gop = try tiled_shapes.getOrPut(std.heap.c_allocator, .{ .n = key.n, .kw = key.kw });
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+
+fn shapeReleased(key: TiledKey) void {
+    const count = tiled_shapes.getPtr(.{ .n = key.n, .kw = key.kw }) orelse return;
+    count.* -= 1;
+    if (count.* == 0) _ = tiled_shapes.remove(.{ .n = key.n, .kw = key.kw });
+}
+
+/// Frees `owner`'s tiled entries and EVERY model's derived (s, b) copies (a
+/// model unload): a copy holds its sources alive and nothing says whose they
+/// are, and another model rebuilds its own on the next read. That model's
+/// tiled weights stay registered.
 pub fn release(owner: usize) void {
     var it = packed_scales.valueIterator();
     while (it.next()) |e| {
@@ -405,6 +427,7 @@ pub fn release(owner: usize) void {
     while (ti.next()) |e| if (e.value_ptr.owner == owner) keys.append(std.heap.c_allocator, e.key_ptr.*) catch {};
     for (keys.items) |k| if (tiled.fetchRemove(k)) |kv| {
         for ([_]mlx.mlx_array{ kv.value.w, kv.value.st, kv.value.bt }) |h| _ = mlx.mlx_array_free(h);
+        shapeReleased(k);
     };
 }
 
@@ -467,7 +490,7 @@ fn dropPacked(sc: mlx.mlx_array, bi: mlx.mlx_array) void {
 fn tiledEntry(w: mlx.mlx_array) !?Tiled {
     if (tiled.count() == 0 or mlx.mlx_array_dtype(w) != .uint32) return null;
     const sh = mlx.getShape(w);
-    if (sh.len != 2) return null;
+    if (sh.len != 2 or !tiled_shapes.contains(.{ .n = sh[0], .kw = sh[1] })) return null;
     try mlx.check(mlx.mlx_array_eval(w));
     const p = @intFromPtr(mlx.mlx_array_data_uint32(w) orelse return null);
     return tiled.get(.{ .ptr = p, .n = sh[0], .kw = sh[1] });
@@ -535,6 +558,7 @@ pub fn tileInPlace(owner: usize, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
         const key = TiledKey{ .ptr = base + @as(usize, @intCast(r0)) * @as(usize, @intCast(kw)) * 4, .n = rows, .kw = kw };
         const e = Tiled{ .owner = owner, .w = try hold(w), .st = try hold(sc), .bt = try hold(bi), .ntot = n, .r0 = r0, .nt = nt, .bits = @intCast(bits) };
         try tiled.put(std.heap.c_allocator, key, e);
+        try shapeRegistered(key);
         if (li == 1) r0 += rows;
     };
     return w_bytes + 2 * s_bytes;
@@ -571,6 +595,13 @@ fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
 
 fn planFor(key: PlanKey) !mlx.mlx_fast_metal_kernel_config {
     if (plans.get(key)) |p| return p;
+    const cfg = try buildPlan(key);
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try plans.put(std.heap.c_allocator, key, cfg);
+    return cfg;
+}
+
+fn buildPlan(key: PlanKey) !mlx.mlx_fast_metal_kernel_config {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.rows, key.n }, 2, .bfloat16));
@@ -585,7 +616,6 @@ fn planFor(key: PlanKey) !mlx.mlx_fast_metal_kernel_config {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(key.n + width - 1, width) * width * sk, @divTrunc(key.rows + block - 1, block), 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, width * sk, 1, 1));
     }
-    try plans.put(std.heap.c_allocator, key, cfg);
     return cfg;
 }
 
@@ -606,10 +636,15 @@ pub fn fits(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, g
 
 fn mdimsFor(rows: c_int) !mlx.mlx_array {
     if (mdims_cache.get(rows)) |m| return m;
-    const d = [_]i32{rows};
-    const m = mlx.mlx_array_new_data(&d, &[_]c_int{1}, 1, .int32);
+    const m = newMdims(rows);
+    errdefer _ = mlx.mlx_array_free(m);
     try mdims_cache.put(std.heap.c_allocator, rows, m);
     return m;
+}
+
+fn newMdims(rows: c_int) mlx.mlx_array {
+    const d = [_]i32{rows};
+    return mlx.mlx_array_new_data(&d, &[_]c_int{1}, 1, .int32);
 }
 
 fn run(key: KernelKey, rows: c_int, x: mlx.mlx_array, xs: []const c_int, weights: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -620,11 +655,20 @@ fn run(key: KernelKey, rows: c_int, x: mlx.mlx_array, xs: []const c_int, weights
     defer _ = mlx.mlx_array_free(xc);
     try mlx.check(mlx.mlx_contiguous(&xc, x2, false, s));
     const mk = try kernelFor(key);
-    const mcfg = try planFor(.{ .kind = key.kind, .rows = rows, .n = key.n, .k = key.k });
+    const cached = rows <= MAX_ROWS;
+    const pkey: PlanKey = .{ .kind = key.kind, .rows = rows, .n = key.n, .k = key.k };
+    const mcfg = if (cached) try planFor(pkey) else try buildPlan(pkey);
+    defer if (!cached) {
+        _ = mlx.mlx_fast_metal_kernel_config_free(mcfg);
+    };
+    const mdims = if (cached) try mdimsFor(rows) else newMdims(rows);
+    defer if (!cached) {
+        _ = mlx.mlx_array_free(mdims);
+    };
     var ins: [5]mlx.mlx_array = undefined;
     ins[0] = xc;
     @memcpy(ins[1 .. 1 + weights.len], weights);
-    ins[1 + weights.len] = try mdimsFor(rows);
+    ins[1 + weights.len] = mdims;
     const in_vec = mlx.mlx_vector_array_new_data(&ins, weights.len + 2);
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var outs = mlx.mlx_vector_array_new();
@@ -696,6 +740,39 @@ fn randBf16(shape: []const c_int, scale: f32, seed: u64, s: mlx.mlx_stream) !mlx
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
     return out;
+}
+
+test "lane_qmm: prompt-width calls on a tiled weight leave the plan caches at their lane-width size" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    defer release(0);
+    const wf = try randBf16(&.{ 256, 1024 }, 0.02, 300, s);
+    defer _ = mlx.mlx_array_free(wf);
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var parts: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (parts) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&parts, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
+    try mlx.check(mlx.mlx_array_eval(parts[0]));
+    try testing.expect(try tileInPlace(0, parts[0], parts[1], parts[2], 4, 64, &.{}, s) > 0);
+    const x = try randBf16(&.{ MAX_ROWS + 3, 1024 }, 1.0, 301, s);
+    defer _ = mlx.mlx_array_free(x);
+    var sizes: [2]usize = undefined;
+    for ([_]c_int{ 8, MAX_ROWS + 1, MAX_ROWS + 2, MAX_ROWS + 3 }, 0..) |rows, i| {
+        var xr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xr);
+        try mlx.check(mlx.mlx_slice(&xr, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ rows, 1024 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        const y = (try tiledQmm(xr, parts[0], s)).?;
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_array_eval(y));
+        // The lane-width call fills the caches; prompt-width ones add nothing.
+        if (i == 0) sizes = .{ plans.count(), mdims_cache.count() };
+    }
+    try testing.expectEqual(sizes[0], plans.count());
+    try testing.expectEqual(sizes[1], mdims_cache.count());
 }
 
 test "lane_qmm: every row of an R-row call equals its one-row call bit for bit up to 128 rows, at 4, 5, 6 and 8 bits, tiled in place or not, and the product is the fp32 one" {

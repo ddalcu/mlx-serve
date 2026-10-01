@@ -82,9 +82,10 @@ cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────
 # MLX 0.32.3's gather_qmm takes a global_scale before sorted_indices; the
-# pinned mlx-c predates it (the same patch the Linux build applies). Applied
-# to a clean checkout, so an edited patch replaces the old one.
-git -C "$MLXC_SRC" checkout -- .
+# pinned mlx-c predates it (the same patch the Linux build applies). The files
+# the patch touches are reset first, so an edited patch replaces the old one;
+# local edits anywhere else in the submodule are kept.
+git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3)
 git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH"
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \
   -DCMAKE_BUILD_TYPE=Release \

@@ -321,6 +321,26 @@ fn addDims(cfg: mlx.mlx_fast_metal_kernel_config, g: c_int, d: c_int, extra_name
     if (extra_name) |n| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, n, extra));
 }
 
+var chain_cache: [MAX_ROWS + 1]?Tree = @splat(null);
+
+/// A chain's window depths and paths (depth r, path 0..r), built once per width.
+fn chainTree(w: c_int) Tree {
+    const wu: usize = @intCast(w);
+    if (chain_cache[wu]) |t| return t;
+    var chain: [MAX_ROWS * MAX_ROWS]i32 = undefined;
+    var depth: [MAX_ROWS]i32 = undefined;
+    for (0..wu) |r| {
+        depth[r] = @intCast(r);
+        for (0..wu) |i| chain[r * wu + i] = @intCast(i);
+    }
+    chain_cache[wu] = Tree{
+        .depth = mlx.mlx_array_new_data(&depth, &[_]c_int{w}, 1, .int32),
+        .path = mlx.mlx_array_new_data(&chain, &[_]c_int{ w, w }, 2, .int32),
+        .max_depth = w - 1,
+    };
+    return chain_cache[wu].?;
+}
+
 /// q [1, H, W, D] of a window whose rows sit at the last W positions of k/v
 /// [1, HKV, L, D] (the cache views after this step's update) -> [1, H, W, D].
 /// `tree` null: a chain. False outside the kernels.
@@ -337,25 +357,7 @@ pub fn sdpa(out: *mlx.mlx_array, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_
     const pt = @divTrunc(p, TK) * TK; // the prefix's whole tiles
     const ca = @divTrunc(pt + CK - 1, CK);
 
-    // Window depths and paths (a chain: depth r, path 0..r).
-    var chain: [MAX_ROWS * MAX_ROWS]i32 = undefined;
-    var chain_depth: [MAX_ROWS]i32 = undefined;
-    const t = tree orelse blk: {
-        const wu: usize = @intCast(w);
-        for (0..wu) |r| {
-            chain_depth[r] = @intCast(r);
-            for (0..wu) |i| chain[r * wu + i] = @intCast(i);
-        }
-        break :blk Tree{
-            .depth = mlx.mlx_array_new_data(&chain_depth, &[_]c_int{w}, 1, .int32),
-            .path = mlx.mlx_array_new_data(&chain, &[_]c_int{ w, w }, 2, .int32),
-            .max_depth = w - 1,
-        };
-    };
-    defer if (tree == null) {
-        _ = mlx.mlx_array_free(t.depth);
-        _ = mlx.mlx_array_free(t.path);
-    };
+    const t = tree orelse chainTree(w);
     const maxd = t.max_depth + 1;
     const ncb = @divTrunc(p + t.max_depth, CK) - @divTrunc(pt, CK) + 1;
     const r_rows = g * w;

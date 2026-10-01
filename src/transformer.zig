@@ -19853,7 +19853,7 @@ pub const Transformer = struct {
     /// path reads them there at every width, the prompt path through the same
     /// layout. The lm_head and embeddings keep MLX's layout (other readers).
     pub fn tileLaneWeights(self: *Transformer) !u64 {
-        if (!naxAvailable() or !self.config.rowExactDecode() or self.rht != null) return 0;
+        if (!naxAvailable() or !self.config.rowExactDecode() or self.rht != null or self.actDtype() != .bfloat16) return 0;
         const layers = self.moe_layers orelse return 0;
         try mlx.check(mlx.mlx_synchronize(self.s));
         const owner = @intFromPtr(self);
@@ -38958,6 +38958,7 @@ var strided_sig_gate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var strided_sig_gate_key: SigGateCfgKey = std.mem.zeroes(SigGateCfgKey);
 
 fn stridedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(x);
     if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(g) != dt) return null;
     const xsh = mlx.getShape(x);
@@ -48522,6 +48523,10 @@ test "strided sigmoid gate is bit-identical to mlx_sigmoid + multiply over a tra
         const got = (try stridedSigmoidGateMul(s, x, g)) orelse return error.FusedDeclined;
         defer _ = mlx.mlx_array_free(got);
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, ref, s));
+        // A metal_kernel helper declines off the GPU stream.
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        try std.testing.expect((try stridedSigmoidGateMul(cpu, x, g)) == null);
     }
 }
 
@@ -61937,11 +61942,14 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
 }
 
 test "gdn_decode.recurTree: every node of a draft tree equals a chain over its own path" {
-    try gdnDecodeTreeCase(.bfloat16);
-    try gdnDecodeTreeCase(.float32);
+    // A tree of 1 or 2 nodes has fewer rows than the conv window it commits.
+    for ([_]usize{ 1, 2, 8 }) |nodes| {
+        try gdnDecodeTreeCase(.bfloat16, nodes);
+        try gdnDecodeTreeCase(.float32, nodes);
+    }
 }
 
-fn gdnDecodeTreeCase(st: mlx.mlx_dtype) !void {
+fn gdnDecodeTreeCase(st: mlx.mlx_dtype, nodes: usize) !void {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x7EE);
     const rnd = prng.random();
@@ -61950,10 +61958,13 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype) !void {
     const hv: c_int = 8;
     const c_dim: c_int = hk * 128 * 2 + hv * 128;
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
-    // Rows 1 and 2 follow the root, 3 and 4 follow row 1, 5 follows 2, 6 and 7 follow 3.
-    const parents = [_]i32{ -1, 0, 0, 1, 1, 2, 3, 3 };
-    const paths = [_][]const i32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2 }, &.{ 0, 1, 3 }, &.{ 0, 1, 4 }, &.{ 0, 2, 5 }, &.{ 0, 1, 3, 6 }, &.{ 0, 1, 3, 7 } };
-    const w: c_int = parents.len;
+    // Rows 1 and 2 follow the root, 3 and 4 follow row 1, 5 follows 2, 6 and 7 follow 3;
+    // every prefix is a tree of its own.
+    const all_parents = [_]i32{ -1, 0, 0, 1, 1, 2, 3, 3 };
+    const all_paths = [_][]const i32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2 }, &.{ 0, 1, 3 }, &.{ 0, 1, 4 }, &.{ 0, 2, 5 }, &.{ 0, 1, 3, 6 }, &.{ 0, 1, 3, 7 } };
+    const parents = all_parents[0..nodes];
+    const paths = all_paths[0..nodes];
+    const w: c_int = @intCast(nodes);
     const qkv = try gdnParityRand(rnd, &[_]c_int{ 1, w, c_dim }, 1.0, dt, s);
     defer _ = mlx.mlx_array_free(qkv);
     const a = try gdnParityRand(rnd, &[_]c_int{ 1, w, hv }, 16.0, dt, s);
@@ -61975,8 +61986,8 @@ fn gdnDecodeTreeCase(st: mlx.mlx_dtype) !void {
             return .{ .qkv = q, .z = f[6], .a = aa, .b = bb, .conv_state = f[0], .ssm_state = f[1], .conv_w = f[2], .A_log = f[3], .dt_bias = f[4], .q_scale = qs, .k_scale = qs, .norm_w = f[5], .eps = e, .signs = .{ .ctx = null } };
         }
     }.of;
-    var table: [6 * parents.len]i32 = undefined;
-    gdn_decode.treeTable(&parents, &table);
+    var table: [6 * all_parents.len]i32 = undefined;
+    gdn_decode.treeTable(parents, table[0 .. 6 * nodes]);
     const tab = mlx.mlx_array_new_data(&table, &[_]c_int{6 * w}, 1, .int32);
     defer _ = mlx.mlx_array_free(tab);
     const tree = (try gdn_decode.recurTree(g, w, inputs(qkv, a, b, fixed, q_scale, eps_arr), null, tab, s)) orelse return error.TreeDeclined;

@@ -999,6 +999,12 @@ class DownloadManager: ObservableObject {
         downloads.removeValue(forKey: gem.repo)
     }
 
+    /// The model's own bytes for a gem fit check: `fits` bills the gem, so the
+    /// pack's `drafter/` must not be counted on both sides.
+    nonisolated static func packBytesWithoutDrafter(_ entries: [[String: Any]]) -> Int64 {
+        selectNeededFiles(from: entries, selection: .chatWithoutDrafter).reduce(0) { $0 + $1.1 }
+    }
+
     /// A fresh download fills its socket with the default gem when it fits in
     /// RAM and the user has not chosen one. A pack's own `drafter/` stays
     /// "auto" (the server finds it); a separate repo is written as a path.
@@ -1011,7 +1017,7 @@ class DownloadManager: ObservableObject {
         let files = PackUpdateCheck.sizes(entries)
         packListings[repoId] = files
         let gems = DrafterGems.gems(forRepoId: repoId, packFiles: files, localDrafter: false, mtpAvailable: false)
-        let modelGB = Double(Self.selectNeededFiles(from: entries).reduce(0) { $0 + $1.1 }) / 1e9
+        let modelGB = Double(Self.packBytesWithoutDrafter(entries)) / 1e9
         guard let gem = DrafterGems.defaultGem(gems),
               DrafterGems.fits(gem, modelGB: modelGB, memory: .current()) else { return }
         if gemPath(gem, modelDir: modelDir) == nil {

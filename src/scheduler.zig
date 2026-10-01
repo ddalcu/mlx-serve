@@ -3496,6 +3496,24 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     return avail_bytes < loadRequirementBytes(weights_bytes);
 }
 
+/// Resident bytes a sidecar takes once loaded: `bits` per weight plus a bf16
+/// (scale, bias) pair per group of 64 for a dense DFlash assistant quantized
+/// at load; its file size otherwise (`bits == 0`).
+pub fn drafterResidentBytes(disk_bytes: u64, bits: u32) u64 {
+    if (bits == 0) return disk_bytes;
+    return disk_bytes * (2 * bits + 1) / 32;
+}
+
+const PreflightVerdict = enum { fits, drop_drafter, refuse };
+
+/// The load preflight over the model AND its sidecar: a sidecar the checkpoint
+/// brought along (`drafter_optional`) is dropped before the model is refused.
+fn preflightVerdict(weights_bytes: u64, drafter_bytes: u64, avail_bytes: u64, drafter_optional: bool) PreflightVerdict {
+    if (!memInsufficientForLoad(weights_bytes + drafter_bytes, avail_bytes)) return .fits;
+    if (drafter_optional and drafter_bytes > 0 and !memInsufficientForLoad(weights_bytes, avail_bytes)) return .drop_drafter;
+    return .refuse;
+}
+
 /// Total free memory a load demands: the model's own peak plus the headroom the
 /// guard wants for warmup buffers and a baseline KV cache.
 ///
@@ -3625,6 +3643,21 @@ test "a media model commits the residency the gate reserved" {
     try testing.expectEqual(@as(u64, 0), genLoadResidentBytes(0, 0));
 }
 
+test "a sidecar bills its loaded width, and only an in-dir one is dropped to fit" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // A dense bf16 assistant quantized at load: bits per weight plus a bf16
+    // (scale, bias) pair per group of 64; a packed or dense-loaded one its own bytes.
+    try std.testing.expectEqual(@as(u64, 32 * 9), drafterResidentBytes(32 * 32, 4));
+    try std.testing.expectEqual(@as(u64, 32 * 17), drafterResidentBytes(32 * 32, 8));
+    try std.testing.expectEqual(@as(u64, 1000), drafterResidentBytes(1000, 0));
+    // 20 GB of weights want ~23.5 GB; a 3 GB drafter pushes that past 26 GB.
+    try std.testing.expectEqual(PreflightVerdict.fits, preflightVerdict(20 * GB, 3 * GB, 30 * GB, true));
+    try std.testing.expectEqual(PreflightVerdict.drop_drafter, preflightVerdict(20 * GB, 3 * GB, 25 * GB, true));
+    try std.testing.expectEqual(PreflightVerdict.refuse, preflightVerdict(20 * GB, 3 * GB, 25 * GB, false));
+    try std.testing.expectEqual(PreflightVerdict.refuse, preflightVerdict(20 * GB, 3 * GB, 20 * GB, true));
+    try std.testing.expectEqual(PreflightVerdict.fits, preflightVerdict(20 * GB, 0, 25 * GB, true));
+}
+
 test "memInsufficientForLoad: headroom + unknown-query guards" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -3714,21 +3747,50 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // an actionable error, when free RAM clearly can't hold the weights + warmup
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
+    // The sidecar is resolved here so the preflight bills it with the weights:
+    // launch flags, then the per-model setting; otherwise the checkpoint's own
+    // `drafter/` subdir (dflash.resolveInDirDrafter). That is what makes the
+    // drafter a LOAD-time dependency rather than a launch flag: a hot model
+    // switch brings its own, and no pairing table has to decide which sidecar
+    // goes with which checkpoint.
+    const chosen_drafter = drafterFor(params.no_drafter, params.drafter_dir, params.config.drafter_override);
+    var in_dir_drafter: ?[]u8 = if (chosen_drafter == null)
+        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir)
+    else
+        null;
+    defer if (in_dir_drafter) |p| sch.allocator.free(p);
     if (!skip_mem_preflight) {
-        const weights_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const gb = 1024.0 * 1024.0 * 1024.0;
+        const model_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
+        const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
+        const weights_bytes = model_bytes + drafter_bytes;
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
-            @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(model_bytes)) / gb,
+            @as(f64, @floatFromInt(avail_bytes)) / gb,
         });
-        if (memInsufficientForLoad(weights_bytes, avail_bytes)) {
-            const gb = 1024.0 * 1024.0 * 1024.0;
-            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
-                @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
-                @as(f64, @floatFromInt(weights_bytes)) / gb,
-                @as(f64, @floatFromInt(avail_bytes)) / gb,
-            });
-            return error.InsufficientMemory;
+        if (drafter_bytes > 0) log.info("[preflight] drafter ~{d:.2} GB at {s}\n", .{ @as(f64, @floatFromInt(drafter_bytes)) / gb, sidecar });
+        switch (preflightVerdict(model_bytes, drafter_bytes, avail_bytes, in_dir_drafter != null)) {
+            .fits => {},
+            .drop_drafter => {
+                log.warn("[dflash] sidecar at {s} skipped: model + drafter need ~{d:.1} GB free, {d:.1} GB available; the model loads without it\n", .{
+                    sidecar,
+                    @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
+                    @as(f64, @floatFromInt(avail_bytes)) / gb,
+                });
+                sch.allocator.free(in_dir_drafter.?);
+                in_dir_drafter = null;
+            },
+            .refuse => {
+                log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+                    @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
+                    @as(f64, @floatFromInt(weights_bytes)) / gb,
+                    if (drafter_bytes > 0) " and drafter" else "",
+                    @as(f64, @floatFromInt(avail_bytes)) / gb,
+                });
+                return error.InsufficientMemory;
+            },
         }
     }
 
@@ -3883,17 +3945,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // to the Gemma cross-attention drafter loader.
     var drafter_ptr: ?*DrafterModel = null;
     var dflash_ptr: ?*DflashModel = null;
-    // Launch flags, then the per-model setting; otherwise the checkpoint's own
-    // `drafter/` subdir is the sidecar (dflash.resolveInDirDrafter). That is
-    // what makes the drafter a LOAD-time dependency rather than a launch
-    // flag: a hot model switch brings its own, and no pairing table has to
-    // decide which sidecar goes with which checkpoint.
-    const chosen_drafter = drafterFor(params.no_drafter, params.drafter_dir, params.config.drafter_override);
-    const in_dir_drafter: ?[]u8 = if (chosen_drafter == null)
-        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir)
-    else
-        null;
-    defer if (in_dir_drafter) |p| sch.allocator.free(p);
+    errdefer if (drafter_ptr) |d| {
+        d.deinit();
+        sch.allocator.destroy(d);
+    };
+    errdefer if (dflash_ptr) |d| {
+        d.deinit();
+        sch.allocator.destroy(d);
+    };
     const drafter_dir: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
     if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
         const env_off = if (std.c.getenv("MLX_SERVE_DFLASH")) |v| v[0] == '0' else false;
@@ -3952,7 +4011,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             });
             const tiled_bytes = try xfm_ptr.tileLaneWeights();
             if (tiled_bytes > 0) log.info("[lane] trunk projections tiled in place ({d:.1} GB, no copy)\n", .{@as(f64, @floatFromInt(tiled_bytes)) / (1 << 30)});
-            const drafter_tiled = try d.tileLaneWeights(mlx.gpuStream());
+            const drafter_tiled = try d.tileLaneWeights(xfm_ptr.actDtype(), mlx.gpuStream());
             if (drafter_tiled > 0) log.info("[lane] drafter projections tiled in place ({d:.2} GB, no copy)\n", .{@as(f64, @floatFromInt(drafter_tiled)) / (1 << 30)});
         }
     } else if (drafter_dir.len > 0) {
@@ -4006,14 +4065,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     params.config.dflash_bound = xfm_ptr.config.dflash_bound;
     if (params.config.dflash_bound and std.meta.activeTag(params.config.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default) != .exact)
         log.info("[dflash] MTP acceptance forced to exact while the drafter is bound\n", .{});
-    errdefer if (drafter_ptr) |d| {
-        d.deinit();
-        sch.allocator.destroy(d);
-    };
-    errdefer if (dflash_ptr) |d| {
-        d.deinit();
-        sch.allocator.destroy(d);
-    };
 
     // After the drafter binds: an exact-mode arch runs its row kernels only then.
     // DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH=N): time N decode-width forward

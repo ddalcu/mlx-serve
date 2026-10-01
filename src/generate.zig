@@ -5128,11 +5128,9 @@ pub const Generator = struct {
         } else if (tree_round) {
             const prompt = self.prompt_ids_owned;
             const gen = self.generated_ids.items;
-            const committed = try allocator.alloc(u32, prompt.len + gen.len + 1);
+            const committed = try allocator.alloc(u32, @min(prompt.len + gen.len + 1, DFLASH_COPY_WINDOW));
             defer allocator.free(committed);
-            @memcpy(committed[0..prompt.len], prompt);
-            @memcpy(committed[prompt.len..][0..gen.len], gen);
-            committed[committed.len - 1] = t1;
+            pld_index.tailWindow(committed, prompt, gen, t1);
             if (pld_index.backedCopy(committed, dflashTreeNodes(m), DFLASH_COPY_MATCH)) |c| if (c.draft.len == dflashTreeNodes(m))
                 return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, c.draft);
         }
@@ -5591,6 +5589,8 @@ pub const Generator = struct {
     /// Context tokens that must back a copied continuation (TensorFold's
     /// "confident" bar: shorter backing lost more rounds than it won at 4k-16k).
     const DFLASH_COPY_MATCH = 24;
+    /// Tokens the copy lookup scans back over each round (the copy and the scan are per round).
+    const DFLASH_COPY_WINDOW = 65536;
 
     /// `[m, k]` Gumbel noise each lattice position's candidates get from the
     /// keyed draw of its verify row (generated index G + 1 + position).
@@ -5849,6 +5849,9 @@ pub const Generator = struct {
             self.dflash_accepted_tokens,
             self.dflash_min_accepted_per_round,
         )) return;
+        // The table's own measure outranks the calibrated bar: a round emitting
+        // tokens cheaper than the plain step it would yield to stays on.
+        if (self.xfm.round_cost.roundBeatsSerial(self.dflash_block_size -| 1, self.mtpKvLen()) == true) return;
         const avg = @as(f32, @floatFromInt(self.dflash_accepted_tokens)) /
             @as(f32, @floatFromInt(self.dflash_attempted));
         log.info(

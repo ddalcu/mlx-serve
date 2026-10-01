@@ -153,6 +153,17 @@ fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
     return c;
 }
 
+/// The width a DFlash sidecar at `dir` is quantized to at load: 0 when it is
+/// not one, ships packed already (`quantization` in its config) or loads dense.
+pub fn sidecarQuantBits(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) u32 {
+    const content = readConfigFile(io, allocator, dir) catch return 0;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object or !isDflashConfigJson(parsed.value.object)) return 0;
+    return if (parsed.value.object.get("quantization") != null) 0 else quantBitsFromEnv();
+}
+
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
 /// read/parse failure is a quiet false — the caller falls through to the
 /// gemma drafter loader, whose own errors are the user-facing ones.
@@ -514,9 +525,10 @@ pub const DflashLinear = struct {
             try mlx.check(mlx.mlx_matmul(&out, x, self.w, s));
             return out;
         }
-        // Up to 16 rows (a draft block, a round's kept captures) the row kernels
-        // read each weight once for every row, where MLX's matmul falls off at
-        // 4..16 rows; drafts need speed, not bits.
+        // Up to the lane kernels' row cap (a draft block, a round's kept
+        // captures, a window of context rows) they read each weight once for
+        // every row, where MLX's matmul falls off at 4..16 rows; drafts need
+        // speed, not bits.
         const row = if (transformer_mod.naxAvailable())
             try lane_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s)
         else
@@ -740,9 +752,11 @@ pub const DflashModel = struct {
 
     /// Re-orders every 4-bit linear into the lane kernel's tiled layout in its
     /// own buffer (NAX only; no copy stays resident). From then on they are
-    /// read through `lane_qmm` alone, as `DflashLinear.apply` does.
-    pub fn tileLaneWeights(self: *DflashModel, s: mlx.mlx_stream) !u64 {
-        if (!transformer_mod.naxAvailable()) return 0;
+    /// read through `lane_qmm` alone, as `DflashLinear.apply` does, and that
+    /// read is bf16-only: a trunk in another activation dtype (`act`) keeps
+    /// MLX's layout.
+    pub fn tileLaneWeights(self: *DflashModel, act: mlx.mlx_dtype, s: mlx.mlx_stream) !u64 {
+        if (!transformer_mod.naxAvailable() or act != .bfloat16) return 0;
         try mlx.check(mlx.mlx_synchronize(s));
         const owner = @intFromPtr(self);
         var bytes: u64 = 0;
@@ -1730,7 +1744,9 @@ pub const Lattice = struct {
 
 // Top K of each row in one threadgroup: every thread keeps its own sorted K
 // (a compare-and-select chain), each simdgroup merges its lanes' lists, then
-// simdgroup 0 merges the NT / 32 lists. Equal values go to the lower index.
+// simdgroup 0 merges the NT / 32 lists. Equal values go to the lower index
+// within a thread's own list; across lanes the lower lane wins, so a tie can
+// pick the higher id (drafts only).
 // 256 threads: M1/M2 cap threadgroups below 1024 for kernels this heavy.
 const TOPK_SOURCE =
     \\constexpr int NT = 256, NSG = NT / 32;
@@ -3327,7 +3343,9 @@ test "dflash: tiling the 4-bit drafter in place leaves its forward unchanged" {
     defer m.deinit();
     const before = try tinyBlockHidden(&m, allocator, s);
     defer allocator.free(before);
-    try testing.expect(try m.tileLaneWeights(s) > 0);
+    // The tiled read is bf16-only: an f16-activation trunk keeps MLX's layout.
+    try testing.expectEqual(@as(u64, 0), try m.tileLaneWeights(.float16, s));
+    try testing.expect(try m.tileLaneWeights(.bfloat16, s) > 0);
     const after = try tinyBlockHidden(&m, allocator, s);
     defer allocator.free(after);
     try testing.expectEqualSlices(f32, before, after);
