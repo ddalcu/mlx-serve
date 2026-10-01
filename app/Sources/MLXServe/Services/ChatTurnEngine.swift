@@ -682,28 +682,24 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // mode's style guidance (so spoken answers stay short and Markdown-free).
         // They share ONE system message, persona first.
         var messagesArray = history
-        var plainSystemBits: [String] = []
         let persona = config.systemPromptPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !persona.isEmpty { plainSystemBits.append(persona) }
-        if config.voiceStyle {
-            // `hasPersona`: with an agent above it, the voice guidance must not
-            // name the assistant after the app's wake phrase — it's appended last,
-            // so that name would override the persona (live: an agent said it was
-            // called Jarvis).
-            plainSystemBits.append(VoicePrompt.systemPrompt(
-                phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
-                hasPersona: !persona.isEmpty))
-        }
+        // `hasPersona`: with an agent above it, the voice guidance must not
+        // name the assistant after the app's wake phrase — it's appended last,
+        // so that name would override the persona (live: an agent said it was
+        // called Jarvis).
+        let voiceGuidance = config.voiceStyle
+            ? VoicePrompt.systemPrompt(phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
+                                       hasPersona: !persona.isEmpty)
+            : ""
         // Third explicit ask: a skill the user invoked by NAME (`/music3 …`).
         // Plain chat builds its own system message, so this is a SECOND
         // construction site — the agent loop's injection does not cover it
         // (live: /music3 with Tools off answered from the model's own head).
         let invokedSkill = AgentPrompt.skillManager.invokedSkill(for: text)
-        if !invokedSkill.isEmpty { plainSystemBits.append(invokedSkill) }
-        if !plainSystemBits.isEmpty {
-            messagesArray.insert(["role": "system",
-                                  "content": plainSystemBits.joined(separator: "\n\n")],
-                                 at: 0)
+        if let system = Self.plainSystemPrompt(persona: persona, voiceGuidance: voiceGuidance,
+                                               invokedSkill: invokedSkill,
+                                               grounding: SystemGrounding.dateLine()) {
+            messagesArray.insert(["role": "system", "content": system], at: 0)
         }
 
         // Streaming placeholder for the UI — appended AFTER the request body is
@@ -1676,16 +1672,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// LAN IP) change mid-session, so they go LAST — a change there re-prefills
     /// only the short tail, not the big cached prefix. Pure → unit-tested.
     /// `persona` (the active agent's system prompt) REPLACES the whole
-    /// composition: an agent's prompt is the entire system prompt, so the
-    /// normal instructions never ride along to compete with it. The
+    /// composition but `grounding`, so the normal instructions never ride along
+    /// to compete with it; grounding states facts, not an identity, and is the
+    /// only way a persona learns today's date. The
     /// agent-prompt body opens with its own identity claim ("You are an
     /// autonomous agent…"), which sat right after the persona and overrode it
     /// (live 2026-07-29: Laguna answered "who are you?" with "I'm poolside
     /// Malibu" under an Elon Musk persona) — the composeSystemPrompt instance
     /// of the voice-prompt "Jarvis" class. Tools still ride the request's
     /// tools JSON, so tool dispatch is unaffected; the agent's prompt has to
-    /// carry anything else it needs (matching plain chat, where a persona is
-    /// already the whole system message). Persona is "" when there's no agent,
+    /// carry anything else it needs, as on the plain-chat path
+    /// (`plainSystemPrompt`). Persona is "" when there's no agent,
     /// and the result is then byte-identical to what this produced before
     /// agents existed.
     nonisolated static func composeSystemPrompt(persona: String = "",
@@ -1693,11 +1690,23 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                                 volatileTail: String,
                                                 grounding: String) -> String {
         if !persona.isEmpty {
-            return persona.trimmingCharacters(in: .whitespacesAndNewlines)
+            let p = persona.trimmingCharacters(in: .whitespacesAndNewlines)
+            return grounding.isEmpty ? p : p + "\n\n" + grounding
         }
         var p = stable + volatileTail
         if !grounding.isEmpty { p += "\n\n" + grounding }
         return p
+    }
+
+    /// The one system message a plain turn sends, nil when it needs none: plain
+    /// chat synthesizes nothing of its own. A persona carries `grounding`, as on
+    /// the agent path, unless voice guidance follows: it states date and time itself.
+    nonisolated static func plainSystemPrompt(persona: String, voiceGuidance: String,
+                                              invokedSkill: String, grounding: String) -> String? {
+        let personaGrounding = persona.isEmpty || !voiceGuidance.isEmpty ? "" : grounding
+        let text = [persona, personaGrounding, voiceGuidance, invokedSkill]
+            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        return text.isEmpty ? nil : text
     }
 
     /// Nudge for a tool call cut off by the token cap (the call was NOT

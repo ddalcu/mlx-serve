@@ -178,23 +178,46 @@ final class AgentTurnConfigTests: XCTestCase {
 
     // MARK: - Where the persona lands
 
-    func testAgentPersonaIsTheEntireSystemPrompt() {
+    func testAgentPersonaReplacesEverythingButTheGrounding() {
         // An agent's prompt REPLACES the normal system prompt — base
-        // instructions, listings, volatile tail and grounding are the app's
-        // voice, and composing them after a persona is how the persona got
-        // overridden (live 2026-07-29: Laguna answered "who are you?" with
-        // "I'm poolside Malibu" under an Elon Musk persona — the agent-prompt
-        // body opens with its own "You are an autonomous agent" claim). Tools
-        // still ride the request's tools JSON, so dispatch is unaffected; the
-        // agent's prompt has to carry anything else it needs. Matches the
-        // plain-chat path, where a persona is already the whole system message.
+        // instructions, listings and volatile tail are the app's voice, and
+        // composing them after a persona is how the persona got overridden
+        // (live 2026-07-29: Laguna answered "who are you?" with "I'm poolside
+        // Malibu" under an Elon Musk persona — the agent-prompt body opens with
+        // its own "You are an autonomous agent" claim). Grounding states facts,
+        // not an identity, and a persona cannot know today's date, so it follows.
         let out = ChatTurnEngine.composeSystemPrompt(
             persona: "You are Elon Musk.\n\n",
             stable: "You are an autonomous agent. STABLE-BLOCK",
             volatileTail: "VOLATILE-TAIL",
             grounding: "Today is Monday.")
-        XCTAssertEqual(out, "You are Elon Musk.",
-                       "the persona alone, trimmed — nothing composed around it")
+        XCTAssertEqual(out, "You are Elon Musk.\n\nToday is Monday.",
+                       "the persona, trimmed, then the grounding — nothing else composed around it")
+        XCTAssertEqual(ChatTurnEngine.composeSystemPrompt(
+            persona: "You are Elon Musk.", stable: "S", volatileTail: "V", grounding: ""),
+                       "You are Elon Musk.", "no grounding, no trailing separator")
+    }
+
+    func testPlainChatWithoutAPersonaSendsNoSystemMessage() {
+        // Plain chat synthesizes nothing of its own, not even the date.
+        XCTAssertNil(ChatTurnEngine.plainSystemPrompt(
+            persona: "", voiceGuidance: "", invokedSkill: "", grounding: "Today is Monday."))
+        XCTAssertEqual(ChatTurnEngine.plainSystemPrompt(
+            persona: "", voiceGuidance: "", invokedSkill: "SKILL", grounding: "Today is Monday."), "SKILL")
+    }
+
+    func testPlainChatPersonaIsToldTheDate() {
+        // A plain-chat agent (Assistant, Chef) gets the date line a tool-loop agent gets.
+        XCTAssertEqual(ChatTurnEngine.plainSystemPrompt(
+            persona: "You are a cook.", voiceGuidance: "", invokedSkill: "SKILL", grounding: "Today is Monday."),
+                       "You are a cook.\n\nToday is Monday.\n\nSKILL")
+    }
+
+    func testPlainVoiceTurnSaysTheDateOnce() {
+        // Voice guidance states the date and time itself, so the date line would only repeat it.
+        XCTAssertEqual(ChatTurnEngine.plainSystemPrompt(
+            persona: "You are a cook.", voiceGuidance: "VOICE", invokedSkill: "", grounding: "Today is Monday."),
+                       "You are a cook.\n\nVOICE")
     }
 
     func testNoPersonaLeavesThePromptByteIdentical() {
