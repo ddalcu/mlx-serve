@@ -4939,8 +4939,12 @@ group thins. Flash Next's head kept per-request state on the module
 exclusive and a second user queued; the state is now a per-request
 `Qwen4MtpState` swapped onto the module before every head touch
 (`qwen4MtpActivate`). Its verify rows are expert bytes and a batched verify measured no
-better than solo rounds, so it stays opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`): rounds stay
-solo, two interleave, three go plain. Bars: `tests/test_mtp_batched.sh` (fixed
+better than solo rounds, so it stayed opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`): rounds stay
+solo, two interleave, three go plain. The qwen4 grouped policy supersedes it
+(`MLX_SERVE_MTP_QWEN4_GROUPS`, default ON at depth 3 from 2 MTP-active streams, `=0` restores the
+opt-in behaviour): the planner rejects 4-slot groups, and one fixed-depth `verifyGroupMerged` round
+over all of them wins; a stale planner owner declines the whole tick, and M-RoPE rows, unequal widths
+and a slot whose acceptance collapses (256-token cool-down) sit out and decode solo that tick. Bars: `tests/test_mtp_batched.sh` (fixed
 depth: byte-identical on qwen4, near-tie acquitted on the batched verify),
 `tests/bench_concurrency_ladder.sh` (the numbers).
 

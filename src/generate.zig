@@ -1651,6 +1651,14 @@ pub const Generator = struct {
     mtp_group_cap: u32 = 0,
     /// Read with a non-zero `mtp_group_cap`: draft to the cap (`mtpGroupPlan`).
     mtp_group_fill: bool = false,
+    /// `MLX_SERVE_MTP_QWEN4_GROUPS`: non-zero while this slot is in a grouped round, every
+    /// round drafts exactly this (clamped by `mtp_group_cap`) and the depth controllers sit out.
+    mtp_group_fixed_depth: u32 = 0,
+    /// Consecutive fixed-depth rounds that kept no draft (`mtpLowAcceptStreak` on the raw round
+    /// tokens): the qwen4 groups policy's collapse escape reads it (`scheduler.qwen4GroupsTick`).
+    mtp_group_low: u32 = 0,
+    /// The policy keeps this slot on the default path until `completion_tokens` reaches this.
+    mtp_group_cooldown_until: u32 = 0,
     mtp_planner_owned: bool = false,
     mtp_planner_pending: bool = false,
     mtp_planner_width: ?u8 = null,
@@ -6203,6 +6211,8 @@ pub const Generator = struct {
     fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !u32 {
         if (!mtpLookupEnabled() or self.mtp_batch_head) return 0;
         if (group_planner.enabled() and self.mtp_planner_owned) return 0;
+        // A fixed-depth round must verify exactly its depth: a lookup chain is sized by its own gate.
+        if (self.mtp_group_fixed_depth > 0) return 0;
         const idx = try self.mtpLookupIndex(allocator);
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
         const got = idx.match(t1, mtp_lookup.MAX_DRAFT_STRONG);
@@ -9608,6 +9618,7 @@ pub const Generator = struct {
 
     fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool, m_lo: u32, width_trial: bool, round_ms: f32) void {
         if (self.mtp_serial_accept) self.mtpExactObserve(m, tokens - 1);
+        if (self.mtp_group_fixed_depth > 0) self.mtp_group_low = mtpLowAcceptStreak(self.mtp_group_low, @floatFromInt(tokens));
         if (group_planner.enabled() and self.mtp_planner_width != null) return;
         // An interval spanning a speculative round is neither arm's number.
         self.mtp_serial_clock = null;
@@ -11237,6 +11248,13 @@ pub const Generator = struct {
     }
 
     fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
+        if (self.mtp_group_fixed_depth > 0) {
+            // Exact acceptance keeps its own depth ceiling of 2 (`mtpRoundPlanInner`).
+            const d = @min(self.mtp_group_fixed_depth, if (self.mtp_serial_accept) 2 else mtp_mod.MAX_DEPTH);
+            self.mtp_ev_m_lo_prev = d;
+            const fixed: MtpRoundPlan = .{ .m_lo = d, .m_hi = d, .tau_ln = 0 };
+            return if (self.mtp_group_cap > 0) mtpGroupPlan(fixed, self.mtp_group_cap, false) else fixed;
+        }
         if (group_planner.enabled()) if (self.mtp_planner_width) |width| {
             return .{ .m_lo = width, .m_hi = width, .tau_ln = 0 };
         };
@@ -11510,7 +11528,7 @@ pub const Generator = struct {
     fn updateMtpEvRound(self: *Generator, drafted: u32, accepted: u32) void {
         mtpEvObserve(&self.mtp_ev_accept, drafted, accepted, MTP_EV_EMA_BETA);
         self.mtp_ev_rounds += 1;
-        if (mtpForcedDepth() != null) return;
+        if (mtpForcedDepth() != null or self.mtp_group_fixed_depth > 0) return;
         if (self.mtp_ev_rounds <= MTP_EV_WARMUP_ROUNDS) {
             self.updateMtpDepth(drafted, accepted);
             // Warmup may evaluate several depths. None of that mixed evidence
@@ -16241,6 +16259,7 @@ fn mtpEvTestGenerator() Generator {
     g.mtp_ev_m_lo_prev = 1;
     g.mtp_ev_costs = Generator.MTP_EV_DEFAULT_COSTS;
     g.spec_disabled_runtime = false;
+    g.mtp_group_fixed_depth = 0;
     return g;
 }
 
@@ -20079,6 +20098,19 @@ test "mtpSerialProbeEarned: a sidecar head probes only after a run of low-accept
     try testing.expectEqual(@as(u32, 0), G.mtpLowAcceptStreak(streak, 3.0)); // code/echo never earn it
 }
 
+test "mtpRoundPlan: a fixed grouped depth is exact, and exact acceptance keeps its ceiling of 2" {
+    var gen: Generator = undefined;
+    gen.mtp_group_fixed_depth = 4;
+    gen.mtp_group_cap = 0;
+    gen.mtp_serial_accept = false;
+    try testing.expectEqual(@as(u32, 4), gen.mtpRoundPlan().m_lo);
+    try testing.expectEqual(@as(u32, 4), gen.mtpRoundPlan().m_hi);
+    gen.mtp_serial_accept = true;
+    try testing.expectEqual(@as(u32, 2), gen.mtpRoundPlan().m_lo);
+    gen.mtp_group_fixed_depth = 1;
+    try testing.expectEqual(@as(u32, 1), gen.mtpRoundPlan().m_lo);
+}
+
 test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first" {
     const G = Generator;
     try testing.expect(!G.mtpSerialProbeUseful(null));
@@ -20898,6 +20930,7 @@ test "selected depth bypasses legacy planning and keeps acceptance private" {
     gen.mtp_planner_spec_rounds = 0;
     gen.mtp_planner_history = .{};
     gen.mtp_hidden_stale = true;
+    gen.mtp_group_fixed_depth = 0;
     const plan = gen.mtpRoundPlan();
     try testing.expectEqual(@as(u32, 2), plan.m_lo);
     try testing.expectEqual(plan.m_lo, plan.m_hi);

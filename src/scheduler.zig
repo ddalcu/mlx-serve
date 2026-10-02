@@ -6996,6 +6996,11 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         if (s.legacy_gen) |*g| g.spec_cost_solo = active.len == 1;
     }
 
+    // `MLX_SERVE_MTP_QWEN4_GROUPS` (on by default; `=0` or a tick without a qwen4 slot: this
+    // returns false without touching a slot).
+    // Engaged = this tick's qwen4 MTP slots run as one fixed-depth grouped round further down,
+    // so the planner is bypassed for the tick.
+    const qwen4_groups_engaged = qwen4GroupsTick(sch, active);
     if (Planner.enabled()) {
         for (active) |slot| if (slot.legacy_gen) |*gen| {
             gen.mtp_planner_width = null;
@@ -7004,10 +7009,16 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             slot.planner_plain_transition = false;
             slot.planner_force_plain = false;
         };
-        if (try tryPlannerTick(sch, active)) return;
-        for (active) |slot| if (slot.legacy_gen) |*gen| {
-            if (gen.mtp_planner_owned) slot.planner_force_plain = true;
-        };
+        if (!qwen4_groups_engaged) {
+            if (try tryPlannerTick(sch, active)) return;
+            for (active) |slot| if (slot.legacy_gen) |*gen| {
+                if (gen.mtp_planner_owned) slot.planner_force_plain = true;
+            };
+        } else {
+            // The planner never ran, so no owned+stale slot was primed: keep the parent's
+            // guarantee for the ones that do not take the grouped round (they run plain).
+            qwen4GroupsForcePlainStale(active);
+        }
     }
     defer if (Planner.enabled()) for (active) |slot| {
         slot.planner_force_plain = false;
@@ -7042,7 +7053,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
             batchable_n += 1;
-        } else if (why == .spec_active and slotMtpGroupable(s) and mtp_n < mtp_buf.len) {
+        } else if (why == .spec_active and slotMtpGroupable(s) and qwen4GroupSlotSkip(s) == null and mtp_n < mtp_buf.len) {
             mtp_buf[mtp_n] = s;
             mtp_n += 1;
         } else {
@@ -7065,7 +7076,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         while (i < mtp_n) {
             var j = i + 1;
             while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
-            if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len) {
+            if (qwen4GroupedRun(mtp_buf[i], j - i) == null and j - i >= mtpCrowdThresholdFor(mtp_buf[i], j - i) and batchable_n + (j - i) <= batchable_buf.len) {
                 for (mtp_buf[i..j]) |slot| {
                     const gen = &slot.legacy_gen.?;
                     gen.mtpDetachHead(slot.allocator, true) catch |e| {
@@ -8310,13 +8321,244 @@ pub fn verifyShapeFor(rows: usize, has_qwen4: bool, width: u32) VerifyShape {
 
 var merged_verify_decline_logged: bool = false;
 
-fn mtpRoundsStaySolo(slot: *const Slot) bool {
+/// `run_len` = the MTP-active slots of this slot's model in the tick. With the qwen4 groups
+/// switch on, it alone decides solo vs grouped for a qwen4 trunk (`MLX_SERVE_MTP_BATCHED_QWEN4`
+/// is ignored there); with it off this is exactly the old env-only answer.
+fn mtpRoundsStaySolo(slot: *const Slot, run_len: usize) bool {
     const t = slot.model.transformer orelse return true;
+    if (t.qwen4 != null and qwen4GroupsDepth() != null) return qwen4GroupedRun(slot, run_len) == null;
     return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
 }
 
-fn mtpCrowdThresholdFor(slot: *const Slot) usize {
-    return if (mtpRoundsStaySolo(slot)) 3 else mtpCrowdThreshold();
+fn mtpCrowdThresholdFor(slot: *const Slot, run_len: usize) usize {
+    return if (mtpRoundsStaySolo(slot, run_len)) 3 else mtpCrowdThreshold();
+}
+
+/// `MLX_SERVE_MTP_QWEN4_GROUPS=<D>` (u8 1..6; unset or invalid = depth 3, `0` = off): policy for
+/// a qwen4 trunk, on by default. A tick with >= `MLX_SERVE_MTP_QWEN4_GROUPS_MIN` (default 2, range 2..8) MTP-active
+/// slots runs them as ONE grouped round (merged [N,S] verify, `verifyGroupMerged`) at fixed
+/// depth D, planner bypassed; below that the tick is today's default (solo MTP, planner as is).
+/// Why: the planner prices a 4-slot qwen4 group out, while always grouping from 2 streams at a
+/// fixed depth wins. `MLX_SERVE_MTP_QWEN4_GROUPS=0` restores the planner / `MLX_SERVE_MTP_BATCHED_QWEN4` paths.
+pub const Qwen4GroupPolicy = enum { default, grouped };
+
+pub const QWEN4_GROUPS_DEPTH_DEFAULT: u8 = 3;
+pub const QWEN4_GROUPS_MIN_DEFAULT: usize = 2;
+pub const QWEN4_GROUPS_MAX_SLOTS: usize = Planner.MAX_ROWS;
+
+/// Null = off (`0` only); unset, empty, unparsable or out-of-range text keeps the default depth.
+pub fn parseQwen4GroupsDepth(raw: ?[]const u8) ?u8 {
+    const text = raw orelse return QWEN4_GROUPS_DEPTH_DEFAULT;
+    const v = std.fmt.parseInt(u8, text, 10) catch return QWEN4_GROUPS_DEPTH_DEFAULT;
+    if (v == 0) return null;
+    return if (v <= 6) v else QWEN4_GROUPS_DEPTH_DEFAULT;
+}
+
+pub fn parseQwen4GroupsMin(raw: ?[]const u8) usize {
+    const text = raw orelse return QWEN4_GROUPS_MIN_DEFAULT;
+    const v = std.fmt.parseInt(usize, text, 10) catch return QWEN4_GROUPS_MIN_DEFAULT;
+    return if (v >= 2 and v <= 8) v else QWEN4_GROUPS_MIN_DEFAULT;
+}
+
+/// The whole decision: off (`depth == null`) is always `.default`; otherwise grouped iff the
+/// tick has at least `min_slots` MTP-active slots.
+pub fn qwen4GroupPolicy(active_mtp_slots: usize, depth: ?u8, min_slots: usize) Qwen4GroupPolicy {
+    if (depth == null) return .default;
+    return if (active_mtp_slots >= min_slots) .grouped else .default;
+}
+
+/// A grouped slot's verify width: the fixed depth, clamped by that slot's own cap.
+pub fn qwen4GroupWidth(depth: u8, slot_cap: u32) u32 {
+    return @min(@as(u32, depth), slot_cap);
+}
+
+pub var qwen4_groups_depth_override: ??u8 = null;
+pub var qwen4_groups_min_override: ?usize = null;
+var qwen4_groups_depth_cache: ??u8 = null;
+var qwen4_groups_min_cache: ?usize = null;
+
+fn qwen4GroupsDepth() ?u8 {
+    if (qwen4_groups_depth_override) |v| return v;
+    if (qwen4_groups_depth_cache) |v| return v;
+    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_QWEN4_GROUPS")) |p| std.mem.span(p) else null;
+    const v = parseQwen4GroupsDepth(raw);
+    qwen4_groups_depth_cache = v;
+    // The default is silent (the first grouped tick logs it); only an explicit setting is echoed.
+    if (raw != null) {
+        if (v) |d| {
+            log.info("[mtp-groups] qwen4 grouped verify policy: depth={d}, min_slots={d}\n", .{ d, qwen4GroupsMin() });
+        } else log.info("[mtp-groups] qwen4 grouped verify policy off (MLX_SERVE_MTP_QWEN4_GROUPS=0)\n", .{});
+    }
+    return v;
+}
+
+fn qwen4GroupsMin() usize {
+    if (qwen4_groups_min_override) |v| return v;
+    if (qwen4_groups_min_cache) |v| return v;
+    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_QWEN4_GROUPS_MIN")) |p| std.mem.span(p) else null;
+    const v = parseQwen4GroupsMin(raw);
+    qwen4_groups_min_cache = v;
+    return v;
+}
+
+/// The fixed depth when `slot`'s run of `run_len` MTP-active slots takes the grouped round.
+/// Null for off, a non-qwen4 trunk, or a run below MIN (all of those = today's code path).
+fn qwen4GroupedRun(slot: *const Slot, run_len: usize) ?u8 {
+    const depth = qwen4GroupsDepth() orelse return null;
+    const t = slot.model.transformer orelse return null;
+    if (t.qwen4 == null) return null;
+    return qwen4GroupRunDepth(depth, qwen4_groups_tick_declined, run_len, qwen4GroupsMin());
+}
+
+/// The grouped depth for a run, or null: a tick that declined for a stale owner groups nothing.
+fn qwen4GroupRunDepth(depth: u8, tick_declined: bool, run_len: usize, min: usize) ?u8 {
+    if (tick_declined) return null;
+    return if (qwen4GroupPolicy(run_len, depth, min) == .grouped) depth else null;
+}
+
+/// Set by `qwen4GroupsDecide` when the tick declined for a `.stale_owner` candidate; cleared
+/// at the next decision. While set `qwen4GroupedRun` is null for every run, so a declined tick
+/// is the parent's tick throughout (no grouped round for the fresh slots either).
+var qwen4_groups_tick_declined: bool = false;
+
+var qwen4_groups_grouped_logged: bool = false;
+var qwen4_groups_default_logged: bool = false;
+var qwen4_groups_stale_logged: bool = false;
+var qwen4_groups_cooling_logged: bool = false;
+
+/// A slot of a qwen4 MTP run that sits out the grouped round and takes the default path.
+pub const Qwen4GroupSkip = enum {
+    /// Planner-owned with a stale hidden: `mtpRoundBegin` would fail it (`error.MtpHiddenStale`).
+    stale_owner,
+    /// `verifyGroupMerged` does not carry M-RoPE positions.
+    mrope,
+    /// The collapse escape tripped; the slot is on the default path until its cool-down ends.
+    cooling,
+    /// Exact acceptance caps its depth at 2, so at D > 2 its width could not equal D.
+    exact_depth,
+    /// A pre-drafted chain narrower than D would pad its row (`verifyGroupMerged` pads with token 0).
+    short_chain,
+};
+
+/// Decode tokens a slot stays off the grouped round after its collapse escape trips.
+pub const QWEN4_GROUPS_COOLDOWN_TOKENS: u32 = 256;
+
+fn qwen4GroupSkip(gen: *const Generator, depth: u8) ?Qwen4GroupSkip {
+    if (Planner.enabled() and gen.mtp_planner_owned and gen.mtp_hidden_stale) return .stale_owner;
+    if (gen.ctx.mrope_pos != null) return .mrope;
+    if (gen.completion_tokens < gen.mtp_group_cooldown_until) return .cooling;
+    if (gen.mtp_serial_accept and depth > 2) return .exact_depth;
+    if (gen.mtp_pre_draft) |pd| if (pd.m < depth) return .short_chain;
+    return null;
+}
+
+/// Null with the switch off or for a non-qwen4 slot; else why `slot` is kept out of the grouped round.
+fn qwen4GroupSlotSkip(slot: *const Slot) ?Qwen4GroupSkip {
+    const depth = qwen4GroupsDepth() orelse return null;
+    const t = slot.model.transformer orelse return null;
+    if (t.qwen4 == null) return null;
+    const gen = if (slot.legacy_gen) |*g| g else return null;
+    return qwen4GroupSkip(gen, depth);
+}
+
+/// Start of tick: a slot whose last round was grouped and kept no draft for
+/// `MTP_PROBE_LOW_ROUNDS` rounds in a row starts a cool-down off the policy; every slot then
+/// leaves any group (fixed depth and cap cleared) so a slot that left rounds at its own plan.
+fn qwen4GroupsReset(active: []*Slot) void {
+    for (active) |s| if (s.legacy_gen) |*g| {
+        if (g.mtp_group_fixed_depth == 0) {
+            g.mtp_group_low = 0;
+        } else if (g.mtp_group_low >= Generator.MTP_PROBE_LOW_ROUNDS) {
+            g.mtp_group_cooldown_until = g.completion_tokens +| QWEN4_GROUPS_COOLDOWN_TOKENS;
+            g.mtp_group_low = 0;
+            log.info("[mtp-groups] slot kept no draft for {d} grouped rounds: default path for {d} tokens\n", .{ Generator.MTP_PROBE_LOW_ROUNDS, QWEN4_GROUPS_COOLDOWN_TOKENS });
+        }
+        g.mtp_group_fixed_depth = 0;
+        g.mtp_group_cap = 0;
+    };
+}
+
+/// `cands` = this tick's qwen4 MTP-groupable slots. True when at least `min` of them may take
+/// the grouped round (the others are `qwen4GroupSkip`ped and run the default path). Any
+/// stale planner-owned candidate declines the whole tick: the default path (planner prime
+/// tick) is what clears the stale hidden, and no grouped round can then reach
+/// `error.MtpHiddenStale`. The decline is whole-tick for real: it sets
+/// `qwen4_groups_tick_declined`, so `qwen4GroupedRun` groups no run of that tick either. On an engaged tick a slot held back only by a narrow pre-drafted
+/// chain runs its solo round at fixed depth D, so its next chain is D wide and it joins then.
+fn qwen4GroupsDecide(cands: []const *Slot, depth: u8, min: usize) bool {
+    qwen4_groups_tick_declined = false;
+    if (cands.len == 0) return false;
+    var n: usize = 0;
+    for (cands) |s| {
+        if (qwen4GroupSkip(&s.legacy_gen.?, depth)) |why| {
+            if (why == .stale_owner) {
+                qwen4_groups_tick_declined = true;
+                if (!qwen4_groups_stale_logged) {
+                    qwen4_groups_stale_logged = true;
+                    log.info("[mtp-groups] stale-owner decline: whole tick on the default path (planner prime)\n", .{});
+                }
+                return false;
+            }
+            if (why == .cooling and !qwen4_groups_cooling_logged) {
+                qwen4_groups_cooling_logged = true;
+                log.info("[mtp-groups] cooling slot excluded from the grouped round\n", .{});
+            }
+            continue;
+        }
+        if (s.model == cands[0].model) n += 1;
+    }
+    if (qwen4GroupPolicy(n, depth, min) != .grouped) {
+        if (!qwen4_groups_default_logged) {
+            qwen4_groups_default_logged = true;
+            log.info("[mtp-groups] first below-MIN tick (mtp_slots={d}, min_slots={d}): default path\n", .{ n, min });
+        }
+        return false;
+    }
+    for (cands) |s| {
+        const gen = &s.legacy_gen.?;
+        if (qwen4GroupSkip(gen, depth) == .short_chain) gen.mtp_group_fixed_depth = depth;
+    }
+    if (!qwen4_groups_grouped_logged) {
+        qwen4_groups_grouped_logged = true;
+        log.info("[mtp-groups] first grouped tick (mtp_slots={d}, depth={d}, min_slots={d})\n", .{ n, depth, min });
+    }
+    return true;
+}
+
+/// Engaged tick (planner bypassed): an owned slot with a stale hidden that is not in the grouped
+/// round (not groupable, e.g. no ssm entries / mtp cache / serial-left > 0, or another model)
+/// would reach `mtpRoundBegin` -> `error.MtpHiddenStale`. Force it plain, as the parent does when
+/// the planner declines. Candidates that are stale-owned never reach here (they decline the tick),
+/// so no grouped slot is ever forced plain.
+fn qwen4GroupsForcePlainStale(active: []*Slot) void {
+    if (!Planner.enabled()) return;
+    for (active) |s| if (s.legacy_gen) |*g| {
+        if (g.mtp_planner_owned and g.mtp_hidden_stale) s.planner_force_plain = true;
+    };
+}
+
+/// Per-tick entry (see the call in `runDecodeTick`): true when the tick's qwen4 MTP slots take
+/// the grouped round. Does nothing at all while the switch is off.
+fn qwen4GroupsTick(sch: *Scheduler, active: []*Slot) bool {
+    const depth = qwen4GroupsDepth() orelse return false;
+    // The policy is on by default: a tick without a qwen4 slot must not touch any slot.
+    const any_qwen4 = for (active) |s| {
+        if (s.model.transformer != null and s.model.transformer.?.qwen4 != null) break true;
+    } else false;
+    if (!any_qwen4) return false;
+    qwen4_groups_tick_declined = false;
+    qwen4GroupsReset(active);
+    var cands: [MAX_BATCH_GROUP]*Slot = undefined;
+    var k: usize = 0;
+    for (active) |s| {
+        if (s.model.transformer == null or s.model.transformer.?.qwen4 == null) continue;
+        if (!(sch.batchVerdict(s) == .spec_active and slotMtpGroupable(s))) continue;
+        if (k < cands.len) {
+            cands[k] = s;
+            k += 1;
+        }
+    }
+    return qwen4GroupsDecide(cands[0..k], depth, qwen4GroupsMin());
 }
 
 fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
@@ -8461,7 +8703,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
         var end = start + 1;
         while (end < slots.len and slots[end].model == slots[start].model) end += 1;
         var group = slots[start..end];
-        if (mtpRoundsStaySolo(group[0])) {
+        if (mtpRoundsStaySolo(group[0], group.len)) {
             for (group) |slot| try runSingleDecodeTick(sch, slot);
             start = end;
             continue;
@@ -8491,6 +8733,30 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 try runSingleDecodeTick(sch, s);
             }
             group = group[0..keep];
+        }
+        // Qwen4 grouped policy: ONE fixed-depth round over the whole run (chunks of at most 8
+        // slots), not the tile-sized sub-groups; a leftover single slot rounds solo as default.
+        if (qwen4GroupedRun(group[0], end - start)) |depth| {
+            var c0: usize = 0;
+            while (c0 < group.len) {
+                const take = @min(group.len - c0, QWEN4_GROUPS_MAX_SLOTS);
+                const chunk = group[c0 .. c0 + take];
+                if (take >= 2) {
+                    for (chunk) |slot| {
+                        const gen = &slot.legacy_gen.?;
+                        gen.mtp_group_cap = depth;
+                        gen.mtp_group_fill = false;
+                        gen.mtp_group_fixed_depth = depth;
+                    }
+                    try runBatchedMtpTick(sch, chunk);
+                } else {
+                    chunk[0].legacy_gen.?.mtp_group_cap = 0;
+                    try runSingleDecodeTick(sch, chunk[0]);
+                }
+                c0 += take;
+            }
+            start = end;
+            continue;
         }
         // Sub-groups sized to the verify lane's row budget; the leftover slot rounds solo.
         var g0: usize = 0;
@@ -9434,6 +9700,344 @@ test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw k
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&raw_pair));
     const other = [_]u32{ 1_000, 162_000 };
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&other));
+}
+
+test "qwen4 groups policy: truth table" {
+    // Off: default at every count.
+    var n: usize = 0;
+    while (n <= 8) : (n += 1) try testing.expectEqual(Qwen4GroupPolicy.default, qwen4GroupPolicy(n, null, 2));
+    // D=3, MIN=2: below default, at/above grouped.
+    try testing.expectEqual(Qwen4GroupPolicy.default, qwen4GroupPolicy(0, 3, 2));
+    try testing.expectEqual(Qwen4GroupPolicy.default, qwen4GroupPolicy(1, 3, 2));
+    for ([_]usize{ 2, 3, 4, 8 }) |k| try testing.expectEqual(Qwen4GroupPolicy.grouped, qwen4GroupPolicy(k, 3, 2));
+    // MIN=4 moves the threshold.
+    try testing.expectEqual(Qwen4GroupPolicy.default, qwen4GroupPolicy(3, 3, 4));
+    try testing.expectEqual(Qwen4GroupPolicy.grouped, qwen4GroupPolicy(4, 3, 4));
+}
+
+test "qwen4 groups policy: widths honour each slot's cap" {
+    try testing.expectEqual(@as(u32, 3), qwen4GroupWidth(3, 6));
+    try testing.expectEqual(@as(u32, 3), qwen4GroupWidth(3, 3));
+    try testing.expectEqual(@as(u32, 2), qwen4GroupWidth(3, 2));
+    try testing.expectEqual(@as(u32, 0), qwen4GroupWidth(3, 0));
+}
+
+test "qwen4 groups policy: env parsing (default on at depth 3, 0 is the only off)" {
+    // Unset: on at the default depth.
+    try testing.expectEqual(@as(?u8, 3), parseQwen4GroupsDepth(null));
+    // "0" is the escape hatch.
+    try testing.expectEqual(@as(?u8, null), parseQwen4GroupsDepth("0"));
+    // 1..6 set the depth.
+    try testing.expectEqual(@as(?u8, 1), parseQwen4GroupsDepth("1"));
+    try testing.expectEqual(@as(?u8, 3), parseQwen4GroupsDepth("3"));
+    try testing.expectEqual(@as(?u8, 6), parseQwen4GroupsDepth("6"));
+    // Anything else keeps the default (a typo must not silently turn the policy off).
+    for ([_][]const u8{ "", "abc", "7", "9", "-1", "256", "3x" }) |bad|
+        try testing.expectEqual(@as(?u8, 3), parseQwen4GroupsDepth(bad));
+    try testing.expectEqual(@as(usize, 2), parseQwen4GroupsMin(null));
+    try testing.expectEqual(@as(usize, 2), parseQwen4GroupsMin("1"));
+    try testing.expectEqual(@as(usize, 2), parseQwen4GroupsMin("9"));
+    try testing.expectEqual(@as(usize, 2), parseQwen4GroupsMin("abc"));
+    try testing.expectEqual(@as(usize, 4), parseQwen4GroupsMin("4"));
+    try testing.expectEqual(@as(usize, 8), parseQwen4GroupsMin("8"));
+    // The unset default groups from two streams.
+    try testing.expectEqual(Qwen4GroupPolicy.default, qwen4GroupPolicy(1, parseQwen4GroupsDepth(null), parseQwen4GroupsMin(null)));
+    try testing.expectEqual(Qwen4GroupPolicy.grouped, qwen4GroupPolicy(2, parseQwen4GroupsDepth(null), parseQwen4GroupsMin(null)));
+    try testing.expectEqual(Qwen4GroupPolicy.default, qwen4GroupPolicy(4, parseQwen4GroupsDepth("0"), parseQwen4GroupsMin(null)));
+}
+
+/// A Generator with only the fields the qwen4 groups policy reads set (all idle).
+fn testGroupGen() Generator {
+    var g: Generator = undefined;
+    g.mtp_group_fixed_depth = 0;
+    g.mtp_group_cap = 0;
+    g.mtp_group_low = 0;
+    g.mtp_group_cooldown_until = 0;
+    g.completion_tokens = 0;
+    g.mtp_planner_owned = false;
+    g.mtp_hidden_stale = false;
+    g.ctx.mrope_pos = null;
+    g.mtp_serial_accept = false;
+    g.mtp_pre_draft = null;
+    return g;
+}
+
+test "qwen4 groups policy: switch off never engages and never touches a slot" {
+    // The override hook, not the environment: a developer's MLX_SERVE_MTP_QWEN4_GROUPS cannot flip this.
+    qwen4_groups_depth_override = @as(?u8, null);
+    defer qwen4_groups_depth_override = null;
+    try testing.expectEqual(@as(?u8, null), qwen4GroupsDepth());
+    // The per-tick hook returns before it reads a single slot (an undefined scheduler is safe).
+    var none: [0]*Slot = .{};
+    try testing.expect(!qwen4GroupsTick(undefined, &none));
+    // A slot carrying every policy field at a non-default value comes out byte-identical.
+    var slot: Slot = undefined;
+    var gen = testGroupGen();
+    gen.mtp_group_fixed_depth = 3;
+    gen.mtp_group_cap = 2;
+    gen.mtp_group_low = 15;
+    gen.mtp_group_cooldown_until = 99;
+    slot.legacy_gen = gen;
+    var active = [_]*Slot{&slot};
+    try testing.expect(!qwen4GroupsTick(undefined, &active));
+    const g = &slot.legacy_gen.?;
+    try testing.expectEqual(@as(u32, 3), g.mtp_group_fixed_depth);
+    try testing.expectEqual(@as(u32, 2), g.mtp_group_cap);
+    try testing.expectEqual(@as(u32, 15), g.mtp_group_low);
+    try testing.expectEqual(@as(u32, 99), g.mtp_group_cooldown_until);
+    // And the decision for any count is the old branch.
+    try testing.expectEqual(Qwen4GroupPolicy.default, qwen4GroupPolicy(8, qwen4GroupsDepth(), qwen4GroupsMin()));
+}
+
+test "qwen4 groups policy: default on, a tick without a qwen4 slot touches nothing" {
+    qwen4_groups_depth_override = @as(?u8, 3);
+    defer qwen4_groups_depth_override = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.transformer = null;
+    var slot: Slot = undefined;
+    slot.model = &model;
+    var gen = testGroupGen();
+    gen.mtp_group_fixed_depth = 3;
+    gen.mtp_group_cap = 2;
+    slot.legacy_gen = gen;
+    var active = [_]*Slot{&slot};
+    try testing.expect(!qwen4GroupsTick(undefined, &active));
+    try testing.expectEqual(@as(u32, 3), slot.legacy_gen.?.mtp_group_fixed_depth);
+    try testing.expectEqual(@as(u32, 2), slot.legacy_gen.?.mtp_group_cap);
+}
+
+test "qwen4 groups policy: a stale planner-owned slot is never grouped" {
+    Planner.enabled_override = true;
+    defer Planner.enabled_override = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    var c: Slot = undefined;
+    a.model = &model;
+    b.model = &model;
+    c.model = &model;
+    a.legacy_gen = testGroupGen();
+    b.legacy_gen = testGroupGen();
+    c.legacy_gen = testGroupGen();
+    var cands = [_]*Slot{ &a, &b, &c };
+    // All fresh: three slots at MIN 2 group.
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    // `mtpRoundBegin` fails exactly this state with error.MtpHiddenStale: the predicate names it
+    // and the whole tick declines (the default path's prime tick clears it), grouping nobody
+    // even though the two fresh slots alone would meet MIN.
+    a.legacy_gen.?.mtp_planner_owned = true;
+    a.legacy_gen.?.mtp_hidden_stale = true;
+    try testing.expectEqual(@as(?Qwen4GroupSkip, .stale_owner), qwen4GroupSkip(&a.legacy_gen.?, 3));
+    try testing.expect(!qwen4GroupsDecide(&cands, 3, 2));
+    try testing.expectEqual(@as(u32, 0), b.legacy_gen.?.mtp_group_fixed_depth);
+    // Owned but primed (hidden fresh) is a valid grouped participant again.
+    a.legacy_gen.?.mtp_hidden_stale = false;
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    // With the planner off nothing can be stale-owned (the same gate `mtpRoundBegin` uses).
+    a.legacy_gen.?.mtp_hidden_stale = true;
+    Planner.enabled_override = false;
+    try testing.expectEqual(@as(?Qwen4GroupSkip, null), qwen4GroupSkip(&a.legacy_gen.?, 3));
+}
+
+test "qwen4 groups policy: an engaged tick forces plain every owned stale slot outside the group" {
+    Planner.enabled_override = true;
+    defer Planner.enabled_override = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    var a: Slot = undefined; // owned + stale, not groupable (not a candidate): would hit MtpHiddenStale
+    var b: Slot = undefined; // owned, primed (fresh)
+    var c: Slot = undefined; // not owned, stale hidden
+    var d: Slot = undefined; // plain slot with no generator
+    for ([_]*Slot{ &a, &b, &c }) |s| {
+        s.model = &model;
+        s.legacy_gen = testGroupGen();
+        s.planner_force_plain = false;
+    }
+    d.legacy_gen = null;
+    d.planner_force_plain = false;
+    a.legacy_gen.?.mtp_planner_owned = true;
+    a.legacy_gen.?.mtp_hidden_stale = true;
+    b.legacy_gen.?.mtp_planner_owned = true;
+    c.legacy_gen.?.mtp_hidden_stale = true;
+    var active = [_]*Slot{ &a, &b, &c, &d };
+    // Candidates {b, c-like fresh slots} still group: a is not among them, so no decline.
+    var cands = [_]*Slot{ &b, &c };
+    qwen4_groups_depth_override = @as(?u8, 3);
+    defer qwen4_groups_depth_override = null;
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    qwen4GroupsForcePlainStale(&active);
+    try testing.expect(a.planner_force_plain);
+    try testing.expect(!b.planner_force_plain);
+    try testing.expect(!c.planner_force_plain);
+    try testing.expect(!d.planner_force_plain);
+    // Planner off: the helper touches nothing (the same gate `mtpRoundBegin` uses).
+    a.planner_force_plain = false;
+    Planner.enabled_override = false;
+    qwen4GroupsForcePlainStale(&active);
+    try testing.expect(!a.planner_force_plain);
+}
+
+test "qwen4 groups policy: a stale-owner decline groups no run that tick, the next decision clears it" {
+    Planner.enabled_override = true;
+    defer Planner.enabled_override = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    var c: Slot = undefined;
+    a.model = &model;
+    b.model = &model;
+    c.model = &model;
+    a.legacy_gen = testGroupGen();
+    b.legacy_gen = testGroupGen();
+    c.legacy_gen = testGroupGen();
+    var cands = [_]*Slot{ &a, &b, &c };
+    // Fresh tick: groups, and the run depth agrees.
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    try testing.expect(!qwen4_groups_tick_declined);
+    try testing.expectEqual(@as(?u8, 3), qwen4GroupRunDepth(3, qwen4_groups_tick_declined, 2, 2));
+    // Decline: b and c alone meet MIN 2, yet the run is not grouped.
+    a.legacy_gen.?.mtp_planner_owned = true;
+    a.legacy_gen.?.mtp_hidden_stale = true;
+    try testing.expect(!qwen4GroupsDecide(&cands, 3, 2));
+    try testing.expect(qwen4_groups_tick_declined);
+    try testing.expectEqual(@as(?u8, null), qwen4GroupRunDepth(3, qwen4_groups_tick_declined, 2, 2));
+    // Next tick, stale cleared: grouped again.
+    a.legacy_gen.?.mtp_hidden_stale = false;
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    try testing.expectEqual(@as(?u8, 3), qwen4GroupRunDepth(3, qwen4_groups_tick_declined, 2, 2));
+    // A cooling slot is excluded without declining; the one-shot logs latch.
+    a.legacy_gen.?.mtp_group_cooldown_until = 10;
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    try testing.expect(!qwen4_groups_tick_declined);
+    try testing.expect(qwen4_groups_cooling_logged and qwen4_groups_stale_logged);
+}
+
+test "qwen4 groups policy: an M-RoPE slot is excluded and does not count toward MIN" {
+    Planner.enabled_override = false;
+    defer Planner.enabled_override = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    a.model = &model;
+    b.model = &model;
+    a.legacy_gen = testGroupGen();
+    b.legacy_gen = testGroupGen();
+    const pos = [_]i32{ 0, 1, 2 };
+    b.legacy_gen.?.ctx.mrope_pos = &pos;
+    var cands = [_]*Slot{ &a, &b };
+    try testing.expectEqual(@as(?Qwen4GroupSkip, .mrope), qwen4GroupSkip(&b.legacy_gen.?, 3));
+    // 1 groupable of MIN 2: default tick.
+    try testing.expect(!qwen4GroupsDecide(&cands, 3, 2));
+    b.legacy_gen.?.ctx.mrope_pos = null;
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+}
+
+test "qwen4 groups policy: low-acceptance streak trips the escape, cool-down restores eligibility" {
+    Planner.enabled_override = false;
+    defer Planner.enabled_override = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    a.model = &model;
+    b.model = &model;
+    a.legacy_gen = testGroupGen();
+    b.legacy_gen = testGroupGen();
+    var active = [_]*Slot{ &a, &b };
+    var cands = [_]*Slot{ &a, &b };
+    // The streak is the existing machinery on raw round tokens: 16 one-token rounds trip it,
+    // a single round that keeps a draft resets it.
+    const R = Generator.MTP_PROBE_LOW_ROUNDS;
+    var streak: u32 = 0;
+    for (0..R - 1) |_| streak = Generator.mtpLowAcceptStreak(streak, 1.0);
+    try testing.expectEqual(R - 1, streak);
+    streak = Generator.mtpLowAcceptStreak(streak, 2.0);
+    try testing.expectEqual(@as(u32, 0), streak);
+    // One round short: still grouped, streak kept.
+    a.legacy_gen.?.completion_tokens = 1000;
+    a.legacy_gen.?.mtp_group_fixed_depth = 3;
+    a.legacy_gen.?.mtp_group_low = R - 1;
+    qwen4GroupsReset(&active);
+    try testing.expectEqual(R - 1, a.legacy_gen.?.mtp_group_low);
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    // At R: cool-down starts at the slot's token count, the streak restarts, the slot is out.
+    a.legacy_gen.?.mtp_group_fixed_depth = 3;
+    a.legacy_gen.?.mtp_group_low = R;
+    qwen4GroupsReset(&active);
+    try testing.expectEqual(@as(u32, 1000 + QWEN4_GROUPS_COOLDOWN_TOKENS), a.legacy_gen.?.mtp_group_cooldown_until);
+    try testing.expectEqual(@as(u32, 0), a.legacy_gen.?.mtp_group_low);
+    try testing.expectEqual(@as(?Qwen4GroupSkip, .cooling), qwen4GroupSkip(&a.legacy_gen.?, 3));
+    try testing.expect(!qwen4GroupsDecide(&cands, 3, 2));
+    // Still cooling one token before the end, eligible at the end.
+    a.legacy_gen.?.completion_tokens = 1000 + QWEN4_GROUPS_COOLDOWN_TOKENS - 1;
+    try testing.expectEqual(@as(?Qwen4GroupSkip, .cooling), qwen4GroupSkip(&a.legacy_gen.?, 3));
+    a.legacy_gen.?.completion_tokens = 1000 + QWEN4_GROUPS_COOLDOWN_TOKENS;
+    try testing.expectEqual(@as(?Qwen4GroupSkip, null), qwen4GroupSkip(&a.legacy_gen.?, 3));
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    // A streak that was not built at fixed depth (default-path rounds) does not trip.
+    a.legacy_gen.?.mtp_group_fixed_depth = 0;
+    a.legacy_gen.?.mtp_group_low = R;
+    qwen4GroupsReset(&active);
+    try testing.expectEqual(@as(u32, 0), a.legacy_gen.?.mtp_group_low);
+    try testing.expectEqual(@as(u32, 1000 + QWEN4_GROUPS_COOLDOWN_TOKENS), a.legacy_gen.?.mtp_group_cooldown_until);
+}
+
+test "qwen4 groups policy: widths in a group are equal (narrow pre-drafted chains sit out)" {
+    Planner.enabled_override = false;
+    defer Planner.enabled_override = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    var c: Slot = undefined;
+    a.model = &model;
+    b.model = &model;
+    c.model = &model;
+    a.legacy_gen = testGroupGen();
+    b.legacy_gen = testGroupGen();
+    c.legacy_gen = testGroupGen();
+    var cands = [_]*Slot{ &a, &b, &c };
+    // A chain of width m: only `m` is read by the policy.
+    var chain: Generator.MtpPreDraft = undefined;
+    chain.m = 2;
+    b.legacy_gen.?.mtp_pre_draft = chain;
+    try testing.expectEqual(@as(?Qwen4GroupSkip, .short_chain), qwen4GroupSkip(&b.legacy_gen.?, 3));
+    // 2 of 3 group at MIN 2; b's solo round runs at fixed depth so its next chain is D wide.
+    try testing.expect(qwen4GroupsDecide(&cands, 3, 2));
+    try testing.expectEqual(@as(u32, 3), b.legacy_gen.?.mtp_group_fixed_depth);
+    try testing.expectEqual(@as(u32, 0), a.legacy_gen.?.mtp_group_fixed_depth);
+    // MIN 3: b cannot be counted, the tick is the default one and b is not touched.
+    b.legacy_gen.?.mtp_group_fixed_depth = 0;
+    try testing.expect(!qwen4GroupsDecide(&cands, 3, 3));
+    try testing.expectEqual(@as(u32, 0), b.legacy_gen.?.mtp_group_fixed_depth);
+    // A chain exactly D or wider is consumed clipped to D (`mtpRoundAfterChain`): groups.
+    chain.m = 3;
+    b.legacy_gen.?.mtp_pre_draft = chain;
+    try testing.expectEqual(@as(?Qwen4GroupSkip, null), qwen4GroupSkip(&b.legacy_gen.?, 3));
+    chain.m = 5;
+    b.legacy_gen.?.mtp_pre_draft = chain;
+    try testing.expectEqual(@as(?Qwen4GroupSkip, null), qwen4GroupSkip(&b.legacy_gen.?, 3));
+    // Exact acceptance caps at 2: at D 3 it cannot match, at D 2 it does.
+    b.legacy_gen.?.mtp_pre_draft = null;
+    b.legacy_gen.?.mtp_serial_accept = true;
+    try testing.expectEqual(@as(?Qwen4GroupSkip, .exact_depth), qwen4GroupSkip(&b.legacy_gen.?, 3));
+    try testing.expectEqual(@as(?Qwen4GroupSkip, null), qwen4GroupSkip(&b.legacy_gen.?, 2));
+}
+
+test "qwen4 groups policy: fixed depth and cap are cleared when a slot leaves a group" {
+    qwen4_groups_depth_override = @as(?u8, 3);
+    defer qwen4_groups_depth_override = null;
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    a.legacy_gen = testGroupGen();
+    b.legacy_gen = testGroupGen();
+    a.legacy_gen.?.mtp_group_fixed_depth = 3;
+    a.legacy_gen.?.mtp_group_cap = 3;
+    b.legacy_gen.?.mtp_group_fixed_depth = 3;
+    b.legacy_gen.?.mtp_group_cap = 3;
+    var active = [_]*Slot{ &a, &b };
+    qwen4GroupsReset(&active);
+    for (active) |s| {
+        try testing.expectEqual(@as(u32, 0), s.legacy_gen.?.mtp_group_fixed_depth);
+        try testing.expectEqual(@as(u32, 0), s.legacy_gen.?.mtp_group_cap);
+    }
 }
 
 test "mtpQwen4StaySolo is opt-in" {
