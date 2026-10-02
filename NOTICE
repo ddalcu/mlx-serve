@@ -220,6 +220,8 @@ The verifier expert-pair kernel (`VERIFY_EXPERT_REUSE_SOURCE`) adapts the
 4-bit affine `qmv_impl`, `load_vector` and `qdot` arithmetic from MLX's
 `backend/metal/kernels/quantized.h`. Modifications: sorted expert-run pairing,
 shared packed-weight reads for two inputs, and verification-only shape guards.
+The DSpark block-FP8 loader's `fp8_e4m3` byte decoder follows MLX's
+`backend/metal/kernels/fp8.h`; its indexing and 128x128 scale expansion are ours.
 The fused expert reduction preserves the bf16 partial-sum order of MLX
 `reduction/reduce_col.h:col_reduce_small` while gathering, weighting and
 reducing in one dispatch. The batched coarse-head pair kernel

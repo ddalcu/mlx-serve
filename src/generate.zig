@@ -1510,6 +1510,8 @@ pub const Generator = struct {
     unforwarded_tail: u32 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
+    /// Draft slots actually sent to verification after confidence truncation.
+    dflash_verified_tokens: u64 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
@@ -2016,20 +2018,27 @@ pub const Generator = struct {
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
             // Under the chooser the width varies per round: drafts proposed
             // is the histogram's sum, not attempts x a fixed block.
-            const drafts_proposed: u64 = if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
+            const confidence_on = self.dflash != null and self.dflash.?.confidence != null and dflash_mod.confidenceThreshold() > 0;
+            const drafts_proposed: u64 = if (confidence_on)
+                self.dflash_verified_tokens
+            else if (self.dflash_chooser) |ch|
+                ch.draftsProposed()
+            else
+                self.dflash_attempted * @as(u64, drafts_per_round);
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% verified_avg={d:.2} block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
                     avg_per_round,
                     self.dflash_min_accepted_per_round,
                     per_draft_pct,
+                    @as(f64, @floatFromInt(drafts_proposed)) / @as(f64, @floatFromInt(self.dflash_attempted)),
                     if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
                     self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
@@ -5204,6 +5213,9 @@ pub const Generator = struct {
         };
         var draft_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_ids);
+        const confidence_enabled = model.confidence != null and dflash_mod.confidenceThreshold() > 0;
+        var confidence_logits: ?[]f32 = null;
+        defer if (confidence_logits) |values| allocator.free(values);
         if (use_markov) {
             const mh = &model.markov.?;
             const ids_i32 = try allocator.alloc(i32, m);
@@ -5218,6 +5230,18 @@ pub const Generator = struct {
                 for (rows) |*r| r.* = .{ .ctx = null };
                 q_rows = rows;
             }
+            var confidence_rows: ?[]mlx.mlx_array = null;
+            defer if (confidence_rows) |rows| {
+                for (rows) |r| if (r.ctx != null) {
+                    _ = mlx.mlx_array_free(r);
+                };
+                allocator.free(rows);
+            };
+            if (confidence_enabled) {
+                const rows = try allocator.alloc(mlx.mlx_array, m);
+                for (rows) |*r| r.* = .{ .ctx = null };
+                confidence_rows = rows;
+            }
             var prev: u32 = t1;
             var step: u32 = 0;
             while (step < m) : (step += 1) {
@@ -5229,8 +5253,23 @@ pub const Generator = struct {
                     const strides = [_]c_int{ 1, 1, 1 };
                     try mlx.check(mlx.mlx_slice(&base_row, draft_logits, &start, 3, &stop, 3, &strides, 3, s));
                 }
+                var markov_embed: mlx.mlx_array = .{ .ctx = null };
+                defer if (markov_embed.ctx != null) {
+                    _ = mlx.mlx_array_free(markov_embed);
+                };
+                if (confidence_rows != null) markov_embed = try mh.embedding(prev, s);
                 const corrected = try mh.stepLogits(base_row, prev, s);
                 defer _ = mlx.mlx_array_free(corrected);
+                if (confidence_rows) |rows| {
+                    var hidden_row = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(hidden_row);
+                    const hsh = mlx.getShape(blk_hidden);
+                    const start = [_]c_int{ 0, @intCast(step), 0 };
+                    const stop = [_]c_int{ 1, @as(c_int, @intCast(step)) + 1, hsh[2] };
+                    const strides = [_]c_int{ 1, 1, 1 };
+                    try mlx.check(mlx.mlx_slice(&hidden_row, blk_hidden, &start, 3, &stop, 3, &strides, 3, s));
+                    rows[step] = try model.confidence.?.logits(hidden_row, markov_embed, s);
+                }
                 if (stochastic) {
                     // Sample the step from the request's own filtered
                     // distribution and keep the row as q — the accept ratio
@@ -5268,6 +5307,25 @@ pub const Generator = struct {
                 for (rows) |r| _ = mlx.mlx_vector_array_append_value(vec, r);
                 draft_q = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_concatenate_axis(&draft_q, vec, 0, s));
+            }
+            if (confidence_rows) |rows| {
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                for (rows) |r| _ = mlx.mlx_vector_array_append_value(vec, r);
+                var cat = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(cat);
+                try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 1, s));
+                var flat = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(flat);
+                try mlx.check(mlx.mlx_reshape(&flat, cat, &[_]c_int{@intCast(m)}, 1, s));
+                var f32_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(f32_arr);
+                try mlx.check(mlx.mlx_astype(&f32_arr, flat, .float32, s));
+                try mlx.check(mlx.mlx_array_eval(f32_arr));
+                const data = mlx.mlx_array_data_float32(f32_arr) orelse return error.MlxArrayDataNull;
+                const host = try allocator.alloc(f32, m);
+                @memcpy(host, data[0..m]);
+                confidence_logits = host;
             }
             const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
             const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
@@ -5322,20 +5380,34 @@ pub const Generator = struct {
             ph.reset();
         }
 
-        // ── Phase 2: verify input [t1, drafts...] — [1, bs] int32, lazy ──
+        // ── Phase 2: verify input [t1, drafts...] ──
+        var verify_m = m;
+        const confidence_threshold = dflash_mod.confidenceThreshold();
+        if (confidence_logits) |values| {
+            if (confidence_threshold > 0) {
+                verify_m = dflash_mod.confidencePrefixFromLogits(values, confidence_threshold, 1);
+            }
+        }
+        self.dflash_round_width = verify_m;
+        self.dflash_verified_tokens += verify_m;
+
         const t1_i32: i32 = @intCast(t1);
         const t1_shape = [_]c_int{ 1, 1 };
         const t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(t1_arr);
+        var verify_drafts = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(verify_drafts);
+        try mlx.check(mlx.mlx_slice(&verify_drafts, draft_ids, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 1, @intCast(verify_m) }, 2, &[_]c_int{ 1, 1 }, 2, s));
         var verify_input = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(verify_input);
         {
             const vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(vec);
             _ = mlx.mlx_vector_array_append_value(vec, t1_arr);
-            _ = mlx.mlx_vector_array_append_value(vec, draft_ids);
+            _ = mlx.mlx_vector_array_append_value(vec, verify_drafts);
             try mlx.check(mlx.mlx_concatenate_axis(&verify_input, vec, 1, s));
         }
+        const verify_len = 1 + verify_m;
 
         // Verify forward with layer captures — this round's verify IS the
         // next round's context producer.
@@ -5379,7 +5451,7 @@ pub const Generator = struct {
             allocator.free(slots);
         };
         if (stochastic) {
-            const slots = try allocator.alloc(mlx.mlx_array, bs);
+            const slots = try allocator.alloc(mlx.mlx_array, verify_len);
             per_pos_logits = slots;
             const slice_strides = [_]c_int{ 1, 1, 1 };
             for (slots, 0..) |*slot, idx| {
@@ -5395,7 +5467,7 @@ pub const Generator = struct {
         defer verify_argmax.deinit();
         if (!stochastic) {
             verify_argmax = if (serial)
-                try self.verifySerialSamples(verify_logits, 1 + m)
+                try self.verifySerialSamples(verify_logits, verify_len)
             else
                 try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
@@ -5426,7 +5498,7 @@ pub const Generator = struct {
         var accepted: u32 = 0;
         if (stochastic) {
             var k: u32 = 0;
-            while (k < m) : (k += 1) {
+            while (k < verify_m) : (k += 1) {
                 const target_p = try probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
                 defer _ = mlx.mlx_array_free(target_p);
                 const p_draft = try probAt(target_p, drafts[k], s);
@@ -5445,9 +5517,9 @@ pub const Generator = struct {
                 accepted += 1;
             }
         } else {
-            const argmax_data = try verify_argmax.ids(1 + m);
+            const argmax_data = try verify_argmax.ids(verify_len);
             var k: u32 = 0;
-            while (k < m) : (k += 1) {
+            while (k < verify_m) : (k += 1) {
                 if (@as(u32, @intCast(argmax_data[k])) != drafts[k]) break;
                 accepted += 1;
             }
@@ -5470,7 +5542,7 @@ pub const Generator = struct {
                 const correction_logits = per_pos_logits.?[accepted];
                 const probs = try probsAtLastPos(correction_logits, self.sampling, s);
                 defer _ = mlx.mlx_array_free(probs);
-                if (accepted < m) {
+                if (accepted < verify_m) {
                     // norm(max(0, p − q)) against the q the draft was drawn
                     // from — a one-hot here is the WRONG residual for a
                     // sampled draft, and wrong silently.
@@ -5486,7 +5558,7 @@ pub const Generator = struct {
                     break :blk try sampleFromProbs(probs, s);
                 }
             } else {
-                const argmax_data = try verify_argmax.ids(1 + m);
+                const argmax_data = try verify_argmax.ids(verify_len);
                 break :blk @intCast(argmax_data[accepted]);
             }
         };
@@ -5499,7 +5571,7 @@ pub const Generator = struct {
         // ── Phase 4: commit — truncate on partial accept, then grow the
         // assistant context by exactly the committed positions ──
         const n_commit: usize = 1 + @as(usize, accepted);
-        if (accepted < m) {
+        if (accepted < verify_m) {
             try self.ctx.cache.truncate(anchor_pos + n_commit, s);
             if (moe_path) {
                 // Same bookkeeping as nextMtp's GDN arm: preserve the
@@ -5511,7 +5583,7 @@ pub const Generator = struct {
                 if (self.ctx.ssm_entries) |entries| {
                     const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
                     if (!gdn_captured) return error.SpecRollbackUnavailable;
-                    try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
+                    try self.rollbackSsmFromCapture(entries, accepted, verify_len, s);
                 }
                 self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
             } else if (hybrid_path) {
@@ -5527,12 +5599,12 @@ pub const Generator = struct {
                         }
                     }
                     if (!captured) return error.SpecRollbackUnavailable;
-                    try self.rollbackSsmFromCapture(entries, accepted, bs, s);
+                    try self.rollbackSsmFromCapture(entries, accepted, verify_len, s);
                 }
                 self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
             }
         }
-        if (accepted == m) {
+        if (accepted == verify_m) {
             try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);
         } else {
             const sliced = try allocator.alloc(mlx.mlx_array, cap_out.len);
@@ -5577,7 +5649,7 @@ pub const Generator = struct {
         self.dflash_accepted_tokens += accepted;
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
-        if (self.dflash_chooser) |*ch| ch.observe(m, accepted, MTP_EV_EMA_BETA);
+        if (self.dflash_chooser) |*ch| ch.observe(verify_m, accepted, MTP_EV_EMA_BETA);
         // The calibrated sticky gate stays as the bootstrap that gets serial
         // MEASURED (the chooser picks serial only from a measured w0 cell).
         self.checkDflashRuntimeGate();
@@ -19088,6 +19160,45 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         try testing.expectEqual(want, got.items.len);
         try testing.expectEqual(@as(u32, @intCast(want)), gen.completion_tokens);
         try testing.expectEqual(want, gen.generated_ids.items.len);
+        for (serial, got.items) |a, b| try testing.expectEqual(a, b);
+    }
+
+    // DSpark confidence arm: the learned prefix gate may shorten verification,
+    // but every committed token still comes from the target's verify rows.
+    {
+        var tmp_ds = std.testing.tmpDir(.{});
+        defer tmp_ds.cleanup();
+        var ds_buf: [512]u8 = undefined;
+        const ds_path = ds_buf[0..try tmp_ds.dir.realPath(io, &ds_buf)];
+        try dflash_mod.TinyFix.writeDspark(io, tmp_ds.dir, ds_path, s);
+
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        var dm = try dflash_mod.loadDflash(io, allocator, s, ds_path);
+        defer dm.deinit();
+        try dm.bind(&xfm);
+        dflash_mod.confidence_threshold_override = 0.5;
+        defer dflash_mod.confidence_threshold_override = null;
+
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
+            .dflash_enabled = true,
+            .dflash = &dm,
+            .dflash_min_accepted_per_round = 0,
+        });
+        defer gen.deinit(allocator);
+
+        var got = std.ArrayList(u32).empty;
+        defer got.deinit(allocator);
+        while (true) {
+            const res = (try gen.nextDflash(allocator)) orelse break;
+            defer allocator.free(res.tokens);
+            try got.appendSlice(allocator, res.tokens);
+            try testing.expectEqual(prompt.len + gen.generated_ids.items.len - gen.unforwarded_tail, gen.ctx.cache.step);
+            try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
+        }
+        try testing.expect(gen.dflash_attempted > 0);
+        try testing.expect(gen.dflash_verified_tokens > 0);
+        try testing.expectEqual(want, got.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
 

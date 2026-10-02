@@ -107,6 +107,54 @@ final class DownloadManagerTransferTests: XCTestCase {
         XCTAssertTrue(shardRequests.allSatisfy { $0.range != nil })
     }
 
+    func testDSparkGemDownloadsResolvesAndCanBeRemovedWithoutTouchingTheTarget() async throws {
+        let config = Data(#"{"block_size":8,"mask_token_id":248077,"markov_rank":256,"aux_hidden_state_layer_ids":[4],"transformer_layer_config":{"model_type":"qwen3"}}"#.utf8)
+        let files = [("config.json", config), ("model.safetensors", Self.pseudoRandom(bytes: 1 << 20))]
+        let repo = "fixtures/Qwen3.8-27B-speculator.dspark-fp8-\(UUID().uuidString)"
+        HuggingFaceStubProtocol.serve(repo: repo, files: files)
+        let target = (tempRoot as NSString).appendingPathComponent("target")
+        try FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+        let targetWeight = (target as NSString).appendingPathComponent("model.safetensors")
+        try Data([42]).write(to: URL(fileURLWithPath: targetWeight))
+        let manager = DownloadManager(modelsRoot: tempRoot)
+        let gem = DrafterGem(kind: .dspark, repo: repo, subfolder: nil, sizeGB: 0.001)
+        XCTAssertTrue(manager.gemDestination(gem, modelDir: target).hasPrefix(tempRoot + "/"))
+        let finished = expectation(description: "DSpark downloaded")
+        manager.startGem(gem, modelDir: target) { ok in
+            XCTAssertTrue(ok)
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 30)
+        let dir = try XCTUnwrap(manager.gemPath(gem, modelDir: target))
+        XCTAssertTrue(dir.hasPrefix(tempRoot + "/"), "test downloads never write to the real drafter library")
+        XCTAssertFalse(manager.isFetchingGem(gem))
+        XCTAssertEqual(DrafterGems.stone(drafterConfig: try XCTUnwrap(DrafterGems.readConfig(dir))), .amethyst)
+        for (name, data) in files {
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: (dir as NSString).appendingPathComponent(name))), data)
+        }
+        XCTAssertFalse(manager.discoverLocalModels().contains { $0.path == dir })
+        var override = ModelOverride()
+        DrafterSocket.gem(gem).write(into: &override, gemPath: dir)
+        XCTAssertEqual(override.drafter, dir)
+        manager.removeGem(gem, modelDir: target)
+        XCTAssertNil(manager.gemPath(gem, modelDir: target))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: targetWeight)), Data([42]))
+    }
+
+    func testConfigOnlyDSparkDownloadDoesNotFillTheSocket() async throws {
+        let repo = "fixtures/DSpark-incomplete-\(UUID().uuidString)"
+        HuggingFaceStubProtocol.serve(repo: repo, files: [("config.json", Data(#"{"markov_rank":256}"#.utf8))])
+        let manager = DownloadManager(modelsRoot: tempRoot)
+        let gem = DrafterGem(kind: .dspark, repo: repo, subfolder: nil, sizeGB: 0)
+        let finished = expectation(description: "incomplete DSpark rejected")
+        manager.startGem(gem, modelDir: tempRoot) { ok in
+            XCTAssertFalse(ok)
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 30)
+        XCTAssertNil(manager.gemPath(gem, modelDir: tempRoot))
+    }
+
     // MARK: - Failure and resume
 
     func testATransientFailureIsRetriedAndTheFileStillLands() async throws {

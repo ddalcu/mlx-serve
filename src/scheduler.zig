@@ -3254,6 +3254,12 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
+fn modelAndDrafterDiskBytes(io: std.Io, model_dir: []const u8, drafter_dir: []const u8) u64 {
+    const model_bytes = modelDiskBytes(io, model_dir);
+    if (drafter_dir.len == 0 or std.mem.eql(u8, model_dir, drafter_dir)) return model_bytes;
+    return model_bytes +| modelDiskBytes(io, drafter_dir);
+}
+
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -3279,6 +3285,30 @@ test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     defer std.testing.allocator.free(snap);
 
     try std.testing.expectEqual(@as(u64, 16), modelDiskBytes(io, snap));
+}
+
+test "modelDiskBytes includes an external drafter directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.createDirPath(io, "drafter");
+    try tmp.dir.writeFile(io, .{ .sub_path = "target/model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drafter/model.safetensors", .data = "012345" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, "target" });
+    defer std.testing.allocator.free(target);
+    const drafter = try std.fs.path.join(std.testing.allocator, &.{ root, "drafter" });
+    defer std.testing.allocator.free(drafter);
+
+    try std.testing.expectEqual(@as(u64, 16), modelAndDrafterDiskBytes(io, target, drafter));
+    try std.testing.expectEqual(@as(u64, 10), modelAndDrafterDiskBytes(io, target, ""));
+    try std.testing.expectEqual(@as(u64, 10), modelAndDrafterDiskBytes(io, target, target));
 }
 
 test "modelDiskBytes bills only the shards the index names (issue #274)" {
@@ -3927,7 +3957,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
-
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
     // (model declares vision in config but the safetensors didn't ship the
     // tower); other errors fail the whole load.
@@ -4024,6 +4053,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.draft_block_size_explicit,
                 wide_lane,
                 block_cap.cap,
+                dflash_mod.targetBlockCap(&xfm_ptr.config),
             );
             if (params.draft_block_size_explicit and params.draft_block_size > sch.drafter_block_size)
                 log.warn("--draft-block-size {d} is past the drafter's trained block; using {d}\n", .{ params.draft_block_size, sch.drafter_block_size });
@@ -4032,8 +4062,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (!params.draft_block_size_explicit and d.selector != null and xfm_ptr.specTreeSupported() and transformer_mod.naxAvailable())
                 sch.drafter_block_size = dflash_mod.TREE_NAX_BLOCK;
             var cap_note_buf: [96]u8 = undefined;
+            const target_cap = dflash_mod.targetBlockCap(&xfm_ptr.config);
             const cap_note: []const u8 = if (params.draft_block_size_explicit)
                 ", user-clamped"
+            else if (d.config.block_size > sch.drafter_block_size and target_cap < d.config.block_size)
+                std.fmt.bufPrint(&cap_note_buf, ", capped (target verify cap {d})", .{target_cap}) catch ", capped"
             else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
                 std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
                     block_cap.label,
@@ -4401,7 +4434,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.vision_encoder = vision_ptr;
     entry.drafter = drafter_ptr;
     entry.dflash = dflash_ptr;
-    if (entry.config) |c| c.drafter_ctx_bytes_per_token = if (dflash_ptr) |d| dflash_mod.ctxBytesPerToken(&d.config) else 0;
+    params.config.drafter_ctx_bytes_per_token = if (dflash_ptr) |d| dflash_mod.ctxBytesPerToken(&d.config) else 0;
     entry.drafter_block_size = sch.drafter_block_size;
     entry.mtp = if (mtp_ptr) |h|
         generate_mod.MtpHeadRef{ .qwen = h }
@@ -4548,10 +4581,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // ins), else fall back to a rough multiple of layers × hidden. The
     // value drives LRU eviction's "will the new model fit?" gate in Phase
     // D; precise accounting isn't required here.
-    const bytes_resident: u64 = if (entry.bytes_on_disk) |b|
-        b
-    else
-        @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;
+    const bytes_resident: u64 = blk: {
+        const target = if (entry.bytes_on_disk) |b|
+            b
+        else
+            @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;
+        if (drafter_dir.len == 0 or (dflash_ptr == null and drafter_ptr == null)) break :blk target;
+        break :blk target +| modelDiskBytes(sch.io, drafter_dir);
+    };
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);

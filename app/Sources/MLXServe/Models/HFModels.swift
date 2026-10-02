@@ -370,23 +370,11 @@ struct HFModel: Identifiable, Codable {
         return toolFamilies.contains { lower.contains($0) }
     }
 
-    /// Whether this repo is a Gemma 4 assistant drafter checkpoint. Drafters
-    /// pair with a base Gemma 4 model via `--drafter <dir>`; loading one as a
-    /// target on its own would fail, and they already have a dedicated home
-    /// (the Drafters tab), so Discover hides them entirely.
-    ///
-    /// Search-result metadata carries no `model_type`, so this is name-based:
-    /// any Gemma 4 repo whose name carries "assistant" as its own
-    /// hyphen-delimited token. Drafters ship under more than one author
-    /// (`mlx-community` for the community bf16/qat/quant builds, `google` for
-    /// the official 12B upload) and in many quant/qat permutations
-    /// (`-assistant-bf16`, `-qat-assistant-4bit`, `-qat-assistant-mxfp8`, …),
-    /// so this checks the NAME SHAPE rather than a fixed list of exact
-    /// strings — the previous regex only matched the original bf16-only,
-    /// four-size-only naming and missed every qat/quant/12B variant
-    /// mlx-community has since published.
+    /// Sidecars belong in the target model's Drafter menu, never in the chat picker.
+    /// Search metadata without a config uses the published sidecar name tokens.
     var isDrafter: Bool {
-        let tokens = modelName.lowercased().split(separator: "-").map(String.init)
+        let tokens = modelName.lowercased().split { $0 == "-" || $0 == "." }.map(String.init)
+        if tokens.contains("dspark") || tokens.contains("dflash") || tokens.contains("dflash2") { return true }
         return tokens.contains("gemma") && tokens.contains("4") && tokens.contains("assistant")
     }
 

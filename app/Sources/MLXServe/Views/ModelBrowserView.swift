@@ -1988,7 +1988,7 @@ private struct LocalModelRow: View {
                             .foregroundStyle(.purple)
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(Color.purple.opacity(0.15), in: Capsule())
-                            .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
+                            .help("Speculative-decoding drafter — select it in the matching model's Drafter menu, not loadable on its own.")
                     }
                     if let stone = badge.stone {
                         HStack(spacing: 3) {

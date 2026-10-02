@@ -59,7 +59,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--pld` / `--no-pld` | on | Prompt Lookup Decoding (model-agnostic spec-decode) |
 | `--pld-draft-len N` | `5` | Max draft tokens per PLD step |
 | `--pld-key-len N` | `3` | N-gram match key length for PLD |
-| `--drafter DIR` | none | Speculative-decoding drafter checkpoint: a Gemma 4 assistant or a DFlash draft companion. Models that ship a `drafter/` subdir (Muse-Glimmer builds) load theirs automatically |
+| `--drafter DIR` | none | Speculative-decoding drafter checkpoint: Gemma 4 assistant, DFlash, or DSpark companion. Models that ship a `drafter/` subdir load theirs automatically |
 | `--no-drafter` | off | Never load a drafter, including one shipped inside the checkpoint |
 | `--draft-block-size N` | auto | Drafts per round for the drafter (auto-sized to what this Mac's verify path can use) |
 | `--no-mtp` / `--mtp` | on when a head is loaded | Disable the native MTP head; `--mtp` is a no-op kept for old launch lines (dense and MoE both default on) |

@@ -366,14 +366,17 @@ struct SpeculationSocketRow: View {
     let modelGB: Double
     let mtpAvailable: Bool
     @State private var removing: DrafterGem?
+    @State private var packConfig: [String: Any]?
 
     private var gems: [DrafterGem] {
-        Self.gems(repoId: repoId, modelDir: modelDir, mtpAvailable: mtpAvailable, listing: downloads.packListings[repoId])
+        DrafterGems.gems(forRepoId: repoId, packFiles: downloads.packListings[repoId], localDrafter: packConfig != nil,
+                        mtpAvailable: mtpAvailable, localDrafterConfig: packConfig)
     }
 
     static func gems(repoId: String, modelDir: String, mtpAvailable: Bool, listing: [String: Int64]?) -> [DrafterGem] {
-        let local = FileManager.default.fileExists(atPath: (modelDir as NSString).appendingPathComponent(DrafterGems.packFolder + "/config.json"))
-        return DrafterGems.gems(forRepoId: repoId, packFiles: listing, localDrafter: local, mtpAvailable: mtpAvailable)
+        let config = DrafterGems.readConfig((modelDir as NSString).appendingPathComponent(DrafterGems.packFolder))
+        return DrafterGems.gems(forRepoId: repoId, packFiles: listing, localDrafter: config != nil,
+                               mtpAvailable: mtpAvailable, localDrafterConfig: config)
     }
 
     private var fetching: DrafterGem? { gems.first { downloads.isFetchingGem($0) } }
@@ -403,11 +406,20 @@ struct SpeculationSocketRow: View {
         .alert("Remove drafter", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
                presenting: removing) { g in
             Button("Keep Files", role: .cancel) {}
-            Button("Delete Files", role: .destructive) { downloads.removeGem(g, modelDir: modelDir) }
+            Button("Delete Files", role: .destructive) {
+                downloads.removeGem(g, modelDir: modelDir)
+                refreshPackConfig()
+            }
                 .keyboardShortcut(.defaultAction)
         } message: { g in
             Text("Also delete the \(g.label) files (\(SystemMemoryInfo.preciseGB(g.sizeGB)))?").font(.app(.body))
         }
+        .onAppear { refreshPackConfig() }
+        .onChange(of: downloads.downloads[repoId]?.status) { _, _ in refreshPackConfig() }
+    }
+
+    private func refreshPackConfig() {
+        packConfig = DrafterGems.readConfig((modelDir as NSString).appendingPathComponent(DrafterGems.packFolder))
     }
 
     static func label(_ s: DrafterSocket) -> String {

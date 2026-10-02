@@ -19,7 +19,9 @@ struct DrafterGem: Equatable, Hashable, Identifiable {
         switch kind {
         case .mtp: "MTP head (built in)"
         case .dflash2: "DFlash2 drafter"
-        case .dspark: "DSpark drafter"
+        case .dspark:
+            repo == DrafterGems.qwen38DSparkFP8Repo ? "DSpark drafter (FP8)"
+                : repo == DrafterGems.qwen38DSparkRepo ? "DSpark drafter (BF16)" : "DSpark drafter"
         case .gemmaAssistant: "Gemma assistant drafter"
         case .museAssistant: "Muse assistant drafter"
         case .packDrafter: "Pack drafter"
@@ -34,6 +36,8 @@ struct DrafterGem: Equatable, Hashable, Identifiable {
 enum DrafterGems {
     static let packFolder = "drafter"
     static let qwen38DFlash2Repo = "z-lab/Qwen3.8-27B-DFlash2"
+    static let qwen38DSparkRepo = "RedHatAI/Qwen3.8-27B-speculator.dspark"
+    static let qwen38DSparkFP8Repo = "lonelyj3w/Qwen3.8-27B-speculator.dspark-fp8"
     static let museAssistantRepo = "meta-models/Muse-Glimmer-30B-assistant"
     /// LiquidAI's DSpark drafters, by the LFM2.5 base they draft for.
     static let lfmDSparkRepos = ["lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-DSpark", "lfm2.5-8b-a1b": "LiquidAI/LFM2.5-8B-A1B-DSpark"]
@@ -42,7 +46,7 @@ enum DrafterGems {
     /// `packFiles`: the pack's HF listing (path → size) when fetched, nil when
     /// unknown. `localDrafter`: `<model_dir>/drafter` is already on disk.
     static func gems(forRepoId repoId: String, packFiles: [String: Int64]?,
-                     localDrafter: Bool, mtpAvailable: Bool) -> [DrafterGem] {
+                     localDrafter: Bool, mtpAvailable: Bool, localDrafterConfig: [String: Any]? = nil) -> [DrafterGem] {
         var out: [DrafterGem] = []
         if mtpAvailable { out.append(DrafterGem(kind: .mtp, repo: "", subfolder: nil, sizeGB: 0)) }
         let base = (repoId as NSString).lastPathComponent.lowercased()
@@ -52,13 +56,21 @@ enum DrafterGems {
         let packBytes = packFiles?.filter { $0.key.hasPrefix(prefix) }.values.reduce(0, +) ?? 0
         let packHasDrafter = localDrafter || packFiles?[prefix + "config.json"] != nil
         let packGB = Double(packBytes) / 1e9
+        let packKind: DrafterGem.Kind = switch localDrafterConfig.flatMap(stone(drafterConfig:)) {
+        case .amethyst: .dspark
+        case .topaz: .dflash2
+        case .ruby: .gemmaAssistant
+        default: base.contains("qwen3.8-27b") ? .dflash2 : .packDrafter
+        }
 
         if base.contains("qwen3.8-27b") {
             out.append(packHasDrafter
-                ? DrafterGem(kind: .dflash2, repo: repoId, subfolder: packFolder, sizeGB: packGB > 0 ? packGB : 3.85)
+                ? DrafterGem(kind: packKind, repo: repoId, subfolder: packFolder, sizeGB: packGB > 0 ? packGB : 3.85)
                 : DrafterGem(kind: .dflash2, repo: qwen38DFlash2Repo, subfolder: nil, sizeGB: 3.85))
+            out.append(DrafterGem(kind: .dspark, repo: qwen38DSparkFP8Repo, subfolder: nil, sizeGB: 2.12))
+            out.append(DrafterGem(kind: .dspark, repo: qwen38DSparkRepo, subfolder: nil, sizeGB: 3.98))
         } else if packHasDrafter {
-            out.append(DrafterGem(kind: .packDrafter, repo: repoId, subfolder: packFolder, sizeGB: packGB))
+            out.append(DrafterGem(kind: packKind, repo: repoId, subfolder: packFolder, sizeGB: packGB))
         } else if base.contains("muse-glimmer") {
             out.append(DrafterGem(kind: .museAssistant, repo: museAssistantRepo, subfolder: nil, sizeGB: 5.11))
         } else if let repo = lfmDSparkRepos.first(where: { base.hasPrefix($0.key) })?.value {
@@ -71,10 +83,9 @@ enum DrafterGems {
         return out
     }
 
-    /// The gem a fresh download fills its socket with. z-lab's 27B drafter is
-    /// offered but never auto-filled: our packs ship it only where it pays.
+    /// External Qwen sidecars are opt-in; a pack's own drafter stays automatic.
     static func defaultGem(_ gems: [DrafterGem]) -> DrafterGem? {
-        gems.first { $0.needsDownload && $0.repo != qwen38DFlash2Repo }
+        gems.first { $0.needsDownload && ![qwen38DFlash2Repo, qwen38DSparkRepo, qwen38DSparkFP8Repo].contains($0.repo) }
     }
 
     /// Whether `gem` fits beside a model of `modelGB` in this Mac's usable memory.
@@ -120,10 +131,12 @@ extension DrafterGems {
     /// contract triple nested-first, a Markov head is DSpark, a selector or
     /// dynamic convs DFlash2; a Gemma assistant is the one non-DFlash drafter.
     static func stone(drafterConfig root: [String: Any]) -> GemStone? {
-        if (root["model_type"] as? String)?.hasSuffix("_assistant") == true { return .ruby }
+        if (root["model_type"] as? String)?.hasPrefix("gemma4") == true,
+           (root["model_type"] as? String)?.hasSuffix("_assistant") == true { return .ruby }
         let nested = root["dflash_config"] as? [String: Any] ?? [:]
         func get(_ k: String) -> Any? { nested[k] ?? root[k] }
-        guard get("block_size") != nil, get("mask_token_id") != nil, get("target_layer_ids") != nil else { return nil }
+        guard get("block_size") != nil, get("mask_token_id") != nil,
+              get("target_layer_ids") ?? root["aux_hidden_state_layer_ids"] != nil else { return nil }
         let archs = root["architectures"] as? [String] ?? []
         if root["markov_rank"] != nil || get("projector_type") as? String == "dspark" || archs.contains(where: { $0.contains("DSpark") }) {
             return .amethyst

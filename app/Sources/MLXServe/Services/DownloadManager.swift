@@ -930,17 +930,27 @@ class DownloadManager: ObservableObject {
         return out
     }
 
+    func gemDestination(_ gem: DrafterGem, modelDir: String) -> String {
+        if gem.subfolder != nil { return modelDir }
+        let root = pinnedRoot.map { ($0 as NSString).appendingPathComponent(".drafters") } ?? Self.draftersRoot
+        return (root as NSString).appendingPathComponent(gem.repo)
+    }
+
     /// Where `gem`'s files sit for the model at `modelDir`, nil when not downloaded.
     /// A Gemma assistant fetched by an older build lives in a model root.
     func gemPath(_ gem: DrafterGem, modelDir: String) -> String? {
         guard gem.needsDownload else { return nil }
         let fm = FileManager.default
-        func ready(_ dir: String) -> Bool { fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) }
+        func ready(_ dir: String) -> Bool {
+            guard fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")),
+                  let entries = try? fm.contentsOfDirectory(atPath: dir) else { return false }
+            return Self.weightDefect(inDir: dir, entries: entries) == nil
+        }
         if let sub = gem.subfolder {
             let dir = (modelDir as NSString).appendingPathComponent(sub)
             return ready(dir) ? dir : nil
         }
-        let dir = Self.gemDir(repo: gem.repo)
+        let dir = gemDestination(gem, modelDir: modelDir)
         if ready(dir) { return dir }
         return existingModelDir(for: gem.repo).flatMap { ready($0) ? $0 : nil }
     }
@@ -983,15 +993,15 @@ class DownloadManager: ObservableObject {
     }
 
     private func fetchGem(_ gem: DrafterGem, modelDir: String, alertOnFailure: Bool) async -> Bool {
-        let dest = gem.subfolder != nil ? modelDir : Self.gemDir(repo: gem.repo)
+        let dest = gemDestination(gem, modelDir: modelDir)
         await download(repoId: gem.repo,
                        selection: gem.subfolder.map { .packFolder($0) } ?? .chatDefault,
                        alertOnFailure: alertOnFailure, destDirOverride: dest)
-        return downloads[gem.repo]?.status == .completed
+        return downloads[gem.repo]?.status == .completed && gemPath(gem, modelDir: modelDir) != nil
     }
 
     private func removeGemPartials(_ gem: DrafterGem, modelDir: String) {
-        let dir = gem.subfolder.map { (modelDir as NSString).appendingPathComponent($0) } ?? Self.gemDir(repo: gem.repo)
+        let dir = gem.subfolder.map { (modelDir as NSString).appendingPathComponent($0) } ?? gemDestination(gem, modelDir: modelDir)
         let fm = FileManager.default
         for f in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where f.hasSuffix(".partial") || f.hasSuffix(".partial.parts") {
             try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(f))
@@ -1835,7 +1845,7 @@ class DownloadManager: ObservableObject {
         // them out. `gemma4_unified_assistant` is the newer "unified"
         // architecture (spans dense + MoE targets) shipped with the 12B
         // drafter — same UI treatment as `gemma4_assistant`.
-        let kind: ModelKind = drafterModelTypes.contains(modelType) ? .drafter : .base
+        let kind: ModelKind = drafterModelTypes.contains(modelType) || meta.isDrafter ? .drafter : .base
         return [LocalModel(
             id: "\(source.rawValue):\(idKey)",
             name: displayName,
@@ -1946,6 +1956,7 @@ class DownloadManager: ObservableObject {
     /// reliably carries the headline param count, which isn't a config field).
     struct ConfigMetadata: Equatable {
         var modelType = "unknown"
+        var isDrafter = false
         var hasVision = false
         var quantBits: Int? = nil
         var contextLength: Int? = nil
@@ -1961,6 +1972,7 @@ class DownloadManager: ObservableObject {
         guard let data = FileManager.default.contents(atPath: configPath),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return meta }
         if let mt = cfg["model_type"] as? String { meta.modelType = mt }
+        meta.isDrafter = DrafterGems.stone(drafterConfig: cfg) != nil
         // Vision: a NON-EMPTY `vision_config` block on a non-`_text` arch. Both
         // guards earn their place — `_text` skips text-only quantized
         // checkpoints with a vestigial block, and the emptiness check catches

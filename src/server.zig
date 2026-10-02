@@ -920,7 +920,7 @@ pub var prefix_cache_mem_explicit = false;
 /// Bytes one cached session at `ctx_tokens` holds: its KV and state, plus the SSM checkpoints
 /// a cold prefill of that length retains, which the commit path bills to the entry.
 pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
+    return workingSessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
         retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
 }
 
@@ -3882,7 +3882,7 @@ pub fn planHotCache(
     const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, requested, chunk_override);
     const reserve_chunk = clampReserveWidth(config, chunk);
     const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
-    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes();
+    const ctx_kv: u64 = workingSessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes();
     return .{
         .chunk = chunk,
         .reserve_chunk = reserve_chunk,
@@ -3947,7 +3947,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         active_mem,
         ctxSizingCacheReserve(config),
         prefillTransientReserve(config, kv_bits, chunk),
-        sessionBytesPerToken(config, kv_bits),
+        workingSessionBytesPerToken(config, kv_bits),
         config.contextCap(),
     );
 }
@@ -4023,7 +4023,7 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
         active_mem,
         ctxSizingCacheReserve(config),
         prefillTransientReserve(config, kv_bits, chunk),
-        sessionBytesPerToken(config, kv_bits),
+        workingSessionBytesPerToken(config, kv_bits),
         config.contextCap(),
     );
 }
@@ -5072,7 +5072,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
     const kv_bits: u64 = defaultKvBits(config);
-    const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
+    const per_tok: u64 = workingSessionBytesPerToken(config, kv_bits);
 
     // `total_ctx = 0` asks for the unshrunk cap: the widest forward any prompt can run.
     const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(
@@ -5485,6 +5485,10 @@ fn mtpHeadBilled(config: *const model_mod.ModelConfig) bool {
 fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     const head: u64 = if (mtpHeadBilled(config)) mtpHeadKvBytesPerToken(config) +| mtpHeadStateBytesPerToken(config) else 0;
     return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config) +| head;
+}
+
+fn workingSessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    return sessionBytesPerToken(config, kv_bits) +| config.drafter_ctx_bytes_per_token;
 }
 
 /// The per-request terms of the admission bill, in one place.
@@ -23035,11 +23039,13 @@ test "the guard credits only PROVABLY reclaimable cache bytes, never the entry a
     try t.expect(bill.fitsAfterEviction());
 }
 
-test "a loaded DFlash drafter's context K/V is billed per prompt row" {
+test "a loaded DFlash drafter's context K/V is billed by context sizing and admission" {
     var cfg = qwen4ExpOomConfig();
-    const base = prefillNeededAtChunk(&cfg, 32768, 1024, 16, 2048, .{});
+    const base_session = sessionBytesPerToken(&cfg, 16);
+    const base_bill = prefillNeededAtChunk(&cfg, 32768, 1024, 16, 2048, .{});
     cfg.drafter_ctx_bytes_per_token = 20480;
-    try std.testing.expectEqual(base + (32768 + 1024) * 20480, prefillNeededAtChunk(&cfg, 32768, 1024, 16, 2048, .{}));
+    try std.testing.expectEqual(base_session + 20480, workingSessionBytesPerToken(&cfg, 16));
+    try std.testing.expectEqual(base_bill + (32768 + 1024) * 20480, prefillNeededAtChunk(&cfg, 32768, 1024, 16, 2048, .{}));
 }
 
 test "the admission probe bills the request's OWN kv-quant and chunking, not the process defaults" {

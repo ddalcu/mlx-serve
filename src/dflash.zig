@@ -31,6 +31,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
+const gdn_decode = @import("gdn_decode.zig");
 // The chunked row requantizer + its packed-triple handle are shared with the
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
@@ -98,6 +99,18 @@ pub const DflashConfig = struct {
     /// v1/v2 sidecar so far is neox (half-split); DSpark's is not, and the
     /// wrong half rotates silently.
     rope_traditional: bool = false,
+    /// Speculators trains sliding draft layers against a fixed context window
+    /// ending at the anchor. Older sidecars use a moving query window.
+    sliding_window_fixed_anchor: bool = false,
+    /// Visibility inside a sliding layer's synthetic block. Full-attention
+    /// layers are always bidirectional.
+    sliding_window_non_causal: bool = true,
+    /// Output vocabulary of the sidecar. Zero means the legacy config omitted
+    /// it and the target vocabulary remains authoritative.
+    draft_vocab_size: u32 = 0,
+    /// Learned per-position acceptance predictor over the block hidden and optional Markov embedding.
+    confidence_head: bool = false,
+    confidence_with_markov: bool = false,
 
     pub fn isDflash2(self: *const DflashConfig) bool {
         return self.selector_rank > 0 or self.conv_kernel_size > 0;
@@ -137,6 +150,10 @@ const Contract = struct {
         }
         return self.root.get(key);
     }
+
+    fn targetLayers(self: Contract) ?std.json.Value {
+        return self.get("target_layer_ids") orelse self.root.get("aux_hidden_state_layer_ids");
+    }
 };
 
 fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
@@ -149,19 +166,27 @@ fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
     const c = Contract{ .nested = nested, .root = root };
     if (c.get("block_size") == null) return null;
     if (c.get("mask_token_id") == null) return null;
-    if (c.get("target_layer_ids") == null) return null;
+    if (c.targetLayers() == null) return null;
     return c;
 }
 
-/// The width a DFlash sidecar at `dir` is quantized to at load: 0 when it is
-/// not one, ships packed already (`quantization` in its config) or loads dense.
+/// The affine load width for a dense DFlash sidecar; 0 bills source bytes
+/// for non-DFlash, packed or block-FP8 checkpoints, and dense serving.
 pub fn sidecarQuantBits(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) u32 {
     const content = readConfigFile(io, allocator, dir) catch return 0;
     defer allocator.free(content);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return 0;
     defer parsed.deinit();
     if (parsed.value != .object or !isDflashConfigJson(parsed.value.object)) return 0;
-    return if (parsed.value.object.get("quantization") != null) 0 else quantBitsFromEnv();
+    if (parsed.value.object.get("quantization") != null) return 0;
+    if (parsed.value.object.get("quantization_config")) |q| {
+        if (q == .object) if (q.object.get("quant_method")) |method| {
+            if (method == .string and std.mem.eql(u8, method.string, "fp8")) return 0;
+        };
+    }
+    var cfg = parseConfigFromJson(allocator, content) catch return 0;
+    defer cfg.deinit(allocator);
+    return resolveQuantBits(quantBitsFromEnv(), transformer_mod.verifyQmmNaxAvailable(), cfg.isDspark());
 }
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
@@ -222,16 +247,35 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
 
     const contract = dflashContractObject(root) orelse return error.NotDflashConfig;
 
+    const speculators_shape = root.get("transformer_layer_config") != null and root.get("aux_hidden_state_layer_ids") != null;
+    if ((root.get("transformer_layer_config") != null) != (root.get("aux_hidden_state_layer_ids") != null))
+        return error.IncompleteDflashConfig;
+    const nested_geometry: ?std.json.ObjectMap = if (root.get("transformer_layer_config")) |tc|
+        (if (tc == .object) tc.object else return error.IncompleteDflashConfig)
+    else
+        null;
+    const Geometry = struct {
+        fn get(r: std.json.ObjectMap, nested: ?std.json.ObjectMap, key: []const u8) ?std.json.Value {
+            if (nested) |n| if (n.get(key)) |v| return v;
+            return r.get(key);
+        }
+    };
+
     // DSpark export markers. `markov_rank` is the load-bearing one (the head
     // IS DSpark); the architecture string and `projector_type` cover exports
-    // that ship the row convention without one.
+    // that ship the row convention without one. `sample_from_anchor` is the
+    // explicit Speculators contract and wins when present.
     var anchor_row_drafts = root.get("markov_rank") != null;
+    if (root.get("sample_from_anchor")) |v| {
+        if (v != .bool) return error.InvalidDflashConfigValue;
+        anchor_row_drafts = v.bool;
+    }
     if (contract.get("projector_type")) |pt| if (pt == .string and std.mem.eql(u8, pt.string, "dspark")) {
         anchor_row_drafts = true;
     };
     if (root.get("architectures")) |archs| if (archs == .array) {
         for (archs.array.items) |a| {
-            if (a == .string and std.mem.indexOf(u8, a.string, "DSpark") != null) anchor_row_drafts = true;
+            if (a == .string and std.mem.indexOf(u8, a.string, "DSpark") != null and root.get("sample_from_anchor") == null) anchor_row_drafts = true;
         }
     };
 
@@ -268,37 +312,41 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         if (output_multiplier == 0) return error.InvalidDflashConfigValue;
     }
 
-    const tl_val = contract.get("target_layer_ids").?;
+    const tl_val = contract.targetLayers().?;
     if (tl_val != .array or tl_val.array.items.len == 0) return error.InvalidDflashTargetLayers;
     const target_layer_ids = try allocator.alloc(u32, tl_val.array.items.len);
     errdefer allocator.free(target_layer_ids);
     for (tl_val.array.items, 0..) |elem, i| {
-        target_layer_ids[i] = try jsonU32(elem);
+        const declared = try jsonU32(elem);
+        // Speculators numbers the hidden-state stream: hidden_states[4] is the
+        // output of decoder layer 3. The runtime capture seam names the decoder
+        // layer whose output it retains.
+        if (speculators_shape and declared == 0) return error.InvalidDflashTargetLayers;
+        target_layer_ids[i] = if (speculators_shape) declared - 1 else declared;
         // The encoder concatenates in list order and the fc weight is trained
         // against it; a non-ascending list is a converter bug worth naming.
         if (i > 0 and target_layer_ids[i] <= target_layer_ids[i - 1]) return error.InvalidDflashTargetLayers;
     }
 
-    const hidden_size: u32 = try jsonU32(root.get("hidden_size") orelse return error.IncompleteDflashConfig);
+    const hidden_size: u32 = try jsonU32(Geometry.get(root, nested_geometry, "hidden_size") orelse return error.IncompleteDflashConfig);
     if (conv_group_size > 0 and hidden_size % conv_group_size != 0) return error.InvalidDflashConfigValue;
-    const num_layers: u32 = try jsonU32(root.get("num_hidden_layers") orelse return error.IncompleteDflashConfig);
-    const n_heads: u32 = try jsonU32(root.get("num_attention_heads") orelse return error.IncompleteDflashConfig);
-    const kv_heads: u32 = if (root.get("num_key_value_heads")) |v| try jsonU32(v) else n_heads;
-    const head_dim: u32 = try jsonU32(root.get("head_dim") orelse return error.IncompleteDflashConfig);
-    const intermediate: u32 = try jsonU32(root.get("intermediate_size") orelse return error.IncompleteDflashConfig);
-    const eps: f32 = jsonFloat(root.get("rms_norm_eps") orelse return error.IncompleteDflashConfig);
-    const sliding: u32 = if (root.get("sliding_window")) |v| try jsonU32(v) else 0;
+    const num_layers: u32 = try jsonU32(Geometry.get(root, nested_geometry, "num_hidden_layers") orelse return error.IncompleteDflashConfig);
+    const n_heads: u32 = try jsonU32(Geometry.get(root, nested_geometry, "num_attention_heads") orelse return error.IncompleteDflashConfig);
+    const kv_heads: u32 = if (Geometry.get(root, nested_geometry, "num_key_value_heads")) |v| try jsonU32(v) else n_heads;
+    const head_dim: u32 = try jsonU32(Geometry.get(root, nested_geometry, "head_dim") orelse return error.IncompleteDflashConfig);
+    const intermediate: u32 = try jsonU32(Geometry.get(root, nested_geometry, "intermediate_size") orelse return error.IncompleteDflashConfig);
+    const eps: f32 = jsonFloat(Geometry.get(root, nested_geometry, "rms_norm_eps") orelse return error.IncompleteDflashConfig);
+    const sliding: u32 = if (Geometry.get(root, nested_geometry, "sliding_window")) |v| try jsonU32(v) else 0;
 
     // `rope_parameters.rope_theta` is the transformers-5 spelling (muse,
-    // DFlash2); DSpark ships a flat root `rope_theta`. Reading only the
-    // nested one leaves theta at 10000 and every drafted position mis-rotated.
+    // DFlash2 and Speculators); older DSpark exports use a flat root value.
     var rope_theta: f32 = 10000.0;
-    if (root.get("rope_theta")) |t| rope_theta = jsonFloat(t);
-    if (root.get("rope_parameters")) |rp| if (rp == .object) {
+    if (Geometry.get(root, nested_geometry, "rope_theta")) |t| rope_theta = jsonFloat(t);
+    if (Geometry.get(root, nested_geometry, "rope_parameters")) |rp| if (rp == .object) {
         if (rp.object.get("rope_theta")) |t| rope_theta = jsonFloat(t);
     };
     var rope_traditional = false;
-    if (root.get("rope_is_neox_style")) |v| {
+    if (Geometry.get(root, nested_geometry, "rope_is_neox_style")) |v| {
         if (v == .bool) rope_traditional = !v.bool;
     }
 
@@ -312,7 +360,23 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         if (!std.mem.eql(u8, kind, "vanilla")) return error.UnsupportedMarkovHeadType;
     }
 
-    const lt_val = root.get("layer_types") orelse return error.IncompleteDflashConfig;
+    var sliding_window_non_causal = true;
+    if (root.get("sliding_window_non_causal")) |v| {
+        if (v != .bool) return error.InvalidDflashConfigValue;
+        sliding_window_non_causal = v.bool;
+    }
+    const draft_vocab_size: u32 = if (root.get("draft_vocab_size")) |v| try jsonU32(v) else 0;
+    const confidence_head = if (root.get("enable_confidence_head")) |v| blk: {
+        if (v != .bool) return error.InvalidDflashConfigValue;
+        break :blk v.bool;
+    } else false;
+    const confidence_with_markov = if (root.get("confidence_head_with_markov")) |v| blk: {
+        if (v != .bool) return error.InvalidDflashConfigValue;
+        break :blk v.bool;
+    } else false;
+    if (confidence_with_markov and markov_rank == 0) return error.InvalidDflashConfigValue;
+
+    const lt_val = Geometry.get(root, nested_geometry, "layer_types") orelse return error.IncompleteDflashConfig;
     if (lt_val != .array or lt_val.array.items.len != num_layers) return error.LayerTypesLengthMismatch;
     const layer_types = try allocator.alloc(LayerType, num_layers);
     errdefer allocator.free(layer_types);
@@ -345,6 +409,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .markov_rank = markov_rank,
         .rope_traditional = rope_traditional,
         .anchor_row_drafts = anchor_row_drafts,
+        .sliding_window_fixed_anchor = speculators_shape,
+        .sliding_window_non_causal = sliding_window_non_causal,
+        .draft_vocab_size = draft_vocab_size,
+        .confidence_head = confidence_head,
+        .confidence_with_markov = confidence_with_markov,
     };
 }
 
@@ -422,19 +491,23 @@ pub fn blockCapForMachine(chip: []const u8, tree: bool) BlockCap {
     return .{ .cap = NO_WIDE_LANE_BLOCK_CAP, .label = "no wide verify lane" };
 }
 
-/// Resolve the effective block size: the config's value, capped by what the
-/// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`
-/// when there is no wide lane), then clamped DOWNWARD by an explicit
-/// `--draft-block-size` (never raised past the config — the assistant was
-/// trained at its config block). Floor 2 (1 draft + t1).
-pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool, no_lane_cap: u32) u32 {
+/// Resolve the effective block size: the config's value, capped by the
+/// target forward's efficient verify width and, without a wide lane, the
+/// machine cap. Explicit `--draft-block-size` bypasses both performance caps
+/// but never raises past the trained block. Floor 2 (1 draft + t1).
+pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool, no_lane_cap: u32, target_cap: u32) u32 {
     const base = if (cli_explicit)
         @min(config_block, cli_block)
     else if (wide_verify_lane)
-        config_block
+        @min(config_block, target_cap)
     else
-        @min(config_block, no_lane_cap);
+        @min(config_block, @min(no_lane_cap, target_cap));
     return @max(base, 2);
+}
+
+/// GDN targets cap at the fused recurrence's widest supported verify width.
+pub fn targetBlockCap(config: *const ModelConfig) u32 {
+    return if (config.supportsBatchedGdnDecode()) @intCast(gdn_decode.FOLD_MAX_SEQ) else std.math.maxInt(u32);
 }
 
 /// True when this machine has a verify lane for widths past the split-K
@@ -451,6 +524,7 @@ pub fn wideVerifyLaneAvailable() bool {
 /// quality rides on it — the trunk verify is exact either way, so the worst
 /// a bad width can do is cost acceptance.
 pub const DEFAULT_QUANT_BITS: u32 = 8;
+const AUTO_QUANT_BITS: u32 = std.math.maxInt(u32);
 
 /// Draft-only lm_head width — DEFAULT OFF (drafts use the trunk's own head).
 /// A narrower head shrinks a read the round barely notices and pays for it in
@@ -467,10 +541,10 @@ pub const DEFAULT_DRAFT_HEAD_BITS: u32 = 0;
 /// contraction dim, dense when neither does.
 pub const QUANT_GROUP: u32 = 64;
 
-/// `MLX_SERVE_DFLASH_QUANT_BITS`: absent → `DEFAULT_QUANT_BITS`, a supported
+/// `MLX_SERVE_DFLASH_QUANT_BITS`: absent → per-sidecar auto width, a supported
 /// affine width → that, anything else ("0", "off") → dense bf16.
 pub fn quantBitsFromEnv() u32 {
-    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return defaultQuantBits(transformer_mod.verifyQmmNaxAvailable());
+    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return AUTO_QUANT_BITS;
     const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
     return switch (v) {
         2, 3, 4, 5, 6, 8 => v,
@@ -478,14 +552,29 @@ pub fn quantBitsFromEnv() u32 {
     };
 }
 
-/// A NAX chip (M5) drafts faster from a 4-bit assistant; M1-M4 keep 8-bit.
-pub fn defaultQuantBits(nax: bool) u32 {
-    return if (nax) 4 else DEFAULT_QUANT_BITS;
+/// NAX uses 3-bit DSpark or 4-bit DFlash; older GPUs keep 8-bit.
+pub fn autoQuantBits(nax: bool, dspark: bool) u32 {
+    if (!nax) return DEFAULT_QUANT_BITS;
+    return if (dspark) 3 else 4;
 }
 
-test "defaultQuantBits: 4-bit assistant on NAX, 8-bit elsewhere" {
-    try testing.expectEqual(@as(u32, 4), defaultQuantBits(true));
-    try testing.expectEqual(DEFAULT_QUANT_BITS, defaultQuantBits(false));
+fn resolveQuantBits(bits: u32, nax: bool, dspark: bool) u32 {
+    return if (bits == AUTO_QUANT_BITS) autoQuantBits(nax, dspark) else bits;
+}
+
+test "autoQuantBits: DSpark uses 3-bit on NAX; other defaults stay unchanged" {
+    try testing.expectEqual(@as(u32, 3), autoQuantBits(true, true));
+    try testing.expectEqual(@as(u32, 4), autoQuantBits(true, false));
+    try testing.expectEqual(DEFAULT_QUANT_BITS, autoQuantBits(false, true));
+    try testing.expectEqual(DEFAULT_QUANT_BITS, autoQuantBits(false, false));
+}
+
+test "sidecar quant width resolves automatic before memory billing" {
+    try testing.expectEqual(@as(u32, 3), resolveQuantBits(AUTO_QUANT_BITS, true, true));
+    try testing.expectEqual(@as(u32, 4), resolveQuantBits(AUTO_QUANT_BITS, true, false));
+    try testing.expectEqual(@as(u32, 8), resolveQuantBits(AUTO_QUANT_BITS, false, true));
+    try testing.expectEqual(@as(u32, 0), resolveQuantBits(0, true, true));
+    try testing.expectEqual(@as(u32, 6), resolveQuantBits(6, true, true));
 }
 
 /// Widest supported group that divides the contraction dim, or null when the
@@ -630,12 +719,7 @@ pub const MarkovHead = struct {
 
     /// `logits + w2(w1[prev_token])` for ONE block position. `base_row` is
     /// `[1, 1, vocab]`; the result is a fresh array the caller owns.
-    pub fn stepLogits(
-        self: *const MarkovHead,
-        base_row: mlx.mlx_array,
-        prev_token: u32,
-        s: mlx.mlx_stream,
-    ) !mlx.mlx_array {
+    pub fn embedding(self: *const MarkovHead, prev_token: u32, s: mlx.mlx_stream) !mlx.mlx_array {
         const idx_i32: i32 = @intCast(prev_token);
         const idx_shape = [_]c_int{1};
         const idx = mlx.mlx_array_new_data(&idx_i32, &idx_shape, 1, .int32);
@@ -644,7 +728,23 @@ pub const MarkovHead = struct {
         var row = mlx.mlx_array_new(); // [1, rank]
         defer _ = mlx.mlx_array_free(row);
         try mlx.check(mlx.mlx_take_axis(&row, self.w1, idx, 0, s));
+        const rsh = mlx.getShape(row);
+        const shaped = [_]c_int{ 1, 1, rsh[1] };
+        var row3 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&row3, row, &shaped, 3, s));
+        return row3;
+    }
 
+    /// `logits + w2(w1[prev_token])` for one block position.
+    pub fn stepLogits(self: *const MarkovHead, base_row: mlx.mlx_array, prev_token: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+        const idx_i32: i32 = @intCast(prev_token);
+        const idx_shape = [_]c_int{1};
+        const idx = mlx.mlx_array_new_data(&idx_i32, &idx_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(idx);
+
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_take_axis(&row, self.w1, idx, 0, s));
         const rsh = mlx.getShape(row);
         const shaped = [_]c_int{ 1, 1, rsh[1] };
         var row3 = mlx.mlx_array_new();
@@ -653,10 +753,44 @@ pub const MarkovHead = struct {
 
         const bias = try self.w2.apply(row3, s);
         defer _ = mlx.mlx_array_free(bias);
-
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_add(&out, base_row, bias, s));
+        return out;
+    }
+};
+
+pub const ConfidenceHead = struct {
+    weight: mlx.mlx_array, // [hidden + optional markov_rank, 1], pre-transposed
+    bias: mlx.mlx_array, // [1]
+    with_markov: bool,
+
+    pub fn deinit(self: *ConfidenceHead) void {
+        _ = mlx.mlx_array_free(self.weight);
+        _ = mlx.mlx_array_free(self.bias);
+    }
+
+    fn appendEval(self: *const ConfidenceHead, vec: mlx.mlx_vector_array) void {
+        _ = mlx.mlx_vector_array_append_value(vec, self.weight);
+        _ = mlx.mlx_vector_array_append_value(vec, self.bias);
+    }
+
+    pub fn logits(self: *const ConfidenceHead, hidden: mlx.mlx_array, markov_embed: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        var features = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(features);
+        if (self.with_markov) {
+            const parts = [_]mlx.mlx_array{ hidden, markov_embed };
+            const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&features, vec, 2, s));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&features, hidden));
+        }
+        var projected = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(projected);
+        try mlx.check(mlx.mlx_matmul(&projected, features, self.weight, s));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&out, projected, self.bias, s));
         return out;
     }
 };
@@ -711,6 +845,39 @@ pub const DflashLayer = struct {
     }
 };
 
+fn draftVocabRows(config: *const model_mod.ModelConfig, has_markov: bool) c_int {
+    if (has_markov) return 0;
+    return config.draftVocab();
+}
+
+pub var confidence_threshold_override: ?f32 = null;
+var confidence_threshold_cache: ?f32 = null;
+
+pub fn confidenceThreshold() f32 {
+    if (confidence_threshold_override) |v| return std.math.clamp(v, 0, 1);
+    if (confidence_threshold_cache) |v| return v;
+    const raw = if (std.c.getenv("MLX_SERVE_DFLASH_CONFIDENCE")) |p| std.mem.span(p) else "0";
+    const value = std.math.clamp(std.fmt.parseFloat(f32, raw) catch 0, 0, 1);
+    confidence_threshold_cache = value;
+    return value;
+}
+
+pub fn confidencePrefixFromLogits(logits: []const f32, threshold: f32, min_drafts: u32) u32 {
+    if (!(threshold > 0.0) or logits.len == 0) return @intCast(logits.len);
+    var n: u32 = 0;
+    for (logits) |raw| {
+        const p: f32 = if (raw >= 0)
+            1.0 / (1.0 + @exp(-raw))
+        else blk: {
+            const e = @exp(raw);
+            break :blk e / (1.0 + e);
+        };
+        if (p < threshold) break;
+        n += 1;
+    }
+    return @min(@as(u32, @intCast(logits.len)), @max(@min(min_drafts, @as(u32, @intCast(logits.len))), n));
+}
+
 pub const DflashModel = struct {
     config: DflashConfig,
     allocator: std.mem.Allocator,
@@ -735,12 +902,14 @@ pub const DflashModel = struct {
 
     /// DSpark Markov head — null unless the config declares `markov_rank`.
     markov: ?MarkovHead = null,
+    confidence: ?ConfidenceHead = null,
 
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
         lane_qmm.release(@intFromPtr(self));
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
+        if (self.confidence) |*ch| ch.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
@@ -792,6 +961,12 @@ pub const DflashModel = struct {
         if (self.config.mask_token_id >= target.config.vocab_size) {
             log.err("[dflash] mask_token_id {d} outside target vocab {d}\n", .{
                 self.config.mask_token_id, target.config.vocab_size,
+            });
+            return error.DflashTargetMismatch;
+        }
+        if (self.config.draft_vocab_size != 0 and self.config.draft_vocab_size != target.config.vocab_size) {
+            log.err("[dflash] draft_vocab_size mismatch: assistant={d}, target={d}\n", .{
+                self.config.draft_vocab_size, target.config.vocab_size,
             });
             return error.DflashTargetMismatch;
         }
@@ -908,6 +1083,7 @@ pub const DflashModel = struct {
     /// selector sums these logits with codebook edges and the sampled arm
     /// softmaxes them, neither of which survives a scale change.
     pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        const draft_vocab = draftVocabRows(&target.config, self.markov != null);
         var out: mlx.mlx_array = undefined;
         if (self.draft_head) |*dh| {
             out = mlx.mlx_array_new();
@@ -924,8 +1100,8 @@ pub const DflashModel = struct {
                 "affine",
                 self.s,
             ));
-        } else if (target.config.draftVocab() > 0) {
-            out = try target.lmHeadRowsForDraft(x, target.config.draftVocab());
+        } else if (draft_vocab > 0) {
+            out = try target.lmHeadRowsForDraft(x, draft_vocab);
         } else {
             out = try target.lmHeadForDraft(x);
         }
@@ -1009,11 +1185,9 @@ fn checkCodebook(arr: mlx.mlx_array, which: []const u8, rank: u32) !void {
     return error.InvalidDflashCodebook;
 }
 
-/// Load `<prefix>.weight` as an assistant linear. A checkpoint that already
-/// ships `<prefix>.scales` is served packed as-is (affine only — its true
-/// params are solved from the packed geometry, never assumed); a dense bf16
-/// weight is quantized to `bits` when the contraction dim allows it and
-/// pre-transposed for a plain matmul otherwise.
+/// Load `<prefix>.weight` as an assistant linear. Affine weights with `.scales`
+/// stay packed; block-FP8 weights with `.weight_scale_inv` dequantize to bf16;
+/// dense weights are load-time quantized when requested, else transposed.
 fn loadLinear(
     w: *const Weights,
     prefix: []const u8,
@@ -1043,15 +1217,91 @@ fn loadLinear(
     var kb: [256]u8 = undefined;
     const raw = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix}));
     defer _ = mlx.mlx_array_free(raw);
+    const dense = if (mlx.mlx_array_dtype(raw) == .uint8) blk: {
+        const scale_key = try std.fmt.bufPrint(&kb, "{s}.weight_scale_inv", .{prefix});
+        const scales = w.get(scale_key) orelse return error.UnsupportedDflashQuant;
+        break :blk try dequantBlockFp8(raw, scales, 128, s);
+    } else raw;
+    defer if (dense.ctx != raw.ctx) {
+        _ = mlx.mlx_array_free(dense);
+    };
 
     if (bits != 0) {
-        if (quantGroupFor(in_features)) |group| return quantizeDense(raw, bits, group, s);
+        if (quantGroupFor(in_features)) |group| return quantizeDense(dense, bits, group, s);
     }
     var transposed = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(transposed);
     const perm = [_]c_int{ 1, 0 };
-    try mlx.check(mlx.mlx_transpose_axes(&transposed, raw, &perm, 2, s));
+    try mlx.check(mlx.mlx_transpose_axes(&transposed, dense, &perm, 2, s));
     return .{ .w = transposed, .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
+}
+
+var block_fp8_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const BlockFp8Config = struct {
+    rows: c_int,
+    cols: c_int,
+    cfg: mlx.mlx_fast_metal_kernel_config,
+};
+var block_fp8_configs: [16]?BlockFp8Config = @splat(null);
+
+fn dequantBlockFp8(raw: mlx.mlx_array, scales: mlx.mlx_array, block: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const wsh = mlx.getShape(raw);
+    const ssh = mlx.getShape(scales);
+    if (!mlx.streamIsGpu(s) or block != 128 or wsh.len != 2 or ssh.len != 2 or
+        ssh[0] != @divTrunc(wsh[0] + block - 1, block) or
+        ssh[1] != @divTrunc(wsh[1] + block - 1, block)) return error.UnsupportedDflashQuant;
+    const rows = wsh[0];
+    const cols = wsh[1];
+    if (block_fp8_kernel == null) {
+        const input_names = [_][*:0]const u8{ "w", "scales", "cols", "scale_cols" };
+        const output_names = [_][*:0]const u8{"out"};
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        block_fp8_kernel = mlx.mlx_fast_metal_kernel_new(
+            "msv_dflash_fp8_dequant",
+            in_vec,
+            out_vec,
+            "uint i = thread_position_in_grid.x; if (i < OUT_SIZE) { uint r = i / cols; uint c = i - r * cols; fp8_e4m3 v; v.bits = w[i]; out[i] = static_cast<T>(float(v) * float(scales[(r / 128) * scale_cols + c / 128])); }",
+            "struct fp8_e4m3 { operator float16_t() thread { uint16_t v = (bits & 127) << 7; half converted = as_type<half>(v); converted *= 256.0; return (bits & 128) ? -converted : converted; } operator float() thread { return static_cast<float>(this->operator float16_t()); } uint8_t bits; };",
+            true,
+            false,
+        );
+        if (block_fp8_kernel.?.ctx == null) return error.MetalKernelCompileFailed;
+    }
+    var cfg: mlx.mlx_fast_metal_kernel_config = undefined;
+    for (&block_fp8_configs) |*slot| {
+        if (slot.*) |entry| {
+            if (entry.rows == rows and entry.cols == cols) {
+                cfg = entry.cfg;
+                break;
+            }
+            continue;
+        }
+        cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, wsh.ptr, wsh.len, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(mlx.mlx_array_size(raw)), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "OUT_SIZE", @intCast(mlx.mlx_array_size(raw))));
+        slot.* = .{ .rows = rows, .cols = cols, .cfg = cfg };
+        break;
+    } else return error.TooManyDflashFp8Shapes;
+    const cols_arr = mlx.mlx_array_new_int(cols);
+    defer _ = mlx.mlx_array_free(cols_arr);
+    const scale_cols_arr = mlx.mlx_array_new_int(ssh[1]);
+    defer _ = mlx.mlx_array_free(scale_cols_arr);
+    const inputs = [_]mlx.mlx_array{ raw, scales, cols_arr, scale_cols_arr };
+    const input_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(input_vec);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, block_fp8_kernel.?, input_vec, cfg, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs, 0));
+    return out;
 }
 
 /// Affine-quantize a dense `[out, in]` weight in place of a transpose — the
@@ -1106,6 +1356,7 @@ pub fn loadDflashQuant(
 ) !DflashModel {
     var cfg = try parseConfig(io, allocator, model_dir);
     errdefer cfg.deinit(allocator);
+    const serve_bits = resolveQuantBits(bits, transformer_mod.verifyQmmNaxAvailable(), cfg.isDspark());
 
     var weights = try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
@@ -1118,7 +1369,7 @@ pub fn loadDflashQuant(
     // `encoder.fc` + `encoder.output_norm_enc`, z-lab DFlash2 ships root
     // `fc` + `hidden_norm`. Same tensors, keyed on which one the file has.
     const zlab_names = weights.get("fc.weight") != null;
-    var fc = try loadLinear(&weights, if (zlab_names) "fc" else "encoder.fc", fc_in, bits, s);
+    var fc = try loadLinear(&weights, if (zlab_names) "fc" else "encoder.fc", fc_in, serve_bits, s);
     errdefer fc.deinit();
     const enc_norm = try ownWeight(&weights, if (zlab_names) "hidden_norm.weight" else "encoder.output_norm_enc.weight");
     errdefer _ = mlx.mlx_array_free(enc_norm);
@@ -1140,20 +1391,20 @@ pub fn loadDflashQuant(
             .layer_type = cfg.layer_types[li],
             .input_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.input_layernorm.weight", .{li})),
             .post_attn_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.post_attention_layernorm.weight", .{li})),
-            .q = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_proj", .{li}), hidden, bits, s),
+            .q = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_proj", .{li}), hidden, serve_bits, s),
             .q_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_norm.weight", .{li})),
-            .k = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj", .{li}), hidden, bits, s),
+            .k = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj", .{li}), hidden, serve_bits, s),
             .k_norm = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_norm.weight", .{li})),
-            .v = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj", .{li}), hidden, bits, s),
-            .o = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj", .{li}), q_out, bits, s),
-            .gate = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj", .{li}), hidden, bits, s),
-            .up = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj", .{li}), hidden, bits, s),
-            .down = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj", .{li}), cfg.intermediate_size, bits, s),
+            .v = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj", .{li}), hidden, serve_bits, s),
+            .o = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj", .{li}), q_out, serve_bits, s),
+            .gate = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj", .{li}), hidden, serve_bits, s),
+            .up = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj", .{li}), hidden, serve_bits, s),
+            .down = try loadLinear(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj", .{li}), cfg.intermediate_size, serve_bits, s),
         };
         layers_inited += 1;
         if (cfg.conv_kernel_size > 0) {
-            layers[li].attention_conv = try loadDynConv(&weights, li, "attention_conv", hidden, bits, s);
-            layers[li].mlp_conv = try loadDynConv(&weights, li, "mlp_conv", hidden, bits, s);
+            layers[li].attention_conv = try loadDynConv(&weights, li, "attention_conv", hidden, serve_bits, s);
+            layers[li].mlp_conv = try loadDynConv(&weights, li, "mlp_conv", hidden, serve_bits, s);
         }
     }
 
@@ -1166,7 +1417,7 @@ pub fn loadDflashQuant(
         errdefer _ = mlx.mlx_array_free(succ);
         try checkCodebook(pred, "predecessor", cfg.selector_rank);
         try checkCodebook(succ, "successor", cfg.selector_rank);
-        const hp = try loadLinear(&weights, "candidate_selector.hidden_projection", hidden, bits, s);
+        const hp = try loadLinear(&weights, "candidate_selector.hidden_projection", hidden, serve_bits, s);
         selector = .{ .pred_codebook = pred, .succ_codebook = succ, .hidden_projection = hp };
     }
 
@@ -1175,15 +1426,30 @@ pub fn loadDflashQuant(
     if (cfg.markov_rank > 0) {
         const w1 = try ownWeight(&weights, "markov_head.markov_w1.weight");
         errdefer _ = mlx.mlx_array_free(w1);
-        const w2 = try loadLinear(&weights, "markov_head.markov_w2", cfg.markov_rank, bits, s);
+        const w2 = try loadLinear(&weights, "markov_head.markov_w2", cfg.markov_rank, serve_bits, s);
         markov = .{ .w1 = w1, .w2 = w2 };
-        // The confidence head trims the drafted block per request in the
-        // reference's ragged-verify mode; we serve a STATIC block, so its
-        // weights are deliberately unread. Say so rather than let a silently
-        // ignored trained module read as a port that covers it.
-        if (weights.get("confidence_head.proj.weight") != null) {
-            log.info("[dflash] dspark: confidence head present but unused (static verify width)\n", .{});
+    }
+
+    var confidence: ?ConfidenceHead = null;
+    errdefer if (confidence) |*ch| ch.deinit();
+    if (cfg.confidence_head) {
+        const raw = try ownWeight(&weights, "confidence_head.proj.weight");
+        defer _ = mlx.mlx_array_free(raw);
+        const shape = mlx.getShape(raw);
+        const input_dim = cfg.hidden_size + if (cfg.confidence_with_markov) cfg.markov_rank else 0;
+        if (shape.len != 2 or shape[0] != 1 or shape[1] != @as(c_int, @intCast(input_dim)))
+            return error.BadDflashConfidenceShape;
+        var transposed = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(transposed);
+        const perm = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&transposed, raw, &perm, 2, s));
+        const bias = try ownWeight(&weights, "confidence_head.proj.bias");
+        const bias_shape = mlx.getShape(bias);
+        if (bias_shape.len != 1 or bias_shape[0] != 1) {
+            _ = mlx.mlx_array_free(bias);
+            return error.BadDflashConfidenceShape;
         }
+        confidence = .{ .weight = transposed, .bias = bias, .with_markov = cfg.confidence_with_markov };
     }
 
     // Force-eval all weights so serve time never faults a lazy transpose or
@@ -1197,6 +1463,7 @@ pub fn loadDflashQuant(
         for (layers) |*lw| lw.appendEval(eval_vec);
         if (selector) |*sel| sel.appendEval(eval_vec);
         if (markov) |*mh| mh.appendEval(eval_vec);
+        if (confidence) |*ch| ch.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
 
@@ -1216,8 +1483,11 @@ pub fn loadDflashQuant(
         });
     }
     if (cfg.isDspark()) {
-        log.info("[dflash] dspark: markov head rank={d}, rope theta={d:.0} ({s})\n", .{
-            cfg.markov_rank, cfg.rope_theta, if (cfg.rope_traditional) "interleaved" else "neox",
+        log.info("[dflash] dspark: markov head rank={d}, confidence={s}, rope theta={d:.0} ({s})\n", .{
+            cfg.markov_rank,
+            if (confidence != null) "loaded" else "absent",
+            cfg.rope_theta,
+            if (cfg.rope_traditional) "interleaved" else "neox",
         });
     }
 
@@ -1231,6 +1501,7 @@ pub fn loadDflashQuant(
         .layers = layers,
         .selector = selector,
         .markov = markov,
+        .confidence = confidence,
     };
 }
 
@@ -1366,14 +1637,23 @@ fn projectHeads(
     return roped;
 }
 
+fn contextSkip(layer_type: LayerType, base_pos: usize, ctx_len: usize, anchor_pos: usize, window: u32, fixed_anchor: bool) usize {
+    if (layer_type != .sliding_attention) return 0;
+    const visible = if (fixed_anchor) window else window - 1;
+    return @min(ctx_len, (anchor_pos -| visible) -| base_pos);
+}
+
+test "dflash: trimmed context keeps the Speculators fixed-window boundary" {
+    try testing.expectEqual(@as(usize, 2), contextSkip(.sliding_attention, 0, 10, 10, 8, true));
+    try testing.expectEqual(@as(usize, 3), contextSkip(.sliding_attention, 0, 10, 10, 8, false));
+    try testing.expectEqual(@as(usize, 0), contextSkip(.sliding_attention, 4, 6, 10, 8, true));
+    try testing.expectEqual(@as(usize, 0), contextSkip(.full_attention, 0, 10, 10, 8, true));
+}
+
 /// Additive attention bias `[1, 1, q_len, kv_len]` for one assistant layer,
-/// or null when nothing is masked. KV layout: context at absolute positions
-/// `[base_pos, base_pos + ctx_len)` followed by the block at
-/// `[anchor_pos, anchor_pos + q_len)`. Sliding layers: query q sees key k iff
-/// `|q - k| < window` (block queries sit at/after every context position, so
-/// "bidirectional sliding" reduces to a back-window over context plus full
-/// visibility inside the block whenever `q_len <= window`). Full layers see
-/// everything → null.
+/// or null when nothing is masked. KV layout is context followed by the block.
+/// Legacy sidecars use a moving bidirectional window. Speculators uses a fixed
+/// context window ending at the anchor and optionally causal block visibility.
 fn buildBlockMask(
     layer_type: LayerType,
     base_pos: usize,
@@ -1381,15 +1661,16 @@ fn buildBlockMask(
     anchor_pos: usize,
     q_len: u32,
     window: u32,
+    fixed_anchor: bool,
+    non_causal: bool,
     s: mlx.mlx_stream,
 ) !?mlx.mlx_array {
     if (layer_type == .full_attention) return null;
     std.debug.assert(q_len <= window);
-    // No context row falls outside the LAST query's back-window → nothing masked.
     const max_dist = anchor_pos + q_len - 1 - base_pos;
-    if (max_dist < window) return null;
+    if (!fixed_anchor and non_causal and max_dist < window) return null;
+    if (fixed_anchor) std.debug.assert(anchor_pos >= base_pos + ctx_len);
 
-    // Absolute key positions: [ctx…, block…].
     const kv_len = ctx_len + q_len;
     var k_abs = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k_abs);
@@ -1414,18 +1695,47 @@ fn buildBlockMask(
     const q_shape = [_]c_int{ @intCast(q_len), 1 };
     try mlx.check(mlx.mlx_reshape(&q_col, q_abs, &q_shape, 2, s));
 
-    // diff = q - k; allowed iff |diff| < window.
-    var diff = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(diff);
-    try mlx.check(mlx.mlx_subtract(&diff, q_col, k_abs, s));
-    var abs_diff = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(abs_diff);
-    try mlx.check(mlx.mlx_abs(&abs_diff, diff, s));
-    const win_arr = mlx.mlx_array_new_float(@floatFromInt(window));
-    defer _ = mlx.mlx_array_free(win_arr);
     var allowed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(allowed);
-    try mlx.check(mlx.mlx_less(&allowed, abs_diff, win_arr, s));
+    if (!fixed_anchor) {
+        var diff = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(diff);
+        try mlx.check(mlx.mlx_subtract(&diff, q_col, k_abs, s));
+        var abs_diff = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(abs_diff);
+        try mlx.check(mlx.mlx_abs(&abs_diff, diff, s));
+        const win_arr = mlx.mlx_array_new_float(@floatFromInt(window));
+        defer _ = mlx.mlx_array_free(win_arr);
+        try mlx.check(mlx.mlx_less(&allowed, abs_diff, win_arr, s));
+    } else {
+        const anchor = mlx.mlx_array_new_float(@floatFromInt(anchor_pos));
+        defer _ = mlx.mlx_array_free(anchor);
+        const window_start = mlx.mlx_array_new_float(@floatFromInt(anchor_pos -| window));
+        defer _ = mlx.mlx_array_free(window_start);
+        var before_anchor = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(before_anchor);
+        try mlx.check(mlx.mlx_less(&before_anchor, k_abs, anchor, s));
+        var in_window = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(in_window);
+        try mlx.check(mlx.mlx_greater_equal(&in_window, k_abs, window_start, s));
+        var context_visible = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(context_visible);
+        try mlx.check(mlx.mlx_logical_and(&context_visible, before_anchor, in_window, s));
+        var block_key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(block_key);
+        try mlx.check(mlx.mlx_greater_equal(&block_key, k_abs, anchor, s));
+        if (non_causal) {
+            try mlx.check(mlx.mlx_logical_or(&allowed, context_visible, block_key, s));
+        } else {
+            var through_query = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(through_query);
+            try mlx.check(mlx.mlx_less_equal(&through_query, k_abs, q_col, s));
+            var block_visible = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(block_visible);
+            try mlx.check(mlx.mlx_logical_and(&block_visible, block_key, through_query, s));
+            try mlx.check(mlx.mlx_logical_or(&allowed, context_visible, block_visible, s));
+        }
+    }
 
     const zero = mlx.mlx_array_new_float(0.0);
     defer _ = mlx.mlx_array_free(zero);
@@ -1704,7 +2014,6 @@ fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !m
 }
 
 // ── DFlash2 path selector (forward + host trace) ──
-
 
 pub const SelectedPath = struct {
     ids: []u32, // [m] chosen draft token ids
@@ -2037,7 +2346,6 @@ pub fn lattice(
         lat.e = try allocator.dupe(f32, e_data[0 .. (m - 1) * k * k]);
     }
     return lat;
-
 }
 
 /// A best-first draft tree over the lattice: node values are path sums of
@@ -2390,10 +2698,7 @@ pub fn forwardBlock(
         const view = try ctx.cache.update(@intCast(li), bk, bv, s, 0);
         // A sliding layer never sees context before the first query's window:
         // attend over the rest, so the cost stops growing with the context.
-        const skip: usize = if (lw.layer_type == .sliding_attention)
-            @min(ctx_len, (anchor_pos -| (cfg.sliding_window - 1)) -| ctx.base_pos)
-        else
-            0;
+        const skip = contextSkip(lw.layer_type, ctx.base_pos, ctx_len, anchor_pos, cfg.sliding_window, cfg.sliding_window_fixed_anchor);
         var kv_k = view.k;
         var kv_v = view.v;
         var cut: [2]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null } };
@@ -2411,7 +2716,17 @@ pub fn forwardBlock(
             kv_v = cut[1];
         }
 
-        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos + skip, ctx_len - skip, anchor_pos, q_len, cfg.sliding_window, s);
+        const mask = try buildBlockMask(
+            lw.layer_type,
+            ctx.base_pos + skip,
+            ctx_len - skip,
+            anchor_pos,
+            q_len,
+            cfg.sliding_window,
+            cfg.sliding_window_fixed_anchor,
+            cfg.sliding_window_non_causal,
+            s,
+        );
         defer if (mask) |m| {
             _ = mlx.mlx_array_free(m);
         };
@@ -2563,6 +2878,101 @@ test "dflash: muse assistant config parses with the full DFlash contract" {
 
 // The real incoai/Qwen3.8-27B-DFlash2 config shape (fetched 2026-08-18):
 // the contract nests under `dflash_config`, model_type is a bare "qwen3".
+const REDHAT_QWEN38_DSPARK_CONFIG_JSON =
+    \\{
+    \\  "architectures": ["DSparkDraftModel"],
+    \\  "aux_hidden_state_layer_ids": [4, 12, 20, 28, 36, 44, 52, 60],
+    \\  "block_size": 8,
+    \\  "confidence_head_with_markov": true,
+    \\  "draft_vocab_size": 248320,
+    \\  "enable_confidence_head": true,
+    \\  "markov_head_type": "vanilla",
+    \\  "markov_rank": 256,
+    \\  "mask_token_id": 248077,
+    \\  "sample_from_anchor": true,
+    \\  "sliding_window_non_causal": false,
+    \\  "transformer_layer_config": {
+    \\    "head_dim": 256,
+    \\    "hidden_size": 5120,
+    \\    "intermediate_size": 17408,
+    \\    "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+    \\    "max_position_embeddings": 262144,
+    \\    "model_type": "qwen3",
+    \\    "num_attention_heads": 20,
+    \\    "num_hidden_layers": 5,
+    \\    "num_key_value_heads": 4,
+    \\    "rms_norm_eps": 1e-06,
+    \\    "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"},
+    \\    "sliding_window": 2048,
+    \\    "vocab_size": 248320
+    \\  }
+    \\}
+;
+
+// Speculators exports auxiliary hidden-state indices, where hidden state 4 is
+// the output of decoder layer 3. The runtime capture seam names decoder layers.
+test "dflash: block-FP8 sidecar memory billing keeps its source bytes" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const json = try std.mem.replaceOwned(u8, allocator, REDHAT_QWEN38_DSPARK_CONFIG_JSON, "\"markov_rank\": 256,", "\"markov_rank\": 256, \"quantization_config\": {\"quant_method\": \"fp8\"},");
+    defer allocator.free(json);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+    try testing.expectEqual(@as(u32, 0), sidecarQuantBits(io, allocator, dir));
+}
+
+test "dflash: Speculators DSpark config normalizes nested geometry and auxiliary layer ids" {
+    const allocator = testing.allocator;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, REDHAT_QWEN38_DSPARK_CONFIG_JSON, .{});
+    defer parsed.deinit();
+    try testing.expect(isDflashConfigJson(parsed.value.object));
+
+    var cfg = try parseConfigFromJson(allocator, REDHAT_QWEN38_DSPARK_CONFIG_JSON);
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 9), cfg.block_size);
+    try testing.expect(cfg.anchor_row_drafts);
+    try testing.expectEqual(@as(u32, 248077), cfg.mask_token_id);
+    try testing.expectEqualSlices(u32, &[_]u32{ 3, 11, 19, 27, 35, 43, 51, 59 }, cfg.target_layer_ids);
+    try testing.expectEqual(@as(u32, 5120), cfg.hidden_size);
+    try testing.expectEqual(@as(u32, 5), cfg.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 20), cfg.num_attention_heads);
+    try testing.expectEqual(@as(u32, 4), cfg.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 256), cfg.head_dim);
+    try testing.expectEqual(@as(u32, 17408), cfg.intermediate_size);
+    try testing.expectEqual(@as(u32, 2048), cfg.sliding_window);
+    try testing.expectApproxEqAbs(@as(f32, 1e7), cfg.rope_theta, 1.0);
+    try testing.expectEqual(@as(u32, 256), cfg.markov_rank);
+    try testing.expect(cfg.sliding_window_fixed_anchor);
+    try testing.expect(!cfg.sliding_window_non_causal);
+    try testing.expectEqual(@as(u32, 248320), cfg.draft_vocab_size);
+    try testing.expect(cfg.confidence_head);
+    try testing.expect(cfg.confidence_with_markov);
+}
+
+test "dflash: confidence prefix stops at the first low-survival position" {
+    const hi: f32 = @log(0.9 / 0.1);
+    const lo: f32 = @log(0.2 / 0.8);
+    try testing.expectEqual(@as(u32, 2), confidencePrefixFromLogits(&.{ hi, hi, lo, hi }, 0.5, 1));
+    try testing.expectEqual(@as(u32, 1), confidencePrefixFromLogits(&.{ lo, hi }, 0.5, 1));
+    try testing.expectEqual(@as(u32, 2), confidencePrefixFromLogits(&.{ lo, hi }, 0.5, 2));
+    try testing.expectEqual(@as(u32, 4), confidencePrefixFromLogits(&.{ hi, hi, lo, hi }, 0, 1));
+}
+
+test "dflash: DSpark Markov correction keeps full-vocab base logits" {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    cfg.vocab_size = 248320;
+    cfg.row_exact_covered = true;
+    cfg.dflash_bound = true;
+
+    try testing.expectEqual(@as(c_int, 98304), draftVocabRows(&cfg, false));
+    try testing.expectEqual(@as(c_int, 0), draftVocabRows(&cfg, true));
+}
+
 const DFLASH2_CONFIG_JSON =
     \\{
     \\  "architectures": ["DFlash2DraftModel"],
@@ -2760,15 +3170,25 @@ test "dflash: out-of-range target_layer_ids rejected by name" {
     try testing.expectError(error.DflashTargetLayerOutOfRange, validateTargetLayers(&[_]u32{60}, 52));
 }
 
-test "dflash: block size resolves from config, clamped downward by explicit CLI" {
-    // A machine WITH a wide verify lane keeps the checkpoint's own block.
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true, NO_WIDE_LANE_BLOCK_CAP));
-    // Explicit smaller CLI clamps down.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true, NO_WIDE_LANE_BLOCK_CAP));
-    // Explicit LARGER CLI never raises past the config (training contract).
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true, NO_WIDE_LANE_BLOCK_CAP));
+test "dflash: block size resolves from config and target verify width" {
+    // A machine WITH a wide verify lane keeps the checkpoint's own block when
+    // the target forward has no narrower efficient width.
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true, NO_WIDE_LANE_BLOCK_CAP, std.math.maxInt(u32)));
+    // A GDN target caps at the fused recurrent verifier's supported width.
+    try testing.expectEqual(@as(u32, 9), resolveBlockSize(10, 4, false, true, NO_WIDE_LANE_BLOCK_CAP, 9));
+    // Explicit CLI bypasses performance caps but remains bounded by training.
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true, NO_WIDE_LANE_BLOCK_CAP, 5));
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true, NO_WIDE_LANE_BLOCK_CAP, 8));
     // Floor 2.
-    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true, NO_WIDE_LANE_BLOCK_CAP, 8));
+}
+
+test "dflash: GDN targets cap at the fused recurrence fold width" {
+    var cfg = ModelConfig{};
+    try testing.expectEqual(std.math.maxInt(u32), targetBlockCap(&cfg));
+    cfg.model_type = "qwen3_5_moe";
+    cfg.full_attention_interval = 4;
+    try testing.expectEqual(@as(u32, @intCast(gdn_decode.FOLD_MAX_SEQ)), targetBlockCap(&cfg));
 }
 
 test "dflash: an assistant merged into the checkpoint is found without a flag" {
@@ -2816,16 +3236,16 @@ test "dflash: an assistant merged into the checkpoint is found without a flag" {
 test "dflash: no wide verify lane caps the block at the split-K width" {
     // Without an M 8..16 verify lane the trunk forward falls off a cliff at
     // width 8, so the block is capped even though the checkpoint asks for 16.
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false, NO_WIDE_LANE_BLOCK_CAP, std.math.maxInt(u32)));
     // The cap is a CEILING, never a floor: an explicit smaller CLI still wins,
     // and a checkpoint whose own block is already narrow is left alone.
-    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false, NO_WIDE_LANE_BLOCK_CAP));
-    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false, NO_WIDE_LANE_BLOCK_CAP, 8));
+    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false, NO_WIDE_LANE_BLOCK_CAP, 8));
     // Explicit CLI is the escape hatch for a wider block on capped hardware:
     // it clamps against the CONFIG block, not the cap.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false, NO_WIDE_LANE_BLOCK_CAP, 5));
     // An explicit CLI also bypasses a per-silicon cap entirely.
-    try testing.expectEqual(@as(u32, 10), resolveBlockSize(16, 10, true, false, 8));
+    try testing.expectEqual(@as(u32, 10), resolveBlockSize(16, 10, true, false, 8, 5));
 }
 
 test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" {
@@ -2843,8 +3263,8 @@ test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" 
     try testing.expectEqual(@as(u32, 8), blockCapForMachine("Apple M4 Max", true).cap);
     // Resolution with the M3 Ultra row: a block-16 checkpoint caps at 8, a
     // block-8 one is left alone.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap));
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(8, 4, false, false, ultra.cap));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap, std.math.maxInt(u32)));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(8, 4, false, false, ultra.cap, std.math.maxInt(u32)));
 }
 
 // ── Hermetic fixtures: tiny llama trunk + tiny DFlash assistant ──
@@ -3000,6 +3420,30 @@ pub const TinyFix = struct {
         \\}
     ;
 
+    pub const DSPARK_CONFIG =
+        \\{
+        \\  "model_type": "tiny_assistant",
+        \\  "block_size": 3,
+        \\  "sample_from_anchor": true,
+        \\  "mask_token_id": 127,
+        \\  "target_layer_ids": [0, 2],
+        \\  "hidden_size": 64,
+        \\  "intermediate_size": 128,
+        \\  "num_hidden_layers": 2,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 16,
+        \\  "rms_norm_eps": 1e-5,
+        \\  "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        \\  "sliding_window": 8,
+        \\  "layer_types": ["sliding_attention", "full_attention"],
+        \\  "markov_rank": 32,
+        \\  "markov_head_type": "vanilla",
+        \\  "enable_confidence_head": true,
+        \\  "confidence_head_with_markov": true
+        \\}
+    ;
+
     /// `quantize`: also emit `.scales`/`.biases` for every matmul weight, the
     /// shape a sidecar published pre-quantized would ship.
     pub fn writeAssistant(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
@@ -3015,6 +3459,22 @@ pub const TinyFix = struct {
         const meta = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta);
         try putV1AssistantWeights(map, s, quantize);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    pub fn writeDspark(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = DSPARK_CONFIG });
+        const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
+        defer testing.allocator.free(st_path);
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try putV1AssistantWeights(map, s, false);
+        try putW(map, "markov_head.markov_w1.weight", VOCAB, 32, 200, s);
+        try putW(map, "markov_head.markov_w2.weight", VOCAB, 32, 201, s);
+        try putW(map, "confidence_head.proj.weight", 1, HIDDEN + 32, 202, s);
+        try putW(map, "confidence_head.proj.bias", 1, 0, 203, s);
         try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
     }
 
@@ -3160,6 +3620,55 @@ pub const TinyFix = struct {
         try put(map, try std.fmt.bufPrint(&buf, "{s}.biases", .{base}), lin.biases);
     }
 
+    pub fn blockFp8Weight(rows: usize, cols: usize, block: usize, seed: usize, s: mlx.mlx_stream) !struct { raw: mlx.mlx_array, scales: mlx.mlx_array, dense: mlx.mlx_array } {
+        const padded_rows = std.mem.alignForward(usize, rows, block);
+        const padded_cols = std.mem.alignForward(usize, cols, block);
+        const source = try bf16Arr(padded_rows, padded_cols, seed, s);
+        defer _ = mlx.mlx_array_free(source);
+        var source_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(source_f32);
+        try mlx.check(mlx.mlx_astype(&source_f32, source, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(source_f32));
+        const source_data = mlx.mlx_array_data_float32(source_f32) orelse return error.MlxArrayDataNull;
+        const nrb = padded_rows / block;
+        const ncb = padded_cols / block;
+        const scale_data = try testing.allocator.alloc(f32, nrb * ncb);
+        defer testing.allocator.free(scale_data);
+        const normalized_data = try testing.allocator.alloc(f32, padded_rows * padded_cols);
+        defer testing.allocator.free(normalized_data);
+        for (0..nrb) |br| for (0..ncb) |bc| {
+            var amax: f32 = 0;
+            for (0..block) |r| for (0..block) |c| {
+                amax = @max(amax, @abs(source_data[(br * block + r) * padded_cols + bc * block + c]));
+            };
+            const scale = @max(amax / 448.0, 1e-8);
+            scale_data[br * ncb + bc] = scale;
+            for (0..block) |r| for (0..block) |c| {
+                const idx = (br * block + r) * padded_cols + bc * block + c;
+                normalized_data[idx] = source_data[idx] / scale;
+            };
+        };
+        const padded_shape = [_]c_int{ @intCast(padded_rows), @intCast(padded_cols) };
+        const normalized = mlx.mlx_array_new_data(normalized_data.ptr, &padded_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(normalized);
+        var raw_padded = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(raw_padded);
+        try mlx.check(mlx.mlx_to_fp8(&raw_padded, normalized, s));
+        var raw = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(raw);
+        try mlx.check(mlx.mlx_slice(&raw, raw_padded, &.{ 0, 0 }, 2, &.{ @intCast(rows), @intCast(cols) }, 2, &.{ 1, 1 }, 2, s));
+        const scale_shape = [_]c_int{ @intCast(nrb), @intCast(ncb) };
+        const scales_f32 = mlx.mlx_array_new_data(scale_data.ptr, &scale_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(scales_f32);
+        var scales = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(scales);
+        try mlx.check(mlx.mlx_astype(&scales, scales_f32, .bfloat16, s));
+        var dense = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense);
+        try mlx.check(mlx.mlx_slice(&dense, source, &.{ 0, 0 }, 2, &.{ @intCast(rows), @intCast(cols) }, 2, &.{ 1, 1 }, 2, s));
+        return .{ .raw = raw, .scales = scales, .dense = dense };
+    }
+
     pub fn readF32(arr: mlx.mlx_array, allocator: std.mem.Allocator, s: mlx.mlx_stream) ![]f32 {
         var f = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f);
@@ -3193,6 +3702,37 @@ pub const TinyFix = struct {
         return bf;
     }
 };
+
+test "dflash: DSpark loader binds the Markov-conditioned confidence head" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp_dir.dir.realPath(io, &path_buf)];
+    try TinyFix.writeDspark(io, tmp_dir.dir, dir_path, s);
+
+    var m = try loadDflashQuant(io, allocator, s, dir_path, 0);
+    defer m.deinit();
+    const confidence = m.confidence orelse return error.TestExpectedConfidenceHead;
+    try testing.expect(m.markov != null);
+    try testing.expect(confidence.with_markov);
+    try testing.expectEqualSlices(c_int, &.{ TinyFix.HIDDEN + 32, 1 }, mlx.getShape(confidence.weight));
+    try testing.expectEqualSlices(c_int, &.{1}, mlx.getShape(confidence.bias));
+
+    const hidden = try TinyFix.capArr(1, 210, s);
+    defer _ = mlx.mlx_array_free(hidden);
+    const markov_embed = try m.markov.?.embedding(7, s);
+    defer _ = mlx.mlx_array_free(markov_embed);
+    const logits = try confidence.logits(hidden, markov_embed, s);
+    defer _ = mlx.mlx_array_free(logits);
+    const values = try TinyFix.readF32(logits, allocator, s);
+    defer allocator.free(values);
+    try testing.expectEqual(@as(usize, 1), values.len);
+    try testing.expect(std.math.isFinite(values[0]));
+}
 
 test "dflash: loadDflash keeps a dense bf16 assistant dense + pre-transposed when quantization is off" {
     const allocator = testing.allocator;
@@ -3230,13 +3770,13 @@ test "dflash: buildBlockMask sliding/full arms and window edges" {
     const s = mlx.gpuStream();
 
     // Full layer: never a mask.
-    try testing.expectEqual(@as(?mlx.mlx_array, null), try buildBlockMask(.full_attention, 0, 100, 100, 4, 8, s));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try buildBlockMask(.full_attention, 0, 100, 100, 4, 8, false, true, s));
     // Sliding, everything inside the window: no mask needed.
-    try testing.expectEqual(@as(?mlx.mlx_array, null), try buildBlockMask(.sliding_attention, 0, 4, 4, 4, 8, s));
+    try testing.expectEqual(@as(?mlx.mlx_array, null), try buildBlockMask(.sliding_attention, 0, 4, 4, 4, 8, false, true, s));
 
     // Sliding, ctx_len 10, anchor 10, block 4, window 8: rows are queries at
     // abs 10..13, cols are ctx abs 0..9 then block abs 10..13.
-    const mask = (try buildBlockMask(.sliding_attention, 0, 10, 10, 4, 8, s)).?;
+    const mask = (try buildBlockMask(.sliding_attention, 0, 10, 10, 4, 8, false, true, s)).?;
     defer _ = mlx.mlx_array_free(mask);
     const msh = mlx.getShape(mask);
     try testing.expectEqualSlices(c_int, &[_]c_int{ 1, 1, 4, 14 }, msh);
@@ -3257,6 +3797,35 @@ test "dflash: buildBlockMask sliding/full arms and window edges" {
     // Block ↔ block always visible (|q-k| ≤ 3 < 8).
     try testing.expectEqual(@as(f32, 0.0), at(vals, 0, 13));
     try testing.expectEqual(@as(f32, 0.0), at(vals, 3, 10));
+}
+
+test "dflash: Speculators sliding mask uses fixed anchor context and causal block" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    // Context positions 0..9, anchor 10, block positions 10..13, window 8.
+    // Speculators keeps context [2,10) for every query and makes the block causal.
+    const mask = (try buildBlockMask(.sliding_attention, 0, 10, 10, 4, 8, true, false, s)).?;
+    defer _ = mlx.mlx_array_free(mask);
+    const vals = try TinyFix.readF32(mask, allocator, s);
+    defer allocator.free(vals);
+    const at = struct {
+        fn f(v: []const f32, row: usize, col: usize) f32 {
+            return v[row * 14 + col];
+        }
+    }.f;
+
+    for (0..4) |row| {
+        try testing.expect(std.math.isNegativeInf(at(vals, row, 1)));
+        try testing.expectEqual(@as(f32, 0.0), at(vals, row, 2));
+        try testing.expectEqual(@as(f32, 0.0), at(vals, row, 9));
+    }
+    // Synthetic block: row r sees block columns 0..r, never future slots.
+    try testing.expectEqual(@as(f32, 0.0), at(vals, 0, 10));
+    try testing.expect(std.math.isNegativeInf(at(vals, 0, 11)));
+    try testing.expectEqual(@as(f32, 0.0), at(vals, 2, 12));
+    try testing.expect(std.math.isNegativeInf(at(vals, 2, 13)));
+    try testing.expectEqual(@as(f32, 0.0), at(vals, 3, 13));
 }
 
 test "dflash: appendContext grows the cache; forwardBlock evicts its block K/V" {
@@ -3390,6 +3959,26 @@ test "dflash: load-time quantization packs every matmul weight and tracks the de
     const p = try paritySlices(a, b);
     try testing.expect(p.cos > 0.99);
     try testing.expect(@abs(p.rms_ratio - 1.0) < 0.05);
+}
+
+test "dflash: block-FP8 weights dequantize by 128x128 scale blocks before affine packing" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const fp8 = try TinyFix.blockFp8Weight(129, 257, 128, 810, s);
+    defer _ = mlx.mlx_array_free(fp8.raw);
+    defer _ = mlx.mlx_array_free(fp8.scales);
+    defer _ = mlx.mlx_array_free(fp8.dense);
+
+    const dequantized = try dequantBlockFp8(fp8.raw, fp8.scales, 128, s);
+    defer _ = mlx.mlx_array_free(dequantized);
+    const want = try TinyFix.readF32(fp8.dense, allocator, s);
+    defer allocator.free(want);
+    const got = try TinyFix.readF32(dequantized, allocator, s);
+    defer allocator.free(got);
+    const p = try paritySlices(got, want);
+    try testing.expect(p.cos > 0.999);
+    try testing.expect(@abs(p.rms_ratio - 1.0) < 0.01);
 }
 
 test "dflash: a sidecar shipping packed weights loads at its own declared width" {

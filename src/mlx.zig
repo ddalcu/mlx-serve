@@ -252,6 +252,7 @@ pub extern "c" fn mlx_var_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepd
 pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_to_fp8(res: *mlx_array, x: mlx_array, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_array_equal(res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) c_int;

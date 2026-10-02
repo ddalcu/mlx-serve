@@ -14,7 +14,8 @@ final class DrafterGemsTests: XCTestCase {
     func testA27BPackTakesItsOwnDrafterWhenItShipsOneElseZLab() {
         let listed = DrafterGems.gems(forRepoId: pack27B, packFiles: ["drafter/config.json": 1, "drafter/model.safetensors": 3_849_999_999],
                                       localDrafter: false, mtpAvailable: false)
-        XCTAssertEqual(listed, [DrafterGem(kind: .dflash2, repo: pack27B, subfolder: "drafter", sizeGB: 3.85)])
+        XCTAssertEqual(listed.first, DrafterGem(kind: .dflash2, repo: pack27B, subfolder: "drafter", sizeGB: 3.85))
+        XCTAssertEqual(kinds(listed), [.dflash2, .dspark, .dspark])
 
         let onDisk = DrafterGems.gems(forRepoId: pack27B, packFiles: nil, localDrafter: true, mtpAvailable: false)
         XCTAssertEqual(onDisk.first?.subfolder, "drafter")
@@ -49,6 +50,116 @@ final class DrafterGemsTests: XCTestCase {
         let gems = DrafterGems.gems(forRepoId: "LiquidAI/LFM2.5-2.6B-MLX-8bit", packFiles: nil, localDrafter: true, mtpAvailable: true)
         XCTAssertEqual(kinds(gems), [.mtp, .packDrafter])
         XCTAssertEqual(DrafterGems.defaultGem(gems)?.kind, .packDrafter)
+    }
+
+    func testQwenDSparkSourcesAreOfferedWithoutChangingTheDefault() {
+        for repo in [pack27B, "mlx-community/Qwen3.8-27B-6bit", "ddalcu/Qwen3.8-27B-iQ-MLX"] {
+            let gems = DrafterGems.gems(forRepoId: repo, packFiles: nil, localDrafter: false, mtpAvailable: true)
+            XCTAssertEqual(kinds(gems), [.mtp, .dflash2, .dspark, .dspark])
+            let dspark = gems.filter { $0.kind == .dspark }
+            XCTAssertEqual(dspark.map(\.repo), ["lonelyj3w/Qwen3.8-27B-speculator.dspark-fp8", "RedHatAI/Qwen3.8-27B-speculator.dspark"])
+            XCTAssertEqual(Set(dspark.map(\.id)).count, 2)
+            XCTAssertEqual(dspark.map(\.label), ["DSpark drafter (FP8)", "DSpark drafter (BF16)"])
+            XCTAssertTrue(dspark.allSatisfy { $0.needsDownload && $0.isDflash && $0.subfolder == nil })
+            XCTAssertNil(DrafterGems.defaultGem(gems))
+        }
+        for repo in ["ddalcu/Qwen3.8-35B-A3B-4bit", "ddalcu/Qwen3.5-27B-4bit",
+                     "RedHatAI/Qwen3.8-27B-speculator.dspark", "lonelyj3w/Qwen3.8-27B-speculator.dspark-fp8"] {
+            XCTAssertFalse(DrafterGems.gems(forRepoId: repo, packFiles: nil, localDrafter: false, mtpAvailable: false)
+                .contains { $0.kind == .dspark }, repo)
+        }
+    }
+
+    private var speculatorsConfig: [String: Any] {
+        ["architectures": ["DSparkDraftModel"], "block_size": 8, "mask_token_id": 248077,
+         "markov_rank": 256, "aux_hidden_state_layer_ids": [4, 12, 20], "sample_from_anchor": true,
+         "transformer_layer_config": ["model_type": "qwen3", "hidden_size": 5120]]
+    }
+
+    func testAPacksOwnSpeculatorsDrafterUsesTheDSparkGem() {
+        let gems = DrafterGems.gems(forRepoId: pack27B, packFiles: nil, localDrafter: true,
+                                   mtpAvailable: false, localDrafterConfig: speculatorsConfig)
+        XCTAssertEqual(gems.first?.kind, .dspark)
+        XCTAssertEqual(gems.first?.subfolder, "drafter")
+        XCTAssertEqual(DrafterGems.defaultGem(gems), gems.first)
+        XCTAssertEqual(DrafterSocket.read(ModelOverride(json: ["drafter": "auto"]), gems: gems) { _ in nil }, .gem(gems[0]))
+    }
+
+    func testSpeculatorsBadgeAndExternalSocketRoundTrip() throws {
+        XCTAssertEqual(DrafterGems.stone(drafterConfig: speculatorsConfig), .amethyst)
+        XCTAssertEqual(DrafterGems.stone(drafterConfig: ["model_type": "muse_glimmer_assistant", "block_size": 16,
+                                                       "mask_token_id": 7, "target_layer_ids": [1, 3]]), .sapphire)
+        var incomplete = speculatorsConfig
+        incomplete.removeValue(forKey: "aux_hidden_state_layer_ids")
+        XCTAssertNil(DrafterGems.stone(drafterConfig: incomplete))
+        let gems = DrafterGems.gems(forRepoId: pack27B, packFiles: nil, localDrafter: false, mtpAvailable: true)
+        let dspark = gems.filter { $0.kind == .dspark }
+        XCTAssertEqual(dspark.count, 2)
+        for gem in dspark {
+            let path = "/drafters/\(gem.repo)"
+            var override = ModelOverride(mtpAcceptance: .typical)
+            DrafterSocket.gem(gem).write(into: &override, gemPath: path)
+            XCTAssertEqual(override.drafter, path)
+            XCTAssertEqual(DrafterSocket.read(override, gems: gems) { $0 == gem ? path : nil }, .gem(gem))
+            XCTAssertTrue(DrafterSocket.gem(gem).bindsDflash(localDrafter: false))
+            XCTAssertEqual(DrafterGems.badge(override, modelDir: "/target", hasMtpHead: true, options: ServerOptions()) {
+                $0 == path ? self.speculatorsConfig : nil
+            }, SocketBadge(stone: .amethyst, skull: false))
+        }
+    }
+
+    func testSpeculatorsLocalModelIsADrafterNotAChatTarget() throws {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("dspark-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try JSONSerialization.data(withJSONObject: speculatorsConfig)
+            .write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("config.json")))
+        try Data(count: Int(DownloadManager.minimumWeightBytes))
+            .write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("model.safetensors")))
+        let model = try XCTUnwrap(DownloadManager.makeLocalModels(atDir: dir, displayName: "RedHatAI/Qwen3.8-27B-speculator.dspark",
+                                                               idKey: "dspark", source: .custom).first)
+        XCTAssertEqual(model.kind, .drafter)
+        XCTAssertFalse(model.isChatPickable)
+    }
+
+    @MainActor
+    func testDSparkGemNeedsCompleteWeightsBeforeItCanBeSelected() throws {
+        let root = (NSTemporaryDirectory() as NSString).appendingPathComponent("gem-ready-\(UUID().uuidString)")
+        let repo = "fixtures/DSpark-\(UUID().uuidString)"
+        let dir = DownloadManager.newLayoutDir(rootDir: root, repoId: repo)
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let config = (dir as NSString).appendingPathComponent("config.json")
+        try JSONSerialization.data(withJSONObject: speculatorsConfig).write(to: URL(fileURLWithPath: config))
+        let manager = DownloadManager(modelsRoot: root)
+        let gem = DrafterGem(kind: .dspark, repo: repo, subfolder: nil, sizeGB: 1)
+        XCTAssertNil(manager.gemPath(gem, modelDir: "/target"), "config alone is not a downloaded sidecar")
+        let weight = (dir as NSString).appendingPathComponent("model.safetensors")
+        try Data(count: Int(DownloadManager.minimumWeightBytes)).write(to: URL(fileURLWithPath: weight))
+        XCTAssertEqual(manager.gemPath(gem, modelDir: "/target"), dir)
+        let partial = weight + ".partial"
+        try Data([1]).write(to: URL(fileURLWithPath: partial))
+        XCTAssertNil(manager.gemPath(gem, modelDir: "/target"))
+        try FileManager.default.removeItem(atPath: partial)
+        let index = ["weight_map": ["a": "model.safetensors", "b": "model-00002.safetensors"]]
+        try JSONSerialization.data(withJSONObject: index)
+            .write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("model.safetensors.index.json")))
+        XCTAssertNil(manager.gemPath(gem, modelDir: "/target"), "every declared shard must exist")
+        try Data([1]).write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("model-00002.safetensors")))
+        XCTAssertEqual(manager.gemPath(gem, modelDir: "/target"), dir)
+    }
+
+    private func hf(_ repo: String) -> HFModel {
+        HFModel(id: repo, downloads: 0, likes: 0, lastModified: nil,
+                tags: nil, safetensors: nil, pipelineTag: "text-generation")
+    }
+
+    func testSpeculatorsAndDFlash2SearchRowsAreNotChatModels() {
+        for repo in ["RedHatAI/Qwen3.8-27B-speculator.dspark", "lonelyj3w/Qwen3.8-27B-speculator.dspark-fp8",
+                     "LiquidAI/LFM2.5-2.6B-DSpark", "z-lab/Qwen3.8-27B-DFlash2"] {
+            XCTAssertTrue(hf(repo).isDrafter, repo)
+        }
+        XCTAssertFalse(hf(pack27B).isDrafter)
     }
 
     // MARK: - Socket <-> settings
