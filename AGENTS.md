@@ -400,7 +400,7 @@ Spec decode:
 - **qwen4 MTP specifics**: head projects only the consumed row (`Qwen4MtpProject`); EV seed lives on `Qwen4Mtp`, declines under FORCE_DEPTH; head rides the slot's M-RoPE table on image turns; a verify row is BYTES (MTP stays opt-in); grouped-expert NAX tile is a measured LOSS. Solo greedy rounds pad the head history and build the next chain lazily (`MLX_SERVE_MTP_PADDED_HEAD=0` / `MLX_SERVE_MTP_LAZY_PREDRAFT=0`); the lazy plan lags one round at auto depth BY DESIGN (see engine-mlx gotchas).
 
 Sampling:
-- **Penalties apply in `Generator.sampleLazy`** (#564); `SamplingParams.penalized()` keeps a request off `next`'s fast path, spec and batching. Guard: `tests/test_repeat_penalty.sh`.
+- **Penalties apply in `Generator.sampleLazy`**; nonneutral `generation_config.json` `repetition_penalty` / `presence_penalty` defaults also disable pipelined, speculative and batched decode. Explicit request `repeat_penalty: 1` / `presence_penalty: 0` restore eligibility; other gates can still decline acceleration. Guards: `tests/test_repeat_penalty.sh`, `tests/test_sampling_defaults.py`.
 - **`top_p` 0 is GREEDY** (`applyTopP` floors at `floatMin`). Filters cut by RANK with lowest-id tie break (`ranksDescending`, `topRanksDescending`); cumsum in f32; top-k + top-p are ONE pass (`filterTopKTopP`). Block helpers use `_axis` ops.
 
 Kernels + numerics:

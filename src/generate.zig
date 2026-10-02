@@ -12866,8 +12866,9 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
         if (applyMinP(&next, current, sampling.min_p.?, s)) |_| {
             _ = mlx.mlx_array_free(current);
             current = next;
-        } else |_| {
+        } else |err| {
             _ = mlx.mlx_array_free(next);
+            log.warn("[sampling] min_p failed ({s}); this draw skips min_p\n", .{@errorName(err)});
         }
     }
 
