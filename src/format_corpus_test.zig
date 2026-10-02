@@ -2095,7 +2095,7 @@ fn specialMarkerLenAt(s: []const u8) ?usize {
 }
 
 test "format corpus: reasoning streamed mid-thought is a prefix of the delivered reasoning" {
-    // Replay of the tools-path stream order both SSE handlers use, byte by byte
+    // Replay of the tools-path stream order every SSE handler uses, byte by byte
     // except `<|…>` markers, which are special tokens and arrive whole:
     // tool hold first, then the think gate; `.hold_thinking` streams the
     // unsent tail of the split so far. A delta cannot be retracted, so every

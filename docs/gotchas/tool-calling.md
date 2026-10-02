@@ -439,6 +439,18 @@ emits diffs and holds back only the minimal ambiguous suffix, which is what
 vLLM's `extract_tool_calls_streaming` and llama.cpp's `common/chat.cpp` partial
 parse do — is in TODO.md.
 
+### `/v1/responses` never got it (2026-09-30)
+
+The fix above landed on chat and `/v1/messages`; the Responses stream still did
+`if (active_has_tools) continue;`, so after `response.in_progress` a tools
+request sent nothing and its whole thought arrived in the terminal burst beside
+the function call. Codex-style clients always send tools, so none of their turns
+could show thinking live or measure a first token. The Responses arm now runs
+the same order (tool hold, `streamThinkGateScan`, `streamableReasoning`,
+`unstreamedReasoning`) into `response.reasoning_summary_text.delta`, and the end
+sends only the unsent tail before the `.done` events. The answer and the calls
+still wait for the parse. Guard: `tests/test_responses_streaming.sh` [B2].
+
 ---
 
 ## A `</think>` inside a tool ARGUMENT destroyed the whole call (2026-08-05)
