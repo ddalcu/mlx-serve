@@ -17259,16 +17259,25 @@ pub const Transformer = struct {
             errdefer allocator.destroy(st);
             st.* = .{
                 .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
-                .table = try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
+                .table = if (config.embedded_ple_payload_bytes != null)
+                    try qwen4_mod.NgramTable.openEmbedded(std.fs.path.dirname(config.ngram_table_path orelse return error.MissingNgramTable) orelse return error.MissingNgramTable, try model_mod.qwen4EmbeddedSpec(&config))
+                else
+                    try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
             };
             errdefer st.deinit();
+            if (config.embedded_ple_payload_bytes) |bytes| {
+                if (st.table.embeddedPayloadBytes() != bytes) return error.EmbeddedNgramTableChanged;
+            }
             if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
                 log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
                 return error.NgramTableMismatch;
             }
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
-            st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
+            if (config.embedded_ple_payload_bytes != null and ple_gpu.enabled) {
+                log.info("[qwen4] --ple-gpu declined: embedded PLE table is unsupported by the GPU kernel; host row gather is active.\n", .{});
+            }
+            st.gpu = if (config.embedded_ple_payload_bytes == null) ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes) else null;
             st.table.startWarm(); // the weights load just evicted the table from page cache
             qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
@@ -23904,8 +23913,12 @@ pub const Transformer = struct {
 
     /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
     fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
-        const mtp_prefix = "language_model.mtp";
-        if (weights.get(mtp_prefix ++ ".fc_hidden.weight") == null) return null;
+        const mtp_prefix = if (weights.get("language_model.mtp.fc_hidden.weight") != null)
+            "language_model.mtp"
+        else if (weights.get("mtp.fc_hidden.weight") != null)
+            "mtp"
+        else
+            return null;
         var mcfg = config;
         mcfg.weight_prefix = mtp_prefix;
         mcfg.num_hidden_layers = 1;
@@ -23921,11 +23934,16 @@ pub const Transformer = struct {
         allocator.free(ml.moe_layers);
         const entry = ml.ssm_entries[0];
         allocator.free(ml.ssm_entries);
-        const fe = try weightTriple(weights, mtp_prefix ++ ".fc_embedding", &owned, allocator, s);
-        const fh = try weightTriple(weights, mtp_prefix ++ ".fc_hidden", &owned, allocator, s);
-        const mixer = try loadHcWeights(weights, mtp_prefix ++ ".hyper_connection_mixer", false, config.hc_count, config.hidden_size, &owned, allocator, s);
-        const pne = weights.get(mtp_prefix ++ ".pre_fc_norm_embedding.weight") orelse return error.MissingWeight;
-        const pnh = weights.get(mtp_prefix ++ ".pre_fc_norm_hidden.weight") orelse return error.MissingWeight;
+        var fe_buf: [80]u8 = undefined;
+        var fh_buf: [80]u8 = undefined;
+        var mixer_buf: [80]u8 = undefined;
+        var pne_buf: [80]u8 = undefined;
+        var pnh_buf: [80]u8 = undefined;
+        const fe = try weightTriple(weights, try std.fmt.bufPrint(&fe_buf, "{s}.fc_embedding", .{mtp_prefix}), &owned, allocator, s);
+        const fh = try weightTriple(weights, try std.fmt.bufPrint(&fh_buf, "{s}.fc_hidden", .{mtp_prefix}), &owned, allocator, s);
+        const mixer = try loadHcWeights(weights, try std.fmt.bufPrint(&mixer_buf, "{s}.hyper_connection_mixer", .{mtp_prefix}), false, config.hc_count, config.hidden_size, &owned, allocator, s);
+        const pne = weights.get(try std.fmt.bufPrint(&pne_buf, "{s}.pre_fc_norm_embedding.weight", .{mtp_prefix})) orelse return error.MissingWeight;
+        const pnh = weights.get(try std.fmt.bufPrint(&pnh_buf, "{s}.pre_fc_norm_hidden.weight", .{mtp_prefix})) orelse return error.MissingWeight;
         var cache = try KVCache.init(allocator, config.num_hidden_layers + 1);
         errdefer cache.deinit();
         log.info("[qwen4] MTP head loaded (1 hyper-connected QSA+MoE layer; drafts armed by --mtp)\n", .{});

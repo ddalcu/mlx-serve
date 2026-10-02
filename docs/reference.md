@@ -79,6 +79,7 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `gemma3` | Gemma 3 | `language_model.model` | -- | -- | |
 | `qwen3` | Qwen 3 | `model` | -- | -- | QK norm |
 | `qwen3_5`, `qwen3_5_moe(_text)` | Qwen 3.5/3.6 | `language_model.model` | -- | Optional | GatedDeltaNet + MoE/dense, shared expert routing |
+| `qwen4_exp` | Qwen3.8-Flash-Next | `language_model.model` | Qwen3-VL | 512/top-10 | Hyper-connections, n-gram PLE, QSA; external or embedded PLE table |
 | `qwen3_next` | Qwen 3-next | `model` | -- | Optional | DeltaNet |
 | `nemotron_h` | Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM |
 | `lfm2`, `lfm2_vl` | Liquid LFM2.5 / LFM2.5-VL | `model` | -- | `vision_tower` + `multi_modal_projector` | Hybrid gated conv + full attention; the VL tag adds a SigLIP2-NaFlex tower (`src/lfm2_vision.zig`) |
@@ -87,6 +88,10 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `*.gguf` (any) | via llama.cpp | -- | -- | -- | Embedded libllama engine; reported as `model_type=gguf`. See Embedded engines. |
 
 **TODO**: `phi`/`phi3` (different layout), `command-r` (different arch).
+
+The embedded Qwen4 PLE path accepts indexed safetensors with complete `ngram_embedding.shards.N.{weight,scales,biases}` triplets matching the config's shard count and table geometry. `ngram_embedding.weight_scale` may be absent (identity) or a scalar BF16 1.0; other values are refused. The table is read through host memory; `--ple-gpu` logs that the embedded layout uses host row gather. The loader leaves other PLE weights in MLX and excludes only the validated table payload from the one resident-weight estimate used by eviction, preflight, and commit.
+
+Norm storage is independent of table layout. For an unmarked embedded pack, the loader checks both `self_attn.indexer.{q_layernorm,k_layernorm}.weight` arrays already loaded in the weights map on every expected full-attention layer, before folding any norms. Each must be a finite BF16/F16/F32 1-D tensor of `indexer_head_dim`; all tensor means must agree near 0 (delta, within ±0.2) or near 1 (folded, within ±0.2). Missing, malformed, mixed, or ambiguous anchors are refused by name. If that happens, set `"qwen4_norm_convention":"delta"` or `"folded"` in that checkpoint's root `config.json` after verifying its norms; a server-wide `--config-overrides` value for this field is refused. The checkpoint-local marker takes priority regardless of table layout, and unmarked external-table packs keep their folded default. Only the ten Qwen4 norm suffixes in `qwen4NormNeedsFold` are folded for `delta`, once in the shared weights map before the Transformer and MTP head use them; the gated linear-attention norm stays unchanged. F16 delta norms receive the +1 before narrowing to BF16.
 
 ### GGUF auto-routing
 

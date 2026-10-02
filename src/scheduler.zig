@@ -115,6 +115,7 @@ pub const LoadParams = struct {
     chat_config: *ChatConfig,
     /// Path to the model directory. Borrowed; outlive scheduler.
     model_dir: []const u8,
+    resident_model_bytes: ?u64 = null,
     /// Path to the assistant drafter checkpoint. Empty disables the drafter.
     /// Borrowed; outlive scheduler.
     drafter_dir: []const u8 = "",
@@ -1152,6 +1153,7 @@ pub const LoadRequest = struct {
 
     /// Borrowed paths. Conn thread keeps the buffers alive until `done`.
     model_dir: []const u8,
+    resident_model_bytes: ?u64 = null,
     drafter_dir: []const u8 = "",
     /// `--no-drafter`: never load a drafter, including one MERGED into the
     /// checkpoint. `drafter_dir == ""` stopped meaning "off" the moment a
@@ -1994,6 +1996,17 @@ pub const Scheduler = struct {
         // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
         // other load should block on our filesystem.
         const media_peak = self.mediaPeakFor(entry);
+        const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null;
+        const validated_model_bytes: ?u64 = if (mlx_text)
+            residentModelDiskBytes(self.io, entry.path, owned.config) catch |err| {
+                self.registry.mutex.lockUncancelable(self.io);
+                if (entry.state == .unloaded) self.registry.markErrorLocked(entry, @errorName(err));
+                self.registry.mutex.unlock(self.io);
+                return error.LoadFailed;
+            }
+        else
+            null;
+        const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
 
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
@@ -2026,7 +2039,7 @@ pub const Scheduler = struct {
 
             // Estimate post-load bytes (see `gateEstimateBytes` for why a media
             // entry cannot be billed by its directory's size).
-            const estimated: u64 = gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
+            const estimated: u64 = gateEstimateBytes(media_peak, resident_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
             // concurrent loader sees the pending allocation in its own gate.
@@ -2069,6 +2082,7 @@ pub const Scheduler = struct {
             .tok = owned.tok,
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
+            .resident_model_bytes = resident_model_bytes,
             // `--no-drafter` / `--drafter` / `--draft-block-size` reach cold
             // loads too; the path itself is scoped by `coldLoadDrafterDir`.
             .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
@@ -3254,6 +3268,69 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
+fn residentModelDiskBytes(io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
+    const total = modelDiskBytes(io, model_dir);
+    if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
+    const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
+    if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
+    if (info.payload_bytes > total) return error.InvalidEmbeddedNgramTable;
+    return total - info.payload_bytes;
+}
+
+fn residentGateBytes(validated: ?u64, discovered: ?u64, mlx_text: bool) ?u64 {
+    if (!mlx_text) return discovered;
+    if (validated) |bytes| if (bytes > 0) return bytes;
+    return discovered orelse 0;
+}
+
+test "GGUF and unavailable media peak retain discovery bytes at the eviction gate" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(?u64, 100 * GB), residentGateBytes(null, 100 * GB, false));
+    try std.testing.expectEqual(110 * GB, gateEstimateBytes(0, residentGateBytes(null, 100 * GB, false), 48, 2560));
+    try std.testing.expectEqual(24 * GB, gateEstimateBytes(24 * GB, residentGateBytes(null, 100 * GB, false), 0, 0));
+    try std.testing.expectEqual(@as(?u64, 70 * GB), residentGateBytes(70 * GB, 100 * GB, true));
+    try std.testing.expectEqual(@as(?u64, 100 * GB), residentGateBytes(0, 100 * GB, true));
+    try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(0, null, true));
+    try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(null, 0, false));
+}
+
+fn committedTextBytes(model_bytes: u64, config: *const model_mod.ModelConfig) u64 {
+    if (model_bytes > 0) return model_bytes;
+    return @as(u64, config.num_hidden_layers) * @as(u64, config.hidden_size) * 4 * 4;
+}
+
+test "validated embedded weight estimate feeds eviction preflight and residency" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("qwen4_ple.zig").writeFixture(&td, .valid);
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try td.dir.realPath(io, &path);
+    const dir = path[0..len];
+    var config: model_mod.ModelConfig = .{
+        .model_type = "qwen4_exp",
+        .vocab_size = 1,
+        .ngram_size = 3,
+        .heads_per_ngram = 1,
+        .ngram_vocab_base = 2,
+        .ngram_vocab_divisor = 6,
+        .ple_embed_dim = 64,
+        .split_ngram_parts = 3,
+        .ple_layer_idx = 1,
+        .embedded_ple_payload_bytes = 120,
+        .num_hidden_layers = 2,
+        .hidden_size = 64,
+    };
+    const disk = modelDiskBytes(io, dir);
+    const snapshot = try residentModelDiskBytes(io, dir, &config);
+    try std.testing.expectEqual(disk - 120, snapshot);
+    try std.testing.expectEqual(snapshot, committedTextBytes(snapshot, &config));
+    try std.testing.expectEqual(snapshot + snapshot / 10, gateEstimateBytes(0, snapshot, config.num_hidden_layers, config.hidden_size));
+    try std.testing.expectEqual(loadRequirementBytes(snapshot), loadRequirementBytes(committedTextBytes(snapshot, &config)));
+    config.embedded_ple_payload_bytes = 121;
+    try std.testing.expectError(error.EmbeddedNgramTableChanged, residentModelDiskBytes(io, dir, &config));
+}
+
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -3640,29 +3717,6 @@ test "the eviction gate bills a media entry its BACKEND peak, never the dir's sa
     try testing.expectEqual(fallback + fallback / 10, gateEstimateBytes(0, null, 32, 4096));
 }
 
-test "the gate and the media preflight read ONE estimator" {
-    // The class bug in #126 is not the formula, it is that two sites computed
-    // the same bill differently and the stricter one ran first. Both call
-    // `gen.estimatePeakResidentBytes`; the gate reaches it through
-    // `mediaPeakFor`, which is the only place allowed to decide "is this a
-    // media entry, and what backend is it". Needles are ++-split so this
-    // test's own source cannot satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    const peek = "const media_peak = self.mediaPeak" ++ "For(entry);";
-    try testing.expect(std.mem.indexOf(u8, src, peek) != null);
-    const gate = "gateEstimateBytes(media_peak, entry.bytes_on" ++ "_disk,";
-    try testing.expect(std.mem.indexOf(u8, src, gate) != null);
-    // The raw-bytes_on_disk shape the gate used to have must be GONE.
-    const old = "const base: u64 = if (entry.bytes_on" ++ "_disk) |b|";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
-    // Both the preflight and the committed residency go through the estimator.
-    var n: usize = 0;
-    var i: usize = 0;
-    const needle = "gen_mod.estimatePeakResident" ++ "Bytes(";
-    while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
-    try testing.expect(n >= 2);
-}
-
 test "a media model commits the residency the gate reserved" {
     // Secondary #1 of the issue: the gate reserved the staged peak and then
     // `markReadyLocked` committed the DIR SUM, so H3 sat in the budget at
@@ -3776,6 +3830,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try doLoadGenOnInferenceThread(sch, params, modality);
         return;
     }
+    const model_bytes = params.resident_model_bytes orelse blk: {
+        const scanned = try residentModelDiskBytes(sch.io, params.model_dir, params.config);
+        break :blk residentGateBytes(scanned, params.entry.bytes_on_disk, true).?;
+    };
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
@@ -3797,7 +3855,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     defer if (in_dir_drafter) |p| sch.allocator.free(p);
     if (!skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;
-        const model_bytes = modelDiskBytes(sch.io, params.model_dir);
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
@@ -4543,15 +4600,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.llama_kv_type_k = params.llama_kv_type_k;
     entry.llama_kv_type_v = params.llama_kv_type_v;
 
-    // Best-effort bytes_resident estimate: prefer the disk size hint when
-    // available (it's close to actual GPU resident bytes after Metal page-
-    // ins), else fall back to a rough multiple of layers × hidden. The
-    // value drives LRU eviction's "will the new model fit?" gate in Phase
-    // D; precise accounting isn't required here.
-    const bytes_resident: u64 = if (entry.bytes_on_disk) |b|
-        b
-    else
-        @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;
+    // Commit the same validated weight estimate used by the eviction gate
+    // and preflight; zero means no disk estimate was available.
+    const bytes_resident = committedTextBytes(model_bytes, params.config);
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);

@@ -1677,11 +1677,27 @@ pub fn resolveMtpSource(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Di
 /// Qwen3.8-Flash-Next's head is the checkpoint's own layer, loaded by the
 /// trunk (`loadQwen4Mtp`), never through `resolveMtpSource`.
 const qwen4_mtp_marker = "\"language_model.mtp.fc_hidden.weight\"";
+const qwen4_root_mtp_marker = "\"mtp.fc_hidden.weight\"";
+
+test "qwen4 root MTP head is advertised from the shard index" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.fc_hidden.weight\":\"model-00001.safetensors\"}}" });
+    try testing.expect(dirAdvertisesMtp(io, allocator, tmp.dir));
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    try testing.expect(!hasMtpHead(io, allocator, path_buf[0..path_len]));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.fc_embedding.weight\":\"model-00001.safetensors\"}}" });
+    try testing.expect(!dirAdvertisesMtp(io, allocator, tmp.dir));
+}
 
 fn indexJsonHasQwen4Mtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
     const bytes = readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit) orelse return false;
     defer allocator.free(bytes);
-    return std.mem.indexOf(u8, bytes, qwen4_mtp_marker) != null;
+    return std.mem.indexOf(u8, bytes, qwen4_mtp_marker) != null or
+        std.mem.indexOf(u8, bytes, qwen4_root_mtp_marker) != null;
 }
 
 /// Advertisement probe: ANY head the server can run, including qwen4's.
@@ -1689,9 +1705,8 @@ pub fn dirAdvertisesMtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Di
     return resolveMtpSource(io, allocator, dir) != null or indexJsonHasQwen4Mtp(io, allocator, dir);
 }
 
-/// True when `model_dir` carries an MTP head we know how to load — a
-/// sidecar file OR in-checkpoint tensors. `model_dir` is absolute (same
-/// contract as `model.parseConfig`).
+/// True when `model_dir` carries a head for the generic MTP loader.
+/// `model_dir` is absolute (same contract as `model.parseConfig`).
 pub fn hasMtpHead(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
