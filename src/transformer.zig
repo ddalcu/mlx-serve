@@ -16161,7 +16161,7 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     const h_kv: c_int = ks[1];
     if (h_kv <= 0 or @rem(h_q, h_kv) != 0 or vs[1] != h_kv or vs[2] != ks[2] or ks[0] != 1) return null;
     const gqa: c_int = @divExact(h_q, h_kv);
-    if (gqa * t_q > 64) return null;
+    if (@divTrunc(gqa * t_q + 7, 8) * 8 > 56) return null; // past 56 padded rows the threadgroup arrays exceed Metal's 32 KiB
     const t_k: c_int = ks[2];
     if (t_k < t_q) return null;
 
@@ -44247,6 +44247,12 @@ test "qkv matmul2d kernel parity: t_q 1..8 x bits, partial last page, many split
         }
     }
     try qkvVerParityCaseWith(24, 4, 256, 8, 0, 4, true); // cache holds only the verify rows
+}
+
+test "qkv matmul2d kernel declines rows past its 32 KiB threadgroup budget (GQA 8 x t_q 8)" {
+    if (verifyQmmTile() == .off) return error.SkipZigTest;
+    try testing.expectError(error.KernelDeclined, qkvVerParityCaseWith(16, 2, 256, 4, 3000, 8, true));
+    try qkvVerParityCaseWith(16, 2, 256, 4, 3000, 7, true);
 }
 
 test "qkvMppWins: the matmul2d window needs rows or length" {
