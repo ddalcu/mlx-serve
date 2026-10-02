@@ -40,6 +40,9 @@ const LATENCY_BOUNDS_NS: [10]u64 = .{
 /// 8 token-count buckets: 32 → 8 192 (raw integers, no scaling).
 const TOKEN_BOUNDS: [8]u64 = .{ 32, 128, 256, 512, 1024, 2048, 4096, 8192 };
 
+/// How a request that owned a slot ended.
+pub const Outcome = enum { success, cancelled, failed };
+
 // ---------------------------------------------------------------------------
 // Metrics — the single global struct allocated when --metrics is on
 // ---------------------------------------------------------------------------
@@ -74,6 +77,8 @@ pub const Metrics = struct {
     generation_tokens_total: Counter,
     requests_success_total: Counter,
     requests_cancelled_total: Counter,
+    requests_failed_total: Counter,
+    requests_rejected_total: Counter,
     prefix_cache_queries_total: Counter,
     prefix_cache_hits_total: Counter,
 
@@ -139,6 +144,8 @@ pub const Metrics = struct {
             .generation_tokens_total = Counter.init(),
             .requests_success_total = Counter.init(),
             .requests_cancelled_total = Counter.init(),
+            .requests_failed_total = Counter.init(),
+            .requests_rejected_total = Counter.init(),
             .prefix_cache_queries_total = Counter.init(),
             .prefix_cache_hits_total = Counter.init(),
             .requests_running = Gauge.init(),
@@ -159,18 +166,20 @@ pub const Metrics = struct {
         };
     }
 
-    /// Record per-request metrics at slot completion.
-    /// Called exactly once per request from the `finishSlot` funnel.
+    /// A request refused before it owned a slot (context overflow, memory preflight).
+    pub fn recordRejected(self: *Metrics) void {
+        self.requests_rejected_total.inc();
+    }
+
+    /// Record per-request metrics once per request that owned a slot.
     ///
-    /// On success ("stop" | "length" | "tool_calls"): updates all latency
-    /// histograms, token histograms, and counters.
+    /// `.success`: updates all latency histograms, token histograms, and counters.
     ///
-    /// On cancel ("cancelled"): only increments `requests_cancelled_total`.
-    /// Latency histograms are NOT touched — a cancelled slot's decode_ns is
-    /// zero or garbage and would poison the distribution.
+    /// `.cancelled`: only increments `requests_cancelled_total`. Latency
+    /// histograms are NOT touched: a cancelled slot's decode_ns is zero or
+    /// garbage and would poison the distribution.
     ///
-    /// Other reasons (Zig error names from markError): silently ignored for
-    /// now; these are rare and already visible in --log-level warn output.
+    /// `.failed`: only increments `requests_failed_total`, histograms untouched.
     ///
     /// Parameters:
     ///   - `real_ttft_ns`: time from request arrival (Slot.init, pre-queue-wait)
@@ -183,7 +192,7 @@ pub const Metrics = struct {
     ///   - e2e latency = real_ttft_ns + decode_ns (= queue_wait + prefill + decode).
     pub fn recordRequest(
         self: *Metrics,
-        finish_reason: []const u8,
+        outcome: Outcome,
         real_ttft_ns: u64,
         prefill_ns: u64,
         decode_ns: u64,
@@ -195,15 +204,16 @@ pub const Metrics = struct {
         self.prefix_cache_queries_total.inc();
         if (cached_tokens > 0) self.prefix_cache_hits_total.inc();
 
-        const is_success = std.mem.eql(u8, finish_reason, "stop") or
-            std.mem.eql(u8, finish_reason, "length") or
-            std.mem.eql(u8, finish_reason, "tool_calls");
-
-        if (!is_success) {
-            if (std.mem.eql(u8, finish_reason, "cancelled"))
+        switch (outcome) {
+            .success => {},
+            .cancelled => {
                 self.requests_cancelled_total.inc();
-            // Error reasons (OOM, etc.) are rare; logged by the scheduler.
-            return;
+                return;
+            },
+            .failed => {
+                self.requests_failed_total.inc();
+                return;
+            },
         }
 
         // Success path — record all instrumented metrics.
@@ -253,6 +263,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeCounter(w, "vllm:generation_tokens_total", "Total generated tokens", m.generation_tokens_total.load());
     try writeCounter(w, "vllm:request_success_total", "Completed requests", m.requests_success_total.load());
     try writeCounter(w, "vllm:request_cancelled_total", "Requests cancelled by client disconnect", m.requests_cancelled_total.load());
+    try writeCounter(w, "mlx_serve:request_failed_total", "Requests that ended in a generation error", m.requests_failed_total.load());
+    try writeCounter(w, "mlx_serve:request_rejected_total", "Requests refused before a slot existed (context overflow, memory preflight)", m.requests_rejected_total.load());
     try writeCounter(w, "vllm:prefix_cache_queries_total", "Prefix cache lookup count", m.prefix_cache_queries_total.load());
     try writeCounter(w, "vllm:prefix_cache_hits_total", "Prefix cache hit count", m.prefix_cache_hits_total.load());
 
@@ -342,6 +354,8 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             "\"generation_tokens_total\":{d}," ++
             "\"requests_success_total\":{d}," ++
             "\"requests_cancelled_total\":{d}," ++
+            "\"requests_failed_total\":{d}," ++
+            "\"requests_rejected_total\":{d}," ++
             "\"prefix_cache_queries_total\":{d}," ++
             "\"prefix_cache_hits_total\":{d}" ++
             "}},\"gauges\":{{" ++
@@ -367,6 +381,8 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             m.generation_tokens_total.load(),
             m.requests_success_total.load(),
             m.requests_cancelled_total.load(),
+            m.requests_failed_total.load(),
+            m.requests_rejected_total.load(),
             m.prefix_cache_queries_total.load(),
             m.prefix_cache_hits_total.load(),
             m.requests_running.load(),
@@ -612,7 +628,7 @@ test "prefill throughput must exclude cache-restored tokens" {
     // a 91% token-level cache hit rate reported 9.8K tok/s where the server's
     // own log line said ~220-1100. The panel needs the FORWARDED token count.
     var m = Metrics.init();
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900);
 
     // vLLM semantics preserved: every prompt token is billed.
     try testing.expectEqual(@as(u64, 1000), m.prompt_tokens_total.load());
@@ -627,12 +643,12 @@ test "prefill throughput must exclude cache-restored tokens" {
     );
 
     // A cold request (no cache hit) forwards everything.
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 400, 10, 0);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 400, 10, 0);
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 900), m.prefix_cache_tokens_total.load());
 
     // Degenerate: cached >= prompt must saturate (restore 10, not 99) and never wrap.
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 10, 1, 99);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 10, 1, 99);
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 910), m.prefix_cache_tokens_total.load());
     // Invariant survives the saturation.
@@ -760,7 +776,7 @@ test "Metrics.recordRequest increments correct fields on success" {
     const testing = std.testing;
     var m = Metrics.init();
     // real_ttft=60ms (includes 10ms queue wait + 50ms prefill), prefill=50ms, decode=200ms
-    m.recordRequest("stop", 60_000_000, 50_000_000, 200_000_000, 128, 64, 20);
+    m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20);
 
     try testing.expectEqual(@as(u64, 1), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
@@ -787,7 +803,7 @@ test "Metrics.recordRequest increments correct fields on success" {
 test "Metrics.recordRequest skips histograms on cancelled request" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest("cancelled", 50_000_000, 50_000_000, 0, 128, 0, 0);
+    m.recordRequest(.cancelled, 50_000_000, 50_000_000, 0, 128, 0, 0);
 
     try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 1), m.requests_cancelled_total.load());
@@ -943,4 +959,50 @@ test "renderJson lists each live session's context against its model's limit" {
     try testing.expectEqual(@as(i64, 1200), row.get("cached_tokens").?.integer);
     try testing.expectEqual(@as(i64, 200), row.get("generated_tokens").?.integer);
     try testing.expectEqual(@as(i64, 4096), row.get("state_bytes").?.integer);
+}
+
+test "Metrics.recordRequest counts a failed request and leaves histograms and token counters alone" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRequest(.failed, 50_000_000, 50_000_000, 100_000_000, 128, 5, 0);
+
+    try testing.expectEqual(@as(u64, 1), m.requests_failed_total.load());
+    try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
+    try testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+}
+
+test "Metrics.recordRejected moves only the rejected counter" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRejected();
+    m.recordRejected();
+    try testing.expectEqual(@as(u64, 2), m.requests_rejected_total.load());
+    try testing.expectEqual(@as(u64, 0), m.requests_failed_total.load());
+    try testing.expectEqual(@as(u64, 0), m.prefix_cache_queries_total.load());
+}
+
+test "failed and rejected counters render under their Prometheus and JSON names" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRequest(.failed, 0, 0, 0, 1, 0, 0);
+    m.recordRejected();
+    m.recordRejected();
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderPrometheus(&m, &w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:request_failed_total 1\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:request_rejected_total 2\n") != null);
+
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &.{}, &jw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jbuf[0..jw.end], .{});
+    defer parsed.deinit();
+    const counters = parsed.value.object.get("counters").?.object;
+    try testing.expectEqual(@as(i64, 1), counters.get("requests_failed_total").?.integer);
+    try testing.expectEqual(@as(i64, 2), counters.get("requests_rejected_total").?.integer);
 }
