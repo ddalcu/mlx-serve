@@ -1,27 +1,5 @@
 'use strict';
-// Live metrics panel — the markup AND the polling logic in one file. The panel
-// is injected into the `#mlx-metrics` mount on the index page (only present when
-// the server ran with --metrics), then this polls the open /metrics.json feed
-// once a second. Everything here is NON-PERSISTED: the sparkline history lives
-// only in these JS ring buffers, derived live from the counters/histograms the
-// server already exposes (no server-side time series is stored).
-//
-// Decode & prefill "tok/s" are ACTIVE speeds — Δtokens ÷ Δ(phase time) over a
-// trailing window. The phase-time sums (decode_time_seconds / prefill_time_
-// seconds) and token counters only advance when a request COMPLETES, so this is
-// the true generation/prefill speed of recently-finished requests — NOT the
-// idle-averaged counter rate (which reads ~0 between requests).
-// ── Pure rate math (no DOM, no module state) ─────────────────────────────────
-//
-// Every displayed rate is derived FROM THE CURRENT DATA on every tick. Nothing
-// is carried between ticks. A value stashed in a module-level `let` outlives the
-// condition that produced it: the Prefill tile used to keep showing the last
-// prefill speed for the whole of a long decode, and only a page refresh cleared
-// it — which is exactly the signature of state that isn't derived from the feed.
-// Exported for `tests/metrics_panel_test.mjs`.
 
-// Newest sample that is at least winMs old (tightest window >= winMs); the
-// oldest retained sample while still warming up.
 function panelAt(now, samples, winMs) {
   let s = samples[0];
   for (const x of samples) { if (now - x.t >= winMs) s = x; else break; }
@@ -78,309 +56,324 @@ function computeRates(now, samples, c, g, psum) {
   return { decodeTps, prefillTps, avgPrefillTps, reqRate, prefilling, liveTok, livePre };
 }
 
-// Node (tests) sees no `document`; the browser sees no `globalThis.__mlxPanel`
-// consumer. Either way the IIFE below only runs in a real page.
-if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt };
+function monitorWindow(data, now, windowMs, model) {
+  const m = data.monitor || {}, start = windowMs === 'startup' ? m.server?.started_at_ms : now - windowMs;
+  if (!Number.isFinite(start) || start > now) return { requests: [], history: [], percentile: () => null, rate: () => null, partial: false };
+  const requests = (m.recent_requests || []).filter(r => r.finished_at_ms >= start && r.finished_at_ms <= now && (!model || r.model === model));
+  const history = monitorHistory(m).filter(s => s.at_ms >= start && s.at_ms <= now);
+  const values = key => requests.filter(r => r.outcome === 'success').map(r => r[key]).filter(v => typeof v === 'number' && Number.isFinite(v) && v >= 0).sort((a,b) => a-b);
+  const percentile = (key, q) => { const v = values(key); return v.length ? v[Math.max(0, Math.ceil(v.length*q)-1)] : null; };
+  const rate = key => { if (history.length < 2 || model) return null; const a=history[0], b=history[history.length-1], dt=(b.at_ms-a.at_ms)/1000; return dt > 0 && b[key] >= a[key] ? (b[key]-a[key])/dt : null; };
+  const oldest = (m.recent_requests || [])[0];
+  return { requests, history, percentile, rate, partial: !!(m.retention?.requests_dropped && oldest && oldest.finished_at_ms > start) };
+}
+function monitorHistory(m) {
+  const raw = m.history || [], oldest = raw[0]?.at_ms;
+  return (m.history_archive || []).filter(s => Number.isFinite(s.at_ms) && (oldest == null || s.at_ms < oldest)).concat(raw);
+}
+function monitorValidPair(a, b, sampleIntervalMs) {
+  const dt = b.at_ms - a.at_ms;
+  if (!Number.isFinite(dt) || dt <= 0) return false;
+  if (Number.isSafeInteger(a.continuity_id) && Number.isSafeInteger(b.continuity_id)) return a.continuity_id === b.continuity_id;
+  return dt <= sampleIntervalMs * 3;
+}
+function monitorWindowCounters(history, keys, start, end, sampleIntervalMs=2000) {
+  const deltas=Object.fromEntries(keys.map(key=>[key,0]));
+  let coverageMs=0;
+  for(let i=1;i<history.length;i++) {
+    const a=history[i-1], b=history[i], dt=b.at_ms-a.at_ms;
+    if(a.at_ms<start||b.at_ms>end||!monitorValidPair(a,b,sampleIntervalMs))continue;
+    if(!keys.every(key=>Number.isSafeInteger(a[key])&&a[key]>=0&&Number.isSafeInteger(b[key])&&b[key]>=a[key]))continue;
+    for(const key of keys)deltas[key]+=b[key]-a[key];
+    coverageMs+=dt;
+  }
+  return {deltas,seconds:coverageMs/1000,coverageMs};
+}
+function monitorWindowActiveRate(history, tokenKey, activeKey, start, end, sampleIntervalMs=2000) {
+  const measured=monitorWindowCounters(history,[tokenKey,activeKey],start,end,sampleIntervalMs);
+  const activeSeconds=measured.deltas[activeKey]/1e9;
+  return {rate:activeSeconds>0?measured.deltas[tokenKey]/activeSeconds:null,activeSeconds,coverageMs:measured.coverageMs};
+}
+function monitorWindowGauge(history, key, start, end, sampleIntervalMs=2000) {
+  let weighted=0, coverageMs=0;
+  for(let i=1;i<history.length;i++) {
+    const a=history[i-1], b=history[i], dt=b.at_ms-a.at_ms;
+    if(a.at_ms<start||b.at_ms>end||!monitorValidPair(a,b,sampleIntervalMs))continue;
+    if(!Number.isFinite(a[key])||a[key]<0||!Number.isFinite(b[key])||b[key]<0)continue;
+    weighted+=(a[key]+b[key])/2*dt;
+    coverageMs+=dt;
+  }
+  return {average:coverageMs?weighted/coverageMs:null,seconds:coverageMs/1000,coverageMs};
+}
+function monitorWindowMemory(history, start, end, sampleIntervalMs=2000) {
+  let area=0, seconds=0, coverageMs=0;
+  for(let i=1;i<history.length;i++) {
+    const a=history[i-1], b=history[i], dt=b.at_ms-a.at_ms;
+    if(a.at_ms<start||b.at_ms>end||!monitorValidPair(a,b,sampleIntervalMs))continue;
+    const nextArea=b.process_memory_byte_seconds_total-a.process_memory_byte_seconds_total;
+    const nextSeconds=b.process_memory_observed_seconds_total-a.process_memory_observed_seconds_total;
+    if(!Number.isFinite(nextArea)||nextArea<0||!Number.isFinite(nextSeconds)||nextSeconds<0)continue;
+    area+=nextArea;seconds+=nextSeconds;coverageMs+=dt;
+  }
+  return {average:seconds>0?area/seconds:null,seconds,coverageMs:seconds*1000};
+}
+function monitorLifetime(sample) {
+  const nonnegative = v => Number.isSafeInteger(v) && v >= 0;
+  const speed = (tokens, activeNs) => nonnegative(tokens) && nonnegative(activeNs) && activeNs > 0 ? tokens / (activeNs / 1e9) : null;
+  const queries = sample?.cache_queries_total, hits = sample?.cache_hits_total;
+  const ttftSum = sample?.ttft_ns_sum, ttftCount = sample?.ttft_count;
+  const area = sample?.process_memory_byte_seconds_total, seconds = sample?.process_memory_observed_seconds_total;
+  return {
+    decode: speed(sample?.generation_tokens_live, sample?.decode_active_ns_total),
+    prefill: speed(sample?.prefill_tokens_forwarded_live_total, sample?.prefill_active_ns_total),
+    cache: nonnegative(queries) && nonnegative(hits) && queries > 0 && hits <= queries ? 100 * hits / queries : null,
+    queries: nonnegative(queries) && nonnegative(hits) && hits <= queries ? queries : null,
+    hits: nonnegative(queries) && nonnegative(hits) && hits <= queries ? hits : null,
+    ttft: nonnegative(ttftSum) && nonnegative(ttftCount) && ttftCount > 0 && ttftSum > 0 ? ttftSum / ttftCount / 1e6 : null,
+    ttftCount: nonnegative(ttftSum) && nonnegative(ttftCount) && ((ttftSum===0)===(ttftCount===0)) ? ttftCount : null,
+    memory: Number.isFinite(area) && area >= 0 && Number.isFinite(seconds) && seconds > 0 ? area / seconds : null,
+    memorySeconds: Number.isFinite(seconds) && seconds >= 0 ? seconds : null,
+    decodeActiveNs: nonnegative(sample?.decode_active_ns_total) ? sample.decode_active_ns_total : null,
+    prefillActiveNs: nonnegative(sample?.prefill_active_ns_total) ? sample.prefill_active_ns_total : null,
+  };
+}
+function monitorWindowTTFT(history, start, end, sampleIntervalMs=2000) {
+  let sum=0, count=0, coverageMs=0, tainted=false, untrusted=false;
+  for(let i=1;i<history.length;i++) {
+    const a=history[i-1], b=history[i], dt=b.at_ms-a.at_ms;
+    if(!monitorValidPair(a,b,sampleIntervalMs)||![a.ttft_ns_sum,b.ttft_ns_sum,a.ttft_count,b.ttft_count].every(v=>Number.isSafeInteger(v)&&v>=0)){tainted=false;continue;}
+    const nextSum=b.ttft_ns_sum-a.ttft_ns_sum, nextCount=b.ttft_count-a.ttft_count;
+    if(nextSum<0||nextCount<0){tainted=false;continue;}
+    const inWindow=a.at_ms>=start&&b.at_ms<=end;
+    if((nextSum===0)!==(nextCount===0)){tainted=true;if(inWindow)untrusted=true;continue;}
+    if(tainted){tainted=false;if(inWindow)untrusted=true;continue;}
+    if(!inWindow)continue;
+    sum+=nextSum;count+=nextCount;coverageMs+=dt;
+  }
+  const average=count>0?sum/count/1e6:null;
+  return untrusted?{average:null,count:0,coverageMs:0}:{average:Number.isFinite(average)&&average>0?average:null,count,coverageMs};
+}
+function monitorIntervalMeans(history, sumKey, countKey, divisor=1, sampleIntervalMs=2000) {
+  let tainted=false;
+  return history.map((s,i)=>{
+    const p=history[i-1], dt=p?s.at_ms-p.at_ms:0;
+    const valid=p&&monitorValidPair(p,s,sampleIntervalMs)&&[p[sumKey],s[sumKey],p[countKey],s[countKey]].every(v=>Number.isSafeInteger(v)&&v>=0);
+    const sum=valid?s[sumKey]-p[sumKey]:0, count=valid?s[countKey]-p[countKey]:0;
+    if(!valid||sum<0||count<0){tainted=false;return {t:s.at_ms,value:null};}
+    if((sum===0)!==(count===0)){tainted=true;return {t:s.at_ms,value:null};}
+    if(tainted){tainted=false;return {t:s.at_ms,value:null};}
+    return {t:s.at_ms,value:sum>0&&count>0?sum/count/divisor:null};
+  });
+}
+function monitorGaugeSeries(history, key, sampleIntervalMs=2000) {
+  const points=[];
+  history.forEach((s,i)=>{
+    const value=Number.isFinite(s[key])&&s[key]>=0?s[key]:null;
+    const p=history[i-1], dt=p?s.at_ms-p.at_ms:0;
+    if(value!=null&&points.at(-1)?.value!=null&&p&&!monitorValidPair(p,s,sampleIntervalMs))points.push({t:s.at_ms,value:null});
+    points.push({t:s.at_ms,value});
+  });
+  return points;
+}
+function monitorSeries(history, key, derivative, sampleIntervalMs=2000) {
+  return history.map((s,i) => {
+    let value = typeof s[key] === 'number' ? s[key] : null;
+    if (derivative) { const p=history[i-1], dt=p ? (s.at_ms-p.at_ms)/1000 : 0; value = p && monitorValidPair(p,s,sampleIntervalMs) && value != null && p[key] != null && value >= p[key] ? (value-p[key])/dt : null; }
+    return { t:s.at_ms, value };
+  });
+}
+function monitorNearestPoint(series, start, end, x, y, max) {
+  if (!(end > start)) return null;
+  let best = null, distance = Infinity;
+  series.forEach((s, seriesIndex) => s.points.forEach((point, pointIndex) => {
+    if (!Number.isFinite(point.t) || !Number.isFinite(point.value) || point.t < start || point.t > end) return;
+    const px = 30 + (point.t - start) / (end - start) * 560;
+    const py = 108 - point.value / max * 90;
+    const d = Math.abs(px - x) + (y == null ? 0 : Math.abs(py - y) * .35);
+    if (d < distance) { distance = d; best = { seriesIndex, pointIndex, point, x: px, y: py }; }
+  }));
+  return distance <= 28 ? best : null;
+}
+function monitorEscape(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function monitorFormatTTFT(valueMs) {
+  if (!Number.isFinite(valueMs)) return '—';
+  return valueMs>=1000?(valueMs/1000).toLocaleString(undefined,{maximumFractionDigits:1})+' s':valueMs.toLocaleString(undefined,{maximumFractionDigits:1})+' ms';
+}
+function monitorChartTimeLabel(at, start, end, tooltip=false) {
+  const a=new Date(start), b=new Date(end);
+  const sameDay=a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate();
+  const options={hour:'numeric',minute:'2-digit'};
+  if(!sameDay){options.month='short';options.day='numeric';if(a.getFullYear()!==b.getFullYear())options.year='numeric';}
+  if(tooltip)options.second='2-digit';
+  return new Date(at).toLocaleString(undefined,options);
+}
+if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt, monitorWindow, monitorHistory, monitorValidPair, monitorWindowCounters, monitorWindowActiveRate, monitorWindowGauge, monitorWindowMemory, monitorLifetime, monitorWindowTTFT, monitorIntervalMeans, monitorGaugeSeries, monitorSeries, monitorNearestPoint, monitorEscape, monitorFormatTTFT, monitorChartTimeLabel };
 
 if (typeof document !== 'undefined') (function () {
-  // Panel markup, injected into the page. A template literal, so the CSS/HTML
-  // braces need no escaping — the reason this lives here and not inline in the
-  // std.fmt-formatted index.html.
-  const PANEL_HTML = `
-<style>
-.mhead{display:flex;align-items:center;gap:10px;margin:24px 0 10px}
-.mhead h2{margin:0}
-#m-status{font-size:0.6875rem;font-weight:600;letter-spacing:.02em;padding:2px 9px;border-radius:999px;background:#1a1e25;color:#7d8794}
-#m-status.live{background:#0f2a17;color:#4ade80}
-#m-status.err{background:#2a0f14;color:#ff95a8}
-.mgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-@media(max-width:640px){.mgrid{grid-template-columns:repeat(2,1fr)}}
-.mtile{background:#0f1216;border:1px solid #1f242c;border-radius:8px;padding:12px 14px}
-.mlbl{font-size:0.625rem;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;margin-bottom:7px}
-.mval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.625rem;font-weight:700;line-height:1;color:#e6e9ee}
-.munit{font-size:0.75rem;font-weight:400;color:#7d8794;margin-left:4px}
-.msub{font-size:0.6875rem;color:#5b6470;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mbar{height:5px;background:#1f242c;border-radius:3px;margin-top:10px;overflow:hidden}
-.mfill{height:100%;width:0;border-radius:3px;background:#3b82f6;transition:width .5s}
-.mfill.warn{background:#f59e0b}.mfill.crit{background:#ef4444}
-.mspark{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
-@media(max-width:640px){.mspark{grid-template-columns:1fr}}
-.msparkbox{background:#0f1216;border:1px solid #1f242c;border-radius:8px;padding:10px 12px}
-.msparkhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
-.msparkval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.9375rem;font-weight:700;color:#e6e9ee}
-.msparkbox svg{width:100%;height:44px;display:block}
-:root[data-theme=light] .mbase{stroke:var(--line)}
-:root[data-theme=light] .mtile,:root[data-theme=light] .msparkbox{background:#fff;border-color:#e1e2e6}
-:root[data-theme=light] .mval,:root[data-theme=light] .msparkval{color:#1e1f22}
-:root[data-theme=light] .mlbl,:root[data-theme=light] .munit{color:#5b616b}
-:root[data-theme=light] .msub{color:#878d96}
-:root[data-theme=light] .mbar{background:#e7e8ec}
-:root[data-theme=light] #m-status{background:#ececf0;color:#5b616b}
-:root[data-theme=light] #m-status.live{background:#e3f5ee;color:#0f7b5f}
-:root[data-theme=light] #m-status.err{background:#fdeceb;color:#b3261e}
-.msess{margin-top:12px}
-.msess table{width:100%;border-collapse:collapse;font-size:0.75rem}
-.msess th{text-align:left;font-weight:600;font-size:0.625rem;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;padding:0 8px 6px 0}
-.msess td{padding:6px 8px 6px 0;border-top:1px solid #1f242c;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee;white-space:nowrap}
-.msess td.mmodel{font-family:inherit;max-width:260px;overflow:hidden;text-overflow:ellipsis}
-.msess td.mctx{width:34%}
-.msess .mbar{margin-top:4px}
-.msess .mempty{color:#5b6470;font-size:0.75rem}
-:root[data-theme=light] .msess td{color:#1e1f22;border-color:#e1e2e6}
-</style>
-<div class=mhead><h2 style="margin:0" data-i18n="Live metrics">Live metrics</h2><span id=m-status data-i18n="connecting…">connecting…</span></div>
-<div class=card style="padding:16px">
-<div class=mgrid>
-<div class=mtile><div class=mlbl data-i18n="Decode">Decode</div><div class=mval><span id=m-decode-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-decode-ms data-i18n="— ms avg">— ms avg</div></div>
-<div class=mtile><div class=mlbl data-i18n="Prefill">Prefill</div><div class=mval><span id=m-prefill-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-prefill-ms data-i18n="— ms avg">— ms avg</div><div class=mbar><div class=mfill id=m-prefillbar></div></div></div>
-<div class=mtile><div class=mlbl data-i18n="Requests">Requests</div><div class=mval><span id=m-running>0</span><span class=munit data-i18n="running">running</span></div><div class=msub id=m-waiting data-i18n="0 waiting · — req/s">0 waiting · — req/s</div></div>
-<div class=mtile><div class=mlbl data-i18n="Avg TTFT">Avg TTFT</div><div class=mval><span id=m-ttft>—</span><span class=munit>ms</span></div><div class=msub id=m-e2e data-i18n="— ms e2e">— ms e2e</div></div>
-<div class=mtile><div class=mlbl data-i18n="Cache hit rate">Cache hit rate</div><div class=mval><span id=m-cache>—</span><span class=munit>%</span></div><div class=msub id=m-cachedetail data-i18n="— / — queries">— / — queries</div></div>
-<div class=mtile><div class=mlbl>GPU</div><div class=mval><span id=m-gpu>0</span><span class=munit>%</span></div><div class=mbar><div class=mfill id=m-gpubar></div></div></div>
-<div class=mtile><div class=mlbl data-i18n="Memory">Memory</div><div class=mval><span id=m-mem>0</span><span class=munit>MB</span></div><div class=msub id=m-memdetail data-i18n="physical footprint">physical footprint</div></div>
-<div class=mtile><div class=mlbl data-i18n="Generated">Generated</div><div class=mval><span id=m-gen>0</span><span class=munit>tok</span></div><div class=msub id=m-success data-i18n="0 requests">0 requests</div></div>
-</div>
-<div class=mspark>
-<div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Decode tok/s · last 60s">Decode tok/s · last 60s</span><span class=msparkval id=m-spark-decode-val>—</span></div><svg id=m-spark-decode viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
-<div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Prefill tok/s · last 60s">Prefill tok/s · last 60s</span><span class=msparkval id=m-spark-prefill-val>—</span></div><svg id=m-spark-prefill viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
-</div>
-<div class="msparkbox msess"><div class=mlbl data-i18n="Sessions">Sessions</div><div id=m-sessions></div></div>
-</div>`;
-
-  // The panel brings its own markup, so the language boot cannot know about it:
-  // translate it here, and follow later switches.
-  const I18N = (typeof window !== 'undefined' && window.mlxI18n) ? window.mlxI18n : null;
-  const t = (key, params) => (I18N ? I18N.t(key, params) : key);
-
   const mount = document.getElementById('mlx-metrics');
-  if (mount) mount.innerHTML = PANEL_HTML;
-  if (I18N && mount) I18N.applyMarkup(mount);
+  if (!mount) return;
+  const I18N = window.mlxI18n, t = (s,p) => I18N ? I18N.t(s,p) : s;
+  const esc=monitorEscape, $=id=>document.getElementById(id);
+  const liveSamples=[];
+  let data=null, models=[], props=null, paused=false, windowMs=300000, selected='', lastReceived=0, state='Connecting', timer=null, inFlight=false;
+  const fmt=(v,d=1)=>typeof v==='number' && Number.isFinite(v) ? v.toLocaleString(undefined,{maximumFractionDigits:d}) : '—';
+  const bytes=v=>v==null?'—':v>=1073741824?fmt(v/1073741824)+' GiB':fmt(v/1048576)+' MiB';
+  const ms=v=>v==null?'—':v>=1000?fmt(v/1000)+' s':fmt(v,0)+' ms';
+  const duration=v=>v>=86400000?fmt(v/86400000,1)+'d':v>=3600000?fmt(v/3600000,1)+'h':v>=60000?fmt(v/60000,1)+'m':v>=1000?fmt(v/1000,1)+'s':fmt(v,0)+'ms';
+  const measured=(amount,total)=>t('Measured %@ of %@',[amount,total]);
+  const coverage=(value,shared,interval)=>shared-value>interval*1.5?' · '+measured(duration(value),duration(shared)):'';
+  const requests=(count,kind)=>t('%@ '+kind+(count===1?' request':' requests'),[fmt(count,0)]);
+  const text=(id,v)=>{const e=$(id);if(e)e.textContent=v;};
+  const labelKeys=new Map();
+  const label=s=>{const value=t(s);labelKeys.set(value,s);return esc(value);};
+  const tile=(name,id,unit='',hint='')=>`<div class="monitor-tile"><div class="monitor-label">${label(name)}${hint?` <span class="monitor-help" tabindex="0" title="${label(hint)}" aria-label="${label(hint)}">ⓘ</span>`:''}</div><div class="monitor-value" id="${id}">—</div><div class="monitor-caption" id="${id}-caption">${label(unit)}</div></div>`;
+  mount.innerHTML=`<div class="monitor-heading"><div><div class="monitor-eyebrow">MLX SERVE / ${label('Observability')}</div><h1>${label('Monitor')}</h1><p>${label('Live server health and request performance')}</p></div><span id="m-status" role="status">${label('Connecting')}</span></div>
+  <div class="monitor-toolbar"><label>${label('Time range')} <select id="m-window" aria-label="${label('Time range')}"><option value="60000">1m</option><option value="300000" selected>5m</option><option value="900000">15m</option><option value="1800000">30m</option><option value="3600000">1h</option><option value="10800000">3h</option><option value="21600000">6h</option><option value="43200000">12h</option><option value="86400000">24h</option><option value="startup">${label('Since startup')}</option></select></label><label>${label('Model')} <select id="m-model" aria-label="${label('Model')}"><option value="">${label('All models')}</option></select></label><span class="monitor-spacer"></span><button id="m-pause">${label('Pause')}</button><button id="m-copy">${label('Copy diagnostics')}</button></div>
+  <div id="m-notice" class="monitor-notice" role="status"></div><div id="m-meta" class="monitor-meta"></div>
+  <div class="monitor-summary"><div><span class="monitor-label">${label('Loaded model')}</span><strong id="m-loaded-model">—</strong></div><div><span class="monitor-label">${label('Current phase')}</span><strong id="m-phase">—</strong></div><div><span class="monitor-label">${label('Active / queued')}</span><strong id="m-active-queued">—</strong></div></div>
+  <div id="m-overview-scope" class="monitor-overview-scope monitor-meta"></div>
+  <div class="monitor-grid monitor-overview">${tile('Decode speed','m-live-decode','tok/s')}${tile('Prefill speed','m-live-prefill','tok/s')}${tile('Cache hit rate','m-window-cache','Selected period','Includes finished inference requests, even if cancelled or failed.')}${tile('TTFT','m-ttft','ms')}${tile('Process memory','m-memory','GiB')}</div>
+  <div class="monitor-section-head"><h2>${label('Performance over time')}</h2><span>${label('Global · hover for a sampled value')}</span></div>
+  <div class="monitor-charts monitor-primary-charts">${['prefill','decode','ttft','memory'].map(id=>`<section class="monitor-chart"><div class="monitor-section-head"><h3 id="m-${id}-title">${label(({prefill:'Prefill · tok/s',decode:'Decode · tok/s',ttft:'TTFT mean · ms',memory:'Process memory · GiB'})[id])}</h3><span id="m-${id}-legend"></span></div><div class="monitor-plot"><svg id="m-chart-${id}" viewBox="0 0 600 130" role="img" tabindex="0" aria-label="${label(({prefill:'Prefill · tok/s',decode:'Decode · tok/s',ttft:'TTFT mean · ms',memory:'Process memory · GiB'})[id])}"></svg><div id="m-${id}-tooltip" class="monitor-tooltip" role="status" hidden></div></div><div class="monitor-axis"><span id="m-${id}-start"></span><span id="m-${id}-end"></span></div></section>`).join('')}</div>
+  <section class="monitor-section"><div class="monitor-section-head"><h2>${label('Active requests')}</h2><span>${label('Current · model filter')}</span></div><div id="m-active" class="monitor-table-wrap"></div></section>
+  <section class="monitor-section"><div class="monitor-section-head"><h2>${label('Recent requests and failures')}</h2><span>${label('Retained rows · selected period · click to inspect')}</span></div><div id="m-recent" class="monitor-table-wrap"></div><details id="m-inspector" hidden><summary>${label('Request details')}</summary><pre id="m-request-detail"></pre></details></section>
+  <details id="m-details" class="monitor-section monitor-details"><summary>${label('More details')}</summary><div class="monitor-detail-body"><div id="m-coverage" class="monitor-meta"></div>
+  <div class="monitor-grid monitor-latency">${tile('TTFT · p50 / p95','m-ttft-range','Successful retained requests')}${tile('Queue wait · p50 / p95','m-queue-latency','Successful retained requests')}${tile('End-to-end · p50 / p95','m-e2e','Successful retained requests')}</div>
+  <div class="monitor-charts">${['latency','queue'].map(id=>`<section class="monitor-chart"><div class="monitor-section-head"><h3>${label(({latency:'Request latency',queue:'Queue and concurrency'})[id])}</h3><span id="m-${id}-legend"></span></div><div class="monitor-plot"><svg id="m-chart-${id}" viewBox="0 0 600 130" role="img" tabindex="0" aria-label="${label(({latency:'Request latency',queue:'Queue and concurrency'})[id])}"></svg><div id="m-${id}-tooltip" class="monitor-tooltip" role="status" hidden></div></div><div class="monitor-axis"><span id="m-${id}-start"></span><span id="m-${id}-end"></span></div></section>`).join('')}</div>
+  <section class="monitor-section"><div class="monitor-section-head"><h2>${label('Model inventory')}</h2><span>${label('Current · disk and RAM are separate')}</span></div><div id="m-inventory" class="monitor-table-wrap"></div></section>
+  <div class="monitor-pair"><section class="monitor-section"><div class="monitor-section-head"><h2>${label('Resources')}</h2><span>${label('Current · global')}</span></div><div id="m-resources" class="monitor-facts"></div></section><section class="monitor-section"><div class="monitor-section-head"><h2>${label('Prefix cache')}</h2><span>${label('Lifetime · global')}</span></div><div id="m-cache" class="monitor-facts"></div></section></div>
+  <section class="monitor-section"><div class="monitor-section-head"><h2>${label('Per-model performance')}</h2><span>${label('Retained · selected period')}</span></div><div id="m-model-stats" class="monitor-table-wrap"></div></section>
+  <section class="monitor-section"><div class="monitor-section-head"><h2>${label('Events')}</h2><span>${label('Retained rows · current server instance')}</span></div><div id="m-events" class="monitor-events"></div></section>
+  <details class="monitor-section"><summary>${label('Runtime diagnostics')}</summary><div id="m-diagnostics" class="monitor-facts"></div></details></div></details>`;
 
-  const $ = (id) => document.getElementById(id);
-  const samples = [];              // {t, gen, dsum, prompt, psum, req} ring buffer
-  const RETAIN_MS = 120000;        // keep 2 min of samples for the 60s window
-  const SPARK_N = 60;              // sparkline points (≈60s at 1 Hz)
-  const decodeHist = [], prefillHist = [];
-  const hover = { decode: null, prefill: null };  // hovered point index per chart
+  const staticLabels=[];
+  const walker=document.createTreeWalker(mount,NodeFilter.SHOW_TEXT);
+  while(walker.nextNode()){const node=walker.currentNode,key=node.textContent.trim();if(key)staticLabels.push([node,labelKeys.get(key)||key]);}
 
-  function fmt(v, d) {
-    if (v === null || v === undefined || isNaN(v)) return '—';
-    if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
-    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
-    return v.toFixed(d === undefined ? 1 : d);
-  }
-
-  // The status text is never table copy (it carries a fetch error verbatim), so
-  // the slot's data-i18n must go with it — otherwise a language switch would
-  // put "connecting…" back over a live feed.
-  // A value slot also carries a static placeholder in the markup ("— ms avg"),
-  // so writing a number has to take that key away: a language switch must
-  // re-render data by re-running the tick, not by restoring the placeholder.
-  function setVal(id, txt) {
-    const e = $(id);
-    if (e) { e.removeAttribute('data-i18n'); e.textContent = txt; }
-  }
-
-  function setStatus(cls, txt) {
-    const e = $('m-status');
-    if (e) { e.removeAttribute('data-i18n'); e.className = cls; e.textContent = txt; }
-  }
-
-
-  // Draw a sparkline (auto-scaled) into an <svg>, set its value label, and — when
-  // the mouse is over that chart (hover[key] set) — draw a marker at the hovered
-  // point and show that point's value in the label instead of the latest.
-  function spark(id, data, color, valId, key, dec) {
-    const svg = $(id), label = $(valId);
-    if (!svg) return;
-    if (data.length < 2) {
-      svg.innerHTML = '';
-      if (label) label.textContent = data.length ? fmt(data[0], dec) : '—';
-      return;
+  function facts(id, entries) { $(id).innerHTML=entries.filter(([,v])=>v!=null).map(([k,v])=>`<div><span>${label(k)}</span><strong>${esc(v)}</strong></div>`).join(''); }
+  function table(id, headings, rows, empty) { const html=`<table aria-label="${esc(t(({ 'm-active':'Active requests','m-recent':'Recent requests','m-inventory':'Model inventory','m-model-stats':'Per-model performance'})[id]||id))}"><thead><tr>${headings.map(h=>`<th scope="col">${label(h)}</th>`).join('')}</tr></thead><tbody>${rows.length?rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${headings.length}" class="monitor-empty">${label(empty)}</td></tr>`}</tbody></table>`; if($(id).innerHTML!==html)$(id).innerHTML=html; }
+  const chartData=new Map(), chartFocus=new Map(), chartColors=['#76a9fa','#63d7b0','#d9a5fc'];
+  function showChartFocus(id) {
+    const svg=$('m-chart-'+id), tip=$('m-'+id+'-tooltip'), info=chartData.get(id), focus=chartFocus.get(id);
+    if(!info||!focus||!svg.getBoundingClientRect().width){tip.hidden=true;return;}
+    const rect=svg.getBoundingClientRect(), matrix=svg.getScreenCTM();
+    let x=focus.x, y=focus.y;
+    if(focus.clientX!=null&&matrix){const point=svg.createSVGPoint();point.x=focus.clientX;point.y=focus.clientY;const local=point.matrixTransform(matrix.inverse());x=local.x;y=local.y;}
+    const saved=focus.clientX!=null||focus.seriesIndex==null?null:info.series[focus.seriesIndex]?.points.find(p=>p.t===focus.time&&Number.isFinite(p.value));
+    const hit=saved?{seriesIndex:focus.seriesIndex,point:saved,x:30+(saved.t-info.start)/(info.end-info.start)*560,y:108-saved.value/info.max*90}:monitorNearestPoint(info.series,info.start,info.end,x,y,info.max);
+    if(focus.clientX!=null){focus.seriesIndex=hit?.seriesIndex;focus.time=hit?.point.t;}
+    const mark=svg.querySelector('.monitor-chart-focus');
+    if(!hit){mark.innerHTML='';tip.textContent=t('No measured sample here');tip.hidden=false;}
+    else {
+      const color=chartColors[hit.seriesIndex], name=t(info.series[hit.seriesIndex].name);
+      mark.innerHTML=`<line x1="${hit.x}" y1="18" x2="${hit.x}" y2="108" stroke="var(--fg)" stroke-opacity=".5" stroke-dasharray="3 3"/><circle cx="${hit.x}" cy="${hit.y}" r="5" fill="${color}" stroke="var(--card)" stroke-width="2"/>`;
+      tip.innerHTML=`<strong>${esc(name)} · ${esc(info.formatValue(hit.point.value))} ${esc(info.unit)}</strong><span>${esc(monitorChartTimeLabel(hit.point.t,info.start,info.end,true))}</span>`;
+      tip.hidden=false;
     }
-    const max = Math.max.apply(null, data.concat([0.001]));
-    const n = data.length, W = 300, H = 44, p = 3;
-    const xs = new Array(n), ys = new Array(n);
-    let pts = '';
-    for (let i = 0; i < n; i++) {
-      xs[i] = p + (i / (n - 1)) * (W - 2 * p);
-      ys[i] = H - p - (data[i] / max) * (H - 2 * p);
-      pts += (i ? ' ' : '') + xs[i].toFixed(1) + ',' + ys[i].toFixed(1);
-    }
-    let m =
-      '<polyline points="' + pts + '" fill="none" stroke="' + color +
-      '" stroke-width="1.5" stroke-linejoin="round"/>' +
-      '<line class=mbase x1="' + p + '" y1="' + (H - 1) + '" x2="' + (W - p) + '" y2="' + (H - 1) +
-      '" stroke="#1f242c" stroke-width="1"/>';
-    const hi = hover[key];
-    if (hi !== null && hi >= 0 && hi < n) {
-      m += '<line x1="' + xs[hi].toFixed(1) + '" y1="' + p + '" x2="' + xs[hi].toFixed(1) +
-        '" y2="' + (H - 1) + '" stroke="' + color + '" stroke-width="1" opacity="0.35"/>' +
-        '<circle cx="' + xs[hi].toFixed(1) + '" cy="' + ys[hi].toFixed(1) + '" r="2.5" fill="' + color + '"/>';
-      if (label) label.textContent = fmt(data[hi], dec);
-    } else if (label) {
-      label.textContent = fmt(data[n - 1], dec);
-    }
-    svg.innerHTML = m;
+    const plot=svg.parentElement, plotRect=plot.getBoundingClientRect(), point=svg.createSVGPoint();point.x=hit?.x??x;point.y=hit?.y??y;
+    const screen=matrix?point.matrixTransform(matrix):{x:rect.left+x/600*rect.width,y:rect.top+y/130*rect.height};
+    tip.style.left=Math.max(4,Math.min(screen.x-plotRect.left+10,plot.clientWidth-tip.offsetWidth-4))+'px';
+    tip.style.top=Math.max(4,Math.min(screen.y-plotRect.top+8,plot.clientHeight-tip.offsetHeight-4))+'px';
   }
-
-  // Wire mouse hover on a sparkline: map cursor x → nearest data point, mark it,
-  // show that value in the chart's label; mouseleave restores the latest value.
-  function attachSparkHover(id, key, getData, color, valId, dec) {
-    const svg = $(id);
-    if (!svg) return;
-    svg.style.cursor = 'crosshair';
-    svg.addEventListener('mousemove', function (e) {
-      const data = getData();
-      if (data.length < 2) return;
-      const rect = svg.getBoundingClientRect();
-      const frac = rect.width ? (e.clientX - rect.left) / rect.width : 0;
-      hover[key] = Math.max(0, Math.min(data.length - 1, Math.round(frac * (data.length - 1))));
-      spark(id, data, color, valId, key, dec);
-    });
-    svg.addEventListener('mouseleave', function () {
-      hover[key] = null;
-      spark(id, getData(), color, valId, key, dec);
-    });
+  function chart(id, series, start, end, unit, digits=1, formatValue=v=>fmt(v,digits)) {
+    const svg=$('m-chart-'+id);
+    const values=series.flatMap(s=>s.points.map(p=>p.value)).filter(v=>v!=null&&Number.isFinite(v));
+    const max=Math.max(1,...values), x=t=>30+((t-start)/(end-start))*560, y=v=>108-(v/max)*90;
+    let out=`<line x1="30" y1="108" x2="590" y2="108" stroke="var(--line)"/><text x="0" y="16" fill="var(--dim)" font-size="11">${esc(id==='ttft'?formatValue(max)+' '+unit:fmt(max))}</text>`;
+    series.forEach((s,i)=>{let segment=[];const flush=()=>{if(segment.length>1)out+=`<polyline points="${segment.join(' ')}" fill="none" stroke="${chartColors[i]}" stroke-width="2"/>`;else if(segment.length)out+=`<circle cx="${segment[0].split(',')[0]}" cy="${segment[0].split(',')[1]}" r="2" fill="${chartColors[i]}"/>`;segment=[];};s.points.forEach(p=>{if(!Number.isFinite(p.value)){flush();return;}segment.push(x(p.t).toFixed(1)+','+y(p.value).toFixed(1));});flush();});
+    if(!values.length)out+=`<text x="300" y="65" text-anchor="middle" fill="var(--dim)" font-size="13">${label('No samples in this period')}</text>`;
+    svg.innerHTML=out+'<g class="monitor-chart-focus" aria-hidden="true"></g>';
+    chartData.set(id,{series,start,end,max,unit,digits,formatValue});
+    text('m-'+id+'-legend',series.map(s=>t(s.name)+' '+formatValue(s.points.filter(p=>Number.isFinite(p.value)).at(-1)?.value)).join(' / ')+' · '+unit);
+    text('m-'+id+'-start',monitorChartTimeLabel(start,start,end));text('m-'+id+'-end',monitorChartTimeLabel(end,start,end));
+    if(chartFocus.has(id))showChartFocus(id);
   }
-
-  function fmtBytes(b) {
-    if (!b) return '0';
-    return b >= 1073741824 ? (b / 1073741824).toFixed(1) + ' GB' : (b / 1048576).toFixed(0) + ' MB';
+  for(const id of ['prefill','decode','ttft','memory','latency','queue']){
+    const svg=$('m-chart-'+id), tip=$('m-'+id+'-tooltip');
+    svg.addEventListener('pointermove',e=>{chartFocus.set(id,{clientX:e.clientX,clientY:e.clientY});showChartFocus(id);});
+    svg.addEventListener('pointerleave',()=>{chartFocus.delete(id);tip.hidden=true;svg.querySelector('.monitor-chart-focus').innerHTML='';});
+    svg.addEventListener('pointerdown',e=>{chartFocus.set(id,{clientX:e.clientX,clientY:e.clientY});showChartFocus(id);});
+    svg.addEventListener('focus',()=>{if(chartFocus.has(id))return;const info=chartData.get(id);if(!info)return;const entries=info.series.flatMap((s,seriesIndex)=>s.points.filter(p=>Number.isFinite(p.value)).map(point=>({point,seriesIndex}))).sort((a,b)=>a.point.t-b.point.t||a.seriesIndex-b.seriesIndex);const entry=entries.at(-1);if(entry){chartFocus.set(id,{seriesIndex:entry.seriesIndex,time:entry.point.t,x:30+(entry.point.t-info.start)/(info.end-info.start)*560,y:108-entry.point.value/info.max*90});showChartFocus(id);}});
+    svg.addEventListener('blur',()=>{chartFocus.delete(id);tip.hidden=true;svg.querySelector('.monitor-chart-focus').innerHTML='';});
+    svg.addEventListener('keydown',e=>{if(e.key==='Escape'){chartFocus.delete(id);tip.hidden=true;svg.querySelector('.monitor-chart-focus').innerHTML='';e.preventDefault();return;}if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;const info=chartData.get(id);if(!info)return;const entries=info.series.flatMap((s,seriesIndex)=>s.points.filter(p=>Number.isFinite(p.value)).map(point=>({point,seriesIndex}))).sort((a,b)=>a.point.t-b.point.t||a.seriesIndex-b.seriesIndex);if(!entries.length)return;e.preventDefault();const focus=chartFocus.get(id), current=entries.findIndex(e=>e.seriesIndex===focus?.seriesIndex&&e.point.t===focus.time);const index=e.key==='Home'?0:e.key==='End'?entries.length-1:e.key==='ArrowLeft'?Math.max(0,current<0?entries.length-1:current-1):Math.min(entries.length-1,current+1);const {point,seriesIndex}=entries[index];chartFocus.set(id,{seriesIndex,time:point.t,x:30+(point.t-info.start)/(info.end-info.start)*560,y:108-point.value/info.max*90});showChartFocus(id);});
   }
-
-  // Built with DOM nodes, never innerHTML: the model id is a folder name.
-  function renderSessions(list) {
-    const box = $('m-sessions');
-    if (!box) return;
-    box.textContent = '';
-    if (!list || list.length === 0) {
-      const e = document.createElement('div');
-      e.className = 'mempty';
-      e.textContent = t('No sessions');
-      box.appendChild(e);
-      return;
-    }
-    const table = document.createElement('table');
-    const head = table.insertRow();
-    for (const h of ['Model', 'Phase', 'Context', 'Cached', 'Generated', 'KV + state']) {
-      const th = document.createElement('th');
-      th.textContent = t(h);
-      head.appendChild(th);
-    }
-    const idle = (s) => (s.phase === 'cached' ? 1 : 0);
-    const rows = list.slice().sort((a, b) => a.model.localeCompare(b.model) || idle(a) - idle(b));
-    for (const s of rows) {
-      const tr = table.insertRow();
-      const cell = (txt, cls) => { const td = tr.insertCell(); td.textContent = txt; if (cls) td.className = cls; return td; };
-      cell(s.model, 'mmodel').title = s.model;
-      cell(t({ prefill: 'prefilling', decode: 'decoding', cached: 'in cache' }[s.phase] || s.phase));
-      const pct = s.context_length > 0 ? Math.min(100, (s.context_tokens / s.context_length) * 100) : null;
-      const ctx = cell(fmt(s.context_tokens, 0) + (s.context_length > 0 ? ' / ' + fmt(s.context_length, 0) + ' · ' + pct.toFixed(0) + '%' : ''), 'mctx');
-      if (pct !== null) {
-        const bar = document.createElement('div'); bar.className = 'mbar';
-        const fill = document.createElement('div');
-        fill.className = 'mfill' + (pct >= 90 ? ' crit' : pct >= 70 ? ' warn' : '');
-        fill.style.width = pct + '%';
-        bar.appendChild(fill); ctx.appendChild(bar);
-      }
-      cell(fmt(s.cached_tokens, 0));
-      cell(s.phase === 'cached' ? '—' : fmt(s.generated_tokens, 0));
-      cell(fmtBytes(s.state_bytes));
-    }
-    box.appendChild(table);
+  function render() {
+    if(document.hidden || (location.hash && location.hash!=='#monitor'))return;
+    const m=data?.monitor||{}, g=data?.gauges||{}, c=data?.counters||{}, now=m.server?.sampled_at_ms||Date.now(), w=monitorWindow(data||{},now,windowMs,selected), res=m.resources||(props?.memory?{mlx_active_bytes:props.memory.active_bytes,mlx_cache_bytes:props.memory.cache_bytes,system_available_bytes:props.memory.available_bytes}:{}), diag=m.diagnostics||{}, cache=m.cache||{};
+    const age=lastReceived?Math.max(Date.now()-lastReceived,m.server?.sampled_at_ms?Date.now()-m.server.sampled_at_ms:0):0;
+    text('m-status',t(paused?'Paused':state==='Live'&&age>6500?'Stale':state)); $('m-status').dataset.state=paused?'paused':state.toLowerCase();
+    text('m-notice',state==='Metrics disabled'?t('Metrics are disabled. Restart with --metrics to collect request and resource history.'):state==='Offline'?t(data?'Server unavailable. Last received values are retained; they are not live.':'Server unavailable.'):state==='Unauthorized'?t('Authentication required. Open the console with an API key.'):state==='Live'&&age>6500?t('Telemetry is stale. Showing the last received sample.'):t('Request records contain metadata only. Unavailable measurements are shown as —.'));
+    text('m-meta',[m.server?.version?'v'+m.server.version:'',m.server?.uptime_seconds!=null?t('Uptime')+' '+fmt(m.server.uptime_seconds/60,0)+'m':'',lastReceived?t('Last sample')+' '+new Date(m.server?.sampled_at_ms||lastReceived).toLocaleTimeString():''].filter(Boolean).join(' · '));
+    const inventory=m.models||models, active=(m.active_requests||[]).filter(r=>!selected||r.model===selected);
+    const ready=inventory.filter(r=>r.state==='ready'&&(!selected||r.id===selected)).map(r=>r.id);
+    text('m-loaded-model',ready.length?ready.join(', '):t('None loaded'));
+    text('m-phase',active.length?[...new Set(active.map(r=>t(r.phase||'running')))].join(' · '):t('Idle'));
+    text('m-active-queued',(data?fmt(g.requests_running,0):'—')+' / '+(data?fmt(g.requests_waiting,0):'—'));
+    const startup=windowMs==='startup', started=m.server?.started_at_ms, validStart=Number.isFinite(started)&&started<=now;
+    const start=startup?(validStart&&started<now?started:now-1):now-windowMs, interval=m.server?.sample_interval_ms||2000, history=monitorHistory(m);
+    const decode=monitorWindowActiveRate(history,'generation_tokens_live','decode_active_ns_total',start,now,interval);
+    const prefill=monitorWindowActiveRate(history,'prefill_tokens_forwarded_live_total','prefill_active_ns_total',start,now,interval);
+    const cacheWindow=monitorWindowCounters(history,['cache_queries_total','cache_hits_total'],start,now,interval);
+    const ttft=monitorWindowTTFT(history,start,now,interval);
+    const memory=history.some(s=>Number.isFinite(s.process_memory_observed_seconds_total))?monitorWindowMemory(history,start,now,interval):monitorWindowGauge(history,'process_bytes',start,now,interval);
+    const sharedCoverage=monitorWindowCounters(history,[],start,now,interval).coverageMs;
+    const lifetime=startup&&validStart&&m.lifetime_totals?monitorLifetime(m.lifetime_totals):null;
+    const windowLabel=$('m-window').selectedOptions[0]?.textContent||duration(windowMs);
+    text('m-overview-scope',startup?t('Global')+' · '+windowLabel+(validStart?' · '+t('Runtime')+' '+duration(now-started):' · '+t('Start time unavailable')):t('Global')+' · '+measured(duration(sharedCoverage),windowLabel));
+    text('m-live-decode',startup?(lifetime?.decode==null?'—':fmt(lifetime.decode)):(decode.rate==null?'—':fmt(decode.rate)));
+    text('m-live-prefill',startup?(lifetime?.prefill==null?'—':fmt(lifetime.prefill)):(prefill.rate==null?'—':fmt(prefill.rate)));
+    const queryCount=startup?lifetime?.queries:cacheWindow.deltas.cache_queries_total, hitCount=startup?lifetime?.hits:cacheWindow.deltas.cache_hits_total;
+    text('m-window-cache',startup?(lifetime?.cache==null?'—':fmt(lifetime.cache)+'%'):(cacheWindow.seconds&&queryCount?fmt(Math.min(100,100*hitCount/queryCount))+'%':'—'));
+    text('m-ttft',monitorFormatTTFT(startup?lifetime?.ttft:ttft.average));text('m-memory',bytes(startup?lifetime?.memory:memory.average));
+    text('m-live-decode-caption',startup?(lifetime?.decode!=null?t('Processing average')+' · '+t('%@ active',[duration(lifetime.decodeActiveNs/1e6)]):t(lifetime?.decodeActiveNs===0?'No processing in this period':'No measured samples')):(decode.rate!=null?t('Processing average')+' · '+t('%@ active',[duration(decode.activeSeconds*1000)]):t(decode.coverageMs?'No processing in this period':'No measured samples'))+coverage(decode.coverageMs,sharedCoverage,interval));
+    text('m-live-prefill-caption',startup?(lifetime?.prefill!=null?t('Processing average')+' · '+t('%@ active',[duration(lifetime.prefillActiveNs/1e6)]):t(lifetime?.prefillActiveNs===0?'No processing in this period':'No measured samples')):(prefill.rate!=null?t('Processing average')+' · '+t('%@ active',[duration(prefill.activeSeconds*1000)]):t(prefill.coverageMs?'No processing in this period':'No measured samples'))+coverage(prefill.coverageMs,sharedCoverage,interval));
+    text('m-window-cache-caption',startup?(queryCount==null?t('No measured samples'):queryCount?(t(hitCount===1?'%@ hit':'%@ hits',[fmt(hitCount,0)])+' / '+requests(queryCount,'finished')):t('No finished requests')):(cacheWindow.seconds?(queryCount?t(hitCount===1?'%@ hit':'%@ hits',[fmt(hitCount,0)])+' / '+requests(queryCount,'finished'):t('No finished requests')):t('No measured samples'))+coverage(cacheWindow.coverageMs,sharedCoverage,interval));
+    text('m-ttft-caption',startup?(lifetime?.ttft!=null?t('Average')+' · '+requests(lifetime.ttftCount,'successful'):t(lifetime?.ttftCount===0?'No successful requests':'No measured samples')):(ttft.coverageMs?(ttft.average!=null?t('Average')+' · '+requests(ttft.count,'successful'):t(ttft.count?'TTFT unavailable':'No successful requests')):t('No measured samples'))+coverage(ttft.coverageMs,sharedCoverage,interval));
+    text('m-memory-caption',startup?(lifetime?.memorySeconds>0?t('Average')+' · '+measured(duration(lifetime.memorySeconds*1000),duration(now-started)):t('No measured samples')):(memory.seconds?t('Average'):t('No measured samples'))+coverage(memory.coverageMs,sharedCoverage,interval));
+    text('m-coverage',`${(m.recent_requests||[]).length} / ${fmt(m.retention?.request_capacity??256,0)} ${t('retained requests')}${w.partial?' · '+t('Partial coverage'):''} · ${(m.events||[]).length} / ${fmt(m.retention?.event_capacity??128,0)} ${t('retained events')} · ${t('Older chart detail is compacted')} · ${t('Raw history retained')}: ${fmt((m.retention?.history_seconds||0)/60,0)}m`);
+    for(const [id,key] of [['m-ttft-range','ttft_ms'],['m-queue-latency','queue_ms'],['m-e2e','e2e_ms']])text(id,ms(w.percentile(key,.5))+' / '+ms(w.percentile(key,.95)));
+    chart('prefill',[{name:'Prefill',points:monitorSeries(w.history,'prefill_tokens_forwarded_live_total',true,interval)}],start,now,'tok/s',0);
+    chart('decode',[{name:'Decode',points:monitorSeries(w.history,'generation_tokens_live',true,interval)}],start,now,'tok/s',1);
+    const ttftPoints=monitorIntervalMeans(history,'ttft_ns_sum','ttft_count',1e6,interval).filter(p=>p.t>=start&&p.t<=now);
+    const ttftSeconds=ttftPoints.some(p=>p.value>=1000);
+    const ttftUnit=ttftSeconds?'s':'ms';
+    const ttftTitle=t('TTFT mean')+' · '+ttftUnit;
+    text('m-ttft-title',ttftTitle);$('m-chart-ttft').setAttribute('aria-label',ttftTitle);
+    chart('ttft',[{name:'TTFT mean',points:ttftPoints}],start,now,ttftUnit,1,v=>v==null?'—':ttftSeconds?fmt(v/1000):fmt(v));
+    chart('memory',[{name:'Process',points:monitorGaugeSeries(w.history,'process_bytes',interval).map(p=>({...p,value:p.value==null?null:p.value/1073741824}))}],start,now,'GiB · '+t('global'));
+    chart('latency',[{name:'End-to-end',points:w.requests.map(r=>({t:r.finished_at_ms,value:r.e2e_ms}))},{name:'Queue wait',points:w.requests.map(r=>({t:r.finished_at_ms,value:r.queue_ms}))}],start,now,'ms');
+    chart('queue',[{name:'Active',points:monitorSeries(w.history,'running')},{name:'Queued',points:monitorSeries(w.history,'queued')}],start,now,t('global'));
+    table('m-active',['Request','Model','Phase','Elapsed','Queue wait','Prompt / cached / output'],active.map(r=>[`<button class="monitor-request" data-request="${esc(r.id)}">${esc(r.id)}</button>`,esc(r.model),label(r.phase),ms(now-r.started_at_ms),ms(r.queue_ms),[r.prompt_tokens,r.cached_tokens,r.output_tokens].map(v=>fmt(v,0)).join(' / ')]),'No active requests');
+    table('m-recent',['Request','Model','Outcome','TTFT','End-to-end','Prompt / cached / output'],w.requests.slice().reverse().map(r=>[`<button class="monitor-request" data-request="${esc(r.id)}">${esc(r.id)}</button>`,esc(r.model),`<span class="monitor-outcome ${r.outcome==='success'?'ok':'other'}">${esc(r.outcome)}</span>${r.error_code?'<div class="monitor-caption">'+esc(r.error_code)+'</div>':''}`,ms(r.ttft_ms),ms(r.e2e_ms),[r.prompt_tokens,r.cached_tokens,r.output_tokens].map(v=>fmt(v,0)).join(' / ')]),'No completed requests in this period');
+    table('m-inventory',['Model','State','Backend','Quantization','Context','Disk','RAM'],inventory.filter(r=>!selected||r.id===selected).map(r=>[esc(r.id),label(r.state||'unknown'),esc(r.backend??r.engine??'—'),esc(r.quantization??(r.quantization_bits!=null?r.quantization_bits+' bit':'—')),fmt(r.context_length,0),bytes(r.bytes_on_disk),bytes(r.bytes_resident)+(r.estimate&&r.estimated_resident_bytes!=null?'<div class="monitor-caption">'+bytes(r.estimated_resident_bytes)+' '+label('(estimate)')+'</div>':'')]),'No models discovered');
+    facts('m-resources',[['CPU',res.cpu_pct==null?null:fmt(res.cpu_pct)+'%'],['GPU',res.gpu_pct==null?null:fmt(res.gpu_pct)+'%'],['Process footprint',bytes(res.process_bytes)],['MLX active',bytes(res.mlx_active_bytes)],['MLX reusable pool',bytes(res.mlx_cache_bytes)],['System available / total',bytes(res.system_available_bytes)+' / '+bytes(res.system_total_bytes)],['Memory pressure',res.memory_pressure_pct==null?null:fmt(res.memory_pressure_pct)+'%'],['Swap used',bytes(res.swap_used_bytes)]]);
+    facts('m-cache',[['Request hit rate',cache.queries>0?fmt(100*cache.hits/cache.queries)+'%':'—'],['Hits / queries',fmt(cache.hits,0)+' / '+fmt(cache.queries,0)],['Reused tokens',fmt(cache.reused_tokens,0)],['Token reuse',c.prompt_tokens_total>0?fmt(100*c.prefix_cache_tokens_total/c.prompt_tokens_total)+'%':null],['Hot cache / capacity',bytes(cache.hot_bytes)+' / '+bytes(cache.capacity_bytes)],['Entries',cache.entries],['Evictions',cache.evictions]]);
+    const ids=[...new Set(w.requests.map(r=>r.model))];
+    table('m-model-stats',['Model','Requests','Errors','Output tokens','TTFT p50 / p95'],ids.map(id=>{const rows=w.requests.filter(r=>r.model===id), mw=monitorWindow(data||{},now,windowMs,id);return[esc(id),fmt(rows.length,0),fmt(rows.filter(r=>r.outcome==='failed'||r.outcome==='rejected').length,0),fmt(rows.reduce((n,r)=>n+(r.output_tokens||0),0),0),ms(mw.percentile('ttft_ms',.5))+' / '+ms(mw.percentile('ttft_ms',.95))];}),'No completed requests in this period');
+    const events=(m.events||[]).filter(e=>e.at_ms>=start&&(!selected||!e.model||e.model===selected)).slice().reverse();
+    $('m-events').innerHTML=events.length?events.map(e=>`<div><time>${esc(new Date(e.at_ms).toLocaleTimeString())}</time><strong>${esc(e.kind)}</strong><span>${esc([e.model,e.code,e.message].filter(Boolean).join(' · '))}</span></div>`).join(''):`<p class="monitor-empty">${label('No events in this period')}</p>`;
+    const pre=w.requests.reduce((n,r)=>n+(r.prefill_ms||0),0), dec=w.requests.reduce((n,r)=>n+(r.decode_ms||0),0);
+    facts('m-diagnostics',[['Concurrency limit',diag.max_concurrent],['Resident model limit',diag.max_resident_models],['Resident memory limit',diag.max_resident_bytes===0?t('Automatic'):bytes(diag.max_resident_bytes)],['Last batch size',g.batched_group_size],['Prefill share · retained phase time',pre+dec?fmt(pre/(pre+dec)*100)+'%':'—'],['KV quantization',diag.kv_quant],['KV attention mode',diag.kv_attn_mode],['Prefill chunk',diag.prefill_chunk===0?t('Automatic'):diag.prefill_chunk],['Speculative acceptance',diag.speculative_drafted>0?fmt(diag.speculative_accepted/diag.speculative_drafted*100)+'%':null],['ANE layers',diag.ane_layers],['ANE weight copies',bytes(diag.ane_int8_bytes)],['N-gram warm progress',bytes(diag.ngram_warm_bytes)],['Request timeout',diag.request_timeout_seconds==null?null:fmt(diag.request_timeout_seconds)+' s'],['Serial decode reasons · lifetime',Object.entries(diag.decode_serial_reasons||data?.decode_serial||{}).map(([k,v])=>k+': '+v).join(' · ')||null]]);
+    const options=[...new Set(inventory.map(r=>r.id).concat((m.recent_requests||[]).map(r=>r.model)))].sort();
+    const select=$('m-model');if(JSON.stringify(options)!==select.dataset.options){select.innerHTML=`<option value="">${label('All models')}</option>`+options.map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join('');select.value=selected;select.dataset.options=JSON.stringify(options);}
   }
-
-  const histSum = (hist) => (hist && typeof hist.sum === 'number') ? hist.sum : 0;
-
-  async function tick() {
-    let d;
-    try {
-      const r = await fetch('/metrics.json', { cache: 'no-store' });
-      if (r.status === 503) { setStatus('err', t('metrics disabled')); return; }
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      d = await r.json();
-    } catch (e) { setStatus('err', t('error: %@', [e.message])); return; }
-
-    setStatus('live', t('● live'));
-    const c = d.counters, g = d.gauges, h = d.histograms;
-    const now = Date.now();
-
-    const psum = histSum(h.prefill_time_seconds);
-    const liveTok = (g.generation_tokens_live != null) ? g.generation_tokens_live : c.generation_tokens_total;
-    const livePre = (g.prefill_tokens_live != null) ? g.prefill_tokens_live : 0;
-    samples.push({ t: now, live: liveTok, pre: livePre, pretok: c.prefill_tokens_total, psum: psum, req: c.requests_success_total });
-    while (samples.length > 2 && now - samples[0].t > RETAIN_MS) samples.shift();
-
-    // Everything displayed is derived here, from THIS tick's data. Nothing is
-    // remembered between ticks — see the note above `computeRates`.
-    const r = computeRates(now, samples, c, g, psum);
-    const { decodeTps, prefillTps, avgPrefillTps, reqRate, prefilling } = r;
-
-    // Sparkline history: both series dip to 0 when their phase is idle.
-    decodeHist.push(decodeTps); if (decodeHist.length > SPARK_N) decodeHist.shift();
-    prefillHist.push(prefillTps); if (prefillHist.length > SPARK_N) prefillHist.shift();
-
-    // Average latency from each histogram's sum/count (seconds → ms).
-    const avgMs = (hist) => (hist && hist.count > 0) ? (hist.sum / hist.count) * 1000 : null;
-    const ttft = avgMs(h.time_to_first_token_seconds);
-    const e2e = avgMs(h.e2e_request_latency_seconds);
-    const decodeMs = avgMs(h.decode_time_seconds);
-    const prefillMs = avgMs(h.prefill_time_seconds);
-
-    const cq = c.prefix_cache_queries_total, ch = c.prefix_cache_hits_total;
-    const cachePct = cq > 0 ? Math.round((ch / cq) * 100) : null;
-    // Token-level reuse: what fraction of billed prompt tokens never reached the
-    // GPU. This is the number that explains a low prefill tok/s on warm turns.
-    const tokTotal = c.prompt_tokens_total;
-    const tokPct = tokTotal > 0 ? Math.round((c.prefix_cache_tokens_total / tokTotal) * 100) : null;
-
-    $('m-decode-tps').textContent = fmt(decodeTps, 1);
-    setVal('m-decode-ms', t('%@ ms avg', [decodeMs !== null ? fmt(decodeMs, 0) : '—']));
-    // Big number = live prefill speed, 0 when not prefilling (mirrors Decode).
-    $('m-prefill-tps').textContent = fmt(prefillTps, 0);
-    // Sub-line doubles as the phase indicator AND carries the stable average, so
-    // "0 tok/s while decoding" never means "I don't know how fast prefill is".
-    // The phase flag flips at prefill START; the token count appears once the
-    // first chunk lands (and never for ds4/llama, which prefill elsewhere).
-    setVal('m-prefill-ms', prefilling
-      ? (t('prefilling') + (r.livePre > 0 ? ' · ' + fmt(r.livePre, 0) + ' tok' : ''))
-      : (avgPrefillTps !== null
-          ? t('%@ tok/s avg · %@ ms', [fmt(avgPrefillTps, 0), prefillMs !== null ? fmt(prefillMs, 0) : '—'])
-          : t('%@ ms avg', ['—'])));
-    const pexp = g.prefill_tokens_expected || 0;
-    $('m-prefillbar').style.width = (prefilling && pexp > 0 ? Math.min(100, (r.livePre / pexp) * 100) : 0) + '%';
-    $('m-running').textContent = g.requests_running;
-    setVal('m-waiting', t('%@ waiting · %@ req/s', [g.requests_waiting, reqRate !== null ? fmt(reqRate, 2) : '—'])
-      + (g.batched_group_size > 1 ? ' · ' + t('batch of %@', [g.batched_group_size]) : '')
-      + (c.requests_cancelled_total > 0 ? ' · ' + t('%@ cancelled', [c.requests_cancelled_total]) : ''));
-    $('m-ttft').textContent = ttft !== null ? fmt(ttft, 0) : '—';
-    setVal('m-e2e', t('%@ ms e2e', [e2e !== null ? fmt(e2e, 0) : '—']));
-    $('m-cache').textContent = cachePct !== null ? cachePct : '—';
-    setVal('m-cachedetail', t('%@ / %@ queries', [ch, cq])
-      + (tokPct !== null ? ' · ' + t('%@% tokens reused', [tokPct]) : ''));
-
-    const gp = g.gpu_utilization_pct;
-    $('m-gpu').textContent = gp;
-    const bar = $('m-gpubar');
-    bar.style.width = gp + '%';
-    bar.className = 'mfill' + (gp >= 90 ? ' crit' : gp >= 70 ? ' warn' : '');
-
-    $('m-mem').textContent = g.memory_mb;
-    setVal('m-memdetail', t('MLX %@ active · %@ pool', [fmtBytes(g.mlx_active_bytes), fmtBytes(g.mlx_cache_bytes)]));
-    // Live count (completed + in-flight) so it moves during a running request.
-    $('m-gen').textContent = fmt(liveTok, 0);
-    setVal('m-success', t('%@ requests', [fmt(c.requests_success_total, 0)]));
-
-    spark('m-spark-decode', decodeHist, '#22c55e', 'm-spark-decode-val', 'decode', 1);
-    spark('m-spark-prefill', prefillHist, '#3b82f6', 'm-spark-prefill-val', 'prefill', 0);
-    renderSessions(d.sessions);
+  function headers(){const p=new URLSearchParams(location.search),key=p.get('api_key')||p.get('key');return key?{Authorization:'Bearer '+key}:{};}
+  async function tick(){
+    if(inFlight)return;
+    if(paused||document.hidden||(location.hash&&location.hash!=='#monitor')){timer=setTimeout(tick,2000);return;}
+    inFlight=true;
+    try{const response=await fetch('/metrics.json',{headers:headers(),signal:AbortSignal.timeout(5000)});if(response.status===503){state='Metrics disabled';data=null;liveSamples.length=0;lastReceived=0;}else if(response.status===401||response.status===403){state='Unauthorized';}else{if(!response.ok)throw Error(response.status);const next=await response.json();if(next.monitor?.server?.instance_id!==data?.monitor?.server?.instance_id)liveSamples.length=0;data=next;state='Live';lastReceived=Date.now();const at=data.monitor?.server?.sampled_at_ms||lastReceived;if(liveSamples.at(-1)?.t!==at){liveSamples.push({t:at,live:data.gauges?.generation_tokens_live||0,pre:data.gauges?.prefill_tokens_live||0,req:data.counters?.requests_success_total||0});while(liveSamples.length>120||liveSamples[0]?.t<at-120000)liveSamples.shift();}}}
+    catch(e){state='Offline';}
+    finally{inFlight=false;render();timer=setTimeout(tick,2000);}
   }
-
-  attachSparkHover('m-spark-decode', 'decode', function () { return decodeHist; }, '#22c55e', 'm-spark-decode-val', 1);
-  attachSparkHover('m-spark-prefill', 'prefill', function () { return prefillHist; }, '#3b82f6', 'm-spark-prefill-val', 0);
-  if (I18N) I18N.onChange(function () { if (mount) I18N.applyMarkup(mount); tick(); });
-
-  tick();
-  setInterval(tick, 1000);
+  window.mlxMonitor={updateModels(value){models=value;render();},updateProps(value){props=value;render();}};
+  $('m-window').addEventListener('change',e=>{windowMs=e.target.value==='startup'?'startup':Number(e.target.value);render();});
+  $('m-model').addEventListener('change',e=>{selected=e.target.value;render();});
+  $('m-pause').addEventListener('click',()=>{paused=!paused;text('m-pause',t(paused?'Resume':'Pause'));render();if(!paused&&!inFlight){clearTimeout(timer);tick();}});
+  $('m-copy').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(JSON.stringify({captured_at:new Date().toISOString(),status:state,selected_model:selected,window_ms:windowMs,monitor:data?.monitor||{models,props}},null,2));text('m-copy',t('Copied'));}catch(e){text('m-copy',t('Copy failed'));}setTimeout(()=>text('m-copy',t('Copy diagnostics')),1800);});
+  mount.addEventListener('click',e=>{const button=e.target.closest('[data-request]');if(!button)return;const row=[...(data?.monitor?.recent_requests||[]),...(data?.monitor?.active_requests||[])].find(r=>String(r.id)===button.dataset.request);if(row){$('m-inspector').hidden=false;$('m-inspector').open=true;text('m-request-detail',JSON.stringify(row,null,2));}});
+  window.addEventListener('hashchange',()=>{render();if(!inFlight){clearTimeout(timer);tick();}});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden){render();if(!inFlight){clearTimeout(timer);tick();}}});
+  if(I18N)I18N.onChange(()=>{ staticLabels.forEach(([node,key])=>{node.textContent=t(key);});render(); });
+  render();tick();
 })();

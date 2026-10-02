@@ -990,12 +990,30 @@
       var name = e.currentTarget.getAttribute('data-tab');
       if (e.currentTarget.id === 'nav-new') newChat();
       showTab(name);
+      if (window.matchMedia('(max-width: 820px)').matches) closeSidebar();
     });
   }
   window.addEventListener('hashchange', function () { showTab(location.hash.slice(1) || 'chat'); });
 
-  $('side-toggle').addEventListener('click', function () { $('app').classList.add('collapsed'); });
-  $('side-open').addEventListener('click', function () { $('app').classList.remove('collapsed'); });
+  var mobileSidebar = window.matchMedia('(max-width: 820px)');
+  function syncSidebar() {
+    var closed = mobileSidebar.matches ? !$('app').classList.contains('mobile-open') : $('app').classList.contains('collapsed');
+    $('sidebar').toggleAttribute('inert', closed);
+    $('side-open').setAttribute('aria-expanded', String(!closed));
+  }
+  function closeSidebar() {
+    if (mobileSidebar.matches) $('app').classList.remove('mobile-open');
+    else $('app').classList.add('collapsed');
+    syncSidebar();
+  }
+  $('side-toggle').addEventListener('click', closeSidebar);
+  $('side-open').addEventListener('click', function () {
+    if (mobileSidebar.matches) $('app').classList.add('mobile-open');
+    else $('app').classList.remove('collapsed');
+    syncSidebar();
+  });
+  mobileSidebar.addEventListener('change', function () { $('app').classList.remove('mobile-open'); syncSidebar(); });
+  syncSidebar();
   $('theme-toggle').addEventListener('click', function () { window.mlxTheme.toggle(); });
   $('lang-toggle').addEventListener('click', function () {
     if (I18N) I18N.setLang(I18N.lang === 'zh-Hans' ? 'en' : 'zh-Hans');
@@ -1112,52 +1130,7 @@
 
   // ── Model list + monitor ──────────────────────────────────────────────────
   function renderMonitor() {
-    var body = $('mon-models').querySelector('tbody');
-    body.innerHTML = '';
-    if (!MODELS.length) {
-      var empty = document.createElement('tr');
-      var td = document.createElement('td');
-      td.colSpan = 4;
-      td.className = 'muted';
-      setText(td, 'No models discovered. Point the server at a models directory with --model-dir, or pull one with `mlx-serve pull`.');
-      empty.appendChild(td);
-      body.appendChild(empty);
-      return;
-    }
-    // Loaded first — a monitor is mostly read for "what is resident right now".
-    var rows = MODELS.slice().sort(function (a, b) {
-      var ar = a.state === 'ready' ? 0 : 1, br = b.state === 'ready' ? 0 : 1;
-      return ar - br || a.id.localeCompare(b.id);
-    });
-    for (var i = 0; i < rows.length; i++) {
-      var m = rows[i];
-      var tr = document.createElement('tr');
-      if (m.state === 'ready') tr.className = 'ready';
-
-      var id = document.createElement('td');
-      id.className = 'mono';
-      id.textContent = m.id;
-
-      var caps = document.createElement('td');
-      var list = capsOf(m);
-      for (var c = 0; c < list.length; c++) {
-        var pill = document.createElement('span');
-        pill.className = 'cap';
-        pill.textContent = t(list[c]);
-        caps.appendChild(pill);
-      }
-
-      var size = document.createElement('td');
-      size.className = 'num';
-      size.textContent = formatBytes(m.bytes_resident || m.bytes_on_disk);
-
-      var state = document.createElement('td');
-      state.className = 'state ' + (m.state || 'unloaded');
-      state.textContent = t(m.state || 'unloaded');
-
-      tr.appendChild(id); tr.appendChild(caps); tr.appendChild(size); tr.appendChild(state);
-      body.appendChild(tr);
-    }
+    if (window.mlxMonitor) window.mlxMonitor.updateModels(MODELS);
   }
 
   async function refreshModels() {
@@ -1188,6 +1161,7 @@
     try {
       var res = await fetch('/props', { headers: authHeaders(API_KEY) });
       var p = await res.json();
+      if (window.mlxMonitor) window.mlxMonitor.updateProps(p);
       var mem = p && p.memory ? p.memory.active_bytes : 0;
       $('hdr-mem').textContent = t('%@ resident', [formatBytes(mem)]);
     } catch (e) { /* transient */ }
@@ -2050,5 +2024,5 @@
   refreshModels();
   refreshMemory();
   setInterval(refreshMemory, 5000);
-  setInterval(function () { if (!chatAbort) refreshModels(); }, 15000);
+  setInterval(refreshModels, 15000);
 })();

@@ -116,11 +116,15 @@ pub fn getAppRssMb() u32 {
 /// On Linux the honest analog is VmRSS (unified-memory footprint has no
 /// equivalent); swap-paged-out pages are invisible to it.
 pub fn getAppMemFootprintMb() u32 {
+    return getAppMemFootprintMbOptional() orelse 0;
+}
+
+pub fn getAppMemFootprintMbOptional() ?u32 {
     if (comptime !builtin.os.tag.isDarwin())
-        return @intCast(linuxProcStatusKib("VmRSS:") / 1024);
+        return @intCast((linuxProcStatusKibOptional("VmRSS:") orelse return null) / 1024);
     var info = std.mem.zeroes(TaskVmInfo);
     var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
-    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
+    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return null;
     return @intCast(info.phys_footprint / (1024 * 1024));
 }
 
@@ -173,18 +177,42 @@ pub fn getTotalMemBytes() u64 {
     return total_mem;
 }
 
+pub fn getSwapUsedBytes() ?u64 {
+    if (comptime !builtin.os.tag.isDarwin()) {
+        const total = linuxMemInfoKib("SwapTotal:");
+        const free = linuxMemInfoKib("SwapFree:");
+        if (total == 0) return null;
+        return (total -| free) * 1024;
+    }
+    const SwapUsage = extern struct {
+        total: u64,
+        avail: u64,
+        used: u64,
+        pagesize: u32,
+        encrypted: u32,
+    };
+    var usage = std.mem.zeroes(SwapUsage);
+    var len: usize = @sizeOf(SwapUsage);
+    if (sysctlbyname("vm.swapusage", @ptrCast(&usage), &len, null, 0) != 0) return null;
+    return usage.used;
+}
+
 pub fn getAvailableMemBytes() u64 {
-    if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
+    return getAvailableMemBytesOptional() orelse 0;
+}
+
+pub fn getAvailableMemBytesOptional() ?u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return (linuxMemInfoKibOptional("MemAvailable:") orelse return null) * 1024;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return null;
 
     var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
+    if (host_page_size(mach_host_self(), &page) != 0) return null;
 
     var vm = std.mem.zeroes(VmStats64);
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
+    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return null;
 
     return computeAvailableBytes(total_mem, vm.wire_count, vm.compressor_page_count, vm.internal_page_count, vm.purgeable_count, page);
 }
@@ -192,30 +220,38 @@ pub fn getAvailableMemBytes() u64 {
 /// One `/proc/meminfo` field in KiB ("MemTotal:", "MemAvailable:", …).
 /// 0 when missing or unreadable — callers treat 0 as "unknown".
 fn linuxMemInfoKib(key: []const u8) u64 {
+    return linuxMemInfoKibOptional(key) orelse 0;
+}
+
+fn linuxMemInfoKibOptional(key: []const u8) ?u64 {
     var buf: [8192]u8 = undefined;
-    const n = readProcFile("/proc/meminfo", &buf) orelse return 0;
+    const n = readProcFile("/proc/meminfo", &buf) orelse return null;
     var it = std.mem.splitScalar(u8, buf[0..n], '\n');
     while (it.next()) |line| {
         if (!std.mem.startsWith(u8, line, key)) continue;
         const val = std.mem.trim(u8, line[key.len..], " \t");
         const end = std.mem.indexOf(u8, val, " kB") orelse val.len;
-        return std.fmt.parseInt(u64, std.mem.trim(u8, val[0..end], " \t"), 10) catch 0;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, val[0..end], " \t"), 10) catch null;
     }
-    return 0;
+    return null;
 }
 
 /// One `/proc/self/status` field in KiB ("VmRSS:", "VmHWM:", …). 0 unknown.
 fn linuxProcStatusKib(key: []const u8) u64 {
+    return linuxProcStatusKibOptional(key) orelse 0;
+}
+
+fn linuxProcStatusKibOptional(key: []const u8) ?u64 {
     var buf: [8192]u8 = undefined;
-    const n = readProcFile("/proc/self/status", &buf) orelse return 0;
+    const n = readProcFile("/proc/self/status", &buf) orelse return null;
     var it = std.mem.splitScalar(u8, buf[0..n], '\n');
     while (it.next()) |line| {
         if (!std.mem.startsWith(u8, line, key)) continue;
         const val = std.mem.trim(u8, line[key.len..], " \t");
         const end = std.mem.indexOf(u8, val, " kB") orelse val.len;
-        return std.fmt.parseInt(u64, std.mem.trim(u8, val[0..end], " \t"), 10) catch 0;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, val[0..end], " \t"), 10) catch null;
     }
-    return 0;
+    return null;
 }
 
 /// Whole-file read of a small procfs file. Returns null when missing/unreadable.
@@ -289,12 +325,16 @@ pub fn getSysMemPct() u32 {
 }
 
 pub fn getCpuPct() u32 {
+    return getCpuPctOptional() orelse 0;
+}
+
+pub fn getCpuPctOptional() ?u32 {
     if (comptime !builtin.os.tag.isDarwin()) {
         // /proc/stat aggregate line: "cpu  user nice system idle iowait irq
         // softirq steal ...". Delta over the calls, idle = nice-adjusted idle
         // columns, mirroring the Mach ticks loop below.
         var buf: [512]u8 = undefined;
-        const n = readProcFile("/proc/stat", &buf) orelse return 0;
+        const n = readProcFile("/proc/stat", &buf) orelse return null;
         const line_end = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n;
         var it = std.mem.tokenizeAny(u8, buf[0..line_end], " \t");
         _ = it.next(); // "cpu"
@@ -322,7 +362,7 @@ pub fn getCpuPct() u32 {
     }
     var info = std.mem.zeroes(CpuLoadInfo);
     var count: u32 = 4;
-    if (host_statistics(mach_host_self(), 3, @ptrCast(&info), &count) != 0) return 0;
+    if (host_statistics(mach_host_self(), 3, @ptrCast(&info), &count) != 0) return null;
 
     var total: u64 = 0;
     var idle: u64 = 0;
@@ -338,29 +378,33 @@ pub fn getCpuPct() u32 {
 }
 
 pub fn getGpuPct() u32 {
+    return getGpuPctOptional() orelse 0;
+}
+
+pub fn getGpuPctOptional() ?u32 {
     // IOKit's IOServiceMatching/AGXAccelerator path is macOS-only; the symbols
     // aren't in the public iOS SDK (and apps are sandboxed from the GPU service
     // registry anyway). On iOS we report 0 — the value is only a log-line stat.
-    if (comptime !is_macos) return 0;
-    const matching = IOServiceMatching("AGXAccelerator") orelse return 0;
+    if (comptime !is_macos) return null;
+    const matching = IOServiceMatching("AGXAccelerator") orelse return null;
     var iter: u32 = 0;
-    if (IOServiceGetMatchingServices(0, matching, &iter) != 0) return 0;
+    if (IOServiceGetMatchingServices(0, matching, &iter) != 0) return null;
     defer _ = IOObjectRelease(iter);
 
     const entry = IOIteratorNext(iter);
-    if (entry == 0) return 0;
+    if (entry == 0) return null;
     defer _ = IOObjectRelease(entry);
 
     var props: ?*anyopaque = null;
-    if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) return 0;
+    if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) return null;
     defer if (props) |p| CFRelease(p);
 
-    const perf = cfDictGet(props, "PerformanceStatistics") orelse return 0;
-    const util = cfDictGet(perf, "Device Utilization %") orelse return 0;
+    const perf = cfDictGet(props, "PerformanceStatistics") orelse return null;
+    const util = cfDictGet(perf, "Device Utilization %") orelse return null;
 
     var value: i64 = 0;
-    _ = CFNumberGetValue(util, 4, @ptrCast(&value));
-    return if (value >= 0 and value <= 100) @intCast(value) else 0;
+    if (CFNumberGetValue(util, 4, @ptrCast(&value)) == 0) return null;
+    return if (value >= 0 and value <= 100) @intCast(value) else null;
 }
 
 fn cfDictGet(dict: ?*const anyopaque, key_name: [*:0]const u8) ?*const anyopaque {
@@ -375,4 +419,10 @@ test "getAppMemFootprintMb returns a plausible nonzero footprint" {
     // would yield 0 or absurd garbage.
     try std.testing.expect(fp > 0);
     try std.testing.expect(fp < 1024 * 1024); // < 1 TB sanity bound
+}
+
+test "optional proc readings keep missing fields distinct from zero" {
+    try std.testing.expect(linuxProcStatusKibOptional("NoSuchField:") == null);
+    try std.testing.expect(linuxMemInfoKibOptional("NoSuchField:") == null);
+    try std.testing.expect((getAppMemFootprintMbOptional() orelse 0) > 0);
 }

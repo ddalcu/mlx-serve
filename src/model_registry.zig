@@ -84,6 +84,8 @@ pub const LoadState = enum {
     evicting,
 };
 
+pub var monitor_event_hook: ?*const fn ([]const u8, []const u8, []const u8) void = null;
+
 /// One discovered + possibly-loaded model. The mlx-allocating fields
 /// (weights/transformer/vision_encoder/drafter) are optional so a stub
 /// entry can exist for `unloaded`/`error_state`/`loading` without faking
@@ -1059,6 +1061,7 @@ pub const ModelRegistry = struct {
     pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
         if (entry.state != .unloaded) return false;
         entry.state = .loading;
+        if (monitor_event_hook) |hook| hook("model_loading", entry.id, "");
         self.state_cond.broadcast(self.io);
         return true;
     }
@@ -1083,6 +1086,7 @@ pub const ModelRegistry = struct {
     pub fn markEvictingLocked(self: *ModelRegistry, entry: *LoadedModel) void {
         std.debug.assert(entry.state == .ready);
         entry.state = .evicting;
+        if (monitor_event_hook) |hook| hook("model_evicting", entry.id, "");
         self.state_cond.broadcast(self.io);
     }
 
@@ -1105,6 +1109,7 @@ pub const ModelRegistry = struct {
         // (unloadResident sets bytes_resident=0 itself, so we tracked the
         // pre-eviction value externally — pass-through here is a no-op.)
         entry.state = .unloaded;
+        if (monitor_event_hook) |hook| hook("model_evicted", entry.id, "");
         entry.error_name = null;
         self.state_cond.broadcast(self.io);
     }
@@ -1224,6 +1229,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         entry.state = .ready;
+        if (monitor_event_hook) |hook| hook("model_ready", entry.id, "");
         entry.error_name = null;
         self.lru_clock += 1;
         entry.last_used_ns = self.lru_clock;
@@ -1388,6 +1394,7 @@ pub const ModelRegistry = struct {
         if (entry.error_name) |old| self.allocator.free(old);
         entry.error_name = self.allocator.dupe(u8, error_name) catch null;
         entry.state = .error_state;
+        if (monitor_event_hook) |hook| hook("model_load_failed", entry.id, error_name);
         self.state_cond.broadcast(self.io);
     }
 

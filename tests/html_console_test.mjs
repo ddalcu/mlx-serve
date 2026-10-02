@@ -988,7 +988,6 @@ test('speechBody never sends both voice and ref_audio', () => {
 // throws. What the shell script used to grep for is asserted here instead.
 const themeSrc = readFileSync(join(here, '..', 'src', 'html', 'theme.js'), 'utf8');
 const themeCss = readFileSync(join(here, '..', 'src', 'html', 'app.css'), 'utf8');
-const metricsSrc = readFileSync(join(here, '..', 'src', 'html', 'metrics.js'), 'utf8');
 
 function bootTheme({ stored = null, osLight = false, throwOnRead = false, throwOnWrite = false } = {}) {
   const attrs = new Map();
@@ -1048,8 +1047,6 @@ test('a store that throws still leaves a themed page', () => {
 });
 
 test('the light palette restates every variable the dark palette sets', () => {
-  // metrics.js carries its own <style>, so it needs its own light block too.
-  assert.ok(/:root\[data-theme=light\]/.test(metricsSrc), 'metrics.js must restate its palette');
   // Colours only: a font stack like `--mono` is the same in both themes.
   const varsIn = (text, coloursOnly = false) =>
     new Set([...text.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)]

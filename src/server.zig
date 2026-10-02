@@ -53,8 +53,28 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 var active_conn_threads = std.atomic.Value(u32).init(0);
 /// Set from main.zig before serve() is called when --metrics is on; null
 /// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
-/// routes. When null, `/metrics*` return 503 and the index page shows no panel.
+/// routes. When null, `/metrics*` return 503 and the dashboard shows its disabled state.
 pub var g_metrics: ?*instr.Metrics = null;
+var monitor_started_at_ms: i64 = 0;
+var monitor_sampled_at_ms = std.atomic.Value(i64).init(0);
+var monitor_cpu_pct = std.atomic.Value(u32).init(0);
+var monitor_cpu_available = std.atomic.Value(bool).init(false);
+var monitor_gpu_available = std.atomic.Value(bool).init(false);
+var monitor_process_memory_available = std.atomic.Value(bool).init(false);
+var monitor_system_total_bytes = std.atomic.Value(u64).init(0);
+var monitor_system_available_bytes = std.atomic.Value(u64).init(0);
+var monitor_system_available = std.atomic.Value(bool).init(false);
+var monitor_swap_used_bytes = std.atomic.Value(u64).init(0);
+var monitor_swap_available = std.atomic.Value(bool).init(false);
+
+fn recordModelMonitorEvent(kind: []const u8, model: []const u8, code: []const u8) void {
+    if (g_metrics) |m| m.monitor.recordEvent(.{
+        .at_ms = @intCast(@max(0, nowMs(global_scheduler.?.io))),
+        .kind = kind,
+        .model = model,
+        .code = code,
+    });
+}
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
 /// CORS preflight requires the key — the OpenAI/Anthropic/Ollama APIs AND the
@@ -324,6 +344,9 @@ pub const Conn = struct {
     /// output through `writer()` directly, bypassing this hook — same
     /// interception pattern as `ws_mode`. See src/ollama.zig.
     ollama_sink: ?*ollama_mod.Sink = null,
+    monitor_inference_request: bool = false,
+    monitor_slot_started: bool = false,
+    monitor_rejection_recorded: bool = false,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
@@ -333,6 +356,9 @@ pub const Conn = struct {
         c.ws_mode = null;
         c.ollama_sink = null;
         c.sse_headers_sent = false;
+        c.monitor_inference_request = false;
+        c.monitor_slot_started = false;
+        c.monitor_rejection_recorded = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
@@ -1689,6 +1715,7 @@ pub fn serve(
     cfg: ServerConfig,
 ) !void {
     server_config = cfg;
+    monitor_started_at_ms = nowMs(io);
     // Before `Scheduler.init`: that call is the model load and every load-time bill inside it
     // asks for the KV width.
     configured_kv_quant = load_params.kv_quant_config;
@@ -1704,9 +1731,20 @@ pub fn serve(
         load_params,
         max_concurrent,
     );
-    defer scheduler.deinit();
     global_scheduler = scheduler;
-    defer global_scheduler = null;
+    defer {
+        scheduler.deinit();
+        global_scheduler = null;
+        model_registry_mod.monitor_event_hook = null;
+    }
+    model_registry_mod.monitor_event_hook = if (g_metrics != null) &recordModelMonitorEvent else null;
+    if (g_metrics) |m| {
+        const boot_models = try scheduler.registry.snapshot(allocator);
+        defer allocator.free(boot_models);
+        for (boot_models) |model| if (model.loaded) {
+            m.monitor.recordEvent(.{ .at_ms = @intCast(@max(0, nowMs(io))), .kind = "model_ready", .model = model.id });
+        };
+    }
     // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
     scheduler_mod.prefill_admission_fits = &prefillFitsNow;
     defer scheduler_mod.prefill_admission_fits = null;
@@ -2134,8 +2172,11 @@ fn handleConnection(
     const req_path = blk: {
         const line_end = std.mem.indexOf(u8, hdr_buf[0..header_end_pos], "\r\n") orelse break :blk "";
         var it = std.mem.splitScalar(u8, hdr_buf[0..line_end], ' ');
-        _ = it.next();
-        break :blk it.next() orelse "";
+        const request_method = it.next() orelse break :blk "";
+        const request_path = it.next() orelse break :blk "";
+        const route = if (std.mem.indexOfScalar(u8, request_path, '?')) |q| request_path[0..q] else request_path;
+        stream.monitor_inference_request = isMonitorInferenceRoute(request_method, route);
+        break :blk request_path;
     };
     const max_request_size = maxRequestBytesFor(req_path);
     if (total_size > max_request_size) {
@@ -2262,7 +2303,9 @@ fn handleConnection(
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
-            try instr.renderJson(m, liveSessions(registry, &sessions), &out.writer);
+            const extra = try monitorExtrasJson(allocator, stream.io, registry, m);
+            defer allocator.free(extra);
+            try instr.renderJsonWithExtras(m, liveSessions(registry, &sessions), &out.writer, extra);
             // Quiet: the index panel polls this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
@@ -2673,6 +2716,7 @@ fn ollamaSinkNowMs(impl: *anyopaque) i64 {
 }
 
 fn sendOllamaError(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, message: []const u8) !void {
+    recordMonitorRejection(stream, "ollama_error");
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"error\":");
@@ -7564,12 +7608,9 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     const version_esc = try htmlEscape(allocator, build_options.version);
     defer allocator.free(version_esc);
 
-    // Optional live-metrics panel: a mount div + the polling script (which also
-    // carries the panel markup and injects it into the mount). Rendered into
-    // the header's `{s}` slot — but ONLY when --metrics is on; off ⇒ empty
-    // string, so nothing polls a 503 feed.
+    // The dashboard mount remains available when monitoring is disabled.
     const METRICS_SECTION = "\n<div id=mlx-metrics></div>\n<script>\n" ++ @embedFile("html/metrics.js") ++ "\n</script>\n";
-    const metrics_section: []const u8 = if (g_metrics != null) METRICS_SECTION else "";
+    const metrics_section: []const u8 = METRICS_SECTION;
 
     // The page lives in src/html/index.html (@embedFile resolves relative to
     // this source file, so no build.zig change) and is a std.fmt FORMAT
@@ -7597,7 +7638,7 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
         @embedFile("html/app.css"),
         // header version
         version_esc,
-        // optional live-metrics panel (empty when --metrics is off)
+        // dashboard panel
         metrics_section,
         // curl example port
         global_port,
@@ -7606,6 +7647,122 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "text/html; charset=utf-8", body);
+}
+
+fn writeOptionalU64(w: *std.Io.Writer, value: ?u64) !void {
+    if (value) |n| try w.print("{d}", .{n}) else try w.writeAll("null");
+}
+
+fn monitorExtrasJson(allocator: std.mem.Allocator, io: std.Io, registry: *ModelRegistry, m: *instr.Metrics) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const now_ms = nowMs(io);
+    const sampled_ms = monitor_sampled_at_ms.load(.monotonic);
+    try w.print(",\"server\":{{\"instance_id\":\"{d}\",\"version\":", .{monitor_started_at_ms});
+    try std.json.Stringify.encodeJsonString(build_options.version, .{}, w);
+    try w.print(",\"started_at_ms\":{d},\"uptime_seconds\":{d},\"sampled_at_ms\":{d},\"sample_interval_ms\":2000}}", .{
+        monitor_started_at_ms, @divTrunc(@max(0, now_ms - monitor_started_at_ms), 1000), sampled_ms,
+    });
+    try w.writeAll(",\"resources\":{\"cpu_pct\":");
+    try writeOptionalU64(w, if (monitor_cpu_available.load(.monotonic)) monitor_cpu_pct.load(.monotonic) else null);
+    try w.writeAll(",\"gpu_pct\":");
+    try writeOptionalU64(w, if (monitor_gpu_available.load(.monotonic)) m.gpu_utilization_pct.load() else null);
+    try w.writeAll(",\"process_bytes\":");
+    try writeOptionalU64(w, if (monitor_process_memory_available.load(.monotonic)) m.memory_mb.load() * 1024 * 1024 else null);
+    try w.print(",\"mlx_active_bytes\":{d},\"mlx_cache_bytes\":{d},\"system_total_bytes\":", .{
+        m.mlx_active_bytes.load(), m.mlx_cache_bytes.load(),
+    });
+    const total = monitor_system_total_bytes.load(.monotonic);
+    const available = monitor_system_available_bytes.load(.monotonic);
+    try writeOptionalU64(w, if (total > 0) total else null);
+    try w.writeAll(",\"system_available_bytes\":");
+    try writeOptionalU64(w, if (monitor_system_available.load(.monotonic)) available else null);
+    try w.writeAll(",\"memory_pressure_pct\":null,\"swap_used_bytes\":");
+    try writeOptionalU64(w, if (monitor_swap_available.load(.monotonic)) monitor_swap_used_bytes.load(.monotonic) else null);
+    try w.writeAll("}");
+    try w.print(",\"cache\":{{\"queries\":{d},\"hits\":{d},\"reused_tokens\":{d},\"hot_bytes\":{d},\"capacity_bytes\":{d},\"entries\":null,\"evictions\":null}}", .{
+        m.prefix_cache_queries_total.load(),                          m.prefix_cache_hits_total.load(), m.prefix_cache_tokens_total.load(),
+        global_scheduler.?.resident_hot_cache_bytes.load(.monotonic), resolvedPrefixCacheMem(),
+    });
+    try w.print(",\"diagnostics\":{{\"max_concurrent\":{d},\"max_resident_models\":{d},\"max_resident_bytes\":{d},\"request_timeout_seconds\":{d},\"kv_attn_mode\":", .{
+        max_concurrent, registry.max_resident_models, registry.max_resident_mem, server_config.request_timeout_sec,
+    });
+    try std.json.Stringify.encodeJsonString(@tagName(server_config.kv_attn_mode), .{}, w);
+    try w.writeAll(",\"kv_quant\":");
+    try std.json.Stringify.encodeJsonString(if (configuredKvQuant().isQuant()) (if (configuredKvQuant().bits == 4) "4" else "8") else "off", .{}, w);
+    try w.print(",\"prefill_chunk\":{d},\"ane_int8_bytes\":{d},\"ane_layers\":{d},\"ngram_warm_bytes\":{d},\"speculative_drafted\":null,\"speculative_accepted\":null,\"decode_serial_reasons\":{{", .{
+        generate_mod.prefill_chunk_override, m.ane_int8_bytes.load(), m.ane_layers.load(), m.ngram_warm_bytes.load(),
+    });
+    var first_reason = true;
+    for (instr.SERIAL_REASONS, 0..) |name, i| {
+        if (name.len == 0) continue;
+        if (!first_reason) try w.writeAll(",");
+        first_reason = false;
+        try std.json.Stringify.encodeJsonString(name, .{}, w);
+        try w.print(":{d}", .{m.decode_serial_total[i].load()});
+    }
+    try w.writeAll("}}");
+    try w.writeAll(",\"models\":[");
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    var models = registry.entries.valueIterator();
+    var i: usize = 0;
+    while (models.next()) |entry_ptr| : (i += 1) {
+        const model = entry_ptr.*;
+        const loaded = model.state == .ready;
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"id\":");
+        try std.json.Stringify.encodeJsonString(model.id, .{}, w);
+        try w.writeAll(",\"state\":");
+        try std.json.Stringify.encodeJsonString(model_registry_mod.ModelStatus.stateName(model.state), .{}, w);
+        try w.writeAll(",\"backend\":");
+        if (loaded) {
+            const backend: ?[]const u8 = if (model.ds4_engine != null) "ds4" else if (model.llama_engine != null) "llama" else if (model.config != null) "mlx" else null;
+            if (backend) |name| try std.json.Stringify.encodeJsonString(name, .{}, w) else try w.writeAll("null");
+        } else try w.writeAll("null");
+        try w.writeAll(",\"bytes_on_disk\":");
+        try writeOptionalU64(w, model.bytes_on_disk);
+        try w.print(",\"bytes_resident\":{d},\"estimated_resident_bytes\":", .{model.bytes_resident});
+        try writeOptionalU64(w, if (loaded) null else model.bytes_on_disk);
+        try w.print(",\"estimate\":{},\"context_length\":", .{!loaded and model.bytes_on_disk != null});
+        try writeOptionalU64(w, if (loaded and model.config != null and model.config.?.max_position_embeddings > 0) model.config.?.max_position_embeddings else null);
+        try w.writeAll(",\"quantization_bits\":");
+        try writeOptionalU64(w, if (loaded and model.config != null and model.config.?.quant_bits > 0) model.config.?.quant_bits else null);
+        try w.writeAll(",\"error_name\":");
+        if (model.error_name) |name| try std.json.Stringify.encodeJsonString(name, .{}, w) else try w.writeAll("null");
+        try w.writeAll("}");
+    }
+    try w.writeAll("]");
+    return out.toOwnedSlice();
+}
+
+test "monitor extras report unloaded model estimate and JSON-safe metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var registry = try ModelRegistry.init(allocator, io, null, 2, 0, null);
+    defer registry.deinit();
+    _ = try registry.registerStub("model\"test", "/path/to/model", 1024);
+    var scheduler: scheduler_mod.Scheduler = undefined;
+    scheduler.resident_hot_cache_bytes = .init(0);
+    scheduler.kv_quant_config = .dense;
+    global_scheduler = &scheduler;
+    defer global_scheduler = null;
+    var m = instr.Metrics.init();
+    monitor_started_at_ms = nowMs(io);
+    const extras = try monitorExtrasJson(allocator, io, registry, &m);
+    defer allocator.free(extras);
+    const json = try std.mem.concat(allocator, u8, &.{ "{\"monitor\":{\"schema_version\":1", extras, "}}" });
+    defer allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const monitor = parsed.value.object.get("monitor").?;
+    const model = monitor.object.get("models").?.array.items[0];
+    try std.testing.expectEqualStrings("model\"test", model.object.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 1024), model.object.get("estimated_resident_bytes").?.integer);
+    try std.testing.expect(model.object.get("estimate").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), model.object.get("bytes_resident").?.integer);
+    try std.testing.expect(monitor.object.get("resources").?.object.get("memory_pressure_pct").? == .null);
 }
 
 /// Minimal HTML escape — covers the five chars that matter inside element
@@ -9475,6 +9632,7 @@ fn handleStreamingCompletion(
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
     });
+    stream.monitor_slot_started = true;
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
     // Legacy completions carries logprobs as four parallel arrays whose
@@ -9744,6 +9902,7 @@ fn nonStreamingViaScheduler(
         .logprobs_n = logprobs_n,
         .kv_quant_config = kv_quant_override,
     });
+    if (conn) |c| c.monitor_slot_started = true;
     defer sch.complete(slot);
 
     var output_ids = std.ArrayList(u32).empty;
@@ -10718,6 +10877,7 @@ fn handleStreamingGeneration(
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
     });
+    stream.monitor_slot_started = true;
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
 
@@ -11932,8 +12092,28 @@ const GaugeSamplerCtx = struct {
 /// fields off-thread, so the inference path stays lock-free per token.
 fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // System gauges (non-blocking syscalls).
-    ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
-    ctx.metrics.memory_mb.set(@as(u64, metrics.getAppMemFootprintMb()));
+    const cpu_sample = metrics.getCpuPctOptional();
+    const gpu_sample = metrics.getGpuPctOptional();
+    const footprint_sample = metrics.getAppMemFootprintMbOptional();
+    const total_bytes = metrics.getTotalMemBytes();
+    const available_sample = metrics.getAvailableMemBytesOptional();
+    const cpu_pct = cpu_sample orelse 0;
+    const gpu_pct = gpu_sample orelse 0;
+    const footprint_mb = footprint_sample orelse 0;
+    const available_bytes = available_sample orelse 0;
+    monitor_cpu_pct.store(cpu_pct, .monotonic);
+    monitor_cpu_available.store(cpu_sample != null, .monotonic);
+    monitor_gpu_available.store(gpu_sample != null, .monotonic);
+    monitor_process_memory_available.store(footprint_sample != null, .monotonic);
+    monitor_system_total_bytes.store(total_bytes, .monotonic);
+    monitor_system_available_bytes.store(available_bytes, .monotonic);
+    monitor_system_available.store(available_sample != null, .monotonic);
+    if (metrics.getSwapUsedBytes()) |swap_bytes| {
+        monitor_swap_used_bytes.store(swap_bytes, .monotonic);
+        monitor_swap_available.store(true, .monotonic);
+    } else monitor_swap_available.store(false, .monotonic);
+    ctx.metrics.gpu_utilization_pct.set(@as(u64, gpu_pct));
+    ctx.metrics.memory_mb.set(@as(u64, footprint_mb));
     // The two halves of the MLX allocator, so `memory_mb`'s gap has a name.
     var mlx_active: usize = 0;
     var mlx_cache: usize = 0;
@@ -11952,7 +12132,13 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
     const running = @as(u64, ctx.scheduler.in_flight);
     const waiting = @as(u64, ctx.scheduler.pending.items.len);
+    var live_sessions: [instr.MAX_SESSIONS]instr.Session = undefined;
+    const live_count = ctx.scheduler.live_session_count;
+    @memcpy(live_sessions[0..live_count], ctx.scheduler.live_sessions[0..live_count]);
     ctx.scheduler.queue_mu.unlock(ctx.scheduler.io);
+    for (live_sessions[0..live_count]) |session| {
+        if (session.request_id != 0) ctx.metrics.monitor.updateRequestOutput(session.request_id, session.generated_tokens);
+    }
     ctx.metrics.requests_running.set(running);
     ctx.metrics.requests_waiting.set(waiting);
 
@@ -11970,6 +12156,67 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic));
     ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic));
     ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
+    const sampled_at_ms: u64 = @intCast(@max(0, nowMs(ctx.scheduler.io)));
+    monitor_sampled_at_ms.store(@intCast(sampled_at_ms), .monotonic);
+    const ttft = ctx.metrics.monitor.ttftTotals();
+    const active_time = ctx.metrics.monitor.activeTime(@intCast(std.Io.Timestamp.now(ctx.scheduler.io, .boot).nanoseconds));
+    ctx.metrics.monitor.appendSample(.{
+        .at_ms = sampled_at_ms,
+        .running = running,
+        .queued = waiting,
+        .prefill_tokens_total = ctx.metrics.prefill_tokens_total.load(),
+        .prefill_tokens_forwarded_live_total = ctx.metrics.prefill_forwarded_live_total.load(),
+        .generation_tokens_live = ctx.metrics.generation_tokens_emitted_total.load(),
+        .prefill_active_ns_total = if (active_time) |time| time.prefill_ns else null,
+        .decode_active_ns_total = if (active_time) |time| time.decode_ns else null,
+        .requests_completed_total = ctx.metrics.requests_success_total.load() + ctx.metrics.requests_cancelled_total.load() + ctx.metrics.requests_failed_total.load(),
+        .cache_queries_total = ctx.metrics.prefix_cache_queries_total.load(),
+        .cache_hits_total = ctx.metrics.prefix_cache_hits_total.load(),
+        .ttft_ns_sum = ttft.ns_sum,
+        .ttft_count = ttft.count,
+        .cpu_pct = if (cpu_sample) |value| @floatFromInt(value) else null,
+        .gpu_pct = if (gpu_sample) |value| @floatFromInt(value) else null,
+        .process_bytes = if (footprint_sample) |value| @as(u64, value) * 1024 * 1024 else null,
+        .mlx_active_bytes = mlx_active,
+        .mlx_cache_bytes = mlx_cache,
+    });
+}
+
+test "gauge sampler publishes active output and live prefill history" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var m = instr.Metrics.init();
+    const id = m.monitor.beginRequest("model", @intCast(@max(0, nowMs(io))));
+    m.prefill_forwarded_live_total.add(11);
+    m.prefix_cache_queries_total.add(4);
+    m.prefix_cache_hits_total.add(2);
+    m.generation_tokens_emitted_total.add(9);
+    m.ttft_ns.observe(99_000_000);
+    const finished_id = m.monitor.beginRequest("model", 0);
+    m.monitor.completeRequest(.{ .id = finished_id, .model = "model", .outcome = .success, .started_at_ms = 0, .finished_at_ms = 50, .ttft_ns = 42_000_000 });
+    var scheduler: scheduler_mod.Scheduler = undefined;
+    scheduler.io = io;
+    scheduler.queue_mu = .init;
+    scheduler.pending = .empty;
+    scheduler.in_flight = 1;
+    scheduler.live_session_count = 1;
+    scheduler.live_sessions[0] = instr.Session.init("model", .decode, 10, 0, 7, 0);
+    scheduler.live_sessions[0].request_id = id;
+    scheduler.inflight_generated_tokens = .init(7);
+    scheduler.inflight_prefill_tokens = .init(0);
+    scheduler.inflight_prefill_expected = .init(0);
+    scheduler.requests_prefilling = .init(0);
+    var stop = std.atomic.Value(bool).init(false);
+    sampleGauges(.{ .metrics = &m, .scheduler = &scheduler, .stop = &stop });
+    const snapshot = m.monitor.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.history_len);
+    try std.testing.expectEqual(@as(u64, 11), snapshot.history[0].prefill_tokens_forwarded_live_total);
+    try std.testing.expectEqual(@as(?u64, 4), snapshot.history[0].cache_queries_total);
+    try std.testing.expectEqual(@as(?u64, 2), snapshot.history[0].cache_hits_total);
+    try std.testing.expectEqual(@as(u64, 9), snapshot.history[0].generation_tokens_live);
+    try std.testing.expectEqual(@as(?u64, 42_000_000), snapshot.history[0].ttft_ns_sum);
+    try std.testing.expectEqual(@as(?u64, 1), snapshot.history[0].ttft_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.active_len);
+    try std.testing.expectEqual(@as(?u32, 7), snapshot.active[0].output_tokens);
 }
 
 const IdleEvictCtx = struct {
@@ -12371,6 +12618,7 @@ fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
 /// Send a 401 with a Basic-auth challenge so browsers prompt for the key on the
 /// index + metrics pages; API clients read the JSON error body.
 fn sendUnauthorized(stream: *Conn) !void {
+    recordMonitorRejection(stream, "authentication_error");
     const body = "{\"error\":{\"message\":\"missing or invalid API key\",\"type\":\"authentication_error\"}}";
     logHttpResponse("401 Unauthorized", "application/json", body);
     if (stream.ws_mode) |bridge| {
@@ -12951,6 +13199,28 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *s
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
 }
 
+fn isMonitorInferenceRoute(method: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, method, "GET")) return std.mem.eql(u8, path, "/v1/responses");
+    if (!std.mem.eql(u8, method, "POST")) return false;
+    const routes = [_][]const u8{
+        "/v1/chat/completions",   "/v1/completions",    "/v1/embeddings",   "/v1/messages",  "/v1/responses",
+        "/v1/images/generations", "/v1/images/edits",   "/v1/audio/speech", "/v1/decisions", "/v1/audio/music-generations",
+        "/v1/video/generations",  "/v1/3d/generations", "/api/chat",        "/api/generate", "/api/embed",
+        "/api/embeddings",
+    };
+    for (routes) |route| if (std.mem.eql(u8, path, route)) return true;
+    return false;
+}
+
+fn recordMonitorRejection(stream: *Conn, code: []const u8) void {
+    if (!stream.monitor_inference_request or stream.monitor_slot_started or stream.monitor_rejection_recorded) return;
+    if (g_metrics) |m| {
+        m.requests_rejected_total.inc();
+        m.monitor.recordEvent(.{ .at_ms = @intCast(@max(0, nowMs(stream.io))), .kind = "request_rejected", .code = code });
+    }
+    stream.monitor_rejection_recorded = true;
+}
+
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
     return std.fmt.bufPrint(
         buf,
@@ -12960,6 +13230,7 @@ fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u
 }
 
 fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
+    recordMonitorRejection(stream, err_type);
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
 
@@ -13625,7 +13896,7 @@ fn piecesOf(item: MediaItem) usize {
 }
 
 fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
-    var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(piece)));
+    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(piece)));
     switch (piece) {
         .image => |im| {
             h.update(std.mem.asBytes(&[_]u32{ im.width, im.height, im.grid_h, im.grid_w }));
@@ -14573,6 +14844,7 @@ test "RequestMedia frees every decoded buffer it was handed" {
 // ── Anthropic Messages API ──
 
 fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
+    recordMonitorRejection(stream, err_type);
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
     const body = try std.fmt.allocPrint(allocator,
@@ -15749,6 +16021,7 @@ fn handleAnthropicStreaming(
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
     });
+    stream.monitor_slot_started = true;
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
 
@@ -17330,6 +17603,7 @@ fn handleResponsesInner(
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
         });
+        stream.monitor_slot_started = true;
         var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_slice);
         defer ts.deinit(allocator);
 
@@ -20040,8 +20314,22 @@ test "expandMediaPlaceholders: an LFM2-VL tiled source is one item, every tile l
     // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
     const want = [_]u32{
         1,
-        125009, 124908, 124907, 124909, 124907, 124918, 124907, 124919, 124907, 125008, 124907, 125010,
-        125009, 124907, 124907, 125010,
+        125009,
+        124908,
+        124907,
+        124909,
+        124907,
+        124918,
+        124907,
+        124919,
+        124907,
+        125008,
+        124907,
+        125010,
+        125009,
+        124907,
+        124907,
+        125010,
         2,
     };
     try testing.expectEqualSlices(u32, &want, out.ids);

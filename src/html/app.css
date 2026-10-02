@@ -525,7 +525,10 @@ table.models .state.error { color: #f28b82 }
 .ep .d { color: var(--dim); font-size: 0.8125rem; margin-top: 2px }
 
 @media (max-width: 820px) {
-  .side { position: absolute; z-index: 30; height: 100%; box-shadow: 0 0 40px rgba(0, 0, 0, .5) }
+  .side { position: absolute; z-index: 30; height: 100%; margin-left: -260px; box-shadow: 0 0 40px rgba(0, 0, 0, .5) }
+  .app.mobile-open .side { margin-left: 0 }
+  .side-open { display: block }
+  .app.mobile-open .side-open { display: none }
   .greeting { font-size: 1.875rem }
   .scroll, .log { padding-left: 16px; padding-right: 16px }
   .dock { padding-left: 12px; padding-right: 12px }
@@ -632,3 +635,81 @@ html[lang^=zh] .lang-toggle::after { content: "EN" }
 :root[data-theme=light] .m.post { background: #e6effd; color: #1a5fd0 }
 :root[data-theme=light] .m.del { background: #fdeaea; color: #b3261e }
 :root[data-theme=light] .m.ws { background: #f1eafd; color: #6b3fbf }
+
+#tab-monitor .scroll { padding-top: 28px }
+#tab-monitor .scroll > * { max-width: 1400px }
+.monitor-heading { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:24px }
+.monitor-heading h1 { font-size:1.9rem; line-height:1.2; margin:7px 0 }
+.monitor-heading p { color:var(--dim); margin:0; font-size:.875rem }
+.monitor-eyebrow { font-size:.625rem; letter-spacing:.16em; color:var(--dim) }
+#m-status { border:1px solid var(--line); border-radius:999px; padding:5px 12px; font-size:.75rem; white-space:nowrap }
+#m-status[data-state=live] { color:#63d7b0 }
+#m-status[data-state=offline], #m-status[data-state=unauthorized] { color:#f3a6a6 }
+.monitor-toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px }
+.monitor-toolbar label { font-size:.75rem; color:var(--dim); display:flex; align-items:center; gap:8px }
+.monitor-toolbar select, .monitor-toolbar button { border:1px solid var(--line); background:var(--card); color:var(--fg); padding:7px 11px; border-radius:7px; font:inherit; font-size:.75rem; max-width:260px }
+.monitor-toolbar button:hover { border-color:var(--accent) }
+.monitor-spacer { flex:1 }
+.monitor-notice { font-size:.75rem; color:var(--dim); border-left:2px solid var(--line); padding:4px 10px; margin:14px 0 8px }
+.monitor-meta { color:var(--dim); font-size:.6875rem; margin-bottom:20px; min-height:18px }
+.monitor-grid { display:grid; gap:12px }
+.monitor-overview-scope { margin-bottom:8px; min-height:0 }
+.monitor-overview { grid-template-columns:repeat(5,minmax(0,1fr)) }
+.monitor-latency { grid-template-columns:repeat(3,minmax(0,1fr)) }
+.monitor-summary { display:grid; grid-template-columns:minmax(0,2fr) repeat(2,minmax(0,1fr)); gap:12px; margin-bottom:12px; padding:14px 16px; border:1px solid var(--line); border-radius:10px; background:var(--card) }
+.monitor-summary > div { min-width:0; display:flex; flex-direction:column; gap:5px }
+.monitor-summary strong { font-size:.875rem; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.monitor-tile { border:1px solid var(--line); background:var(--card); border-radius:10px; padding:16px }
+.monitor-label { color:var(--dim); font-size:.6875rem; margin-bottom:10px }
+.monitor-help { cursor:help; margin-left:3px; color:var(--accent) }
+.monitor-value { font-family:var(--mono); font-size:1.625rem; line-height:1.3; letter-spacing:-.045em; font-variant-numeric:tabular-nums }
+.monitor-latency .monitor-value { font-size:1.25rem }
+.monitor-caption { font-size:.625rem; color:var(--dim); margin-top:8px }
+.monitor-section-head { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:6px 14px; margin:22px 0 12px }
+.monitor-section-head h2, .monitor-section-head h3 { margin:0; font-size:.875rem; font-weight:600 }
+.monitor-section-head span { color:var(--dim); font-size:.625rem }
+.monitor-charts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:12px }
+.monitor-primary-charts { margin-top:0 }
+.monitor-chart { min-width:0; border:1px solid var(--line); border-radius:10px; background:var(--card); padding:16px }
+.monitor-chart .monitor-section-head { margin:0 0 14px }
+.monitor-chart svg { width:100%; height:130px; display:block }
+.monitor-chart svg:focus { outline:2px solid var(--accent); outline-offset:3px }
+.monitor-plot { position:relative; min-width:0 }
+.monitor-tooltip { position:absolute; z-index:2; max-width:calc(100% - 8px); min-width:120px; padding:7px 9px; border:1px solid var(--line); border-radius:7px; background:var(--bg); box-shadow:0 8px 24px rgba(0,0,0,.22); font:normal .6875rem var(--mono); pointer-events:none; white-space:normal; overflow-wrap:anywhere }
+.monitor-tooltip strong, .monitor-tooltip span { display:block }
+.monitor-tooltip strong { color:var(--fg); font-weight:600 }
+.monitor-tooltip span { color:var(--dim); margin-top:3px }
+.monitor-tooltip[hidden] { display:none }
+.monitor-axis { display:flex; justify-content:space-between; font-size:.625rem; color:var(--dim); font-family:var(--mono) }
+.monitor-section { min-width:0; margin-top:20px; border:1px solid var(--line); background:var(--card); border-radius:10px; padding:16px }
+.monitor-section .monitor-section-head { margin:0 0 14px }
+.monitor-table-wrap { overflow-x:auto }
+.monitor-table-wrap table { border-collapse:collapse; width:100%; font-size:.75rem; text-align:left }
+.monitor-table-wrap th { color:var(--dim); font-weight:500; font-size:.625rem; padding:8px 12px; white-space:nowrap; border-bottom:1px solid var(--line) }
+.monitor-table-wrap td { padding:11px 12px; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; white-space:nowrap; max-width:340px; overflow:hidden; text-overflow:ellipsis }
+.monitor-table-wrap tr:last-child td { border-bottom:0 }
+.monitor-empty { color:var(--dim); font-size:.75rem; padding:20px 0 }
+.monitor-request { background:transparent; border:0; padding:0; color:var(--accent); cursor:pointer; font-family:var(--mono); font-size:.75rem; text-decoration:underline; text-underline-offset:3px }
+.monitor-outcome { font-size:.6875rem; padding:3px 7px; border-radius:5px; background:var(--bg) }
+.monitor-outcome.ok { color:#63d7b0 }
+.monitor-outcome.other { color:#e8b784 }
+.monitor-pair { display:grid; grid-template-columns:1fr 1fr; gap:12px }
+.monitor-facts { display:grid; gap:0 }
+.monitor-facts > div { display:flex; justify-content:space-between; gap:20px; padding:9px 0; border-bottom:1px solid var(--line); font-size:.75rem }
+.monitor-facts > div:last-child { border:0 }
+.monitor-facts span { color:var(--dim) }
+.monitor-facts strong { font-weight:500; text-align:right; overflow-wrap:anywhere }
+.monitor-events > div { display:grid; grid-template-columns:85px 125px 1fr; gap:12px; font-size:.75rem; padding:9px 0; border-bottom:1px solid var(--line) }
+.monitor-events time { color:var(--dim); font-family:var(--mono); font-size:.625rem }
+.monitor-events strong { font-weight:500 }
+.monitor-events span { overflow-wrap:anywhere; color:var(--dim) }
+.monitor-section summary, #m-inspector summary { cursor:pointer; font-size:.875rem; font-weight:600 }
+.monitor-detail-body { margin-top:18px }
+.monitor-detail-body > .monitor-section { margin-top:12px }
+#m-inspector { margin-top:14px }
+#m-request-detail { overflow:auto; padding:14px; background:var(--bg); border-radius:8px; font-size:.75rem; max-height:350px }
+#mlx-metrics :focus-visible { outline:2px solid var(--accent); outline-offset:3px }
+:root[data-theme=light] #m-status[data-state=live], :root[data-theme=light] .monitor-outcome.ok { color:#087c60 }
+:root[data-theme=light] .monitor-outcome.other { color:#9c5716 }
+@media(max-width:900px) { .monitor-overview { grid-template-columns:repeat(2,minmax(0,1fr)) } .monitor-overview .monitor-tile:last-child { grid-column:1/-1 } .monitor-latency { grid-template-columns:1fr } .monitor-charts, .monitor-pair { grid-template-columns:1fr } }
+@media(max-width:480px) { .monitor-heading { align-items:flex-start } .monitor-heading h1 { font-size:1.6rem } .monitor-summary { grid-template-columns:1fr 1fr } .monitor-summary > div:first-child { grid-column:1/-1 } .monitor-toolbar { gap:8px } .monitor-toolbar label { width:100%; justify-content:space-between } .monitor-toolbar select { max-width:70% } .monitor-spacer { display:none } .monitor-value { font-size:1.4rem } .monitor-events > div { grid-template-columns:75px 1fr } .monitor-events span { grid-column:1/-1 } }
