@@ -18,6 +18,8 @@ test {
     _ = @import("server.zig");
     _ = @import("model.zig");
     _ = @import("generate.zig");
+    _ = @import("generate_common.zig");
+    _ = @import("loop_detect.zig");
     _ = @import("transformer.zig");
     _ = @import("vision.zig");
     _ = @import("qwen_vision.zig");
@@ -46,6 +48,7 @@ test {
     _ = @import("ws.zig");
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
+    _ = @import("kv_quant_config.zig");
     _ = @import("model_settings.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");

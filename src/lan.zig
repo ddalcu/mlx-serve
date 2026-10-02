@@ -14,8 +14,8 @@
 //! Design rules:
 //!   - The proxy is a TRANSPORT: no scheduler, no MLX, no inference-thread
 //!     involvement. Tunnels run on the calling connection thread; discovery
-//!     runs on one browser thread; dns_sd (mDNSResponder, in libSystem) does
-//!     all mDNS work — no hand-rolled multicast.
+//!     runs on one browser thread, using dns_sd on macOS and the built-in
+//!     IPv4 mDNS responder on Linux.
 //!   - Loops are impossible by construction: remote entries are never
 //!     included in the model list served to LAN peers, and `@peer` ids from
 //!     non-loopback clients are denied at the gate (no multi-hop).
@@ -23,6 +23,8 @@
 //!     the Swift Settings pane carries the disclosure.
 
 const std = @import("std");
+const is_linux = @import("builtin").os.tag == .linux;
+const mdns = if (is_linux) @import("lan_mdns.zig") else struct {};
 const log = @import("log.zig");
 
 pub const SERVICE_TYPE = "_mlxserve._tcp";
@@ -342,6 +344,7 @@ pub const Lan = struct {
     /// (and skips) its own advertisement.
     token_hex: [16]u8 = undefined,
     reg_ref: DNSServiceRef = null,
+    responder: if (is_linux) ?*mdns.Responder else void = if (is_linux) null else {},
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = .init(false),
     /// pthread mutex, not `std.Io.Mutex`: lookups run on conn threads and the
@@ -401,7 +404,7 @@ pub const Lan = struct {
     pub fn shutdown(l: *Lan) void {
         l.stop_flag.store(true, .release);
         if (l.thread) |th| th.join();
-        if (l.reg_ref != null) DNSServiceRefDeallocate(l.reg_ref); // unregisters
+        if (!is_linux and l.reg_ref != null) DNSServiceRefDeallocate(l.reg_ref); // unregisters
         var it = l.peers.valueIterator();
         while (it.next()) |p| p.deinit(l.alloc);
         l.peers.deinit();
@@ -482,6 +485,7 @@ pub const Lan = struct {
     }
 
     fn startAdvertise(l: *Lan) void {
+        if (is_linux) return; // the Linux browser thread owns the multicast socket
         var txt_buf: [32]u8 = undefined;
         const txt = txtBuild(&txt_buf, &l.token_hex);
         var name_z: [72]u8 = undefined;
@@ -537,25 +541,37 @@ pub const Lan = struct {
         const display = sanitizeName(&disp_buf, service_name);
 
         var res: ResolveOut = .{};
-        var ref: DNSServiceRef = null;
-        if (DNSServiceResolve(&ref, 0, 0, service_name.ptr, SERVICE_TYPE, domain.ptr, onResolve, &res) != 0) return .failed;
-        const resolved = pumpUntil(ref, &res.done, 3000);
-        DNSServiceRefDeallocate(ref);
-        if (!resolved) {
-            log.debug("[lan] resolve timed out for \"{s}\"\n", .{display});
-            return .failed;
-        }
-        if (std.mem.eql(u8, res.token[0..res.token_len], &l.token_hex)) return .self_ad;
-
         var addr: AddrOut = .{};
-        var aref: DNSServiceRef = null;
-        res.host[res.host_len] = 0;
-        if (DNSServiceGetAddrInfo(&aref, 0, 0, kDNSServiceProtocol_IPv4, @ptrCast(&res.host), onAddr, &addr) != 0) return .failed;
-        const addressed = pumpUntil(aref, &addr.done, 3000);
-        DNSServiceRefDeallocate(aref);
-        if (!addressed or addr.count == 0) {
-            log.debug("[lan] no IPv4 for \"{s}\" host \"{s}\"\n", .{ display, res.host[0..res.host_len] });
-            return .failed;
+        if (is_linux) {
+            const responder = l.responder orelse return .failed;
+            const svc = for (responder.found()) |*svc| {
+                if (std.ascii.eqlIgnoreCase(svc.name(), service_name)) break svc;
+            } else return .failed;
+            if (!svc.resolved()) return .failed;
+            if (txtFind(svc.txt(), "t=")) |token|
+                if (std.mem.eql(u8, token, &l.token_hex)) return .self_ad;
+            res.port = svc.port;
+            addr.add(svc.ip4.?);
+        } else {
+            var ref: DNSServiceRef = null;
+            if (DNSServiceResolve(&ref, 0, 0, service_name.ptr, SERVICE_TYPE, domain.ptr, onResolve, &res) != 0) return .failed;
+            const resolved = pumpUntil(ref, &res.done, 3000);
+            DNSServiceRefDeallocate(ref);
+            if (!resolved) {
+                log.debug("[lan] resolve timed out for \"{s}\"\n", .{display});
+                return .failed;
+            }
+            if (std.mem.eql(u8, res.token[0..res.token_len], &l.token_hex)) return .self_ad;
+
+            var aref: DNSServiceRef = null;
+            res.host[res.host_len] = 0;
+            if (DNSServiceGetAddrInfo(&aref, 0, 0, kDNSServiceProtocol_IPv4, @ptrCast(&res.host), onAddr, &addr) != 0) return .failed;
+            const addressed = pumpUntil(aref, &addr.done, 3000);
+            DNSServiceRefDeallocate(aref);
+            if (!addressed or addr.count == 0) {
+                log.debug("[lan] no IPv4 for \"{s}\" host \"{s}\"\n", .{ display, res.host[0..res.host_len] });
+                return .failed;
+            }
         }
 
         // Try each address, loopback first; the first one that ACCEPTS is the
@@ -768,6 +784,7 @@ fn onBrowse(ref: DNSServiceRef, flags: u32, if_idx: u32, err: i32, name: ?[*:0]c
 const REVIVE_INTERVAL_MS: i64 = 5_000;
 
 fn threadMain(l: *Lan) void {
+    if (is_linux) return threadMainLinux(l);
     var browse_ref: DNSServiceRef = null;
     defer if (browse_ref != null) DNSServiceRefDeallocate(browse_ref);
 
@@ -856,6 +873,60 @@ fn threadMain(l: *Lan) void {
             last_refresh = now;
             l.refreshKnown();
         }
+    }
+}
+
+fn threadMainLinux(l: *Lan) void {
+    var responder: mdns.Responder = undefined;
+    var host_buf: [32]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "mlx-{s}", .{l.token_hex}) catch unreachable;
+    responder.init(.{ .discover = l.discover, .host_name = host }) catch |err| {
+        log.warn("[lan] mDNS socket unavailable ({s})\n", .{@errorName(err)});
+        return;
+    };
+    l.responder = &responder;
+    defer {
+        responder.deinit();
+        l.responder = null;
+    }
+    if (l.share != null) {
+        var name_buf: [64]u8 = undefined;
+        var txt_buf: [32]u8 = undefined;
+        const name = responder.claimName(l.name, &l.token_hex, &name_buf);
+        responder.setAdvertisement(.{ .instance = name, .port = l.port, .txt = txtBuild(&txt_buf, &l.token_hex) });
+        responder.announceBurst();
+        log.info("[lan] sharing as \"{s}\" ({s} port {d})\n", .{ name, SERVICE_TYPE, l.port });
+    }
+    if (l.discover) log.info("[lan] discovering peers ({s})\n", .{SERVICE_TYPE});
+    var next_refresh: i64 = 0;
+    while (!l.stop_flag.load(.acquire)) {
+        responder.pump(1000);
+        const now = monoMs();
+        const poked = l.refresh_asap.swap(false, .acq_rel);
+        if (!l.discover or (now < next_refresh and !poked)) continue;
+        next_refresh = now + 10_000;
+        responder.clearServices();
+        responder.sendQuery();
+        responder.pump(750);
+        // PTR-only replies need SRV/TXT, then the SRV target's A record.
+        for (0..2) |_| {
+            responder.sendResolveQueries();
+            responder.pump(250);
+        }
+        for (responder.found()) |*svc| {
+            if (!svc.resolved() or l.known.contains(svc.name())) continue;
+            const key = l.alloc.dupe(u8, svc.name()) catch continue;
+            const domain = l.alloc.dupeSentinel(u8, "local.", 0) catch {
+                l.alloc.free(key);
+                continue;
+            };
+            l.known.put(key, .{ .domain = domain }) catch {
+                l.alloc.free(key);
+                l.alloc.free(domain);
+            };
+        }
+        // Missing services count as failed resolves, preserving main's grace.
+        l.refreshKnown();
     }
 }
 

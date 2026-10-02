@@ -126,6 +126,12 @@ PR #95 threaded `enable_pld` into the function and left the two literals beside 
 
 Diagnosis signature for the class: a flag that parses, documents, and boots without complaint but produces no behavioral difference, on ONE serve path only, where that path constructs a config aggregate by hand. Grep for the config literal, not the flag — the flag's parse site is always innocent. Guards: `server.PldDefaults` unit tests + `tests/test_headless_spec_flags.sh`, which boots headless over an EMPTY `--model-dir` (discovers zero models, needs no checkpoint, runs in seconds) and asserts the boot banner echoes non-default lengths — red on the pre-fix binary at `draft_len=5, key_len=3`.
 
+Linux llama KV had the same flag-eater shape: `--kv-quant` configured only
+MLX, and headless loads omitted the existing llama K/V type fields. Map the
+Linux flag to the llama option and carry both types through headless loads.
+Guard: `tests/test_llama_kv_quant.py` checks the context's actual K/V types,
+allocation size and generation for startup and headless loads, not the banner.
+
 ### `name=` matched inside `filename=` → a well-formed image upload 400'd "missing image"
 Found by pre-merge review of the MageFlow branch (2026-07-25), in `multipart.zig`, before it could reach a user. `paramValue(line, key)` pulled a `Content-Disposition` parameter with a plain `indexOfIgnoreCase` substring search. `name=` is a substring of `filename=`, so the value it returned depended entirely on which parameter the client wrote FIRST:
 

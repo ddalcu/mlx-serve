@@ -1,6 +1,7 @@
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
 const log = @import("log.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
+const mlx_gguf = if (build_cfg.mlx_enabled) @import("arch/mlx_gguf.zig") else @import("mlx_gguf_stub.zig");
 const io_util = @import("io_util.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };

@@ -1,11 +1,12 @@
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
 const jinja_c = @import("jinja_c");
 const tokenizer_mod = @import("tokenizer.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (build_cfg.ds4_enabled) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const ds4_ffi = if (build_cfg.ds4_enabled) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const arch_llama = if (build_cfg.llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const log = @import("log.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
+const mlx_gguf = if (build_cfg.mlx_enabled) @import("arch/mlx_gguf.zig") else @import("mlx_gguf_stub.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 

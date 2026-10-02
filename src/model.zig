@@ -1,13 +1,14 @@
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
 const builtin = @import("builtin");
-const mlx = @import("mlx.zig");
+const mlx = if (build_cfg.mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
 const log = @import("log.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
-const sushi_exl3 = @import("sushi_exl3");
+const mlx_gguf = if (build_cfg.mlx_enabled) @import("arch/mlx_gguf.zig") else @import("mlx_gguf_stub.zig");
+const sushi_exl3 = if (build_cfg.mlx_enabled) @import("sushi_exl3") else @import("model_weights_stub.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
-const qwen4_exp = @import("qwen4_exp.zig");
-const kv_quant_mod = @import("kv_quant.zig");
+const qwen4_exp = @import("qwen4_common.zig");
+const kv_quant_mod = @import("kv_quant_config.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
@@ -853,7 +854,7 @@ pub const ModelConfig = struct {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
-        const rows = @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS));
+        const rows = @as(u64, @intCast((if (build_cfg.mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig")).QSA_RING_ROWS));
         return n * rows * hd * 2;
     }
 
@@ -861,7 +862,7 @@ pub const ModelConfig = struct {
     /// (`SSMCacheEntry.qsa_score_bank`). Never in an entry. Zero without an indexer.
     pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
-        if (@import("transformer.zig").qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
+        if ((if (build_cfg.mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig")).qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
@@ -3674,7 +3675,8 @@ fn jsonFloat(v: std.json.Value) !f32 {
 }
 
 /// Holds all loaded weights as mlx arrays, keyed by name.
-pub const Weights = struct {
+pub const Weights = if (build_cfg.mlx_enabled) MlxWeights else @import("model_weights_stub.zig").Weights;
+const MlxWeights = struct {
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
 
@@ -3783,6 +3785,7 @@ pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
 /// Load all safetensors files from model_dir.
 /// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
+    if (comptime !build_cfg.mlx_enabled) return error.MlxUnavailable;
     return loadWeightsOpt(io, allocator, model_dir, .{});
 }
 
@@ -3793,6 +3796,7 @@ pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
+    if (comptime !build_cfg.mlx_enabled) return error.MlxUnavailable;
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
     if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
@@ -3821,6 +3825,7 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
 }
 
 pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
+    if (comptime !build_cfg.mlx_enabled) return error.MlxUnavailable;
     return loadWeightsOpt(io, allocator, model_dir, .{ .vision = true });
 }
 
@@ -7053,7 +7058,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
     try testing.expectEqual(@as(u64, 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
-    try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
+    try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast((if (build_cfg.mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig")).QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
     try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);

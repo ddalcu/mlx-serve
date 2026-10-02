@@ -162,3 +162,32 @@ jobs:
           bash ../scripts/patch-swatex-font-lookup.sh .build/checkouts/SwaTex
           swift build --build-tests
           bash test.sh
+
+  linux-gguf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize embedded CLI plugin
+        run: git submodule update --init lib/opencode2-mlx-serve
+
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: .zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
+      - name: Install Zig (pinned nightly)
+        run: |
+          bash scripts/fetch-zig.sh
+          echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebp-dev
+
+      - name: Check GGUF-only server
+        run: zig build check -Dgguf-only -Doptimize=ReleaseFast
+
+      - name: Run Linux unit tests
+        run: zig build test -Dgguf-only --summary all

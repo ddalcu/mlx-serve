@@ -4,7 +4,7 @@
 //! The app edits the file; the server owns applying it. A malformed file is
 //! logged and treated as empty: a settings typo must never stop a load.
 const std = @import("std");
-const kv_quant = @import("kv_quant.zig");
+const kv_quant = @import("kv_quant_config.zig");
 const log = @import("log.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 

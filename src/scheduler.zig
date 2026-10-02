@@ -31,33 +31,34 @@
 //! drains. Generation end is signaled by `state == .finished` (or `.errored`)
 //! plus a cv broadcast.
 
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const mlx = if (build_cfg.mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
+const transformer_mod = if (build_cfg.mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
 const tokenizer_mod = @import("tokenizer.zig");
-const generate_mod = @import("generate.zig");
+const generate_mod = if (build_cfg.mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
 const rp_mod = @import("reasoning_protocol.zig");
-const gen_mod = @import("gen.zig");
-const drafter_mod = @import("drafter.zig");
-const mtp_graft = @import("mtp_graft.zig");
-const mtp_mod = @import("mtp.zig");
-const ane_mod = @import("ane.zig");
-const diffusion_mod = @import("diffusion.zig");
+const gen_mod = if (build_cfg.mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
+const drafter_mod = if (build_cfg.mlx_enabled) @import("drafter.zig") else @import("spec_stub.zig");
+const mtp_graft = if (build_cfg.mlx_enabled) @import("mtp_graft.zig") else @import("spec_stub.zig");
+const mtp_mod = if (build_cfg.mlx_enabled) @import("mtp.zig") else @import("spec_stub.zig");
+const ane_mod = if (build_cfg.mlx_enabled) @import("ane.zig") else @import("ane_stub.zig");
+const diffusion_mod = if (build_cfg.mlx_enabled) @import("diffusion.zig") else @import("diffusion_stub.zig");
 const model_mod = @import("model.zig");
-const vision_mod = @import("vision.zig");
+const vision_mod = if (build_cfg.mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
 const chat_mod = @import("chat.zig");
-const prefix_cache_mod = @import("prefix_cache.zig");
-const restore_dump = @import("restore_dump.zig");
+const prefix_cache_mod = if (build_cfg.mlx_enabled) @import("prefix_cache.zig") else @import("mlx_cache_stub.zig");
+const restore_dump = if (build_cfg.mlx_enabled) @import("restore_dump.zig") else @import("mlx_cache_stub.zig");
 const metrics_mod = @import("metrics.zig");
-const kv_disk_cache = @import("kv_disk_cache.zig");
+const kv_disk_cache = if (build_cfg.mlx_enabled) @import("kv_disk_cache.zig") else @import("mlx_cache_stub.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
+const arch_ds4 = if (build_cfg.ds4_enabled) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (build_cfg.llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const mlx_gguf = if (build_cfg.mlx_enabled) @import("arch/mlx_gguf.zig") else @import("mlx_gguf_stub.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
@@ -72,7 +73,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
-const dflash_mod = @import("dflash.zig");
+const dflash_mod = if (build_cfg.mlx_enabled) @import("dflash.zig") else @import("spec_stub.zig");
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const DflashModel = dflash_mod.DflashModel;
@@ -3134,6 +3135,7 @@ pub fn genLoadResidentBytes(media_peak: u64, bytes_on_disk: u64) u64 {
 /// mark ready. The MLX/ds4/llama fields stay null; request handlers route
 /// through the matching `image_engine`/`audio_engine`/`video_engine` slot.
 fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mod.Modality) !void {
+    if (comptime !build_cfg.media_gen_enabled) return error.MlxUnavailable;
     log.info("[gen] loading {s} engine: {s}\n", .{ @tagName(modality), params.model_dir });
     const entry = params.entry;
 
@@ -3776,6 +3778,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try doLoadGenOnInferenceThread(sch, params, modality);
         return;
     }
+
+    if (comptime !build_cfg.mlx_enabled) return error.MlxUnavailable;
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
@@ -4582,6 +4586,7 @@ pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 /// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
 /// entries are excluded from the read so a full cache cannot ratchet itself down.
 fn reviseHotCacheBudgets(sch: *Scheduler) void {
+    if (comptime !build_cfg.mlx_enabled) return;
     const resolve = sch.prefix_cache_mem_resolver orelse return;
     sch.registry.mutex.lockUncancelable(sch.io);
     // The resolver publishes the process-global budget the admission guard reads, so the
@@ -4614,6 +4619,7 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
 
 /// Caller must not hold `registry.mutex`.
 fn publishCachedSessions(sch: *Scheduler) void {
+    if (comptime !build_cfg.mlx_enabled) return;
     var rows: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined;
     var n: usize = 0;
     {
@@ -5074,6 +5080,7 @@ fn slotStateBytes(s: *const Slot) u64 {
 /// not the scheduler's borrowed-view singleton — each LoadedModel has its
 /// own vision encoder when applicable.
 fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
+    if (comptime !build_cfg.mlx_enabled) return finishVisionRequest(sch, req, "MlxUnavailable");
     const vision_enc = req.model.vision_encoder orelse {
         finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
         return;
@@ -5414,6 +5421,7 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
 /// `waitNext`). Skipped for pad-only generations, vision-bearing slots
 /// (stale embeddings would be reused), and slots with no generated tokens.
 fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
+    if (comptime !build_cfg.mlx_enabled) return;
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     if (slot.error_code != null) return;
@@ -5560,6 +5568,7 @@ fn cancelledPrefillCommitLen(step: usize, prompt_len: usize) ?usize {
 /// keep their checkpoints in the live Generator and commit through the
 /// normal arm above.
 fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache) void {
+    if (comptime !build_cfg.mlx_enabled) return;
     const salvage = &slot.cancelled_prefill;
     // Hybrid restore requires SSM checkpoints; a checkpoint-less hybrid
     // entry restores as a cold miss ("hybrid miss") while occupying an LRU
@@ -6541,6 +6550,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     if (slot.model.llama_engine) |engine| {
         return runPrefillLlama(sch, slot, engine);
     }
+    if (comptime !build_cfg.mlx_enabled) return error.MlxUnavailable;
+
     // DiffusionGemma: generation is a canvas-denoising loop, not
     // autoregressive decode — no Generator. The encoder prefill fills the
     // slot's own KV cache; PLD/drafter/MTP/batching never apply.
@@ -6988,6 +6999,11 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // and O(active), never per token. Finished slots are excluded, so the last
     // slot's completion drives this to 0 (live == total at rest).
     defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+
+    if (comptime !build_cfg.mlx_enabled) {
+        for (active) |slot| try runSingleDecodeTick(sch, slot);
+        return;
+    }
 
     // Contention discipline for the spec cost model's kv term: it learns
     // from realized round times, and contention only ever ADDS time. Rather
@@ -7448,7 +7464,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     if (inner_err) |e| return e;
 }
 
-fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
+fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) anyerror!void {
     // ds4-backed slot: drive the engine's session forward by one token. No
     // PLD / drafter / batched paths apply — ds4 has its own internal MTP
     // (see TODO: wire `evalSpeculative` when temp=0 and engine.hasMtp()).
@@ -7458,6 +7474,8 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     if (slot.llama_session) |session| {
         return runLlamaDecodeTick(sch, slot, session);
     }
+    if (comptime !build_cfg.mlx_enabled) return error.MlxUnavailable;
+
     if (slot.diffusion) |runner| {
         return runDiffusionDecodeTick(sch, slot, runner);
     }

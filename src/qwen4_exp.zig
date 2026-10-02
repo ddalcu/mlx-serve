@@ -11,6 +11,7 @@
 //! merged RAW BF16 table (`weight` BF16 [R, dim], no scales/biases,
 //! `"bits":"16"`) for bit-exact PLE lookups.
 
+const common = @import("qwen4_common.zig");
 const std = @import("std");
 const log = @import("log.zig");
 const ple_gpu = @import("ple_gpu.zig");
@@ -48,10 +49,10 @@ fn nthPrimeAfter(start: u64, count: u32) u64 {
 }
 
 /// Config-driven bounds; `model.validateQwen4Config` refuses a checkpoint past them at load.
-pub const MAX_HEADS = 32;
-pub const MAX_NGRAM_SIZE = 8;
-
 /// Everything `Qwen4ExpTextNGramEmbedding.__init__` derives from the config.
+pub const MAX_HEADS = common.MAX_HEADS;
+pub const MAX_NGRAM_SIZE = common.MAX_NGRAM_SIZE;
+
 pub const NgramHash = struct {
     ngram_size: u32,
     heads_per_ngram: u32,
@@ -153,9 +154,6 @@ fn warmEnabled() bool {
 
 /// What the background page-cache warm has read so far, and the table's total size. Published
 /// by the warm thread, read lock-free by metrics and `/props`; zero when nothing is warming.
-pub var live_warm_bytes = std.atomic.Value(u64).init(0);
-pub var live_warm_total = std.atomic.Value(u64).init(0);
-
 /// A progress line at each 8 GB step or after 10 s of silence, never twice per step. Pure.
 pub const WARM_LOG_BYTES: u64 = 8 << 30;
 pub const WARM_LOG_NS: u64 = 10_000_000_000;
@@ -365,8 +363,8 @@ pub const NgramTable = struct {
             th.join();
             self.warm_thread = null;
         }
-        live_warm_bytes.store(0, .release);
-        live_warm_total.store(0, .release);
+        common.live_warm_bytes.store(0, .release);
+        common.live_warm_total.store(0, .release);
         if (self.pool) |p| p.destroy();
         self.pool = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
@@ -389,8 +387,8 @@ pub const NgramTable = struct {
         }
         self.warm_stop.store(false, .release);
         self.warm_bytes.store(0, .release);
-        live_warm_bytes.store(0, .release);
-        live_warm_total.store(self.map.len, .release);
+        common.live_warm_bytes.store(0, .release);
+        common.live_warm_total.store(self.map.len, .release);
         log.info("[qwen4] ngram table warm: started, {d:.1} GB in the background (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{asGb(self.map.len)});
         self.warm_thread = std.Thread.spawn(.{}, warmMain, .{self}) catch null;
     }
@@ -409,7 +407,7 @@ pub const NgramTable = struct {
             if (got <= 0) return;
             off += @intCast(got);
             self.warm_bytes.store(off, .release);
-            live_warm_bytes.store(off, .release);
+            common.live_warm_bytes.store(off, .release);
             // One clock read per 8 MB pread is free next to the read itself.
             const el: u64 = @intCast(t0.untilNow(wio, .boot).nanoseconds);
             if (prog.should(off, el)) log.info("[qwen4] ngram table warm: {d:.1}/{d:.1} GB after {d:.0} s\n", .{ asGb(off), asGb(total), @as(f64, @floatFromInt(el)) / 1e9 });
@@ -501,7 +499,6 @@ pub const NgramTable = struct {
         };
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
-
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on

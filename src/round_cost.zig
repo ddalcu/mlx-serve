@@ -17,10 +17,11 @@
 //! Beside the width grid sits one more row: `serial`, the measured ms of a plain decode
 //! token per bucket. Kept out of the width grid (a serial tick is not a round), it answers
 //! the one question no width can: is speculation worth running here at all?
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const transformer_mod = @import("transformer.zig");
+const transformer_mod = if (build_cfg.mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
 pub const MAX_WIDTH: u32 = 16;

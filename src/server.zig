@@ -1,41 +1,42 @@
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
 const builtin = @import("builtin");
-const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
-const kv_quant_mod = @import("kv_quant.zig");
+const mlx = if (build_cfg.mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
+const transformer_mod = if (build_cfg.mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
+const kv_quant_mod = @import("kv_quant_config.zig");
 const tokenizer_mod = @import("tokenizer.zig");
-const generate_mod = @import("generate.zig");
-const mtp_mod = @import("mtp.zig");
+const generate_mod = if (build_cfg.mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
+const mtp_mod = if (build_cfg.mlx_enabled) @import("mtp.zig") else @import("spec_stub.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
-const drafter_mod = @import("drafter.zig");
+const drafter_mod = if (build_cfg.mlx_enabled) @import("drafter.zig") else @import("spec_stub.zig");
 const chat_mod = @import("chat.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
 const model_mod = @import("model.zig");
-const dsv4_mod = @import("deepseek_v4.zig");
+const dsv4_mod = if (build_cfg.mlx_enabled) @import("deepseek_v4.zig") else @import("dsv4_stub.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const mrope_mod = @import("mrope.zig");
-const vision_mod = @import("vision.zig");
+const vision_mod = if (build_cfg.mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
 const pld_index = @import("pld_index.zig");
-const prefix_cache_mod = @import("prefix_cache.zig");
+const prefix_cache_mod = if (build_cfg.mlx_enabled) @import("prefix_cache.zig") else @import("mlx_cache_stub.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const ds4_ffi = if (build_cfg.ds4_enabled) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
-const media_mod = @import("gen.zig");
+const mlx_gguf = if (build_cfg.mlx_enabled) @import("arch/mlx_gguf.zig") else @import("mlx_gguf_stub.zig");
+const arch_llama = if (build_cfg.llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const media_mod = if (build_cfg.mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
 const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
-const ane_mod = @import("ane.zig");
-const qwen4_mod = @import("qwen4_exp.zig");
+const ane_mod = if (build_cfg.mlx_enabled) @import("ane.zig") else @import("ane_stub.zig");
+const qwen4_mod = @import("qwen4_common.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -5207,6 +5208,7 @@ fn attnLayersPerEvalWindow(config: *const model_mod.ModelConfig, window: u32) u3
 /// the size of the cache. A forward narrower than `prefillEvalCadenceApplies` runs one eval for
 /// the whole layer loop and therefore does pay the whole old cache.
 fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, kv_per_tok: u64) u64 {
+    if (comptime !build_cfg.mlx_enabled) return 0;
     if (!warm.grows(seq)) return 0;
     const attn = config.attnCacheLayerCount();
     if (attn == 0) return 0;
@@ -5391,6 +5393,7 @@ fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
 /// or `MLX_SERVE_KV_RESERVE=0`), plus the f32 block-score bank the two-copy slack used to
 /// hide. One helper because the auto-context sizer and the admission guard must agree.
 pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
+    if (comptime !build_cfg.mlx_enabled) return 0;
     const one = config.qsaHistoryBytesPerToken();
     if (one == 0) return 0;
     const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled() and transformer_mod.KVCache.kvReservationEnabled()) 1 else 2;
@@ -5409,6 +5412,7 @@ pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 
 /// restored prefix: a warm prefill captures only over `seq - matched` (the entry's own
 /// checkpoints are already resident and merged, never re-allocated).
 pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, matched: u64, chunk: u64) u64 {
+    if (comptime !build_cfg.mlx_enabled) return 0;
     const per_cp = config.ssmCheckpointBytes();
     if (per_cp == 0 or ssm_checkpoint_stride == 0) return 0;
     const stride: u64 = generate_mod.effectiveSsmCheckpointStride(
@@ -5428,6 +5432,7 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
 /// Per-token bytes of the qwen4 MTP head's own KV at the scheme it was LOADED with,
 /// billed once per request when MTP is on. It was resident and unbilled before.
 pub fn mtpHeadKvBytesPerToken(config: *const model_mod.ModelConfig) u64 {
+    if (comptime !build_cfg.mlx_enabled) return 0;
     if (!config.longCtxGated()) return 0;
     const n = config.attnCacheLayerCount();
     if (n == 0) return 0;
@@ -7683,7 +7688,7 @@ fn handleEmbeddings(
     };
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
-    const gen_mod = @import("generate.zig");
+    const gen_mod = if (build_cfg.mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", null);
         return;
@@ -13626,7 +13631,7 @@ fn piecesOf(item: MediaItem) usize {
 }
 
 fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
-    var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(piece)));
+    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(piece)));
     switch (piece) {
         .image => |im| {
             h.update(std.mem.asBytes(&[_]u32{ im.width, im.height, im.grid_h, im.grid_w }));

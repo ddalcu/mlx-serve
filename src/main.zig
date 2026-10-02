@@ -1,54 +1,54 @@
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
-pub const mlx = @import("mlx.zig");
+pub const mlx = if (build_cfg.mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
 pub const io_util = @import("io_util.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
+const mlx_gguf = if (build_cfg.mlx_enabled) @import("arch/mlx_gguf.zig") else @import("mlx_gguf_stub.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
-const transformer_mod = @import("transformer.zig");
+const transformer_mod = if (build_cfg.mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
 const round_cost_mod = @import("round_cost.zig");
-const generate_mod = @import("generate.zig");
+const generate_mod = if (build_cfg.mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
-const drafter_mod = @import("drafter.zig");
-const mtp_graft = @import("mtp_graft.zig");
-const mtp_mod = @import("mtp.zig");
+const drafter_mod = if (build_cfg.mlx_enabled) @import("drafter.zig") else @import("spec_stub.zig");
+const mtp_graft = if (build_cfg.mlx_enabled) @import("mtp_graft.zig") else @import("spec_stub.zig");
+const mtp_mod = if (build_cfg.mlx_enabled) @import("mtp.zig") else @import("spec_stub.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_settings_mod = @import("model_settings.zig");
-const vision_mod = @import("vision.zig");
-const ds4_arch = if (build_options.macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const llama_arch = if (build_options.macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
-const gen_mod = @import("gen.zig");
+const vision_mod = if (build_cfg.mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
+const ds4_arch = if (build_cfg.ds4_enabled) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_cfg.llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const gen_mod = if (build_cfg.mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
 const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
-const ane_mod = @import("ane.zig");
-const ple_gpu = @import("ple_gpu.zig");
+const ane_mod = if (build_cfg.mlx_enabled) @import("ane.zig") else @import("ane_stub.zig");
+const ple_gpu = if (build_cfg.mlx_enabled) @import("ple_gpu.zig") else @import("spec_stub.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
-// ggml runtime version (llama.cpp), linked into the macOS exe. Referenced only
+// ggml runtime version (llama.cpp), linked into desktop builds. Referenced only
 // by the `--version` report, which runs before any engine init.
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
 
-// The embedded llama.cpp engine only links on macOS builds (macos_engines);
-// elsewhere the stub engine replaces it, so the libllama symbols above are
-// not referenced and `--version` reports these placeholders instead.
+// iOS uses the stub engine and has no ggml runtime symbols.
 fn ggmlEngineVersion() []const u8 {
-    if (comptime !build_options.macos_engines) return "unavailable (no embedded llama.cpp)";
+    if (comptime !build_cfg.llama_enabled) return "unavailable (no embedded llama.cpp)";
     return std.mem.span(ggml_version());
 }
 fn ggmlEngineCommit() []const u8 {
-    if (comptime !build_options.macos_engines) return "";
+    if (comptime !build_cfg.llama_enabled) return "";
     return std.mem.span(ggml_commit());
 }
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -97,8 +97,11 @@ fn replThreadMain(allocator: std.mem.Allocator, io: std.Io, port: u16) void {
 fn printUsage(io: std.Io) void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
+    stdout_w.interface.writeAll(if (build_cfg.gguf_only)
+        "mlx-serve — GGUF inference server (llama.cpp + Vulkan), for Linux\n"
+    else
+        "mlx-serve — MLX inference server for Apple Silicon\n") catch {};
     stdout_w.interface.writeAll(
-        \\mlx-serve — MLX inference server for Apple Silicon
         \\
         \\Usage: mlx-serve <command> [options]
         \\       mlx-serve [options]
@@ -272,10 +275,22 @@ fn printUsage(io: std.Io) void {
         \\                        more than 16384 tokens only build head history
         \\                        for the last <n> (default: 0 = full history;
         \\                        windowing costs acceptance on stock Qwen heads).
+        \\
+    ) catch {};
+    stdout_w.interface.writeAll(if (build_cfg.gguf_only)
+        \\  --kv-quant <mode>   llama.cpp KV cache: off (F16, default), 4 (Q4_0),
+        \\                        8 (Q8_0). Quantized KV enables flash attention.
+        \\                        Load-time only; the body field does not override it.
+        \\                        Alias: --llama-kv-quant. Last flag wins.
+        \\
+    else
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        off (default), 4, 8     — affine group quant.
         \\                          Per-request override via the `kv_quant`
         \\                          body field.
+        \\
+    ) catch {};
+    stdout_w.interface.writeAll(
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -444,8 +459,8 @@ pub fn main(init: std.process.Init) !void {
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
     // Resolve lazily-cached env reads on the main thread before other threads exist.
-    @import("transformer.zig").warmQsaEnvCaches();
-    @import("prefix_cache.zig").warmEnvCaches();
+    transformer_mod.warmQsaEnvCaches();
+    (if (build_cfg.mlx_enabled) @import("prefix_cache.zig") else @import("mlx_cache_stub.zig")).warmEnvCaches();
 
     // mlx-c's default handler exits the process; latch MLX failures instead (#353).
     mlx.installErrorHandler();
@@ -603,14 +618,14 @@ pub fn main(init: std.process.Init) !void {
             _ = mlx.mlx_version(&mlx_ver);
             const info = version_mod.Info{
                 .app = VERSION,
-                .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
-                .mlx_c = build_options.mlx_c_version,
+                .mlx = if (build_cfg.mlx_enabled) std.mem.span(mlx.mlx_string_data(mlx_ver)) else "unavailable",
+                .mlx_c = if (build_cfg.mlx_enabled) build_options.mlx_c_version else "unavailable",
                 .nax = transformer_mod.naxStatus(),
                 .ggml = ggmlEngineVersion(),
                 .ggml_commit = ggmlEngineCommit(),
                 .llama_tag = build_options.llama_tag,
                 .gguf_format = GGUF_FORMAT_VERSION,
-                .ds4_commit = build_options.ds4_commit,
+                .ds4_commit = if (build_cfg.ds4_enabled) build_options.ds4_commit else "unavailable",
             };
             var ver_buf: [512]u8 = undefined;
             var ver_w = std.Io.File.stdout().writer(io, &ver_buf);
@@ -906,6 +921,8 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (llama_arch.LlamaKvQuant.fromString(args[i])) |q| {
                 server_mod.llama_kv_quant = q;
+                if (build_cfg.gguf_only)
+                    kv_quant_config = if (q == .off) transformer_mod.KVQuantConfig.dense else transformer_mod.KVQuantConfig.affine(if (q == .q4) 4 else 8);
             } else {
                 log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
                 std.process.exit(1);
@@ -972,6 +989,8 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--kv-quant: expected one of {{off, 4, 8}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+            if (build_cfg.gguf_only)
+                server_mod.llama_kv_quant = llama_arch.LlamaKvQuant.fromString(kv_quant_config.wireName()).?;
         } else if (std.mem.eql(u8, args[i], "--engine") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "auto")) {
@@ -1236,7 +1255,9 @@ pub fn main(init: std.process.Init) !void {
             sleep_inhibit_mod.isEnabled(),
         });
     }
-    switch (kv_quant_config.scheme) {
+    if (build_cfg.gguf_only) {
+        log.info("[args] llama KV: {s} (load-time)\n", .{server_mod.llama_kv_quant.label()});
+    } else switch (kv_quant_config.scheme) {
         .off => log.info("[args] kv-quant: off\n", .{}),
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
@@ -1280,6 +1301,8 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
     }
+
+    if (comptime !build_cfg.mlx_enabled) return error.MlxUnavailable;
 
     // Parse config — heap allocate so the LoadedModel can take ownership
     // (Plan 05). Free path in serve_mode = registry.deinit; offline mode =
@@ -1826,6 +1849,7 @@ fn runGenServe(
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
 ) !void {
+    if (comptime !build_cfg.media_gen_enabled) return error.MlxUnavailable;
     log.info("mlx-serve {s} (native {s} engine)\n", .{ VERSION, @tagName(modality) });
     log.info("[args] model: {s}\n", .{model_dir});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1993,6 +2017,8 @@ fn runHeadlessServe(
         .warmup_eager = false,
         .draft_block_size = 0,
         .kv_quant_config = kv_quant_config,
+        .llama_kv_type_k = if (build_cfg.gguf_only) server_mod.llama_kv_quant.ggmlType() else 0,
+        .llama_kv_type_v = if (build_cfg.gguf_only) server_mod.llama_kv_quant.ggmlType() else 0,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         // Seed the scheduler's prefix-cache config from the server globals so
         // on-demand (headless/discover-mode) loads get the SAME hot prefix
@@ -2495,7 +2521,11 @@ fn runLlamaServe(
         .warmup_eager = false,
         .draft_block_size = 0,
         .draft_block_size_explicit = false,
-        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .kv_quant_config = if (build_cfg.gguf_only) switch (server_mod.llama_kv_quant) {
+            .off => transformer_mod.KVQuantConfig.dense,
+            .q4 => transformer_mod.KVQuantConfig.affine(4),
+            .q8 => transformer_mod.KVQuantConfig.affine(8),
+        } else transformer_mod.KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         // Iteration 2 + 3-5: thread the tokenize cache + multi-session

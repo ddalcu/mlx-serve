@@ -9,8 +9,9 @@
 //! `grid_h = resized_H/patch`, `grid_w = resized_W/patch` — a DYNAMIC count, unlike
 //! Gemma 4's fixed 280.
 
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = if (build_cfg.mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
 const model_mod = @import("model.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;

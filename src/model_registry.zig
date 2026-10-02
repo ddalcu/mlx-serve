@@ -16,23 +16,24 @@
 //! `vision_queue`/`embed_queue`-shaped channel; cold-load completion
 //! broadcasts on `state_cond` so blocked callers wake.
 
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
 const model_mod = @import("model.zig");
-const transformer_mod = @import("transformer.zig");
+const transformer_mod = if (build_cfg.mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
-const vision_mod = @import("vision.zig");
-const drafter_mod = @import("drafter.zig");
-const prefix_cache_mod = @import("prefix_cache.zig");
+const vision_mod = if (build_cfg.mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
+const drafter_mod = if (build_cfg.mlx_enabled) @import("drafter.zig") else @import("spec_stub.zig");
+const prefix_cache_mod = if (build_cfg.mlx_enabled) @import("prefix_cache.zig") else @import("mlx_cache_stub.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const token_mask_mod = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
-const gen_mod = @import("gen.zig");
-const generate_mod = @import("generate.zig");
+const arch_ds4 = if (build_cfg.ds4_enabled) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (build_cfg.llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const gen_mod = if (build_cfg.mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
+const generate_mod = if (build_cfg.mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
 const log = @import("log.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
@@ -45,9 +46,9 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;
 const VisionEncoder = vision_mod.VisionEncoder;
 const DrafterModel = drafter_mod.DrafterModel;
-const dflash_mod = @import("dflash.zig");
+const dflash_mod = if (build_cfg.mlx_enabled) @import("dflash.zig") else @import("spec_stub.zig");
 const DflashModel = dflash_mod.DflashModel;
-const mtp_mod = @import("mtp.zig");
+const mtp_mod = if (build_cfg.mlx_enabled) @import("mtp.zig") else @import("spec_stub.zig");
 const MtpModel = mtp_mod.MtpModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
 const TokenizeCache = tokenize_cache_mod.TokenizeCache;

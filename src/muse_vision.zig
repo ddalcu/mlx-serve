@@ -7,8 +7,9 @@
 //! `[freq_w, freq_h, freq_w, freq_h]` 2D RoPE, and window/full attention
 //! alternating per `layer_types`. Images only — video is not wired.
 
+const build_cfg = @import("build_cfg.zig");
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = if (build_cfg.mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
 const model_mod = @import("model.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
