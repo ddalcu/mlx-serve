@@ -494,6 +494,9 @@ pub const ModelConfig = struct {
     gen_temperature: ?f32 = null,
     gen_top_p: ?f32 = null,
     gen_top_k: ?u32 = null,
+    gen_min_p: ?f32 = null,
+    gen_presence_penalty: ?f32 = null,
+    gen_repeat_penalty: ?f32 = null,
 
     // The checkpoint's OWN thinking default, from generation_config.json's
     // `default_chat_template_kwargs.enable_thinking`. null = the file or key
@@ -1090,6 +1093,9 @@ pub const ModelConfig = struct {
         self.gen_temperature = gd.temperature;
         self.gen_top_p = gd.top_p;
         self.gen_top_k = gd.top_k;
+        self.gen_min_p = gd.min_p;
+        self.gen_presence_penalty = gd.presence_penalty;
+        self.gen_repeat_penalty = gd.repeat_penalty;
         self.gen_enable_thinking = gd.enable_thinking;
         self.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
     }
@@ -1493,6 +1499,9 @@ pub const GenerationDefaults = struct {
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?u32 = null,
+    min_p: ?f32 = null,
+    presence_penalty: ?f32 = null,
+    repeat_penalty: ?f32 = null,
     /// `default_chat_template_kwargs.enable_thinking` — the checkpoint's own
     /// thinking default. null when absent or not a bool.
     enable_thinking: ?bool = null,
@@ -1599,6 +1608,9 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
             else => {},
         }
     }
+    gd.min_p = generationFloat(root.get("min_p"), 0.0, 1.0, false);
+    gd.presence_penalty = generationFloat(root.get("presence_penalty"), 0.0, 2.0, false);
+    gd.repeat_penalty = generationFloat(root.get("repetition_penalty"), 0.0, 10.0, true);
     if (root.get("eos_token_id")) |v| {
         switch (v) {
             .integer => |i| if (i >= 0) {
@@ -1624,6 +1636,17 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
         }
     }
     return gd;
+}
+
+fn generationFloat(value: ?std.json.Value, min: f32, max: f32, exclusive_min: bool) ?f32 {
+    const v = value orelse return null;
+    const raw: f32 = switch (v) {
+        .float => |f| @floatCast(f),
+        .integer => |i| @floatFromInt(i),
+        else => return null,
+    };
+    if (!std.math.isFinite(raw) or raw < min or raw > max or (exclusive_min and raw == min)) return null;
+    return raw;
 }
 
 /// One qwen4_exp integer bound, read strictly: wrong-typed or negative refuses.
@@ -6746,6 +6769,22 @@ test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {
     try testing.expectEqual(@as(?f32, 1.0), gd.temperature);
     try testing.expectEqual(@as(?f32, 0.95), gd.top_p);
     try testing.expectEqual(@as(?u32, 20), gd.top_k);
+}
+
+test "sampling defaults read standard HF repetition key and reject invalid values" {
+    const valid = parseGenerationDefaultsFromJson(
+        \\{"min_p":0.05,"presence_penalty":0.75,"repetition_penalty":1.3,"repeat_penalty":1.8}
+    );
+    try testing.expectEqual(@as(?f32, 0.05), valid.min_p);
+    try testing.expectEqual(@as(?f32, 0.75), valid.presence_penalty);
+    try testing.expectEqual(@as(?f32, 1.3), valid.repeat_penalty);
+
+    const invalid = parseGenerationDefaultsFromJson(
+        \\{"min_p":-0.1,"presence_penalty":3,"repetition_penalty":0}
+    );
+    try testing.expectEqual(@as(?f32, null), invalid.min_p);
+    try testing.expectEqual(@as(?f32, null), invalid.presence_penalty);
+    try testing.expectEqual(@as(?f32, null), invalid.repeat_penalty);
 }
 
 test "pooling: config.json pooling_mode key parses; unknown value rejected at parse" {
