@@ -155,6 +155,16 @@ MIT License
 ================================================================================
 
 --------------------------------------------------------------------------------
+Sushi n-gram gather calibration
+https://github.com/beamivalice/sushi
+Copyright (c) 2026 Theinruj Toranavikrai
+Copyright (c) 2026 David Dalcu
+Licensed under the MIT License (the permission and warranty terms in LICENSE).
+
+The load-time read-path calibration in `src/qwen4_exp.zig` is adapted from
+Sushi commit feb9ed7d92149e7ebc46a34595e19d440a929a0a.
+
+--------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)
 https://github.com/maderix/h3.c-ane
 https://github.com/maderix/ANE

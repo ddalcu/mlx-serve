@@ -471,6 +471,7 @@ Weights, quant, loading:
 qwen4_exp:
 - **NOT a qwen3_5 pack**: hyper-connections, n-gram PLE, QSA around the trunk; HF `hidden_states[i]` is the INPUT of layer i. Vision rows splice BEFORE the hc tile (`forwardQwen4With`).
 - **Tiny MoE oracles tie everywhere**: fixtures dump the reference's OWN margins, `Qwen4Ties` acquits by those; k < E selection coverage = the MTP head's one MoE layer (`--topk 2`, `route_gap`).
+- **PLE read-path selection is measured before and after warming**, on the inference thread (`NgramTable.calibrateArm`); the warmer only signals completion. Explicit overrides win, and the long-KV pool gate remains. Guard: `ngram prefill` tests.
 - **QSA's visible tail is PER QUERY**; scores in f32; `torch.topk` keeps the LOWER index on ties; n-gram hash eos is the TEXT config's (`ngram_eos`).
 - **The spec "hidden" IS the pre-mixer stream** (`[B,L,hc*hidden]`); head row r = (stream r, token r+1) at position r+1 (`pos_base`).
 - **Per-request state outside conv/ssm rides `SSMCacheEntry.aux_state` + `ple_prev`**; every reset/free via `ssmFreeQsaState`; restore-parity bar = the CHUNKING class (~0.3 nats top-5).

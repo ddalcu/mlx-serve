@@ -4861,14 +4861,24 @@ reads the first attention layer's own offset. Gated: the 27B's batched
 +12%/+8% were measured with the cap dead, and un-batching those streams is
 unmeasured.
 
-## The PLE prefill prefetch is a kv gate, not a flag (PR #363)
+## PLE prefill must measure table reads, not infer residency from context length
 
-The pool served decode widths only. On the 374k ladder the serial gather went
-67.7 -> 267.9 ms per 1000 prompt tokens as the weights evicted the 32 GB
-mapping (31% of the prefill slowdown); on a resident table the pool LOSES
-2-7% at every rung to 256k. `PREFILL_PREFETCH_MIN_KV` 262144 sits at the top
-of the measured-cost range; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm,
-and both arms announce which one ran.
+Short KV does not guarantee a resident n-gram mapping. A cold 29.8 GiB table
+reproduced 1.6–3.0 s TTFT after startup; parallel reads restored throughput.
+Resident tables can favor serial reads (the earlier sweep found a 2–7% pool penalty).
+
+`NgramTable.calibrateArm` samples 128 disjoint rows per arm with a 20% margin.
+Warming completion publishes an atomic refresh request; the next automatic wide
+gather measures fresh rows on the inference thread. The warmer never borrows
+the reader pool or mutates its policy. Completion alone does not force serial
+on a table that cannot stay resident. The KV gate still handles long contexts.
+With `MLX_SERVE_NGRAM_WARM=0`, only the load-time calibration runs: demand reads
+do not re-arm it. A cold-load pool choice therefore persists even if demand
+reads later warm the table. Reload to remeasure, or explicitly force the read arm.
+`QWEN4_PLE_PREFETCH_PREFILL=0|1` forces serial/pool and skips calibration.
+BF16 and GPU gathers retain their existing paths. The `ngram prefill` tests pin
+the margin, overrides, warm refresh, pool engagement and identical gathered rows.
+Adapted from Sushi's measured gather selection.
 
 ## A contaminated round-cost cell that no trial could ever re-measure (2026-09-07)
 

@@ -17269,6 +17269,7 @@ pub const Transformer = struct {
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
             st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
+            if (st.gpu == null) st.table.calibrateArm();
             st.table.startWarm(); // the weights load just evicted the table from page cache
             qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
