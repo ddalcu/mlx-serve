@@ -1951,7 +1951,18 @@ private struct MemorySectionContent: View {
                     .frame(minWidth: 220).font(.app(.body))
                 }
             }
-            if let m = meta["prefixCacheEntries"] {
+            if let m = meta["hotPrefixCacheEnabled"] {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.hotPrefixCacheEnabled)
+                ) {
+                    Toggle("", isOn: opts.hotPrefixCacheEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
+            }
+            if let m = meta["prefixCacheEntries"], appState.serverOptions.hotPrefixCacheEnabled {
                 // Surface the RAM clamp so a 16 GB Mac user who sets, say, 8 sees
                 // that the launcher will actually pass 1 (and why).
                 let ram = ProcessInfo.processInfo.physicalMemory
@@ -1965,13 +1976,13 @@ private struct MemorySectionContent: View {
                     explainer: m.explainer + capNote,
                     isDirty: dirty.dirty(\.prefixCacheEntries)
                 ) {
-                    Stepper(value: opts.prefixCacheEntries, in: 0...16) {
+                    Stepper(value: opts.prefixCacheEntries, in: 1...16) {
                         Text("\(appState.serverOptions.prefixCacheEntries)")
                             .font(.app(.body).monospacedDigit())
                     }
                 }
             }
-            if let m = meta["prefixCacheMem"] {
+            if let m = meta["prefixCacheMem"], appState.serverOptions.hotPrefixCacheEnabled {
                 SettingsRow(
                     title: m.title,
                     explainer: m.explainer,

@@ -133,6 +133,8 @@ pub const CommitStatus = union(enum) {
     /// Entry committed (inserted or replaced) at this many tokens — the
     /// post-trim EFFECTIVE length, never the candidate's forwarded length.
     ok: usize,
+    /// Full state captured for the SSD tier; no idle RAM entry retained.
+    disk_only: usize,
     /// The budget decline kept a resident entry that already covers this
     /// many tokens; the longer candidate was discarded (details logged).
     kept_resident: usize,
@@ -316,8 +318,8 @@ pub fn restoreMoveEnabled() bool {
 /// The SSD-first predicate: arch, env switch, AND a disk tier. Without the tier the mode used
 /// to arm with nowhere to spill and a budget floor sized for a tier that did not exist. The
 /// budget resolver asks `--prefix-cache-disk > 0`, the arming asks `disk != null`.
-pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool) bool {
-    return has_disk and config.ssdFirstCapable() and ssdFirstEnabled();
+pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool, ram_enabled: bool) bool {
+    return has_disk and ssdFirstEnabled() and (config.ssdFirstCapable() or !ram_enabled);
 }
 
 /// What the live cache held at commit time, captured before the RAM byte-budget trim: the
@@ -441,6 +443,9 @@ pub const HotPrefixCache = struct {
     /// Checkpoint-retention policy, mirrored once at wiring from `ModelConfig.longCtxGated()`
     /// (this struct never sees a ModelConfig). The default is the previous behaviour.
     cp_thin: transformer_mod.ThinPolicy = .min_span,
+    /// Whether completed requests retain reusable KV in RAM. The live slot still owns its
+    /// working KV; false keeps reusable prefixes only on the SSD tier.
+    ram_enabled: bool = true,
     /// SSD-first mode; set by the scheduler at load.
     ssd_first: bool = false,
     /// SSD-first: the RAM allowance for idle entries (the resolved `--prefix-cache-mem`).
@@ -458,7 +463,8 @@ pub const HotPrefixCache = struct {
     pub fn initWithMem(allocator: std.mem.Allocator, max_entries: u32, max_kv_bytes: u64) HotPrefixCache {
         return .{
             .entries = std.ArrayList(Entry).empty,
-            .max_entries = if (max_entries == 0) 1 else max_entries,
+            .max_entries = max_entries,
+            .ram_enabled = max_entries > 0,
             .max_kv_bytes = max_kv_bytes,
             .current_kv_bytes = 0,
             .allocator = allocator,
@@ -1582,6 +1588,16 @@ pub const HotPrefixCache = struct {
             p.deinit(self.allocator);
             self.pending_disk = null;
         };
+
+        if (!self.ram_enabled) {
+            if (ssm_cps) |cps| {
+                for (cps) |*cp| cp.deinit(self.allocator);
+                self.allocator.free(cps);
+            }
+            if (self.pending_disk == null) return .declined;
+            self.disk_dirty = true;
+            return .{ .disk_only = tokens.len };
+        }
 
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
@@ -2967,10 +2983,11 @@ test "HotPrefixCache: shouldUse rejects deepseek_v4 (module-owned decode state)"
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
 
-test "HotPrefixCache: init zero capacity clamps to 1" {
+test "HotPrefixCache: zero capacity disables RAM retention" {
     var cache = HotPrefixCache.init(testing.allocator, 0);
     defer cache.deinit();
-    try testing.expectEqual(@as(u32, 1), cache.max_entries);
+    try testing.expectEqual(@as(u32, 0), cache.max_entries);
+    try testing.expect(!cache.ram_enabled);
     try testing.expectEqual(@as(usize, 0), cache.entryCount());
 }
 
@@ -3244,6 +3261,123 @@ fn testFillHeadCache(cache: *KVCache, s: mlx.mlx_stream, layer: u32, tokens: u32
         try testWriteCacheLayer(cache, s, layer, written, step);
         transformer_mod.Transformer.qwen4MtpAdvance(cache, seq_offset, @intCast(step));
         written += step;
+    }
+}
+
+test "HotPrefixCache: disk-only commit persists the full prefix and retains no RAM entry" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+        try testing.expectEqual(@as(u32, 0), hc.max_entries);
+        try testing.expect(!hc.ram_enabled);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-disk-only", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        try testing.expect(hc.disk.?.writer != null);
+        defer hc.deinit();
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, tokens.len);
+        const status = try hc.commit(&cache, &tokens, false);
+        try testing.expectEqual(@as(usize, tokens.len), status.disk_only);
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+        try testing.expect(hc.pending_disk != null);
+
+        hc.flushPendingDisk(s);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+        try testing.expectEqual(@as(u32, 0), hc.max_entries);
+        try testing.expect(!hc.ram_enabled);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-disk-only", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        try testing.expect(hc.disk.?.writer != null);
+        defer hc.deinit();
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        var moe_offset: usize = 0;
+        const restored = try hc.lookupAndRestore(&cache, &moe_offset, null, s, &tokens, false, &.{}, null, null);
+        try testing.expect(restored.slot_owned);
+        try testing.expectEqual(@as(usize, tokens.len - 1), restored.matched);
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    }
+}
+
+test "HotPrefixCache: SSD-only LFM2 conv state survives background flush and restart" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const s = mlx.gpuStream();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path: [512]u8 = undefined;
+    const base = path[0..try tmp.dir.realPath(io, &path)];
+    var config = model_mod.ModelConfig{ .model_type = "lfm2", .has_hybrid_layers = true };
+    try testing.expect(HotPrefixCache.shouldUse(&config, true));
+    try testing.expect(ssdFirstActive(&config, true, false));
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*token, i| token.* = @intCast(i + 7);
+    for (0..2) |boot| {
+        var hc = HotPrefixCache.initWithMem(a, 0, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(a, io, base, "lfm-conv", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        defer hc.deinit();
+        try testing.expect(hc.disk.?.writer != null);
+        var cache = try KVCache.init(a, 3);
+        defer cache.deinit();
+        if (boot == 0) {
+            var written: u32 = 0;
+            while (written < tokens.len) : (written += 64) {
+                try testWriteCacheLayer(&cache, s, 1, written, @intCast(@min(64, tokens.len - written)));
+            }
+            var source = pcEmptySsm();
+            defer pcFreeHybrid(&source);
+            _ = mlx.mlx_array_free(source[0].conv_state);
+            source[0].conv_state = pcArange(s, &conv_shape_pc, 300);
+            source[0].initialized = true;
+            const cps = try a.alloc(SSMCheckpoint, 1);
+            cps[0] = try transformer_mod.captureSsmCheckpoint(a, &source, 512, s);
+            const status = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
+            try testing.expectEqual(@as(usize, tokens.len), status.disk_only);
+            hc.flushPendingDisk(s);
+            hc.disk.?.drainWriter();
+            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        } else {
+            var restored = pcEmptySsm();
+            defer pcFreeHybrid(&restored);
+            var offset: usize = 0;
+            const hit = try hc.lookupAndRestore(&cache, &offset, &restored, s, &tokens, false, &.{}, null, null);
+            try testing.expectEqual(@as(usize, 512), hit.matched);
+            try testing.expectEqual(@as(usize, 512), offset);
+            try testing.expect(!cache.entries[0].initialized);
+            try testing.expect(cache.entries[1].initialized);
+            try testing.expectEqual(@as(usize, 512), cache.entries[1].offset);
+            try testing.expect(restored[0].initialized);
+            try testing.expectEqual(@as(f32, 300), pcSsmVal(restored[0].conv_state, 0, s));
+            try testing.expect(restored[0].ssm_state.ctx == null);
+        }
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
     }
 }
 

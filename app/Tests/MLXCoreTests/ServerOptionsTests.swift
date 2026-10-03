@@ -284,15 +284,45 @@ final class ServerOptionsTests: XCTestCase {
                        "clamp is a ceiling, never raises a smaller request")
         // big RAM → uncapped
         XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(16, physicalMemoryBytes: 128 * Self.GiB), 16)
-        // explicit disable is preserved on every machine
-        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(0, physicalMemoryBytes: 16 * Self.GiB), 0)
+        // Entry count is a RAM-cache size; the separate hot-cache toggle owns disable.
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(0, physicalMemoryBytes: 16 * Self.GiB), 1)
     }
 
-    func testPrefixCacheDisableSurvivesClamp() {
+    func testHotPrefixCacheToggleOwnsDisableInsteadOfTheEntryCount() {
         var opts = ServerOptions()
         opts.prefixCacheEntries = 0
         XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB),
-                               flag: "--prefix-cache-entries", value: "0"))
+                               flag: "--prefix-cache-entries", value: "1"))
+        opts.hotPrefixCacheEnabled = false
+        XCTAssertTrue(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB).contains("--no-prefix-cache-ram"))
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB),
+                               flag: "--prefix-cache-entries", value: "1"))
+    }
+
+    func testHotPrefixCacheCanBeDisabledWithoutDisablingSSD() {
+        var opts = ServerOptions()
+        opts.enablePrefixCacheDisk = true
+        opts.hotPrefixCacheEnabled = false
+        let args = opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
+        XCTAssertTrue(args.contains("--no-prefix-cache-ram"))
+        XCTAssertTrue(contains(args, flag: "--prefix-cache-entries", value: "8"))
+        XCTAssertTrue(contains(args, flag: "--prefix-cache-disk", value: "10GB"))
+    }
+
+    func testHotPrefixCacheToggleIsMigrationSafeAndRequiresRestart() throws {
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertTrue(legacy.hotPrefixCacheEnabled)
+        let disabledBeforeToggle = try JSONDecoder().decode(
+            ServerOptions.self, from: Data(#"{"prefixCacheEntries":0}"#.utf8))
+        XCTAssertFalse(disabledBeforeToggle.hotPrefixCacheEnabled)
+        let disabledWithDisk = try JSONDecoder().decode(
+            ServerOptions.self, from: Data(#"{"prefixCacheEntries":0,"enablePrefixCacheDisk":true}"#.utf8))
+        XCTAssertFalse(disabledWithDisk.enablePrefixCacheDisk)
+
+        let base = ServerOptions()
+        var changed = base
+        changed.hotPrefixCacheEnabled = false
+        XCTAssertFalse(base.serverLaunchEquals(changed))
     }
 
     func testTokenizeCacheEntriesEmitsWhenChanged() {
@@ -480,6 +510,7 @@ extension ServerOptionsTests {
         o.pldKeyLen = 4
         o.maxConcurrent = 4
         o.kvQuant = .int8
+        o.hotPrefixCacheEnabled = false
         o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it
         o.prefixCacheMem = "4GB"
         o.skipMemPreflight = true

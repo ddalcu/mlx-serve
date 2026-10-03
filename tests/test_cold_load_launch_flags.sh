@@ -50,10 +50,10 @@ run_test() {
     else FAIL=$((FAIL + 1)); echo "  FAIL: $1 — $3"; fi
 }
 
-# Boots with $MODEL as the primary, then COLD-loads the clone by name. Prints
-# the clone's load log.
-cold_load_with() { # $1 = extra launch flags, $2 = log path
-    ./zig-out/bin/mlx-serve --model "$MODEL" --serve --port $PORT --host 127.0.0.1 \
+# Boots with $MODEL as the primary, then COLD-loads the clone by name.
+cold_load_with() { # $1 = extra launch flags, $2 = log path, $3 = optional RAM/SSD probe
+    mkdir -p "$2.home"
+    HOME="$2.home" ./zig-out/bin/mlx-serve --model "$MODEL" --serve --port $PORT --host 127.0.0.1 \
         --log-level info --model-dir "$ROOT" $1 >"$2" 2>&1 &
     SERVER_PID=$!
     for i in $(seq 1 60); do
@@ -66,9 +66,42 @@ cold_load_with() { # $1 = extra launch flags, $2 = log path
     # `curl -sf` here leaves the arms differing for a reason this test does
     # not name.
     local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m 900 "$BASE/v1/load-model" \
+    code=$(curl -s -o "$2.load.json" -w '%{http_code}' -m 900 "$BASE/v1/load-model" \
         -H "Content-Type: application/json" -d '{"model":"scratch-org/cold-load-probe"}')
     echo "  (load-model -> HTTP $code)"
+    if [ "$code" != 200 ]; then jq -r '.error.message // .' "$2.load.json"; fi
+    if [ -n "${3:-}" ]; then
+        if [ "$code" != 200 ]; then
+            run_test "prefix-cache arm cold-loaded the clone" FAIL "HTTP $code"
+        else
+            local body
+            body=$(jq -nc '{model:"scratch-org/cold-load-probe",prompt:(([range(0;900) | "cache flag probe "] | join("")) + "\nWrite one word:"),max_tokens:1,temperature:0}')
+            code=$(curl -s -o "$2.response.json" -w '%{http_code}' -m 900 "$BASE/v1/completions" \
+                -H "Content-Type: application/json" -d "$body")
+            if [ "$code" = 200 ] && jq -e '.usage.prompt_tokens > 1024 and .usage.completion_tokens == 1' "$2.response.json" >/dev/null; then
+                run_test "prefix-cache arm generated with the cold-loaded clone" PASS ""
+            else
+                run_test "prefix-cache arm generated with the cold-loaded clone" FAIL "HTTP $code or missing token usage"
+            fi
+            for i in $(seq 1 10); do
+                grep -q '\[disk-cache\].*\(persisted\|complete on disk\)' "$2" && break
+                sleep 1
+            done
+            if [ "$3" = ram ]; then
+                if grep -q '\[hot-cache\] resident=' "$2"; then
+                    run_test "cold-loaded clone retains RAM prefixes by default" PASS ""
+                else
+                    run_test "cold-loaded clone retains RAM prefixes by default" FAIL "no hot-cache residency line"
+                fi
+            elif grep -q '\[disk-cache\] e[0-9][0-9]* complete on disk' "$2" &&
+                 ! grep -q '\[hot-cache\] resident=' "$2"; then
+                run_test "--no-prefix-cache-ram survives a cold load with SSD persistence" PASS ""
+            else
+                run_test "--no-prefix-cache-ram survives a cold load with SSD persistence" FAIL "missing complete SSD prefix or idle RAM retained"
+                grep -E '\[disk-cache\]|\[hot-cache\]' "$2" || true
+            fi
+        fi
+    fi
     kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; SERVER_PID=
 }
 
@@ -98,6 +131,10 @@ if grep -q "model id=scratch-org/cold-load-probe ready" "$ROOT/nodrafter.log"; t
 else
     run_test "the --no-drafter arm actually cold-loaded the clone" FAIL "no ready line — the silent arm proves nothing"
 fi
+
+# The cold-loaded model must honor RAM retention independently of the SSD tier.
+cold_load_with "--no-drafter --no-mtp --no-pld --prefix-cache-entries 2 --prefix-cache-mem 256MB --prefix-cache-disk 4GB" "$ROOT/ram.log" ram || exit 1
+cold_load_with "--no-drafter --no-mtp --no-pld --prefix-cache-entries 2 --prefix-cache-mem 256MB --prefix-cache-disk 4GB --no-prefix-cache-ram" "$ROOT/ssdonly.log" disk || exit 1
 
 echo ""
 echo "=== Result: $PASS/$TOTAL passed ==="

@@ -57,7 +57,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `responses.zig` | Responses API pure data: parser, envelope, `ResponseStore`, compaction |
 | `ws.zig` | RFC 6455 framing (server-side) |
 | `pld_index.zig` | PLD n-gram index (`findMatch`, `ngramRepeatScore`) |
-| `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` | Hot prefix cache + SSD tier (`--prefix-cache-disk`, default OFF); SSD-first mode (qwen4_exp) + its background writer thread |
+| `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` | Hot prefix cache + SSD tier (`--prefix-cache-disk`, default OFF); SSD-first mode (qwen4_exp or RAM disabled) + its background writer thread |
 | `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `dflash.zig` | DFlash block-drafter: config-contract detection (root OR nested `dflash_config`), per-request context cache, block forward; DFlash2 adds `selectPath` + 2-tap grouped convs; trunk seam = `ForwardCtx.capture_layers` + `rawEmbedding` |
 | `mtp.zig` | Qwen 3.5/3.6/3.8 native MTP head (sidecar OR in-checkpoint `mtp.*` via `resolveMtpSource`; per-weight quant re-solve; committed-history cache) |
@@ -75,7 +75,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `status.zig` / `log.zig` | TUI status bar; leveled logging + file sink (`~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation) |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` / `mtp_replay_test.zig` | Hermetic format corpus + real-traffic replay (`src/fixtures/tool_traffic.jsonl`) + MTP depth-policy replay over recorded acceptance traces (`src/fixtures/mtp_accept_traces.txt`) |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-greedy-tail --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --prefill-decode-share --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --ple-gpu --no-ds4-mtp --mlx-gguf --model-dir --log-level --log-file --version --help`
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-greedy-tail --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --no-prefix-cache-ram --prefix-cache-mem --prefix-cache-disk --max-concurrent --prefill-decode-share --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --ple-gpu --no-ds4-mtp --mlx-gguf --model-dir --log-level --log-file --version --help`
 
 Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off). Missing generation_config = wild-sampling signature.
 
@@ -318,7 +318,7 @@ Prefix cache (RAM + SSD):
 - **SSD tier**: serves the text before the first media item, entries with media never spill; checkpoints come off the TOP of the flush budget; hybrid arm ranks by restorable checkpoint (`bestHybridMatch`); a RAM decline spills (`spillDeclinedToDisk`, 4 GB floor).
 - **A change to what stored K/V MEAN gets a fresh SSD root** (`ModelConfig.cacheLayoutNamespace` → `modelFingerprintWithLayout`; null keeps the old root): the fingerprint hashes only the dir, the config's stat and the overrides, so a fixed model would restore its buggy keys (Nemotron-H NoPE).
 - **A disk restore evals each chunk before loading the next** (a lazy `mlx_load_safetensors` holds its fd until eval: 256 files = ~250k tokens); restore entry points drop their own latch, or the cold fallback fails.
-- **SSD-first** (qwen4 + disk tier, `ssdFirstActive`): RAM floors at one session; spill and EVICT are two decisions (`PersistOutcome`); writes ride `kv_disk_writer.zig`; a checkout is a PROMISE until the append DONATES (`donateCheckout`/`releaseCheckout`).
+- **SSD-first** (qwen4 + disk tier, or `--no-prefix-cache-ram` + disk): SSD-only retains no idle RAM KV; writes ride `kv_disk_writer.zig`; a checkout is a PROMISE until append donates (`donateCheckout`/`releaseCheckout`).
 - **The batched pad-waste cap reads `KVCache.kvLenForBatching`**, never `cache.step`.
 - **An in-place SSD commit bills by MEASURE** (`nonChunkBytes` after − before, #573): the per-term delta in `appendSsmOnly` under-billed whole checkpoint lists in ReleaseFast builds and the tier outgrew its cap. Its guard is red only under `zig build test -Doptimize=ReleaseFast`.
 

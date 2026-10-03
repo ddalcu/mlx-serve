@@ -901,6 +901,8 @@ pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]cons
 // (`--prefix-cache-mem`, default 2 GB) is what actually bounds memory,
 // evicting LRU entries by size. 0 disables.
 pub var prefix_cache_capacity: u32 = 32;
+/// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
+pub var prefix_cache_ram_enabled: bool = true;
 
 /// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
 /// commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. The
@@ -938,7 +940,7 @@ var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
 pub fn resolvedPrefixCacheMem() u64 {
-    if (prefix_cache_capacity == 0) return 0;
+    if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
     const v = hot_cache_mem_resolved.load(.monotonic);
     return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
 }
@@ -994,20 +996,19 @@ pub var ssm_checkpoint_stride: u32 = 256;
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
 pub var ssm_checkpoint_max: u32 = 16;
 
-/// SSM prefill checkpoints exist ONLY to feed the hot prefix cache (RAM +
-/// disk tiers key their hybrid restores off them). With the cache disabled
-/// (`--prefix-cache-entries 0`) every capture is a 48-layer materialize +
-/// eval thrown straight away — measured ~2-4% of short-prompt prefill on
-/// Qwen3.6-27B. Single chokepoint for every LoadParams builder.
-pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32) u32 {
-    if (cache_capacity == 0) return 0;
+/// SSM checkpoints feed reusable prefix tiers; zero capacity disables all reuse.
+pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enabled: bool, disk_bytes: u64) u32 {
+    if (cache_capacity == 0 or (!ram_enabled and disk_bytes == 0)) return 0;
     return stride;
 }
 
-test "effectiveSsmCheckpointStride: disabled prefix cache disables checkpoint capture" {
-    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0));
-    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32));
-    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32));
+test "effectiveSsmCheckpointStride: zero capacity disables both tiers, RAM-off preserves disk" {
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, true, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, false, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, true, 0));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, false, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 32, false, 0));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32, true, 0));
 }
 
 /// PLD request defaults carried as ONE value, so a `ServerConfig` builder
@@ -1797,16 +1798,18 @@ pub fn serve(
     g_model_aliases.alloc = scheduler.registry.allocator;
     g_model_aliases.path = model_settings_mod.defaultPath(&g_model_aliases_path);
 
-    // Plan 05: the hot prefix cache lives on the LoadedModel
-    // (entry.prefix_cache) and is set up by `loadModelOnInferenceThread`
-    // using the per-LoadParams capacity + byte budget. Surface a friendly
-    // log line so users see whether the cache engaged.
+    // Prefix cache lives on LoadedModel and may retain idle prefixes in RAM, SSD, or both.
     if (scheduler.hot_prefix_cache != null) {
         const ssm_note: []const u8 = if (config.has_hybrid_layers)
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (resolvedPrefixCacheMem() > 0) {
+        if (!prefix_cache_ram_enabled and prefix_cache_disk_bytes > 0) {
+            log.info("Prefix cache: SSD ONLY (RAM retention disabled, disk cap={d:.1} MB){s}\n", .{
+                @as(f64, @floatFromInt(prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
+                ssm_note,
+            });
+        } else if (resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
@@ -3971,7 +3974,7 @@ fn ssdFirstBudgetForLoad(
     quiet: bool,
 ) ?u64 {
     // The predicate, shared with the spill site: without a disk tier the mode's floor would be RAM the server cannot use.
-    if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0)) return null;
+    if (prefix_cache_capacity == 0 or !prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
         ceiling,
@@ -4514,13 +4517,14 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     defer static_ceiling_override = orig_ceiling;
     static_ceiling_override = 109_395 * (1 << 20);
 
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false));
-    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false, true));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     var dense = model_mod.ModelConfig{};
     dense.model_type = "qwen3";
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true, true));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&dense, true, false));
     prefix_cache_mod.ssd_first_override = false;
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     prefix_cache_mod.ssd_first_override = true;
 
     // The SSD arm floors at one session's KV, the RAM arm is a residual bounded by the ask.
@@ -7364,6 +7368,7 @@ const PropsSettings = struct {
     max_concurrent: u32,
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
+    prefix_cache_ram_enabled: bool = true,
     /// `--prefill-decode-share`: decode's target wall-time fraction during another slot's prefill.
     prefill_decode_share: f32 = 0,
 };
@@ -7414,6 +7419,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .max_concurrent = max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
+        .prefix_cache_ram_enabled = prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
         // Diffusion prefill returns before the interleave hook: nothing to share.
         .prefill_decode_share = if (config.isDiffusion()) 0 else scheduler_mod.prefillDecodeShare(),
     };
@@ -7427,7 +7433,7 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
@@ -7438,7 +7444,8 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         st.drafter,                                 st.pld.enable,
         st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
-        st.prefix_cache_mem_bytes,                  st.prefix_cache_disk_bytes,
+        st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
+        st.prefix_cache_disk_bytes,
     });
 }
 
@@ -23526,6 +23533,19 @@ test "the published hot-cache budget is retired when the cache is dropped" {
     try t.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
     clearResolvedPrefixCacheMem();
     try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+}
+
+test "resolvedPrefixCacheMem: RAM-off bills zero despite a configured disk tier" {
+    const capacity = prefix_cache_capacity;
+    const ram = prefix_cache_ram_enabled;
+    defer prefix_cache_capacity = capacity;
+    defer prefix_cache_ram_enabled = ram;
+    prefix_cache_capacity = 8;
+    prefix_cache_ram_enabled = false;
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    prefix_cache_ram_enabled = true;
+    prefix_cache_capacity = 0;
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
 }
 
 test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 19,032 MB)" {

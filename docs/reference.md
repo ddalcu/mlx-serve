@@ -35,7 +35,7 @@ Verbatim deep detail: per-file contracts, subsystem designs, API surfaces. Root 
 | `responses.zig` | OpenAI Responses API: parser, envelope, in-memory `ResponseStore`, compaction blob |
 | `ws.zig` | RFC 6455 WebSocket framing (server-side, generic over `Conn`) |
 | `pld_index.zig` | PLD n-gram index (`PldLookup.findMatch`, `ngramRepeatScore`) |
-| `kv_disk_cache.zig` | SSD tier for the hot prefix cache (`--prefix-cache-disk`, **default OFF** — opt-in because it can persist many GB; the Swift app exposes a Settings toggle, off by default, and ALWAYS emits `--prefix-cache-disk off`/`<size>` so it's never silently on): committed KV prefixes persist as position-chunked safetensors under `~/.mlx-serve/kv-cache/<model-fingerprint>/e<id>/` and are RESTORED across RAM evictions AND server restarts instead of recomputed (restart TTFT on an 11K-token prompt: e4b 5.9s→0.7s, gemma-3-12B 40.6s→2.7s, byte-identical output). Commit = chunk-APPEND (only the new tail, ≤`max_flush_bytes`/turn, runs POST-markFinished so the client never waits); lookup falls back to disk when it beats the RAM match by ≥256 tokens. meta.json (written last, tmp+rename, v3) records per-chunk AND per-SSM-file byte sizes — scan salvages the valid prefix after a kill -9 mid-flush. **Phase 3 — hybrid SSM archs (qwen3_5/3_6 GatedDeltaNet, lfm2, nemotron_h):** the RAM tier's per-position `SSMCheckpoint`s persist beside the chunks as immutable `s{pos:0>7}.safetensors` (per-layer `l{i}.conv`/`l{i}.ssm`; absent key = null state; `initialized` bitmap in the safetensors metadata map), bounded per entry by `SSM_DISK_MAX_PER_ENTRY=8` (evict-lowest). A hybrid restore (`restoreIntoHybrid`) rebuilds KV `[0,cp_pos)` AND the SSM state at `cp_pos`, mirroring the RAM rewind-both; the RAM-vs-disk fairness compares EFFECTIVE checkpoint positions, not raw match length. The disk tier is now attached whenever the RAM tier accepted the arch (`ssm_checkpoint_stride > 0`), unblocking Qwen3.6-27B's ~50s cold re-prefill. Schemes off/affine, B==1. Guard: `tests/test_prefix_cache_disk.sh` (hybrid section) + hermetic DiskTier tests. |
+| `kv_disk_cache.zig` | Persistent prefix tier (`--prefix-cache-disk`, default OFF): chunked safetensors survive RAM eviction and server restart. `--no-prefix-cache-ram` disables only idle RAM retention when disk is enabled (`--prefix-cache-entries 0` disables both tiers); completed prefixes write through continuously and restore directly into the next request's working KV. Hybrid SSM checkpoints persist beside KV chunks and restore both states at one position. Schemes off/affine, B==1. Guard: `tests/test_prefix_cache_disk.sh` + hermetic DiskTier/HotPrefixCache tests. |
 | `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `mtp.zig` | Qwen 3.5/3.6 native MTP head (sidecar spec-decode; self-contained — delete this + `Generator.nextMtp` to remove the feature). MLP is a union: dense SwiGLU OR the 35B-A3B MoE layout (`language_model.mtp.` prefix, mlx-lm `switch_mlp` split experts + shared expert + SEG — forwards through the trunk's `moeMLP`); quant params re-solve PER WEIGHT per call (`transformer.affineParamsFromGeometry` — sidecars mix 5/6-bit gs-128 beside 4-bit gs-64). Prefill history is FULL by default (`--mtp-history-window` opts into last-window capture; the A/B showed windowing costs 14 acceptance points at 64K on the stock head) |
 | `diffusion.zig` | DiffusionGemma block-diffusion generation: canvas denoising loop, entropy-bound sampler, self-conditioning, per-slot `Runner` |
@@ -466,7 +466,13 @@ One model, two workloads: an agent conversation and a batch sweep of documents s
 
 When an entry must go (count cap, byte budget, `evictLruToAdmit`), `lruIndexExcluding` counts eligible entries per key (the incoming request's key counts as one more on the append path), keeps only the key(s) with the most, and takes the LRU among them; a tie between groups is plain LRU. A sweep therefore evicts its own documents, an unkeyed sweep is one anonymous group that evicts itself, and one workload alone is byte-identical to before. Matching is still by token prefix, the SSD tier's schema and the SSD-first idle spill (`oldestIdleIndex`) are untouched; a disk restore re-enters RAM under the restoring request's key. `[hot-cache] evicted LRU entry (...; key=<hex>; ...)` names the victim's key.
 
-### SSD-first prefix cache (qwen4_exp)
+### SSD-first prefix cache
+
+Qwen4_exp uses SSD-first automatically when its disk tier is enabled. Any MLX
+architecture with a restorable prefix cache uses the same path when
+`--no-prefix-cache-ram --prefix-cache-disk <size>` selects SSD-only mode:
+RAM holds model weights plus active requests, while completed reusable prefixes
+remain only on SSD.
 
 At 1M context on a 128 GB M5 Max the budget is weights ~70 GB + one session's
 entry ~24 GB (~24 KB/token: 12.3 KB of 8-bit KV, 3.8 KB of QSA indexer history,
@@ -475,16 +481,16 @@ RAM therefore holds the model and ONE session; the SSD is the capacity tier and
 `--prefix-cache-disk` is the real limit (~100 GB ≈ four 1M sessions). A disk hit
 streams the entry back in seconds against ~25 minutes of re-prefill.
 
-One predicate, `prefix_cache.ssdFirstActive` (`ModelConfig.ssdFirstCapable()` AND
-`MLX_SERVE_PREFIX_SSD_FIRST` AND a disk tier), is read at the scheduler's
-disk-tier attach into `HotPrefixCache.ssd_first` and mirrored onto
-`DiskTier.ssd_first`; every mechanism reads that field, never a model_type.
+One predicate, `prefix_cache.ssdFirstActive`, requires the env switch and a disk
+tier, then admits either `ModelConfig.ssdFirstCapable()` or explicit SSD-only
+mode. Scheduler mirrors the result onto both cache tiers; every mechanism reads
+that field, never a model type.
 
 | mechanism | what it does |
 |---|---|
 | 1 flush the LIVE cache | `capturePendingDisk` records the live snapshot, full token record, checkpoints and spec snaps at commit, BEFORE the RAM byte-budget trim; the flush prefers that record. Refcount-shared, consumed once. |
 | 2 background writer | `src/kv_disk_writer.zig`: one thread, FIFO, ~1 GiB host-byte permit, prefix-scoped epoch fence at the tier's one directory-removal site, failures attributed to their entry. The inference thread keeps the device→host readback and hands over bytes; `meta.json` is submitted after its chunks so the index lands LAST; every file is tmp+rename. |
-| 3 per-chunk write-through | `Generator.WriteThroughHook` at each completed prefill chunk (one chunk per boundary, only for a new span of at least one chunk; `MLX_SERVE_SSD_WRITE_THROUGH=0`): a killed prefill leaves a restorable chunk-aligned prefix. |
+| 3 per-chunk write-through | `Generator.WriteThroughHook` at each completed prefill chunk (`MLX_SERVE_SSD_WRITE_THROUGH=0`): RAM-backed mode banks one disk chunk per boundary for crash salvage; SSD-only mode drains every completed chunk available at that boundary so a finished turn is fully persistent. |
 | 4 checkpoint-bearing chunks | SSM checkpoints ride OUTSIDE the per-flush byte budget, beside the chunk that closes their position, so a hybrid entry restores from its first flush. |
 | 5 budget semantics | `server.ssdFirstPrefixCacheMem` floors RAM at one session at the working context (the entry IS the live KV) and `--prefix-cache-mem` becomes the IDLE allowance (0 = none idle), logged once at load. Disk budget = `min(operator cap, free − min(64 GiB, 10% of volume))`, 1 GiB store floor, re-read via `volumeSpace` before every store. |
 | 6 evict-on-idle + root-wide LRU | `HotPrefixCache.spillIdleEntries` at end of request: every idle entry is written; past the allowance the durable ones are shed first, then the rest (naming why). `DiskTier.sweepSiblings` walks the other fingerprints under `<base>`: aged strays go, LRU past one budget's worth. |

@@ -84,6 +84,7 @@ enum SettingsReset {
                 f("maxResidentModels") { $0.maxResidentModels = $1.maxResidentModels },
                 f("idleEvictSecs") { $0.idleEvictSecs = $1.idleEvictSecs },
                 f("kvQuant") { $0.kvQuant = $1.kvQuant },
+                f("hotPrefixCacheEnabled") { $0.hotPrefixCacheEnabled = $1.hotPrefixCacheEnabled },
                 f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },
                 f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },
                 f("pleGpu") { $0.pleGpu = $1.pleGpu },
