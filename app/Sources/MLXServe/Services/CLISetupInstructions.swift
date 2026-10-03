@@ -139,6 +139,17 @@ enum CLISetupInstructions {
                 export OPENAI_API_KEY=mlx-serve
                 aider --model openai/\(servedModelId) --weak-model openai/\(servedModelId) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
                 """),
+            Tab(id: "zcode",
+                title: "ZCode",
+                installHint: "Build or install ZCode: https://github.com/zai-org/ZCode",
+                command: """
+                mkdir -p ~/.mlx-serve/zcode
+                cat > ~/.mlx-serve/zcode/provider_config.json <<'EOF'
+                \(AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: servedModelId, budget: budget, entries: []))
+                EOF
+                \(AgentConfigs.zcodeExports)
+                zcode
+                """),
         ]
     }
 }

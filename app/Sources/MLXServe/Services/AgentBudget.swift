@@ -547,6 +547,59 @@ enum AgentConfigs {
         return "{\n\(rows)\n}"
     }
 
+    /// ZCode personal provider config — twin of Zig `launch.zcodeConfigJson`:
+    /// one rule per chat model so ZCode never guesses limits from the id.
+    /// The served model is force-included.
+    static func zcodeProviderJSON(baseURL: String, model: String, budget: AgentBudget.Budget,
+                                  entries: [AgentModelEntry]) -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == model }) {
+            list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+        }
+        let rules: [[String: Any]] = list.map { e in
+            ["providerId": "mlx", "modelId": e.id, "config": [
+                "enabled": true,
+                "properties": [
+                    "contextWindow": e.budget.context, "requiresMfjsToolSchema": false,
+                    "inputFormat": ["supportsText": true, "supportsImage": e.vision,
+                                    "supportsVideo": false, "supportsAudio": false, "supportsPdf": false],
+                    "outputFormat": ["supportsText": true], "supportsToolCall": true,
+                    "supportsJsonSchemaOutput": false, "supportsNativeWebSearch": false,
+                    "supportsMidConversationSystem": false,
+                ],
+                "optionSpecs": [
+                    "reasoningLevel": ["values": ["none", "low", "medium", "high"],
+                                       "map": "{\"reasoning_effort\": reasoningLevel}"],
+                    "maxOutputTokens": ["max": e.budget.output,
+                                        "map": "{\"max_tokens\": maxOutputTokens}"],
+                ],
+            ]]
+        }
+        let config: [String: Any] = ["schemaVersion": 1, "config": [
+            "providerOrder": ["mlx"],
+            "defaultModelSelection": ["providerId": "mlx", "modelId": model,
+                                      "options": ["reasoningLevel": "medium"]],
+            "providerConfigRules": ["providerRules": [[
+                "providerId": "mlx", "providerName": "mlx-serve", "enabled": true,
+                "config": ["group": "standard-personal",
+                           "access": ["type": "api-key", "apiKey": "mlx-serve"],
+                           "api": ["type": "openai-chat-completions", "baseUrl": "\(baseURL)/v1"],
+                           "personalModelIds": list.map(\.id)],
+            ]]],
+            "modelConfigRules": ["manualProviderModelRules": [], "providerModelRules": rules],
+        ]]
+        let data = try! JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// ZCode reads its whole state from these, so the launch never touches
+    /// the user's own ~/.zcode.
+    static let zcodeExports = #"""
+    export ZCODE_DATA_BASE_DIR="$HOME/.mlx-serve/zcode"
+    export ZCODE_STORAGE_DIR="$HOME/.mlx-serve/zcode/storage"
+    export ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.mlx-serve/zcode/provider_config.json"
+    """#
+
     /// hermes `.env` — the first-run wizard kill switch: hermes's
     /// `_has_any_provider_configured()` is satisfied by `OPENAI_BASE_URL`
     /// alone, and the file lives under HERMES_HOME (hermes_constants.py), so

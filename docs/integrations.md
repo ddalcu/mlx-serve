@@ -27,14 +27,18 @@ Two ways to skip everything below:
 - **`mlx-serve launch <agent>`**: same thing from the terminal, ollama-style:
 
 ```bash
-mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider
+mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider, zcode
 mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # everything after -- goes to the agent
 ```
 
 If no server is running, `launch` starts the MLX Core app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
 
-Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes` stay yours).
+Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.zcode` stay yours).
+
+### ZCode
+
+[ZCode](https://github.com/zai-org/ZCode) installs from source: build its CLI per its README and put `zcode` on your PATH. `mlx-serve launch zcode` then points it at the server's OpenAI Chat Completions API with every served chat model and its advertised context; `--model` picks one, args after `--` go to `zcode` (`-- -p "fix the tests"` runs one headless prompt). Config lands in `~/.mlx-serve/zcode/provider_config.json`, and ZCode's data dir moves to `~/.mlx-serve/zcode` via `ZCODE_DATA_BASE_DIR`.
 
 ## Coding agents (manual setup)
 

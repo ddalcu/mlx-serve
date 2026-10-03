@@ -3,6 +3,7 @@
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
 ### New
+- **ZCode.** `mlx-serve launch zcode` and the app's code launcher point Z.ai's ZCode agent (built from source) at the local server with every served chat model and its advertised context, keeping its data under `~/.mlx-serve/zcode` (#708). Thanks @beamivalice.
 - **oMLX's Qwen3.8 Flash Next packs load.** Packs that ship the n-gram table inside the model files (such as `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp`) now run, MTP included; the table is read from host memory, so `--ple-gpu` does not apply to them yet (#686). Thanks @otarkhan.
 - **Chat keeps answering while media renders.** An agent or chat session no longer freezes while the same server generates an image, speech, music, video or a 3D model: chat runs between generation steps, and the CPU-heavy parts of 3D generation run beside it. Two coding agents on Qwen3.8 27B kept their first token under a second while image, speech, music and a textured 3D model rendered on one M5 Ultra, and the images come out byte-identical to a solo run.
 - **GLM-5.3-Flash.** TensorFold's MLX packs of GLM-5-Next run with text, thinking (with `reasoning_effort`) and tool calls, and the pack's own multi-token-prediction layer drafts ahead of the model (`--no-mtp` turns it off).

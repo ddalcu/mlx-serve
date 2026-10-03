@@ -129,9 +129,41 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertEqual(decideOpenCodeLaunch(forcedV2: true, detection: unanswered), .shellFailed)
     }
 
+    func testZCodeConfigForceIncludesTheServedModelWithItsBudget() throws {
+        let served = "served/model\"with-quote"
+        let other = AgentModelEntry(id: "other", budget: AgentBudget.Budget(context: 8192, output: 4096), vision: true)
+        let json = AgentConfigs.zcodeProviderJSON(baseURL: "http://localhost:11234", model: served,
+                                                 budget: budget, entries: [other])
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        let config = try XCTUnwrap(root["config"] as? [String: Any])
+        let selection = try XCTUnwrap(config["defaultModelSelection"] as? [String: Any])
+        XCTAssertEqual(selection["modelId"] as? String, served)
+        let providerRules = try XCTUnwrap((config["providerConfigRules"] as? [String: Any])?["providerRules"] as? [[String: Any]])
+        let provider = try XCTUnwrap(providerRules.first)
+        XCTAssertEqual(provider["providerName"] as? String, "mlx-serve")
+        let providerConfig = try XCTUnwrap(provider["config"] as? [String: Any])
+        XCTAssertEqual(providerConfig["personalModelIds"] as? [String], [served, "other"])
+        XCTAssertEqual((providerConfig["api"] as? [String: Any])?["baseUrl"] as? String, "http://localhost:11234/v1")
+        let rules = try XCTUnwrap((config["modelConfigRules"] as? [String: Any])?["providerModelRules"] as? [[String: Any]])
+        let first = try XCTUnwrap(rules.first?["config"] as? [String: Any])
+        XCTAssertEqual(rules.first?["modelId"] as? String, served)
+        XCTAssertEqual((first["properties"] as? [String: Any])?["contextWindow"] as? Int, budget.context)
+    }
+
+    func testZCodeGuardsAMissingBinaryOnlyInTheLauncherScript() throws {
+        let script = LauncherCLI.zcode.scriptBody("http://localhost:11234", "m", "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains("exit 127"), script)
+        XCTAssertTrue(script.contains("zcode \"$@\""), script)
+        let tab = try XCTUnwrap(tabs.first { $0.id == "zcode" })
+        // Pasted into the user's own interactive shell: an `exit` closes it.
+        XCTAssertFalse(tab.command.contains("exit"), tab.command)
+        XCTAssertTrue(tab.command.contains("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"), tab.command)
+        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/zcode/provider_config.json <<'EOF'"), tab.command)
+    }
+
     func testTabsHaveStableIdsInLauncherOrder() {
         XCTAssertEqual(tabs.map(\.id),
-                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider"],
+                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider", "zcode"],
                        "same CLIs, same order as the DMG launcher dropdown")
         for tab in tabs {
             XCTAssertFalse(tab.command.isEmpty, tab.id)
@@ -164,7 +196,7 @@ final class CLISetupInstructionsTests: XCTestCase {
     }
 
     func testEveryOtherLauncherStillRequiresTheServer() {
-        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .codex, .hermes, .aider] {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .codex, .hermes, .aider, .zcode] {
             XCTAssertTrue(cli.requiresServer, cli.id)
         }
     }
@@ -522,7 +554,7 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertEqual(LauncherCLI.codex.fallbackPaths.count, 4)
         XCTAssertTrue(LauncherCLI.codex.fallbackPaths.contains(
             "/Applications/ChatGPT.app/Contents/Resources/codex"))
-        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider] {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider, .zcode] {
             XCTAssertTrue(cli.fallbackPaths.isEmpty, cli.id)
         }
     }

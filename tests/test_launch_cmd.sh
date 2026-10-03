@@ -22,6 +22,9 @@
 #   [8] launch opencode --print detects `opencode --version` and routes: a
 #       2.x install gets the v2 arm (standalone + model pinned in the config)
 #       and names the detected version on stderr
+#   [9] launch zcode --print: script exports the dedicated data dir + provider
+#       config file and invokes zcode; provider_config.json targets base + /v1
+#       with the ADVERTISED context for the served model
 #
 # The configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
 # launcher writes (never a user's real agent config) — asserted per agent.
@@ -198,6 +201,28 @@ if [ "$OK" = 1 ]; then
 else
     run_test "launch opencode --print routes the detected version" FAIL "$OUT"
 fi
+fi
+
+# ── [9] zcode --print ──
+OUT=$("$BIN" launch zcode --print --url "$BASE" 2>&1)
+OK=1
+echo "$OUT" | grep -q 'export ZCODE_DATA_BASE_DIR="$HOME/.mlx-serve/zcode"' || OK=0
+echo "$OUT" | grep -q 'export ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.mlx-serve/zcode/provider_config.json"' || OK=0
+echo "$OUT" | grep -q '^zcode$' || OK=0
+python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    c = json.load(f)['config']
+base, model, ctx = sys.argv[2], sys.argv[3], int(sys.argv[4])
+assert c['providerConfigRules']['providerRules'][0]['config']['api']['baseUrl'] == base + '/v1', c
+assert c['defaultModelSelection']['modelId'] == model, c
+rule = [r for r in c['modelConfigRules']['providerModelRules'] if r['modelId'] == model]
+assert rule and rule[0]['config']['properties']['contextWindow'] == ctx, rule
+" "$HOME/.mlx-serve/zcode/provider_config.json" "$BASE" "$MODEL_ID" "$ADV_CTX" || OK=0
+if [ "$OK" = 1 ]; then
+    run_test "zcode script + provider_config.json carry the advertised context" PASS
+else
+    run_test "zcode script + provider_config.json carry the advertised context" FAIL "$OUT"
 fi
 
 echo ""
