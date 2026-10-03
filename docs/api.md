@@ -81,5 +81,6 @@ image backends return HTTP 400 when `transparent` is true.
 
 Use the [official RGBA prompt convention](https://github.com/QwenLM/Qwen-Image-2.1#transparent-image-generation-rgba), for example:
 `This is an RGBA image with transparency. A red apple. The image has alpha channel and the background is transparent.`
-The option preserves generated alpha; it does not remove a background or rewrite
-the prompt. This is output support only: input images still follow the RGB path.
+The option preserves generated alpha; it does not rewrite the prompt. It also applies
+to `"mode":"edit"`, so an instruction such as "remove the background" returns the
+edited image with its alpha channel.

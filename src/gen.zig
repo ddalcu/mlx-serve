@@ -789,6 +789,7 @@ pub const ImageEngine = struct {
                         .guidance_scale = opts.guidance_scale,
                         .negative_prompt = opts.negative_prompt,
                         .ref_resolution = opts.ref_resolution,
+                        .transparent = opts.transparent,
                     }, progress);
                 if (opts.edit_images.len != 0) break :blk error.EditUnsupported;
                 break :blk q.generateImage(allocator, prompt, width, height, seed, steps, .{
