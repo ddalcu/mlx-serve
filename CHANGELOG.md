@@ -5,6 +5,7 @@
 ### Fixes
 - Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
 - Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
+- The built-in web console works when the server is reached through a reverse proxy that mounts it under a path (e.g. Tailscale Serve `--set-path`); opened that way it showed "0 models" on a fully loaded server.
 
 ---
 

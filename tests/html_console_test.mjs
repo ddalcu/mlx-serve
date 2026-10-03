@@ -15,6 +15,9 @@ import { runInNewContext } from 'node:vm';
 import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
+// api.js publishes the ONE `apiPrefix` that app.js binds; evaluate it first, the
+// way the page's boot slot does.
+new Function(readFileSync(join(here, '..', 'src', 'html', 'api.js'), 'utf8'))();
 const src = readFileSync(join(here, '..', 'src', 'html', 'app.js'), 'utf8');
 
 // app.js guards its DOM wiring on `typeof document`, so in node only the pure
@@ -1206,4 +1209,32 @@ test('no console stylesheet states a font size in px', () => {
   assert.deepEqual(offenders, [],
     `font sizes in px ignore the reader's own text size:\n  ${offenders.join('\n  ')}\n` +
     'Use rem (px / 16): 13px is 0.8125rem.');
+});
+
+// ── The console talks to the server that served it, wherever it is mounted ──
+// A proxy can mount the server below its own root and strip that prefix on the
+// way in, so a root-absolute `fetch('/v1/models')` asks the PROXY's root, gets
+// its 404, and the page reports an empty server.
+
+test('the path prefix the page was served under is the base of every API path', () => {
+  const prefix = globalThis.apiPrefix;
+  assert.equal(prefix('/'), '');
+  assert.equal(prefix('/mount'), '/mount');
+  assert.equal(prefix('/mount/'), '/mount');
+  assert.equal(prefix('/deep/mount/'), '/deep/mount');
+  // A page addressed AS a file resolves against its directory.
+  assert.equal(prefix('/index.html'), '');
+  assert.equal(prefix('/mount/index.html'), '/mount');
+  // Not a pathname at all (an absolute URL, a stubbed location) never invents
+  // a prefix: the endpoint path is what the server expects.
+  assert.equal(prefix(''), '');
+  assert.equal(prefix(undefined), '');
+  assert.equal(prefix('https://x/y'), '');
+});
+
+// The page has one implementation, not one per script: a second copy is the bug
+// report for the next divergence, and identity is what says app.js resolves
+// through api.js rather than around it.
+test('app.js resolves through the page\'s one apiPrefix', () => {
+  assert.equal(C.apiPrefix, globalThis.apiPrefix);
 });

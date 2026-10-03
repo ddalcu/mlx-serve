@@ -7605,12 +7605,17 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     // the CSS and JS are separate files injected as RUNTIME `{s}` args —
     // std.fmt does not re-parse a runtime argument, so app.css/app.js/
     // metrics.js can be ordinary CSS and JavaScript. Don't inline them back.
-    // The console's two boot scripts share the page's single `<script>{s}`
-    // slot: theme.js sets the stored/OS theme before the stylesheet paints,
-    // i18n.js resolves the language (and <html lang>) before the body. They are
-    // concatenated here rather than given a second slot because std.fmt does
-    // not re-parse a runtime argument, so both stay ordinary JavaScript.
+    // The console's three boot scripts share the page's single `<script>{s}`
+    // slot: api.js publishes `apiPrefix` (the mount the page was served under),
+    // which every later script — including the metrics panel rendered into the
+    // header below — resolves its requests through; theme.js sets the stored/OS
+    // theme before the stylesheet paints; i18n.js resolves the language (and
+    // <html lang>) before the body. They are concatenated here rather than given
+    // a second slot because std.fmt does not re-parse a runtime argument, so all
+    // three stay ordinary JavaScript.
     const boot_script = try std.mem.concat(allocator, u8, &.{
+        @embedFile("html/api.js"),
+        "\n;\n",
         @embedFile("html/theme.js"),
         "\n;\n",
         @embedFile("html/i18n.js"),
@@ -7619,7 +7624,7 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
         // <title> version
         version_esc,
-        // <script> — src/html/theme.js + src/html/i18n.js (before first paint)
+        // <script> — src/html/api.js + theme.js + i18n.js (before first paint)
         boot_script,
         // <style> — src/html/app.css
         @embedFile("html/app.css"),

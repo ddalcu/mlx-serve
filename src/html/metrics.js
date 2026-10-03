@@ -28,6 +28,9 @@ function panelAt(now, samples, winMs) {
   return s;
 }
 
+// `apiPrefix` (the mount the page was served under) comes from `api.js`, the
+// boot script that this panel's own script is rendered after.
+
 function computeRates(now, samples, c, g, psum) {
   const liveTok = (g.generation_tokens_live != null) ? g.generation_tokens_live : c.generation_tokens_total;
   const livePre = (g.prefill_tokens_live != null) ? g.prefill_tokens_live : 0;
@@ -80,7 +83,7 @@ function computeRates(now, samples, c, g, psum) {
 
 // Node (tests) sees no `document`; the browser sees no `globalThis.__mlxPanel`
 // consumer. Either way the IIFE below only runs in a real page.
-if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt };
+if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt, apiPrefix };
 
 if (typeof document !== 'undefined') (function () {
   // Panel markup, injected into the page. A template literal, so the CSS/HTML
@@ -296,7 +299,7 @@ if (typeof document !== 'undefined') (function () {
   async function tick() {
     let d;
     try {
-      const r = await fetch('/metrics.json', { cache: 'no-store' });
+      const r = await fetch(apiPrefix(location.pathname) + '/metrics.json', { cache: 'no-store' });
       if (r.status === 503) { setStatus('err', t('metrics disabled')); return; }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       d = await r.json();

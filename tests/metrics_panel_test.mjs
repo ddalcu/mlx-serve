@@ -16,12 +16,15 @@ import { dirname, join } from 'node:path';
 import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
+// The page's boot slot evaluates api.js before this script; the panel has no
+// prefix logic of its own, so the harness keeps that order.
+new Function(readFileSync(join(here, '..', 'src', 'html', 'api.js'), 'utf8'))();
 const src = readFileSync(join(here, '..', 'src', 'html', 'metrics.js'), 'utf8');
 
 // The file guards its IIFE on `typeof document`, so in node only the top-level
 // helpers evaluate. It hands them back through `globalThis.__mlxPanel`.
 new Function(src)();
-const { computeRates } = globalThis.__mlxPanel ?? {};
+const { computeRates, apiPrefix } = globalThis.__mlxPanel ?? {};
 assert.ok(computeRates, 'metrics.js must expose computeRates for tests');
 
 const counters = (over = {}) => ({
@@ -131,6 +134,15 @@ test('decode tok/s is 0 when nothing is running', () => {
   ];
   const r = computeRates(now, samples, counters(), gauges({ requests_running: 0 }), 5.0);
   assert.equal(r.decodeTps, 0);
+});
+
+// The panel polls through the prefix the page was served under, not the proxy's
+// root — and through the page's ONE implementation (a twin is the next
+// divergence waiting to happen).
+test('the metrics poll resolves against the page prefix', () => {
+  assert.equal(apiPrefix, globalThis.apiPrefix);
+  assert.equal(apiPrefix('/mount') + '/metrics.json', '/mount/metrics.json');
+  assert.equal(apiPrefix('/') + '/metrics.json', '/metrics.json');
 });
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
