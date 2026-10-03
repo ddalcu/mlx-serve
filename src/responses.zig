@@ -585,9 +585,8 @@ pub const ImageUrlDecoder = *const fn (
 
 /// Translate a Responses `input` value (string or array of input items) into
 /// `chat_mod.Message`s. Optionally prepends `instructions` as the single leading
-/// `system` msg. If `previous_messages` already contains a stored system message
-/// and fresh instructions are provided, the fresh instructions replace it so
-/// templates like Qwen's never see a non-leading/duplicate system message.
+/// `system` msg. Fresh instructions replace stored leading instructions;
+/// historical late system notes remain in conversation order.
 /// `previous_messages` are deep-referenced (not copied) into the result if
 /// non-null — caller must keep them alive.
 /// `namespace_aliases` (from `buildToolsJson`) rewrites echoed `function_call`
@@ -620,10 +619,11 @@ pub fn parseInput(
     }
 
     if (previous_messages) |prev| {
+        var leading = true;
         for (prev) |m| {
-            if (fresh_instructions != null and std.mem.eql(u8, m.role, "system")) {
-                continue;
-            }
+            const is_system = std.mem.eql(u8, m.role, "system");
+            if (!is_system) leading = false;
+            if (fresh_instructions != null and leading and is_system) continue;
             try pi.messages.append(allocator, m);
         }
     }
@@ -663,10 +663,9 @@ pub fn parseInput(
         else => {},
     }
 
-    // Templates we serve require the system turn first; fold any system past
-    // index 0 into the leading one — the same unconditional fold /v1/messages
-    // applies — so the native template renders a multi-system Responses input.
-    if (try chat_mod.foldSystemMessages(allocator, &pi.messages)) |joined| {
+    // Adjacent leading instructions share one turn; late notes stay in order
+    // until the renderer checks the template's role support.
+    if (try chat_mod.foldSystemMessages(allocator, &pi.messages, true)) |joined| {
         errdefer allocator.free(joined);
         try pi.owned_strings.append(allocator, joined);
     }
@@ -1514,6 +1513,20 @@ test "parseInput with instructions prepends system" {
     try testing.expectEqualStrings("user", pi.messages.items[1].role);
 }
 
+test "mid-system: fresh Responses instructions retain historical late notes" {
+    const prev = [_]chat_mod.Message{
+        .{ .role = "system", .content = "old instructions" },
+        .{ .role = "user", .content = "first" },
+        .{ .role = "system", .content = "historical note" },
+        .{ .role = "assistant", .content = "answer" },
+    };
+    var pi = try parseInput(testing.allocator, .{ .string = "next" }, "new instructions", &prev, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 5), pi.messages.items.len);
+    try testing.expectEqualStrings("new instructions", pi.messages.items[0].content);
+    try testing.expectEqualStrings("historical note", pi.messages.items[2].content);
+}
+
 test "parseInput replaces stored system when fresh instructions are provided" {
     const v: std.json.Value = .{ .string = "next" };
     const prev = [_]chat_mod.Message{
@@ -1533,6 +1546,20 @@ test "parseInput replaces stored system when fresh instructions are provided" {
     for (pi.messages.items[1..]) |m| {
         try testing.expect(!std.mem.eql(u8, m.role, "system"));
     }
+}
+
+test "parseInput preserves late system messages for template-aware rendering" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[ {"role":"user","content":"first"}, {"role":"assistant","content":"answer"},
+        \\  {"role":"system","content":"runtime note"}, {"role":"user","content":"next"} ]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, "stable instructions", null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 5), pi.messages.items.len);
+    try testing.expectEqualStrings("stable instructions", pi.messages.items[0].content);
+    try testing.expectEqualStrings("system", pi.messages.items[3].role);
+    try testing.expectEqualStrings("runtime note", pi.messages.items[3].content);
 }
 
 test "parseInput folds a non-leading system into the leading one" {

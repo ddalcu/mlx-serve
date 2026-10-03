@@ -41,6 +41,38 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
+test "format corpus: late system notes never vanish or rewrite supported history" {
+    const templates = [_]struct { source: []const u8, in_place: bool }{
+        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/inkling_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/muse_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/dsv4_chat_template.jinja"), .in_place = true },
+        .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
+    };
+    for (templates) |template| {
+        const config = chat.ChatConfig{ .chat_template = template.source, .bos_token = "<bos>", .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
+        const messages = [_]chat.Message{
+            .{ .role = "system", .content = "stable instructions" },
+            .{ .role = "user", .content = "corpus question marker" },
+            .{ .role = "system", .content = "corpus runtime note marker" },
+            .{ .role = "assistant", .content = "corpus answer marker" },
+            .{ .role = "user", .content = "corpus next question marker" },
+            .{ .role = "system", .content = "corpus newer note marker" },
+        };
+        const first = try chat.renderChatTemplate(testing.allocator, messages[0..3], &config, null, null, true, null, false);
+        defer testing.allocator.free(first);
+        const next = try chat.renderChatTemplate(testing.allocator, &messages, &config, null, null, true, null, false);
+        defer testing.allocator.free(next);
+        const q = std.mem.indexOf(u8, first, "corpus question marker").?;
+        const n = std.mem.indexOf(u8, first, "corpus runtime note marker").?;
+        try testing.expect(std.mem.indexOf(u8, next, "corpus runtime note marker") != null);
+        try testing.expect(std.mem.indexOf(u8, next, "corpus newer note marker") != null);
+        try testing.expectEqual(template.in_place, n > q);
+        if (template.in_place) try testing.expect(std.mem.startsWith(u8, next, first[0 .. n + "corpus runtime note marker".len]));
+    }
+}
+
 test "format corpus: MTP cost profiles classify full target tensor surfaces" {
     const Case = struct {
         bits: u32,

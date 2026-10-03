@@ -15053,7 +15053,7 @@ fn handleAnthropicMessages(
         }
     }
 
-    if (try chat_mod.foldSystemMessages(allocator, &messages)) |joined| try content_allocs.append(allocator, joined);
+    if (try chat_mod.foldSystemMessages(allocator, &messages, true)) |joined| try content_allocs.append(allocator, joined);
 
     if (image_decode_failed) {
         log.warn("POST /v1/messages -> 400 (undecodable image)\n", .{});
