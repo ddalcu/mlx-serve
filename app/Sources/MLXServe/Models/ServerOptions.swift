@@ -552,11 +552,6 @@ struct ServerOptions: Codable, Equatable {
     /// the entry count is the reliable lever — the byte cap under-counts the
     /// true retained allocation. An explicit 0 (disable) is preserved.
     ///   ≤18 GB (16 GB Macs): 1   ≤36 GB (24/32 GB): 8   else: uncapped.
-    /// Mirrors `server.osReserveBytes`: an eighth of RAM in GiB, never under 2 or over 8.
-    static func autoOsReserveGiB(physicalMemoryBytes: UInt64) -> Double {
-        min(max(Double(physicalMemoryBytes) / 8 / 1_073_741_824, 2), 8)
-    }
-
     /// Snap points for the model memory cap slider, in GiB. 0 is Auto and is
     /// always first. The ladder stops at the machine's RAM — a cap above it
     /// can never be reached, so offering it is theatre.
@@ -564,6 +559,11 @@ struct ServerOptions: Codable, Equatable {
         let ram = Int(physicalMemoryBytes / 1_073_741_824)
         return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
             .filter { $0 <= max(ram, 8) }
+    }
+
+    /// Mirrors `server.osReserveBytes`: an eighth of RAM in GiB, never under 2 or over 8.
+    static func autoOsReserveGiB(physicalMemoryBytes: UInt64) -> Double {
+        min(max(Double(physicalMemoryBytes) / 8 / 1_073_741_824, 2), 8)
     }
 
     /// Snap points for the idle-eviction slider, in seconds. Off first; every
@@ -1171,7 +1171,7 @@ extension ServerOptions {
             needsRestart: true),
         "osReserveGiB": .init(
             title: "Keep a memory reserve for macOS",
-            explainer: "The server leaves an eighth of your RAM (2 to 8 GB) out of its plans so macOS always has room. Turning this off gives models more context and admits more requests at once, but on a small Mac under heavy load it can freeze or restart the machine. Leave it on unless you know the load fits.",
+            explainer: "Free RAM the server leaves out of its plans so macOS always has room. Auto is an eighth of your RAM (2 to 8 GB). A smaller size, or Off, gives models more context and admits more requests at once, but on a small Mac under heavy load less reserve can freeze or restart the machine.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",

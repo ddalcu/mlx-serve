@@ -1682,7 +1682,7 @@
 "The server is started with this model when the run starts." = "运行开始时会用这个模型启动服务器。";
 "The server isn't running — the task will start it on its first run." = "服务器未运行 —— 任务首次运行时会自动启动它。";
 "The server isn't running, so nothing can answer. Click to start it." = "服务器未运行，无法应答。点击启动。";
-"The server leaves an eighth of your RAM (2 to 8 GB) out of its plans so macOS always has room. Turning this off gives models more context and admits more requests at once, but on a small Mac under heavy load it can freeze or restart the machine. Leave it on unless you know the load fits." = "服务器会从规划中留出八分之一的内存（2 到 8 GB），让 macOS 始终有余量。关闭后模型能获得更多上下文、同时接纳更多请求，但在小内存 Mac 高负载时可能造成系统卡死或重启。除非确定负载放得下，否则请保持开启。";
+"Free RAM the server leaves out of its plans so macOS always has room. Auto is an eighth of your RAM (2 to 8 GB). A smaller size, or Off, gives models more context and admits more requests at once, but on a small Mac under heavy load less reserve can freeze or restart the machine." = "服务器在规划中留出的空闲内存，让 macOS 始终有余量。自动为内存的八分之一（2 到 8 GB）。更小的余量或关闭可让模型获得更多上下文、同时接纳更多请求，但在小内存 Mac 高负载时，余量过少可能造成系统卡死或重启。";
 "The session running inside the sandbox will be terminated. Files it wrote are kept." = "沙盒中运行的会话将被终止。它写入的文件会保留。";
 "The sharpest LTX we ship. Same model as the 4-bit pack at twice the weight precision — noticeably more detail in faces, fur and fine texture, for about the same generation time. Needs a Mac with plenty of memory." = "我们提供的最清晰的 LTX。与 4-bit 包是同一模型，但权重精度翻倍 —— 面部、毛发和细腻纹理的细节明显更多，生成时间大致相同。需要内存充足的 Mac。";
 "The smallest rung's decode, measured again after the whole ladder. Beyond ±10% the run's numbers are a range, not figures." = "最小档位的解码速度，在整个阶梯测试结束后再测一次。超过 ±10% 时，本次结果只是一个范围，而不是确切数值。";
