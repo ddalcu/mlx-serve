@@ -27,14 +27,32 @@ Two ways to skip everything below:
 - **`mlx-serve launch <agent>`**: same thing from the terminal, ollama-style:
 
 ```bash
-mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider
+mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider, zcode
 mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # everything after -- goes to the agent
 ```
 
 If no server is running, `launch` starts the MLX Core app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
 
-Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes` stay yours).
+Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.zcode` stay yours).
+
+### ZCode (any served chat model)
+
+Install [ZCode](https://github.com/zai-org/ZCode) repository v3.14.3 (CLI package 0.16.9) and put its `zcode` executable on PATH. The launcher uses the current versioned Personal Provider Config contract; no ZCode source patch is required.
+
+```bash
+mlx-serve launch zcode --model MODEL_ID
+mlx-serve launch zcode --url http://127.0.0.1:11234 --model MODEL_ID -- --prompt "Inspect this repository" --mode build --output-format json
+mlx-serve launch zcode --model MODEL_ID --print
+```
+
+The same `launch zcode` command in Sushi accepts its own serving URL. Selection comes from `/v1/models`: any chat model is eligible, including native or EXL3 models once the server advertises them. A diagnostic-only model must first gain public serving support. Embedding and media rows are excluded. `--model` must match an advertised ID exactly; omit it to pick the loaded/default chat model.
+
+The launcher writes `~/.mlx-serve/zcode/provider_config.json` (schema version 1) and exports `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_DATA_BASE_DIR`, and `ZCODE_STORAGE_DIR` into dedicated directories. It refreshes the launch snapshot and default selection every launch. ZCode still reads its normal project configuration and skills. Its cloud account/provider configuration and session store are outside these dedicated paths.
+
+Wire protocol: OpenAI Chat Completions at `/v1/chat/completions`, SSE streaming, standard function tools and tool-result replay. Context comes from the server's advertised context, with the existing 32768/8192 fallback for older rows. Output is capped at `clamp(context / 2, 1024, 65536)`. Per-model overrides map output to `max_tokens` and reasoning to `reasoning_effort` (`none`, `low`, `medium`, `high`; initial selection `medium`). Image input follows the row's vision capability; native web search, PDF/video/audio input, and structured JSON output are not advertised by this integration.
+
+CPU verification: `python3 tests/test_zcode_launch.py --bin zig-out/bin/mlx-serve` checks arbitrary model IDs, chat filtering, budgets, selection errors, and argument quoting. Add `--zcode /absolute/path/to/zcode.cjs` to exercise the real ZCode client against a local fixture that streams reasoning and fragmented calls to two `Read` tools, verifies both tool results on the next request, and completes the turn. Fixture IDs establish transport compatibility, not model quality or GPU inference coverage.
 
 ## Coding agents (manual setup)
 

@@ -10,9 +10,27 @@ final class CLISetupInstructionsTests: XCTestCase {
                                   budget: budget)
     }
 
+
+    func testZCodeUsesTheAdvertisedGenericModelAndIsolatedConfig() throws {
+        let model = "arbitrary/org/model\"with-quote"
+        let entries = [AgentModelEntry(id: model, budget: budget, vision: true)]
+        let json = AgentConfigs.zcodeProviderJSON(baseURL: "http://localhost:11234", model: model,
+                                                 budget: budget, entries: entries)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        let config = try XCTUnwrap(root["config"] as? [String: Any])
+        let selection = try XCTUnwrap(config["defaultModelSelection"] as? [String: Any])
+        XCTAssertEqual(selection["modelId"] as? String, model)
+        XCTAssertTrue(json.contains("90112"))
+        let script = LauncherCLI.zcode.scriptBody("http://localhost:11234", model, "cd '/tmp'", budget, entries)
+        XCTAssertTrue(script.contains(AgentConfigs.zcodeExports))
+        XCTAssertTrue(script.contains("zcode \"$@\""))
+        let tab = try XCTUnwrap(tabs.first { $0.id == "zcode" })
+        XCTAssertTrue(tab.command.contains(AgentConfigs.zcodeExports))
+        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/zcode/provider_config.json <<'EOF'"))
+    }
     func testTabsHaveStableIdsInLauncherOrder() {
         XCTAssertEqual(tabs.map(\.id),
-                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider"],
+                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider", "zcode"],
                        "same CLIs, same order as the DMG launcher dropdown")
         for tab in tabs {
             XCTAssertFalse(tab.command.isEmpty, tab.id)
@@ -45,7 +63,7 @@ final class CLISetupInstructionsTests: XCTestCase {
     }
 
     func testEveryOtherLauncherStillRequiresTheServer() {
-        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .codex, .hermes, .aider] {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .codex, .hermes, .aider, .zcode] {
             XCTAssertTrue(cli.requiresServer, cli.id)
         }
     }
@@ -261,7 +279,7 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertEqual(LauncherCLI.codex.fallbackPaths.count, 4)
         XCTAssertTrue(LauncherCLI.codex.fallbackPaths.contains(
             "/Applications/ChatGPT.app/Contents/Resources/codex"))
-        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider] {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider, .zcode] {
             XCTAssertTrue(cli.fallbackPaths.isEmpty, cli.id)
         }
     }

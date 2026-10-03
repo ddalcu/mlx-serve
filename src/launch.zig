@@ -56,6 +56,7 @@ pub const AgentKind = enum {
     codex,
     hermes,
     aider,
+    zcode,
 
     pub fn fromName(name: []const u8) ?AgentKind {
         // The codex rebrand: issue #188 asks for `mlx-serve launch chatgpt`.
@@ -66,8 +67,10 @@ pub const AgentKind = enum {
         return null;
     }
 
-    pub const names = "claude, pi, omp, opencode, opencode2, codex, hermes, aider";
+    pub const names = "claude, pi, omp, opencode, opencode2, codex, hermes, aider, zcode";
 };
+
+pub const zcodeConfigJson = @import("zcode_launch.zig").configJson;
 
 // ── Config builders (pure — unit-tested below) ──────────────────────────
 
@@ -536,6 +539,15 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\hermes
             );
         },
+        .zcode => {
+            try out.appendSlice(allocator,
+                \\export ZCODE_DATA_BASE_DIR="$HOME/.mlx-serve/zcode"
+                \\export ZCODE_STORAGE_DIR="$HOME/.mlx-serve/zcode/storage"
+                \\export ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.mlx-serve/zcode/provider_config.json"
+                \\if ! command -v zcode >/dev/null 2>&1; then echo "zcode is not installed: build or install ZCode (https://github.com/zai-org/ZCode)" >&2; exit 127; fi
+                \\zcode
+            );
+        },
         .aider => {
             try out.print(allocator,
                 \\export OPENAI_API_BASE='{s}/v1'
@@ -718,7 +730,7 @@ fn agentSkillLink(kind: AgentKind) ?[]const u8 {
         .codex => "codex/skills/" ++ agent_skills.name,
         .hermes => "hermes/skills/" ++ agent_skills.name,
         .claude => claude_plugin_dir ++ "/skills/" ++ agent_skills.name,
-        .opencode, .opencode2, .aider => null,
+        .opencode, .opencode2, .aider, .zcode => null,
     };
 }
 
@@ -809,6 +821,11 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
             const env = try hermesEnvFile(allocator, base_url);
             defer allocator.free(env);
             try writeAgentFile(allocator, io, "hermes", ".env", env);
+        },
+        .zcode => {
+            const json = try zcodeConfigJson(allocator, base_url, model, entries);
+            defer allocator.free(json);
+            try writeAgentFile(allocator, io, "zcode", "provider_config.json", json);
         },
         .aider => {
             const json = try aiderMetadataJson(allocator, entries);
@@ -1367,4 +1384,26 @@ test "launch scripts point every agent at the skill and export MLX_SERVE_URL" {
     const oc = try opencodeJson(t.allocator, "http://x:1", &entries, null, false);
     defer t.allocator.free(oc);
     try t.expect(std.mem.indexOf(u8, oc, "\"skills\": {\"paths\": [\"~/.mlx-serve/skills/mlx-serve\"]}") != null);
+}
+
+test "zcode config escapes arbitrary model ids and declares server budgets and wire maps" {
+    const entries = [_]Entry{
+        .{ .id = "org/model\"quoted", .budget = .{ .context = 98304, .output = 49152 }, .vision = true, .loaded = false },
+        .{ .id = "glm-native", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true },
+    };
+    const json = try zcodeConfigJson(t.allocator, "http://127.0.0.1:11234", entries[0].id, &entries);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("config").?.object;
+    try t.expectEqualStrings(entries[0].id, config.get("defaultModelSelection").?.object.get("modelId").?.string);
+    const rules = config.get("modelConfigRules").?.object.get("providerModelRules").?.array.items;
+    try t.expectEqual(@as(usize, 2), rules.len);
+    const m = rules[0].object.get("config").?.object;
+    try t.expectEqual(@as(i64, 98304), m.get("properties").?.object.get("contextWindow").?.integer);
+    try t.expectEqualStrings("{\"max_tokens\": maxOutputTokens}", m.get("optionSpecs").?.object.get("maxOutputTokens").?.object.get("map").?.string);
+    const script = try scriptFor(t.allocator, .zcode, "http://127.0.0.1:11234", entries[0].id, entries[0].budget, null, &.{ "--prompt", "it's a prompt" });
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE") != null);
+    try t.expect(std.mem.indexOf(u8, script, "zcode '--prompt' 'it'\\''s a prompt'") != null);
 }
