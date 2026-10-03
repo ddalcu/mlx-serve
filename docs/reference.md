@@ -458,7 +458,7 @@ With a DFlash drafter bound, a row-exact trunk (`ModelConfig.rowExactDecode`) ve
 
 ### OS memory reserve (`--os-reserve-gib`)
 
-Every memory plan (load preflight, auto-context, prefill admission) subtracts a reserve for macOS from available memory before it bills anything: an eighth of RAM, never under 2 GB or over 8 GB (`server.osReserveBytes`). `--os-reserve-gib N` sets it explicitly and `0` turns it off; the app's "Keep a memory reserve for macOS" switch in Settings passes `--os-reserve-gib 0` when off. It exists because wired GPU memory starves the kernel before Metal reports an error: a 16 GB Mac panicked with 14 MB free. It works with the sibling bill (`scheduler.PromiseLedger`): a restored prefix shares the cached buffers until its first append, so concurrent admits are billed against what earlier admits were promised and have not allocated yet, plus a 2 GB margin.
+Every memory plan (load preflight, auto-context, prefill admission) subtracts a reserve for macOS from available memory before it bills anything: an eighth of RAM, never under 2 GB or over 8 GB (`server.osReserveBytes`). `--os-reserve-gib N` sets it explicitly and `0` turns it off; the app's "Keep a memory reserve for macOS" setting passes its number (Off = 0) and omits the flag on Auto. It exists because wired GPU memory starves the kernel before Metal reports an error: a 16 GB Mac panicked with 14 MB free. It works with the sibling bill (`scheduler.PromiseLedger`): a restored prefix shares the cached buffers until its first append, so concurrent admits are billed against what earlier admits were promised and have not allocated yet, plus a 2 GB margin.
 
 ### Workload-fair hot-cache eviction (#378)
 
