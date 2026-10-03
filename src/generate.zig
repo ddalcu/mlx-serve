@@ -756,6 +756,7 @@ pub const ThinkBound = struct {
     count: u32 = 0,
     cursor: usize = 0,
     fired: bool = false,
+    enforced: bool = false,
 
     pub fn observe(self: *ThinkBound, ids: []const u32) void {
         while (self.cursor < ids.len) : (self.cursor += 1) {
@@ -764,7 +765,7 @@ pub const ThinkBound = struct {
                 self.in_think = false;
             } else if (self.opener_id != null and id == self.opener_id.?) {
                 self.in_think = true;
-                self.count = 0;
+                if (self.enforced) self.fired = false else self.count = 0;
             } else if (self.in_think) {
                 self.count += 1;
             }
@@ -821,7 +822,8 @@ pub const SamplingParams = struct {
 
     /// A grammar or a penalty reshapes the logits spec verify compares against.
     pub fn shapesLogits(self: SamplingParams) bool {
-        return self.constraint != null or self.penalized();
+        return self.constraint != null or self.penalized() or
+            (if (self.think_bound) |bound| bound.enforced else false);
     }
 };
 
@@ -15539,6 +15541,23 @@ test "ThinkBound: counts only tokens inside the think block and fires at the bud
     po.observe(&[_]u32{ 6, 7, 30, 31, CLOSE, 32, 40 });
     try testing.expect(!po.in_think);
     try testing.expect(!po.due());
+}
+
+test "ThinkBound: enforced budgets count across reopened blocks and disable speculative logits" {
+    const t = std.testing;
+    var bound = ThinkBound{ .budget = 3, .opener_id = 10, .closer_id = 11, .forced = &.{11}, .in_think = true, .enforced = true };
+    var sampling = SamplingParams{ .think_bound = &bound };
+    try t.expect(sampling.shapesLogits());
+    bound.observe(&.{ 1, 2, 11, 99, 10, 3 });
+    try t.expect(bound.due());
+    bound.fired = true;
+    bound.observe(&.{ 1, 2, 11, 99, 10, 3, 11, 10 });
+    try t.expect(bound.due());
+    bound.enforced = false;
+    bound.fired = true;
+    try t.expect(!sampling.shapesLogits());
+    sampling.think_bound = null;
+    try t.expect(!sampling.shapesLogits());
 }
 
 test "degenerateTail: a short exact cycle convicts only past the minimum span" {

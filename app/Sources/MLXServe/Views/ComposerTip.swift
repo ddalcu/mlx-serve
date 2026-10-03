@@ -38,6 +38,11 @@ struct ComposerTip: Equatable {
         return ComposerTip(title: L10n.text("Attach"), body: L10n.text(body))
     }
 
+    static var generationSettings: ComposerTip {
+        ComposerTip(title: L10n.text("Chat generation settings"),
+                    body: L10n.text("Sampling and output limits for this chat only. Server locks still win."))
+    }
+
     static func thinking(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(title: L10n.format("Thinking · %@", state(isOn)),
                     body: agent.map(locked)

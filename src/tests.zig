@@ -16,6 +16,7 @@ test {
     _ = @import("mtp_replay_test.zig");
     _ = @import("mtp_lookup.zig");
     _ = @import("server.zig");
+    _ = @import("generation_settings.zig");
     _ = @import("model.zig");
     _ = @import("generate.zig");
     _ = @import("transformer.zig");

@@ -2,6 +2,39 @@
    Keys are the English source strings; anything not listed here
    falls back to English. */
 
+"All: %@" = "全部：%@";
+"Chat generation settings" = "聊天生成设置";
+"Sampling and output limits for this chat only. Server locks still win." = "仅用于此聊天的采样与输出限制。服务器锁定仍优先。";
+"Saved only for this chat. Explicit values override agent and server defaults; server locks still win. Changes apply to the next turn." = "仅保存于此聊天。明确指定的值覆盖 Agent 与服务器默认值；服务器锁定仍优先。更改在下一轮生效。";
+"Thinking and reasoning effort use the brain control in the composer." = "思考与推理努力级别使用输入区的脑形控件。";
+"Default inherits agent or server settings. Explicit values apply only to this chat." = "默认继承 Agent 或服务器设置。明确指定的值仅用于此聊天。";
+"-1 is unlimited; 0 closes thinking immediately. Server limits still apply." = "-1 表示无限制；0 立即结束思考。服务器限制仍然适用。";
+"Generation Defaults" = "生成默认值";
+"Generation defaults" = "生成默认值";
+"Ignore client override" = "忽略客户端覆盖";
+"Inherit" = "继承";
+"Global" = "全局";
+"Model default" = "模型默认值";
+"Max output tokens" = "最大输出 token 数";
+"Thinking budget" = "思考预算";
+"Frequency penalty" = "频率惩罚";
+"Reload settings" = "重新加载设置";
+"Server generation defaults for all clients — next request, no restart." = "面向所有客户端的服务器生成默认值 —— 下一次请求生效，无需重启。";
+"Defaults for app chats and external API clients. Explicit client values win unless locked. Model rules override global rules. Applies to the next request." = "用于应用聊天和外部 API 客户端的默认值。未锁定时，以客户端明确指定的值为准。模型规则覆盖全局规则。下一次请求生效。";
+"Applies to the next request without reloading. Model rules replace global values and their client-override policy." = "下一次请求生效，无需重新加载。模型规则替代全局值及其客户端覆盖策略。";
+"Generation defaults apply to the next request. Load settings apply when the model loads." = "生成默认值在下一次请求生效。加载设置在模型加载时生效。";
+"The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here." = "已保存的生成策略包含无效或不受支持的字段。原内容会保留；请先修正 model-settings.json，再在此编辑。";
+"0 disables top-k. Inherit uses the next configured default." = "0 禁用 top-k。继承使用下一层配置的默认值。";
+"1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding." = "1 禁用重复惩罚。非中性惩罚可能禁用投机解码和批量解码。";
+"Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control." = "使用此引擎现有的频率惩罚映射。重复惩罚和频率惩罚共用一个采样器控制项。";
+"0 uses remaining context. Context and memory limits still apply." = "0 使用剩余上下文。上下文和内存限制仍然适用。";
+"-1 is unlimited; 0 closes thinking immediately. A locked finite budget requires decode-time enforcement." = "-1 表示无限制；0 立即结束思考。锁定的有限预算需要在解码时强制执行。";
+"Explicit client thinking or effort wins unless locked." = "未锁定时，以客户端明确指定的思考或努力级别为准。";
+"Mapped to the model's template vocabulary. Numeric thinking budget is a separate control." = "映射到模型模板的词汇。数值思考预算是独立控制项。";
+"Client values win unless Ignore client override is checked." = "未勾选“忽略客户端覆盖”时，以客户端值为准。";
+"This resets every section — Server, Speculative Decoding, Performance, Generation Defaults, Voice, Agent Sandbox and Messaging — not just the one you're looking at. Your Telegram bot token is kept, since only @BotFather can reissue it. Generation defaults apply to the next request; launch flags apply after Restart Now." = "这会重置所有区块 —— 服务器、投机解码、性能、生成默认值、语音、Agent 沙盒和消息 —— 而不只是当前区块。Telegram 机器人令牌会保留，因为只有 @BotFather 才能重新签发。生成默认值在下一次请求生效；启动参数在点击“立即重启”后生效。";
+" Generation defaults apply to the next request without a restart. Per-model rules are kept." = " 生成默认值在下一次请求生效，无需重启。每模型规则会保留。";
+
 " (Turbo)" = " （Turbo）";
 " (our estimate)" = " （我们的估算）";
 " (with its built-in draft head)" = " （自带草稿头）";

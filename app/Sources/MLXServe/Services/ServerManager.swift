@@ -183,6 +183,12 @@ class ServerManager: ObservableObject {
     /// carries `--model`/`--model-dir`; this wires the env, stderr capture,
     /// termination handler, and health polling.
     private func launch(args: [String], options: ServerOptions) {
+        do { try GenerationDefaultsFile.migrate(options) }
+        catch {
+            lastError = "Could not save generation defaults: \(error.localizedDescription)"
+            status = .error(lastError)
+            return
+        }
         port = options.port
         api.host = options.host
         status = .starting

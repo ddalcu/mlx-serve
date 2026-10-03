@@ -51,6 +51,7 @@ Existing tools:
 | `./tests/test_tool_response.sh [port]` | Tool calling round-trip |
 | `./tests/test_kv_cache_poison.sh [port]` | KV cache poisoning regression |
 | `./tests/test_anthropic_api.sh [port]` | Anthropic Messages API |
+| `python3 tests/test_generation_defaults.py <model_dir>` | Global/model generation defaults and per-field client locks across Chat, Messages, Responses, raw completions and Ollama, stream/non-stream; next-request file edits, configured `/props` without loading, resolved logs, adaptive-effort budget enforcement and named malformed/unsupported-policy errors. Starts only its own server on a free loopback port with a private HOME. Hermetic counterparts: `generation_settings.zig`, `ThinkBound`, Swift `GenerationDefaultsTests`. |
 | `LLAMA_GGUF_MODEL=<file.gguf> ./tests/test_llama_gguf.sh [port]` | Embedded llama.cpp GGUF engine end-to-end (auto-routing, chat, streaming, Anthropic, prefix reuse — needs a pure-attention GGUF: llama.cpp cannot trim a recurrent Qwen3.5 session, so that fixture reports `cached_n=0` by design; same for `test_llama_multi_session.sh`) + the issue-#59 headless case: GGUF dir discovered via `--model-dir` (no config.json), cold-loads on first request, unloads, reloads |
 | `PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh` | PLD byte-equivalence (default gemma-4-e4b-it-8bit) |
 | `./tests/test_streaming_pld.sh [port]` | Streaming PLD byte-identical to non-streaming |

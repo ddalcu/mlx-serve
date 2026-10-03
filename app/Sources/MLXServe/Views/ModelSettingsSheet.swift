@@ -116,7 +116,7 @@ struct ModelSettingsSheet: View {
         if rows.acceptance { n += 1 }
         if live?.loaded == true { n += 1 }
         if !isGguf { n += 2 + override.templateKwargs.count + (addingCustom ? 1 : 0) }
-        return CGFloat(44 * n + 50)
+        return min(650, CGFloat(44 * n + 50 + 10 * 72))
     }
 
     @ViewBuilder
@@ -159,7 +159,7 @@ struct ModelSettingsSheet: View {
 
     private var footnote: String {
         switch plan {
-        case .saveOnly: return "Applied when the model loads."
+        case .saveOnly: return "Generation defaults apply to the next request. Load settings apply when the model loads."
         case .reload: return "Applied when the model loads; the resident model is reloaded now."
         case .restart: return "Applied when the model loads; the server is restarted now."
         }
@@ -224,6 +224,16 @@ struct ModelSettingsSheet: View {
                     Text("Off").font(.app(.body)).tag(0)
                 }
                 .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU.")
+                }
+                Section("Generation defaults") {
+                    if override.extra["generation_defaults"] != nil {
+                        Text("The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here.")
+                            .font(.app(.caption)).foregroundStyle(.orange)
+                    }
+                    GenerationDefaultsRows(profile: $override.generationDefaults, inheritance: "Global")
+                        .disabled(override.extra["generation_defaults"] != nil)
+                    Text("Applies to the next request without reloading. Model rules replace global values and their client-override policy.")
+                        .font(.app(.caption)).foregroundStyle(.secondary)
                 }
                 if !isGguf {
                     Section {
@@ -299,7 +309,7 @@ struct ModelSettingsSheet: View {
             }
             .padding(16)
         }
-        .frame(width: 440)
+        .frame(width: 660)
         .onAppear {
             settingsFile = ModelSettingsFile.load()
             override = settingsFile.override(for: request.path) ?? ModelOverride()

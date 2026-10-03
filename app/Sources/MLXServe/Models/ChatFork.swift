@@ -59,6 +59,7 @@ enum ChatFork {
         fork.useMCP = source.useMCP
         fork.agentId = source.agentId
         fork.disabledTools = source.disabledTools
+        fork.generationParams = source.generationParams
         return fork
     }
 }

@@ -1,17 +1,5 @@
 import Foundation
 
-/// All user-tunable mlx-serve options, persisted to UserDefaults as JSON.
-///
-/// Split into two groups:
-/// 1. Server-launch flags: passed on the `mlx-serve --serve` CLI; require a
-///    server restart to take effect.
-/// 2. Per-request defaults: injected into the JSON body of every chat request
-///    by APIClient; apply on the next request, no restart needed.
-///
-/// The Settings UI introspects these via the `serverFlagFields` /
-/// `requestDefaultFields` metadata to render labels, captions and the
-/// "needs restart" badge automatically — every option carries its own
-/// human-readable explainer.
 /// The voice backend for hands-free mode.
 enum VoiceEngine: String, Codable, CaseIterable, Sendable {
     /// macOS `AVSpeechSynthesizer`. No download, no GPU, but robotic.
@@ -526,14 +514,7 @@ struct ServerOptions: Codable, Equatable {
         llamaCacheEntries == other.llamaCacheEntries &&
         ssdStreaming == other.ssdStreaming &&
         mlxGguf == other.mlxGguf &&
-        tokenizeCacheEntries == other.tokenizeCacheEntries &&
-        // Sampling defaults are ALSO launch flags (server-side defaults for
-        // clients that omit sampling, e.g. Claude Code) — changing them must
-        // trip the restart detector. The app's own chats still pick them up
-        // immediately via request bodies.
-        defaultTemperature == other.defaultTemperature &&
-        defaultTopP == other.defaultTopP &&
-        defaultTopK == other.defaultTopK
+        tokenizeCacheEntries == other.tokenizeCacheEntries
     }
 
     // MARK: CLI args builder
@@ -743,19 +724,7 @@ struct ServerOptions: Codable, Equatable {
         if tokenizeCacheEntries != 4 {
             args += ["--tokenize-cache-entries", "\(tokenizeCacheEntries)"]
         }
-        // Sampling defaults double as server-launch flags so third-party
-        // clients that omit sampling params (Claude Code sends none at all)
-        // inherit the Settings values. Per-request body fields always win.
-        // Top-k 0 = "no opinion": OMIT the flag so the model's own
-        // generation_config.json recommendation (Qwen 3.6: 20, Gemma 4: 64)
-        // stays in effect rather than being force-disabled.
-        // %g: slider arithmetic leaves float dirt (0.8 - 0.1 stepped to
-        // 0.7000000000000001) that "\(Double)" would print verbatim into argv.
-        args += ["--temp", String(format: "%g", defaultTemperature)]
-        args += ["--top-p", String(format: "%g", defaultTopP)]
-        if defaultTopK > 0 {
-            args += ["--top-k", "\(defaultTopK)"]
-        }
+        // Generation defaults are read per request from generation-settings.json.
         // Opt-in escape hatch — omitted by default so the load pre-flight runs.
         if skipMemPreflight {
             args += ["--skip-mem-preflight"]
@@ -1186,47 +1155,4 @@ extension ServerOptions {
             needsRestart: true),
     ]
 
-    /// Human-readable metadata for the per-request defaults.
-    static let requestDefaultFields: [String: ServerOptionField] = [
-        "defaultMaxTokens": .init(
-            title: "Max tokens",
-            explainer: "Max tokens to generate per chat turn. \"Auto\" pegs it to the remaining context window — the safe choice on a small-RAM / small-context machine. Per-message overrides win when set.",
-            needsRestart: false),
-        "defaultTemperature": .init(
-            title: "Temperature",
-            explainer: "0 = deterministic greedy. 0.6–1.0 typical chat. Above 1.0 gets erratic. Applies to the app's chats immediately; also becomes the server default for external clients that omit temperature (Claude Code) after a restart.",
-            needsRestart: true),
-        "defaultTopP": .init(
-            title: "Top-p",
-            explainer: "Nucleus sampling threshold. 0.95 keeps all but the long tail. 1.0 disables top-p filtering. Also the server default for external clients that omit top_p (restart needed for that part).",
-            needsRestart: true),
-        "defaultTopK": .init(
-            title: "Top-k",
-            explainer: "Cap on candidate tokens per step. 0 = follow the model's own recommendation from generation_config.json (Qwen 3.6: 20, Gemma 4: 64); explicit values override it server-wide after a restart.",
-            needsRestart: true),
-        "defaultRepeatPenalty": .init(
-            title: "Repetition penalty",
-            explainer: "Penalty multiplier for tokens already in the context. 1.0 = none. 1.1 is a typical anti-repeat setting.",
-            needsRestart: false),
-        "defaultPresencePenalty": .init(
-            title: "Presence penalty",
-            explainer: "Additive penalty per token already present in the context. 0 = none.",
-            needsRestart: false),
-        "defaultReasoningBudget": .init(
-            title: "Reasoning budget",
-            explainer: "Max thinking tokens per request. -1 = unlimited. Only applies when thinking is enabled.",
-            needsRestart: false),
-        "defaultEnableThinking": .init(
-            title: "Enable thinking",
-            explainer: "Default the chat client to send `enable_thinking: true`. Only models with reasoning support honor this.",
-            needsRestart: false),
-        "perRequestEnablePLD": .init(
-            title: "Per-request PLD",
-            explainer: "Auto = follow the server's --pld setting (and the adaptive gate). On/Off forces it.",
-            needsRestart: false),
-        "perRequestEnableDrafter": .init(
-            title: "Per-request drafter",
-            explainer: "Auto = follow the server. On/Off forces it. Only meaningful when --drafter is loaded.",
-            needsRestart: false),
-    ]
 }

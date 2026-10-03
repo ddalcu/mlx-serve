@@ -146,9 +146,9 @@ struct SettingsView: View {
         EngineAwareSections()
         SettingsSection(
             category: .requestDefaults,
-            subtitle: "Apply on the next chat request — no restart needed."
+            subtitle: "Server generation defaults for all clients — next request, no restart."
         ) {
-            RequestDefaultsSectionContent()
+            GlobalGenerationDefaultsView()
         }
 
         SettingsSection(
@@ -295,7 +295,7 @@ private struct SettingsVisibleRowCountKey: PreferenceKey {
 /// Wraps one row so the filter can hide it, and reports it as visible when it
 /// survives. `searchText` is conventionally `[label, description]` — the same
 /// text the row renders, so what you read is what you can search for.
-private struct SearchableRow<Content: View>: View {
+struct SearchableRow<Content: View>: View {
     let searchText: [String]
     @ViewBuilder var content: Content
 
@@ -369,6 +369,7 @@ private struct ResetDefaultsFooter: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.settingsSelection) private var selection
     @State private var showConfirm = false
+    @State private var resetError: String?
 
     private var label: String { SettingsReset.buttonLabel(selection) }
 
@@ -395,13 +396,22 @@ private struct ResetDefaultsFooter: View {
                     .help(helpText)
                 }
                 .padding(.top, 4)
+                .overlay(alignment: .bottomLeading) {
+                    if let resetError { Text(verbatim: resetError).font(.app(.caption)).foregroundStyle(.red) }
+                }
                 .confirmationDialog(
                     SettingsReset.confirmTitle(selection),
                     isPresented: $showConfirm,
                     titleVisibility: .visible
                 ) {
                     Button(role: .destructive) {
-                        appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
+                        do {
+                            if selection == .all || selection == .category(.requestDefaults) {
+                                try GenerationDefaultsFile.save(.init())
+                            }
+                            appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
+                            resetError = nil
+                        } catch { resetError = "Could not reset generation defaults: \(error.localizedDescription)" }
                     } label: { Text("Reset")
                         .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
@@ -2273,163 +2283,6 @@ extension InterfaceSectionContent {
                                                           UInt8((c.blueComponent * 255).rounded())).hex
             })
     }
-}
-
-private struct RequestDefaultsSectionContent: View {
-    @EnvironmentObject var appState: AppState
-    @EnvironmentObject var server: ServerManager
-
-    private var meta: [String: ServerOptionField] { ServerOptions.requestDefaultFields }
-
-    /// Snapping presets for Max Tokens. Position 0 is "Auto" (= 0 sentinel):
-    /// the request omits max_tokens and the server pegs generation to the
-    /// remaining context window — the right cap on a small-RAM / small-context
-    /// machine, where a fixed number would over- or under-shoot. The rest are
-    /// powers of 2 from 256 up to 256K plus 1.5× midpoints from 3K up
-    /// (issue #188 — finer steps; every value formats exactly under the
-    /// 1024-division formatter).
-    private static let maxTokensPresets: [Int] = [
-        0, 256, 512, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576,
-        32768, 49152, 65536, 98304, 131072, 196608, 262144,
-    ]
-
-    /// Snapping presets for Reasoning Budget. Position 0 is the special
-    /// "Unlimited" sentinel (-1); the rest are powers of 2 from 256 up to 32K.
-    private static let reasoningPresets: [Int] = [
-        -1, 0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-    ]
-
-    private static func formatTokens(_ n: Int) -> String {
-        if n >= 1_048_576 { return "\(n / 1_048_576)M" }
-        if n >= 1024 { return "\(n / 1024)K" }
-        return "\(n)"
-    }
-
-    var body: some View {
-        let opts = $appState.serverOptions
-
-        // Max Tokens — snapping slider
-        if let m = meta["defaultMaxTokens"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                snappingSlider(
-                    presets: Self.maxTokensPresets,
-                    current: appState.serverOptions.defaultMaxTokens,
-                    set: { appState.serverOptions.defaultMaxTokens = $0 },
-                    label: appState.serverOptions.defaultMaxTokens <= 0
-                        ? "Auto"
-                        : Self.formatTokens(appState.serverOptions.defaultMaxTokens)
-                )
-            }
-        }
-        if let m = meta["defaultTemperature"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                VStack(alignment: .trailing, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Slider(value: opts.defaultTemperature, in: 0...2, step: 0.05)
-                        Text(String(format: "%.2f", appState.serverOptions.defaultTemperature))
-                            .font(.app(.body).monospacedDigit())
-                            .frame(minWidth: 36, alignment: .trailing)
-                    }
-                    recPill(server.modelInfo?.recTemperature.map { String(format: "%.2f", $0) })
-                }
-            }
-        }
-        if let m = meta["defaultTopP"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                VStack(alignment: .trailing, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Slider(value: opts.defaultTopP, in: 0.1...1.0, step: 0.01)
-                        Text(String(format: "%.2f", appState.serverOptions.defaultTopP))
-                            .font(.app(.body).monospacedDigit())
-                            .frame(minWidth: 36, alignment: .trailing)
-                    }
-                    recPill(server.modelInfo?.recTopP.map { String(format: "%.2f", $0) })
-                }
-            }
-        }
-        if let m = meta["defaultTopK"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                VStack(alignment: .trailing, spacing: 4) {
-                    Stepper(value: opts.defaultTopK, in: 0...1000) {
-                        Text(L10n.text(
-                             appState.serverOptions.defaultTopK == 0
-                             ? "Disabled"
-                             : "\(appState.serverOptions.defaultTopK)"
-))
-                            .font(.app(.body).monospacedDigit())
-                    }
-                    // Top-k is the one sampling field that actually falls
-                    // through to the model's recommendation: when the slider
-                    // reads "Disabled" (0) no `--top-k` flag is sent, so the
-                    // model's own value takes effect. Say so when it's live.
-                    recPill(
-                        server.modelInfo?.recTopK.map { "\($0)" },
-                        active: server.modelInfo?.recTopK != nil
-                            && appState.serverOptions.defaultTopK == 0
-                    )
-                }
-            }
-        }
-        if let m = meta["defaultRepeatPenalty"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                HStack(spacing: 8) {
-                    Slider(value: opts.defaultRepeatPenalty, in: 1.0...2.0, step: 0.01)
-                    Text(String(format: "%.2f", appState.serverOptions.defaultRepeatPenalty))
-                        .font(.app(.body).monospacedDigit())
-                        .frame(minWidth: 40, alignment: .trailing)
-                }
-            }
-        }
-        if let m = meta["defaultPresencePenalty"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                HStack(spacing: 8) {
-                    Slider(value: opts.defaultPresencePenalty, in: 0.0...2.0, step: 0.01)
-                    Text(String(format: "%.2f", appState.serverOptions.defaultPresencePenalty))
-                        .font(.app(.body).monospacedDigit())
-                        .frame(minWidth: 40, alignment: .trailing)
-                }
-            }
-        }
-        // Reasoning Budget — snapping slider; position 0 is the "Unlimited"
-        // sentinel (-1).
-        if let m = meta["defaultReasoningBudget"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                snappingSlider(
-                    presets: Self.reasoningPresets,
-                    current: appState.serverOptions.defaultReasoningBudget,
-                    set: { appState.serverOptions.defaultReasoningBudget = $0 },
-                    label: appState.serverOptions.defaultReasoningBudget < 0
-                        ? "Unlimited"
-                        : Self.formatTokens(appState.serverOptions.defaultReasoningBudget)
-                )
-            }
-        }
-    }
-
-    /// Small "model recommends" hint pill shown under a sampling slider. The
-    /// value comes from the loaded model's `generation_config.json` (surfaced
-    /// over `/v1/models`); nil → nothing rendered (no model loaded, or the
-    /// model ships no recommendation). `active=true` switches the styling to
-    /// green + "(in effect)" for the top-k case, where a Disabled slider
-    /// actually lets the model's value win.
-    @ViewBuilder
-    private func recPill(_ value: String?, active: Bool = false) -> some View {
-        if let value {
-            let color: Color = active ? .green : .secondary
-            HStack(spacing: 4) {
-                Text(L10n.text(active ? "Model default (in effect):" : "Model recommends:"))
-                    .font(.app(.caption2))
-                Text(value)
-                    .font(.app(.caption2).monospacedDigit().weight(.medium))
-            }
-            .foregroundStyle(color)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.12))
-            .clipShape(Capsule())
-        }
-    }
-
 }
 
 // MARK: - Voice (wake phrase) section

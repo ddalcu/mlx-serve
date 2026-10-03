@@ -3269,6 +3269,9 @@ struct ChatDetailView: View {
         thinkToggle
         agentToggle
         mcpToggle
+        ChatGenerationSettings(sessionId: sessionId)
+            .environmentObject(appState)
+            .disabled(appState.useAppleModel)
 
         // The model answering, right of the discs and left of the gauge. It
         // belongs to the MESSAGE — which model writes the reply — the same

@@ -312,6 +312,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var repeatPenalty: Double? = nil
         var presencePenalty: Double? = nil
         var reasoningBudget: Int? = nil
+        var generationParams = GenerationDefaults()
         /// The surface's `reasoning_effort` pick, sent only while thinking is
         /// on (see `reasoningEffortParam`).
         var reasoningEffort: ReasoningEffort = .low
@@ -358,19 +359,47 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             thinking ? reasoningEffort.rawValue : nil
         }
 
-        /// The per-request defaults for this turn: the user's saved sampling
-        /// with the agent's overrides laid on top. An override REPLACES the
-        /// saved value — including with the canonical "off" (top_k 0, repeat
-        /// 1.0, presence 0.0, budget -1), which clears the global rather than
-        /// leaving it standing, mapped to an omitted field exactly as
-        /// `RequestDefaults.from` maps it.
-        func requestDefaults(from opts: ServerOptions) -> APIClient.RequestDefaults {
-            var d = APIClient.RequestDefaults.from(opts)
+        func applyingGeneration(_ profile: GenerationDefaults) -> TurnConfig {
+            var copy = self
+            copy.generationParams = profile
+            if let value = profile.number(.temperature) { copy.temperature = value }
+            if let value = profile.number(.topP) { copy.topP = value }
+            if let value = profile.number(.topK) { copy.topK = Int(value) }
+            if let value = profile.number(.repeatPenalty) { copy.repeatPenalty = value }
+            else if profile.number(.frequencyPenalty) != nil { copy.repeatPenalty = nil }
+            if let value = profile.number(.presencePenalty) { copy.presencePenalty = value }
+            if let value = profile.number(.maxTokens) { copy.maxTokens = Int(value) }
+            if let value = profile.number(.budget) { copy.reasoningBudget = Int(value) }
+            return copy
+        }
+
+        func thinkingForRequest(_ options: ServerOptions, inheritGeneration: Bool) -> Bool {
+            enableThinking || (!inheritGeneration && options.defaultEnableThinking)
+        }
+
+        /// Local servers resolve inherited generation defaults; explicit agent
+        /// values, including neutral values, stay in the request. Remote clients
+        /// retain their saved sampling behavior.
+        func requestDefaults(from opts: ServerOptions, inheritGeneration: Bool = false) -> APIClient.RequestDefaults {
+            var d = inheritGeneration ? APIClient.RequestDefaults() : APIClient.RequestDefaults.from(opts)
+            d.inheritGeneration = inheritGeneration
+            d.temperatureOverride = temperature
+            d.maxTokensOverride = maxTokens
+            if inheritGeneration {
+                d.enablePLD = opts.perRequestEnablePLD.asOptionalBool
+                d.enableDrafter = opts.perRequestEnableDrafter.asOptionalBool
+                d.topK = topK
+                d.repeatPenalty = repeatPenalty
+                d.presencePenalty = presencePenalty
+                d.reasoningBudget = reasoningBudget
+            } else {
+                if let v = topK { d.topK = v > 0 ? v : nil }
+                if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
+                if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
+                if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
+            }
             if let v = topP { d.topP = v }
-            if let v = topK { d.topK = v > 0 ? v : nil }
-            if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
-            if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
-            if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
+            d.generationParams = generationParams
             return d
         }
 
@@ -557,6 +586,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
               Self.canRunTurn(serverRunning: server.status == .running,
                               apple: appState.useAppleModel) else { return }
 
+        let config = config.applyingGeneration(session(sessionId)?.generationParams ?? .init())
+
         // A new submission to the SAME session supersedes its in-flight turn.
         // Other sessions' turns are untouched — the engine is multi-turn.
         stop(sessionId: sessionId)
@@ -632,6 +663,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // continuation as a new one.
         appState.markContinuing(sessionId)
         publishTurnState()
+        let config = config.applyingGeneration(session(sessionId)?.generationParams ?? .init())
         runPlainTurn(sessionId: sessionId, text: "", images: nil, audio: nil,
                      config: config, token: token, continuing: true)
     }
@@ -730,7 +762,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                      token: UUID, continuing: Bool = false) async {
         var failed = false
         do {
-            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
+            let thinking = config.thinkingForRequest(appState.serverOptions,
+                                                      inheritGeneration: server.chatModelInfo?.provider == nil && server.lanChatModelId == nil)
             let stream: AsyncThrowingStream<SSEEvent, Error>
             if appState.useAppleModel {
                 // Apple's on-device model needs no server and no load.
@@ -750,7 +783,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
-                defaults: config.requestDefaults(from: appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions,
+                                                  inheritGeneration: server.chatModelInfo?.provider == nil && server.lanChatModelId == nil),
                 modelId: server.chatModelId,
                 continueFinalMessage: continuing
             )
@@ -1081,7 +1115,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: config.enableThinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
-                defaults: config.requestDefaults(from: appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions,
+                                                  inheritGeneration: server.chatModelInfo?.provider == nil && server.lanChatModelId == nil),
                 modelId: server.chatModelId
             )
             }

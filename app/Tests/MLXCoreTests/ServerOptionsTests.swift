@@ -431,32 +431,27 @@ final class ServerOptionsTests: XCTestCase {
 }
 
 extension ServerOptionsTests {
-    /// The Settings temperature must reach third-party clients (Claude Code
-    /// omits sampling params entirely, so the server-launch default is the
-    /// only channel). Top-p rides along; top-k 0 means "no opinion" and must
-    /// be OMITTED so the model's generation_config.json recommendation
-    /// (Qwen 3.6: top_k=20, Gemma 4: 64) stays in effect.
-    func testSamplingDefaultsReachLaunchArgs() {
+    /// Generation profiles are hot-read rather than pinned into launch flags.
+    func testSamplingDefaultsDoNotPinLaunchArgs() {
         var opts = ServerOptions()
         opts.defaultTemperature = 0.7
         opts.defaultTopP = 0.95
         opts.defaultTopK = 0
         let args = opts.toCLIArgs()
-        XCTAssertTrue(contains(args, flag: "--temp", value: "0.7"))
-        XCTAssertTrue(contains(args, flag: "--top-p", value: "0.95"))
+        XCTAssertFalse(args.contains("--temp"))
+        XCTAssertFalse(args.contains("--top-p"))
         XCTAssertFalse(args.contains("--top-k"))
 
         opts.defaultTopK = 40
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--top-k", value: "40"))
+        XCTAssertFalse(opts.toCLIArgs().contains("--top-k"))
     }
 
-    /// Changing a sampling default must trip the restart detector — these now
-    /// affect the launched process, not just the app's own request bodies.
-    func testSamplingDefaultsAffectRestartDetection() {
+    /// Generation settings apply to the next request without restarting.
+    func testSamplingDefaultsDoNotAffectRestartDetection() {
         let base = ServerOptions()
         var changed = base
         changed.defaultTemperature = 0.42
-        XCTAssertFalse(base.serverLaunchEquals(changed))
+        XCTAssertTrue(base.serverLaunchEquals(changed))
     }
 }
 
@@ -508,12 +503,10 @@ extension ServerOptionsTests {
         XCTAssertEqual(o, decoded, "a field missing from the custom init(from:) would revert to its default here")
     }
 
-    /// Slider arithmetic leaves float dirt (0.8 − 0.1 = 0.7000000000000001);
-    /// argv must carry the clean decimal (seen verbatim in `ps` output live).
-    func testSamplingFlagFormattingIsClean() {
+    func testSamplingMigrationKeepsNumericPrecision() {
         var opts = ServerOptions()
         opts.defaultTemperature = 0.8 - 0.1
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--temp", value: "0.7"))
+        XCTAssertEqual(GenerationDefaults.legacy(opts).rules["temperature"]?.value, .number(opts.defaultTemperature))
     }
 }
 

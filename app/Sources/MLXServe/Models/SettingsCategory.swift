@@ -55,7 +55,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .neuralEngine:      return "Neural Engine"
         case .specDecode:        return "Speculative Decoding (MLX only)"
         case .engines:           return "Engines"
-        case .requestDefaults:   return "Per-Request Defaults"
+        case .requestDefaults:   return "Generation Defaults"
         case .interface:         return "Interface"
         case .voice:             return "Voice"
         case .sandbox:           return "Agent Sandbox"

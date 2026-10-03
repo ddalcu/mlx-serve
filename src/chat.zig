@@ -148,15 +148,11 @@ pub const ChatConfig = struct {
     /// Template variables as a JSON object: the model's `chat_template_kwargs`
     /// (`model-settings.json`), with a request's own merged over them per request.
     chat_template_kwargs: ?[]const u8 = null,
-    /// The model's `enable_thinking` / `reasoning_effort` kwargs, typed: used
-    /// only when a request names neither (`server.resolveChatThinking`).
-    default_enable_thinking: ?bool = null,
-    default_reasoning_effort: ?[]const u8 = null,
+    generation_defaults: @import("generation_settings.zig").Profile = .{},
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
         if (self.chat_template_kwargs) |k| self.allocator.free(k);
-        if (self.default_reasoning_effort) |e| self.allocator.free(e);
         if (self.bos_token) |t| self.allocator.free(t);
         if (self.eos_token) |t| self.allocator.free(t);
     }

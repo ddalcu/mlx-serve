@@ -812,6 +812,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
+            @import("generation_settings.zig").cli_reasoning_budget = reasoning_budget;
         } else if (std.mem.eql(u8, args[i], "--log-level") and i + 1 < args.len) {
             i += 1;
             if (log.Level.fromString(args[i])) |level| {

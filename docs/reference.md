@@ -47,7 +47,7 @@ CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p -
 
 CLI subcommands (Ollama-grade, `src/cli.zig`): `mlx-serve run <model>` (pull-if-missing + serve + TTY chat REPL), `pull <model>`, `list`, `serve` (headless over `~/.mlx-serve/models`). Short names resolve via the alias table in cli.zig (mirrors `gemmaModelOptions`); `org/repo`, `hf.co/org/repo`, and `:tag` forms accepted everywhere.
 
-Sampling defaults for request fields the client OMITS resolve as: request body > `--temp`/`--top-p`/`--top-k` launch flags (the app passes its Settings values) > the model's `generation_config.json` (Qwen 3.6: top_k 20 / top_p 0.95; Gemma 4: top_k 64 / top_p 0.95) > hardcoded (1.0/1.0/off). Claude Code omits all sampling params, so pre-2026-06 it sampled the full untruncated distribution at temp 1.0.
+Generation settings resolve per field: client > model rules > global rules (explicit CLI defaults replace global-file values) > the model's `generation_config.json` > built-in defaults. A rule's `ignore_client` forces its value. App Settings writes the global file instead of sampling launch flags; changes apply to the next request. See “Generation defaults” below.
 
 ### Swift macOS app (`app/Sources/MLXServe/`)
 
@@ -206,6 +206,16 @@ Pure data in `responses.zig`; HTTP/orchestration in `server.zig`. Supports `POST
 - **Compliance**: `experiments/openresponses` validates strict schema; currently 17/17. `top_level response_format` accepted as alias for `text.format`.
 - **Compaction (`POST /v1/responses/compact`)**: pure data, no LLM call. Synthesizes opaque base64 `encrypted_content` over `{"v":1,"msgs":[...]}`. `appendCompactionInputItem` reconstitutes on round-trip. `model` required (422 on missing). Drops tool calls + images.
 - **WebSocket transport (`ws[s]://host/v1/responses`)**: same endpoint, opt-in via `Upgrade: websocket`. Each text frame is a `response.create`-shaped JSON; SSE events become single WS text frames via `WsBridge` on `Conn.ws_mode`. **No `[DONE]` on success** (`response.completed`/`.failed`/`.incomplete` is the terminator). Sequence numbers reset per response. `WsLocalCache` holds `store: false` responses for the connection lifetime; failed continuations evict the chain root.
+
+## Generation defaults
+
+`~/.mlx-serve/generation-settings.json` is a global object of `{ "temperature": {"value": 0.8, "ignore_client": false}, "reasoning_budget": {"value": 1024, "ignore_client": true} }` rules. Each model may carry the same object under `generation_defaults` in `model-settings.json`. A missing rule inherits; zero/off values are explicit. Per-model rules replace global rules and their lock state. Unlocked rules yield to native client fields; locked rules ignore them. Explicit sampling/output/budget CLI flags replace global-file values while retaining their lock state. Checkpoint and built-in defaults fill remaining omissions.
+
+The server snapshots profiles and template kwargs through `model_settings.Cache`, shared with request aliases, checking changes at most once a second. Generation-only edits need no reload; malformed settings refuse generation by name rather than discard enforcement. Each handler parses native Chat, Messages, Responses or translated Ollama fields once and resolves typed values against the profile; request bodies are never rewritten. Effort is mapped to the model's template independently of numeric budget. Locked finite budgets require decode-time enforcement; unsupported protocols are refused. Enforced-budget requests decode serially without speculation; a later reopened block keeps the same per-request reasoning bill. Raw completions do not implement thinking policy. Penalties retain the engine's existing semantics and can disable speculation/batching; embedded ds4/llama engines refuse nonneutral configured penalty policies they do not implement.
+
+`/props` carries `generation_defaults.global` and `.model`; `[generation-settings]` logs resolved fields, sources and locks. App Settings migrates saved generation values once into the global file without replacing an existing profile. Model Settings generation edits apply to the next request; context/KV/speculation changes retain their load behavior. Section checkboxes toggle all inheritance or all configured client locks; native mixed state means the rows disagree. Explicit chat/agent values still reach the request; inherited local defaults do not mask model settings. Provider/LAN defaults are unchanged.
+
+The composer's gear edits `ChatSession.generationParams`: sampling, penalties, output cap and numeric thinking budget for that session only, persisted in chat history and copied on fork. Missing values inherit the agent/server; explicit session values replace agent sampling and ride both plain and tool-loop requests, including neutral values. Server locks still win. Thinking and effort keep the composer's existing brain control. Changes are snapshotted at the next turn, including regeneration, continuation and voice turns in that session.
 
 ## Anthropic Messages API (`/v1/messages`)
 
