@@ -20,7 +20,7 @@ enum SettingsSearch {
     static func matches(query: String, in haystack: [String]) -> Bool {
         let needles = tokens(query)
         if needles.isEmpty { return true }
-        let hay = normalize(haystack.joined(separator: " "))
+        let hay = normalize((haystack + haystack.map(L10n.text)).joined(separator: " "))
         if hay.isEmpty { return false }
         return needles.allSatisfy { hay.contains($0) }
     }
