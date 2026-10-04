@@ -110,13 +110,16 @@ final class CLISetupInstructionsTests: XCTestCase {
     func testOpencode2TabUsesDedicatedXdgConfigAndRegistersThePlugin() throws {
         let tab = try XCTUnwrap(tabs.first { $0.id == "opencode2" })
         XCTAssertTrue(tab.command.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#))
-        XCTAssertTrue(tab.command.contains("opencode2 --standalone"))
-        XCTAssertFalse(tab.command.contains("opencode2 --model"))
+        XCTAssertTrue(tab.command.contains(#""$oc_bin" --standalone"#), tab.command)
+        XCTAssertFalse(tab.command.contains("--model"), tab.command)
         XCTAssertTrue(tab.command.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#))
-        XCTAssertTrue(tab.command.contains("npm install -g @opencode/cli"))
+        XCTAssertTrue(tab.installHint.contains("npm install -g @opencode/cli"))
         XCTAssertTrue(tab.command.contains("./plugins/mlx-serve"))
         XCTAssertTrue(tab.command.contains("http://localhost:11234/metrics.json"))
         XCTAssertFalse(tab.command.contains("~/.config/opencode"), "must never write the user's real opencode config")
+        // The v2 binary is version-resolved: Homebrew ships 2.x as `opencode`.
+        XCTAssertTrue(tab.command.contains("grep -qE"), tab.command)
+        XCTAssertTrue(tab.command.contains("oc_bin=opencode"), tab.command)
         let json = AgentConfigs.opencodeJSON(
             baseURL: "http://localhost:11234", defaultModel: "gemma-4-e4b-it-4bit",
             entries: [AgentModelEntry(id: "gemma-4-e4b-it-4bit", budget: budget, vision: false)],
@@ -124,16 +127,154 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertTrue(tab.command.contains("export OPENCODE_CONFIG_CONTENT='\(json)'"))
     }
 
-    func testDMGLauncherOpencode2MatchesTheTab() {
+    func testDMGLauncherOpencode2MatchesTheTab() throws {
         XCTAssertNotNil(LauncherCLI.opencode2.prepareConfig)
         let script = LauncherCLI.opencode2.scriptBody("http://localhost:11234",
                                                      "gemma-4-e4b-it-4bit", "cd '/tmp'", budget, [])
         XCTAssertTrue(script.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#), script)
-        XCTAssertTrue(script.contains("opencode2 --standalone"), script)
+        XCTAssertTrue(script.contains(#""$oc_bin" --standalone"#), script)
         XCTAssertFalse(script.contains("opencode2 --model"), script)
         XCTAssertTrue(script.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#), script)
-        XCTAssertTrue(script.contains("npm install -g @opencode/cli"), script)
         XCTAssertTrue(script.contains("exit 127"), script)
+        // Resolver order like `launch opencode2`: v2 `opencode`, then legacy, else refuse.
+        let lines = script.split(separator: "\n").map(String.init)
+        let assign = try XCTUnwrap(lines.first { $0.hasPrefix("oc_bin=") })
+        let check = try XCTUnwrap(lines.first { $0.contains("grep -qE") })
+        XCTAssertLessThan(lines.firstIndex(of: assign)!, lines.firstIndex(of: check)!,
+                          "oc_bin must default to the legacy binary and be replaced only by a v2 version check")
+    }
+
+    // MARK: - OpenCode version routing (twin of Zig's launch.zig detection)
+
+    /// Same table as Zig's `parseOpencodeVersion` unit test.
+    func testOpencodeVersionParserTable() {
+        for input in ["1.18.34", "v1.18.34", "opencode 1.18.34\n"] {
+            let got = try? XCTUnwrap(parseOpencodeVersion(input))
+            XCTAssertEqual(got?.generation, .v1, input)
+            XCTAssertEqual(got?.version, "1.18.34", input)
+        }
+        let later: [(String, String)] = [
+            ("2.0.20", "2.0.20"),
+            ("v2.0.20", "2.0.20"),
+            ("opencode v2.0.20", "2.0.20"),
+            ("3.0.0", "3.0.0"),
+            ("2.0.20-nightly", "2.0.20"),
+        ]
+        for (input, version) in later {
+            let got = try? XCTUnwrap(parseOpencodeVersion(input))
+            XCTAssertEqual(got?.generation, .v2, input)
+            XCTAssertEqual(got?.version, version, input)
+        }
+        for input in ["", "dev", "0.14.0", "OpenCode — canary build"] {
+            XCTAssertNil(parseOpencodeVersion(input), input)
+        }
+    }
+
+    /// Same marker extraction as Zig: rc banners cannot pose as the version.
+    func testExtractMarkedVersionIsolatesTheVersionSubshell() {
+        let m = extractMarkedVersion("Welcome! node 18.2.0\nMLXOCV=0 opencode v2.0.20\n")
+        XCTAssertEqual(m?.rc, 0)
+        let v = m.flatMap { parseOpencodeVersion($0.out) }
+        XCTAssertEqual(v?.generation, .v2)
+        XCTAssertEqual(v?.version, "2.0.20")
+        XCTAssertEqual(extractMarkedVersion("MLXOCV=127 opencode: boom\n")?.rc, 127)
+        XCTAssertEqual(extractMarkedVersion("b\nMLXOCV=0 open 2.0.20\nbuild x\n")?.out.contains("build x"), true)
+        XCTAssertNil(extractMarkedVersion("opencode v2.0.20"))
+        XCTAssertNil(extractMarkedVersion("MLXOCV=0"))
+        XCTAssertNil(extractMarkedVersion("MLXOCV=x out"))
+    }
+
+    /// The same table as Zig's `resolveOpencode2Bin` unit test.
+    func testOpencode2ResolverPrefersTheV2OpencodeThenTheLegacyBinary() {
+        let v2 = OpenCodeVersion(generation: .v2, version: "2.0.20")
+        let v3 = OpenCodeVersion(generation: .v2, version: "3.0.0")
+        let v1 = OpenCodeVersion(generation: .v1, version: "1.18.34")
+        XCTAssertEqual(resolveOpencode2Bin(detected: v2, legacyInstalled: true), "opencode")
+        XCTAssertEqual(resolveOpencode2Bin(detected: v3, legacyInstalled: false), "opencode")
+        XCTAssertEqual(resolveOpencode2Bin(detected: v1, legacyInstalled: true), "opencode2")
+        XCTAssertEqual(resolveOpencode2Bin(detected: nil, legacyInstalled: true), "opencode2")
+        XCTAssertNil(resolveOpencode2Bin(detected: v1, legacyInstalled: false))
+        XCTAssertNil(resolveOpencode2Bin(detected: nil, legacyInstalled: false))
+    }
+
+    /// Routing notices and refuse-on-failure for `launch opencode`.
+    @MainActor
+    func testLaunchOpencodeRoutesOnTheDetectedVersion() throws {
+        let detection = OpenCodeDetection(probe: .ok(OpenCodeVersion(generation: .v2, version: "2.0.20")),
+                                          legacyOpencode2Installed: false)
+        let routed = try XCTUnwrap(CLILauncher.launchCommand(
+            .opencode, baseURL: "http://localhost:11234", servedModelId: "m1",
+            budget: budget, entries: [], workingDirectory: "/tmp",
+            opencodeDetection: detection).args.last)
+        let script = try String(contentsOfFile: routed, encoding: .utf8)
+        XCTAssertTrue(script.contains("detected OpenCode 2.0.20; using the v2 integration."), script)
+        XCTAssertTrue(script.contains("\nopencode --standalone "), script)
+        XCTAssertTrue(script.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#), script)
+        XCTAssertTrue(script.contains(#""model": "mlx/m1""#), script)
+        XCTAssertFalse(script.contains("--model mlx/"), script)
+
+        let v1 = OpenCodeDetection(probe: .ok(OpenCodeVersion(generation: .v1, version: "1.18.34")),
+                                   legacyOpencode2Installed: true)
+        let old = try String(contentsOfFile: try XCTUnwrap(CLILauncher.launchCommand(
+            .opencode, baseURL: "http://localhost:11234", servedModelId: "m1",
+            budget: budget, entries: [], workingDirectory: "/tmp",
+            opencodeDetection: v1).args.last), encoding: .utf8)
+        XCTAssertTrue(old.contains("detected OpenCode 1.18.34; using the v1 integration."), old)
+        XCTAssertTrue(old.contains("opencode --model mlx/m1"), old)
+        XCTAssertFalse(old.contains("XDG_CONFIG_HOME"), old)
+
+        let missing = OpenCodeDetection(probe: .missing, legacyOpencode2Installed: false)
+        let none = try String(contentsOfFile: try XCTUnwrap(CLILauncher.launchCommand(
+            .opencode, baseURL: "http://localhost:11234", servedModelId: "m1",
+            budget: budget, entries: [], workingDirectory: "/tmp",
+            opencodeDetection: missing).args.last), encoding: .utf8)
+        XCTAssertTrue(none.contains("OpenCode is not installed or is not available on PATH."), none)
+        XCTAssertTrue(none.contains("exit 1"), none)
+
+        // A shell that cannot start is not reported as "not installed".
+        let unrunnable = try String(contentsOfFile: try XCTUnwrap(CLILauncher.launchCommand(
+            .opencode, baseURL: "http://localhost:11234", servedModelId: "m1",
+            budget: budget, entries: [], workingDirectory: "/tmp",
+            opencodeDetection: OpenCodeDetection(probe: .shellUnrunnable,
+                                                 legacyOpencode2Installed: false)).args.last), encoding: .utf8)
+        XCTAssertTrue(unrunnable.contains("could not run the login shell"), unrunnable)
+        XCTAssertFalse(unrunnable.contains("not installed"), unrunnable)
+
+        // A `--version` failure quotes the CLI's own output and refuses to guess.
+        let failed = OpenCodeDetection(probe: .versionFailed(output: "boom's bad"), legacyOpencode2Installed: true)
+        let bad = try String(contentsOfFile: try XCTUnwrap(CLILauncher.launchCommand(
+            .opencode, baseURL: "http://localhost:11234", servedModelId: "m1",
+            budget: budget, entries: [], workingDirectory: "/tmp",
+            opencodeDetection: failed).args.last), encoding: .utf8)
+        XCTAssertTrue(bad.contains("could not determine the installed OpenCode version"), bad)
+        XCTAssertTrue(bad.contains(#"printf '%s\n' 'boom'\''s bad'"#), bad)
+        XCTAssertTrue(bad.contains("supports OpenCode 1.x (the v1 integration) and 2.x or newer"), bad)
+        XCTAssertFalse(bad.contains("opencode --model mlx/m1"), "a detection failure must not launch a fallback profile")
+    }
+
+    /// `launch opencode2` resolver order; a v1 `opencode` never starts under v2 config.
+    @MainActor
+    func testLaunchOpencode2AliasResolvesTheV2Binary() throws {
+        func script(_ detection: OpenCodeDetection) throws -> String {
+            let path = try XCTUnwrap(CLILauncher.launchCommand(
+                .opencode2, baseURL: "http://localhost:11234", servedModelId: "m1",
+                budget: budget, entries: [], workingDirectory: "/tmp",
+                opencodeDetection: detection).args.last)
+            return try String(contentsOfFile: path, encoding: .utf8)
+        }
+        let v2 = try script(OpenCodeDetection(
+            probe: .ok(OpenCodeVersion(generation: .v2, version: "2.0.20")), legacyOpencode2Installed: true))
+        XCTAssertTrue(v2.contains("detected OpenCode 2.0.20; using the v2 integration."), v2)
+        XCTAssertTrue(v2.contains("\nopencode --standalone "), v2)
+        XCTAssertFalse(v2.contains("opencode2 --standalone"), v2)
+
+        let legacy = try script(OpenCodeDetection(
+            probe: .ok(OpenCodeVersion(generation: .v1, version: "1.18.34")), legacyOpencode2Installed: true))
+        XCTAssertTrue(legacy.contains("\nopencode2 --standalone "), legacy)
+
+        let refused = try script(OpenCodeDetection(probe: .missing, legacyOpencode2Installed: false))
+        XCTAssertTrue(refused.contains("no OpenCode v2 binary found"), refused)
+        XCTAssertFalse(refused.contains("--standalone"), refused)
     }
 
     func testOpencode2CliJsonMergeKeepsThemeAndReplacesMlxServe() throws {

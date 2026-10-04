@@ -416,6 +416,119 @@ pub fn aiderMetadataJson(allocator: std.mem.Allocator, entries: []const Entry) !
     return out.toOwnedSlice(allocator);
 }
 
+// ── OpenCode version detection ──────────────────────────────────────────
+
+/// The integration profile a detected OpenCode major selects. The binary
+/// name no longer says the generation (Homebrew v2 ships as `opencode`),
+/// so the version output is the only source of truth.
+pub const OpenCodeGeneration = enum { v1, v2 };
+
+pub const OpenCodeVersion = struct {
+    generation: OpenCodeGeneration,
+    /// The version token exactly as detected — the detection notice quotes
+    /// the real string, a 3.0.0 is never displayed as a 2.x.
+    version: []const u8,
+};
+
+/// Reads the first version token (optional `v` prefix, `digits.digits…`) out
+/// of `opencode --version` output: major 1 → v1, major >= 2 → the newest
+/// profile we ship. No token, major 0, or junk like `dev` is undecided.
+pub fn parseOpencodeVersion(output: []const u8) ?OpenCodeVersion {
+    var i: usize = 0;
+    while (i < output.len) : (i += 1) {
+        var start = i;
+        if (output[i] == 'v' or output[i] == 'V') {
+            if (i + 1 >= output.len or !std.ascii.isDigit(output[i + 1])) continue;
+            start = i + 1;
+        } else if (!std.ascii.isDigit(output[i])) continue;
+        var j = start;
+        while (j < output.len and std.ascii.isDigit(output[j])) j += 1;
+        if (j >= output.len or output[j] != '.') continue;
+        const major = std.fmt.parseInt(u32, output[start..j], 10) catch continue;
+        if (major < 1) return null;
+        var k = j;
+        while (k < output.len and (std.ascii.isDigit(output[k]) or output[k] == '.')) k += 1;
+        const version = std.mem.trim(u8, output[start..k], ".");
+        return .{
+            .generation = if (major == 1) .v1 else .v2,
+            .version = version,
+        };
+    }
+    return null;
+}
+
+/// The `launch opencode2` compatibility alias forces the v2 profile: the
+/// canonical `opencode` name when it resolves to major >= 2, else the
+/// legacy standalone binary — a v1 install never starts under it.
+fn resolveOpencode2Bin(detected: ?OpenCodeVersion, legacy_installed: bool) ?[]const u8 {
+    if (detected) |d| {
+        if (d.generation == .v2) return "opencode";
+    }
+    if (legacy_installed) return "opencode2";
+    return null;
+}
+
+/// Run one command through the same login shell the real launch execs
+/// through, so PATH resolution (nvm, Homebrew) is identical for detection
+/// and launch. Captured stdout comes back owned by the caller.
+fn runLoginShell(allocator: std.mem.Allocator, io: std.Io, cmd: []const u8) !struct { ok: bool, out: []u8 } {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "/bin/zsh", "-l", "-c", cmd },
+        .stdout_limit = .limited(64 * 1024),
+    }) catch return error.LoginShellFailed;
+    allocator.free(result.stderr);
+    return .{
+        .ok = switch (result.term) {
+            .exited => |code| code == 0,
+            else => false,
+        },
+        .out = result.stdout,
+    };
+}
+
+/// Rc files print banners to stdout, so the version runs in a marked subshell
+/// and only the marker's payload parses (keyed output, like Swift's
+/// `detectInstalled`). Twin of OpenCodeVersion.swift's marker constants.
+const version_marker = "MLXOCV=";
+const version_probe_cmd = "out=$(opencode --version 2>&1); rc=$?; printf 'MLXOCV=%s %s\\n' $rc \"$out\"";
+
+const MarkedVersion = struct { rc: u8, out: []const u8 };
+
+/// The version subshell's exit code and output from a login-shell capture:
+/// everything after the LAST `MLXOCV=<rc> ` token, so rc banners sitting
+/// before it can never pose as the version. Null = it never answered.
+fn extractMarkedVersion(captured: []const u8) ?MarkedVersion {
+    const pos = std.mem.lastIndexOf(u8, captured, version_marker) orelse return null;
+    const after = captured[pos + version_marker.len ..];
+    const sp = std.mem.indexOfScalar(u8, after, ' ') orelse return null;
+    const rc = std.fmt.parseInt(u8, after[0..sp], 10) catch return null;
+    return .{ .rc = rc, .out = after[sp + 1 ..] };
+}
+
+/// `opencode --version` resolved through the login shell. On `ok` the
+/// `version` string is owned; on the failure arms the quoted output is.
+const OpenCodeProbe = union(enum) {
+    missing,
+    version_failed: []u8,
+    unparsed: []u8,
+    ok: OpenCodeVersion,
+};
+
+fn probeOpenCode(allocator: std.mem.Allocator, io: std.Io) !OpenCodeProbe {
+    const found = try runLoginShell(allocator, io, "command -v opencode >/dev/null 2>&1");
+    allocator.free(found.out);
+    if (!found.ok) return .missing;
+    const run = try runLoginShell(allocator, io, version_probe_cmd);
+    defer allocator.free(run.out);
+    // No marker at all = the version subshell itself never answered.
+    const marked = extractMarkedVersion(run.out) orelse
+        return .{ .version_failed = try allocator.dupe(u8, run.out) };
+    if (marked.rc != 0) return .{ .version_failed = try allocator.dupe(u8, marked.out) };
+    const parsed = parseOpencodeVersion(marked.out) orelse
+        return .{ .unparsed = try allocator.dupe(u8, marked.out) };
+    return .{ .ok = .{ .generation = parsed.generation, .version = try allocator.dupe(u8, parsed.version) } };
+}
+
 // ── Launch script assembly ──────────────────────────────────────────────
 
 /// Shell-quote one extra passthrough arg (single quotes, '\'' escape).
@@ -449,7 +562,7 @@ pub fn contextFloor(kind: AgentKind) u64 {
     };
 }
 
-pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, opencode_config: ?[]const u8, extras: []const []const u8) ![]u8 {
+pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, opencode_config: ?[]const u8, agent_bin: []const u8, extras: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     if (budget.context > 0 and budget.context < contextFloor(kind)) {
@@ -501,16 +614,18 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
         .opencode => {
             try out.print(allocator,
                 \\export OPENCODE_CONFIG_CONTENT='{s}'
-                \\opencode --model mlx/{s}
-            , .{ opencode_config.?, model });
+                \\{s} --model mlx/{s}
+            , .{ opencode_config.?, agent_bin, model });
         },
         .opencode2 => {
+            // The binary is the version-detected resolution, not a fixed
+            // name: Homebrew ships v2 as `opencode`, `opencode2` is legacy.
             try out.print(allocator,
                 \\export OPENCODE_CONFIG_CONTENT='{s}'
                 \\export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
-                \\if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-                \\opencode2 --standalone
-            , .{opencode_config.?});
+                \\if ! command -v {s} >/dev/null 2>&1; then echo "{s} is not installed"; exit 127; fi
+                \\{s} --standalone
+            , .{ opencode_config.?, agent_bin, agent_bin, agent_bin });
         },
         .codex => {
             // PATH first, then the CLI the desktop app bundles (codex's
@@ -960,21 +1075,81 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     }
     const chosen = pick.?;
 
-    writeConfigs(allocator, io, parsed.kind, base_url, chosen.id, chosen.budget, models.entries) catch |err| {
-        log.err("could not write the {s} config: {s}\n", .{ @tagName(parsed.kind), @errorName(err) });
+    // Detect the OpenCode generation before anything is written: the v2
+    // profile ships different config files (cli.json + monitor plugin), so
+    // the routing decision cannot live inside the launch script.
+    var oc_kind: AgentKind = parsed.kind;
+    var oc_bin: []const u8 = "opencode";
+    if (parsed.kind == .opencode) {
+        const probe = probeOpenCode(allocator, io) catch {
+            log.err("could not run the login shell to detect the OpenCode version; retry, or use `mlx-serve launch opencode2` to force the v2 integration.\n", .{});
+            std.process.exit(1);
+        };
+        switch (probe) {
+            .missing => {
+                log.err("OpenCode is not installed or is not available on PATH.\n", .{});
+                log.err("install OpenCode and make sure `opencode` is on PATH, then rerun.\n", .{});
+                std.process.exit(1);
+            },
+            .version_failed, .unparsed => |out| {
+                log.err("could not determine the installed OpenCode version from `opencode --version`.\n", .{});
+                log.err("Output:\n{s}\n", .{out});
+                log.err("mlx-serve currently supports OpenCode 1.x (the v1 integration) and 2.x or newer (the v2 integration).\n", .{});
+                allocator.free(out);
+                std.process.exit(1);
+            },
+            .ok => |v| {
+                oc_kind = if (v.generation == .v1) .opencode else .opencode2;
+                log.info("detected OpenCode {s}; using the {s} integration.\n", .{
+                    v.version, if (v.generation == .v1) "v1" else "v2",
+                });
+                allocator.free(v.version);
+            },
+        }
+    } else if (parsed.kind == .opencode2) {
+        // Compatibility alias forcing the v2 profile; a v1 `opencode` must
+        // never start under it, so only a major >= 2 resolution counts.
+        const probe = probeOpenCode(allocator, io) catch .missing;
+        var detected: ?OpenCodeVersion = null;
+        switch (probe) {
+            .ok => |v| {
+                if (v.generation == .v2) detected = v;
+                if (v.generation != .v2) allocator.free(v.version);
+            },
+            .version_failed, .unparsed => |out| allocator.free(out),
+            .missing => {},
+        }
+        var legacy_ok = false;
+        if (runLoginShell(allocator, io, "command -v opencode2 >/dev/null 2>&1")) |legacy| {
+            legacy_ok = legacy.ok;
+            allocator.free(legacy.out);
+        } else |_| {}
+        oc_bin = resolveOpencode2Bin(detected, legacy_ok) orelse {
+            log.err("no OpenCode v2 binary found: `launch opencode2` needs an `opencode` 2.x+ or the legacy `opencode2` on PATH.\n", .{});
+            log.err("install OpenCode (https://opencode.ai/docs) and rerun, or use `mlx-serve launch opencode`.\n", .{});
+            std.process.exit(1);
+        };
+        if (detected) |v| {
+            log.info("detected OpenCode {s}; using the v2 integration.\n", .{v.version});
+            allocator.free(v.version);
+        }
+    }
+
+    writeConfigs(allocator, io, oc_kind, base_url, chosen.id, chosen.budget, models.entries) catch |err| {
+        log.err("could not write the {s} config: {s}\n", .{ @tagName(oc_kind), @errorName(err) });
         std.process.exit(1);
     };
 
-    const oc_config: ?[]u8 = if (parsed.kind == .opencode or parsed.kind == .opencode2)
-        try opencodeJson(allocator, base_url, models.entries, if (parsed.kind == .opencode2) chosen.id else null, parsed.kind == .opencode2)
+    const oc_config: ?[]u8 = if (oc_kind == .opencode or oc_kind == .opencode2)
+        try opencodeJson(allocator, base_url, models.entries, if (oc_kind == .opencode2) chosen.id else null, oc_kind == .opencode2)
     else
         null;
     defer if (oc_config) |c| allocator.free(c);
 
-    const script = try scriptFor(allocator, parsed.kind, base_url, chosen.id, chosen.budget, oc_config, parsed.extras);
+    const script = try scriptFor(allocator, oc_kind, base_url, chosen.id, chosen.budget, oc_config, oc_bin, parsed.extras);
     defer allocator.free(script);
 
-    if (parsed.kind == .opencode2) {
+    if (oc_kind == .opencode2) {
         // The plugin's whole data source is /metrics.json; say so now rather
         // than leave an empty panel to explain itself.
         if (metricsStatus(allocator, io, base_url)) |status| {
@@ -1170,14 +1345,14 @@ test "launch args: passthrough after --, unknown agent named, url trailing slash
 }
 
 test "script assembly: extras are shell-quoted onto the invocation line" {
-    const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{ "resume", "it's" });
+    const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, "codex", &.{ "resume", "it's" });
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" 'resume' 'it'\\''s'") != null);
     try t.expect(std.mem.indexOf(u8, script, "export CODEX_HOME=\"$HOME/.mlx-serve/codex\"") != null);
 }
 
 test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebrand)" {
-    const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{});
+    const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, "codex", &.{});
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "/Applications/ChatGPT.app") != null);
     try t.expect(std.mem.indexOf(u8, script, "/Applications/Codex.app") != null);
@@ -1283,7 +1458,7 @@ test "opencode2 feed note: 200 is silent, 503 names --metrics, 401 names the key
 
 test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and invokes opencode2" {
     const cfg = "{\"provider\":{}}";
-    const script = try scriptFor(t.allocator, .opencode2, "http://127.0.0.1:11234", "m1", .{ .context = 4096, .output = 1024 }, cfg, &.{ "resume", "it's" });
+    const script = try scriptFor(t.allocator, .opencode2, "http://127.0.0.1:11234", "m1", .{ .context = 4096, .output = 1024 }, cfg, "opencode2", &.{ "resume", "it's" });
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "export XDG_CONFIG_HOME=\"$HOME/.mlx-serve/opencode2\"") != null);
     try t.expect(std.mem.indexOf(u8, script, "export OPENCODE_CONFIG_CONTENT='{\"provider\":{}}'") != null);
@@ -1291,9 +1466,95 @@ test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and inv
     // service that never sees our env: --standalone, model pinned in the config.
     try t.expect(std.mem.indexOf(u8, script, "opencode2 --standalone") != null);
     try t.expect(std.mem.indexOf(u8, script, "--model") == null);
-    try t.expect(std.mem.indexOf(u8, script, "npm install -g @opencode/cli") != null);
+    try t.expect(std.mem.indexOf(u8, script, "opencode2 is not installed") != null);
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
     try t.expect(std.mem.indexOf(u8, script, "'resume' 'it'\\''s'") != null);
+}
+
+test "opencode version parser: major 1 = v1, major >= 2 = the newest profile, else undecided" {
+    for ([_][]const u8{ "1.18.34", "v1.18.34", "opencode 1.18.34\n" }) |input| {
+        const got = parseOpencodeVersion(input).?;
+        try t.expectEqual(OpenCodeGeneration.v1, got.generation);
+        try t.expectEqualStrings("1.18.34", got.version);
+    }
+    // Major >= 2 routes to the newest profile with its real version quoted verbatim.
+    const later = [_]struct { in: []const u8, version: []const u8 }{
+        .{ .in = "2.0.20", .version = "2.0.20" },
+        .{ .in = "v2.0.20", .version = "2.0.20" },
+        .{ .in = "opencode v2.0.20", .version = "2.0.20" },
+        .{ .in = "3.0.0", .version = "3.0.0" },
+        .{ .in = "2.0.20-nightly", .version = "2.0.20" },
+    };
+    for (later) |c| {
+        const got = parseOpencodeVersion(c.in).?;
+        try t.expectEqual(OpenCodeGeneration.v2, got.generation);
+        try t.expectEqualStrings(c.version, got.version);
+    }
+    // No token, a non-numeric tag, or a pre-1 major is undecided.
+    for ([_][]const u8{ "", "dev", "0.14.0", "OpenCode — canary build" }) |input|
+        try t.expect(parseOpencodeVersion(input) == null);
+}
+
+test "marked version output survives login-shell rc banners" {
+    // An rc file's own banner must not pose as the version (keyed output).
+    const m = extractMarkedVersion("Welcome! node 18.2.0\nMLXOCV=0 opencode v2.0.20\n").?;
+    try t.expectEqual(0, m.rc);
+    const v = parseOpencodeVersion(m.out).?;
+    try t.expectEqual(OpenCodeGeneration.v2, v.generation);
+    try t.expectEqualStrings("2.0.20", v.version);
+    // A nonzero rc is the --version failure itself; the tail is its message.
+    try t.expectEqual(127, extractMarkedVersion("MLXOCV=127 opencode: boom\n").?.rc);
+    // A multiline version output keeps its tail after the marker line.
+    try t.expect(std.mem.indexOf(u8, extractMarkedVersion("b\nMLXOCV=0 open 2.0.20\nbuild x\n").?.out, "build x") != null);
+    // No marker, no rc token, or a junk rc = the subshell never answered.
+    try t.expect(extractMarkedVersion("opencode v2.0.20") == null);
+    try t.expect(extractMarkedVersion("MLXOCV=0") == null);
+    try t.expect(extractMarkedVersion("MLXOCV=x out") == null);
+}
+
+test "launch opencode2 resolves the v2 `opencode` first, then the legacy binary" {
+    const v2 = OpenCodeVersion{ .generation = .v2, .version = "2.0.20" };
+    const v3 = OpenCodeVersion{ .generation = .v2, .version = "3.0.0" };
+    const v1 = OpenCodeVersion{ .generation = .v1, .version = "1.18.34" };
+    try t.expectEqualStrings("opencode", resolveOpencode2Bin(v2, true).?);
+    try t.expectEqualStrings("opencode", resolveOpencode2Bin(v3, false).?);
+    try t.expectEqualStrings("opencode2", resolveOpencode2Bin(v1, true).?);
+    try t.expectEqualStrings("opencode2", resolveOpencode2Bin(null, true).?);
+    try t.expect(resolveOpencode2Bin(v1, false) == null);
+    try t.expect(resolveOpencode2Bin(null, false) == null);
+}
+
+test "opencode launch routing: the detected generation picks the script, config, and binary" {
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = "m1", .budget = b, .vision = false, .loaded = true }};
+    // A Homebrew migration under ONE command: a v1 install gets the inline
+    // config + --model arm and nothing under the v2 config dir.
+    const v1_cfg = try opencodeJson(t.allocator, "http://x:1", &entries, null, false);
+    defer t.allocator.free(v1_cfg);
+    const before = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, v1_cfg, "opencode", &.{});
+    defer t.allocator.free(before);
+    try t.expect(std.mem.indexOf(u8, before, "opencode --model mlx/m1") != null);
+    try t.expect(std.mem.indexOf(u8, before, "XDG_CONFIG_HOME") == null);
+    try t.expect(std.mem.indexOf(u8, v1_cfg, "\"model\"") == null);
+
+    // After the same `opencode` name upgrades to 2.x, the SAME launch routes
+    // to the v2 arm: standalone invocation under the RESOLVED binary name,
+    // the dedicated XDG dir, and the model pinned in the config.
+    const v2_cfg = try opencodeJson(t.allocator, "http://x:1", &entries, "m1", true);
+    defer t.allocator.free(v2_cfg);
+    const after = try scriptFor(t.allocator, .opencode2, "http://x:1", "m1", b, v2_cfg, "opencode", &.{});
+    defer t.allocator.free(after);
+    try t.expect(std.mem.indexOf(u8, after, "\nopencode --standalone") != null);
+    try t.expect(std.mem.indexOf(u8, after, "command -v opencode ") != null);
+    try t.expect(std.mem.indexOf(u8, after, "opencode2 --standalone") == null);
+    try t.expect(std.mem.indexOf(u8, after, "XDG_CONFIG_HOME=\"$HOME/.mlx-serve/opencode2\"") != null);
+    try t.expect(std.mem.indexOf(u8, v2_cfg, "\"model\": \"mlx/m1\"") != null);
+    try t.expect(std.mem.indexOf(u8, v2_cfg, "\"compaction\"") != null);
+
+    // The legacy alias resolves the standalone opencode2 binary instead.
+    const legacy = try scriptFor(t.allocator, .opencode2, "http://x:1", "m1", b, v2_cfg, "opencode2", &.{});
+    defer t.allocator.free(legacy);
+    try t.expect(std.mem.indexOf(u8, legacy, "\nopencode2 --standalone") != null);
 }
 
 test "opencodeJson pins the default model only when asked" {
@@ -1308,7 +1569,7 @@ test "opencodeJson pins the default model only when asked" {
 }
 
 test "claude script keeps a slow local turn on one streamed request" {
-    const script = try scriptFor(t.allocator, .claude, "http://x:1", "m1", budgetForContext(786432), null, &.{});
+    const script = try scriptFor(t.allocator, .claude, "http://x:1", "m1", budgetForContext(786432), null, "claude", &.{});
     defer t.allocator.free(script);
     for ([_][]const u8{
         "export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1\n",
@@ -1321,7 +1582,7 @@ test "claude script keeps a slow local turn on one streamed request" {
 
 test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONTEXT_TOKENS)" {
     // Claude Code assumes 200k outside its catalog; CLAUDE_CODE_MAX_CONTEXT_TOKENS is the override.
-    const script = try scriptFor(t.allocator, .claude, "http://x:1", "m1", budgetForContext(786432), null, &.{});
+    const script = try scriptFor(t.allocator, .claude, "http://x:1", "m1", budgetForContext(786432), null, "claude", &.{});
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS=786432") != null);
     try t.expect(std.mem.indexOf(u8, script, "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536") != null);
@@ -1329,7 +1590,7 @@ test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONT
 
     // An unknown context is not a claim: omit the export rather than pin a
     // number the server never advertised.
-    const unknown = try scriptFor(t.allocator, .claude, "http://x:1", "m1", .{ .context = 0, .output = 8192 }, null, &.{});
+    const unknown = try scriptFor(t.allocator, .claude, "http://x:1", "m1", .{ .context = 0, .output = 8192 }, null, "claude", &.{});
     defer t.allocator.free(unknown);
     try t.expect(std.mem.indexOf(u8, unknown, "CLAUDE_CODE_MAX_CONTEXT_TOKENS") == null);
     try t.expect(std.mem.indexOf(u8, unknown, "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192") != null);
@@ -1358,7 +1619,7 @@ test "skill install: writes a missing skill, keeps an edited one, links the agen
 
 test "launch scripts point every agent at the skill and export MLX_SERVE_URL" {
     const b = Budget{ .context = 65536, .output = 8192 };
-    const claude = try scriptFor(t.allocator, .claude, "http://x:1", "m1", b, null, &.{});
+    const claude = try scriptFor(t.allocator, .claude, "http://x:1", "m1", b, null, "claude", &.{});
     defer t.allocator.free(claude);
     try t.expect(std.mem.indexOf(u8, claude, "export MLX_SERVE_URL='http://x:1'\n") != null);
     try t.expect(std.mem.indexOf(u8, claude, "claude --plugin-dir \"$HOME/.mlx-serve/claude/plugin\" --model m1") != null);

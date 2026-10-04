@@ -69,6 +69,9 @@ enum CLISetupInstructions {
                 title: "OpenCode",
                 installHint: "Requires the opencode CLI: curl -fsSL https://opencode.ai/install | bash",
                 command: """
+                # OpenCode 1.x (the v1 integration). OpenCode 2.x+ ships under the
+                # same name — `mlx-serve launch opencode` detects the version and
+                # routes itself; this block is the manual v1 setup.
                 export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, model: servedModelId, budget: budget))'
                 opencode --model mlx/\(servedModelId)
                 """),
@@ -76,6 +79,10 @@ enum CLISetupInstructions {
                 title: "OpenCode 2",
                 installHint: "Requires the opencode2 CLI: npm install -g @opencode/cli",
                 command: """
+                # The v2 integration, for OpenCode 2.x+ — `launch opencode` routes
+                # here automatically and `launch opencode2` forces it. Newer
+                # OpenCode ships as `opencode`, so the v2 binary is resolved by
+                # version below; the `opencode2` name is the legacy fallback.
                 mkdir -p ~/.mlx-serve/opencode2/opencode/plugins
                 [ -d ~/.mlx-serve/opencode2/opencode/plugins/mlx-serve ] || git clone https://github.com/beamivalice/opencode2-mlx-serve ~/.mlx-serve/opencode2/opencode/plugins/mlx-serve
                 cat > ~/.mlx-serve/opencode2/opencode/cli.json <<'EOF'
@@ -83,8 +90,7 @@ enum CLISetupInstructions {
                 EOF
                 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
                 export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: servedModelId, entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)], pinModel: true, compaction: true))'
-                if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-                opencode2 --standalone
+                \(opencodeV2BinResolver)
                 """),
             // codex honors CODEX_HOME for its whole config tree; the dir must
             // exist before codex runs. Responses wire API — our /v1/responses.

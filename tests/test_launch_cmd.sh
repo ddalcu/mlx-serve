@@ -15,8 +15,13 @@
 #       Claude Code assumes 200k and auto-compacts there) + the derived output
 #       budget
 #   [6] extra args after -- ride the agent invocation line
-#   [7] launch opencode2 --print: XDG_CONFIG_HOME under the dedicated dir,
-#       cli.json carries metricsUrl = base + /metrics.json, plugin has tui.tsx
+#   [7] launch opencode2 --print (compatibility alias): XDG_CONFIG_HOME under
+#       the dedicated dir, standalone invocation of the RESOLVED binary
+#       (v2 `opencode` when installed, else legacy `opencode2`), cli.json
+#       carries metricsUrl = base + /metrics.json, plugin has tui.tsx
+#   [8] launch opencode --print detects `opencode --version` and routes: a
+#       2.x install gets the v2 arm (standalone + model pinned in the config)
+#       and names the detected version on stderr
 #
 # The configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
 # launcher writes (never a user's real agent config) — asserted per agent.
@@ -133,12 +138,22 @@ else
     run_test "extra args after -- ride the agent invocation" FAIL "$OUT"
 fi
 
-# ── [7] opencode2 --print ──
+# ── [7] launch opencode2 --print (compatibility alias) ──
+# The alias forces the v2 profile and resolves the binary the same way:
+# `opencode` when it is major >= 2, else a legacy `opencode2` on PATH.
+OC_VER=$(opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+[0-9.]*' | head -1)
+OC_MAJOR=${OC_VER%%.*}
+EXPECTED_BIN=""
+if [ "${OC_MAJOR:-0}" -ge 2 ] 2>/dev/null; then EXPECTED_BIN=opencode; fi
+if [ -z "$EXPECTED_BIN" ] && command -v opencode2 >/dev/null 2>&1; then EXPECTED_BIN=opencode2; fi
+if [ -z "$EXPECTED_BIN" ]; then
+    echo "  SKIP: no OpenCode v2 binary on PATH for [7]/[8]"
+else
 OUT=$("$BIN" launch opencode2 --print --url "$BASE" 2>&1)
 OK=1
 echo "$OUT" | grep -q 'export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"' || OK=0
 echo "$OUT" | grep -q 'export OPENCODE_CONFIG_CONTENT=' || OK=0
-echo "$OUT" | grep -q '^opencode2 --standalone$' || OK=0
+echo "$OUT" | grep -q "^$EXPECTED_BIN --standalone\$" || OK=0
 echo "$OUT" | grep -q "\"model\": \"mlx/$MODEL_ID\"" || OK=0
 CLI_JSON="$HOME/.mlx-serve/opencode2/opencode/cli.json"
 if [ ! -f "$CLI_JSON" ]; then
@@ -159,9 +174,29 @@ assert 'metricsToken' not in (mlx[0].get('options') or {})
 fi
 [ -f "$HOME/.mlx-serve/opencode2/opencode/plugins/mlx-serve/tui.tsx" ] || OK=0
 if [ "$OK" = 1 ]; then
-    run_test "opencode2 script + cli.json + plugin tui.tsx" PASS
+    run_test "opencode2 alias: v2 script via the resolved binary + cli.json + plugin tui.tsx" PASS
 else
-    run_test "opencode2 script + cli.json + plugin tui.tsx" FAIL "$OUT"
+    run_test "opencode2 alias: v2 script via the resolved binary + cli.json + plugin tui.tsx" FAIL "$OUT"
+fi
+
+# ── [8] launch opencode --print routes on the detected version ──
+OUT=$("$BIN" launch opencode --print --url "$BASE" 2>&1)
+OK=1
+if [ "${OC_MAJOR:-0}" -ge 2 ] 2>/dev/null; then
+    # A v2 install under the canonical name: standalone, no --model flag,
+    # the detection names the real version and the profile it picked.
+    echo "$OUT" | grep -q '^opencode --standalone$' || OK=0
+    echo "$OUT" | grep -q -- '--model mlx/' && OK=0
+    echo "$OUT" | grep -q "using the v2 integration" || OK=0
+else
+    echo "$OUT" | grep -q '^opencode --model mlx/' || OK=0
+    echo "$OUT" | grep -q "using the v1 integration" || OK=0
+fi
+if [ "$OK" = 1 ]; then
+    run_test "launch opencode --print routes the detected version" PASS
+else
+    run_test "launch opencode --print routes the detected version" FAIL "$OUT"
+fi
 fi
 
 echo ""

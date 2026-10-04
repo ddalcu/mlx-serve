@@ -12,7 +12,7 @@ mlx-serve serve             # 对外提供所有已拉取模型的服务 —— 
 mlx-serve launch claude     # 配置并启动一个针对本地服务器的编码 Agent CLI
 ```
 
-`launch` 支持 claude、pi、omp、opencode、opencode2、codex、hermes 与 aider。它会读取运行中服务器的模型列表与真实上下文窗口，把 Agent 配置写进专用的 `~/.mlx-serve/<agent>/` 文件夹（绝不碰你真实的 Agent 配置），然后启动该 Agent。如果服务器没在运行，它会先启动 MLX Core 应用。`--model <id>` 选择模型，`--print` 只显示启动脚本而不真正运行，`--` 之后的任何内容都会传给 Agent（`mlx-serve launch codex -- resume`）。`opencode2` 还会安装 mlx-serve 监控插件，这要求服务器以 `--metrics` 启动。每种 Agent 的完整细节见 [integrations.md](integrations.md)。
+`launch` 支持 claude、pi、omp、opencode、opencode2、codex、hermes 与 aider。它会读取运行中服务器的模型列表与真实上下文窗口，把 Agent 配置写进专用的 `~/.mlx-serve/<agent>/` 文件夹（绝不碰你真实的 Agent 配置），然后启动该 Agent。如果服务器没在运行，它会先启动 MLX Core 应用。`--model <id>` 选择模型，`--print` 只显示启动脚本而不真正运行，`--` 之后的任何内容都会传给 Agent（`mlx-serve launch codex -- resume`）。`launch opencode` 会检测已安装 OpenCode 的版本（即使 `--print` 也会运行 `opencode --version` 来路由）并自动选择 v1 或 v2 集成；`launch opencode2` 作为强制 v2 的后兼容别名保留，它还会安装 mlx-serve 监控插件，这要求服务器以 `--metrics` 启动。每种 Agent 的完整细节见 [integrations.md](integrations.md)。
 
 短名称、`org/repo` 形式的 HuggingFace id 以及 `name:tag` 都可用。模型会落进一个共享的 `~/.mlx-serve/models` 存储目录，MLX Core 应用用的也是它。
 

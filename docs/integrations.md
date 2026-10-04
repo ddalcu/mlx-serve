@@ -117,6 +117,8 @@ omp also supports live discovery instead of a static list: replace the `models:`
 
 ### OpenCode
 
+`mlx-serve launch opencode` is the recommended path: it runs `opencode --version` and picks the v1 or the v2 integration below automatically (the executable name no longer says the generation — current Homebrew/npm distributions ship OpenCode 2 as `opencode`). For a manual v1 setup:
+
 No file needed. `OPENCODE_CONFIG_CONTENT` merges over your own config, so plugins and settings keep working.
 
 ```bash
@@ -126,13 +128,13 @@ opencode --model mlx/MODEL_ID
 
 ### OpenCode 2
 
-`opencode2` (npm `@opencode/cli`) reuses the same `OPENCODE_CONFIG_CONTENT` provider JSON. The launcher also writes a dedicated config dir and registers the mlx-serve monitor plugin (sidebar stats + footer turn meter, reading `GET /metrics.json`).
+OpenCode 2 reuses the same `OPENCODE_CONFIG_CONTENT` provider JSON, and the launcher also writes a dedicated config dir and registers the mlx-serve monitor plugin (sidebar stats + footer turn meter, reading `GET /metrics.json`). `mlx-serve launch opencode` routes a detected major >= 2 here (the profile is v2 for any newer major too); `mlx-serve launch opencode2` remains as a compatibility alias that forces v2 — it resolves `opencode` when that is the v2 binary, else a legacy `opencode2` still on PATH.
 
-**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX Core app enables metrics by default. `mlx-serve launch opencode2` probes the endpoint and prints a warning when it is off.
+**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX Core app enables metrics by default. A v2 launch probes the endpoint and prints a warning when it is off.
 
 ```bash
 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
-export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
+export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "model": "mlx/MODEL_ID", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
 ```
 
 `$XDG_CONFIG_HOME/opencode/cli.json` (plugin `package` is relative to that config dir):
@@ -141,10 +143,11 @@ export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "
 { "plugins": [ { "package": "./plugins/mlx-serve", "options": { "metricsUrl": "http://127.0.0.1:11234/metrics.json" } } ] }
 ```
 
-Loopback omits `metricsToken`; a non-loopback URL adds `"metricsToken": "mlx-serve"` (`Authorization: Bearer`). `mlx-serve launch opencode2` copies the plugin into `~/.mlx-serve/opencode2/opencode/plugins/mlx-serve/` and never writes `~/.config/opencode/`.
+Loopback omits `metricsToken`; a non-loopback URL adds `"metricsToken": "mlx-serve"` (`Authorization: Bearer`). A v2 launch copies the plugin into `~/.mlx-serve/opencode2/opencode/plugins/mlx-serve/` and never writes `~/.config/opencode/`.
 
 ```bash
-opencode2 --model mlx/MODEL_ID
+# v2 has no root --model flag — the model is pinned in the config above
+opencode --standalone
 ```
 
 ### Codex
