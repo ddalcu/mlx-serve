@@ -39,6 +39,15 @@ for f in "$MODEL"/*; do ln -s "$f" "$CLONE/$(basename "$f")"; done
 cat > "$CLONE/drafter/config.json" <<'JSON'
 {"model_type":"probe_assistant","block_size":4,"mask_token_id":1,"target_layer_ids":[0,1]}
 JSON
+# An MTP sidecar whose header names the marker tensor and nothing else: the
+# probe accepts it, the load fails loudly, the model still serves.
+mkdir -p "$CLONE/mtp"
+python3 - "$CLONE/mtp/weights.safetensors" <<'PY'
+import json, struct, sys
+h = json.dumps({"mtp.fc.weight": {"dtype": "F32", "shape": [1, 1], "data_offsets": [0, 4]}}).encode()
+h += b" " * (-len(h) % 8)
+open(sys.argv[1], "wb").write(struct.pack("<Q", len(h)) + h + b"\0" * 4)
+PY
 # `kill 0` signals the whole process GROUP — i.e. this script. Guard on
 # a non-empty pid, since cold_load_with clears it after each arm.
 cleanup_all() { [ -n "${SERVER_PID:-}" ] && { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; }; rm -rf "$ROOT"; }
@@ -50,10 +59,12 @@ run_test() {
     else FAIL=$((FAIL + 1)); echo "  FAIL: $1 — $3"; fi
 }
 
-# Boots with $MODEL as the primary, then COLD-loads the clone by name. Prints
-# the clone's load log.
-cold_load_with() { # $1 = extra launch flags, $2 = log path
-    ./zig-out/bin/mlx-serve --model "$MODEL" --serve --port $PORT --host 127.0.0.1 \
+# Boots with $MODEL as the primary (or headless, with no --model at all — the
+# mode the app always launches), then COLD-loads the clone by name.
+cold_load_with() { # $1 = extra launch flags, $2 = log path, $3 = primary|headless
+    local primary=(--model "$MODEL")
+    [ "${3:-primary}" = headless ] && primary=()
+    ./zig-out/bin/mlx-serve ${primary[@]+"${primary[@]}"} --serve --port $PORT --host 127.0.0.1 \
         --log-level info --model-dir "$ROOT" $1 >"$2" 2>&1 &
     SERVER_PID=$!
     for i in $(seq 1 60); do
@@ -97,6 +108,44 @@ if grep -q "model id=scratch-org/cold-load-probe ready" "$ROOT/nodrafter.log"; t
     run_test "the --no-drafter arm actually cold-loaded the clone" PASS ""
 else
     run_test "the --no-drafter arm actually cold-loaded the clone" FAIL "no ready line — the silent arm proves nothing"
+fi
+
+# The same two arms with no --model: headless builds its own load params.
+cold_load_with "" "$ROOT/headless-plain.log" headless || exit 1
+if grep -q "DFlash" "$ROOT/headless-plain.log"; then
+    run_test "in-dir drafter probed on a headless cold load (baseline)" PASS ""
+else
+    run_test "in-dir drafter probed on a headless cold load (baseline)" FAIL "no DFlash line — test setup is not exercising the probe"
+fi
+
+cold_load_with "--no-drafter" "$ROOT/headless-nodrafter.log" headless || exit 1
+if grep -q "DFlash" "$ROOT/headless-nodrafter.log"; then
+    run_test "--no-drafter survives a headless cold load" FAIL "cold-loaded model still probed: $(grep -m1 DFlash "$ROOT/headless-nodrafter.log")"
+else
+    run_test "--no-drafter survives a headless cold load" PASS ""
+fi
+if grep -q "model id=scratch-org/cold-load-probe ready" "$ROOT/headless-nodrafter.log"; then
+    run_test "the headless --no-drafter arm actually cold-loaded the clone" PASS ""
+else
+    run_test "the headless --no-drafter arm actually cold-loaded the clone" FAIL "no ready line — the silent arm proves nothing"
+fi
+
+# --no-mtp the same way: the --no-drafter arm above is its baseline.
+if grep -q "MTP sidecar" "$ROOT/headless-nodrafter.log"; then
+    run_test "in-dir MTP sidecar probed on a headless cold load (baseline)" PASS ""
+else
+    run_test "in-dir MTP sidecar probed on a headless cold load (baseline)" FAIL "no MTP sidecar line — test setup is not exercising the probe"
+fi
+cold_load_with "--no-drafter --no-mtp" "$ROOT/headless-nomtp.log" headless || exit 1
+if grep -q "MTP sidecar" "$ROOT/headless-nomtp.log"; then
+    run_test "--no-mtp survives a headless cold load" FAIL "cold-loaded model still probed: $(grep -m1 "MTP sidecar" "$ROOT/headless-nomtp.log")"
+else
+    run_test "--no-mtp survives a headless cold load" PASS ""
+fi
+if grep -q "model id=scratch-org/cold-load-probe ready" "$ROOT/headless-nomtp.log"; then
+    run_test "the headless --no-mtp arm actually cold-loaded the clone" PASS ""
+else
+    run_test "the headless --no-mtp arm actually cold-loaded the clone" FAIL "no ready line — the silent arm proves nothing"
 fi
 
 echo ""

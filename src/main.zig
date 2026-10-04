@@ -1264,7 +1264,13 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld, .{
+                .no_drafter = no_drafter,
+                .mtp_enabled = enable_mtp,
+                .mtp_depth = mtp_depth,
+                .draft_block_size = draft_block_size,
+                .draft_block_size_explicit = draft_block_size_explicit,
+            });
             return;
         }
 
@@ -1907,6 +1913,16 @@ fn runGenServe(
     });
 }
 
+/// Launch flags that shape every on-demand load. Headless takes them as one
+/// value so its LoadParams cannot leave any of them at a struct default.
+const SpecLoadFlags = struct {
+    no_drafter: bool,
+    mtp_enabled: bool,
+    mtp_depth: u32,
+    draft_block_size: u32,
+    draft_block_size_explicit: bool,
+};
+
 /// Headless serve mode: start with NO primary model. The registry holds all
 /// discovery stubs; chat AND media models load on demand via `/v1/load-model`
 /// (or a request targeting a discovered id), coexisting under one memory
@@ -1927,6 +1943,7 @@ fn runHeadlessServe(
     idle_evict_secs: ?u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
     pld: server_mod.PldDefaults,
+    spec: SpecLoadFlags,
 ) !void {
     log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1991,7 +2008,11 @@ fn runHeadlessServe(
         .no_initial_load = true,
         .load_vision = false,
         .warmup_eager = false,
-        .draft_block_size = 0,
+        .no_drafter = spec.no_drafter,
+        .mtp_enabled = spec.mtp_enabled,
+        .mtp_depth = spec.mtp_depth,
+        .draft_block_size = spec.draft_block_size,
+        .draft_block_size_explicit = spec.draft_block_size_explicit,
         .kv_quant_config = kv_quant_config,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         // Seed the scheduler's prefix-cache config from the server globals so
