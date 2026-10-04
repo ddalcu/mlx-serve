@@ -630,10 +630,12 @@ fn scalarValue(arr: mlx.mlx_array, s: mlx.mlx_stream) ?f32 {
 pub fn validatePath(path: []const u8) !void {
     if (path.len == 0 or !std.fs.path.isAbsolute(path)) return error.BadLoraPath;
     const io = std.Io.Threaded.global_single_threaded.io();
+    // Kind before open: opening a FIFO blocks until a writer appears, and a
+    // directory opens fine.
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return error.BadLoraPath;
+    if (st.kind != .file) return error.BadLoraPath;
     const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.BadLoraPath;
-    defer f.close(io);
-    const st = f.stat(io) catch return error.BadLoraPath;
-    if (st.kind != .file) return error.BadLoraPath; // a directory opens fine
+    f.close(io);
 }
 
 pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !File {
@@ -1334,6 +1336,43 @@ test "canonicalize resolves Kohya flat-scheme module names, not just dotted ones
 test "loadFile rejects relative/empty paths (openFileAbsolute UB class)" {
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "", .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "rel/lora.safetensors", .generic));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "validatePath refuses a FIFO without waiting for a writer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const fifo = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/lora.safetensors", .{buf[0..root_len]}, 0);
+    defer testing.allocator.free(fifo);
+    try testing.expectEqual(@as(c_int, 0), mkfifo(fifo.ptr, 0o600));
+
+    const Probe = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn run(self: *@This(), path: []const u8) void {
+            self.result = validatePath(path);
+            self.done.store(true, .release);
+        }
+    };
+    var probe: Probe = .{};
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{ &probe, fifo });
+    var waited_ms: u32 = 0;
+    while (!probe.done.load(.acquire) and waited_ms < 2000) : (waited_ms += 10) {
+        std.Io.sleep(io, .fromMilliseconds(10), .real) catch {};
+    }
+    const blocked = !probe.done.load(.acquire);
+    // A blocked open is released by a writer, so a red run fails instead of hanging.
+    if (blocked) {
+        const w = std.c.open(fifo.ptr, .{ .ACCMODE = .WRONLY, .NONBLOCK = true });
+        if (w >= 0) _ = std.c.close(w);
+    }
+    thread.join();
+    try testing.expect(!blocked);
+    try testing.expectError(error.BadLoraPath, probe.result);
 }
 
 test "loadFile rejects a MISSING file before mlx can kill the process" {
