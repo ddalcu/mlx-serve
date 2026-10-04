@@ -6307,7 +6307,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
             slot.sampling.temperature,
             @intCast(slot.sampling.top_k),
             slot.sampling.top_p,
-            0.05,
+            slot.sampling.min_p orelse 0.05,
             &slot.ds4_rng,
         );
 
@@ -6337,7 +6337,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         const spec = if (slot.sampling.temperature <= 0.0)
             session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..])
         else
-            session.evalSpeculativeSampled(next_id, remaining, engine.eosToken(), slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, 0.05, &slot.ds4_rng, spec_buf[0..]);
+            session.evalSpeculativeSampled(next_id, remaining, engine.eosToken(), slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, slot.sampling.min_p orelse 0.05, &slot.ds4_rng, spec_buf[0..]);
         const n = spec catch {
             session.invalidate();
             slot.markError("ds4_spec_failed");
@@ -6412,7 +6412,7 @@ fn runLlamaDecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_llama.LlamaSe
             slot.sampling.temperature,
             @intCast(slot.sampling.top_k),
             slot.sampling.top_p,
-            0.0, // min_p disabled — matches the MLX sampler (top_k + top_p only)
+            slot.sampling.min_p orelse 0.0,
             &slot.llama_rng,
         );
 

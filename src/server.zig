@@ -8698,6 +8698,7 @@ fn handleChatCompletions(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
     const repeat_penalty = requestRepeatPenalty(root);
 
@@ -9163,6 +9164,7 @@ fn handleChatCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
@@ -9300,6 +9302,7 @@ fn handleCompletions(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
     const repeat_penalty = requestRepeatPenalty(root);
     const presence_penalty_c = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
@@ -9419,6 +9422,7 @@ fn handleCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
         .seed = seed,
@@ -15349,6 +15353,7 @@ fn handleAnthropicMessages(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Tools
@@ -15654,6 +15659,7 @@ fn handleAnthropicMessages(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = 1.0,
         .presence_penalty = 0.0,
         .seed = seed,
@@ -17174,6 +17180,7 @@ fn handleResponsesInner(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
     const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
@@ -17443,6 +17450,7 @@ fn handleResponsesInner(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
