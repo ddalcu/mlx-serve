@@ -179,8 +179,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         steering.append(text, for: sessionId)
     }
 
-    func clearSteeringNote(for sessionId: UUID) {
-        steering.clear(for: sessionId)
+    func pauseSteeringNote(for sessionId: UUID) {
+        steering.pause(for: sessionId)
+    }
+
+    func restoreSteeringNote(for sessionId: UUID, into draft: String,
+                             hasMarkedText: Bool) -> String? {
+        steering.restore(for: sessionId, into: draft, hasMarkedText: hasMarkedText)
     }
 
     /// Only the turn that still owns the slot hands its note on; a stopped or
@@ -257,9 +262,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// defense in depth for any future removal path.
     func stopIfOrphaned() {
         let existing = Set(appState.chatSessions.map(\.id))
+        steering.retain(only: existing)
         for sid in ledger.orphaned(existingSessions: existing) {
             stop(sessionId: sid)
-            steering.clear(for: sid)
             activity.markSeen(sid)
         }
     }

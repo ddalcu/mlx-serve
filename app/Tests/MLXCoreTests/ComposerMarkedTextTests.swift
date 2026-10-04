@@ -1,4 +1,6 @@
 import XCTest
+import AppKit
+import SwiftUI
 @testable import MLXCore
 
 // A live input-method composition reaches no SwiftUI state until it commits.
@@ -58,61 +60,89 @@ final class ComposerMarkedTextTests: XCTestCase {
                        "an underlined composition is text the user can see")
     }
 
-    // MARK: - Wiring; headless tests cannot drive an NSTextView, so consumers are pinned.
-
-    private var chatView: String {
-        SourceScan.source("Views/ChatView.swift", from: #filePath)
+    @MainActor
+    func testCompositionReportsTheLiveStateThroughCommitAndUnmark() {
+        let tv = ComposerTextView()
+        var states: [Bool] = []
+        tv.onMarkedTextChanged = { [weak tv] marked in
+            XCTAssertEqual(marked, tv?.hasMarkedText())
+            states.append(marked)
+        }
+        tv.setMarkedText("にほん", selectedRange: NSRange(location: 3, length: 0),
+                         replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(states.last, true)
+        tv.insertText("日本", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(states.last, false)
+        XCTAssertEqual(tv.string, "日本")
+        states.removeAll()
+        tv.setMarkedText("ご", selectedRange: NSRange(location: 1, length: 0),
+                         replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(states.last, true)
+        tv.unmarkText()
+        XCTAssertEqual(states.last, false)
     }
 
-    func testTheComposerDecidesReturnWithTheComposingState() {
-        guard let body = SourceScan.declarationBody(
-            from: "func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {",
-            in: chatView) else {
-            return XCTFail("the composer's doCommandBy is gone — renamed?")
+    @MainActor
+    func testEditorPreservesMarkedTextAndReportsTheCommittedBinding() throws {
+        _ = NSApplication.shared
+        var draft = ""
+        var marked = false
+        let binding = Binding<String>(get: { draft }, set: { draft = $0 })
+        var editor = GrowingTextEditor(text: binding, isFocused: .constant(false),
+                                       measuredHeight: .constant(40), isIdle: true,
+                                       onMarkedTextChanged: { marked = $0 }, onSend: {})
+        let host = NSHostingView(rootView: editor)
+        host.frame = NSRect(x: 0, y: 0, width: 320, height: 80)
+        host.layout()
+        func textView(in view: NSView) -> ComposerTextView? {
+            if let tv = view as? ComposerTextView { return tv }
+            for child in view.subviews {
+                if let tv = textView(in: child) { return tv }
+            }
+            return nil
         }
-        XCTAssertTrue(body.contains("hasMarkedText:"),
-                      "onReturn must be called with the field's marked-text state; its default keeps the old ladder")
+        let tv = try XCTUnwrap(textView(in: host))
+        tv.setMarkedText("にほん", selectedRange: NSRange(location: 3, length: 0),
+                         replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(marked)
+        XCTAssertEqual(draft, "")
+        editor.isIdle = false
+        host.rootView = editor
+        host.layout()
+        XCTAssertTrue(tv.hasMarkedText())
+        XCTAssertEqual(tv.string, "にほん")
+        tv.insertText("日本", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertFalse(marked)
+        XCTAssertEqual(draft, "日本")
+        draft = "recalled draft"
+        editor.isIdle = true
+        host.rootView = editor
+        host.layout()
+        XCTAssertEqual(tv.string, draft)
+        tv.setMarkedText("ご", selectedRange: NSRange(location: 1, length: 0),
+                         replacementRange: NSRange(location: NSNotFound, length: 0))
+        tv.unmarkText()
+        XCTAssertFalse(marked)
+        XCTAssertEqual(draft, tv.string)
     }
 
-    func testTheRedrawGuardIsTheSharedDecision() {
-        guard let body = SourceScan.declarationBody(
-            from: "func updateNSView(_ scroll: NSScrollView, context: Context) {",
-            in: chatView) else {
-            return XCTFail("GrowingTextEditor.updateNSView is gone — renamed?")
-        }
-        XCTAssertTrue(body.contains("shouldAdoptExternalText("),
-                      "the string assignment must run through the marked-text guard, not a bare inequality")
-    }
-
-    func testThePlaceholderAsksAboutTheComposingState() {
-        guard let body = SourceScan.declarationBody(
-            from: "private var composerField: some View {",
-            in: chatView) else {
-            return XCTFail("composerField is gone — renamed?")
-        }
-        XCTAssertTrue(body.contains("showsPlaceholder("),
-                      "the overlay must not gate on `inputText.isEmpty` alone")
-    }
-
-    func testTheFieldReportsCompositionToSwiftUI() {
-        // ComposerTextView is the file's last declaration, so its anchor's suffix is its body.
-        guard let start = chatView.range(of: "final class ComposerTextView: NSTextView {") else {
-            return XCTFail("ComposerTextView is gone — renamed?")
-        }
-        let body = String(chatView[start.lowerBound...])
-        XCTAssertTrue(body.contains("override func setMarkedText"),
-                      "composition beginning is invisible to SwiftUI unless the field reports it")
-        XCTAssertTrue(body.contains("override func unmarkText"),
-                      "composition ending is invisible to SwiftUI unless the field reports it")
-    }
-
-    func testTheEditorWiresTheReportThrough() {
-        guard let body = SourceScan.declarationBody(
-            from: "func makeNSView(context: Context) -> NSScrollView {",
-            in: chatView) else {
-            return XCTFail("GrowingTextEditor.makeNSView is gone — renamed?")
-        }
-        XCTAssertTrue(body.contains("onMarkedTextChanged"),
-                      "the report must reach the coordinator, or the SwiftUI side never learns")
+    @MainActor
+    func testReturnInTheEditorPassesCompositionAndThenSends() {
+        var sent = 0
+        var accepted = 0
+        let editor = GrowingTextEditor(text: .constant(""), isFocused: .constant(false),
+                                       measuredHeight: .constant(40), isIdle: true,
+                                       onSend: { sent += 1 },
+                                       onKeyCommand: { _ in accepted += 1; return false })
+        let coordinator = editor.makeCoordinator()
+        let tv = ComposerTextView()
+        tv.setMarkedText("にほん", selectedRange: NSRange(location: 3, length: 0),
+                         replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertFalse(coordinator.textView(tv, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(sent, 0)
+        XCTAssertEqual(accepted, 0)
+        tv.insertText("日本", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(coordinator.textView(tv, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(sent, 1)
     }
 }

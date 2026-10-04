@@ -1244,6 +1244,7 @@
 "Paste the token @BotFather gives you after /newbot. Stored locally on this Mac and sent only to Telegram's API." = "粘贴 /newbot 之后 @BotFather 给你的令牌。它只保存在这台 Mac 本地，且仅发送给 Telegram 的 API。";
 "Path to a Gemma 4 assistant drafter directory (gemma-4-*-it-assistant-bf16). Must pair with a Gemma 4 target. Empty = no drafter." = "Gemma 4 助手草稿模型目录的路径（gemma-4-*-it-assistant-bf16）。必须与 Gemma 4 目标模型配对。留空 = 不使用草稿模型。";
 "Pause" = "暂停";
+"Paused" = "已暂停";
 "Penalty multiplier for tokens already in the context. 1.0 = none. 1.1 is a typical anti-repeat setting." = "对已出现在上下文中的 Token 施加的惩罚倍数。1.0 = 不惩罚。1.1 是常见的防重复设置。";
 "People" = "人物";
 "Per-LoadedModel LRU of chat-template render+tokenize results. Skips re-rendering identical message lists on warm reuse — drops warm tokenize_ms from ~240 ms to ~0 on long-prompt repeats. Applies to all engines. 0 disables." = "按已加载模型维度缓存聊天模板渲染 + 分词结果的 LRU。热复用时跳过对相同消息列表的重复渲染 —— 在长提示词重复的场景下，把热 tokenize_ms 从约 240 ms 降到约 0。适用于所有引擎。0 表示关闭。";

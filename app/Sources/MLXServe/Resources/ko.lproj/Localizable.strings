@@ -904,6 +904,7 @@
 "Text to be generated" = "생성할 텍스트";
 "Delete All Sandbox Data" = "모든 샌드박스 데이터 삭제";
 "Pause" = "일시 정지";
+"Paused" = "일시 정지됨";
 "Clear reference" = "참조 지우기";
 "Open Settings" = "설정 열기";
 "the bundled guest is missing vsock support or the vz-agent binary — the app bundle is incomplete" = "번들에 포함된 게스트에 vsock 지원 또는 vz-agent 실행 파일이 없습니다. 앱 번들이 불완전합니다";

@@ -2903,6 +2903,9 @@ struct ChatDetailView: View {
                 if let note = steeringNote {
                     SteeringNoteRow(note: note, onPause: { pauseSteeringNote() })
                 }
+                if let note = chatEngine.steering.restoringNote(for: sessionId) {
+                    SteeringNoteRow(note: note, isPaused: true, onPause: { restoreSteeringNote() })
+                }
 
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
@@ -3175,6 +3178,12 @@ struct ChatDetailView: View {
                 pauseSteeringNote()
                 inputFocused = true
             }
+        }
+        .onChange(of: composerHasMarkedText) { _, marked in
+            if !marked { restoreSteeringNote() }
+        }
+        .onChange(of: chatEngine.steering.restoringNote(for: sessionId)) { _, _ in
+            restoreSteeringNote()
         }
         // The keyboard arriving in the composer collapses the sidebar selection
         // to this chat. Keyed on the focus MIRROR rather than on the click, so
@@ -3982,16 +3991,22 @@ struct ChatDetailView: View {
     /// typed there, so nothing fires while it is being rewritten; Return
     /// queues it again.
     private func pauseSteeringNote() {
-        guard let note = steeringNote else { return }
-        chatEngine.clearSteeringNote(for: sessionId)
-        inputText = SteeringNotes.joined(note, inputText)
+        chatEngine.pauseSteeringNote(for: sessionId)
+        restoreSteeringNote()
         inputFocused = true
+    }
+
+    private func restoreSteeringNote() {
+        guard let draft = chatEngine.restoreSteeringNote(
+            for: sessionId, into: inputText, hasMarkedText: composerHasMarkedText) else { return }
+        inputText = draft
     }
 
     /// A note whose turn ended while this chat was in another tab: nobody
     /// watched the state flip, so it is recovered on the way in.
     private func recoverSteeringNoteIfIdle() {
         if composerState == .idle { pauseSteeringNote() }
+        else { restoreSteeringNote() }
     }
 
     /// Names of MCP servers the user currently has enabled (disabled != true).
@@ -4117,7 +4132,7 @@ struct ChatDetailView: View {
                                caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
         // A waiting steering note is the newest thing said and not yet sent:
         // ↑ on an empty draft takes it back first, exactly as Pause does.
-        if direction == .up, steeringNote != nil,
+        if direction == .up, chatEngine.steering.composerNote(for: sessionId) != nil,
            inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             pauseSteeringNote()
             return true
@@ -6906,7 +6921,7 @@ enum ComposerKey {
 /// string on every edit (janky on a big paste) and exposes no scroller (the
 /// mouse wheel does nothing past the line limit). TextKit handles large text
 /// natively and the scroll view gives real mouse-wheel scrolling.
-fileprivate struct GrowingTextEditor: NSViewRepresentable {
+struct GrowingTextEditor: NSViewRepresentable {
     @Binding var text: String
     @Binding var isFocused: Bool
     @Binding var measuredHeight: CGFloat
@@ -7125,7 +7140,7 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
 
 /// NSTextView that reports focus transitions so SwiftUI's `inputFocused` mirror
 /// stays accurate — the Cmd+V "attach from clipboard" monitor reads it.
-fileprivate final class ComposerTextView: NSTextView {
+final class ComposerTextView: NSTextView {
     var onBecomeFocus: (() -> Void)?
     var onResignFocus: (() -> Void)?
     /// The only channel by which SwiftUI learns about composition — every

@@ -53,6 +53,7 @@ Estimated from the measured per-step cost:
 - **Full quality:** Turbo off, Max quality on (`"fast": false`), 30 steps.
 
 ### Fixes
+- The app's Japanese input method keeps its Enter: Return mid-composition only confirms the conversion instead of sending, steering or breaking the line, text being composed survives external redraws, the empty-field placeholder steps aside while you compose, and a steering note paused mid-composition returns to the composer once the conversion ends.
 - `mlx-serve launch omp` and the app send omp's thinking level as `reasoning_effort` (off as `none`) and offer every level up to `xhigh`; before, every level ran at the server default (#760).
 - MiniMax-H3 Turbo accepts any distillation built for its DiT: `turbo_lora.safetensors` must attach every module it ships rather than the bundled adapter's 259, so Lightx2v's distills (`lightx2v/Minimax-h3-Turbo`) run as Turbo with its exact audio step instead of being refused.
 - The app's Turbo steps slider stops at 8: Turbo turns the fast recipe off, so past 8 a Turbo render costs more than the regular 30-step one.
