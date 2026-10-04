@@ -166,8 +166,12 @@ var test_space: ?VolumeSpace = null;
 var test_qsa_overlay_mismatch = false;
 var test_ssm_write_qsa_aux = false;
 
+/// How many free-space probes the test hook answered.
+pub var test_space_probes: usize = 0;
+
 fn testSpaceProbe(path: []const u8) ?VolumeSpace {
     _ = path;
+    test_space_probes += 1;
     return test_space;
 }
 
@@ -1214,11 +1218,6 @@ pub const DiskTier = struct {
             }
         }
 
-        // Re-derive the budget from free space before every store.
-        if (self.ssd_first) self.refreshDiskBudget();
-        // The refresh gates THIS store, not merely the next one.
-        if (self.store_declined) return .skipped;
-
         // Superseded check: an existing entry that already covers `tokens`
         // (same key, tokens is a prefix of its tokens, kv already >= ours)
         // makes this commit a no-op — UNLESS the entry is hybrid and still has
@@ -1253,6 +1252,11 @@ pub const DiskTier = struct {
                 extend_idx = i;
             }
         }
+        // Re-derive the budget from free space before every store, and only a store: the
+        // purgeable-space query is slow and the idle spill reaches this point once per idle entry.
+        if (self.ssd_first) self.refreshDiskBudget();
+        // The refresh gates THIS store, not merely the next one.
+        if (self.store_declined) return .skipped;
         if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, dflash_snap, mtp_snap, s);
 
         const sw = io_util.Stopwatch.init(self.io);

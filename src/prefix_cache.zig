@@ -8725,6 +8725,72 @@ test "SSD-first: a write failure inside the SAME pass still keeps the entry resi
     try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
 }
 
+test "SSD-first: a spill pass probes the volume only for a store, never for a copy already on disk" {
+    // A spill pass probes the volume only for an entry it will write.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tok_a: [600]u32 = undefined;
+    for (&tok_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tok_b: [600]u32 = undefined;
+    for (&tok_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+    var tok_c: [600]u32 = undefined;
+    for (&tok_c, 0..) |*t, i| t.* = @intCast(i + 180_000);
+    var tok_d: [600]u32 = undefined;
+    for (&tok_d, 0..) |*t, i| t.* = @intCast(i + 270_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-probe", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    const roomy: u64 = 1024 * 1024 * 1024 * 1024;
+    hc.disk.?.armTestSpace(roomy, 2 * roomy);
+    hc.disk.?.enableBackgroundWriter();
+    hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+
+    _ = try hc.commit(&cache, &tok_a, false);
+    _ = try hc.commit(&cache, &tok_b, false);
+    _ = try hc.commit(&cache, &tok_c, false);
+
+    // The first pass stores A and B: each store is gated on a fresh probe.
+    const p0 = kv_disk_cache.test_space_probes;
+    hc.spillIdleEntries(s);
+    try testing.expect(kv_disk_cache.test_space_probes > p0);
+    hc.disk.?.drainWriter();
+
+    // Both copies are whole now. Passes that find them on disk probe nothing and call them durable.
+    const p1 = kv_disk_cache.test_space_probes;
+    hc.spillIdleEntries(s);
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(p1, kv_disk_cache.test_space_probes);
+    try testing.expect((try testEntryFor(&hc, &tok_a)).spill_durable);
+    try testing.expect((try testEntryFor(&hc, &tok_b)).spill_durable);
+
+    // Below the store floor no NEW entry persists, but a copy already on disk is still a copy:
+    // it stays restorable, so RAM may be shed against it.
+    hc.disk.?.armTestSpace(0, 2 * roomy);
+    _ = try hc.commit(&cache, &tok_d, false);
+    hc.spillIdleEntries(s);
+    try testing.expect((try testEntryFor(&hc, &tok_a)).spill_durable);
+    try testing.expect(!(try testEntryFor(&hc, &tok_c)).spill_durable);
+
+    // Room again: the new idle entry is a store, so its pass probes.
+    hc.disk.?.armTestSpace(roomy, 2 * roomy);
+    const p2 = kv_disk_cache.test_space_probes;
+    hc.spillIdleEntries(s);
+    try testing.expect(kv_disk_cache.test_space_probes > p2);
+}
+
 test "SSD-first: the durability check STATS the chunks — a truncated file is never durable" {
     // A byte can go missing with no write error at all; one stat per chunk catches it.
     const io = std.testing.io;
