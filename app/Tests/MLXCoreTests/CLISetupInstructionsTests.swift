@@ -10,6 +10,121 @@ final class CLISetupInstructionsTests: XCTestCase {
                                   budget: budget)
     }
 
+    func testOpenCodeProbeStatusesAndUncheckedLegacy() {
+        let version = OpenCodeVersion(generation: .v2, version: "2.0.20")
+        let vectors: [(String, Bool, OpenCodeProbe)] = [
+            ("MLXOCV=missing\n", true, .missing),
+            ("banner 18.2.0\nMLXOCV=missing\n", true, .missing),
+            ("MLXOCV=127 \n", true, .versionFailed(output: "\n")),
+            ("MLXOCV=1 failed\n", true, .versionFailed(output: "failed\n")),
+            ("2.0.20", true, .versionFailed(output: "2.0.20")),
+            ("MLXOCV=0", true, .versionFailed(output: "MLXOCV=0")),
+            ("MLXOCV=x out", true, .versionFailed(output: "MLXOCV=x out")),
+            ("MLXOCV=0 dev\n", true, .unparsed(output: "dev\n")),
+            ("MLXOCV=0 2.0.20\n", false, .versionFailed(output: "MLXOCV=0 2.0.20\n")),
+            ("MLXOCV=missing\n", false, .versionFailed(output: "MLXOCV=missing\n")),
+            ("MLXOCV=missing\nMLXOCV=0 2.0.20\n", true, .ok(version)),
+            ("MLXOCV=0 2.0.20\nMLXOCV=missing\n", true, .missing),
+        ]
+        for (capture, shellOK, expected) in vectors {
+            XCTAssertEqual(classifyOpenCodeProbe(capture, shellOK: shellOK), expected)
+        }
+        for token in ["1.18.34", "2.0.20", "3.0.0", "10.2.0"] {
+            XCTAssertEqual(classifyOpenCodeProbe("banner node 18.2.0\nMLXOCV=0 opencode v\(token)\nbuild x\n", shellOK: true),
+                           .ok(OpenCodeVersion(generation: token.hasPrefix("1.") ? .v1 : .v2, version: token)))
+        }
+        XCTAssertEqual(resolveOpencode2Bin(detected: version, legacyInstalled: nil), "opencode")
+        XCTAssertNil(resolveOpencode2Bin(detected: nil, legacyInstalled: nil))
+        XCTAssertEqual(decideOpenCodeLaunch(forcedV2: true, detection: OpenCodeDetection(
+            probe: .ok(version), legacyOpencode2Installed: nil)), .v2(version: version, binary: "opencode"))
+        XCTAssertEqual(decideOpenCodeLaunch(forcedV2: true, detection: OpenCodeDetection(
+            probe: .missing, legacyOpencode2Installed: nil)), .shellFailed)
+        XCTAssertEqual(decideOpenCodeLaunch(forcedV2: true, detection: OpenCodeDetection(
+            probe: .missing, legacyOpencode2Installed: false)), .noV2Binary)
+    }
+
+    func testOpenCodeManualTabExplainsItsGeneration() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "opencode" })
+        XCTAssertTrue(tab.installHint.contains("1.x"))
+        XCTAssertTrue(tab.installHint.contains("2.x+"))
+        XCTAssertTrue(tab.installHint.contains("OpenCode 2 tab"))
+    }
+
+    func testProductionOpenCodeProbeCountsShellsAndSkipsUnusedLegacy() throws {
+        let scratch = ProcessInfo.processInfo.environment["TMPDIR"]
+            .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("tmp", isDirectory: true)
+        let root = scratch.appendingPathComponent("pr723-swift-fixture-" + UUID().uuidString)
+        let fm = FileManager.default
+        try fm.createDirectory(at: root.appendingPathComponent("bin"), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        let oldHome = getenv("HOME").map { String(cString: $0) }
+        let oldZdotdir = getenv("ZDOTDIR").map { String(cString: $0) }
+        setenv("HOME", root.path, 1)
+        setenv("ZDOTDIR", root.path, 1)
+        defer {
+            if let oldHome { setenv("HOME", oldHome, 1) } else { unsetenv("HOME") }
+            if let oldZdotdir { setenv("ZDOTDIR", oldZdotdir, 1) } else { unsetenv("ZDOTDIR") }
+        }
+        try "export HOME=\(CLILauncher.shellSingleQuoted(root.path))\n".write(
+            to: root.appendingPathComponent(".zshenv"), atomically: true, encoding: .utf8)
+        try "export PATH=\(CLILauncher.shellSingleQuoted(root.appendingPathComponent("bin").path)):/usr/bin:/bin\n".write(
+            to: root.appendingPathComponent(".zprofile"), atomically: true, encoding: .utf8)
+        try """
+        print shell >> "$HOME/shells"
+        print 'banner node 18.2.0'
+        command() {
+            if [[ "$*" == *opencode2* ]]; then print legacy >> "$HOME/legacy"; fi
+            builtin command "$@"
+        }
+        """.write(to: root.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
+        let vectors: [(String?, Bool, Int, Int, OpenCodeProbe)] = [
+            ("print 2.0.20", false, 1, 0, .ok(OpenCodeVersion(generation: .v2, version: "2.0.20"))),
+            ("print 3.0.0", true, 1, 0, .ok(OpenCodeVersion(generation: .v2, version: "3.0.0"))),
+            ("print 1.18.34", true, 2, 1, .ok(OpenCodeVersion(generation: .v1, version: "1.18.34"))),
+            ("exit 127", false, 1, 0, .versionFailed(output: "\n")),
+            ("exit 127", true, 2, 1, .versionFailed(output: "\n")),
+            (nil, false, 1, 0, .missing),
+            (nil, true, 2, 1, .missing),
+        ]
+        for (body, forcedV2, shells, legacyChecks, expected) in vectors {
+            for file in ["shells", "legacy", "bin/opencode"] {
+                try? fm.removeItem(at: root.appendingPathComponent(file))
+            }
+            if let body {
+                let executable = root.appendingPathComponent("bin/opencode")
+                try ("#!/bin/zsh -f\n" + body + "\n").write(to: executable, atomically: true, encoding: .utf8)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+            }
+            let detection = CLILauncher.probeOpenCode(forcedV2: forcedV2)
+            XCTAssertEqual(detection.probe, expected)
+            func count(_ name: String) -> Int {
+                (try? String(contentsOf: root.appendingPathComponent(name), encoding: .utf8))?
+                    .split(separator: "\n").count ?? 0
+            }
+            XCTAssertEqual(count("shells"), shells, "forcedV2=\(forcedV2), body=\(body ?? "missing")")
+            XCTAssertEqual(count("legacy"), legacyChecks)
+            if legacyChecks == 0 {
+                XCTAssertNil(detection.legacyOpencode2Installed)
+            } else {
+                XCTAssertEqual(detection.legacyOpencode2Installed, false)
+            }
+        }
+        let legacy = root.appendingPathComponent("bin/opencode2")
+        try "#!/bin/zsh -f\nexit 0\n".write(to: legacy, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: legacy.path)
+        let fallback = CLILauncher.probeOpenCode(forcedV2: true)
+        XCTAssertEqual(fallback.legacyOpencode2Installed, true)
+        XCTAssertEqual(decideOpenCodeLaunch(forcedV2: true, detection: fallback),
+                       .v2(version: nil, binary: "opencode2"))
+        try "exit 1\n".write(to: root.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
+        let unanswered = CLILauncher.probeOpenCode(forcedV2: true)
+        XCTAssertNil(unanswered.legacyOpencode2Installed)
+        XCTAssertEqual(decideOpenCodeLaunch(forcedV2: true, detection: unanswered), .shellFailed)
+    }
+
     func testTabsHaveStableIdsInLauncherOrder() {
         XCTAssertEqual(tabs.map(\.id),
                        ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider"],
@@ -113,7 +228,8 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertTrue(tab.command.contains(#""$oc_bin" --standalone"#), tab.command)
         XCTAssertFalse(tab.command.contains("--model"), tab.command)
         XCTAssertTrue(tab.command.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#))
-        XCTAssertTrue(tab.installHint.contains("npm install -g @opencode/cli"))
+        XCTAssertTrue(tab.installHint.contains("curl -fsSL https://opencode.ai/install | bash"))
+        XCTAssertTrue(tab.installHint.contains("opencode 2.x+"))
         XCTAssertTrue(tab.command.contains("./plugins/mlx-serve"))
         XCTAssertTrue(tab.command.contains("http://localhost:11234/metrics.json"))
         XCTAssertFalse(tab.command.contains("~/.config/opencode"), "must never write the user's real opencode config")

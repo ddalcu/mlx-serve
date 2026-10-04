@@ -67,7 +67,7 @@ enum CLISetupInstructions {
             // config, so their own settings and plugins keep working.
             Tab(id: "opencode",
                 title: "OpenCode",
-                installHint: "Requires the opencode CLI: curl -fsSL https://opencode.ai/install | bash",
+                installHint: "Manual setup for OpenCode 1.x only; for 2.x+, use the OpenCode 2 tab.",
                 command: """
                 # OpenCode 1.x (the v1 integration). OpenCode 2.x+ ships under the
                 # same name — `mlx-serve launch opencode` detects the version and
@@ -77,7 +77,7 @@ enum CLISetupInstructions {
                 """),
             Tab(id: "opencode2",
                 title: "OpenCode 2",
-                installHint: "Requires the opencode2 CLI: npm install -g @opencode/cli",
+                installHint: "Requires opencode 2.x+: curl -fsSL https://opencode.ai/install | bash",
                 command: """
                 # The v2 integration, for OpenCode 2.x+ — `launch opencode` routes
                 # here automatically and `launch opencode2` forces it. Newer

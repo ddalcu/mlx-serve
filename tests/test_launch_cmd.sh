@@ -68,7 +68,8 @@ else
 fi
 
 echo "Starting server..."
-"$BIN" --model "$MODEL_DIR" --serve --port "$PORT" >/tmp/mlx-serve-launch-test.log 2>&1 &
+mkdir -p "${TMPDIR:?set TMPDIR to a workspace scratch directory}"
+"$BIN" --model "$MODEL_DIR" --serve --port "$PORT" >"$TMPDIR/mlx-serve-launch-test.log" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
 trap cleanup EXIT

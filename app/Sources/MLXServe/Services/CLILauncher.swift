@@ -146,35 +146,28 @@ final class CLILauncher: ObservableObject {
         return (ok, out)
     }
 
-    /// `opencode --version` through the login shell; the legacy `opencode2`
-    /// is probed only when the v2 profile is forced (Zig `probeOpenCode` twin).
+    /// Use the launch shell's PATH; a canonical v2 success needs no legacy probe.
     nonisolated static func probeOpenCode(forcedV2: Bool) -> OpenCodeDetection {
         let probe: OpenCodeProbe
-        if let found = runLoginShell("command -v opencode >/dev/null 2>&1") {
-            if !found.ok {
-                probe = .missing
-            } else if let run = runLoginShell(versionProbeCmd) {
-                if let marked = extractMarkedVersion(run.out) {
-                    if marked.rc != 0 {
-                        probe = .versionFailed(output: marked.out)
-                    } else if let version = parseOpencodeVersion(marked.out) {
-                        probe = .ok(version)
-                    } else {
-                        probe = .unparsed(output: marked.out)
-                    }
-                } else {
-                    // No marker at all = the version subshell itself never answered.
-                    probe = .versionFailed(output: run.out)
-                }
-            } else {
-                probe = .shellUnrunnable
-            }
+        if let run = runLoginShell(versionProbeCmd) {
+            probe = classifyOpenCodeProbe(run.out, shellOK: run.ok)
         } else {
-            // The shell itself could not run — say so, not "not installed".
             probe = .shellUnrunnable
         }
-        var legacy = false
-        if forcedV2 { legacy = runLoginShell("command -v opencode2 >/dev/null 2>&1")?.ok ?? false }
+        var legacy: Bool?
+        if forcedV2 {
+            if case .ok(let version) = probe, version.generation == .v2 {
+                return OpenCodeDetection(probe: probe, legacyOpencode2Installed: nil)
+            }
+            if let run = runLoginShell(#"if command -v opencode2 >/dev/null 2>&1; then printf 'MLXOCL=1\n'; else printf 'MLXOCL=0\n'; fi"#),
+               run.ok, let pos = run.out.range(of: "MLXOCL=", options: .backwards) {
+                switch run.out[pos.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines) {
+                case "1": legacy = true
+                case "0": legacy = false
+                default: break
+                }
+            }
+        }
         return OpenCodeDetection(probe: probe, legacyOpencode2Installed: legacy)
     }
 
@@ -254,7 +247,7 @@ final class CLILauncher: ObservableObject {
             """, nil)
         case .shellFailed:
             return ("""
-            echo 'could not run the login shell to detect the OpenCode version; retry, or use `mlx-serve launch opencode2` to force the v2 integration.'
+            echo 'could not run the login shell to detect OpenCode availability; retry.'
             exit 1
             """, nil)
         case .noV2Binary:

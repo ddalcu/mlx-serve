@@ -31,10 +31,10 @@ enum OpenCodeProbe: Equatable {
 }
 
 /// Everything `launch opencode` / `launch opencode2` need to route: the
-/// version probe plus whether the legacy standalone `opencode2` is on PATH.
+/// version probe plus legacy availability (nil means it was not checked).
 struct OpenCodeDetection: Equatable {
     let probe: OpenCodeProbe
-    let legacyOpencode2Installed: Bool
+    let legacyOpencode2Installed: Bool?
 }
 
 /// Reads the first version token (optional `v` prefix, `digits.digits…`) out
@@ -75,9 +75,9 @@ func parseOpencodeVersion(_ output: String) -> OpenCodeVersion? {
 /// The `launch opencode2` compatibility alias forces the v2 profile: the
 /// canonical `opencode` name when it resolves to major >= 2, else the legacy
 /// standalone binary — a v1 install never starts under the v2 config.
-func resolveOpencode2Bin(detected: OpenCodeVersion?, legacyInstalled: Bool) -> String? {
+func resolveOpencode2Bin(detected: OpenCodeVersion?, legacyInstalled: Bool?) -> String? {
     if let d = detected, d.generation == .v2 { return "opencode" }
-    if legacyInstalled { return "opencode2" }
+    if legacyInstalled == true { return "opencode2" }
     return nil
 }
 
@@ -99,6 +99,7 @@ func decideOpenCodeLaunch(forcedV2: Bool, detection: OpenCodeDetection) -> OpenC
     if forcedV2 {
         var detected: OpenCodeVersion?
         if case .ok(let v) = detection.probe, v.generation == .v2 { detected = v }
+        if detected == nil, detection.legacyOpencode2Installed == nil { return .shellFailed }
         guard let bin = resolveOpencode2Bin(detected: detected,
                                             legacyInstalled: detection.legacyOpencode2Installed) else {
             return .noV2Binary
@@ -118,7 +119,7 @@ func decideOpenCodeLaunch(forcedV2: Bool, detection: OpenCodeDetection) -> OpenC
 /// and only the marker's payload parses (keyed output, like `detectInstalled`).
 /// Twin of the Zig `launch.zig` marker constants — keep in sync.
 let versionMarker = "MLXOCV="
-let versionProbeCmd = #"out=$(opencode --version 2>&1); rc=$?; printf 'MLXOCV=%s %s\n' $rc "$out""#
+let versionProbeCmd = #"if ! command -v opencode >/dev/null 2>&1; then printf 'MLXOCV=missing\n'; else out=$(opencode --version 2>&1); rc=$?; printf 'MLXOCV=%s %s\n' $rc "$out"; fi"#
 
 /// The version subshell's exit code and output from a login-shell capture:
 /// everything after the LAST `MLXOCV=<rc> ` token, so rc banners sitting
@@ -128,6 +129,19 @@ func extractMarkedVersion(_ captured: String) -> (rc: Int, out: String)? {
     let after = captured[pos.upperBound...]
     guard let sp = after.firstIndex(of: " "), let rc = Int(after[..<sp]) else { return nil }
     return (rc, String(after[after.index(after: sp)...]))
+}
+
+func classifyOpenCodeProbe(_ captured: String, shellOK: Bool) -> OpenCodeProbe {
+    guard shellOK, let pos = captured.range(of: versionMarker, options: .backwards) else {
+        return .versionFailed(output: captured)
+    }
+    if captured[pos.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines) == "missing" {
+        return .missing
+    }
+    guard let marked = extractMarkedVersion(captured) else { return .versionFailed(output: captured) }
+    guard marked.rc == 0 else { return .versionFailed(output: marked.out) }
+    guard let version = parseOpencodeVersion(marked.out) else { return .unparsed(output: marked.out) }
+    return .ok(version)
 }
 
 /// Resolve the v2 binary INSIDE the launch shell (the MAS tab is copy-paste):
