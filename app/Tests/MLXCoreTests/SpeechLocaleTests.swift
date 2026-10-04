@@ -51,8 +51,6 @@ final class SpeechLocaleTests: XCTestCase {
             supportedLocales: [Locale(identifier: "en_US"), Locale(identifier: "en_GB")],
             isAvailable: { _ in true },
             fallback: .current)
-        // Which concrete en wins is `isEquivalent` territory (OS-dependent);
-        // our determinism contract is the input-order test.
         XCTAssertTrue(["en_GB", "en_US"].contains(result.locale.identifier))
     }
 
