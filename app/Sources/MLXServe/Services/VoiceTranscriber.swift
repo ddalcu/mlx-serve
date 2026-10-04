@@ -21,14 +21,26 @@ enum VoiceTranscriber {
         case failed(String)
     }
 
-    static func transcribe(fileURL: URL, locale: Locale = .current) async -> Result<String, Failure> {
-        guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
-            return .failure(.unavailable("Speech recognition isn't available for \(locale.identifier)."))
+    static func transcribe(fileURL: URL, locale: Locale? = nil) async -> Result<String, Failure> {
+        let resolvedLocale: Locale
+        if let locale {
+            resolvedLocale = locale
+        } else {
+            switch SpeechLocale.legacyResolution() {
+            case .available(let locale), .unavailable(let locale):
+                resolvedLocale = locale
+            case .unsupported(let reported):
+                return .failure(.unavailable(
+                    "Speech recognition isn't available for \(reported.identifier)."))
+            }
         }
-        // On-device-only gate (reused pure helper, already unit-tested).
+
+        guard let recognizer = SFSpeechRecognizer(locale: resolvedLocale), recognizer.isAvailable else {
+            return .failure(.unavailable("Speech recognition isn't available for \(resolvedLocale.identifier)."))
+        }
         if let message = OnDeviceSpeech.unavailableMessage(
             supportsOnDevice: recognizer.supportsOnDeviceRecognition,
-            locale: locale.identifier) {
+            locale: resolvedLocale.identifier) {
             return .failure(.unavailable(message))
         }
 

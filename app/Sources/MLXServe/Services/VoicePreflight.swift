@@ -1,10 +1,7 @@
 import Foundation
 
-/// Voice mode's three prerequisites and the friendly, actionable notice shown
-/// when one is missing — surfaced non-invasively as a card in the voice panel
-/// (no blocking modal) the moment the user enables Voice. Pure → unit-testable
-/// without the Speech/AVFoundation frameworks; the live status read lives in
-/// `BaseSpeechRecognizer.preflight()`.
+/// Pure voice prerequisite checks and actionable notices; each concrete
+/// recognizer supplies its live status through `preflight()`.
 enum VoicePreflight {
     /// A point-in-time read of the three things voice mode needs.
     struct Snapshot: Equatable {

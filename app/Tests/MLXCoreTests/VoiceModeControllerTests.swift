@@ -199,6 +199,35 @@ final class VoiceModeControllerTests: XCTestCase {
         XCTAssertEqual(rec.startCount, 0)
     }
 
+    func testBeginUsesPreflightLocaleForVoiceSelection() async {
+        UserDefaults.standard.removeObject(forKey: "voiceModeVoiceId")
+        let rec = FakeRecognizer(); let syn = FakeSynth()
+        rec.preflightSnapshot = VoicePreflight.Snapshot(
+            micAuthorized: true, speechAuthorized: true, onDeviceAvailable: true, locale: "ja_JP")
+        let voices = Self.testVoices + [
+            VoiceOption(id: "japanese", name: "Kyoko", language: "ja-JP", quality: 2)
+        ]
+        let controller = VoiceModeController(
+            recognizer: rec, synthesizer: syn, voices: voices)
+
+        _ = await controller.begin()
+
+        XCTAssertEqual(controller.availableVoices.map(\.id), ["japanese"])
+        XCTAssertEqual(controller.selectedVoiceId, "japanese")
+    }
+
+    func testRuntimeDictationIssueUsesPreflightLocale() async {
+        let (controller, recognizer, _) = make()
+        recognizer.preflightSnapshot = VoicePreflight.Snapshot(
+            micAuthorized: true, speechAuthorized: true, onDeviceAvailable: true, locale: "ja_JP")
+        _ = await controller.begin()
+
+        recognizer.onUnrecognizedSpeech?()
+        recognizer.onUnrecognizedSpeech?()
+
+        XCTAssertEqual(controller.setupIssue, .dictationUnavailable(locale: "ja_JP"))
+    }
+
     /// The Dictation-switch-OFF case the user hit: pre-flight passes (model is
     /// installed → `supportsOnDeviceRecognition` true), the mic hears speech, but
     /// recognition returns nothing. Two empty-speech turns → surface the notice.
