@@ -505,23 +505,15 @@ fn extractMarkedVersion(captured: []const u8) ?MarkedVersion {
     return .{ .rc = rc, .out = after[sp + 1 ..] };
 }
 
-/// `opencode --version` resolved through the login shell. On `ok` the
-/// `version` string is owned; on the failure arms the quoted output is.
 const OpenCodeProbe = union(enum) {
-    missing,
-    version_failed: []u8,
-    unparsed: []u8,
-    ok: OpenCodeVersion,
-};
-
-const OpenCodeProbeResult = union(enum) {
     missing,
     version_failed: []const u8,
     unparsed: []const u8,
     ok: OpenCodeVersion,
 };
 
-fn classifyOpenCodeProbe(captured: []const u8, shell_ok: bool) OpenCodeProbeResult {
+/// Returned strings borrow from captured and remain valid only while it lives.
+fn classifyOpenCodeProbe(captured: []const u8, shell_ok: bool) OpenCodeProbe {
     if (!shell_ok) return .{ .version_failed = captured };
     const pos = std.mem.lastIndexOf(u8, captured, version_marker) orelse return .{ .version_failed = captured };
     const payload = captured[pos + version_marker.len ..];
@@ -532,6 +524,7 @@ fn classifyOpenCodeProbe(captured: []const u8, shell_ok: bool) OpenCodeProbeResu
     return .{ .ok = parsed };
 }
 
+/// Returned version or failure output is owned by the caller and must be freed.
 fn probeOpenCode(allocator: std.mem.Allocator, io: std.Io) !OpenCodeProbe {
     const run = try runLoginShell(allocator, io, version_probe_cmd);
     defer allocator.free(run.out);
@@ -1659,7 +1652,7 @@ test "launch scripts point every agent at the skill and export MLX_SERVE_URL" {
 }
 
 test "opencode probe status distinguishes missing from executable failure" {
-    const cases = [_]struct { capture: []const u8, shell_ok: bool = true, expected: std.meta.Tag(OpenCodeProbeResult) }{
+    const cases = [_]struct { capture: []const u8, shell_ok: bool = true, expected: std.meta.Tag(OpenCodeProbe) }{
         .{ .capture = "MLXOCV=missing\n", .expected = .missing },
         .{ .capture = "banner 18.2.0\nMLXOCV=missing\n", .expected = .missing },
         .{ .capture = "MLXOCV=127 \n", .expected = .version_failed },
