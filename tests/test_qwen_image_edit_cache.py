@@ -9,6 +9,7 @@ Run after building: uv run tests/test_qwen_image_edit_cache.py --model <pack>
 Needs the vision tower in text_encoder/. Uses a private server, generated benign
 references, bounded requests and owned-process cleanup. Saves PNGs, SSE timings,
 sampled memory and a JSON report; visual inspection is still required.
+Use --transparent to check RGBA output; the default checks RGB output.
 """
 
 import argparse
@@ -119,7 +120,7 @@ def generate(api, process, body, folder, name, timeout, guard_url):
         im = Image.open(io.BytesIO(png))
         im.load()
         assert im.size == tuple(map(int, body["size"].split("x"))), im.size
-        assert im.mode in ("RGB", "RGBA"), im.mode
+        assert im.mode == ("RGBA" if body["transparent"] else "RGB"), im.mode
         (folder / f"{name}.png").write_bytes(png)
         steps = [e["elapsed_s"] for e in events if e.get("stage") == "Generating"]
         assert len(steps) == (body["steps"] or 40), events
@@ -164,6 +165,7 @@ def main():
     parser.add_argument("--steps", type=int, default=20, help="Denoise steps; 0 tests the server's 40-step default")
     parser.add_argument("--cfg", type=float, default=1)
     parser.add_argument("--opaque", action="store_true", help="Use white rather than transparent reference backgrounds")
+    parser.add_argument("--transparent", action="store_true", help="Request RGBA output instead of the default RGB")
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--guard-url", help="Abort if this separate server loads any model")
@@ -180,7 +182,7 @@ def main():
                 prompt="Change the roof of the house in <image1> to blue. Keep its windows and door.",
                 size=args.size, ref_resolution=args.ref_resolution, steps=args.steps, seed=42,
                 guidance_scale=args.cfg, negative_prompt="blurry, distorted" if args.cfg != 1 else "",
-                stream=True)
+                transparent=args.transparent, stream=True)
     report = {"status": "running", "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
               "parameters": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "arms": {}, "memory_note": "Sampled process footprint MB and MLX active bytes, not exact peaks.",
