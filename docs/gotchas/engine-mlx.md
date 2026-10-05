@@ -94,9 +94,9 @@ That review also found two DFlash lifecycle assumptions that were only true on t
 
 **The per-request default is ONE chokepoint: `server.defaultEnableMtp(mtp_loaded, dsv4_stages)`**, called by all four surfaces (chat / completions / messages / responses). Never inline the policy at a new surface; an output-equality test cannot see a spec path that silently never engaged (the drafter-dispatch-hole lesson). MoE heads used to default OFF (the verify forward pays expert routing), which left them unreachable from every client that sends no `enable_mtp` (Claude Code, llmprobe, curl) unless the operator passed `--mtp`; the app always passed it, so headless and app disagreed. A loaded head now drafts by default everywhere (`--mtp` is a no-op); `--no-mtp`, a model's `"mtp": false` or a request's `enable_mtp:false` opt out. The trade-off that remains: on qwen4 the MTP slot decodes exclusively, so concurrent chats stop batching while it drafts.
 
-**EV adaptive depth controller** (default ON; `MLX_SERVE_MTP_ADAPTIVE=0` reverts to the fixed windowed controller for same-boot A/Bs): each request tracks per-index CONDITIONAL acceptance EMAs `a[i] = P(draft i accepted | i−1 accepted)` (β 0.15, ~10-round legacy warmup) and plans every round via the pure `mtpEvPlanFor` — base `m_lo` = static EV argmax, extended to `m_hi` when the head's chain log-confidence on chunk A clears a cost-derived τ (ONE bounded sync at the chunk boundary). Invariants: (1) a single-chunk plan (`m_lo == m_hi`) is byte-identical in round shape to the fixed path — no confidence graph, no sync; (2) sticky-disable needs a FULL 16-round window of first-draft outcomes collected only while base depth is 1 (wider-base rounds reset it; demotion instant via EMA decay; `m_lo` climbs ≤ +1/round); (3) `MTP_EV_PRIOR` (0.85) sits ABOVE the ~77% average rate ON PURPOSE — deep indices are OBSERVED only when extension fires, so a realistic prior starves exploration forever (τ + the full-confidence horizon are the only gates, pinned by the exploration test). `--mtp-depth 0` = auto: cap 6 ordinarily, cap 8 ONLY for the calibrated G17-NAX fingerprint (see verifyQmm gotcha); explicit depths win (clamped to `MAX_DEPTH`), 0-sentinel plumbed through LoadParams so `lm.mtp_depth` logs stay truthful. `[spec-stats]` reports `drafted=`/`ext_rounds=` (per_draft_pct divides by DRAFTED tokens — depth varies per round). Guard: `tests/test_mtp_equivalence.sh` asserts ext_rounds>0 on a max-confidence echo AND `MLX_SERVE_MTP_ADAPTIVE=0` reverts to depth 3, zero extensions.
+**EV adaptive depth controller** (default ON; `MLX_SERVE_MTP_ADAPTIVE=0` reverts to the fixed windowed controller for same-boot A/Bs): each request tracks per-index CONDITIONAL acceptance EMAs `a[i] = P(draft i accepted | i−1 accepted)` (β 0.15, ~10-round legacy warmup) and plans every round via the pure `mtpEvPlanFor` — base `m_lo` = static EV argmax, extended to `m_hi` when the head's chain log-confidence on chunk A clears a cost-derived τ (ONE bounded sync at the chunk boundary). Invariants: (1) a single-chunk plan (`m_lo == m_hi`) is byte-identical in round shape to the fixed path — no confidence graph, no sync; (2) sticky-disable needs a FULL 16-round window of first-draft outcomes collected only while base depth is 1 (wider-base rounds reset it; demotion instant via EMA decay; `m_lo` climbs ≤ +1/round); (3) `MTP_EV_PRIOR` (0.85) sits ABOVE the ~77% average rate ON PURPOSE — deep indices are OBSERVED only when extension fires, so a realistic prior starves exploration forever (τ + the full-confidence horizon are the only gates, pinned by the exploration test). Omitting `--mtp-max-depth` selects the automatic cap: cap 6 ordinarily, cap 8 ONLY for the calibrated G17-NAX fingerprint (see verifyQmm gotcha); explicit bounds win (validated in 1..`MAX_DEPTH`); `--mtp-min-depth` lifts the automatic cap when needed, and equal min/max values pin one depth; the internal 0 sentinel is plumbed through LoadParams so `lm.mtp_depth` logs stay truthful. `[spec-stats]` reports `drafted=`/`ext_rounds=` (per_draft_pct divides by DRAFTED tokens — depth varies per round). Guard: `tests/test_mtp_equivalence.sh` asserts ext_rounds>0 on a max-confidence echo AND `MLX_SERVE_MTP_ADAPTIVE=0` reverts to depth 3, zero extensions.
 
-**Auto cap-8 fingerprint** covers the whole round, not just the trunk: also requires the native dense sidecar's affine-8/gs-32, 4/gs-32, or 4/gs-64 q/k/v/o/MLP geometry + a materialized affine-3/gs-64 draft-only lm_head. The Qwen3.8 profile additionally pins its bf16 token embedding; uniformly-quantized and oQ4e mixed-q4/q5/q6 trunks remain separate surfaces even when their sidecars are q4/gs64. `MLX_SERVE_MTP_DRAFT_HEAD_BITS=0`, a failed requant, or a compatible sidecar with different geometry keeps cap 6; explicit `--mtp-depth` wins.
+**Auto cap-8 fingerprint** covers the whole round, not just the trunk: also requires the native dense sidecar's affine-8/gs-32, 4/gs-32, or 4/gs-64 q/k/v/o/MLP geometry + a materialized affine-3/gs-64 draft-only lm_head. The Qwen3.8 profile additionally pins its bf16 token embedding; uniformly-quantized and oQ4e mixed-q4/q5/q6 trunks remain separate surfaces even when their sidecars are q4/gs64. `MLX_SERVE_MTP_DRAFT_HEAD_BITS=0`, a failed requant, or a compatible sidecar with different geometry keeps cap 6; explicit `--mtp-max-depth` wins.
 
 ### MTP auto-depth profiles are full-round tensor fingerprints, not sidecar labels (2026-08-16)
 
@@ -283,7 +283,7 @@ Trap: the draft TEMPERATURE is per family. 0.6 was swept on the dense 27B oQ4e s
 
 **MTP round pipelining — the CPU graph-build was the recoverable overhead; our emit gap is ~0.03 ms so pre-draft buys little beyond early dispatch.** Three landed levers, each kill-switched and BIT-IDENTICAL to its off state (lazy sampling ops bind their PRNG key at graph BUILD): (1) **early dispatch** (`MLX_SERVE_MTP_EARLY_DISPATCH=0`) — `mlx_async_eval` the draft chain as soon as Phase 1 builds it, so it runs while the CPU builds Phases 2–4. (2) **cross-round pre-draft** (`MLX_SERVE_MTP_PREDRAFT=0`) — `nextMtp` tail builds+dispatches the next round's chunk A (plan after the EV update == head-of-round); mirrors oMLX `_step_mtp` but our scheduler has no Python-sized emit window, so it ≈ early-dispatch on totals (kept for the cheaper EV boundary sync). A `MtpPreDraft` owns every handle; consume asserts stash-XOR-predraft. (3) **GDN capture-tail trim** — the seq kernel emits `state_out` from registers and never writes `state_seq[T-1]` (partial accept reads ≤ T-2), so the final state is no longer a slice VIEW pinning the whole [T,…] buffer. Residual vs oMLX is GPU work (their round ≈ their AR forward), not scheduling.
 
-**qwen4 lazy predraft — a solo greedy round builds round N+1's chain from its own LAZY verdict, before the host read.** Two layers, each kill-switched: (1) the **padded head** (`MLX_SERVE_MTP_PADDED_HEAD=0` restores the merged `1 + accepted` step) appends the whole verify row `[t1, drafts]` as head history and drafts past the dead rows through `HeadPlace` (dynamic RoPE offset `live_end`, a mask hiding rows `live_end..dead_end`, QSA blocks touching a dead row scored `-inf`), so one formulation serves every accept count; (2) the **lazy chain** (`MLX_SERVE_MTP_LAZY_PREDRAFT=0` restores the tail pre-draft) takes `a` = argmax over the draft/verify mismatch mask with a mismatch appended at m, `t1 = take(argmax, a)`, `h_prev = take_axis(verify_hidden, a)`, and dispatches the chain behind the verify. `mtpPreDraftResolve` keeps it, or discards it and truncates the head to the stash origin (exactly the tail path's input) on a budget/EOS cut, `done`, spec off, or a lookup pick. Gate: solo greedy padded rounds with a successor round only (`mtpLazyPredraftAllowedFor`). **The plan is drawn one round early**: an auto depth change lands a round later than on the tail path. Deliberate: `mtpRoundPlan` advances serial probes and width trials, so drawing it again after the read double-advances the planner. Byte bar is `MLX_SERVE_MTP_FORCE_DEPTH`. Draft ids arrive in mixed ranks (`[1]` head, `[1,1]` samplers): flatten before concatenating (`concatIds`). Measured M5 Ultra: +2.6% greedy decode; `[mtp-trace]` `dispatch` is 14.3 of a 19 ms round with `wait` 0, so host encode, not the tail, bounds what overlap can buy.
+**qwen4 lazy predraft — a solo greedy round builds round N+1's chain from its own LAZY verdict, before the host read.** Two layers, each kill-switched: (1) the **padded head** (`MLX_SERVE_MTP_PADDED_HEAD=0` restores the merged `1 + accepted` step) appends the whole verify row `[t1, drafts]` as head history and drafts past the dead rows through `HeadPlace` (dynamic RoPE offset `live_end`, a mask hiding rows `live_end..dead_end`, QSA blocks touching a dead row scored `-inf`), so one formulation serves every accept count; (2) the **lazy chain** (`MLX_SERVE_MTP_LAZY_PREDRAFT=0` restores the tail pre-draft) takes `a` = argmax over the draft/verify mismatch mask with a mismatch appended at m, `t1 = take(argmax, a)`, `h_prev = take_axis(verify_hidden, a)`, and dispatches the chain behind the verify. `mtpPreDraftResolve` keeps it, or discards it and truncates the head to the stash origin (exactly the tail path's input) on a budget/EOS cut, `done`, spec off, or a lookup pick. Gate: solo greedy padded rounds with a successor round only (`mtpLazyPredraftAllowedFor`). **The plan is drawn one round early**: an auto depth change lands a round later than on the tail path. Deliberate: `mtpRoundPlan` advances serial probes and width trials, so drawing it again after the read double-advances the planner. Byte bar is `--mtp-min-depth n --mtp-max-depth n`. Draft ids arrive in mixed ranks (`[1]` head, `[1,1]` samplers): flatten before concatenating (`concatIds`). Measured M5 Ultra: +2.6% greedy decode; `[mtp-trace]` `dispatch` is 14.3 of a 19 ms round with `wait` 0, so host encode, not the tail, bounds what overlap can buy.
 
 **EV controller under honest costs — two structural traps fire once marginals stop being cheap.** (Refit cost constants only on a SATURATED sweep whose realized `m_avg`==depth — ladder prompts demote-flap and poison the fit; echo pins it.) Trap 1 — **two-chunk plans pay a mid-pipeline boundary sync the cost surface can't see** (the chunk-A sync blocks on the still-running head chain + confidence graphs): fix = the extension **dry-spell gate** (`mtpExtDryAllows`: ~16 dry rounds → short single-chunk cooldown → fresh trial; `MLX_SERVE_MTP_EXT_DRY=0`), fed by REALIZED extension rate never priors, cooldown SHORT vs a request's round count (64 swallowed a 160-token request's echo stretch). Trap 2 — **the horizon check deadlocks on an unobservable EMA**: `a[m_lo]` updates ONLY when extension fires, so a value dragged cold under an earlier workload closes the horizon FOREVER (pure echo runs ext_rounds=0). Fix: when the base pays (`best_r > MTP_EV_EXPLORE_MIN_R = 1.10`) one extension position stays reachable at the clamped tau. Pinned by the equivalence echo test + `mtpEvPlanFor` unit tests.
 
@@ -2675,7 +2675,7 @@ Two null results from the same round, recorded so nobody re-chases them:
   already exists. The G17 recheck at 9009 prompt tokens likewise found no
   first-request pipeline spike: q4 10.253/10.586 s, q6 10.762/12.156 s, and
   q8 10.707/11.443 s for first/second request TTFT. No warmup change shipped.
-- **`--mtp-depth` is a CAP, not a force**: the EV controller still plans
+- **`--mtp-max-depth` is a CAP, not a force**: the EV controller still plans
   per-round depth under it, so "force depth 6" content that drafts shallow
   (random-word echo measured avg 1.4 drafts/round at 72% per-draft) never
   reaches verify widths 6..9. An attention-lane A/B wants PLD at a fixed
@@ -2732,7 +2732,7 @@ T(4)=68.2, T(6)=95.4, T(8)=142.3 ms → floor ≈ 38.2 ms; marginals k<=4 ≈
 hi over-priced k4 at 0.34 vs its measured 0.24 and under-drafted moderate
 content); per_pos_hi 0.24 → 0.26; the k>=7 register cliff rides the struct's
 generic third region (`nax_from=7, per_pos_nax=0.52` — only reachable when
---mtp-depth forces past the generic cap of 6). Measured on adaptive echo:
+--mtp-max-depth forces past the generic cap of 6). Measured on adaptive echo:
 69.6/69.4 vs 67.6/67.4 tok/s (+2.9%), planning 3.83 accepts/round vs 3.4.
 The env override (`MLX_SERVE_MTP_EV_COSTS`) now ZEROES the third region —
 it used to inherit DEFAULT's, which would have silently priced a cliff into
@@ -3551,7 +3551,7 @@ a rise past 4 (`per_pos_hi = 0.26`), nowhere near enough here.
 Fix is the `dflash.blockCapForMachine` pattern: `mtp.adaptiveDepthCapForMachine`,
 keyed on the CPU brand string (the GPU arch string cannot tell Ultra from Max),
 M1 Pro → 4, every unmeasured chip → today's `MTP_ADAPTIVE_DEFAULT_CAP`. An
-explicit `--mtp-depth` still outranks the table, and `MLX_SERVE_MTP_ADAPTIVE=0`
+explicit `--mtp-max-depth` still outranks the table, and `MLX_SERVE_MTP_ADAPTIVE=0`
 still yields `DEFAULT_DEPTH`. `mtpDepthCapForProfileChip` takes the chip so the
 unit tests are not assertions about whichever Mac runs the suite.
 
@@ -3594,7 +3594,7 @@ resolver logs it once when a row actually lowers the default:
 Verified both ways with the chip string injected: the M1 Pro row logs and runs
 `depth=4`, an M4 stays silent at `depth=6`. Without the line, `[spec-stats]
 … depth=4` on that machine is indistinguishable from the EV controller having
-promoted no further on its own, or from someone having passed `--mtp-depth 4`
+promoted no further on its own, or from someone having passed `--mtp-max-depth 4`
 — three very different situations with one symptom. The resolve site is
 source-scan-pinned to keep naming the row.
 
@@ -3883,7 +3883,7 @@ Two corrections fell out of getting this far, both worth keeping:
 
 ### Precedence, and why each rung is where it is
 
-1. An explicit `--mtp-depth` / `--draft-block-size` / `MLX_SERVE_MTP_EV_COSTS`
+1. An explicit `--mtp-max-depth` / `--draft-block-size` / `MLX_SERVE_MTP_EV_COSTS`
    wins over everything. A measurement must never silently outrank a value the
    operator typed, and the fixed 1..8 values are what every A/B in the repo
    (`tests/bench.sh`, `tests/greedy_ab.sh`, `MLX_SERVE_MTP_ADAPTIVE=0`) depends
@@ -4348,7 +4348,7 @@ position) was bookkeeping, head quantization, or the prompt. Three probes:
    merged head forward vs a fresh head over every committed row: cos
    1.00000, argmax 2/2, with the head past its QSA budget. Green — the
    bookkeeping is acquitted (single-forward parity only proved the math).
-3. **Per-index acceptance on the real packs** (`MLX_SERVE_MTP_FORCE_DEPTH=n`,
+3. **Per-index acceptance on the real packs** (`--mtp-min-depth n --mtp-max-depth n`,
    `acc_idx=` on the trace line, temp 0):
 
 | pack (head width) | depth | 8.4k repetitive prompt | code (LRU cache) | prose (essay) |
@@ -4631,7 +4631,7 @@ Also measured null in the same window (sibling A/B, not this branch): 8-bit MTP 
 
 The seed is per-LOADED-MODEL state, exactly like the sidecar's, so it goes on `Qwen4Mtp` (`ev_seed_accept` + `ev_seed_m_lo`) and dies with the head — it can never reach another model. `qwen4MtpReset` deliberately does not clear it: a reset starts a new REQUEST, which is precisely who should inherit it. transformer.zig cannot import mtp.zig (mtp imports transformer), so the array width is a local `MTP_EV_SEED_DEPTH` and generate.zig — which sees both — asserts it equals `mtp.MAX_DEPTH` at comptime.
 
-Both gates also decline under `MLX_SERVE_MTP_FORCE_DEPTH`. That mode early-returns from `mtpRoundPlan` and never plans, so a forced run must neither inherit a seed nor, at deinit, PUBLISH the surface it measured at a fixed depth for the next ordinary request to pick up.
+Both gates also decline under `--mtp-min-depth n --mtp-max-depth n`. That mode early-returns from `mtpRoundPlan` and never plans, so a forced run must neither inherit a seed nor, at deinit, PUBLISH the surface it measured at a fixed depth for the next ordinary request to pick up.
 
 AUTO-mode A/B (no `--mtp-depth`, no forced depth; boot order proto3, control, control, proto3; the same 100 s cooldowns plus one before the judge). Acceptance per request, protocol requests only — the pooled `[mtp-trace]` medians are ~84% llmprobe traffic and mislead:
 
@@ -4662,7 +4662,7 @@ Open follow-up: the prose block runs right after the code block, so the seed han
 
 The auto A/B came back 3/9 cells byte-identical, which looks like a regression and is not one. The control differs from ITSELF across two boots of the same binary in 4 of 9 cells. In auto mode the EV controller picks depth from MEASURED round times; timing is nondeterministic, so depth is, so the verify width is, so which kernel runs is — and a greedy near-tie flips. Differences are paraphrase-level from an early offset ("not a sudden event but a slow erosion" vs "not a singular event but a gradual erosion" at offset 46).
 
-Confirming that reading: the only cells identical everywhere are the ones with no controller freedom — the warmup request (first of the boot, no seed in either arm) and both `enable_mtp:false` cells. The forced-depth protocol was 9/9 identical in both earlier runs precisely BECAUSE depth was pinned. So: pin `MLX_SERVE_MTP_FORCE_DEPTH` when the bar is bytes, and note that this also disables the EV seed by the gate above — the seed is byte-neutral by construction (it moves only the planner's starting depth; greedy verify decides every token), and no auto-mode run can demonstrate that empirically.
+Confirming that reading: the only cells identical everywhere are the ones with no controller freedom — the warmup request (first of the boot, no seed in either arm) and both `enable_mtp:false` cells. The forced-depth protocol was 9/9 identical in both earlier runs precisely BECAUSE depth was pinned. So: pin `--mtp-min-depth n --mtp-max-depth n` when the bar is bytes, and note that this also disables the EV seed by the gate above — the seed is byte-neutral by construction (it moves only the planner's starting depth; greedy verify decides every token), and no auto-mode run can demonstrate that empirically.
 
 `[spec-stats] depth=` is NOT the chosen depth — it is the controller's cap, and it read `depth 6` for all 86 requests in both arms. The informative fields are `avg_per_round` per request and `m_avg` on the trace line; MTP emits no per-round depth histogram (only DFlash has `block_hist`).
 
