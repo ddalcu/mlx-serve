@@ -25,6 +25,7 @@ const COLS_TG: c_int = 16;
 
 const ND_SOURCE =
     \\const uint t = thread_index_in_threadgroup;
+    \\const int row = int(threadgroup_position_in_grid.z);
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const int s = int(threadgroup_position_in_grid.y) % HC;
@@ -46,6 +47,7 @@ const ND_SOURCE =
     \\threadgroup float npart[8];
     \\threadgroup float tgi[8 * HC];
     \\const int base = s * H;
+    \\const size_t xrow = (size_t)row * K;
     \\const bool down = g < NDG;
     \\
     \\// The down weights do not wait for the norm: every load of this simdgroup's rows goes out first.
@@ -80,15 +82,15 @@ const ND_SOURCE =
     \\T written[PER];
     \\if (WR) {
     \\  // Pending hcWrite: stream' = T(stream + T(out * inj)), the chain's two roundings.
-    \\  const float gate = float(wi_in[s]);
+    \\  const float gate = float(wi_in[row * HC + s]);
     \\  for (int i = 0; i < PER; ++i) {
     \\    const int k = int(t) + 256 * i;
-    \\    const T v = T(float(x_in[base + k]) + float(T(float(wo_in[k]) * gate)));
+    \\    const T v = T(float(x_in[xrow + base + k]) + float(T(float(wo_in[(size_t)row * H + k]) * gate)));
     \\    written[i] = v;
     \\    xv[i] = float(v);
     \\  }
     \\} else {
-    \\  for (int i = 0; i < PER; ++i) xv[i] = float(x_in[base + int(t) + 256 * i]);
+    \\  for (int i = 0; i < PER; ++i) xv[i] = float(x_in[xrow + base + int(t) + 256 * i]);
     \\}
     \\float a = 0.0f;
     \\for (int i = 0; i < PER; ++i) a += xv[i] * xv[i];
@@ -105,7 +107,7 @@ const ND_SOURCE =
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-    \\device float* pp = parts_out + (size_t)s * PR;
+    \\device float* pp = parts_out + (size_t)(row * HC + s) * PR;
     \\if (down) {
     \\  float acc[RPS];
     \\  for (int r = 0; r < RPS; ++r) acc[r] = 0.0f;
@@ -154,8 +156,8 @@ const ND_SOURCE =
     \\// Device stores come last: a later device load waits on every earlier store it cannot prove disjoint.
     \\if (g == 0) {
     \\  for (int i = 0; i < PER; ++i) {
-    \\    xn_out[base + int(t) + 256 * i] = xnv[i];
-    \\    if (WR) xs_out[base + int(t) + 256 * i] = written[i];
+    \\    xn_out[xrow + base + int(t) + 256 * i] = xnv[i];
+    \\    if (WR) xs_out[xrow + base + int(t) + 256 * i] = written[i];
     \\  }
     \\}
 ;
@@ -164,6 +166,7 @@ const U2_SOURCE =
     \\const uint t = thread_index_in_threadgroup;
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;
+    \\const int row = int(threadgroup_position_in_grid.z);
     \\const int j = int(threadgroup_position_in_grid.y) * COLS + int(sg);
     \\constexpr bool WORD = (32 % BITS) == 0;
     \\constexpr int VPW = WORD ? 32 / BITS : 8;
@@ -181,14 +184,14 @@ const U2_SOURCE =
     \\float pb[HC][RIT];
     \\float xnv[HC];
     \\for (int h = 0; h < HC; ++h) {
-    \\  const size_t row = (size_t)h * H + (size_t)j;
-    \\  xnv[h] = float(xn_in[row]);
+    \\  const size_t hrow = (size_t)h * H + (size_t)j;
+    \\  xnv[h] = float(xn_in[(size_t)row * HC * H + hrow]);
     \\  for (int i = 0; i < RIT; ++i) {
     \\    const int pack = int(lane) + 32 * i;
     \\    if (pack < R_by_p) {
-    \\      if constexpr (WORD) pw[h][i] = uw_q[row * R_by_p + (size_t)pack];
-    \\      else pr[h][i] = hc_pack8<BITS>((const device uchar*)uw_q + row * (size_t)(R * BITS / 8) + (size_t)pack * BITS);
-    \\      const size_t gi = row * R_by_gs + (size_t)((pack * VPW) / GS);
+    \\      if constexpr (WORD) pw[h][i] = uw_q[hrow * R_by_p + (size_t)pack];
+    \\      else pr[h][i] = hc_pack8<BITS>((const device uchar*)uw_q + hrow * (size_t)(R * BITS / 8) + (size_t)pack * BITS);
+    \\      const size_t gi = hrow * R_by_gs + (size_t)((pack * VPW) / GS);
     \\      ps[h][i] = float(uw_s[gi]);
     \\      pb[h][i] = float(uw_b[gi]);
     \\    }
@@ -197,17 +200,17 @@ const U2_SOURCE =
     \\// act = silu(T(sum of the stream partials)), as the three-kernel down launch ends.
     \\for (int i = int(t); i < R; i += COLS * 32) {
     \\  float tsum = 0.0f;
-    \\  for (int s = 0; s < HC; ++s) tsum += parts_in[s * PR + i];
+    \\  for (int s = 0; s < HC; ++s) tsum += parts_in[(row * HC + s) * PR + i];
     \\  const T v = T(tsum);
     \\  const T sig = T(1.0f / (1.0f + metal::exp(-float(v))));
     \\  acts[i] = v * sig;
     \\}
     \\if (INJ != 0 && threadgroup_position_in_grid.y == 0 && t < uint(HC)) {
     \\  float tsum = 0.0f;
-    \\  for (int s = 0; s < HC; ++s) tsum += parts_in[s * PR + R + int(t)];
+    \\  for (int s = 0; s < HC; ++s) tsum += parts_in[(row * HC + s) * PR + R + int(t)];
     \\  const T v = T(tsum);
     \\  const T sig = T(1.0f / (1.0f + metal::exp(-float(v))));
-    \\  inj_out[t] = sig * T(2.0f);
+    \\  inj_out[row * HC + t] = sig * T(2.0f);
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
@@ -234,7 +237,87 @@ const U2_SOURCE =
     \\  const T sgv = T(1.0f / (1.0f + metal::exp(-float(u))));
     \\  sum += float(T(float(sgv) * xnv[h]));
     \\}
-    \\if (lane == 0) mixed_out[j] = T(float(T(sum)) * float(T(1.0f / float(HC))));
+    \\if (lane == 0) mixed_out[(size_t)row * H + j] = T(float(T(sum)) * float(T(1.0f / float(HC))));
+;
+
+/// The up/mix launch for 1..16 rows at hc 4, 8-bit. Lanes split
+/// [part:2][stream:2][column:1], so one lane holds one stream's slice of a weight row in registers (16-byte loads issued
+/// before any math) and every row's activations are applied to it; the activations (the stream partials summed, then
+/// silu) are staged once per threadgroup. Rounding sites are U2_SOURCE's; only the f32 summation order differs.
+const U2V_SOURCE =
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const uint tid = thread_index_in_threadgroup;
+    \\const uint sgi = simdgroup_index_in_threadgroup;
+    \\const uint part = lane & 3u;
+    \\const uint h = (lane >> 2) & 3u;
+    \\const uint cl = lane >> 4;
+    \\const uint j = threadgroup_position_in_grid.x * 16u + sgi * 2u + cl;
+    \\constexpr int VPW = 32 / BITS;
+    \\constexpr int R_by_p = R / VPW;
+    \\constexpr int R_by_gs = R / GS;
+    \\constexpr int PV = R / 4;
+    \\constexpr int PU4 = PV / (4 * VPW);
+    \\constexpr int PR = R + HC;
+    \\threadgroup float act_tg[ROWS * R];
+    \\const size_t wrow = (size_t)h * (size_t)H + (size_t)j;
+    \\const device uint4* wq4 = (const device uint4*)(uw_q + wrow * (size_t)R_by_p) + part * PU4;
+    \\uint4 wv[PU4];
+    \\for (int i = 0; i < PU4; ++i) wv[i] = wq4[i];
+    \\float sc[PU4], bi[PU4];
+    \\for (int i = 0; i < PU4; ++i) {
+    \\  const int k0 = int(part) * PV + i * 4 * VPW;
+    \\  sc[i] = float(uw_s[wrow * (size_t)R_by_gs + (size_t)(k0 / GS)]);
+    \\  bi[i] = float(uw_b[wrow * (size_t)R_by_gs + (size_t)(k0 / GS)]);
+    \\}
+    \\float xnv[ROWS];
+    \\for (int r = 0; r < ROWS; ++r) xnv[r] = float(xn_in[(size_t)r * (size_t)(HC * H) + wrow]);
+    \\for (uint e = tid; e < uint(ROWS * R); e += 256) {
+    \\  const int r = int(e) / R;
+    \\  const int k = int(e) % R;
+    \\  float tsum = 0.0f;
+    \\  for (int s = 0; s < HC; ++s) tsum += parts_in[(size_t)(r * HC + s) * PR + k];
+    \\  const T v = T(tsum);
+    \\  const T sig = T(1.0f / (1.0f + metal::exp(-float(v))));
+    \\  act_tg[e] = float(v * sig);
+    \\}
+    \\if (INJ != 0 && threadgroup_position_in_grid.x == 0 && tid < uint(ROWS * HC)) {
+    \\  const int r = int(tid) / HC;
+    \\  const int c = int(tid) % HC;
+    \\  float tsum = 0.0f;
+    \\  for (int s = 0; s < HC; ++s) tsum += parts_in[(size_t)(r * HC + s) * PR + R + c];
+    \\  const T v = T(tsum);
+    \\  const T sig = T(1.0f / (1.0f + metal::exp(-float(v))));
+    \\  inj_out[tid] = sig * T(2.0f);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float acc[ROWS];
+    \\for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+    \\for (int i = 0; i < PU4; ++i) {
+    \\  const int k0 = int(part) * PV + i * 4 * VPW;
+    \\  const uint words[4] = {wv[i].x, wv[i].y, wv[i].z, wv[i].w};
+    \\  for (int wd = 0; wd < 4; ++wd) {
+    \\    for (int b = 0; b < VPW; ++b) {
+    \\      const float wf = float((words[wd] >> (b * BITS)) & ((1u << BITS) - 1u)) * sc[i] + bi[i];
+    \\      const int k = k0 + wd * VPW + b;
+    \\      for (int r = 0; r < ROWS; ++r) acc[r] += act_tg[r * R + k] * wf;
+    \\    }
+    \\  }
+    \\}
+    \\float mix[ROWS];
+    \\for (int r = 0; r < ROWS; ++r) {
+    \\  float a = acc[r];
+    \\  a += simd_shuffle_xor(a, 1);
+    \\  a += simd_shuffle_xor(a, 2);
+    \\  const T u = T(a);
+    \\  const T sgv = T(1.0f / (1.0f + metal::exp(-float(u))));
+    \\  float m = float(T(float(sgv) * xnv[r]));
+    \\  m += simd_shuffle_xor(m, 4);
+    \\  m += simd_shuffle_xor(m, 8);
+    \\  mix[r] = m;
+    \\}
+    \\if ((lane & 15u) == 0) {
+    \\  for (int r = 0; r < ROWS; ++r) mixed_out[(size_t)r * (size_t)H + (size_t)j] = T(float(T(mix[r])) * float(T(1.0f / float(HC))));
+    \\}
 ;
 
 var env_enabled: ?bool = null;
@@ -242,14 +325,28 @@ pub var override: ?bool = null;
 var engaged = false;
 /// Reads served by the two launches (the tests assert the path engaged).
 pub var served: u64 = 0;
+/// Of those, reads whose up launch took the vectorized kernel.
+pub var served_vec: u64 = 0;
 
-/// `MLX_SERVE_HC_DECODE2=0` keeps the three-launch read.
+/// `MLX_SERVE_HC_DECODE2=0` keeps the unfused chain.
 pub fn enabled() bool {
     if (override) |v| return v;
     if (env_enabled) |v| return v;
     const raw = std.c.getenv("MLX_SERVE_HC_DECODE2");
     env_enabled = raw == null or raw.?[0] != '0';
     return env_enabled.?;
+}
+
+var env_rows: ?c_int = null;
+pub var rows_override: ?c_int = null;
+/// Widest read the two launches serve (the verify widths and batched slots); `MLX_SERVE_HC_DECODE2_ROWS=1` limits it to one row.
+pub fn maxRows() c_int {
+    if (rows_override) |v| return v;
+    if (env_rows) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_HC_DECODE2_ROWS");
+    const parsed = if (raw) |r| std.fmt.parseInt(c_int, std.mem.span(r), 10) catch 16 else 16;
+    env_rows = std.math.clamp(parsed, 1, 16);
+    return env_rows.?;
 }
 
 /// Values per pack the HC kernels read: one word at 2/4/8 bits, 8 values in BITS bytes at 3/5/6.
@@ -311,16 +408,36 @@ fn run(kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config,
     }
 }
 
-const Key = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: c_int, dtype: mlx.mlx_dtype };
-const Armed = struct { key: Key, nd: mlx.mlx_fast_metal_kernel_config, up: mlx.mlx_fast_metal_kernel_config };
+const Key = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: c_int, dtype: mlx.mlx_dtype, rows: c_int };
+const Armed = struct { key: Key, nd: mlx.mlx_fast_metal_kernel_config, up: mlx.mlx_fast_metal_kernel_config, upv: ?mlx.mlx_fast_metal_kernel_config };
 var nd_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var up_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var up_v_kernel: ?mlx.mlx_fast_metal_kernel = null;
 /// A mixed pack's per-layer widths each keep their configs, so no layer re-arms; round-robin eviction.
 var armed: [16]?Armed = @splat(null);
 var armed_next: usize = 0;
 
-/// The two-launch read of one row, or null outside its envelope (the caller keeps the
-/// three-launch path). `dw` [R, K/vpw] and `uw` [K, R/vpw] are the packed projections with
+/// Rows the vectorized up launch serves (hc 4, 8-bit weights, 1..16 rows): its threadgroup holds every row's activations.
+/// One row takes it too, so a row sums in the same order at every row count and a grouped verify stays byte-identical to a
+/// solo one.
+fn upVectorized(rows: c_int, hc: c_int, r: c_int, bits: u32, gs: c_int) bool {
+    if (rows < 1 or rows > 16 or hc != 4 or bits != 8 or @rem(r, 64) != 0 or r > 512 or @rem(gs, 16) != 0) return false;
+    return true;
+}
+
+/// The up launch's 16-byte weight loads need a 16-byte-aligned buffer. A lazy weight has no data pointer yet, so it is
+/// evaluated here: the launch must not depend on whether an earlier read already did, or one row would sum in
+/// a different order from the same row read before the weights were resident.
+fn aligned16(a: mlx.mlx_array) bool {
+    var avail = false;
+    if (mlx._mlx_array_is_available(&avail, a) != 0) return false;
+    if (!avail) mlx.check(mlx.mlx_array_eval(a)) catch return false;
+    const p = mlx.mlx_array_data_uint32(a) orelse return false;
+    return @intFromPtr(p) % 16 == 0;
+}
+
+/// The two-launch read of `rows` rows, or null outside its envelope (the caller keeps the
+/// unfused chain). `dw` [R, K/vpw] and `uw` [K, R/vpw] are the packed projections with
 /// scales and biases in x's dtype, `iw` the dense [K, hc] inject weight or null-ctx.
 pub fn read(
     s: mlx.mlx_stream,
@@ -334,6 +451,7 @@ pub fn read(
     ub: mlx.mlx_array,
     iw: mlx.mlx_array,
     eps: mlx.mlx_array,
+    rows: c_int,
     hc: c_int,
     hidden: c_int,
     bits: u32,
@@ -361,9 +479,9 @@ pub fn read(
     if (@rem(16, vpw) != 0 or @rem(hidden, 16) != 0) return null;
     const inj: c_int = @intFromBool(iw.ctx != null);
     const wr: c_int = @intFromBool(pend != null);
-    if (mlx.mlx_array_size(x) != @as(usize, @intCast(K)) or mlx.mlx_array_size(nw) != @as(usize, @intCast(K))) return null;
+    if (rows < 1 or mlx.mlx_array_size(x) != @as(usize, @intCast(rows * K)) or mlx.mlx_array_size(nw) != @as(usize, @intCast(K))) return null;
 
-    const key = Key{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = gs, .dtype = dt };
+    const key = Key{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = gs, .dtype = dt, .rows = rows };
     if (nd_kernel == null) {
         const ins = [_][*:0]const u8{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "dw_q", "dw_s", "dw_b" };
         const outs = [_][*:0]const u8{ "xn_out", "parts_out", "xs_out" };
@@ -374,19 +492,30 @@ pub fn read(
         const outs = [_][*:0]const u8{ "mixed_out", "inj_out" };
         up_kernel = try makeKernel("mlxserve_hc_read_u2", &ins, &outs, U2_SOURCE);
     }
+    if (up_v_kernel == null) {
+        const ins = [_][*:0]const u8{ "xn_in", "parts_in", "uw_q", "uw_s", "uw_b" };
+        const outs = [_][*:0]const u8{ "mixed_out", "inj_out" };
+        up_v_kernel = try makeKernel("mlxserve_hc_read_u2v", &ins, &outs, U2V_SOURCE);
+    }
     const pr: c_int = R + hc;
     const cfgs: Armed = for (armed) |a| {
         if (a != null and std.meta.eql(a.?.key, key)) break a.?;
     } else blk: {
         const groups = @divExact(R, ROWS_TG) + inj;
-        const nd = try config(&.{ .{ K, dt }, .{ hc * pr, .float32 }, .{ if (wr == 1) K else 1, dt } }, .{ 256, groups * hc, 1 }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "WR", wr }, .{ "RPS", RPS }, .{ "ROWS_TG", ROWS_TG } }, dt);
+        const nd = try config(&.{ .{ rows * K, dt }, .{ rows * hc * pr, .float32 }, .{ if (wr == 1) rows * K else 1, dt } }, .{ 256, groups * hc, rows }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "WR", wr }, .{ "RPS", RPS }, .{ "ROWS_TG", ROWS_TG } }, dt);
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(nd);
-        const up = try config(&.{ .{ hidden, dt }, .{ hc, dt } }, .{ 32 * COLS_TG, @divExact(hidden, COLS_TG), 1 }, 32 * COLS_TG, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "COLS", COLS_TG } }, dt);
+        const up = try config(&.{ .{ rows * hidden, dt }, .{ rows * hc, dt } }, .{ 32 * COLS_TG, @divExact(hidden, COLS_TG), rows }, 32 * COLS_TG, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "COLS", COLS_TG } }, dt);
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(up);
+        const upv: ?mlx.mlx_fast_metal_kernel_config = if (upVectorized(rows, hc, R, bits, gs))
+            try config(&.{ .{ rows * hidden, dt }, .{ rows * hc, dt } }, .{ 256 * @divExact(hidden, 16), 1, 1 }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "ROWS", rows } }, dt)
+        else
+            null;
         if (armed[armed_next]) |old| {
             _ = mlx.mlx_fast_metal_kernel_config_free(old.nd);
             _ = mlx.mlx_fast_metal_kernel_config_free(old.up);
+            if (old.upv) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         }
-        const fresh: Armed = .{ .key = key, .nd = nd, .up = up };
+        const fresh: Armed = .{ .key = key, .nd = nd, .up = up, .upv = upv };
         armed[armed_next] = fresh;
         armed_next = (armed_next + 1) % armed.len;
         break :blk fresh;
@@ -399,7 +528,12 @@ pub fn read(
     defer _ = mlx.mlx_array_free(nd_out[1]);
     errdefer _ = mlx.mlx_array_free(nd_out[2]);
     var upmix: [2]mlx.mlx_array = undefined;
-    try run(up_kernel.?, cfgs.up, &.{ nd_out[0], nd_out[1], uw, us, ub }, s, &upmix);
+    if (cfgs.upv != null and aligned16(uw)) {
+        try run(up_v_kernel.?, cfgs.upv.?, &.{ nd_out[0], nd_out[1], uw, us, ub }, s, &upmix);
+        served_vec += 1;
+    } else {
+        try run(up_kernel.?, cfgs.up, &.{ nd_out[0], nd_out[1], uw, us, ub }, s, &upmix);
+    }
     var stream = nd_out[2];
     if (wr == 0) {
         _ = mlx.mlx_array_free(stream);
@@ -412,7 +546,7 @@ pub fn read(
     }
     if (!engaged) {
         engaged = true;
-        log.info("[qwen4] two-launch hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d} (MLX_SERVE_HC_DECODE2=0 restores three)\n", .{ hc, hidden, R, bits, group_size });
+        log.info("[qwen4] two-launch hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d} (MLX_SERVE_HC_DECODE2=0 restores the unfused chain)\n", .{ hc, hidden, R, bits, group_size });
     }
     served += 1;
     return .{ .mixed = upmix[0], .inj = inj_out, .stream = stream };
@@ -468,8 +602,7 @@ fn readF32(a: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
     return out;
 }
 
-/// Per element within a couple of bf16 ulps of the three-launch read (the f32 accumulation
-/// order is the only difference), on every output.
+/// Per element within a couple of bf16 ulps (the f32 accumulation order is the only difference), on every output.
 fn expectClose(ref: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !void {
     const rh = try readF32(ref, s);
     defer testing.allocator.free(rh);
@@ -489,66 +622,104 @@ fn expectClose(ref: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !void 
     try testing.expect(dot / @sqrt(nr * ng) >= 0.9999);
 }
 
-fn parityCase(h: c_int, r: c_int, bits: u32, gs: u32, seed: u64) !void {
+/// Row `row` of `a`, whose dim 1 holds the rows (rank 3: [1,rows,n], rank 4: [1,rows,n,1]).
+fn sliceRow(a: mlx.mlx_array, row: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(a);
+    var start: [4]c_int = @splat(0);
+    var stop: [4]c_int = @splat(1);
+    @memcpy(stop[0..shape.len], shape);
+    start[1] = row;
+    stop[1] = row + 1;
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_slice(&out, a, &start, shape.len, &stop, shape.len, &[_]c_int{ 1, 1, 1, 1 }, shape.len, s));
+    return out;
+}
+
+/// A `rows`-row read agrees, row by row, with each row read alone through the one-row launches.
+/// A row read among others is byte-identical to the same row read alone: a grouped verify must not change a row's output.
+fn expectEqualBits(ref: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    const rh = try readF32(ref, s);
+    defer testing.allocator.free(rh);
+    const gh = try readF32(got, s);
+    defer testing.allocator.free(gh);
+    try testing.expectEqualSlices(f32, rh, gh);
+}
+
+fn parityRows(h: c_int, r: c_int, bits: u32, gs: u32, seed: u64, rows: c_int) !void {
     const xfm = @import("transformer.zig");
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
     xfm.hc_fused_override = true;
     defer xfm.hc_fused_override = null;
-    defer override = null;
+    rows_override = rows;
+    defer rows_override = null;
     const hc: c_int = 4;
     const k = hc * h;
     const down = try quantRandom(rnd, r, k, bits, gs, s);
     defer down.deinit();
     const up = try quantRandom(rnd, k, r, bits, gs, s);
     defer up.deinit();
-    const x = try randBf16(rnd, &.{ 1, 1, k }, 4.0, 0.0, s);
+    // The weight stays lazy on purpose: the launch choice must not depend on whether an earlier read evaluated it.
+    const x = try randBf16(rnd, &.{ 1, rows, k }, 4.0, 0.0, s);
     defer _ = mlx.mlx_array_free(x);
     const nw = try randBf16(rnd, &.{ hc, h }, 1.0, 1.0, s);
     defer _ = mlx.mlx_array_free(nw);
     const iw = try randBf16(rnd, &.{ k, hc }, 0.1, 0.0, s);
     defer _ = mlx.mlx_array_free(iw);
-    const wo = try randBf16(rnd, &.{ 1, 1, h }, 2.0, 0.0, s);
+    const wo = try randBf16(rnd, &.{ 1, rows, h }, 2.0, 0.0, s);
     defer _ = mlx.mlx_array_free(wo);
-    const wi = try randBf16(rnd, &.{ 1, 1, hc, 1 }, 1.0, 1.0, s);
+    const wi = try randBf16(rnd, &.{ 1, rows, hc, 1 }, 1.0, 1.0, s);
     defer _ = mlx.mlx_array_free(wi);
 
     const cases = [_]struct { inject: bool, pending: bool }{ .{ .inject = true, .pending = false }, .{ .inject = true, .pending = true }, .{ .inject = false, .pending = false } };
     for (cases) |c| {
         const inj_w: mlx.mlx_array = if (c.inject) iw else .{ .ctx = null };
         const pend: ?xfm.HcPending = if (c.pending) .{ .out = wo, .inj = wi } else null;
-        override = false;
         const before = served;
-        const ref = (try xfm.hcReadFused(s, x, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, gs, pend)) orelse return error.HcFusedDeclined;
-        try testing.expectEqual(before, served);
-        override = true;
-        const got = (try xfm.hcReadFused(s, x, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, gs, pend)) orelse return error.HcFusedDeclined;
+        const before_vec = served_vec;
+        const got = (try xfm.hcReadFused(s, x, 1, rows, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, gs, pend)) orelse return error.HcFusedDeclined;
+        defer {
+            _ = mlx.mlx_array_free(got.mixed);
+            if (got.inj.ctx != null) _ = mlx.mlx_array_free(got.inj);
+            if (got.stream.ctx != null) _ = mlx.mlx_array_free(got.stream);
+        }
         try testing.expectEqual(before + 1, served);
-        defer inline for (.{ ref, got }) |o| {
-            _ = mlx.mlx_array_free(o.mixed);
-            if (o.inj.ctx != null) _ = mlx.mlx_array_free(o.inj);
-            if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
-        };
-        try expectClose(ref.mixed, got.mixed, s);
-        if (c.inject) try expectClose(ref.inj, got.inj, s);
-        if (c.pending) try expectClose(ref.stream, got.stream, s);
-        try testing.expect((ref.inj.ctx != null) == (got.inj.ctx != null));
-        try testing.expect((ref.stream.ctx != null) == (got.stream.ctx != null));
+        try testing.expectEqual(before_vec + @intFromBool(upVectorized(rows, 4, r, bits, @intCast(gs))), served_vec);
+        try testing.expect((got.inj.ctx != null) == c.inject);
+        try testing.expect((got.stream.ctx != null) == c.pending);
+        var row: c_int = 0;
+        while (row < rows) : (row += 1) {
+            const xr = try sliceRow(x, row, s);
+            defer _ = mlx.mlx_array_free(xr);
+            const wor = try sliceRow(wo, row, s);
+            defer _ = mlx.mlx_array_free(wor);
+            const wir = try sliceRow(wi, row, s);
+            defer _ = mlx.mlx_array_free(wir);
+            const one_pend: ?xfm.HcPending = if (c.pending) .{ .out = wor, .inj = wir } else null;
+            const one = (try xfm.hcReadFused(s, xr, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, gs, one_pend)) orelse return error.HcFusedDeclined;
+            defer {
+                _ = mlx.mlx_array_free(one.mixed);
+                if (one.inj.ctx != null) _ = mlx.mlx_array_free(one.inj);
+                if (one.stream.ctx != null) _ = mlx.mlx_array_free(one.stream);
+            }
+            inline for (.{ "mixed", "inj", "stream" }) |name| {
+                if (@field(got, name).ctx != null) {
+                    const part = try sliceRow(@field(got, name), row, s);
+                    defer _ = mlx.mlx_array_free(part);
+                    try expectEqualBits(@field(one, name), part, s);
+                }
+            }
+        }
     }
 }
 
-test "hc decode2: the two-launch read matches the three-launch read (Flash Next geometry, 8-bit)" {
-    try parityCase(2560, 320, 8, 64, 0x2D0DE2);
+test "hc decode2: a multi-row read matches each row read alone (Flash Next geometry, 8-bit, vectorized up launch)" {
+    for ([_]c_int{ 2, 6, 9, 16 }) |rows| try parityRows(2560, 320, 8, 64, 0x2D0DE9 + @as(u64, @intCast(rows)), rows);
 }
 
-test "hc decode2: the two-launch read matches the three-launch read (small geometry, 4-bit)" {
-    try parityCase(512, 64, 4, 64, 0x2D0DE4);
-}
-
-test "hc decode2: the two-launch read matches the three-launch read at byte-packed widths (5/6-bit, g64 and g128)" {
-    for ([_]u32{ 5, 6 }) |bits| {
-        try parityCase(2560, 320, bits, 64, 0x2D0DE5 + bits);
-        try parityCase(512, 128, bits, 128, 0x2D0DE7 + bits);
-    }
+test "hc decode2: a multi-row read matches each row read alone (4/5/6-bit, per-row up launch)" {
+    try parityRows(512, 64, 4, 64, 0x2D0DE4, 3);
+    for ([_]u32{ 5, 6 }) |bits| try parityRows(2560, 320, bits, 64, 0x2D0DE5 + bits, 5);
 }
