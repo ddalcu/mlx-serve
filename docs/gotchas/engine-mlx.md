@@ -35,6 +35,18 @@ A 27B 8-bit agent turn on a 64 GB Mac, 46k of 47.7k tokens warm, got `PrefillDoe
 - Same pass: a repeated ONE-token prompt fully matched its own entry and restored it whole, leaving nothing to forward; `Generator.initWithOptions` segfaulted. The lookup now declines it (cold prefill).
 - Guards: `restore by move ON DEMAND` and `a one-token prompt that hits its own entry` unit tests; live `~/claude-tmp/rel-2696-20260923/move/move_repro.py` (red 400 on the old binary, green 200 with byte-equal output vs the share on Qwen3.5-2B, gemma-4-e4b, kv8).
 
+### Concurrent checkout was credited as evictable cache
+Admission digests excluded checked-out entries, but their residency base still included them.
+A sibling's protected KV therefore looked reclaimable; eviction returned less than advertised.
+- Publish digests, eviction base, protected bytes and conservative credit under one lock. Failed publication grants zero credit.
+- Recheck the warm bill on the inference thread. Beside live decoders, return restored state and queue the request again; alone, refuse a request that still does not fit.
+- A hold pays only while the shortfall is at most what the live slots hold (`resident_live_kv_bytes`): a bigger one can never run, and parking it at the head of `pending` stalls everything behind it. The inference-side shortfall is POST-eviction (the eviction pass's final probe already priced the freed bytes — never subtract `evicted_live_bytes` again); the connection thread's is pre-eviction and subtracts only the reclaimable credit.
+- Cancelled slots must never re-enter the pending queue after `complete` has removed them. Release promises and balance pass counts when requeuing.
+- The hold loop's wait is bounded by a deadline counted FROM the hold, not from arrival: `--timeout` is a stall timeout, so queue depth alone must never finish a queued request empty, and a slot whose company drained is refused by name, not killed.
+- An expired hold answers the named memory refusal it was billed for: no forward ever ran, so an empty `"length"` 200 would teach the agent the model ran out of tokens.
+- A defer-to-warm arm must never run before the idle-model-unload arm: a queued live sibling would then shield an idle model's residency, and the request dies with the 400 the unload existed to prevent.
+- Guards: checkout-credit/live-eviction regression, restored-KV/SSM rollback, failed publication, cancelled FIFO requeue; `test_prefill_concurrent_admission.sh` covers HTTP lifecycle.
+
 ### A disk restore was billed as a cold prompt (PR #621)
 The SSD tier restores into arrays the SLOT owns, but both disk-restore returns in `lookupAndRestoreWithMedia` leave `LookupResult.checked_out` false — that field means a RAM entry moved. `scheduler` took `warm_will_donate` straight from it, so `WarmPrefix.creditedRows` returned 0 and the estimator billed the WHOLE prompt instead of the new tail.
 Live (M5 Pro 48 GB, 27B Q5, 26.9.3, single stream): 78,156 of 78,475 tokens already persisted, billed 4,790 MB, refused by 1,218 MB; a 128k turn restored 121,833/123,689 and was refused by **93 MB**. Every one reported `reclaimable=0 MB` with an EMPTY hot cache, so eviction could not help — the bill was the whole problem, and the refusal had already cost the entries eviction dropped on the way in. 48 refusals in one log, at 40k-128k prompts.
