@@ -513,17 +513,38 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertTrue(yml.contains("thinkingFormat: qwen"), yml)
     }
 
-    /// codex only speaks the Responses wire API (WireApi has one variant) and
-    /// honors CODEX_HOME for its whole config tree — dedicated dir, keyless
-    /// provider (no env_key: the loopback server ignores keys).
-    func testCodexTabWritesAnIsolatedCodexHome() throws {
+    /// The tab and the launcher carry the SAME override builder and write nothing.
+    func testCodexTabAndLauncherShareTheOverridesAndWriteNothing() throws {
         let tab = try XCTUnwrap(tabs.first { $0.id == "codex" })
-        XCTAssertTrue(tab.command.contains("mkdir -p ~/.mlx-serve/codex"))
-        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/codex/config.toml <<'EOF'"))
-        XCTAssertTrue(tab.command.contains(#"export CODEX_HOME="$HOME/.mlx-serve/codex""#))
-        XCTAssertTrue(tab.command.contains(AgentConfigs.codexConfigTOML(
-            baseURL: "http://localhost:11234", model: "gemma-4-e4b-it-4bit", budget: budget)))
-        XCTAssertFalse(tab.command.contains("~/.codex"), "must never touch the user's real codex config")
+        let args = AgentConfigs.codexConfigArgs(baseURL: "http://localhost:11234",
+                                                model: "gemma-4-e4b-it-4bit", budget: budget)
+        let script = LauncherCLI.codex.scriptBody("http://localhost:11234",
+                                                  "gemma-4-e4b-it-4bit", "", budget, [])
+        for surface in [tab.command, script] {
+            XCTAssertTrue(surface.contains("\"$CODEX_BIN\" \(args)"), surface)
+            XCTAssertFalse(surface.contains("CODEX_HOME"), surface)
+            XCTAssertFalse(surface.contains("mkdir"), surface)
+            XCTAssertFalse(surface.contains("cat >"), surface)
+        }
+    }
+
+    func testCodexConfigArgsOmitsTheContextWhenUnknown() {
+        let zero = AgentConfigs.codexConfigArgs(baseURL: "http://x:1", model: "m1",
+                                                budget: AgentBudget.Budget(context: 0, output: 0))
+        XCTAssertFalse(zero.contains("model_context_window"), zero)
+        XCTAssertTrue(zero.contains(#"-c 'model_providers.mlx.base_url="http://x:1/v1"'"#), zero)
+    }
+
+    /// Byte-identical to launch.zig's "codex overrides escape a model id" test.
+    func testCodexConfigArgsEscapeForTOMLThenShell() {
+        let args = AgentConfigs.codexConfigArgs(baseURL: "http://x:1", model: #"o'ne"il\m"#,
+                                                budget: AgentBudget.Budget(context: 0, output: 0))
+        XCTAssertTrue(args.hasPrefix(#"-c 'model="o'\''ne\"il\\m"' -c 'model_provider="mlx"'"#), args)
+    }
+
+    func testModelArgsAreQuotedOnlyWhenNeeded() {
+        XCTAssertEqual(AgentConfigs.shellArg("mlx/ok-m1"), "mlx/ok-m1")
+        XCTAssertEqual(AgentConfigs.shellArg("a b'c"), #"'a b'\''c'"#)
     }
 
     /// The ChatGPT desktop app (codex's rebranded app; bundle id
@@ -560,14 +581,14 @@ final class CLISetupInstructionsTests: XCTestCase {
     }
 
     func testCodexConfigTargetsOurResponsesAPIAndCarriesTheContext() {
-        let toml = AgentConfigs.codexConfigTOML(
+        let args = AgentConfigs.codexConfigArgs(
             baseURL: "http://localhost:11234", model: "m1", budget: budget)
-        XCTAssertTrue(toml.contains(#"wire_api = "responses""#), toml)
-        XCTAssertTrue(toml.contains(#"base_url = "http://localhost:11234/v1""#), toml)
-        XCTAssertTrue(toml.contains("model_context_window = \(budget.context)"), toml)
-        XCTAssertTrue(toml.contains(#"model = "m1""#), toml)
-        XCTAssertTrue(toml.contains(#"model_provider = "mlx""#), toml)
-        XCTAssertFalse(toml.contains("env_key"), "keyless — loopback is exempt from --api-key")
+        XCTAssertTrue(args.contains(#"-c 'model_providers.mlx.wire_api="responses"'"#), args)
+        XCTAssertTrue(args.contains(#"-c 'model_providers.mlx.base_url="http://localhost:11234/v1"'"#), args)
+        XCTAssertTrue(args.contains("-c model_context_window=\(budget.context)"), args)
+        XCTAssertTrue(args.contains(#"-c 'model="m1"'"#), args)
+        XCTAssertTrue(args.contains(#"-c 'model_provider="mlx"'"#), args)
+        XCTAssertFalse(args.contains("env_key"), "keyless — loopback is exempt from --api-key")
     }
 
     /// hermes reads its whole tree from HERMES_HOME (hermes_constants.py) —

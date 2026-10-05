@@ -26,6 +26,13 @@ final class AgentSkillsTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root + "/claude/plugin/.claude-plugin/plugin.json"))
     }
 
+    func testCodexGetsNoSkillLinkAndNoDedicatedDir() throws {
+        XCTAssertNil(AgentSkills.linkPath(agentId: "codex"))
+        let root = try tempDir()
+        AgentSkills.install(agentId: "codex", root: root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root + "/codex"))
+    }
+
     // The update menu restores every shipped skill file, backing up the edited ones where no scan finds them as skills.
     func testRefreshBacksUpEditsOutsideTheSkillsDir() throws {
         let root = try tempDir()

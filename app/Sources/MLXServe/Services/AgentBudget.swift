@@ -481,27 +481,29 @@ enum AgentConfigs {
                      entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
     }
 
-    /// codex `config.toml` — written into a dedicated `CODEX_HOME`
-    /// (`~/.mlx-serve/codex`; codex requires the dir to EXIST, so every
-    /// writer creates it first) so the user's real `~/.codex` is never
-    /// touched. Current codex speaks ONLY the Responses wire API (`WireApi`
-    /// has one variant in codex-rs), so this points at our `/v1/responses`.
-    /// No `env_key`: with `requires_openai_auth` false (the default) and no
-    /// key var, codex skips login entirely — the loopback server ignores
-    /// keys anyway.
-    static func codexConfigTOML(baseURL: String, model: String,
-                                budget: AgentBudget.Budget) -> String {
-        """
-        # written by mlx-serve — dedicated CODEX_HOME, regenerated at each launch.
-        model = "\(model)"
-        model_provider = "mlx"
-        model_context_window = \(budget.context)
+    /// A model-derived arg, quoted only when needed so plain ids keep the exact
+    /// script bytes (twin of launch.zig `appendModelArg`).
+    static func shellArg(_ s: String) -> String {
+        let safe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/+:@=")
+        return !s.isEmpty && s.unicodeScalars.allSatisfy(safe.contains) ? s : CLIInstaller.shellQuote(s)
+    }
 
-        [model_providers.mlx]
-        name = "MLX Serve (local)"
-        base_url = "\(baseURL)/v1"
-        wire_api = "responses"
-        """
+    /// codex launch-line overrides, merged over the user's own config.toml so
+    /// nothing is written into their Codex home. Responses wire API only;
+    /// keyless (no `env_key`). Twin of launch.zig `codexConfigOverrides`.
+    static func codexConfigArgs(baseURL: String, model: String,
+                                budget: AgentBudget.Budget) -> String {
+        func opt(_ key: String, _ value: String) -> String {
+            let toml = value.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "-c " + CLIInstaller.shellQuote("\(key)=\"\(toml)\"")
+        }
+        var args = [opt("model", model), opt("model_provider", "mlx")]
+        if budget.context > 0 { args.append("-c model_context_window=\(budget.context)") }
+        args += [opt("model_providers.mlx.name", "MLX Serve (local)"),
+                 opt("model_providers.mlx.base_url", "\(baseURL)/v1"),
+                 opt("model_providers.mlx.wire_api", "responses")]
+        return args.joined(separator: " ")
     }
 
     /// Shell snippet that resolves the codex binary: PATH first, then the

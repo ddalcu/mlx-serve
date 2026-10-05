@@ -34,7 +34,7 @@ mlx-serve launch codex -- resume     # everything after -- goes to the agent
 
 If no server is running, `launch` starts the MLX Core app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
 
-Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.grok`, `~/.zcode` stay yours). fx is the exception: it reads providers only from `~/.fx/settings.json`, so the launch sets the `providers.mlx-serve` entry there and selects it with `FX_PROVIDER`/`FX_MODEL`, leaving the rest of the file, your default provider included, as it was.
+Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.grok`, `~/.zcode` stay yours). fx is the exception: it reads providers only from `~/.fx/settings.json`, so the launch sets the `providers.mlx-serve` entry there and selects it with `FX_PROVIDER`/`FX_MODEL`, leaving the rest of the file, your default provider included, as it was. Codex is the exception: it launches against your real Codex home so MCP servers, plugins, and auth work — see [Codex](#codex).
 
 ### ZCode
 
@@ -156,26 +156,20 @@ opencode --standalone
 
 ### Codex
 
-Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. `CODEX_HOME` relocates its whole config tree (the folder must exist before codex runs). No key setup: with no `env_key` configured, codex skips the login screen.
+Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. mlx-serve writes nothing into your Codex home (`${CODEX_HOME:-$HOME/.codex}`): its settings ride `-c key=value` overrides that codex merges over your own `config.toml`, so your MCP servers, plugins, login and project trusts keep working. No key setup: with no `env_key` configured, codex skips the login screen. Codex launches carry no mlx-serve skill, since codex has no setting for an extra skills folder.
 
 No `codex` on PATH but you have the ChatGPT desktop app? It bundles the CLI at `/Applications/ChatGPT.app/Contents/Resources/codex` (the launchers find it there automatically; `mlx-serve launch chatgpt` works too).
 
-Codex will print `Model metadata for <id> not found. Defaulting to fallback metadata` on every turn. That's its internal catalog of OpenAI model ids and it fires for any custom provider's model; it's cosmetic. The part that matters, the context window, comes from `model_context_window` in the config above, which overrides the fallback.
+Codex will print `Model metadata for <id> not found. Defaulting to fallback metadata` on every turn. That's its internal catalog of OpenAI model ids and it fires for any custom provider's model; it's cosmetic. The part that matters, the context window, comes from the `-c model_context_window=…` override below, which overrides the fallback.
 
 ```bash
-mkdir -p ~/.mlx-serve/codex
-cat > ~/.mlx-serve/codex/config.toml <<'EOF'
-model = "MODEL_ID"
-model_provider = "mlx"
-model_context_window = CTX
-
-[model_providers.mlx]
-name = "MLX Serve (local)"
-base_url = "http://127.0.0.1:11234/v1"
-wire_api = "responses"
-EOF
-export CODEX_HOME="$HOME/.mlx-serve/codex"
-codex
+codex \
+  -c 'model="MODEL_ID"' \
+  -c 'model_provider="mlx"' \
+  -c model_context_window=CTX \
+  -c 'model_providers.mlx.name="MLX Serve (local)"' \
+  -c 'model_providers.mlx.base_url="http://127.0.0.1:11234/v1"' \
+  -c 'model_providers.mlx.wire_api="responses"'
 ```
 
 ### Hermes

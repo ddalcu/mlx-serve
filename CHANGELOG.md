@@ -37,6 +37,7 @@
 - `mlx-serve launch pi` offers pi's `xhigh` and `max` thinking levels, so a model's maximum effort (GLM-5.3's default) is reachable from pi.
 - `/metrics` and `/metrics.json` now count every request outcome exactly once: a client that disconnects mid-decode shows in `request_cancelled_total`, errors in the new `mlx_serve:request_failed_total`, and requests refused before they start in `mlx_serve:request_rejected_total`.
 - The built-in web console works when the server is reached through a reverse proxy that mounts it under a path (e.g. Tailscale Serve `--set-path`); opened that way it showed "0 models" on a fully loaded server.
+- `mlx-serve launch codex` and the app's Codex launcher now run codex on your own Codex home with mlx-serve's settings passed as `-c` overrides, so your MCP servers, plugins, login and folder trusts carry over; a launched codex no longer gets the mlx-serve skill, and the old `~/.mlx-serve/codex/` folder can be deleted (#409). Thanks @kmahara.
 
 ---
 

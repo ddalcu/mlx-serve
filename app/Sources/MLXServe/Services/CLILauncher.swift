@@ -194,7 +194,7 @@ final class CLILauncher: ObservableObject {
         return """
         export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list))'
         \(cdLine)
-        opencode --model mlx/\(model) "$@"
+        opencode --model \(AgentConfigs.shellArg("mlx/" + model)) "$@"
         """
     }
 
@@ -377,7 +377,7 @@ extension LauncherCLI {
             """
             \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
             \(cdLine)
-            claude --dangerously-skip-permissions --plugin-dir "$HOME/.mlx-serve/\(AgentSkills.claudePluginDir)" --model \(model) "$@"
+            claude --dangerously-skip-permissions --plugin-dir "$HOME/.mlx-serve/\(AgentSkills.claudePluginDir)" --model \(AgentConfigs.shellArg(model)) "$@"
             """
         }
     )
@@ -426,7 +426,7 @@ extension LauncherCLI {
             """
             export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
             \(cdLine)
-            pi --provider mlx --model \(model) "$@"
+            pi --provider mlx --model \(AgentConfigs.shellArg(model)) "$@"
             """
         }
     )
@@ -456,28 +456,22 @@ extension LauncherCLI {
             export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
             export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
             \(cdLine)
-            omp --model mlx/\(model) "$@"
+            omp --model \(AgentConfigs.shellArg("mlx/" + model)) "$@"
             """
         }
     )
 
-    /// codex (https://github.com/openai/codex) — Responses-wire only; config
-    /// rides a dedicated CODEX_HOME (the dir must exist before codex runs).
-    /// The script resolves the binary itself (PATH, then the desktop app's
-    /// bundled CLI) so a ChatGPT.app-only install still launches.
+    /// codex (https://github.com/openai/codex) — Responses-wire only; the
+    /// settings ride `-c` overrides, so nothing is written into the user's
+    /// Codex home. The script resolves the binary itself (PATH, then the
+    /// desktop app's bundled CLI) so a ChatGPT.app-only install still launches.
     static let codex = LauncherCLI(
         id: "codex",
         displayName: "Codex",
         binaryName: "codex",
         iconSystemName: "chevron.left.forwardslash.chevron.right",
         useClaudeIcon: false,
-        prepareConfig: { baseURL, model, budget, _ in
-            let dir = NSString(string: "~/.mlx-serve/codex").expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? AgentConfigs.codexConfigTOML(baseURL: baseURL, model: model, budget: budget)
-                .write(toFile: (dir as NSString).appendingPathComponent("config.toml"),
-                       atomically: true, encoding: .utf8)
-        },
+        prepareConfig: nil,
         fallbackPaths: [
             "/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
@@ -485,12 +479,11 @@ extension LauncherCLI {
             "$HOME/Applications/Codex.app/Contents/Resources/codex",
         ],
         resumeArgs: "resume --last",
-        scriptBody: { _, _, cdLine, _, _ in
+        scriptBody: { baseURL, model, cdLine, budget, _ in
             """
-            export CODEX_HOME="$HOME/.mlx-serve/codex"
             \(AgentConfigs.codexBinResolver)
             \(cdLine)
-            "$CODEX_BIN" "$@"
+            "$CODEX_BIN" \(AgentConfigs.codexConfigArgs(baseURL: baseURL, model: model, budget: budget)) "$@"
             """
         }
     )
@@ -568,7 +561,7 @@ extension LauncherCLI {
             export OPENAI_API_BASE='\(baseURL)/v1'
             export OPENAI_API_KEY=mlx-serve
             \(cdLine)
-            aider --model openai/\(model) --weak-model openai/\(model) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json "$@"
+            aider --model \(AgentConfigs.shellArg("openai/" + model)) --weak-model \(AgentConfigs.shellArg("openai/" + model)) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json "$@"
             """
         }
     )

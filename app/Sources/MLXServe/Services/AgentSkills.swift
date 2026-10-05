@@ -32,10 +32,11 @@ enum AgentSkills {
     }
 
     /// Where an agent discovers skills in its dedicated config dir; opencode
-    /// reads `skills.paths` from its inline config instead.
+    /// reads `skills.paths` from its inline config instead. Codex gets none:
+    /// a link in the user's own Codex home would reach every codex session.
     static func linkPath(agentId: String) -> String? {
         switch agentId {
-        case "pi", "omp", "codex", "hermes", "grok": return "\(agentId)/skills/\(name)"
+        case "pi", "omp", "hermes", "grok": return "\(agentId)/skills/\(name)"
         case "claude": return "\(claudePluginDir)/skills/\(name)"
         default: return nil
         }

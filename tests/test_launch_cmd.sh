@@ -8,8 +8,9 @@
 #   [3] launch omp --print against a live server: script exports the pi-spelled
 #       agent dir var, targets the served model, and the written models.yml
 #       carries the server's ADVERTISED context (never a hardcoded one)
-#   [4] launch codex --print: config.toml targets our /v1/responses
-#       (wire_api = "responses") with the advertised context
+#   [4] launch codex --print: the launch line rides -c key=value overrides
+#       (model_providers.mlx.* → /v1/responses, wire_api = "responses") with
+#       the advertised context, and NOTHING is written into CODEX_HOME
 #   [5] launch claude --print: env-only script, no config file, ADVERTISED
 #       context declared verbatim (CLAUDE_CODE_MAX_CONTEXT_TOKENS — without it
 #       Claude Code assumes 200k and auto-compacts there) + the derived output
@@ -26,10 +27,14 @@
 #       config file and invokes zcode; provider_config.json targets base + /v1
 #       with the ADVERTISED context for the served model
 #
-# The configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
+# Most configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
 # launcher writes (never a user's real agent config) — asserted per agent.
+# codex writes nothing: CODEX_HOME points at an empty temp dir that must stay empty.
 
 set -u
+
+CODEX_HOME=$(mktemp -d)
+export CODEX_HOME
 
 MODEL_DIR=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
 PORT=${2:-8097}
@@ -74,7 +79,7 @@ echo "Starting server..."
 mkdir -p "${TMPDIR:?set TMPDIR to a workspace scratch directory}"
 "$BIN" --model "$MODEL_DIR" --serve --port "$PORT" >"$TMPDIR/mlx-serve-launch-test.log" 2>&1 &
 SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
+cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -rf "$CODEX_HOME"; }
 trap cleanup EXIT
 for i in $(seq 1 40); do
     curl -sf "$BASE/health" >/dev/null 2>&1 && break
@@ -105,17 +110,18 @@ fi
 # ── [4] codex --print ──
 OUT=$("$BIN" launch codex --print --url "$BASE" 2>&1)
 OK=1
-echo "$OUT" | grep -q 'export CODEX_HOME="$HOME/.mlx-serve/codex"' || OK=0
+echo "$OUT" | grep -q 'CODEX_HOME' && OK=0
+echo "$OUT" | grep -q -- "-c 'model_providers.mlx.wire_api=\"responses\"'" || OK=0
+echo "$OUT" | grep -q -- "-c model_context_window=$ADV_CTX" || OK=0
+echo "$OUT" | grep -q -- "-c 'model_providers.mlx.base_url=\"$BASE/v1\"'" || OK=0
 # desktop-app fallback: the ChatGPT/Codex app bundles the CLI off PATH
 echo "$OUT" | grep -q '/Applications/ChatGPT.app' || OK=0
 echo "$OUT" | grep -q 'Contents/Resources/codex' || OK=0
-grep -q 'wire_api = "responses"' ~/.mlx-serve/codex/config.toml || OK=0
-grep -q "model_context_window = $ADV_CTX" ~/.mlx-serve/codex/config.toml || OK=0
-grep -q "base_url = \"$BASE/v1\"" ~/.mlx-serve/codex/config.toml || OK=0
+[ -z "$(ls -A "$CODEX_HOME")" ] || OK=0
 if [ "$OK" = 1 ]; then
-    run_test "codex config targets /v1/responses with the advertised context" PASS
+    run_test "codex -c overrides target /v1/responses with the advertised context" PASS
 else
-    run_test "codex config targets /v1/responses with the advertised context" FAIL "$OUT"
+    run_test "codex -c overrides target /v1/responses with the advertised context" FAIL "$OUT"
 fi
 
 # ── [5] claude --print ──
@@ -136,7 +142,7 @@ fi
 
 # ── [6] passthrough args ──
 OUT=$("$BIN" launch codex --print --url "$BASE" -- resume 2>&1)
-if echo "$OUT" | grep -q "\"\$CODEX_BIN\" 'resume'"; then
+if echo "$OUT" | grep -q -- "-c 'model_providers.mlx.wire_api=\"responses\"' 'resume'"; then
     run_test "extra args after -- ride the agent invocation" PASS
 else
     run_test "extra args after -- ride the agent invocation" FAIL "$OUT"
