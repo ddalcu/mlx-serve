@@ -97,10 +97,9 @@ struct ServerOptions: Codable, Equatable {
     /// auto-loads when present and models without one are unaffected, so
     /// `toCLIArgs` emits `--no-mtp` ONLY when the user turns it off.
     var enableMTP: Bool = true
-    /// How many tokens the MTP head drafts per round. `0` = auto, which is the
-    /// server's own default (`--mtp-depth 0` → the adaptive EV controller tunes
-    /// depth live from the measured acceptance rate). A fixed value is a
-    /// benchmarking lever; emitted only when non-zero.
+    /// Maximum tokens the MTP head drafts per round. `0` = auto: omit the
+    /// flag so the server tunes depth from measured acceptance. An explicit
+    /// value emits `--mtp-max-depth`; the planner may choose a lower depth.
     var mtpDepth: Int = 0
     /// Decode attention requant, TRI-STATE: nil = the server's own default
     /// (laguna-class dense attention requants ON, DeepSeek-V4's comp_in
@@ -665,7 +664,7 @@ struct ServerOptions: Codable, Equatable {
             args += ["--no-mtp"]
         }
         if mtpDepth > 0 {
-            args += ["--mtp-depth", "\(mtpDepth)"]
+            args += ["--mtp-max-depth", "\(mtpDepth)"]
         }
         // DSpark (DeepSeek-V4 draft stages): server default is OFF (opt-in —
         // the stages cost ~11 GB resident), so only ON emits.

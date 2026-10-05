@@ -16690,7 +16690,7 @@ pub const Transformer = struct {
     /// Persistence key of `round_cost` (empty = not persisted).
     round_cost_key_buf: [64]u8 = undefined,
     round_cost_key_len: u8 = 0,
-    /// MTP depth cap WITHOUT the per-silicon row (explicit --mtp-depth, else
+    /// MTP depth cap WITHOUT the per-silicon row (explicit --mtp-max-depth, else
     /// the adaptive default), set at load. The row-resolved cap travels as
     /// `mtp_depth` through server -> slot -> Generator and reads there like
     /// an explicit flag, so the row-less value needs its own carrier.

@@ -2,7 +2,7 @@
 """Record src/fixtures/mtp_accept_traces.txt: per request, accepted drafts per round at forced depth 6.
 
 Boot the server first, one request at a time, nothing else on the GPU:
-  MLX_SERVE_MTP_FORCE_DEPTH=6 zig-out/bin/mlx-serve --model <27B pack> --serve --port 11260 \
+  zig-out/bin/mlx-serve --mtp-min-depth 6 --mtp-max-depth 6 --model <27B pack> --serve --port 11260 \
       --mtp --prefix-cache-entries 0 --log-level debug > server.log 2>&1
 usage: record_mtp_accept_traces.py server.log out.txt [url]
 The replay's `hitProb` table came from aligning forced-depth 1 and 3 runs of the code prompts

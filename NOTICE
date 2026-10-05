@@ -178,7 +178,7 @@ MIT License
 ================================================================================
 
 --------------------------------------------------------------------------------
-Sushi n-gram gather calibration
+Sushi n-gram gather calibration and MTP depth bounds
 https://github.com/beamivalice/sushi
 Copyright (c) 2026 Theinruj Toranavikrai
 Copyright (c) 2026 David Dalcu
@@ -186,6 +186,9 @@ Licensed under the MIT License (the permission and warranty terms in LICENSE).
 
 The load-time read-path calibration in `src/qwen4_exp.zig` is adapted from
 Sushi commit feb9ed7d92149e7ebc46a34595e19d440a929a0a.
+The CLI depth-range helpers in `src/mtp_depth_bounds.zig`, planner clamping
+and associated regression tests in `src/generate.zig` and `src/scheduler.zig`
+are adapted from Sushi commit 09e6d4792e6178b864b809299d53dbd05cd054cd.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)

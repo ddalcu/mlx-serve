@@ -35,12 +35,12 @@ for n,e in enumerate(d['choices'][0]['logprobs']['content'][:30]):
 print(ok)" "$other"
 }
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
-# MTP_FORCE_DEPTH=3: every MTP round verifies 4 rows, so [5b] exercises the
+# --mtp-min-depth 3 --mtp-max-depth 3: every MTP round verifies 4 rows, so [5b] exercises the
 # array-mask row split (S >= 3 at gqa 12 is MLX's unfused fallback).
 # --max-concurrent 4: [8]-[10] batch plain slots; --prefix-cache-entries 0: the
 # serial reruns those arms compare against must not restore (hybrid restore
 # class 0.14-0.30 nats > the near-tie bar).
-MLX_SERVE_MTP_FORCE_DEPTH=3 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --max-concurrent 4 --prefix-cache-entries 0 > "$LOG" 2>&1 &
+"$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --max-concurrent 4 --prefix-cache-entries 0 > "$LOG" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 for _ in $(seq 1 600); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
@@ -201,7 +201,7 @@ echo "[11] --no-vision boot: tower absent, text works, media 400s by name"
 kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
 LOG11="$LOG.novision"
 sleep 20
-"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --no-vision > "$LOG11" 2>&1 &
+"$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --no-vision > "$LOG11" 2>&1 &
 SPID=$!
 for _ in $(seq 1 600); do curl -s "$U/health" >/dev/null 2>&1 && grep -q "Model ready" "$LOG11" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG11"; exit 1; }; sleep 2; done
 check "vision encoder load line absent" "$(grep -c 'Vision encoder: Qwen3-VL ViT' "$LOG11")" "0"

@@ -879,10 +879,9 @@ fn qwen4ProfileArmed() bool {
 }
 
 pub fn persistDiagArmed() bool {
-    return qwen4ProfileArmed() or
+    return qwen4ProfileArmed() or @import("mtp_depth_bounds.zig").active.pinned() != null or
         persistDiagArmedFrom(&.{
             std.c.getenv("MLX_SERVE_MTP_TRACE"),
-            std.c.getenv("MLX_SERVE_MTP_FORCE_DEPTH"),
         });
 }
 

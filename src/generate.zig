@@ -1,3 +1,4 @@
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const keyed_sample = @import("keyed_sample.zig");
@@ -1668,7 +1669,7 @@ pub const Generator = struct {
     mtp_position_base: usize = 0,
     /// CONFIGURED max tokens drafted per round (verify length = depth + 1).
     mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
-    /// The cap WITHOUT the per-silicon row: an explicit --mtp-depth, else
+    /// The cap WITHOUT the per-silicon row: an explicit --mtp-max-depth, else
     /// the adaptive default. The row is the cold-start cap; once the table
     /// has trusted widths it may plan up to this instead (the M4 base row
     /// of 4 measured -6% against what the table found at 6).
@@ -2311,7 +2312,7 @@ pub const Generator = struct {
         mtp: ?MtpHeadRef = null,
         /// The model's head before this request's opt-out (the qwen4 weights load with the trunk regardless).
         model_has_mtp: bool = false,
-        /// Max tokens drafted per nextMtp round. 0 = auto (`--mtp-depth` not
+        /// Max tokens drafted per nextMtp round. 0 = auto (`--mtp-max-depth` not
         /// passed): resolved by `resolveMtpDepthCap` — MTP_ADAPTIVE_NAX_CAP
         /// for the measured M5 target+sidecar profile, otherwise
         /// MTP_ADAPTIVE_DEFAULT_CAP under the EV controller; DEFAULT_DEPTH in
@@ -3377,6 +3378,7 @@ pub const Generator = struct {
                 options.mtp.?.costProfile(xfm, ctx.cache.config)
             else
                 .generic;
+            const mtp_cap = @min(resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile), if (options.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
             const dflash_bs: u32 = if (dflash_active)
                 (if (options.dflash_block_size > 0) options.dflash_block_size else options.dflash.?.config.block_size)
             else if (options.dflash_block_size > 0)
@@ -3430,13 +3432,13 @@ pub const Generator = struct {
                 .mtp_serial_accept = mtp_active and xfm.config.rowExactDecode() and std.meta.activeTag(options.mtp_acceptance) == .exact,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
-                .mtp_depth = @min(resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile), if (options.mtp) |h| h.maxDepth() else std.math.maxInt(u32)),
+                .mtp_depth = mtp_cap,
                 .mtp_depth_free = if (xfm.mtp_depth_free != 0) xfm.mtp_depth_free else mtpDepthCapFree(xfm.config.mtpDepth(options.mtp_depth)),
                 .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
                 // Start at depth 1 and climb with evidence: the cheap depth
                 // is the safe default (1.11x on cold/creative content), and
                 // hot workloads promote within ~8 rounds.
-                .mtp_depth_current = 1,
+                .mtp_depth_current = depth_bounds.floorFor(depth_bounds.active, mtp_cap),
             };
             mtp_cache = null; // ownership transferred to the Generator
             dflash_ctx = null; // ownership transferred to the Generator
@@ -3783,7 +3785,7 @@ pub const Generator = struct {
             // A forced-depth run never consulted the EV plan, so its surface
             // is not one the controller chose — publishing it would hand a
             // later ordinary request a diagnostic's numbers.
-            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null and
+            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpPinnedDepth() == null and
                 !self.spec_disabled_runtime and self.mtp_attempted >= 8 and
                 (!group_planner.enabled() or !self.mtp_planner_owned))
             {
@@ -6332,14 +6334,16 @@ pub const Generator = struct {
         if (group_planner.enabled() and self.mtp_planner_owned) return 0;
         const idx = try self.mtpLookupIndex(allocator);
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
-        const got = idx.match(t1, mtp_lookup.MAX_DRAFT_STRONG);
+        const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
+        const got = idx.match(t1, lookup_cap);
         return mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
     }
 
     fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
         const k = try self.mtpLookupDrafts(allocator, plan, t1);
-        if (k == 0) return null;
-        const got = (try self.mtpLookupIndex(allocator)).match(t1, mtp_lookup.MAX_DRAFT_STRONG);
+        const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
+        if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return null;
+        const got = (try self.mtpLookupIndex(allocator)).match(t1, lookup_cap);
         const Once = struct {
             var logged = false;
         };
@@ -8107,11 +8111,11 @@ pub const Generator = struct {
         // (~10 legacy rounds + a +1/round base climb — a third of a short
         // generation). Demotion stays instant (EMA decay + sticky disable are
         // per-request), so a workload change costs a few rounds, not the win.
-        // `MLX_SERVE_MTP_FORCE_DEPTH` is a measurement mode: every round drafts
+        // A pinned depth is a measurement mode: every round drafts
         // exactly n and the controller never plans, so a seed must not be
         // applied (nor, at deinit, published).
         if (self.mtp_ev_rounds == 0 and self.mtp_attempted == 0 and
-            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null and
+            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpPinnedDepth() == null and
             (!group_planner.enabled() or !self.mtp_planner_owned))
         {
             if (head.evSeed()) |seed| {
@@ -9390,7 +9394,8 @@ pub const Generator = struct {
         }
         if (drafted_sum == 0) return;
         const rate = @as(f32, @floatFromInt(accepted_sum)) / @as(f32, @floatFromInt(drafted_sum));
-        const next_depth = mtpDepthDecision(self.mtp_depth_current, self.mtp_depth, rate, n, self.mtp_promote_cooldown > 0);
+        const decided = mtpDepthDecision(self.mtp_depth_current, self.mtp_depth, rate, n, self.mtp_promote_cooldown > 0);
+        const next_depth = if (decided == 0) 0 else depth_bounds.clampWidth(decided, depth_bounds.floorFor(depth_bounds.active, self.mtp_depth), self.mtp_depth);
         if (next_depth == self.mtp_depth_current) return;
         if (next_depth == 0) {
             log.info(
@@ -9425,7 +9430,7 @@ pub const Generator = struct {
     // Disable via MLX_SERVE_MTP_ADAPTIVE=0 (reverts to the windowed
     // fixed-depth controller above).
 
-    /// Default depth cap when `--mtp-depth` is not passed (0 = auto) and the
+    /// Default depth cap when `--mtp-max-depth` is not passed (0 = auto) and the
     /// EV controller is active. 6 keeps the verify forward at seq 1+6 = 7,
     /// the split-K verify-qmm kernel's ceiling on M1-M4. Eligible M5/G17
     /// targets use MTP_ADAPTIVE_NAX_CAP instead: their measured NAX round-cost
@@ -9539,7 +9544,7 @@ pub const Generator = struct {
     /// under-drafted it on moderate content), k5-6 ≈ 0.36 (13.6 ms/pos),
     /// k7-8 ≈ 0.62 (23.5 ms/pos — the plain-SIMD verify-qmm register cliff
     /// at M 8/9, expressed through the generic third region; only reachable
-    /// when --mtp-depth forces past the generic cap of 6). The G17 NAX
+    /// when --mtp-max-depth forces past the generic cap of 6). The G17 NAX
     /// tables below predate the sdpa split — refit them on an M5 when one
     /// is available. draft/verify split not separately identifiable; only
     /// the sums enter the controller.
@@ -9877,7 +9882,7 @@ pub const Generator = struct {
         width_trial: bool = false,
     };
 
-    /// Resolve the configured depth cap. 0 = auto (`--mtp-depth` not passed):
+    /// Resolve the configured depth cap. 0 = auto (`--mtp-max-depth` not passed):
     /// MTP_ADAPTIVE_NAX_CAP only when the EV controller and a calibrated G17
     /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
@@ -9886,7 +9891,7 @@ pub const Generator = struct {
         const cap = mtpDepthCapResolved(configured, adaptive, profile, chip);
         // Name the row ONCE when a per-silicon measurement is what fenced the
         // depth. Without it `[spec-stats] depth=4` on an M1 Pro reads the same
-        // as the EV controller having chosen 4, or as `--mtp-depth 4` — and
+        // as the EV controller having chosen 4, or as `--mtp-max-depth 4` — and
         // the fence is exactly what someone debugging MTP there needs to see.
         if (configured == 0 and adaptive and !mtp_depth_cap_logged) {
             const row = mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP);
@@ -9899,14 +9904,14 @@ pub const Generator = struct {
                 });
             }
         }
-        return cap;
+        return depth_bounds.liftCap(cap, depth_bounds.active, mtp_mod.MAX_DEPTH);
     }
 
     /// The cap with no per-silicon row applied: explicit wins, else the
     /// adaptive default (fixed mode keeps DEFAULT_DEPTH).
     pub fn mtpDepthCapFree(configured: u32) u32 {
-        if (configured != 0) return @min(mtp_mod.MAX_DEPTH, @max(1, configured));
-        return if (mtpAdaptiveEnabled()) MTP_ADAPTIVE_DEFAULT_CAP else mtp_mod.DEFAULT_DEPTH;
+        const free = if (configured != 0) @min(mtp_mod.MAX_DEPTH, @max(1, configured)) else if (mtpAdaptiveEnabled()) MTP_ADAPTIVE_DEFAULT_CAP else mtp_mod.DEFAULT_DEPTH;
+        return depth_bounds.liftCap(free, depth_bounds.active, mtp_mod.MAX_DEPTH);
     }
 
     /// Same, with the chip string injected (tests, and the one live caller).
@@ -10466,7 +10471,6 @@ pub const Generator = struct {
     /// Adaptive (EV) controller gate — DEFAULT ON. MLX_SERVE_MTP_ADAPTIVE=0
     /// reverts to the fixed-depth windowed controller for same-boot A/Bs.
     var mtp_adaptive_cache: ?bool = null;
-    var mtp_force_depth_cache: ??u32 = null;
 
     pub fn mtpAdaptiveEnabled() bool {
         if (mtp_adaptive_cache) |v| return v;
@@ -10928,15 +10932,20 @@ pub const Generator = struct {
     /// Post-warmup EV mode: the pure plan over the acceptance EMAs, with the
     /// base-depth climb damped to one step per round and two-chunk plans
     /// gated by the extension dry-spell policy.
-    /// DIAGNOSTIC (MLX_SERVE_MTP_FORCE_DEPTH=n): every round drafts exactly
+    /// DIAGNOSTIC (--mtp-min-depth n --mtp-max-depth n): every round drafts exactly
     /// n, the EV/windowed controllers never demote or disable — the
     /// per-index acceptance meter (`acc_idx=` on the trace line).
-    pub fn mtpForcedDepth() ?u32 {
-        if (mtp_force_depth_cache) |v| return v;
-        const n = readEnvUsize("MLX_SERVE_MTP_FORCE_DEPTH", 0);
-        const v: ?u32 = if (n == 0) null else @intCast(@min(n, mtp_mod.MAX_DEPTH));
-        mtp_force_depth_cache = v;
-        return v;
+    pub fn mtpPinnedDepth() ?u32 {
+        return depth_bounds.active.pinned();
+    }
+
+    /// A plan held inside the depth range: the EV argmax may sit outside it.
+    pub fn mtpPlanInBounds(plan: MtpRoundPlan, lo: u32, hi: u32) MtpRoundPlan {
+        var p = plan;
+        p.m_lo = depth_bounds.clampWidth(p.m_lo, lo, hi);
+        p.m_hi = depth_bounds.clampWidth(p.m_hi, p.m_lo, hi);
+        if (p.m_hi == p.m_lo and plan.m_hi != plan.m_lo) p.tau_ln = 0.0;
+        return p;
     }
 
     // Adaptive serial: the EV controller picks the best depth but never compares a round with
@@ -11388,7 +11397,11 @@ pub const Generator = struct {
             return .{ .m_lo = width, .m_hi = width, .tau_ln = 0 };
         };
         const plan = self.mtpRoundPlanTraced();
-        return if (self.mtp_group_cap > 0) mtpGroupPlan(plan, self.mtp_group_cap, self.mtp_group_fill and mtpForcedDepth() == null) else plan;
+        if (self.mtp_group_cap > 0) {
+            const cap = @min(depth_bounds.lookupCap(self.mtp_group_cap, depth_bounds.active), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
+            return mtpPlanInBounds(mtpGroupPlan(plan, cap, self.mtp_group_fill and mtpPinnedDepth() == null), depth_bounds.floorFor(depth_bounds.active, cap), cap);
+        }
+        return plan;
     }
 
     /// A lane's plan inside a batched verify. The group pays for its widest lane's rows,
@@ -11424,7 +11437,7 @@ pub const Generator = struct {
         var cells: [256]u8 = undefined;
         const a = self.mtp_ev_accept;
         const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
-        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
+        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
         const target = mtpWidthTrialTarget(t, kv_len, plan, cap_free, self.mtp_m_lo_streak >= 2);
         log.debug(
             "  [mtp-plan] r={d} kv={d} bucket={s} m_lo={d} m_hi={d} tau={d:.3} a=[{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2}] src={s} trial={s}{d} serial_step={s} streak={d} serial_left={d} drops=t{d}/c{d}/b{d} cap={d}/{d} solo={} rte={d} wt={d}/{d} tgt={?d} cells={s}\n",
@@ -11451,21 +11464,22 @@ pub const Generator = struct {
     }
 
     fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
-        if (mtpForcedDepth()) |d| {
+        if (mtpPinnedDepth()) |pinned| {
+            const d = @min(pinned, self.mtp_depth);
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
         if (self.mtp_serial_accept) {
-            const d = self.mtpExactDepth(@min(@max(@as(u32, 1), self.mtp_depth), 2));
+            const d = depth_bounds.clampWidth(self.mtpExactDepth(@min(@max(@as(u32, 1), self.mtp_depth), 2)), depth_bounds.floorFor(depth_bounds.active, self.mtp_depth), self.mtp_depth);
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
         const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
-        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
+        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
         var cap: u32 = cap_row;
         const kv_len = self.mtpKvLen();
         if (!mtpAdaptiveEnabled() or self.mtp_ev_rounds < MTP_EV_WARMUP_ROUNDS) {
-            const d = @min(@max(@as(u32, 1), self.mtp_depth_current), cap);
+            const d = depth_bounds.clampWidth(self.mtp_depth_current, depth_bounds.floorFor(depth_bounds.active, cap), cap);
             self.mtp_ev_m_lo_prev = d;
             // Independent of the depth controller's kill switch and warmup.
             _ = self.mtpAdaptiveSerialStep(d, kv_len);
@@ -11488,7 +11502,7 @@ pub const Generator = struct {
         // closed), and the width trial may reach one past that to measure.
         if (src.fromTable()) cap = @min(cap_free, @max(cap_row, self.xfm.round_cost.widestMeasured(src.bucket) orelse cap_row));
         const policy = mtpDepthPolicyFor(mtpDepthPolicy(), kv_len);
-        var plan = mtpBasePlan(policy, self.mtp_ev_accept[0..cap], cap, src, self.mtp_ev_m_lo_prev + 1);
+        var plan = mtpPlanInBounds(mtpBasePlan(policy, self.mtp_ev_accept[0..cap], cap, src, self.mtp_ev_m_lo_prev + 1), depth_bounds.floorFor(depth_bounds.active, cap), cap);
         if (plan.m_lo == self.mtp_ev_m_lo_prev) self.mtp_m_lo_streak +|= 1 else self.mtp_m_lo_streak = 0;
         self.mtp_ev_m_lo_prev = plan.m_lo;
         // Live-cost lever: shorten dry exploration bursts when the MEASURED
@@ -11532,7 +11546,7 @@ pub const Generator = struct {
                     mtpWidthTrialPeriod(&self.xfm.round_cost, kv_len, plan.m_lo);
                 const reread = round_cost.schedulePeriodReread(self.xfm.round_cost.layout);
                 if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period, reread)) {
-                    plan = mtpWidthTrialPlan(target);
+                    plan = mtpPlanInBounds(mtpWidthTrialPlan(target), depth_bounds.floorFor(depth_bounds.active, cap_free), cap_free);
                 }
             }
         }
@@ -11657,7 +11671,7 @@ pub const Generator = struct {
     fn updateMtpEvRound(self: *Generator, drafted: u32, accepted: u32) void {
         mtpEvObserve(&self.mtp_ev_accept, drafted, accepted, MTP_EV_EMA_BETA);
         self.mtp_ev_rounds += 1;
-        if (mtpForcedDepth() != null) return;
+        if (mtpPinnedDepth() != null) return;
         if (self.mtp_ev_rounds <= MTP_EV_WARMUP_ROUNDS) {
             self.updateMtpDepth(drafted, accepted);
             // Warmup may evaluate several depths. None of that mixed evidence
@@ -12340,7 +12354,7 @@ const StepTrace = struct {
     }
     fn lap(sw: *?io_util.Stopwatch, phase: Phase) void {
         if (sw.*) |*w| {
-            ns[@intFromEnum(phase)] += w.read();
+            ns[@backingInt(phase)] += w.read();
             w.reset();
         }
     }
@@ -17273,7 +17287,7 @@ test "MTP cross-round pre-draft defaults on and explicit zero disables" {
 }
 
 test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit always wins" {
-    // 0 = auto (--mtp-depth not passed).
+    // 0 = auto (--mtp-max-depth not passed).
     // .generic's auto cap is per-silicon, so the chip must be injected here
     // or the assertion is a property of whichever Mac runs the suite.
     try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfileChip(0, true, .generic, "Apple M4 Max"));
@@ -18113,7 +18127,7 @@ test "mtpEvPlanFor: DEFAULT costs carry the post-sdpa-split surface (2026-08-15 
     // flat_max 4: the old hi over-priced k4 at 0.34 (measured 0.24), so
     // moderate content under-drafted it. The k>=7 third region carries the
     // plain-SIMD verify-qmm register cliff — only reachable when
-    // --mtp-depth forces past the generic cap of 6.
+    // --mtp-max-depth forces past the generic cap of 6.
     const costs = Generator.MTP_EV_DEFAULT_COSTS;
     // Hot uniform 90%: base now rides the WIDER flat region (m_lo 4, was 3
     // under refit #3), extension one step into the ramp.
@@ -20928,9 +20942,9 @@ test "lazy predraft: greedy tokens equal the eager padded path, lookup off and o
     const io = std.Io.Threaded.global_single_threaded.io();
     const rig = try LazyRig.load(a, io);
     defer rig.deinit(a);
-    const forced = Generator.mtp_force_depth_cache;
-    defer Generator.mtp_force_depth_cache = forced;
-    Generator.mtp_force_depth_cache = @as(?u32, 3);
+    const forced = depth_bounds.active;
+    defer depth_bounds.active = forced;
+    depth_bounds.active = .{ .min = 3, .max = 3 };
     defer Generator.mtp_lookup_override = null;
     for ([_]bool{ false, true }) |lookup| {
         Generator.mtp_lookup_override = lookup;
@@ -20969,9 +20983,9 @@ test "lazy predraft: a failure after the lazy dispatch leaves the head committed
     const io = std.Io.Threaded.global_single_threaded.io();
     const rig = try LazyRig.load(a, io);
     defer rig.deinit(a);
-    const forced = Generator.mtp_force_depth_cache;
-    defer Generator.mtp_force_depth_cache = forced;
-    Generator.mtp_force_depth_cache = @as(?u32, 3);
+    const forced = depth_bounds.active;
+    defer depth_bounds.active = forced;
+    depth_bounds.active = .{ .min = 3, .max = 3 };
     Generator.mtp_lazy_predraft_override = true;
     defer Generator.mtp_lazy_predraft_override = null;
     var buf: [192]u32 = undefined;
@@ -20999,11 +21013,11 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     Generator.mtp_padded_head_override = false;
     defer Generator.mtp_padded_head_override = null;
     const predraft = Generator.mtp_predraft_cache;
-    const forced = Generator.mtp_force_depth_cache;
+    const forced = depth_bounds.active;
     const planner = group_planner.enabled_override;
     defer {
         Generator.mtp_predraft_cache = predraft;
-        Generator.mtp_force_depth_cache = forced;
+        depth_bounds.active = forced;
         group_planner.enabled_override = planner;
     }
     // Observe the completed-round stash before any successor consumes it.
@@ -21030,7 +21044,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
     for ([_]usize{ 2, 4 }) |n| {
         for ([_]u32{ 1, 2, 4 }) |depth| {
-            Generator.mtp_force_depth_cache = @as(?u32, depth);
+            depth_bounds.active = .{ .min = depth, .max = depth };
             var solo: [4]?*MtpChainTestSlot = @splat(null);
             var batch: [4]?*MtpChainTestSlot = @splat(null);
             defer for (solo, batch) |ss, bs| {
@@ -22257,4 +22271,162 @@ test "keyed sampling draws the softmax distribution" {
         counts[@intCast(v)] += 1;
     }
     for (probs, counts) |p, c| try testing.expect(@abs(@as(f32, @floatFromInt(c)) / @as(f32, @floatFromInt(n)) - p) < 0.03);
+}
+
+fn mtpBoundsPlanFixture(xfm: *Transformer, prompt: []u32, depth: u32) Generator {
+    xfm.config.model_type = "qwen4_exp";
+    xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = xfm.round_cost.observe(2, 1000, 29.0, 2.6, true, false);
+        _ = xfm.round_cost.observe(3, 1000, 31.0, 2.9, true, false);
+        _ = xfm.round_cost.observe(4, 1000, 36.0, 3.1, true, false);
+        _ = xfm.round_cost.observe(5, 1000, 42.0, 3.5, true, false);
+    }
+    return Generator{
+        .xfm = xfm,
+        .ctx = undefined,
+        .tok = undefined,
+        .next_token_id = 0,
+        .step = 0,
+        .max_tokens = 1,
+        .sampling = .{ .temperature = 0 },
+        .prompt_tokens = 0,
+        .completion_tokens = 0,
+        .finish_reason = "length",
+        .done = false,
+        .eos_token_ids = &.{},
+        .generated_ids = .empty,
+        .timeout_ns = 0,
+        .timer = io_util.Stopwatch.init(testing.io),
+        .last_hidden = .{ .ctx = null },
+        .has_last_hidden = false,
+        .prompt_ids_owned = prompt,
+        .mtp_depth = depth,
+        .mtp_depth_free = depth,
+        .mtp_ev_rounds = 64,
+        .mtp_ev_accept = .{ 0.92, 0.9, 0.88, 0.86, 0.84, 0.8, 0.8, 0.8 },
+        .mtp_ev_m_lo_prev = 4,
+        .spec_cost_solo = false,
+    };
+}
+
+test "MTP depth bounds: an EV plan outside min..max is clamped, one inside is untouched" {
+    const wide = Generator.MtpRoundPlan{ .m_lo = 3, .m_hi = 7, .tau_ln = -1.5 };
+    const low = Generator.mtpPlanInBounds(wide, 5, 8);
+    try testing.expectEqual(@as(u32, 5), low.m_lo);
+    try testing.expectEqual(@as(u32, 7), low.m_hi);
+    try testing.expectEqual(@as(f32, -1.5), low.tau_ln);
+
+    const high = Generator.mtpPlanInBounds(wide, 1, 2);
+    try testing.expectEqual(@as(u32, 2), high.m_lo);
+    try testing.expectEqual(@as(u32, 2), high.m_hi);
+    // The extension collapsed: no confidence read, as in any single-chunk plan.
+    try testing.expectEqual(@as(f32, 0.0), high.tau_ln);
+
+    const pinned = Generator.mtpPlanInBounds(wide, 4, 4);
+    try testing.expectEqual(@as(u32, 4), pinned.m_lo);
+    try testing.expectEqual(@as(u32, 4), pinned.m_hi);
+
+    const inside = Generator.mtpPlanInBounds(wide, 1, 8);
+    try testing.expectEqual(wide, inside);
+}
+
+test "MTP depth bounds: both policies keep table-priced plans inside min..max" {
+    const before = depth_bounds.active;
+    const policy_before = Generator.mtp_depth_policy_cache;
+    defer {
+        depth_bounds.active = before;
+        Generator.mtp_depth_policy_cache = policy_before;
+    }
+    var xfm: Transformer = undefined;
+    var prompt: [1000]u32 = @splat(0);
+    for ([_]Generator.MtpDepthPolicy{ .accept, .legacy }) |policy| {
+        Generator.mtp_depth_policy_cache = policy;
+        depth_bounds.active = .{};
+        var gen = mtpBoundsPlanFixture(&xfm, &prompt, 6);
+        try testing.expectEqual(@as(u32, if (policy == .accept) 4 else 3), gen.mtpRoundPlan().m_lo);
+
+        depth_bounds.active = .{ .min = 5 };
+        gen = mtpBoundsPlanFixture(&xfm, &prompt, 6);
+        var plan = gen.mtpRoundPlan();
+        try testing.expect(plan.m_lo >= 5 and plan.m_hi >= plan.m_lo and plan.m_hi <= 6);
+
+        depth_bounds.active = .{ .max = 2 };
+        gen = mtpBoundsPlanFixture(&xfm, &prompt, 2);
+        plan = gen.mtpRoundPlan();
+        try testing.expect(plan.m_lo <= 2 and plan.m_hi <= 2);
+    }
+}
+
+test "MTP depth bounds: min == max drafts that depth every round" {
+    const before = depth_bounds.active;
+    defer depth_bounds.active = before;
+    var xfm: Transformer = undefined;
+    var prompt: [1000]u32 = @splat(0);
+    for ([_]u32{ 2, 4, 5 }) |depth| {
+        depth_bounds.active = .{ .min = depth, .max = depth };
+        var gen = mtpBoundsPlanFixture(&xfm, &prompt, depth);
+        for (0..4) |_| {
+            const plan = gen.mtpRoundPlan();
+            try testing.expectEqual(depth, plan.m_lo);
+            try testing.expectEqual(depth, plan.m_hi);
+        }
+    }
+}
+
+test "MTP depth bounds: the windowed controller never leaves min..max and never disables above a floor of 1" {
+    const before = depth_bounds.active;
+    defer depth_bounds.active = before;
+    depth_bounds.active = .{ .min = 3, .max = 5 };
+    var hot = mtpEvTestGenerator();
+    hot.mtp_depth = 5;
+    hot.mtp_depth_current = 3;
+    for (0..64) |_| {
+        hot.updateMtpDepth(5, 5);
+        try testing.expect(hot.mtp_depth_current >= 3 and hot.mtp_depth_current <= 5);
+    }
+    try testing.expectEqual(@as(u32, 5), hot.mtp_depth_current);
+
+    var cold = mtpEvTestGenerator();
+    cold.mtp_depth = 5;
+    cold.mtp_depth_current = 5;
+    for (0..64) |_| {
+        cold.updateMtpDepth(5, 0);
+        try testing.expect(cold.mtp_depth_current >= 3 and cold.mtp_depth_current <= 5);
+    }
+    try testing.expectEqual(@as(u32, 3), cold.mtp_depth_current);
+    try testing.expect(!cold.spec_disabled_runtime);
+}
+
+test "MTP depth bounds: a min above the default cap lifts both caps, an explicit max leaves them" {
+    const before = depth_bounds.active;
+    defer depth_bounds.active = before;
+    depth_bounds.active = .{ .min = 7 };
+    try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapForProfile(0, true, .generic));
+    try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapFree(0));
+    depth_bounds.active = .{ .min = 2, .max = 4 };
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapForProfile(4, true, .generic));
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapFree(4));
+}
+
+test "MTP depth bounds: warmup, group fill and native head caps constrain the final plan" {
+    const before = depth_bounds.active;
+    defer depth_bounds.active = before;
+    var xfm: Transformer = undefined;
+    var prompt: [1000]u32 = @splat(0);
+    depth_bounds.active = .{ .min = 3, .max = 5 };
+    var gen = mtpBoundsPlanFixture(&xfm, &prompt, 5);
+    gen.mtp_ev_rounds = 0;
+    gen.mtp_depth_current = 1;
+    gen.mtp_batch_head = true; // No serial probe on a grouped lane.
+    try testing.expectEqual(@as(u32, 3), gen.mtpRoundPlan().m_lo);
+    gen.mtp_group_cap = 8;
+    gen.mtp_group_fill = true;
+    try testing.expectEqual(@as(u32, 5), gen.mtpRoundPlan().m_hi);
+    gen.mtp_group_cap = 2; // The verify row budget wins over the floor.
+    try testing.expectEqual(@as(u32, 2), gen.mtpRoundPlan().m_lo);
+    gen.mtp_group_cap = 0;
+    gen.mtp_depth = 3; // Native multi-head cap resolved at initialization.
+    depth_bounds.active = .{ .min = 5, .max = 5 };
+    try testing.expectEqual(@as(u32, 3), gen.mtpRoundPlan().m_hi);
 }

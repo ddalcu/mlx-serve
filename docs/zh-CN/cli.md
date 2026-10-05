@@ -63,7 +63,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--no-drafter` | 关闭 | 永不加载草稿模型，包括检查点内自带的那个 |
 | `--draft-block-size N` | 自动 | 草稿模型每轮的草稿数（自动取这台 Mac 的验证路径可用的值） |
 | `--no-mtp` / `--mtp` | 加载了 MTP 头时开启 | 禁用原生 MTP 头；`--mtp` 为兼容旧命令保留，无作用（稠密与 MoE 均默认开启） |
-| `--mtp-depth N` | `3` | 每轮 MTP 最多草拟的 Token 数（自适应控制器在 `[1, N]` 内调节） |
+| `--mtp-min-depth N` | `1` | 每轮 MTP 最少草拟的 Token 数（1..8） |
+| `--mtp-max-depth N` | auto | 每轮 MTP 最多草拟的 Token 数（1..8）；上下限相同则固定深度，替代 `MLX_SERVE_MTP_FORCE_DEPTH`。草拟头数量和剩余 Token 数仍可缩短一轮。 |
 | `--mtp-history-window N` | `0`（完整） | 超过 16K Token 的提示词只为最后 N 个 Token 构建 MTP 头历史（开窗会在原版 Qwen 头上损失接受率） |
 | `--dspark` | 关闭 | DeepSeek V4 自有的块并行草稿阶段（在模型之上额外约 11 GB） |
 | `--ssd-streaming` | 关闭 | 仅 ds4 / DeepSeek-V4-Flash GGUF：从 SSD 流式读取专家权重，而不是把整个模型放在内存里 |

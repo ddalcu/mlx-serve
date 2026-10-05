@@ -11,7 +11,7 @@ PORT=${1:-18850}; BASE="http://127.0.0.1:$PORT"
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 LOG=$(mktemp); OUT=$(mktemp -d)
-MLX_SERVE_MTP_FORCE_DEPTH=2 MLX_SERVE_ROUND_COST_PERSIST=0 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --mtp --max-concurrent 8 --prefix-cache-entries 0 > "$LOG" 2>&1 &
+MLX_SERVE_ROUND_COST_PERSIST=0 "$BINARY" --mtp-min-depth 2 --mtp-max-depth 2 --model "$MODEL" --serve --port "$PORT" --no-pld --mtp --max-concurrent 8 --prefix-cache-entries 0 > "$LOG" 2>&1 &
 PID=$!; trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$LOG" "$OUT"' EXIT
 for i in $(seq 1 240); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
 curl -sf "$BASE/health" >/dev/null || { echo -e "${RED}FAIL${NC} server did not start"; tail -20 "$LOG"; exit 1; }
