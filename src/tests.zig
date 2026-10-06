@@ -64,6 +64,7 @@ test {
     _ = @import("mtp.zig");
     _ = @import("round_cost.zig");
     _ = @import("mtp_group_planner.zig");
+    _ = @import("mtp_group_depth.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");

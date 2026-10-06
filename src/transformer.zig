@@ -16700,6 +16700,7 @@ pub const Transformer = struct {
     /// spans only its own max_tokens. Inference thread only.
     round_cost: round_cost_mod.Table = .{},
     mtp_group_cost: group_cost_mod.Table = .{},
+    mtp_group_depth: @import("mtp_group_depth.zig").Pickers = .{},
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
     cost_moe: u8 = 0,

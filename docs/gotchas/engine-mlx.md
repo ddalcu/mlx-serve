@@ -4968,11 +4968,18 @@ exclusive and a second user queued; the state is now a per-request
 (`qwen4MtpActivate`). Its verify rows are expert bytes and a batched verify measured no
 better than solo rounds, so it stayed opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`): rounds stay
 solo, two interleave, three go plain. The qwen4 grouped policy supersedes it
-(`MLX_SERVE_MTP_QWEN4_GROUPS`, default ON at depth 3 from 2 MTP-active streams, `=0` restores the
-opt-in behaviour): the planner rejects 4-slot groups, and one fixed-depth `verifyGroupMerged` round
-over all of them wins; a stale planner owner declines the whole tick, and M-RoPE rows, unequal widths
-and a slot whose acceptance collapses (256-token cool-down) sit out and decode solo that tick. Bars: `tests/test_mtp_batched.sh` (fixed
-depth: byte-identical on qwen4, near-tie acquitted on the batched verify),
+(`MLX_SERVE_MTP_QWEN4_GROUPS`, default on from 2 MTP-active streams, `=0` restores the opt-in
+path): the planner prices qwen4 groups out, and one `verifyGroupMerged` round over all of them
+wins. Its depth cannot be a constant: a fixed depth 3 won code and lost prose on M4 Max and M5
+Ultra, and on M4 depth 3's 16 rows ride a cheaper tile than depth 2's 12. Round cost per
+(streams, depth) barely moves with content, acceptance does, so `mtp_group_depth.zig` prices each
+depth from its own ticks, predicts tokens from live acceptance, and moves deeper only after a
+trial wins: a deeper position's acceptance is only fresh while drafted. A narrow pre-drafted chain
+still counts toward MIN, or every depth raise handed the tick to the planner. A stale planner
+owner declines the whole tick; M-RoPE rows and a collapsed-acceptance slot decode solo. Grouped
+qwen4 output is not bit-identical to solo: its top logits sit in [16, 32), a bf16 step of 0.125, and
+a batched reduction flips two-step ties, as main's plain 4-stream tick always did. Bars:
+`tests/test_mtp_batched.sh` (fixed depth, 2 and 4 streams, near-ties acquitted at two bf16 steps),
 `tests/bench_concurrency_ladder.sh` (the numbers).
 
 ## The exact block select was one threadgroup per row, and decode has one row (2026-09-09)
