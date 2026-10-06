@@ -1891,9 +1891,13 @@
       "&sort=downloads&direction=-1&limit=200" +
       "&expand[]=downloads&expand[]=likes&expand[]=tags&expand[]=safetensors&expand[]=createdAt";
     // two pipelines: VLMs live under image-text-to-text, not text-generation
+    // Bound both HF fetches: the boot sequence awaits this before any UI
+    // renders, so a hung HF API would leave an empty skeleton. Abort after 5 s
+    // and fall back to cached/seed data instead.
+    const hfSignal = AbortSignal.timeout(5000);
     const [text, vision] = await Promise.all([
-      fetch(q("text-generation")).then((r) => { if (!r.ok) throw new Error("HF " + r.status); return r.json(); }),
-      fetch(q("image-text-to-text")).then((r) => (r.ok ? r.json() : [])).catch(() => []),
+      fetch(q("text-generation"), { signal: hfSignal }).then((r) => { if (!r.ok) throw new Error("HF " + r.status); return r.json(); }),
+      fetch(q("image-text-to-text"), { signal: hfSignal }).then((r) => (r.ok ? r.json() : [])).catch(() => []),
     ]);
     const models = groupHfModels(text, vision, Date.now());
     if (models.length) {
