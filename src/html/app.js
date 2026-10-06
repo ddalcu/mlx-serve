@@ -1993,7 +1993,7 @@
     try {
       var r = await fetch(API_PREFIX + '/v1/audio/speech', {
         method: 'POST',
-        headers: authHeaders({ 'content-type': 'application/json' }),
+        headers: jsonHeaders(),
         body: JSON.stringify(speechBody({ model: model, text: text, voice: VOICE_NAME })),
       });
       if (!r.ok) return null;
