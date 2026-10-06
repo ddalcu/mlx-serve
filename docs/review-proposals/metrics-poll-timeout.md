@@ -19,3 +19,7 @@ Actual Monitor exercised in Chromium against deliberately stalled HTTP/1.1 metri
 AbortSignal.timeout requires a supported browser. The fixed five-second policy is a design choice. The preserved patch comment overstates universal 6–8 connection exhaustion; HTTP/2 and other protocols differ. No production-wide chat freeze is claimed.
 
 No full server/app build or model inference benchmark is claimed.
+
+## Publication boundary
+
+Fork-only migration review, against the unchanged reviewed baseline. Upstream's `CONTRIBUTING.md:63` full-tree build and `zig build test` gate has not been met. Zig is absent from PATH and the MLX submodules are unstaged. This proposal is not upstream-ready; no merge is authorized.
