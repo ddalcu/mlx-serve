@@ -27,8 +27,9 @@ pub fn expectedTokens(accept: []const f32, depth: u8) f64 {
 /// picker may move shallower at any tick, deeper only after a `TRIAL`-tick trial published
 /// `MARGIN` more tokens per ns. Every depth in bounds is tried once, the most promising deeper
 /// one again when the running depth's tokens rose by `EASIER`, a neighbour every `PERIOD`
-/// ticks. A depth runs `TRIAL` clean ticks before it may hand over. The first tick after a
-/// switch is never a sample: it pays the previous depth's in-flight work and a new compile.
+/// ticks. The running depth gets `TRIAL` clean ticks after a switch or a trial before the
+/// next one. The first tick after a switch is never a sample: it pays the previous depth's
+/// in-flight work and a new compile.
 pub const Picker = struct {
     pub const PERIOD: u32 = 256;
     pub const TRIAL: u32 = 4;
@@ -38,6 +39,7 @@ pub const Picker = struct {
 
     ns: [ARMS]f64 = @splat(0),
     priced: u8 = 0,
+    tried: u8 = 0,
     home: u8 = 1,
     home_n: u32 = 0,
     depth: u8 = 1,
@@ -67,6 +69,8 @@ pub const Picker = struct {
                 p.depth = d;
                 p.left = TRIAL - 1;
                 p.since = 0;
+                p.home_n = 0;
+                p.tried |= bit(d);
                 p.easier = expect[p.home];
                 p.trial_ns = 0;
                 p.trial_tok = 0;
@@ -128,7 +132,7 @@ pub const Picker = struct {
     }
 
     fn trialDepth(p: *Picker, expect: [ARMS]f64) ?u8 {
-        for (1..ARMS) |i| if (expect[i] > 0 and !p.isPriced(@intCast(i))) return @intCast(i);
+        for (1..ARMS) |i| if (expect[i] > 0 and p.tried & bit(@intCast(i)) == 0) return @intCast(i);
         if (expect[p.home] > p.easier * EASIER) {
             var deeper: ?u8 = null;
             for (p.home + 1..ARMS) |i| {
@@ -165,8 +169,8 @@ pub const Pickers = struct {
     tick: u8 = 1,
     /// Group size of the last picked tick (0 = none).
     last_size: u8 = 0,
-    /// Grouped rounds run, so a tick can tell whether it engaged.
-    grouped: u64 = 0,
+    /// Slots that rode a grouped round, so a tick can tell whether all of it did.
+    grouped_rows: u64 = 0,
 };
 
 /// `ticks` ticks of four slots with acceptance `accept` at every position, depth d costing
@@ -241,4 +245,18 @@ test "depth picker: re-prices a deeper depth when the content gets easier" {
         if (t == 199) try testing.expectEqual(@as(u8, 1), p.home);
     }
     try testing.expect(p.home >= 2);
+}
+
+test "depth picker: a trial that never gets a clean tick hands back to the running depth" {
+    var p: Picker = .{};
+    const a: [MAX_DEPTH]f32 = @splat(0.85);
+    var home_ticks: u32 = 0;
+    for (0..200) |_| {
+        var expect: [ARMS]f64 = @splat(0);
+        for (1..ARMS) |d| expect[d] = 4 * expectedTokens(&a, @intCast(d));
+        const d = p.choose(expect);
+        if (d == 1) home_ticks += 1;
+        p.observe(expect[d], @intFromFloat(M4_N4[d] * std.time.ns_per_ms), d == 1);
+    }
+    try testing.expect(home_ticks >= 180);
 }

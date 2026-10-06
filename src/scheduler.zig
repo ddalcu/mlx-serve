@@ -8838,7 +8838,7 @@ const Qwen4DepthTick = struct {
     pickers: *group_depth_mod.Pickers,
     size: u8,
     tokens: u64,
-    grouped: u64,
+    grouped_rows: u64,
     clean: bool,
 };
 
@@ -8879,16 +8879,16 @@ fn qwen4DepthBegin(sch: *Scheduler, active: []*Slot) ?Qwen4DepthTick {
     });
     const clean = pk.last_size == size;
     pk.last_size = size;
-    return .{ .pickers = pk, .size = size, .tokens = sumInflightGeneratedTokens(active), .grouped = pk.grouped, .clean = clean };
+    return .{ .pickers = pk, .size = size, .tokens = sumInflightGeneratedTokens(active), .grouped_rows = pk.grouped_rows, .clean = clean };
 }
 
 /// A tick is a sample only at an unchanged group size, with no prefill, no slot ending and
-/// a grouped round actually run.
+/// every active slot in the grouped round: a slot decoded beside it would price that depth.
 fn qwen4DepthEnd(tick: Qwen4DepthTick, active: []*Slot, tick_ns: u64, prefilled: bool) void {
     var clean = tick.clean and !prefilled;
     for (active) |s| clean = clean and !(s.finished or s.error_code != null or s.cancelled.load(.acquire));
     const picker = &tick.pickers.by_size[tick.size];
-    clean = clean and tick.pickers.grouped != tick.grouped;
+    clean = clean and tick.pickers.grouped_rows - tick.grouped_rows == active.len;
     picker.observe(@floatFromInt(sumInflightGeneratedTokens(active) -| tick.tokens), tick_ns, clean);
 }
 
@@ -9249,7 +9249,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                         gen.mtp_group_fill = false;
                         gen.mtp_group_fixed_depth = depth;
                     }
-                    chunk[0].model.transformer.?.mtp_group_depth.grouped += 1;
+                    chunk[0].model.transformer.?.mtp_group_depth.grouped_rows += chunk.len;
                     try runBatchedMtpTick(sch, chunk);
                 } else {
                     chunk[0].legacy_gen.?.mtp_group_cap = 0;
@@ -10212,6 +10212,28 @@ test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw k
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&raw_pair));
     const other = [_]u32{ 1_000, 162_000 };
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&other));
+}
+
+test "qwen4 depth sample: a slot that decoded outside the grouped round makes the tick no sample" {
+    var pk: group_depth_mod.Pickers = .{};
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    for ([_]*Slot{ &a, &b }) |s| {
+        s.finished = false;
+        s.error_code = null;
+        s.cancelled = std.atomic.Value(bool).init(false);
+        s.completion_tokens = 0;
+    }
+    var active = [_]*Slot{ &a, &b };
+    var expect: [group_depth_mod.ARMS]f64 = @splat(0);
+    expect[1] = 4;
+    for (0..3) |_| {
+        _ = pk.by_size[2].choose(expect);
+        const tick: Qwen4DepthTick = .{ .pickers = &pk, .size = 2, .tokens = 0, .grouped_rows = pk.grouped_rows, .clean = true };
+        pk.grouped_rows += 1;
+        qwen4DepthEnd(tick, &active, 50 * std.time.ns_per_ms, false);
+    }
+    try testing.expectEqual(@as(u32, 0), pk.by_size[2].home_n);
 }
 
 test "qwen4 groups policy: truth table" {
