@@ -19,3 +19,7 @@ Actual console exercised in Chromium with a controlled recognizer and HTTP fixtu
 Uses the existing jsonHeaders helper; changes only the voice reply request. No retry/error-reporting scope added.
 
 No full server/app build or model inference benchmark is claimed.
+
+## Publication boundary
+
+Fork-only migration review, against the unchanged reviewed baseline. Upstream's `CONTRIBUTING.md:63` full-tree build and `zig build test` gate has not been met. Zig is absent from PATH and the MLX submodules are unstaged. This proposal is not upstream-ready; no merge is authorized.
