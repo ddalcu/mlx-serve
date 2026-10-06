@@ -265,6 +265,17 @@ pub const SpecAdopt = union(enum) {
     decline_head_no_history,
 };
 
+/// PURE: a restore one row past a history whose next row's hidden was kept (a decode-end commit).
+pub fn specCarriesOneRow(base_pos: usize, snap_step: usize, matched: usize, has_tail: bool) bool {
+    return has_tail and matched > base_pos and matched - base_pos == snap_step + 1;
+}
+
+fn shareArray(a: mlx.mlx_array) mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    _ = mlx.mlx_array_set(&out, a);
+    return out;
+}
+
 pub fn specAdoptPlan(base_pos: usize, snap_step: usize, matched: usize, has_head_target: bool, has_head_aux: bool) SpecAdopt {
     if (base_pos > matched) return .skip;
     const want = matched - base_pos;
@@ -359,12 +370,17 @@ pub const DflashSnap = struct {
     /// A clamp to a restored trunk position lands far below the head's raw-key ring; this is
     /// what makes it exact there.
     head_marks: transformer_mod.QsaHeadMarkSet = .{},
+    /// MTP only: the trunk hidden for the history's next row (position `base_pos + step`), which
+    /// pairs with a token only the next prompt knows.
+    tail_hidden: ?mlx.mlx_array = null,
 
     pub fn deinit(self: *DflashSnap) void {
         self.snapshot.deinit();
         if (self.head_aux) |*a| transformer_mod.ssmSnapshotDeinit(a);
         self.head_aux = null;
         self.head_marks.deinit();
+        if (self.tail_hidden) |h| _ = mlx.mlx_array_free(h);
+        self.tail_hidden = null;
     }
 };
 
@@ -375,6 +391,7 @@ pub const DflashCommit = struct {
     head: ?*const SSMCacheEntry = null,
     head_pos_base: c_int = 0,
     head_marks: []const transformer_mod.QsaHeadMark = &.{},
+    tail_hidden: ?mlx.mlx_array = null,
 };
 
 /// Where `lookupAndRestore` puts a restored assistant context. `base_pos` is
@@ -384,6 +401,9 @@ pub const DflashTarget = struct {
     cache: *KVCache,
     base_pos: *usize,
     head: ?*transformer_mod.Transformer = null,
+    /// Receives the snap's `tail_hidden` when the restore lands one row past the history;
+    /// the caller appends that row and frees the handle.
+    tail_hidden: ?*mlx.mlx_array = null,
 };
 
 /// What `evictLruToAdmit` gave up, and whether it was enough.
@@ -517,7 +537,8 @@ pub const HotPrefixCache = struct {
     fn restoreSpecSnap(snap_opt: ?*const DflashSnap, target: ?DflashTarget, matched: usize, s: mlx.mlx_stream, what: []const u8) ?usize {
         const t = target orelse return null;
         const snap = snap_opt orelse return null;
-        const want = switch (specAdoptPlan(snap.base_pos, snap.snapshot.step, matched, t.head != null, snap.head_aux != null)) {
+        const carry = specCarriesOneRow(snap.base_pos, snap.snapshot.step, matched, snap.tail_hidden != null and t.tail_hidden != null);
+        const want = switch (specAdoptPlan(snap.base_pos, snap.snapshot.step, matched - @intFromBool(carry), t.head != null, snap.head_aux != null)) {
             .skip => {
                 log.info("  [hot-cache] {s} not adopted: want {d} tokens from base {d}, snap holds {d} (matched {d})\n", .{ what, matched -| snap.base_pos, snap.base_pos, snap.snapshot.step, matched });
                 return null;
@@ -536,6 +557,7 @@ pub const HotPrefixCache = struct {
                 return null;
             };
             t.base_pos.* = snap.base_pos;
+            if (carry) t.tail_hidden.?.* = shareArray(snap.tail_hidden.?);
             log.info("  [qwen4] MTP head restored ({d} tokens from base {d})\n", .{ want, snap.base_pos });
             return snap.base_pos;
         }
@@ -548,6 +570,7 @@ pub const HotPrefixCache = struct {
             return null;
         };
         t.base_pos.* = snap.base_pos;
+        if (carry) t.tail_hidden.?.* = shareArray(snap.tail_hidden.?);
         log.debug("  [hot-cache] {s} restored: {d} tokens from base {d}\n", .{ what, want, snap.base_pos });
         return snap.base_pos;
     }
@@ -1666,6 +1689,7 @@ pub const HotPrefixCache = struct {
                     .head_aux = if (m2.head) |h| transformer_mod.ssmSnapshot(h) else null,
                     .head_pos_base = m2.head_pos_base,
                     .head_marks = transformer_mod.QsaHeadMarkSet.share(m2.head_marks),
+                    .tail_hidden = if (m2.tail_hidden) |h| shareArray(h) else null,
                 };
                 new_mtp_bytes = specSnapBytes(&new_mtp.?);
             } else |err| {
@@ -7375,6 +7399,15 @@ test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-on
     // A payload the trunk cannot use is skipped before the aux question.
     try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(40, 40, 31, true, false)));
     try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(0, 20, 31, true, false)));
+}
+
+test "spec adoption: a decode-end restore one row past the history carries that row" {
+    // Bar: only exactly one row past a history that kept its next row's hidden.
+    try testing.expect(specCarriesOneRow(10, 40, 51, true));
+    try testing.expect(!specCarriesOneRow(10, 40, 50, true));
+    try testing.expect(!specCarriesOneRow(10, 40, 52, true));
+    try testing.expect(!specCarriesOneRow(10, 40, 51, false));
+    try testing.expect(!specCarriesOneRow(60, 40, 51, true));
 }
 
 test "qwen4 MTP head persist: the head's row count IS its cache step, so a committed history adopts" {

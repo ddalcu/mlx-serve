@@ -27,6 +27,9 @@
 # asserts P1 >= turn_1_prompt + turn_1_completion - 8 and fails because P1
 # is short by `turn_1_completion - 8` tokens.
 #
+# On a hybrid (GDN) model the reuse comes from the decode-end SSM checkpoint:
+# run it with CACHE_GEN_TEST_MODEL=<a Qwen3.5/3.8 dir>.
+#
 # Default port 8092 (own server). Pass [port] to reuse a running one.
 
 set -u
@@ -97,6 +100,7 @@ def chat(messages, max_tokens=120):
     msg = d["choices"][0]["message"]
     return {
         "content": msg.get("content") or "",
+        "reasoning": msg.get("reasoning_content") or "",
         "prompt_tokens": d["usage"]["prompt_tokens"],
         "completion_tokens": d["usage"]["completion_tokens"],
         "elapsed_ms": elapsed_ms,
@@ -137,7 +141,8 @@ check(r1["completion_tokens"] >= 30,
 # ── Turn 2 ── append the assistant reply + a short follow-up.
 print("\nTurn 2: history grows, follow-up should reuse turn-1 prompt + generation")
 m2 = m1 + [
-    {"role": "assistant", "content": r1["content"]},
+    # Thinking models get their reasoning back, as agents send it, so the turn re-renders token for token.
+    {"role": "assistant", "content": r1["content"], **({"reasoning_content": r1["reasoning"]} if r1["reasoning"] else {})},
     {"role": "user", "content": "Now do the same but with squares of those numbers."},
 ]
 r2 = chat(m2, max_tokens=200)

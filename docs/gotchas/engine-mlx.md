@@ -5614,3 +5614,23 @@ Defect: z-lab's bf16 DFlash2 drafter over the f16 Ternary Bonsai 2 27B pack on a
 Cause: f16 trunk inputs (raw embedding rows, captured hiddens) met bf16 drafter weights, so every drafter op promoted to f32 and `simd_qmm` (bf16 only) declined: assist 40 ms/round. The bf16 draft hidden through the f16 head did the same: head 30 ms. The loader quantized every linear lazily and evaluated once at the end, so the whole bf16 checkpoint (3.85 GB) was resident at once: peak 12.5 GB.
 Fix: `toDrafterDtype` at the drafter's entries, `hadamardLmHead` for the draft logits, per-linear eval + `Weights.replace` in `loadLinear`. Assist 13.5 ms, head 7.4 ms, peak 9.4 GB; with the M4 MMA lane block 8 is the default: 22.5 tok/s mean (code 24.6, math 29.7, prose 13.3).
 Guard: `dflash: a load-time quantized linear no longer pins its bf16 source in the weights map`. Tell: `[dflash-trace]` assist far above the drafter's bytes / bandwidth.
+
+## Every tool round re-forwarded the previous turn's generated tail (2026-10-06)
+
+- Defect: on Qwen3.8 Flash Next behind a coding agent, 98% of tool rounds sent a prompt that
+  matched the previous turn's prompt plus its whole reply, yet each one logged
+  `[hot-cache] reused P-31/...` and re-prefilled the 31-token backoff plus the full reply.
+- Cause: a hybrid restore can only land on an SSM checkpoint, and every checkpoint was a
+  prefill one; the newest sits `SSM_SNAPSHOT_BACKOFF` before the prompt end, and nothing
+  snapshotted the state where decode stopped.
+- Fix: `commitSlotIfApplicable` appends a checkpoint of the live state at the committed
+  length when `decodeEndCheckpointWanted` holds (live position == commit key, no media). It
+  is the newest, so the QSA handoff gives it the history. The MTP head's history ends one row
+  short there (its last row pairs with a token only the next prompt has), so the commit keeps
+  that row's trunk hidden and the restore appends it (`specCarriesOneRow`); without it every
+  such turn drafted blind. The SSD tier does not carry the hidden: a disk restore still does.
+  Only a turn that ends in speculative decode qualifies: serial decode keeps a forwarded
+  lookahead past the key (`live position 98, committed 96`), so it falls back as before.
+- Guard: `scheduler.decode-end checkpoint: taken only where the live state is the committed
+  prefix`, `prefix_cache.spec adoption: a decode-end restore one row past the history carries
+  that row`; `tests/test_cache_reuses_generated_tokens.sh` with a hybrid `CACHE_GEN_TEST_MODEL`.
