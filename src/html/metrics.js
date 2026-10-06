@@ -701,14 +701,25 @@ if (typeof document !== 'undefined') (function () {
 
   const histSum = (hist) => (hist && typeof hist.sum === 'number') ? hist.sum : 0;
 
+  let ticking = false;
   async function tick() {
+    // A hanging /metrics.json must not pile up requests: each new fetch occupies
+    // one per-origin TCP connection, and exhausting the limit (6-8) freezes all
+    // network I/O to the server origin including chat/completions. Never start a
+    // new fetch while one is in flight, and bound each one with a timeout.
+    if (ticking) return;
+    ticking = true;
     let d;
     try {
-      const r = await fetch(apiPrefix(location.pathname) + '/metrics.json', { cache: 'no-store' });
+      const r = await fetch(apiPrefix(location.pathname) + '/metrics.json', {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(5000),
+      });
       if (r.status === 503) { setStatus('err', t('metrics disabled')); return; }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       d = await r.json();
     } catch (e) { setStatus('err', t('error: %@', [e.message])); return; }
+    finally { ticking = false; }
 
     setStatus('live', t('● live'));
     const c = d.counters, g = d.gauges, h = d.histograms;
