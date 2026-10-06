@@ -4218,7 +4218,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 return err;
             };
             dflash_ptr = d;
-            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+            const wide_lane = dflash_mod.wideVerifyLaneAvailable() or xfm_ptr.ternaryWideVerify();
             const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand(), d.selector != null and xfm_ptr.specTreeSupported());
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,

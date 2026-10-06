@@ -5607,3 +5607,10 @@ Guard: `kda decode step over T rows equals T one-row steps` (kda_recurrence.zig)
 
 ### A grouped verify drifted from its solo verify after two perf PRs (#727)
 `row-axis verify: every row of a group verify is byte-identical to its solo verify` failed from row 1 on. Two causes, both later than the test. (1) The fused GDN verify arm (#517) required `projected == null`, so a grouped verify, which hands each slot slices of one joined projection, ran the composed chain while a solo verify ran the kernel: same projections bit for bit, different recurrence rounding. The guard is gone; the joined path is now exact and takes the faster kernel. (2) Solo verify widths 2..8 take the MoE rows arm, and a joined group past 8 rows cannot, so it runs the sorted verify kernels, which reduce differently. Restricting joins to 8 rows made every larger grouped verify slower, so the join stays and the test pins each arm on both sides (`moe_verify_rows_override`). Bisected with `MLX_SERVE_LAYER_CAP=1`: the first divergent layer named the stage.
+
+## DFlash2 over Bonsai ran slower than MTP: dtypes and a load peak (2026-10-06)
+
+Defect: z-lab's bf16 DFlash2 drafter over the f16 Ternary Bonsai 2 27B pack on an M4 16 GB ran 14.6 tok/s vs MTP's 20.5, and OOMed under the default 8-bit drafter.
+Cause: f16 trunk inputs (raw embedding rows, captured hiddens) met bf16 drafter weights, so every drafter op promoted to f32 and `simd_qmm` (bf16 only) declined: assist 40 ms/round. The bf16 draft hidden through the f16 head did the same: head 30 ms. The loader quantized every linear lazily and evaluated once at the end, so the whole bf16 checkpoint (3.85 GB) was resident at once: peak 12.5 GB.
+Fix: `toDrafterDtype` at the drafter's entries, `hadamardLmHead` for the draft logits, per-linear eval + `Weights.replace` in `loadLinear`. Assist 13.5 ms, head 7.4 ms, peak 9.4 GB; with the M4 MMA lane block 8 is the default: 22.5 tok/s mean (code 24.6, math 29.7, prose 13.3).
+Guard: `dflash: a load-time quantized linear no longer pins its bf16 source in the weights map`. Tell: `[dflash-trace]` assist far above the drafter's bytes / bandwidth.

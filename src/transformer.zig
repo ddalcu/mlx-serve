@@ -17544,6 +17544,7 @@ pub const Transformer = struct {
             reg.* = rht.Registry.init(allocator, config.hadamard_block);
             rht_registry = reg;
             try registerRhtSigns(reg, weights, s);
+            if (moe_layers) |ml| try aliasFusedRotations(reg, ml);
         }
         var ternary_2bit = false;
         if (ternaryKernelCandidate(&config)) {
@@ -19190,6 +19191,12 @@ pub const Transformer = struct {
 
     pub fn ssmStateDtype(self: *const Transformer) mlx.mlx_dtype {
         return self.config.ssmStateDtype();
+    }
+
+    /// A 2-bit ternary trunk whose verify rows ride qmv2's MMA lane: an
+    /// 8-row window costs about what 5 rows do, like the NAX lane.
+    pub fn ternaryWideVerify(self: *const Transformer) bool {
+        return (self.rht != null or self.ternary_2bit) and qmv2.deviceMmaVerifiesWide();
     }
 
     /// Hadamard packs: the trunk's lm_head for a caller holding another
@@ -34278,7 +34285,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try maybeTransposeForBf16(&la.a_w, la.a_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
-                if (la.qkv_s.ctx != null and config.hadamard_block == 0 and config.quant_bits != 2) {
+                if (la.qkv_s.ctx != null) {
                     var parts = [_][3]*mlx.mlx_array{ .{ &la.qkv_w, &la.qkv_s, &la.qkv_b }, .{ &la.z_w, &la.z_s, &la.z_b }, .{ &la.a_w, &la.a_s, &la.a_b }, .{ &la.b_w, &la.b_s, &la.b_b } };
                     const names = [_][]const u8{ "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b" };
                     la.in = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
@@ -35029,9 +35036,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try maybeTransposeForBf16(&dw.gate_w, dw.gate_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&dw.up_w, dw.up_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&dw.down_w, dw.down_s, &owned_bf16, allocator, s);
-                // Not on Hadamard packs: the rotation registry keys on the
-                // per-weight handle, which a joined buffer would bypass.
-                if (dw.gate_s.ctx != null and config.hadamard_block == 0 and config.quant_bits != 2) {
+                // Hadamard packs: `aliasFusedRotations` binds the joined buffer's signs.
+                if (dw.gate_s.ctx != null) {
                     var parts = [_][3]*mlx.mlx_array{ .{ &dw.gate_w, &dw.gate_s, &dw.gate_b }, .{ &dw.up_w, &dw.up_s, &dw.up_b } };
                     const names = [_][]const u8{ "mlp.gate_proj", "mlp.up_proj" };
                     dw.gu = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
@@ -44379,6 +44385,21 @@ test "ternaryKernelCandidate: affine 2-bit group-128 packs without rotations" {
     c.quant_group_size = 128;
     c.quant_bits = 4;
     try std.testing.expect(!ternaryKernelCandidate(&c));
+}
+
+/// Hadamard packs: a row-joined group reads ONE rotation of its input, so it
+/// is served only when its parts share a sign vector; else the parts' views are.
+fn aliasFusedRotations(reg: *rht.Registry, layers: []MoeLayerWeights) !void {
+    for (layers) |*lw| {
+        if (lw.attn == .linear) {
+            const la = &lw.attn.linear;
+            if (la.in.w.ctx != null and !try reg.alias(la.in.w, (&[_]mlx.mlx_array{ la.qkv_w, la.z_w, la.a_w, la.b_w })[0..la.in.count])) la.in.w = .{ .ctx = null };
+        }
+        if (lw.mlp == .dense) {
+            const dw = &lw.mlp.dense;
+            if (dw.gu.w.ctx != null and !try reg.alias(dw.gu.w, &.{ dw.gate_w, dw.up_w })) dw.gu.w = .{ .ctx = null };
+        }
+    }
 }
 
 /// Binds every `<base>.signs` to `<base>.weight`; ONE eval for every sign
