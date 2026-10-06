@@ -1,172 +1,62 @@
 <!doctype html>
-<html lang=en>
+<html lang="en" data-studio-embedded>
 <head>
-<meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<!-- Inline, so the front page doesn't 404 on /favicon.ico for every visitor. -->
-<link rel=icon href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='11' fill='%2310b981'/%3E%3C/svg%3E">
-<title>mlx-serve {s}</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'sha256-7U5MZ/+dwlgdOlwUuwyzlLvLw5iYzE4ijgoidjH7lfk=' 'sha256-shX8zONgyiAAqsfw12dcvmNlGpqgGIgueLmy5W9OYeI=' 'sha256-NRL4VLNocoiHqdnwMA+sV2Ve6uRjhZzYkQNxYCeLQEc='; style-src 'sha256-FwlVTWkri9ax2H2oDTFmYx1vRKnmdLUfe5iy3wqIBUk='; connect-src 'self' http: https:; img-src 'self' blob: data:; media-src 'self' blob:; font-src data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:,">
+<title>MLX Serve Studio · {s}</title>
 <script>{s}</script>
-<style>
+<style>{s}</style>
+</head>
+<body>
+<a class="skip-link" href="#content">Skip to content</a>
+<div id="app"></div>
+<noscript><h1>MLX Serve Studio · {s}</h1><p>Enable JavaScript to use Studio.</p></noscript>
 {s}
-</style></head><body>
-<div class=app id=app>
-
-<!-- ══ Sidebar ═══════════════════════════════════════════════════════════ -->
-<aside class=side>
-<div class=side-head>
-<img class=logo alt="" src="data:image/png;base64,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"><span class=wordmark>MLX-Serve</span>
-<button class=lang-toggle id=lang-toggle title="Language" aria-label="Language" data-i18n-title="Language" data-i18n-aria-label="Language"></button>
-<button class=side-toggle id=side-toggle title="Hide sidebar" aria-label="Hide sidebar" data-i18n-title="Hide sidebar" data-i18n-aria-label="Hide sidebar"></button>
-<button class=theme-toggle id=theme-toggle title="Switch light/dark theme" aria-label="Switch light/dark theme" data-i18n-title="Switch light/dark theme" data-i18n-aria-label="Switch light/dark theme"></button>
-</div>
-
-<nav class=nav>
-<button class="nav-item" data-tab="chat" id=nav-new><span class=ic><svg viewBox="0 0 24 24"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg></span><span data-i18n="New chat">New chat</span></button>
-<button class="nav-item" data-tab="monitor"><span class="ic ic-monitor"></span><span data-i18n="Monitor">Monitor</span></button>
-<button class="nav-item" data-tab="api"><span class=ic><svg viewBox="0 0 24 24"><path d="m18 16 4-4-4-4M6 8l-4 4 4 4M14.5 4l-5 16"/></svg></span><span data-i18n="API">API</span></button>
-</nav>
-
-<div class=recents>
-<div class=recents-h data-i18n="Recents">Recents</div>
-<div id=recent-list></div>
-</div>
-
-<div class=side-foot>
-<div><span class=dot></span>v{s}</div>
-<div class=stat id=hdr-models>…</div>
-<div class=stat id=hdr-mem>…</div>
-</div>
-</aside>
-
-<!-- ══ Main ══════════════════════════════════════════════════════════════ -->
-<main class=main>
-<button class=side-open id=side-open title="Show sidebar" aria-label="Show sidebar" data-i18n-title="Show sidebar" data-i18n-aria-label="Show sidebar"></button>
-
-<!-- ── Chat ──────────────────────────────────────────────────────────── -->
-<section class="panel active" id=tab-chat>
-<div class=chat id=chat-empty>
-<h1 class=greeting data-i18n="What's on your mind?">What's on your mind?</h1>
-</div>
-
-<div class=log id=chat-log></div>
-
-<div class=dock id=chat-dock>
-<div class=attached id=chat-attached></div>
-<div class=composer>
-<label class=ibtn for=chat-files title="Attach an image" data-i18n-title="Attach an image"><svg viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-<input id=chat-files type=file accept="image/*" multiple hidden></label>
-<textarea id=chat-input rows=1 placeholder="Ask anything, or ask for an image, a song, an edit…" data-i18n-placeholder="Ask anything, or ask for an image, a song, an edit…"></textarea>
-<button class=ibtn id=chat-model aria-haspopup=true aria-label="Model" data-i18n-aria-label="Model"><svg viewBox="0 0 24 24"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/></svg></button>
-<button class=ibtn id=chat-think aria-label="Thinking" data-i18n-aria-label="Thinking"><svg viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375M6.003 5.125A3 3 0 0 0 6.401 6.5M3.477 10.896a4 4 0 0 1 .585-.396M19.938 10.5a4 4 0 0 1 .585.396M6 18a4 4 0 0 1-1.967-.516M19.967 17.484A4 4 0 0 1 18 18"/></svg></button>
-<button class=ibtn id=chat-tools-toggle aria-label="Media tools" data-i18n-aria-label="Media tools" hidden><svg viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></button>
-<button class=ibtn id=chat-voice title="Voice mode: speak, and hear the reply" aria-label="Voice mode" data-i18n-title="Voice mode: speak, and hear the reply" data-i18n-aria-label="Voice mode" hidden><svg viewBox="0 0 24 24"><path d="M2 10v3M6 6v11M10 3v18M14 8v7M18 5v13M22 10v3"/></svg></button>
-<button class=send id=chat-send title="Send" aria-label="Send" data-i18n-title="Send" data-i18n-aria-label="Send"></button>
-<button class=send stop id=chat-stop title="Stop" aria-label="Stop" data-i18n-title="Stop" data-i18n-aria-label="Stop" hidden></button>
-</div>
-<div class=disclaimer id=chat-tools>Runs entirely on this Mac. Models can make mistakes.</div>
-</div>
-
-<div class=menu id=model-menu hidden></div>
-</section>
-
-<!-- ── Monitor ───────────────────────────────────────────────────────── -->
-<section class=panel id=tab-monitor>
-<div class=scroll>
-{s}
-<h2>Models</h2>
-<div class=card>
-<table class=models id=mon-models><tbody></tbody></table>
-</div>
-</div>
-</section>
-
-<!-- ── API ───────────────────────────────────────────────────────────── -->
-<section class=panel id=tab-api>
-<div class=scroll>
-
-<h2>OpenAI Chat Completions</h2>
-<div class=card>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/chat/completions</div><div class=d>Streaming and non-streaming · tool calling · JSON mode · vision (when supported)</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/completions</div><div class=d>Legacy text completions</div></div></div>
-</div>
-
-<h2>OpenAI Responses</h2>
-<div class=card>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/responses</div><div class=d>Stateful responses with tool calling · stream/non-stream · vision</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/responses/compact</div><div class=d>Compact a conversation into a round-trippable opaque blob</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p>/v1/responses/&#123;id&#125;</div><div class=d>Retrieve a stored response envelope</div></div></div>
-<div class=ep><span class="m del">DEL</span><div><div class=p>/v1/responses/&#123;id&#125;</div><div class=d>Delete a stored response</div></div></div>
-<div class=ep><span class="m ws">WS</span><div><div class=p>/v1/responses</div><div class=d>WebSocket transport · per-connection store-false cache · sequential turns</div></div></div>
-</div>
-
-<h2>Anthropic Messages</h2>
-<div class=card>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/messages</div><div class=d>Claude SDK / Claude Code compatible · stream &amp; non-stream · tool use · thinking blocks</div></div></div>
-</div>
-
-<h2>Ollama</h2>
-<div class=card>
-<div class=ep><span class="m post">POST</span><div><div class=p>/api/chat</div><div class=d>Ollama chat · NDJSON stream (default on) · tool calls · images · <code>think</code></div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/api/generate</div><div class=d>Ollama completion · templated or <code>raw</code></div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/api/tags>/api/tags</a></div><div class=d>List local models (<code>ollama list</code>)</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/api/show</div><div class=d>Model details, template and parameters</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/api/ps>/api/ps</a></div><div class=d>Models currently resident in memory</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/api/pull</div><div class=d>Download a model from Hugging Face · NDJSON progress</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/api/version>/api/version</a></div><div class=d>Version string (clients probe this to detect an Ollama server)</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/api/embed</div><div class=d>Embeddings, current shape (<code>input</code> string or array)</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/api/embeddings</div><div class=d>Embeddings, legacy shape (<code>prompt</code>)</div></div></div>
-</div>
-
-<h2>Embeddings &amp; utilities</h2>
-<div class=card>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/embeddings</div><div class=d>Vector embeddings (encoder-only models)</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/decisions</div><div class=d>Laya, Kev and Clef typed decisions · choice / score / noul questions over a JSON state</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/systemone</div><div class=d>Alias for /v1/decisions</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/tokenize</div><div class=d>Tokenize a string</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/detokenize</div><div class=d>Detokenize an id sequence</div></div></div>
-</div>
-
-<h2>Media generation</h2>
-<div class=card>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/images/generations</div><div class=d>FLUX.2, Krea &amp; Mage-Flow text-to-image · img2img + instruction edit · runtime LoRA · base64 PNG</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/images/edits</div><div class=d>OpenAI-compatible image editing · multipart form · one or more reference images + an instruction</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/audio/speech</div><div class=d>Qwen3-TTS (zero-shot voice cloning) or Kokoro (54 blendable voices) · WAV</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/audio/music-generations</div><div class=d>ACE-Step text-to-music · 48 kHz stereo WAV</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/audio/sound-generations</div><div class=d>Stable Audio 3 text-to-audio · sound effects · 44.1 kHz stereo WAV</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/video/generations</div><div class=d>LTX-Video or MiniMax-H3 · text / image / audio → video with its own soundtrack · frames + PCM</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/3d/generations</div><div class=d>Hunyuan3D-2.1 · one photo → GLB mesh · optional PBR texturing</div></div></div>
-</div>
-
-<h2>Model management</h2>
-<div class=card>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/load-model</div><div class=d>Load a discovered model, or register + load one by absolute path</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/unload-model</div><div class=d>Free a model's memory now</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/models/rescan</div><div class=d>Pick up models added to the model folders since startup</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/providers>/v1/providers</a></div><div class=d>Configured upstream chat providers (~/.mlx-serve/providers.json) and whether each answered its last probe</div></div></div>
-<div class=ep><span class="m post">POST</span><div><div class=p>/v1/providers/reload</div><div class=d>Re-read providers.json and re-probe now</div></div></div>
-</div>
-
-<h2>Discovery</h2>
-<div class=card>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/models>/v1/models</a></div><div class=d>OpenAI models list (id, capabilities, context length) — this console's model picker</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/props>/props</a></div><div class=d>llama.cpp-style server props (chat template, memory)</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/health>/health</a></div><div class=d>Liveness probe</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics>/metrics</a></div><div class=d>Prometheus metrics, text exposition format (enable with <code>--metrics</code>)</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics.json>/metrics.json</a></div><div class=d>Metrics as JSON — drives the Monitor panel (enable with <code>--metrics</code>)</div></div></div>
-</div>
-
-<h2>Quick start</h2>
-<pre>curl http://localhost:{d}/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '&#123;"model":"<span id=curl-model>your-model-id</span>","messages":[&#123;"role":"user","content":"hello"&#125;]&#125;'</pre>
-
-</div>
-</section>
-
-</main>
-</div>
-<script>
-{s}
-</script>
-</body></html>
+<noscript><h2>API reference</h2><p>Based on the mlx-serve console by David Dalcu and contributors.</p>
+<table><thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead><tbody><tr><td>GET</td><td>/</td><td>MLX Serve Studio web console</td></tr>
+<tr><td>POST</td><td>/v1/chat/completions</td><td>Streaming and non-streaming · tool calling · JSON mode · vision (when supported)</td></tr>
+<tr><td>POST</td><td>/v1/completions</td><td>Legacy text completions</td></tr>
+<tr><td>POST</td><td>/v1/responses</td><td>Stateful responses with tool calling · stream/non-stream · vision</td></tr>
+<tr><td>POST</td><td>/v1/responses/compact</td><td>Compact a conversation into a round-trippable opaque blob</td></tr>
+<tr><td>GET</td><td>/v1/responses/{{id}}</td><td>Retrieve a stored response envelope</td></tr>
+<tr><td>DELETE</td><td>/v1/responses/{{id}}</td><td>Delete a stored response</td></tr>
+<tr><td>WS</td><td>/v1/responses</td><td>WebSocket transport · per-connection store-false cache · sequential turns</td></tr>
+<tr><td>POST</td><td>/v1/messages</td><td>Claude SDK / Claude Code compatible · stream &amp; non-stream · tool use · thinking blocks</td></tr>
+<tr><td>POST</td><td>/api/chat</td><td>Ollama chat · NDJSON stream (default on) · tool calls · images · think</td></tr>
+<tr><td>POST</td><td>/api/generate</td><td>Ollama completion · templated or raw</td></tr>
+<tr><td>GET</td><td>/api/tags</td><td>List local models (ollama list)</td></tr>
+<tr><td>POST</td><td>/api/show</td><td>Model details, template and parameters</td></tr>
+<tr><td>GET</td><td>/api/ps</td><td>Models currently resident in memory</td></tr>
+<tr><td>POST</td><td>/api/pull</td><td>Download a model from Hugging Face · NDJSON progress</td></tr>
+<tr><td>GET</td><td>/api/version</td><td>Version string (clients probe this to detect an Ollama server)</td></tr>
+<tr><td>POST</td><td>/api/embed</td><td>Embeddings, current shape (input string or array)</td></tr>
+<tr><td>POST</td><td>/api/embeddings</td><td>Embeddings, legacy shape (prompt)</td></tr>
+<tr><td>POST</td><td>/v1/embeddings</td><td>Vector embeddings (encoder-only models)</td></tr>
+<tr><td>POST</td><td>/v1/decisions</td><td>Laya, Kev and Clef typed decisions · choice / score / noul questions over a JSON state</td></tr>
+<tr><td>POST</td><td>/v1/systemone</td><td>Alias for /v1/decisions</td></tr>
+<tr><td>POST</td><td>/tokenize</td><td>Tokenize a string</td></tr>
+<tr><td>POST</td><td>/detokenize</td><td>Detokenize an id sequence</td></tr>
+<tr><td>POST</td><td>/v1/images/generations</td><td>FLUX.2, Krea &amp; Mage-Flow text-to-image · img2img + instruction edit · runtime LoRA · base64 PNG</td></tr>
+<tr><td>POST</td><td>/v1/images/edits</td><td>OpenAI-compatible image editing · multipart form · one or more reference images + an instruction</td></tr>
+<tr><td>POST</td><td>/v1/audio/speech</td><td>Qwen3-TTS (zero-shot voice cloning) or Kokoro (54 blendable voices) · WAV</td></tr>
+<tr><td>POST</td><td>/v1/audio/music-generations</td><td>ACE-Step text-to-music · 48 kHz stereo WAV</td></tr>
+<tr><td>POST</td><td>/v1/audio/sound-generations</td><td>Stable Audio 3 text-to-audio · sound effects · 44.1 kHz stereo WAV</td></tr>
+<tr><td>POST</td><td>/v1/video/generations</td><td>LTX-Video or MiniMax-H3 · text / image / audio → video with its own soundtrack · frames + PCM</td></tr>
+<tr><td>POST</td><td>/v1/3d/generations</td><td>Hunyuan3D-2.1 · one photo → GLB mesh · optional PBR texturing</td></tr>
+<tr><td>POST</td><td>/v1/load-model</td><td>Load a discovered model, or register + load one by absolute path</td></tr>
+<tr><td>POST</td><td>/v1/unload-model</td><td>Free a model&#39;s memory now</td></tr>
+<tr><td>POST</td><td>/v1/models/rescan</td><td>Pick up models added to the model folders since startup</td></tr>
+<tr><td>GET</td><td>/v1/providers</td><td>Configured upstream chat providers (~/.mlx-serve/providers.json) and whether each answered its last probe</td></tr>
+<tr><td>POST</td><td>/v1/providers/reload</td><td>Re-read providers.json and re-probe now</td></tr>
+<tr><td>GET</td><td>/v1/models</td><td>OpenAI models list (id, capabilities, context length) — this console&#39;s model picker</td></tr>
+<tr><td>GET</td><td>/props</td><td>llama.cpp-style server props (chat template, memory)</td></tr>
+<tr><td>GET</td><td>/health</td><td>Liveness probe</td></tr>
+<tr><td>GET</td><td>/metrics</td><td>Prometheus metrics, text exposition format (enable with --metrics)</td></tr>
+<tr><td>GET</td><td>/metrics.json</td><td>Metrics as JSON — drives the Monitor panel (enable with --metrics)</td></tr></tbody></table>
+<pre>curl http://localhost:{d}/v1/chat/completions -H 'Content-Type: application/json' -d '{{"model":"YOUR_CHAT_MODEL","messages":[{{"role":"user","content":"Hello!"}}]}}'</pre></noscript>
+<script>{s}</script>
+</body>
+</html>

@@ -14,6 +14,15 @@ Apache License, Version 2.0
 ================================================================================
 
 --------------------------------------------------------------------------------
+mux.js 6.3.0
+https://github.com/videojs/mux.js/tree/v6.3.0
+Copyright (c) Brightcove
+Licensed under the Apache License, Version 2.0.
+
+MP4 generator lives in `src/html/app.js`. Converted to an ES module; the
+MAX_UINT32 constant is inlined. License text is included in the bundle.
+
+--------------------------------------------------------------------------------
 Cloudflare Clef and mlx-community Clef MLX
 https://huggingface.co/Cloudflare/clef
 https://huggingface.co/mlx-community/clef-flash-4bit
@@ -185,6 +194,76 @@ additions providing the C interface the Zig side calls.
 ================================================================================
 MIT License
 ================================================================================
+
+--------------------------------------------------------------------------------
+markdown-it 15.0.2
+https://github.com/markdown-it/markdown-it/tree/15.0.2
+Copyright (c) 2014 Vitaly Puzrin, Alex Kocharin.
+Licensed under the MIT License.
+
+Markdown renderer lives in `src/html/app.js`, including its license text.
+
+--------------------------------------------------------------------------------
+mdurl 2.1.0
+https://github.com/markdown-it/mdurl/tree/2.1.0
+Copyright (c) 2015 Vitaly Puzrin, Alex Kocharin.
+Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+Licensed under the MIT License.
+
+Vendored browser code lives in `src/html/app.js`, including its license text.
+Bundled with markdown-it 15.0.2; versions follow its release lockfile and
+embedded runtime marker.
+
+--------------------------------------------------------------------------------
+linkify-it 6.1.0
+https://github.com/markdown-it/linkify-it/tree/6.1.0
+Copyright (c) 2015 Vitaly Puzrin.
+Licensed under the MIT License.
+
+Vendored browser code lives in `src/html/app.js`, including its license text.
+Bundled with markdown-it 15.0.2; versions follow its release lockfile and
+embedded runtime marker.
+
+--------------------------------------------------------------------------------
+punycode.js 2.3.1
+https://github.com/mathiasbynens/punycode.js/tree/v2.3.1
+Copyright Mathias Bynens <https://mathiasbynens.be/>
+Licensed under the MIT License.
+
+Vendored browser code lives in `src/html/app.js`, including its license text.
+Bundled with markdown-it 15.0.2; versions follow its release lockfile and
+embedded runtime marker.
+
+--------------------------------------------------------------------------------
+uc.micro 3.0.0
+https://github.com/markdown-it/uc.micro/tree/3.0.0
+Copyright Mathias Bynens <https://mathiasbynens.be/>
+Licensed under the MIT License.
+
+Vendored browser code lives in `src/html/app.js`, including its license text.
+Bundled with markdown-it 15.0.2; versions follow its release lockfile and
+embedded runtime marker.
+
+--------------------------------------------------------------------------------
+Rolldown runtime 1.2.1
+https://github.com/rolldown/rolldown/tree/v1.2.1
+Copyright (c) 2024-present VoidZero Inc. & Contributors
+Licensed under the MIT License.
+
+Vendored browser code lives in `src/html/app.js`, including its license text.
+Bundled with markdown-it 15.0.2; versions follow its release lockfile and
+embedded runtime marker.
+
+--------------------------------------------------------------------------------
+@oxc-project/runtime 0.142.0
+https://github.com/oxc-project/oxc
+Copyright (c) 2024-present VoidZero Inc. & Contributors
+Copyright (c) 2023 Boshen
+Licensed under the MIT License.
+
+Vendored browser code lives in `src/html/app.js`, including its license text.
+Bundled with markdown-it 15.0.2; versions follow its release lockfile and
+embedded runtime marker.
 
 --------------------------------------------------------------------------------
 Sushi n-gram gather calibration and MTP depth bounds
@@ -448,6 +527,23 @@ Other licenses
 ================================================================================
 
 --------------------------------------------------------------------------------
+highlight.js 11.11.1
+https://github.com/highlightjs/highlight.js/tree/11.11.1
+Copyright (c) 2006, Ivan Sagalaev. All rights reserved.
+Licensed under the BSD 3-Clause License.
+
+Syntax highlighter lives in `src/html/app.js`, including its license text.
+
+--------------------------------------------------------------------------------
+entities 8.0.0
+https://github.com/fb55/entities/tree/v8.0.0
+Copyright (c) Felix Böhm. All rights reserved.
+Licensed under the BSD 2-Clause License.
+
+HTML entity decoder bundled with markdown-it 15.0.2 lives in
+`src/html/app.js`, including its license text.
+
+--------------------------------------------------------------------------------
 libwebp
 https://chromium.googlesource.com/webm/libwebp
 Copyright (c) 2010, Google Inc. All rights reserved.
@@ -479,16 +575,15 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 --------------------------------------------------------------------------------
-Lucide icons
-https://github.com/lucide-icons/lucide
-Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part
-of Feather (MIT). All other copyright (c) for Lucide are held by Lucide
-Contributors 2022.
-Licensed under the ISC License.
+Lucide icons, revision 500620a2e8123f8d1db191538886dc0c223f69a9
+https://github.com/lucide-icons/lucide/tree/500620a2e8123f8d1db191538886dc0c223f69a9
+Copyright (c) 2026 Lucide Icons and Contributors
+Copyright (c) 2013-present Cole Bemis (Feather-derived icons).
+Licensed under the ISC License; Feather-derived portions use the MIT License.
 
-The web console's icons (`src/html/index.html`: cpu, brain, wrench,
-audio-lines, paperclip, square-pen, code-xml) are Lucide's SVG paths,
-unmodified.
+Unmodified SVG paths live in `src/html/app.js` and as icon data URLs in
+`src/html/app.css`. Both license texts are included with the vendored icons.
+The revision above is the exact vendored version (not an npm package).
 
 Permission to use, copy, modify, and/or distribute this software for any
 purpose with or without fee is hereby granted, provided that the above
