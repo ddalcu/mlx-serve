@@ -2,19 +2,20 @@
 # Integration tests for the opt-in observability layer (--metrics):
 #   * GET /metrics       — Prometheus text exposition (headless scraping)
 #   * GET /metrics.json  — open JSON feed (drives the index-page panel)
-#   * GET /              — index page hosts a live metrics panel when --metrics
+#   * GET /              — console enables Monitoring feeds only with --metrics
 #
 # There is NO admin dashboard, NO auth, and NO admin mutations — the panel is
 # open and read-only. (The old tests/test_admin_api.sh is retired.)
 #
 # Tests:
-#  1. Without --metrics: /metrics + /metrics.json → 503; index page has no panel.
+#  1. Without --metrics: /metrics + /metrics.json → 503; console has no metrics-enabled marker.
 #  2. With    --metrics: /metrics → 200 Prometheus text; /metrics.json → 200 JSON;
-#                        index page embeds the panel + polls /metrics.json.
+#                        console enables Monitoring and polls /metrics.json.
 #  3. After one chat request: counters/histograms increment; live-gauge holds
 #                             (live > 0 after a request, live == total at rest).
 #
 # Usage: ./tests/test_metrics.sh [model_dir] [port]
+#   --console-only runs just the hermetic phase 0.
 #   Starts its own servers. Default model: Gemma 4 E4B 8-bit.
 
 set -u
@@ -40,6 +41,19 @@ check() {
     fi
 }
 
+# Phase 0 is hermetic and must run even when the model/build is unavailable.
+echo "── Phase 0: Monitoring math (shipped console bundle) ──"
+if ! command -v node >/dev/null 2>&1; then
+    echo "FAIL: node is required for the console guard"; exit 1
+fi
+if node --test "$(dirname "$0")/metrics_panel_test.mjs"; then
+    check "Monitoring rates, refresh, reset, gaps and Sessions" 1
+else
+    check "Monitoring rates, refresh, reset, gaps and Sessions" 0
+    exit 1
+fi
+[ "${1:-}" = "--console-only" ] && exit 0
+
 if [ ! -d "$MODEL" ]; then
     echo "SKIP: model dir not found: $MODEL (pass as first arg)"
     exit 0
@@ -58,25 +72,7 @@ wait_health() {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
-# Phase 0: index-panel rate math (pure, no server, no GPU)
-# ════════════════════════════════════════════════════════════════════════════
-echo ""
-echo "── Phase 0: panel rate math (src/html/metrics.js) ──"
-NODE_BIN="$(command -v node || true)"
-if [ -z "$NODE_BIN" ]; then
-    echo "  SKIP: node not on PATH"
-else
-    if "$NODE_BIN" "$(dirname "$0")/metrics_panel_test.mjs" > /tmp/metrics_panel.out 2>&1; then
-        sed 's/^/  /' /tmp/metrics_panel.out | grep -E "PASS|ALL PASS"
-        check "panel rate math (no carry-forward; prefill 0 while decoding)" 1
-    else
-        sed 's/^/  /' /tmp/metrics_panel.out
-        check "panel rate math (no carry-forward; prefill 0 while decoding)" 0
-    fi
-fi
-
-# ════════════════════════════════════════════════════════════════════════════
-# Phase 1: Without --metrics, /metrics* return 503 and the index page has no panel
+# Phase 1: Without --metrics, /metrics* return 503 and the console has no metrics-enabled marker
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "── Phase 1: without --metrics ──"
@@ -97,15 +93,15 @@ check "GET /metrics.json without --metrics → 503" "$([ "$STATUS" = "503" ] && 
 
 INDEX=$(curl -s "$BASE/")
 check "index page renders (200-ish, console markup present)" \
-    "$(echo "$INDEX" | grep -q 'data-tab="chat"' && echo 1 || echo 0)"
-check "index page has NO metrics panel when --metrics off" \
-    "$(echo "$INDEX" | grep -q 'id=m-status' && echo 0 || echo 1)"
+    "$(echo "$INDEX" | grep -q 'id="app"' && echo 1 || echo 0)"
+check "console does not enable metrics when --metrics off" \
+    "$(echo "$INDEX" | grep -q 'dataset.studioMetrics = "enabled"' && echo 0 || echo 1)"
 
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true; sleep 1
 
 # ════════════════════════════════════════════════════════════════════════════
-# Phase 2: With --metrics, endpoints + index panel are present
+# Phase 2: With --metrics, endpoints + metrics-enabled marker are present
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "── Phase 2: with --metrics (idle — no requests yet) ──"
@@ -165,14 +161,14 @@ check "/metrics.json has 'bucket_counts'"  "$(echo "$JBODY" | grep -q '"bucket_c
 
 # Index page hosts the live panel when --metrics is on
 INDEX=$(curl -s "$BASE/")
-check "index page HAS the metrics panel when --metrics on" \
-    "$(echo "$INDEX" | grep -q 'id=m-status' && echo 1 || echo 0)"
+check "console enables metrics when --metrics on" \
+    "$(echo "$INDEX" | grep -q 'dataset.studioMetrics = "enabled"' && echo 1 || echo 0)"
 check "index panel polls /metrics.json" \
     "$(echo "$INDEX" | grep -q "/metrics.json" && echo 1 || echo 0)"
 check "index panel has decode + prefill tok/s tiles" \
-    "$(echo "$INDEX" | grep -q 'm-decode-tps' && echo "$INDEX" | grep -q 'm-prefill-tps' && echo 1 || echo 0)"
+    "$(echo "$INDEX" | grep -q '\["decode", "Decode", "tok/s"\]' && echo "$INDEX" | grep -q '\["prefill", "Prefill", "tok/s"\]' && echo 1 || echo 0)"
 check "index panel has decode + prefill sparklines" \
-    "$(echo "$INDEX" | grep -q 'm-spark-decode' && echo "$INDEX" | grep -q 'm-spark-prefill' && echo 1 || echo 0)"
+    "$(echo "$INDEX" | grep -q 'id="chart-\${id}"' && echo "$INDEX" | grep -q 'liveSeries("prefill")' && echo 1 || echo 0)"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 3: After one chat request, counters are non-zero

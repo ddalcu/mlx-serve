@@ -46,24 +46,25 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-EMPTY_DIR="$(mktemp -d)"
+WORK_DIR="$(mktemp -d)"
+EMPTY_DIR="$WORK_DIR/models"
+mkdir -p "$EMPTY_DIR" "$WORK_DIR/home"
 LOG="$(mktemp)"
 BODY="$(mktemp)"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
-    rm -rf "$EMPTY_DIR" "$LOG" "$BODY"
+    [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null
+    rm -rf "$WORK_DIR" "$LOG" "$BODY"
 }
 trap cleanup EXIT
 
 boot() {
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
-    sleep 0.5
     : > "$LOG"
-    "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off "$@" > "$LOG" 2>&1 &
+    HOME="$WORK_DIR/home" "$BINARY" --serve --host 127.0.0.1 --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off "$@" > "$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 60); do
+        kill -0 "$SERVER_PID" 2>/dev/null || break
         curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
         sleep 0.5
         kill -0 "$SERVER_PID" 2>/dev/null || break
@@ -77,6 +78,10 @@ stop() {
     [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null
     SERVER_PID=""
 }
+
+if curl -s --max-time 1 "http://127.0.0.1:$PORT/health" >/dev/null; then
+    echo "FAIL: test port $PORT is occupied"; exit 1
+fi
 
 echo "Built-in console at GET / (port $PORT, no model)"
 
@@ -94,61 +99,30 @@ if boot; then
 
     # ── 2. The console + the full endpoint reference are in the page ────────
     echo "[2/3] console markup + endpoint coverage"
-    for tab in chat monitor api; do
-        grep -q "data-tab=\"$tab\"" "$BODY"
-        check "sidebar destination '$tab' present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+    for pane in models monitoring api settings image video audio library; do
+        check "navigation destination '$pane' bundled" \
+            "$(grep -q "nav(\"$pane\"" "$BODY" && echo 1 || echo 0)"
     done
-    # Chat opens in its empty state before any JS runs.
-    grep -q '<section class="panel active" id=tab-chat>' "$BODY"
-    check "chat is the default panel" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?chat-empty"?' "$BODY"
-    check "chat has a simple empty state" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?recent-list"?' "$BODY"
-    check "sidebar has a Recents list" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    # Media work is natural language in the chat, not its own destination.
-    grep -q 'data-tab="images"' "$BODY"
-    check "no separate images tab" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-    grep -q 'data-tab="audio"' "$BODY"
-    check "no separate audio tab" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-    # Quote-tolerant: the page mixes quoted and bare attribute values.
-    grep -Eq 'id="?chat-send"?' "$BODY"
-    check "chat composer present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?chat-model"?' "$BODY"
-    check "model picker present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?chat-files"?' "$BODY"
-    check "image attach control present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?mon-models"?' "$BODY"
-    check "monitor model table present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    # Ours now — a user-facing system prompt box would fight it. Sampling knobs
-    # went with it: this is a console, not a tuning rig.
-    grep -Eq 'id="?chat-system"?' "$BODY"
-    check "no user system-prompt box" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?chat-temp"?|id="?chat-maxtok"?' "$BODY"
-    check "no temperature / max-tokens inputs" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-    grep -q '/v1/models' "$BODY"
-    check "console fetches the model list" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-
-    # The Ollama surface is the one the hand-written reference had omitted
-    # wholesale. Zig's `index page documents every endpoint` test pins this
-    # against ROUTE_PATHS; this is the served-bytes end of the same claim.
-    MISSING=""
-    for ep in /api/chat /api/generate /api/tags /api/show /api/ps /api/pull \
-              /api/version /api/embed /api/embeddings; do
-        grep -q "$ep" "$BODY" || MISSING="$MISSING $ep"
+    for id in app content session-list chat-input chat-send image-files monitor-sessions; do
+        check "console mount/control '$id' present" \
+            "$(grep -q "id=\"$id\"" "$BODY" && echo 1 || echo 0)"
     done
-    check "every /api/* endpoint documented (missing:${MISSING:-none})" \
-        "$([ -z "$MISSING" ] && echo 1 || echo 0)"
-
-    MISSING=""
-    for ep in /v1/chat/completions /v1/completions /v1/responses /v1/messages \
-              /v1/embeddings /v1/images/generations /v1/images/edits \
-              /v1/audio/speech /v1/audio/music-generations /v1/video/generations \
-              /v1/3d/generations /v1/load-model /v1/unload-model /tokenize \
-              /detokenize /props /health /metrics.json; do
-        grep -q "$ep" "$BODY" || MISSING="$MISSING $ep"
-    done
-    check "every non-Ollama endpoint documented (missing:${MISSING:-none})" \
-        "$([ -z "$MISSING" ] && echo 1 || echo 0)"
+    check "Chat is the initial view" \
+        "$(grep -q 'view = "chat"' "$BODY" && echo 1 || echo 0)"
+    check "unified Monitoring range picker present" \
+        "$(grep -q 'data-range' "$BODY" && echo 1 || echo 0)"
+    # Read the route table, then check the documentation, not route strings in JS.
+    check "every served endpoint has a documentation row" \
+        "$(python3 - "$BODY" <<'PYROUTES'
+import re, sys
+page = open(sys.argv[1]).read()
+source = open('src/server.zig').read()
+block = re.search(r'const ROUTE_PATHS = .*?\{(.*?)\n\};', source, re.S)
+routes = re.findall(r'"(/[^" ]*)"', block.group(1)) if block else []
+rows = set(re.findall(r'<td>(/[^<]*)</td>', page))
+print(int(len(routes) > 30 and all(path in rows for path in routes)))
+PYROUTES
+)"
 
     check "no metrics panel mount without --metrics" \
         "$(grep -q 'id=mlx-metrics' "$BODY" && echo 0 || echo 1)"
@@ -165,8 +139,8 @@ if boot --metrics; then
         "$([ "$STATUS" = "200" ] && echo 1 || echo 0)"
     check "metrics mount present with --metrics" \
         "$(grep -q 'id=mlx-metrics' "$BODY" && echo 1 || echo 0)"
-    check "panel markup injected (m-status tile)" \
-        "$(grep -q 'm-status' "$BODY" && echo 1 || echo 0)"
+    check "metrics-enabled boot injected" \
+        "$(grep -q 'dataset.studioMetrics = "enabled"' "$BODY" && echo 1 || echo 0)"
     stop
 else
     check "boot with --metrics" 0

@@ -1,23 +1,16 @@
 #!/bin/bash
-# Integration tests for the console's theme (GET /):
-#   * the theme boot is injected BEFORE the stylesheet, so a light page never
-#     paints dark first;
-#   * the served page carries the switch.
-# The boot's behaviour (OS default, a stored choice, toggling, a store that
-# throws) and the palettes' variable parity are pinned in
-# tests/html_console_test.mjs, which evaluates the shipped files.
-#
-# Usage: ./tests/test_console_theme.sh [port]
-#   Starts its own server (no model is needed: the console is served headless).
-#   BINARY overrides the server binary, e.g. BINARY="/Applications/MLX Core.app/Contents/MacOS/mlx-serve"
+# Guard the served console's theme boot before first paint; no model required.
+# English is the first-release language; Simplified Chinese remains deferred.
+# Stored/OS theme choices and blocked storage are exercised by html_console_test.mjs.
+# Usage: ./tests/test_console_theme.sh [port] (BINARY overrides the test binary)
 
 set -u
 
 PORT="${1:-11292}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
-LOG=/tmp/test_console_theme.log
-PAGE=/tmp/test_console_theme_page.html
+LOG="$(mktemp)"
+PAGE="$(mktemp)"
 PASS=0
 FAIL=0
 
@@ -34,37 +27,34 @@ check() {
     fi
 }
 
-if [ ! -x "$BINARY" ]; then
-    echo "SKIP: server binary not found: $BINARY (build with: zig build -Doptimize=ReleaseFast)"
-    exit 0
-fi
-
-"$BINARY" --serve --port "$PORT" --host 127.0.0.1 --model-dir /tmp --metrics --log-level warn >"$LOG" 2>&1 &
+WORK_DIR="$(mktemp -d)"
+EMPTY_DIR="$WORK_DIR/models"
+mkdir -p "$EMPTY_DIR" "$WORK_DIR/home"
+SERVER_PID=""
+cleanup() {
+    if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; fi
+    rm -rf "$WORK_DIR" "$LOG" "$PAGE"
+}
+trap cleanup EXIT
+if [ ! -x "$BINARY" ]; then echo "FAIL: build the test binary first: $BINARY"; exit 1; fi
+if curl -s --max-time 1 "$BASE/health" >/dev/null; then echo "FAIL: test port $PORT is occupied"; exit 1; fi
+HOME="$WORK_DIR/home" "$BINARY" --serve --port "$PORT" --host 127.0.0.1 --model-dir "$EMPTY_DIR" --metrics --log-level warn >"$LOG" 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null' EXIT
-
 for _ in $(seq 1 60); do
+    kill -0 "$SERVER_PID" 2>/dev/null || { cat "$LOG"; exit 1; }
     curl -sf -o /dev/null "$BASE/" && break
     sleep 0.5
 done
-
-curl -sf "$BASE/" -o "$PAGE" || { echo "FAIL: GET / failed (see $LOG)"; exit 1; }
-
-has() { grep -q -e "$1" "$PAGE" && echo 1 || echo 0; }
-
-# Offsets, not just presence: the order is the whole point of the boot file.
-check "the theme boot precedes the stylesheet" \
-    "$(python3 - "$PAGE" <<'PY'
+curl -sf "$BASE/" -o "$PAGE" || { echo "FAIL: GET / failed"; cat "$LOG"; exit 1; }
+check "theme boot is in the head before the stylesheet" \
+    "$(python3 - "$PAGE" <<'PYBOOT'
 import sys
-page = open(sys.argv[1], encoding='utf-8', errors='replace').read()
-boot = page.find('Theme boot for the built-in console')
-style = page.find('<style>')
-print(1 if 0 <= boot < style else 0)
-PY
+page = open(sys.argv[1]).read()
+boot = page.find('document.documentElement.dataset.theme =')
+print(int(0 <= boot < page.find('<style>') < page.find('</head>')))
+PYBOOT
 )"
-
-check "the switch is in the sidebar head" "$(has 'id=theme-toggle')"
-
-echo
+check "System, Light and Dark choices are wired in Settings" \
+    "$(node --test tests/html_console_test.mjs >/dev/null 2>&1 && grep -q 'data-pref=' "$PAGE" && echo 1 || echo 0)"
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

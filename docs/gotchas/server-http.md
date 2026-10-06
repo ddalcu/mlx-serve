@@ -202,7 +202,7 @@ Everything below was found by driving the real page in a real browser over CDP a
 - **Rank candidates by how likely they are to WORK.** Two Qwen3-TTS checkpoints on disk, the bf16 one an incomplete download (config + tokenizer, no safetensors). It sorted first, so every "say this out loud" spent a load attempt on it — `NoWeightFiles`, "Model load failed" — before a retry found the sibling. The pre-load tell is in `/v1/models` already: discovery sums the checkpoint's `*.safetensors`, so `bytes_on_disk: null` means the shards are missing. `rankedIds` orders resident (free, and provably loadable) → sized → unsized → `error`, and a failed tool call refreshes the model list so a retry inside the same turn ranks past the entry the registry just marked. The picker deliberately does NOT reorder: it refreshes every 15 s and would shuffle under the cursor.
 - **Whatever the system prompt leaves out, the model invents.** With only paths and one-line descriptions in the prompt, "how do I edit an image?" produced `curl -X POST https://your-ollama-ip-address/api/v1/images/edits -F "ref1=<base64>"` — wrong host, wrong path prefix, invented field names. The prompt now carries `location.origin` and a short true list of real request fields. Listing accepted and rejected fields in one sentence was not enough either: the model presented `mask`, `n`, `response_format:"url"` as available options, so rejections are now a separate, explicitly-labelled clause. And "give me a curl for the edit endpoint" was answered by GENERATING A PICTURE until the prompt said in as many words that questions are answered in text with no tool call at all.
 - **The API reference has one source.** The prompt's endpoint list is scraped from the API tab's own rendered markup (`#tab-api .ep`), so the page and the assistant cannot disagree, and the Zig drift guard (every `ROUTE_PATHS` entry appears in `index.html`) covers both at once.
-- **Guards**: `tests/html_console_test.mjs` grew to 44 tests over `mediaTools` / `toolInvocation` / `accumulateToolCalls` / `systemPrompt` — each of the bullets above is a named regression test. `tests/test_index_page.sh` pins the tab set, that Monitor ships `class="panel active"` (what a visitor sees before any JS runs), that Images/Audio tabs are GONE, and that no user system-prompt box came back.
+- **Current guards**: `tests/html_console_test.mjs` checks Studio’s bundled decision layer and control wiring; `tests/test_index_page.sh` pins Chat as the landing view, the media panes, unified Monitoring/Sessions, endpoint documentation and the metrics marker.
 
 ### Third pass: a sidebar, persisted chats, and the metric a client cannot measure (2026-07-25)
 Layout moved to a sidebar — **New chat / Monitor / API**, plus **Recents** — and chat became the landing view: a greeting and a centred composer that turns into a transcript on the first send. It is ONE composer element in two layouts (`.panel.empty` flips it), because two composers is two sets of listeners and one of them always rots. Temperature and max-tokens went away; model choice and Extended thinking live in the composer's pill menu, both remembered in localStorage.
@@ -2496,9 +2496,8 @@ Fix: `apiPrefix(pathname)` — in `src/html/api.js`, the first script of the pag
 `app.js` and `metrics.js` bind the ONE implementation — is that mount: a last segment holding a dot
 is a file, anything else a directory. Every fetch, the API reference's own links and the base URL the
 chat system prompt hands the model resolve through it.
-Guards: `the path prefix the page was served under is the base of every API path`,
-`app.js resolves through the page's one apiPrefix` (identity, not a source scan),
-`tests/metrics_panel_test.mjs`.
+Guard: `console and Monitoring share mount-prefix resolution, without query keys`
+in `tests/metrics_panel_test.mjs`; requests use Studio’s selected server base URL.
 
 ## A GGUF picked by its file 404'd on the first chat (2026-10-06)
 
