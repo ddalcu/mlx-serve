@@ -2,14 +2,16 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Audio generation window — two tabs over one window: **Voice** (neural TTS
-/// with zero-shot voice cloning, Qwen3-TTS) and **Music** (prompt-driven music
-/// generation, ACE-Step). Each tab is its own self-contained pane; this
-/// container only hosts the segmented switcher.
+/// Audio generation window — three tabs over one window: **Voice** (neural TTS
+/// with zero-shot voice cloning, Qwen3-TTS), **Music** (prompt-driven music
+/// generation, ACE-Step) and **Sound Effects** (text-to-audio, Stable Audio 3).
+/// Each tab is its own self-contained pane; this container only hosts the
+/// segmented switcher.
 struct AudioGenView: View {
     enum Tab: String, CaseIterable {
         case voice = "Voice"
         case music = "Music"
+        case sound = "Sound Effects"
     }
 
     /// The left menu's "Audio & Music" row must reopen on the tab you left it
@@ -29,13 +31,14 @@ struct AudioGenView: View {
             .pickerStyle(.segmented)
             .controlSize(.large)
             .labelsHidden()
-            .frame(width: 280)
+            .frame(width: 400)
             .padding(.top, 10)
             .padding(.bottom, 14).font(.app(.body))
 
             switch tab {
             case .voice: VoiceGenView()
             case .music: MusicGenView()
+            case .sound: SoundGenView()
             }
         }
     }
@@ -149,8 +152,6 @@ struct VoiceGenView: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
-    /// For "Send to Chat" — the hand-off opens a new conversation and switches
-    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
     @EnvironmentObject var appState: AppState
 
     @StateObject private var recorder = AudioRecorder()

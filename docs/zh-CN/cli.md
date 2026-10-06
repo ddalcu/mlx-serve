@@ -12,7 +12,7 @@ mlx-serve serve             # 对外提供所有已拉取模型的服务 —— 
 mlx-serve launch claude     # 配置并启动一个针对本地服务器的编码 Agent CLI
 ```
 
-`launch` 支持 claude、pi、omp、opencode、opencode2、codex、hermes 与 aider。它会读取运行中服务器的模型列表与真实上下文窗口，把 Agent 配置写进专用的 `~/.mlx-serve/<agent>/` 文件夹（绝不碰你真实的 Agent 配置），然后启动该 Agent。如果服务器没在运行，它会先启动 MLX Core 应用。`--model <id>` 选择模型，`--print` 只显示启动脚本而不真正运行，`--` 之后的任何内容都会传给 Agent（`mlx-serve launch codex -- resume`）。`opencode2` 还会安装 mlx-serve 监控插件，这要求服务器以 `--metrics` 启动。每种 Agent 的完整细节见 [integrations.md](integrations.md)。
+`launch` 支持 claude、pi、omp、opencode、opencode2、codex、hermes 与 aider。它会读取运行中服务器的模型列表与真实上下文窗口，把 Agent 配置写进专用的 `~/.mlx-serve/<agent>/` 文件夹（绝不碰你真实的 Agent 配置），然后启动该 Agent。如果服务器没在运行，它会先启动 MLX Core 应用。`--model <id>` 选择模型，`--print` 只显示启动脚本而不真正运行，`--` 之后的任何内容都会传给 Agent（`mlx-serve launch codex -- resume`）。`launch opencode` 会检测已安装 OpenCode 的版本（即使 `--print` 也会运行 `opencode --version` 来路由）并自动选择 v1 或 v2 集成；`launch opencode2` 作为强制 v2 的后兼容别名保留，它还会安装 mlx-serve 监控插件，这要求服务器以 `--metrics` 启动。每种 Agent 的完整细节见 [integrations.md](integrations.md)。
 
 短名称、`org/repo` 形式的 HuggingFace id 以及 `name:tag` 都可用。模型会落进一个共享的 `~/.mlx-serve/models` 存储目录，MLX Core 应用用的也是它。
 
@@ -63,7 +63,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--no-drafter` | 关闭 | 永不加载草稿模型，包括检查点内自带的那个 |
 | `--draft-block-size N` | 自动 | 草稿模型每轮的草稿数（自动取这台 Mac 的验证路径可用的值） |
 | `--no-mtp` / `--mtp` | 加载了 MTP 头时开启 | 禁用原生 MTP 头；`--mtp` 为兼容旧命令保留，无作用（稠密与 MoE 均默认开启） |
-| `--mtp-depth N` | `3` | 每轮 MTP 最多草拟的 Token 数（自适应控制器在 `[1, N]` 内调节） |
+| `--mtp-min-depth N` | `1` | 每轮 MTP 最少草拟的 Token 数（1..8） |
+| `--mtp-max-depth N` | auto | 每轮 MTP 最多草拟的 Token 数（1..8）；上下限相同则固定深度，替代 `MLX_SERVE_MTP_FORCE_DEPTH`；`--mtp-depth` 是旧写法。草拟头数量和剩余 Token 数仍可缩短一轮。 |
 | `--mtp-history-window N` | `0`（完整） | 超过 16K Token 的提示词只为最后 N 个 Token 构建 MTP 头历史（开窗会在原版 Qwen 头上损失接受率） |
 | `--dspark` | 关闭 | DeepSeek V4 自有的块并行草稿阶段（在模型之上额外约 11 GB） |
 | `--ssd-streaming` | 关闭 | 仅 ds4 / DeepSeek-V4-Flash GGUF：从 SSD 流式读取专家权重，而不是把整个模型放在内存里 |

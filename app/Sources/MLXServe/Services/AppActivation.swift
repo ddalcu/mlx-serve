@@ -60,17 +60,22 @@ enum AppActivation {
     /// Title of the window a scene id opens — used to raise the right one once
     /// SwiftUI has created it. Lived inline in a `switch` in MLXServeApp, where
     /// the call sites that bypassed `openAndFocus` couldn't reach it.
-    static func windowTitle(for id: String) -> String {
+    static func windowTitle(for id: String) -> String? {
         switch id {
-        case "chat":         return "MLX-Serve"
-        case "serverLog":    return "Server Log"
-        default:             return "Browser"
+        case "chat":          return "MLX-Serve"
+        case "browser":       return "Browser"
+        case "serverLog":     return "Server Log"
+        case "benchmarks":    return "Benchmarks"
+        case "layaDecisions": return "Decisions"
+        case "modelSettings": return "Model Settings"
+        case "agents":        return "Agents"
+        default:              return nil
         }
     }
 
     /// Is this NSWindow the one scene `id` opens?
     static func windowMatches(id: String, title: String, identifier: String?) -> Bool {
-        if !title.isEmpty, title == windowTitle(for: id) { return true }
+        if let expectedTitle = windowTitle(for: id), !title.isEmpty, title == expectedTitle { return true }
         if let identifier, identifier.localizedCaseInsensitiveContains(id) { return true }
         return false
     }

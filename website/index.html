@@ -149,7 +149,7 @@
         "name": "How do I install mlx-serve?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "The easiest way is the MLX-Serve menu-bar app from the GitHub Releases page (signed and notarized DMG). Or via Homebrew: brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve && brew install --cask mlx-core. The CLI server alone is brew install mlx-serve."
+          "text": "The easiest way is the MLX-Serve menu-bar app from the GitHub Releases page (signed and notarized DMG). Or via Homebrew: brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve && brew trust ddalcu/mlx-serve && brew install --cask mlx-serve. The CLI server alone is brew install mlx-serve."
         }
       }
     ]
@@ -2002,6 +2002,7 @@
         <div class="code-body">
 <pre><span class="comment"># Install via Homebrew (or grab the app from Releases)</span>
 <span class="cmd">brew tap</span> ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
+<span class="cmd">brew trust</span> ddalcu/mlx-serve
 <span class="cmd">brew install</span> mlx-serve
 
 <span class="comment"># One command: download, serve, chat — Ollama-style</span>
@@ -2245,7 +2246,7 @@
       </details>
       <details class="faq-item">
         <summary>How do I install it?</summary>
-        <p>The easiest way is the <a href="https://github.com/ddalcu/mlx-serve/releases/latest">MLX-Serve app from GitHub Releases</a> (signed and notarized DMG). Or via Homebrew: <code>brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve &amp;&amp; brew install --cask mlx-core</code>. CLI server alone: <code>brew install mlx-serve</code>.</p>
+        <p>The easiest way is the <a href="https://github.com/ddalcu/mlx-serve/releases/latest">MLX-Serve app from GitHub Releases</a> (signed and notarized DMG). Or via Homebrew: <code>brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve &amp;&amp; brew trust ddalcu/mlx-serve &amp;&amp; brew install --cask mlx-serve</code>. CLI server alone: <code>brew install mlx-serve</code>.</p>
       </details>
     </div>
     <p style="text-align:center; margin-top: 32px; font-size: 14px; color: var(--text-tertiary);">

@@ -105,7 +105,7 @@ METAL_FUNC void map_rows(
   }
 }
 
-template <typename T, typename DTile>
+template <typename T, int EPI, typename DTile>
 METAL_FUNC void store_act(thread DTile& D, device T* y, const int ld,
                           const int rows, const device T* sigtab);
 
@@ -235,7 +235,7 @@ METAL_FUNC void gather_mapped_seg(
 
     if constexpr (kPair) {
       if (sg_active) {
-        store_act<T>(
+        store_act<T, EPI>(
             Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), sigtab);
       }
     } else if (kAlignedM.value && sgp_sn == kSN) {
@@ -368,7 +368,7 @@ METAL_FUNC void gather_mapped_db(
 
   if constexpr (kPair) {
     if (rows > 0) {
-      store_act<T>(
+      store_act<T, EPI>(
           D,
           y + size_t(row_start + m0) * half_n + w_col + (kSN / 2) * (sgid % kWN),
           half_n,
@@ -386,7 +386,9 @@ METAL_FUNC void gather_mapped_db(
 }
 
 
-template <typename T, typename DTile>
+// EPI 1: silu(g) * u. EPI = 1 + L: the gate clamped above at L and u to [-L, L] first
+// (a `swiglu_limit`), on the rounded values like the split path's ops.
+template <typename T, int EPI, typename DTile>
 METAL_FUNC void store_act(
     thread DTile& D, device T* y, const int ld, const int rows,
     const device T* sigtab) {
@@ -402,8 +404,12 @@ METAL_FUNC void store_act(
         STEEL_PRAGMA_UNROLL
         for (short j = 0; j < 4; j++) {
           const short e = h * 4 + j;
-          const T g = T(D.frag_at(i, 0)[e]);
-          const T u = T(D.frag_at(i, 1)[e]);
+          T g = T(D.frag_at(i, 0)[e]);
+          T u = T(D.frag_at(i, 1)[e]);
+          if constexpr (EPI > 1) {
+            g = metal::min(g, T(EPI - 1));
+            u = metal::max(metal::min(u, T(EPI - 1)), T(1 - EPI));
+          }
           const T a = T(g * sigtab[as_type<ushort>(g)]);
           v[j] = T(a * u);
         }

@@ -333,6 +333,54 @@ extension MusicGenSettings {
     }
 }
 
+// MARK: - Sound effects
+
+struct SoundGenSettings: Codable, Equatable {
+    var modelId: String = SoundModelPreset.stableAudio3SmallSFX.id
+    var prompt: String = ""
+    var durationSeconds: Double = 10
+    var steps: Int? = nil
+    var seed: Int = -1
+    var keepResident: Bool = false
+    var showAdvanced: Bool = true
+
+    private static let storageKey = "soundGenSettings"
+
+    static func load() -> SoundGenSettings {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let v = try? JSONDecoder().decode(SoundGenSettings.self, from: data) else {
+            return SoundGenSettings()
+        }
+        return v
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+
+    func resolvedModel(models: [ModelInfo]) -> SoundModelPreset {
+        SoundModelPreset.all.first { $0.id == modelId }
+            ?? CustomMediaModels.soundPreset(for: modelId, from: models)
+            ?? .stableAudio3SmallSFX
+    }
+
+    /// Every key optional (see `MusicGenSettings`).
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(String.self, forKey: .modelId) { modelId = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .durationSeconds) { durationSeconds = v }
+        steps = try c.decodeIfPresent(Int.self, forKey: .steps)
+        if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
+    }
+
+    init() {}
+}
+
 // MARK: - Video
 
 struct VideoGenSettings: Codable, Equatable {

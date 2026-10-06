@@ -14,7 +14,7 @@ Timings measured 2026-07-16 on the M4 Max 128 GB, AFTER the `stop_all_engines` p
 | 3 | **Perf gate** (did WE regress?) | `./tests/bench.sh` (mlx-serve only, llmprobe) → diff vs the previous column in `benchmarks.md` → append this release's column | ~15 min |
 | 4 | Tool-call correctness | `zig build test -Dtest-filter="format corpus"` + `-Dtest-filter="tool traffic"`; live: `./tests/test_tool_matrix_small.sh` | ~3 min |
 | 5 | API conformance | `npx llmprobe@latest http://127.0.0.1:<port>/v1 --quick` → expect **100%** engine conformance | ~10 s/model |
-| 6 | Regression scripts | `integration_test.sh`, `test_anthropic_api.sh`, `test_ollama_api.sh`, `test_stream_keepalive.sh`, `test_disconnect_cancel.sh`, `test_pld_equivalence.sh`, `test_mtp_equivalence.sh` | ~15 min |
+| 6 | Regression scripts | `integration_test.sh`, `test_anthropic_api.sh`, `test_ollama_api.sh`, `test_stream_keepalive.sh`, `test_disconnect_cancel.sh`, `test_pld_equivalence.sh`, `test_mtp_equivalence.sh`, `test_gen_chat_mix.sh` | ~15 min |
 | 7 | Soak (bigger releases) | `SOAK_DURATION_HOURS=1 ./tests/test_soak_24h.sh` — RSS drift < 10% | 1 h |
 | 8 | **Cross-engine check** (only before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` per engine; record in `~/claude-tmp/bench-<tag>/`, name the engine in every win — `benchmarks.md` carries mlx-serve only | ~90 min |
 | 9 | Bundle | `SKIP_NOTARIZE=1 bash app/build.sh` (both binaries move together) | ~2 min |

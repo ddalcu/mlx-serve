@@ -79,6 +79,7 @@ enum ToolCallDisplay {
         "generate_image": "prompt",
         "generate_speech": "text",
         "generate_music": "prompt",
+        "generate_sound": "prompt",
         "generate_video": "prompt",
     ]
 

@@ -986,9 +986,8 @@ private struct ProvidersSectionContent: View {
                             serverPort: server.port,
                             status: status.first { $0.name == entry.name },
                             duplicate: ProvidersFile.duplicateNames(formState.providerEntries).contains(entry.name),
-                            onDelete: {
-                                formState.providerEntries.removeAll { $0.id == entry.id }
-                                formState.providerModelText[entry.id] = nil
+                            onDelete: { [id = entry.id] in
+                                formState.removeProvider(id: id)
                                 save()
                             },
                             onCommit: save)
@@ -1923,15 +1922,23 @@ private struct MemorySectionContent: View {
                     .toggleStyle(.switch).font(.app(.body))
             }
         }
-        if let m = meta["osMemoryReserve"] {
+        if let m = meta["osReserveGiB"] {
             SettingsRow(
                 title: m.title,
                 explainer: m.explainer,
-                isDirty: dirty.dirty(\.osMemoryReserve)
+                isDirty: dirty.dirty(\.osReserveGiB)
             ) {
-                Toggle("", isOn: opts.osMemoryReserve)
-                    .labelsHidden()
-                    .toggleStyle(.switch).font(.app(.body))
+                let auto = ServerOptions.autoOsReserveGiB(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+                Picker("", selection: opts.osReserveGiB) {
+                    Text("Auto (\(auto.formatted(.number.precision(.fractionLength(0...1)))) GB)")
+                        .font(.app(.body)).tag(Int?.none)
+                    ForEach([0, 2, 3, 4, 6, 8], id: \.self) { gib in
+                        Text(gib == 0 ? "Off" : "\(gib) GB").font(.app(.body)).tag(Int?.some(gib))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 220).font(.app(.body))
             }
         }
         if showMLX {
@@ -1951,7 +1958,18 @@ private struct MemorySectionContent: View {
                     .frame(minWidth: 220).font(.app(.body))
                 }
             }
-            if let m = meta["prefixCacheEntries"] {
+            if let m = meta["hotPrefixCacheEnabled"] {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.hotPrefixCacheEnabled)
+                ) {
+                    Toggle("", isOn: opts.hotPrefixCacheEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
+            }
+            if let m = meta["prefixCacheEntries"], appState.serverOptions.hotPrefixCacheEnabled {
                 // Surface the RAM clamp so a 16 GB Mac user who sets, say, 8 sees
                 // that the launcher will actually pass 1 (and why).
                 let ram = ProcessInfo.processInfo.physicalMemory
@@ -1965,13 +1983,13 @@ private struct MemorySectionContent: View {
                     explainer: m.explainer + capNote,
                     isDirty: dirty.dirty(\.prefixCacheEntries)
                 ) {
-                    Stepper(value: opts.prefixCacheEntries, in: 0...16) {
+                    Stepper(value: opts.prefixCacheEntries, in: 1...16) {
                         Text("\(appState.serverOptions.prefixCacheEntries)")
                             .font(.app(.body).monospacedDigit())
                     }
                 }
             }
-            if let m = meta["prefixCacheMem"] {
+            if let m = meta["prefixCacheMem"], appState.serverOptions.hotPrefixCacheEnabled {
                 SettingsRow(
                     title: m.title,
                     explainer: m.explainer,

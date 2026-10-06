@@ -11,8 +11,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Pinned Zig nightly (homebrew's `zig` formula still ships 0.16.0, which no
-# longer builds — see build.zig's version-gate comptime block).
+# Pinned Zig release (see build.zig's version-gate comptime block).
 bash scripts/fetch-zig.sh
 ZIG="$ROOT/.zig-toolchain/zig"
 

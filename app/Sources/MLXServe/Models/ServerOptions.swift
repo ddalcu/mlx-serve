@@ -97,10 +97,9 @@ struct ServerOptions: Codable, Equatable {
     /// auto-loads when present and models without one are unaffected, so
     /// `toCLIArgs` emits `--no-mtp` ONLY when the user turns it off.
     var enableMTP: Bool = true
-    /// How many tokens the MTP head drafts per round. `0` = auto, which is the
-    /// server's own default (`--mtp-depth 0` → the adaptive EV controller tunes
-    /// depth live from the measured acceptance rate). A fixed value is a
-    /// benchmarking lever; emitted only when non-zero.
+    /// Maximum tokens the MTP head drafts per round. `0` = auto: omit the
+    /// flag so the server tunes depth from measured acceptance. An explicit
+    /// value emits `--mtp-max-depth`; the planner may choose a lower depth.
     var mtpDepth: Int = 0
     /// Decode attention requant, TRI-STATE: nil = the server's own default
     /// (laguna-class dense attention requants ON, DeepSeek-V4's comp_in
@@ -146,13 +145,11 @@ struct ServerOptions: Codable, Equatable {
     /// KV-cache quantization scheme. `off` = dense bf16. `int4` / `int8` apply
     /// affine quant.
     var kvQuant: KVQuant = .off
-    /// Hot prefix cache entry count. >0 enables cross-request KV reuse for
-    /// shared system prompts. 0 disables. The launcher RAM-clamps the emitted
-    /// value via `ramCappedPrefixCacheEntries` — each entry on a hybrid SSM
-    /// model (Qwen 3.5/3.6, etc.) retains large per-position KV + conv/SSM
-    /// snapshots whose true footprint dwarfs the model, so an uncapped count
-    /// fills a 16 GB Mac and starves the context window. Default 8 suits
-    /// 32 GB+; a 16 GB Mac caps to 1.
+    /// Keep completed prefix snapshots in RAM for low-latency reuse. Turning this off keeps
+    /// the live request KV but retains reusable prefixes only on the SSD tier when enabled.
+    var hotPrefixCacheEnabled: Bool = true
+    /// Hot prefix cache entry count. Used only while RAM retention is enabled. The launcher
+    /// RAM-clamps the emitted value via `ramCappedPrefixCacheEntries`.
     var prefixCacheEntries: Int = 8
     /// Hot prefix cache memory budget. `2GB`, `512MB`, etc. `0` or `off`
     /// disables the byte cap (count cap still applies). Empty = server default
@@ -203,9 +200,8 @@ struct ServerOptions: Codable, Equatable {
     /// so a load it refuses often still fits — but a genuine over-commit can
     /// hard-crash the server, so this is opt-in.
     var skipMemPreflight: Bool = false
-    /// When false, launch with `--os-reserve-gib 0`: the server stops holding free RAM back for
-    /// macOS (an eighth of RAM, 2 to 8 GB) when it plans context and admits requests.
-    var osMemoryReserve: Bool = true
+    /// `--os-reserve-gib` in GiB; nil = the server's automatic reserve, 0 = none.
+    var osReserveGiB: Int? = nil
 
     // MARK: Engines
     /// `--mlx-gguf`. EXPERIMENTAL: lib/mlx-serve-gguf claims the `.gguf` files
@@ -512,6 +508,7 @@ struct ServerOptions: Codable, Equatable {
         aneAudio == other.aneAudio &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
+        hotPrefixCacheEnabled == other.hotPrefixCacheEnabled &&
         prefixCacheEntries == other.prefixCacheEntries &&
         prefixCacheMem == other.prefixCacheMem &&
         pleGpu == other.pleGpu &&
@@ -521,7 +518,7 @@ struct ServerOptions: Codable, Equatable {
         maxResidentModels == other.maxResidentModels &&
         idleEvictSecs == other.idleEvictSecs &&
         skipMemPreflight == other.skipMemPreflight &&
-        osMemoryReserve == other.osMemoryReserve &&
+        osReserveGiB == other.osReserveGiB &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
         ssdStreaming == other.ssdStreaming &&
@@ -551,7 +548,7 @@ struct ServerOptions: Codable, Equatable {
     /// as resident memory climbs, the auto-context ceiling shrinks until
     /// prompts no longer fit ("Prompt exceeds maximum context length"). Capping
     /// the entry count is the reliable lever — the byte cap under-counts the
-    /// true retained allocation. An explicit 0 (disable) is preserved.
+    /// true retained allocation. Disabling RAM retention uses `hotPrefixCacheEnabled`.
     ///   ≤18 GB (16 GB Macs): 1   ≤36 GB (24/32 GB): 8   else: uncapped.
     /// Snap points for the model memory cap slider, in GiB. 0 is Auto and is
     /// always first. The ladder stops at the machine's RAM — a cap above it
@@ -560,6 +557,11 @@ struct ServerOptions: Codable, Equatable {
         let ram = Int(physicalMemoryBytes / 1_073_741_824)
         return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
             .filter { $0 <= max(ram, 8) }
+    }
+
+    /// Mirrors `server.osReserveBytes`: an eighth of RAM in GiB, never under 2 or over 8.
+    static func autoOsReserveGiB(physicalMemoryBytes: UInt64) -> Double {
+        min(max(Double(physicalMemoryBytes) / 8 / 1_073_741_824, 2), 8)
     }
 
     /// Snap points for the idle-eviction slider, in seconds. Off first; every
@@ -574,7 +576,7 @@ struct ServerOptions: Codable, Equatable {
     }
 
     static func ramCappedPrefixCacheEntries(_ requested: Int, physicalMemoryBytes: UInt64) -> Int {
-        if requested <= 0 { return requested }
+        let requested = max(requested, 1)
         let gib = physicalMemoryBytes / 1_073_741_824
         let ceiling: Int
         if gib <= 18 { ceiling = 1 }
@@ -662,7 +664,7 @@ struct ServerOptions: Codable, Equatable {
             args += ["--no-mtp"]
         }
         if mtpDepth > 0 {
-            args += ["--mtp-depth", "\(mtpDepth)"]
+            args += ["--mtp-max-depth", "\(mtpDepth)"]
         }
         // DSpark (DeepSeek-V4 draft stages): server default is OFF (opt-in —
         // the stages cost ~11 GB resident), so only ON emits.
@@ -698,6 +700,7 @@ struct ServerOptions: Codable, Equatable {
         // Macs. Emit the RAM-clamped value so the entry count stays bounded.
         let cappedEntries = Self.ramCappedPrefixCacheEntries(prefixCacheEntries, physicalMemoryBytes: physicalMemoryBytes)
         args += ["--prefix-cache-entries", "\(cappedEntries)"]
+        if !hotPrefixCacheEnabled { args += ["--no-prefix-cache-ram"] }
         // Empty leaves the size to the server; any value, the old "2GB" default included, is sent.
         let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPrefixMem.isEmpty {
@@ -760,8 +763,8 @@ struct ServerOptions: Codable, Equatable {
         if skipMemPreflight {
             args += ["--skip-mem-preflight"]
         }
-        if !osMemoryReserve {
-            args += ["--os-reserve-gib", "0"]
+        if let gib = osReserveGiB {
+            args += ["--os-reserve-gib", "\(gib)"]
         }
         // ds4-only opt-in: stream DeepSeek-V4-Flash experts from SSD. The MLX
         // and llama.cpp engines ignore the flag, so it's safe to leave in argv
@@ -853,6 +856,9 @@ extension ServerOptions {
     private enum LegacyDecodeAttnQuantKey: String, CodingKey {
         case decodeAttnQuant
     }
+    private enum LegacyOsMemoryReserveKey: String, CodingKey {
+        case osMemoryReserve
+    }
 
     init(from decoder: Decoder) throws {
         self.init()   // every property seeded with its default
@@ -898,16 +904,29 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
-        if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
+        let storedPrefixEntries = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries)
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .hotPrefixCacheEnabled) {
+            hotPrefixCacheEnabled = v
+        } else if storedPrefixEntries == 0 {
+            hotPrefixCacheEnabled = false
+        }
+        if let v = storedPrefixEntries { prefixCacheEntries = max(v, 1) }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheMem) { prefixCacheMem = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .pleGpu) { pleGpu = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
+        if !c.contains(.hotPrefixCacheEnabled) && storedPrefixEntries == 0 { enablePrefixCacheDisk = false }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .idleEvictSecs) { idleEvictSecs = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .osMemoryReserve) { osMemoryReserve = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .osReserveGiB) {
+            osReserveGiB = v
+        } else if try decoder.container(keyedBy: LegacyOsMemoryReserveKey.self)
+            .decodeIfPresent(Bool.self, forKey: .osMemoryReserve) == false
+        {
+            osReserveGiB = 0
+        }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .ssdStreaming) { ssdStreaming = v }
@@ -1123,9 +1142,13 @@ extension ServerOptions {
             title: "KV cache quantization",
             explainer: "A memory-for-speed trade, not a free upgrade: shrinks KV-cache RAM (8-bit ≈ 2× smaller, 4-bit ≈ 4×) but makes decode ~10% slower at typical contexts — and slower still on long ones, since every generated token pays a dequantize step. Turn on when memory is the constraint (long contexts or big models on a 16 GB Mac); leave OFF for maximum tokens/sec if you have plenty of RAM.",
             needsRestart: true),
+        "hotPrefixCacheEnabled": .init(
+            title: "Hot prefix cache",
+            explainer: "Keep completed KV prefixes in RAM for fastest repeated turns. Turn off to keep only the live request KV in memory; with SSD prefix cache enabled, prefixes still persist across turns and restarts and restore from disk.",
+            needsRestart: true),
         "prefixCacheEntries": .init(
             title: "Prefix cache entries",
-            explainer: "Hot prefix cache size: how many separate KV snapshots to keep across requests. Lets multi-turn chats skip re-prefilling shared system prompts. 0 disables. Auto-capped on RAM-limited Macs (a 16 GB Mac caps to 1) — on hybrid SSM models each entry pins large KV + state snapshots that can otherwise fill memory.",
+            explainer: "How many separate KV snapshots to retain in RAM while Hot prefix cache is on. Auto-capped on RAM-limited Macs; SSD persistence is controlled separately.",
             needsRestart: true),
         "prefixCacheMem": .init(
             title: "Prefix cache memory cap",
@@ -1156,9 +1179,9 @@ extension ServerOptions {
             title: "Unload idle models",
             explainer: "Free a model's memory once it has served nothing for this long; the next request reloads it. Off by default. Turn it on when something else needs the RAM between sessions. The trade is paid on the next request: a cold load (seconds to a minute for a large model) plus a full re-prefill of the conversation, and if the memory is gone by then the reload is refused and that request fails. A model with a request in flight is never evicted. Passes --idle-evict-secs.",
             needsRestart: true),
-        "osMemoryReserve": .init(
+        "osReserveGiB": .init(
             title: "Keep a memory reserve for macOS",
-            explainer: "The server leaves an eighth of your RAM (2 to 8 GB) out of its plans so macOS always has room. Turning this off gives models more context and admits more requests at once, but on a small Mac under heavy load it can freeze or restart the machine. Leave it on unless you know the load fits.",
+            explainer: "Free RAM the server leaves out of its plans so macOS always has room. Auto is an eighth of your RAM (2 to 8 GB). A smaller size, or Off, gives models more context and admits more requests at once, but on a small Mac under heavy load less reserve can freeze or restart the machine.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",

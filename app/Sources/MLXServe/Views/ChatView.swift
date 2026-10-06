@@ -50,6 +50,7 @@ struct ToolApprovalSheet: View {
         case "generate_image": return "Generate an image"
         case "generate_speech": return "Generate spoken audio"
         case "generate_music": return "Generate a music track"
+        case "generate_sound": return "Generate a sound effect"
         case "generate_video": return "Generate a video"
         default:           return "Run \(request.toolName)"
         }
@@ -238,6 +239,42 @@ private struct AttachmentPreviewRow: View {
             .background(Color.secondary.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 10))
             removeButton(remove)
+        }
+    }
+}
+
+/// A chat image decoded off-main once, not per bubble redraw.
+private struct AttachmentImageCell: View {
+    let image: ChatImage
+    @State private var decoded: NSImage?
+    @State private var undecodable = false
+
+    var body: some View {
+        Group {
+            if let decoded {
+                // `.fill`: the rounded corners clip the frame,
+                // so a letterboxed picture keeps square corners.
+                Image(nsImage: decoded)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: ChatImagePreview.displayWidth(for: decoded),
+                           height: ChatMetrics.attachmentHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(image) }
+                    .help("Double-click to open in Preview")
+            } else if !undecodable {
+                // Hold the row's height so the transcript does not jump.
+                Color.clear
+                    .frame(width: ChatMetrics.attachmentHeight,
+                           height: ChatMetrics.attachmentHeight)
+            }
+        }
+        .task(id: image.id) {
+            let loaded = await MediaImage.load(data: image.data,
+                                               id: image.id.uuidString,
+                                               maxPixel: 1536)
+            guard !Task.isCancelled else { return }
+            if let loaded { decoded = loaded } else { undecodable = true }
         }
     }
 }
@@ -555,6 +592,7 @@ struct ChatView: View {
         case .audio:   AudioGenView()
                            .environmentObject(appState.audioGen)
                            .environmentObject(appState.musicGen)
+                           .environmentObject(appState.soundGen)
         case .model3d: Model3DGenView().environmentObject(appState.model3dGen)
         }
     }
@@ -4578,17 +4616,8 @@ struct MessageBubble: View {
                                     .padding(.vertical, 8)
                                     .background(.quaternary.opacity(0.4))
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                            } else if let nsImage = NSImage(data: img.data) {
-                                // `.fill`: the rounded corners clip the frame,
-                                // so a letterboxed picture keeps square corners.
-                                Image(nsImage: nsImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
-                                           height: ChatMetrics.attachmentHeight)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
-                                    .help("Double-click to open in Preview")
+                            } else {
+                                AttachmentImageCell(image: img)
                             }
                         }
                     }

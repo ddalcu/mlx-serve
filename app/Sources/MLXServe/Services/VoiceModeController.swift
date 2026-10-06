@@ -151,6 +151,9 @@ final class VoiceModeController: ObservableObject {
     private var resumeListeningAfterPreview = false
     private var cancellables = Set<AnyCancellable>()
     private var isBound = false
+    private let voiceOptions: [VoiceOption]
+    private var recognitionLocaleIdentifier = SpeechLocale.reportingLocale(
+        preferredLanguages: Locale.preferredLanguages, fallback: .current).identifier
 
     private static let voiceDefaultsKey = "voiceModeVoiceId"
     /// Which assistant message we're currently voicing — when it changes (e.g. a
@@ -175,13 +178,16 @@ final class VoiceModeController: ObservableObject {
         self.loadingCue = loadingCue
         self.followUpTimer = followUpTimer
         self.chime = chime
+        self.voiceOptions = voices
         // Default ON: the tray assistant is hands-free and listens continuously,
         // so without a wake word it would answer ambient conversation. Setting it
         // in the initializer doesn't trip `didSet`, so this costs no UserDefaults
         // write on launch.
         self.requireWakeWord = (UserDefaults.standard.object(forKey: Self.wakeWordDefaultsKey) as? Bool) ?? true
         wire()
-        setUpVoices(voices)
+        let initialLocale = SpeechLocale.reportingLocale(
+            preferredLanguages: Locale.preferredLanguages, fallback: .current)
+        setUpVoices(locale: initialLocale)
     }
 
     /// Production wiring: the system synthesizer is wrapped in the voice-clone
@@ -326,12 +332,12 @@ final class VoiceModeController: ObservableObject {
     /// Build the picker list and choose the active voice: a persisted choice if it
     /// still exists, otherwise the highest-quality voice for the user's language
     /// (so we don't default to the robotic compact voice).
-    private func setUpVoices(_ all: [VoiceOption]) {
-        let prefix = Locale.current.language.languageCode?.identifier ?? "en"
-        availableVoices = VoiceCatalog.options(from: all, preferredLanguagePrefix: prefix)
+    private func setUpVoices(locale: Locale) {
+        let prefix = locale.language.languageCode?.identifier ?? "en"
+        availableVoices = VoiceCatalog.options(from: voiceOptions, preferredLanguagePrefix: prefix)
         let saved = UserDefaults.standard.string(forKey: Self.voiceDefaultsKey)
         let chosen = (saved != nil && availableVoices.contains { $0.id == saved }) ? saved
-            : VoiceCatalog.defaultVoiceId(from: all, preferredLanguagePrefix: prefix)
+            : VoiceCatalog.defaultVoiceId(from: voiceOptions, preferredLanguagePrefix: prefix)
         selectedVoiceId = chosen
         synthesizer.voiceIdentifier = chosen
     }
@@ -382,6 +388,8 @@ final class VoiceModeController: ObservableObject {
         // permission, on-device dictation model) and, if one is missing, surface
         // a precise notice in the panel instead of opening a dead mic. No modal.
         let snapshot = await recognizer.preflight()
+        recognitionLocaleIdentifier = snapshot.locale
+        setUpVoices(locale: Locale(identifier: snapshot.locale))
         if let issue = VoicePreflight.firstIssue(snapshot) {
             setupIssue = issue
             send(.failed(VoicePreflight.shortMessage(for: issue)))
@@ -418,7 +426,7 @@ final class VoiceModeController: ObservableObject {
         unrecognizedSpeechStreak += 1
         guard unrecognizedSpeechStreak >= Self.unrecognizedSpeechLimit else { return }
         end()
-        setupIssue = .dictationUnavailable(locale: Locale.current.identifier)
+        setupIssue = .dictationUnavailable(locale: recognitionLocaleIdentifier)
     }
 
     /// Close voice mode and release all audio resources.

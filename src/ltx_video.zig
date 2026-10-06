@@ -3311,7 +3311,7 @@ pub fn ditSampleCfg(
             tryEmitLtxPreview(p, alloc, win, win.base + @as(u32, @intCast(i + 1)), total, x0.v, s);
             // Client hung up (progress write failed) → stop burning GPU on a
             // video nobody will receive; the queued next request unblocks.
-            if (p.cancelled()) {
+            if (p.boundary()) {
                 if (owned) {
                     _ = mlx.mlx_array_free(vx);
                     _ = mlx.mlx_array_free(ax);
@@ -3692,7 +3692,7 @@ pub fn ditSampleRes2s(
             // d2.v is the second-stage x0 prediction (the later, refined one).
             tryEmitLtxPreview(p, alloc, win, win.base + @as(u32, @intCast(step + 1)), total, d2.v, s);
             // vx/ax are released by the function's errdefers.
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
         }
     }
 

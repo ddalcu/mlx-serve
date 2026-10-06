@@ -35,7 +35,7 @@ enum AgentSkills {
     /// reads `skills.paths` from its inline config instead.
     static func linkPath(agentId: String) -> String? {
         switch agentId {
-        case "pi", "omp", "codex", "hermes": return "\(agentId)/skills/\(name)"
+        case "pi", "omp", "codex", "hermes", "grok": return "\(agentId)/skills/\(name)"
         case "claude": return "\(claudePluginDir)/skills/\(name)"
         default: return nil
         }

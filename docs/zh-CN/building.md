@@ -9,7 +9,7 @@
 - macOS 26.2+ 与 Apple Silicon（M1/M2/M3/M4/M5）—— 内置的 MLX 以 deployment target 26.2 构建，因此 M5 神经加速器（NAX）kernel 是启用状态随包的
 - Xcode 26.2+ 与 Metal Toolchain 组件 —— mlx + mlx-c 是由 `scripts/build-mlx.sh` 编译的固定子模块，不是 brew 包，所以 brew bottle 静默省略的那些 NAX kernel 都被包含进来。Xcode 26 把 Metal 编译器作为单独的下载项发布，因此如果 `xcrun -sdk macosx metal --version` 失败，先运行 `xcodebuild -downloadComponent MetalToolchain`
 - cmake 与 libwebp：在仓库根目录执行 `brew bundle install --file=Brewfile`。cmake 构建 mlx 子模块，webp 在视觉流水线中解码图像（`webp >= 1.6.0`，构建时检查）
-- [Zig 0.17 nightly](https://ziglang.org/download/) —— 由 `./scripts/fetch-zig.sh` 自动落到 `.zig-toolchain/`
+- [Zig 0.17](https://ziglang.org/download/) —— 由 `./scripts/fetch-zig.sh` 自动落到 `.zig-toolchain/`
 
 ## 应用 + 服务器
 
@@ -22,12 +22,12 @@ brew bundle install --file=Brewfile
 open "app/MLX-Serve.app"
 ```
 
-`app/build.sh` 会把固定子模块拉回各自的 commit，落位 llama.cpp 与 Zig nightly，在断言 NAX kernel 的前提下构建 mlx + mlx-c，编译 Swift 应用与 Zig 服务器，然后打包并签名。环境里没有签名身份时，它做 ad-hoc 签名并跳过公证，因此不需要 Apple 开发者账号。版本由 `.github/workflows/release.yml` 发布。
+`app/build.sh` 会把固定子模块拉回各自的 commit，落位 llama.cpp 与 Zig，在断言 NAX kernel 的前提下构建 mlx + mlx-c，编译 Swift 应用与 Zig 服务器，然后打包并签名。环境里没有签名身份时，它做 ad-hoc 签名并跳过公证，因此不需要 Apple 开发者账号。版本由 `.github/workflows/release.yml` 发布。
 
 ## 只构建服务器
 
 ```bash
-./scripts/fetch-zig.sh                               # 把固定的 nightly 落位到 .zig-toolchain/
+./scripts/fetch-zig.sh                               # 把固定的 Zig 落位到 .zig-toolchain/
 export PATH="$PWD/.zig-toolchain:$PATH"
 ./scripts/fetch-llama.sh && ./scripts/build-mlx.sh   # 执行一次，之后每次更新 pin 时再执行
 zig build -Doptimize=ReleaseFast                     # 始终用 ReleaseFast；Debug 慢 2-4 倍

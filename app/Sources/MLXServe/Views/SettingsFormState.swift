@@ -13,6 +13,13 @@ final class SettingsFormState: ObservableObject {
     /// (a trailing comma included); the entry holds the parsed ids.
     @Published var providerModelText: [UUID: String] = [:]
 
+    /// Removes one provider row and its field text. Takes the id, not a row binding: the
+    /// binding reads by index, which the removal itself invalidates.
+    func removeProvider(id: UUID) {
+        providerEntries.removeAll { $0.id == id }
+        providerModelText[id] = nil
+    }
+
     /// Port field text. Nil until the field has been seen — an empty string is
     /// a state the field allows (nothing is committed from it).
     @Published var portText: String?

@@ -33,6 +33,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
     // duration). One overloaded tool makes a small local model guess.
     case generateSpeech = "generate_speech"
     case generateMusic = "generate_music"
+    case generateSound = "generate_sound"
     case generateVideo = "generate_video"
 
     var icon: String {
@@ -55,6 +56,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         case .generateImage: "photo"
         case .generateSpeech: "waveform"
         case .generateMusic: "music.note"
+        case .generateSound: "speaker.wave.3"
         case .generateVideo: "film"
         }
     }
@@ -79,6 +81,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         case .generateImage: "Generate Image"
         case .generateSpeech: "Generate Speech"
         case .generateMusic: "Generate Music"
+        case .generateSound: "Generate Sound Effect"
         case .generateVideo: "Generate Video"
         }
     }
@@ -124,7 +127,7 @@ enum AgentToolGroup: String, CaseIterable, Sendable {
         case .files: [.readFile, .writeFile, .editFile, .searchFiles, .listFiles, .cwd]
         case .shell: [.shell, .listProcesses, .readProcessOutput, .killProcess]
         case .web: [.browse, .webSearch]
-        case .media: [.generateImage, .generateSpeech, .generateMusic, .generateVideo]
+        case .media: [.generateImage, .generateSpeech, .generateMusic, .generateSound, .generateVideo]
         case .knowledge: [.saveMemory, .createTask]
         }
     }

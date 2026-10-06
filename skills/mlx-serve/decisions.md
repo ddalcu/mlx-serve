@@ -1,4 +1,4 @@
-# mlx-serve decisions (Laya, Kev): `POST /v1/decisions`
+# mlx-serve decisions (Laya, Kev, Clef): `POST /v1/decisions`
 
 A decision model (capability `decisions`) answers typed questions about a STATE
 with probabilities instead of free text. Use it for game logic an LLM is too
@@ -6,7 +6,7 @@ slow or too unpredictable for: NPC intent, dialogue routing, moderation, "is
 the player stuck", "which quest fits this situation", difficulty scoring. It
 never generates text; pair it with a chat model when you also need words.
 
-Two families take the same request:
+Three families share this endpoint (also available as `POST /v1/systemone`):
 
 - **Laya** (model type `laya`, ~0.35 GB): a few milliseconds per request.
   Pick it when you call often and speed matters most.
@@ -14,6 +14,8 @@ Two families take the same request:
   and often more accurate on nuanced text (on one 2,394-headline news-labeling
   test: Laya 55%, Kev-4B 79%). Pick it when getting the answer right matters
   more than speed.
+- **Clef / Clef-Flash** (model type `clef`): jointly score all questions over
+  text and optional images. MLX 4-bit and 8-bit packs are supported.
 
 `GET /v1/models` shows which one a model is in `meta.architecture`; use whichever is installed.
 
@@ -43,11 +45,16 @@ Two families take the same request:
   - `noul`: yes/no. Optional `criteria: {"false": "...", "true": "..."}`
     describing each side.
   - `choice`: pick one label. `criteria` is a list of unique labels, or an
-    object `{label: description}` (descriptions improve accuracy).
+    object `{label: description}` (descriptions improve accuracy). Clef requires
+    the object form; use `null` for labels without descriptions.
   - `score`: ordinal scale. `criteria` is a list from low to high; items may be
     strings or objects.
 - `instructions`: the question, in plain words. Required for Laya; Kev
-  accepts a question without it, but always send it.
+  and Clef accept a question without it, but always send it.
+- Clef accepts `images`, an array of base64 strings or image data URLs (up to
+  16). Remote image URLs, videos and `media_kwargs` are rejected. Its context
+  limit is 16,384 tokens: the state is truncated by default, preserving the
+  schema. Set `truncate: false` to reject an oversized state instead.
 
 ## Response
 
@@ -70,7 +77,7 @@ Two families take the same request:
   its probability that the answer is safe to act on rather than escalate. Gate
   game behavior on them: act above a threshold you tune, fall back to a default
   below it.
-- Kev answers have no `action`, and its `noul` answers no `confidence`; gate
+- Kev and Clef answers have no `action`, and their `noul` answers no `confidence`; gate
   on the probability itself (`noul`, or the chosen label's probability).
 - The numbers are illustrative; always read them from the response.
 

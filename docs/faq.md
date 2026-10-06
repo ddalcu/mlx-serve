@@ -42,7 +42,7 @@ Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-
 
 ## Can mlx-serve run Tencent's Hunyuan 3 (295B) locally?
 
-Yes — the largest open model mlx-serve runs. The 2-bit mixed-precision build (`mlx-serve run hy3`, ~105 GB on disk) decodes at ~26 tok/s with ~235 tok/s prefill on an M4 Max, with thinking, tool calling, and all four API surfaces working. It's recommended for Macs with **more than 128 GB** of unified memory; on a 128 GB Mac it loads and answers correctly, but only a minimal context window (~3K tokens) fits beside the weights — fine for short chats, tight for agent work. The checkpoint's native multi-token-prediction head is supported too (`enable_mtp: true` per request, best with `--mtp-depth 1`).
+Yes — the largest open model mlx-serve runs. The 2-bit mixed-precision build (`mlx-serve run hy3`, ~105 GB on disk) decodes at ~26 tok/s with ~235 tok/s prefill on an M4 Max, with thinking, tool calling, and all four API surfaces working. It's recommended for Macs with **more than 128 GB** of unified memory; on a 128 GB Mac it loads and answers correctly, but only a minimal context window (~3K tokens) fits beside the weights — fine for short chats, tight for agent work. The checkpoint's native multi-token-prediction head is supported too (`enable_mtp: true` per request, best with `--mtp-max-depth 1`).
 
 ## How does it compare to MTPLX for Qwen MTP models?
 
@@ -76,4 +76,4 @@ Nowhere off your machines. Everything runs locally — no analytics, no telemetr
 
 ## How do I update?
 
-The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew upgrade --cask mlx-core` or `brew upgrade mlx-serve`.
+The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew upgrade --cask mlx-serve` or `brew upgrade mlx-serve`.

@@ -2,9 +2,10 @@
 // Live metrics panel — the markup AND the polling logic in one file. The panel
 // is injected into the `#mlx-metrics` mount on the index page (only present when
 // the server ran with --metrics), then this polls the open /metrics.json feed
-// once a second. Everything here is NON-PERSISTED: the sparkline history lives
-// only in these JS ring buffers, derived live from the counters/histograms the
-// server already exposes (no server-side time series is stored).
+// once a second. The server keeps no time series: the history below the live
+// tiles is held in this browser (IndexedDB, else localStorage, else memory) and
+// every rate in it is a delta of the cumulative counters, as Prometheus computes
+// rate().
 //
 // Decode & prefill "tok/s" are ACTIVE speeds — Δtokens ÷ Δ(phase time) over a
 // trailing window. The phase-time sums (decode_time_seconds / prefill_time_
@@ -27,6 +28,9 @@ function panelAt(now, samples, winMs) {
   for (const x of samples) { if (now - x.t >= winMs) s = x; else break; }
   return s;
 }
+
+// `apiPrefix` (the mount the page was served under) comes from `api.js`, the
+// boot script that this panel's own script is rendered after.
 
 function computeRates(now, samples, c, g, psum) {
   const liveTok = (g.generation_tokens_live != null) ? g.generation_tokens_live : c.generation_tokens_total;
@@ -78,9 +82,271 @@ function computeRates(now, samples, c, g, psum) {
   return { decodeTps, prefillTps, avgPrefillTps, reqRate, prefilling, liveTok, livePre };
 }
 
+// ── Browser-held history ─────────────────────────────────────────────────────
+//
+// A history document is {samples, rows}. A sample is {t, p, m, c}: its time
+// (whole seconds, so two tabs polling the same second agree on the key), the
+// server's process start time or null, the one model with an active session or
+// null, and the cumulative counters. Everything below is pure except the
+// storage functions, which take their environment as an argument.
+
+const HISTORY_KEYS = [
+  'requests_success_total', 'requests_failed_total', 'requests_rejected_total',
+  'requests_cancelled_total', 'prompt_tokens_total', 'prefill_tokens_total',
+  'generation_tokens_total', 'prefix_cache_queries_total', 'prefix_cache_hits_total',
+  'prefix_cache_tokens_total',
+];
+const RAW_MS = 3600000;          // samples newer than this are kept as polled
+const KEEP_MS = 86400000;        // nothing older than this is kept
+const BUCKET_MS = 60000;         // older samples are thinned to one per minute
+const GAP_MS = 300000;           // two samples further apart than this share no rate
+const MAX_ROWS = 200;
+const ROW_JOIN_MS = 2000;        // tabs see a request open up to a second apart
+
+const finite = (v) => typeof v === 'number' && Number.isFinite(v);
+
+function activeModel(sessions) {
+  const live = new Set();
+  for (const s of Array.isArray(sessions) ? sessions : []) {
+    if (s && s.phase !== 'cached' && typeof s.model === 'string') live.add(s.model);
+  }
+  return live.size === 1 ? [...live][0] : null;
+}
+
+function makeSample(now, d) {
+  const c = (d && d.counters) || {};
+  const g = (d && d.gauges) || {};
+  const out = {
+    t: Math.floor(now / 1000) * 1000,
+    p: finite(g.process_start_time_seconds) ? g.process_start_time_seconds : null,
+    m: activeModel(d && d.sessions),
+    c: {},
+  };
+  for (const k of HISTORY_KEYS) out.c[k] = c[k];
+  return out;
+}
+
+// A new process start time, or any counter going down, means the server restarted.
+function resetBetween(a, b) {
+  if (a.p !== null && b.p !== null && a.p !== b.p) return true;
+  return HISTORY_KEYS.some((k) => b.c[k] < a.c[k]);
+}
+
+const noRate = (a, b) => b.t - a.t > GAP_MS || resetBetween(a, b);
+
+function compact(samples, now) {
+  const latest = now === undefined ? (samples.length ? samples[samples.length - 1].t : 0) : now;
+  const rawFrom = latest - RAW_MS, keepFrom = latest - KEEP_MS;
+  const out = [];
+  let lastBucket = null;
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    if (s.t < keepFrom) continue;
+    const bucket = Math.floor(s.t / BUCKET_MS);
+    const edge = (i > 0 && resetBetween(samples[i - 1], s)) ||
+      (i + 1 < samples.length && resetBetween(s, samples[i + 1]));
+    if (s.t >= rawFrom || bucket !== lastBucket || edge) out.push(s);
+    lastBucket = bucket;
+  }
+  return out;
+}
+
+function mergeStores(a, b, now) {
+  const all = a.concat(b).sort((x, y) => x.t - y.t);
+  const uniq = [];
+  for (const s of all) if (!uniq.length || uniq[uniq.length - 1].t !== s.t) uniq.push(s);
+  return compact(uniq, now);
+}
+
+function appendSample(store, sample, now) {
+  const at = now === undefined ? sample.t : now;
+  if (!store.length || sample.t > store[store.length - 1].t) return compact(store.concat([sample]), at);
+  return mergeStores(store, [sample], at);
+}
+
+// Consecutive sample pairs ending inside (fromT, toT]; `gap` marks the pairs a
+// rate must not span.
+function pairsIn(store, fromT, toT) {
+  const out = [];
+  for (let i = 1; i < store.length; i++) {
+    const a = store[i - 1], b = store[i];
+    if (b.t > fromT && b.t <= toT) out.push({ a, b, dt: (b.t - a.t) / 1000, gap: noRate(a, b) });
+  }
+  return out;
+}
+
+// Delta per second over the trailing window, from the current process only.
+function rateOver(store, key, windowMs, now) {
+  const inWin = store.filter((s) => s.t >= now - windowMs && s.t <= now);
+  let start = inWin.length - 1;
+  while (start > 0 && !noRate(inWin[start - 1], inWin[start])) start--;
+  const reset = start > 0;
+  if (inWin.length - start < 2) return { rate: null, reset };
+  const first = inWin[start], last = inWin[inWin.length - 1];
+  return { rate: (last.c[key] - first.c[key]) / ((last.t - first.t) / 1000), reset };
+}
+
+// n buckets across (fromT, toT]; null where there is no data or the server restarted.
+function rateSeries(store, key, fromT, toT, n) {
+  const step = (toT - fromT) / n;
+  const num = new Array(n).fill(0), den = new Array(n).fill(0), cut = new Array(n).fill(false);
+  for (const { a, b, dt, gap } of pairsIn(store, fromT, toT)) {
+    const i = Math.min(n - 1, Math.max(0, Math.ceil((b.t - fromT) / step) - 1));
+    if (gap) { cut[i] = resetBetween(a, b) || cut[i]; continue; }
+    num[i] += b.c[key] - a.c[key];
+    den[i] += dt;
+  }
+  return num.map((v, i) => (cut[i] || den[i] === 0 ? null : v / den[i]));
+}
+
+function sumDeltas(store, fromT, toT, bucketOf) {
+  const out = {};
+  for (const { a, b, gap } of pairsIn(store, fromT, toT)) {
+    if (gap) continue;
+    const name = bucketOf(a, b);
+    const into = out[name] || (out[name] = Object.fromEntries(HISTORY_KEYS.map((k) => [k, 0])));
+    for (const k of HISTORY_KEYS) into[k] += b.c[k] - a.c[k];
+  }
+  return out;
+}
+
+function windowTotals(store, fromT, toT) {
+  return sumDeltas(store, fromT, toT, () => 'all').all ||
+    Object.fromEntries(HISTORY_KEYS.map((k) => [k, 0]));
+}
+
+// A delta belongs to the model whose session was live at the start of the
+// interval, since a counter only moves after the session has left the list.
+function modelTotals(store, fromT, toT) {
+  return sumDeltas(store, fromT, toT, (a, b) => a.m || b.m || '');
+}
+
+// ── Request table ────────────────────────────────────────────────────────────
+
+function mkRow(r) {
+  const n = (v) => (finite(v) ? v : 0);
+  return {
+    key: String(r.key), id: finite(r.id) ? r.id : null,
+    client: typeof r.client === 'string' && r.client ? r.client : null,
+    model: typeof r.model === 'string' ? r.model : '',
+    phase: typeof r.phase === 'string' ? r.phase : '',
+    startT: r.startT, endT: finite(r.endT) ? r.endT : null, lastT: finite(r.lastT) ? r.lastT : r.startT,
+    ctx: n(r.ctx), ctxLen: n(r.ctxLen), cached: n(r.cached), generated: n(r.generated),
+  };
+}
+
+const requestKey = (s) => 'r' + s.request_id;
+
+function capClosed(rows) {
+  const closed = rows.filter((r) => r.endT !== null);
+  const drop = new Set(closed.slice(0, Math.max(0, closed.length - MAX_ROWS)));
+  return rows.filter((r) => !drop.has(r));
+}
+
+// A row opens when its session appears and closes when it leaves.
+function trackRequests(rows, sessions, now) {
+  const out = rows.map((r) => Object.assign({}, r));
+  const seen = new Set();
+  for (const s of Array.isArray(sessions) ? sessions : []) {
+    if (!s || s.phase === 'cached') continue;
+    const key = requestKey(s);
+    seen.add(key);
+    let row = out.find((r) => r.endT === null && r.key === key);
+    if (!row) { row = mkRow({ key, id: s.request_id, client: s.client, model: s.model, startT: now }); out.push(row); }
+    Object.assign(row, {
+      phase: s.phase, lastT: now, ctx: s.context_tokens || 0, ctxLen: s.context_length || 0,
+      cached: s.cached_tokens || 0, generated: s.generated_tokens || 0,
+    });
+  }
+  for (const r of out) if (r.endT === null && !seen.has(r.key)) r.endT = now;
+  return capClosed(out);
+}
+
+function mergeRows(a, b) {
+  const out = [];
+  for (const r of a.concat(b).sort((x, y) => x.startT - y.startT)) {
+    const twin = out.find((o) => o.key === r.key && Math.abs(o.startT - r.startT) <= ROW_JOIN_MS);
+    if (!twin) { out.push(mkRow(r)); continue; }
+    twin.endT = twin.endT === null || r.endT === null ? (twin.endT ?? r.endT) : Math.max(twin.endT, r.endT);
+    if (r.lastT > twin.lastT) {
+      Object.assign(twin, { phase: r.phase, lastT: r.lastT, ctx: r.ctx, ctxLen: r.ctxLen, cached: r.cached, generated: r.generated });
+    }
+  }
+  return capClosed(out);
+}
+
+// ── Persistence ──────────────────────────────────────────────────────────────
+//
+// Every read and write is best effort: a store that throws, is missing, or
+// holds something unreadable is an empty history, never an error in the panel.
+
+const DB_NAME = 'mlx-serve-monitor', DB_STORE = 'kv', DB_KEY = 'history', LS_KEY = 'mlx-serve-history';
+const emptyDoc = () => ({ samples: [], rows: [] });
+
+function sanitizeDoc(raw) {
+  if (!raw || typeof raw !== 'object') return emptyDoc();
+  const samples = [];
+  for (const s of Array.isArray(raw.samples) ? raw.samples : []) {
+    if (!s || !finite(s.t) || !s.c || typeof s.c !== 'object') continue;
+    const c = {};
+    for (const k of HISTORY_KEYS) c[k] = finite(s.c[k]) ? s.c[k] : 0;
+    samples.push({ t: s.t, p: finite(s.p) ? s.p : null, m: typeof s.m === 'string' ? s.m : null, c });
+  }
+  const rows = (Array.isArray(raw.rows) ? raw.rows : [])
+    .filter((r) => r && typeof r.key === 'string' && finite(r.startT)).map(mkRow);
+  return { samples: mergeStores(samples, []), rows };
+}
+
+function idbRun(idb, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const open = idb.open(DB_NAME, 1);
+    open.onupgradeneeded = () => open.result.createObjectStore(DB_STORE);
+    open.onerror = () => reject(open.error || new Error('indexedDB open failed'));
+    open.onsuccess = () => {
+      const db = open.result;
+      try {
+        const tx = db.transaction(DB_STORE, mode);
+        const req = fn(tx.objectStore(DB_STORE));
+        const fin = (v) => { try { db.close(); } catch (e) { /* closing is best effort */ } resolve(v); };
+        if (mode === 'readonly') req.onsuccess = () => fin(req.result);
+        else tx.oncomplete = () => fin();
+        req.onerror = tx.onerror = tx.onabort = () => reject(new Error('indexedDB transaction failed'));
+      } catch (e) { reject(e); }
+    };
+  });
+}
+
+async function loadDoc(env) {
+  let raw;
+  try { raw = await idbRun(env.indexedDB, 'readonly', (st) => st.get(DB_KEY)); } catch (e) { raw = undefined; }
+  if (raw === undefined) {
+    try { raw = JSON.parse(env.localStorage.getItem(LS_KEY)); } catch (e) { raw = null; }
+  }
+  try { return sanitizeDoc(raw); } catch (e) { return emptyDoc(); }
+}
+
+// Resolves to where the history landed: 'indexedDB', 'localStorage' or 'memory'.
+async function saveDoc(env, doc) {
+  try { await idbRun(env.indexedDB, 'readwrite', (st) => st.put(doc, DB_KEY)); return 'indexedDB'; } catch (e) { /* next backend */ }
+  try { env.localStorage.setItem(LS_KEY, JSON.stringify(doc)); return 'localStorage'; } catch (e) { /* next backend */ }
+  return 'memory';
+}
+
+const mergeDocs = (a, b, now) => ({ samples: mergeStores(a.samples, b.samples, now), rows: mergeRows(a.rows, b.rows) });
+
+// Folds in what another tab saved before writing, so tabs add to one history.
+async function persistDoc(env, doc, now) {
+  const merged = mergeDocs(await loadDoc(env), doc, now);
+  merged.where = await saveDoc(env, { samples: merged.samples, rows: merged.rows });
+  return merged;
+}
+
 // Node (tests) sees no `document`; the browser sees no `globalThis.__mlxPanel`
 // consumer. Either way the IIFE below only runs in a real page.
-if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt };
+if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = {
+  computeRates, panelAt, makeSample, appendSample, mergeStores, rateOver, rateSeries, windowTotals,
+  modelTotals, trackRequests, loadDoc, saveDoc, persistDoc, mergeDocs, HISTORY_KEYS, apiPrefix,
+};
 
 if (typeof document !== 'undefined') (function () {
   // Panel markup, injected into the page. A template literal, so the CSS/HTML
@@ -118,7 +384,17 @@ if (typeof document !== 'undefined') (function () {
 :root[data-theme=light] #m-status{background:#ececf0;color:#5b616b}
 :root[data-theme=light] #m-status.live{background:#e3f5ee;color:#0f7b5f}
 :root[data-theme=light] #m-status.err{background:#fdeceb;color:#b3261e}
-.msess{margin-top:12px}
+.mwin{display:flex;gap:6px;margin-left:auto}
+.mwin button{font:inherit;font-size:0.6875rem;padding:2px 9px;border-radius:999px;border:1px solid #1f242c;background:transparent;color:#7d8794;cursor:pointer}
+.mwin button.on{background:#1a1e25;color:#e6e9ee}
+.mhist{margin-top:16px}
+.mhist .mhead{margin:0 0 10px}
+.mhist .mnote{font-size:0.6875rem;color:#5b6470;margin-top:8px}
+.mtot{font-size:0.75rem;color:#7d8794;margin-top:10px}
+:root[data-theme=light] .mwin button{border-color:#e1e2e6;color:#5b616b}
+:root[data-theme=light] .mwin button.on{background:#ececf0;color:#1e1f22}
+:root[data-theme=light] .mhist .mnote{color:#878d96}
+.msess{margin-top:12px;overflow-x:auto}
 .msess table{width:100%;border-collapse:collapse;font-size:0.75rem}
 .msess th{text-align:left;font-weight:600;font-size:0.625rem;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;padding:0 8px 6px 0}
 .msess td{padding:6px 8px 6px 0;border-top:1px solid #1f242c;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee;white-space:nowrap}
@@ -145,6 +421,22 @@ if (typeof document !== 'undefined') (function () {
 <div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Prefill tok/s · last 60s">Prefill tok/s · last 60s</span><span class=msparkval id=m-spark-prefill-val>—</span></div><svg id=m-spark-prefill viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
 </div>
 <div class="msparkbox msess"><div class=mlbl data-i18n="Sessions">Sessions</div><div id=m-sessions></div></div>
+</div>
+<div class=mhist>
+<div class=mhead><h2 style="margin:0" data-i18n="History">History</h2><div class=mwin id=m-win><button data-win=3600000 class=on data-i18n="1 hour">1 hour</button><button data-win=21600000 data-i18n="6 hours">6 hours</button><button data-win=86400000 data-i18n="24 hours">24 hours</button></div></div>
+<div class=mspark>
+<div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Generated tok/s">Generated tok/s</span><span class=msparkval id=m-h-gen-val>—</span></div><svg id=m-h-gen viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
+<div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Prefill tok/s">Prefill tok/s</span><span class=msparkval id=m-h-pre-val>—</span></div><svg id=m-h-pre viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
+<div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Requests / min">Requests / min</span><span class=msparkval id=m-h-req-val>—</span></div><svg id=m-h-req viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
+<div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Failed + rejected + cancelled / min">Failed + rejected + cancelled / min</span><span class=msparkval id=m-h-bad-val>—</span></div><svg id=m-h-bad viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
+</div>
+<div class=mtot id=m-h-tot></div>
+<div class=mtot id=m-h-since></div>
+<div class="msparkbox msess"><div class=mlbl data-i18n="By model">By model</div><div id=m-h-models></div></div>
+<div class="msparkbox msess"><div class=mlbl data-i18n="Request history">Request history</div><div id=m-h-rows></div></div>
+<div class=mnote data-i18n="Requests shorter than one poll (1 s) appear only in the totals. Gaps in a chart mean the server restarted or was unreachable.">Requests shorter than one poll (1 s) appear only in the totals. Gaps in a chart mean the server restarted or was unreachable.</div>
+<div class=mnote id=m-h-where></div>
+</div>
 </div>`;
 
   // The panel brings its own markup, so the language boot cannot know about it:
@@ -291,12 +583,128 @@ if (typeof document !== 'undefined') (function () {
     box.appendChild(table);
   }
 
+  // ── History view ───────────────────────────────────────────────────────────
+  let doc = { samples: [], rows: [] };
+  let winMs = 3600000, storedIn = null;
+  const HIST_N = 60;
+
+  // Draws a series with gaps: a null breaks the line.
+  function drawSeries(id, vals, color, valId, scale, dec) {
+    const svg = $(id), label = $(valId);
+    if (!svg) return;
+    const W = 300, H = 44, p = 3, n = vals.length;
+    const max = Math.max.apply(null, vals.map((v) => (v === null ? 0 : v * scale)).concat([0.001]));
+    let m = '<line class=mbase x1="' + p + '" y1="' + (H - 1) + '" x2="' + (W - p) + '" y2="' + (H - 1) + '" stroke="#1f242c" stroke-width="1"/>';
+    let run = '', last = null;
+    const flush = () => { if (run) m += '<polyline points="' + run + '" fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linejoin="round"/>'; run = ''; };
+    for (let i = 0; i < n; i++) {
+      if (vals[i] === null) { flush(); continue; }
+      last = vals[i] * scale;
+      const x = p + (i / Math.max(1, n - 1)) * (W - 2 * p), y = H - p - (last / max) * (H - 2 * p);
+      run += (run ? ' ' : '') + x.toFixed(1) + ',' + y.toFixed(1);
+    }
+    flush();
+    svg.innerHTML = m;
+    if (label) label.textContent = last === null ? '—' : fmt(last, dec);
+  }
+
+  function renderHistoryTable(box, heads, rows, emptyKey) {
+    box.textContent = '';
+    if (!rows.length) {
+      const e = document.createElement('div');
+      e.className = 'mempty';
+      e.textContent = t(emptyKey);
+      box.appendChild(e);
+      return;
+    }
+    const table = document.createElement('table');
+    const head = table.insertRow();
+    for (const h of heads) { const th = document.createElement('th'); th.textContent = t(h); head.appendChild(th); }
+    for (const cells of rows) {
+      const tr = table.insertRow();
+      cells.forEach((txt, i) => { const td = tr.insertCell(); td.textContent = txt; if (heads[i] === 'Model') td.className = 'mmodel'; });
+    }
+    box.appendChild(table);
+  }
+
+  const clock = (ts) => new Date(ts).toLocaleTimeString();
+  const secs = (ms) => (ms < 60000 ? Math.max(1, Math.round(ms / 1000)) + ' s' : Math.round(ms / 60000) + ' min');
+
+  function renderHistory(now) {
+    const from = now - winMs, st = doc.samples;
+    const gen = rateSeries(st, 'generation_tokens_total', from, now, HIST_N);
+    const pre = rateSeries(st, 'prefill_tokens_total', from, now, HIST_N);
+    const req = rateSeries(st, 'requests_success_total', from, now, HIST_N);
+    const bad = ['requests_failed_total', 'requests_rejected_total', 'requests_cancelled_total']
+      .map((k) => rateSeries(st, k, from, now, HIST_N))
+      .reduce((a, b) => a.map((v, i) => (v === null || b[i] === null ? null : v + b[i])));
+    drawSeries('m-h-gen', gen, '#22c55e', 'm-h-gen-val', 1, 1);
+    drawSeries('m-h-pre', pre, '#3b82f6', 'm-h-pre-val', 1, 0);
+    drawSeries('m-h-req', req, '#a78bfa', 'm-h-req-val', 60, 1);
+    drawSeries('m-h-bad', bad, '#ef4444', 'm-h-bad-val', 60, 1);
+
+    const w = windowTotals(st, from, now);
+    setVal('m-h-tot', t('In this window: %@ ok · %@ failed · %@ rejected · %@ cancelled',
+      [w.requests_success_total, w.requests_failed_total, w.requests_rejected_total, w.requests_cancelled_total]));
+    const last = st.length ? st[st.length - 1].c : null;
+    setVal('m-h-since', last ? t('Since startup: %@ ok · %@ failed · %@ rejected · %@ cancelled',
+      [last.requests_success_total, last.requests_failed_total, last.requests_rejected_total, last.requests_cancelled_total]) : '');
+
+    const mt = modelTotals(st, from, now);
+    const names = Object.keys(mt).sort();
+    renderHistoryTable($('m-h-models'), ['Model', 'Requests', 'Generated', 'Prefill'],
+      names.map((n) => [n || t('unattributed'), fmt(mt[n].requests_success_total, 0), fmt(mt[n].generation_tokens_total, 0), fmt(mt[n].prefill_tokens_total, 0)]),
+      'No requests yet');
+
+    const rows = doc.rows.slice().reverse().slice(0, 50);
+    renderHistoryTable($('m-h-rows'), ['Started', 'Client', 'Model', 'Phase', 'Duration', 'Context', 'Cached', 'Generated'],
+      rows.map((r) => [clock(r.startT), r.client, r.model,
+        r.endT === null ? t({ prefill: 'prefilling', decode: 'decoding' }[r.phase] || r.phase) : t('finished'),
+        secs((r.endT === null ? now : r.endT) - r.startT), fmt(r.ctx, 0), fmt(r.cached, 0), fmt(r.generated, 0)]),
+      'No requests yet');
+
+    const where = $('m-h-where');
+    if (where && storedIn) {
+      where.removeAttribute('data-i18n');
+      where.textContent = storedIn === 'memory'
+        ? t('History is kept in memory only and is lost on reload.')
+        : t('History is kept in this browser (%@).', [storedIn]);
+    }
+  }
+
+  let lastSave = 0, saving = false;
+  async function save(now) {
+    if (saving) return;
+    saving = true;
+    try {
+      const merged = await persistDoc(window, doc, now);
+      storedIn = merged.where;
+      doc = { samples: mergeStores(doc.samples, merged.samples, now), rows: mergeRows(doc.rows, merged.rows) };
+    } catch (e) { storedIn = 'memory'; }
+    saving = false;
+    lastSave = now;
+  }
+
+  const winBox = $('m-win');
+  if (winBox) winBox.addEventListener('click', function (e) {
+    const b = e.target.closest('button[data-win]');
+    if (!b) return;
+    winMs = Number(b.getAttribute('data-win'));
+    for (const x of winBox.querySelectorAll('button')) x.className = x === b ? 'on' : '';
+    renderHistory(Date.now());
+  });
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') save(Date.now()); });
+  loadDoc(window).then(function (stored) {
+    doc = mergeDocs(stored, doc, Date.now());
+    renderHistory(Date.now());
+  });
+
   const histSum = (hist) => (hist && typeof hist.sum === 'number') ? hist.sum : 0;
 
   async function tick() {
     let d;
     try {
-      const r = await fetch('/metrics.json', { cache: 'no-store' });
+      const r = await fetch(apiPrefix(location.pathname) + '/metrics.json', { cache: 'no-store' });
       if (r.status === 503) { setStatus('err', t('metrics disabled')); return; }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       d = await r.json();
@@ -375,6 +783,14 @@ if (typeof document !== 'undefined') (function () {
     spark('m-spark-decode', decodeHist, '#22c55e', 'm-spark-decode-val', 'decode', 1);
     spark('m-spark-prefill', prefillHist, '#3b82f6', 'm-spark-prefill-val', 'prefill', 0);
     renderSessions(d.sessions);
+
+    const sample = makeSample(now, d);
+    doc = {
+      samples: appendSample(doc.samples, sample, now),
+      rows: trackRequests(doc.rows, d.sessions, sample.t),
+    };
+    renderHistory(now);
+    if (now - lastSave >= 15000) save(now);
   }
 
   attachSparkHover('m-spark-decode', 'decode', function () { return decodeHist; }, '#22c55e', 'm-spark-decode-val', 1);

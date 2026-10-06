@@ -1512,6 +1512,50 @@ struct MusicModelPreset: Identifiable, Hashable {
     static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit]
 }
 
+/// Text-to-audio checkpoints (Stable Audio 3), served on
+/// `/v1/audio/sound-generations`. The official repo loads as published: no
+/// converter, no `config.json` (the server classifies `model_config.json`).
+struct SoundModelPreset: Identifiable, Hashable {
+    var id: String
+    var name: String
+    var repo: String
+    let approxRAMGB: Int
+    let approxDownloadGB: Double
+    let description: String
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    /// The server's bounds: (0, 120] seconds (the small models' longest
+    /// generation), 1–50 sampler steps, 8 by default (the distilled schedule).
+    var durationRange: ClosedRange<Double> { 0.5...120 }
+    var stepsRange: ClosedRange<Int> { 1...50 }
+    var defaultSteps: Int { 8 }
+
+    static let stableAudio3SmallSFX = SoundModelPreset(
+        id: "stable-audio-3-small-sfx",
+        name: "Stable Audio 3 Small SFX",
+        repo: "stabilityai/stable-audio-3-small-sfx",
+        approxRAMGB: 5,
+        approxDownloadGB: 3.5,
+        description: "Sound effects and ambiences from a description — footsteps, rain, engines, impacts — up to two minutes, in about a second. Stability AI gates the download: accept its license on Hugging Face and sign in with a token first."
+    )
+
+    static let all: [SoundModelPreset] = [.stableAudio3SmallSFX]
+}
+
+struct SoundGenRequest {
+    var model: SoundModelPreset
+    var prompt: String
+    var durationSeconds: Double = 10
+    /// nil = the server's default schedule.
+    var steps: Int? = nil
+    /// -1 = a fresh random seed, resolved when the body is built.
+    var seed: Int = -1
+    var keepResident: Bool = false
+    var lanModelId: String? = nil
+}
+
 extension MusicGenRequest {
     /// Is the lyrics requirement met? Music 3 is lyric-conditioned and the
     /// server 400s an empty block — but ticking instrumental LIFTS that, or the

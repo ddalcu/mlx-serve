@@ -284,15 +284,45 @@ final class ServerOptionsTests: XCTestCase {
                        "clamp is a ceiling, never raises a smaller request")
         // big RAM → uncapped
         XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(16, physicalMemoryBytes: 128 * Self.GiB), 16)
-        // explicit disable is preserved on every machine
-        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(0, physicalMemoryBytes: 16 * Self.GiB), 0)
+        // Entry count is a RAM-cache size; the separate hot-cache toggle owns disable.
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(0, physicalMemoryBytes: 16 * Self.GiB), 1)
     }
 
-    func testPrefixCacheDisableSurvivesClamp() {
+    func testHotPrefixCacheToggleOwnsDisableInsteadOfTheEntryCount() {
         var opts = ServerOptions()
         opts.prefixCacheEntries = 0
         XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB),
-                               flag: "--prefix-cache-entries", value: "0"))
+                               flag: "--prefix-cache-entries", value: "1"))
+        opts.hotPrefixCacheEnabled = false
+        XCTAssertTrue(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB).contains("--no-prefix-cache-ram"))
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB),
+                               flag: "--prefix-cache-entries", value: "1"))
+    }
+
+    func testHotPrefixCacheCanBeDisabledWithoutDisablingSSD() {
+        var opts = ServerOptions()
+        opts.enablePrefixCacheDisk = true
+        opts.hotPrefixCacheEnabled = false
+        let args = opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
+        XCTAssertTrue(args.contains("--no-prefix-cache-ram"))
+        XCTAssertTrue(contains(args, flag: "--prefix-cache-entries", value: "8"))
+        XCTAssertTrue(contains(args, flag: "--prefix-cache-disk", value: "10GB"))
+    }
+
+    func testHotPrefixCacheToggleIsMigrationSafeAndRequiresRestart() throws {
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertTrue(legacy.hotPrefixCacheEnabled)
+        let disabledBeforeToggle = try JSONDecoder().decode(
+            ServerOptions.self, from: Data(#"{"prefixCacheEntries":0}"#.utf8))
+        XCTAssertFalse(disabledBeforeToggle.hotPrefixCacheEnabled)
+        let disabledWithDisk = try JSONDecoder().decode(
+            ServerOptions.self, from: Data(#"{"prefixCacheEntries":0,"enablePrefixCacheDisk":true}"#.utf8))
+        XCTAssertFalse(disabledWithDisk.enablePrefixCacheDisk)
+
+        let base = ServerOptions()
+        var changed = base
+        changed.hotPrefixCacheEnabled = false
+        XCTAssertFalse(base.serverLaunchEquals(changed))
     }
 
     func testTokenizeCacheEntriesEmitsWhenChanged() {
@@ -480,6 +510,7 @@ extension ServerOptionsTests {
         o.pldKeyLen = 4
         o.maxConcurrent = 4
         o.kvQuant = .int8
+        o.hotPrefixCacheEnabled = false
         o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it
         o.prefixCacheMem = "4GB"
         o.skipMemPreflight = true
@@ -525,18 +556,38 @@ extension ServerOptionsTests {
     // var) — same shape as every other launch knob, so it shows in --help, in
     // `ps`, and in the launch-command echo at the top of the server log.
 
-    func testOsMemoryReserveOnByDefaultAndOmitted() {
-        XCTAssertTrue(ServerOptions().osMemoryReserve, "the OS memory reserve must stay on by default")
+    func testOsReserveAutoByDefaultAndOmitted() {
+        XCTAssertNil(ServerOptions().osReserveGiB, "the OS memory reserve must stay automatic by default")
         XCTAssertFalse(ServerOptions().toCLIArgs().contains("--os-reserve-gib"),
-                       "default (on) must not emit the flag so the server keeps its automatic reserve")
+                       "Auto must not emit the flag so the server keeps its automatic reserve")
     }
 
-    func testOsMemoryReserveOffEmitsZero() {
+    func testOsReserveExplicitSizeEmitsItsGiB() throws {
         var opts = ServerOptions()
-        opts.osMemoryReserve = false
-        let args = opts.toCLIArgs()
-        guard let i = args.firstIndex(of: "--os-reserve-gib") else { return XCTFail("flag missing") }
-        XCTAssertEqual(args[i + 1], "0")
+        for gib in [0, 2, 12] {
+            opts.osReserveGiB = gib
+            XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--os-reserve-gib", value: "\(gib)"))
+            XCTAssertEqual(try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(opts)).osReserveGiB, gib)
+        }
+    }
+
+    func testLegacyOsMemoryReserveSwitchMigrates() throws {
+        let on = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"osMemoryReserve": true}"#.utf8))
+        XCTAssertNil(on.osReserveGiB)
+        let off = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"osMemoryReserve": false}"#.utf8))
+        XCTAssertEqual(off.osReserveGiB, 0)
+        let newWins = try JSONDecoder().decode(ServerOptions.self,
+                                               from: Data(#"{"osMemoryReserve": false, "osReserveGiB": 3}"#.utf8))
+        XCTAssertEqual(newWins.osReserveGiB, 3)
+    }
+
+    func testAutoOsReserveMatchesTheServer() {
+        let gib: UInt64 = 1 << 30
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 8 * gib), 2)
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 16 * gib), 2)
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 36 * gib), 4.5)
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 48 * gib), 6)
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 128 * gib), 8)
     }
 
     func testSkipMemPreflightDefaultsOff() {

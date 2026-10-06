@@ -262,7 +262,7 @@ final class MusicGenService: ObservableObject {
                         }
                         phase = .running(step: step, total: total, message: label)
                     case "complete":
-                        if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                        if let b64 = ev["data"] as? String { wav = await offMain { Data(base64Encoded: b64) } }
                     case "error":
                         await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Music generation failed.")
@@ -271,6 +271,7 @@ final class MusicGenService: ObservableObject {
                         break
                     }
                 }
+                try Task.checkCancellation()
                 await releaseIfNeeded()
                 guard let wav, wav.count > 44 else {
                     phase = .failed("Server returned an empty audio response.")
@@ -337,13 +338,14 @@ final class MusicGenService: ObservableObject {
                 case .progress(let step, let total, let stage):
                     report(step, total, MediaSSE.stageLabel(stage))
                 case .complete:
-                    if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                    if let b64 = ev["data"] as? String { wav = await offMain { Data(base64Encoded: b64) } }
                 case .failed(let m):
                     throw MediaGenError.server(m)
                 case .ignored:
                     break
                 }
             }
+            try Task.checkCancellation()
             guard let wav, wav.count > 44 else {
                 throw MediaGenError.server("Server returned an empty audio response.")
             }
@@ -377,19 +379,6 @@ final class MusicGenService: ObservableObject {
     /// Slug + dated `.wav` path under `musicRoot`, mirroring the audio output
     /// layout. `internal static` so a unit test can pin the slug contract.
     nonisolated static func makeOutputPath(prompt: String) -> String {
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd"
-        let day = df.string(from: Date())
-        let dayDir = (MediaStorage.musicRoot as NSString).appendingPathComponent(day)
-        try? FileManager.default.createDirectory(atPath: dayDir, withIntermediateDirectories: true)
-        let tf = DateFormatter()
-        tf.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let slug = prompt
-            .lowercased()
-            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-            .prefix(40)
-        let filename = "\(tf.string(from: Date()))_\(slug).wav"
-        return (dayDir as NSString).appendingPathComponent(filename)
+        MediaStorage.datedPath(root: MediaStorage.musicRoot, prompt: prompt, ext: "wav")
     }
 }

@@ -903,7 +903,7 @@ pub fn linear(x: A, w_t: A, b: ?A, s: S) !A {
     return y;
 }
 
-fn layerNorm(x: A, w: A, b: ?A, eps: f32, s: S) !A {
+pub fn layerNorm(x: A, w: A, b: ?A, eps: f32, s: S) !A {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_layer_norm(&out, x, w, b orelse none, eps, s));
     return out;

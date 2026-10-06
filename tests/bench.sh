@@ -71,6 +71,8 @@ TARGETS=(
     "qwen38-27b|ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
     "qwen38-27b-iq|ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw"
     "qwen38-flash-next|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+    "mimo-v26-flash|ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8"
+    "glm53-flash|TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP"
 )
 
 # Only ever called on the path that STARTED a server: --url may be pointed at
@@ -98,6 +100,7 @@ probe() { # logical host model_id
 drafter_for() { # logical
     case "$1" in
         qwen38-27b) find_model z-lab/Qwen3.8-27B-DFlash2 ;;
+        *) return 1 ;;
     esac
 }
 

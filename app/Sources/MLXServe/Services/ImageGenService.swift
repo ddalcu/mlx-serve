@@ -95,6 +95,7 @@ final class ImageGenService: ObservableObject {
                         break
                     }
                 }
+                try Task.checkCancellation()
                 await releaseIfNeeded()
                 guard let png else {
                     phase = .failed("Server returned no image data.")
@@ -174,6 +175,7 @@ final class ImageGenService: ObservableObject {
                     break
                 }
             }
+            try Task.checkCancellation()
             guard let png else { throw GenError.server("Server returned no image data.") }
             try png.write(to: URL(fileURLWithPath: outputPath))
             await releaseIfNeeded()

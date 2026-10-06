@@ -82,21 +82,20 @@ final class AppActivationTests: XCTestCase {
     /// bypass `openAndFocus` couldn't reach it.
     func testWindowTitleMapCoversEveryOpenableWindow() {
         XCTAssertEqual(AppActivation.windowTitle(for: "chat"), "MLX-Serve")
-        // "modelBrowser" is deliberately absent: the Model Browser is a MODE
-        // of the chat window now (`ChatWorkspace`), not a window to raise.
-        XCTAssertNotEqual(AppActivation.windowTitle(for: "modelBrowser"), "Model Browser")
-        // "settings" is retired: Settings renders in the chat window's detail
-        // column (`ChatWorkspace.settings`), never as a second window.
-        XCTAssertEqual(AppActivation.windowTitle(for: "settings"), "Browser")
-        // The four media generators went the way of the Model Browser: pages of
-        // the chat window (`ChatWorkspace.create`), not windows to raise.
-        for retired in ["imageGen", "videoGen", "audioGen", "model3dGen"] {
-            XCTAssertEqual(AppActivation.windowTitle(for: retired), "Browser",
-                           "\(retired) is retired — it must fall through to the default")
-        }
+        XCTAssertEqual(AppActivation.windowTitle(for: "browser"), "Browser")
         XCTAssertEqual(AppActivation.windowTitle(for: "serverLog"), "Server Log")
-        // "tasks" is retired too — the Tasks pane lives in the chat window.
-        XCTAssertEqual(AppActivation.windowTitle(for: "tasks"), "Browser")
+        XCTAssertEqual(AppActivation.windowTitle(for: "benchmarks"), "Benchmarks")
+        XCTAssertEqual(AppActivation.windowTitle(for: "agents"), "Agents")
+        XCTAssertEqual(AppActivation.windowTitle(for: "layaDecisions"), "Decisions")
+        XCTAssertEqual(AppActivation.windowTitle(for: "modelSettings"), "Model Settings")
+    }
+
+    func testRetiredAndUnknownSceneIdsDoNotFallThroughToBrowser() {
+        // These are modes of the chat window now, not Browser windows to raise.
+        for retired in ["modelBrowser", "settings", "tasks", "imageGen", "videoGen", "audioGen", "model3dGen"] {
+            XCTAssertNil(AppActivation.windowTitle(for: retired), "\(retired) must not match Browser by title")
+        }
+        XCTAssertNil(AppActivation.windowTitle(for: "unknown"))
     }
 
     // MARK: - Raising the right window
@@ -120,13 +119,17 @@ final class AppActivationTests: XCTestCase {
         XCTAssertFalse(AppActivation.windowMatches(id: "chat", title: "Settings", identifier: "settings"))
         XCTAssertFalse(AppActivation.windowMatches(id: "chat", title: "", identifier: nil),
                        "a blank, unidentified window is not evidence it's ours")
+        XCTAssertFalse(AppActivation.windowMatches(id: "agents", title: "Browser", identifier: "browser"),
+                       "opening Agents after Browser must not raise Browser again")
+        XCTAssertFalse(AppActivation.windowMatches(id: "benchmarks", title: "Browser", identifier: "browser"),
+                       "opening Benchmarks after Browser must not raise Browser again")
     }
 
     /// The sandbox terminal window is retired (terminals are rows of the chat
     /// window, 2026-09-02): its id falls through like every other retired
     /// scene, so nothing can raise a window that no longer exists.
     func testSandboxTerminalSceneIsRetired() {
-        XCTAssertEqual(AppActivation.windowTitle(for: "sandboxTerminal"), "Browser")
+        XCTAssertNil(AppActivation.windowTitle(for: "sandboxTerminal"))
     }
 
     // MARK: - Source audit (the universal part)

@@ -256,7 +256,11 @@ final class BenchmarkLogicTests: XCTestCase {
         XCTAssertNil(BenchmarkDrift.percent(first: 0, last: 50), "a zero start is no measurement")
         XCTAssertNil(BenchmarkDrift.percent(first: 50, last: nil))
         XCTAssertEqual(BenchmarkDrift.percent(first: 63.39, last: 60.1) ?? 0, -5.2, accuracy: 0.001, "rounded to one decimal")
-        XCTAssertEqual(BenchmarkDrift.summary(first: 61.2, last: 58.4, percent: -4.6), "61.2 → 58.4 tok/s (-4.6%, steady)")
+        let start = String(format: "%.1f", locale: Locale.current, 61.2)
+        let end = String(format: "%.1f", locale: Locale.current, 58.4)
+        let change = String(format: "%.1f", locale: Locale.current, -4.6)
+        XCTAssertEqual(BenchmarkDrift.summary(first: 61.2, last: 58.4, percent: -4.6),
+                       "\(start) → \(end) tok/s (\(change)%, steady)")
         XCTAssertEqual(BenchmarkDrift.summary(first: nil, last: nil, percent: nil), "not measured")
     }
 

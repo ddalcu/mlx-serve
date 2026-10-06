@@ -110,3 +110,23 @@ final class ProvidersConfigTests: XCTestCase {
                        ["http://box:1234/models", "http://box:1234/v1/models"])
     }
 }
+
+final class SettingsFormStateProviderTests: XCTestCase {
+    /// Delete removes exactly the named row and its field text, whichever row it is.
+    func testRemovingAProviderKeepsTheOthersAndTheirText() {
+        let form = SettingsFormState()
+        let rows = ["a", "b", "c"].map { name -> ProviderEntry in
+            var e = ProviderEntry()
+            e.name = name
+            return e
+        }
+        form.providerEntries = rows
+        for row in rows { form.providerModelText[row.id] = row.name }
+
+        form.removeProvider(id: rows[2].id) // the last row: its index is gone after the removal
+        XCTAssertEqual(form.providerEntries.map(\.name), ["a", "b"])
+        form.removeProvider(id: rows[0].id)
+        XCTAssertEqual(form.providerEntries.map(\.name), ["b"])
+        XCTAssertEqual(form.providerModelText, [rows[1].id: "b"])
+    }
+}

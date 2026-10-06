@@ -192,7 +192,7 @@ pub const LoadedModel = struct {
     /// head auto-loaded from the model dir, or an arch whose head is part of
     /// its own trunk. Null when neither is present.
     mtp: ?generate_mod.MtpHeadRef = null,
-    /// Default draft depth for MTP rounds (CLI `--mtp-depth`).
+    /// Default draft depth for MTP rounds (CLI `--mtp-max-depth`).
     mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     /// Per-model hot prefix cache — plan 05 drops the module-global hot
     /// cache. `model_id`-keyed isolation falls out of "one cache per
@@ -415,7 +415,7 @@ pub const LoadedModel = struct {
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
-            // Only the Qwen sidecar is a separately allocated object; an
+            // The Qwen sidecar and the MiMo heads are separately allocated; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
             switch (h) {
@@ -424,6 +424,14 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(q);
                 },
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
+                .mimo => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
+                .glm => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
             }
             self.mtp = null;
         }
@@ -585,7 +593,7 @@ pub const LoadedModel = struct {
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
-            // Only the Qwen sidecar is a separately allocated object; an
+            // The Qwen sidecar and the MiMo heads are separately allocated; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
             switch (h) {
@@ -594,6 +602,14 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(q);
                 },
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
+                .mimo => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
+                .glm => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
             }
             self.mtp = null;
         }
@@ -1292,6 +1308,8 @@ pub const ModelRegistry = struct {
         self.state_cond.broadcast(self.io);
     }
 
+    /// `live_bytes` is what the allocator holds right now (weights + KV + caches + wired
+    /// tables): the billed weights alone under-count a busy model, so the larger one gates.
     /// Select LRU victims to evict so that, once `entry` (already `.loading`,
     /// with its estimate reserved) becomes resident, both caps hold. Marks each
     /// chosen victim `.evicting` and writes it into `out`; returns the count,
@@ -1299,13 +1317,13 @@ pub const ModelRegistry = struct {
     /// too small) — in which case any victims marked here are rolled back so
     /// the registry is left untouched. Caller holds `mutex` and must drain each
     /// returned victim's refcount, then hand them to the load request to free.
-    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel) ?usize {
+    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, live_bytes: u64) ?usize {
         var n: usize = 0;
         var freed: u64 = 0;
         while (true) {
             // Resident-after-plan = current minus what these victims free, plus
             // every in-flight reservation (including this load's own estimate).
-            const projected_mem = (self.current_resident_bytes -| freed) + self.reserved_bytes;
+            const projected_mem = (@max(self.current_resident_bytes, live_bytes) -| freed) + self.reserved_bytes;
             // Count: .ready+.evicting now, minus the victims we'll drop, plus
             // this load (currently `.loading`, becomes resident).
             const projected_count = self.countLoadedLocked() - @as(u32, @intCast(n)) + 1;
@@ -2007,10 +2025,27 @@ test "planEvictions: evicts one LRU victim to fit the memory budget" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(c.id, &buf).?;
+    const n = reg.planEvictionsLocked(c.id, &buf, 0).?;
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a", buf[0].id); // LRU victim
     try testing.expectEqual(LoadState.evicting, buf[0].state);
+}
+
+test "planEvictions: live memory above the billed weights forces an eviction" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    _ = try makeReadyStub(reg, "a", 40);
+    _ = try makeReadyStub(reg, "b", 40);
+    const c = try beginLoad(reg, "c", 10); // billed 80 + 10 = 90 <= 100
+
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0));
+    // KV, caches and a wired table put 95 bytes live: 95 + 10 > 100.
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 95));
+    try testing.expectEqualStrings("a", buf[0].id);
 }
 
 test "planEvictions: multi-victim — evicts as many as needed to fit" {
@@ -2025,7 +2060,7 @@ test "planEvictions: multi-victim — evicts as many as needed to fit" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(d.id, &buf).?;
+    const n = reg.planEvictionsLocked(d.id, &buf, 0).?;
     try testing.expectEqual(@as(usize, 2), n); // a and b (the two oldest)
 }
 
@@ -2039,7 +2074,7 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     const b = try beginLoad(reg, "b", 80); // 80 + 80 = 160 > 100 → must evict a
     reg.mutex.lockUncancelable(io);
     var buf: [16]*LoadedModel = undefined;
-    const plan = reg.planEvictionsLocked(b.id, &buf);
+    const plan = reg.planEvictionsLocked(b.id, &buf, 0);
     try testing.expectEqual(@as(?usize, null), plan); // can't evict the pinned victim
     try testing.expectEqual(LoadState.ready, a.state); // rolled back, not left .evicting
     // Scheduler then rolls back the load → releases the reservation.
@@ -2065,7 +2100,7 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf));
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0));
 }
 
 test "reservation: released back to zero on markReady / markUnloaded" {

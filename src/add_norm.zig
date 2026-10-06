@@ -3,8 +3,14 @@
 //! itself: the f32 router-weighted sum over the K expert outputs (rounded
 //! like the composed chain) plus the shared expert's output. One dispatch
 //! replaces up to six. Same structure as TensorFold's `add_norm` (MIT).
+//!
+//! The third variant is the adaLN-zero block seam (MiniMax-H3): the residual is GATED per row
+//! (`h + gate[row_mod[r]] * x`), and the normed row is then modulated (`n * (1 + scale) + shift`,
+//! both looked up through the same row table). Every op rounds to T exactly where the unfused
+//! chain did, so it is bit-equal to it.
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const log = @import("log.zig");
 
 // Mirrors MLX's `rms_norm` kernels so the normed output is bit-equal to
 // `add -> fast::rms_norm`: FOUR consecutive elements per thread per pass,
@@ -12,7 +18,22 @@ const mlx = @import("mlx.zig");
 // `w * T(x * inv)` in the output dtype. Up to 4096 wide that is MLX's
 // single-row kernel (TN = ceil(D/4) threads, one pass); wider, its looped one
 // (1024 threads striding 4096 elements a pass).
-fn source(comptime moe: bool) [:0]const u8 {
+const Kind = enum { plain, moe, mod };
+
+fn source(comptime kind: Kind) [:0]const u8 {
+    const write_h = if (kind == .mod) "if (HAS_ADD) H_NEW[at] = hn;" else "H_NEW[at] = hn;";
+    const out = switch (kind) {
+        .mod =>
+        \\{
+        \\    const T n = T(float(W[c]) * float(T(hv[p * 4 + i] * inv)));
+        \\    const size_t mi = size_t(ROWMOD[r]) * D + c;
+        \\    const T sc1 = T(float(SC[mi]) + 1.0f);
+        \\    const T mm = T(float(n) * float(sc1));
+        \\    HN[size_t(r) * D + c] = T(float(mm) + float(SH[mi]));
+        \\}
+        ,
+        else => "HN[size_t(r) * D + c] = T(float(W[c]) * float(T(hv[p * 4 + i] * inv)));",
+    };
     return std.fmt.comptimePrint(
         \\const uint t = thread_position_in_threadgroup.x;
         \\const uint r = threadgroup_position_in_grid.x;
@@ -31,7 +52,7 @@ fn source(comptime moe: bool) [:0]const u8 {
         \\        float delta;
         \\        {s}
         \\        const T hn = T(float(H[at]) + delta);
-        \\        H_NEW[at] = hn;
+        \\        {s}
         \\        hv[p * 4 + i] = float(hn);
         \\    }}
         \\    acc += hv[p * 4 + i] * hv[p * 4 + i];
@@ -46,9 +67,17 @@ fn source(comptime moe: bool) [:0]const u8 {
         \\for (int p = 0; p < NC; p++)
         \\for (int i = 0; i < 4; i++) {{
         \\    const int c = p * TN * 4 + int(t) * 4 + i;
-        \\    if (c < D) HN[size_t(r) * D + c] = T(float(W[c]) * float(T(hv[p * 4 + i] * inv)));
+        \\    if (c < D) {s}
         \\}}
-    , .{if (moe)
+    , .{ switch (kind) {
+        .mod =>
+        // Gated residual: the product rounds to T before the add, like the chain's mul then add.
+        \\{
+        \\    delta = 0.0f;
+        \\    if (HAS_ADD) delta = float(T(float(X[at]) * float(G[size_t(ROWMOD[r]) * D + c])));
+        \\}
+        ,
+        .moe =>
         // The chain's own rounding points: f32 multiply-adds over the K slots
         // in slot order, `.astype` to T, the shared expert added in T.
         \\{
@@ -57,21 +86,29 @@ fn source(comptime moe: bool) [:0]const u8 {
         \\    delta = float(T(routed));
         \\    if (SHARED) delta = float(T(delta + float(XS[at])));
         \\}
-    else
-        \\delta = float(X[at]);
-    });
+        ,
+        .plain => "delta = float(X[at]);",
+    }, write_h, out });
 }
 
-const PLAIN_SOURCE = source(false);
-const MOE_SOURCE = source(true);
+const PLAIN_SOURCE = source(.plain);
+const MOE_SOURCE = source(.moe);
+const MOD_SOURCE = source(.mod);
 
 var plain_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var moe_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const CfgKey = struct { rows: c_int, d: c_int, k: c_int, shared: bool, dt: mlx.mlx_dtype, tn: c_int };
+// Keyed by the FULL [B,S] layout, not the row count: the config carries the output
+// shape, and a 16-row verify ([1,16,D]) and a 16-slot batched tick ([16,1,D]) share a row count.
+const CfgKey = struct { b: c_int, s: c_int, d: c_int, k: c_int, shared: bool, dt: mlx.mlx_dtype, tn: c_int, mod: bool = false, has_add: bool = true };
 var plain_key: ?CfgKey = null;
 var plain_cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
 var moe_key: ?CfgKey = null;
 var moe_cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
+var mod_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var mod_engaged = false;
+// One slot per `has_add`: a forward alternates the two, and a rebuild per call is waste.
+var mod_keys: [2]?CfgKey = .{ null, null };
+var mod_cfgs: [2]mlx.mlx_fast_metal_kernel_config = .{ .{ .ctx = null }, .{ .ctx = null } };
 
 // MLX's single-row kernel serves widths up to its looped limit (4096) with
 // ceil(D/4) threads; its looped one runs 1024 (two passes cover 8192).
@@ -113,11 +150,12 @@ fn buildConfig(key: CfgKey, shape: []const c_int) !mlx.mlx_fast_metal_kernel_con
     const tn = key.tn;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, shape.ptr, shape.len, key.dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, shape.ptr, shape.len, key.dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, tn * key.rows, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, tn * key.b * key.s, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, tn, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", key.dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "D", key.d));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TN", tn));
+    if (key.mod) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "HAS_ADD", @intFromBool(key.has_add)));
     if (key.k > 0) {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "K", key.k));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "SHARED", @intFromBool(key.shared)));
@@ -164,7 +202,7 @@ pub fn addNorm(h: mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, eps: mlx.ml
     if (!eligible(sh[2], dt, s)) return null;
     if (mlx.mlx_array_dtype(x) != dt or mlx.mlx_array_dtype(w) != dt) return null;
     if (plain_kernel == null) plain_kernel = try makeKernel("msv_add_norm", &[_][*:0]const u8{ "H", "X", "W", "eps" }, PLAIN_SOURCE);
-    const key = CfgKey{ .rows = sh[0] * sh[1], .d = sh[2], .k = 0, .shared = false, .dt = dt, .tn = threadsFor(sh[2]).? };
+    const key = CfgKey{ .b = sh[0], .s = sh[1], .d = sh[2], .k = 0, .shared = false, .dt = dt, .tn = threadsFor(sh[2]).? };
     if (plain_key == null or !std.meta.eql(plain_key.?, key)) {
         const c = try buildConfig(key, sh);
         if (plain_cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(plain_cfg);
@@ -172,6 +210,47 @@ pub fn addNorm(h: mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, eps: mlx.ml
         plain_key = key;
     }
     return try apply(plain_kernel.?, plain_cfg, key, &[_]mlx.mlx_array{ h, x, w, eps }, s);
+}
+
+/// The adaLN-zero block seam over rows of `[S, D]`: with `gated` (a branch output and its gate
+/// table), `h' = h + gate[row_mod[r]] * x`; then `m = rmsnorm(h') * w * (1 + scale) + shift`, the
+/// tables indexed through `row_mod` ([S] i32). `gated` null skips the add (`h` comes back
+/// unwritten: use the input). Null outside the envelope.
+pub fn gateNormMod(h: mlx.mlx_array, gated: ?struct { x: mlx.mlx_array, gate: mlx.mlx_array }, w: mlx.mlx_array, scale: mlx.mlx_array, shift: mlx.mlx_array, row_mod: mlx.mlx_array, eps: mlx.mlx_array, s: mlx.mlx_stream) !?Out {
+    const sh = mlx.getShape(h);
+    if (sh.len != 2) return null;
+    const dt = mlx.mlx_array_dtype(h);
+    if (!eligible(sh[1], dt, s)) return null;
+    if (mlx.mlx_array_dtype(w) != dt or mlx.mlx_array_dtype(scale) != dt or mlx.mlx_array_dtype(shift) != dt) return null;
+    if (mlx.mlx_array_dtype(row_mod) != .int32 or mlx.getShape(row_mod).len != 1 or mlx.getShape(row_mod)[0] != sh[0]) return null;
+    // The tables are [R, D] rows; the kernel indexes them flat.
+    for ([_]mlx.mlx_array{ scale, shift }) |t| {
+        const ts = mlx.getShape(t);
+        if (ts.len != 2 or ts[1] != sh[1]) return null;
+    }
+    const x = if (gated) |g| g.x else h;
+    const gate = if (gated) |g| g.gate else scale;
+    if (gated != null) {
+        if (mlx.mlx_array_dtype(x) != dt or !std.mem.eql(c_int, mlx.getShape(x), sh)) return null;
+        const gs = mlx.getShape(gate);
+        if (mlx.mlx_array_dtype(gate) != dt or gs.len != 2 or gs[1] != sh[1]) return null;
+    }
+    if (mod_kernel == null) mod_kernel = try makeKernel("msv_gate_norm_mod", &[_][*:0]const u8{ "H", "X", "G", "W", "SC", "SH", "ROWMOD", "eps" }, MOD_SOURCE);
+    const has_add = gated != null;
+    const slot: usize = @intFromBool(has_add);
+    const key = CfgKey{ .b = 1, .s = sh[0], .d = sh[1], .k = 0, .shared = false, .dt = dt, .tn = threadsFor(sh[1]).?, .mod = true, .has_add = has_add };
+    if (mod_keys[slot] == null or !std.meta.eql(mod_keys[slot].?, key)) {
+        const c = try buildConfig(key, sh);
+        if (mod_cfgs[slot].ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(mod_cfgs[slot]);
+        mod_cfgs[slot] = c;
+        mod_keys[slot] = key;
+    }
+    const out = try apply(mod_kernel.?, mod_cfgs[slot], key, &[_]mlx.mlx_array{ h, x, gate, w, scale, shift, row_mod, eps }, s);
+    if (out != null and !mod_engaged) {
+        mod_engaged = true;
+        log.info("[add-norm] fused gate+norm+modulation engaged: rows={d} d={d}\n", .{ sh[0], sh[1] });
+    }
+    return out;
 }
 
 /// h: [B,S,D]; y: [B*S, K, D] per-expert outputs; wt: [B*S, K] f32 router
@@ -193,7 +272,7 @@ pub fn moeCombineAddNorm(h: mlx.mlx_array, y: mlx.mlx_array, wt: mlx.mlx_array, 
         if (xsh.len != 2 or xsh[0] != rows or xsh[1] != sh[2] or mlx.mlx_array_dtype(xs) != dt) return null;
     }
     if (moe_kernel == null) moe_kernel = try makeKernel("msv_moe_combine_add_norm", &[_][*:0]const u8{ "H", "Y", "WT", "XS", "W", "eps" }, MOE_SOURCE);
-    const key = CfgKey{ .rows = rows, .d = sh[2], .k = wsh[1], .shared = shared != null, .dt = dt, .tn = threadsFor(sh[2]).? };
+    const key = CfgKey{ .b = sh[0], .s = sh[1], .d = sh[2], .k = wsh[1], .shared = shared != null, .dt = dt, .tn = threadsFor(sh[2]).? };
     if (moe_key == null or !std.meta.eql(moe_key.?, key)) {
         const c = try buildConfig(key, sh);
         if (moe_cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(moe_cfg);
@@ -243,6 +322,34 @@ test "addNorm declines, and stays declined, when the GPU refuses the looped widt
     try std.testing.expect(!eligible(5120, .bfloat16, s));
     try std.testing.expect(eligible(4096, .bfloat16, s));
     try std.testing.expect(!mlx.errorPending());
+}
+
+test "addNorm returns each call's own [B,S,D] layout at one row count" {
+    // The bar: a 16-row verify ([1,16,D]) followed by a 16-slot batched tick ([16,1,D]) each get
+    // outputs in their input's shape; a config cached by row count alone hands the second the first's.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+    const d: c_int = 5120;
+    for ([_][2]c_int{ .{ 1, 16 }, .{ 16, 1 }, .{ 1, 16 } }) |bs| {
+        const arrs = try randTriple(16, d, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const shape = [_]c_int{ bs[0], bs[1], d };
+        var h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h);
+        try mlx.check(mlx.mlx_reshape(&h, arrs[0], &shape, 3, s));
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_reshape(&x, arrs[1], &shape, 3, s));
+        const got = (try addNorm(h, x, arrs[2], eps, s)) orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(got.h);
+        defer _ = mlx.mlx_array_free(got.normed);
+        try std.testing.expectEqualSlices(c_int, &shape, mlx.getShape(got.h));
+        try std.testing.expectEqualSlices(c_int, &shape, mlx.getShape(got.normed));
+    }
 }
 
 test "addNorm is bit-equal to add -> fast::rms_norm on both sides of MLX's looped limit" {

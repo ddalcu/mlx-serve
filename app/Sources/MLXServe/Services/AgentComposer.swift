@@ -49,7 +49,7 @@ enum AgentComposer {
             maxTokens: maxTokens,
             temperature: 0.7,
             defaults: APIClient.RequestDefaults.from(appState.serverOptions),
-            modelId: appState.server.chatModelId)
+            modelId: appState.server.chatRequestModelId(selectedPath: appState.selectedModelPath))
 
         return AsyncThrowingStream { continuation in
             let task = Task {

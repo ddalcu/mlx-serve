@@ -10,8 +10,8 @@
 # What it asserts is CORRECTNESS UNDER LOAD, not latency: every stream
 # terminates cleanly ([DONE], finish_reason), every media request returns real
 # bytes, no request is lost, and the server is alive and functional afterwards.
-# A media generation legitimately stalls chat decode (single GPU, accepted
-# design) — client timeouts here are generous on purpose.
+# Chat runs between media steps (one GPU, shared time) and cold model loads
+# still block — client timeouts here are generous on purpose.
 #
 # Usage:
 #   ./tests/test_multiclient_stress.sh [port]
@@ -83,7 +83,7 @@ import json, os, sys, time, urllib.request, urllib.error
 kind, label, base, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 MAX_TOKENS = int(sys.argv[5]) if len(sys.argv) > 5 else 200
 ROUNDS = int(sys.argv[6]) if len(sys.argv) > 6 else 1
-TIMEOUT = 900  # generous: cold model loads + image gen block decode
+TIMEOUT = 900  # generous: cold model loads block, media steps share time
 THINK = os.environ.get("STRESS_THINK") == "1"
 MTP = os.environ.get("STRESS_MTP") == "1"
 

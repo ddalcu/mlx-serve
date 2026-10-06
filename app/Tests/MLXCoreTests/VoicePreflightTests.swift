@@ -1,9 +1,6 @@
 import XCTest
 @testable import MLXCore
 
-/// Unit tests for `VoicePreflight` — the pure decision + copy layer behind the
-/// non-invasive "voice needs setup" notice. The live status read
-/// (`BaseSpeechRecognizer.preflight()`) is the untestable system shell.
 final class VoicePreflightTests: XCTestCase {
 
     private func snap(mic: Bool = true, speech: Bool = true, onDevice: Bool = true,

@@ -15,11 +15,10 @@ struct VideoGenView: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
-    /// For "Send to Chat" — the hand-off opens a new conversation and switches
-    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
     @EnvironmentObject var appState: AppState
 
     @State private var prompt: String = ""
+    @State private var showEnhance = false
     /// The editor's caret or selection, for dropping a reference marker where
     /// the user is typing. nil until the editor has had focus.
     @State private var promptSelection: TextSelection? = nil
@@ -230,6 +229,13 @@ struct VideoGenView: View {
         } message: {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
+        .sheet(isPresented: $showEnhance) {
+            PromptRewriteSheet(title: "Rewrite video prompt", clip: clipLengthRange,
+                               request: { PromptRewriter.video(text: prompt, format: model.promptFormat, seconds: $0) },
+                               onApplyClip: { numFrames = model.framesCovering(durationSeconds: Double($0)) ?? numFrames },
+                               onApply: { prompt = $0 })
+                .environmentObject(appState)
+        }
     }
 
     // MARK: - Sections
@@ -240,6 +246,7 @@ struct VideoGenView: View {
                 Text("Prompt").font(.app(.headline).weight(.semibold))
                 Spacer()
                 if let hint = promptHint { promptWarning(hint) }
+                PromptEnhanceButton(disabled: prompt.isBlank) { showEnhance = true }
                 templatesMenu
             }
             // The header's hover bubble reaches over the editor below it, and
@@ -804,6 +811,12 @@ struct VideoGenView: View {
         }
     }
 
+    /// The Enhance sheet's clip-length slider: starts at the knob and tops out at the model's longest clip.
+    private var clipLengthRange: (initial: Int, max: Int) {
+        let maxSeconds = Int(Double(availableFrameOptions.last ?? numFrames) / Double(fps))
+        return (min(max(1, Int((Double(numFrames) / Double(fps)).rounded())), max(1, maxSeconds)), maxSeconds)
+    }
+
     private var frameSlider: some View {
         let opts = availableFrameOptions
         let maxIdx = max(1, opts.count - 1)
@@ -1000,13 +1013,9 @@ struct VideoGenView: View {
                 // picked image must not change where the form sits.
                 MediaDropWellFilled(isTargeted: isTargeted.wrappedValue) {
                     HStack(spacing: 8) {
-                        if let img = NSImage(contentsOf: picked) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: 64, height: 48)
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
+                        MediaImageView(url: picked, maxPixel: 192)
+                            .frame(width: 64, height: 48)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
                         Text(picked.lastPathComponent)
                             .font(.app(.caption))
                             .lineLimit(1)
@@ -1724,7 +1733,7 @@ struct VideoGenView: View {
                     // toggle that could not change anything is a dead control.
                     .disabled(turboEngaged)
             }
-            Toggle("Show live preview while generating", isOn: $livePreview)
+            Toggle("Show live preview while generating (~1% slower)", isOn: $livePreview)
                 .font(.app(.caption))
                 .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It is not free — every step solves for the clean latent and copies the previewed frame to the CPU.")
 
@@ -1986,6 +1995,8 @@ struct VideoGenView: View {
                             .progressViewStyle(.linear)
                             .frame(width: 240)
                         Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
+                        Text(service.startedAt, style: .timer)
+                            .font(.app(.footnote)).monospacedDigit().foregroundStyle(.secondary)
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -2024,15 +2035,6 @@ struct VideoGenView: View {
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless)
                 .help("Reveal in Finder")
-                // The one bridge from the workshop to a conversation. It opens
-                // a NEW chat and switches to it — see
-                // `AppState.sendGeneratedMediaToNewChat`.
-                Button {
-                    appState.sendGeneratedMediaToNewChat(
-                        path: path, prompt: prompt, kind: .video)
-                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
-                .buttonStyle(.borderless)
-                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(8)

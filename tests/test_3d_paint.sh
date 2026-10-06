@@ -3,7 +3,9 @@
 # headless boot -> load shape model by path -> POST /v1/3d/generations with
 # "texture": true -> assert a valid TEXTURED GLB (TEXCOORD_0 attribute, PBR
 # material, embedded PNG images) -> 400 when the paint weights are missing ->
-# streaming carries paint-stage progress labels -> unload.
+# streaming carries paint-stage progress labels -> unload. The textured job
+# runs at res=320, the shape that never finished before the paint stage
+# decimated to upstream's 40k faces ahead of the unwrap.
 #
 # Skips gracefully when either converted model is absent. Convert with:
 #   python3 tests/convert_hunyuan3d_weights.py --src <ckpt dir> --bits 8
@@ -71,7 +73,7 @@ python3 - "$SRC" /tmp/test_3d_paint_req.json <<PY
 import json, base64, sys
 b64 = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
 json.dump({"model": "$HY3D_ID", "image": b64, "steps": 10,
-           "octree_resolution": 128, "seed": 7,
+           "octree_resolution": 320, "seed": 7,
            "texture": True, "texture_steps": 8}, open(sys.argv[2], "w"))
 PY
 
@@ -98,14 +100,20 @@ assert imgs and imgs[0].get("mimeType") == "image/png", "no embedded PNG images"
 uv_acc = doc["accessors"][prim["attributes"]["TEXCOORD_0"]]
 pos_acc = doc["accessors"][prim["attributes"]["POSITION"]]
 assert uv_acc["type"] == "VEC2" and uv_acc["count"] == pos_acc["count"]
-print(f"PASS: textured GLB, {pos_acc['count']} verts, {len(imgs)} embedded textures, {len(glb)} bytes")
+faces = doc["accessors"][prim["indices"]]["count"] // 3
+assert faces <= 40000, f"{faces} faces: the paint stage did not decimate"
+print(f"PASS: textured GLB, {pos_acc['count']} verts, {faces} faces, {len(imgs)} embedded textures, {len(glb)} bytes")
 PY
 [ $? -eq 0 ] || exit 1
+line=$(grep -o "decimated [0-9]* -> [0-9]* faces" /tmp/test_3d_paint_server.log | tail -1)
+python3 -c "import sys; a = '$line'.split(); sys.exit(0 if a and int(a[1]) > 40000 >= int(a[3]) else 1)" ||
+  { echo "FAIL: no decimation past 40k faces at res=320 (log: '$line')"; exit 1; }
+echo "PASS: $line"
 
 # 2. Streaming carries paint-stage progress (a stage label beyond the shape set).
 python3 - /tmp/test_3d_paint_req.json <<PY
 import json
-d = json.load(open("/tmp/test_3d_paint_req.json")); d["stream"] = True
+d = json.load(open("/tmp/test_3d_paint_req.json")); d["stream"] = True; d["octree_resolution"] = 128
 json.dump(d, open("/tmp/test_3d_paint_req_stream.json", "w"))
 PY
 api /v1/3d/generations -X POST -H 'Content-Type: application/json' \

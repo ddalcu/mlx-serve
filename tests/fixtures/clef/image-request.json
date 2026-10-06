@@ -1,0 +1,1 @@
+{"model":"clef","state":"Look at the attached picture.","questions":{"robot":{"type":"noul","instructions":"Does the image show a robot?"},"subject":{"type":"choice","instructions":"What is the main subject?","criteria":{"animal":"A real animal","robot":"A robot or mechanical character","landscape":"A natural landscape"}}}}

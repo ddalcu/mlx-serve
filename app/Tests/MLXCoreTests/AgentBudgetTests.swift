@@ -131,6 +131,22 @@ final class AgentBudgetTests: XCTestCase {
         XCTAssertFalse(js.contains("supportsReasoningEffort: false"))
     }
 
+    func testPiSurfacesOfferEveryThinkingLevel() throws {
+        // pi offers xhigh/max only when the level map names them; without them
+        // `--thinking max` clamps to high and a model's max effort is unreachable.
+        let json = AgentConfigs.piModelsJSON(
+            baseURL: "http://127.0.0.1:11234", model: "m",
+            budget: AgentBudget.Budget(context: 32768, output: 8192))
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        let mlx = try XCTUnwrap((obj["providers"] as? [String: Any])?["mlx"] as? [String: Any])
+        let m = try XCTUnwrap((mlx["models"] as? [[String: Any]])?.first)
+        let levels = try XCTUnwrap(m["thinkingLevelMap"] as? [String: String])
+        XCTAssertEqual(levels, ["off": "none", "xhigh": "xhigh", "max": "max"])
+        let js = AgentConfigs.piModelsExtensionJS(baseURL: "http://127.0.0.1:11234")
+        XCTAssertTrue(js.contains("thinkingLevelMap: \(AgentConfigs.piThinkingLevelMap)"),
+                      "extension models must carry the same level map: \(js)")
+    }
+
     func testPiAgentsMDStatesTheCapAndTheChunkingRecovery() {
         let b = AgentBudget.forServerContext(262144)
         let md = AgentConfigs.piAgentsMD(budget: b)

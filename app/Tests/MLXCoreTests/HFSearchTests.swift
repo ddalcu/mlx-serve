@@ -718,6 +718,29 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertNil(m.incompatibleReason)
     }
 
+    func testGlm5NextIsSupportedButOtherGlmIsNot() {
+        // GLM-5.3-Flash packs carry model_type glm5_next (text config glm5_next_text).
+        for type in ["glm5_next", "glm5_next_text"] {
+            XCTAssertTrue(supportedModelTypes.contains(type))
+            XCTAssertTrue(mlx(id: "TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP",
+                              tags: ["mlx", "safetensors", type, "glm", "text-generation"]).isSupportedArchitecture)
+        }
+        // GLM-5 (glm_moe_dsa) and GLM-4 MoE are other architectures we do not serve.
+        XCTAssertFalse(mlx(id: "mlx-community/GLM-5-4bit", tags: ["mlx", "safetensors", "glm_moe_dsa", "glm"]).isSupportedArchitecture)
+        XCTAssertFalse(mlx(id: "mlx-community/GLM-4.6-4bit", tags: ["mlx", "safetensors", "glm4_moe", "glm"]).isSupportedArchitecture)
+    }
+
+    func testMimoV2IsSupportedButMimoV1IsNot() {
+        // MiMo-V2.6-Flash packs carry model_type mimo_v2 (TensorFold/Vontra: mimo_v2_flash).
+        for type in ["mimo_v2", "mimo_v2_flash"] {
+            XCTAssertTrue(supportedModelTypes.contains(type))
+            XCTAssertTrue(mlx(id: "mlx-community/MiMo-V2.6-Flash-mxfp4-q8",
+                              tags: ["mlx", "safetensors", type, "text-generation"]).isSupportedArchitecture)
+        }
+        // The MiMo-7B family (model_type mimo) is a different architecture we do not serve.
+        XCTAssertFalse(mlx(id: "XiaomiMiMo/MiMo-7B-RL", tags: ["safetensors", "mimo", "text-generation"]).isSupportedArchitecture)
+    }
+
     /// HF tags a repo with its config.json model_type, so a served model_type
     /// passes search with no family prefix to remember (Prism Bonsai 2's tags
     /// carry no "qwen").

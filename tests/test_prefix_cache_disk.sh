@@ -15,6 +15,8 @@
 #      the whole entry (`persisted` with a small chunk count).
 #   5. `--prefix-cache-disk off` boots clean, serves, and never touches the
 #      kv-cache dir.
+#   6. `--no-prefix-cache-ram` keeps RAM residency at zero while SSD still
+#      persists and restores prefixes across a restart.
 #
 # Usage: ./tests/test_prefix_cache_disk.sh [/path/to/model] [port]
 
@@ -204,7 +206,46 @@ fi
 stop_server
 
 echo
-echo "== 6. hybrid SSM arch (Qwen 3.5 GatedDeltaNet) persists + restores SSM state =="
+echo "== 6. SSD-only mode persists without RAM retention =="
+rm -rf "$KV_DIR"
+start_server --no-prefix-cache-ram || { echo -e "${RED}FAIL${NC} SSD-only server failed to start"; exit 1; }
+fire_long > /dev/null
+sleep 1
+if grep -q 'Prefix cache: SSD ONLY' "$LOGFILE" &&
+   grep -q '\[disk-cache\] e[0-9][0-9]* complete on disk' "$LOGFILE"; then
+    echo -e "${GREEN}PASS${NC} SSD-only mode persisted a complete prefix"
+else
+    echo -e "${RED}FAIL${NC} SSD-only mode did not persist a complete prefix"
+    tail -30 "$LOGFILE"; FAIL=1
+fi
+stop_server
+start_server --no-prefix-cache-ram || { echo -e "${RED}FAIL${NC} SSD-only restart failed"; exit 1; }
+curl -fsS "$BASE/v1/unload-model" -H 'Content-Type: application/json' -d '{"model":"mlx-serve"}' > /dev/null
+jq -nc --arg model "$MODEL" '{model:$model}' |
+    curl -fsS "$BASE/v1/load-model" -H 'Content-Type: application/json' --data-binary @- > /dev/null
+curl -fsS "$BASE/props" | jq -e '.settings.prefix_cache | .ram_enabled == false and .mem_bytes == 0' > /dev/null
+fire_long > /dev/null
+if grep -q '\[disk-cache\] restored .* tokens from SSD' "$LOGFILE" &&
+   ! grep -q '\[hot-cache\] resident=' "$LOGFILE"; then
+    echo -e "${GREEN}PASS${NC} SSD-only restart restored with no hot-cache residency"
+else
+    echo -e "${RED}FAIL${NC} SSD-only restart did not restore cleanly"
+    tail -30 "$LOGFILE"; FAIL=1
+fi
+stop_server
+
+echo "  -- zero entries disables all reuse even with SSD configured --"
+start_server --prefix-cache-entries 0 || { echo -e "${RED}FAIL${NC} cache-off server failed"; exit 1; }
+fire_long > /dev/null
+if grep -q '\[disk-cache\]\|\[hot-cache\] reused' "$LOGFILE"; then
+    echo -e "${RED}FAIL${NC} zero entries still reused or wrote prefixes"; FAIL=1
+else
+    echo -e "${GREEN}PASS${NC} zero entries disables both tiers"
+fi
+stop_server
+
+echo
+echo "== 7. hybrid SSM arch (Qwen 3.5 GatedDeltaNet) persists + restores SSM state =="
 # Phase 3: hybrid recurrent archs persist their per-position SSM checkpoints
 # beside the KV chunks and restore both across a restart. Gated on a local
 # Qwen3.5-0.8B; SKIPs cleanly otherwise (the attention sections above cover the
@@ -269,7 +310,7 @@ else
 fi
 
 echo
-echo "== 7. a restore wider than the fd limit, and a failed restore's fallback =="
+echo "== 8. a restore wider than the fd limit, and a failed restore's fallback =="
 # A restore reads one chunk file per 1024 tokens. It must fit under a soft
 # RLIMIT_NOFILE smaller than its chunk count, and an unreadable chunk must
 # fall back to a cold prefill that answers 200.

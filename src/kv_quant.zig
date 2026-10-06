@@ -1018,7 +1018,7 @@ test "kv-quant decode µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
                     try mlx.check(mlx.mlx_eval(ev));
                 }
 
-                // This Zig nightly has no std.time.Timer; time via std.Io
+                // Zig 0.17 has no std.time.Timer; time via std.Io
                 // (same pattern as transformer.zig's ProfClock).
                 const io = std.Io.Threaded.global_single_threaded.io();
                 var mark = std.Io.Timestamp.now(io, .boot);

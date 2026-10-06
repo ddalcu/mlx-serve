@@ -132,12 +132,22 @@ final class TerminalSessionStore: ObservableObject {
             }
             let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)
             warnIfSmallContext(agentId: cli.id, context: budget.context)
-            let cmd = CLILauncher.launchCommand(
-                cli, baseURL: server.baseURL, servedModelId: server.chatModelId ?? "mlx-serve",
-                budget: budget,
-                entries: AgentModelEntry.chatEntries(from: server.allModels),
-                workingDirectory: s.workspace, resume: s.resumes)
-            install(handle: makeHandle(id: id, executable: cmd.executable, args: cmd.args), cli: nil, for: id)
+            let run = { (detection: OpenCodeDetection?) in
+                let cmd = CLILauncher.launchCommand(
+                    cli, baseURL: self.server.baseURL, servedModelId: self.server.chatModelId ?? "mlx-serve",
+                    budget: budget,
+                    entries: AgentModelEntry.chatEntries(from: self.server.allModels),
+                    workingDirectory: s.workspace, resume: s.resumes, opencodeDetection: detection)
+                self.install(handle: self.makeHandle(id: id, executable: cmd.executable, args: cmd.args), cli: nil, for: id)
+            }
+            guard cli.id == "opencode" || cli.id == "opencode2" else { run(nil); return }
+            // The OpenCode version probe runs a login shell: off the main thread, like `detectInstalled`.
+            let forcedV2 = cli.id == "opencode2"
+            Task {
+                let detection = await Task.detached { CLILauncher.probeOpenCode(forcedV2: forcedV2) }.value
+                guard sessions.session(id)?.phase == .preparing else { return }
+                run(detection)
+            }
             return
         }
         let agent = sandboxAgent(s)

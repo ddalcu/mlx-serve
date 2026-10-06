@@ -15,6 +15,9 @@ import { runInNewContext } from 'node:vm';
 import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
+// api.js publishes the ONE `apiPrefix` that app.js binds; evaluate it first, the
+// way the page's boot slot does.
+new Function(readFileSync(join(here, '..', 'src', 'html', 'api.js'), 'utf8'))();
 const src = readFileSync(join(here, '..', 'src', 'html', 'app.js'), 'utf8');
 
 // app.js guards its DOM wiring on `typeof document`, so in node only the pure
@@ -146,7 +149,8 @@ const M = (id, capabilities, over = {}) => ({
 });
 
 // A slice of a real `/v1/models` payload: chat models, an encoder, an image
-// backend, a TTS voice, a music model, and a LAN-mirrored peer entry.
+// backend, a TTS voice, a music model, a text-to-audio model, and a
+// LAN-mirrored peer entry.
 const FLEET = [
   M('gemma-4-e4b-it-4bit', ['chat', 'tool_use', 'streaming', 'json_schema', 'vision']),
   M('qwen3.6-27b', ['chat', 'tool_use', 'streaming', 'json_schema'], { loaded: true, state: 'ready' }),
@@ -154,6 +158,7 @@ const FLEET = [
   M('ddalcu/Mage-Flow-Turbo-MLX-Serve-8bit', ['image']),
   M('Qwen3-TTS-Flash-Base-MLX-8bit', ['audio']),
   M('ACE-Step-v1-3.5B-MLX-8bit', ['audio', 'music']),
+  M('stabilityai/stable-audio-3-small-sfx', ['audio', 'sound']),
   M('no-caps-gguf-shelf', undefined),
 ];
 
@@ -175,7 +180,7 @@ test('image selection lists image backends only', () => {
   ]);
 });
 
-test('speech selection excludes the music backend', () => {
+test('speech selection excludes the music and text-to-audio backends', () => {
   // Music models advertise BOTH "audio" and "music" (additive rule in
   // readyCapsJson), so a naive `has("audio")` filter routes a TTS request at
   // ACE-Step, which 400s "loaded audio model is a music generator".
@@ -190,10 +195,16 @@ test('music selection lists music backends only', () => {
   ]);
 });
 
+test('sound selection lists text-to-audio backends only', () => {
+  assert.deepEqual(C.pickModels(FLEET, 'sound').map(m => m.id), [
+    'stabilityai/stable-audio-3-small-sfx',
+  ]);
+});
+
 test('a model with no capabilities array is never selected', () => {
   // Unloaded stubs whose config.json couldn't be read ship no `capabilities`
   // key at all — `undefined.includes` would throw and blank every list.
-  for (const kind of ['chat', 'image', 'speech', 'music']) {
+  for (const kind of ['chat', 'image', 'speech', 'music', 'sound']) {
     assert.equal(C.pickModels(FLEET, kind).some(m => m.id === 'no-caps-gguf-shelf'), false);
   }
   assert.deepEqual(C.pickModels([], 'chat'), []);
@@ -207,7 +218,7 @@ test('a model with no capabilities array is never selected', () => {
 
 test('mediaTools offers one tool per modality that exists on this server', () => {
   const names = C.mediaTools(FLEET).map(t => t.function.name);
-  assert.deepEqual(names.sort(), ['edit_image', 'generate_image', 'generate_music', 'generate_speech']);
+  assert.deepEqual(names.sort(), ['edit_image', 'generate_image', 'generate_music', 'generate_sound', 'generate_speech']);
 });
 
 test('mediaTools offers nothing a server cannot run', () => {
@@ -419,6 +430,15 @@ test('toolInvocation maps speech and music onto their endpoints', () => {
   assert.equal(music.path, '/v1/audio/music-generations');
   assert.deepEqual(music.body, {
     model: 'ACE-Step-v1-3.5B-MLX-8bit', prompt: 'lofi', lyrics: 'la', duration_seconds: 30,
+  });
+
+  const sound = C.toolInvocation(
+    { name: 'generate_sound', args: { prompt: 'door creak', duration_seconds: 3 } },
+    { models: FLEET, refs: [] },
+  );
+  assert.equal(sound.path, '/v1/audio/sound-generations');
+  assert.deepEqual(sound.body, {
+    model: 'stabilityai/stable-audio-3-small-sfx', prompt: 'door creak', duration_seconds: 3,
   });
 });
 
@@ -1206,4 +1226,32 @@ test('no console stylesheet states a font size in px', () => {
   assert.deepEqual(offenders, [],
     `font sizes in px ignore the reader's own text size:\n  ${offenders.join('\n  ')}\n` +
     'Use rem (px / 16): 13px is 0.8125rem.');
+});
+
+// ── The console talks to the server that served it, wherever it is mounted ──
+// A proxy can mount the server below its own root and strip that prefix on the
+// way in, so a root-absolute `fetch('/v1/models')` asks the PROXY's root, gets
+// its 404, and the page reports an empty server.
+
+test('the path prefix the page was served under is the base of every API path', () => {
+  const prefix = globalThis.apiPrefix;
+  assert.equal(prefix('/'), '');
+  assert.equal(prefix('/mount'), '/mount');
+  assert.equal(prefix('/mount/'), '/mount');
+  assert.equal(prefix('/deep/mount/'), '/deep/mount');
+  // A page addressed AS a file resolves against its directory.
+  assert.equal(prefix('/index.html'), '');
+  assert.equal(prefix('/mount/index.html'), '/mount');
+  // Not a pathname at all (an absolute URL, a stubbed location) never invents
+  // a prefix: the endpoint path is what the server expects.
+  assert.equal(prefix(''), '');
+  assert.equal(prefix(undefined), '');
+  assert.equal(prefix('https://x/y'), '');
+});
+
+// The page has one implementation, not one per script: a second copy is the bug
+// report for the next divergence, and identity is what says app.js resolves
+// through api.js rather than around it.
+test('app.js resolves through the page\'s one apiPrefix', () => {
+  assert.equal(C.apiPrefix, globalThis.apiPrefix);
 });

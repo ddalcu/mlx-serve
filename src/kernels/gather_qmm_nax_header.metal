@@ -184,6 +184,33 @@ struct AffineQ {
   }
 };
 
+// MXFP4: e2m1 nibbles under an e8m0 scale per 32, no biases (the bias pointer
+// is a dummy). Decoded as MLX's fp4_e2m1 / fp8_e8m0 do; s * v is exact in fp32.
+template <typename T, int GS>
+struct Fp4Q {
+  using WT = T;
+  STEEL_CONST int kBits = 4;
+  STEEL_CONST int kGroup = GS;
+  const device uint8_t* scales;
+  const device T* biases;
+
+  struct P {
+    float s;
+  };
+
+  METAL_FUNC void advance(const size_t n) thread {
+    scales += n;
+  }
+  METAL_FUNC P params(const int g) const thread {
+    const uint b = scales[g];
+    return P{as_type<float>(b == 0u ? 0x400000u : (b << 23))};
+  }
+  METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
+    const float v = float(as_type<half>(ushort((q & 0x7u) << 9))) * 16384.0f;
+    return static_cast<WT>(p.s * ((q & 0x8u) ? -v : v));
+  }
+};
+
 // Weight-tile loader: loader thread lid owns row lid / kTPR of the
 // kBN x BK tile and the kVPT values from column (lid % kTPR) * kVPT, in
 // kNG chunks that each lie in one quantization group. fetch() reads the

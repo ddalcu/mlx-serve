@@ -43,17 +43,15 @@ jobs:
           DMG_SHA=$(shasum -a 256 MLX-Serve.dmg | awk '{print $1}')
           CLI_SHA=$(shasum -a 256 mlx-serve-bin-macos-arm64.tar.gz | awk '{print $1}')
 
-          sed -i "s/version \".*\"/version \"$VERSION\"/" Casks/mlx-core.rb
-          sed -i "s/sha256 \".*\"/sha256 \"$DMG_SHA\"/" Casks/mlx-core.rb
-          sed -i 's#/MLXCore\.dmg"#/MLX-Serve.dmg"#' Casks/mlx-core.rb
-          sed -i 's/app "MLX Core\.app"/app "MLX-Serve.app"/; s/name "MLX Core"/name "MLX-Serve"/' Casks/mlx-core.rb
+          sed -i "s/version \".*\"/version \"$VERSION\"/" Casks/mlx-serve.rb
+          sed -i "s/sha256 \".*\"/sha256 \"$DMG_SHA\"/" Casks/mlx-serve.rb
 
           sed -i "s/version \".*\"/version \"$VERSION\"/" Formula/mlx-serve.rb
           sed -i "s/sha256 \".*\"/sha256 \"$CLI_SHA\"/" Formula/mlx-serve.rb
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/mlx-core.rb Formula/mlx-serve.rb
+          git add Casks/mlx-serve.rb Formula/mlx-serve.rb
           git commit -m "brew: update to v$VERSION"
 
           # Retry with rebase in case main advanced meanwhile

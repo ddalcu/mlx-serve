@@ -23,7 +23,10 @@ enum CLISetupInstructions {
     /// Same CLIs, same order as the DMG launcher dropdown.
     static func tabs(baseURL: String, servedModelId: String,
                      budget: AgentBudget.Budget) -> [Tab] {
-        [
+        let fxSettings = AgentConfigs.fxSettingsJSON(
+            existing: "{}", baseURL: baseURL,
+            entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)]) ?? ""
+        return [
             Tab(id: "claude",
                 title: "Claude Code",
                 installHint: "Requires the claude CLI: npm install -g @anthropic-ai/claude-code",
@@ -67,15 +70,22 @@ enum CLISetupInstructions {
             // config, so their own settings and plugins keep working.
             Tab(id: "opencode",
                 title: "OpenCode",
-                installHint: "Requires the opencode CLI: curl -fsSL https://opencode.ai/install | bash",
+                installHint: "Manual setup for OpenCode 1.x only; for 2.x+, use the OpenCode 2 tab.",
                 command: """
+                # OpenCode 1.x (the v1 integration). OpenCode 2.x+ ships under the
+                # same name — `mlx-serve launch opencode` detects the version and
+                # routes itself; this block is the manual v1 setup.
                 export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, model: servedModelId, budget: budget))'
                 opencode --model mlx/\(servedModelId)
                 """),
             Tab(id: "opencode2",
                 title: "OpenCode 2",
-                installHint: "Requires the opencode2 CLI: npm install -g @opencode/cli",
+                installHint: "Requires opencode 2.x+: curl -fsSL https://opencode.ai/install | bash",
                 command: """
+                # The v2 integration, for OpenCode 2.x+ — `launch opencode` routes
+                # here automatically and `launch opencode2` forces it. Newer
+                # OpenCode ships as `opencode`, so the v2 binary is resolved by
+                # version below; the `opencode2` name is the legacy fallback.
                 mkdir -p ~/.mlx-serve/opencode2/opencode/plugins
                 [ -d ~/.mlx-serve/opencode2/opencode/plugins/mlx-serve ] || git clone https://github.com/beamivalice/opencode2-mlx-serve ~/.mlx-serve/opencode2/opencode/plugins/mlx-serve
                 cat > ~/.mlx-serve/opencode2/opencode/cli.json <<'EOF'
@@ -83,8 +93,7 @@ enum CLISetupInstructions {
                 EOF
                 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
                 export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: servedModelId, entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)], pinModel: true, compaction: true))'
-                if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-                opencode2 --standalone
+                \(opencodeV2BinResolver)
                 """),
             // codex honors CODEX_HOME for its whole config tree; the dir must
             // exist before codex runs. Responses wire API — our /v1/responses.
@@ -133,6 +142,49 @@ enum CLISetupInstructions {
                 export OPENAI_API_KEY=mlx-serve
                 aider --model openai/\(servedModelId) --weak-model openai/\(servedModelId) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
                 """),
+            // fx reads providers only from ~/.fx/settings.json; a shell block
+            // cannot merge JSON safely, so it writes a fresh file only and
+            // otherwise prints the entry to merge by hand.
+            Tab(id: "fx",
+                title: "fx",
+                installHint: "Requires the fx CLI: https://fx.sh",
+                command: """
+                mkdir -p ~/.fx
+                if [ -s ~/.fx/settings.json ]; then
+                echo 'Merge "providers"."mlx-serve" below into ~/.fx/settings.json:'
+                cat <<'EOF'
+                \(fxSettings)
+                EOF
+                else
+                cat > ~/.fx/settings.json <<'EOF'
+                \(fxSettings)
+                EOF
+                fi
+                FX_PROVIDER=\(AgentConfigs.fxProvider) FX_MODEL=\(servedModelId) fx
+                """),
+            // grok reads its whole tree from GROK_HOME.
+            Tab(id: "grok",
+                title: "Grok",
+                installHint: "Requires the grok CLI: curl -fsSL https://x.ai/cli/install.sh | bash",
+                command: """
+                mkdir -p ~/.mlx-serve/grok
+                cat > ~/.mlx-serve/grok/config.toml <<'EOF'
+                \(AgentConfigs.grokConfigTOML(baseURL: baseURL, model: servedModelId, budget: budget, entries: []))
+                EOF
+                export GROK_HOME="$HOME/.mlx-serve/grok"
+                grok
+                """),
+            Tab(id: "zcode",
+                title: "ZCode",
+                installHint: "Build or install ZCode: https://github.com/zai-org/ZCode",
+                command: """
+                mkdir -p ~/.mlx-serve/zcode
+                cat > ~/.mlx-serve/zcode/provider_config.json <<'EOF'
+                \(AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: servedModelId, budget: budget, entries: []))
+                EOF
+                \(AgentConfigs.zcodeExports)
+                zcode
+                """),
         ]
     }
 }
@@ -167,7 +219,7 @@ struct CLISetupInstructionsButton: View {
         .frame(maxWidth: .infinity)
         .onHover { hovering = $0 }
         .disabled(!isEnabled)
-        .help("Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider) to this server — shows the terminal commands to run")
+        .help("Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider, fx, Grok) to this server — shows the terminal commands to run")
         .popover(isPresented: $showPanel, arrowEdge: .bottom) {
             CLISetupInstructionsView(
                 tabs: CLISetupInstructions.tabs(

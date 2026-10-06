@@ -222,22 +222,19 @@ pub fn planFor(gen: u32, phone: bool, dt: mlx.mlx_dtype, m: c_int, n: c_int, k: 
     };
 }
 
-/// Test seam: pin the generation the plan reads (null = the device's).
-pub var gen_override: ?struct { gen: u32, phone: bool } = null;
-var gen_cache: ?struct { gen: u32, phone: bool } = null;
+var gen_logged = false;
 
 fn deviceGen() struct { gen: u32, phone: bool } {
-    if (gen_override) |g| return .{ .gen = g.gen, .phone = g.phone };
-    if (gen_cache) |g| return .{ .gen = g.gen, .phone = g.phone };
     const xfm = @import("transformer.zig");
-    var buf: [128]u8 = undefined;
-    const parsed = xfm.naxArchGeneration(xfm.gpuArchitecture(&buf) orelse "");
-    gen_cache = .{ .gen = parsed.gen, .phone = parsed.phone };
-    log.info("[qmv2] 2-bit dispatch for GPU generation {d}{s}: {s}\n", .{ parsed.gen, if (parsed.phone) " (phone)" else "", switch (planFor(parsed.gen, parsed.phone, .float16, 2, 17408, 5120)) {
-        .legacy => "legacy (unmeasured generation)",
-        else => "measured plan",
-    } });
-    return .{ .gen = parsed.gen, .phone = parsed.phone };
+    const g = xfm.deviceGeneration();
+    if (!gen_logged and xfm.device_gen_override == null) {
+        gen_logged = true;
+        log.info("[qmv2] 2-bit dispatch for GPU generation {d}{s}: {s}\n", .{ g.gen, if (g.phone) " (phone)" else "", switch (planFor(g.gen, g.phone, .float16, 2, 17408, 5120)) {
+            .legacy => "legacy (unmeasured generation)",
+            else => "measured plan",
+        } });
+    }
+    return .{ .gen = g.gen, .phone = g.phone };
 }
 
 var rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -506,7 +503,7 @@ test "qmv2.qmm: routing per generation; legacy is the old dispatch byte for byte
     const xv = try std.testing.allocator.alloc(f32, @intCast(MAX_ROWS * k));
     defer std.testing.allocator.free(xv);
     for (xv) |*e| e.* = rnd.floatNorm(f32);
-    defer gen_override = null;
+    defer @import("transformer.zig").device_gen_override = null;
 
     const Case = struct { gen: u32, dt: mlx.mlx_dtype, m: c_int, bneg: bool, legacy_ok: bool, want: enum { none, qmv, r4g8, r4g2 } };
     const cases = [_]Case{
@@ -526,7 +523,7 @@ test "qmv2.qmm: routing per generation; legacy is the old dispatch byte for byte
         .{ .gen = 17, .dt = .bfloat16, .m = 1, .bneg = true, .legacy_ok = false, .want = .none },
     };
     for (cases) |c| {
-        gen_override = .{ .gen = c.gen, .phone = false };
+        @import("transformer.zig").device_gen_override = .{ .gen = c.gen, .phone = false };
         var sc = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sc);
         try mlx.check(mlx.mlx_astype(&sc, sc32, c.dt, s));

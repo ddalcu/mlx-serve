@@ -40,6 +40,8 @@ pub const ImageData = struct {
 /// config. Threaded into `parseImageUrlContent`/`decodeImageToPixels` so decode
 /// stays race-safe (no global state) under `--max-concurrent ≥ 2`.
 pub const VisionPreproc = struct {
+    /// Clef's Pillow RGB conversion discards alpha instead of compositing it.
+    composite_alpha: bool = true,
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
     mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
@@ -89,13 +91,16 @@ pub fn canonicalRole(role: []const u8) []const u8 {
     return if (std.mem.eql(u8, role, "developer")) "system" else role;
 }
 
-/// Fold every `system` message past index 0 into the leading one (created
-/// when absent). Templates we serve raise on a system turn that is not first
-/// and the raise is a silent generic fallback. Returns the joined buffer the
-/// caller owns, null when nothing moved.
-pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !?[]const u8 {
+/// Join system messages into one leading turn. With `leading_only`, later
+/// turns keep their position. Caller owns the joined buffer, if any.
+pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message), leading_only: bool) !?[]const u8 {
+    var end = messages.items.len;
+    if (leading_only) {
+        end = 0;
+        while (end < messages.items.len and std.mem.eql(u8, messages.items[end].role, "system")) : (end += 1) {}
+    }
     var extra: usize = 0;
-    for (messages.items[@min(messages.items.len, 1)..]) |m| {
+    for (messages.items[@min(end, 1)..end]) |m| {
         if (std.mem.eql(u8, m.role, "system")) extra += 1;
     }
     if (extra == 0) return null;
@@ -104,7 +109,7 @@ pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList
     errdefer joined.deinit(allocator);
     if (lead_is_system) try joined.appendSlice(allocator, messages.items[0].content);
     var i: usize = if (lead_is_system) 1 else 0;
-    while (i < messages.items.len) {
+    while (i < end) {
         if (!std.mem.eql(u8, messages.items[i].role, "system")) {
             i += 1;
             continue;
@@ -112,6 +117,7 @@ pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList
         if (joined.items.len > 0) try joined.appendSlice(allocator, "\n\n");
         try joined.appendSlice(allocator, messages.items[i].content);
         _ = messages.orderedRemove(i);
+        end -= 1;
     }
     const text = try joined.toOwnedSlice(allocator);
     if (lead_is_system) {
@@ -152,6 +158,9 @@ pub const ChatConfig = struct {
     /// only when a request names neither (`server.resolveChatThinking`).
     default_enable_thinking: ?bool = null,
     default_reasoning_effort: ?[]const u8 = null,
+    /// `templateRendersToolTurn` for this template, probed ONCE at load (a probe render
+    /// per request is a second parse of a multi-KB template); null = unknown, probe.
+    renders_tool_turn: ?bool = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
@@ -246,21 +255,24 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
     {   // no "default" named: fall back to the first usable entry
-        const json = \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
+        const json =
+            \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
     {   // the ordinary string shape is untouched
-        const json = \\{"chat_template":"BARE"}
+        const json =
+            \\{"chat_template":"BARE"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
     {   // junk shapes return null so the caller uses its jinja/family fallback
-        const json = \\{"chat_template":[{"name":"x"},{"nope":1}]}
+        const json =
+            \\{"chat_template":[{"name":"x"},{"nope":1}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -274,21 +286,24 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         // taking the pointer literally fails the render and SILENTLY drops to
         // the generic fallback — wrong-family markers the model then echoes.
         // Read it as "no inline template" so the sidecar file is used.
-        const json = \\{"chat_template":"{% include 'chat_template.jinja' %}"}
+        const json =
+            \\{"chat_template":"{% include 'chat_template.jinja' %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
     {   // whitespace/dash variants are the same pointer
-        const json = \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
+        const json =
+            \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
     {   // a real template that merely CONTAINS the word include is untouched
-        const json = \\{"chat_template":"{% if x %}include{% endif %}"}
+        const json =
+            \\{"chat_template":"{% if x %}include{% endif %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -358,12 +373,14 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     else
         false;
 
+    const renders_tool_turn: ?bool = templateRendersToolTurn(allocator, chat_template) catch null;
     return .{
         .chat_template = chat_template,
         .bos_token = bos_token,
         .eos_token = eos_token,
         .add_bos_token = add_bos_token,
         .allocator = allocator,
+        .renders_tool_turn = renders_tool_turn,
     };
 }
 
@@ -384,7 +401,6 @@ pub fn formatChat(
 ) ![]u32 {
     const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
-
 
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
@@ -441,12 +457,15 @@ pub fn prepareDs4Prompt(
     errdefer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const messages_have_tool_content = messagesHaveToolContent(messages);
-    var effective_messages = messages;
+    var folded = std.ArrayList(Message).empty;
+    try folded.appendSlice(arena_alloc, messages);
+    _ = try foldSystemMessages(arena_alloc, &folded, false);
+    const messages_have_tool_content = messagesHaveToolContent(folded.items);
+    var effective_messages: []const Message = folded.items;
     if (tools_json != null or messages_have_tool_content) {
         effective_messages = try synthesizeToolFallbackMessages(
             arena_alloc,
-            messages,
+            effective_messages,
             tools_json,
             tool_choice_instruction,
             tools_json != null,
@@ -580,7 +599,7 @@ pub fn decodeViaLlama(
 }
 
 /// Render the Jinja chat template with the given messages.
-fn renderChatTemplate(
+pub fn renderChatTemplate(
     allocator: std.mem.Allocator,
     messages: []const Message,
     chat_config: *const ChatConfig,
@@ -614,9 +633,11 @@ fn renderChatTemplate(
     // form so the model still sees the tool context.
     const tpl = chat_config.chat_template;
     const tpl_has_tools = std.mem.indexOf(u8, tpl, "tools") != null;
-    const tpl_has_tool_role = templateReferencesToolRole(tpl);
+    const has_tool_content = messagesHaveToolContent(msgs);
+    const tpl_has_tool_role = templateReferencesToolRole(tpl) or
+        (has_tool_content and (chat_config.renders_tool_turn orelse try templateRendersToolTurn(allocator, tpl)));
     const needs_inject_tools = tools_json != null and !tpl_has_tools;
-    const needs_rewrite_tool_role = !tpl_has_tool_role and messagesHaveToolContent(msgs);
+    const needs_rewrite_tool_role = !tpl_has_tool_role and has_tool_content;
 
     var fallback_arena: ?std.heap.ArenaAllocator = null;
     defer if (fallback_arena) |*a| a.deinit();
@@ -631,7 +652,7 @@ fn renderChatTemplate(
             effective_tools_json = filled;
         }
     }
-    if (needs_inject_tools or needs_rewrite_tool_role) {
+    if (needs_inject_tools or needs_rewrite_tool_role or tool_choice_instruction != null) {
         // NEVER re-init: the tool-def fill above may already own this arena,
         // and clobbering it orphans everything allocated there (a leak here, a
         // use-after-free the moment `effective_tools_json` points into it).
@@ -677,41 +698,21 @@ fn renderChatTemplate(
         .empty_string
     else
         .null_literal;
-    const messages_json = try serializeMessagesJsonFor(allocator, effective_messages, empty_content, chat_config);
-    defer allocator.free(messages_json);
-
-    // Build extra context (bos_token, eos_token, enable_thinking, effort)
     const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
     defer allocator.free(extra_json);
-
-    // Null-terminate strings for C
-    const tmpl_z = try allocator.dupeSentinel(u8, chat_config.chat_template, 0);
-    defer allocator.free(tmpl_z);
-    const msgs_z = try allocator.dupeSentinel(u8, messages_json, 0);
-    defer allocator.free(msgs_z);
-    const extra_z = try allocator.dupeSentinel(u8, extra_json, 0);
-    defer allocator.free(extra_z);
-
-    var tools_z: ?[:0]const u8 = null;
-    defer if (tools_z) |tz| allocator.free(tz);
-    if (effective_tools_json) |tj| {
-        tools_z = try allocator.dupeSentinel(u8, tj, 0);
+    if (hasExtraSystemMessages(effective_messages)) {
+        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+        const a = fallback_arena.?.allocator();
+        var prepared = std.ArrayList(Message).empty;
+        try prepared.appendSlice(a, effective_messages);
+        const preserve = try templatePreservesMidSystem(a, effective_messages, chat_config, effective_tools_json, extra_json, empty_content);
+        _ = try foldSystemMessages(a, &prepared, preserve);
+        effective_messages = prepared.items;
     }
 
-    // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
-    var rendered_len: usize = 0;
-    const result_ptr = jinja_c.jinja_render_chat(
-        tmpl_z.ptr,
-        msgs_z.ptr,
-        if (tools_z) |tz| tz.ptr else null,
-        extra_z.ptr,
-        1,
-        &rendered_len,
-    );
-
-    if (result_ptr) |ptr| {
-        defer jinja_c.jinja_str_free(ptr);
-        const collapsed = try collapseDoubledThinkTags(allocator, ptr[0..rendered_len]);
+    if (try renderJinja(allocator, effective_messages, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
+        defer allocator.free(rendered);
+        const collapsed = try collapseDoubledThinkTags(allocator, rendered);
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
         // tail, never beside it — both append the same channel commit, and
@@ -743,6 +744,128 @@ fn renderChatTemplate(
         return std.mem.concat(allocator, u8, &.{ base, partial });
     }
     return base;
+}
+
+fn hasExtraSystemMessages(messages: []const Message) bool {
+    for (messages[@min(messages.len, 1)..]) |m| {
+        if (std.mem.eql(u8, m.role, "system")) return true;
+    }
+    return false;
+}
+
+/// Only byte-pinned Qwen templates accept this ChatML extension. Unknown
+/// revisions retain their native contract and use late-system consolidation.
+fn qwenLateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]const u8 {
+    const templates = [_]struct { source: []const u8, content: []const u8 }{
+        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .content = "render_content(message.content, false, true)|trim" },
+        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .content = "content" },
+    };
+    const branch =
+        \\{%- if message.role == "system" %}
+        \\        {%- if not loop.first %}
+        \\            {{- raise_exception('System message must be at the beginning.') }}
+        \\        {%- endif %}
+    ;
+    for (templates) |template| {
+        if (!std.mem.eql(u8, tpl, template.source)) continue;
+        if (std.mem.count(u8, tpl, branch) != 1) return null;
+        const replacement = try std.mem.concat(allocator, u8, &.{
+            "{%- if message.role == \"system\" %}{%- if not loop.first %}{{- '<|im_start|>system\\n' + (",
+            template.content,
+            ") + '<|im_end|>\\n' }}{%- endif %}",
+        });
+        defer allocator.free(replacement);
+        return try std.mem.replaceOwned(u8, allocator, tpl, branch, replacement);
+    }
+    return null;
+}
+
+fn renderJinja(
+    allocator: std.mem.Allocator,
+    messages: []const Message,
+    config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    extra_json: []const u8,
+    empty_content: EmptyContent,
+) !?[]const u8 {
+    const json = try serializeMessagesJsonFor(allocator, messages, empty_content, config);
+    defer allocator.free(json);
+    const adapted = if (hasExtraSystemMessages(messages)) try qwenLateSystemTemplate(allocator, config.chat_template) else null;
+    defer if (adapted) |t| allocator.free(t);
+    const tpl = try allocator.dupeSentinel(u8, adapted orelse config.chat_template, 0);
+    defer allocator.free(tpl);
+    const msgs = try allocator.dupeSentinel(u8, json, 0);
+    defer allocator.free(msgs);
+    const extra = try allocator.dupeSentinel(u8, extra_json, 0);
+    defer allocator.free(extra);
+    const tools = if (tools_json) |t| try allocator.dupeSentinel(u8, t, 0) else null;
+    defer if (tools) |t| allocator.free(t);
+    var len: usize = 0;
+    const ptr = jinja_c.jinja_render_chat(tpl.ptr, msgs.ptr, if (tools) |t| t.ptr else null, extra.ptr, 1, &len) orelse return null;
+    defer jinja_c.jinja_str_free(ptr);
+    return try allocator.dupe(u8, ptr[0..len]);
+}
+
+/// Probe each distinct late-system boundary with the request's tools and kwargs.
+/// Raising, dropping or moving the note to the front all require consolidation.
+fn templatePreservesMidSystem(
+    allocator: std.mem.Allocator,
+    messages: []const Message,
+    config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    extra_json: []const u8,
+    empty_content: EmptyContent,
+) !bool {
+    const before = "mlxserve_before_note_7c91";
+    const note = "mlxserve_system_note_a83d";
+    const after = "mlxserve_after_note_b462";
+    const calls = [_]ToolCall{.{ .id = "probe_call", .name = "probe", .arguments = "{}" }};
+    const Role = enum { user, assistant, tool, tail };
+    var checked: u16 = 0;
+    var i: usize = 0;
+    while (i < messages.len) {
+        if (!std.mem.eql(u8, messages[i].role, "system")) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < messages.len and std.mem.eql(u8, messages[i].role, "system")) : (i += 1) {}
+        if (start == 0) continue;
+        const prev = messages[start - 1].role;
+        const next = if (i < messages.len) messages[i].role else "tail";
+        const prev_role = std.meta.stringToEnum(Role, prev) orelse return false;
+        const next_role = std.meta.stringToEnum(Role, next) orelse return false;
+        const bit = @as(u16, 1) << @as(u4, @intCast(@as(u8, @backingInt(prev_role)) * 4 + @backingInt(next_role)));
+        if (checked & bit != 0) continue;
+        checked |= bit;
+        var probe = std.ArrayList(Message).empty;
+        defer probe.deinit(allocator);
+        try probe.append(allocator, .{ .role = "system", .content = "stable instructions" });
+        if (!std.mem.eql(u8, prev, "user")) try probe.append(allocator, .{ .role = "user", .content = "question" });
+        if (std.mem.eql(u8, prev, "tool")) try probe.append(allocator, .{ .role = "assistant", .content = "", .tool_calls = &calls });
+        try probe.append(allocator, .{ .role = prev, .content = before, .tool_call_id = if (std.mem.eql(u8, prev, "tool")) "probe_call" else null });
+        try probe.append(allocator, .{ .role = "system", .content = note });
+        if (i < messages.len) try probe.append(allocator, .{ .role = next, .content = after });
+        // A tail note must also survive when it becomes history next turn.
+        for (0..@as(usize, if (i == messages.len) 2 else 1)) |pass| {
+            if (pass == 1) try probe.append(allocator, .{ .role = "assistant", .content = after });
+            const rendered = (try renderJinja(allocator, probe.items, config, tools_json, extra_json, empty_content)) orelse return false;
+            defer allocator.free(rendered);
+            if (!systemNoteInOrder(rendered, before, note, if (i < messages.len or pass == 1) after else null)) return false;
+        }
+    }
+    return true;
+}
+
+fn systemNoteInOrder(rendered: []const u8, before: []const u8, note: []const u8, after: ?[]const u8) bool {
+    const p = std.mem.indexOf(u8, rendered, before) orelse return false;
+    const n = std.mem.indexOf(u8, rendered, note) orelse return false;
+    if (n <= p) return false;
+    if (after) |marker| {
+        const a = std.mem.indexOf(u8, rendered, marker) orelse return false;
+        if (a <= n) return false;
+    }
+    return true;
 }
 
 /// Null `reasoning_content` on assistant messages BEFORE the last user
@@ -818,6 +941,20 @@ fn templateReferencesToolRole(tpl: []const u8) bool {
     return false;
 }
 
+/// A template that renders tool CALLS but names no 'tool' role (MiMo's generic
+/// `<|im_start|>{{ role }}` header) was trained on tool turns: probe-render one
+/// and keep it native when its content survives.
+fn templateRendersToolTurn(allocator: std.mem.Allocator, tpl: []const u8) !bool {
+    if (std.mem.indexOf(u8, tpl, "tool_calls") == null) return false;
+    const marker = "__mlx_serve_tool_turn_probe__";
+    const tpl_z = try allocator.dupeSentinel(u8, tpl, 0);
+    defer allocator.free(tpl_z);
+    var len: usize = 0;
+    const out = jinja_c.jinja_render_chat(tpl_z.ptr, "[{\"role\":\"tool\",\"content\":\"" ++ marker ++ "\"}]", null, "{}", 0, &len) orelse return false;
+    defer jinja_c.jinja_str_free(out);
+    return std.mem.indexOf(u8, out[0..len], marker) != null;
+}
+
 /// True if any message has `role: "tool"` or an assistant message with tool_calls.
 fn messagesHaveToolContent(messages: []const Message) bool {
     for (messages) |m| {
@@ -849,6 +986,9 @@ fn synthesizeToolFallbackMessages(
         var buf = std.ArrayList(u8).empty;
         try appendToolSystemPrompt(arena, &buf, tools_json.?, tool_choice_instruction);
         tool_prompt = try buf.toOwnedSlice(arena);
+    } else if (tool_choice_instruction) |instr| {
+        // The template renders the tools itself; only the choice is ours to add.
+        tool_prompt = std.mem.trim(u8, instr, "\n");
     }
 
     var injected = false;
@@ -1143,7 +1283,13 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 /// Qwen3.8's effort vocabulary (xhigh|medium|low); `qwen38EffortFor` maps an
 /// absent effort to low on this family.
 pub fn isQwen38EffortTemplate(tpl: []const u8) bool {
-    return std.mem.indexOf(u8, tpl, "'xhigh'") != null;
+    // Kolibri's effort list also spells 'xhigh' but has its own vocabulary.
+    return std.mem.indexOf(u8, tpl, "'xhigh'") != null and !isKolibriEffortTemplate(tpl);
+}
+
+/// Kolibri-1's template: the one place that names its private effort variable.
+pub fn isKolibriEffortTemplate(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "_sv_reasoning_effort") != null;
 }
 
 pub fn templateConsumesEffort(tpl: []const u8) bool {
@@ -1160,6 +1306,14 @@ pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
     if (std.mem.eql(u8, e, "high")) return "high";
     if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max") or std.mem.eql(u8, e, "ultra")) return "max";
     return "low";
+}
+
+/// OpenAI's effort vocabulary -> GLM-5-Next's low|high|max (the template's default is max).
+fn glm5EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "max";
+    if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) return "low";
+    if (std.mem.eql(u8, e, "medium") or std.mem.eql(u8, e, "high")) return "high";
+    return "max";
 }
 
 /// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
@@ -1226,6 +1380,17 @@ pub fn mergeTemplateKwargs(allocator: std.mem.Allocator, model_kwargs: ?[]const 
     }
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
+}
+
+/// Kolibri-1's template reads none|minimal|low|medium|high|xhigh|max and treats
+/// "none" as thinking-off; any other word it does not know falls through to high.
+fn kolibriEffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
+    if (!enable_thinking) return "none";
+    const e = effort orelse return "high";
+    for ([_][]const u8{ "minimal", "low", "medium", "high", "xhigh", "max" }) |w| {
+        if (std.mem.eql(u8, e, w)) return w;
+    }
+    return "high";
 }
 
 fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ![]const u8 {
@@ -1301,6 +1466,14 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, qwen38EffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
+    } else if (std.mem.indexOf(u8, chat_config.chat_template, "reasoning_effort in ['low', 'high']") != null) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, glm5EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else if (isKolibriEffortTemplate(chat_config.chat_template)) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, kolibriEffortFor(effort, enable_thinking));
+        try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
     else if (inkling_style)
@@ -1341,14 +1514,6 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         kwargs = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null;
     }
     const kw_obj: ?std.json.ObjectMap = if (kwargs) |k| (if (k.value == .object) k.value.object else null) else null;
-
-    // Qwen3.8 renders EVERY turn's <think> when `preserve_thinking` is
-    // undefined; round-tripped agent reasoning then swamps the prompt.
-    if (std.mem.indexOf(u8, chat_config.chat_template, "preserve_thinking") != null and
-        (kw_obj == null or kw_obj.?.get("preserve_thinking") == null))
-    {
-        try buf.appendSlice(allocator, ",\"preserve_thinking\":false");
-    }
 
     if (kw_obj) |obj| {
         // Set above from resolved values, or the wrapper's own context.
@@ -1400,6 +1565,15 @@ fn fallbackFormatChat(
 ) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
+
+    if (hasExtraSystemMessages(messages)) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var folded = std.ArrayList(Message).empty;
+        try folded.appendSlice(arena.allocator(), messages);
+        _ = try foldSystemMessages(arena.allocator(), &folded, false);
+        return fallbackFormatChat(allocator, folded.items, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    }
 
     const is_chatml = chat_config.eos_token != null and
         std.mem.indexOf(u8, chat_config.eos_token.?, "<|im_end|>") != null;
@@ -2926,13 +3100,22 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         // 14185 decode to exactly `<funct`); omitting that one rung flushed the
         // fragment and leaked the rest of the tag. The rungs are DERIVED in the
         // test, so a future gap fails there instead of shipping.
-        "<f", "<fu", "<fun", "<func", "<funct", "<functi", "<functio", "<function",
+        "<f",
+        "<fu",      "<fun",      "<func",     "<funct",     "<functi",
+        "<functio", "<function",
         // Muse ATEM (a fused multi-char BPE fragment can end mid-marker)
-        "<a", "<at", "<ate", "<atem", "<atem:",
+        "<a",        "<at",        "<ate",
+        "<atem",    "<atem:",
         // DSML fullwidth-bar prefixes (`｜` = 3 bytes; cover mid-codepoint
         // splits too in case the tokenizer spells the marker in pieces)
-        "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
-        "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
+           "<\xef",     "<\xef\xbd",
+        "<｜",
+        "<｜D",
+        "<｜DS",
+        "<｜DSM",
+        "<｜DSML",
+        "<｜DSML\xef",
+        "<｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -3368,10 +3551,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         }
         // Gemma 4 close marker: `<tool_call|>`. Detected when after `<tool`
         // we see `_call|`. Let the Gemma 4 branch below pick this up.
-        if (next == '_'
-            and after_tool + 6 <= effective_text.len
-            and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|"))
-        {
+        if (next == '_' and after_tool + 6 <= effective_text.len and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|")) {
             search_pos = after_tool + 6;
             continue;
         }
@@ -3865,10 +4045,11 @@ fn isScalarJsonType(want: []const u8) bool {
 
 /// The JSON type a property declares. `"type"` may be a union array
 /// (`["string","null"]`) — the first non-null entry wins. Absent/odd → null,
-/// which means "leave the value alone".
+/// which means "leave the value alone". Without a `"type"`, a `oneOf`/`anyOf`
+/// union declares one only when every non-null branch names the same.
 fn declaredJsonType(prop: std.json.Value) ?[]const u8 {
     if (prop != .object) return null;
-    const t = prop.object.get("type") orelse return null;
+    const t = prop.object.get("type") orelse return unionJsonType(prop.object);
     switch (t) {
         .string => |s| return s,
         .array => |arr| {
@@ -3881,6 +4062,20 @@ fn declaredJsonType(prop: std.json.Value) ?[]const u8 {
         },
         else => return null,
     }
+}
+
+fn unionJsonType(prop: std.json.ObjectMap) ?[]const u8 {
+    const branches = (prop.get("oneOf") orelse prop.get("anyOf") orelse return null);
+    if (branches != .array) return null;
+    var agreed: ?[]const u8 = null;
+    for (branches.array.items) |b| {
+        const bt = declaredJsonType(b) orelse return null;
+        if (std.mem.eql(u8, bt, "null")) continue;
+        if (agreed) |a| {
+            if (!std.mem.eql(u8, a, bt)) return null;
+        } else agreed = bt;
+    }
+    return agreed;
 }
 
 /// Tolerant boolean spelling — the union of what weak models actually emit:
@@ -7104,6 +7299,44 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
     try buf.append(allocator, '"');
 }
 
+/// `tool_choice` that obliges a call: any declared tool, or the named one.
+pub const ForcedTool = union(enum) { any, name: []const u8 };
+
+/// The prompt line for a forced choice; the caller frees it.
+pub fn toolChoiceInstruction(allocator: std.mem.Allocator, forced: ForcedTool) ![]u8 {
+    return switch (forced) {
+        .any => allocator.dupe(u8, "\nYou MUST call one of the available functions. Do not respond with text."),
+        .name => |n| std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{n}),
+    };
+}
+
+/// Whether a request's `tools` array declares `name`, as `function.name`
+/// (chat completions) or a top-level `name` (Anthropic, Responses).
+pub fn toolsDeclare(tools: ?std.json.Value, name: []const u8) bool {
+    const arr = tools orelse return false;
+    if (arr != .array) return false;
+    for (arr.array.items) |t| {
+        if (t != .object) continue;
+        const holder = if (t.object.get("function")) |f| f else t;
+        if (holder != .object) continue;
+        const n = holder.object.get("name") orelse continue;
+        if (n == .string and std.mem.eql(u8, n.string, name)) return true;
+    }
+    return false;
+}
+
+/// The assistant text that commits a tool call in the template's own dialect,
+/// or null for a dialect we cannot spell (the instruction line alone asks then).
+pub fn forcedToolOpener(allocator: std.mem.Allocator, template: []const u8, forced: ForcedTool) !?[]u8 {
+    // The pair, escaped or literal: Llama 3.1 spells a different `<function=` dialect.
+    if (std.mem.indexOf(u8, template, "<tool_call>\\n<function=") == null and
+        std.mem.indexOf(u8, template, "<tool_call>\n<function=") == null) return null;
+    return switch (forced) {
+        .any => try allocator.dupe(u8, "<tool_call>\n<function="),
+        .name => |n| try std.fmt.allocPrint(allocator, "<tool_call>\n<function={s}>\n", .{n}),
+    };
+}
+
 /// Append tool definitions as a system prompt section.
 fn appendToolSystemPrompt(allocator: std.mem.Allocator, result_buf: *std.ArrayList(u8), tools_json: []const u8, tool_choice_instruction: ?[]const u8) !void {
     try result_buf.appendSlice(allocator,
@@ -7144,8 +7377,7 @@ test "collapseDoubledThinkTags leaves single </think> unchanged" {
 }
 
 test "collapseDoubledThinkTags handles multiple separated doublings" {
-    const out = try collapseDoubledThinkTags(testing.allocator,
-        "A</think></think>B</think></think>C");
+    const out = try collapseDoubledThinkTags(testing.allocator, "A</think></think>B</think></think>C");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("A</think>B</think>C", out);
 }
@@ -9536,6 +9768,31 @@ test "appendJsonString escapes ALL control characters (2026-06-11 ESC-byte regre
     try testing.expectEqualStrings(&input, parsed.value.string);
 }
 
+test "renderChatTemplate: a tool-aware template with a generic role header renders tool turns natively" {
+    // MiMo's template names no 'tool' literal: every non-assistant turn is
+    // `<|im_start|>{{ role }}`. It renders tool CALLS, so tool results are its
+    // own turns; a template that renders no tool calls keeps the rewrite.
+    const a = testing.allocator;
+    const generic = "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}" ++
+        "{%- if m.tool_calls is defined and m.tool_calls -%}{%- for tc in m.tool_calls -%}<tool_call>{{ tc.function.name }}</tool_call>{%- endfor -%}{%- endif -%}<|im_end|>{%- endfor -%}";
+    const calls = [_]ToolCall{.{ .id = "c1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Weather?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "18C", .tool_call_id = "c1" },
+    };
+    var config = ChatConfig{ .chat_template = generic, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+    const native = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(native);
+    try testing.expect(std.mem.indexOf(u8, native, "<|im_start|>tool\n18C<|im_end|>") != null);
+    try testing.expect(std.mem.indexOf(u8, native, "<tool_response>") == null);
+
+    config.chat_template = "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{%- endfor -%}";
+    const plain = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "<|im_start|>user\n<tool_response>\n18C\n</tool_response>") != null);
+}
+
 test "renderChatTemplate: tool result with raw ANSI escapes still renders via Jinja" {
     // Regression for the 2026-06-11 pi/gemma-4-31b session: the third request
     // was the first whose history held a tool result with a raw ESC byte (the
@@ -9862,8 +10119,7 @@ test "templateConsumesEffort: the real templates that READ the effort word" {
     try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
     // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, laguna, Ling,
     // Nemotron, llama, mistral) reads neither: thinking is a bool there.
-    try testing.expect(!templateConsumesEffort(
-        "{%- if enable_thinking %}<think>\n{%- endif %}"));
+    try testing.expect(!templateConsumesEffort("{%- if enable_thinking %}<think>\n{%- endif %}"));
     try testing.expect(!templateConsumesEffort(""));
 }
 
@@ -9989,6 +10245,71 @@ test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallb
     }
 }
 
+test "renderChatTemplate: tool_choice reaches a tool-aware template's prompt" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const tools_json =
+        \\[{"type":"function","function":{"name":"calculator","description":"Math","parameters":{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}}}]
+    ;
+    const instr = "\nYou MUST call one of the available functions. Do not respond with text.";
+    const bare = [_]Message{.{ .role = "user", .content = "What is 7 times 8?" }};
+    const with_system = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What is 7 times 8?" },
+    };
+    for ([_][]const Message{ &bare, &with_system }) |msgs| {
+        const rendered = try renderChatTemplate(allocator, msgs, &config, tools_json, instr, true, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You MUST call one of the available functions.") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "<|im_start|>system"));
+    }
+}
+
+test "toolChoiceInstruction: one line per forced choice" {
+    const allocator = testing.allocator;
+    const any = try toolChoiceInstruction(allocator, .any);
+    defer allocator.free(any);
+    try testing.expectEqualStrings("\nYou MUST call one of the available functions. Do not respond with text.", any);
+    const named = try toolChoiceInstruction(allocator, .{ .name = "calculator" });
+    defer allocator.free(named);
+    try testing.expectEqualStrings("\nYou MUST call the function \"calculator\". Do not respond with text.", named);
+}
+
+test "toolsDeclare: a name in the OpenAI, Anthropic or Responses tool shape" {
+    const body =
+        \\{"chat":[{"type":"function","function":{"name":"calculator"}}],"flat":[{"name":"probe_ping"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const chat = parsed.value.object.get("chat");
+    const flat = parsed.value.object.get("flat");
+    try testing.expect(toolsDeclare(chat, "calculator"));
+    try testing.expect(!toolsDeclare(chat, "bogus"));
+    try testing.expect(toolsDeclare(flat, "probe_ping"));
+    try testing.expect(!toolsDeclare(null, "calculator"));
+}
+
+test "forcedToolOpener: the XML dialect commits a call in the template's own spelling" {
+    const allocator = testing.allocator;
+    const qwen = @embedFile("fixtures/qwen38_chat_template.jinja");
+    const any = (try forcedToolOpener(allocator, qwen, .any)).?;
+    defer allocator.free(any);
+    try testing.expectEqualStrings("<tool_call>\n<function=", any);
+    const named = (try forcedToolOpener(allocator, qwen, .{ .name = "calculator" })).?;
+    defer allocator.free(named);
+    try testing.expectEqualStrings("<tool_call>\n<function=calculator>\n", named);
+    try testing.expect(try forcedToolOpener(allocator, "<function=example>{}</function>", .any) == null);
+    // A dialect we cannot spell keeps the instruction line only.
+    try testing.expect(try forcedToolOpener(allocator, @embedFile("fixtures/glm5_next_chat_template.jinja"), .any) == null);
+}
+
 test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" {
     // Same family, DIFFERENT gates: `qwen38_chat_template.jinja` (2.4T-A95B)
     // raises on `enable_thinking is false`, while the 27B's template answers
@@ -10079,6 +10400,46 @@ test "serializeExtraContext with thinking disabled" {
     const result = try serializeExtraContext(allocator, &config, false, null);
     defer allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":false") != null);
+}
+
+test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
+    // The template reads low|high and renders anything else as Max.
+    const allocator = testing.allocator;
+    var glm = ChatConfig{
+        .chat_template = @embedFile("fixtures/glm5_next_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const cases = [_]struct { in: ?[]const u8, out: []const u8 }{
+        .{ .in = null, .out = "max" },
+        .{ .in = "none", .out = "low" },
+        .{ .in = "minimal", .out = "low" },
+        .{ .in = "low", .out = "low" },
+        .{ .in = "medium", .out = "high" },
+        .{ .in = "high", .out = "high" },
+        .{ .in = "xhigh", .out = "max" },
+        .{ .in = "max", .out = "max" },
+    };
+    for (cases) |c| {
+        const r = try serializeExtraContext(allocator, &glm, true, c.in);
+        defer allocator.free(r);
+        var want: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
+    }
+}
+
+test "kolibriEffortFor: thinking-off is the word 'none', never hy3's no_think" {
+    try testing.expectEqualStrings("none", kolibriEffortFor(null, false));
+    try testing.expectEqualStrings("none", kolibriEffortFor("high", false));
+    try testing.expectEqualStrings("high", kolibriEffortFor(null, true));
+    try testing.expectEqualStrings("low", kolibriEffortFor("low", true));
+    try testing.expectEqualStrings("medium", kolibriEffortFor("medium", true));
+    try testing.expectEqualStrings("high", kolibriEffortFor("banana", true));
+    // Its effort list spells 'xhigh' too, which must not read as Qwen3.8.
+    try testing.expect(!isQwen38EffortTemplate("{%- set _sv_reasoning_effort = reasoning_effort -%}['high', 'xhigh', 'max']"));
+    try testing.expect(isQwen38EffortTemplate("reasoning_effort|default('xhigh')"));
 }
 
 test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max" {
@@ -11756,8 +12117,10 @@ const adversarial_strings = [_][]const u8{
     "false",      "true",         "False",   "True",    "null",   "None",
     "42",         "-7",           "3.14",    "0",       "1",      "",
     "[1,2]",      "{\"k\":1}",    "nan",     "inf",     "  ",     "yes",
-    "a\"b",       "line\nline",   "tab\there", "back\\slash", "café ☕", "0x1f",
-    "{not json",  "[unclosed",    "1e400",   "00",      "+5",     "-",
+    "a\"b",  "line\nline", "tab\there", "back\\slash",
+    "café ☕",
+    "0x1f",  "{not json",  "[unclosed", "1e400",       "00",   "+5",
+    "-",
 };
 
 test "fuzz: a conforming tool call round-trips byte-identical through parse+coerce" {
@@ -11822,8 +12185,7 @@ test "fuzz: a conforming tool call round-trips byte-identical through parse+coer
 
         // Serialize as a canonical Hermes JSON call — always VALID input.
         const args_json = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = args }, .{});
-        const raw = try std.fmt.allocPrint(arena,
-            "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
+        const raw = try std.fmt.allocPrint(arena, "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
 
         const calls = (try parseToolCalls(allocator, raw)) orelse {
             std.debug.print("\n[fuzz iter {d}] valid tool call did not parse\n  {s}\n", .{ iter, raw });
@@ -12123,6 +12485,49 @@ test "coerceToolArgsToSchema: nullable union type [\"string\",\"null\"] coerces 
     try testing.expect(parsed.value.object.get("flag").? == .bool);
     try testing.expectEqual(false, parsed.value.object.get("flag").?.bool);
     try testing.expectEqualStrings("hi", parsed.value.object.get("note").?.string);
+}
+
+test "coerceToolArgsToSchema: an object param declared as a oneOf union coerces from its JSON text" {
+    // fx's shell tool: `request` is a discriminated union with no top-level "type".
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","required":["request"],"properties":{"request":{"oneOf":[{"type":"object","required":["action","command"],"properties":{"action":{"const":"run"},"command":{"type":"string"}}},{"type":"object","required":["action"],"properties":{"action":{"const":"cancel"}}}]}}}}}]
+    ;
+    const raw = "<tool_call>\n<function=shell>\n<parameter=request>\n{\"action\":\"run\",\"command\":\"ls\"}\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const req = parsed.value.object.get("request").?;
+    try testing.expect(req == .object);
+    try testing.expectEqualStrings("ls", req.object.get("command").?.string);
+}
+
+test "declaredJsonType: a oneOf/anyOf union declares a type only when its branches agree" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { schema: []const u8, want: ?[]const u8 }{
+        .{ .schema = "{\"oneOf\":[{\"type\":\"object\"},{\"type\":\"object\"}]}", .want = "object" },
+        .{ .schema = "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}]}", .want = "string" },
+        .{ .schema = "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"object\"}]}", .want = null },
+        .{ .schema = "{\"oneOf\":[{\"type\":\"object\"},{\"const\":1}]}", .want = null },
+    };
+    for (cases) |c| {
+        var doc = try std.json.parseFromSlice(std.json.Value, allocator, c.schema, .{});
+        defer doc.deinit();
+        const got = declaredJsonType(doc.value);
+        if (c.want) |w| {
+            try testing.expectEqualStrings(w, got.?);
+        } else {
+            try testing.expect(got == null);
+        }
+    }
 }
 
 test "coerceToolArgsToSchema: an explicit JSON null satisfies any typed param (not coerced away)" {
@@ -13465,9 +13870,8 @@ test "serializeExtraContext: muse maps effort onto reasoning_strength" {
     try testing.expect(std.mem.indexOf(u8, r, "reasoning_strength") == null);
 }
 
-test "serializeExtraContext: preserve_thinking defaults false; chat_template_kwargs fill what the request did not decide" {
-    // Qwen3.8's template keeps EVERY turn's <think> block when the variable is
-    // undefined; the bar is that prior-turn reasoning stays out of the prompt.
+test "serializeExtraContext: preserve_thinking keeps the template's default; chat_template_kwargs fill what the request did not decide" {
+    // Qwen3.8 is trained to reuse prior-turn reasoning; only an explicit kwarg turns it off.
     const allocator = testing.allocator;
     var qwen38 = ChatConfig{
         .chat_template = "…{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}…",
@@ -13478,17 +13882,16 @@ test "serializeExtraContext: preserve_thinking defaults false; chat_template_kwa
     };
     const r = try serializeExtraContext(allocator, &qwen38, true, null);
     defer allocator.free(r);
-    try testing.expect(std.mem.indexOf(u8, r, "\"preserve_thinking\":false") != null);
-    // The per-model kwargs turn Qwen's trained-for behaviour back on and carry
-    // any other key; a key the request decides (enable_thinking) is not theirs.
-    qwen38.chat_template_kwargs = "{\"preserve_thinking\":true,\"custom\":{\"n\":1},\"enable_thinking\":false}";
-    const on = try serializeExtraContext(allocator, &qwen38, true, null);
-    defer allocator.free(on);
-    try testing.expect(std.mem.indexOf(u8, on, "\"preserve_thinking\":true") != null);
-    try testing.expect(std.mem.indexOf(u8, on, "\"preserve_thinking\":false") == null);
-    try testing.expect(std.mem.indexOf(u8, on, "\"custom\":{\"n\":1}") != null);
-    try testing.expect(std.mem.indexOf(u8, on, "\"enable_thinking\":true") != null);
-    try testing.expect(std.mem.indexOf(u8, on, "\"enable_thinking\":false") == null);
+    try testing.expect(std.mem.indexOf(u8, r, "preserve_thinking") == null);
+    // The per-model kwargs can turn it off and carry any other key; a key the
+    // request decides (enable_thinking) is not theirs.
+    qwen38.chat_template_kwargs = "{\"preserve_thinking\":false,\"custom\":{\"n\":1},\"enable_thinking\":false}";
+    const off = try serializeExtraContext(allocator, &qwen38, true, null);
+    defer allocator.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "\"preserve_thinking\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, off, "\"custom\":{\"n\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, off, "\"enable_thinking\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, off, "\"enable_thinking\":false") == null);
 
     // A kwarg can never replace the conversation the wrapper puts in context.
     qwen38.chat_template_kwargs = "{\"messages\":[],\"tools\":[],\"add_generation_prompt\":false}";
@@ -13805,7 +14208,6 @@ test "streamContentLead never touches whitespace inside the answer" {
     // whole, so its logprobs entry still describes bytes that reached content.
     try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", false));
 }
-
 
 test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} (never a fragment)" {
     // A 4 KB edit call that hit EOS inside a string value. The object never
@@ -14701,6 +15103,261 @@ test "K2-Horizon: assistant history always carries a thinking field, and the eff
     try testing.expect(std.mem.indexOf(u8, extra, "\"reasoning_effort\":\"high\"") != null);
 }
 
+const mid_system_test_template =
+    \\{# tools 'tool' #}
+    \\{%- for m in messages -%}{{ '<|im_start|>' + m.role + '\n' + (m.content or '') + '<|im_end|>\n' }}{%- endfor -%}
+    \\{{ '<|im_start|>assistant\n' }}
+;
+
+test "mid-system: supported templates preserve late notes and stable history" {
+    const allocator = testing.allocator;
+    const config = ChatConfig{ .chat_template = mid_system_test_template, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable instructions" },
+        .{ .role = "user", .content = "first question" },
+        .{ .role = "system", .content = "<total_tokens>15000000 tokens left</total_tokens>" },
+        .{ .role = "assistant", .content = "checking", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result", .tool_call_id = "call_1" },
+        .{ .role = "system", .content = "<total_tokens>14999999 tokens left</total_tokens>" },
+    };
+    const before = try renderChatTemplate(allocator, messages[0..3], &config, "[]", null, true, null, false);
+    defer allocator.free(before);
+    const after = try renderChatTemplate(allocator, &messages, &config, "[]", null, true, null, false);
+    defer allocator.free(after);
+    try testing.expect(std.mem.startsWith(u8, after, before));
+    try testing.expect(std.mem.indexOf(u8, after, "result<|im_end|>\n<|im_start|>system\n<total_tokens>14999999") != null);
+}
+
+test "mid-system: stock Qwen notes preserve tool rounds without rewriting history" {
+    const a = testing.allocator;
+    const templates = [_][]const u8{
+        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
+    };
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"description\":\"Read a value\",\"parameters\":{\"type\":\"object\"}}}]";
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{\"index\":3}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable instructions" },
+        .{ .role = "user", .content = "first question" },
+        .{ .role = "system", .content = "runtime note one" },
+        .{ .role = "assistant", .content = "checking", .reasoning_content = "current reasoning", .tool_calls = &calls },
+        .{ .role = "tool", .content = "first result", .tool_call_id = "call_1" },
+        .{ .role = "system", .content = "runtime note two" },
+        .{ .role = "system", .content = "runtime note three" },
+        .{ .role = "assistant", .content = "answer", .reasoning_content = "more reasoning" },
+    };
+    for (templates) |tpl| {
+        const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        const first = try renderChatTemplate(a, messages[0..3], &config, tools, null, true, "low", false);
+        defer a.free(first);
+        const second = try renderChatTemplate(a, messages[0..6], &config, tools, null, true, "low", false);
+        defer a.free(second);
+        const third = try renderChatTemplate(a, &messages, &config, tools, null, true, "low", false);
+        defer a.free(third);
+        try testing.expectEqualStrings(first, second[0..@min(first.len, second.len)]);
+        const stable_second = second[0 .. second.len - "<|im_start|>assistant\n<think>\n".len];
+        try testing.expectEqualStrings(stable_second, third[0..@min(stable_second.len, third.len)]);
+        try testing.expect(std.mem.indexOf(u8, third, "<|im_start|>system\nruntime note one<|im_end|>\n<|im_start|>assistant") != null);
+        try testing.expect(std.mem.indexOf(u8, third, "</tool_response><|im_end|>\n<|im_start|>system\nruntime note two") != null);
+        try testing.expect(std.mem.indexOf(u8, third, "<|im_start|>system\nruntime note three<|im_end|>") != null);
+        try testing.expect(std.mem.indexOf(u8, third, "current reasoning") != null);
+        try testing.expect(std.mem.indexOf(u8, third, "<function=lookup>\n<parameter=index>\n3\n</parameter>") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, third, "<tools>"));
+    }
+}
+
+test "mid-system: real Qwen pack loaded through ChatConfig preserves tool-round prefixes" {
+    const dir = std.c.getenv("QWEN_MID_SYSTEM_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try loadChatConfig(io, a, std.mem.span(dir));
+    defer config.deinit();
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}}]";
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable instructions" },
+        .{ .role = "user", .content = "first question" },
+        .{ .role = "system", .content = "runtime note one" },
+        .{ .role = "assistant", .content = "checking", .reasoning_content = "thought", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result", .tool_call_id = "call_1" },
+        .{ .role = "system", .content = "runtime note two" },
+    };
+    const first = try renderChatTemplate(a, messages[0..3], &config, tools, null, true, "low", false);
+    defer a.free(first);
+    const next = try renderChatTemplate(a, &messages, &config, tools, null, true, "low", false);
+    defer a.free(next);
+    try testing.expect(std.mem.indexOf(u8, first, "first question<|im_end|>\n<|im_start|>system\nruntime note one<|im_end|>") != null);
+    try testing.expect(std.mem.startsWith(u8, next, first));
+    try testing.expect(std.mem.indexOf(u8, next, "</tool_response><|im_end|>\n<|im_start|>system\nruntime note two<|im_end|>") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, next, "<tools>"));
+}
+
+test "mid-system: unknown Qwen revisions consolidate without rewriting the template" {
+    const a = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "user", .content = "question" },
+        .{ .role = "system", .content = "late note" },
+    };
+    for ([_][]const u8{
+        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
+    }) |tpl| {
+        const revised = try std.mem.concat(a, u8, &.{ tpl, "{{- 'revision marker' }}" });
+        defer a.free(revised);
+        const respelled = try std.mem.replaceOwned(u8, a, tpl, "message.role == \"system\"", "message.role == 'system'");
+        defer a.free(respelled);
+        for ([_][]const u8{ revised, respelled }) |unknown| {
+            const config = ChatConfig{ .chat_template = unknown, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+            const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, "low", false);
+            defer a.free(rendered);
+            try testing.expect(std.mem.indexOf(u8, rendered, "stable\n\nlate note<|im_end|>\n<|im_start|>user\nquestion") != null);
+            if (unknown.ptr == revised.ptr) try testing.expect(std.mem.endsWith(u8, rendered, "revision marker"));
+        }
+    }
+}
+
+test "mid-system: stock Qwen adapter leaves unchanged turns and media native" {
+    const a = testing.allocator;
+    const tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja");
+    const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    const images = [_]ImageData{.{ .pixels = "", .width = 1, .height = 1 }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "user", .content = "question", .images = &images },
+        .{ .role = "assistant", .content = "answer", .reasoning_content = "thought" },
+        .{ .role = "tool", .content = "result one" },
+        .{ .role = "system", .content = "late note" },
+        .{ .role = "tool", .content = "result two", .images = &images },
+    };
+    const adapted = (try qwenLateSystemTemplate(a, tpl)).?;
+    defer a.free(adapted);
+    var native = config;
+    native.chat_template = adapted;
+    const original = try renderChatTemplate(a, messages[0..3], &config, null, null, true, "low", false);
+    defer a.free(original);
+    const equivalent = try renderChatTemplate(a, messages[0..3], &native, null, null, true, "low", false);
+    defer a.free(equivalent);
+    try testing.expectEqualStrings(original, equivalent);
+    const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, "low", false);
+    defer a.free(rendered);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered, "<|vision_start|><|image_pad|><|vision_end|>"));
+    try testing.expect(std.mem.indexOf(u8, rendered, "</tool_response><|im_end|>\n<|im_start|>system\nlate note<|im_end|>\n<|im_start|>user\n<tool_response>") != null);
+    const media_note = [_]Message{ messages[0], messages[1], .{ .role = "system", .content = "invalid", .images = &images } };
+    const extra = try serializeExtraContext(a, &config, true, "low");
+    defer a.free(extra);
+    try testing.expect((try renderJinja(a, &media_note, &config, null, extra, .null_literal)) == null);
+}
+
+test "mid-system: pinned Qwen extension preserves native tool reasoning and media bytes" {
+    const a = testing.allocator;
+    const images = [_]ImageData{.{ .pixels = "", .width = 1, .height = 1 }};
+    const videos = [_]VideoData{.{ .pixels = "", .grid_t = 1, .grid_h = 1, .grid_w = 1 }};
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{\"index\":3}" }};
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}}]";
+    for ([_][]const u8{
+        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
+    }, 0..) |tpl, index| {
+        const adapted = (try qwenLateSystemTemplate(a, tpl)).?;
+        defer a.free(adapted);
+        const messages = [_]Message{
+            .{ .role = "system", .content = "stable" },
+            .{ .role = "user", .content = "question", .images = if (index == 0) &images else &.{}, .videos = if (index == 0) &videos else &.{} },
+            .{ .role = "assistant", .content = "checking", .reasoning_content = "thought", .tool_calls = &calls },
+            .{ .role = "tool", .content = "result", .tool_call_id = "call_1" },
+            .{ .role = "assistant", .content = "answer", .reasoning_content = "more thought" },
+            .{ .role = "user", .content = "next question" },
+        };
+        for ([_]bool{ false, true }) |preserve| {
+            const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .chat_template_kwargs = if (preserve) "{\"preserve_thinking\":true}" else "{\"preserve_thinking\":false}" };
+            var extended = config;
+            extended.chat_template = adapted;
+            for ([_]?[]const u8{ null, tools }) |tool_set| {
+                for ([_][]const u8{ "low", "medium", "xhigh" }) |effort| {
+                    const extra = try serializeExtraContext(a, &config, true, effort);
+                    defer a.free(extra);
+                    for ([_][]const Message{ &messages, messages[1..] }) |history| {
+                        const native = (try renderJinja(a, history, &config, tool_set, extra, .null_literal)).?;
+                        defer a.free(native);
+                        const rendered = (try renderJinja(a, history, &extended, tool_set, extra, .null_literal)).?;
+                        defer a.free(rendered);
+                        try testing.expectEqualStrings(native, rendered);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "mid-system: a tail-only template uses stable consolidation across turns" {
+    const allocator = testing.allocator;
+    const tpl =
+        \\{% for m in messages %}{% if m.role == 'system' and not loop.first and not loop.last %}{{ raise_exception('system must be first or last') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}
+    ;
+    const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "user", .content = "question" },
+        .{ .role = "system", .content = "late note" },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings("system:stable\n\nlate note;user:question;", rendered);
+}
+
+test "mid-system: a template dropping tail notes cannot preserve them" {
+    const allocator = testing.allocator;
+    const tpl =
+        \\{% for m in messages %}{% if m.role != 'system' or loop.first or not loop.last %}{{ m.role + ':' + (m.content or '') + ';' }}{% endif %}{% endfor %}
+    ;
+    const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "user", .content = "question" },
+        .{ .role = "system", .content = "late note" },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "late note") != null);
+}
+
+test "mid-system: generic ChatML fallback injects tools only once" {
+    const allocator = testing.allocator;
+    const config = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "user", .content = "question" },
+        .{ .role = "system", .content = "late note" },
+    };
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"unique_tool_marker\",\"parameters\":{}}}]";
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools, null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "unique_tool_marker"));
+}
+
+test "mid-system: unsupported templates fold without generic fallback or lost notes" {
+    const allocator = testing.allocator;
+    const templates = [_][]const u8{
+        "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}",
+        "{% for m in messages %}{% if m.role != 'system' or loop.first %}{{ m.role + ':' + (m.content or '') + ';' }}{% endif %}{% endfor %}",
+        "{% for m in messages %}{% if m.role == 'system' %}{{ 'system:' + m.content + ';' }}{% endif %}{% endfor %}{% for m in messages %}{% if m.role != 'system' %}{{ m.role + ':' + m.content + ';' }}{% endif %}{% endfor %}",
+    };
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "system", .content = "initial hook" },
+        .{ .role = "user", .content = "question" },
+        .{ .role = "system", .content = "late note" },
+    };
+    for (templates) |tpl| {
+        const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+        const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+        defer allocator.free(rendered);
+        try testing.expectEqualStrings("system:stable\n\ninitial hook\n\nlate note;user:question;", rendered);
+    }
+}
+
 test "foldSystemMessages: a system turn past index 0 joins the leading system message" {
     // Live 2026-09-15: Claude Code carries SessionStart hook output as a
     // `system`-role message INSIDE `messages`, after the top-level system
@@ -14713,7 +15370,7 @@ test "foldSystemMessages: a system turn past index 0 joins the leading system me
     try msgs.append(al, .{ .role = "system", .content = "hook output" });
     try msgs.append(al, .{ .role = "user", .content = "hi" });
     try msgs.append(al, .{ .role = "system", .content = "late note" });
-    const owned = try foldSystemMessages(al, &msgs);
+    const owned = try foldSystemMessages(al, &msgs, false);
     defer if (owned) |o| al.free(o);
     try std.testing.expectEqual(@as(usize, 2), msgs.items.len);
     try std.testing.expectEqualStrings("You are S.\n\nhook output\n\nlate note", msgs.items[0].content);
@@ -14724,7 +15381,7 @@ test "foldSystemMessages: a system turn past index 0 joins the leading system me
     defer lone.deinit(al);
     try lone.append(al, .{ .role = "user", .content = "hi" });
     try lone.append(al, .{ .role = "system", .content = "hook output" });
-    const owned2 = try foldSystemMessages(al, &lone);
+    const owned2 = try foldSystemMessages(al, &lone, false);
     defer if (owned2) |o| al.free(o);
     try std.testing.expectEqualStrings("system", lone.items[0].role);
     try std.testing.expectEqualStrings("hook output", lone.items[0].content);
@@ -14735,7 +15392,7 @@ test "foldSystemMessages: a system turn past index 0 joins the leading system me
     defer plain.deinit(al);
     try plain.append(al, .{ .role = "system", .content = "You are S." });
     try plain.append(al, .{ .role = "user", .content = "hi" });
-    try std.testing.expect((try foldSystemMessages(al, &plain)) == null);
+    try std.testing.expect((try foldSystemMessages(al, &plain, false)) == null);
     try std.testing.expectEqual(@as(usize, 2), plain.items.len);
 }
 
@@ -14781,4 +15438,20 @@ test "answerStopIndex: a stop after trailing whitespace in the answer still cuts
     try t.expectEqual(@as(?usize, std.mem.indexOf(u8, hard_break, "  \n").? + 2), answerStopIndex(hard_break, 0, "\n", true));
     // Whitespace leading the answer is never delivered, so it never matches.
     try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
+}
+
+test "renderChatTemplate: GLM-5-Next tool history renders natively (jinja `obj.0` is `obj[0]`)" {
+    // The template probes `m.content.0.output`; jinja.cpp refused a numeric attribute and the
+    // whole turn fell back to the generic format, which the model answered with `<end_of_turn>`.
+    const cfg = ChatConfig{ .chat_template = @embedFile("fixtures/glm5_next_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const calls = [_]ToolCall{.{ .id = "a", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "{\"temp_c\": 21}", .tool_call_id = "a" },
+    };
+    const out = try renderChatTemplate(testing.allocator, &messages, &cfg, null, null, true, null, false);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<|observation|><tool_response>{\"temp_c\": 21}</tool_response><|assistant|><think>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "<start_of_turn>") == null);
 }

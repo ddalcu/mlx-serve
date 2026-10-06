@@ -196,42 +196,9 @@ pub fn normVec(w: *const Weights, key: []const u8, s: S) !mlx.mlx_array {
     return astype(raw, .float32, s);
 }
 
-/// Load ONE safetensors file into a Weights map. The three component files all
-/// use `blocks.N.*` namespaces that would collide in a whole-dir load, so each
-/// is loaded separately. Safetensors load runs on a CPU stream (Load::eval_gpu
-/// is Not Implemented — the GPU-stream path kills the whole server). The
-/// iterator hands a +1 reference in `value`; transfer it straight into the map
-/// (the model.zig pattern) — copying and dropping it leaks every tensor.
-pub fn loadFileWeights(allocator: std.mem.Allocator, model_dir: []const u8, file: []const u8) !Weights {
-    var w = Weights.init(allocator);
-    errdefer w.deinit();
-    const cpu_s = mlx.mlx_default_cpu_stream_new();
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, file }, 0);
-    defer allocator.free(path);
-
-    var tensor_map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-    var meta_map = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, cpu_s));
-
-    const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var value = mlx.mlx_array_new();
-        const rc = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
-        if (rc != 0 or key == null) {
-            _ = mlx.mlx_array_free(value);
-            break;
-        }
-        const owned_key = try allocator.dupe(u8, std.mem.span(key.?));
-        errdefer allocator.free(owned_key);
-        try w.map.put(owned_key, value);
-    }
-    log.info("[hy3d] loaded {d} tensors from {s}\n", .{ w.count(), file });
-    return w;
-}
+/// The three component files all use `blocks.N.*` namespaces that would
+/// collide in a whole-dir load, so each is loaded separately.
+pub const loadFileWeights = model_mod.loadWeightsFile;
 
 // ════════════════════════════════════════════════════════════════════════
 // MixedLinear — fp16 OR affine-quantized, bits/group_size inferred from
@@ -1461,7 +1428,7 @@ pub fn denoise(dit: *Dit, allocator: std.mem.Allocator, cond: mlx.mlx_array, ste
         const ds = sigmas[i + 1] - sigmas[i];
         if (ds == 0.0) continue; // the appended trailing σ — a no-op step
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("denoise", @intCast(i + 1), steps);
         }
         const xh = try astype(x, .float16, s);
@@ -1904,7 +1871,7 @@ pub fn decodeVolume(vae: *VaeDecoder, allocator: std.mem.Allocator, latent_set: 
         @memcpy(grid[start .. start + count], data[0..count]);
         start += count;
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("volume", ci + 1, n_chunks);
         }
     }
@@ -1969,7 +1936,7 @@ pub fn fillGridHierarchical(
             evaluated += count;
             start += count;
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit("volume", ci + 1, cchunks);
             }
         }
@@ -2096,7 +2063,7 @@ pub fn fillGridHierarchical(
         evaluated += count;
         start += count;
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("volume", cchunks + ri + 1, cchunks + rchunks);
         }
     }
@@ -2198,7 +2165,7 @@ pub const Engine = struct {
         defer _ = mlx.mlx_array_free(cond);
         _ = mlx.mlx_array_eval(cond);
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("encode", 1, 1);
         }
 
@@ -2216,7 +2183,8 @@ pub const Engine = struct {
         if (progress) |p| p.emit("mesh", 0, 1);
         const n: usize = res + 1;
         const mc_scale = 2.0 * VOLUME_BOUND / @as(f32, @floatFromInt(res + 1));
-        const mesh = try mc.extract(alloc, grid, .{ n, n, n }, opts.mc_level, .{ mc_scale, mc_scale, mc_scale }, .{ -VOLUME_BOUND, -VOLUME_BOUND, -VOLUME_BOUND });
+        // Pure CPU over the host grid (zero MLX): a worker runs it while chat keeps this thread.
+        const mesh = try sse.offload(mc.extract, .{ alloc, grid, [3]usize{ n, n, n }, opts.mc_level, [3]f32{ mc_scale, mc_scale, mc_scale }, [3]f32{ -VOLUME_BOUND, -VOLUME_BOUND, -VOLUME_BOUND } });
         if (progress) |p| p.emit("mesh", 1, 1);
         return mesh;
     }
@@ -2225,7 +2193,7 @@ pub const Engine = struct {
     pub fn generateGlb(self: *Engine, alloc: std.mem.Allocator, image_rgba: []const u8, w: u32, h: u32, opts: MeshOpts, progress: ?sse.Progress) ![]u8 {
         var mesh = try self.generateMeshRaw(alloc, image_rgba, w, h, opts, progress);
         defer mesh.deinit(alloc);
-        return glb.writeGlb(alloc, &mesh);
+        return sse.offload(glb.writeGlb, .{ alloc, &mesh });
     }
 };
 

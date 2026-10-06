@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Ported from oMLX (jundot/omlx) omlx/patches/m5_gather_qmm_nax.py @ d6b2b92.
-using Q = omlx_gqmm::AffineQ<T, GS, BITS>;
+using Q = metal::conditional_t<MX == 1, omlx_gqmm::Fp4Q<T, GS>, omlx_gqmm::AffineQ<T, GS, BITS>>;
 using G = omlx_gqmm::Geo<BM, BK>;
 using WT = typename Q::WT;
 constexpr int BKP = BK + 16 / sizeof(WT);

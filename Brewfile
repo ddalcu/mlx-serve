@@ -1,8 +1,6 @@
-# Zig is NOT a brew dep: homebrew's `zig` formula still ships 0.16.0, but this
-# project requires a 0.17 nightly (comptime check at the top of build.zig —
-# 0.16.0's bundled libc++ fails against the macOS 27 SDK) until 0.17.0 stable
-# ships. `scripts/fetch-zig.sh` fetches the pinned nightly into
-# .zig-toolchain/ instead (CI: same script in release.yml).
+# Zig is NOT a brew dep: `scripts/fetch-zig.sh` fetches the pinned 0.17.0
+# release into .zig-toolchain/ (comptime check at the top of build.zig; CI:
+# same script in release.yml).
 #
 # Brewfile can't pin versions, so this floor is enforced at build time:
 #   webp >= 1.6.0   build.zig verifyBrewDeps

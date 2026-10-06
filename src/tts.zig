@@ -1039,7 +1039,13 @@ pub const TtsModel = struct {
         while (frame < max_frames) : (frame += 1) {
             // Audio length is model-determined (until EOS), so total is unknown:
             // emit step=frame with total=0 (indeterminate) every few frames.
-            if (progress) |p| if (frame % 8 == 0) p.emit("Generating audio", frame, 0);
+            if (progress) |p| if (frame % 8 == 0) {
+                p.emit("Generating audio", frame, 0);
+                if (p.boundary()) {
+                    _ = mlx.mlx_array_free(input);
+                    return error.Cancelled;
+                }
+            };
             const pt0 = std.Io.Timestamp.now(io_prof, .boot);
             const hidden = try qwenStackCached(input, self.talker_layers, self.talker_norm, t_dims, &talker_cache, s);
             _ = mlx.mlx_array_free(input);
@@ -3291,6 +3297,39 @@ test "parseConfig reads talker dims" {
     try std.testing.expectEqual(@as(u32, 1024), cfg.cp_hidden);
     try std.testing.expectEqual(@as(u32, 5), cfg.cp_layers);
     try std.testing.expectEqual(@as(i32, 151673), cfg.tts_eos);
+}
+
+// Gated on TTS_TEST_MODEL (any Qwen3-TTS dir): the frame loop gives chat its turn and
+// stops when the client is gone.
+test "generateCodes yields at frame boundaries and stops on cancel" {
+    const model_dir = std.mem.span(std.c.getenv("TTS_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var m = try loadModel(io, allocator, s, model_dir);
+    defer m.deinit();
+
+    const H = struct {
+        yields: u32 = 0,
+        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32) void {}
+        fn cancelCb(ctx: *anyopaque) bool {
+            return @as(*@This(), @ptrCast(@alignCast(ctx))).yields >= 2;
+        }
+        fn step(ctx: *anyopaque) void {
+            @as(*@This(), @ptrCast(@alignCast(ctx))).yields += 1;
+        }
+        fn serve(_: *anyopaque, _: *const std.atomic.Value(bool)) void {}
+        fn wake(_: *anyopaque) void {}
+    };
+    var h = H{};
+    const y = sse.Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
+    sse.gen_yield = &y;
+    defer sse.gen_yield = null;
+    const ids = [_]i32{ 9707, 11, 1879, 13 };
+    const p = sse.Progress{ .ctx = &h, .cb = H.emitCb, .cancelled_cb = H.cancelCb };
+    try std.testing.expectError(error.Cancelled, m.generateCodes(&ids, 2048, p, null));
+    try std.testing.expectEqual(@as(u32, 2), h.yields);
 }
 
 // Live equivalence test against the Python pure-greedy oracle (rep_pen=1.0,

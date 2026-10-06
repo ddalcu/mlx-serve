@@ -63,6 +63,7 @@ pub fn reservedOutputIds(
 }
 
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
+/// `.llama3` is Muse-Glimmer's CASED Llama-3 variant; the plain Llama-3 regex is `.gpt2`.
 pub const PretokStyle = enum { gpt2, llama3 };
 
 pub const Tokenizer = struct {
@@ -97,6 +98,8 @@ pub const Tokenizer = struct {
     /// consecutive unks fuse when `fuse_unk`. Gemma / mmBERT class.
     byte_fallback: bool = false,
     fuse_unk: bool = false,
+    /// HF BPE `ignore_merges`: a word the vocab holds whole is that one token, before any merge.
+    ignore_merges: bool = false,
     unk_id: ?u32 = null,
     /// tokenizer.json decoder carries `ByteFallback`: runs of `<0xNN>`
     /// tokens decode as the bytes they spell (U+FFFD per byte when the run
@@ -739,6 +742,11 @@ pub const Tokenizer = struct {
     /// with no pre-tokenization, so the previous rescan-all-pairs loop was
     /// O(n²) and cost seconds on agent-sized (tens-of-KB) system prompts.
     fn bpeMerge(self: *const Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]u32 {
+        if (self.ignore_merges) if (self.vocab.get(input)) |id| {
+            const out = try allocator.alloc(u32, 1);
+            out[0] = id;
+            return out;
+        };
         // Split into individual UTF-8 characters.
         var nodes: std.ArrayList(BpeNode) = .empty;
         defer nodes.deinit(allocator);
@@ -1205,6 +1213,7 @@ fn isLetterOrMark(cp: u21) bool {
 /// combining ranges. Not exhaustive, but handles every codepoint our test
 /// corpus encounters; expand if a non-ASCII model surfaces a false negative.
 fn isMark(cp: u21) bool {
+    if (cp >= 0x80 and isDigit(cp)) return false; // whole-block ranges below hold digits
     if (cp >= 0x0300 and cp <= 0x036F) return true; // Combining diacritical marks
     if (cp >= 0x0483 and cp <= 0x0489) return true; // Cyrillic combining
     if (cp >= 0x0591 and cp <= 0x05BD) return true; // Hebrew points
@@ -1230,6 +1239,8 @@ fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
 }
 
 fn isLetter(cp: u21) bool {
+    // The script ranges below are whole blocks; their digits are \p{N}, not letters.
+    if (cp >= 0x80 and isDigit(cp)) return false;
     // ASCII letters
     if (cp >= 'A' and cp <= 'Z') return true;
     if (cp >= 'a' and cp <= 'z') return true;
@@ -1245,8 +1256,54 @@ fn isLetter(cp: u21) bool {
     return false;
 }
 
+/// `\p{N}` (Nd, Nl, No) as inclusive ranges, Unicode 15.1.0:
+/// `[(a, b) for runs of unicodedata.category(c)[0] == 'N']`.
+const NUMBER_RANGES = [_][2]u21{
+    .{ 0x30, 0x39 }, .{ 0xB2, 0xB3 }, .{ 0xB9, 0xB9 }, .{ 0xBC, 0xBE }, .{ 0x660, 0x669 },
+    .{ 0x6F0, 0x6F9 }, .{ 0x7C0, 0x7C9 }, .{ 0x966, 0x96F }, .{ 0x9E6, 0x9EF }, .{ 0x9F4, 0x9F9 },
+    .{ 0xA66, 0xA6F }, .{ 0xAE6, 0xAEF }, .{ 0xB66, 0xB6F }, .{ 0xB72, 0xB77 }, .{ 0xBE6, 0xBF2 },
+    .{ 0xC66, 0xC6F }, .{ 0xC78, 0xC7E }, .{ 0xCE6, 0xCEF }, .{ 0xD58, 0xD5E }, .{ 0xD66, 0xD78 },
+    .{ 0xDE6, 0xDEF }, .{ 0xE50, 0xE59 }, .{ 0xED0, 0xED9 }, .{ 0xF20, 0xF33 }, .{ 0x1040, 0x1049 },
+    .{ 0x1090, 0x1099 }, .{ 0x1369, 0x137C }, .{ 0x16EE, 0x16F0 }, .{ 0x17E0, 0x17E9 },
+    .{ 0x17F0, 0x17F9 }, .{ 0x1810, 0x1819 }, .{ 0x1946, 0x194F }, .{ 0x19D0, 0x19DA },
+    .{ 0x1A80, 0x1A89 }, .{ 0x1A90, 0x1A99 }, .{ 0x1B50, 0x1B59 }, .{ 0x1BB0, 0x1BB9 },
+    .{ 0x1C40, 0x1C49 }, .{ 0x1C50, 0x1C59 }, .{ 0x2070, 0x2070 }, .{ 0x2074, 0x2079 },
+    .{ 0x2080, 0x2089 }, .{ 0x2150, 0x2182 }, .{ 0x2185, 0x2189 }, .{ 0x2460, 0x249B },
+    .{ 0x24EA, 0x24FF }, .{ 0x2776, 0x2793 }, .{ 0x2CFD, 0x2CFD }, .{ 0x3007, 0x3007 },
+    .{ 0x3021, 0x3029 }, .{ 0x3038, 0x303A }, .{ 0x3192, 0x3195 }, .{ 0x3220, 0x3229 },
+    .{ 0x3248, 0x324F }, .{ 0x3251, 0x325F }, .{ 0x3280, 0x3289 }, .{ 0x32B1, 0x32BF },
+    .{ 0xA620, 0xA629 }, .{ 0xA6E6, 0xA6EF }, .{ 0xA830, 0xA835 }, .{ 0xA8D0, 0xA8D9 },
+    .{ 0xA900, 0xA909 }, .{ 0xA9D0, 0xA9D9 }, .{ 0xA9F0, 0xA9F9 }, .{ 0xAA50, 0xAA59 },
+    .{ 0xABF0, 0xABF9 }, .{ 0xFF10, 0xFF19 }, .{ 0x10107, 0x10133 }, .{ 0x10140, 0x10178 },
+    .{ 0x1018A, 0x1018B }, .{ 0x102E1, 0x102FB }, .{ 0x10320, 0x10323 }, .{ 0x10341, 0x10341 },
+    .{ 0x1034A, 0x1034A }, .{ 0x103D1, 0x103D5 }, .{ 0x104A0, 0x104A9 }, .{ 0x10858, 0x1085F },
+    .{ 0x10879, 0x1087F }, .{ 0x108A7, 0x108AF }, .{ 0x108FB, 0x108FF }, .{ 0x10916, 0x1091B },
+    .{ 0x109BC, 0x109BD }, .{ 0x109C0, 0x109CF }, .{ 0x109D2, 0x109FF }, .{ 0x10A40, 0x10A48 },
+    .{ 0x10A7D, 0x10A7E }, .{ 0x10A9D, 0x10A9F }, .{ 0x10AEB, 0x10AEF }, .{ 0x10B58, 0x10B5F },
+    .{ 0x10B78, 0x10B7F }, .{ 0x10BA9, 0x10BAF }, .{ 0x10CFA, 0x10CFF }, .{ 0x10D30, 0x10D39 },
+    .{ 0x10E60, 0x10E7E }, .{ 0x10F1D, 0x10F26 }, .{ 0x10F51, 0x10F54 }, .{ 0x10FC5, 0x10FCB },
+    .{ 0x11052, 0x1106F }, .{ 0x110F0, 0x110F9 }, .{ 0x11136, 0x1113F }, .{ 0x111D0, 0x111D9 },
+    .{ 0x111E1, 0x111F4 }, .{ 0x112F0, 0x112F9 }, .{ 0x11450, 0x11459 }, .{ 0x114D0, 0x114D9 },
+    .{ 0x11650, 0x11659 }, .{ 0x116C0, 0x116C9 }, .{ 0x11730, 0x1173B }, .{ 0x118E0, 0x118F2 },
+    .{ 0x11950, 0x11959 }, .{ 0x11C50, 0x11C6C }, .{ 0x11D50, 0x11D59 }, .{ 0x11DA0, 0x11DA9 },
+    .{ 0x11F50, 0x11F59 }, .{ 0x11FC0, 0x11FD4 }, .{ 0x12400, 0x1246E }, .{ 0x16A60, 0x16A69 },
+    .{ 0x16AC0, 0x16AC9 }, .{ 0x16B50, 0x16B59 }, .{ 0x16B5B, 0x16B61 }, .{ 0x16E80, 0x16E96 },
+    .{ 0x1D2C0, 0x1D2D3 }, .{ 0x1D2E0, 0x1D2F3 }, .{ 0x1D360, 0x1D378 }, .{ 0x1D7CE, 0x1D7FF },
+    .{ 0x1E140, 0x1E149 }, .{ 0x1E2F0, 0x1E2F9 }, .{ 0x1E4F0, 0x1E4F9 }, .{ 0x1E8C7, 0x1E8CF },
+    .{ 0x1E950, 0x1E959 }, .{ 0x1EC71, 0x1ECAB }, .{ 0x1ECAD, 0x1ECAF }, .{ 0x1ECB1, 0x1ECB4 },
+    .{ 0x1ED01, 0x1ED2D }, .{ 0x1ED2F, 0x1ED3D }, .{ 0x1F100, 0x1F10C }, .{ 0x1FBF0, 0x1FBF9 },
+};
+
+/// `\p{N}`: every script's digits, superscripts, fractions and numerals, not just ASCII.
 fn isDigit(cp: u21) bool {
-    return cp >= '0' and cp <= '9';
+    if (cp < 0x80) return cp >= '0' and cp <= '9';
+    var lo: usize = 0;
+    var hi: usize = NUMBER_RANGES.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (cp < NUMBER_RANGES[mid][0]) hi = mid else if (cp > NUMBER_RANGES[mid][1]) lo = mid + 1 else return true;
+    }
+    return false;
 }
 
 fn isWhitespace(c: u8) bool {
@@ -1498,6 +1555,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .metaspace_prepend = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).prepend else .never,
         .metaspace_split = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).split else false,
         .byte_fallback = if (model_obj.get("byte_fallback")) |v| v == .bool and v.bool else false,
+        .ignore_merges = if (model_obj.get("ignore_merges")) |v| v == .bool and v.bool else false,
         .fuse_unk = if (model_obj.get("fuse_unk")) |v| v == .bool and v.bool else false,
         .unk_id = if (model_obj.get("unk_token")) |v| (if (v == .string) vocab.get(v.string) else null) else null,
         .byte_fallback_decode = if (root.get("decoder")) |d| decoderHasByteFallback(d) else false,
@@ -1565,9 +1623,12 @@ fn splitRegexIsLlama3(node: std.json.Value) bool {
     return llama3StyleFromSplitRegex(rx);
 }
 
+/// Muse's cased grammar only: the plain Llama-3 regex (`\p{L}+`, no case classes) is the gpt2
+/// grammar with 3-digit groups.
 fn llama3StyleFromSplitRegex(rx: []const u8) bool {
     return std.mem.indexOf(u8, rx, "'s|'t|'re|'ve|'m|'ll|'d") != null and
-        std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null;
+        std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null and
+        std.mem.indexOf(u8, rx, "\\p{Lu}") != null;
 }
 
 fn splitRegexOf(node: std.json.Value) ?[]const u8 {
@@ -2225,6 +2286,21 @@ test "llama3 style detection: muse's combined Split regex selects it, others kee
     try testing.expect(!llama3StyleFromSplitRegex("[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}"));
 }
 
+test "the plain Llama-3 regex is the gpt2 grammar with 3-digit groups, never the cased one" {
+    // GLM-5.3, Llama-3.2, LFM2.5 and K2 ship this pattern: `\p{L}+` keeps camelCase whole
+    // and `//!\n` one pre-token, where the cased grammar split both against the reference.
+    const pre =
+        \\{"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false}, {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, pre, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(PretokStyle.gpt2, pretokStyleFromPreTokenizer(parsed.value));
+    try testing.expectEqual(@as(u8, 3), digitGroupFromPreTokenizer(parsed.value));
+    try expectPreTokensG(testing.allocator, "x.indexOf(UserDefaults)\n//!\n//! 12345", 3, &.{
+        "x", ".indexOf", "(UserDefaults", ")\n", "//!\n", "//!", " ", "123", "45",
+    });
+}
+
 test "gpt2PreTokenize: leading space combines with punctuation" {
     // Pattern 4 is ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`.
     try expectPreTokens(testing.allocator, " =", &.{" ="});
@@ -2495,6 +2571,43 @@ test "bpeMerge: symbols missing from vocab fall back to byte pieces" {
     const ids = try tok.bpeMerge(allocator, "az");
     defer allocator.free(ids);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 99 }, ids);
+}
+
+test "gpt2PreTokenize: every \\p{N} digit groups like an ASCII one (superscripts, fractions, Indic)" {
+    // Reference: HF `tokenizers` on the plain Llama-3 regex; `²` sat outside `\p{N}{1,3}`.
+    try expectPreTokensG(testing.allocator, "x4\u{b2} \u{bd} \u{663}\u{664}\u{665} \u{967}\u{968} \u{2460}", 3, &.{
+        "x", "4\u{b2}", " ", "\u{bd}", " ", "\u{663}\u{664}\u{665}", " ", "\u{967}\u{968}", " ", "\u{2460}",
+    });
+}
+
+test "ignore_merges: a word the vocab holds whole is one token, whatever the merges reach" {
+    // HF BPE `ignore_merges` (Llama-3 / LFM2.5 / GLM class): LFM2.5's merges never build
+    // `_tokens`, its vocab does, and the reference emits the vocab entry.
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    for ([_][]const u8{ "_", "t", "o", "k", "e", "n", "s", "_t", "ok", "ens", "_tokens" }, 0..) |w, i| try vocab.put(w, @intCast(i));
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    try merge_ranks.put(.{ .left = "_", .right = "t" }, 0);
+    try merge_ranks.put(.{ .left = "o", .right = "k" }, 1);
+    try merge_ranks.put(.{ .left = "e", .right = "n" }, 2);
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    tok.ignore_merges = true;
+    const whole = try tok.bpeMerge(allocator, "_tokens");
+    defer allocator.free(whole);
+    try testing.expectEqualSlices(u32, &[_]u32{10}, whole);
+
+    tok.ignore_merges = false;
+    const merged = try tok.bpeMerge(allocator, "_tokens");
+    defer allocator.free(merged);
+    try testing.expect(merged.len > 1);
 }
 
 test "byte_fallback: an unknown character becomes its UTF-8 bytes as <0xNN> tokens; missing byte token -> fused unk" {

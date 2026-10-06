@@ -1,4 +1,4 @@
-![mlx-serve —— Apple Silicon 上的统一 AI 平台：聊天、编码 Agent、图像、视频、音乐、语音克隆、3D](website/assets/mlx-serve-header.png)
+![mlx-serve —— Apple Silicon 上的统一 AI 平台：聊天、编码 Agent、图像、视频、音乐、语音克隆、3D](website/assets/mlx-serve-header.jpg)
 
 # mlx-serve —— 在你的 Mac 上运行任意 LLM
 
@@ -35,7 +35,8 @@ mlx-serve 是一个原生 Zig 服务器，让**任意 LLM 都能跑在 Apple Sil
 
 ```bash
 brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
-brew install --cask mlx-core   # 应用（推荐）
+brew trust ddalcu/mlx-serve
+brew install --cask mlx-serve  # 应用（推荐）
 brew install mlx-serve         # 仅 CLI + 服务器，不含 GUI
 ```
 
@@ -109,7 +110,7 @@ brew bundle install --file=Brewfile   # cmake + webp
 - **任意模型：** 所有受支持的 MLX 架构，加上通过内置 llama.cpp 覆盖的整个 GGUF 世界；DeepSeek V4 Flash 走专门的 [antirez/ds4](https://github.com/antirez/ds4) 引擎。
 - **一个端口，四套 API 接口面：** OpenAI chat/completions 与 Responses（带 WebSocket 传输）、Anthropic Messages，以及 Ollama API。完整参考见 [docs/api.md](docs/zh-CN/api.md)。
 - **现代服务端的完整能力：** 流式、带 schema 驱动自动修复的工具调用、JSON schema 约束解码、logprobs、视觉、以 `reasoning_content` 返回的思考内容。
-- **适配你的编码 Agent：** Claude Code、pi、oh-my-pi、OpenCode、OpenCode 2、Codex、hermes、aider，以及 Zed 这类编辑器。在应用里一键启动，或在终端跑 `mlx-serve launch <agent>`，两者都会预配好服务器真实的上下文窗口。每个工具的配置见 [docs/integrations.md](docs/zh-CN/integrations.md)。
+- **适配你的编码 Agent：** Claude Code、pi、oh-my-pi、OpenCode、OpenCode 2、Codex、hermes、aider、fx、Grok，以及 Zed 这类编辑器。在应用里一键启动，或在终端跑 `mlx-serve launch <agent>`，两者都会预配好服务器真实的上下文窗口。每个工具的配置见 [docs/integrations.md](docs/zh-CN/integrations.md)。
 - **快：** 四种投机解码（PLD、模型自带的配套草稿模型、Gemma 4 草稿模型、原生 Qwen MTP）、自定义 Metal kernel、连续批处理、KV cache 量化、前缀与分词缓存。数字见 [docs/performance.md](docs/zh-CN/performance.md)。
 - **内置 Web 控制台：** 在浏览器里打开 `http://localhost:11234`，就有聊天演练场、实时监控、图像与音频工具，以及 API 参考。
 - **局域网模型共享：** 零配置，通过 Bonjour 使用另一台 Mac 的模型；连指向 `localhost` 的 Claude Code 也能跑到 Studio 上的 27B 模型。
@@ -162,7 +163,7 @@ Apple M4 Max，各引擎权重完全相同，每个引擎都用出厂默认设�
 
 - [docs/cli.md](docs/zh-CN/cli.md) —— CLI 命令与每一项服务器参数
 - [docs/api.md](docs/zh-CN/api.md) —— 完整 HTTP API 参考：OpenAI、Anthropic、Ollama、媒体端点
-- [docs/integrations.md](docs/zh-CN/integrations.md) —— 接入编码 Agent 与编辑器：Claude Code、pi、oh-my-pi、OpenCode、Codex、hermes、aider、Zed、OpenClaw
+- [docs/integrations.md](docs/zh-CN/integrations.md) —— 接入编码 Agent 与编辑器：Claude Code、pi、oh-my-pi、OpenCode、Codex、hermes、aider、fx、Grok、Zed、OpenClaw
 - [docs/models.md](docs/zh-CN/models.md) —— 支持的模型架构
 - [docs/app.md](docs/zh-CN/app.md) —— MLX Core 应用的全部能力，含媒体生成导览
 - [docs/performance.md](docs/zh-CN/performance.md) —— 基准测试、投机解码、调优旋钮

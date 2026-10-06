@@ -27,14 +27,18 @@ Two ways to skip everything below:
 - **`mlx-serve launch <agent>`**: same thing from the terminal, ollama-style:
 
 ```bash
-mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider
+mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider, fx, grok, zcode
 mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # everything after -- goes to the agent
 ```
 
 If no server is running, `launch` starts the MLX Core app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
 
-Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes` stay yours).
+Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.grok`, `~/.zcode` stay yours). fx is the exception: it reads providers only from `~/.fx/settings.json`, so the launch sets the `providers.mlx-serve` entry there and selects it with `FX_PROVIDER`/`FX_MODEL`, leaving the rest of the file, your default provider included, as it was.
+
+### ZCode
+
+[ZCode](https://github.com/zai-org/ZCode) installs from source: build its CLI per its README and put `zcode` on your PATH. `mlx-serve launch zcode` then points it at the server's OpenAI Chat Completions API with every served chat model and its advertised context; `--model` picks one, args after `--` go to `zcode` (`-- -p "fix the tests"` runs one headless prompt). Config lands in `~/.mlx-serve/zcode/provider_config.json`, and ZCode's data dir moves to `~/.mlx-serve/zcode` via `ZCODE_DATA_BASE_DIR`.
 
 ## Coding agents (manual setup)
 
@@ -117,6 +121,8 @@ omp also supports live discovery instead of a static list: replace the `models:`
 
 ### OpenCode
 
+`mlx-serve launch opencode` is the recommended path: it runs `opencode --version` and picks the v1 or the v2 integration below automatically (the executable name no longer says the generation — current Homebrew/npm distributions ship OpenCode 2 as `opencode`). For a manual v1 setup:
+
 No file needed. `OPENCODE_CONFIG_CONTENT` merges over your own config, so plugins and settings keep working.
 
 ```bash
@@ -126,13 +132,13 @@ opencode --model mlx/MODEL_ID
 
 ### OpenCode 2
 
-`opencode2` (npm `@opencode/cli`) reuses the same `OPENCODE_CONFIG_CONTENT` provider JSON. The launcher also writes a dedicated config dir and registers the mlx-serve monitor plugin (sidebar stats + footer turn meter, reading `GET /metrics.json`).
+OpenCode 2 reuses the same `OPENCODE_CONFIG_CONTENT` provider JSON, and the launcher also writes a dedicated config dir and registers the mlx-serve monitor plugin (sidebar stats + footer turn meter, reading `GET /metrics.json`). `mlx-serve launch opencode` routes a detected major >= 2 here (the profile is v2 for any newer major too); `mlx-serve launch opencode2` remains as a compatibility alias that forces v2 — it resolves `opencode` when that is the v2 binary, else a legacy `opencode2` still on PATH.
 
-**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX Core app enables metrics by default. `mlx-serve launch opencode2` probes the endpoint and prints a warning when it is off.
+**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX Core app enables metrics by default. A v2 launch probes the endpoint and prints a warning when it is off.
 
 ```bash
 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
-export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
+export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "model": "mlx/MODEL_ID", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
 ```
 
 `$XDG_CONFIG_HOME/opencode/cli.json` (plugin `package` is relative to that config dir):
@@ -141,10 +147,11 @@ export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "
 { "plugins": [ { "package": "./plugins/mlx-serve", "options": { "metricsUrl": "http://127.0.0.1:11234/metrics.json" } } ] }
 ```
 
-Loopback omits `metricsToken`; a non-loopback URL adds `"metricsToken": "mlx-serve"` (`Authorization: Bearer`). `mlx-serve launch opencode2` copies the plugin into `~/.mlx-serve/opencode2/opencode/plugins/mlx-serve/` and never writes `~/.config/opencode/`.
+Loopback omits `metricsToken`; a non-loopback URL adds `"metricsToken": "mlx-serve"` (`Authorization: Bearer`). A v2 launch copies the plugin into `~/.mlx-serve/opencode2/opencode/plugins/mlx-serve/` and never writes `~/.config/opencode/`.
 
 ```bash
-opencode2 --model mlx/MODEL_ID
+# v2 has no root --model flag — the model is pinned in the config above
+opencode --standalone
 ```
 
 ### Codex
@@ -224,6 +231,55 @@ EOF
 export OPENAI_API_BASE='http://127.0.0.1:11234/v1'
 export OPENAI_API_KEY=mlx-serve
 aider --model openai/MODEL_ID --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
+```
+
+### Grok
+
+xAI's `grok` CLI (Grok Build) reads its whole config tree from `GROK_HOME`. An env-only setup (`GROK_MODELS_BASE_URL` + `XAI_API_KEY`) does not work against a local server: grok checks the key with xAI and treats a placeholder as signed out. The key goes on each model instead, and the helper models (session titles, image descriptions, suggestions) are pinned to the same model; otherwise they ask for an xAI model id.
+
+```bash
+mkdir -p ~/.mlx-serve/grok
+cat > ~/.mlx-serve/grok/config.toml <<'EOF'
+[models]
+default = "MODEL_ID"
+session_summary = "MODEL_ID"
+image_description = "MODEL_ID"
+prompt_suggestion = "MODEL_ID"
+
+[model."MODEL_ID"]
+model = "MODEL_ID"
+base_url = "http://127.0.0.1:11234/v1"
+name = "MODEL_ID (mlx-serve)"
+api_key = "mlx-serve"
+context_window = CTX
+max_completion_tokens = 8192
+supports_reasoning_effort = true
+reasoning_efforts = ["none", "low", "medium", "high"]
+inference_idle_timeout_secs = 1800
+EOF
+export GROK_HOME="$HOME/.mlx-serve/grok"
+grok
+```
+
+### fx
+
+fx reads custom providers only from `~/.fx/settings.json`. Add this entry to its `providers` object (keep the rest of the file):
+
+```json
+"mlx-serve": {
+  "protocol": "openai-chat-completions",
+  "base_url": "http://127.0.0.1:11234/v1",
+  "auth": { "type": "none" },
+  "model_metadata": {
+    "MODEL_ID": { "context_window": CTX, "max_output_tokens": 8192, "supports_tool_use": true }
+  }
+}
+```
+
+Then select it per run, so your default provider stays as it is:
+
+```bash
+FX_PROVIDER=mlx-serve FX_MODEL=MODEL_ID fx
 ```
 
 ## Editors and apps

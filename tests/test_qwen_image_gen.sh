@@ -160,6 +160,8 @@ grep -q "\[qwen-image\] edit 512x512 refs=1 steps=6 guidance=1.0 refres=1024 (on
   && pass "edit engaged (one forward per step)" || fail "no edit engagement line"
 grep -q "\[image\] edit: reference .* bytes (byte-based backend)" "$LOG" \
   && pass "byte-based edit transport engaged" || fail "no byte-based edit reference line"
+[ "$(gen "$OUT/e1a.json" "\"prompt\":\"remove the background\",\"mode\":\"edit\",\"transparent\":true,\"image\":\"$(cat "$OUT/src43.b64")\"")" = 200 ] \
+  && png_check "$OUT/e1a.json" 6 && pass "transparent edit -> RGBA PNG" || fail "transparent edit"
 
 # ── no size: the output follows the LAST reference's aspect at 1024², snapped
 # /32 — the pinned qwenEditDims chain (4:3 -> 1184x896 EXACT; a floor would

@@ -7,6 +7,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const qwen4 = @import("qwen4_exp.zig");
+const qwen4_ple = @import("qwen4_ple.zig");
 
 /// Why the loader picked its arm. Everything but `.gpu` serves the host gather.
 pub const Arm = enum { gpu, off, bits, misaligned, too_large, low_memory };
@@ -50,6 +51,12 @@ fn kernelBits(bits: u32) bool {
 
 pub const Table = struct {
     arr: mlx.mlx_array,
+    /// Byte offsets of the three regions inside `arr`, and the embedded pack's global
+    /// weight scale (1.0 for `ngram_table.bin`).
+    w_off: u64,
+    s_off: u64,
+    b_off: u64,
+    scale: f32 = 1.0,
 
     pub fn release(self: Table) void {
         _ = mlx.mlx_array_free(self.arr);
@@ -80,14 +87,29 @@ const ROW: usize = 4096;
 /// `table`'s mapping as one no-copy GPU buffer. On success MLX owns the munmap, and the
 /// table stops unmapping it on close.
 pub fn wrap(table: *qwen4.NgramTable) !Table {
-    const t = try wrapMap(table.map);
+    const arr = try wrapMap(table.map);
     table.gpu_owns_map = true;
-    return t;
+    return .{ .arr = arr, .w_off = table.w_off, .s_off = table.s_off, .b_off = table.b_off };
+}
+
+/// An embedded pack's shards copied into one anonymous page-aligned mapping in the
+/// `ngram_table.bin` layout, wrapped no-copy; MLX owns the munmap on success.
+fn wrapEmbedded(src: *const qwen4_ple.EmbeddedTable) !Table {
+    const len: usize = @intCast(std.mem.alignForward(u64, src.repackedLen(), std.heap.pageSize()));
+    const map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    var owned = true;
+    defer if (owned) std.posix.munmap(map);
+    try src.repackInto(map);
+    const arr = try wrapMap(map);
+    owned = false;
+    const wbytes = src.rows * @as(u64, src.wcols) * 4;
+    const sbytes = src.rows * @as(u64, src.scols) * 2;
+    return .{ .arr = arr, .w_off = 0, .s_off = wbytes, .b_off = wbytes + sbytes, .scale = src.scale };
 }
 
 /// `map` as one no-copy uint8 `[pages, 4096]` array (no dim past int32). The caller has
 /// checked the base and length (`chooseArm`); on success MLX owns the munmap.
-fn wrapMap(map: []const u8) !Table {
+fn wrapMap(map: []const u8) !mlx.mlx_array {
     const page = std.heap.pageSize();
     if (@intFromPtr(map.ptr) % page != 0) return error.PleMapMisaligned;
     const len = std.mem.alignForward(usize, map.len, page);
@@ -103,7 +125,7 @@ fn wrapMap(map: []const u8) !Table {
         return error.PleWrapCopied;
     }
     m.armed = true;
-    return .{ .arr = arr };
+    return arr;
 }
 
 fn gb(bytes: u64) f64 {
@@ -111,7 +133,8 @@ fn gb(bytes: u64) f64 {
 }
 
 /// Load-time arm choice for `table`; logs one line naming the arm. `on` is `--ple-gpu`,
-/// `model_bytes` the weights already resident. Null = the host gather.
+/// `model_bytes` the weights already resident. Null = the host gather. An embedded pack's
+/// shards are copied into one buffer, so the gate runs before anything is allocated.
 pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
     if (mlx.noGpuBackend()) {
         log.info("[qwen4] ple gather: cpu (no GPU backend)\n", .{});
@@ -123,20 +146,27 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
         .working_set = mlx.maxRecommendedWorkingSet(),
         .model_bytes = model_bytes,
     };
-    const arm = chooseArm(on, table.bits, @intFromPtr(table.map.ptr), table.map.len, b);
+    const src = table.embedded;
+    // A fresh anonymous mapping is page-aligned by construction.
+    const base: usize = if (src != null) 0 else @intFromPtr(table.map.ptr);
+    const len: usize = if (src) |e| @intCast(e.repackedLen()) else table.map.len;
+    const arm = chooseArm(on, table.bits, base, len, b);
     if (arm == .off) {
-        log.info("[qwen4] ple gather: cpu (--ple-gpu keeps the {d:.1} GB table resident for the GPU gather)\n", .{gb(table.map.len)});
+        log.info("[qwen4] ple gather: cpu (--ple-gpu keeps the {d:.1} GB table resident for the GPU gather)\n", .{gb(len)});
         return null;
     }
     if (arm != .gpu) {
-        log.info("[qwen4] ple gather: cpu ({s}: weights {d:.1} GB + table {d:.1} GB + headroom {d:.0} GB vs working set {d:.1} GB, max buffer {d:.1} GB)\n", .{ @tagName(arm), gb(model_bytes), gb(table.map.len), gb(HEADROOM), gb(b.working_set), gb(b.max_buffer) });
+        log.info("[qwen4] ple gather: cpu ({s}: weights {d:.1} GB + table {d:.1} GB + headroom {d:.0} GB vs working set {d:.1} GB, max buffer {d:.1} GB)\n", .{ @tagName(arm), gb(model_bytes), gb(len), gb(HEADROOM), gb(b.working_set), gb(b.max_buffer) });
         return null;
     }
-    const tbl = wrap(table) catch |e| {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const t0 = std.Io.Timestamp.now(io, .boot);
+    const tbl = (if (src) |e| wrapEmbedded(e) else wrap(table)) catch |e| {
         log.warn("[qwen4] ple gather: cpu (no-copy wrap failed: {s})\n", .{@errorName(e)});
         return null;
     };
-    log.info("[qwen4] ple gather: gpu (no-copy {d:.1} GB table buffer, weights {d:.1} GB, working set {d:.1} GB)\n", .{ gb(table.map.len), gb(model_bytes), gb(b.working_set) });
+    if (src != null) log.info("[qwen4] ple gather: embedded shards repacked into one buffer in {d:.1} s\n", .{@as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e9});
+    log.info("[qwen4] ple gather: gpu (no-copy {d:.1} GB table buffer, weights {d:.1} GB, working set {d:.1} GB)\n", .{ gb(len), gb(model_bytes), gb(b.working_set) });
     return tbl;
 }
 
@@ -160,7 +190,12 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
 const P_MULT = 13;
 const P_VOCAB = P_MULT + qwen4.MAX_NGRAM_SIZE;
 const P_OFFSETS = P_VOCAB + qwen4.MAX_HEADS;
-const P_LEN = P_OFFSETS + qwen4.MAX_HEADS;
+const P_SCALE = P_OFFSETS + qwen4.MAX_HEADS;
+const P_LEN = P_SCALE + 1;
+comptime {
+    // ple_gather.metal reads these slots by literal.
+    std.debug.assert(P_VOCAB == 21 and P_OFFSETS == 53 and P_SCALE == 85);
+}
 
 /// bf16 `[S, n_heads * dim]` for the `S` ids of `ids` (any integer dtype, may be lazy),
 /// hashed against `prev` (the `ngram_size - 1` tokens before them). GPU stream only.
@@ -170,11 +205,12 @@ pub fn embed(s: mlx.mlx_stream, tbl: Table, h: *const qwen4.NgramHash, t: *const
     const width: usize = @as(usize, h.n_heads) * t.dim;
     if (n * width > std.math.maxInt(c_int)) return error.PleChunkTooWide;
     var p: [P_LEN]i64 = @splat(0);
-    const head = [_]i64{ @intCast(n), h.n_heads, h.heads_per_ngram, h.ngram_size, h.eos, t.dim, t.bits, t.group_size, t.wcols, t.scols, @intCast(t.w_off), @intCast(t.s_off), @intCast(t.b_off) };
+    const head = [_]i64{ @intCast(n), h.n_heads, h.heads_per_ngram, h.ngram_size, h.eos, t.dim, t.bits, t.group_size, t.wcols, t.scols, @intCast(tbl.w_off), @intCast(tbl.s_off), @intCast(tbl.b_off) };
     @memcpy(p[0..P_MULT], &head);
     @memcpy(p[P_MULT..P_VOCAB], &h.multipliers);
     @memcpy(p[P_VOCAB..P_OFFSETS], &h.vocab);
-    @memcpy(p[P_OFFSETS..P_LEN], &h.offsets);
+    @memcpy(p[P_OFFSETS..P_SCALE], &h.offsets);
+    p[P_SCALE] = @as(u32, @bitCast(tbl.scale));
     const params = mlx.mlx_array_new_data(&p, &[_]c_int{P_LEN}, 1, .int64);
     defer _ = mlx.mlx_array_free(params);
     var prev_i: [qwen4.MAX_NGRAM_SIZE]i32 = undefined;
@@ -396,6 +432,43 @@ test "ple gpu: an 8192-token chunk that reaches the last table row matches the C
     }
     ids[8191] = x;
     try expectArmsEqual(tbl, &h, &fx.table, &[_]u32{ 1, 2 }, ids);
+}
+
+fn openEmbeddedFixture(td: *std.testing.TmpDir, variant: qwen4_ple.FixtureVariant) !qwen4.NgramTable {
+    try qwen4_ple.writeFixture(td, variant);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    return qwen4.NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 });
+}
+
+test "ple gpu: an embedded sharded table, weight scale included, embeds like the host gather" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    // Two heads of primes 2 and 3 over a 6-row table: every shard is read.
+    const h = try qwen4.NgramHash.init(TEST_VOCAB, 3, 1, 2, 6, 1234, 0, TEST_EOS);
+    try testing.expectEqual(@as(u64, 6), h.total_rows);
+    var prng = std.Random.DefaultPrng.init(12);
+    var ids: [256]u32 = undefined;
+    randIds(prng.random(), &ids);
+    for ([_]qwen4_ple.FixtureVariant{ .valid, .scale_nonunit }) |variant| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        var table = try openEmbeddedFixture(&td, variant);
+        defer table.close();
+        const tbl = try wrapEmbedded(table.embedded.?);
+        defer tbl.release();
+        try testing.expectEqual(table.embedded.?.scale, tbl.scale);
+        try expectArmsEqual(tbl, &h, &table, &[_]u32{ 3, 4 }, &ids);
+    }
+}
+
+test "ple gpu: a declined embedded table keeps the host gather" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    var table = try openEmbeddedFixture(&td, .valid);
+    defer table.close();
+    try testing.expect(load(&table, false, 0) == null);
+    try testing.expect(load(&table, true, std.math.maxInt(u64)) == null);
 }
 
 test "ple gpu arm gate: off unless --ple-gpu, a width the kernel lacks, a misaligned base, an over-long buffer, a tight working set" {

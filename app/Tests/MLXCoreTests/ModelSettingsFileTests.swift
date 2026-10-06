@@ -40,6 +40,17 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertEqual(ModelOverride(json: ["mtp_acceptance": "fast"]).mtpAcceptance, nil)
     }
 
+    func testMtpGreedyTailRoundTripsAsABoolean() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        file.set(ModelOverride(mtpGreedyTail: true), for: "/m/a")
+        try file.save(path: path)
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"mtp_greedy_tail\" : true"), text)
+        XCTAssertEqual(ModelSettingsFile.load(path: path).override(for: "/m/a")?.mtpGreedyTail, true)
+        XCTAssertNil(ModelOverride(json: ["mtp_greedy_tail": "yes"]).mtpGreedyTail)
+    }
+
     func testInt8PrefillRoundTripsAsABoolean() throws {
         let path = tempPath()
         var file = ModelSettingsFile()

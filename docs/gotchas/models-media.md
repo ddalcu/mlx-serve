@@ -1994,3 +1994,34 @@ Cause: bare JSON union reads and unchecked integer narrowing or derived dimensio
 Fix: `parseConfigFromJson` checks consumed values and arithmetic. `jsonField` treats optional nulls as absent; explicit disables such as `sliding_window:null`, negative BOS sentinels and guarded skips keep their semantics. Discovery checks root types and metadata ranges. Tensor shapes need separate validation.
 
 Guard: `parseConfigFromJson rejects invalid field types and ranges`, `preserves optional nulls and skipped fields`, `accepts real checkpoint configs`; `config discovery tolerates invalid roots and oversized metadata`.
+
+## The plain Llama-3 pre-tokenizer was served with Muse's cased grammar
+
+Defect: GLM-5.3, Llama-3.2, LFM2.5 and K2 split camelCase (`UserDefaults` -> `User`+`Defaults`, `.indexOf` -> `.index`+`Of`) and `//!\n`, +0.3% tokens on code, every agent prompt off-distribution; LFM2.5 also split vocab words its merges never build (`_tokens`). Cause: the style detector keyed on the contraction group + `\p{N}{1,3}`, which the plain regex shares with Muse's cased one, and BPE `ignore_merges` was never read; `isDigit` was ASCII-only, so `4²` split. Fix: the cased grammar needs `\p{Lu}` in the regex (the plain one is `.gpt2` with 3-digit groups), `ignore_merges` emits a whole vocab word, `\p{N}` is a generated table. Guard: `tests/test_tokenizer_hf_parity.sh` (zero diff vs HF on code, per family).
+
+## Hunyuan3D paint unwrapped the raw marching-cubes mesh (2026-10-03)
+
+Defect: no textured `octree_resolution: 320` job ever finished; xatlas ran 10+ minutes at 300% CPU.
+Cause: upstream's paint pipeline (`use_remesh=True`) quadric-decimates the shape mesh to 40,000
+faces before `mesh_uv_wrap`; our port handed xatlas the raw mesh (900k faces at res 320).
+Fix: vendored Fast-Quadric-Mesh-Simplification (`lib/fqms`, the code fast_simplification runs),
+`mesh_simplify.decimate` to `PAINT_MAX_FACES` ahead of the unwrap, normals re-derived from faces.
+The untextured shape output is unchanged, as upstream. A textured res-320 job now takes about a minute.
+Guard: `decimate:` tests (mesh_simplify.zig), `tests/test_3d_paint.sh` at res 320 (decimation line, GLB ≤ 40k faces).
+
+## A resident H3 text encoder crashed the second keyframe request (2026-10-03)
+
+Defect: with residency on, the second video request carrying a keyframe killed the server.
+Cause: the weights map is opened only when something must be read from it, and the guard
+said "resident text encoder with its vision tower loaded: nothing to read"; the load call
+below then unwrapped that unopened map (`&tw.?`) before `loadVision`'s own early return ran.
+Fix: the tower is loaded only when the encoder has none (`needs_vision and te.vision == null`),
+the one condition under which the map was opened.
+Guard: `tests/test_h3_resident.sh` [4], two keyframe requests on one resident server.
+
+## A runtime LoRA bypass cost H3 Turbo half its step (2026-10-05)
+
+Defect: with `"turbo": true` an 864x480/124f step took 18.7 s against 10.1 s without the adapter; the bypass alone was ~8.7 s although its isolated cost at the same shapes was 1.25 s.
+Cause: `lora.delta` multiplied the bf16 low-rank product by an f32 scalar ARRAY, which promotes it: a 1.3-1.8 GB f32 `[S, out]` tensor, a cast back and a separate add, five full passes per adapted linear, 200 big linears a step. Isolated it costs 1.25 s a step; the real graph paid ~8.7 s (why is unproven; allocator pressure from the f32 tensors is the suspect).
+Fix: `lora.addTo` = one skinny GEMM per adapter and `mlx_addmm`, whose epilogue adds onto the base output in its own dtype. H3 now steps at ~10 s with Turbo. flux/krea/LTX still call `deltaSum` and pay the same tax at their own row counts.
+Guard: `addTo equals y + deltaSum in y's dtype` (lora.zig; the dtype assert is the promotion guard).

@@ -2,7 +2,7 @@
 
 # MLX Core（macOS 应用）
 
-菜单栏应用，用完整的 UI 包住服务器。[下载最新版本](https://github.com/ddalcu/mlx-serve/releases/latest)或执行 `brew install --cask mlx-core`。自 v26.8.4 起，它是一个窗口，含侧边栏、内容列与详情栏：模型、任务、设置以及媒体生成器都是聊天窗口的模式，而不再是独立窗口。
+菜单栏应用，用完整的 UI 包住服务器。[下载最新版本](https://github.com/ddalcu/mlx-serve/releases/latest)或执行 `brew install --cask mlx-serve`。自 v26.8.4 起，它是一个窗口，含侧边栏、内容列与详情栏：模型、任务、设置以及媒体生成器都是聊天窗口的模式，而不再是独立窗口。
 
 - **模型浏览器** —— 从 HuggingFace 下载，支持断点续传的多连接传输（每个文件最多 16 个连接），自动发现 LM Studio 已有的模型文件夹（`~/.lmstudio/settings.json`）和你的 Hugging Face 缓存（`HF_HOME` / `HF_HUB_CACHE` 指向哪里就找哪里），这样磁盘上已有的内容不会再下载一遍，GGUF 行会显示一个 RAM 估算的最小–最大区间。多版本仓库让你自己挑量化版本，**设置 ▸ 模型文件夹**决定下载落到哪里。
 - **无需重启即可切换模型** —— 选中一个聊天模型会把它加载进正在运行的服务器并设为默认（通过 API 调用 `POST /v1/load-model`，带上 `"default": true`）。

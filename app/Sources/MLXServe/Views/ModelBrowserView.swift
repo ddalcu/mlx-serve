@@ -32,6 +32,7 @@ struct ModelBrowserPane: View {
             + readyCount(AudioModelPreset.allIncludingVoiceOnly)
             + readyCount(VideoModelPreset.all)
             + readyCount(MusicModelPreset.all)
+            + readyCount(SoundModelPreset.all)
         return .live(localModelCount: appState.localModels.count,
                      activeDownloadCount: activeDownloads.count,
                      mediaReadyCount: media)
@@ -975,6 +976,14 @@ private struct MediaPane: View {
                     tint: .orange
                 ) {
                     ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, modality: .music, physicalMemoryBytes: physicalMemory) }
+                }
+                ModelGroupSection(
+                    title: "Sound Effects",
+                    subtitle: "Text-to-audio: effects and ambiences.",
+                    systemImage: "speaker.wave.3",
+                    tint: .teal
+                ) {
+                    ForEach(SoundModelPreset.all) { MediaModelRow(preset: $0, modality: .sound, physicalMemoryBytes: physicalMemory) }
                 }
             }
             .padding(16)

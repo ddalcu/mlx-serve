@@ -21,6 +21,8 @@ final class ModelDisplayNameTests: XCTestCase {
     func testTheOrgIsDropped() {
         XCTAssertEqual(ModelDisplayName.pretty("mlx-community/Qwen3-8B-4bit"), "Qwen 3 8b 4-bit")
         XCTAssertEqual(ModelDisplayName.pretty("ddalcu/Kokoro-82M-MLX-Serve"), "Kokoro 82M")
+        XCTAssertTrue(ModelDisplayName.pretty("ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8").hasPrefix("MiMo "))
+        XCTAssertTrue(ModelDisplayName.pretty("TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP").hasPrefix("GLM "))
     }
 
     /// Packaging tokens are true of every model here, so they say nothing.

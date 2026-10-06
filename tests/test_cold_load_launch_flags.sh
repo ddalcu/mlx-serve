@@ -39,6 +39,15 @@ for f in "$MODEL"/*; do ln -s "$f" "$CLONE/$(basename "$f")"; done
 cat > "$CLONE/drafter/config.json" <<'JSON'
 {"model_type":"probe_assistant","block_size":4,"mask_token_id":1,"target_layer_ids":[0,1]}
 JSON
+# An MTP sidecar whose header names the marker tensor and nothing else: the
+# probe accepts it, the load fails loudly, the model still serves.
+mkdir -p "$CLONE/mtp"
+python3 - "$CLONE/mtp/weights.safetensors" <<'PY'
+import json, struct, sys
+h = json.dumps({"mtp.fc.weight": {"dtype": "F32", "shape": [1, 1], "data_offsets": [0, 4]}}).encode()
+h += b" " * (-len(h) % 8)
+open(sys.argv[1], "wb").write(struct.pack("<Q", len(h)) + h + b"\0" * 4)
+PY
 # `kill 0` signals the whole process GROUP — i.e. this script. Guard on
 # a non-empty pid, since cold_load_with clears it after each arm.
 cleanup_all() { [ -n "${SERVER_PID:-}" ] && { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; }; rm -rf "$ROOT"; }
@@ -50,10 +59,13 @@ run_test() {
     else FAIL=$((FAIL + 1)); echo "  FAIL: $1 — $3"; fi
 }
 
-# Boots with $MODEL as the primary, then COLD-loads the clone by name. Prints
-# the clone's load log.
-cold_load_with() { # $1 = extra launch flags, $2 = log path
-    ./zig-out/bin/mlx-serve --model "$MODEL" --serve --port $PORT --host 127.0.0.1 \
+# Boots with $MODEL as the primary (or headless, with no --model at all — the
+# mode the app always launches), then COLD-loads the clone by name.
+cold_load_with() { # $1 = extra launch flags, $2 = log path, $3 = primary|headless, $4 = optional RAM/SSD probe
+    local primary=(--model "$MODEL")
+    [ "${3:-primary}" = headless ] && primary=()
+    mkdir -p "$2.home"
+    HOME="$2.home" ./zig-out/bin/mlx-serve ${primary[@]+"${primary[@]}"} --serve --port $PORT --host 127.0.0.1 \
         --log-level info --model-dir "$ROOT" $1 >"$2" 2>&1 &
     SERVER_PID=$!
     for i in $(seq 1 60); do
@@ -66,9 +78,42 @@ cold_load_with() { # $1 = extra launch flags, $2 = log path
     # `curl -sf` here leaves the arms differing for a reason this test does
     # not name.
     local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m 900 "$BASE/v1/load-model" \
+    code=$(curl -s -o "$2.load.json" -w '%{http_code}' -m 900 "$BASE/v1/load-model" \
         -H "Content-Type: application/json" -d '{"model":"scratch-org/cold-load-probe"}')
     echo "  (load-model -> HTTP $code)"
+    if [ "$code" != 200 ]; then jq -r '.error.message // .' "$2.load.json"; fi
+    if [ -n "${4:-}" ]; then
+        if [ "$code" != 200 ]; then
+            run_test "prefix-cache arm cold-loaded the clone" FAIL "HTTP $code"
+        else
+            local body
+            body=$(jq -nc '{model:"scratch-org/cold-load-probe",prompt:(([range(0;900) | "cache flag probe "] | join("")) + "\nWrite one word:"),max_tokens:1,temperature:0}')
+            code=$(curl -s -o "$2.response.json" -w '%{http_code}' -m 900 "$BASE/v1/completions" \
+                -H "Content-Type: application/json" -d "$body")
+            if [ "$code" = 200 ] && jq -e '.usage.prompt_tokens > 1024 and .usage.completion_tokens == 1' "$2.response.json" >/dev/null; then
+                run_test "prefix-cache arm generated with the cold-loaded clone" PASS ""
+            else
+                run_test "prefix-cache arm generated with the cold-loaded clone" FAIL "HTTP $code or missing token usage"
+            fi
+            for i in $(seq 1 10); do
+                grep -q '\[disk-cache\].*\(persisted\|complete on disk\)' "$2" && break
+                sleep 1
+            done
+            if [ "$4" = ram ]; then
+                if grep -q '\[hot-cache\] resident=' "$2"; then
+                    run_test "cold-loaded clone retains RAM prefixes by default" PASS ""
+                else
+                    run_test "cold-loaded clone retains RAM prefixes by default" FAIL "no hot-cache residency line"
+                fi
+            elif grep -q '\[disk-cache\] e[0-9][0-9]* complete on disk' "$2" &&
+                 ! grep -q '\[hot-cache\] resident=' "$2"; then
+                run_test "--no-prefix-cache-ram survives a cold load with SSD persistence" PASS ""
+            else
+                run_test "--no-prefix-cache-ram survives a cold load with SSD persistence" FAIL "missing complete SSD prefix or idle RAM retained"
+                grep -E '\[disk-cache\]|\[hot-cache\]' "$2" || true
+            fi
+        fi
+    fi
     kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; SERVER_PID=
 }
 
@@ -98,6 +143,48 @@ if grep -q "model id=scratch-org/cold-load-probe ready" "$ROOT/nodrafter.log"; t
 else
     run_test "the --no-drafter arm actually cold-loaded the clone" FAIL "no ready line — the silent arm proves nothing"
 fi
+
+# The same two arms with no --model: headless builds its own load params.
+cold_load_with "" "$ROOT/headless-plain.log" headless || exit 1
+if grep -q "DFlash" "$ROOT/headless-plain.log"; then
+    run_test "in-dir drafter probed on a headless cold load (baseline)" PASS ""
+else
+    run_test "in-dir drafter probed on a headless cold load (baseline)" FAIL "no DFlash line — test setup is not exercising the probe"
+fi
+
+cold_load_with "--no-drafter" "$ROOT/headless-nodrafter.log" headless || exit 1
+if grep -q "DFlash" "$ROOT/headless-nodrafter.log"; then
+    run_test "--no-drafter survives a headless cold load" FAIL "cold-loaded model still probed: $(grep -m1 DFlash "$ROOT/headless-nodrafter.log")"
+else
+    run_test "--no-drafter survives a headless cold load" PASS ""
+fi
+if grep -q "model id=scratch-org/cold-load-probe ready" "$ROOT/headless-nodrafter.log"; then
+    run_test "the headless --no-drafter arm actually cold-loaded the clone" PASS ""
+else
+    run_test "the headless --no-drafter arm actually cold-loaded the clone" FAIL "no ready line — the silent arm proves nothing"
+fi
+
+# --no-mtp the same way: the --no-drafter arm above is its baseline.
+if grep -q "MTP sidecar" "$ROOT/headless-nodrafter.log"; then
+    run_test "in-dir MTP sidecar probed on a headless cold load (baseline)" PASS ""
+else
+    run_test "in-dir MTP sidecar probed on a headless cold load (baseline)" FAIL "no MTP sidecar line — test setup is not exercising the probe"
+fi
+cold_load_with "--no-drafter --no-mtp" "$ROOT/headless-nomtp.log" headless || exit 1
+if grep -q "MTP sidecar" "$ROOT/headless-nomtp.log"; then
+    run_test "--no-mtp survives a headless cold load" FAIL "cold-loaded model still probed: $(grep -m1 "MTP sidecar" "$ROOT/headless-nomtp.log")"
+else
+    run_test "--no-mtp survives a headless cold load" PASS ""
+fi
+if grep -q "model id=scratch-org/cold-load-probe ready" "$ROOT/headless-nomtp.log"; then
+    run_test "the headless --no-mtp arm actually cold-loaded the clone" PASS ""
+else
+    run_test "the headless --no-mtp arm actually cold-loaded the clone" FAIL "no ready line — the silent arm proves nothing"
+fi
+
+# The cold-loaded model must honor RAM retention independently of the SSD tier.
+cold_load_with "--no-drafter --no-mtp --no-pld --prefix-cache-entries 2 --prefix-cache-mem 256MB --prefix-cache-disk 4GB" "$ROOT/ram.log" primary ram || exit 1
+cold_load_with "--no-drafter --no-mtp --no-pld --prefix-cache-entries 2 --prefix-cache-mem 256MB --prefix-cache-disk 4GB --no-prefix-cache-ram" "$ROOT/ssdonly.log" primary disk || exit 1
 
 echo ""
 echo "=== Result: $PASS/$TOTAL passed ==="

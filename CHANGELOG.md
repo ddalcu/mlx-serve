@@ -1,5 +1,45 @@
 # Changelog
 
+## v26.10.2 — Many-User Fix - UNRELEASED - DEV
+
+### New
+- **Kolibri-1.** Aleph Alpha's 78B-A3.5B MoE runs from the MLX packs already on Hugging Face (such as `here-be-dragons-ai/Kolibri-1-MLX-3bit`), with text, tool calls and thinking set by `reasoning_effort`.
+- **MTP depth bounds.** `--mtp-min-depth` / `--mtp-max-depth` bound every speculative planner choice, equal values pin one depth in place of `MLX_SERVE_MTP_FORCE_DEPTH`, and `--mtp-depth` still works as `--mtp-max-depth`, with a warning (#737).
+- **ZCode.** `mlx-serve launch zcode` and the app's code launcher point Z.ai's ZCode agent (built from source) at the local server with every served chat model and its advertised context, keeping its data under `~/.mlx-serve/zcode` (#708). Thanks @beamivalice.
+- **oMLX's Qwen3.8 Flash Next packs load.** Packs that ship the n-gram table inside the model files (such as `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp`) now run, MTP included, and `--ple-gpu` copies their table into one GPU buffer at load (#686). Thanks @otarkhan.
+- **Chat keeps answering while media renders.** An agent or chat session no longer freezes while the same server generates an image, speech, music, video or a 3D model: chat runs between generation steps, and the CPU-heavy parts of 3D generation run beside it. Two coding agents on Qwen3.8 27B kept their first token under a second while image, speech, music and a textured 3D model rendered on one M5 Ultra, and the images come out byte-identical to a solo run.
+- **GLM-5.3-Flash.** TensorFold's MLX packs of GLM-5-Next run with text, thinking (with `reasoning_effort`) and tool calls, and the pack's own multi-token-prediction layer drafts ahead of the model (`--no-mtp` turns it off).
+- **Sound effects with Stable Audio 3.** `POST /v1/audio/sound-generations` turns a description into up to two minutes of 44.1 kHz stereo in about a second, from Stability's own `stabilityai/stable-audio-3-small-sfx` repo as downloaded; the app gets a Sound Effects tab in Audio and a `generate_sound` chat tool.
+- **MiMo-V2.6-Flash.** Xiaomi's 309B MoE runs on a 256 GB Mac, from the MLX packs already on Hugging Face or from the release via `tests/convert_mimo_v2.py`, whose packs also load in mlx-lm; text, thinking and tool calls, with the checkpoint's own MTP heads drafting (up to ~30% faster decode on code).
+- **Monitor history in the browser.** The console Monitor keeps its own history in the browser, computed from the server's counters: 1 hour of samples then one per minute up to 24 hours, kept across reloads, with failed, rejected and cancelled rates, per-model totals and a request table.
+- **fx and Grok join the launchers.** `mlx-serve launch fx` / `mlx-serve launch grok` and the app's Code menu start either agent against the local server, with every chat model and its real context window declared and no sign-in needed; your own fx default provider and `~/.grok` stay as they were.
+- **Sessions name their agent.** `/metrics.json` sessions now name the calling agent (`claude-code`, `opencode`, `codex`, `omp` or `other`) with a per-request id, and a `process_start_time_seconds` gauge lets monitors detect restarts.
+
+### Speed
+- **oMLX's Qwen3.8 Flash Next packs run at full speed.** The fast paths built for our own pack now also serve oMLX's per-layer mixed widths. On an M5 Ultra, `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp` decodes at 172 tok/s with MTP (177 with `--ple-gpu`), against 133 for oMLX 0.7.0 on the same pack and 174 for our own pack.
+- **Textured 3D models in about a minute.** The Hunyuan3D texture stage now simplifies the mesh to 40,000 faces before unwrapping it, as the reference pipeline does; a detailed (resolution 320) textured model that ran for more than ten minutes now finishes in about a minute.
+- **MiniMax-H3 video renders start sooner after the first one.** The text encoder, the DiT and the Turbo adapter now stay loaded between requests while the Mac has the memory for all of them, so a short Turbo clip takes about a quarter less time from the second render on; when memory is short the model is freed first and nothing else is affected.
+- Nemotron-3 Nano answers short prompts sooner on M5 Macs.
+
+### Fixes
+- Homebrew: the app cask is now `mlx-serve` (was `mlx-core`; installs move over on `brew update`), and the install steps add `brew trust ddalcu/mlx-serve`, which Homebrew 7 requires before it installs from our tap.
+- Qwen3.8 agents keep their earlier turns' reasoning in the prompt again, as the model was trained to: multi-turn answers improve and a follow-up message no longer re-reads the whole conversation (up to 8 s saved per follow-up on a 120k-token session). `chat_template_kwargs` `preserve_thinking: false` restores the old behaviour.
+- `tool_choice: "required"`, a named function and Anthropic's `any` now always produce a tool call on Qwen 3.5 and later, even when the prompt says not to call one; the choice used to never reach the model. Naming a function the request does not declare is now a 400.
+- Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
+- Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
+- GLM-5.3, Llama 3, LFM2.5 and K2 prompts are now tokenized exactly as their reference tokenizer does on code: camelCase identifiers (`indexOf`, `UserDefaults`) and `//!` comments were split into extra tokens.
+- A streamed reply no longer sends the start of a stop string that spans several tokens before cutting at it; streamed and non-streamed replies now end on the same byte.
+- `frequency_penalty` now applies on `/v1/completions`, as it already did on chat.
+- Deleting a provider in Settings no longer crashes the app.
+- The app no longer stalls window moves and typing while photos or generated media are on screen: pictures are decoded once, downsampled, off the main thread.
+- A speech request whose client disconnects now stops instead of finishing audio nobody will receive.
+- The model browser lists GLM-5.3-Flash and MiMo-V2.6-Flash packs as supported.
+- `mlx-serve launch pi` offers pi's `xhigh` and `max` thinking levels, so a model's maximum effort (GLM-5.3's default) is reachable from pi.
+- `/metrics` and `/metrics.json` now count every request outcome exactly once: a client that disconnects mid-decode shows in `request_cancelled_total`, errors in the new `mlx_serve:request_failed_total`, and requests refused before they start in `mlx_serve:request_rejected_total`.
+- The built-in web console works when the server is reached through a reverse proxy that mounts it under a path (e.g. Tailscale Serve `--set-path`); opened that way it showed "0 models" on a fully loaded server.
+
+---
+
 ## v26.10.1 — Speed Across the Board - GGUF on Our MLX Engine - Sushi Flash Next - Qwen-Image Editing
 
 ### Highlights
@@ -12,6 +52,7 @@
   | Qwen3.8 27B 4-bit + drafter | M4 Max | +28% | 0% |
   | Qwen3.8 27B 4-bit + drafter | M1 Pro 32 GB | +37% | · |
   | Qwen3.8 Flash Next | M5 Ultra | 0% | +51% |
+  | Qwen3.8 Flash Next | M4 Max | +11% | +2% |
   | Qwen3.6 35B-A3B | M5 Ultra | 0% | +12% |
   | Qwen3.6 35B-A3B | M4 Max | -2% | +2% |
   | Gemma 4 26B-A4B 4-bit | M5 Ultra | +14% | +18% |
@@ -20,6 +61,7 @@
 
   Differences within a few percent are run-to-run noise on speculative cells. The M1 Pro's 27B prefill has no 26.9.6 figure because 26.9.6 refused the long prompts (see Fixes). Bonsai-2's new tensor-unit verify route pays on quoted text (edits, rewrites, repeats): a verbatim-rewrite prompt decodes 48% faster on the M5 Ultra (185 to 273 tok/s), while novel-text decode is unchanged.
 
+- **MLX-Serve Skills** When you launch Pi, you can now ask it to build you something using MLX-Serve API's, like build you a game with Audio and Images generated locally. Or a Laya / Kev Decision / Music generator Web App. (install pi so it shows up in launcher)
 - **Chats no longer freeze while another request reads a long prompt.** Streams that are already answering keep moving instead of stalling for seconds behind a 32k-token prompt (#568). Thanks @STRML.
 - **Qwen3.8 Flash Next is faster everywhere.**
   - **On every Apple Silicon chip, not just Ultra:** speculative decoding gains 5-8% on an M4 Max (code 101.7 → 109.2 tok/s, chat 83.6 → 90.4).

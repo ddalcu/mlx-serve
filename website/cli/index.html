@@ -131,7 +131,7 @@
     <table class="flag-table">
       <tr><th>Method</th><th>How</th></tr>
       <tr><td><b>From the app</b></td><td>The <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg">MLX-Serve</a> welcome screen has a one-click <b>Install</b> button that puts <code>mlx-serve</code> on your PATH — into <code>~/.local/bin</code> or <code>~/bin</code> if you have one (no password), else <code>/usr/local/bin</code> after a single admin prompt. Never touches your shell config. New in v26.7.2.</td></tr>
-      <tr><td><b>Homebrew</b></td><td><code>brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve &amp;&amp; brew install mlx-serve</code></td></tr>
+      <tr><td><b>Homebrew</b></td><td><code>brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve &amp;&amp; brew trust ddalcu/mlx-serve &amp;&amp; brew install mlx-serve</code></td></tr>
       <tr><td><b>From source</b></td><td><code>zig build -Doptimize=ReleaseFast</code> (needs <code>brew install mlx-c webp</code>).</td></tr>
     </table>
 

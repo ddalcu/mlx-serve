@@ -20,7 +20,7 @@ final class MTPSettingsTests: XCTestCase {
     func testDefaultsEmitNoMtpFlag() {
         let a = args { _ in }
         XCTAssertFalse(a.contains("--no-mtp"))
-        XCTAssertFalse(a.contains("--mtp-depth"))
+        XCTAssertFalse(a.contains("--mtp-max-depth"))
         XCTAssertFalse(a.contains("--mtp"))
     }
 
@@ -29,16 +29,15 @@ final class MTPSettingsTests: XCTestCase {
         XCTAssertTrue(a.contains("--no-mtp"))
     }
 
-    /// Depth 0 is the server's "auto" sentinel (its adaptive controller tunes
-    /// depth live) — passing `--mtp-depth 0` would be redundant, and pinning a
-    /// depth the user didn't choose is worse.
+    /// The app stores 0 for automatic depth and omits the flag. Explicit
+    /// maxima use the new flag; the server accepts only 1..8.
     func testFixedDepthIsEmittedButAutoIsNot() {
         let auto = args { $0.mtpDepth = 0 }
-        XCTAssertFalse(auto.contains("--mtp-depth"))
+        XCTAssertFalse(auto.contains("--mtp-max-depth"))
 
         let fixed = args { $0.mtpDepth = 3 }
-        guard let i = fixed.firstIndex(of: "--mtp-depth") else {
-            return XCTFail("expected --mtp-depth in \(fixed)")
+        guard let i = fixed.firstIndex(of: "--mtp-max-depth") else {
+            return XCTFail("expected --mtp-max-depth in \(fixed)")
         }
         XCTAssertEqual(fixed[i + 1], "3")
     }

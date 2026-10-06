@@ -11,10 +11,10 @@ enum TemplateKwargs {
     }
 
     /// Request-decided keys (enable_thinking, reasoning_effort) only fill in when
-    /// the client sends nothing; preserve_thinking's server default is false.
+    /// the client sends nothing; preserve_thinking keeps the template's default.
     static let known: [Known] = [
         Known(key: "preserve_thinking", choices: [true, false],
-              hint: "Prior-turn reasoning in the prompt. Server default: false (dropped)."),
+              hint: "Prior-turn reasoning in the prompt. Default: the template's (Qwen3.8 keeps it)."),
         Known(key: "enable_thinking", choices: [true, false],
               hint: "Only when the request does not decide thinking itself."),
         Known(key: "reasoning_effort", choices: ["low", "medium", "high"],

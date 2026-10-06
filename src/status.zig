@@ -363,6 +363,31 @@ pub fn getGpuPct() u32 {
     return if (value >= 0 and value <= 100) @intCast(value) else 0;
 }
 
+var gpu_cores: ?u32 = null;
+
+/// GPU core count (AGXAccelerator `gpu-core-count`), 0 when unknown. Read once.
+pub fn gpuCoreCount() u32 {
+    if (gpu_cores) |n| return n;
+    gpu_cores = blk: {
+        if (comptime !is_macos) break :blk 0;
+        const matching = IOServiceMatching("AGXAccelerator") orelse break :blk 0;
+        var iter: u32 = 0;
+        if (IOServiceGetMatchingServices(0, matching, &iter) != 0) break :blk 0;
+        defer _ = IOObjectRelease(iter);
+        const entry = IOIteratorNext(iter);
+        if (entry == 0) break :blk 0;
+        defer _ = IOObjectRelease(entry);
+        var props: ?*anyopaque = null;
+        if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) break :blk 0;
+        defer if (props) |p| CFRelease(p);
+        const v = cfDictGet(props, "gpu-core-count") orelse break :blk 0;
+        var n: i64 = 0;
+        _ = CFNumberGetValue(v, 4, @ptrCast(&n));
+        break :blk if (n > 0 and n < 1 << 16) @intCast(n) else 0;
+    };
+    return gpu_cores.?;
+}
+
 fn cfDictGet(dict: ?*const anyopaque, key_name: [*:0]const u8) ?*const anyopaque {
     const key = CFStringCreateWithCString(null, key_name, 0x08000100) orelse return null;
     defer CFRelease(key);
@@ -375,4 +400,11 @@ test "getAppMemFootprintMb returns a plausible nonzero footprint" {
     // would yield 0 or absurd garbage.
     try std.testing.expect(fp > 0);
     try std.testing.expect(fp < 1024 * 1024); // < 1 TB sanity bound
+}
+
+test "gpuCoreCount reads the GPU's core count" {
+    if (comptime !is_macos) return error.SkipZigTest;
+    const n = gpuCoreCount();
+    if (n == 0) return error.SkipZigTest; // a VM exposes no AGX accelerator entry
+    try std.testing.expect(n >= 7 and n <= 256);
 }

@@ -346,6 +346,22 @@ final class ChatModelResolutionTests: XCTestCase {
         XCTAssertEqual(mgr.chatModelId, "big@studio")
     }
 
+    /// A chat turn names what the picker shows, even before the poll sees it
+    /// resident: a headless start answers health before its hot-load lands, and
+    /// the bare alias 503'd "No default model configured".
+    @MainActor
+    func testAChatRequestNamesThePickedModel() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let resident = info("mlx-community/gemma-4-e4b-it-4bit", ["chat"])
+        mgr.allModels = [resident]
+        XCTAssertEqual(mgr.chatRequestModelId(selectedPath: "/m/org/picked"), "/m/org/picked")
+        XCTAssertEqual(mgr.chatRequestModelId(selectedPath: ""), resident.name)
+
+        mgr.lanChatModelId = "big@studio"
+        XCTAssertEqual(mgr.chatRequestModelId(selectedPath: "/m/org/picked"), "big@studio")
+    }
+
     /// Pre-Phase-G / GGUF entries report no capabilities at all and still chat
     /// (the same tolerance `slotKind` and `lanAdvertises` already carry).
     @MainActor

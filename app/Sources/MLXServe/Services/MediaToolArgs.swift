@@ -4,7 +4,7 @@ import Foundation
 /// the same reason they are separate tools — they take different arguments, cost
 /// wildly different amounts of time, and read differently in the transcript.
 enum MediaKind: String, Codable, Sendable, CaseIterable {
-    case image, speech, music, video
+    case image, speech, music, sound, video
 
     /// The tool's wire name — one place, so a rename can't half-land.
     var toolName: String {
@@ -12,6 +12,7 @@ enum MediaKind: String, Codable, Sendable, CaseIterable {
         case .image:  return "generate_image"
         case .speech: return "generate_speech"
         case .music:  return "generate_music"
+        case .sound:  return "generate_sound"
         case .video:  return "generate_video"
         }
     }
@@ -20,7 +21,7 @@ enum MediaKind: String, Codable, Sendable, CaseIterable {
     var attachmentKind: ChatMediaRef.Kind {
         switch self {
         case .image:           return .image
-        case .speech, .music:  return .audio
+        case .speech, .music, .sound:  return .audio
         case .video:           return .video
         }
     }
@@ -30,6 +31,7 @@ enum MediaKind: String, Codable, Sendable, CaseIterable {
         case .image:  return "photo"
         case .speech: return "waveform"
         case .music:  return "music.note"
+        case .sound:  return "speaker.wave.3"
         case .video:  return "film"
         }
     }
@@ -41,6 +43,7 @@ enum MediaKind: String, Codable, Sendable, CaseIterable {
         case .image:  return "Generating image"
         case .speech: return "Synthesizing speech"
         case .music:  return "Composing music"
+        case .sound:  return "Making a sound effect"
         case .video:  return "Rendering video"
         }
     }
@@ -51,6 +54,7 @@ enum MediaKind: String, Codable, Sendable, CaseIterable {
         case .image:  return "an image"
         case .speech: return "spoken audio"
         case .music:  return "a track"
+        case .sound:  return "a sound effect"
         case .video:  return "a video"
         }
     }
@@ -78,6 +82,11 @@ enum MediaChatDefaults {
     /// The server's own accepted range (`duration_seconds`), mirrored here so a
     /// model asking for 9000 gets a track rather than a 400.
     static let musicSecondsRange = 10...600
+
+    /// Sound-effect length. Most effects are a few seconds; a chat preview
+    /// caps at 30 even though the model goes to 120.
+    static let soundSeconds: Double = 5
+    static let soundSecondsRange: ClosedRange<Double> = 0.5...30
 
     /// Clip length. LTX tops out around 8 s of video, but a chat clip is a
     /// preview and every extra second is another ~30 s of GPU.
@@ -372,6 +381,25 @@ enum MediaToolArgs {
             timesignature: musicTimeSignature(args["time_signature"]),
             durationSeconds: musicSeconds(args["duration_seconds"], lyrics: text(args, "lyrics") ?? ""),
             keepResident: keepResident, lanModelId: lanId)
+    }
+
+    // MARK: - Sound
+
+    static func soundSeconds(_ raw: String?) -> Double {
+        guard let raw, let v = Double(raw.prefix(while: { $0.isNumber || $0 == "." })), v.isFinite else {
+            return MediaChatDefaults.soundSeconds
+        }
+        let r = MediaChatDefaults.soundSecondsRange
+        return min(max(v, r.lowerBound), r.upperBound)
+    }
+
+    static func sound(_ args: [String: String], model: SoundModelPreset,
+                      keepResident: Bool, lanId: String?) throws -> SoundGenRequest {
+        let prompt = try required(args, "prompt", tool: "generate_sound",
+                                  example: #"{"prompt": "heavy wooden door creaking open slowly in a stone hall"}"#)
+        return SoundGenRequest(model: model, prompt: prompt,
+                               durationSeconds: soundSeconds(args["duration_seconds"]),
+                               keepResident: keepResident, lanModelId: lanId)
     }
 
     // MARK: - Video

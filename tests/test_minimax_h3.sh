@@ -19,7 +19,8 @@ BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
 LOG=/tmp/test_minimax_h3_server.log
-"$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG" 2>&1 &
+# This script pins the STAGED plan (disjoint stages, AdaLN shed); residency has its own script.
+MLX_SERVE_H3_RESIDENT=0 "$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 for i in $(seq 1 90); do

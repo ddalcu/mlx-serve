@@ -1,3 +1,4 @@
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const keyed_sample = @import("keyed_sample.zig");
@@ -15,6 +16,8 @@ const pld_index = @import("pld_index.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const mimo_mtp = @import("mimo_mtp.zig");
+const glm_mtp = @import("glm_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const round_cost = @import("round_cost.zig");
 const group_cost = @import("mtp_group_cost.zig");
@@ -42,6 +45,9 @@ const KVCache = transformer_mod.KVCache;
 /// `serve()` runs. Per-request reads happen on the same thread that did the
 /// CLI parse, so no atomicity needed.
 pub var prefill_chunk_override: usize = 8192;
+/// Default chunk of an arch that builds no prefill score tensor (score width 0):
+/// only its MoE gather transient grows with the chunk, and the guard bills that.
+pub const WIDE_PREFILL_CHUNK: usize = 16384;
 
 /// Set by `--prefill-chunk` in main.zig. An operator-chosen width outranks the
 /// per-model chunk the memory sizer pins (`ModelConfig.pinned_prefill_chunk`);
@@ -106,6 +112,8 @@ pub const SpecDisableReason = enum {
     /// A thinking budget closed the thought through a plain forward; the spec
     /// state is not resynced, the answer decodes regular.
     think_bound,
+    /// A forced tool-call opener went through a plain forward (`ToolForce`).
+    tool_choice,
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
     /// A DFlash slot gained company: it decodes plain so it can join the batched group.
@@ -224,10 +232,11 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     // the widest chunk whose one-off transient reserve still leaves this box a
     // real KV budget. It NARROWS, never raises, and an explicit
     // `--prefill-chunk` outranks it — the operator asked for a width.
+    const launch: usize = if (head_dim == 0 and !prefill_chunk_explicit) WIDE_PREFILL_CHUNK else prefill_chunk_override;
     const base: usize = if (prefill_chunk_explicit or pinned_chunk == 0)
-        prefill_chunk_override
+        launch
     else
-        @min(prefill_chunk_override, pinned_chunk);
+        @min(launch, pinned_chunk);
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
@@ -297,12 +306,19 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// gate, `mtpBatchedAcceptGraph`, the pre-draft and the horizon valve all work
 /// in tokens and probabilities — so the split is exactly these five operations
 /// and nothing else.
+/// Most drafts one MTP round verifies: the head chain or a prompt-lookup run.
+const MAX_ROUND_DRAFTS: usize = @max(mtp_mod.MAX_DEPTH, mtp_lookup.MAX_DRAFT_STRONG);
+
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
     /// qwen4_exp: the head and its history live on the Transformer
     /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
     /// (pre-mixer stream at position r, token r+1), query position r+1.
     qwen4: *Transformer,
+    /// mimo_v2: the checkpoint's own heads; per-request rows live in `mimo_mtp.State`.
+    mimo: *mimo_mtp.Head,
+    /// glm5_next: the checkpoint's `mtp.0` NextN layer; per-request state is a one-layer `KVCache`.
+    glm: *glm_mtp.Head,
 
     /// Is this head's decode state module-owned (one per model, `Qwen4Mtp.cache`) rather
     /// than per-request? Both the scheduler and the sticky-serial arm ask this.
@@ -310,7 +326,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => false,
             // Per-request state swaps onto the module (`Qwen4MtpState`); nothing is shared.
-            .qwen4 => false,
+            .qwen4, .mimo, .glm => false,
         };
     }
 
@@ -324,6 +340,8 @@ pub const MtpHeadRef = union(enum) {
                 t.qwen4MtpActivate(st);
                 break :blk .{ .qwen4 = .{ .t = t, .st = st, .allocator = allocator } };
             },
+            .mimo => |h| .{ .mimo = .{ .st = try h.newState(allocator) } },
+            .glm => |h| .{ .glm = try h.makeCache(allocator) },
         };
     }
 
@@ -348,7 +366,9 @@ pub const MtpHeadRef = union(enum) {
     /// One head forward over L positions. `.logits` returns the LAST row only,
     /// on both arms. `.mixed` asks for the lm_head's INPUT vector instead: on
     /// the sidecar that is `hidden_next` and nothing extra is produced, on
-    /// qwen4_exp it is the mixer output, returned in `rerank_x`.
+    /// qwen4_exp it is the mixer output, returned in `rerank_x`. `host_ids` are
+    /// `id_arr`'s values when it carries committed rows (null on a chained draft
+    /// step); the MiMo arm keeps them on the host.
     pub fn forward(
         self: MtpHeadRef,
         target: *Transformer,
@@ -358,8 +378,11 @@ pub const MtpHeadRef = union(enum) {
         rope_offset: c_int,
         want: mtp_mod.StepWant,
         mrope_ctx: ?mtp_mod.MropeContext,
+        host_ids: ?[]const u32,
     ) !mtp_mod.StepOut {
         return switch (self) {
+            .mimo => |h| mimoStep(h, target, &cache.mimo, id_arr, hidden, @intCast(rope_offset), want, host_ids),
+            .glm => |h| h.forward(target, &cache.glm, id_arr, hidden, want),
             .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want == .logits, mrope_ctx),
             .qwen4 => |t| blk: {
                 cache.activate();
@@ -371,7 +394,7 @@ pub const MtpHeadRef = union(enum) {
     /// One draft row past a padded history append (`Transformer.HeadPlace`); qwen4 only.
     pub fn forwardPlaced(self: MtpHeadRef, cache: *MtpCacheRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, place: *const Transformer.HeadPlace, want: mtp_mod.StepWant) !mtp_mod.StepOut {
         const t = switch (self) {
-            .qwen => return error.MtpPlacement,
+            .qwen, .mimo, .glm => return error.MtpPlacement,
             .qwen4 => |t| t,
         };
         cache.activate();
@@ -382,6 +405,37 @@ pub const MtpHeadRef = union(enum) {
         };
         const out = try t.qwen4MtpForwardPlaced(hidden, id_arr, place, project);
         return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
+    }
+
+    /// MiMo heads chain no hidden: a step carrying committed rows (`host_ids`) opens
+    /// the round at head 0, each later step runs the next head on its draft.
+    /// `hidden_next` hands the trunk hidden on unchanged.
+    fn mimoStep(h: *mimo_mtp.Head, target: *Transformer, ref: *MtpCacheRef.MimoRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: usize, want: mtp_mod.StepWant, host_ids: ?[]const u32) !mtp_mod.StepOut {
+        var hidden_next = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(hidden_next);
+        try mlx.check(mlx.mlx_array_set(&hidden_next, hidden));
+        if (want == .none) {
+            try h.appendHistory(target, ref.st, host_ids orelse return error.MimoMtpNeedsHostIds, hidden, rope_offset);
+            return .{ .logits = .{ .ctx = null }, .hidden_next = hidden_next };
+        }
+        const step_i: usize = if (host_ids == null) ref.next_step else 0;
+        const last = if (host_ids) |ids|
+            try h.draftStep(target, ref.st, 0, null, ids, hidden, rope_offset)
+        else
+            try h.draftStep(target, ref.st, step_i, id_arr, &.{}, null, rope_offset);
+        ref.next_step = step_i + 1;
+        if (want == .mixed) return .{ .logits = .{ .ctx = null }, .hidden_next = hidden_next, .rerank_x = last };
+        defer _ = mlx.mlx_array_free(last);
+        return .{ .logits = try target.lmHeadForDraft(last), .hidden_next = hidden_next };
+    }
+
+    /// Deepest draft the head can make: a MiMo draft past its last head re-runs
+    /// that head at the same position and is never accepted.
+    pub fn maxDepth(self: MtpHeadRef) u32 {
+        return switch (self) {
+            .mimo => |h| @intCast(h.heads),
+            .qwen, .qwen4, .glm => std.math.maxInt(u32),
+        };
     }
 
     /// Append committed history without projecting logits.
@@ -397,6 +451,8 @@ pub const MtpHeadRef = union(enum) {
     ) !void {
         switch (self) {
             .qwen => |h| try mtp_mod.appendHistoryWithMrope(h, target, &cache.qwen, token_ids, hidden, rope_offset, mrope_ctx),
+            .mimo => |h| try h.appendHistory(target, cache.mimo.st, token_ids, hidden, @intCast(rope_offset)),
+            .glm => |h| try h.appendHistory(target, &cache.glm, token_ids, hidden),
             .qwen4 => |t| {
                 const ids_i32 = try allocator.alloc(i32, token_ids.len);
                 defer allocator.free(ids_i32);
@@ -421,6 +477,8 @@ pub const MtpHeadRef = union(enum) {
             // Transformer is still under construction and its lm_head — the
             // very weight the coarse head is a copy of — is not assigned yet.
             .qwen4 => |t| t.qwen4DraftRerankReady(),
+            .mimo => |h| h.canRerankDrafts(),
+            .glm => |h| h.canRerankDrafts(),
         };
     }
 
@@ -436,6 +494,8 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftSelect(x, suppress_mask),
+            .mimo => |h| h.draftSelect(target, x, suppress_mask),
+            .glm => |h| h.draftSelect(target, x, suppress_mask),
         };
     }
 
@@ -451,6 +511,8 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftShortlist(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftShortlist(x, suppress_mask),
+            .mimo => |h| h.draftShortlist(target, x, suppress_mask),
+            .glm => |h| h.draftShortlist(target, x, suppress_mask),
         };
     }
 
@@ -459,6 +521,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftSelectBatched(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftSelectBatched(x, suppress_mask),
+            .mimo, .glm => mtp_mod.fullReadoutArgmax(target.s, target, x, suppress_mask),
         };
     }
 
@@ -467,6 +530,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftShortlistsBatched(target, x, suppress_mask, out),
             .qwen4 => |t| t.qwen4DraftShortlistsBatched(x, suppress_mask, out),
+            .mimo, .glm => mtp_mod.exactShortlistsBatched(target.s, target, x, suppress_mask, out),
         };
     }
 
@@ -479,6 +543,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.m5NaxCostProfile(target),
             .qwen4 => |t| mtp_mod.qwen4G17CostProfileForKv(t, kv),
+            .mimo, .glm => .generic,
         };
     }
 
@@ -489,6 +554,8 @@ pub const MtpHeadRef = union(enum) {
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {
             .qwen => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
+            .mimo => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
+            .glm => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
             .qwen4 => |t| blk: {
                 if (t.qwen4_mtp) |*m| {
                     if (m.ev_seed_accept) |a| break :blk .{ .accept = a, .m_lo = m.ev_seed_m_lo };
@@ -501,6 +568,14 @@ pub const MtpHeadRef = union(enum) {
     pub fn setEvSeed(self: MtpHeadRef, accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32) void {
         switch (self) {
             .qwen => |h| {
+                h.ev_seed_accept = accept;
+                h.ev_seed_m_lo = m_lo;
+            },
+            .mimo => |h| {
+                h.ev_seed_accept = accept;
+                h.ev_seed_m_lo = m_lo;
+            },
+            .glm => |h| {
                 h.ev_seed_accept = accept;
                 h.ev_seed_m_lo = m_lo;
             },
@@ -535,6 +610,12 @@ pub fn mtpHeadPersistEnabled() bool {
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
     qwen4: Qwen4Ref,
+    mimo: MimoRef,
+    /// The GLM head's one-layer latent + indexer cache, driven like `.qwen`.
+    glm: KVCache,
+
+    /// A MiMo request's head rows, and the draft step its next chained forward runs.
+    pub const MimoRef = struct { st: *mimo_mtp.State, next_step: usize = 0 };
 
     /// The in-checkpoint head plus this request's own half of it.
     pub const Qwen4Ref = struct { t: *Transformer, st: *transformer_mod.Transformer.Qwen4MtpState, allocator: std.mem.Allocator };
@@ -542,7 +623,7 @@ pub const MtpCacheRef = union(enum) {
     /// Install this request's state on the qwen4 head; no-op on the sidecar arm.
     pub fn activate(self: *const MtpCacheRef) void {
         switch (self.*) {
-            .qwen => {},
+            .qwen, .mimo, .glm => {},
             .qwen4 => |r| r.t.qwen4MtpActivate(r.st),
         }
     }
@@ -555,11 +636,12 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
-            .qwen => |*c| c.step,
+            .qwen, .glm => |*c| c.step,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk r.t.qwen4_mtp.?.seq_offset;
             },
+            .mimo => |r| r.st.step(),
         };
     }
 
@@ -568,18 +650,20 @@ pub const MtpCacheRef = union(enum) {
     /// pointer must also carry `head()`. Null when head persistence is off.
     pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
-            .qwen => |*c| c,
+            .qwen, .glm => |*c| c,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk if (mtpHeadPersistEnabled()) &r.t.qwen4_mtp.?.cache else null;
             },
+            // The heads only ever read the last window of rows, rebuilt from the uncached tail.
+            .mimo => null,
         };
     }
 
     /// The Transformer owning the in-checkpoint head; null on the sidecar arm and whenever `kv()` is null.
     pub fn head(self: *MtpCacheRef) ?*Transformer {
         return switch (self.*) {
-            .qwen => null,
+            .qwen, .mimo, .glm => null,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk if (mtpHeadPersistEnabled()) r.t else null;
@@ -589,21 +673,30 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
-            .qwen => |*c| try c.truncate(len, s),
+            .qwen, .glm => |*c| try c.truncate(len, s),
             .qwen4 => |r| {
                 r.t.qwen4MtpActivate(r.st);
                 try r.t.qwen4MtpTruncate(len);
+            },
+            .mimo => |*r| {
+                try r.st.truncate(s, len);
+                r.next_step = 0;
             },
         }
     }
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
-            .qwen => |*c| c.deinit(),
+            .qwen, .glm => |*c| c.deinit(),
             .qwen4 => |r| {
                 r.t.qwen4MtpRelease(r.st);
                 r.st.deinit();
                 r.allocator.destroy(r.st);
+            },
+            .mimo => |r| {
+                const allocator = r.st.allocator;
+                r.st.deinit();
+                allocator.destroy(r.st);
             },
         }
     }
@@ -613,11 +706,12 @@ pub const MtpCacheRef = union(enum) {
     /// across the whole prompt.
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
-            .qwen => |*c| c.appendEvalArrays(vec),
+            .qwen, .glm => |*c| c.appendEvalArrays(vec),
             .qwen4 => |r| {
                 r.t.qwen4MtpActivate(r.st);
                 r.t.qwen4_mtp.?.cache.appendEvalArrays(vec);
             },
+            .mimo => |r| r.st.appendEvalArrays(vec),
         }
     }
 };
@@ -776,11 +870,38 @@ pub const ThinkBound = struct {
     }
 };
 
+/// `tool_choice` that obliges a call: the family's tool-call opener is
+/// committed once the think block closes, or at once when none is open. A
+/// thought still open with a quarter of `max_tokens` left is closed for it, so
+/// the call fits. `forced` = closer, separator, opener; `opener_at` indexes the opener.
+pub const ToolForce = struct {
+    closer_id: ?u32,
+    forced: []const u32,
+    opener_at: usize,
+    in_think: bool,
+    cursor: usize = 0,
+    fired: bool = false,
+
+    pub const Due = struct { tokens: []const u32, closes_thought: bool };
+
+    /// The tokens to commit now, or null.
+    pub fn due(self: *ToolForce, ids: []const u32, completion_tokens: u32, max_tokens: u32) ?Due {
+        if (self.fired) return null;
+        while (self.in_think and self.cursor < ids.len) : (self.cursor += 1) {
+            if (ids[self.cursor] == self.closer_id) self.in_think = false;
+        }
+        if (!self.in_think) return .{ .tokens = self.forced[self.opener_at..], .closes_thought = false };
+        if (completion_tokens +| max_tokens / 4 >= max_tokens) return .{ .tokens = self.forced, .closes_thought = true };
+        return null;
+    }
+};
+
 /// Sampling parameters for token generation.
 pub const SamplingParams = struct {
     temperature: f32 = 1.0,
     top_p: f32 = 1.0,
     top_k: u32 = 0, // 0 = disabled
+    min_p: ?f32 = null,
     repeat_penalty: f32 = 1.0,
     presence_penalty: f32 = 0.0, // 0.0 = disabled
     seed: ?u64 = null,
@@ -793,6 +914,8 @@ pub const SamplingParams = struct {
     /// In-stream thinking budget (`ThinkBound`), owned by the request handler
     /// like `constraint`; null = no bound.
     think_bound: ?*ThinkBound = null,
+    /// Forced tool-call opener (`ToolForce`), owned like `think_bound`.
+    tool_force: ?*ToolForce = null,
     /// Reserved-token suppression mask: `[vocab]` bool, true = the sampler
     /// must never draw this id (reserved specials like `<|fim_hole|>`, which
     /// a degenerate distribution can rank top-5 at a collapsed position — a
@@ -812,6 +935,17 @@ pub const SamplingParams = struct {
     /// Absolute position of generated token 0 (the prompt length): a keyed
     /// draw's position is `position_base + draw`.
     position_base: u64 = 0,
+
+    /// Penalties read the realized history, so they keep a request off the
+    /// pipelined fast path, spec verify and batched decode.
+    pub fn penalized(self: SamplingParams) bool {
+        return self.repeat_penalty != 1.0 or self.presence_penalty != 0.0;
+    }
+
+    /// A grammar or a penalty reshapes the logits spec verify compares against.
+    pub fn shapesLogits(self: SamplingParams) bool {
+        return self.constraint != null or self.penalized();
+    }
 };
 
 /// Build the `[vocab]` bool suppression mask (true = never sample) on the
@@ -1160,23 +1294,19 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
-/// Tokens of KV capacity this prefill reserves up front (#353): removes the grow transient a
-/// long prefill pays, at the price of allocating generation headroom early. Gated on
-/// `longCtxGated`; every other arch keeps proportional growth (`reserve_tokens` stays 0).
-/// `MLX_SERVE_KV_RESERVE=0` turns it off inside the gate. `server.prefillRequestTerms` bills it.
+/// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
+/// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
+/// cache; generation headroom is pre-bought only under `longCtxGated`. `MLX_SERVE_KV_RESERVE=0`
+/// turns it off.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
     max_tokens: u64,
     chunk: u64,
 ) u64 {
-    if (!config.longCtxGated()) return 0;
-    return transformer_mod.KVCache.reservedTokens(
-        seq,
-        max_tokens,
-        chunk,
-        config.max_position_embeddings,
-    );
+    const prompt = if (seq > chunk) seq +| chunk else 0;
+    if (!config.longCtxGated()) return prompt;
+    return @max(prompt, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
 }
 
 /// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
@@ -1539,7 +1669,7 @@ pub const Generator = struct {
     mtp_position_base: usize = 0,
     /// CONFIGURED max tokens drafted per round (verify length = depth + 1).
     mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
-    /// The cap WITHOUT the per-silicon row: an explicit --mtp-depth, else
+    /// The cap WITHOUT the per-silicon row: an explicit --mtp-max-depth, else
     /// the adaptive default. The row is the cold-start cap; once the table
     /// has trusted widths it may plan up to this instead (the M4 base row
     /// of 4 measured -6% against what the table found at 6).
@@ -1936,6 +2066,7 @@ pub const Generator = struct {
     }
 
     pub fn logSpecStats(self: *const Generator) void {
+        StepTrace.report();
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
@@ -2189,7 +2320,7 @@ pub const Generator = struct {
         mtp: ?MtpHeadRef = null,
         /// The model's head before this request's opt-out (the qwen4 weights load with the trunk regardless).
         model_has_mtp: bool = false,
-        /// Max tokens drafted per nextMtp round. 0 = auto (`--mtp-depth` not
+        /// Max tokens drafted per nextMtp round. 0 = auto (`--mtp-max-depth` not
         /// passed): resolved by `resolveMtpDepthCap` — MTP_ADAPTIVE_NAX_CAP
         /// for the measured M5 target+sidecar profile, otherwise
         /// MTP_ADAPTIVE_DEFAULT_CAP under the EV controller; DEFAULT_DEPTH in
@@ -3255,6 +3386,7 @@ pub const Generator = struct {
                 options.mtp.?.costProfile(xfm, ctx.cache.config)
             else
                 .generic;
+            const mtp_cap = @min(resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile), if (options.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
             const dflash_bs: u32 = if (dflash_active)
                 (if (options.dflash_block_size > 0) options.dflash_block_size else options.dflash.?.config.block_size)
             else if (options.dflash_block_size > 0)
@@ -3308,13 +3440,13 @@ pub const Generator = struct {
                 .mtp_serial_accept = mtp_active and xfm.config.rowExactDecode() and std.meta.activeTag(options.mtp_acceptance) == .exact,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
-                .mtp_depth = resolveMtpDepthCapForProfile(xfm.config.mtpDepth(options.mtp_depth), mtp_cost_profile),
+                .mtp_depth = mtp_cap,
                 .mtp_depth_free = if (xfm.mtp_depth_free != 0) xfm.mtp_depth_free else mtpDepthCapFree(xfm.config.mtpDepth(options.mtp_depth)),
                 .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
                 // Start at depth 1 and climb with evidence: the cheap depth
                 // is the safe default (1.11x on cold/creative content), and
                 // hot workloads promote within ~8 rounds.
-                .mtp_depth_current = 1,
+                .mtp_depth_current = depth_bounds.floorFor(depth_bounds.active, mtp_cap),
             };
             mtp_cache = null; // ownership transferred to the Generator
             dflash_ctx = null; // ownership transferred to the Generator
@@ -3605,6 +3737,8 @@ pub const Generator = struct {
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
+        // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
+        self.xfm.discardDeferredPle(&self.ctx);
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
@@ -3659,7 +3793,7 @@ pub const Generator = struct {
             // A forced-depth run never consulted the EV plan, so its surface
             // is not one the controller chose — publishing it would hand a
             // later ordinary request a diagnostic's numbers.
-            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null and
+            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpPinnedDepth() == null and
                 !self.spec_disabled_runtime and self.mtp_attempted >= 8 and
                 (!group_planner.enabled() or !self.mtp_planner_owned))
             {
@@ -3713,6 +3847,8 @@ pub const Generator = struct {
     /// `next_token_id` is sampled but NOT in the cache and pending state is
     /// empty — exactly the batched-tick entry invariant.
     pub fn drainPipelineForBatch(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        // The batched tick hashes against this slot's history: settle the pipelined step's owed advance first.
+        try self.xfm.flushDeferredPle(&self.ctx);
         try self.resolvePendingToken();
         if (try self.checkStop()) {
             if (self.has_pending_logits) {
@@ -3749,6 +3885,13 @@ pub const Generator = struct {
     /// The ONE lazy sampler for a slot's own draws: advances the seed draw index.
     pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array) mlx.mlx_array {
         defer self.sampling.draw +%= 1;
+        if (self.sampling.penalized() and self.generated_ids.items.len > 0) {
+            var pen = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pen);
+            if (applyRepeatPenalty(&pen, logits, self.generated_ids.items, self.sampling.repeat_penalty, self.sampling.presence_penalty, self.xfm.s)) |_| {
+                return sampleTokenLazy(pen, self.sampling, self.xfm.s);
+            } else |err| log.warn("[sampling] repeat penalty failed ({s}); this draw is unpenalized\n", .{@errorName(err)});
+        }
         return sampleTokenLazy(logits, self.sampling, self.xfm.s);
     }
 
@@ -3781,6 +3924,8 @@ pub const Generator = struct {
     /// `pending_logits` WITHOUT forwarding lands exactly on the invariant.
     /// One sync. Also handles the shim-seeded state (`pending_logits` only).
     fn drainPipelineForSpec(self: *Generator, allocator: std.mem.Allocator) !DrainResult {
+        // The spec rounds roll the n-gram history back and forth: settle the pipelined step's owed advance first.
+        try self.xfm.flushDeferredPle(&self.ctx);
         if (!self.has_pending_logits) {
             if (!self.has_pending_token) return .already_clean;
             // pending_token without pending_logits never occurs in the
@@ -5901,6 +6046,8 @@ pub const Generator = struct {
     pub const MtpHistStash = struct {
         /// `[n]` int32 committed token ids: `[t1, drafts[0..accepted]]`.
         ids: mlx.mlx_array,
+        /// `ids` on the host.
+        host_ids: [MAX_ROUND_DRAFTS + 1]u32 = undefined,
         /// `[1, n, H]` trunk hiddens paired 1:1 with `ids` (a lazy concat of
         /// last_hidden + a verify-capture slice — the handle pins the ~90 KB
         /// parent until consumed, deliberately NOT a deep copy).
@@ -6197,14 +6344,16 @@ pub const Generator = struct {
         if (self.mtp_group_fixed_depth > 0) return 0;
         const idx = try self.mtpLookupIndex(allocator);
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
-        const got = idx.match(t1, mtp_lookup.MAX_DRAFT_STRONG);
+        const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
+        const got = idx.match(t1, lookup_cap);
         return mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
     }
 
     fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
         const k = try self.mtpLookupDrafts(allocator, plan, t1);
-        if (k == 0) return null;
-        const got = (try self.mtpLookupIndex(allocator)).match(t1, mtp_lookup.MAX_DRAFT_STRONG);
+        const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
+        if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return null;
+        const got = (try self.mtpLookupIndex(allocator)).match(t1, lookup_cap);
         const Once = struct {
             var logged = false;
         };
@@ -6502,7 +6651,7 @@ pub const Generator = struct {
         errdefer _ = mlx.mlx_array_free(live_end);
         const mc = &self.mtp_cache.?;
         try mc.truncate(off0, self.xfm.s);
-        const out = try self.mtp.?.forward(self.xfm, mc, ids, hidden, @intCast(off0), .none, null);
+        const out = try self.mtp.?.forward(self.xfm, mc, ids, hidden, @intCast(off0), .none, null, null);
         if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
         if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
         if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
@@ -6584,8 +6733,11 @@ pub const Generator = struct {
                     _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                     try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                 }
-                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx);
-            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx);
+                var merged_host: [MAX_ROUND_DRAFTS + 2]u32 = undefined;
+                @memcpy(merged_host[0..st.n], st.host_ids[0..st.n]);
+                merged_host[st.n] = chain.t1;
+                break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx, merged_host[0 .. st.n + 1]);
+            } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx, if (i == 0) &.{chain.t1} else null);
             errdefer {
                 if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
                 _ = mlx.mlx_array_free(step_out.hidden_next);
@@ -6931,6 +7083,10 @@ pub const Generator = struct {
             if (g.mtpMropeContext() != null) any_mrope = true;
             switch (g.mtp.?) {
                 .qwen4 => one_sidecar = false,
+                .mimo, .glm => {
+                    all_qwen4 = false;
+                    one_sidecar = false;
+                },
                 .qwen => |h| {
                     all_qwen4 = false;
                     if (h != gens[0].mtp.?.qwen) one_sidecar = false;
@@ -7521,10 +7677,17 @@ pub const Generator = struct {
         self.mtp_pre_draft = chain;
     }
 
+    /// Whether the eager pre-draft may build the next round's head chain. A
+    /// chain is only worth its cost when a later round reads it: a request
+    /// whose budget is spent or whose pending token ends it keeps no reader.
+    fn mtpPreDraftOpenAllows(completion_tokens: u32, max_tokens: u32, pending_is_eos: bool) bool {
+        return completion_tokens < max_tokens and !pending_is_eos;
+    }
+
     /// The next round's empty chain, or null when this request must not pre-draft.
     /// `allow_lookup`: false for group pre-drafts, which build every chain batched.
     fn mtpPreDraftOpen(self: *Generator, allocator: std.mem.Allocator, allow_lookup: bool) !?MtpPreDraft {
-        if (self.mtp_planner_owned and (self.completion_tokens >= self.max_tokens or isEosId(self.next_token_id, self.eos_token_ids))) return null;
+        if (!mtpPreDraftOpenAllows(self.completion_tokens, self.max_tokens, isEosId(self.next_token_id, self.eos_token_ids))) return null;
         if (!mtpPredraftEnabled() or self.spec_disabled_runtime or self.mtp_planner_pending) return null;
         std.debug.assert(self.mtp_pre_draft == null);
         const plan = self.mtpRoundPlan();
@@ -7601,6 +7764,7 @@ pub const Generator = struct {
             @intCast(st.off0),
             .none,
             self.mtpMropeContext(),
+            st.host_ids[0..st.n],
         );
         if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
         if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
@@ -7957,11 +8121,11 @@ pub const Generator = struct {
         // (~10 legacy rounds + a +1/round base climb — a third of a short
         // generation). Demotion stays instant (EMA decay + sticky disable are
         // per-request), so a workload change costs a few rounds, not the win.
-        // `MLX_SERVE_MTP_FORCE_DEPTH` is a measurement mode: every round drafts
+        // A pinned depth is a measurement mode: every round drafts
         // exactly n and the controller never plans, so a seed must not be
         // applied (nor, at deinit, published).
         if (self.mtp_ev_rounds == 0 and self.mtp_attempted == 0 and
-            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpForcedDepth() == null and
+            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpPinnedDepth() == null and
             (!group_planner.enabled() or !self.mtp_planner_owned))
         {
             if (head.evSeed()) |seed| {
@@ -8117,10 +8281,12 @@ pub const Generator = struct {
         // target is qwen3_5-family hybrid) rollback needs only the pre-verify
         // LENGTH (KV truncate is offset-only; the stale tail past it is
         // unreachable) plus the verify pass's per-position SSM capture, so no
-        // snapshot is taken at all. A hypothetical pure-attention target
-        // (ssm_entries == null) keeps the proven snapshot + re-forward path.
+        // snapshot is taken at all; nor on MiMo, whose attention-only trunk
+        // rolls back by the same truncate. Any other pure-attention target
+        // keeps the proven snapshot + re-forward path.
         const kv_step_snap = self.ctx.cache.step;
-        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null) null else try self.ctx.cache.snapshot();
+        const truncate_only = self.xfm.config.isMimo();
+        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null or truncate_only) null else try self.ctx.cache.snapshot();
         errdefer if (kv_snap) |*snap| snap.deinit();
         const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
@@ -8201,6 +8367,8 @@ pub const Generator = struct {
         self.ctx.ple_defer = true;
         self.ctx.pipeline_build = if (self.mtp_serial_accept) VERIFY_PIPELINE_LAYERS else 0;
         defer self.ctx.pipeline_build = 0;
+        self.ctx.spec_verify = true;
+        defer self.ctx.spec_verify = false;
         const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
@@ -8886,6 +9054,7 @@ pub const Generator = struct {
                 .off0 = mtp_off0,
                 .pad = pad,
             };
+            for (ids_i32, 0..) |id, idx| self.mtp_hist_stash.?.host_ids[idx] = @intCast(id);
         }
         if (tracing) {
             self.mtp_trace.add(.hist, ph.read());
@@ -8959,16 +9128,16 @@ pub const Generator = struct {
 
         var re_new_hidden = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(re_new_hidden);
-        if (gdn_captured) {
+        if (gdn_captured or xfm.config.isMimo()) {
             const accepted_len: usize = 1 + @as(usize, accepted);
-            // `truncate` overwrites cache.step with its length arg; on this
-            // family cache.step is a stale counter the model never reads
-            // (positioning is moe_seq_offset), so preserve the pre-verify
-            // value — keeps prefix-cache kv_step bookkeeping identical to
-            // the restore-based fallback (same rule as nextPld).
+            // `truncate` overwrites cache.step with its length arg. On a GDN
+            // trunk cache.step is a stale counter the model never reads
+            // (positioning is moe_seq_offset), so keep the pre-verify value
+            // (same rule as nextPld); MiMo's attention trunk keeps a LIVE step,
+            // which truncate leaves where the re-forward fallback would.
             try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
-            self.ctx.cache.step = kv_step_snap;
-            try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, st.verify_len, s);
+            if (gdn_captured) self.ctx.cache.step = kv_step_snap;
+            if (gdn_captured) try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, st.verify_len, s);
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
 
             const vh_shape = mlx.getShape(verify_hidden_all);
@@ -9235,7 +9404,8 @@ pub const Generator = struct {
         }
         if (drafted_sum == 0) return;
         const rate = @as(f32, @floatFromInt(accepted_sum)) / @as(f32, @floatFromInt(drafted_sum));
-        const next_depth = mtpDepthDecision(self.mtp_depth_current, self.mtp_depth, rate, n, self.mtp_promote_cooldown > 0);
+        const decided = mtpDepthDecision(self.mtp_depth_current, self.mtp_depth, rate, n, self.mtp_promote_cooldown > 0);
+        const next_depth = if (decided == 0) 0 else depth_bounds.clampWidth(decided, depth_bounds.floorFor(depth_bounds.active, self.mtp_depth), self.mtp_depth);
         if (next_depth == self.mtp_depth_current) return;
         if (next_depth == 0) {
             log.info(
@@ -9270,7 +9440,7 @@ pub const Generator = struct {
     // Disable via MLX_SERVE_MTP_ADAPTIVE=0 (reverts to the windowed
     // fixed-depth controller above).
 
-    /// Default depth cap when `--mtp-depth` is not passed (0 = auto) and the
+    /// Default depth cap when `--mtp-max-depth` is not passed (0 = auto) and the
     /// EV controller is active. 6 keeps the verify forward at seq 1+6 = 7,
     /// the split-K verify-qmm kernel's ceiling on M1-M4. Eligible M5/G17
     /// targets use MTP_ADAPTIVE_NAX_CAP instead: their measured NAX round-cost
@@ -9384,7 +9554,7 @@ pub const Generator = struct {
     /// under-drafted it on moderate content), k5-6 ≈ 0.36 (13.6 ms/pos),
     /// k7-8 ≈ 0.62 (23.5 ms/pos — the plain-SIMD verify-qmm register cliff
     /// at M 8/9, expressed through the generic third region; only reachable
-    /// when --mtp-depth forces past the generic cap of 6). The G17 NAX
+    /// when --mtp-max-depth forces past the generic cap of 6). The G17 NAX
     /// tables below predate the sdpa split — refit them on an M5 when one
     /// is available. draft/verify split not separately identifiable; only
     /// the sums enter the controller.
@@ -9723,7 +9893,7 @@ pub const Generator = struct {
         width_trial: bool = false,
     };
 
-    /// Resolve the configured depth cap. 0 = auto (`--mtp-depth` not passed):
+    /// Resolve the configured depth cap. 0 = auto (`--mtp-max-depth` not passed):
     /// MTP_ADAPTIVE_NAX_CAP only when the EV controller and a calibrated G17
     /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
@@ -9732,7 +9902,7 @@ pub const Generator = struct {
         const cap = mtpDepthCapResolved(configured, adaptive, profile, chip);
         // Name the row ONCE when a per-silicon measurement is what fenced the
         // depth. Without it `[spec-stats] depth=4` on an M1 Pro reads the same
-        // as the EV controller having chosen 4, or as `--mtp-depth 4` — and
+        // as the EV controller having chosen 4, or as `--mtp-max-depth 4` — and
         // the fence is exactly what someone debugging MTP there needs to see.
         if (configured == 0 and adaptive and !mtp_depth_cap_logged) {
             const row = mtp_mod.adaptiveDepthCapForMachine(chip, MTP_ADAPTIVE_DEFAULT_CAP);
@@ -9745,14 +9915,14 @@ pub const Generator = struct {
                 });
             }
         }
-        return cap;
+        return depth_bounds.liftCap(cap, depth_bounds.active, mtp_mod.MAX_DEPTH);
     }
 
     /// The cap with no per-silicon row applied: explicit wins, else the
     /// adaptive default (fixed mode keeps DEFAULT_DEPTH).
     pub fn mtpDepthCapFree(configured: u32) u32 {
-        if (configured != 0) return @min(mtp_mod.MAX_DEPTH, @max(1, configured));
-        return if (mtpAdaptiveEnabled()) MTP_ADAPTIVE_DEFAULT_CAP else mtp_mod.DEFAULT_DEPTH;
+        const free = if (configured != 0) @min(mtp_mod.MAX_DEPTH, @max(1, configured)) else if (mtpAdaptiveEnabled()) MTP_ADAPTIVE_DEFAULT_CAP else mtp_mod.DEFAULT_DEPTH;
+        return depth_bounds.liftCap(free, depth_bounds.active, mtp_mod.MAX_DEPTH);
     }
 
     /// Same, with the chip string injected (tests, and the one live caller).
@@ -10312,7 +10482,6 @@ pub const Generator = struct {
     /// Adaptive (EV) controller gate — DEFAULT ON. MLX_SERVE_MTP_ADAPTIVE=0
     /// reverts to the fixed-depth windowed controller for same-boot A/Bs.
     var mtp_adaptive_cache: ?bool = null;
-    var mtp_force_depth_cache: ??u32 = null;
 
     pub fn mtpAdaptiveEnabled() bool {
         if (mtp_adaptive_cache) |v| return v;
@@ -10774,15 +10943,20 @@ pub const Generator = struct {
     /// Post-warmup EV mode: the pure plan over the acceptance EMAs, with the
     /// base-depth climb damped to one step per round and two-chunk plans
     /// gated by the extension dry-spell policy.
-    /// DIAGNOSTIC (MLX_SERVE_MTP_FORCE_DEPTH=n): every round drafts exactly
+    /// DIAGNOSTIC (--mtp-min-depth n --mtp-max-depth n): every round drafts exactly
     /// n, the EV/windowed controllers never demote or disable — the
     /// per-index acceptance meter (`acc_idx=` on the trace line).
-    pub fn mtpForcedDepth() ?u32 {
-        if (mtp_force_depth_cache) |v| return v;
-        const n = readEnvUsize("MLX_SERVE_MTP_FORCE_DEPTH", 0);
-        const v: ?u32 = if (n == 0) null else @intCast(@min(n, mtp_mod.MAX_DEPTH));
-        mtp_force_depth_cache = v;
-        return v;
+    pub fn mtpPinnedDepth() ?u32 {
+        return depth_bounds.active.pinned();
+    }
+
+    /// A plan held inside the depth range: the EV argmax may sit outside it.
+    pub fn mtpPlanInBounds(plan: MtpRoundPlan, lo: u32, hi: u32) MtpRoundPlan {
+        var p = plan;
+        p.m_lo = depth_bounds.clampWidth(p.m_lo, lo, hi);
+        p.m_hi = depth_bounds.clampWidth(p.m_hi, p.m_lo, hi);
+        if (p.m_hi == p.m_lo and plan.m_hi != plan.m_lo) p.tau_ln = 0.0;
+        return p;
     }
 
     // Adaptive serial: the EV controller picks the best depth but never compares a round with
@@ -11099,7 +11273,7 @@ pub const Generator = struct {
         if (self.mtp_cache == null) return null;
         const mc = &self.mtp_cache.?;
         return switch (mc.*) {
-            .qwen => 0,
+            .qwen, .mimo, .glm => 0,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 const m = &(r.t.qwen4_mtp orelse break :blk 0);
@@ -11241,7 +11415,11 @@ pub const Generator = struct {
             return .{ .m_lo = width, .m_hi = width, .tau_ln = 0 };
         };
         const plan = self.mtpRoundPlanTraced();
-        return if (self.mtp_group_cap > 0) mtpGroupPlan(plan, self.mtp_group_cap, self.mtp_group_fill and mtpForcedDepth() == null) else plan;
+        if (self.mtp_group_cap > 0) {
+            const cap = @min(depth_bounds.lookupCap(self.mtp_group_cap, depth_bounds.active), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
+            return mtpPlanInBounds(mtpGroupPlan(plan, cap, self.mtp_group_fill and mtpPinnedDepth() == null), depth_bounds.floorFor(depth_bounds.active, cap), cap);
+        }
+        return plan;
     }
 
     /// A lane's plan inside a batched verify. The group pays for its widest lane's rows,
@@ -11277,7 +11455,7 @@ pub const Generator = struct {
         var cells: [256]u8 = undefined;
         const a = self.mtp_ev_accept;
         const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
-        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
+        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
         const target = mtpWidthTrialTarget(t, kv_len, plan, cap_free, self.mtp_m_lo_streak >= 2);
         log.debug(
             "  [mtp-plan] r={d} kv={d} bucket={s} m_lo={d} m_hi={d} tau={d:.3} a=[{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2}] src={s} trial={s}{d} serial_step={s} streak={d} serial_left={d} drops=t{d}/c{d}/b{d} cap={d}/{d} solo={} rte={d} wt={d}/{d} tgt={?d} cells={s}\n",
@@ -11304,21 +11482,22 @@ pub const Generator = struct {
     }
 
     fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
-        if (mtpForcedDepth()) |d| {
+        if (mtpPinnedDepth()) |pinned| {
+            const d = @min(pinned, self.mtp_depth);
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
         if (self.mtp_serial_accept) {
-            const d = self.mtpExactDepth(@min(@max(@as(u32, 1), self.mtp_depth), 2));
+            const d = depth_bounds.clampWidth(self.mtpExactDepth(@min(@max(@as(u32, 1), self.mtp_depth), 2)), depth_bounds.floorFor(depth_bounds.active, self.mtp_depth), self.mtp_depth);
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
         const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
-        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
+        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
         var cap: u32 = cap_row;
         const kv_len = self.mtpKvLen();
         if (!mtpAdaptiveEnabled() or self.mtp_ev_rounds < MTP_EV_WARMUP_ROUNDS) {
-            const d = @min(@max(@as(u32, 1), self.mtp_depth_current), cap);
+            const d = depth_bounds.clampWidth(self.mtp_depth_current, depth_bounds.floorFor(depth_bounds.active, cap), cap);
             self.mtp_ev_m_lo_prev = d;
             // Independent of the depth controller's kill switch and warmup.
             _ = self.mtpAdaptiveSerialStep(d, kv_len);
@@ -11341,7 +11520,7 @@ pub const Generator = struct {
         // closed), and the width trial may reach one past that to measure.
         if (src.fromTable()) cap = @min(cap_free, @max(cap_row, self.xfm.round_cost.widestMeasured(src.bucket) orelse cap_row));
         const policy = mtpDepthPolicyFor(mtpDepthPolicy(), kv_len);
-        var plan = mtpBasePlan(policy, self.mtp_ev_accept[0..cap], cap, src, self.mtp_ev_m_lo_prev + 1);
+        var plan = mtpPlanInBounds(mtpBasePlan(policy, self.mtp_ev_accept[0..cap], cap, src, self.mtp_ev_m_lo_prev + 1), depth_bounds.floorFor(depth_bounds.active, cap), cap);
         if (plan.m_lo == self.mtp_ev_m_lo_prev) self.mtp_m_lo_streak +|= 1 else self.mtp_m_lo_streak = 0;
         self.mtp_ev_m_lo_prev = plan.m_lo;
         // Live-cost lever: shorten dry exploration bursts when the MEASURED
@@ -11385,7 +11564,7 @@ pub const Generator = struct {
                     mtpWidthTrialPeriod(&self.xfm.round_cost, kv_len, plan.m_lo);
                 const reread = round_cost.schedulePeriodReread(self.xfm.round_cost.layout);
                 if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period, reread)) {
-                    plan = mtpWidthTrialPlan(target);
+                    plan = mtpPlanInBounds(mtpWidthTrialPlan(target), depth_bounds.floorFor(depth_bounds.active, cap_free), cap_free);
                 }
             }
         }
@@ -11510,7 +11689,7 @@ pub const Generator = struct {
     fn updateMtpEvRound(self: *Generator, drafted: u32, accepted: u32) void {
         mtpEvObserve(&self.mtp_ev_accept, drafted, accepted, MTP_EV_EMA_BETA);
         self.mtp_ev_rounds += 1;
-        if (mtpForcedDepth() != null or self.mtp_group_fixed_depth > 0) return;
+        if (mtpPinnedDepth() != null or self.mtp_group_fixed_depth > 0) return;
         if (self.mtp_ev_rounds <= MTP_EV_WARMUP_ROUNDS) {
             self.updateMtpDepth(drafted, accepted);
             // Warmup may evaluate several depths. None of that mixed evidence
@@ -11614,7 +11793,8 @@ pub const Generator = struct {
         // ── Phase 1: Build and submit the NEXT step FIRST ──
         // This forces the GPU to compute the pending token as a dependency,
         // so when we eval it in Phase 2, it's already ready.
-        if (self.has_pending_logits and self.logprobs_n == 0 and self.step + 1 < self.max_tokens) {
+        // A penalty stays on the slow path: here the pending token is not in `generated_ids` yet.
+        if (self.has_pending_logits and self.logprobs_n == 0 and !self.sampling.penalized() and self.step + 1 < self.max_tokens) {
             const step_logits = self.pending_logits;
             self.has_pending_logits = false;
 
@@ -11629,14 +11809,18 @@ pub const Generator = struct {
                 defer if (!adopted) {
                     _ = mlx.mlx_array_free(next_logits);
                 };
+                var sw = StepTrace.watch();
                 const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
                 _ = mlx.mlx_async_eval(vec);
                 _ = mlx.mlx_vector_array_free(vec);
+                StepTrace.lap(&sw, .submit);
 
                 // NOW resolve the pending token — GPU already computed it as a
                 // dependency of the graph we just submitted. Should be instant.
                 try self.resolvePendingToken();
+                StepTrace.lap(&sw, .resolve);
+                if (sw != null) StepTrace.steps += 1;
 
                 // Check stop conditions on the resolved token
                 if (try self.checkStop()) return null;
@@ -12168,6 +12352,45 @@ pub const Generator = struct {
     }
 };
 
+/// Diagnostic (`MLX_SERVE_STEP_TRACE=1`): host time of a pipelined serial step, per phase,
+/// summed across the request and reported with the spec stats.
+const StepTrace = struct {
+    const Phase = enum { build, flush, submit, resolve };
+    var on: ?bool = null;
+    var steps: u64 = 0;
+    var ns: [4]u64 = .{ 0, 0, 0, 0 };
+
+    fn enabled() bool {
+        if (on) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_STEP_TRACE");
+        const v = raw != null and raw.?[0] != '0';
+        on = v;
+        return v;
+    }
+    fn watch() ?io_util.Stopwatch {
+        return if (enabled()) io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io()) else null;
+    }
+    fn lap(sw: *?io_util.Stopwatch, phase: Phase) void {
+        if (sw.*) |*w| {
+            ns[@backingInt(phase)] += w.read();
+            w.reset();
+        }
+    }
+    fn report() void {
+        if (!enabled() or steps == 0) return;
+        const n: f64 = @floatFromInt(steps);
+        log.info("  [step-trace] steps={d} build={d:.3} flush={d:.3} submit={d:.3} resolve={d:.3} ms/step\n", .{
+            steps,
+            @as(f64, @floatFromInt(ns[0])) / n / 1e6,
+            @as(f64, @floatFromInt(ns[1])) / n / 1e6,
+            @as(f64, @floatFromInt(ns[2])) / n / 1e6,
+            @as(f64, @floatFromInt(ns[3])) / n / 1e6,
+        });
+        steps = 0;
+        ns = .{ 0, 0, 0, 0 };
+    }
+};
+
 /// Build forward pass from a lazy sampled token array.
 /// Reshapes [1] -> [1, 1] and calls transformer forward. All lazy (no eval).
 fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !mlx.mlx_array {
@@ -12175,21 +12398,46 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
     var reshaped = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(reshaped);
     try mlx.check(mlx.mlx_reshape(&reshaped, lazy_token, &tok_shape, 2, xfm.s));
+    // Every array of an async batch carries that batch's END event, so the GPU PLE arm sends
+    // the sampled token out as its own batch: its deferred history settle then waits on the
+    // sampler, not on the forward built on it.
+    if (xfm.qwen4 != null and !pleLazySettleOff()) {
+        const tv = mlx.mlx_vector_array_new_value(reshaped);
+        defer _ = mlx.mlx_vector_array_free(tv);
+        try mlx.check(mlx.mlx_async_eval(tv));
+    }
     // The graph is built while the previous step still runs on the GPU; an
     // arch with a host-side token lookup (qwen4 n-gram PLE) fills its leaf
     // afterwards, so the one sync on the token comes AFTER the build.
     ctx.ple_defer = true;
     defer ctx.ple_defer = false;
+    var sw = StepTrace.watch();
     const logits = xfm.forwardWith(ctx, reshaped) catch |e| {
         xfm.discardDeferredPle(ctx);
         return e;
     };
-    xfm.flushDeferredPle(ctx) catch |e| {
+    StepTrace.lap(&sw, .build);
+    // The GPU arm owes only the host history, and its ids are the token this very forward
+    // waits on; settling now would idle the GPU for the round trip. The next PLE embedding
+    // (or the slot's drain / finish) settles it, when those ids are long evaluated.
+    const settle_now = !Transformer.deferredPleOnGpu(ctx) or pleLazySettleOff();
+    if (settle_now) xfm.flushDeferredPle(ctx) catch |e| {
         xfm.discardDeferredPle(ctx);
         _ = mlx.mlx_array_free(logits);
         return e;
     };
+    StepTrace.lap(&sw, .flush);
     return logits;
+}
+
+var ple_lazy_settle_env: ?bool = null;
+/// `MLX_SERVE_PLE_LAZY_SETTLE=0` restores the per-step host settle on the GPU PLE arm.
+fn pleLazySettleOff() bool {
+    if (ple_lazy_settle_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PLE_LAZY_SETTLE");
+    const off = raw != null and raw.?[0] == '0';
+    ple_lazy_settle_env = off;
+    return off;
 }
 
 /// Sample a token lazily from logits — returns a lazy MLX array (no eval).
@@ -12202,7 +12450,7 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
 /// in the stochastic-verify accept test must be computed via this function so
 /// the ratio `p[draft] / q[draft]` is well-defined over the kept support.
 /// Caller owns the returned array; shape `[B, V]`.
-/// Batched sibling of `probsAtLastPos`: temperature → top-k → top-p →
+/// Batched sibling of `probsAtLastPos`: temperature → top-k → top-p → min-p →
 /// softmax over EVERY position of `[1, L, V]` logits in one set of
 /// row-parallel kernels. A per-position loop pays L separate ~vocab-sized
 /// sort/topk kernel launches per spec-decode round; batched it's one each.
@@ -12234,6 +12482,13 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
     if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
         filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        _ = mlx.mlx_array_free(current);
+        current = masked;
+    }
+    if ((sampling.min_p orelse 0) > 0) {
+        var masked = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(masked);
+        try applyMinP(&masked, current, sampling.min_p.?, s);
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -12368,7 +12623,7 @@ fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx
     return filteredProbsRows(owned, sampling, s);
 }
 
-/// Temperature → top-k → top-p → softmax over the LAST axis of an owned
+/// Temperature → top-k → top-p → min-p → softmax over the LAST axis of an owned
 /// `[.., V]` array (consumed). The ONE place a proposal or target density is
 /// built: a draft sampled from a distribution that is not byte-for-byte the
 /// `q` handed to `specAcceptProb` breaks exactness silently, so both sides
@@ -12377,7 +12632,7 @@ fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx
 fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     var current = owned_rows;
     errdefer _ = mlx.mlx_array_free(current);
-    // Apply temperature → top-k → top-p (same order as `sampleTokenLazy`).
+    // Apply temperature → top-k → top-p → min-p (same order as `sampleTokenLazy`).
     if (sampling.temperature != 1.0) {
         const t = mlx.mlx_array_new_float(sampling.temperature);
         defer _ = mlx.mlx_array_free(t);
@@ -12390,6 +12645,13 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
     if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
         filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        _ = mlx.mlx_array_free(current);
+        current = masked;
+    }
+    if ((sampling.min_p orelse 0) > 0) {
+        var masked = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(masked);
+        try applyMinP(&masked, current, sampling.min_p.?, s);
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -12823,7 +13085,7 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
 
     if (sampling.keyed and sampling.seed != null) {
         defer _ = mlx.mlx_array_free(current);
-        const p: keyed_sample.Params = .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k };
+        const p: keyed_sample.Params = .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k, .min_p = sampling.min_p orelse 0 };
         const pos = [_]u32{@intCast(sampling.position_base + sampling.draw)};
         return keyed_sample.sample(current, p, &pos, s) catch mlx.mlx_array_new();
     }
@@ -12844,6 +13106,16 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
         filterTopKTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = next;
+    }
+    if ((sampling.min_p orelse 0) > 0) {
+        var next = mlx.mlx_array_new();
+        if (applyMinP(&next, current, sampling.min_p.?, s)) |_| {
+            _ = mlx.mlx_array_free(current);
+            current = next;
+        } else |err| {
+            _ = mlx.mlx_array_free(next);
+            log.warn("[sampling] min_p failed ({s}); this draw skips min_p\n", .{@errorName(err)});
+        }
     }
 
     // Sample from categorical distribution (lazy — no eval!)
@@ -12886,7 +13158,7 @@ pub fn sampleRows(out: []i32, row_logits: []const mlx.mlx_array, params: []Sampl
 fn sampleRowsHomogeneous(params: []const SamplingParams) bool {
     const p0 = params[0];
     for (params[1..]) |p| {
-        if (p.temperature != p0.temperature or p.top_k != p0.top_k or p.top_p != p0.top_p) return false;
+        if (p.temperature != p0.temperature or p.top_k != p0.top_k or p.top_p != p0.top_p or (p.min_p orelse 0) != (p0.min_p orelse 0)) return false;
         const m0 = p0.suppress_mask;
         const m1 = p.suppress_mask;
         if (m0 == null and m1 == null) continue;
@@ -13028,6 +13300,13 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
             current = mlx.mlx_array_new();
         };
         if (current.ctx != null) _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+    if ((p0.min_p orelse 0) > 0) {
+        var next = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(next);
+        try applyMinP(&next, current, p0.min_p.?, s);
+        _ = mlx.mlx_array_free(current);
         current = next;
     }
 
@@ -14176,7 +14455,7 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
 
     if (sampling.keyed and sampling.seed != null) {
         const pos = [_]u32{@intCast(sampling.position_base + sampling.draw)};
-        const tok = try keyed_sample.sample(current, .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k }, &pos, s);
+        const tok = try keyed_sample.sample(current, .{ .seed = sampling.seed.?, .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k, .min_p = sampling.min_p orelse 0 }, &pos, s);
         defer _ = mlx.mlx_array_free(tok);
         try mlx.check(mlx.mlx_array_eval(tok));
         const token_id = (mlx.mlx_array_data_uint32(tok) orelse return error.MlxArrayDataNull)[0];
@@ -14216,6 +14495,15 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         try filterTopKTopP(&filtered, current, sampling.top_p, sampling.top_k, s);
         current = filtered;
         filtered_owned = true;
+    }
+    var min_filtered: mlx.mlx_array = .{ .ctx = null };
+    defer if (min_filtered.ctx != null) {
+        _ = mlx.mlx_array_free(min_filtered);
+    };
+    if ((sampling.min_p orelse 0) > 0) {
+        min_filtered = mlx.mlx_array_new();
+        try applyMinP(&min_filtered, current, sampling.min_p.?, s);
+        current = min_filtered;
     }
 
     // Sample from categorical distribution
@@ -14638,6 +14926,23 @@ fn keepByIndex(res: *mlx.mlx_array, logits: mlx.mlx_array, keep_idx: mlx.mlx_arr
 fn filterTopKTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, top_k: u32, s: mlx.mlx_stream) !void {
     if (top_p >= 1.0) return applyTopK(res, logits, top_k, s);
     return applyTopP(res, logits, top_p, top_k, s);
+}
+
+fn applyMinP(res: *mlx.mlx_array, logits: mlx.mlx_array, min_p: f32, s: mlx.mlx_stream) !void {
+    var max_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(max_logits);
+    try mlx.check(mlx.mlx_max_axis(&max_logits, logits, -1, true, s));
+    const log_min_p = mlx.mlx_array_new_float(@log(min_p));
+    defer _ = mlx.mlx_array_free(log_min_p);
+    var threshold = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(threshold);
+    try mlx.check(mlx.mlx_add(&threshold, max_logits, log_min_p, s));
+    var keep = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(keep);
+    try mlx.check(mlx.mlx_greater_equal(&keep, logits, threshold, s));
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    try mlx.check(mlx.mlx_where(res, keep, logits, neg_inf, s));
 }
 
 /// Apply top-p (nucleus) sampling: mask logits outside the top-p probability
@@ -15077,6 +15382,77 @@ test "sampleToken with temperature produces valid token" {
     try testing.expect(result.token_id < 3);
 }
 
+test "min_p keeps only eligible tokens in scalar, lazy and batched sampling" {
+    const s = mlx.gpuStream();
+    const raw = [_]f32{ 3, 2, 0, -5, -5, 0, 2, 3 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 2, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const strict = SamplingParams{ .temperature = 1, .top_k = 2, .min_p = 0.5 };
+    const probs = try probsAllPositions(logits, strict, s);
+    defer _ = mlx.mlx_array_free(probs);
+    const values = try samplerTestReadFlat(testing.allocator, probs, raw.len, s);
+    defer testing.allocator.free(values);
+    try testing.expectEqualSlices(f32, &.{ 1, 0, 0, 0, 0, 0, 0, 1 }, values);
+
+    const first = mlx.mlx_array_new_data(&raw[0], &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(first);
+    const second = mlx.mlx_array_new_data(&raw[4], &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(second);
+    try testing.expectEqual(@as(u32, 0), (try sampleToken(testing.allocator, first, strict, null, 0, s)).token_id);
+    try testing.expectEqual(@as(u32, 0), try evalLazyToken(sampleTokenLazy(first, strict, s)));
+    var params = [_]SamplingParams{ strict, strict };
+    var ids: [2]i32 = undefined;
+    try sampleRows(&ids, &.{ first, second }, &params, s);
+    try testing.expectEqualSlices(i32, &.{ 0, 3 }, &ids);
+    try testing.expect(!sampleRowsHomogeneous(&.{ strict, .{ .temperature = 1, .top_k = 2, .min_p = 0 } }));
+    try testing.expect(sampleRowsHomogeneous(&.{ SamplingParams{ .temperature = 1, .top_k = 2 }, .{ .temperature = 1, .top_k = 2, .min_p = 0 } }));
+}
+
+test "min_p keeps tied maxima and zero matches the omitted filter" {
+    const s = mlx.gpuStream();
+    const tied = mlx.mlx_array_new_data(&[_]f32{ 0, 0, -1, -2 }, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(tied);
+    const strict = try probsAllPositions(tied, .{ .min_p = 1 }, s);
+    defer _ = mlx.mlx_array_free(strict);
+    const values = try samplerTestReadFlat(testing.allocator, strict, 4, s);
+    defer testing.allocator.free(values);
+    try testing.expectEqualSlices(f32, &.{ 0.5, 0.5, 0, 0 }, values);
+
+    const omitted = try probsAllPositions(tied, .{}, s);
+    defer _ = mlx.mlx_array_free(omitted);
+    const zero = try probsAllPositions(tied, .{ .min_p = 0 }, s);
+    defer _ = mlx.mlx_array_free(zero);
+    try samplerTestExpectSameBits(omitted, zero, 4, s);
+}
+
+test "min_p uses temperature and agrees across speculative target and proposal" {
+    const s = mlx.gpuStream();
+    const raw = [_]f32{ 3, 2.8, 0, -5, -5, 0, 2.8, 3 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 2, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const warm = try probsAllPositions(logits, .{ .temperature = 2, .min_p = 0.9 }, s);
+    defer _ = mlx.mlx_array_free(warm);
+    const warm_values = try samplerTestReadFlat(testing.allocator, warm, raw.len, s);
+    defer testing.allocator.free(warm_values);
+    try testing.expect(warm_values[0] > 0 and warm_values[1] > 0);
+    try testing.expectEqual(@as(f32, 0), warm_values[2]);
+    const cold = try probsAllPositions(logits, .{ .temperature = 1, .min_p = 0.9 }, s);
+    defer _ = mlx.mlx_array_free(cold);
+    const cold_values = try samplerTestReadFlat(testing.allocator, cold, raw.len, s);
+    defer testing.allocator.free(cold_values);
+    try testing.expectEqual(@as(f32, 0), cold_values[1]);
+
+    const policy = SamplingParams{ .temperature = 2, .top_k = 3, .top_p = 0.9, .min_p = 0.5 };
+    const target = try probsAllPositions(logits, policy, s);
+    defer _ = mlx.mlx_array_free(target);
+    const grouped = try groupProbsBlock(logits, policy, s);
+    defer _ = mlx.mlx_array_free(grouped);
+    const proposal = try filteredProbsBlock(logits, policy, s);
+    defer _ = mlx.mlx_array_free(proposal);
+    try samplerTestExpectSameBits(target, grouped, raw.len, s);
+    try samplerTestExpectSameBits(target, proposal, raw.len, s);
+}
+
 test "seeded lazy sampling replays the same draws and advances per draw" {
     const s = mlx.gpuStream();
     const data = [_]f32{ 0.0, 0.0 };
@@ -15507,6 +15883,28 @@ test "isDegenerateTailLoop catches a repeated channel-opener cycle" {
         while (k < degenerate_loop_min_span + 1) : (k += 1) try ids.append(testing.allocator, 42);
         try testing.expect(isDegenerateTailLoop(ids.items, P, R));
     }
+}
+
+test "ToolForce: the opener after the thought closes, the closer too at the deadline, never twice" {
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ CLOSE, 20, 40, 41 }; // closer, separator, opener
+    var tf = ToolForce{ .closer_id = CLOSE, .forced = &forced, .opener_at = 2, .in_think = true };
+    try testing.expect(tf.due(&[_]u32{ 6, 7 }, 2, 100) == null);
+    const after = tf.due(&[_]u32{ 6, 7, CLOSE }, 3, 100).?;
+    try testing.expectEqualSlices(u32, &[_]u32{ 40, 41 }, after.tokens);
+    try testing.expect(!after.closes_thought);
+    tf.fired = true;
+    try testing.expect(tf.due(&[_]u32{ 6, 7, CLOSE, 40 }, 4, 100) == null);
+
+    // Still thinking with a quarter of max_tokens left: close it and call.
+    var late = ToolForce{ .closer_id = CLOSE, .forced = &forced, .opener_at = 2, .in_think = true };
+    try testing.expect(late.due(&[_]u32{6}, 74, 100) == null);
+    const closing = late.due(&[_]u32{6}, 75, 100).?;
+    try testing.expectEqualSlices(u32, &forced, closing.tokens);
+    try testing.expect(closing.closes_thought);
+
+    var open = ToolForce{ .closer_id = null, .forced = forced[2..], .opener_at = 0, .in_think = false };
+    try testing.expectEqualSlices(u32, &[_]u32{ 40, 41 }, open.due(&[_]u32{}, 0, 100).?.tokens);
 }
 
 test "ThinkBound: counts only tokens inside the think block and fires at the budget" {
@@ -16132,6 +16530,31 @@ test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE cap
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false, false, false));
 }
 
+test "boundedPrefillChunk: MiMo builds no prefill score tensor, so its chunk never shrinks with the prompt" {
+    const cfg: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .head_dim = 192, .num_attention_heads = 64, .has_sliding_window = true };
+    try testing.expectEqual(@as(u32, 0), cfg.prefillScoreHeadDim());
+    for ([_]usize{ 8192, 32768, 262_144 }) |ctx| try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, cfg.prefillScoreHeadDim(), 64, ctx, true, true, false));
+    try testing.expect(transformer_mod.prefillHeadDimFused(cfg.prefillScoreHeadDim()));
+}
+
+test "effectivePrefillChunk: an arch with no prefill score tensor defaults to the wide chunk, still under the pin and an explicit width" {
+    const saved = .{ prefill_chunk_override, prefill_chunk_explicit };
+    defer {
+        prefill_chunk_override = saved[0];
+        prefill_chunk_explicit = saved[1];
+    }
+    prefill_chunk_override = 8192;
+    prefill_chunk_explicit = false;
+    try testing.expectEqual(WIDE_PREFILL_CHUNK, effectivePrefillChunk(0, 64, 32768, true, true, false, 0));
+    try testing.expectEqual(WIDE_PREFILL_CHUNK, effectivePrefillChunk(0, 64, 32768, true, true, false, WIDE_PREFILL_CHUNK));
+    try testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(0, 64, 32768, true, true, false, 8192));
+    // Every other arch keeps the launch width.
+    try testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(128, 32, 32768, false, false, false, WIDE_PREFILL_CHUNK));
+    prefill_chunk_override = 4096;
+    prefill_chunk_explicit = true;
+    try testing.expectEqual(@as(usize, 4096), effectivePrefillChunk(0, 64, 32768, true, true, false, WIDE_PREFILL_CHUNK));
+}
+
 test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 rung, an ungated one caps at 4096" {
     std.debug.assert(transformer_mod.fused256_override == null);
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, true, true));
@@ -16481,13 +16904,14 @@ test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, gree
     // Stochastic target: drafts sample from the FIXED sharpened distribution
     // (temp 0.6 / top_p 0.95 / top_k 20 — oMLX Lightning's _DRAFT_SAMPLER_*
     // constants; matched-temp drafting collapses on high-entropy content).
-    const target = SamplingParams{ .temperature = 1.0, .top_p = 1.0, .top_k = 0, .repeat_penalty = 1.1 };
+    const target = SamplingParams{ .temperature = 1.0, .top_p = 1.0, .top_k = 0, .min_p = 0.1, .repeat_penalty = 1.1 };
     const d = Generator.mtpDraftSamplingFor(target, false, Generator.MTP_DRAFT_TEMP);
     try testing.expectEqual(@as(f32, 0.6), d.temperature);
     try testing.expectEqual(@as(f32, 0.95), d.top_p);
     try testing.expectEqual(@as(u32, 20), d.top_k);
     // Non-sampler fields ride through untouched.
     try testing.expectEqual(@as(f32, 1.1), d.repeat_penalty);
+    try testing.expectEqual(@as(?f32, 0.1), d.min_p);
 
     // Greedy target keeps greedy drafts (the temp-0 identity contract).
     const greedy = SamplingParams{ .temperature = 0.0 };
@@ -16882,7 +17306,7 @@ test "MTP cross-round pre-draft defaults on and explicit zero disables" {
 }
 
 test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit always wins" {
-    // 0 = auto (--mtp-depth not passed).
+    // 0 = auto (--mtp-max-depth not passed).
     // .generic's auto cap is per-silicon, so the chip must be injected here
     // or the assertion is a property of whichever Mac runs the suite.
     try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfileChip(0, true, .generic, "Apple M4 Max"));
@@ -17722,7 +18146,7 @@ test "mtpEvPlanFor: DEFAULT costs carry the post-sdpa-split surface (2026-08-15 
     // flat_max 4: the old hi over-priced k4 at 0.34 (measured 0.24), so
     // moderate content under-drafted it. The k>=7 third region carries the
     // plain-SIMD verify-qmm register cliff — only reachable when
-    // --mtp-depth forces past the generic cap of 6.
+    // --mtp-max-depth forces past the generic cap of 6.
     const costs = Generator.MTP_EV_DEFAULT_COSTS;
     // Hot uniform 90%: base now rides the WIDER flat region (m_lo 4, was 3
     // under refit #3), extension one step into the ramp.
@@ -19941,6 +20365,18 @@ test "mtpSerialCaptureReady: the capture step's entry invariant is a RUNTIME che
     try testing.expect(!G.mtpSerialCaptureReady(true, true));
 }
 
+test "mtpPreDraftOpenAllows: an eager pre-draft needs a reader, planner-owned or not" {
+    const G = Generator;
+    // One token under budget: the next round reads the chain, so open.
+    try testing.expect(G.mtpPreDraftOpenAllows(9, 10, false));
+    // Exactly at budget: the request ends on length, no later round reads it.
+    try testing.expect(!G.mtpPreDraftOpenAllows(10, 10, false));
+    // Over budget: same.
+    try testing.expect(!G.mtpPreDraftOpenAllows(11, 10, false));
+    // A pending EOS ends the request even with budget left, so no reader.
+    try testing.expect(!G.mtpPreDraftOpenAllows(5, 10, true));
+}
+
 test "MTP head persistence kill switch: only a literal 0 turns it off" {
     try testing.expect(mtpHeadPersistFromEnv(null));
     try testing.expect(mtpHeadPersistFromEnv(""));
@@ -20105,9 +20541,8 @@ test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first
     try testing.expectEqual(@as(u8, 1), t.serial_probes[b]);
 }
 
-test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; every other arch keeps proportional growth" {
-    // The reservation pre-buys prompt + generation headroom + slack past 32k; a pure cost on an
-    // arch nobody measured, so it is gated.
+test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-buys generation headroom" {
+    // Headroom is a pure cost on an arch nobody measured, so it is gated; the prompt is written anyway.
     const t = std.testing;
     const chunk: u64 = 4096;
     const seq: u64 = 200_000;
@@ -20121,10 +20556,11 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     );
     try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk) > seq);
 
-    // Every other arch: zero, which leaves `nextCapacityReserved` == `nextCapacity`.
-    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama" }) |mt| {
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mimo_v2" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
-        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+        try t.expectEqual(seq + chunk, reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+        // One chunk never grows mid-prefill: nothing to reserve.
+        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, chunk, max_tokens, chunk));
     }
 
     var cache = try KVC.init(t.allocator, 4);
@@ -20538,9 +20974,9 @@ test "lazy predraft: greedy tokens equal the eager padded path, lookup off and o
     const io = std.Io.Threaded.global_single_threaded.io();
     const rig = try LazyRig.load(a, io);
     defer rig.deinit(a);
-    const forced = Generator.mtp_force_depth_cache;
-    defer Generator.mtp_force_depth_cache = forced;
-    Generator.mtp_force_depth_cache = @as(?u32, 3);
+    const forced = depth_bounds.active;
+    defer depth_bounds.active = forced;
+    depth_bounds.active = .{ .min = 3, .max = 3 };
     defer Generator.mtp_lookup_override = null;
     for ([_]bool{ false, true }) |lookup| {
         Generator.mtp_lookup_override = lookup;
@@ -20579,9 +21015,9 @@ test "lazy predraft: a failure after the lazy dispatch leaves the head committed
     const io = std.Io.Threaded.global_single_threaded.io();
     const rig = try LazyRig.load(a, io);
     defer rig.deinit(a);
-    const forced = Generator.mtp_force_depth_cache;
-    defer Generator.mtp_force_depth_cache = forced;
-    Generator.mtp_force_depth_cache = @as(?u32, 3);
+    const forced = depth_bounds.active;
+    defer depth_bounds.active = forced;
+    depth_bounds.active = .{ .min = 3, .max = 3 };
     Generator.mtp_lazy_predraft_override = true;
     defer Generator.mtp_lazy_predraft_override = null;
     var buf: [192]u32 = undefined;
@@ -20609,11 +21045,11 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     Generator.mtp_padded_head_override = false;
     defer Generator.mtp_padded_head_override = null;
     const predraft = Generator.mtp_predraft_cache;
-    const forced = Generator.mtp_force_depth_cache;
+    const forced = depth_bounds.active;
     const planner = group_planner.enabled_override;
     defer {
         Generator.mtp_predraft_cache = predraft;
-        Generator.mtp_force_depth_cache = forced;
+        depth_bounds.active = forced;
         group_planner.enabled_override = planner;
     }
     // Observe the completed-round stash before any successor consumes it.
@@ -20622,7 +21058,6 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const coarse_before = transformer_mod.mtp_coarse_pair_dispatches;
-    const hc_prepared_before = transformer_mod.mtp_verify_hc_prepared_calls;
     const verify_kernel_before = transformer_mod.mtp_verify_kernel_calls;
     var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
     defer if (config.ngram_table_path) |path| a.free(path);
@@ -20640,7 +21075,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
     for ([_]usize{ 2, 4 }) |n| {
         for ([_]u32{ 1, 2, 4 }) |depth| {
-            Generator.mtp_force_depth_cache = @as(?u32, depth);
+            depth_bounds.active = .{ .min = depth, .max = depth };
             var solo: [4]?*MtpChainTestSlot = @splat(null);
             var batch: [4]?*MtpChainTestSlot = @splat(null);
             defer for (solo, batch) |ss, bs| {
@@ -20739,10 +21174,6 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     }
     if (transformer_mod.verifySharedHardware()) {
         try testing.expect(transformer_mod.mtp_coarse_pair_dispatches > coarse_before);
-        {
-            try testing.expect(transformer_mod.mtp_verify_hc_prepared_calls > hc_prepared_before);
-            std.debug.print("[prepared HC] calls={d}\n", .{transformer_mod.mtp_verify_hc_prepared_calls - hc_prepared_before});
-        }
         inline for (.{ .dense_tiles, .hc_rows, .route_pack }, 0..) |lever, i| {
             {
                 try testing.expect(transformer_mod.mtp_verify_kernel_calls[i] > verify_kernel_before[i]);
@@ -21790,6 +22221,66 @@ test "constrained generation returns one logprob entry per token, paired with th
     try testing.expect(paired > 0);
 }
 
+test "repeat penalty shapes every sampling path, not only the logprobs one" {
+    // Bar: a penalty changes greedy output with or without logprobs, the same way, and under a grammar.
+    const path = std.c.getenv("LOGPROBS_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = std.mem.span(path);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer if (config.ngram_table_path) |name| a.free(name);
+    var weights = try model_mod.loadWeights(io, a, dir);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = try tokenizer_mod.loadTokenizer(io, a, dir);
+    defer tok.deinit();
+    config.applyTokenizer(&tok, "<|im_end|>");
+    var token_bytes = try token_mask.build(a, &tok);
+    defer token_bytes.deinit();
+
+    const prompt = try tok.encode(a, "<|im_start|>user\nWrite the word apple 40 times separated by spaces. Answer in JSON with a words array.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    defer a.free(prompt);
+    const schema_src =
+        \\{"type":"object","properties":{"words":{"type":"array","items":{"type":"string"}}},"required":["words"],"additionalProperties":false}
+    ;
+    var schema = try std.json.parseFromSlice(std.json.Value, a, schema_src, .{});
+    defer schema.deinit();
+
+    const Run = struct {
+        fn ids(al: std.mem.Allocator, x: *Transformer, t: *const Tokenizer, p: []const u32, eos: []const u32, rp: f32, lp: u32, sv: ?std.json.Value, tb: *token_mask.TokenBytes) ![]u32 {
+            var sc: SchemaConstraint = undefined;
+            if (sv) |v| try sc.initFromValue(al, v, tb);
+            defer if (sv != null) sc.deinit();
+            const sampling: SamplingParams = .{ .temperature = 0, .repeat_penalty = rp, .constraint = if (sv != null) &sc.constraint else null };
+            const r = try generate(std.Io.Threaded.global_single_threaded.io(), al, x, t, p, 48, sampling, eos, 0, lp);
+            al.free(r.text);
+            if (r.logprobs) |lps| {
+                for (lps) |e| al.free(e.top_logprobs);
+                al.free(lps);
+            }
+            return r.token_ids;
+        }
+    };
+    const eos = config.eosTokenSlice();
+    const plain = try Run.ids(a, &xfm, &tok, prompt, eos, 1.0, 0, null, &token_bytes);
+    defer a.free(plain);
+    const pen = try Run.ids(a, &xfm, &tok, prompt, eos, 2.0, 0, null, &token_bytes);
+    defer a.free(pen);
+    const pen_lp = try Run.ids(a, &xfm, &tok, prompt, eos, 2.0, 1, null, &token_bytes);
+    defer a.free(pen_lp);
+    try testing.expect(!std.mem.eql(u32, plain, pen_lp));
+    try testing.expectEqualSlices(u32, pen_lp, pen);
+
+    const json_plain = try Run.ids(a, &xfm, &tok, prompt, eos, 1.0, 0, schema.value, &token_bytes);
+    defer a.free(json_plain);
+    const json_pen = try Run.ids(a, &xfm, &tok, prompt, eos, 4.0, 0, schema.value, &token_bytes);
+    defer a.free(json_pen);
+    try testing.expect(!std.mem.eql(u32, json_plain, json_pen));
+}
+
 test "keyed sampling draws the softmax distribution" {
     const s = mlx.gpuStream();
     const probs = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
@@ -21808,4 +22299,162 @@ test "keyed sampling draws the softmax distribution" {
         counts[@intCast(v)] += 1;
     }
     for (probs, counts) |p, c| try testing.expect(@abs(@as(f32, @floatFromInt(c)) / @as(f32, @floatFromInt(n)) - p) < 0.03);
+}
+
+fn mtpBoundsPlanFixture(xfm: *Transformer, prompt: []u32, depth: u32) Generator {
+    xfm.config.model_type = "qwen4_exp";
+    xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = xfm.round_cost.observe(2, 1000, 29.0, 2.6, true, false);
+        _ = xfm.round_cost.observe(3, 1000, 31.0, 2.9, true, false);
+        _ = xfm.round_cost.observe(4, 1000, 36.0, 3.1, true, false);
+        _ = xfm.round_cost.observe(5, 1000, 42.0, 3.5, true, false);
+    }
+    return Generator{
+        .xfm = xfm,
+        .ctx = undefined,
+        .tok = undefined,
+        .next_token_id = 0,
+        .step = 0,
+        .max_tokens = 1,
+        .sampling = .{ .temperature = 0 },
+        .prompt_tokens = 0,
+        .completion_tokens = 0,
+        .finish_reason = "length",
+        .done = false,
+        .eos_token_ids = &.{},
+        .generated_ids = .empty,
+        .timeout_ns = 0,
+        .timer = io_util.Stopwatch.init(testing.io),
+        .last_hidden = .{ .ctx = null },
+        .has_last_hidden = false,
+        .prompt_ids_owned = prompt,
+        .mtp_depth = depth,
+        .mtp_depth_free = depth,
+        .mtp_ev_rounds = 64,
+        .mtp_ev_accept = .{ 0.92, 0.9, 0.88, 0.86, 0.84, 0.8, 0.8, 0.8 },
+        .mtp_ev_m_lo_prev = 4,
+        .spec_cost_solo = false,
+    };
+}
+
+test "MTP depth bounds: an EV plan outside min..max is clamped, one inside is untouched" {
+    const wide = Generator.MtpRoundPlan{ .m_lo = 3, .m_hi = 7, .tau_ln = -1.5 };
+    const low = Generator.mtpPlanInBounds(wide, 5, 8);
+    try testing.expectEqual(@as(u32, 5), low.m_lo);
+    try testing.expectEqual(@as(u32, 7), low.m_hi);
+    try testing.expectEqual(@as(f32, -1.5), low.tau_ln);
+
+    const high = Generator.mtpPlanInBounds(wide, 1, 2);
+    try testing.expectEqual(@as(u32, 2), high.m_lo);
+    try testing.expectEqual(@as(u32, 2), high.m_hi);
+    // The extension collapsed: no confidence read, as in any single-chunk plan.
+    try testing.expectEqual(@as(f32, 0.0), high.tau_ln);
+
+    const pinned = Generator.mtpPlanInBounds(wide, 4, 4);
+    try testing.expectEqual(@as(u32, 4), pinned.m_lo);
+    try testing.expectEqual(@as(u32, 4), pinned.m_hi);
+
+    const inside = Generator.mtpPlanInBounds(wide, 1, 8);
+    try testing.expectEqual(wide, inside);
+}
+
+test "MTP depth bounds: both policies keep table-priced plans inside min..max" {
+    const before = depth_bounds.active;
+    const policy_before = Generator.mtp_depth_policy_cache;
+    defer {
+        depth_bounds.active = before;
+        Generator.mtp_depth_policy_cache = policy_before;
+    }
+    var xfm: Transformer = undefined;
+    var prompt: [1000]u32 = @splat(0);
+    for ([_]Generator.MtpDepthPolicy{ .accept, .legacy }) |policy| {
+        Generator.mtp_depth_policy_cache = policy;
+        depth_bounds.active = .{};
+        var gen = mtpBoundsPlanFixture(&xfm, &prompt, 6);
+        try testing.expectEqual(@as(u32, if (policy == .accept) 4 else 3), gen.mtpRoundPlan().m_lo);
+
+        depth_bounds.active = .{ .min = 5 };
+        gen = mtpBoundsPlanFixture(&xfm, &prompt, 6);
+        var plan = gen.mtpRoundPlan();
+        try testing.expect(plan.m_lo >= 5 and plan.m_hi >= plan.m_lo and plan.m_hi <= 6);
+
+        depth_bounds.active = .{ .max = 2 };
+        gen = mtpBoundsPlanFixture(&xfm, &prompt, 2);
+        plan = gen.mtpRoundPlan();
+        try testing.expect(plan.m_lo <= 2 and plan.m_hi <= 2);
+    }
+}
+
+test "MTP depth bounds: min == max drafts that depth every round" {
+    const before = depth_bounds.active;
+    defer depth_bounds.active = before;
+    var xfm: Transformer = undefined;
+    var prompt: [1000]u32 = @splat(0);
+    for ([_]u32{ 2, 4, 5 }) |depth| {
+        depth_bounds.active = .{ .min = depth, .max = depth };
+        var gen = mtpBoundsPlanFixture(&xfm, &prompt, depth);
+        for (0..4) |_| {
+            const plan = gen.mtpRoundPlan();
+            try testing.expectEqual(depth, plan.m_lo);
+            try testing.expectEqual(depth, plan.m_hi);
+        }
+    }
+}
+
+test "MTP depth bounds: the windowed controller never leaves min..max and never disables above a floor of 1" {
+    const before = depth_bounds.active;
+    defer depth_bounds.active = before;
+    depth_bounds.active = .{ .min = 3, .max = 5 };
+    var hot = mtpEvTestGenerator();
+    hot.mtp_depth = 5;
+    hot.mtp_depth_current = 3;
+    for (0..64) |_| {
+        hot.updateMtpDepth(5, 5);
+        try testing.expect(hot.mtp_depth_current >= 3 and hot.mtp_depth_current <= 5);
+    }
+    try testing.expectEqual(@as(u32, 5), hot.mtp_depth_current);
+
+    var cold = mtpEvTestGenerator();
+    cold.mtp_depth = 5;
+    cold.mtp_depth_current = 5;
+    for (0..64) |_| {
+        cold.updateMtpDepth(5, 0);
+        try testing.expect(cold.mtp_depth_current >= 3 and cold.mtp_depth_current <= 5);
+    }
+    try testing.expectEqual(@as(u32, 3), cold.mtp_depth_current);
+    try testing.expect(!cold.spec_disabled_runtime);
+}
+
+test "MTP depth bounds: a min above the default cap lifts both caps, an explicit max leaves them" {
+    const before = depth_bounds.active;
+    defer depth_bounds.active = before;
+    depth_bounds.active = .{ .min = 7 };
+    try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapForProfile(0, true, .generic));
+    try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapFree(0));
+    depth_bounds.active = .{ .min = 2, .max = 4 };
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapForProfile(4, true, .generic));
+    try testing.expectEqual(@as(u32, 4), Generator.mtpDepthCapFree(4));
+}
+
+test "MTP depth bounds: warmup, group fill and native head caps constrain the final plan" {
+    const before = depth_bounds.active;
+    defer depth_bounds.active = before;
+    var xfm: Transformer = undefined;
+    var prompt: [1000]u32 = @splat(0);
+    depth_bounds.active = .{ .min = 3, .max = 5 };
+    var gen = mtpBoundsPlanFixture(&xfm, &prompt, 5);
+    gen.mtp_ev_rounds = 0;
+    gen.mtp_depth_current = 1;
+    gen.mtp_batch_head = true; // No serial probe on a grouped lane.
+    try testing.expectEqual(@as(u32, 3), gen.mtpRoundPlan().m_lo);
+    gen.mtp_group_cap = 8;
+    gen.mtp_group_fill = true;
+    try testing.expectEqual(@as(u32, 5), gen.mtpRoundPlan().m_hi);
+    gen.mtp_group_cap = 2; // The verify row budget wins over the floor.
+    try testing.expectEqual(@as(u32, 2), gen.mtpRoundPlan().m_lo);
+    gen.mtp_group_cap = 0;
+    gen.mtp_depth = 3; // Native multi-head cap resolved at initialization.
+    depth_bounds.active = .{ .min = 5, .max = 5 };
+    try testing.expectEqual(@as(u32, 3), gen.mtpRoundPlan().m_hi);
 }

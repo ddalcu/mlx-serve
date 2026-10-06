@@ -2275,7 +2275,7 @@ pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, 
     const use_cfg = opts.guidance_scale != 1.0 and opts.neg_enc != null;
     const run_steps = steps - start_step;
     for (start_step..steps) |t| {
-        if (progress) |p| if (p.cancelled()) return error.Cancelled;
+        if (progress) |p| if (p.boundary()) return error.Cancelled;
         const nz_cond = try ditVelocity(dit, latents, enc, sched.ts[t], img_ids, txt_ids, ref_tokens, all_ids, @intCast(nlat), s);
         const nz = if (use_cfg) blk: {
             defer _ = mlx.mlx_array_free(nz_cond);

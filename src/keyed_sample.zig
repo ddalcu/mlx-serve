@@ -33,6 +33,7 @@ const SOURCE =
     \\  const size_t base = size_t(row) * V;
     \\  const float inv_t = cfg[0];
     \\  const float top_p = cfg[1];
+    \\  const float min_p = cfg[3];
     \\  const uint cap = (kcap[0] == 0u || kcap[0] > C) ? C : kcap[0];
     \\  const ulong seed = ulong(seeds[2 * row]) | (ulong(seeds[2 * row + 1]) << 32);
     \\  const uint position = positions[row];
@@ -218,6 +219,12 @@ const SOURCE =
     \\        if (cum >= top_p) { keep = j + 1; break; }
     \\      }
     \\    }
+    \\    if (min_p > 0.0f) {
+    \\      const float floor_v = m + metal::log(min_p);
+    \\      for (uint j = 0; j < keep; j++) {
+    \\        if (tf_val(ck[j]) < floor_v) { keep = j; break; }
+    \\      }
+    \\    }
     \\    st[0] = keep;
     \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -280,7 +287,7 @@ pub fn gumbel(seed: u64, position: u64, id: u32) f32 {
     return -@log(-@log(u));
 }
 
-pub const Params = struct { seed: u64, temperature: f32, top_p: f32, top_k: u32 };
+pub const Params = struct { seed: u64, temperature: f32, top_p: f32, top_k: u32, min_p: f32 = 0 };
 
 /// Tokens `[R]` uint32 (lazy) for `logits` `[..., V]` (R rows), row r at absolute position `positions[r]`.
 pub fn sample(logits: mlx.mlx_array, p: Params, positions: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -301,8 +308,8 @@ pub fn sample(logits: mlx.mlx_array, p: Params, positions: []const u32, s: mlx.m
     defer _ = mlx.mlx_array_free(seeds);
     const pos = mlx.mlx_array_new_data(positions.ptr, &[_]c_int{rows}, 1, .uint32);
     defer _ = mlx.mlx_array_free(pos);
-    const cfg_v = [_]f32{ 1.0 / @max(p.temperature, 1e-6), p.top_p, NEAR };
-    const cfg = mlx.mlx_array_new_data(&cfg_v, &[_]c_int{3}, 1, .float32);
+    const cfg_v = [_]f32{ 1.0 / @max(p.temperature, 1e-6), p.top_p, NEAR, p.min_p };
+    const cfg = mlx.mlx_array_new_data(&cfg_v, &[_]c_int{4}, 1, .float32);
     defer _ = mlx.mlx_array_free(cfg);
     const kcap = mlx.mlx_array_new_data(&p.top_k, &[_]c_int{1}, 1, .uint32);
     defer _ = mlx.mlx_array_free(kcap);
@@ -397,5 +404,37 @@ test "keyed_sample.gumbel: the host noise picks the kernel's token" {
             }
         }
         try testing.expectEqual(best, mlx.mlx_array_data_uint32(tok).?[0]);
+    }
+}
+
+test "keyed_sample min_p excludes low logits after temperature and top_k" {
+    const s = mlx.gpuStream();
+    const raw = [_]f32{ 3, 2, 0, -5 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const p: Params = .{ .seed = 9, .temperature = 1, .top_p = 1, .top_k = 2, .min_p = 0.5 };
+    for (0..8) |draw| {
+        const pos = [_]u32{@intCast(draw)};
+        const tok = try sample(logits, p, &pos, s);
+        defer _ = mlx.mlx_array_free(tok);
+        try mlx.check(mlx.mlx_array_eval(tok));
+        try testing.expectEqual(@as(u32, 0), mlx.mlx_array_data_uint32(tok).?[0]);
+    }
+}
+
+test "keyed_sample min_p retains the temperature-scaled nucleus" {
+    const s = mlx.gpuStream();
+    const raw = [_]f32{ 3, 2.8, 0, -5 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const p: Params = .{ .seed = 1234, .temperature = 2, .top_p = 0.9, .top_k = 3, .min_p = 0.5 };
+    for (0..32) |draw| {
+        const pos: u32 = @intCast(draw);
+        const tok = try sample(logits, p, &.{pos}, s);
+        defer _ = mlx.mlx_array_free(tok);
+        try mlx.check(mlx.mlx_array_eval(tok));
+        const score0 = raw[0] / p.temperature + gumbel(p.seed, pos, 0);
+        const score1 = raw[1] / p.temperature + gumbel(p.seed, pos, 1);
+        try testing.expectEqual(@as(u32, if (score0 >= score1) 0 else 1), mlx.mlx_array_data_uint32(tok).?[0]);
     }
 }

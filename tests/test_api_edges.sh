@@ -89,6 +89,56 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"stop\":[\"\"
 [[ -n "$(echo "$BODY" | J 'd["choices"][0]["message"]["content"]')" ]] && ok "empty stop entry in an array is ignored" || bad "empty stop entry in an array" "$(echo "$BODY" | head -c 160)"
 req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":60,\"stop_sequences\":[\"four\"],\"messages\":[$CNT],\"temperature\":0}"
 [[ "$(echo "$BODY" | J 'd["stop_reason"]')" == stop_sequence && "$(echo "$BODY" | J 'd["stop_sequence"]')" == four ]] && ok "/v1/messages echoes the matched stop_sequence" || bad "/v1/messages stop_sequence echo" "$(echo "$BODY" | head -c 160)"
+# A stop string spanning tokens: the stream sends the same bytes as the reply, both when it
+# matches and when a reply ENDS on a prefix of it (the held tail must still go out).
+cat > "$WORK/stop_stream.py" <<'PY'
+import json, sys, urllib.request
+BASE = sys.argv[1]
+def post(path, body):
+    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=120)
+def events(r):
+    for line in r:
+        line = line.decode().strip()
+        if line.startswith("data: {"):
+            yield json.loads(line[6:])
+COUNT = "Count from 1 to 30, separated by commas and spaces. Output only the numbers."
+def chat(stop, stream):
+    body = {"model": "m", "messages": [{"role": "user", "content": COUNT}], "max_tokens": 200, "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": False}, "stop": [stop], "stream": stream}
+    r = post("/v1/chat/completions", body)
+    if not stream:
+        return json.load(r)["choices"][0]["message"]["content"]
+    return "".join((c.get("delta") or {}).get("content") or "" for d in events(r) for c in d.get("choices", []))
+def completions(stop, stream):
+    body = {"model": "m", "prompt": "1, 2, 3, 4, 5, 6, 7, 8,", "max_tokens": 40, "temperature": 0, "stop": [stop], "stream": stream}
+    r = post("/v1/completions", body)
+    if not stream:
+        return json.load(r)["choices"][0]["text"]
+    return "".join(c.get("text") or "" for d in events(r) for c in d.get("choices", []))
+def messages(stop, stream):
+    body = {"model": "m", "messages": [{"role": "user", "content": COUNT}], "max_tokens": 200, "temperature": 0,
+            "thinking": {"type": "disabled"}, "stop_sequences": [stop], "stream": stream}
+    r = post("/v1/messages", body)
+    if not stream:
+        return "".join(b.get("text", "") for b in json.load(r)["content"] if b["type"] == "text")
+    return "".join((d.get("delta") or {}).get("text") or "" for d in events(r) if d.get("type") == "content_block_delta")
+def responses(stop, stream):
+    body = {"model": "m", "input": COUNT, "max_output_tokens": 200, "temperature": 0, "reasoning": {"effort": "none"},
+            "stop": [stop], "stream": stream}
+    r = post("/v1/responses", body)
+    if not stream:
+        return "".join(c["text"] for o in json.load(r)["output"] if o["type"] == "message" for c in o["content"] if c["type"] == "output_text")
+    return "".join(d.get("delta") or "" for d in events(r) if d.get("type") == "response.output_text.delta")
+for name, call in (("chat", chat), ("completions", completions), ("messages", messages), ("responses", responses)):
+    for stop, what in ((", 12", "a matching multi-token stop"), (", 30x", "a reply ending on a stop prefix")):
+        ns, st = call(stop, False), call(stop, True)
+        print(f"{'ok' if ns and ns == st else 'bad'}|{name}: stream == non-stream with {what} ({st[-12:]!r} vs {ns[-12:]!r})")
+PY
+python3 "$WORK/stop_stream.py" "$BASE" > "$WORK/stop_stream.out" 2>&1 || bad "stop stream script" "$(tail -3 "$WORK/stop_stream.out")"
+while IFS='|' read -r verdict name; do
+    case "$verdict" in ok) ok "$name" ;; bad) bad "$name" ;; esac
+done < "$WORK/stop_stream.out"
 
 echo "=== ignore_eos ==="
 # vLLM contract: with ignore_eos the reply runs to max_tokens even though the

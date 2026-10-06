@@ -1898,7 +1898,7 @@ fn vocodeWindow(e: *const Engine, allocator: std.mem.Allocator, latents: mlx.mlx
 // Engine
 // ════════════════════════════════════════════════════════════════════════
 
-/// Monotonic lap clock over std.Io (this Zig nightly has no std.time.Timer).
+/// Monotonic lap clock over std.Io (Zig 0.17 has no std.time.Timer).
 const LapClock = struct {
     io: std.Io,
     start: std.Io.Timestamp,
@@ -2213,7 +2213,7 @@ pub const Engine = struct {
 
         while (frame <= opts.max_frames) : (frame += 1) {
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 if (frame % 25 == 0) p.emit("frames", result.emitted, opts.max_frames);
             }
             if (probe) _ = pclk.lapUs();
@@ -2394,7 +2394,7 @@ pub const Engine = struct {
             var i: u32 = 0;
             while (i < steps) : (i += 1) {
                 if (progress) |p| {
-                    if (p.cancelled()) return error.Cancelled;
+                    if (p.boundary()) return error.Cancelled;
                     p.emit("diffuse", @intCast(k * steps + i), n_chunks * steps);
                 }
                 const t = flowTime(i, steps);
@@ -2449,7 +2449,7 @@ pub const Engine = struct {
 
             // vocode this window, crop the overlap spans, append
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit("decode", @intCast(k), n_chunks);
             }
             const wave = try vocodeWindow(self, allocator, latents); // [2,N,1] f32

@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
-# Fetch the pinned Zig nightly and stage it at .zig-toolchain/ (stable path,
+# Fetch the pinned Zig release and stage it at .zig-toolchain/ (stable path,
 # independent of the version string in the tarball's own top-level dir name).
 #
-# 0.17.0 isn't tagged stable yet (homebrew's `zig` formula still ships
-# 0.16.0), and 0.16.0's bundled libc++ fails to compile against the macOS 27
-# SDK (`use of undeclared identifier 'INFINITY'` in its vendored <random> —
-# see build.zig's version-gate comptime block). Fixed upstream by 0.17.0-dev;
-# this script pins the exact dev snapshot until 0.17.0 stable ships, at which
-# point ZIG_VERSION should drop back to a plain "0.17.0" and this script can
-# eventually retire in favor of the homebrew formula again.
+# Pinned to Zig 0.17.0 stable. 0.16.0's bundled libc++ fails to compile
+# against the macOS 27 SDK (`use of undeclared identifier 'INFINITY'` in its
+# vendored <random> — see build.zig's version-gate comptime block).
 #
 # This is the single source of truth for the pinned Zig version. Bump
 # ZIG_VERSION to upgrade; CI and local builds re-fetch automatically.
 set -euo pipefail
 
-ZIG_VERSION="${ZIG_VERSION:-0.17.0-dev.2248+3f6a02acd}"
+ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -44,7 +40,7 @@ case "$(uname -s)" in
 esac
 
 ASSET="zig-${ARCH}-${OS}-${ZIG_VERSION}.tar.xz"
-URL="https://ziglang.org/builds/${ASSET}"
+URL="https://ziglang.org/download/${ZIG_VERSION}/${ASSET}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

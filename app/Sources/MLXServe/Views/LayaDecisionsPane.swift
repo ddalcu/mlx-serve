@@ -7,7 +7,7 @@ struct LayaDecisionsWindow: View {
         if let path = appState.decisionsModelPath {
             LayaDecisionsPane(modelPath: path).id(path)
         } else {
-            Text("Pick a Laya or Kev model in Models \u{2192} Downloaded and press Use.")
+            Text("Pick a decision model in Models \u{2192} Downloaded and press Use.")
                 .font(.app(.callout))
                 .padding(40)
         }
@@ -22,11 +22,13 @@ struct LayaDecisionsPane: View {
     let modelPath: String
     /// Read once from the dir's marker files, the way the browser row was typed.
     private let isKev: Bool
+    private let isClef: Bool
     @EnvironmentObject var server: ServerManager
 
     init(modelPath: String) {
         self.modelPath = modelPath
         isKev = DownloadManager.markerModelType(inDir: modelPath) == "kev"
+        isClef = DownloadManager.markerModelType(inDir: modelPath) == "clef"
     }
 
     @State private var state = "Refund me now or I cancel my subscription. Second time this month your app charged me twice."
@@ -52,13 +54,22 @@ struct LayaDecisionsPane: View {
 
         enum Kind: String, CaseIterable { case choice, noul, score }
 
+        static func choiceCriteriaExample(forClef: Bool) -> String {
+            forClef ? #""criteria": {"billing": null, "sales": null}"#
+                : #""criteria": ["billing", "sales"]"#
+        }
+
         var json: [String: Any]? {
+            json(forClef: false)
+        }
+
+        func json(forClef: Bool) -> [String: Any]? {
             let parts = criteria.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             var q: [String: Any] = ["type": type.rawValue, "instructions": instructions]
             switch type {
             case .choice:
                 guard parts.count >= 2 else { return nil }
-                q["criteria"] = parts
+                q["criteria"] = forClef ? Dictionary(parts.map { ($0, NSNull()) }, uniquingKeysWith: { first, _ in first }) : parts as Any
             case .noul:
                 guard parts.isEmpty || parts.count == 2 else { return nil }
                 if parts.count == 2 { q["criteria"] = ["false": parts[0], "true": parts[1]] }
@@ -72,7 +83,11 @@ struct LayaDecisionsPane: View {
 
     private var requestBody: [String: Any] {
         var qs: [String: Any] = [:]
-        for q in questions where !q.name.isEmpty { if let j = q.json { qs[q.name] = j } }
+        for q in questions where !q.name.isEmpty {
+            if let j = q.json(forClef: isClef) {
+                qs[q.name] = j
+            }
+        }
         return ["model": (modelPath as NSString).lastPathComponent, "state": state, "questions": qs]
     }
 
@@ -85,7 +100,7 @@ struct LayaDecisionsPane: View {
         HSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text(isKev ? "Kev Decisions" : "Laya Decisions").font(.app(.title2).bold())
+                    Text(isClef ? "Clef Decisions" : isKev ? "Kev Decisions" : "Laya Decisions").font(.app(.title2).bold())
                     Text((modelPath as NSString).lastPathComponent).font(.app(.caption)).foregroundStyle(.secondary)
 
                     Text("State").font(.app(.headline))
@@ -106,7 +121,7 @@ struct LayaDecisionsPane: View {
                                     ForEach(Question.Kind.allCases, id: \.self) { Text($0.rawValue) }.font(.app(.body))
                                 }.frame(width: 100)
                                 Spacer()
-                                Button { questions.removeAll { $0.id == q.id } } label: { Image(systemName: "minus.circle") }
+                                Button { [id = q.id] in questions.removeAll { $0.id == id } } label: { Image(systemName: "minus.circle") }
                                     .buttonStyle(.plain).foregroundStyle(.secondary).font(.app(.body))
                             }
                             TextField("instructions", text: $q.instructions).font(.app(.body))
@@ -186,21 +201,23 @@ struct LayaDecisionsPane: View {
     private var docs: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("What this is").font(.app(.headline))
-            if isKev {
+            if isClef {
+                Text("Clef reads the state and all questions together, then scores their allowed options jointly. It returns probabilities for routing, triage, labeling and scoring.")
+            } else if isKev {
                 Text("Kev is not a chat model. It reads the state once, then scores every option of each question with a small head on a Qwen3.5 model. About 60 ms per question on an M4 Max: slower than Laya, and often more accurate on nuanced text. Suits triage, routing and labeling where getting it right matters more than speed.")
             } else {
                 Text("Laya is not a chat model. It reads a piece of text (the state) and answers typed questions about it in one forward pass, with calibrated probabilities. A few milliseconds per request, so it suits routing, triage, moderation and scoring.")
             }
             Text("Question types").font(.app(.headline))
-            Text("**choice** picks one of your options.\n`\"criteria\": [\"billing\", \"sales\"]`")
+            Text("**choice** picks one of your options.\n`\(Question.choiceCriteriaExample(forClef: isClef))`")
             Text("**noul** is a yes/no; the answer is P(true). Criteria are optional labels for each side.\n`\"criteria\": {\"false\": \"no threat\", \"true\": \"explicit threat\"}`")
             Text("**score** is an ordinal over labelled rungs, low to high; the answer is the expected rung index plus per-rung probabilities.\n`\"criteria\": [\"not urgent\", \"soon\", \"blocking\"]`")
             Text("Every question needs `instructions`. The state can be a string or a JSON object.")
             Text("API").font(.app(.headline))
             Text("`POST /v1/decisions` with `model`, `state` and `questions`. Chat endpoints refuse this model and point here.")
             codeBlock("curl -X POST http://localhost:\(server.port)/v1/decisions \\\n  -H 'content-type: application/json' \\\n  -d '\(requestJSON.replacingOccurrences(of: "\n", with: "").replacingOccurrences(of: "  ", with: ""))'")
-            if isKev {
-                Text("Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`. Kev has no `action` field.")
+            if isKev || isClef {
+                Text("Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`.")
             } else {
                 Text("Answers carry the chosen value, per-option `probabilities`, a `confidence` and an `action.act_probability` (how sure the model is that acting on the answer is right).")
             }

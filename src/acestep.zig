@@ -1397,7 +1397,7 @@ fn vaeDecodeChunked(e: *const Engine, allocator: std.mem.Allocator, latents: mlx
     var ci: usize = 0;
     while (ci < n_chunks) : (ci += 1) {
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("decode", @intCast(ci), @intCast(n_chunks));
         }
         const core_start = ci * chunk_frames;
@@ -1493,7 +1493,7 @@ pub fn vaeEncodeMeanChunked(e: *const Engine, allocator: std.mem.Allocator, audi
     var ci: usize = 0;
     while (ci < n_chunks) : (ci += 1) {
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("encode", @intCast(ci), @intCast(n_chunks));
         }
         const core_start = ci * VAE_ENC_CHUNK_FRAMES;
@@ -2210,7 +2210,7 @@ pub const Engine = struct {
             _ = mlx.mlx_array_free(x);
         };
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
         }
 
         // ── condition encoder: timbre = the reference clip's VAE mean OR the
@@ -2244,7 +2244,7 @@ pub const Engine = struct {
         var cross2: ?CrossKv = if (cond2048_2) |c2| try self.conditionSet(allocator, c2, s) else null;
         defer if (cross2) |*c| c.deinit(allocator);
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("encode", 1, 1);
         }
 
@@ -2316,7 +2316,7 @@ pub const Engine = struct {
         self.buildAne(@intCast(frames / self.cfg.patch_size));
         for (start_step..NUM_STEPS) |step| {
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit("diffuse", @intCast(step - start_step), @intCast(remaining));
             }
             if (two_sets and !switched and step - start_step >= cover_steps) {

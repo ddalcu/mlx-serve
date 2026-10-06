@@ -169,7 +169,11 @@ struct RefTile: View {
                 }
             }
         }
-        .onAppear { if kind.isImage { image = NSImage(contentsOf: url) } }
+        .task(id: url) {
+            guard kind.isImage else { image = nil; return }
+            let loaded = await MediaImage.load(url: url, maxPixel: 512)
+            if !Task.isCancelled { image = loaded }
+        }
     }
 
     @ViewBuilder

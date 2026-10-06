@@ -114,6 +114,10 @@ struct AgentModelEntry: Equatable {
 /// config silently strands the user on the CLI's own defaults.
 enum AgentConfigs {
 
+    /// Off is an explicit "none"; pi offers xhigh/max only when the map names them.
+    /// Valid JSON and JS alike, so models.json and the extension share it.
+    static let piThinkingLevelMap = #"{"off": "none", "xhigh": "xhigh", "max": "max"}"#
+
     /// pi `models.json` — written to the dedicated `~/.mlx-serve/pi/` config
     /// dir (selected via `PI_CODING_AGENT_DIR`), never the user's real
     /// `~/.pi/agent`, so their own providers are never overwritten.
@@ -146,7 +150,7 @@ enum AgentConfigs {
               "models": [
                 {"id": "\(model)", "name": "mlx-\(model)", "input": ["text"],
                  "contextWindow": \(budget.context), "maxTokens": \(budget.output), "reasoning": true,
-                 "thinkingLevelMap": {"off": "none"}}
+                 "thinkingLevelMap": \(piThinkingLevelMap)}
               ]
             }
           }
@@ -241,7 +245,7 @@ enum AgentConfigs {
                   contextWindow: ctx,
                   maxTokens: maxTokens,
                   compat: COMPAT,
-                  thinkingLevelMap: { off: "none" },
+                  thinkingLevelMap: \(piThinkingLevelMap),
                 };
               });
           } catch {
@@ -542,6 +546,131 @@ enum AgentConfigs {
         }.joined(separator: ",\n")
         return "{\n\(rows)\n}"
     }
+
+    /// fx keeps custom providers only in `~/.fx/settings.json` (no config-dir
+    /// override), so we own ONE key there, `providers.mlx-serve`, selected per
+    /// launch with FX_PROVIDER/FX_MODEL: the user's default provider and every
+    /// other setting stay as found. fx rejects unknown keys. Twin of Zig
+    /// `launch.mergeFxSettingsJson`.
+    static let fxProvider = "mlx-serve"
+
+    /// The user's fx settings with our provider set; nil when the existing
+    /// file is not a JSON object — never replace a file we cannot read.
+    static func fxSettingsJSON(existing: String, baseURL: String,
+                               entries: [AgentModelEntry]) -> String? {
+        let blank = existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard var obj = blank ? [:]
+                : (try? JSONSerialization.jsonObject(with: Data(existing.utf8))) as? [String: Any]
+        else { return nil }
+        var metadata: [String: Any] = [:]
+        for e in entries {
+            metadata[e.id] = ["context_window": e.budget.context,
+                              "max_output_tokens": e.budget.output,
+                              "supports_tool_use": true,
+                              "supports_vision": e.vision]
+        }
+        var providers = obj["providers"] as? [String: Any] ?? [:]
+        providers[fxProvider] = ["protocol": "openai-chat-completions",
+                                 "base_url": "\(baseURL)/v1",
+                                 "auth": ["type": "none"],
+                                 "model_metadata": metadata]
+        obj["providers"] = providers
+        guard let data = try? JSONSerialization.data(
+                withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// grok `config.toml` under a dedicated GROK_HOME. A dummy XAI_API_KEY
+    /// fails grok's key probe against xAI, so the credential is each model's
+    /// `api_key`; helper calls default to xAI model ids, which would load the
+    /// server's default model, so they are pinned to the launched one. The
+    /// served model is force-included. Twin of Zig `launch.grokConfigToml`.
+    static func grokConfigTOML(baseURL: String, model: String, budget: AgentBudget.Budget,
+                               entries: [AgentModelEntry]) -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == model }) {
+            list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+        }
+        let models = list.map { e in
+            """
+
+            [model."\(e.id)"]
+            model = "\(e.id)"
+            base_url = "\(baseURL)/v1"
+            name = "\(e.id) (mlx-serve)"
+            api_key = "mlx-serve"
+            context_window = \(e.budget.context)
+            max_completion_tokens = \(e.budget.output)
+            supports_reasoning_effort = true
+            reasoning_efforts = ["none", "low", "medium", "high"]
+            inference_idle_timeout_secs = 1800
+
+            """
+        }.joined()
+        return """
+        # written by mlx-serve — dedicated GROK_HOME, regenerated at each launch.
+        [models]
+        default = "\(model)"
+        session_summary = "\(model)"
+        image_description = "\(model)"
+        prompt_suggestion = "\(model)"
+
+        """ + models
+    }
+
+    /// ZCode personal provider config — twin of Zig `launch.zcodeConfigJson`:
+    /// one rule per chat model so ZCode never guesses limits from the id.
+    /// The served model is force-included.
+    static func zcodeProviderJSON(baseURL: String, model: String, budget: AgentBudget.Budget,
+                                  entries: [AgentModelEntry]) -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == model }) {
+            list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+        }
+        let rules: [[String: Any]] = list.map { e in
+            ["providerId": "mlx", "modelId": e.id, "config": [
+                "enabled": true,
+                "properties": [
+                    "contextWindow": e.budget.context, "requiresMfjsToolSchema": false,
+                    "inputFormat": ["supportsText": true, "supportsImage": e.vision,
+                                    "supportsVideo": false, "supportsAudio": false, "supportsPdf": false],
+                    "outputFormat": ["supportsText": true], "supportsToolCall": true,
+                    "supportsJsonSchemaOutput": false, "supportsNativeWebSearch": false,
+                    "supportsMidConversationSystem": false,
+                ],
+                "optionSpecs": [
+                    "reasoningLevel": ["values": ["none", "low", "medium", "high"],
+                                       "map": "{\"reasoning_effort\": reasoningLevel}"],
+                    "maxOutputTokens": ["max": e.budget.output,
+                                        "map": "{\"max_tokens\": maxOutputTokens}"],
+                ],
+            ]]
+        }
+        let config: [String: Any] = ["schemaVersion": 1, "config": [
+            "providerOrder": ["mlx"],
+            "defaultModelSelection": ["providerId": "mlx", "modelId": model,
+                                      "options": ["reasoningLevel": "medium"]],
+            "providerConfigRules": ["providerRules": [[
+                "providerId": "mlx", "providerName": "mlx-serve", "enabled": true,
+                "config": ["group": "standard-personal",
+                           "access": ["type": "api-key", "apiKey": "mlx-serve"],
+                           "api": ["type": "openai-chat-completions", "baseUrl": "\(baseURL)/v1"],
+                           "personalModelIds": list.map(\.id)],
+            ]]],
+            "modelConfigRules": ["manualProviderModelRules": [], "providerModelRules": rules],
+        ]]
+        let data = try! JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// ZCode reads its whole state from these, so the launch never touches
+    /// the user's own ~/.zcode.
+    static let zcodeExports = #"""
+    export ZCODE_DATA_BASE_DIR="$HOME/.mlx-serve/zcode"
+    export ZCODE_STORAGE_DIR="$HOME/.mlx-serve/zcode/storage"
+    export ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.mlx-serve/zcode/provider_config.json"
+    """#
 
     /// hermes `.env` — the first-run wizard kill switch: hermes's
     /// `_has_any_provider_configured()` is satisfied by `OPENAI_BASE_URL`

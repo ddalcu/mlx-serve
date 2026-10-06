@@ -19,6 +19,11 @@ Two phases, run from the torch venv (transformers main carries the arch):
   QWEN4_TEST_MODEL=~/claude-tmp/qwen4-tiny/pack QWEN4_FIXTURE=~/claude-tmp/qwen4-tiny/fixture.safetensors \
       zig build test -Dtest-filter="qwen4 fixture"
 
+`--oq4e-mix --embedded-ngram 2.0` on the converter writes the oMLX-style pack instead
+(per-module 4/5/6/8-bit, g128 where the row allows, quantized inject + shared gate,
+the n-gram table as embedded shards with a global weight_scale); `dump` reads either
+layout, solving every tensor's width from its geometry.
+
 `--vision` on both phases builds Qwen4ExpForConditionalGeneration with a tiny
 tower (the converter packs it via `--add-vision --src`) and dumps ONE image
 prompt: pixel_values + grid, the tower's pooler_output, the 3-D position ids
@@ -215,15 +220,30 @@ def build(out, vision=False):
     print(f"wrote {len(sd)} tensors to {out}")
 
 
-def dequant_pack(pack):
-    """Every tensor of the pack in HF naming, quantized ones dequantized."""
+def solve_quant(base, wq_cols, sc_cols, k, qcfg):
+    """(bits, group_size) of one packed tensor from its GEOMETRY: `k` is the dense input
+    width (from the reference model). A per-module config entry must agree with it."""
+    gs = k // sc_cols
+    bits = wq_cols * 32 // k
+    assert gs * sc_cols == k and bits * k == wq_cols * 32 and bits in (2, 3, 4, 5, 6, 8), (base, wq_cols, sc_cols, k)
+    o = qcfg.get(base)
+    if isinstance(o, dict):
+        assert (o["bits"], o["group_size"]) == (bits, gs), (base, o, bits, gs)
+    return bits, gs
+
+
+def dequant_pack(pack, dense_k):
+    """Every tensor of the pack in HF naming, quantized ones dequantized. `dense_k(key)` is
+    a packed tensor's dense input width, None for one the dump never reads (skipped)."""
     import mlx.core as mx
     pack = Path(pack)
     idx = json.loads((pack / "model.safetensors.index.json").read_text())
+    qcfg = json.loads((pack / "config.json").read_text()).get("quantization", {})
     raw = {}
     for f in sorted(set(idx["weight_map"].values())):
         raw.update(load_raw(str(pack / f)))
     out = {}
+    shards = {}
     for k, v in raw.items():
         if k.endswith(".scales") or k.endswith(".biases"):
             continue
@@ -231,19 +251,26 @@ def dequant_pack(pack):
         if v.dtype == np.uint32 and base + ".scales" in raw:
             sc = raw[base + ".scales"]
             bi = raw[base + ".biases"]
-            # widths the converter uses, by name (see its docstring)
-            bits = 4 if (".switch_mlp." in base or base.endswith("embed_tokens")) else 8
-            gs = 64
-            wq = mx.array(v)
-            s_ = mx.array(sc).view(mx.bfloat16)
-            b_ = mx.array(bi).view(mx.bfloat16)
-            deq = mx.dequantize(wq, s_, b_, group_size=gs, bits=bits)
-            out[base + ".weight"] = np.array(deq.astype(mx.float32))
+            dk = dense_k(k)
+            if dk is None:
+                continue
+            bits, gs = solve_quant(base, v.shape[-1], sc.shape[-1], dk, qcfg)
+            deq = mx.dequantize(mx.array(v), mx.array(sc).view(mx.bfloat16), mx.array(bi).view(mx.bfloat16), group_size=gs, bits=bits)
+            arr = np.array(deq.astype(mx.float32))
+            if ".ngram_embedding.shards." in base:
+                shards[int(base.rsplit(".", 1)[1])] = arr
+            else:
+                out[base + ".weight"] = arr
         else:
             arr = v
             if arr.dtype == np.uint16:  # bf16 raw
                 arr = (arr.astype(np.uint32) << 16).view(np.float32)
             out[k] = arr
+    if shards:
+        # oMLX's embedded table: shards stored unscaled, every row times the global weight_scale
+        ws = next((float(v.reshape(-1)[0]) for k, v in out.items() if k.endswith("ngram_embedding.weight_scale")), 1.0)
+        out["__ngram__"] = np.concatenate([shards[i] for i in sorted(shards)]) * np.float32(ws)
+        return out
     # merged n-gram table
     from struct import unpack
     with open(pack / "ngram_table.bin", "rb") as f:
@@ -276,8 +303,24 @@ def pack_to_torch_key(k, vision=False):
 
 def dump(hf, pack, out, vision=False):
     cfg, m = make_model(vision)
-    ten = dequant_pack(pack)
     sd = m.state_dict()
+
+    def dense_k(k):
+        tk = pack_to_torch_key(k, vision)
+        if tk.startswith("language_model.mtp."):
+            # `build` copies the head from trunk layer 3 and the trunk mixer; fc_* are [H, H].
+            rest = tk[len("language_model.mtp."):]
+            if rest.startswith("fc_"):
+                return TINY["hidden_size"]
+            lm = "model.language_model." if vision else "model."
+            tk = lm + ("layers.3." + rest[len("layers.0."):] if rest.startswith("layers.0.") else rest)
+        if ".ngram_embedding.shards." in tk:
+            tk = tk.split(".shards.")[0] + ".weight"
+        tk = tk.replace("switch_mlp.gate_proj.weight", "experts.gate_up_proj").replace(
+            "switch_mlp.up_proj.weight", "experts.gate_up_proj").replace("switch_mlp.down_proj.weight", "experts.down_proj")
+        return sd[tk].shape[-1] if tk in sd else None
+
+    ten = dequant_pack(pack, dense_k)
     with torch.no_grad():
         for k, v in ten.items():
             if k == "__ngram__" or k.startswith("language_model.mtp."):

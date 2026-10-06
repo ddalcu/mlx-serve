@@ -209,6 +209,7 @@ pub extern "c" fn mlx_arctan2(res: *mlx_array, a: mlx_array, b: mlx_array, s: ml
 pub extern "c" fn mlx_array_new_complex(real_val: f32, imag_val: f32) mlx_array;
 pub extern "c" fn mlx_minimum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_addmm(res: *mlx_array, c: mlx_array, a: mlx_array, b: mlx_array, alpha: f32, beta: f32, s: mlx_stream) c_int;
 pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_rsqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
@@ -223,12 +224,14 @@ pub extern "c" fn mlx_erf(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_reshape(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_hadamard_transform(res: *mlx_array, a: mlx_array, scale: mlx_optional_float, s: mlx_stream) c_int;
 pub extern "c" fn mlx_transpose(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_swapaxes(res: *mlx_array, a: mlx_array, axis1: c_int, axis2: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_transpose_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_expand_dims(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_squeeze(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_broadcast_to(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_take(res: *mlx_array, a: mlx_array, indices: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_depends(res: *mlx_vector_array, inputs: mlx_vector_array, dependencies: mlx_vector_array) c_int;
 pub extern "c" fn mlx_take_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_concatenate_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
@@ -369,6 +372,7 @@ pub extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: m
 // ── Random ──
 pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
+pub extern "c" fn mlx_random_split(res_0: *mlx_array, res_1: *mlx_array, key: mlx_array, s: mlx_stream) c_int;
 // Uniform noise — Kokoro's SineGen draws a random initial phase per harmonic.
 // Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
 pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;

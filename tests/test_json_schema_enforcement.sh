@@ -244,5 +244,35 @@ OK=$(echo "$RESULT" | check_chat_strict)
 run_test "chat tools + tool_choice:none + schema" "$( [ "$OK" = ok ] && echo PASS || echo FAIL )" "$OK"
 echo ""
 
+# ── Case G: /v1/chat/completions + a schema whose items are a $ref into $defs ──
+# Pydantic's shape (#565): the mask must hold inside the referenced object too.
+echo "--- Case G: /v1/chat/completions + \$ref into \$defs ---"
+REF_SCHEMA='{"type":"object","additionalProperties":false,"required":["facts"],"properties":{"facts":{"type":"array","items":{"$ref":"#/$defs/Fact"}}},"$defs":{"Fact":{"type":"object","additionalProperties":false,"required":["kind","what"],"properties":{"kind":{"enum":["fact"]},"what":{"type":"string"}}}}}'
+BODY=$(jq -n --argjson schema "$REF_SCHEMA" '{
+    model:"mlx-serve",
+    messages:[{role:"user",content:"Return one fact with kind \"opinion\", what \"cats are great\" and a source field set to null."}],
+    response_format:{type:"json_schema",json_schema:{name:"facts",schema:$schema,strict:true}},
+    max_tokens:256, temperature:0
+}')
+LOG_MARK=$(wc -l < /tmp/mlx-serve-schema-test.log)
+RESULT=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY" || true)
+OK=$(echo "$RESULT" | python3 -c '
+import sys, json
+try:
+    text = json.loads(sys.stdin.read())["choices"][0]["message"]["content"] or ""
+    obj = json.loads(text)
+except Exception:
+    print("fail:no_json_reply"); sys.exit()
+for f in obj.get("facts", []):
+    if not isinstance(f, dict) or set(f) != {"kind", "what"} or f["kind"] != "fact":
+        print("fail:item_off_schema:" + repr(f)); sys.exit()
+print("ok")
+')
+if tail -n +"$((LOG_MARK + 1))" /tmp/mlx-serve-schema-test.log | grep -q "disabling further mask enforcement"; then
+    OK="fail:mask_disabled"
+fi
+run_test "chat \$ref into \$defs" "$( [ "$OK" = ok ] && echo PASS || echo FAIL )" "$OK"
+echo ""
+
 echo "=== Result: $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ]

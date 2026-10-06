@@ -56,13 +56,20 @@ Found by a test that expected a 400 and got `000` — curl couldn't complete, be
 Found live while checking that a MageFlow txt2img checkpoint correctly refuses an edit request: the 400 came back as `{"error":{"message":"instruction editing (mode:"edit") requires a FLUX.2 or Mage-Flow-Edit model"}}` — raw double quotes inside a JSON string, so every client sees a parse error instead of the (perfectly good) explanation. The Zig source reads `"… (mode:\"edit\") …"`, which is a Zig escape producing a real `"` byte; `gen.sendError` then interpolated it with `{s}` straight into a JSON body. Six messages in `gen.zig` had it (`'mode' must be "edit" or "variation"`, the edit/variation gates, `'ref_images' requires mode:"edit"`, the content-filter refusal), and the SSE variant shared the flaw. A second failure hid behind the same line: both senders build into a fixed 256-byte buffer with `bufPrint(...) catch return`, so a message longer than the buffer sent NO body at all — a bare status code with an empty payload. Fix is at the SINK, not the literals (a future message must not be able to reintroduce it): `gen_sse.jsonEscapeMessage(out, msg)` escapes `"` `\` and the control bytes, maps other sub-0x20 bytes to a space, and TRUNCATES to fit while backing off to a UTF-8 boundary so the tail can never be a torn sequence; both `gen.sendError` and `gen_sse.sendError` route through it into a 640-byte body buffer. Pinned by a hermetic test that feeds the exact live message through a real `std.json` parse. Same class as the tool-calling `appendJsonString` rule — the mistake there is trusting model output, here it's trusting your own literal; both are just bytes going into a JSON string.
 
 ### A buffered streaming surface must beat on SOCKET SILENCE, not on token arrival (client idle-timeout class)
-Every streaming surface buffers generated tokens while it might be looking at a tool call (`chat.streamShouldBufferForTools`) or an unclosed thinking block (`chat.streamThinkGate` → `.hold_thinking`); `/v1/responses` buffers a tool-active request outright (`if (active_has_tools) continue;`). During that span the handler emits NOTHING. The keepalive used to fire only on the `.idle` arm of `ts.nextOrIdle` — i.e. only while WAITING for the first token (long prefill) — so once tokens started flowing into a buffer the socket went dead silent for the whole tool call. **Tokens flowing ≠ bytes flowing**, and only bytes hold off a client's idle-body timeout. Live failure 2026-07-08: a pi agent session (Node `fetch` → undici, default `bodyTimeout: 300_000`) building a JS game lost two ~5-minute `write` calls to `TypeError: terminated` / `BodyTimeoutError` — ~10 minutes of 27B GPU work discarded, twice, and the agent never learned why. Reproduced exactly: old binary dies at 301.6 s having received 1 chunk / 267 bytes; fixed binary streams a 612 s generation to completion with 122 keepalives and a 5.0 s max gap. Symptom signature: a client-side `terminated` / read-timeout at almost exactly the client's idle timeout, `chunks=1` before it, the server log showing the request later completing normally (the server never noticed) or a `[cancel] client disconnected` line one keepalive later.
+Every streaming surface buffers generated tokens while it might be looking at a tool call (`chat.streamShouldBufferForTools`) or an unclosed thinking block (`chat.streamThinkGate` → `.hold_thinking`); `/v1/responses` holds a tool-active answer until the parse (only the leading thought streams). During that span the handler emits NOTHING. The keepalive used to fire only on the `.idle` arm of `ts.nextOrIdle` — i.e. only while WAITING for the first token (long prefill) — so once tokens started flowing into a buffer the socket went dead silent for the whole tool call. **Tokens flowing ≠ bytes flowing**, and only bytes hold off a client's idle-body timeout. Live failure 2026-07-08: a pi agent session (Node `fetch` → undici, default `bodyTimeout: 300_000`) building a JS game lost two ~5-minute `write` calls to `TypeError: terminated` / `BodyTimeoutError` — ~10 minutes of 27B GPU work discarded, twice, and the agent never learned why. Reproduced exactly: old binary dies at 301.6 s having received 1 chunk / 267 bytes; fixed binary streams a 612 s generation to completion with 122 keepalives and a 5.0 s max gap. Symptom signature: a client-side `terminated` / read-timeout at almost exactly the client's idle timeout, `chunks=1` before it, the server log showing the request later completing normally (the server never noticed) or a `[cancel] client disconnected` line one keepalive later.
 - Fix: `Conn.heartbeat` (`server.StreamHeartbeat`) is stamped by `Conn.writeAll`/`writeAllNoFlush`/`flush` — the only places bytes reach the socket — and every token loop calls `beatStreamKeepalive(stream, .sse_comment | .anthropic_ping)` once per iteration, at the BOTTOM of the loop (so all branches, including the ones that wrote nothing, are covered) or before an early `continue` (`/v1/responses`). It emits only when `Conn.keepaliveDue()` (no bytes for `STREAM_KEEPALIVE_MS` = 5 s), so a normally-streaming request pays one timestamp per token and sends nothing extra. WS transports no-op both senders (a raw comment would corrupt framing) and are stamped anyway.
 - **Rule: liveness is a property of the SOCKET, never of the generator.** Any new streaming surface, or any new branch that swallows a token into a buffer, must beat once per loop iteration. Never gate the keepalive on "no token available".
 - `StreamHeartbeat` is the mirror of `generate.StallClock`: StallClock protects the SERVER from a wedged model (silence = no new *tokens*), StreamHeartbeat protects the CLIENT from a wedged-looking socket (silence = no new *bytes*). Confusing the two is what produced the bug.
 - Guards: `tests/test_stream_keepalive.sh` (class guard — asserts for chat + messages + responses that the max inter-chunk gap stays under 15 s across a long buffered tool call, that a keepalive/ping actually arrived, and that the tool call still parses with valid JSON args so the injected bytes never corrupt the stream; SKIPs when the generation was too short to exercise the buffer) plus the `StreamHeartbeat` unit tests in server.zig (verified red-on-revert: all three surfaces FAIL with `max_gap ≈ 17.8s, keepalives=0`).
 - KNOWN GAP: the Ollama surface is still exposed. `Conn.writeAll` feeds `ollama_sink`, whose SSE re-framer DROPS comment lines (`ollama.zig` `if (line[0] == ':') continue;`), and NDJSON has no comment/ping form — so a buffered tool call over `/api/chat` still writes nothing. Fix (if an Ollama client ever reports it): translate the keepalive comment into an empty-content `{"message":{"role":"assistant","content":""},"done":false}` line in the sink.
 - Related but NOT the same bug: pi's `~/.pi/agent/models.json` declared `contextWindow: 32768` for a model whose server advertises `meta.context_length` ≈ 96k, so pi's own `max_tokens` budget collapsed late in the session and its `write` calls truncated mid-argument — surfacing as our (deliberate) truncation salvage: tool name recovered, `arguments: {}`, `finish_reason: "length"`. A client that validates args against the schema instead of honoring `finish_reason: "length"` reads that as a malformed call. Clients should read `context_length` off `/v1/models`.
+
+### A reader that lags the end of a stream got ECONNRESET instead of EOF
+A client that processed a streamed response slower than the server produced it read every byte through `response.completed` and `[DONE]`, then failed with `Connection reset by peer`. Deltas go out one per token, so a client that spends tens of milliseconds per event can sit a minute behind the server's last write; every surface that ends by closing the socket has it.
+- Cause: the SSE head is `Connection: close` with no length or chunking, so the end of the body IS the close. `Conn.close` released the fd at once. A socket the process has closed is orphaned in FIN_WAIT_2, and macOS drops it with an RST after `net.inet.tcp.fin_timeout` (60 s), which replaces the EOF the reader had not reached yet.
+- Fix: for a close-delimited body (SSE, NDJSON: no `Content-Length`), `Conn.close` sends the FIN (`shutdown(SHUT_WR)`) and keeps the socket until the peer hangs up (polling, `CLOSE_WAIT_MS` = 5 min, or server shutdown), so it is never orphaned. The slot is already released by then; only the connection thread waits.
+- A response with a `Content-Length` ends by its length, so it closes at once: the writers (`sendResponseFramed`, `sendUnauthorized`, `sendModelsResponse`, the media `sendBytes*`/`sendError`) set `Conn.length_framed`. Waiting there would pin a thread for 5 minutes per request on a client that ignores `Connection: close`. Any head not marked keeps the wait (the safe default). KNOWN GAP: Ollama's aggregated non-stream JSON (`Sink.sendHttpJson`) and the LAN tunnel relay (`lan.tunnel`) are unmarked, so they still wait; mark them if a keep-alive client there pins threads.
+- Guards: the hermetic `Conn.close keeps the socket until the peer hangs up, after a close-delimited body` and `Conn.close does not wait for the peer after a Content-Length response`; `tests/test_responses_streaming.sh` [G] (a reader that waits out `fin_timeout` after the server is done must still get EOF; takes over a minute).
 
 ### Shutdown race: drain connection threads before `Scheduler.deinit` (SIGSEGV in `complete`)
 Per-connection threads are spawned in `server.serve`'s accept loop. On shutdown the accept loop breaks and `serve` returns, firing `defer scheduler.deinit()` — which frees the slot queues (`pending`/`decoding`/`cleanup_queue`) on the assumption that "all conn threads called `complete` properly". They hadn't: a conn thread still inside `Scheduler.complete` (touching those very lists) raced the free → use-after-free SIGSEGV (crash report `mlx-serve-2026-06-20-141700.ips`: thread 0 in `Scheduler.deinit`/`Thread.join`, thread 13 in `Scheduler.complete`; null-deref at +0x18). Triggered by a shutdown/model-switch while a stream was in flight. Fix (three parts):
@@ -2416,3 +2423,73 @@ reaches `ensureLoaded` and its named 500. An unregistered path is a 404. The LAN
 the same helper. Startup was already loud: a failed `--model` load exits 1.
 Guards: `resolveRequestModelId: a path names its own entry, never the default model`,
 `tests/test_load_failure_no_fallback.sh`.
+
+## A stop string spanning tokens leaked its first bytes on every stream
+
+Defect: `stop: [", 12"]` streamed `…11, 1` where the non-stream reply ended `…11`, on chat, completions, messages and responses. Cause: each streaming loop sent a token as it decoded and the cut could trim only the ARRIVING token, never bytes already sent. Fix: `StopStream` holds a tail that could still begin a stop string until the next token decides it, and flushes it as one last token when generation ends without a match. Guard: `StopStream` unit test (every token split of the text) + `tests/test_api_edges.sh` stream == non-stream on all four surfaces.
+
+## A media job held the inference thread for its whole life (2026-10-03)
+
+Defect: a pi session on GLM-5.3 showed "Operation aborted" on every turn for 10+ minutes while
+its own asset script ran a textured Hunyuan3D job on the same server. Cause: `runGenRequests`
+ran the job to completion on the inference thread, so no chat request was admitted, prefilled
+or decoded until it returned, CPU-only stages (marching cubes, xatlas, bake, PNG/GLB) included.
+Fix: the loop body is `chatPass(.main)`; every backend's per-step poll is `Progress.boundary()`,
+which runs `chatPass(.yield)` for as long as the step took (`GenYield`, equal share) before the
+cancel check; a pure-CPU stage runs on a worker via `gen_sse.offload` while the inference thread
+serves chat; the job's estimated peak is billed to chat admission (`gen_reserve_bytes`), since a
+chat prefill taking a later denoise step's memory is an uncatchable Metal OOM. Chat's decode clocks reset at
+each boundary and at job end (`invalidateDecodeClocks`), or a media step folds into the round-cost table
+as one slow spec round. Loads still run whole.
+Guard: `tests/test_gen_chat_interleave.sh` (chat before gen, same image bytes, `[gen-yield] engaged`,
+cancel frees the server, chat during the mesh job), `admissionFits`, the `offload`/`boundary` tests.
+
+## An image turn never reached the SSD tier, not even its text (#494)
+
+Defect: once a session carried an image, none of it was persisted. An idle unload or restart
+then restored an older text-only entry (123k of a 364k-token Qwen3.8-Flash-Next session) and
+prefilled the rest cold.
+
+Cause: restore already served the text before the first media item, but every disk writer
+skipped media entries outright: the SSD-first capture in `commitWithMediaState`, both
+`spillDeclinedToDisk` call sites, and the plain `flushPendingDisk`.
+
+Fix: the writers persist `HotPrefixCache.diskTokens`, the record cut at the first item (the KV
+extent follows `tokens.len`, checkpoints past it are skipped). No spec snapshot rides a media
+turn, since it covers rows past the cut. The disk key stays token-only and never holds an image row.
+A hybrid restores only from an SSM checkpoint, so its record stops at the last checkpoint below
+the item (`HotPrefixCache.hybrid`, set at load) and nothing is written when there is none.
+Guard: `an image turn persists the text before its first item to the SSD tier`.
+
+## A streamed Responses turn reported no prompt-cache hit
+
+Defect: the same 3,016-token prompt sent twice to `/v1/responses` reported
+`input_tokens_details.cached_tokens` 2985 non-streaming and 0 on the streamed
+`response.completed`, and the streamed `timings` read 0 ms, while the log showed the
+`[hot-cache]` reuse.
+
+Cause: the streaming arm rebuilt its `GenerationResult` by hand and copied only the token
+counts from the finalized stream; the non-streaming arm takes every field from the slot.
+
+Fix: `StreamingTokenStream.generationResult` builds the result from everything `finalize`
+snapshotted. Guards: `a streamed turn's result keeps the prompt-cache hit and timings the
+slot measured`, `tests/test_responses_streaming.sh` [F].
+
+## The console showed 0 models behind a proxy that mounts it under a path (#698)
+
+Defect: reached through a reverse proxy that mounts the server below its own root
+(`tailscale serve --set-path /mlx-serve http://127.0.0.1:8003`), the console opened and reported
+"0 models", no memory and a dead Monitor panel — on a server with everything loaded.
+
+Cause: every console request was root-absolute (`fetch('/v1/models')`), so it resolved against the
+PROXY's origin root, not the mount that served the page — the mount answers `/<prefix>/v1/models`
+(it strips the prefix on the way in, so the server never learns it) and 404s `/v1/models`. And
+silently: that 404 body is HTML, `res.json()` throws, the catch assigns `MODELS = []`.
+
+Fix: `apiPrefix(pathname)` — in `src/html/api.js`, the first script of the page's boot slot, so
+`app.js` and `metrics.js` bind the ONE implementation — is that mount: a last segment holding a dot
+is a file, anything else a directory. Every fetch, the API reference's own links and the base URL the
+chat system prompt hands the model resolve through it.
+Guards: `the path prefix the page was served under is the base of every API path`,
+`app.js resolves through the page's one apiPrefix` (identity, not a source scan),
+`tests/metrics_panel_test.mjs`.

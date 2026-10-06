@@ -151,6 +151,7 @@
         <div class="code-body">
 <pre><span class="comment"># 1. Install and serve a model (Ollama-style, resumable download)</span>
 <span class="cmd">brew tap</span> ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
+<span class="cmd">brew trust</span> ddalcu/mlx-serve
 <span class="cmd">brew install</span> mlx-serve
 <span class="cmd">mlx-serve run</span> <span class="string">qwen3.6:27b</span>   <span class="comment"># or gemma4 — any MLX or GGUF model</span>
 

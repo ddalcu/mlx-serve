@@ -160,6 +160,61 @@ else
 fi
 echo ""
 
+# ── Test B2: with tools, the thought still streams while it is generated ──
+# A tools request holds its answer for the tool-call parse; the thought before
+# it must not wait for the end of generation. Whether the model thinks or calls
+# is its choice, so only the invariants are checked. The deltas may carry
+# whitespace the finished text trims before its close tag.
+echo "--- Test B2: tools + reasoning — reasoning deltas stream before the turn ends ---"
+BODY='{"model":"mlx-serve","input":"What is the weather in Paris right now? Use the get_weather tool.","tools":[{"type":"function","name":"get_weather","description":"Get the current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"reasoning":{"effort":"medium"},"max_output_tokens":1024,"temperature":0,"stream":true}'
+B2=$(sse_with_timestamps "$BODY" | python3 -c '
+import sys, json
+deltas, first, done, reasoning, args_ok = [], None, None, "", 1
+for line in sys.stdin:
+    ms, _, payload = line.partition("\t")
+    payload = payload.strip()
+    if not payload.startswith("data: {"):
+        continue
+    ev = json.loads(payload[6:])
+    if ev["type"] == "response.reasoning_summary_text.delta":
+        deltas.append(ev["delta"])
+        first = int(ms) if first is None else first
+    elif ev["type"] == "response.completed":
+        done = int(ms)
+        for item in ev["response"]["output"]:
+            if item["type"] == "reasoning":
+                reasoning = "".join(s["text"] for s in item["summary"])
+            elif item["type"] == "function_call":
+                try:
+                    json.loads(item["arguments"])
+                except ValueError:
+                    args_ok = 0
+lead = done - first if first is not None and done is not None else 0
+print(len(reasoning), len(deltas), lead, int("".join(deltas).rstrip() == reasoning.rstrip()), args_ok if done is not None else 0)
+')
+read -r B2_RLEN B2_N B2_LEAD B2_SAME B2_ARGS <<< "${B2:-0 0 0 0 0}"
+echo "  reasoning chars=$B2_RLEN deltas=$B2_N first delta ${B2_LEAD}ms before response.completed, deltas==reasoning: $B2_SAME"
+if [ "${B2_RLEN:-0}" -eq 0 ]; then
+    echo "  (model did not think: nothing to stream)"
+else
+    if [ "$B2_N" -ge 2 ] && [ "$B2_LEAD" -ge 100 ]; then
+        run_test "tools: reasoning streams incrementally, before the turn ends" "PASS" ""
+    else
+        run_test "tools: reasoning streams incrementally, before the turn ends" "FAIL" "deltas=$B2_N lead=${B2_LEAD}ms (one burst at the end)"
+    fi
+    if [ "$B2_SAME" = "1" ]; then
+        run_test "tools: reasoning deltas add up to the delivered reasoning" "PASS" ""
+    else
+        run_test "tools: reasoning deltas add up to the delivered reasoning" "FAIL" "streamed bytes differ from the reasoning item"
+    fi
+fi
+if [ "${B2_ARGS:-0}" = "1" ]; then
+    run_test "tools: every function_call carries JSON arguments" "PASS" ""
+else
+    run_test "tools: every function_call carries JSON arguments" "FAIL" "unparseable arguments or no response.completed"
+fi
+echo ""
+
 # ── Test C: HTTP SSE terminates with the `data: [DONE]` sentinel ──
 # OpenAI ends every Responses HTTP SSE stream with the same terminal
 # `data: [DONE]` sentinel as chat completions, after `response.completed`.
@@ -285,6 +340,92 @@ if [ "$(echo "$WS_OUT" | awk '/^ws/{print $2}')" = "1" ]; then
     run_test "WS: two chained turns complete, zero [DONE] frames" "PASS" ""
 else
     run_test "WS: two chained turns complete, zero [DONE] frames" "FAIL" "$WS_OUT"
+fi
+echo ""
+
+# ── Test F: a streamed repeat reports the prefix-cache hit in its usage ──
+echo "--- Test F: streamed response.completed usage carries cached_tokens + timings ---"
+# Long enough that a hybrid (GDN) model has a restorable checkpoint behind the prompt end.
+FILLER=$(printf 'The quick brown fox jumps over the lazy dog. %.0s' $(seq 1 30))
+BODY="{\"model\":\"mlx-serve\",\"input\":\"${FILLER}Name three primary colors, one per line.\",\"max_output_tokens\":24,\"temperature\":0,\"stream\":true}"
+sse_with_timestamps "$BODY" > /dev/null
+USAGE=$(sse_with_timestamps "$BODY" | python3 -c '
+import sys, json
+for line in sys.stdin:
+    payload = line.split("\t", 1)[-1].strip()
+    if payload.startswith("data: {") and "\"response.completed\"" in payload:
+        r = json.loads(payload[6:])["response"]
+        t = r.get("timings") or {}
+        print(r["usage"]["input_tokens"], r["usage"]["input_tokens_details"]["cached_tokens"], t.get("predicted_ms", 0))
+')
+read -r IN_TOK CACHED PRED_MS <<< "${USAGE:-0 0 0}"
+echo "  input_tokens=$IN_TOK cached_tokens=$CACHED predicted_ms=$PRED_MS"
+if [ "${CACHED:-0}" -gt 0 ] && [ "$CACHED" -le "$IN_TOK" ]; then
+    run_test "streamed repeat reports cached_tokens > 0" "PASS" ""
+else
+    run_test "streamed repeat reports cached_tokens > 0" "FAIL" "cached_tokens=$CACHED of $IN_TOK"
+fi
+if python3 -c "import sys; sys.exit(0 if float('${PRED_MS:-0}') > 0 else 1)"; then
+    run_test "streamed response.completed carries decode timings" "PASS" ""
+else
+    run_test "streamed response.completed carries decode timings" "FAIL" "timings.predicted_ms=$PRED_MS"
+fi
+echo ""
+
+# ── Test G: a reader that lags the end of the stream gets EOF, not a reset ──
+# The SSE body ends when the server closes. A socket closed under a reader that
+# has not caught up is dropped by the kernel with an RST once its FIN_WAIT_2
+# timer runs out (net.inet.tcp.fin_timeout, 60 s), so the client read the whole
+# body and then ECONNRESET instead of EOF. The reader here waits out that timer
+# after the server has finished (this test takes over a minute).
+echo "--- Test G: tools + reasoning budget — a lagging reader ends with EOF, not a reset ---"
+G_OUT=$(python3 - "$PORT" <<'PY'
+import json, socket, subprocess, sys, time
+
+port = int(sys.argv[1])
+fin_timeout = int(subprocess.check_output(["sysctl", "-n", "net.inet.tcp.fin_timeout"]).strip()) / 1000
+body = json.dumps({
+    "model": "mlx-serve",
+    "input": "What is the weather in Paris? Think about which unit to use first.",
+    "tools": [{"type": "function", "name": "get_weather", "description": "Get the current weather for a city",
+               "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
+    "reasoning": {"effort": "high"}, "reasoning_budget_tokens": 24,
+    "max_output_tokens": 512, "temperature": 0, "stream": True,
+}).encode()
+sock = socket.create_connection(("127.0.0.1", port))
+sock.sendall((f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+              f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body)
+client_port = sock.getsockname()[1]
+
+def server_closed():
+    rows = subprocess.run(["netstat", "-an", "-p", "tcp"], capture_output=True, text=True).stdout.splitlines()
+    return any(len(c) >= 6 and c[3].endswith(f".{port}") and c[4].endswith(f".{client_port}") and c[5] == "FIN_WAIT_2"
+               for c in (r.split() for r in rows))
+
+deadline = time.time() + 180
+while time.time() < deadline and not server_closed():
+    time.sleep(1)
+time.sleep(fin_timeout + 5)
+
+data, end = b"", "eof"
+try:
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+except ConnectionResetError:
+    end = "reset"
+text = data.decode("utf-8", errors="replace")
+print(f"g end={end} completed={int('response.completed' in text)} done={int('data: [DONE]' in text)} "
+      f"budget_closed={int('Considering the limited time' in text)} bytes={len(data)}")
+PY
+) || G_OUT="g end=exception"
+echo "  $G_OUT"
+if echo "$G_OUT" | grep -q "end=eof completed=1 done=1"; then
+    run_test "lagging reader: whole body, then EOF" "PASS" ""
+else
+    run_test "lagging reader: whole body, then EOF" "FAIL" "$G_OUT"
 fi
 echo ""
 

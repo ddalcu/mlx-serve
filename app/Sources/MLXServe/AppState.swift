@@ -230,6 +230,7 @@ class AppState: ObservableObject {
     lazy var videoGen = VideoGenService()
     lazy var audioGen = AudioGenService()
     lazy var musicGen = MusicGenService()
+    lazy var soundGen = SoundGenService()
     lazy var model3dGen = Model3DGenService()
     @Published var autoStartServer: Bool {
         didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
@@ -488,21 +489,6 @@ class AppState: ObservableObject {
     func selectCreatePage(_ experiment: GenExperiment) {
         guard chatWorkspace.isCreate else { return }
         chatWorkspace = .create(experiment)
-    }
-
-    /// "Send to Chat" on a Create-pane result: open a NEW conversation holding
-    /// it, and switch to Chats so the user SEES where it went.
-    @discardableResult
-    func sendGeneratedMediaToNewChat(path: String, prompt: String,
-                                     kind: ChatMediaRef.Kind) -> UUID {
-        let sessionId = newChatSession(agentId: defaultAgentId)
-        if let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) {
-            chatSessions[idx].messages.append(
-                GeneratedMediaHandoff.message(path: path, prompt: prompt, kind: kind))
-            saveChatHistory()
-        }
-        showConversation()
-        return sessionId
     }
 
     /// Back to the transcript. Selecting a conversation does this too — the

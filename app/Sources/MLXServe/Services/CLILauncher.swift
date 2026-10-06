@@ -23,6 +23,9 @@ final class CLILauncher: ObservableObject {
         .codex,
         .hermes,
         .aider,
+        .fx,
+        .grok,
+        .zcode,
     ]
 
     /// Stable id list — pinned against the MAS instructions panel's tabs
@@ -122,6 +125,143 @@ final class CLILauncher: ObservableObject {
         return result
     }
 
+    /// Run one command through the SAME login+interactive zsh the real launch
+    /// execs through, so PATH resolution (nvm, Homebrew) is identical for
+    /// detection and launch. stdout and stderr merge into one pipe, like `2>&1`.
+    nonisolated private static func runLoginShell(_ cmd: String) -> (ok: Bool, out: String)? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        proc.arguments = ["-i", "-l", "-c", cmd]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        var ok = false
+        var out = ""
+        do {
+            try proc.run()
+            // Read before waiting: a full pipe would deadlock the child.
+            // Cap the capture like the Zig twin's stdout_limit.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            ok = proc.terminationStatus == 0
+            out = String(data: data.prefix(64 * 1024), encoding: .utf8) ?? ""
+        } catch { return nil }
+        return (ok, out)
+    }
+
+    /// Use the launch shell's PATH; a canonical v2 success needs no legacy probe.
+    nonisolated static func probeOpenCode(forcedV2: Bool) -> OpenCodeDetection {
+        let probe: OpenCodeProbe
+        if let run = runLoginShell(versionProbeCmd) {
+            probe = classifyOpenCodeProbe(run.out, shellOK: run.ok)
+        } else {
+            probe = .shellUnrunnable
+        }
+        var legacy: Bool?
+        if forcedV2 {
+            if case .ok(let version) = probe, version.generation == .v2 {
+                return OpenCodeDetection(probe: probe, legacyOpencode2Installed: nil)
+            }
+            if let run = runLoginShell(#"if command -v opencode2 >/dev/null 2>&1; then printf 'MLXOCL=1\n'; else printf 'MLXOCL=0\n'; fi"#),
+               run.ok, let pos = run.out.range(of: "MLXOCL=", options: .backwards) {
+                switch run.out[pos.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines) {
+                case "1": legacy = true
+                case "0": legacy = false
+                default: break
+                }
+            }
+        }
+        return OpenCodeDetection(probe: probe, legacyOpencode2Installed: legacy)
+    }
+
+    /// The only character special inside single quotes is the quote itself,
+    /// so untrusted text can never escape it.
+    nonisolated static func shellSingleQuoted(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// The v1 profile: inline config with no model pin, `--model` on the
+    /// command line. Shared with the MAS instructions tab.
+    nonisolated static func opencodeV1Body(baseURL: String, model: String, cdLine: String,
+                                           budget: AgentBudget.Budget,
+                                           entries: [AgentModelEntry]) -> String {
+        // Force-include the served model (with ITS budget) so `--model`
+        // always resolves, even on an empty registry snapshot.
+        var list = entries
+        if !list.contains(where: { $0.id == model }) {
+            list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+        }
+        return """
+        export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list))'
+        \(cdLine)
+        opencode --model mlx/\(model) "$@"
+        """
+    }
+
+    /// The v2 profile: model pinned in the config, dedicated XDG dir,
+    /// standalone invocation under the RESOLVED binary name — the profile
+    /// itself never depends on the name `opencode2`.
+    nonisolated static func opencodeV2Body(baseURL: String, model: String, cdLine: String,
+                                           budget: AgentBudget.Budget, entries: [AgentModelEntry],
+                                           binary: String) -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == model }) {
+            list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+        }
+        return """
+        export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true))'
+        export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
+        \(cdLine)
+        if ! command -v \(binary) >/dev/null 2>&1; then echo "\(binary) is not installed"; exit 127; fi
+        \(binary) --standalone "$@"
+        """
+    }
+
+    /// The opencode/opencode2 launch body, Zig `cmdLaunch`'s routing as a pure
+    /// function: the probe picks the profile and binary, and a detection failure
+    /// writes and starts nothing. `agentId` is nil on failure.
+    nonisolated static func opencodeScript(forcedV2: Bool, detection: OpenCodeDetection,
+                                           baseURL: String, model: String, cdLine: String,
+                                           budget: AgentBudget.Budget,
+                                           entries: [AgentModelEntry]) -> (script: String, agentId: String?) {
+        switch decideOpenCodeLaunch(forcedV2: forcedV2, detection: detection) {
+        case .v1(let v):
+            let body = opencodeV1Body(baseURL: baseURL, model: model, cdLine: cdLine,
+                                      budget: budget, entries: entries)
+            return ("echo \"detected OpenCode \(v.version); using the v1 integration.\"\n" + body, "opencode")
+        case .v2(let v, let bin):
+            let body = opencodeV2Body(baseURL: baseURL, model: model, cdLine: cdLine,
+                                      budget: budget, entries: entries, binary: bin)
+            let notice = v.map { "echo \"detected OpenCode \($0.version); using the v2 integration.\"\n" } ?? ""
+            return (notice + body, "opencode2")
+        case .notInstalled:
+            return ("""
+            echo 'OpenCode is not installed or is not available on PATH.'
+            echo 'install OpenCode and make sure `opencode` is on PATH, then rerun.'
+            exit 1
+            """, nil)
+        case .undetermined(let out):
+            return ("""
+            echo 'could not determine the installed OpenCode version from `opencode --version`.'
+            echo 'Output:'
+            printf '%s\\n' \(shellSingleQuoted(out))
+            echo 'mlx-serve currently supports OpenCode 1.x (the v1 integration) and 2.x or newer (the v2 integration).'
+            exit 1
+            """, nil)
+        case .shellFailed:
+            return ("""
+            echo 'could not run the login shell to detect OpenCode availability; retry.'
+            exit 1
+            """, nil)
+        case .noV2Binary:
+            return ("""
+            echo 'no OpenCode v2 binary found: `launch opencode2` needs an `opencode` 2.x+ or the legacy `opencode2` on PATH.'
+            echo 'install OpenCode (https://opencode.ai/docs) and rerun, or use `mlx-serve launch opencode`.'
+            exit 1
+            """, nil)
+        }
+    }
+
     /// Write a shell script that sets the right env vars / config for the given
     /// CLI and return the command an embedded terminal spawns to run it: a
     /// login+interactive zsh (rc files are where PATH lives — the same shell
@@ -130,17 +270,35 @@ final class CLILauncher: ObservableObject {
     /// now it runs in a terminal row of the chat window like the sandbox ones.
     static func launchCommand(_ cli: LauncherCLI, baseURL: String, servedModelId: String,
                               budget: AgentBudget.Budget, entries: [AgentModelEntry],
-                              workingDirectory: String?, resume: Bool = false) -> (executable: String, args: [String]) {
-        // pi and opencode both need their config files written before launch.
-        // The budget travels with them: neither CLI reads `/v1/models` on its
-        // own (pi's live list rides the extension we write), so the numbers
-        // baked here ARE the contexts they believe the models have. `entries`
-        // is the full chat-capable registry — the in-agent /model switch list.
-        cli.prepareConfig?(baseURL, servedModelId, budget, entries)
-        if cli.requiresServer { AgentSkills.install(agentId: cli.id) }
-
+                              workingDirectory: String?, resume: Bool = false,
+                              opencodeDetection: OpenCodeDetection? = nil) -> (executable: String, args: [String]) {
         let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
-        var script = cli.scriptBody(baseURL, servedModelId, cdLine, budget, entries)
+        var script: String
+        // The LauncherCLI whose config + skill the launch installs: under the
+        // OpenCode rows the DETECTED generation picks it, not the row's name.
+        var configAgentId: String? = cli.id
+        if cli.id == "opencode" || cli.id == "opencode2" {
+            // Detection runs before any config is written: the v2 profile
+            // ships different files (cli.json + monitor plugin), and a failed
+            // detection writes nothing and launches nothing (no fallback).
+            let detection = opencodeDetection
+                ?? Self.probeOpenCode(forcedV2: cli.id == "opencode2")
+            let routed = Self.opencodeScript(forcedV2: cli.id == "opencode2",
+                                             detection: detection, baseURL: baseURL,
+                                             model: servedModelId, cdLine: cdLine,
+                                             budget: budget, entries: entries)
+            script = routed.script
+            configAgentId = routed.agentId
+        } else {
+            script = cli.scriptBody(baseURL, servedModelId, cdLine, budget, entries)
+        }
+        if let agentId = configAgentId {
+            // Config files before launch: the budget travels with them —
+            // neither CLI reads `/v1/models` on its own, so the numbers baked
+            // here ARE the contexts they believe the models have.
+            Self.cli(id: agentId)?.prepareConfig?(baseURL, servedModelId, budget, entries)
+            if cli.requiresServer { AgentSkills.install(agentId: agentId) }
+        }
         if resume, let args = cli.resumeArgs {
             // Nothing to resume fails the CLI (claude: "No conversation found to continue"): start fresh then.
             script = "mlx_agent() {\n\(script)\n}\nmlx_agent \(args) || mlx_agent"
@@ -367,6 +525,28 @@ extension LauncherCLI {
         }
     )
 
+    /// ZCode (https://github.com/zai-org/ZCode) — env-selected data dir +
+    /// personal provider config file, both under ~/.mlx-serve/zcode.
+    static let zcode = LauncherCLI(
+        id: "zcode", displayName: "ZCode", binaryName: "zcode",
+        iconSystemName: "terminal", useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            let dir = NSString(string: "~/.mlx-serve/zcode").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: model, budget: budget, entries: entries)
+                .write(toFile: "\(dir)/provider_config.json", atomically: true, encoding: .utf8)
+        },
+        resumeArgs: "--continue",
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            \(AgentConfigs.zcodeExports)
+            if ! command -v zcode >/dev/null 2>&1; then echo "zcode is not installed: build or install ZCode (https://github.com/zai-org/ZCode)" >&2; exit 127; fi
+            \(cdLine)
+            zcode "$@"
+            """
+        }
+    )
+
     /// aider (https://aider.chat) — pure env vars plus a litellm metadata
     /// file carrying the real per-model context windows.
     static let aider = LauncherCLI(
@@ -393,11 +573,71 @@ extension LauncherCLI {
         }
     )
 
+    /// fx (https://fx.sh) — its providers live only in `~/.fx/settings.json`,
+    /// so the launch sets our one key there (`AgentConfigs.fxSettingsJSON`)
+    /// and picks it by env, leaving the user's default provider alone.
+    static let fx = LauncherCLI(
+        id: "fx",
+        displayName: "fx",
+        binaryName: "fx",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            var list = entries
+            if !list.contains(where: { $0.id == model }) {
+                list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+            }
+            let dir = NSString(string: "~/.fx").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let path = (dir as NSString).appendingPathComponent("settings.json")
+            let existing = (try? String(contentsOfFile: path, encoding: .utf8))
+                ?? (FileManager.default.fileExists(atPath: path) ? nil : "{}")
+            guard let existing,
+                  let json = AgentConfigs.fxSettingsJSON(existing: existing, baseURL: baseURL, entries: list)
+            else { return }
+            // Not atomic: an in-place write keeps the file's owner-only mode.
+            try? Data(json.utf8).write(to: URL(fileURLWithPath: path))
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        },
+        resumeArgs: "--continue",
+        scriptBody: { _, model, cdLine, _, _ in
+            """
+            export FX_PROVIDER=\(AgentConfigs.fxProvider)
+            export FX_MODEL=\(model)
+            \(cdLine)
+            fx "$@"
+            """
+        }
+    )
+
+    /// grok (xAI's Grok Build) — its whole tree rides GROK_HOME, so config.toml
+    /// lands in a dedicated dir and the user's real ~/.grok login stays theirs.
+    static let grok = LauncherCLI(
+        id: "grok",
+        displayName: "Grok",
+        binaryName: "grok",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            let dir = NSString(string: "~/.mlx-serve/grok").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.grokConfigTOML(baseURL: baseURL, model: model, budget: budget, entries: entries)
+                .write(toFile: (dir as NSString).appendingPathComponent("config.toml"),
+                       atomically: true, encoding: .utf8)
+        },
+        resumeArgs: "--continue",
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            export GROK_HOME="$HOME/.mlx-serve/grok"
+            \(cdLine)
+            grok "$@"
+            """
+        }
+    )
+
     /// opencode (https://opencode.ai) — registers a custom OpenAI-compatible
     /// provider via the inline `OPENCODE_CONFIG_CONTENT` env var, which MERGES
-    /// over the user's global/project config (their settings and plugins keep
-    /// working) and needs no file writes at all. Same block as the MAS
-    /// instructions panel (CLISetupInstructionsTests pins the two together).
+    /// over the user's own config. The launcher probes `opencode --version`.
     static let opencode = LauncherCLI(
         id: "opencode",
         displayName: "OpenCode",
@@ -407,22 +647,14 @@ extension LauncherCLI {
         prepareConfig: nil,
         resumeArgs: "--continue",
         scriptBody: { baseURL, model, cdLine, budget, entries in
-            // Full chat-capable list — opencode's in-session /models picker
-            // shows exactly what this config declares. The served model is
-            // force-included (with ITS budget) so `--model mlx/<id>` always
-            // resolves, even on an empty registry snapshot.
-            var list = entries
-            if !list.contains(where: { $0.id == model }) {
-                list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
-            }
-            return """
-            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list))'
-            \(cdLine)
-            opencode --model mlx/\(model) "$@"
-            """
+            CLILauncher.opencodeV1Body(baseURL: baseURL, model: model, cdLine: cdLine,
+                                       budget: budget, entries: entries)
         }
     )
 
+    /// The v2 integration profile (model pinned in the config, dedicated XDG
+    /// dir, monitor plugin, `--standalone`). `launch opencode` routes here on a
+    /// 2.x+ install; this row forces it, resolving the v2 binary name in-shell.
     static let opencode2 = LauncherCLI(
         id: "opencode2",
         displayName: "OpenCode 2",
@@ -455,8 +687,7 @@ extension LauncherCLI {
             export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true))'
             export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
             \(cdLine)
-            if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-            opencode2 --standalone "$@"
+            \(opencodeV2BinResolver) "$@"
             """
         }
     )

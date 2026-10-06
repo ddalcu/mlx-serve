@@ -1900,6 +1900,7 @@ const texinpaint = @import("texinpaint.zig");
 const glb_mod = @import("glb.zig");
 const png_mod = @import("png.zig");
 const mc = @import("marching_cubes.zig");
+const mesh_simplify = @import("mesh_simplify.zig");
 const punet = @import("hunyuan3d_paint_unet.zig");
 const sse = @import("gen_sse.zig");
 
@@ -1913,6 +1914,41 @@ pub const PaintOpts = struct {
     texture_size: u32 = 2048,
     view_size: u32 = 512,
 };
+
+/// Upstream's `remesh_mesh` budget (hy3dpaint `use_remesh=True`): the shape mesh is
+/// quadric-decimated to this many faces before the unwrap. xatlas on a raw
+/// marching-cubes mesh (up to a million faces) ran for tens of minutes.
+pub const PAINT_MAX_FACES: u32 = 40_000;
+
+/// Paint step 1: the decimated, unwrapped mesh with seam-duplicated attributes.
+const UnwrappedMesh = struct {
+    uw: uvwrap.Unwrap,
+    positions: []f32,
+    normals: []f32,
+
+    fn deinit(self: *UnwrappedMesh, alloc: std.mem.Allocator) void {
+        self.uw.deinit(alloc);
+        alloc.free(self.positions);
+        alloc.free(self.normals);
+    }
+};
+
+fn unwrapForPaint(alloc: std.mem.Allocator, mesh: *const mc.Mesh) !UnwrappedMesh {
+    var dec = try mesh_simplify.decimate(alloc, mesh, PAINT_MAX_FACES);
+    defer dec.deinit(alloc);
+    log.info("[hy3d-paint] decimated {d} -> {d} faces\n", .{ mesh.indices.len / 3, dec.indices.len / 3 });
+    var uw = try uvwrap.parametrize(alloc, dec.vertices, dec.indices);
+    errdefer uw.deinit(alloc);
+    const n_new = uw.vmapping.len;
+    const positions = try alloc.alloc(f32, n_new * 3);
+    errdefer alloc.free(positions);
+    const normals = try alloc.alloc(f32, n_new * 3);
+    for (uw.vmapping, 0..) |orig, i| {
+        @memcpy(positions[i * 3 ..][0..3], dec.vertices[orig * 3 ..][0..3]);
+        @memcpy(normals[i * 3 ..][0..3], dec.normals[orig * 3 ..][0..3]);
+    }
+    return .{ .uw = uw, .positions = positions, .normals = normals };
+}
 
 /// glTF texcoords: v grows DOWNWARD while xatlas/reference uvs grow upward,
 /// and the bake atlas row = (1−v)·(H−1) — so the glTF uv is exactly (u, 1−v).
@@ -2020,25 +2056,21 @@ pub const PaintEngine = struct {
     /// SAME straight-alpha reference photo the shape stage consumed. Returns
     /// the textured-mesh COMPONENTS (caller frees via deinit) — the rig stage
     /// composes them with a skeleton; `paintMeshToGlb` wraps them into a GLB.
+    /// Every `sse.offload` stage is pure CPU (zero MLX): it runs on a worker
+    /// thread while chat keeps the inference thread.
     pub fn paintMesh(self: *PaintEngine, alloc: std.mem.Allocator, mesh: *const mc.Mesh, image_rgba: []const u8, img_w: u32, img_h: u32, opts: PaintOpts, progress: ?sse.Progress) !PaintedMesh {
         const s = self.s;
         const vsz = opts.view_size;
 
-        // ── 1. UV unwrap (xatlas), seam-duplicate vertex attributes ──
+        // ── 1. Decimate (upstream remesh), UV unwrap (xatlas), seam-duplicate attributes ──
         if (progress) |p| p.emit("paint-unwrap", 0, 1);
-        var uw = try uvwrap.parametrize(alloc, mesh.vertices, mesh.indices);
-        defer uw.deinit(alloc);
-        const n_new = uw.vmapping.len;
-        const positions_u = try alloc.alloc(f32, n_new * 3);
-        defer alloc.free(positions_u);
-        const normals_u = try alloc.alloc(f32, n_new * 3);
-        defer alloc.free(normals_u);
-        for (uw.vmapping, 0..) |orig, i| {
-            @memcpy(positions_u[i * 3 ..][0..3], mesh.vertices[orig * 3 ..][0..3]);
-            @memcpy(normals_u[i * 3 ..][0..3], mesh.normals[orig * 3 ..][0..3]);
-        }
+        var um = try sse.offload(unwrapForPaint, .{ alloc, mesh });
+        defer um.deinit(alloc);
+        const uw = &um.uw;
+        const positions_u = um.positions;
+        const normals_u = um.normals;
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("paint-unwrap", 1, 1);
         }
 
@@ -2055,7 +2087,7 @@ pub const PaintEngine = struct {
         const nrmmaps_chw = try alloc.alloc(f32, 6 * 3 * plane);
         defer alloc.free(nrmmaps_chw);
         for (views, 0..) |view, vi| {
-            var maps = try bake.renderGeometryMaps(alloc, &geom, view, vsz, rcfg);
+            var maps = try sse.offload(bake.renderGeometryMaps, .{ alloc, &geom, view, vsz, rcfg });
             defer maps.deinit();
             // HWC → CHW.
             for (0..plane) |pix| {
@@ -2065,7 +2097,7 @@ pub const PaintEngine = struct {
                 }
             }
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit("paint-render", @intCast(vi + 1), 6);
             }
         }
@@ -2094,7 +2126,7 @@ pub const PaintEngine = struct {
         defer rel_(dino.feats);
         defer rel_(dino.context);
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("paint-encode", 14, 14);
         }
 
@@ -2146,7 +2178,7 @@ pub const PaintEngine = struct {
             punet.cfgCombine(va_cpu, db[0..lat_n], opts.guidance, v_cpu);
             sch.step(v_cpu, t, lat_cpu);
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit("paint-denoise", @intCast(si + 1), @intCast(sch.timesteps.len));
             }
         }
@@ -2173,13 +2205,13 @@ pub const PaintEngine = struct {
             view_imgs[vi] = out;
             decoded += 1;
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit("paint-decode", @intCast(vi + 1), 12);
             }
         }
 
         // ── 7. Back-project bake (albedo = views 0..5, mr = 6..11) ──
-        var textiles = try bake.extractTextiles(alloc, &geom, opts.texture_size);
+        var textiles = try sse.offload(bake.extractTextiles, .{ alloc, &geom, opts.texture_size });
         defer textiles.deinit();
         var albedo_bake = try self.bakeMaterial(alloc, &geom, &textiles, views, view_imgs[0..6], vsz, rcfg, opts.texture_size, progress, "paint-bake");
         defer albedo_bake.deinit();
@@ -2194,23 +2226,23 @@ pub const PaintEngine = struct {
         defer alloc.free(mask);
         for (albedo_bake.mask, mask) |m, *o| o.* = if (m) 1 else 0;
         // inpaintAtlas does its own internal v-flip — pass the UNflipped uvs.
-        try texinpaint.inpaintAtlas(alloc, albedo_bake.atlas, mask, tex, tex, geom.positions, uw.uvs, geom.indices);
+        try sse.offload(texinpaint.inpaintAtlas, .{ alloc, albedo_bake.atlas, mask, tex, tex, geom.positions, uw.uvs, geom.indices });
         if (progress) |p| p.emit("paint-inpaint", 1, 2);
         for (mr_bake.mask, mask) |m, *o| o.* = if (m) 1 else 0;
-        try texinpaint.inpaintAtlas(alloc, mr_bake.atlas, mask, tex, tex, geom.positions, uw.uvs, geom.indices);
+        try sse.offload(texinpaint.inpaintAtlas, .{ alloc, mr_bake.atlas, mask, tex, tex, geom.positions, uw.uvs, geom.indices });
         if (progress) |p| {
-            if (p.cancelled()) return error.Cancelled;
+            if (p.boundary()) return error.Cancelled;
             p.emit("paint-inpaint", 2, 2);
         }
 
         // ── 9. PNG encode + textured GLB ──
         const albedo_rgb = try rgbF32ToBytes(alloc, albedo_bake.atlas);
         defer alloc.free(albedo_rgb);
-        const albedo_png = try png_mod.encodeRgb(alloc, albedo_rgb, tex, tex);
+        const albedo_png = try sse.offload(png_mod.encodeRgb, .{ alloc, albedo_rgb, tex, tex });
         defer alloc.free(albedo_png);
         const mr_rgb = try mrChannelsToGltf(alloc, mr_bake.atlas);
         defer alloc.free(mr_rgb);
-        const mr_png = try png_mod.encodeRgb(alloc, mr_rgb, tex, tex);
+        const mr_png = try sse.offload(png_mod.encodeRgb, .{ alloc, mr_rgb, tex, tex });
         defer alloc.free(mr_png);
         const gltf_uvs = try gltfUvsFromAtlas(alloc, uw.uvs);
         defer alloc.free(gltf_uvs);
@@ -2242,7 +2274,7 @@ pub const PaintEngine = struct {
         var pm = try self.paintMesh(alloc, mesh, image_rgba, img_w, img_h, opts, progress);
         defer pm.deinit(alloc);
         const tm = pm.textured();
-        return glb_mod.writeGlbTextured(alloc, &tm);
+        return sse.offload(glb_mod.writeGlbTextured, .{ alloc, &tm });
     }
 
     fn bakeMaterial(self: *PaintEngine, alloc: std.mem.Allocator, geom: *const bake.MeshGeom, textiles: *const bake.Textiles, views: [6]bake.View, imgs: []const []f32, vsz: u32, rcfg: bake.RenderConfig, tex_size: u32, progress: ?sse.Progress, stage: []const u8) !bake.BakeResult {
@@ -2251,14 +2283,14 @@ pub const PaintEngine = struct {
         var built: usize = 0;
         defer for (0..built) |i| vps[i].deinit();
         for (views, 0..) |view, vi| {
-            vps[vi] = try bake.backProject(alloc, geom, textiles, view, imgs[vi], vsz, vsz, 3, rcfg);
+            vps[vi] = try sse.offload(bake.backProject, .{ alloc, geom, textiles, view, imgs[vi], vsz, vsz, 3, rcfg });
             built += 1;
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit(stage, @intCast(vi + 1), 6);
             }
         }
-        return bake.bakeBlend(alloc, vps[0..built], 4.0, tex_size, 3);
+        return sse.offload(bake.bakeBlend, .{ alloc, vps[0..built], 4.0, tex_size, 3 });
     }
 
     /// VAE-encode one CHW [3,size,size] f32 image in [0,1]: (x−0.5)·2 →
@@ -2284,7 +2316,7 @@ pub const PaintEngine = struct {
             lats[vi] = try self.encodeChw(maps_chw[vi * plane ..][0..plane], size);
             made += 1;
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 p.emit("paint-encode", prog_base + @as(u32, @intCast(vi)), 14);
             }
         }

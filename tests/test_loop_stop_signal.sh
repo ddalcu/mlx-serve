@@ -105,6 +105,23 @@ print("verdict", "trimmed" if reps <= 4 else "carries the loop")
 PY
 grep -q "^verdict trimmed$" "$LOG.trim"; check "the degenerate tail is cut from the non-streaming body ($(grep '^reps' "$LOG.trim"))" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
+# Thinking on: wherever the loop lands, reasoning_content is cut with the rest.
+# Agents send reasoning back as history; a loop kept there re-seeds the next turn.
+# Bar: fewer than the 16 cycles the guard needs to fire (a model may write a few
+# legit copies before the loop starts).
+BODY=$(curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,\"enable_thinking\":true}")
+python3 - "$BODY" <<'PY' > "$LOG.trimthink"
+import json,sys,re
+ch = json.loads(sys.argv[1])["choices"][0]
+m = ch["message"]
+reps = len(re.findall(r"ping pong", (m.get("reasoning_content") or "") + (m.get("content") or "")))
+looped = (ch.get("finish_details") or {}).get("type") == "repetition_loop"
+print("reps", reps)
+print("verdict", "trimmed" if not looped or reps < 16 else "carries the loop")
+PY
+grep -q "^verdict trimmed$" "$LOG.trimthink"; check "thinking on: reasoning + content carry no loop back ($(grep '^reps' "$LOG.trimthink"))" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+
 # ── 2. chat, streaming: signal on the final chunk, ONCE ──────────────────
 # The include_usage chunk used to RESTATE finish_reason + finish_details
 # beside the usage object (OpenAI ships that chunk with "choices": []), so

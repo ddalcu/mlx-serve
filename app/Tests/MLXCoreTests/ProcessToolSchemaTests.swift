@@ -25,9 +25,10 @@ final class ProcessToolSchemaTests: XCTestCase {
     func testToolCountIncludesNewProcessTools() {
         // 11 base (shell, cwd, writeFile, readFile, editFile, searchFiles,
         // listFiles, browse, webSearch, saveMemory, createTask) + 3 process
-        // (killProcess, readProcessOutput, listProcesses) + 4 media
-        // (generate_image, generate_speech, generate_music, generate_video) = 18.
-        XCTAssertEqual(defs().count, 18)
+        // (killProcess, readProcessOutput, listProcesses) + 5 media
+        // (generate_image, generate_speech, generate_music, generate_sound,
+        // generate_video) = 19.
+        XCTAssertEqual(defs().count, 19)
     }
 
     /// The four media-generation tools, each with exactly one required argument

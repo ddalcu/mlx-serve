@@ -22,6 +22,12 @@ class ServerManager: ObservableObject {
     /// else the local default. Every chat surface reads THIS, never
     /// `modelInfo?.name` directly, so a LAN selection applies everywhere.
     var chatModelId: String? { lanChatModelId ?? residentChatModel?.name }
+    /// The model a chat REQUEST names: the picker's selection, the local pick by
+    /// PATH (the server cold-loads it, or waits out a load in flight). Never the
+    /// bare alias while something is picked: a headless server has no default.
+    func chatRequestModelId(selectedPath: String) -> String? {
+        lanChatModelId ?? (selectedPath.isEmpty ? residentChatModel?.name : selectedPath)
+    }
     /// Metadata for the chat model (context length, vision, architecture):
     /// the LAN entry when one is selected and discovered, else the local
     /// model that can actually hold a conversation.

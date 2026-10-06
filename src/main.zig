@@ -1,3 +1,4 @@
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
@@ -113,7 +114,7 @@ fn printUsage(io: std.Io) void {
         \\                      (every pulled model loads on demand by name)
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
-        \\                      hermes, aider); starts the MLX Core app if the
+        \\                      hermes, aider, zcode); starts the MLX Core app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
         \\
@@ -237,12 +238,19 @@ fn printUsage(io: std.Io) void {
         \\                      MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=<layer>
         \\                      moves the 4-bit boundary, =off keeps the whole
         \\                      stack INT8.
-        \\  --mtp-depth <n>     Max tokens drafted per MTP round (default:
+        \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
+        \\                        (default 1). Every depth the planner picks
+        \\                        stays inside --mtp-min-depth..--mtp-max-depth;
+        \\                        equal values pin one depth.
+        \\  --mtp-max-depth <n> Most tokens an MTP round drafts, 1..8 (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
-        \\                        otherwise 6; MLX_SERVE_MTP_ADAPTIVE=0
+        \\                        otherwise 6, lower on silicon with a measured
+        \\                        verify-width cliff; MLX_SERVE_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
-        \\                        cap 3). Pass an explicit <n> to hard-cap.
+        \\                        cap 3). A --mtp-min-depth above that default
+        \\                        lifts it. --mtp-depth is the old spelling.
+        \\                        Each machine finds its own range.
         \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
         \\                        Use 0.2 for the Qwen3.8 matched comparison.
         \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
@@ -296,9 +304,10 @@ fn printUsage(io: std.Io) void {
         \\                        Default 0 (env MLX_SERVE_PREFILL_DECODE_SHARE).
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
-        \\                        (default: 32). 0 disables the cache — which also
-        \\                        turns off SSM checkpoint capture, since
-        \\                        checkpoints exist only to feed it.
+        \\                        (default: 32). 0 disables all prefix reuse.
+        \\  --no-prefix-cache-ram
+        \\                      Disable idle RAM retention; an enabled SSD tier
+        \\                        still persists and restores reusable prefixes.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB,
         \\                        or one session at the working context on
@@ -566,7 +575,6 @@ pub fn main(init: std.process.Init) !void {
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     var mtp_head_kv_quant = false;
-    var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
     var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TOKENV3")) |v| std.mem.span(v) else null;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
@@ -789,9 +797,17 @@ pub fn main(init: std.process.Init) !void {
             transformer_mod.decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
             transformer_mod.decode_attn_quant_flag = false;
-        } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth") or std.mem.eql(u8, args[i], "--mtp-depth")) {
+            const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
+            const deprecated = std.mem.eql(u8, args[i], "--mtp-depth");
+            if (deprecated) log.warn("{s}\n", .{depth_bounds.deprecated_flag_message});
             i += 1;
-            mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+            const text: []const u8 = if (i < args.len) args[i] else "";
+            const n = (if (deprecated) depth_bounds.parseClamped(text, mtp_mod.MAX_DEPTH) else depth_bounds.parseDepth(text, mtp_mod.MAX_DEPTH)) catch {
+                log.err("{s}: expected an integer in 1..{d}; got '{s}'\n", .{ args[i - 1], mtp_mod.MAX_DEPTH, text });
+                std.process.exit(1);
+            };
+            if (is_min) depth_bounds.active.min = n else depth_bounds.active.max = n;
         } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
             i += 1;
             mtp_typical_raw = args[i];
@@ -838,6 +854,8 @@ pub fn main(init: std.process.Init) !void {
             } else |_| {}
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
             generate_mod.prefill_trace_force = true;
+        } else if (std.mem.eql(u8, args[i], "--no-prefix-cache-ram")) {
+            server_mod.prefix_cache_ram_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -1032,6 +1050,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    depth_bounds.validate(depth_bounds.active) catch {
+        log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
+        std.process.exit(1);
+    };
+    if (std.c.getenv("MLX_SERVE_MTP_FORCE_DEPTH") != null) log.warn("MLX_SERVE_MTP_FORCE_DEPTH no longer does anything: pin a depth with --mtp-min-depth n --mtp-max-depth n\n", .{});
+
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models
     // so every pulled model is loadable by name (Ollama-style).
@@ -1163,7 +1187,10 @@ pub fn main(init: std.process.Init) !void {
     // defer clears the global so an early serve() failure can't leave it
     // dangling. Off (the default) → null: a single per-request branch, no cost.
     var metrics_instance: ?metrics_mod.Metrics = if (metrics_enabled) metrics_mod.Metrics.init() else null;
-    if (metrics_instance) |*m| server_mod.g_metrics = m;
+    if (metrics_instance) |*m| {
+        m.process_start_time_seconds.set(@intCast(@max(0, io_util.nowSecs(io))));
+        server_mod.g_metrics = m;
+    }
     defer server_mod.g_metrics = null;
 
     // ── GGUF early-branch: route to an embedded engine ──
@@ -1264,7 +1291,13 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld, .{
+                .no_drafter = no_drafter,
+                .mtp_enabled = enable_mtp,
+                .mtp_depth = depth_bounds.active.max,
+                .draft_block_size = draft_block_size,
+                .draft_block_size_explicit = draft_block_size_explicit,
+            });
             return;
         }
 
@@ -1447,7 +1480,7 @@ pub fn main(init: std.process.Init) !void {
             .no_drafter = no_drafter,
             .mtp_enabled = enable_mtp,
             .mtp_head_kv_quant = mtp_head_kv_quant,
-            .mtp_depth = mtp_depth,
+            .mtp_depth = depth_bounds.active.max,
             .ane_prefill = ane_prefill,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
             .ane_headroom_resolver = server_mod.aneGateHeadroom,
@@ -1457,10 +1490,11 @@ pub fn main(init: std.process.Init) !void {
             .draft_block_size_explicit = draft_block_size_explicit,
             .kv_quant_config = kv_quant_config,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
+            .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
-            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
+            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama_cache_entries = server_mod.llama_cache_entries,
@@ -1604,7 +1638,7 @@ pub fn main(init: std.process.Init) !void {
         } else {
             // Non-streaming: generate all tokens then print
             const result = if (mtp_head) |*h|
-                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, mtp_depth, null)
+                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, depth_bounds.active.max, null)
             else
                 try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);
@@ -1907,6 +1941,16 @@ fn runGenServe(
     });
 }
 
+/// Launch flags that shape every on-demand load. Headless takes them as one
+/// value so its LoadParams cannot leave any of them at a struct default.
+const SpecLoadFlags = struct {
+    no_drafter: bool,
+    mtp_enabled: bool,
+    mtp_depth: u32,
+    draft_block_size: u32,
+    draft_block_size_explicit: bool,
+};
+
 /// Headless serve mode: start with NO primary model. The registry holds all
 /// discovery stubs; chat AND media models load on demand via `/v1/load-model`
 /// (or a request targeting a discovered id), coexisting under one memory
@@ -1927,6 +1971,7 @@ fn runHeadlessServe(
     idle_evict_secs: ?u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
     pld: server_mod.PldDefaults,
+    spec: SpecLoadFlags,
 ) !void {
     log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1991,7 +2036,11 @@ fn runHeadlessServe(
         .no_initial_load = true,
         .load_vision = false,
         .warmup_eager = false,
-        .draft_block_size = 0,
+        .no_drafter = spec.no_drafter,
+        .mtp_enabled = spec.mtp_enabled,
+        .mtp_depth = spec.mtp_depth,
+        .draft_block_size = spec.draft_block_size,
+        .draft_block_size_explicit = spec.draft_block_size_explicit,
         .kv_quant_config = kv_quant_config,
         .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         // Seed the scheduler's prefix-cache config from the server globals so
@@ -2002,10 +2051,11 @@ fn runHeadlessServe(
         // was silently dead for the entire headless serving mode (the default
         // `serve` path). Mirrors the LoadParams built in `main()`.
         .prefix_cache_capacity = server_mod.prefix_cache_capacity,
+        .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
-        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
+        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         // ds4 spec flags must survive headless/on-demand GGUF loads (the

@@ -52,7 +52,7 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      # The pinned nightly tarball is ~50 MB off ziglang.org; fetch-zig.sh skips
+      # The pinned Zig tarball is ~50 MB off ziglang.org; fetch-zig.sh skips
       # the download when the restored dir's stamp already matches the pin.
       - name: Cache Zig toolchain
         uses: actions/cache@v4

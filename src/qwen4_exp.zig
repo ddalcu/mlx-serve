@@ -12,8 +12,14 @@
 //! `"bits":"16"`) for bit-exact PLE lookups.
 
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const ple_gpu = @import("ple_gpu.zig");
+const embedded_ple = @import("qwen4_ple.zig");
+pub const EmbeddedSpec = embedded_ple.EmbeddedSpec;
+pub const EmbeddedInfo = embedded_ple.EmbeddedInfo;
+pub const inspectEmbedded = embedded_ple.inspectEmbedded;
+pub const embeddedTensorName = embedded_ple.embeddedTensorName;
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
@@ -155,6 +161,7 @@ fn warmEnabled() bool {
 /// by the warm thread, read lock-free by metrics and `/props`; zero when nothing is warming.
 pub var live_warm_bytes = std.atomic.Value(u64).init(0);
 pub var live_warm_total = std.atomic.Value(u64).init(0);
+const empty_embedded_map: [0]u8 align(std.heap.page_size_min) = .{};
 
 /// A progress line at each 8 GB step or after 10 s of silence, never twice per step. Pure.
 pub const WARM_LOG_BYTES: u64 = 8 << 30;
@@ -202,6 +209,33 @@ pub const NgramTable = struct {
     /// Set once `ple_gpu.wrap` hands the mapping to a no-copy Metal buffer: MLX unmaps it
     /// when its last reference drops, so a kernel still in flight never reads freed pages.
     gpu_owns_map: bool = false,
+    embedded: ?*embedded_ple.EmbeddedTable = null,
+
+    pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !NgramTable {
+        var source = (try embedded_ple.openEmbedded(model_dir, expected)) orelse return error.EmbeddedPleMissing;
+        errdefer source.close();
+        const ptr = try std.heap.page_allocator.create(embedded_ple.EmbeddedTable);
+        ptr.* = source;
+        var table: NgramTable = .{
+            .map = empty_embedded_map[0..],
+            .rows = ptr.rows,
+            .dim = ptr.dim,
+            .bits = ptr.bits,
+            .group_size = ptr.group_size,
+            .w_off = 0,
+            .s_off = 0,
+            .b_off = 0,
+            .wcols = ptr.wcols,
+            .scols = ptr.scols,
+            .embedded = ptr,
+        };
+        if (plePrefetchEnabled()) table.pool = PrefetchPool.create() catch null;
+        return table;
+    }
+
+    pub fn embeddedPayloadBytes(self: *const NgramTable) u64 {
+        return if (self.embedded) |source| source.payload_bytes else 0;
+    }
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -235,16 +269,7 @@ pub const NgramTable = struct {
         };
     }
 
-    const HeaderRegion = struct {
-        rows: u64,
-        cols: u64,
-        start: u64, // relative to the data section, as the header spells it
-        end: u64,
-
-        fn overlaps(a: HeaderRegion, b: HeaderRegion) bool {
-            return a.start < b.end and b.start < a.end;
-        }
-    };
+    const HeaderRegion = embedded_ple.HeaderRegion;
 
     /// One header entry, every access checked and the region proven to hold exactly
     /// `rows x cols x elem` bytes inside the mapping.
@@ -256,34 +281,12 @@ pub const NgramTable = struct {
         map_len: usize,
         data_off: usize,
     ) !HeaderRegion {
-        const v = obj.get(key) orelse return error.NgramTableHeader;
-        if (v != .object) return error.NgramTableHeader;
-        const o = v.object;
-        const dt = o.get("dtype") orelse return error.NgramTableHeader;
-        if (dt != .string or !std.mem.eql(u8, dt.string, dtype)) return error.NgramTableHeader;
-        const shape = o.get("shape") orelse return error.NgramTableHeader;
-        if (shape != .array or shape.array.items.len != 2) return error.NgramTableHeader;
-        if (shape.array.items[0] != .integer or shape.array.items[1] != .integer) return error.NgramTableHeader;
-        const dofs = o.get("data_offsets") orelse return error.NgramTableHeader;
-        if (dofs != .array or dofs.array.items.len != 2) return error.NgramTableHeader;
-        if (dofs.array.items[0] != .integer or dofs.array.items[1] != .integer) return error.NgramTableHeader;
-
-        const rows_i = shape.array.items[0].integer;
-        const cols_i = shape.array.items[1].integer;
-        const start_i = dofs.array.items[0].integer;
-        const end_i = dofs.array.items[1].integer;
-        if (rows_i <= 0 or cols_i <= 0 or start_i < 0 or end_i < start_i) return error.NgramTableRegion;
-        const r: HeaderRegion = .{
-            .rows = @intCast(rows_i),
-            .cols = @intCast(cols_i),
-            .start = @intCast(start_i),
-            .end = @intCast(end_i),
+        const r = embedded_ple.headerRegion(obj, key, dtype, elem, map_len, data_off, .matrix) catch |err| return switch (err) {
+            error.TensorHeader, error.TensorDtype => error.NgramTableHeader,
+            error.TensorRegion => error.NgramTableRegion,
+            error.TensorTruncated => error.NgramTableTruncated,
         };
         if (r.cols > std.math.maxInt(u32) or r.rows > std.math.maxInt(u32)) return error.NgramTableRegion;
-        const need = std.math.mul(u64, r.rows, r.cols * elem) catch return error.NgramTableRegion;
-        if (r.end - r.start != need) return error.NgramTableRegion;
-        const abs_end = std.math.add(u64, data_off, r.end) catch return error.NgramTableTruncated;
-        if (abs_end > map_len) return error.NgramTableTruncated;
         return r;
     }
 
@@ -312,7 +315,6 @@ pub const NgramTable = struct {
         const bits: u32 = std.fmt.parseInt(u32, bits_v.string, 10) catch return error.NgramTableHeader;
         const gs: u32 = std.fmt.parseInt(u32, gs_v.string, 10) catch return error.NgramTableHeader;
         if (!bitsSupported(bits)) return error.NgramTableBits;
-        if (gs == 0 or gs > 1024) return error.NgramTableBits;
 
         // Raw BF16 mode: one `weight` BF16 [rows, dim] region, no
         // scales/biases. `wcols`/`scols` stay 0; only `row`'s raw arm reads it.
@@ -332,6 +334,8 @@ pub const NgramTable = struct {
                 .scols = 0,
             };
         }
+
+        if (gs == 0 or gs > 1024) return error.NgramTableBits;
 
         const w = try headerRegion(obj, "weight", "U32", 4, map.len, data_off);
         const sc = try headerRegion(obj, "scales", "BF16", 2, map.len, data_off);
@@ -370,49 +374,136 @@ pub const NgramTable = struct {
         self.pool = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
         self.fd = -1;
-        if (!self.gpu_owns_map) std.posix.munmap(self.map);
+        if (self.embedded) |source| {
+            source.close();
+            std.heap.page_allocator.destroy(source);
+            self.embedded = null;
+        } else if (!self.gpu_owns_map) std.posix.munmap(self.map);
+    }
+
+    /// Sample before background warming; explicit read-path overrides skip calibration.
+    pub fn calibrateArm(self: *const NgramTable) void {
+        self.calibrate(.load);
+    }
+
+    /// Only the inference thread may use the reader pool or update its measured policy.
+    fn refreshAfterWarm(self: *const NgramTable) void {
+        const p = self.pool orelse return;
+        if (plePrefillPrefetchMode() == .kv_gated and p.warm_finished.swap(false, .acq_rel))
+            self.calibrate(.warmed);
+    }
+
+    fn calibrate(self: *const NgramTable, phase: CalibrationPhase) void {
+        if (self.bits == 16 or plePrefillPrefetchMode() != .kv_gated) return;
+        const p = self.pool orelse return;
+        if ((self.fd < 0 and self.embedded == null) or self.rows < 2 * PLE_CALIBRATION_ROWS) return;
+        if (self.wcols * 4 + self.scols * 4 > PrefetchPool.ROW_BUF) return;
+
+        var serial_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
+        var pool_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
+        calibrationRows(self.rows, &serial_rows, &pool_rows, phase);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var sw = io_util.Stopwatch.init(io);
+        var acc: u64 = 0;
+        for (serial_rows) |r| acc +%= self.touchRow(@intCast(r));
+        const serial_ns = sw.read();
+        std.mem.doNotOptimizeAway(acc);
+
+        sw.reset();
+        var start: usize = 0;
+        while (start < pool_rows.len) : (start += PrefetchPool.MAX_ROWS) {
+            const end = @min(start + PrefetchPool.MAX_ROWS, pool_rows.len);
+            if (!p.run(self, pool_rows[start..end])) return;
+        }
+        const pool_ns = sw.read();
+        if (serial_ns == 0 or pool_ns == 0) return;
+        p.recordCalibration(.{ .serial_ns = serial_ns, .pool_ns = pool_ns, .phase = phase });
+        log.info("[qwen4] ngram gather calibration ({s}): {s} ({d} rows per arm: serial {d:.2} ms, pool {d:.2} ms)\n", .{
+            @tagName(phase),
+            if (p.prefer_pool) "POOLED" else "SERIAL",
+            PLE_CALIBRATION_ROWS,
+            @as(f64, @floatFromInt(serial_ns)) / 1e6,
+            @as(f64, @floatFromInt(pool_ns)) / 1e6,
+        });
+    }
+
+    /// Touch every page read by a quantized row, without the common dequantization work.
+    fn touchRow(self: *const NgramTable, r: u64) u64 {
+        const wl: usize = self.wcols * 4;
+        const sl: usize = self.scols * 2;
+        const regions = if (self.embedded) |source| blk: {
+            const p = source.rowParts(r);
+            break :blk [_][]const u8{ p.weight, p.scales, p.biases };
+        } else [_][]const u8{
+            self.map[self.w_off + r * wl ..][0..wl],
+            self.map[self.s_off + r * sl ..][0..sl],
+            self.map[self.b_off + r * sl ..][0..sl],
+        };
+        var acc: u64 = 0;
+        for (regions) |region| {
+            var i: usize = 0;
+            while (i < region.len) : (i += std.heap.page_size_min) acc +%= region[i];
+            if (region.len > 0) acc +%= region[region.len - 1];
+        }
+        return acc;
     }
 
     const WARM_CHUNK: usize = 8 << 20;
 
-    /// Read the whole table through the fd once, in the background, so the
+    /// The `i`-th byte range the warm reads: the whole file, or an embedded pack's shard parts.
+    fn warmRegion(self: *const NgramTable, i: usize) ?embedded_ple.Region {
+        if (self.embedded) |source| return source.region(i);
+        return if (i == 0 and self.fd >= 0) .{ .fd = self.fd, .off = 0, .len = self.map.len } else null;
+    }
+
+    /// Read the whole table through its fds once, in the background, so the
     /// first prompt's PLE gathers hit a warm page cache. Call only once the
     /// table sits at its final address (the thread holds `self`). Off via
     /// MLX_SERVE_NGRAM_WARM=0.
     pub fn startWarm(self: *NgramTable) void {
-        if (self.fd < 0 or self.warm_thread != null) return;
+        if (self.warmRegion(0) == null or self.warm_thread != null) return;
         // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).
         if (!warmEnabled()) {
             log.info("[qwen4] ngram table warm: disabled (MLX_SERVE_NGRAM_WARM=0) - the first long prompt faults the table in from SSD\n", .{});
             return;
         }
+        var total: u64 = 0;
+        var i: usize = 0;
+        while (self.warmRegion(i)) |r| : (i += 1) total += r.len;
         self.warm_stop.store(false, .release);
         self.warm_bytes.store(0, .release);
         live_warm_bytes.store(0, .release);
-        live_warm_total.store(self.map.len, .release);
-        log.info("[qwen4] ngram table warm: started, {d:.1} GB in the background (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{asGb(self.map.len)});
-        self.warm_thread = std.Thread.spawn(.{}, warmMain, .{self}) catch null;
+        live_warm_total.store(total, .release);
+        log.info("[qwen4] ngram table warm: started, {d:.1} GB in the background (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{asGb(total)});
+        self.warm_thread = std.Thread.spawn(.{}, warmMain, .{ self, total }) catch null;
     }
 
-    fn warmMain(self: *NgramTable) void {
+    fn warmMain(self: *NgramTable, total: u64) void {
         var scratch: [WARM_CHUNK]u8 align(16) = undefined;
         const wio = std.Io.Threaded.global_single_threaded.io();
         const t0 = std.Io.Timestamp.now(wio, .boot);
-        var off: u64 = 0;
-        const total: u64 = self.map.len;
+        var done: u64 = 0;
         var prog: WarmProgress = .{};
-        while (off < total) {
-            if (self.warm_stop.load(.acquire)) return;
-            const want: usize = @intCast(@min(total - off, WARM_CHUNK));
-            const got = std.c.pread(self.fd, &scratch, want, @intCast(off));
-            if (got <= 0) return;
-            off += @intCast(got);
-            self.warm_bytes.store(off, .release);
-            live_warm_bytes.store(off, .release);
-            // One clock read per 8 MB pread is free next to the read itself.
-            const el: u64 = @intCast(t0.untilNow(wio, .boot).nanoseconds);
-            if (prog.should(off, el)) log.info("[qwen4] ngram table warm: {d:.1}/{d:.1} GB after {d:.0} s\n", .{ asGb(off), asGb(total), @as(f64, @floatFromInt(el)) / 1e9 });
+        var i: usize = 0;
+        while (self.warmRegion(i)) |r| : (i += 1) {
+            var off: u64 = 0;
+            while (off < r.len) {
+                if (self.warm_stop.load(.acquire)) return;
+                const want: usize = @intCast(@min(r.len - off, WARM_CHUNK));
+                const got = std.c.pread(r.fd, &scratch, want, @intCast(r.off + off));
+                if (got <= 0) return;
+                off += @intCast(got);
+                done += @intCast(got);
+                self.warm_bytes.store(done, .release);
+                live_warm_bytes.store(done, .release);
+                // One clock read per 8 MB pread is free next to the read itself.
+                const el: u64 = @intCast(t0.untilNow(wio, .boot).nanoseconds);
+                if (prog.should(done, el)) log.info("[qwen4] ngram table warm: {d:.1}/{d:.1} GB after {d:.0} s\n", .{ asGb(done), asGb(total), @as(f64, @floatFromInt(el)) / 1e9 });
+            }
         }
+        // Completion does not imply residency when the table exceeds available RAM.
+        // Publish a request; recalibration must not race the inference thread's pool use.
+        if (self.pool) |p| p.warm_finished.store(true, .release);
         const secs: f64 = @as(f64, @floatFromInt(t0.untilNow(wio, .boot).nanoseconds)) / 1e9;
         log.info("[qwen4] ngram table warm: done, {d:.1} GB in {d:.1} s (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{ asGb(total), secs });
     }
@@ -422,6 +513,11 @@ pub const NgramTable = struct {
     /// straddle a word boundary at 3/5/6 bits).
     pub fn row(self: *const NgramTable, r: u64, out: []f32) void {
         std.debug.assert(r < self.rows and out.len >= self.dim);
+        if (self.embedded) |source| {
+            const parts = source.rowParts(r);
+            self.dequantRow(parts.weight, parts.scales, parts.biases, out);
+            return;
+        }
         // Raw BF16 arm: straight convert, no scales/biases.
         if (self.bits == 16) {
             const raw = self.map[self.w_off + r * self.dim * 2 ..][0 .. self.dim * 2];
@@ -439,6 +535,8 @@ pub const NgramTable = struct {
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
+        // An embedded pack's global weight scale; 1.0 leaves every other table exact.
+        const ws: f32 = if (self.embedded) |source| source.scale else 1.0;
         var i: u32 = 0;
         while (i < self.dim) : (i += 1) {
             const off = i * self.bits;
@@ -450,7 +548,7 @@ pub const NgramTable = struct {
             const g = i / self.group_size;
             const sc = bf16ToF32(std.mem.readInt(u16, scales[g * 2 ..][0..2], .little));
             const bi = bf16ToF32(std.mem.readInt(u16, biases[g * 2 ..][0..2], .little));
-            out[i] = @as(f32, @floatFromInt(q)) * sc + bi;
+            out[i] = (@as(f32, @floatFromInt(q)) * sc + bi) * ws;
         }
     }
 
@@ -464,15 +562,16 @@ pub const NgramTable = struct {
             return;
         }
         const need: usize = self.wcols * 4 + self.scols * 4;
-        // Prefill-width gathers ride the pool only past `PREFILL_PREFETCH_MIN_KV`: a resident
-        // table loses 2-7% to the wake rounds, an evicted one (weights pushed the 32 GB
-        // mapping out) went 67.7 -> 267.9 ms per 1000 tokens on the serial walk.
+        // Avoid pool wakeups on resident tables unless calibration or long KV warrants them.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
-        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len);
+        if (wide) self.refreshAfterWarm();
+        const prefer_pool = if (self.pool) |p| p.prefer_pool else false;
+        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
         // Announce the arm that actually runs, not the lever that permits it.
-        const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
-        if (wide) notePrefillGatherArm(pooled, row_ids.len);
-        if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and wide_ok) {
+        const readable = self.fd >= 0 or self.embedded != null;
+        const pooled = wide_ok and self.pool != null and readable and need <= PrefetchPool.ROW_BUF;
+        if (wide) notePrefillGatherArm(pooled, row_ids.len, prefer_pool);
+        if (self.pool) |p| if (readable and need <= PrefetchPool.ROW_BUF and wide_ok) {
             const wl: usize = self.wcols * 4;
             const sl: usize = self.scols * 2;
             var start: usize = 0;
@@ -498,6 +597,7 @@ pub const NgramTable = struct {
             1 => .{ self.s_off + r * sl, buf[wl .. wl + sl] },
             else => .{ self.b_off + r * sl, buf[wl + sl .. wl + 2 * sl] },
         };
+        if (self.embedded) |source| return source.preadPart(r, region, dst);
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 
@@ -513,6 +613,10 @@ const PrefetchPool = struct {
     const N = 48;
     const MAX_ROWS = 64;
     const ROW_BUF = 512;
+    /// The warmer only publishes this flag; measured state belongs to the inference thread.
+    warm_finished: std.atomic.Value(bool) = .init(false),
+    prefer_pool: bool = false,
+    calib: Calibration = .{},
     mu: std.Io.Mutex = .init,
     cv: std.Io.Condition = .init,
     gen: u64 = 0,
@@ -525,6 +629,11 @@ const PrefetchPool = struct {
     /// Fan-out rounds issued; the engagement counter the prefill test reads.
     runs: std.atomic.Value(u64) = .init(0),
     threads: [N]std.Thread = undefined,
+
+    fn recordCalibration(self: *PrefetchPool, result: Calibration) void {
+        self.calib = result;
+        self.prefer_pool = plePrefillPrefetchArm(result.serial_ns, result.pool_ns);
+    }
 
     fn create() !*PrefetchPool {
         const a = std.heap.page_allocator;
@@ -614,16 +723,17 @@ pub const PREFILL_SAY_MIN_ROWS: usize = 1024;
 pub var ple_prefill_arm_said: [2][2]std.atomic.Value(bool) =
     .{ .{ .init(false), .init(false) }, .{ .init(false), .init(false) } };
 
-fn notePrefillGatherArm(pooled: bool, rows: usize) void {
+fn notePrefillGatherArm(pooled: bool, rows: usize, prefer_pool: bool) void {
     const arm: usize = if (pooled) 1 else 0;
     const bucket: usize = if (rows >= PREFILL_SAY_MIN_ROWS) 1 else 0;
     if (ple_prefill_arm_said[arm][bucket].swap(true, .monotonic)) return;
     const width: []const u8 = if (bucket == 1) "prefill width" else "warmup width";
+    const why: []const u8 = if (plePrefillPrefetchMode() != .kv_gated) "QWEN4_PLE_PREFETCH_PREFILL override" else if (prefer_pool) "pool measured faster" else "KV gate";
     if (pooled) {
         const batches = (rows + PrefetchPool.MAX_ROWS - 1) / PrefetchPool.MAX_ROWS;
-        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; past kv {d}, QWEN4_PLE_PREFETCH_PREFILL=0 forces the serial walk)\n", .{ width, rows, batches, PrefetchPool.MAX_ROWS, plePrefillPrefetchMinKv() });
+        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; {s})\n", .{ width, rows, batches, PrefetchPool.MAX_ROWS, why });
     } else {
-        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; the pool engages past kv {d}, QWEN4_PLE_PREFETCH_PREFILL_MIN_KV overrides)\n", .{ width, rows, plePrefillPrefetchMinKv() });
+        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; {s}, threshold {d})\n", .{ width, rows, why, plePrefillPrefetchMinKv() });
     }
 }
 
@@ -631,14 +741,12 @@ fn notePrefillGatherArm(pooled: bool, rows: usize) void {
 pub var ple_prefill_prefetch_override: ?bool = null;
 pub var ple_prefill_min_kv_override: ?u64 = null;
 
-/// The kv length past which a wide prefill gather takes the pool: the top of the measured
-/// cost range (the pool loses at every rung to 256k on a resident table; the only win is the
-/// evicted table on the 374k ladder). `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` overrides.
+/// Long KV can evict a table that was resident at load. This gate supplements calibration.
 pub const PREFILL_PREFETCH_MIN_KV: u64 = 262144;
 
 pub const PrefillPrefetchMode = enum { off, kv_gated, on };
 
-/// `QWEN4_PLE_PREFETCH_PREFILL`: absent = the kv gate, `0` = serial walk, `1` = pool.
+/// `QWEN4_PLE_PREFETCH_PREFILL`: absent = calibration + KV gate, `0` = serial, `1` = pool.
 pub fn plePrefillPrefetchModeFromEnv(raw: ?[]const u8) PrefillPrefetchMode {
     const r = raw orelse return .kv_gated;
     if (r.len == 0) return .kv_gated;
@@ -655,11 +763,34 @@ pub fn plePrefillPrefetchMinKvFromEnv(raw: ?[]const u8) u64 {
     return std.fmt.parseInt(u64, t, 10) catch PREFILL_PREFETCH_MIN_KV;
 }
 
-pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: u64) bool {
+const PLE_CALIBRATION_ROWS = 128;
+const CalibrationPhase = enum { load, warmed };
+const Calibration = struct { serial_ns: u64 = 0, pool_ns: u64 = 0, phase: CalibrationPhase = .load };
+
+fn calibrationRows(rows: u64, serial_rows: []i64, pool_rows: []i64, phase: CalibrationPhase) void {
+    const half = rows / 2;
+    var seed: u64 = if (phase == .load) SPLITMIX_GAMMA else SPLITMIX_M1;
+    for (serial_rows) |*r| {
+        r.* = @intCast(splitmix64(seed) % half);
+        seed +%= SPLITMIX_GAMMA;
+    }
+    for (pool_rows) |*r| {
+        r.* = @intCast(half + splitmix64(seed) % (rows - half));
+        seed +%= SPLITMIX_GAMMA;
+    }
+}
+
+/// Require a win greater than 20%; ties, noise and unreadable timers retain serial.
+pub fn plePrefillPrefetchArm(serial_ns: u64, pool_ns: u64) bool {
+    if (serial_ns == 0 or pool_ns == 0) return false;
+    return @as(u128, pool_ns) * 100 < @as(u128, serial_ns) * 80;
+}
+
+pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: u64, prefer_pool: bool) bool {
     return switch (mode) {
         .off => false,
         .on => true,
-        .kv_gated => kv_len >= min_kv,
+        .kv_gated => prefer_pool or kv_len >= min_kv,
     };
 }
 
@@ -675,8 +806,8 @@ fn plePrefillPrefetchMinKv() u64 {
     return v;
 }
 
-fn plePrefillPrefetchEnabled(kv_len: u64) bool {
-    if (ple_prefill_prefetch_override) |v| return v;
+fn plePrefillPrefetchMode() PrefillPrefetchMode {
+    if (ple_prefill_prefetch_override) |v| return if (v) .on else .off;
     const S = struct {
         var v: ?PrefillPrefetchMode = null;
     };
@@ -686,7 +817,11 @@ fn plePrefillPrefetchEnabled(kv_len: u64) bool {
         S.v = m;
         break :blk m;
     };
-    return plePrefillPrefetchWanted(mode, kv_len, plePrefillPrefetchMinKv());
+    return mode;
+}
+
+fn plePrefillPrefetchEnabled(kv_len: u64, prefer_pool: bool) bool {
+    return plePrefillPrefetchWanted(plePrefillPrefetchMode(), kv_len, plePrefillPrefetchMinKv(), prefer_pool);
 }
 
 pub fn bf16ToF32(u: u16) f32 {
@@ -806,6 +941,28 @@ test "ngram table row dequant reads the dense mx.quantize packing at every width
     }
 }
 
+test "ngram table raw BF16 rows do not depend on quantization group size" {
+    for ([_][]const u8{ "0", "1", "32", "1024" }) |group_size| {
+        var header_buf: [512]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &header_buf,
+            "{{\"__metadata__\":{{\"format\":\"mlx-serve-ngram\",\"bits\":\"16\",\"group_size\":\"{s}\"}}," ++
+                "\"weight\":{{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}}}",
+            .{group_size},
+        );
+        const buf = try ngramTestImage(header, 8);
+        defer std.heap.page_allocator.free(buf);
+        const values = [_]u16{ 0x3F80, 0xC000, 0x3F00, 0x4040 };
+        for (values, 0..) |value, i| std.mem.writeInt(u16, buf[520 + i * 2 ..][0..2], value, .little);
+        const table = try NgramTable.parse(buf, buf[8..520], 520);
+        var row: [2]f32 = undefined;
+        table.row(0, &row);
+        try testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, &row);
+        table.row(1, &row);
+        try testing.expectEqualSlices(f32, &.{ 0.5, 3.0 }, &row);
+    }
+}
+
 test "ngram table raw bf16 rows copy out converted without scales" {
     // bits 16: `weight` BF16 [2,4], no scales/biases keys at all.
     const header = "{\"__metadata__\":{\"format\":\"mlx-serve-ngram\",\"bits\":\"16\",\"group_size\":\"32\"},\"weight\":{\"dtype\":\"BF16\",\"shape\":[2,4],\"data_offsets\":[0,16]}}";
@@ -829,6 +986,68 @@ test "ngram table raw bf16 rows copy out converted without scales" {
     try testing.expectEqualSlices(f32, &[_]f32{ -1.0, 0.5, -3.0, 3.0 }, &out);
 }
 
+test "embedded PLE rows carry the pack's global weight scale" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var gathered: [2][32]f32 = undefined;
+    inline for (.{ embedded_ple.FixtureVariant.scale_unit, embedded_ple.FixtureVariant.scale_nonunit }, 0..) |variant, i| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try embedded_ple.writeFixture(&td, variant);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        var table = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 });
+        defer table.close();
+        table.row(5, &gathered[i]);
+    }
+    for (gathered[0], gathered[1]) |unit, doubled| try std.testing.expectEqual(unit * 2, doubled);
+}
+
+test "embedded PLE rows and gathers match the merged table" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeFixture(&td, .valid);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var embedded = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 });
+    defer embedded.close();
+    try std.testing.expectEqual(@as(u64, 120), embedded.embeddedPayloadBytes());
+
+    const header = "{\"__metadata__\":{\"format\":\"mlx-serve-ngram\",\"bits\":\"4\",\"group_size\":\"32\"}," ++
+        "\"weight\":{\"dtype\":\"U32\",\"shape\":[6,4],\"data_offsets\":[0,96]}," ++
+        "\"scales\":{\"dtype\":\"BF16\",\"shape\":[6,1],\"data_offsets\":[96,108]}," ++
+        "\"biases\":{\"dtype\":\"BF16\",\"shape\":[6,1],\"data_offsets\":[108,120]}}";
+    const flat_buf = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 8 + 512 + 120);
+    defer std.testing.allocator.free(flat_buf);
+    std.mem.writeInt(u64, flat_buf[0..8], 512, .little);
+    @memset(flat_buf[8..520], ' ');
+    @memcpy(flat_buf[8 .. 8 + header.len], header);
+    for (0..6) |r| {
+        const parts = embedded.embedded.?.rowParts(r);
+        @memcpy(flat_buf[520 + r * 16 ..][0..16], parts.weight);
+        @memcpy(flat_buf[520 + 96 + r * 2 ..][0..2], parts.scales);
+        @memcpy(flat_buf[520 + 108 + r * 2 ..][0..2], parts.biases);
+    }
+    const flat = try NgramTable.parse(flat_buf, flat_buf[8..520], 520);
+    const ids = [_]i64{ 5, 1, 2, 0, 3, 5, 4 };
+    var want: [ids.len * 32]f32 = undefined;
+    var serial: [ids.len * 32]f32 = undefined;
+    var pooled: [ids.len * 32]f32 = undefined;
+    flat.gather(&ids, &want, 0);
+    {
+        const pool = embedded.pool;
+        embedded.pool = null;
+        defer embedded.pool = pool;
+        embedded.gather(&ids, &serial, 0);
+    }
+    try std.testing.expectEqualSlices(f32, &want, &serial);
+    try std.testing.expectEqual(@as(f32, 5), want[0]);
+    if (embedded.pool != null) {
+        embedded.gather(&ids, &pooled, 0);
+        try std.testing.expectEqualSlices(f32, &want, &pooled);
+    }
+}
+
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
 /// the mmapped table. Non-null on `Transformer.qwen4` ⇒ the arch is served
 /// serially with speculation off (`ownsModuleDecodeState`), which is what
@@ -849,16 +1068,16 @@ pub const Qwen4State = struct {
 
 test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools" {
     const min = PREFILL_PREFETCH_MIN_KV;
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min, false));
     for ([_]u64{ 4096, 8192, 16_384, 65_536, 131_072, 262_143 }) |kv| {
-        try testing.expect(!plePrefillPrefetchWanted(.kv_gated, kv, min));
+        try testing.expect(!plePrefillPrefetchWanted(.kv_gated, kv, min, false));
     }
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min));
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min));
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096));
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072));
-    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min));
-    try testing.expect(plePrefillPrefetchWanted(.on, 0, min));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min, false));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min, false));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096, false));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072, false));
+    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min, false));
+    try testing.expect(plePrefillPrefetchWanted(.on, 0, min, false));
 
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(null));
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(""));
@@ -870,6 +1089,43 @@ test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools
     try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv("64k"));
     try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv(""));
     try testing.expectEqual(@as(u64, 0), plePrefillPrefetchMinKvFromEnv("0")); // an explicit always-on
+}
+
+test "ngram prefill calibration: margin, invalid timers and explicit overrides" {
+    try testing.expect(plePrefillPrefetchArm(1000, 799));
+    for ([_]u64{ 0, 800, 900, 1000, 2000 }) |pool_ns| {
+        try testing.expect(!plePrefillPrefetchArm(1000, pool_ns));
+    }
+    try testing.expect(!plePrefillPrefetchArm(0, 1000));
+    try testing.expect(!plePrefillPrefetchArm(std.math.maxInt(u64), std.math.maxInt(u64)));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 0, PREFILL_PREFETCH_MIN_KV, true));
+    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, 0, true));
+    try testing.expect(plePrefillPrefetchWanted(.on, 0, PREFILL_PREFETCH_MIN_KV, false));
+}
+
+test "ngram prefill calibration: warm measurements replace the cold policy" {
+    var pool: PrefetchPool = .{};
+    pool.recordCalibration(.{ .serial_ns = 1000, .pool_ns = 100, .phase = .load });
+    try testing.expect(pool.prefer_pool);
+    pool.recordCalibration(.{ .serial_ns = 100, .pool_ns = 1000, .phase = .warmed });
+    try testing.expect(!pool.prefer_pool);
+    pool.recordCalibration(.{ .serial_ns = 1000, .pool_ns = 100, .phase = .warmed });
+    try testing.expect(pool.prefer_pool);
+}
+
+test "ngram prefill calibration: sampled rows are bounded and disjoint" {
+    for ([_]u64{ 256, 257, 320_000_000 }) |rows| {
+        var serial_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
+        var pool_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
+        calibrationRows(rows, &serial_rows, &pool_rows, .load);
+        const load_rows = serial_rows;
+        for ([_]CalibrationPhase{ .load, .warmed }) |phase| {
+            calibrationRows(rows, &serial_rows, &pool_rows, phase);
+            for (serial_rows) |r| try testing.expect(r >= 0 and r < rows / 2);
+            for (pool_rows) |r| try testing.expect(r >= rows / 2 and r < rows);
+        }
+        try testing.expect(!std.mem.eql(i64, &load_rows, &serial_rows));
+    }
 }
 
 test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {
@@ -904,6 +1160,13 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     defer t.close();
     const pool = t.pool orelse return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 32), t.dim);
+
+    // Calibration exercises the actual mmap and pool, then leaves row values unchanged.
+    t.calibrateArm();
+    try testing.expectEqual(@as(u64, PLE_CALIBRATION_ROWS / PrefetchPool.MAX_ROWS), pool.runs.load(.monotonic));
+    try testing.expect(pool.calib.serial_ns > 0 and pool.calib.pool_ns > 0);
+    try testing.expectEqual(plePrefillPrefetchArm(pool.calib.serial_ns, pool.calib.pool_ns), pool.prefer_pool);
+    pool.prefer_pool = false;
 
     const ids = try testing.allocator.alloc(i64, ROWS);
     defer testing.allocator.free(ids);
@@ -941,6 +1204,13 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
 
     try testing.expectEqualSlices(f32, ref, got);
 
+    // A measured pool win must engage below the KV gate without changing any row.
+    pool.prefer_pool = true;
+    const calibrated_before = pool.runs.load(.monotonic);
+    t.gather(ids, got, 8192);
+    try testing.expectEqual(calibrated_before + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
+    try testing.expectEqualSlices(f32, ref, got);
+
     ple_prefill_prefetch_override = false;
     defer ple_prefill_prefetch_override = null;
     const forced_off = pool.runs.load(.monotonic);
@@ -974,6 +1244,32 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     t.gather(dec, d_got, 0);
     try testing.expectEqualSlices(f32, d_ref, d_got);
     try testing.expectEqual(serial_warm_before, said(0, 0));
+
+    // Warming must publish a refresh without borrowing the inference thread's reader pool.
+    ple_prefill_prefetch_override = null;
+    warm_override = true;
+    const before_warm = pool.runs.load(.monotonic);
+    t.startWarm();
+    (t.warm_thread orelse return error.WarmThreadMissing).join();
+    t.warm_thread = null;
+    try testing.expectEqual(before_warm, pool.runs.load(.monotonic));
+    try testing.expect(pool.warm_finished.load(.acquire));
+    try testing.expectEqual(CalibrationPhase.load, pool.calib.phase);
+
+    // Decode and explicit overrides leave refresh pending; automatic prefill consumes it once.
+    t.gather(dec, d_got, 0);
+    try testing.expect(pool.warm_finished.load(.acquire));
+    ple_prefill_prefetch_override = false;
+    t.gather(ids, got, 0);
+    try testing.expect(pool.warm_finished.load(.acquire));
+    ple_prefill_prefetch_override = null;
+    t.gather(ids, got, 0);
+    try testing.expect(!pool.warm_finished.load(.acquire));
+    try testing.expectEqual(CalibrationPhase.warmed, pool.calib.phase);
+    try testing.expectEqualSlices(f32, ref, got);
+    const after_refresh = pool.runs.load(.monotonic);
+    t.gather(ids, got, 0);
+    try testing.expectEqual(after_refresh + @as(u64, if (pool.prefer_pool) ROWS / PrefetchPool.MAX_ROWS else 0), pool.runs.load(.monotonic));
 }
 
 test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {
@@ -1013,6 +1309,18 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     var t2 = try NgramTable.open(path);
     t2.startWarm();
     t2.close();
+
+    // An embedded pack warms every shard part through its own file.
+    var etd = std.testing.tmpDir(.{});
+    defer etd.cleanup();
+    try embedded_ple.writeFixture(&etd, .valid);
+    const elen = try etd.dir.realPath(io, &pbuf);
+    var te = try NgramTable.openEmbedded(pbuf[0..elen], .{ .rows = 6, .dim = 32, .shards = 3 });
+    te.startWarm();
+    (te.warm_thread orelse return error.WarmThreadMissing).join();
+    te.warm_thread = null;
+    try testing.expectEqual(te.embeddedPayloadBytes(), te.warm_bytes.load(.acquire));
+    te.close();
 
     // Kill switch: no thread.
     warm_override = false;

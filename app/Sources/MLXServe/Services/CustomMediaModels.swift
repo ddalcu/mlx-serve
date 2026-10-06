@@ -71,6 +71,10 @@ enum CustomMediaModels {
         }
     }
 
+    private static func soundFamily(arch: String) -> SoundModelPreset? {
+        arch == "stable_audio3" ? .stableAudio3SmallSFX : nil
+    }
+
     private static func meshFamily(arch: String) -> Model3DModelPreset? {
         arch.hasPrefix("hunyuan3d") ? .hunyuan3d21_8bit : nil
     }
@@ -83,10 +87,12 @@ enum CustomMediaModels {
     static func bundle(arch: String, repoId: String) -> MediaBundle? {
         if arch == "laya" { return .laya(repo: repoId, displayName: repoId, sizeGB: 0.35) }
         if arch == "kev" { return .kev(repo: repoId, displayName: repoId, sizeGB: 4.2) }
+        if arch == "clef" { return .clef(repo: repoId, displayName: repoId, sizeGB: 6.2) }
         if let p = imageFamily(arch: arch, id: repoId) { return p.asCustom(id: repoId).bundle }
         if let p = videoFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         if let p = audioFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         if let p = musicFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
+        if let p = soundFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         if let p = meshFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         return nil
     }
@@ -107,6 +113,10 @@ enum CustomMediaModels {
 
     static func musicPreset(for id: String, from models: [ModelInfo]) -> MusicModelPreset? {
         entry(for: id, in: models).flatMap { musicFamily(arch: $0.architecture) }?.asCustom(id: id)
+    }
+
+    static func soundPreset(for id: String, from models: [ModelInfo]) -> SoundModelPreset? {
+        entry(for: id, in: models).flatMap { soundFamily(arch: $0.architecture) }?.asCustom(id: id)
     }
 
     static func meshPreset(for id: String, from models: [ModelInfo]) -> Model3DModelPreset? {
@@ -140,6 +150,11 @@ enum CustomMediaModels {
         return localIds(in: models, excluding: known).compactMap { musicPreset(for: $0, from: models) }
     }
 
+    static func soundPresets(from models: [ModelInfo]) -> [SoundModelPreset] {
+        let known = Set(SoundModelPreset.all.map(\.repo))
+        return localIds(in: models, excluding: known).compactMap { soundPreset(for: $0, from: models) }
+    }
+
     static func meshPresets(from models: [ModelInfo]) -> [Model3DModelPreset] {
         let known = Set(Model3DModelPreset.all.map(\.repo))
         return localIds(in: models, excluding: known).compactMap { meshPreset(for: $0, from: models) }
@@ -170,6 +185,7 @@ extension ImageModelPreset: CustomizableMediaPreset {}
 extension VideoModelPreset: CustomizableMediaPreset {}
 extension AudioModelPreset: CustomizableMediaPreset {}
 extension MusicModelPreset: CustomizableMediaPreset {}
+extension SoundModelPreset: CustomizableMediaPreset {}
 extension Model3DModelPreset: CustomizableMediaPreset {}
 
 // The old pickers' "On This Mac" Section (`CustomModelPickerRows`) retired

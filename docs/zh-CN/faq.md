@@ -42,7 +42,7 @@
 
 ## mlx-serve 能在本地运行腾讯混元 3（295B）吗？
 
-能 —— mlx-serve 运行的最大开源模型。2-bit 混合精度版本（`mlx-serve run hy3`，磁盘上约 105 GB）在 M4 Max 上解码约 26 tok/s、预填充约 235 tok/s，思考、工具调用与全部四个 API 接口面都能工作。推荐用在统一内存 **超过 128 GB** 的 Mac 上；在 128 GB 的 Mac 上它能加载并正确作答，但权重旁边只放得下极小的上下文窗口（约 3K Token） —— 做短对话没问题，跑 Agent 任务就吃紧。检查点自带的多 Token 预测头也受支持（每次请求 `enable_mtp: true`，配合 `--mtp-depth 1` 最佳）。
+能 —— mlx-serve 运行的最大开源模型。2-bit 混合精度版本（`mlx-serve run hy3`，磁盘上约 105 GB）在 M4 Max 上解码约 26 tok/s、预填充约 235 tok/s，思考、工具调用与全部四个 API 接口面都能工作。推荐用在统一内存 **超过 128 GB** 的 Mac 上；在 128 GB 的 Mac 上它能加载并正确作答，但权重旁边只放得下极小的上下文窗口（约 3K Token） —— 做短对话没问题，跑 Agent 任务就吃紧。检查点自带的多 Token 预测头也受支持（每次请求 `enable_mtp: true`，配合 `--mtp-max-depth 1` 最佳）。
 
 ## 与 MTPLX 在 Qwen MTP 模型上相比如何？
 
@@ -76,4 +76,4 @@
 
 ## 怎么更新？
 
-MLX Core 应用通过检查 GitHub releases 源自动更新。CLI：`brew upgrade --cask mlx-core` 或 `brew upgrade mlx-serve`。
+MLX Core 应用通过检查 GitHub releases 源自动更新。CLI：`brew upgrade --cask mlx-serve` 或 `brew upgrade mlx-serve`。

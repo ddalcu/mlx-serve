@@ -125,10 +125,10 @@ struct MusicGenView: View {
         .sheet(item: $rewriteKind) { kind in
             PromptRewriteSheet(
                 title: kind == .style ? "Rewrite style prompt" : "Rewrite lyrics",
-                request: MusicPromptRewriter.request(
+                request: { _ in MusicPromptRewriter.request(
                     kind, text: kind == .style ? prompt : lyrics, family: model.family,
                     other: kind == .style ? lyrics : prompt,
-                    instrumental: instrumental, language: vocalLanguage),
+                    instrumental: instrumental, language: vocalLanguage) },
                 onApply: { if kind == .style { prompt = $0 } else { lyrics = $0 } })
             .environmentObject(appState)
         }
@@ -203,7 +203,7 @@ struct MusicGenView: View {
             HStack(spacing: 8) {
                 Text("Style prompt").font(.app(.headline).weight(.semibold))
                 Spacer()
-                rewriteButton(.style, text: prompt)
+                PromptEnhanceButton(disabled: prompt.isBlank) { rewriteKind = .style }
                 styleExamplesMenu
             }
             TextEditor(text: $prompt)
@@ -233,7 +233,7 @@ struct MusicGenView: View {
                           ? "Asks for a track with no singing. This model has no dedicated instrumental switch, so it is requested in text — it may still add wordless vocals."
                           : "Generate music with no singing. The lyrics below are not used."))
                 Spacer()
-                rewriteButton(.lyrics, text: lyrics)
+                PromptEnhanceButton(disabled: lyrics.isBlank || instrumental) { rewriteKind = .lyrics }
                 lyricsExamplesMenu
             }
             if instrumental {
@@ -985,25 +985,6 @@ struct MusicGenView: View {
 
     // MARK: - Examples
 
-    /// The wand: asks the chat model to rewrite the field like the current
-    /// family's examples. Disabled until there is something to rewrite.
-    private func rewriteButton(_ kind: MusicPromptRewriter.Kind, text: String) -> some View {
-        let off = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || (kind == .lyrics && instrumental)
-        return Button { rewriteKind = kind } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "wand.and.sparkles")
-                Text("Enhance…").font(.app(.body))
-            }
-            .modifier(PaneChip())
-        }
-        .buttonStyle(.plain)
-        .disabled(off)
-        // A `.plain` button over our own background does not dim itself.
-        .opacity(off ? 0.4 : 1)
-        .help("Rewrite with the chat model")
-    }
-
     /// Style-prompt Templates menu: Save current + your saved styles (with a
     /// Delete submenu) + the built-in genre starters.
     private var styleExamplesMenu: some View {
@@ -1125,80 +1106,5 @@ struct MusicGenView: View {
             return
         }
         service.generate(req, server: server, downloads: downloads)
-    }
-}
-
-// MARK: - Rewrite with LLM
-
-/// The wand sheet: streams the chat model's rewrite into an editable box;
-/// Apply hands the edited text back, Try again re-asks, Cancel keeps the
-/// original untouched.
-struct PromptRewriteSheet: View {
-    let title: String
-    let request: MusicPromptRewriter.Request
-    let onApply: (String) -> Void
-    @EnvironmentObject var appState: AppState
-    @Environment(\.dismiss) private var dismiss
-
-    @State private var text: String = ""
-    @State private var isWriting = false
-    @State private var error: String? = nil
-    @State private var job: Task<Void, Never>? = nil
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(L10n.text(title)).font(.app(.headline))
-                Spacer()
-                if isWriting { ProgressView().controlSize(.small) }
-            }
-            TextEditor(text: $text)
-                .font(.app(.body))
-                .frame(minHeight: 220)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
-            if let error {
-                Text(error).font(.app(.caption)).foregroundStyle(.red)
-            } else {
-                Text("Edit the result, then Apply to replace your text.")
-                    .font(.app(.caption2)).foregroundStyle(.secondary)
-            }
-            HStack {
-                Button { start() } label: { Text("Try again")
-                    .font(.app(.body)) }.disabled(isWriting)
-                Spacer()
-                Button { dismiss() } label: { Text("Cancel")
-                    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
-                Button { onApply(text); dismiss() } label: { Text("Apply")
-                    .font(.app(.body)) }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(isWriting || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-        }
-        .padding(16)
-        .frame(width: 520)
-        .onAppear { start() }
-        .onDisappear { job?.cancel() }
-    }
-
-    private func start() {
-        job?.cancel()
-        text = ""
-        error = nil
-        isWriting = true
-        job = Task {
-            defer { isWriting = false }
-            do {
-                let stream = try await AgentComposer.stream(userText: request.user, systemPrompt: request.system,
-                                                            appState: appState, maxTokens: 1024)
-                for try await delta in stream {
-                    if Task.isCancelled { return }
-                    text += delta
-                }
-                text = MusicPromptRewriter.clean(text)
-            } catch is CancellationError {
-            } catch {
-                self.error = error.localizedDescription
-            }
-        }
     }
 }

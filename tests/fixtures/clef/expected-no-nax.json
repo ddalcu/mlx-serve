@@ -1,0 +1,415 @@
+{
+  "clef-flash-4bit": {
+    "text": {
+      "model": "clef",
+      "answers": {
+        "refund": {
+          "type": "noul",
+          "noul": 0.97
+        },
+        "route": {
+          "type": "choice",
+          "choice": "support",
+          "confidence": 0.9367,
+          "probabilities": {
+            "sales": 0.0466,
+            "support": 0.9367,
+            "spam": 0.0166
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "score": 1.1367,
+          "confidence": 0.7081,
+          "legend": {
+            "0": "Routine",
+            "1": "Prompt attention",
+            "2": "Emergency"
+          },
+          "probabilities": {
+            "0": 0.0776,
+            "1": 0.7081,
+            "2": 0.2143
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 336,
+        "output_tokens": 0
+      }
+    },
+    "image": {
+      "model": "clef",
+      "answers": {
+        "robot": {
+          "type": "noul",
+          "noul": 0.9592
+        },
+        "subject": {
+          "type": "choice",
+          "choice": "robot",
+          "confidence": 0.9866,
+          "probabilities": {
+            "animal": 0.0067,
+            "robot": 0.9866,
+            "landscape": 0.0067
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 361,
+        "output_tokens": 0
+      }
+    },
+    "negative": {
+      "model": "clef",
+      "answers": {
+        "refund": {
+          "type": "noul",
+          "noul": 0.0073
+        },
+        "route": {
+          "type": "choice",
+          "choice": "sales",
+          "confidence": 0.8999,
+          "probabilities": {
+            "sales": 0.8999,
+            "support": 0.0582,
+            "spam": 0.0419
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "score": 0.1743,
+          "confidence": 0.8359,
+          "legend": {
+            "0": "Routine",
+            "1": "Prompt attention",
+            "2": "Emergency"
+          },
+          "probabilities": {
+            "0": 0.8359,
+            "1": 0.154,
+            "2": 0.0101
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 343,
+        "output_tokens": 0
+      }
+    }
+  },
+  "clef-flash-8bit": {
+    "text": {
+      "model": "clef",
+      "answers": {
+        "refund": {
+          "type": "noul",
+          "noul": 0.9677
+        },
+        "route": {
+          "type": "choice",
+          "choice": "support",
+          "confidence": 0.9329,
+          "probabilities": {
+            "sales": 0.051,
+            "support": 0.9329,
+            "spam": 0.0161
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "score": 1.0172,
+          "confidence": 0.7992,
+          "legend": {
+            "0": "Routine",
+            "1": "Prompt attention",
+            "2": "Emergency"
+          },
+          "probabilities": {
+            "0": 0.0918,
+            "1": 0.7992,
+            "2": 0.109
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 336,
+        "output_tokens": 0
+      }
+    },
+    "image": {
+      "model": "clef",
+      "answers": {
+        "robot": {
+          "type": "noul",
+          "noul": 0.9585
+        },
+        "subject": {
+          "type": "choice",
+          "choice": "robot",
+          "confidence": 0.9848,
+          "probabilities": {
+            "animal": 0.0077,
+            "robot": 0.9848,
+            "landscape": 0.0075
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 361,
+        "output_tokens": 0
+      }
+    },
+    "negative": {
+      "model": "clef",
+      "answers": {
+        "refund": {
+          "type": "noul",
+          "noul": 0.0078
+        },
+        "route": {
+          "type": "choice",
+          "choice": "sales",
+          "confidence": 0.9263,
+          "probabilities": {
+            "sales": 0.9263,
+            "support": 0.0451,
+            "spam": 0.0286
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "score": 0.222,
+          "confidence": 0.7859,
+          "legend": {
+            "0": "Routine",
+            "1": "Prompt attention",
+            "2": "Emergency"
+          },
+          "probabilities": {
+            "0": 0.7859,
+            "1": 0.2062,
+            "2": 0.0079
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 343,
+        "output_tokens": 0
+      }
+    }
+  },
+  "clef-4bit": {
+    "text": {
+      "model": "clef",
+      "answers": {
+        "refund": {
+          "type": "noul",
+          "noul": 0.9939
+        },
+        "route": {
+          "type": "choice",
+          "choice": "support",
+          "confidence": 0.984,
+          "probabilities": {
+            "sales": 0.0084,
+            "support": 0.984,
+            "spam": 0.0076
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "score": 1.2008,
+          "confidence": 0.7123,
+          "legend": {
+            "0": "Routine",
+            "1": "Prompt attention",
+            "2": "Emergency"
+          },
+          "probabilities": {
+            "0": 0.0435,
+            "1": 0.7123,
+            "2": 0.2442
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 336,
+        "output_tokens": 0
+      }
+    },
+    "image": {
+      "model": "clef",
+      "answers": {
+        "robot": {
+          "type": "noul",
+          "noul": 0.9939
+        },
+        "subject": {
+          "type": "choice",
+          "choice": "robot",
+          "confidence": 0.9869,
+          "probabilities": {
+            "animal": 0.0072,
+            "robot": 0.9869,
+            "landscape": 0.0059
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 361,
+        "output_tokens": 0
+      }
+    },
+    "negative": {
+      "model": "clef",
+      "answers": {
+        "refund": {
+          "type": "noul",
+          "noul": 0.0061
+        },
+        "route": {
+          "type": "choice",
+          "choice": "sales",
+          "confidence": 0.9754,
+          "probabilities": {
+            "sales": 0.9754,
+            "support": 0.0078,
+            "spam": 0.0168
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "score": 0.157,
+          "confidence": 0.8547,
+          "legend": {
+            "0": "Routine",
+            "1": "Prompt attention",
+            "2": "Emergency"
+          },
+          "probabilities": {
+            "0": 0.8547,
+            "1": 0.1337,
+            "2": 0.0117
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 343,
+        "output_tokens": 0
+      }
+    }
+  },
+  "clef-8bit": {
+    "image": {
+      "model": "clef",
+      "answers": {
+        "robot": {
+          "type": "noul",
+          "noul": 0.9941
+        },
+        "subject": {
+          "type": "choice",
+          "choice": "robot",
+          "confidence": 0.9899,
+          "probabilities": {
+            "animal": 0.0056,
+            "robot": 0.9899,
+            "landscape": 0.0045
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 361,
+        "output_tokens": 0
+      }
+    },
+    "negative": {
+      "model": "clef",
+      "answers": {
+        "refund": {
+          "type": "noul",
+          "noul": 0.005
+        },
+        "route": {
+          "type": "choice",
+          "choice": "sales",
+          "confidence": 0.9828,
+          "probabilities": {
+            "sales": 0.9828,
+            "support": 0.006,
+            "spam": 0.0112
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "score": 0.0777,
+          "confidence": 0.9307,
+          "legend": {
+            "0": "Routine",
+            "1": "Prompt attention",
+            "2": "Emergency"
+          },
+          "probabilities": {
+            "0": 0.9307,
+            "1": 0.0609,
+            "2": 0.0084
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 343,
+        "output_tokens": 0
+      }
+    },
+    "text": {
+      "model": "clef",
+      "answers": {
+        "refund": {
+          "type": "noul",
+          "noul": 0.9944
+        },
+        "route": {
+          "type": "choice",
+          "choice": "support",
+          "confidence": 0.9765,
+          "probabilities": {
+            "sales": 0.0119,
+            "support": 0.9765,
+            "spam": 0.0115
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "score": 1.2735,
+          "confidence": 0.6237,
+          "legend": {
+            "0": "Routine",
+            "1": "Prompt attention",
+            "2": "Emergency"
+          },
+          "probabilities": {
+            "0": 0.0514,
+            "1": 0.6237,
+            "2": 0.3249
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 336,
+        "output_tokens": 0
+      }
+    }
+  },
+  "_reference": {
+    "mlx": "0.32.3",
+    "mlx_vlm": "0.7.4",
+    "loader": "mlx-community/clef-flash-8bit/clef_mlx.py",
+    "metal": "MLX_METAL_NO_NAX",
+    "text": "request.json",
+    "image": "image-request.json with ../robot.png",
+    "negative": "negative-request.json"
+  }
+}

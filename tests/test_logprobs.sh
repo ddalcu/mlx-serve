@@ -91,6 +91,7 @@ def entries_ok(label, content):
 print("── [1/8] chat non-streaming ──")
 r = post("/v1/chat/completions", {**REQ, "stream": False})
 ns = (r["choices"][0].get("logprobs") or {}).get("content") or []
+chat_text = r["choices"][0]["message"].get("content") or ""
 ck("[non-stream] logprobs present", bool(ns), f"got {r['choices'][0].get('logprobs')}")
 if ns:
     entries_ok("non-stream", ns)
@@ -169,6 +170,33 @@ if st:
     ck("[stream] tokens match non-streaming", not tok_mismatch, f"{tok_mismatch[:5]}")
     lp_mismatch = [i for i in range(n) if abs(st[i]["logprob"] - ns[i]["logprob"]) > 1e-6]
     ck("[stream] logprob VALUES match non-streaming", not lp_mismatch, f"{lp_mismatch[:5]}")
+
+print("── [4b] STREAMING + a stop string: entries never run ahead of the delivered content ──")
+# A stop string that spans several tokens makes the stream HOLD a token's tail until the
+# next token decides it; the held token's logprob entry must wait with its bytes.
+if len(chat_text) < 24:
+    ck("[stream+stop] reference answer long enough to carve a stop string from", False, repr(chat_text))
+else:
+    stop = chat_text[len(chat_text) // 3:][:7]
+    resp = post("/v1/chat/completions", {**REQ, "stream": True, "stop": [stop]}, stream=True)
+    text, toks, ahead = "", "", []
+    for raw in resp:
+        line = raw.decode().strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        for ch in json.loads(line[6:]).get("choices", []):
+            text += (ch.get("delta") or {}).get("content") or ""
+            toks += "".join(e["token"] for e in ((ch.get("logprobs") or {}).get("content") or []))
+            if not text.startswith(toks):
+                ahead.append((toks[-20:], text[-20:]))
+    ck("[stream+stop] entries never run ahead of the content", not ahead, f"{ahead[:2]}")
+    # The cut lands INSIDE a token: that token's bytes before the cut ship, its entry (for a
+    # token the client never saw whole) does not.
+    ck("[stream+stop] entries describe the delivered content",
+       text.startswith(toks) and len(text.encode()) - len(toks.encode()) <= 16,
+       f"entries {toks[-30:]!r} vs content {text[-30:]!r}")
+    ck("[stream+stop] the stop string never reached the client", stop not in text, repr(stop))
+
 
 print("── [5/8] STREAMING /v1/completions carries the legacy shape ──")
 CREQ = {"model": MODEL, "prompt": "Count from one to five:", "max_tokens": 24,

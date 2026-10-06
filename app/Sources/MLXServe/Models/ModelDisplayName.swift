@@ -25,7 +25,7 @@ enum ModelDisplayName {
         "hunyuan": "Hunyuan", "nemotron": "Nemotron", "phi": "Phi",
         "lfm": "LFM", "flux": "FLUX", "krea": "Krea", "acestep": "ACE-Step",
         "minimax": "MiniMax", "inkling": "Inkling", "bge": "BGE",
-        "mxbai": "MxBai", "embeddinggemma": "EmbeddingGemma", "laya": "Laya", "kev": "Kev",
+        "mxbai": "MxBai", "embeddinggemma": "EmbeddingGemma", "laya": "Laya", "kev": "Kev", "clef": "Clef", "mimo": "MiMo", "glm": "GLM",
     ]
 
     /// The readable name.

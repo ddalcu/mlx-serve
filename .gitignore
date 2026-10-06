@@ -1,7 +1,7 @@
 .zig-cache/
 zig-out/
 
-# Pinned Zig nightly, staged at build time by scripts/fetch-zig.sh (not vendored)
+# Pinned Zig release, staged at build time by scripts/fetch-zig.sh (not vendored)
 /.zig-toolchain
 # .claude stays private (settings.local.json, locks) EXCEPT checked-in project skills
 .claude/*
@@ -94,3 +94,5 @@ tests/soak_log.csv
 
 # Agent eval runs (tests/agent_eval): projects, sessions, frames, verdicts
 /tests/agent_eval/out/
+runs/*
+data

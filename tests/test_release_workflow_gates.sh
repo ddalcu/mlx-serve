@@ -372,7 +372,7 @@ check(checkout.get("with", {}).get("ref") == "main",
       "formula commit lands on main, not the release tag checkout")
 
 bruns = " ".join(str(s.get("run", "")) for s in bsteps)
-for f in ("Formula/mlx-serve.rb", "Casks/mlx-core.rb"):
+for f in ("Formula/mlx-serve.rb", "Casks/mlx-serve.rb"):
     check(f in bruns, f"homebrew.yml updates {f}")
 
 sys.exit(FAIL)

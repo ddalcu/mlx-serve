@@ -313,7 +313,7 @@ struct AgentCapabilities: Codable, Equatable, Sendable {
     static let loopTools: Set<AgentToolKind> = [
         .shell, .cwd, .readFile, .writeFile, .editFile, .searchFiles, .listFiles,
         .saveMemory, .createTask, .listProcesses, .readProcessOutput, .killProcess,
-        .generateImage, .generateSpeech, .generateMusic, .generateVideo,
+        .generateImage, .generateSpeech, .generateMusic, .generateSound, .generateVideo,
     ]
 
     static let webTools: Set<AgentToolKind> = [.browse, .webSearch]

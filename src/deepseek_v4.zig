@@ -8569,7 +8569,7 @@ pub const DsparkProfile = struct {
     }
 };
 
-/// Monotonic phase clock (this Zig nightly has no std.time.Timer — the
+/// Monotonic phase clock (Zig 0.17 has no std.time.Timer — the
 /// transformer.zig ProfClock pattern).
 const DsparkClock = struct {
     io: std.Io,

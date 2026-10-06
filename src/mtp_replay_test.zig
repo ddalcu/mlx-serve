@@ -61,11 +61,15 @@ pub const Corpus = struct {
     echo: []Request = &.{},
 
     pub fn load(gpa: std.mem.Allocator) !Corpus {
+        return loadText(gpa, @embedFile("fixtures/mtp_accept_traces.txt"));
+    }
+
+    pub fn loadText(gpa: std.mem.Allocator, text: []const u8) !Corpus {
         var self = Corpus{ .arena = std.heap.ArenaAllocator.init(gpa) };
         errdefer self.arena.deinit();
         const a = self.arena.allocator();
         var lists: [3]std.ArrayList(Request) = .{ .empty, .empty, .empty };
-        var lines = std.mem.tokenizeScalar(u8, @embedFile("fixtures/mtp_accept_traces.txt"), '\n');
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
         var id: u32 = 0;
         while (lines.next()) |line| {
             if (line[0] == '#') continue;
@@ -102,6 +106,10 @@ pub const Machine = struct {
 
 /// M4 Max, Qwen3.8-27B 4-bit, short context: decode window / rounds under forced depth.
 pub const M4_MAX_27B = Machine{ .round_ms = .{ 0, 36.71, 41.87, 48.57, 56.06, 63.77, 77.31 }, .sync_ms = 6.5 };
+
+/// M5 Ultra, Jundot Qwen3.8-Flash-Next-oQ4e-mtp, short context: `[spec-stats] round_ms` under
+/// forced depth, code prompts, median per depth. Sync is the measured chunk-boundary read.
+pub const M5_ULTRA_FLASH_NEXT_OQ4E = Machine{ .round_ms = .{ 0, 13.52, 15.64, 17.63, 19.95, 22.13, 24.50 }, .sync_ms = 1.7 };
 
 /// What a policy asks of one round: draft `m_lo`; when `m_hi > m_lo` the round pays the
 /// confidence sync and extends to `m_hi` iff chunk A landed whole (the recorded traces carry
@@ -361,5 +369,25 @@ test "mtp replay: the shipped depth policy stays near the best fixed depth on ev
         try testing.expectEqual(@as(u32, 0), r.sync_rounds);
         try testing.expect(r.tok_s >= c.floor * o.tok_s);
         try testing.expect(r.tok_s >= l.tok_s);
+    }
+}
+
+test "mtp replay: the Flash Next oQ4e pack's cost profile stays near the best fixed depth on its own traces" {
+    var corpus = try Corpus.loadText(testing.allocator, @embedFile("fixtures/mtp_accept_traces_flash_next.txt"));
+    defer corpus.deinit();
+    const m = M5_ULTRA_FLASH_NEXT_OQ4E;
+    for ([_]struct { name: []const u8, reqs: []const Request, floor: f32 }{
+        .{ .name = "code", .reqs = corpus.code, .floor = 0.99 },
+        .{ .name = "prose", .reqs = corpus.prose, .floor = 0.98 },
+    }) |c| {
+        const o = oracleFixed(c.reqs, m);
+        // The profile `qwen4G17CostProfileForFingerprint` picks for this pack, and the generic one.
+        var q4 = Controller{ .costs = Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS };
+        const r = replay(&q4, c.reqs, m);
+        var generic = Controller{};
+        const g = replay(&generic, c.reqs, m);
+        report("{s}: oracle d{d} {d:.2} | qwen4_q4 {d:.2} ({d:.1}%) depths {any} | generic {d:.2} ({d:.1}%)\n", .{ c.name, o.depth, o.tok_s, r.tok_s, 100.0 * r.tok_s / o.tok_s, r.depth_rounds[1..], g.tok_s, 100.0 * g.tok_s / o.tok_s });
+        try testing.expect(r.tok_s >= c.floor * o.tok_s);
+        try testing.expect(r.tok_s >= 0.995 * g.tok_s);
     }
 }

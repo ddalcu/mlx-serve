@@ -52,6 +52,8 @@ let supportedModelTypes: Set<String> = [
     "nemotron_h",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
+    "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
+    "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
@@ -90,6 +92,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
+    "stable_audio3", "clef",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -100,7 +103,7 @@ func isMediaModelType(_ modelType: String) -> Bool {
 /// Typed-decision models (`POST /v1/decisions`): the Use button opens the
 /// Decisions window instead of a create pane.
 func isDecisionModelType(_ modelType: String) -> Bool {
-    modelType == "laya" || modelType == "kev"
+    modelType == "laya" || modelType == "kev" || modelType == "clef"
 }
 
 /// Media architectures a **Discover search row** may offer as a download.
@@ -127,7 +130,7 @@ func discoverableMediaModelType(_ modelType: String) -> Bool {
 /// the same split, minus the running-server requirement (a browser row is a
 /// filesystem `LocalModel` with no capabilities).
 enum MediaModality: CaseIterable {
-    case image, voice, music, video, mesh
+    case image, voice, music, sound, video, mesh
 
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
@@ -137,6 +140,7 @@ enum MediaModality: CaseIterable {
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
         case "acestep", "minimax_music3": self = .music
+        case "stable_audio3": self = .sound
         case "AudioVideo", "minimax_h3": self = .video
         default: return nil
         }
@@ -147,7 +151,7 @@ enum MediaModality: CaseIterable {
     var experiment: GenExperiment {
         switch self {
         case .image: return .image
-        case .voice, .music: return .audio
+        case .voice, .music, .sound: return .audio
         case .video: return .video
         case .mesh: return .model3d
         }
@@ -158,6 +162,7 @@ enum MediaModality: CaseIterable {
         switch self {
         case .voice: return .voice
         case .music: return .music
+        case .sound: return .sound
         default: return nil
         }
     }
@@ -168,6 +173,7 @@ enum MediaModality: CaseIterable {
         case .image: return "Image Generation"
         case .voice: return "Voice"
         case .music: return "Music"
+        case .sound: return "Sound Effects"
         case .video: return "Video Generation"
         case .mesh: return "3D"
         }

@@ -356,6 +356,7 @@ class DownloadManager: ObservableObject {
         case "minimax_h3": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
+        case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
         default: return nil
         }
     }
@@ -364,9 +365,9 @@ class DownloadManager: ObservableObject {
     /// completeness marker is missing.
     nonisolated static func holdsCompleteMediaPack(_ dir: String) -> Bool {
         let fm = FileManager.default
-        guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("config.json")),
-              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let mt = cfg["model_type"] as? String,
+        let cfg = fm.contents(atPath: (dir as NSString).appendingPathComponent("config.json"))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        guard let mt = cfg?["model_type"] as? String ?? markerModelType(inDir: dir),
               let marker = requiredMediaMarker(modelType: mt) else { return true }
         return fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker))
     }
@@ -380,11 +381,26 @@ class DownloadManager: ObservableObject {
     /// `model_discovery.peekKevPack`.
     nonisolated static func markerModelType(inDir dir: String) -> String? {
         let fm = FileManager.default
+        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("joint_head_config.json")) { return "clef" }
         if layaMarkers.allSatisfy({ fm.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }) {
             return "laya"
         }
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
+        if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
         return nil
+    }
+
+    /// A stable-audio-tools inpainting model conditioned on T5Gemma: the
+    /// Stable Audio 3 family as Stability publishes it. Twin of
+    /// `model_discovery.peekStableAudio3Config`.
+    nonisolated static func isStableAudio3Config(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              cfg["model_type"] as? String == "diffusion_cond_inpaint",
+              let model = cfg["model"] as? [String: Any],
+              let cond = model["conditioning"] as? [String: Any],
+              let configs = cond["configs"] as? [[String: Any]] else { return false }
+        return configs.contains { $0["type"] as? String == "t5gemma" }
     }
 
     /// File size in bytes, resolving symlinks first. Hugging Face snapshots

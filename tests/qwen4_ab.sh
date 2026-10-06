@@ -4,7 +4,7 @@
 #   tests/qwen4_ab.sh mtp <tag> [server flags...]     MTP vs serial per prompt, 3 reps interleaved, then MTP + plain concurrent
 #   tests/qwen4_ab.sh batched <tag> [server flags...] serial 3 reps per prompt, then 2-/4-stream prose + 2-stream 8.5k aggregate
 # Env: QWEN4_MODEL (pack), MLX_SERVE_BIN, QWEN4_AB_OUT (default ~/claude-tmp/qwen4-ab), QWEN4_AB_PORT.
-# Engine env (MLX_SERVE_MTP_TRACE, MLX_SERVE_MTP_FORCE_DEPTH, MLX_SERVE_HC_FUSED, ...) passes through to the server.
+# Engine env (MLX_SERVE_MTP_TRACE, MLX_SERVE_HC_FUSED, ...) passes through to the server; --mtp-min-depth/--mtp-max-depth ride the server flags.
 setopt nonomatch
 mode=$1; tag=$2; shift 2
 D=${0:A:h}/fixtures/qwen4_ab

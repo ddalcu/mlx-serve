@@ -1,0 +1,9 @@
+{
+  "model": "clef",
+  "state": {"customer": "Alice", "message": "My order arrived broken. Please refund it.", "order_total": 49.95},
+  "questions": {
+    "refund": {"type": "noul", "instructions": "Does the customer request a refund?"},
+    "route": {"type": "choice", "instructions": "Choose the correct team.", "criteria": {"sales": "New purchases", "support": "Problems with existing orders", "spam": "Unsolicited advertising"}},
+    "urgency": {"type": "score", "instructions": "How urgently should this be handled?", "criteria": ["Routine", "Prompt attention", "Emergency"]}
+  }
+}

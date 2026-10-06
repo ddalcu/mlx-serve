@@ -113,7 +113,7 @@ struct ModelSettingsSheet: View {
         var n = isGguf ? 2 : 3
         if hasInt8PrefillRoute { n += 1 }
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
-        if rows.acceptance { n += 1 }
+        if rows.acceptance { n += 2 }
         if live?.loaded == true { n += 1 }
         if !isGguf { n += 2 + override.templateKwargs.count + (addingCustom ? 1 : 0) }
         return CGFloat(44 * n + 50)
@@ -214,6 +214,16 @@ struct ModelSettingsSheet: View {
                     Text("Default").tag("").font(.app(.body))
                     ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text(L10n.text($0.label)).tag($0.rawValue) }
                 }
+                }
+                if rows.acceptance {
+                Picker("MTP greedy tail", selection: Binding(
+                    get: { override.mtpGreedyTail.map { $0 ? 1 : 0 } ?? -1 },
+                    set: { override.mtpGreedyTail = $0 < 0 ? nil : $0 == 1 })) {
+                    Text("Default").font(.app(.body)).tag(-1)
+                    Text("On").font(.app(.body)).tag(1)
+                    Text("Off").font(.app(.body)).tag(0)
+                }
+                .help("Sampled requests draft only the first MTP token from the sampler and take the head's argmax after it. Pays with Typical acceptance.")
                 }
                 if hasInt8PrefillRoute {
                 Picker("Int8 prefill (lossy)", selection: Binding(
@@ -320,7 +330,7 @@ struct ModelSettingsSheet: View {
             let gemPath: String? = if case .gem(let g) = socket { downloads.gemPath(g, modelDir: request.path) } else { nil }
             socket.write(into: &override, gemPath: gemPath)
         }
-        if bindsDflash { override.mtpAcceptance = nil }
+        if bindsDflash { override.mtpAcceptance = nil; override.mtpGreedyTail = nil }
         var file = ModelSettingsFile.load()
         file.set(override, for: request.path)
         do {

@@ -39,7 +39,54 @@ pub const Progress = struct {
         const f = self.cancelled_cb orelse return false;
         return f(self.ctx);
     }
+    /// The per-step poll: gives chat its turn on the inference thread (when a
+    /// scheduler hook is installed), then reports whether the client left.
+    pub fn boundary(self: Progress) bool {
+        if (gen_yield) |y| y.step(y.ctx);
+        return self.cancelled();
+    }
 };
+
+/// The scheduler's chat turn while a media job owns the inference thread.
+pub const Yield = struct {
+    ctx: *anyopaque,
+    /// At a step boundary: run chat for its share of the step just finished.
+    step: *const fn (ctx: *anyopaque) void,
+    /// Serve chat until `done` is set; `wake` interrupts its idle wait.
+    serve_until: *const fn (ctx: *anyopaque, done: *const std.atomic.Value(bool)) void,
+    wake: *const fn (ctx: *anyopaque) void,
+};
+
+/// Installed by the scheduler around a media job, on the inference thread only.
+/// Thread-local rather than a `Progress` field so every wrapper that rebuilds a
+/// `Progress` (H3's chained windows, LTX's windows) keeps it.
+pub threadlocal var gen_yield: ?*const Yield = null;
+
+fn ReturnOf(comptime func: anytype) type {
+    return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+}
+
+/// Run a pure-CPU stage (zero MLX: it runs off the inference thread) on a worker
+/// thread while chat keeps the inference thread. Inline when no hook is installed.
+pub fn offload(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnOf(func) {
+    const y = gen_yield orelse return @call(.auto, func, args);
+    const Job = struct {
+        args: @TypeOf(args),
+        y: *const Yield,
+        result: ReturnOf(func) = undefined,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(j: *@This()) void {
+            j.result = @call(.auto, func, j.args);
+            j.done.store(true, .release);
+            j.y.wake(j.y.ctx);
+        }
+    };
+    var job = Job{ .args = args, .y = y };
+    const t = std.Thread.spawn(.{}, Job.run, .{&job}) catch return @call(.auto, func, args);
+    y.serve_until(y.ctx, &job.done);
+    t.join();
+    return job.result;
+}
 
 /// SSE response headers (no Content-Length — the body is an event stream).
 pub const headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
@@ -270,6 +317,64 @@ test "Progress.cancelled defaults false, reads the probe when set" {
     try std.testing.expect(!p.cancelled());
     h.flag = true;
     try std.testing.expect(p.cancelled());
+}
+
+test "Progress.boundary gives the installed scheduler hook its turn, then reports cancel" {
+    const H = struct {
+        steps: u32 = 0,
+        flag: bool = false,
+        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32) void {}
+        fn cancelCb(ctx: *anyopaque) bool {
+            return @as(*@This(), @ptrCast(@alignCast(ctx))).flag;
+        }
+        fn step(ctx: *anyopaque) void {
+            @as(*@This(), @ptrCast(@alignCast(ctx))).steps += 1;
+        }
+        fn serve(_: *anyopaque, _: *const std.atomic.Value(bool)) void {}
+        fn wake(_: *anyopaque) void {}
+    };
+    var h = H{};
+    const p = Progress{ .ctx = &h, .cb = H.emitCb, .cancelled_cb = H.cancelCb };
+    try std.testing.expect(!p.boundary()); // no hook: a plain cancel poll
+    try std.testing.expectEqual(@as(u32, 0), h.steps);
+
+    const y = Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
+    gen_yield = &y;
+    defer gen_yield = null;
+    try std.testing.expect(!p.boundary());
+    h.flag = true;
+    try std.testing.expect(p.boundary());
+    try std.testing.expectEqual(@as(u32, 2), h.steps);
+}
+
+test "offload runs a CPU stage on a worker while the hook serves, and returns its result" {
+    const H = struct {
+        served: u32 = 0,
+        fn step(_: *anyopaque) void {}
+        fn serve(ctx: *anyopaque, done: *const std.atomic.Value(bool)) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            while (!done.load(.acquire)) std.atomic.spinLoopHint();
+            self.served += 1;
+        }
+        fn wake(_: *anyopaque) void {}
+        fn work(a: u32, b: u32) error{Odd}!struct { sum: u32, tid: std.Thread.Id } {
+            if ((a + b) % 2 == 1) return error.Odd;
+            return .{ .sum = a + b, .tid = std.Thread.getCurrentId() };
+        }
+    };
+    const me = std.Thread.getCurrentId();
+    const inline_r = try offload(H.work, .{ 2, 4 }); // no hook: inline
+    try std.testing.expectEqual(me, inline_r.tid);
+
+    var h = H{};
+    const y = Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
+    gen_yield = &y;
+    defer gen_yield = null;
+    const r = try offload(H.work, .{ 3, 5 });
+    try std.testing.expectEqual(@as(u32, 8), r.sum);
+    try std.testing.expect(r.tid != me);
+    try std.testing.expectError(error.Odd, offload(H.work, .{ 1, 2 }));
+    try std.testing.expectEqual(@as(u32, 2), h.served);
 }
 
 test "a NON-streaming job still gets a cancellation probe, and writes no SSE" {

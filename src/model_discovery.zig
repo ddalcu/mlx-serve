@@ -41,8 +41,8 @@ const supported_model_types = [_][]const u8{
     "qwen3_5_text",     "qwen3_5_moe",
     "qwen3_5_moe_text", "qwen3_moe",
     "qwen3_moe_text",   "qwen3_next",
-    "qwen4_exp",        "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
-    "llama",            "mistral",
+    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
+    "llama",     "mistral",
     "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
     "nemotron_h",
     "bert",
@@ -54,9 +54,12 @@ const supported_model_types = [_][]const u8{
     "muse_glimmer_text",
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
+    "mimo_v2", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout)
+    "mimo_v2_flash", // MiMo-V2-Flash, and TensorFold's label for V2.6 packs
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
+    "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -82,6 +85,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
     // ACE-Step: the text encoder is a subdir a partial pull can miss.
     if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
+    // Stable Audio 3: same, for its T5Gemma subdir.
+    if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
     return null;
 }
 
@@ -97,8 +102,10 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "stable_audio3") or
         std.mem.eql(u8, model_type, "laya") or
         std.mem.eql(u8, model_type, "kev") or
+        std.mem.eql(u8, model_type, "clef") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -147,6 +154,7 @@ const ConfigPeek = union(enum) {
 fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_name: []const u8) ConfigPeek {
     var sub = dir.openDir(io, entry_name, .{}) catch return .missing_or_unparseable;
     defer sub.close(io);
+    if (peekClefPack(io, sub)) return .{ .supported = allocator.dupe(u8, "clef") catch return .missing_or_unparseable };
     // A Kev pack carries its base model's config.json (qwen3_5): the marker must win before it is read.
     if (peekKevPack(io, sub)) return .{ .supported = allocator.dupe(u8, "kev") catch return .missing_or_unparseable };
     var file = sub.openFile(io, "config.json", .{}) catch {
@@ -169,6 +177,9 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // (the 2.0 family's "QwenImagePipeline" is a different architecture).
         if (peekQwenImage21Index(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "qwen_image21") catch return .missing_or_unparseable };
+        // …and a Stable Audio 3 repo: stable-audio-tools' model_config.json.
+        if (peekStableAudio3Config(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "stable_audio3") catch return .missing_or_unparseable };
         return .missing_or_unparseable;
     };
     defer file.close(io);
@@ -221,6 +232,11 @@ pub fn peekKevPack(io: std.Io, sub: std.Io.Dir) bool {
     return st.kind == .file;
 }
 
+pub fn peekClefPack(io: std.Io, sub: std.Io.Dir) bool {
+    const st = sub.statFile(io, "joint_head_config.json", .{}) catch return false;
+    return st.kind == .file;
+}
+
 /// True when `sub` holds a Laya typed-decision checkpoint (no root config.json;
 /// identified by the two configs every Laya export carries). Twin of
 /// gen.isLayaRepo, which delegates here.
@@ -265,6 +281,35 @@ pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.I
     if (parsed.value != .object) return false;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "QwenImage21Pipeline");
+}
+
+/// True when `sub/model_config.json` is a stable-audio-tools inpainting
+/// diffusion model conditioned on T5Gemma: the Stable Audio 3 family as
+/// Stability publishes it. Twin of gen.isStableAudio3Repo, which delegates here.
+pub fn peekStableAudio3Config(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "model_config.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const mt = parsed.value.object.get("model_type") orelse return false;
+    if (mt != .string or !std.mem.eql(u8, mt.string, "diffusion_cond_inpaint")) return false;
+    var cur = parsed.value;
+    for ([_][]const u8{ "model", "conditioning", "configs" }) |k| {
+        if (cur != .object) return false;
+        cur = cur.object.get(k) orelse return false;
+    }
+    if (cur != .array) return false;
+    for (cur.array.items) |c| {
+        if (c != .object) continue;
+        const t = c.object.get("type") orelse continue;
+        if (t == .string and std.mem.eql(u8, t.string, "t5gemma")) return true;
+    }
+    return false;
 }
 
 /// The FLUX.2 DiT's shared-modulation tensor. Unique to this architecture —
@@ -535,7 +580,7 @@ pub const ModelKind = enum {
     pub fn genEndpoint(self: ModelKind) ?[]const u8 {
         return switch (self) {
             .image => "/v1/images/generations",
-            .audio => "/v1/audio/speech (TTS) or /v1/audio/music-generations (music)",
+            .audio => "/v1/audio/speech (TTS), /v1/audio/music-generations (music) or /v1/audio/sound-generations (sound effects)",
             .video => "/v1/video/generations",
             .mesh => "/v1/3d/generations",
             .decision => "/v1/decisions",
@@ -556,10 +601,11 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
-        std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
+        std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev")) return .decision;
+    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef")) return .decision;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
@@ -916,7 +962,8 @@ fn tryAddModel(
             !peekMageFlowIndex(io, allocator, sub) and
             !peekMfluxFlux2(io, allocator, sub) and
             !peekLayaCheckpoint(io, sub) and
-            !peekQwenImage21Index(io, allocator, sub)) return false;
+            !peekQwenImage21Index(io, allocator, sub) and
+            !peekStableAudio3Config(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
@@ -1325,6 +1372,12 @@ test "mage_flow classifies as image media (modelKind + isMediaModelType)" {
     try testing.expect(!isMediaModelType("gemma4"));
 }
 
+test "the audio kind names every audio generation endpoint" {
+    const ep = ModelKind.audio.genEndpoint().?;
+    for ([_][]const u8{ "/v1/audio/speech", "/v1/audio/music-generations", "/v1/audio/sound-generations" }) |p|
+        try testing.expect(std.mem.indexOf(u8, ep, p) != null);
+}
+
 test "minimax_music3 classifies as audio media with the vocoder marker" {
     try testing.expect(isMediaModelType("minimax_music3"));
     try testing.expectEqual(ModelKind.audio, modelKindFromType("minimax_music3"));
@@ -1589,6 +1642,37 @@ test "discoverModels finds a Qwen-Image-2.1 repo (model_index.json, no root conf
     try testing.expectEqual(@as(usize, 1), result.models.len);
     try testing.expectEqualStrings("mlx-community/Qwen-Image-2.1-MLX-4bit", result.models[0].id);
     try testing.expectEqualStrings("qwen_image21", result.models[0].model_type);
+}
+
+test "discoverModels finds a Stable Audio 3 repo (model_config.json, no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The official stabilityai repo as published: stable-audio-tools'
+    // model_config.json is the only marker; the T5Gemma subdir is the pack's
+    // completion marker. A stable-audio-tools model on another conditioner
+    // (T5-base: Stable Audio Open) is a different pipeline and stays invisible.
+    const sa3_config = "{\"model_type\":\"diffusion_cond_inpaint\",\"model\":{\"conditioning\":{\"configs\":[{\"id\":\"prompt\",\"type\":\"t5gemma\"}]}}}";
+    try tmp.dir.createDirPath(io, "stabilityai/stable-audio-3-small-sfx/t5gemma-b-b-ul2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-3-small-sfx/model_config.json", .data = sa3_config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-3-small-sfx/model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-3-small-sfx/t5gemma-b-b-ul2/model.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "stabilityai/half-pulled-sfx");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/half-pulled-sfx/model_config.json", .data = sa3_config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/half-pulled-sfx/model.safetensors", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "stabilityai/stable-audio-open-1.0");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-open-1.0/model_config.json", .data = "{\"model_type\":\"diffusion_cond\",\"model\":{\"conditioning\":{\"configs\":[{\"id\":\"prompt\",\"type\":\"t5\"}]}}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-open-1.0/model.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("stabilityai/stable-audio-3-small-sfx", result.models[0].id);
+    try testing.expectEqualStrings("stable_audio3", result.models[0].model_type);
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("stable_audio3"));
 }
 
 test "discoverModels finds an mflux FLUX.2 repo (no root config.json)" {
@@ -1974,6 +2058,13 @@ test "isSupportedModelType accepts native media archs (image/audio/video)" {
     try testing.expect(!isMediaModelType("gemma4"));
 }
 
+test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
+    // A served arch missing here is invisible to the picker, and a chat naming
+    // its path is answered 404 instead of cold-loading it.
+    try testing.expect(isSupportedModelType("glm5_next"));
+    try testing.expect(isSupportedModelType("glm5_next_text"));
+}
+
 test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
     // Regression for "[discovery] skip ...: unsupported model_type
     // 'gemma3_text'": text-only Gemma 3 abliterated checkpoints
@@ -2228,6 +2319,27 @@ test "config discovery tolerates invalid roots and oversized metadata" {
     for ([_][]const u8{ "[]", "null", "false", "17", "\"bad\"", "[{}]" }) |content| {
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = content });
         try testing.expect(peekConfig(io, allocator, tmp.dir, ".") == .missing_or_unparseable);
+    }
+}
+
+test "clef: the joint head identifies a decision pack before its Qwen config" {
+    const io = testing.io;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "clef-4bit", "clef-8bit", "clef-flash-4bit", "clef-flash-8bit" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        var dir = try tmp.dir.openDir(io, name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"qwen3_5\"}" });
+        try dir.writeFile(io, .{ .sub_path = "joint_head_config.json", .data = "{\"hidden_size\":4096,\"width\":1024,\"routing_layers\":2,\"layers\":4,\"heads\":16,\"feedforward\":4096}" });
+        try dir.writeFile(io, .{ .sub_path = "joint_head.safetensors", .data = "head" });
+        const peek = peekConfig(io, a, tmp.dir, name);
+        defer if (peek == .supported) a.free(peek.supported);
+        try testing.expect(peek == .supported);
+        try testing.expectEqualStrings("clef", peek.supported);
+        try testing.expectEqual(ModelKind.decision, modelKindFromType(peek.supported));
+        try testing.expect(isMediaModelType(peek.supported));
     }
 }
 

@@ -40,6 +40,9 @@ const LATENCY_BOUNDS_NS: [10]u64 = .{
 /// 8 token-count buckets: 32 → 8 192 (raw integers, no scaling).
 const TOKEN_BOUNDS: [8]u64 = .{ 32, 128, 256, 512, 1024, 2048, 4096, 8192 };
 
+/// How a request that owned a slot ended.
+pub const Outcome = enum { success, cancelled, failed };
+
 // ---------------------------------------------------------------------------
 // Metrics — the single global struct allocated when --metrics is on
 // ---------------------------------------------------------------------------
@@ -74,6 +77,8 @@ pub const Metrics = struct {
     generation_tokens_total: Counter,
     requests_success_total: Counter,
     requests_cancelled_total: Counter,
+    requests_failed_total: Counter,
+    requests_rejected_total: Counter,
     prefix_cache_queries_total: Counter,
     prefix_cache_hits_total: Counter,
 
@@ -82,6 +87,7 @@ pub const Metrics = struct {
     requests_waiting: Gauge,
     gpu_utilization_pct: Gauge, // 0–100
     memory_mb: Gauge, // megabytes (phys_footprint)
+    process_start_time_seconds: Gauge, // unix seconds, set once at startup
     // Real-time throughput source: completed generation tokens PLUS tokens
     // generated so far by in-flight slots. The sampler thread sets this from
     // `generation_tokens_total` plus the scheduler's `inflight_generated_tokens`
@@ -139,12 +145,15 @@ pub const Metrics = struct {
             .generation_tokens_total = Counter.init(),
             .requests_success_total = Counter.init(),
             .requests_cancelled_total = Counter.init(),
+            .requests_failed_total = Counter.init(),
+            .requests_rejected_total = Counter.init(),
             .prefix_cache_queries_total = Counter.init(),
             .prefix_cache_hits_total = Counter.init(),
             .requests_running = Gauge.init(),
             .requests_waiting = Gauge.init(),
             .gpu_utilization_pct = Gauge.init(),
             .memory_mb = Gauge.init(),
+            .process_start_time_seconds = Gauge.init(),
             .generation_tokens_live = Gauge.init(),
             .prefill_tokens_live = Gauge.init(),
             .prefill_tokens_expected = Gauge.init(),
@@ -159,18 +168,20 @@ pub const Metrics = struct {
         };
     }
 
-    /// Record per-request metrics at slot completion.
-    /// Called exactly once per request from the `finishSlot` funnel.
+    /// A request refused before it owned a slot (context overflow, memory preflight).
+    pub fn recordRejected(self: *Metrics) void {
+        self.requests_rejected_total.inc();
+    }
+
+    /// Record per-request metrics once per request that owned a slot.
     ///
-    /// On success ("stop" | "length" | "tool_calls"): updates all latency
-    /// histograms, token histograms, and counters.
+    /// `.success`: updates all latency histograms, token histograms, and counters.
     ///
-    /// On cancel ("cancelled"): only increments `requests_cancelled_total`.
-    /// Latency histograms are NOT touched — a cancelled slot's decode_ns is
-    /// zero or garbage and would poison the distribution.
+    /// `.cancelled`: only increments `requests_cancelled_total`. Latency
+    /// histograms are NOT touched: a cancelled slot's decode_ns is zero or
+    /// garbage and would poison the distribution.
     ///
-    /// Other reasons (Zig error names from markError): silently ignored for
-    /// now; these are rare and already visible in --log-level warn output.
+    /// `.failed`: only increments `requests_failed_total`, histograms untouched.
     ///
     /// Parameters:
     ///   - `real_ttft_ns`: time from request arrival (Slot.init, pre-queue-wait)
@@ -183,7 +194,7 @@ pub const Metrics = struct {
     ///   - e2e latency = real_ttft_ns + decode_ns (= queue_wait + prefill + decode).
     pub fn recordRequest(
         self: *Metrics,
-        finish_reason: []const u8,
+        outcome: Outcome,
         real_ttft_ns: u64,
         prefill_ns: u64,
         decode_ns: u64,
@@ -195,15 +206,16 @@ pub const Metrics = struct {
         self.prefix_cache_queries_total.inc();
         if (cached_tokens > 0) self.prefix_cache_hits_total.inc();
 
-        const is_success = std.mem.eql(u8, finish_reason, "stop") or
-            std.mem.eql(u8, finish_reason, "length") or
-            std.mem.eql(u8, finish_reason, "tool_calls");
-
-        if (!is_success) {
-            if (std.mem.eql(u8, finish_reason, "cancelled"))
+        switch (outcome) {
+            .success => {},
+            .cancelled => {
                 self.requests_cancelled_total.inc();
-            // Error reasons (OOM, etc.) are rare; logged by the scheduler.
-            return;
+                return;
+            },
+            .failed => {
+                self.requests_failed_total.inc();
+                return;
+            },
         }
 
         // Success path — record all instrumented metrics.
@@ -253,6 +265,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeCounter(w, "vllm:generation_tokens_total", "Total generated tokens", m.generation_tokens_total.load());
     try writeCounter(w, "vllm:request_success_total", "Completed requests", m.requests_success_total.load());
     try writeCounter(w, "vllm:request_cancelled_total", "Requests cancelled by client disconnect", m.requests_cancelled_total.load());
+    try writeCounter(w, "mlx_serve:request_failed_total", "Requests that ended in a generation error", m.requests_failed_total.load());
+    try writeCounter(w, "mlx_serve:request_rejected_total", "Requests refused before a slot existed (context overflow, memory preflight)", m.requests_rejected_total.load());
     try writeCounter(w, "vllm:prefix_cache_queries_total", "Prefix cache lookup count", m.prefix_cache_queries_total.load());
     try writeCounter(w, "vllm:prefix_cache_hits_total", "Prefix cache hit count", m.prefix_cache_hits_total.load());
 
@@ -261,6 +275,7 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "vllm:num_requests_waiting", "Number of requests waiting in the queue", m.requests_waiting.load());
     try writeGauge(w, "mlx_serve:gpu_utilization_pct", "GPU utilization percentage (IOKit AGXAccelerator)", m.gpu_utilization_pct.load());
     try writeGauge(w, "mlx_serve:memory_mb", "Server physical memory footprint in megabytes (phys_footprint)", m.memory_mb.load());
+    try writeGauge(w, "mlx_serve:process_start_time_seconds", "Unix time the server process started; a change means a restart", m.process_start_time_seconds.load());
     try writeGauge(w, "mlx_serve:generation_tokens_live", "Generation tokens completed plus generated-so-far by in-flight slots (real-time tok/s source)", m.generation_tokens_live.load());
     try writeGauge(w, "mlx_serve:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
     try writeGauge(w, "mlx_serve:prefill_tokens_expected", "Total tokens the in-flight prefill will forward, post-cache tail on the same scale as prefill_tokens_live (0 when idle; the bar's real target)", m.prefill_tokens_expected.load());
@@ -294,6 +309,51 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 
 pub const MAX_SESSIONS = 32;
 
+/// Which agent sent a request; the only trace of the User-Agent that leaves the connection.
+/// Each token is the product a real client sends (claude-cli, opencode, codex_exec, omp); a client
+/// that sends a generic SDK header, such as pi's, is `other`.
+pub const Client = enum {
+    claude_code,
+    opencode,
+    codex,
+    omp,
+    other,
+
+    const max_user_agent = 256;
+    const products = [_]struct { []const u8, Client }{
+        .{ "claude-cli", .claude_code },
+        .{ "opencode", .opencode },
+        .{ "codex_exec", .codex },
+        .{ "omp", .omp },
+    };
+
+    /// Matches the product token before the first `/`, ignoring case.
+    pub fn fromUserAgent(ua: ?[]const u8) Client {
+        const text = ua orelse return .other;
+        if (text.len > max_user_agent) return .other;
+        const token = text[0 .. std.mem.indexOfScalar(u8, text, '/') orelse text.len];
+        for (products) |p| if (std.ascii.eqlIgnoreCase(token, p[0])) return p[1];
+        return .other;
+    }
+
+    pub fn label(self: Client) []const u8 {
+        return switch (self) {
+            .claude_code => "claude-code",
+            .opencode => "opencode",
+            .codex => "codex",
+            .omp => "omp",
+            .other => "other",
+        };
+    }
+};
+
+var request_counter = std.atomic.Value(u64).init(0);
+
+/// Process-wide request id: monotonic, never 0.
+pub fn nextRequestId() u64 {
+    return request_counter.fetchAdd(1, .monotonic) + 1;
+}
+
 /// One live request's context occupancy, published by the inference thread.
 /// `context_length` is the model's effective limit, filled at render time by the server.
 pub const Session = struct {
@@ -309,6 +369,9 @@ pub const Session = struct {
     context_length: u32 = 0,
     /// Hot-cache entry id: the entry a live row restored from, or a cached row's own; 0 = none.
     entry_id: u64 = 0,
+    /// Id of the live request this row describes; 0 for a cached row.
+    request_id: u64 = 0,
+    client: Client = .other,
 
     pub fn init(model_id: []const u8, phase: Phase, context_tokens: u32, cached_tokens: u32, generated_tokens: u32, state_bytes: u64) Session {
         var s: Session = .{
@@ -342,6 +405,8 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             "\"generation_tokens_total\":{d}," ++
             "\"requests_success_total\":{d}," ++
             "\"requests_cancelled_total\":{d}," ++
+            "\"requests_failed_total\":{d}," ++
+            "\"requests_rejected_total\":{d}," ++
             "\"prefix_cache_queries_total\":{d}," ++
             "\"prefix_cache_hits_total\":{d}" ++
             "}},\"gauges\":{{" ++
@@ -349,6 +414,7 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             "\"requests_waiting\":{d}," ++
             "\"gpu_utilization_pct\":{d}," ++
             "\"memory_mb\":{d}," ++
+            "\"process_start_time_seconds\":{d}," ++
             "\"generation_tokens_live\":{d}," ++
             "\"prefill_tokens_live\":{d}," ++
             "\"prefill_tokens_expected\":{d}," ++
@@ -367,12 +433,15 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             m.generation_tokens_total.load(),
             m.requests_success_total.load(),
             m.requests_cancelled_total.load(),
+            m.requests_failed_total.load(),
+            m.requests_rejected_total.load(),
             m.prefix_cache_queries_total.load(),
             m.prefix_cache_hits_total.load(),
             m.requests_running.load(),
             m.requests_waiting.load(),
             m.gpu_utilization_pct.load(),
             m.memory_mb.load(),
+            m.process_start_time_seconds.load(),
             m.generation_tokens_live.load(),
             m.prefill_tokens_live.load(),
             m.prefill_tokens_expected.load(),
@@ -410,8 +479,8 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
         if (i > 0) try w.print(",", .{});
         try w.print("{{\"model\":", .{});
         try std.json.Stringify.encodeJsonString(s.model(), .{}, w);
-        try w.print(",\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"state_bytes\":{d}}}", .{
-            @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.state_bytes,
+        try w.print(",\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"state_bytes\":{d},\"request_id\":{d},\"client\":\"{s}\"}}", .{
+            @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.state_bytes, s.request_id, s.client.label(),
         });
     }
     try w.print("]}}", .{});
@@ -612,7 +681,7 @@ test "prefill throughput must exclude cache-restored tokens" {
     // a 91% token-level cache hit rate reported 9.8K tok/s where the server's
     // own log line said ~220-1100. The panel needs the FORWARDED token count.
     var m = Metrics.init();
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900);
 
     // vLLM semantics preserved: every prompt token is billed.
     try testing.expectEqual(@as(u64, 1000), m.prompt_tokens_total.load());
@@ -627,12 +696,12 @@ test "prefill throughput must exclude cache-restored tokens" {
     );
 
     // A cold request (no cache hit) forwards everything.
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 400, 10, 0);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 400, 10, 0);
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 900), m.prefix_cache_tokens_total.load());
 
     // Degenerate: cached >= prompt must saturate (restore 10, not 99) and never wrap.
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 10, 1, 99);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 10, 1, 99);
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 910), m.prefix_cache_tokens_total.load());
     // Invariant survives the saturation.
@@ -760,7 +829,7 @@ test "Metrics.recordRequest increments correct fields on success" {
     const testing = std.testing;
     var m = Metrics.init();
     // real_ttft=60ms (includes 10ms queue wait + 50ms prefill), prefill=50ms, decode=200ms
-    m.recordRequest("stop", 60_000_000, 50_000_000, 200_000_000, 128, 64, 20);
+    m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20);
 
     try testing.expectEqual(@as(u64, 1), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
@@ -787,7 +856,7 @@ test "Metrics.recordRequest increments correct fields on success" {
 test "Metrics.recordRequest skips histograms on cancelled request" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest("cancelled", 50_000_000, 50_000_000, 0, 128, 0, 0);
+    m.recordRequest(.cancelled, 50_000_000, 50_000_000, 0, 128, 0, 0);
 
     try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 1), m.requests_cancelled_total.load());
@@ -943,4 +1012,134 @@ test "renderJson lists each live session's context against its model's limit" {
     try testing.expectEqual(@as(i64, 1200), row.get("cached_tokens").?.integer);
     try testing.expectEqual(@as(i64, 200), row.get("generated_tokens").?.integer);
     try testing.expectEqual(@as(i64, 4096), row.get("state_bytes").?.integer);
+}
+
+test "Client.fromUserAgent maps known agents and nothing else" {
+    const C = Client;
+    const t = std.testing;
+    // Verbatim from the real clients' requests.
+    try t.expectEqual(C.claude_code, C.fromUserAgent("claude-cli/2.1.287 (external, sdk-cli)"));
+    try t.expectEqual(C.opencode, C.fromUserAgent("opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"));
+    try t.expectEqual(C.codex, C.fromUserAgent("codex_exec/0.159.3 (Mac OS 27.0.1; arm64) unknown (codex_exec; 0.159.3)"));
+    try t.expectEqual(C.omp, C.fromUserAgent("omp/18.4.9"));
+    // pi sends the OpenAI SDK's default header, which names no agent.
+    try t.expectEqual(C.other, C.fromUserAgent("OpenAI/JS 6.26.0"));
+    try t.expectEqual(C.other, C.fromUserAgent("pi/0.7.1"));
+    try t.expectEqual(C.claude_code, C.fromUserAgent("Claude-CLI/2.1.0"));
+    try t.expectEqual(C.opencode, C.fromUserAgent("OpenCode/1"));
+    try t.expectEqual(C.other, C.fromUserAgent(null));
+    try t.expectEqual(C.other, C.fromUserAgent(""));
+    try t.expectEqual(C.other, C.fromUserAgent("curl/8.7.1"));
+    try t.expectEqual(C.other, C.fromUserAgent("pixel/1.0"));
+    try t.expectEqual(C.other, C.fromUserAgent("Mozilla/5.0 claude-cli/2.1"));
+}
+
+test "Client.fromUserAgent rejects an oversized header" {
+    var big: [4096]u8 = undefined;
+    @memset(&big, 'a');
+    @memcpy(big[0.."claude-cli/".len], "claude-cli/");
+    try std.testing.expectEqual(Client.other, Client.fromUserAgent(&big));
+}
+
+test "renderJson sessions carry a distinct nonzero request_id and a fixed client label" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    var a = Session.init("m", .decode, 1, 0, 1, 0);
+    a.request_id = nextRequestId();
+    a.client = .claude_code;
+    var b = Session.init("m", .prefill, 1, 0, 0, 0);
+    b.request_id = nextRequestId();
+    b.client = .other;
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{ a, b }, &w);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w.end], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("sessions").?.array.items;
+    const ia = rows[0].object.get("request_id").?.integer;
+    const ib = rows[1].object.get("request_id").?.integer;
+    try testing.expect(ia != 0 and ib != 0 and ia != ib);
+    try testing.expectEqualStrings("claude-code", rows[0].object.get("client").?.string);
+    try testing.expectEqualStrings("other", rows[1].object.get("client").?.string);
+}
+
+test "the raw User-Agent text never reaches /metrics.json" {
+    var m = Metrics.init();
+    const ua = "claude-cli/9.9.9 (secret-host-marker)";
+    var s = Session.init("m", .decode, 1, 0, 1, 0);
+    s.client = .fromUserAgent(ua);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{s}, &w);
+    const out = buf[0..w.end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "secret-host-marker") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "9.9.9") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"client\":\"claude-code\"") != null);
+}
+
+test "process_start_time_seconds is exposed as a gauge in both feeds" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.process_start_time_seconds.set(1_790_000_000);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{}, &w);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w.end], .{});
+    defer parsed.deinit();
+    const g = parsed.value.object.get("gauges").?.object;
+    try testing.expectEqual(@as(i64, 1_790_000_000), g.get("process_start_time_seconds").?.integer);
+
+    var pbuf: [64 * 1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try renderPrometheus(&m, &pw);
+    try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "mlx_serve:process_start_time_seconds 1790000000") != null);
+}
+
+test "Metrics.recordRequest counts a failed request and leaves histograms and token counters alone" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRequest(.failed, 50_000_000, 50_000_000, 100_000_000, 128, 5, 0);
+
+    try testing.expectEqual(@as(u64, 1), m.requests_failed_total.load());
+    try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
+    try testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+}
+
+test "Metrics.recordRejected moves only the rejected counter" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRejected();
+    m.recordRejected();
+    try testing.expectEqual(@as(u64, 2), m.requests_rejected_total.load());
+    try testing.expectEqual(@as(u64, 0), m.requests_failed_total.load());
+    try testing.expectEqual(@as(u64, 0), m.prefix_cache_queries_total.load());
+}
+
+test "failed and rejected counters render under their Prometheus and JSON names" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRequest(.failed, 0, 0, 0, 1, 0, 0);
+    m.recordRejected();
+    m.recordRejected();
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderPrometheus(&m, &w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:request_failed_total 1\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:request_rejected_total 2\n") != null);
+
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &.{}, &jw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jbuf[0..jw.end], .{});
+    defer parsed.deinit();
+    const counters = parsed.value.object.get("counters").?.object;
+    try testing.expectEqual(@as(i64, 1), counters.get("requests_failed_total").?.integer);
+    try testing.expectEqual(@as(i64, 2), counters.get("requests_rejected_total").?.integer);
 }

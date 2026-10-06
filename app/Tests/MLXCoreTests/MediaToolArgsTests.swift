@@ -152,6 +152,19 @@ final class MediaToolArgsTests: XCTestCase {
 
     // MARK: - Music
 
+    func testSoundDurationIsClampedToThePreviewRange() throws {
+        XCTAssertEqual(MediaToolArgs.soundSeconds(nil), MediaChatDefaults.soundSeconds)
+        XCTAssertEqual(MediaToolArgs.soundSeconds("0.1"), 0.5)
+        XCTAssertEqual(MediaToolArgs.soundSeconds("4 seconds"), 4)
+        XCTAssertEqual(MediaToolArgs.soundSeconds("90"), 30)
+        XCTAssertThrowsError(try MediaToolArgs.sound([:], model: .stableAudio3SmallSFX, keepResident: false, lanId: nil))
+        let req = try MediaToolArgs.sound(["prompt": "rain", "duration_seconds": "2.5"], model: .stableAudio3SmallSFX,
+                                          keepResident: true, lanId: nil)
+        XCTAssertEqual(req.prompt, "rain")
+        XCTAssertEqual(req.durationSeconds, 2.5)
+        XCTAssertTrue(req.keepResident)
+    }
+
     func testMusicDurationIsClampedToTheServersRange() {
         XCTAssertEqual(MediaToolArgs.musicSeconds("1"), 10)
         XCTAssertEqual(MediaToolArgs.musicSeconds("9000"), 600)
@@ -414,11 +427,11 @@ final class MediaToolArgsTests: XCTestCase {
 
     // MARK: - Tool identities
 
-    func testTheFourMediaToolsAreAdvertisedAndGateable() {
+    func testTheMediaToolsAreAdvertisedAndGateable() {
         let declared = Set(AgentPrompt.toolDefinitions.compactMap {
             ($0["function"] as? [String: Any])?["name"] as? String
         })
-        for name in ["generate_image", "generate_speech", "generate_music", "generate_video"] {
+        for name in MediaKind.allCases.map(\.toolName) {
             XCTAssertTrue(declared.contains(name), "\(name) must be advertised")
             XCTAssertNotNil(AgentToolKind(rawValue: name), "\(name) must be gateable")
         }
@@ -426,13 +439,13 @@ final class MediaToolArgsTests: XCTestCase {
                        "generate_audio is ambiguous next to generate_music — it was split")
     }
 
-    func testMediaGroupHoldsAllFourTools() {
-        XCTAssertEqual(Set(AgentToolGroup.media.tools),
-                       [.generateImage, .generateSpeech, .generateMusic, .generateVideo])
+    func testMediaGroupHoldsEveryMediaTool() {
+        XCTAssertEqual(Set(AgentToolGroup.media.tools.map(\.rawValue)),
+                       Set(MediaKind.allCases.map(\.toolName)))
     }
 
     @MainActor
-    func testSwitchingMediaOffRemovesAllFourFromTheRequest() {
+    func testSwitchingMediaOffRemovesEveryMediaToolFromTheRequest() {
         // The composer's Tools ▸ Media rows are subtractive at the resolution
         // chokepoint; what the model is SENT has to follow, or it calls a tool
         // that dispatch will then refuse.
@@ -441,7 +454,7 @@ final class MediaToolArgsTests: XCTestCase {
         defaults.disabledTools = Set(AgentToolGroup.media.tools)
         let resolved = AgentResolution.resolve(agent: nil, defaults: defaults)
         let json = AgentPrompt.toolDefinitionsJSON(allowing: resolved.tools)
-        for name in ["generate_image", "generate_speech", "generate_music", "generate_video"] {
+        for name in MediaKind.allCases.map(\.toolName) {
             XCTAssertFalse(json.contains("\"\(name)\""), "\(name) survived Media being switched off")
             XCTAssertNotNil(AgentEngine.disallowedToolRefusal(name: name, allowed: resolved.tools),
                             "\(name) must also be refused at dispatch")

@@ -7,13 +7,8 @@ enum MusicPromptRewriter {
 
     enum Kind: String, Identifiable { case style, lyrics; var id: String { rawValue } }
 
-    struct Request: Equatable {
-        let system: String
-        let user: String
-    }
-
     static func request(_ kind: Kind, text: String, family: MusicEngineFamily,
-                        other: String, instrumental: Bool, language: String) -> Request {
+                        other: String, instrumental: Bool, language: String) -> PromptRewriter.Request {
         let lang = MusicOptions.languages.first { $0.code == language }?.label ?? language
         switch kind {
         case .style:
@@ -33,7 +28,7 @@ enum MusicPromptRewriter {
             if instrumental { user += "\n\nThe track is instrumental: no vocals." }
             let lyricsNote = other.trimmingCharacters(in: .whitespacesAndNewlines)
             if !lyricsNote.isEmpty, !instrumental { user += "\n\nIt will sing these lyrics (for mood and language):\n\(lyricsNote)" }
-            return Request(system: system, user: user)
+            return PromptRewriter.Request(system: system, user: user)
         case .lyrics:
             let examples = MusicPrompt.builtinLyrics.map(\.body).joined(separator: "\n\n---\n\n")
             let system = """
@@ -47,13 +42,7 @@ enum MusicPromptRewriter {
             var user = "Rewrite these lyrics in \(lang):\n\n\(text)"
             let style = other.trimmingCharacters(in: .whitespacesAndNewlines)
             if !style.isEmpty { user += "\n\nThe music style is:\n\(style)" }
-            return Request(system: system, user: user)
+            return PromptRewriter.Request(system: system, user: user)
         }
-    }
-
-    /// Model replies sometimes wear a fence or quotes; the editor gets the bare text.
-    static func clean(_ reply: String) -> String {
-        AgentWriter.stripFences(reply).trimmingCharacters(in: CharacterSet(charactersIn: "\"\u{201C}\u{201D}"))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

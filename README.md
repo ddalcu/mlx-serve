@@ -1,4 +1,4 @@
-![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](website/assets/mlx-serve-header.png)
+![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](website/assets/mlx-serve-header.jpg)
 
 # mlx-serve — run any LLM on your Mac
 
@@ -33,7 +33,8 @@ Needs macOS 26.2+ on Apple Silicon.
 
 ```bash
 brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
-brew install --cask mlx-core   # the app (recommended)
+brew trust ddalcu/mlx-serve
+brew install --cask mlx-serve  # the app (recommended)
 brew install mlx-serve         # CLI + server only, no GUI
 ```
 
@@ -106,7 +107,7 @@ Numbers and charts in [Performance](#performance).
 - **Any model:** every supported MLX architecture plus the entire GGUF universe via embedded llama.cpp; DeepSeek V4 Flash through the dedicated [antirez/ds4](https://github.com/antirez/ds4) engine.
 - **Four API surfaces on one port:** OpenAI chat/completions and Responses (with a WebSocket transport), Anthropic Messages, and the Ollama API. Full reference in [docs/api.md](docs/api.md).
 - **The whole modern serving surface:** streaming, tools with schema-driven auto-repair, JSON-schema constrained decoding, logprobs, vision, thinking as `reasoning_content`.
-- **Works with your coding agent:** Claude Code, pi, oh-my-pi, OpenCode, OpenCode 2, Codex, hermes, aider, and editors like Zed. One-click from the app or `mlx-serve launch <agent>` in the terminal, both preconfigured with the server's real context window. Setup for every tool in [docs/integrations.md](docs/integrations.md).
+- **Works with your coding agent:** Claude Code, pi, oh-my-pi, OpenCode, OpenCode 2, Codex, hermes, aider, fx, Grok, and editors like Zed. One-click from the app or `mlx-serve launch <agent>` in the terminal, both preconfigured with the server's real context window. Setup for every tool in [docs/integrations.md](docs/integrations.md).
 - **Fast:** speculative decoding four ways (PLD, model-shipped draft companions, the Gemma 4 drafter, native Qwen MTP), custom Metal kernels, continuous batching, KV-cache quantization, prefix and tokenize caches. Numbers in [docs/performance.md](docs/performance.md).
 - **Built-in web console:** open `http://localhost:11234` in a browser for a chat playground, live monitor, image and audio tools, and the API reference.
 - **LAN model sharing:** use another Mac's models over Bonjour with zero config; even Claude Code pointed at `localhost` can run on the Studio's 27B.
@@ -159,7 +160,7 @@ Speculative decoding comes in four flavors (PLD, model-shipped draft companions,
 
 - [docs/cli.md](docs/cli.md) — CLI commands and every server flag
 - [docs/api.md](docs/api.md) — full HTTP API reference: OpenAI, Anthropic, Ollama, media endpoints
-- [docs/integrations.md](docs/integrations.md) — connect coding agents and editors: Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider, Zed, OpenClaw
+- [docs/integrations.md](docs/integrations.md) — connect coding agents and editors: Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider, fx, Grok, Zed, OpenClaw
 - [docs/models.md](docs/models.md) — supported model architectures
 - [docs/app.md](docs/app.md) — everything the MLX Core app does, including the media generation tour
 - [docs/performance.md](docs/performance.md) — benchmarks, speculative decoding, tuning knobs

@@ -2,7 +2,7 @@
     .name = .mlx_serve,
     .version = "0.1.0",
     .fingerprint = 0x4f7c897092edeafd,
-    .minimum_zig_version = "0.17.0-dev.1422+e863bf3be",
+    .minimum_zig_version = "0.17.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

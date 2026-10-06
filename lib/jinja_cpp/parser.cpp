@@ -522,6 +522,8 @@ private:
                 expect(token::close_square_bracket, "Expected ]");
             } else {
                 prop = parse_primary_expression();
+                // jinja2 reads `foo.0` as `foo[0]`
+                computed = is_stmt<integer_literal>(prop);
             }
             object = mk_stmt<member_expression>(start_pos, std::move(object), std::move(prop), computed);
         }

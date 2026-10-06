@@ -140,7 +140,7 @@ echo ""
 echo "--- Test 2b: system role inside messages ---"
 sys_tokens() {
   curl -sf "$BASE/v1/messages" -H "Content-Type: application/json" -d "$1" \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['input_tokens'])" 2>/dev/null
+    | jq -r '.usage | .input_tokens + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)'
 }
 SYS_TEXT="You are a pirate. Every response must include the word arrr."
 BASE_TOKENS=$(sys_tokens '{"model":"mlx-serve","max_tokens":1,"messages":[{"role":"user","content":"Greet me."}]}')
@@ -461,32 +461,27 @@ echo ""
 echo "=== Cache usage reporting ==="
 CACHE_PROMPT="You are a careful assistant. Here is a long preamble we will reuse verbatim across requests so the server prefix cache gets a long match. The quick brown fox jumps over the lazy dog, again and again, sentence after sentence, to pad this prefix out to a few hundred tokens. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. Question: what is 1+1? Reply with just the number."
 CACHE_BODY="{\"model\":\"mlx-serve\",\"max_tokens\":8,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$CACHE_PROMPT\"}]}"
-# warm the cache
-curl -s -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY" > /dev/null
-RESP=$(curl -s -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY")
-CACHE_READ=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('usage',{}).get('cache_read_input_tokens',-1))" 2>/dev/null || echo -1)
+FIRST=$(curl -sf -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY")
+PROMPT_TOKENS=$(printf '%s' "$FIRST" | jq -r '.timings.prompt_n')
+FIRST_TOTAL=$(printf '%s' "$FIRST" | jq -r '.usage | .input_tokens + (.cache_creation_input_tokens // 0) + .cache_read_input_tokens')
+assert_eq "first request input buckets equal actual prompt" "$PROMPT_TOKENS" "$FIRST_TOTAL"
+RESP=$(curl -sf -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY")
+CACHE_READ=$(printf '%s' "$RESP" | jq -r '.usage.cache_read_input_tokens')
 assert_gt "non-stream usage.cache_read_input_tokens on repeat prompt" "$CACHE_READ" "0"
+INPUT_TOTAL=$(printf '%s' "$RESP" | jq -r '.usage | .input_tokens + (.cache_creation_input_tokens // 0) + .cache_read_input_tokens')
+assert_eq "warm non-stream input buckets equal actual prompt" "$PROMPT_TOKENS" "$INPUT_TOTAL"
 
-STREAM_CACHE_BODY=$(echo "$CACHE_BODY" | python3 -c "import sys,json; b=json.load(sys.stdin); b['stream']=True; print(json.dumps(b))")
-EVENTS=$(curl -s -N -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$STREAM_CACHE_BODY")
-STREAM_CACHE_READ=$(echo "$EVENTS" | python3 -c "
-import sys, json
-val = -1
-for line in sys.stdin:
-    line = line.strip()
-    if not line.startswith('data: '):
-        continue
-    try:
-        ev = json.loads(line[6:])
-    except Exception:
-        continue
-    if ev.get('type') == 'message_delta':
-        v = (ev.get('usage') or {}).get('cache_read_input_tokens')
-        if isinstance(v, int):
-            val = v
-print(val)
-")
+STREAM_CACHE_BODY=$(printf '%s' "$CACHE_BODY" | jq '.stream = true')
+EVENTS=$(curl -sf -N -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$STREAM_CACHE_BODY")
+STREAM_USAGE=$(printf '%s' "$EVENTS" | jq -Rn '
+  reduce (inputs | select(startswith("data: ")) | .[6:] | fromjson) as $event ({};
+    if $event.type == "message_start" then $event.message.usage
+    elif $event.type == "message_delta" then . + $event.usage
+    else . end)')
+STREAM_CACHE_READ=$(printf '%s' "$STREAM_USAGE" | jq -r '.cache_read_input_tokens')
 assert_gt "streaming message_delta usage.cache_read_input_tokens on repeat prompt" "$STREAM_CACHE_READ" "0"
+STREAM_TOTAL=$(printf '%s' "$STREAM_USAGE" | jq -r '.input_tokens + (.cache_creation_input_tokens // 0) + .cache_read_input_tokens')
+assert_eq "accumulated streaming input buckets equal actual prompt" "$PROMPT_TOKENS" "$STREAM_TOTAL"
 echo ""
 
 # ── Summary ──

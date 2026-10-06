@@ -275,7 +275,8 @@ Prefer Homebrew? It is a third-party tap, so tap it first:
 
 ```bash
 brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
-brew install --cask mlx-core
+brew trust ddalcu/mlx-serve
+brew install --cask mlx-serve
 ```
 
 {use_line}
