@@ -19,3 +19,7 @@ Actual tier-list module exercised in Chromium with HF fetch URLs redirected to a
 Shared AbortSignal.timeout(5000) bounds discovery and body reads. Modern browser support and the five-second policy need review. Static HTML was present even before the correction; this is not a wholly blank-page claim.
 
 No full server/app build or model inference benchmark is claimed.
+
+## Publication boundary
+
+Fork-only migration review, against the unchanged reviewed baseline. Upstream's `CONTRIBUTING.md:63` full-tree build and `zig build test` gate has not been met. Zig is absent from PATH and the MLX submodules are unstaged. This proposal is not upstream-ready; no merge is authorized.
