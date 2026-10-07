@@ -17293,6 +17293,16 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_reshape(&freqs_arr, base_pow, &freq_shape, 1, s));
             }
             rope_freqs_global = freqs_arr;
+        } else if (config.rope_llama3) |l3| {
+            const half: usize = config.head_dim / 2;
+            const freqs_f64 = try allocator.alloc(f64, half);
+            defer allocator.free(freqs_f64);
+            computeLlama3Freqs(freqs_f64, config.head_dim, config.rope_theta, l3);
+            const freqs_f32 = try allocator.alloc(f32, half);
+            defer allocator.free(freqs_f32);
+            for (freqs_f64, freqs_f32) |v, *o| o.* = @floatCast(v);
+            const fshape = [_]c_int{@intCast(half)};
+            rope_freqs_global = mlx.mlx_array_new_data(freqs_f32.ptr, &fshape, 1, .float32);
         }
 
         // YaRN (laguna: full-attention layers only; qwen4_exp: the trunk's one
@@ -17534,6 +17544,7 @@ pub const Transformer = struct {
             reg.* = rht.Registry.init(allocator, config.hadamard_block);
             rht_registry = reg;
             try registerRhtSigns(reg, weights, s);
+            if (moe_layers) |ml| try aliasFusedRotations(reg, ml);
         }
         var ternary_2bit = false;
         if (ternaryKernelCandidate(&config)) {
@@ -17995,8 +18006,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 3);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             if (mlx.mlx_vector_array_size(out_vec) == 1) {
                 var g = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_vector_array_get(&g, out_vec, 0));
@@ -18102,10 +18113,11 @@ pub const Transformer = struct {
         const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var out_vec = mlx.mlx_vector_array{ .ctx = null };
-        try mlx.check(mlx.mlx_closure_apply(&out_vec, c, in_vec));
         defer _ = mlx.mlx_vector_array_free(out_vec);
+        try mlx.check(mlx.mlx_closure_apply(&out_vec, c, in_vec));
         if (mlx.mlx_vector_array_size(out_vec) != 1) return null;
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_vector_array_get(&out, out_vec, 0));
         return out;
     }
@@ -18259,8 +18271,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 2);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
 
             var inds = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(inds);
@@ -18302,8 +18314,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
 
             var inds = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(inds);
@@ -18339,8 +18351,8 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(in_vec);
 
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
 
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
@@ -18391,6 +18403,7 @@ pub const Transformer = struct {
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
         if (self.output_mult) |m| _ = mlx.mlx_array_free(m);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
+        if (self.rope_freqs_global) |f| _ = mlx.mlx_array_free(f);
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
         if (self.yarn_inv_freq) |f| self.allocator.free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
@@ -19180,6 +19193,12 @@ pub const Transformer = struct {
         return self.config.ssmStateDtype();
     }
 
+    /// A 2-bit ternary trunk whose verify rows ride qmv2's MMA lane: an
+    /// 8-row window costs about what 5 rows do, like the NAX lane.
+    pub fn ternaryWideVerify(self: *const Transformer) bool {
+        return (self.rht != null or self.ternary_2bit) and qmv2.deviceMmaVerifiesWide();
+    }
+
     /// Hadamard packs: the trunk's lm_head for a caller holding another
     /// model's activation (an MTP head): cast to the trunk dtype, then the
     /// rotated projection every trunk matmul takes.
@@ -19554,8 +19573,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
@@ -19757,8 +19776,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 2);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
@@ -19816,8 +19835,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
@@ -30511,7 +30530,8 @@ pub const Transformer = struct {
 
         // MTP verify rows (spec capture, 2 <= S <= 8): the same kernel over S
         // tokens with the per-step state capture rollback reads, then the norm-gate.
-        if (self.rht == null and batch == 1 and seq_len >= 1 and seq_len <= gdn_decode.MAX_SEQ and projected == null and
+        // A grouped verify's `projected` slices ride it too, or its rows round unlike a solo verify's.
+        if (self.rht == null and batch == 1 and seq_len >= 1 and seq_len <= gdn_decode.MAX_SEQ and
             self.spec_capture_ssm and ssm.initialized and ssm.ssm_state.ctx != null and kernel == 4 and
             !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and gdnDecodeRecurEnabled())
         fast: {
@@ -34265,7 +34285,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try maybeTransposeForBf16(&la.a_w, la.a_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
-                if (la.qkv_s.ctx != null and config.hadamard_block == 0 and config.quant_bits != 2) {
+                if (la.qkv_s.ctx != null) {
                     var parts = [_][3]*mlx.mlx_array{ .{ &la.qkv_w, &la.qkv_s, &la.qkv_b }, .{ &la.z_w, &la.z_s, &la.z_b }, .{ &la.a_w, &la.a_s, &la.a_b }, .{ &la.b_w, &la.b_s, &la.b_b } };
                     const names = [_][]const u8{ "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b" };
                     la.in = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
@@ -35016,9 +35036,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try maybeTransposeForBf16(&dw.gate_w, dw.gate_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&dw.up_w, dw.up_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&dw.down_w, dw.down_s, &owned_bf16, allocator, s);
-                // Not on Hadamard packs: the rotation registry keys on the
-                // per-weight handle, which a joined buffer would bypass.
-                if (dw.gate_s.ctx != null and config.hadamard_block == 0 and config.quant_bits != 2) {
+                // Hadamard packs: `aliasFusedRotations` binds the joined buffer's signs.
+                if (dw.gate_s.ctx != null) {
                     var parts = [_][3]*mlx.mlx_array{ .{ &dw.gate_w, &dw.gate_s, &dw.gate_b }, .{ &dw.up_w, &dw.up_s, &dw.up_b } };
                     const names = [_][]const u8{ "mlp.gate_proj", "mlp.up_proj" };
                     dw.gu = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
@@ -36342,6 +36361,24 @@ fn computeYarnFreqs(
     };
     spec.invFreq(out);
     for (out) |*v| v.* = 1.0 / v.*;
+}
+
+/// HF `_compute_llama3_parameters` as mlx_fast_rope denominators (angle =
+/// position / freqs[i]): low frequencies slow down by `factor`, high ones keep
+/// their rate, the band between is smoothed. `out.len` = head_dim / 2.
+fn computeLlama3Freqs(out: []f64, head_dim: u32, base: f64, l3: model_mod.Llama3Rope) void {
+    const factor: f64 = l3.factor;
+    const low: f64 = l3.low_freq_factor;
+    const high: f64 = l3.high_freq_factor;
+    const window: f64 = l3.original_max_position_embeddings;
+    for (out, 0..) |*o, i| {
+        const period = std.math.pow(f64, base, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(head_dim)));
+        const wavelen = 2.0 * std.math.pi * period;
+        o.* = if (wavelen < window / high) period else if (wavelen > window / low) period * factor else blk: {
+            const smooth = (window / wavelen - low) / (high - low);
+            break :blk period / ((1.0 - smooth) / factor + smooth);
+        };
+    }
 }
 
 /// Hy3 (hy_v3 / DeepSeek-V3-style) sigmoid routing chain — mirrors the
@@ -38764,6 +38801,7 @@ pub fn qsaPoolNormRopeFused(
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_pool_rope_cfg.?, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (!qsa_pool_rope_engaged) {
         qsa_pool_rope_engaged = true;
@@ -40643,6 +40681,7 @@ fn stridedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array) 
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, strided_sig_gate_kernel.?, inputs_vec, strided_sig_gate_cfg.?, s));
     var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
     try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
     return y;
 }
@@ -43860,6 +43899,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     // load to [in, out] so a single mlx_matmul does the contraction.
     if (sc.ctx == null) {
         var fp_result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(fp_result);
         try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
         return fp_result;
     }
@@ -43870,6 +43910,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     // would misroute e.g. an nvfp4 weight to mxfp8.
     if (mode != .affine) {
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_quantized_matmul(
             &result,
             x,
@@ -43904,6 +43945,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
 
         const null_bi = mlx.mlx_array{ .ctx = null };
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_quantized_matmul(
             &result,
             x,
@@ -43929,6 +43971,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     if (try prefillDqGemm(x, w, sc, bi, bits, group_size, s)) |py| return py;
 
     var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_quantized_matmul(
         &result,
         x,
@@ -44342,6 +44385,21 @@ test "ternaryKernelCandidate: affine 2-bit group-128 packs without rotations" {
     c.quant_group_size = 128;
     c.quant_bits = 4;
     try std.testing.expect(!ternaryKernelCandidate(&c));
+}
+
+/// Hadamard packs: a row-joined group reads ONE rotation of its input, so it
+/// is served only when its parts share a sign vector; else the parts' views are.
+fn aliasFusedRotations(reg: *rht.Registry, layers: []MoeLayerWeights) !void {
+    for (layers) |*lw| {
+        if (lw.attn == .linear) {
+            const la = &lw.attn.linear;
+            if (la.in.w.ctx != null and !try reg.alias(la.in.w, (&[_]mlx.mlx_array{ la.qkv_w, la.z_w, la.a_w, la.b_w })[0..la.in.count])) la.in.w = .{ .ctx = null };
+        }
+        if (lw.mlp == .dense) {
+            const dw = &lw.mlp.dense;
+            if (dw.gu.w.ctx != null and !try reg.alias(dw.gu.w, &.{ dw.gate_w, dw.up_w })) dw.gu.w = .{ .ctx = null };
+        }
+    }
 }
 
 /// Binds every `<base>.signs` to `<base>.weight`; ONE eval for every sign
@@ -53752,6 +53810,23 @@ test "computeYarnFreqs matches HF _compute_yarn_parameters (Laguna full-attn rop
     try testing.expectApproxEqRel(std.math.pow(f64, 500000.0, 0.0), freqs[0], 1e-9);
     // Above the high correction dim (18): pure interpolation → freqs = factor·base^(2i/64).
     try testing.expectApproxEqRel(32.0 * std.math.pow(f64, 500000.0, @as(f64, 2 * 31) / 64.0), freqs[31], 1e-6);
+}
+
+test "computeLlama3Freqs matches HF _compute_llama3_parameters (Llama 3.2)" {
+    // Golden denominators from HF's inv-freq formulation: head_dim 128, base 5e5,
+    // factor 32, low/high 1/4, window 8192. High frequencies keep their rate, low
+    // ones run 32x slower, the band between is smoothed.
+    var freqs: [64]f64 = undefined;
+    computeLlama3Freqs(&freqs, 128, 500000.0, .{ .factor = 32.0, .low_freq_factor = 1.0, .high_freq_factor = 4.0, .original_max_position_embeddings = 8192.0 });
+    const golden = [_]struct { idx: usize, val: f64 }{
+        .{ .idx = 0, .val = 1.0 },
+        .{ .idx = 20, .val = 60.384868705732515 },
+        .{ .idx = 30, .val = 774.8646742531896 },
+        .{ .idx = 40, .val = 116682.63579547375 },
+        .{ .idx = 45, .val = 325265.6956955225 },
+        .{ .idx = 63, .val = 13033875.741704715 },
+    };
+    for (golden) |g| try testing.expectApproxEqRel(g.val, freqs[g.idx], 1e-9);
 }
 
 test "laguna yarn parity vs modeling_laguna.py (LAGUNA_FIXTURES)" {
@@ -70619,7 +70694,19 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     const shared_gate_before = mtp_verify_shared_gate_rows_calls;
     const grouped_before = mtp_verify_moe_group_graphs;
 
-    for ([_][2]usize{ .{ 2, 2 }, .{ 5, 5 }, .{ 2, 3 }, .{ 3, 2 }, .{ 9, 9 }, .{ 2, 9 }, .{ 9, 3 } }) |S_row| {
+    // A solo verify of up to 8 rows takes the MoE rows arm, a joined group past 8 the sorted
+    // verify kernels, which reduce differently: rows match only while both sides run one arm.
+    const old_rows_arm = moe_verify_rows_override;
+    defer moe_verify_rows_override = old_rows_arm;
+    const Pass = struct { rows_arm: bool, shapes: []const [2]usize };
+    const passes = [_]Pass{
+        .{ .rows_arm = false, .shapes = &.{ .{ 2, 2 }, .{ 5, 5 }, .{ 2, 3 }, .{ 3, 2 }, .{ 9, 9 }, .{ 2, 9 }, .{ 9, 3 } } },
+        .{ .rows_arm = true, .shapes = &.{ .{ 2, 2 }, .{ 2, 3 }, .{ 3, 2 } } },
+    };
+    var group_calls: u64 = 0;
+    for (passes) |pass| for (pass.shapes) |S_row| {
+        moe_verify_rows_override = pass.rows_arm;
+        group_calls += 1;
         var slots = try L10VerifySlots.init(allocator, &xfm, n_layers, prompts);
         defer slots.deinit(allocator);
 
@@ -70664,9 +70751,9 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
             try testing.expectEqual(prompts[i].len + S_row[i], slots.group[i].off);
             try testing.expectEqual(slots.solo[i].off, slots.group[i].off);
         }
-        std.debug.print("[mtp verify] S={any}: rows equal (logits, hidden_all, hidden_last)\n", .{S_row});
-    }
-    try testing.expectEqual(@as(u64, 7), mtp_verify_moe_group_graphs - grouped_before);
+        std.debug.print("[mtp verify] S={any} rows_arm={}: rows equal (logits, hidden_all, hidden_last)\n", .{ S_row, pass.rows_arm });
+    };
+    try testing.expectEqual(group_calls, mtp_verify_moe_group_graphs - grouped_before);
     try testing.expect(mtp_verify_indexed_input_calls > indexed_before);
     try testing.expect(mtp_verify_expert_reduce_calls > reduce_before);
     try testing.expect(mtp_verify_expert_pairs_calls > expert_before);

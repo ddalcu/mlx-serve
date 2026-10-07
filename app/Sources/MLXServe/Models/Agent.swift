@@ -202,42 +202,6 @@ struct Agent: Identifiable, Codable, Equatable {
     }
 }
 
-/// The editor's reasoning-budget choices, in the server's own `reasoning_effort`
-/// denominations (`effortBudget`: low 512 / medium 2048 / high 8192; unlimited
-/// = -1). Stored as TOKENS in `Agent.reasoningBudget` so the wire stays
-/// `reasoning_budget` — sending `reasoning_effort` would also flip thinking
-/// on/off, which the Capabilities tri-state owns.
-enum AgentReasoningEffort: CaseIterable {
-    case low, medium, high, unlimited
-
-    var budgetTokens: Int {
-        switch self {
-        case .low: return 512
-        case .medium: return 2048
-        case .high: return 8192
-        case .unlimited: return -1
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .low: return "Low"
-        case .medium: return "Medium"
-        case .high: return "High"
-        case .unlimited: return "Unlimited"
-        }
-    }
-
-    /// The level a token count reads as: any negative is unlimited, anything
-    /// else snaps to the closest finite level — older builds stored raw
-    /// numbers, and the app default can be any preset.
-    static func nearest(to budget: Int) -> AgentReasoningEffort {
-        guard budget >= 0 else { return .unlimited }
-        let finite: [AgentReasoningEffort] = [.low, .medium, .high]
-        return finite.min { abs($0.budgetTokens - budget) < abs($1.budgetTokens - budget) } ?? .high
-    }
-}
-
 /// Which voice an agent speaks with. Mirrors the three engines the app's voice
 /// picker already offers (`VoiceEngine`), so an agent voice is exactly one of
 /// the choices a user can make globally — no fourth code path.

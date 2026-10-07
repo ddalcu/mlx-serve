@@ -38,6 +38,8 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
 
     private let system: any SpeechSynthesizing
     private let voice: () -> NeuralVoice?
+    /// The active agent's own Apple voice, re-read per utterance; nil keeps `voiceIdentifier`.
+    private let systemVoice: () -> String?
     private let synthesizeClone: CloneSynth
     private let playClone: ClonePlay
     /// Silence the in-flight clone clip immediately (barge-in).
@@ -66,8 +68,7 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     /// The system voice picker still applies to fallback utterances; the clone
     /// path has exactly one voice (the clip) and ignores it.
     var voiceIdentifier: String? {
-        get { system.voiceIdentifier }
-        set { system.voiceIdentifier = newValue }
+        didSet { system.voiceIdentifier = voiceIdentifier }
     }
     var isSpeaking: Bool {
         !texts.isEmpty || !playQueue.isEmpty || synthPumping || playPumping || system.isSpeaking
@@ -75,6 +76,7 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
 
     init(system: any SpeechSynthesizing,
          voice: @escaping () -> NeuralVoice?,
+         systemVoice: @escaping () -> String? = { nil },
          synthesizeClone: @escaping CloneSynth,
          playClone: @escaping ClonePlay,
          stopClonePlayback: @escaping () -> Void = {},
@@ -82,6 +84,8 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
          prewarmClone: ((NeuralVoice) async -> Void)? = nil) {
         self.system = system
         self.voice = voice
+        self.systemVoice = systemVoice
+        self.voiceIdentifier = system.voiceIdentifier
         self.synthesizeClone = synthesizeClone
         self.playClone = playClone
         self.stopClonePlayback = stopClonePlayback
@@ -105,6 +109,7 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
                 // very next sentence, with no restart.
                 ActiveAgentVoice.currentNeuralVoice(options: ServerOptions.load())
             },
+            systemVoice: { ActiveAgentVoice.systemVoiceIdentifier(agent: ActiveAgentVoice.current) },
             synthesizeClone: { text, sel in await tts.synthesize(text: text, voice: sel) },
             playClone: { data in await player.play(data) },
             stopClonePlayback: { player.stop() },
@@ -130,7 +135,9 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard let sel = voice() else {
-            system.enqueue(trimmed)     // no neural voice configured → system
+            // No neural voice → system, in the active agent's own voice when it picked one.
+            system.voiceIdentifier = systemVoice() ?? voiceIdentifier
+            system.enqueue(trimmed)
             return
         }
         texts.append(trimmed)
@@ -206,6 +213,7 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     private func speakViaSystem(_ text: String) async {
         await withCheckedContinuation { cont in
             systemDrainContinuation = cont
+            system.voiceIdentifier = voiceIdentifier
             system.enqueue(text)
         }
     }

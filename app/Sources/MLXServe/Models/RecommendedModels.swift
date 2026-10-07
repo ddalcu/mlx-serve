@@ -405,7 +405,8 @@ extension RecommendedModelPick {
         activeParamsB: 3.0
     )
 
-    /// Qwen 3.8 Flash-Next (125B-A6B) in our mixed 4/8-bit MLX-Serve pack:
+    /// Qwen 3.8 Flash-Next (125B-A6B) in our iQ-MLX 4.7 bpw pack (the mixed
+    /// 4/8-bit layout, experts quantized with an importance matrix):
     /// the qwen3_5 trunk inside hyper-connections, an n-gram embedding table
     /// (32 GB, mmapped at serve time, never resident) and the MTP layer in the
     /// checkpoint. ~100 GB on disk, but only the ~70 GB of weights is
@@ -417,10 +418,10 @@ extension RecommendedModelPick {
     /// Max, 26.9.2).
     static let qwen38FlashNext = RecommendedModelPick(
         id: "qwen38-flash-next",
-        name: "Qwen Flash-Next 4-8bit",
+        name: "Qwen Flash-Next iQ 4.7bpw",
         tagline: "Frontier-class, still quick",
-        blurb: "Qwen's largest model here — 125 billion parameters, of which it wakes only about 6 billion per word (mixture of experts), so it answers at a pace closer to a mid-size model than to one this big. Reasoning, coding and agent work at the same level as DeepSeek-V4-Flash, it reads images, and it ships with a built-in speed trick that drafts and double-checks several words at once. This is our own mixed 4/8-bit build, about 100 GB on disk, of which a 32 GB lookup table stays on disk while it runs, so it fits a Mac with 96 GB of memory.",
-        repoId: "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit",
+        blurb: "Qwen's largest model here — 125 billion parameters, of which it wakes only about 6 billion per word (mixture of experts), so it answers at a pace closer to a mid-size model than to one this big. Reasoning, coding and agent work at the same level as DeepSeek-V4-Flash, it reads images, and it ships with a built-in speed trick that drafts and double-checks several words at once. This is our own calibrated build at 4.7 bits per weight, about 100 GB on disk, of which a 32 GB lookup table stays on disk while it runs, so it fits a Mac with 96 GB of memory.",
+        repoId: "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw",
         sizeGB: 100.0,
         family: .largest,
         intelligence: 67,

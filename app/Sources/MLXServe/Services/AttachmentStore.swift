@@ -232,9 +232,11 @@ enum AttachmentStore {
         paths(in: sessions.flatMap(\.messages))
     }
 
-    /// Every file a message owns: its pictures and its audio clips.
+    /// Every file a message owns: its pictures, its audio clips and its video frame folders.
     private static func paths(in messages: [ChatMessage]) -> Set<String> {
-        Set(messages.flatMap { ($0.images ?? []).compactMap(\.path) + ($0.audio ?? []).compactMap(\.path) })
+        Set(messages.flatMap {
+            ($0.images ?? []).compactMap(\.path) + ($0.audio ?? []).compactMap(\.path) + ($0.videos ?? []).compactMap(\.path)
+        })
     }
 
     private static func orphans(_ gone: Set<String>,
@@ -247,5 +249,27 @@ enum AttachmentStore {
 
     static func remove(_ path: String) {
         try? FileManager.default.removeItem(atPath: path)
+    }
+
+    // MARK: - Video
+
+    /// A video's sampled frames, one JPEG per frame in a folder of its own, written on
+    /// SEND like the pictures. A failed write keeps the frames in memory for this turn.
+    static func storedVideo(_ video: ChatVideo, root: String = AttachmentStore.root) -> ChatVideo {
+        let folder = (root as NSString).appendingPathComponent(filename(id: video.id, name: video.name, ext: "frames"))
+        let written = video.frames.enumerated().allSatisfy { i, frame in
+            write(frame, named: String(format: "frame_%02d.jpg", i + 1), in: folder) != nil
+        }
+        if !written { remove(folder) }
+        var result = video
+        result.path = written ? folder : nil
+        return result
+    }
+
+    /// The frames `storedVideo` wrote, in order; empty when the folder is gone.
+    static func videoFrames(at folder: String) -> [Data] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? []
+        return names.filter { $0.hasPrefix("frame_") }.sorted()
+            .compactMap { FileManager.default.contents(atPath: (folder as NSString).appendingPathComponent($0)) }
     }
 }

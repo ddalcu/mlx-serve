@@ -58,6 +58,13 @@ enum ActiveAgentVoice {
         }
     }
 
+    /// The Apple voice an agent pinned, or nil to keep the app's own pick.
+    static func systemVoiceIdentifier(agent: AgentVoice?) -> String? {
+        guard case .system(let id)? = agent else { return nil }
+        let trimmed = id.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// Live read for the synthesizer's per-utterance closure.
     static func currentNeuralVoice(options: ServerOptions) -> NeuralVoice? {
         neuralVoice(agent: current, options: options)

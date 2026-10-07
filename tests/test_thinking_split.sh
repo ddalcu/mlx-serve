@@ -144,6 +144,7 @@ R=$(curl -sN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
     -d "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":2000,\"temperature\":0,\"enable_thinking\":true,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Run a shell command\",\"parameters\":{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}},\"required\":[\"cmd\"]}}}]}" | python3 -c "
 import json,sys
 c=r=''
+calls=False
 for line in sys.stdin:
     line=line.strip()
     if not line.startswith('data:'): continue
@@ -154,12 +155,18 @@ for line in sys.stdin:
     d=(o.get('choices') or [{}])[0].get('delta',{})
     c+=d.get('content') or ''
     r+=d.get('reasoning_content') or ''
-print(json.dumps({'content':c,'reasoning_len':len(r)}))")
+    calls=calls or bool(d.get('tool_calls'))
+print(json.dumps({'content':c,'reasoning_len':len(r),'called':calls}))")
 CONTENT=$(echo "$R" | python3 -c "import json,sys; print(json.load(sys.stdin)['content'])")
 RLEN=$(echo "$R" | python3 -c "import json,sys; print(json.load(sys.stdin)['reasoning_len'])")
-check "tools+thinking: answer (391) in content deltas" "$(echo "$CONTENT" | grep -q 391 && echo 1 || echo 0)"
+CALLED=$(echo "$R" | python3 -c "import json,sys; print(json.load(sys.stdin)['called'])")
 check "tools+thinking: reasoning still separated" "$([ "$RLEN" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
-check "tools+thinking: answer not duplicated into reasoning tail" "$(echo "$CONTENT" | grep -q 391 && echo 1 || echo 0)"
+# The model may answer or reach for the tool (Qwen3.5-4B runs `echo $((17*23))`): only an answer must land in content.
+if [ "$CALLED" = True ]; then
+    echo "  skip tools+thinking: answer in content — the model called the tool instead"
+else
+    check "tools+thinking: answer (391) in content deltas" "$(echo "$CONTENT" | grep -q 391 && echo 1 || echo 0)"
+fi
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

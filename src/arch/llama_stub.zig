@@ -13,13 +13,27 @@ const unavailable = "llama.cpp engine is unavailable on this build (macOS-only e
 pub const Error = error{
     EngineOpenFailed,
     SessionCreateFailed,
+    SessionSyncFailed,
+    SessionEvalFailed,
     TokenizeFailed,
-    DetokenizeFailed,
     OutOfMemory,
 };
 
 pub const OpenOptions = struct {
     n_gpu_layers: i32 = 999,
+    mtp_path: ?[]const u8 = null,
+    load_mtp: bool = false,
+};
+
+pub const MAX_SEQS = 64;
+
+pub const ContextOptions = struct {
+    ctx_size: i32 = 0,
+    n_seq: u32 = 1,
+    type_k: i32 = 0,
+    type_v: i32 = 0,
+    ubatch: u32 = 0,
+    mtp_drafts: u32 = 0,
 };
 
 pub const LlamaKvQuant = enum(u8) {
@@ -85,6 +99,10 @@ pub const LlamaEngine = struct {
         _ = self;
         @panic(unavailable);
     }
+    pub fn hasMtp(self: *LlamaEngine) bool {
+        _ = self;
+        @panic(unavailable);
+    }
     pub fn tokenizeText(
         self: *LlamaEngine,
         allocator: std.mem.Allocator,
@@ -119,62 +137,86 @@ pub const LlamaEngine = struct {
         _ = add_assistant;
         @panic(unavailable);
     }
-    pub fn createSession(self: *LlamaEngine, ctx_size: i32) Error!*LlamaSession {
+    pub fn createContext(self: *LlamaEngine, opts: ContextOptions) Error!*LlamaContext {
         _ = self;
-        _ = ctx_size;
-        @panic(unavailable);
-    }
-    pub fn createSessionWithKvQuant(self: *LlamaEngine, ctx_size: i32, type_k: i32, type_v: i32) Error!*LlamaSession {
-        _ = self;
-        _ = ctx_size;
-        _ = type_k;
-        _ = type_v;
+        _ = opts;
         @panic(unavailable);
     }
 };
 
-pub const LlamaSession = struct {
-    allocator: std.mem.Allocator,
-    resident: std.ArrayList(i32),
+pub const LlamaContext = struct {
+    seqs: []LlamaSeq,
 
-    pub fn free(self: *LlamaSession) void {
+    pub fn free(self: *LlamaContext) void {
         _ = self;
         @panic(unavailable);
     }
-    pub fn pos(self: *LlamaSession) i32 {
+    pub fn mtpDrafts(self: *const LlamaContext) u32 {
         _ = self;
         @panic(unavailable);
     }
-    pub fn sync(self: *LlamaSession, prompt_ids: []const i32) Error!i32 {
+    pub fn step(self: *LlamaContext, seqs: []const *LlamaSeq, tokens: []const i32) Error!void {
+        _ = self;
+        _ = seqs;
+        _ = tokens;
+        @panic(unavailable);
+    }
+};
+
+pub const Sampling = struct {
+    temperature: f32,
+    top_k: i32 = 0,
+    top_p: f32 = 1.0,
+    min_p: f32 = 0.0,
+};
+
+pub const LlamaSeq = struct {
+    ctx: *LlamaContext,
+    id: i32,
+    resident: std.ArrayList(i32) = .empty,
+    last_used_ns: i64 = 0,
+    busy: bool = false,
+
+    pub fn pos(self: *LlamaSeq) i32 {
+        _ = self;
+        @panic(unavailable);
+    }
+    pub fn sync(self: *LlamaSeq, prompt_ids: []const i32) Error!i32 {
         _ = self;
         _ = prompt_ids;
         @panic(unavailable);
     }
-    pub fn reset(self: *LlamaSession) void {
+    pub fn reset(self: *LlamaSeq) void {
         _ = self;
         @panic(unavailable);
     }
-    pub fn syncWithFallback(self: *LlamaSession, prompt_ids: []const i32) Error!i32 {
+    pub fn syncWithFallback(self: *LlamaSeq, prompt_ids: []const i32) Error!i32 {
         _ = self;
         _ = prompt_ids;
         @panic(unavailable);
     }
-    pub fn eval(self: *LlamaSession, token: i32) Error!void {
+    pub fn eval(self: *LlamaSeq, token: i32) Error!void {
         _ = self;
         _ = token;
         @panic(unavailable);
     }
-    pub fn argmax(self: *LlamaSession) i32 {
+    pub fn sample(self: *LlamaSeq, s: Sampling, rng: *u64) i32 {
+        _ = self;
+        _ = s;
+        _ = rng;
+        @panic(unavailable);
+    }
+    pub fn argmax(self: *LlamaSeq) i32 {
         _ = self;
         @panic(unavailable);
     }
-    pub fn sample(self: *LlamaSession, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: *u64) i32 {
+    pub fn specStep(self: *LlamaSeq, id_last: i32, max_drafts: u32, s: Sampling, rng: *u64, out: []i32) Error![]i32 {
         _ = self;
-        _ = temperature;
-        _ = top_k;
-        _ = top_p;
-        _ = min_p;
+        _ = id_last;
+        _ = max_drafts;
+        _ = s;
         _ = rng;
+        _ = out;
         @panic(unavailable);
     }
 };

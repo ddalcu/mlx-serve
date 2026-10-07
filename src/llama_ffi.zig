@@ -8,14 +8,22 @@
 // discipline as `src/ds4_ffi.zig` over `ds4.h`.
 
 pub const Engine = opaque {};
-pub const Session = opaque {};
+pub const Ctx = opaque {};
 
-pub extern fn mlx_llama_open(gguf_path: [*:0]const u8, n_gpu_layers: i32, err: ?[*]u8, errlen: usize) ?*Engine;
+pub extern fn mlx_llama_open(
+    gguf_path: [*:0]const u8,
+    n_gpu_layers: i32,
+    mtp_path: ?[*:0]const u8,
+    load_mtp: bool,
+    err: ?[*]u8,
+    errlen: usize,
+) ?*Engine;
 pub extern fn mlx_llama_close(e: ?*Engine) void;
 
 pub extern fn mlx_llama_eos_token(e: *Engine) i32;
 pub extern fn mlx_llama_is_eog(e: *Engine, token: i32) bool;
 pub extern fn mlx_llama_n_vocab(e: *Engine) i32;
+pub extern fn mlx_llama_has_mtp(e: *Engine) bool;
 
 pub extern fn mlx_llama_tokenize(
     e: *Engine,
@@ -39,19 +47,17 @@ pub extern fn mlx_llama_apply_chat_template(
     buf_cap: i32,
 ) i32;
 
-pub extern fn mlx_llama_session_create(e: *Engine, n_ctx: i32, err: ?[*]u8, errlen: usize) ?*Session;
-pub extern fn mlx_llama_session_create_kv_quant(
-    e: *Engine,
-    n_ctx: i32,
-    type_k: i32,
-    type_v: i32,
-    err: ?[*]u8,
-    errlen: usize,
-) ?*Session;
-pub extern fn mlx_llama_session_free(s: ?*Session) void;
+pub const CtxParams = extern struct {
+    n_ctx: i32 = 0,
+    n_seq: i32 = 1,
+    type_k: i32 = 0,
+    type_v: i32 = 0,
+    n_ubatch: i32 = 0,
+    mtp_drafts: i32 = 0,
+};
 
 /// ggml_type values from lib/llama/include/ggml.h that we expose for KV
-/// quantization. F16 is the default (matches `mlx_llama_session_create`).
+/// quantization. F16 is the default.
 pub const GgmlType = struct {
     pub const F16: i32 = 1;
     pub const Q4_0: i32 = 2;
@@ -61,10 +67,27 @@ pub const GgmlType = struct {
     pub const Q8_0: i32 = 8;
 };
 
-pub extern fn mlx_llama_session_sync(s: *Session, tokens: [*]const i32, n_tokens: i32, err: ?[*]u8, errlen: usize) i32;
-pub extern fn mlx_llama_session_trim(s: *Session, n_keep: i32) i32;
-pub extern fn mlx_llama_session_reset(s: *Session) void;
-pub extern fn mlx_llama_session_eval(s: *Session, token: i32, err: ?[*]u8, errlen: usize) i32;
-pub extern fn mlx_llama_session_sample(s: *Session, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: *u64) i32;
-pub extern fn mlx_llama_session_argmax(s: *Session) i32;
-pub extern fn mlx_llama_session_pos(s: *Session) i32;
+pub extern fn mlx_llama_ctx_create(e: *Engine, p: *const CtxParams, err: ?[*]u8, errlen: usize) ?*Ctx;
+pub extern fn mlx_llama_ctx_free(c: ?*Ctx) void;
+pub extern fn mlx_llama_ctx_mtp_drafts(c: *Ctx) i32;
+
+pub extern fn mlx_llama_seq_prefill(c: *Ctx, seq: i32, tokens: [*]const i32, n_tokens: i32, err: ?[*]u8, errlen: usize) i32;
+pub extern fn mlx_llama_step(c: *Ctx, seqs: [*]const i32, tokens: [*]const i32, n: i32, err: ?[*]u8, errlen: usize) i32;
+pub extern fn mlx_llama_seq_trim(c: *Ctx, seq: i32, n_keep: i32) i32;
+pub extern fn mlx_llama_seq_reset(c: *Ctx, seq: i32) void;
+pub extern fn mlx_llama_seq_pos(c: *Ctx, seq: i32) i32;
+pub extern fn mlx_llama_seq_sample(c: *Ctx, seq: i32, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: *u64) i32;
+pub extern fn mlx_llama_seq_spec_step(
+    c: *Ctx,
+    seq: i32,
+    id_last: i32,
+    max_drafts: i32,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+    rng: *u64,
+    out: [*]i32,
+    err: ?[*]u8,
+    errlen: usize,
+) i32;

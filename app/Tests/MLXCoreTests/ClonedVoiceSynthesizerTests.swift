@@ -57,6 +57,23 @@ final class ClonedVoiceSynthesizerTests: XCTestCase {
                                unloadClone: unload)
     }
 
+    // MARK: - An agent's system voice (#417)
+
+    func testAnAgentsSystemVoiceSpeaksAndTheAppsPickReturnsAfter() {
+        let system = FakeSystemSynth()
+        var agent: AgentVoice? = .system("com.apple.voice.premium.fr-FR.Daniel")
+        let router = ClonedVoiceSynthesizer(system: system, voice: { nil },
+                                            systemVoice: { ActiveAgentVoice.systemVoiceIdentifier(agent: agent) },
+                                            synthesizeClone: { _, _ in nil }, playClone: { _ in })
+        router.voiceIdentifier = "com.apple.voice.compact.fr-FR.Amelie"
+        var heard: [String?] = []
+        system.onSpoke = { _ in heard.append(system.voiceIdentifier) }
+        router.enqueue("Bonjour.")
+        agent = .system("")
+        router.enqueue("Encore.")
+        XCTAssertEqual(heard, ["com.apple.voice.premium.fr-FR.Daniel", "com.apple.voice.compact.fr-FR.Amelie"])
+    }
+
     // MARK: - Engine selection
 
     func testKokoroEngineSendsAVoiceNotAClip() async {

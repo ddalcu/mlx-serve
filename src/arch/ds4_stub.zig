@@ -11,6 +11,7 @@ const unavailable = "ds4 engine is unavailable on this build (macOS-only embedde
 
 pub const Error = error{
     EngineOpenFailed,
+    SplitGgufUnsupported,
     SessionCreateFailed,
     SessionSyncFailed,
     SessionEvalFailed,
@@ -90,6 +91,15 @@ pub const Ds4Engine = struct {
         @panic(unavailable);
     }
     pub fn eosToken(self: *Ds4Engine) i32 {
+        _ = self;
+        @panic(unavailable);
+    }
+    pub fn isStop(self: *Ds4Engine, token: i32) bool {
+        _ = self;
+        _ = token;
+        @panic(unavailable);
+    }
+    pub fn vocabSize(self: *Ds4Engine) u32 {
         _ = self;
         @panic(unavailable);
     }

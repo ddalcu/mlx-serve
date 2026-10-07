@@ -35,6 +35,12 @@ pub const DEFAULT_STEPS: u32 = 8;
 pub const MAX_STEPS: u32 = 50;
 /// The small models' longest generation (the paper's limit for Small).
 pub const MAX_SECONDS: f32 = 120;
+/// Silence sampled past the request, then trimmed (the reference `generate()`'s
+/// `duration_padding_sec`): the model trained with silence after every clip,
+/// never on one that ends at the sequence edge.
+const HEADROOM_SECONDS: f64 = 6;
+/// `model_config.json` `sample_size`: the longest sequence the checkpoint samples.
+const SAMPLE_SIZE: u32 = 5_292_032;
 
 const LATENT: c_int = 256;
 const COND: c_int = 768;
@@ -107,11 +113,18 @@ fn jsonInt(v: std.json.Value, key: []const u8) ?c_int {
     return if (x == .integer and x.integer > 0 and x.integer < std.math.maxInt(c_int)) @intCast(x.integer) else null;
 }
 
-/// Latent frames for a duration: the reference's natural ceil (decoder-independent,
-/// so a seed draws the same noise whatever decodes it).
+/// The `seconds_total` training saw for a clip this long (`ceil(samples / rate)`):
+/// a fraction is a condition it never saw, and the output is clipped noise.
+pub fn trainedSeconds(seconds: f32) f32 {
+    return @max(1, @ceil(seconds));
+}
+
+/// Latent frames sampled for a duration: the request plus the headroom, rounded
+/// up to an even count (the encoder's 2-latent alignment), capped at `SAMPLE_SIZE`.
 pub fn latentCount(seconds: f32) u32 {
-    const n: f64 = @ceil(@as(f64, seconds) * SAMPLE_RATE / SAMPLES_PER_LATENT);
-    return @max(1, @as(u32, @intFromFloat(n)));
+    const samples = @floor((@as(f64, seconds) + HEADROOM_SECONDS) * SAMPLE_RATE);
+    const n: u32 = @intFromFloat(@ceil(samples / SAMPLES_PER_LATENT));
+    return @min(n + n % 2, SAMPLE_SIZE / SAMPLES_PER_LATENT);
 }
 
 /// The ping-pong schedule: linspace(1, 0) warped through LogSNR space
@@ -799,7 +812,8 @@ pub const Engine = struct {
 
     /// prompt → 44.1 kHz stereo PCM16 WAV (owned).
     pub fn generateWav(self: *Engine, allocator: std.mem.Allocator, req: Request, progress: ?sse.Progress) ![]u8 {
-        const t_lat = latentCount(req.seconds);
+        const secs = trainedSeconds(req.seconds);
+        const t_lat = latentCount(secs);
         const ids = try self.tokenize(allocator, req.prompt);
         defer allocator.free(ids);
         log.info("[sa3] {d:.2}s -> {d} latents, {d} prompt tokens, steps={d}, seed={d}\n", .{ req.seconds, t_lat, ids.len, req.steps, req.seed });
@@ -810,7 +824,7 @@ pub const Engine = struct {
         const cond = blk: {
             var cs = Scope.init(self.allocator, self.s);
             defer cs.deinit();
-            const c = try self.condition(&cs, ids, req.seconds);
+            const c = try self.condition(&cs, ids, secs);
             break :blk Cond{ .cross = try sc.keep(cs.out(c.cross)), .global = try sc.keep(cs.out(c.global)) };
         };
         const outs = mlx.mlx_vector_array_new();
@@ -891,10 +905,19 @@ test "sa3 schedule: 8 steps match the reference's LogSNR-shifted linspace" {
     for (ref, s) |r, v| try testing.expectApproxEqAbs(r, v, 1e-6);
 }
 
-test "sa3 latentCount: natural ceil of seconds x 44100 / 4096, floor 1" {
-    try testing.expectEqual(@as(u32, 54), latentCount(5));
-    try testing.expectEqual(@as(u32, 323), latentCount(30));
-    try testing.expectEqual(@as(u32, 1), latentCount(0.01));
+test "sa3 trainedSeconds: whole seconds rounded up, at least 1" {
+    try testing.expectEqual(@as(f32, 1), trainedSeconds(0.01));
+    try testing.expectEqual(@as(f32, 1), trainedSeconds(0.9));
+    try testing.expectEqual(@as(f32, 1), trainedSeconds(1));
+    try testing.expectEqual(@as(f32, 2), trainedSeconds(1.5));
+    try testing.expectEqual(@as(f32, 120), trainedSeconds(119.2));
+}
+
+test "sa3 latentCount: the request plus 6 s of headroom, even, capped at sample_size" {
+    try testing.expectEqual(@as(u32, 76), latentCount(1));
+    try testing.expectEqual(@as(u32, 120), latentCount(5));
+    try testing.expectEqual(@as(u32, 388), latentCount(30));
+    try testing.expectEqual(@as(u32, 1292), latentCount(115));
     try testing.expectEqual(@as(u32, 1292), latentCount(120));
 }
 

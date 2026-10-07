@@ -493,7 +493,7 @@ struct ReadFileHandler: ToolHandler {
             throw ToolError.executionFailed("Cannot read file: \(fullPath)")
         }
 
-        let lines = content.components(separatedBy: "\n")
+        let lines = TextLines(content).lines
         let totalLines = lines.count
         let startLine = Int(parameters["startLine"] ?? "1") ?? 1
         let endLine = Int(parameters["endLine"] ?? "\(totalLines)") ?? totalLines
@@ -521,6 +521,33 @@ struct ReadFileHandler: ToolHandler {
         }
 
         return numbered
+    }
+}
+
+/// A text file's lines as an editor numbers them: LF, CRLF and CR each end one.
+/// `breaks[i]` follows `lines[i]`, so `joined` gives back the file's own bytes.
+struct TextLines {
+    var lines: [String] = []
+    var breaks: [String] = []
+
+    init(_ content: String) {
+        var start = content.startIndex
+        var i = start
+        while i < content.endIndex {
+            let ch = content[i]
+            let next = content.index(after: i)
+            if ch == "\n" || ch == "\r" || ch == "\r\n" {
+                lines.append(String(content[start..<i]))
+                breaks.append(String(ch))
+                start = next
+            }
+            i = next
+        }
+        lines.append(String(content[start...]))
+    }
+
+    var joined: String {
+        zip(lines, breaks + [""]).map { $0 + $1 }.joined()
     }
 }
 
@@ -595,21 +622,21 @@ struct EditFileHandler: ToolHandler {
             guard let replace = parameters["replace"] else {
                 throw ToolError.executionFailed("editFile with startLine/endLine requires 'replace' parameter. You sent startLine=\(startStr) but no replace content. Example: {\"path\": \"file.js\", \"startLine\": \"5\", \"endLine\": \"8\", \"replace\": \"new code\"}")
             }
-            let lines = content.components(separatedBy: "\n")
+            var text = TextLines(content)
             let endLine = Self.parseLineNumber(parameters["endLine"]) ?? startLine
             let actualStart = max(1, startLine)
-            let actualEnd = min(lines.count, endLine)
+            let actualEnd = min(text.lines.count, endLine)
 
             guard actualStart <= actualEnd else {
-                throw ToolError.executionFailed("Invalid line range: \(startLine)-\(endLine) (file has \(lines.count) lines)")
+                throw ToolError.executionFailed("Invalid line range: \(startLine)-\(endLine) (file has \(text.lines.count) lines)")
             }
 
-            var newLines = Array(lines[0..<(actualStart - 1)])
-            newLines.append(contentsOf: replace.components(separatedBy: "\n"))
-            if actualEnd < lines.count {
-                newLines.append(contentsOf: lines[actualEnd...])
-            }
-            content = newLines.joined(separator: "\n")
+            // The replacement takes the file's own line break; the one after the range stays.
+            let newLines = TextLines(replace).lines
+            text.lines.replaceSubrange((actualStart - 1)..<actualEnd, with: newLines)
+            text.breaks.replaceSubrange((actualStart - 1)..<(actualEnd - 1),
+                                        with: repeatElement(text.breaks.first ?? "\n", count: newLines.count - 1))
+            content = text.joined
             try content.write(toFile: fullPath, atomically: true, encoding: .utf8)
             return "Edited \(path) (replaced lines \(actualStart)-\(actualEnd))"
         }
@@ -628,7 +655,7 @@ struct EditFileHandler: ToolHandler {
 
         guard content.contains(find) else {
             // Show nearby content to help the model correct its find pattern
-            let lines = content.components(separatedBy: "\n")
+            let lines = TextLines(content).lines
             let preview = lines.prefix(10).enumerated()
                 .map { "\($0.offset + 1)| \($0.element)" }.joined(separator: "\n")
             throw ToolError.executionFailed(

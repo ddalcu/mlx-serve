@@ -9,6 +9,8 @@
 //!     can actually load (vanilla llama.cpp deepseek4 quants omit it)
 //!
 //! Routing rule (`preferredEngine`):
+//!   a split GGUF (`split.count` > 1) → llama.cpp, the only engine here that
+//!     reads the sibling shards (ds4 reads one file)
 //!   `general.architecture == "deepseek4"` AND lora-rank key present → ds4
 //!   a ds4-only arch (`deepseek41`, `qwen4exp`, `glm-dsa`, `glm5-next`) → ds4,
 //!     except a qwen4exp file with tensor types ds4 rejects → llama.cpp
@@ -41,6 +43,9 @@ pub const Info = struct {
     /// qwen4exp only: a tensor type ds4 rejects, or a non-BF16 n-gram table
     /// (llama.cpp quants such as GSQ-RCO's Q2_0 experts). ds4 would exit the process.
     ds4_unloadable: bool = false,
+    /// `split.count`: shards of a split GGUF (gguf-split / convert --split-max-size).
+    /// Writers put it after every other key, so the whole KV section is walked.
+    split_count: u32 = 1,
 
     pub fn deinit(self: *Info, allocator: std.mem.Allocator) void {
         if (self.architecture) |a| allocator.free(a);
@@ -58,6 +63,7 @@ const GGML_TYPE_BF16: u32 = 30;
 const GGML_MAX_DIMS: u32 = 4;
 
 pub fn preferredEngine(info: Info) Engine {
+    if (info.split_count > 1) return .llama;
     if (info.architecture) |a| {
         if (std.mem.eql(u8, a, "deepseek4") and info.has_ds4_lora_rank) return .ds4;
         for (ds4_only_archs) |d| if (std.mem.eql(u8, a, d)) return if (info.ds4_unloadable) .llama else .ds4;
@@ -96,8 +102,7 @@ const MAX_KEY_LEN: u64 = 1024;
 const MAX_STR_VALUE_LEN: u64 = 16 * 1024 * 1024;
 
 /// Stream-parse Info from a *Reader. Both runtime (file) and test (fixed
-/// bytes) callers go through here. Short-circuits as soon as both probe
-/// keys have been resolved.
+/// bytes) callers go through here.
 pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     var info: Info = .{};
     errdefer info.deinit(allocator);
@@ -110,7 +115,6 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     const tensor_count = takeIntT(r, u64) catch return error.Truncated;
     const kv_count = takeIntT(r, u64) catch return error.Truncated;
 
-    var seen_arch = false;
     var i: u64 = 0;
     while (i < kv_count) : (i += 1) {
         // Key.
@@ -124,6 +128,7 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
         const is_arch = std.mem.eql(u8, key_buf, "general.architecture");
         const is_ds4_lora = std.mem.eql(u8, key_buf, "deepseek4.attention.output_lora_rank");
         const is_nextn = std.mem.endsWith(u8, key_buf, ".nextn_predict_layers");
+        const is_split_count = std.mem.eql(u8, key_buf, "split.count");
 
         const value_type = takeIntT(r, u32) catch return error.Truncated;
 
@@ -132,7 +137,6 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
             if (v_len > MAX_STR_VALUE_LEN) return error.Truncated;
             const v_buf = takeBytes(r, @intCast(v_len)) catch return error.Truncated;
             info.architecture = try allocator.dupe(u8, v_buf);
-            seen_arch = true;
         } else if (is_ds4_lora and isNumeric(value_type)) {
             // Presence is what matters; the actual value (rank) isn't used
             // for routing. Skip past the value cleanly.
@@ -140,13 +144,11 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
             info.has_ds4_lora_rank = true;
         } else if (is_nextn and isNumeric(value_type)) {
             info.embedded_mtp = (try takeNumeric(r, value_type)) > 0;
+        } else if (is_split_count and isNumeric(value_type)) {
+            info.split_count = @intFromFloat(std.math.clamp(try takeNumeric(r, value_type), 1, std.math.maxInt(u32)));
         } else {
             try skipValue(r, value_type);
         }
-
-        // Short-circuit once the routing keys are resolved — saves walking
-        // the (potentially huge) tokenizer/vocab arrays that come later.
-        if (seen_arch and info.has_ds4_lora_rank) break;
     }
 
     if (info.architecture) |a| {
@@ -516,31 +518,23 @@ test "parseInfo: skips string arrays between probe keys" {
     try testing.expectEqual(Engine.ds4, preferredEngine(info));
 }
 
-test "parseInfo: short-circuits once both keys found" {
-    // Add a malformed KV AFTER the two we care about. parseInfo must NOT
-    // reach it; reaching it would error. This pins the early-return.
-    // Build a header with a deliberately broken 3rd KV after the two we
-    // care about. parseInfo must NOT reach it; reaching it would error.
-    // This pins the early-return.
-    var bad: std.ArrayList(u8) = .empty;
-    defer bad.deinit(testing.allocator);
-    try bad.appendSlice(testing.allocator, "GGUF");
-    try appendU32(&bad, testing.allocator, 3);
-    try appendU64(&bad, testing.allocator, 0);
-    try appendU64(&bad, testing.allocator, 3); // kv_count=3
-    try appendStr(&bad, testing.allocator, "general.architecture");
-    try appendU32(&bad, testing.allocator, TY_STRING);
-    try appendStr(&bad, testing.allocator, "deepseek4");
-    try appendStr(&bad, testing.allocator, "deepseek4.attention.output_lora_rank");
-    try appendU32(&bad, testing.allocator, TY_U32);
-    try appendU32(&bad, testing.allocator, 1024);
-    // Third KV: bogus type 99 — would trip UnsupportedType if reached.
-    try appendStr(&bad, testing.allocator, "junk");
-    try appendU32(&bad, testing.allocator, 99);
-
-    var info = try parseBytes(testing.allocator, bad.items);
-    defer info.deinit(testing.allocator);
-    try testing.expectEqual(Engine.ds4, preferredEngine(info));
+test "preferredEngine: a split GGUF goes to llama.cpp, whatever its arch (#586)" {
+    // Split writers put `split.count` after every other key, the vocab included.
+    const tokens = [_][]const u8{ "<s>", "</s>" };
+    for ([_][]const u8{ "qwen4exp", "deepseek4", "llama" }) |arch| {
+        const bytes = try buildHeader(testing.allocator, &.{
+            .{ .key = "general.architecture", .value = .{ .str = arch } },
+            .{ .key = "deepseek4.attention.output_lora_rank", .value = .{ .u32_v = 1024 } },
+            .{ .key = "tokenizer.ggml.tokens", .value = .{ .str_array = &tokens } },
+            .{ .key = "split.no", .value = .{ .u32_v = 0 } },
+            .{ .key = "split.count", .value = .{ .u32_v = 4 } },
+        });
+        defer testing.allocator.free(bytes);
+        var info = try parseBytes(testing.allocator, bytes);
+        defer info.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, 4), info.split_count);
+        try testing.expectEqual(Engine.llama, preferredEngine(info));
+    }
 }
 
 test "parseInfo: bad magic → BadMagic" {

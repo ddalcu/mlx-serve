@@ -73,6 +73,9 @@ struct EmbeddedTerminalView: NSViewRepresentable {
             // SwiftTerm's default is 500 lines; one agent turn's diff or test
             // output scrolls past that.
             terminalView.getTerminal().changeScrollback(20_000)
+            // Option types characters on most non-US layouts (Swiss `@` is Option+G);
+            // as Meta it sent `ESC g` instead (#692). Terminal.app's default too.
+            terminalView.optionAsMetaKey = false
             // Default environment (TERM=xterm-256color etc.) — ssh needs nothing
             // from the host env; every path it uses arrives via argv.
             terminalView.startProcess(executable: executable, args: args)

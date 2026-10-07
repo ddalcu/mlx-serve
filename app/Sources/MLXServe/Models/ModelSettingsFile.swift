@@ -52,6 +52,7 @@ struct ModelOverride: Equatable {
     /// `chat_template_kwargs`: variables handed to the model's Jinja template
     /// verbatim (`TemplateKwargs` types and names them).
     var templateKwargs: [String: Any] = [:]
+    var generationDefaults = GenerationDefaults()
     var extra: [String: Any] = [:]
 
     init(ctxSize: Int? = nil, kvQuant: KvQuantChoice? = nil, mtp: Bool? = nil,
@@ -89,6 +90,12 @@ struct ModelOverride: Equatable {
             if let b = i as? Bool { int8Prefill = b }
         }
         if let kw = rest.removeValue(forKey: "chat_template_kwargs") as? [String: Any] { templateKwargs = kw }
+        if let profile = rest["generation_defaults"] as? [String: Any],
+           let data = try? JSONSerialization.data(withJSONObject: profile),
+           let parsed = try? JSONDecoder().decode(GenerationDefaults.self, from: data) {
+            generationDefaults = parsed
+            rest.removeValue(forKey: "generation_defaults")
+        }
         extra = rest
     }
 
@@ -96,7 +103,7 @@ struct ModelOverride: Equatable {
     /// True when any field the sheet edits is set.
     var hasSettings: Bool {
         alias != nil || ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || mtpGreedyTail != nil || drafter != nil || int8Prefill != nil
-            || !templateKwargs.isEmpty
+            || !templateKwargs.isEmpty || !generationDefaults.rules.isEmpty
     }
     var sortedKwargKeys: [String] { templateKwargs.keys.sorted() }
 
@@ -111,6 +118,7 @@ struct ModelOverride: Equatable {
         if let drafter { out["drafter"] = drafter }
         if let int8Prefill { out["int8_prefill"] = int8Prefill }
         if !templateKwargs.isEmpty { out["chat_template_kwargs"] = templateKwargs }
+        if !generationDefaults.rules.isEmpty { out["generation_defaults"] = generationDefaults.json }
         return out
     }
 
@@ -126,12 +134,14 @@ struct ModelOverride: Equatable {
         var a = self, b = old
         a.alias = nil
         b.alias = nil
+        a.generationDefaults = .init()
+        b.generationDefaults = .init()
         return a != b
     }
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
         a.alias == b.alias && a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.mtpGreedyTail == b.mtpGreedyTail && a.drafter == b.drafter
-            && a.int8Prefill == b.int8Prefill
+            && a.int8Prefill == b.int8Prefill && a.generationDefaults == b.generationDefaults
             && NSDictionary(dictionary: a.templateKwargs).isEqual(to: b.templateKwargs)
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }

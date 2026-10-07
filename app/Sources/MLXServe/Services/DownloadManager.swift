@@ -183,6 +183,7 @@ class DownloadManager: ObservableObject {
         // 0731's replacement for the legacy MTP draft head — same --mtp slot
         // server-side, never a servable chat quant.
         return lower.hasPrefix("mmproj") || lower.contains("tokenizer")
+            || lower.hasPrefix("mtp-") // llama.cpp's head-only `convert --mtp` export
             || lower.contains("-mtp-") || lower.contains("-mtp.")
             || lower.contains("-dspark-") || lower.contains("-dspark.")
     }

@@ -3887,6 +3887,12 @@ pub const Generator = struct {
         return sampleTokenLazy(logits, self.sampling, self.xfm.s);
     }
 
+    /// The token the next publish emits; a pipelined one is resolved now (one sync).
+    pub fn upcomingToken(self: *Generator) !u32 {
+        try self.resolvePendingToken();
+        return self.next_token_id;
+    }
+
     fn resolvePendingToken(self: *Generator) !void {
         if (!self.has_pending_token) return;
         try mlx.check(mlx.mlx_array_eval(self.pending_token));

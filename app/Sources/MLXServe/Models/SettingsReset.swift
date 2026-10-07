@@ -113,6 +113,8 @@ enum SettingsReset {
                 f("mlxGguf") { $0.mlxGguf = $1.mlxGguf },
                 f("llamaKvQuant") { $0.llamaKvQuant = $1.llamaKvQuant },
                 f("llamaCacheEntries") { $0.llamaCacheEntries = $1.llamaCacheEntries },
+                f("llamaMtpDrafts") { $0.llamaMtpDrafts = $1.llamaMtpDrafts },
+                f("llamaUbatch") { $0.llamaUbatch = $1.llamaUbatch },
                 f("ssdStreaming") { $0.ssdStreaming = $1.ssdStreaming },
             ]
 
@@ -219,12 +221,13 @@ enum SettingsReset {
     static func confirmMessage(_ selection: SettingsSelection) -> String {
         switch selection {
         case .all:
-            return "This resets every section — Server, Speculative Decoding, Performance, Per-Request Defaults, Voice, Agent Sandbox and Messaging — not just the one you're looking at. Your Telegram bot token is kept, since only @BotFather can reissue it. The running server keeps its current flags until you hit Restart Now."
+            return "This resets every section — Server, Speculative Decoding, Performance, Generation Defaults, Voice, Agent Sandbox and Messaging — not just the one you're looking at. Your Telegram bot token is kept, since only @BotFather can reissue it. Generation defaults apply to the next request; launch flags apply after Restart Now."
         case .category(let c):
             let scope = "This resets only the \(c.sidebarLabel) section. Every other section is left untouched."
             let tail = c == .messaging
                 ? " Your Telegram bot token is kept, since only @BotFather can reissue it."
                 : ""
+            if c == .requestDefaults { return scope + " Generation defaults apply to the next request without a restart. Per-model rules are kept." }
             return scope + tail + " The running server keeps its current flags until you hit Restart Now."
         }
     }

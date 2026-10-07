@@ -367,6 +367,7 @@ final class TelegramBridge: ObservableObject {
             sessionId: sessionId,
             userText: text,
             images: images,
+            videos: nil,
             audio: audio,
             config: turnConfig,
             approval: { tc in

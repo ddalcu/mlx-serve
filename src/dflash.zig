@@ -926,6 +926,9 @@ pub const DflashModel = struct {
             ));
         } else if (target.config.draftVocab() > 0) {
             out = try target.lmHeadRowsForDraft(x, target.config.draftVocab());
+        } else if (target.rht != null) {
+            // bf16 drafter over an f16 pack: uncast, the head product runs in f32.
+            out = try target.hadamardLmHead(x);
         } else {
             out = try target.lmHeadForDraft(x);
         }
@@ -1015,7 +1018,7 @@ fn checkCodebook(arr: mlx.mlx_array, which: []const u8, rank: u32) !void {
 /// weight is quantized to `bits` when the contraction dim allows it and
 /// pre-transposed for a plain matmul otherwise.
 fn loadLinear(
-    w: *const Weights,
+    w: *Weights,
     prefix: []const u8,
     in_features: u32,
     bits: u32,
@@ -1041,11 +1044,23 @@ fn loadLinear(
     }
 
     var kb: [256]u8 = undefined;
-    const raw = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix}));
+    const wkey = try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix});
+    const raw = try ownWeight(w, wkey);
     defer _ = mlx.mlx_array_free(raw);
 
     if (bits != 0) {
-        if (quantGroupFor(in_features)) |group| return quantizeDense(raw, bits, group, s);
+        if (quantGroupFor(in_features)) |group| {
+            var q = try quantizeDense(raw, bits, group, s);
+            errdefer q.deinit();
+            // Materialize now and drop the map's handle, so the load peaks at
+            // one bf16 tensor, not the whole checkpoint.
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            q.appendEval(vec);
+            try mlx.check(mlx.mlx_eval(vec));
+            w.replace(wkey, mlx.mlx_array_new());
+            return q;
+        }
     }
     var transposed = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(transposed);
@@ -1199,6 +1214,9 @@ pub fn loadDflashQuant(
         if (markov) |*mh| mh.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
+    // Hand the bf16 sources the load-time quantization freed back to the OS
+    // instead of leaving them in MLX's buffer pool.
+    _ = mlx.mlx_clear_cache();
 
     if (fc.isQuantized()) {
         log.info("[dflash] loaded {d} layers, hidden={d}, block_size={d}, targets={any}, weights={d}-bit/gs{d}\n", .{
@@ -1238,7 +1256,7 @@ pub fn loadDflashQuant(
 /// for layer `li`. Both weights are REQUIRED once the config declares
 /// `conv_kernel_size` — a DFlash2 pack missing them is a broken download.
 fn loadDynConv(
-    w: *const Weights,
+    w: *Weights,
     li: u32,
     comptime which: []const u8,
     hidden: u32,
@@ -2294,6 +2312,20 @@ pub fn appendContext(
     }
 }
 
+/// A copy of `x` in `like`'s dtype. An f16 trunk (Hadamard packs) feeding a
+/// bf16 drafter otherwise promotes every drafter op to f32, off the row lanes.
+fn toDrafterDtype(x: mlx.mlx_array, like: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const dt = mlx.mlx_array_dtype(like);
+    if (mlx.mlx_array_dtype(x) == dt) {
+        try mlx.check(mlx.mlx_array_set(&out, x));
+    } else {
+        try mlx.check(mlx.mlx_astype(&out, x, dt, s));
+    }
+    return out;
+}
+
 /// Encoder projection: concatenate the trunk captures on features →
 /// `encoder.fc` → RMS norm. Returns `[1, n, hidden]`, caller frees.
 pub fn encodeContext(model: *const DflashModel, captures: []const mlx.mlx_array) !mlx.mlx_array {
@@ -2307,7 +2339,9 @@ pub fn encodeContext(model: *const DflashModel, captures: []const mlx.mlx_array)
         for (captures) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
     }
-    const projected = try model.fc.apply(cat, s);
+    const cast = try toDrafterDtype(cat, model.enc_norm, s);
+    defer _ = mlx.mlx_array_free(cast);
+    const projected = try model.fc.apply(cast, s);
     defer _ = mlx.mlx_array_free(projected);
     return rmsNormFn(projected, model.enc_norm, model.config.rms_norm_eps, s);
 }
@@ -2357,8 +2391,7 @@ pub fn forwardBlock(
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
 
-    var x = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(&x, noise_embeds));
+    var x = try toDrafterDtype(noise_embeds, model.enc_norm, s);
     errdefer _ = mlx.mlx_array_free(x);
 
     for (model.layers, 0..) |*lw, li| {
@@ -3782,6 +3815,17 @@ test "dflash: the draft-only lm_head shrinks the draft read and leaves verify al
     try testing.expect(m.draft_head != null);
     try m.bindWithDraftBits(&xfm, 0);
     try testing.expect(m.draft_head == null);
+}
+
+test "dflash: a load-time quantized linear no longer pins its bf16 source in the weights map" {
+    const s = mlx.gpuStream();
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    try weights.map.put(try testing.allocator.dupe(u8, "lin.weight"), try TinyFix.bf16Arr(128, 256, 1, s));
+    var lin = try loadLinear(&weights, "lin", 256, 4, s);
+    defer lin.deinit();
+    try testing.expect(lin.isQuantized());
+    try testing.expect(weights.get("lin.weight").?.ctx == null);
 }
 
 test "dflash: quantGroupFor picks the widest divisor, declines what affine cannot pack" {

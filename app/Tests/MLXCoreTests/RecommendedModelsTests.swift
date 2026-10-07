@@ -436,8 +436,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id),
                        ["sushi-2bpw", "sushi-3bpw", "qwen38-flash-next", "deepseek-v4-flash"])
         let fn = RecommendedModelPick.qwen38FlashNext
-        XCTAssertEqual(fn.repoId, "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit")
-        XCTAssertEqual(fn.quantLabel, "mixed 4/8-bit")
+        XCTAssertEqual(fn.repoId, "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw")
+        XCTAssertEqual(fn.quantLabel, "iQ-MLX 4.7 bpw")
         XCTAssertEqual(fn.intelligence, RecommendedModelPick.deepseekV4Flash.intelligence)
     }
 

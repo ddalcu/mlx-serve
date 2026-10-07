@@ -10,13 +10,15 @@
 #                             rerun on the same model and build and diff it
 #   server.log                the boot log
 #
-# Usage: ./tests/test_decode_graph_dump.sh <model-dir> [extra mlx-serve flags...]
+# Usage: ./tests/test_decode_graph_dump.sh [model-dir] [extra mlx-serve flags...]
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
+source tests/_lib_models.sh
 
-MODEL="${1:?usage: test_decode_graph_dump.sh <model-dir> [flags...]}"
-shift
+MODEL="${1:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit)}"
+[ -n "$MODEL" ] && [ -d "$MODEL" ] || { echo "SKIP test_decode_graph_dump: no model (pass <model-dir>)"; exit 0; }
+shift || true
 PORT="${PORT:-8098}"
 BIN="${BIN:-./zig-out/bin/mlx-serve}"
 OUT="${OUT:-/tmp/decode-graph-dump-$PORT}"

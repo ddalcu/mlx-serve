@@ -348,11 +348,20 @@ fn printUsage(io: std.Io) void {
         \\                        rendering identical messages on warm reuse.
         \\                        0 disables.
         \\  --llama-cache-entries <n>
-        \\                      For GGUF models served via llama.cpp, the max
-        \\                        number of resident KV sessions (default: 4).
-        \\                        N > 1 keeps the N most-recently-used prompts
-        \\                        hot so alternating multi-doc workloads don't
-        \\                        cold-prefill on every flip.
+        \\                      For GGUF models served via llama.cpp, the
+        \\                        sequences per model (default: 4, 1..64):
+        \\                        requests decoded together in one batch,
+        \\                        each keeping its own prompt KV warm. Each
+        \\                        holds a full --ctx-size of KV from load.
+        \\  --llama-mtp-drafts <n>
+        \\                      Draft tokens per MTP round for a GGUF with an
+        \\                        MTP head, its own or an mtp-*.gguf beside it
+        \\                        (default: 2, 0 = off, max 8). Drafts only
+        \\                        while one request is decoding.
+        \\  --llama-ubatch <n>
+        \\                      llama.cpp prefill batch in tokens (default:
+        \\                        libllama's 512). 1024-2048 prefill faster,
+        \\                        mostly on MoE models, for more scratch memory.
         \\  --engine {{auto|ds4|llama}}
         \\                      Engine selector for `.gguf` inputs ONLY.
         \\                        Safetensors models always run on the native
@@ -887,12 +896,14 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.tokenize_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
         } else if (std.mem.eql(u8, args[i], "--llama-cache-entries") and i + 1 < args.len) {
-            // Iteration 3-5 (perf-plan Phase 5 #1): max concurrent
-            // llama.cpp KV sessions per model. 1 = legacy single-session
-            // (every prefill fights for the one slot). > 1 enables the
-            // best-prefix-match LRU.
             i += 1;
-            server_mod.llama_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
+            server_mod.llama_settings.seqs = parseLlamaInt(args[i], "--llama-cache-entries", 1, llama_arch.MAX_SEQS);
+        } else if (std.mem.eql(u8, args[i], "--llama-mtp-drafts") and i + 1 < args.len) {
+            i += 1;
+            server_mod.llama_settings.mtp_drafts = parseLlamaInt(args[i], "--llama-mtp-drafts", 0, scheduler_mod.MAX_LLAMA_DRAFTS);
+        } else if (std.mem.eql(u8, args[i], "--llama-ubatch") and i + 1 < args.len) {
+            i += 1;
+            server_mod.llama_settings.ubatch = parseLlamaInt(args[i], "--llama-ubatch", 0, 8192);
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-stride") and i + 1 < args.len) {
             // Phase 1 (perf-plan): per-position SSM/conv state snapshots during
             // chunked prefill enable multi-turn warm reuse on hybrid SSM
@@ -916,14 +927,13 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--llama-kv-quant") and i + 1 < args.len) {
-            // Phase 5 #2: KV-cache quantization for the embedded llama.cpp
-            // engine. Accepts `off`/`f16` (default; F16), `q8`/`8`/`Q8_0`
-            // (~2× compression, near-lossless), `q4`/`4`/`Q4_0` (~4×
-            // compression, some quality impact). Auto-enables flash-attn
-            // in the shim because llama's plain SDPA needs F16/F32 KV.
+            // Accepts `off`/`f16` (default; F16), `q8`/`8`/`Q8_0` (~2×
+            // compression, near-lossless), `q4`/`4`/`Q4_0` (~4× compression,
+            // some quality impact). Auto-enables flash-attn in the shim
+            // because llama's plain SDPA needs F16/F32 KV.
             i += 1;
             if (llama_arch.LlamaKvQuant.fromString(args[i])) |q| {
-                server_mod.llama_kv_quant = q;
+                server_mod.llama_settings.kv_quant = q;
             } else {
                 log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
                 std.process.exit(1);
@@ -1497,11 +1507,9 @@ pub fn main(init: std.process.Init) !void {
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-            .llama_cache_entries = server_mod.llama_cache_entries,
+            .llama = server_mod.llama_settings,
             .ds4_mtp = ds4_mtp,
             .ds4_dspark = ds4_dspark,
-            .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
-            .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
             .metrics = server_mod.g_metrics,
         };
         try server_mod.serve(io, allocator, params, config, host, port, .{
@@ -1709,11 +1717,12 @@ fn chooseGgufEngine(
     defer info.deinit(allocator);
 
     const e = gguf_meta.preferredEngine(info);
-    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, ds4-unloadable={})\n", .{
+    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, ds4-unloadable={}, shards={d})\n", .{
         @tagName(e),
         info.architecture orelse "?",
         info.has_ds4_lora_rank,
         info.ds4_unloadable,
+        info.split_count,
     });
     return e;
 }
@@ -1792,7 +1801,6 @@ fn runDs4Offline(
     const out_w = &stdout.interface;
     try out_w.writeAll("\n");
 
-    const eos = engine.eosToken();
     var generated: u32 = 0;
     while (generated < max_tokens) : (generated += 1) {
         const next_id: i32 = if (temp <= 0.0)
@@ -1800,7 +1808,7 @@ fn runDs4Offline(
         else
             sess.sample(temp, 0, 1.0, 0.05, &rng);
 
-        if (next_id == eos) break;
+        if (engine.isStop(next_id)) break;
 
         const piece = try engine.detokenizeOne(allocator, next_id);
         defer allocator.free(piece);
@@ -2304,6 +2312,16 @@ fn runDs4Serve(
     });
 }
 
+/// A `--llama-*` integer in [lo, hi]; anything else exits naming the flag.
+fn parseLlamaInt(raw: []const u8, flag: []const u8, lo: u32, hi: u32) u32 {
+    const v = std.fmt.parseInt(u32, raw, 10) catch hi + 1;
+    if (v < lo or v > hi) {
+        log.err("{s}: expected an integer {d}..{d}, got '{s}'\n", .{ flag, lo, hi, raw });
+        std.process.exit(1);
+    }
+    return v;
+}
+
 /// Offline single-prompt generation through the embedded llama.cpp engine.
 /// Renders the prompt via the GGUF's built-in chat template (falling back to a
 /// raw tokenize when the template isn't a recognized format) and streams
@@ -2348,10 +2366,11 @@ fn runLlamaOffline(
 
     log.info("[llama] prompt: {d} tokens\n", .{prompt_ids.len});
 
-    var sess = try engine.createSession(8192);
-    defer sess.free();
+    var ctx = try engine.createContext(.{ .ctx_size = 8192 });
+    defer ctx.free();
+    const sess = &ctx.seqs[0];
 
-    _ = try sess.sync(prompt_ids); // cold session: cached count is 0, unused here
+    _ = try sess.sync(prompt_ids); // cold sequence: cached count is 0, unused here
 
     var rng: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
 
@@ -2362,10 +2381,7 @@ fn runLlamaOffline(
 
     var generated: u32 = 0;
     while (generated < max_tokens) : (generated += 1) {
-        const next_id: i32 = if (temp < 0.01)
-            sess.argmax()
-        else
-            sess.sample(temp, 0, 1.0, 0.0, &rng);
+        const next_id = sess.sample(.{ .temperature = temp }, &rng);
 
         if (next_id < 0 or engine.isEog(next_id)) break;
 
@@ -2528,10 +2544,6 @@ fn runLlamaServe(
         chat_config_owned_by_registry = true;
     };
 
-    // Serial for v1 — each llama session owns an independent context (memory
-    // multiplies with concurrency); keep one in flight like the ds4 path.
-    server_mod.max_concurrent = 1;
-
     const params = scheduler_mod.LoadParams{
         .registry = registry,
         .entry = entry,
@@ -2548,16 +2560,8 @@ fn runLlamaServe(
         .kv_quant_config = transformer_mod.KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
-        // Iteration 2 + 3-5: thread the tokenize cache + multi-session
-        // LRU through the llama-specific LoadParams. doLoadLlamaOnInferenceThread
-        // reads both fields.
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        .llama_cache_entries = server_mod.llama_cache_entries,
-        // Phase 5 #2: also thread the llama KV-quant types on this path
-        // (the MLX branch sets them via the shared assignment, which we
-        // don't reach for GGUF models).
-        .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
-        .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
+        .llama = server_mod.llama_settings,
         .llama_path = gguf_path_owned,
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,

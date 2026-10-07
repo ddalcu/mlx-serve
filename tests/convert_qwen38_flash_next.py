@@ -232,9 +232,8 @@ def width_for(name, shape, nonexpert_bits=8, embed_bits=4):
     """(bits, group_size) or None for bf16 pass-through."""
     if len(shape) != 2 or shape[0] < 32 or shape[1] % 64 != 0:
         return None
-    if name.endswith("embed_tokens.weight"):
-        return embed_bits, 64
-    return nonexpert_bits, 64
+    bits = embed_bits if name.endswith("embed_tokens.weight") else nonexpert_bits
+    return (bits, 64) if bits < 16 else None
 
 
 def oq4e_mix_width(name, shape):
@@ -300,18 +299,20 @@ class NgramTable:
 
     def __init__(self, path, rows, bits, gs, dim):
         self.path, self.rows, self.bits, self.gs, self.dim = path, rows, bits, gs, dim
-        self.wcols = dim * bits // 32
-        self.scols = dim // gs
-        self.w_bytes = rows * self.wcols * 4
-        self.s_bytes = rows * self.scols * 2
-        header = {
-            "__metadata__": {"format": "mlx-serve-ngram", "bits": str(bits), "group_size": str(gs)},
-            "weight": {"dtype": "U32", "shape": [rows, self.wcols], "data_offsets": [0, self.w_bytes]},
-            "scales": {"dtype": "BF16", "shape": [rows, self.scols],
-                       "data_offsets": [self.w_bytes, self.w_bytes + self.s_bytes]},
-            "biases": {"dtype": "BF16", "shape": [rows, self.scols],
-                       "data_offsets": [self.w_bytes + self.s_bytes, self.w_bytes + 2 * self.s_bytes]},
-        }
+        header = {"__metadata__": {"format": "mlx-serve-ngram", "bits": str(bits), "group_size": str(gs)}}
+        if bits == 16:  # raw bf16 rows, no scales/biases
+            self.w_bytes, self.s_bytes = rows * dim * 2, 0
+            header["weight"] = {"dtype": "BF16", "shape": [rows, dim], "data_offsets": [0, self.w_bytes]}
+        else:
+            self.wcols = dim * bits // 32
+            self.scols = dim // gs
+            self.w_bytes = rows * self.wcols * 4
+            self.s_bytes = rows * self.scols * 2
+            header["weight"] = {"dtype": "U32", "shape": [rows, self.wcols], "data_offsets": [0, self.w_bytes]}
+            header["scales"] = {"dtype": "BF16", "shape": [rows, self.scols],
+                                "data_offsets": [self.w_bytes, self.w_bytes + self.s_bytes]}
+            header["biases"] = {"dtype": "BF16", "shape": [rows, self.scols],
+                                "data_offsets": [self.w_bytes + self.s_bytes, self.w_bytes + 2 * self.s_bytes]}
         hjson = json.dumps(header).encode()
         hjson += b" " * ((8 - len(hjson) % 8) % 8)
         self.data_off = 8 + len(hjson)
@@ -320,6 +321,12 @@ class NgramTable:
                 f.write(struct.pack("<Q", len(hjson)))
                 f.write(hjson)
                 f.truncate(self.data_off + self.w_bytes + 2 * self.s_bytes)
+
+    def write_bf16(self, row0, arr_u16):
+        with open(self.path, "r+b") as f:
+            f.seek(self.data_off + row0 * self.dim * 2)
+            f.write(np.ascontiguousarray(arr_u16).tobytes())
+        return arr_u16.shape[0]
 
     def write(self, row0, triples):
         (wdt, wshape, wraw), (_, sshape, sraw), (_, _, braw) = triples
@@ -448,17 +455,20 @@ def main():
     ap.add_argument("--alloc", default=None, help="per-layer expert widths from qwen38_flash_next_iq_allocate.py")
     ap.add_argument("--ngram-link", default=None, help="hard-link this ngram_table.bin instead of re-quantizing the table")
     ap.add_argument("--jobs", type=int, default=max(2, (os.cpu_count() or 4) - 2))
-    ap.add_argument("--ngram-bits", type=int, default=4)
-    ap.add_argument("--nonexpert-bits", type=int, default=8, help="width for every non-expert 2-D projection (4 = the -all pack)")
-    ap.add_argument("--embed-bits", type=int, default=4, help="width for embed_tokens (a gather-read table; 8 keeps the input exact-ish)")
+    ap.add_argument("--ngram-bits", type=int, default=4, help="16 = raw bf16 table")
+    ap.add_argument("--nonexpert-bits", type=int, default=8, help="width for every non-expert 2-D projection (4 = the -all pack, 16 = bf16)")
+    ap.add_argument("--embed-bits", type=int, default=4, help="width for embed_tokens (a gather-read table; 8 keeps the input exact-ish, 16 = bf16)")
     ap.add_argument("--ahead", type=int, default=2)
     ap.add_argument("--add-vision", action="store_true", help="append the bf16 vision tower to the pack at --dst (no re-stream)")
     ap.add_argument("--oq4e-mix", action="store_true", help="tiny oracle packs: oMLX-style per-module widths (oq4e_mix_width), recorded in config.json")
+    ap.add_argument("--bf16", action="store_true", help="no quantization at all: every tensor stays bf16 (the reference-quality pack), the n-gram table is raw bf16")
     ap.add_argument("--embedded-ngram", type=float, default=None, metavar="WEIGHT_SCALE",
                     help="tiny oracle packs: ship the n-gram table as oMLX's embedded 4-bit shards stored divided by this global weight_scale")
     args = ap.parse_args()
     args.gate_up_bits = args.gate_up_bits or args.bits
     args.down_bits = args.down_bits or args.bits
+    if args.bf16:
+        args.ngram_bits = 16
     if args.alloc:
         args.alloc = json.loads(Path(os.path.expanduser(args.alloc)).read_text())
     if args.add_vision:
@@ -536,6 +546,10 @@ def main():
         pool = ProcessPoolExecutor(max_workers=args.jobs)
 
     def emit_q(nk, arr, bits, gs, src_name=None):
+        if args.bf16:
+            base = nk[:-len(".weight")] if nk.endswith(".weight") else nk
+            emit(base + ".weight", ("BF16", arr.shape, np.ascontiguousarray(arr).tobytes()))
+            return
         ch = imatrix.get(src_name) if imatrix is not None and src_name else None
         if ch is not None:
             wq, sc, bi = quant_weighted(arr, bits, gs, ch, pool)
@@ -574,7 +588,10 @@ def main():
                     rows = arr.shape[0] * n_ngram_shards
                     state["ngram_rows"] = rows
                     ngram = NgramTable(str(dst / "ngram_table.bin"), rows, args.ngram_bits, 32, arr.shape[1])
-                ngram.write(shard_idx * arr.shape[0], quant(arr, args.ngram_bits, 32))
+                if args.ngram_bits == 16:
+                    ngram.write_bf16(shard_idx * arr.shape[0], arr)
+                else:
+                    ngram.write(shard_idx * arr.shape[0], quant(arr, args.ngram_bits, 32))
                 continue
             nk = rename(name)
             arr = read_raw(path, data_off, meta)
@@ -621,8 +638,9 @@ def main():
     cfg = json.loads((stage / "config.json").read_text())
     cfg.pop("vision_config", None)
     cfg["language_model_only"] = True
-    cfg["quantization"] = {"group_size": 64, "bits": args.bits, "mode": "affine", **overrides}
-    cfg["quantization_config"] = cfg["quantization"]
+    if not args.bf16:
+        cfg["quantization"] = {"group_size": 64, "bits": args.bits, "mode": "affine", **overrides}
+        cfg["quantization_config"] = cfg["quantization"]
     if args.embedded_ngram is None:
         cfg["ngram_table"] = {"file": "ngram_table.bin", "bits": args.ngram_bits, "group_size": 32}
     if imatrix is not None:
@@ -630,12 +648,13 @@ def main():
         pool.shutdown()
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
     ngram_bytes = os.path.getsize(dst / "ngram_table.bin") if (dst / "ngram_table.bin").exists() else 0
-    (dst / "README.md").write_text(README.format(
-        repo_name=dst.name, ngram_gb=ngram_bytes / 1e9, nonexpert_bits=args.nonexpert_bits,
-        resident_gb=state["total"] / 1e9, expert_widths=expert_widths_note(args, n_layers),
-        mtp_widths=f"experts {args.bits}-bit group 64, projections {args.nonexpert_bits}-bit group 64",
-        tier_note=(" (a 64 GB Mac with the wired limit raised, 64k context)" if state["total"] < 56e9
-                   else " (128 GB Macs)")))
+    if not args.bf16:
+        (dst / "README.md").write_text(README.format(
+            repo_name=dst.name, ngram_gb=ngram_bytes / 1e9, nonexpert_bits=args.nonexpert_bits,
+            resident_gb=state["total"] / 1e9, expert_widths=expert_widths_note(args, n_layers),
+            mtp_widths=f"experts {args.bits}-bit group 64, projections {args.nonexpert_bits}-bit group 64",
+            tier_note=(" (a 64 GB Mac with the wired limit raised, 64k context)" if state["total"] < 56e9
+                       else " (128 GB Macs)")))
     state_path.unlink()
     print(f"done: {state['total']/1e9:.1f} GB trunk + ngram_table.bin "
           f"{ngram_bytes/1e9:.1f} GB in {(time.time()-t0)/60:.0f} min")

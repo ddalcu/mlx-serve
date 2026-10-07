@@ -139,6 +139,19 @@ RELOAD="$(curl -fs --max-time 120 "$BASE/v1/chat/completions" -H 'Content-Type: 
     -d '{"model":"testorg/test-model-GGUF","messages":[{"role":"user","content":"Say hi"}],"max_tokens":8,"temperature":0}')"
 assert_contains "reload after unload answers"               '"content"'               "$RELOAD"
 
+# 8. The app picks a GGUF quant by its FILE path, here in a per-quant folder
+#    discovery does not list (unsloth's layout). Before a chat it loads that
+#    path; the load took folders only, so the chat 404'd.
+QUANT="$SCRATCH/testorg/sharded-GGUF/Q8_0/model-Q8_0-00001-of-00001.gguf"
+mkdir -p "$(dirname "$QUANT")"
+ln -s "$MODEL_ABS" "$QUANT"
+LOADED="$(curl -s --max-time 120 -X POST "$BASE/v1/load-model" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$QUANT\"}")"
+assert_contains "a .gguf file path loads, named by its stem" '"id":"model-Q8_0-00001-of-00001"' "$LOADED"
+BYPATH="$(curl -s --max-time 120 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$QUANT\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi\"}],\"max_tokens\":8,\"temperature\":0}")"
+assert_contains "a chat naming the .gguf path answers"      '"content"'               "$BYPATH"
+
 echo ""
 echo -e "  ${GREEN}$PASS passed${NC}, $([ "$FAIL" -gt 0 ] && echo -e "${RED}$FAIL failed${NC}" || echo "0 failed")"
 [ "$FAIL" -eq 0 ]

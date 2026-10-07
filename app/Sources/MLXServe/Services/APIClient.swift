@@ -569,6 +569,28 @@ class APIClient {
         var reasoningBudget: Int? = nil
         var enablePLD: Bool? = nil
         var enableDrafter: Bool? = nil
+        var inheritGeneration = false
+        var temperatureOverride: Double? = nil
+        var maxTokensOverride: Int? = nil
+
+        func applyGeneration(to body: inout [String: Any], maxTokens: Int, temperature: Double,
+                             enableThinking: Bool, effort: String?) {
+            if inheritGeneration {
+                body["temperature"] = temperatureOverride
+                body["max_tokens"] = maxTokensOverride
+                body["top_p"] = topP
+            } else {
+                body["temperature"] = temperature
+                body["top_p"] = topP ?? 0.95
+                if maxTokens > 0 { body["max_tokens"] = maxTokens }
+            }
+            if inheritGeneration || enableThinking { body["enable_thinking"] = enableThinking }
+            body["reasoning_effort"] = effort
+            body["top_k"] = topK
+            body["repeat_penalty"] = repeatPenalty
+            body["presence_penalty"] = presencePenalty
+            body["reasoning_budget_tokens"] = reasoningBudget
+        }
 
         static let none = RequestDefaults()
 
@@ -677,6 +699,30 @@ class APIClient {
         }
     }
 
+    static func chatRequestBody(messages: [[String: Any]], maxTokens: Int, temperature: Double,
+                                enableThinking: Bool, reasoningEffort: String? = nil,
+                                tools: [[String: Any]]? = nil, toolsJSON: String? = nil,
+                                defaults: RequestDefaults = .none, modelId: String? = nil,
+                                continueFinalMessage: Bool = false) throws -> Data {
+        var body: [String: Any] = [
+            "model": modelId ?? "mlx-serve", "messages": messages,
+            "stream": true, "stream_options": ["include_usage": true],
+        ]
+        defaults.applyGeneration(to: &body, maxTokens: maxTokens, temperature: temperature,
+                                 enableThinking: enableThinking, effort: reasoningEffort)
+        if continueFinalMessage { body["continue_final_message"] = true }
+        if let value = defaults.enablePLD { body["enable_pld"] = value }
+        if let value = defaults.enableDrafter { body["enable_drafter"] = value }
+        if toolsJSON == nil, let tools { body["tools"] = tools }
+        let data = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
+        guard let toolsJSON else { return data }
+        // Keep the tool schema's property order while sharing generation fields with plain chat.
+        var spliced = String(decoding: data, as: UTF8.self)
+        spliced.removeLast()
+        spliced += ",\"tools\":\(toolsJSON)}"
+        return Data(spliced.utf8)
+    }
+
     private func performStream(
         port: UInt16,
         messages: [[String: Any]],
@@ -698,72 +744,10 @@ class APIClient {
         request.setValue("close", forHTTPHeaderField: "Connection")
         request.timeoutInterval = 300
 
-        // Effective top_p: use the user's saved default when set, else 0.95.
-        // (`top_p` is special — it has a sane non-disabled default we want to
-        // keep on every request.)
-        let effectiveTopP = defaults.topP ?? 0.95
-
-        // Plan 05 Phase G — pin the request to the user's selected model
-        // when known. Defaults to "mlx-serve" which the server resolves
-        // to its default loaded model (matches pre-Phase-G behavior).
-        let effectiveModelId = modelId ?? "mlx-serve"
-        if let toolsJSON {
-            // Splice pre-serialized tools JSON to preserve property key order
-            let messagesData = try JSONSerialization.data(withJSONObject: messages)
-            guard let messagesStr = String(data: messagesData, encoding: .utf8) else {
-                continuation.finish(throwing: URLError(.cannotParseResponse))
-                return
-            }
-            let escapedModelId = effectiveModelId
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-            var parts = [
-                "\"model\":\"\(escapedModelId)\"",
-                "\"messages\":\(messagesStr)",
-                "\"temperature\":\(temperature)",
-                "\"top_p\":\(effectiveTopP)",
-                "\"stream\":true",
-                "\"stream_options\":{\"include_usage\":true}",
-            ]
-            // maxTokens <= 0 means "Auto": omit the field so the server pegs
-            // generation to the remaining context window.
-            if maxTokens > 0 { parts.append("\"max_tokens\":\(maxTokens)") }
-            if enableThinking { parts.append("\"enable_thinking\":true") }
-            if let v = reasoningEffort { parts.append("\"reasoning_effort\":\"\(v)\"") }
-            if let v = defaults.topK { parts.append("\"top_k\":\(v)") }
-            if let v = defaults.repeatPenalty { parts.append("\"repeat_penalty\":\(v)") }
-            if let v = defaults.presencePenalty { parts.append("\"presence_penalty\":\(v)") }
-            if let v = defaults.reasoningBudget { parts.append("\"reasoning_budget\":\(v)") }
-            if let v = defaults.enablePLD { parts.append("\"enable_pld\":\(v)") }
-            if let v = defaults.enableDrafter { parts.append("\"enable_drafter\":\(v)") }
-            parts.append("\"tools\":\(toolsJSON)")
-            request.httpBody = "{\(parts.joined(separator: ","))}".data(using: .utf8)
-        } else {
-            var body: [String: Any] = [
-                "model": effectiveModelId,
-                "messages": messages,
-                "temperature": temperature,
-                "top_p": effectiveTopP,
-                "stream": true,
-                "stream_options": ["include_usage": true],
-            ]
-            // maxTokens <= 0 means "Auto": omit so the server pegs to context.
-            if maxTokens > 0 { body["max_tokens"] = maxTokens }
-            if enableThinking { body["enable_thinking"] = true }
-            if continueFinalMessage { body["continue_final_message"] = true }
-            if let v = reasoningEffort { body["reasoning_effort"] = v }
-            if let v = defaults.topK { body["top_k"] = v }
-            if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }
-            if let v = defaults.presencePenalty { body["presence_penalty"] = v }
-            if let v = defaults.reasoningBudget { body["reasoning_budget"] = v }
-            if let v = defaults.enablePLD { body["enable_pld"] = v }
-            if let v = defaults.enableDrafter { body["enable_drafter"] = v }
-            if let tools { body["tools"] = tools }
-            // withoutEscapingSlashes: same rationale as loadModel — a LAN model
-            // id ("ddalcu/…@peer") escaped to `\/` misses the peer-table
-            // byte-compare (live 404 "no longer shares this model").
-            request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
-        }
+        request.httpBody = try Self.chatRequestBody(messages: messages, maxTokens: maxTokens,
+            temperature: temperature, enableThinking: enableThinking, reasoningEffort: reasoningEffort,
+            tools: tools, toolsJSON: toolsJSON, defaults: defaults, modelId: modelId,
+            continueFinalMessage: continueFinalMessage)
 
         let streamStart = Date()
         let (bytes, response) = try await session.bytes(for: request)

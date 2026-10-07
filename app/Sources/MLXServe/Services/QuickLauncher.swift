@@ -411,7 +411,7 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
             sid = sessionId! // needsNewSession(false) implies non-nil
         }
         let resolved = appState.resolvedAgentSettings(agentId: appState.defaultAgentId)
-        appState.chatEngine.runTurn(sessionId: sid, userText: text, images: nil, audio: nil,
+        appState.chatEngine.runTurn(sessionId: sid, userText: text, images: nil, videos: nil, audio: nil,
                                     config: QuickLauncherLogic.turnConfig(resolved: resolved),
                                     approval: { _ in false })
         updatePanelFrame(keepTopEdge: true)

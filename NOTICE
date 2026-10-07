@@ -583,6 +583,12 @@ and they are listed because they made that work possible.
     exchanged with `simd_shuffle`, the dequantize-into-the-right-operand
     arrangement, and the two-slice threadgroup reduction. Transcribed into a
     JIT `metal_kernel` here, not shipped as their source.
+  * Layr-Labs/mlxfast-bonsai2-27b-engine (MIT), the reference for the 2-bit
+    simdgroup-MMA verify kernel in `src/qmv2.zig` (`msv_qmv2_mma`): its
+    `FewRowPackedMatmul` fragment coordinate mapping, two codes per lane
+    decoded straight into the weight fragment, and per-group scaling of the
+    partial products. Transcribed into a JIT `metal_kernel` here, not shipped
+    as their source.
   * Layr-Labs/mlxfast-bonsai2-27b-engine (MIT), the reference for the opt-in
     int8 prefill in `src/qmm_int8.zig`: its register-staged prompt matmul (2-bit
     codes expanded to int8 straight into the tensor op's operand, signed

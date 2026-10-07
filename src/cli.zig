@@ -263,13 +263,18 @@ pub fn isTorchShadowBin(path: []const u8) bool {
 }
 
 pub fn shouldDownload(path: []const u8) bool {
-    if (path.len == 0 or path[0] == '.') return false;
     if (std.mem.indexOfScalar(u8, path, '/')) |_| {
         const sidecar_dirs = [_][]const u8{ "mtp/", "drafter/", "g2p/", "speech_tokenizer/" };
         for (sidecar_dirs) |d| {
             if (std.mem.startsWith(u8, path, d)) break;
         } else return false;
     }
+    return shouldDownloadFile(path);
+}
+
+/// The name filter alone: a media pack keeps what passes it at any depth.
+fn shouldDownloadFile(path: []const u8) bool {
+    if (path.len == 0 or path[0] == '.') return false;
     const skip_exact = [_][]const u8{ "README.md", "LICENSE", "LICENSE.txt", "USE_POLICY.md" };
     for (skip_exact) |s| {
         if (std.ascii.eqlIgnoreCase(path, s)) return false;
@@ -445,22 +450,33 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
+    const config_json: ?[]u8 = for (files) |f| {
+        if (!std.mem.eql(u8, f.path, "config.json")) continue;
+        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/config.json", .{resolved.repo});
+        defer allocator.free(url);
+        break curlFetch(allocator, io, url) catch null;
+    } else null;
+    defer if (config_json) |c| allocator.free(c);
+    const media = isMediaListing(allocator, files, config_json);
+
     var wanted: usize = 0;
     var total_bytes: u64 = 0;
+    var has_weights = false;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path)) continue;
+        if (!wantedFile(resolved, f.path, media)) continue;
         wanted += 1;
         total_bytes += f.size;
+        if (std.mem.endsWith(u8, f.path, ".safetensors") or std.mem.endsWith(u8, f.path, ".gguf")) has_weights = true;
     }
-    if (wanted == 0) {
-        reporter.say("error: {s} has no downloadable model files", .{resolved.repo});
+    if (!has_weights) {
+        reporter.say("error: {s} has no weights this pull can fetch", .{resolved.repo});
         return error.PullFailed;
     }
     reporter.say("{d} files, {d} MB total", .{ wanted, total_bytes / (1024 * 1024) });
 
     var idx: usize = 0;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path)) continue;
+        if (!wantedFile(resolved, f.path, media)) continue;
         idx += 1;
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
         defer allocator.free(dest_path);
@@ -483,12 +499,26 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     reporter.say("success: {s} ready", .{resolved.repo});
 }
 
-fn wantedFile(resolved: Resolved, path: []const u8) bool {
+fn wantedFile(resolved: Resolved, path: []const u8, media: bool) bool {
     if (resolved.gguf_file.len > 0) {
         // Single-artifact GGUF repos: just that file (plus nothing else).
         return std.mem.eql(u8, path, resolved.gguf_file);
     }
-    return shouldDownload(path);
+    return if (media) shouldDownloadFile(path) else shouldDownload(path);
+}
+
+/// A media pack keeps its components in folders (FLUX's transformer/ and vae/,
+/// LTX's text encoder, Music3's tokenizers), so its pull takes every folder.
+/// Markers are the ones discovery classifies by: a configless pack's own
+/// config file, else `config.json`'s `model_type`.
+fn isMediaListing(allocator: std.mem.Allocator, files: []const RepoFile, config_json: ?[]const u8) bool {
+    const markers = [_][]const u8{ "model_index.json", "model_config.json", "rl_agent_config.json", "kev_config.json", "joint_head_config.json" };
+    for (files) |f| for (markers) |m| if (std.mem.eql(u8, f.path, m)) return true;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json orelse return false, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const mt = parsed.value.object.get("model_type") orelse return false;
+    return mt == .string and model_discovery.isMediaModelType(mt.string);
 }
 
 // ── Commands ────────────────────────────────────────────────────────────
@@ -920,6 +950,40 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(!shouldDownload("pytorch_model-00001-of-00002.bin"));
     try testing.expect(!shouldDownload("consolidated.pth"));
     try testing.expect(!shouldDownload("flax_model.msgpack"));
+}
+
+test "cli: a media pack's pull keeps its component folders (#362)" {
+    // FLUX.2-klein as Runpod and mlx-community ship it: every weight sits in a folder.
+    const tree =
+        \\[{"type":"file","path":"config.json","size":1},
+        \\ {"type":"file","path":"README.md","size":1},
+        \\ {"type":"file","path":"assets/demo.png","size":1},
+        \\ {"type":"file","path":"transformer/0.safetensors","size":1},
+        \\ {"type":"file","path":"transformer/model.safetensors.index.json","size":1},
+        \\ {"type":"file","path":"text_encoder/0.safetensors","size":1},
+        \\ {"type":"file","path":"text_encoder/pytorch_model.bin","size":1},
+        \\ {"type":"file","path":"vae/0.safetensors","size":1},
+        \\ {"type":"file","path":"tokenizer/tokenizer.json","size":1}]
+    ;
+    const files = try parseTreeJson(testing.allocator, tree);
+    defer freeRepoFiles(testing.allocator, files);
+    const resolved = Resolved{ .repo = "Runpod/FLUX.2-klein-4B-mflux-4bit" };
+
+    const media = isMediaListing(testing.allocator, files, "{\"model_type\": \"flux2-klein-4b\"}");
+    try testing.expect(media);
+    var kept = std.ArrayList([]const u8).empty;
+    defer kept.deinit(testing.allocator);
+    for (files) |f| if (wantedFile(resolved, f.path, media)) try kept.append(testing.allocator, f.path);
+    const want = [_][]const u8{ "config.json", "transformer/0.safetensors", "transformer/model.safetensors.index.json", "text_encoder/0.safetensors", "vae/0.safetensors", "tokenizer/tokenizer.json" };
+    try testing.expectEqual(want.len, kept.items.len);
+    for (want, kept.items) |w, k| try testing.expectEqualStrings(w, k);
+
+    // The same folders on a chat pack stay out, and configless media packs carry a marker.
+    try testing.expect(!isMediaListing(testing.allocator, files, "{\"model_type\": \"qwen3\"}"));
+    try testing.expect(!wantedFile(resolved, "vae/0.safetensors", false));
+    const mage = try parseTreeJson(testing.allocator, "[{\"type\":\"file\",\"path\":\"model_index.json\",\"size\":1}]");
+    defer freeRepoFiles(testing.allocator, mage);
+    try testing.expect(isMediaListing(testing.allocator, mage, null));
 }
 
 test "cli: modelPresentInDir requires a COMPLETE checkpoint" {

@@ -77,7 +77,8 @@ check() {
         return
     fi
     local content
-    content=$(python3 -c "import sys,json; print(json.load(open('$file'))['choices'][0]['message'].get('content','') or '')")
+    # A thinking model can spend the budget on reasoning: either field proves the request ran on it.
+    content=$(python3 -c "import sys,json; m=json.load(open('$file'))['choices'][0]['message']; print(m.get('content') or m.get('reasoning_content') or '')")
     if [ -z "$content" ]; then
         echo -e "${RED}FAIL${NC} $name: empty content"
         FAIL=1

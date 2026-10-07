@@ -36,6 +36,7 @@ struct ModelSettingsSheet: View {
     @State private var override = ModelOverride()
     @State private var initialOverride = ModelOverride()
     @State private var settingsFile = ModelSettingsFile()
+    @State private var inheritedGeneration = GenerationDefaults()
     @State private var addingCustom = false
     @State private var customKey = ""
     @State private var customValue = ""
@@ -116,7 +117,7 @@ struct ModelSettingsSheet: View {
         if rows.acceptance { n += 2 }
         if live?.loaded == true { n += 1 }
         if !isGguf { n += 2 + override.templateKwargs.count + (addingCustom ? 1 : 0) }
-        return CGFloat(44 * n + 50)
+        return min(650, CGFloat(44 * n + 50 + 10 * 72))
     }
 
     @ViewBuilder
@@ -159,7 +160,7 @@ struct ModelSettingsSheet: View {
 
     private var footnote: String {
         switch plan {
-        case .saveOnly: return "Applied when the model loads."
+        case .saveOnly: return "Generation defaults apply to the next request. Load settings apply when the model loads."
         case .reload: return "Applied when the model loads; the resident model is reloaded now."
         case .restart: return "Applied when the model loads; the server is restarted now."
         }
@@ -235,6 +236,17 @@ struct ModelSettingsSheet: View {
                 }
                 .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU.")
                 }
+                Section("Generation defaults") {
+                    if override.extra["generation_defaults"] != nil {
+                        Text("The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here.")
+                            .font(.app(.caption)).foregroundStyle(.orange)
+                    }
+                    GenerationDefaultsRows(profile: $override.generationDefaults, inheritance: "Global",
+                                           inherited: inheritedGeneration)
+                        .disabled(override.extra["generation_defaults"] != nil)
+                    Text("Applies to the next request without reloading. Model rules replace global values and their client-override policy.")
+                        .font(.app(.caption)).foregroundStyle(.secondary)
+                }
                 if !isGguf {
                     Section {
                         ForEach(override.sortedKwargKeys, id: \.self) { key in
@@ -309,11 +321,12 @@ struct ModelSettingsSheet: View {
             }
             .padding(16)
         }
-        .frame(width: 440)
+        .frame(width: 660)
         .onAppear {
             settingsFile = ModelSettingsFile.load()
             override = settingsFile.override(for: request.path) ?? ModelOverride()
             initialOverride = override
+            inheritedGeneration = (try? GenerationDefaultsFile.load()) ?? .init()
             let gems = SpeculationSocketRow.gems(repoId: repoId, modelDir: request.path, mtpAvailable: rows.mtp,
                                                  listing: downloads.packListings[repoId])
             socket = DrafterSocket.read(override, gems: gems) { downloads.gemPath($0, modelDir: request.path) }

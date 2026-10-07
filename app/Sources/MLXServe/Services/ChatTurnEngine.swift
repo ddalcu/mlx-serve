@@ -194,7 +194,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
               session(sessionId) != nil,
               Self.canRunTurn(serverRunning: server.status == .running, apple: appState.useAppleModel),
               let note = steering.take(for: sessionId) else { return }
-        runTurn(sessionId: sessionId, userText: note, images: nil, audio: nil,
+        runTurn(sessionId: sessionId, userText: note, images: nil, videos: nil, audio: nil,
                 config: config.revokingTools(revoked), approval: approval)
     }
 
@@ -360,19 +360,32 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             thinking ? reasoningEffort.rawValue : nil
         }
 
-        /// The per-request defaults for this turn: the user's saved sampling
-        /// with the agent's overrides laid on top. An override REPLACES the
-        /// saved value — including with the canonical "off" (top_k 0, repeat
-        /// 1.0, presence 0.0, budget -1), which clears the global rather than
-        /// leaving it standing, mapped to an omitted field exactly as
-        /// `RequestDefaults.from` maps it.
-        func requestDefaults(from opts: ServerOptions) -> APIClient.RequestDefaults {
-            var d = APIClient.RequestDefaults.from(opts)
+        func thinkingForRequest(_ options: ServerOptions, inheritGeneration: Bool) -> Bool {
+            enableThinking || (!inheritGeneration && options.defaultEnableThinking)
+        }
+
+        /// Local servers resolve inherited generation defaults; explicit agent
+        /// values, including neutral values, stay in the request. Remote clients
+        /// retain their saved sampling behavior.
+        func requestDefaults(from opts: ServerOptions, inheritGeneration: Bool = false) -> APIClient.RequestDefaults {
+            var d = inheritGeneration ? APIClient.RequestDefaults() : APIClient.RequestDefaults.from(opts)
+            d.inheritGeneration = inheritGeneration
+            d.temperatureOverride = temperature
+            d.maxTokensOverride = maxTokens
+            if inheritGeneration {
+                d.enablePLD = opts.perRequestEnablePLD.asOptionalBool
+                d.enableDrafter = opts.perRequestEnableDrafter.asOptionalBool
+                d.topK = topK
+                d.repeatPenalty = repeatPenalty
+                d.presencePenalty = presencePenalty
+                d.reasoningBudget = reasoningBudget
+            } else {
+                if let v = topK { d.topK = v > 0 ? v : nil }
+                if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
+                if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
+                if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
+            }
             if let v = topP { d.topP = v }
-            if let v = topK { d.topK = v > 0 ? v : nil }
-            if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
-            if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
-            if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
             return d
         }
 
@@ -553,7 +566,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
-                 videos: [ChatVideo]? = nil,
+                 videos: [ChatVideo]?,
                  audio: [ChatAudio]?,
                  config: TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool) {
@@ -598,6 +611,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         else { return }
         let text = msgs[lastUserIdx].content
         let images = msgs[lastUserIdx].images
+        let videos = msgs[lastUserIdx].videos
         let audio = msgs[lastUserIdx].audio
         // The reply about to be destroyed. `truncateMessages` drops everything
         // from the last user turn onward, so this is the only moment it can be
@@ -605,7 +619,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // answer is the whole reason the pager exists.
         let replaced = msgs[(lastUserIdx + 1)...].last { $0.role == .assistant && !$0.content.isEmpty }
         appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
-        runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
+        runTurn(sessionId: sessionId, userText: text, images: images, videos: videos, audio: audio,
                 config: config, approval: approval)
         // AFTER runTurn, which opens with `stop(sessionId:)` — and stop is a
         // turn exit, so a seed placed before it would be spent immediately.
@@ -735,7 +749,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                      token: UUID, continuing: Bool = false) async {
         var failed = false
         do {
-            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
+            let thinking = config.thinkingForRequest(appState.serverOptions,
+                                                      inheritGeneration: server.chatIsLocal)
             let stream: AsyncThrowingStream<SSEEvent, Error>
             if appState.useAppleModel {
                 // Apple's on-device model needs no server and no load.
@@ -755,7 +770,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
-                defaults: config.requestDefaults(from: appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions,
+                                                  inheritGeneration: server.chatIsLocal),
                 modelId: requestModelId(config),
                 continueFinalMessage: continuing
             )
@@ -945,8 +961,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 messages: session(sessionId)?.messages ?? [],
                 contextLength: contextLength,
                 maxTokens: turnMax,
-                buildMultimodalContent: { text, images in
-                    Self.buildMultimodalContent(text: text, images: images, serverPreprocess: useServerPreprocess)
+                buildMultimodalContent: { text, msg in
+                    Self.buildMultimodalContent(text: text, images: msg.images ?? [], videos: msg.videos ?? [],
+                                                audio: msg.audio ?? [], serverPreprocess: useServerPreprocess)
                 },
                 historyImages: useServerPreprocess
             )
@@ -1086,7 +1103,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: config.enableThinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
-                defaults: config.requestDefaults(from: appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions,
+                                                  inheritGeneration: server.chatIsLocal),
                 modelId: requestModelId(config)
             )
             }

@@ -115,10 +115,11 @@ check "follow-up completed in <12s (ghost cancelled)" "$([ "$ELAPSED" -lt 12 ] &
 grep -q "client disconnected" "$LOG"
 check "server logged the disconnect-cancel" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
-echo "3. disconnect mid-decode cancels a non-stream ghost (/v1/messages stream=false)"
+echo "3. disconnect mid-decode cancels a non-stream ghost (stream=false)"
 # A non-stream request never idles once tokens flow, so an idle-only peer probe misses a client that left mid-decode.
-curl -s -m 5 "$BASE/v1/messages" -H 'Content-Type: application/json' \
-    -d '{"model":"m","max_tokens":6000,"stream":false,"messages":[{"role":"user","content":"Count from 1 to 3000, one number per line."}]}' > /dev/null 2>&1
+# ignore_eos keeps it decoding past the client's 5 s even when the checkpoint abbreviates the count.
+curl -s -m 5 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model":"m","max_tokens":6000,"stream":false,"ignore_eos":true,"messages":[{"role":"user","content":"Count from 1 to 3000, one number per line."}]}' > /dev/null 2>&1
 # A batching server serves a follow-up beside a ghost, so timing cannot tell; the running count can.
 sleep 8
 LIVE=$(curl -s -m 10 "$BASE/metrics.json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("gauges",{}).get("requests_running",-1))')

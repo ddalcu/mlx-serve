@@ -425,7 +425,7 @@ enum BenchmarkSettings {
     /// Short chips for a table row: "KV 8-bit", "PLD", "MTP off", "ctx 48K".
     static func summaryChips(_ s: [String: String]) -> [String] {
         var chips: [String] = []
-        // ds4 has no KV lever and llama.cpp no MTP; `/props` reports them off.
+        // ds4 has no KV lever; llama.cpp drafts only with a GGUF that ships an MTP head.
         let engine = s["engine"] ?? "mlx"
         if engine == "ds4" { chips.append("ds4") }
         if engine == "llama" { chips.append("llama.cpp") }
@@ -435,7 +435,7 @@ enum BenchmarkSettings {
         }
         if s["decode_attn_quant"] == "true" { chips.append("Attn quant") }
         if s["pld_default_on"] == "true" { chips.append("PLD") }
-        if engine != "llama", let mtp = s["mtp_default_on"] { chips.append(mtp == "true" ? "MTP" : "MTP off") }
+        if let mtp = s["mtp_default_on"], engine != "llama" || mtp == "true" { chips.append(mtp == "true" ? "MTP" : "MTP off") }
         if let drafter = s["drafter"], drafter != "none" {
             chips.append(drafter == "dflash" ? "DFlash" : "Drafter")
         }

@@ -215,6 +215,8 @@ pub extern fn ds4_chat_append_assistant_prefix(e: *Engine, tokens: *Tokens, thin
 
 pub extern fn ds4_token_text(e: *Engine, token: c_int, len: *usize) ?[*]u8;
 pub extern fn ds4_token_eos(e: *Engine) c_int;
+pub extern fn ds4_token_is_stop(e: *Engine, token: c_int) bool;
+pub extern fn ds4_engine_vocab_size(e: *Engine) c_int;
 pub extern fn ds4_token_user(e: *Engine) c_int;
 pub extern fn ds4_token_assistant(e: *Engine) c_int;
 

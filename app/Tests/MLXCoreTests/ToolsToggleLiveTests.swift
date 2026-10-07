@@ -110,7 +110,7 @@ final class ToolsToggleLiveTests: XCTestCase {
         let id = makeSession(appState: appState, dir: dir)
 
         appState.chatEngine.runTurn(sessionId: id, userText: "delete test-folder",
-                                    images: nil, audio: nil,
+                                    images: nil, videos: nil, audio: nil,
                                     config: config(tools: false, mcp: true, dir: dir),
                                     approval: { _ in true })
         try await waitUntil(20, "the turn to end") { appState.chatEngine.activeTurnSessionIds.isEmpty }
@@ -139,7 +139,7 @@ final class ToolsToggleLiveTests: XCTestCase {
         let engine = appState.chatEngine
 
         engine.runTurn(sessionId: id, userText: "make a file then delete test-folder",
-                       images: nil, audio: nil,
+                       images: nil, videos: nil, audio: nil,
                        config: config(tools: true, mcp: false, dir: dir),
                        approval: { _ in true })
         try await waitUntil(20, "the first shell call") { FileManager.default.fileExists(atPath: first) }

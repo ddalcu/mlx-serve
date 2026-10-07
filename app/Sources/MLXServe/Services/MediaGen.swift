@@ -631,6 +631,12 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// backend whose floor is higher declares it, because a slider that goes
     /// somewhere the model does not work is a dead range, not a fast option.
     var stepsRange: ClosedRange<Int> = 4...50
+    /// The Steps slider's range for a render. Turbo turns the server's fast recipe off, so a
+    /// Turbo step costs a full step: past the distillations' trained range a Turbo render costs
+    /// more than the full model's fast 30.
+    func stepsRange(turbo: Bool) -> ClosedRange<Int> {
+        turbo && supportsTurbo ? 4...8 : stepsRange
+    }
     /// One sentence under the Steps slider. Per-backend for the same reason —
     /// LTX's "runs well from ~8" is wrong advice on any other engine.
     var stepsHelp: String = "More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default."

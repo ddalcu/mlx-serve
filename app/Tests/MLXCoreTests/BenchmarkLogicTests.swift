@@ -198,6 +198,8 @@ final class BenchmarkLogicTests: XCTestCase {
                        ["ds4", "MTP", "ctx 128K"])
         XCTAssertEqual(BenchmarkSettings.summaryChips(["engine": "llama", "kv_quant": "q8", "mtp_default_on": "false", "n_ctx": "8192"]),
                        ["llama.cpp", "KV q8", "ctx 8K"])
+        XCTAssertEqual(BenchmarkSettings.summaryChips(["engine": "llama", "kv_quant": "off", "mtp_default_on": "true"]),
+                       ["llama.cpp", "KV off", "MTP"])
     }
 
     // MARK: - Sessions

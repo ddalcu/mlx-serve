@@ -221,6 +221,6 @@ fn run(models_dir: []const u8, host: []const u8, port: u16, ctx_size: u32, max_r
         .default_enable_pld = true,
         .default_pld_draft_len = 5,
         .default_pld_key_len = 3,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .dense,
     });
 }

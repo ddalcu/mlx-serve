@@ -191,6 +191,7 @@ pub const Geom = struct { r: c_int, g: c_int };
 const R4G2 = Geom{ .r = 4, .g = 2 };
 const R4G8 = Geom{ .r = 4, .g = 8 };
 const R2G8 = Geom{ .r = 2, .g = 8 };
+const R2G4 = Geom{ .r = 2, .g = 4 };
 
 pub const Plan = union(enum) {
     /// MLX's own quantized_matmul.
@@ -198,20 +199,25 @@ pub const Plan = union(enum) {
     /// Hadamard packs only: `qmv` at M = 1, the R4 G8 f16 kernel at M = 2..3.
     legacy,
     rows: Geom,
+    mma: MmaGeom,
 };
+
+/// M4 (g16) from 5 rows: the MMA kernel is flat to 8 rows and ~1.7x qmv2 at
+/// 8, ~1.6x stock at 16 (Bonsai 27B shapes); below 5, qmv2 is cheaper.
+const MMA_G16 = MmaGeom{ .rb = 1, .sgs = 4, .split = 1 };
 
 /// Per GPU generation (`applegpu_gNN`), from kernel sweeps over the Bonsai 27B
 /// shapes against stock at M = 1..8; a generation nobody measured keeps `legacy`.
 /// Below 2048 output rows too few threadgroups stream K and stock wins.
 pub fn planFor(gen: u32, phone: bool, dt: mlx.mlx_dtype, m: c_int, n: c_int, k: c_int) Plan {
-    if (m < 1 or m > MAX_ROWS) return .stock;
+    if (m < 1 or m > MMA_MAX_ROWS or (m > MAX_ROWS and gen != 16)) return .stock;
     if (phone) return .legacy;
     const measured = gen == 13 or gen == 16 or gen == 17;
     if (!measured) return .legacy;
     if (n < 2048) return .stock;
     return switch (gen) {
         13 => .{ .rows = R4G2 },
-        16 => .{ .rows = if (@rem(m, 2) == 1) R4G2 else R2G8 },
+        16 => if (m >= 5) .{ .mma = MMA_G16 } else if (m == 1) .{ .rows = R2G4 } else .{ .rows = if (@rem(m, 2) == 1) R4G2 else R2G8 },
         // Stock wins at M = 5, and at M = 1 on anything narrower than the MLP.
         else => if (m == 5 or (m == 1 and (dt == .bfloat16 or n < 16384)))
             .stock
@@ -220,6 +226,18 @@ pub fn planFor(gen: u32, phone: bool, dt: mlx.mlx_dtype, m: c_int, n: c_int, k: 
         else
             .{ .rows = if (m == 3 or k >= 16384) R4G8 else R2G8 },
     };
+}
+
+/// Whether generation `gen` verifies an 8-row window of a 2-bit ternary
+/// weight on the MMA lane, where it costs about what 5 rows do.
+pub fn mmaVerifiesWide(gen: u32, phone: bool) bool {
+    return planFor(gen, phone, .float16, 8, 17408, 5120) == .mma;
+}
+
+/// `mmaVerifiesWide` on this device.
+pub fn deviceMmaVerifiesWide() bool {
+    const g = deviceGen();
+    return mmaVerifiesWide(g.gen, g.phone);
 }
 
 var gen_logged = false;
@@ -301,6 +319,151 @@ pub fn qmvRowsAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     return r;
 }
 
+/// Ternary 2-bit matmul on 8x8 simdgroup MMAs for verify widths: each lane
+/// decodes two codes (minus 1, exact in half) into the weight fragment, and
+/// every fragment multiplies all rows, so 8 rows cost what 1 does. Partials
+/// per 128-group are scaled in f32. RB 8-row weight blocks per simdgroup,
+/// SGS simdgroups, K split SPLIT ways (f32 partials summed by the caller).
+const MMA_SOURCE =
+    \\using BT = metal::conditional_t<metal::is_same_v<T, half>, half, float>;
+    \\constexpr uint CH = 32, TK = 128, KW = K / 16, G = K / 128, KS = K / SPLIT;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint qid = lane / 4;
+    \\uint fm = (qid & 4) + ((lane / 2) % 4);
+    \\uint fn = (qid & 2) * 2 + (lane % 2) * 2;
+    \\uint row_base = (threadgroup_position_in_grid.x * SGS + simdgroup_index_in_threadgroup) * 8 * RB;
+    \\simdgroup_float8x8 acc[RB][NB];
+    \\for (uint b = 0; b < RB; ++b) for (uint c = 0; c < NB; ++c) acc[b][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\uint kl = (fn / 2) * CH;
+    \\uint kb = (fm / 2) * CH + (fm % 2) * 8;
+    \\uint split = threadgroup_position_in_grid.y;
+    \\for (uint k0 = split * KS; k0 < (split + 1) * KS; k0 += TK) {
+    \\  uint2 words[RB];
+    \\  for (uint b = 0; b < RB; ++b) words[b] = *(const device uint2*)(w + (row_base + b * 8 + fm) * KW + (k0 + kl) / 16);
+    \\  simdgroup_float8x8 part[RB][NB];
+    \\  for (uint b = 0; b < RB; ++b) for (uint c = 0; c < NB; ++c) part[b][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\  for (uint j = 0; j < CH / 2; ++j) {
+    \\    uint k = k0 + kb + (j % 8) + 16 * (j / 8);
+    \\    simdgroup_matrix<BT, 8, 8> bx[NB];
+    \\    for (uint c = 0; c < NB; ++c) {
+    \\      bx[c].thread_elements()[0] = BT(x[min(fn + 8 * c, uint(M) - 1) * K + k]);
+    \\      bx[c].thread_elements()[1] = BT(x[min(fn + 8 * c + 1, uint(M) - 1) * K + k]);
+    \\    }
+    \\    for (uint b = 0; b < RB; ++b) {
+    \\      uint u = ((j < 8 ? words[b].x : words[b].y) >> (2 * (j % 8))) & 0x00030003u;
+    \\      half2 q = as_type<half2>(u | 0x64006400u) - half2(1025.0h);
+    \\      simdgroup_half8x8 a;
+    \\      a.thread_elements()[0] = q.x;
+    \\      a.thread_elements()[1] = q.y;
+    \\      for (uint c = 0; c < NB; ++c) simdgroup_multiply_accumulate(part[b][c], a, bx[c], part[b][c]);
+    \\    }
+    \\  }
+    \\  for (uint b = 0; b < RB; ++b) {
+    \\    float sc = float(scales[(row_base + b * 8 + fm) * G + k0 / 128]);
+    \\    for (uint c = 0; c < NB; ++c) {
+    \\      acc[b][c].thread_elements()[0] += sc * part[b][c].thread_elements()[0];
+    \\      acc[b][c].thread_elements()[1] += sc * part[b][c].thread_elements()[1];
+    \\    }
+    \\  }
+    \\}
+    \\for (uint b = 0; b < RB; ++b) {
+    \\  uint row = row_base + b * 8 + fm;
+    \\  for (uint c = 0; c < NB; ++c) {
+    \\    uint m0 = fn + 8 * c;
+    \\    if (m0 < uint(M)) y[(split * M + m0) * N + row] = static_cast<OT>(acc[b][c].thread_elements()[0]);
+    \\    if (m0 + 1 < uint(M)) y[(split * M + m0 + 1) * N + row] = static_cast<OT>(acc[b][c].thread_elements()[1]);
+    \\  }
+    \\}
+;
+
+pub const MMA_MAX_ROWS = 16;
+/// 8-row weight blocks per simdgroup (rb), simdgroups (sgs), K splits (split).
+pub const MmaGeom = struct { rb: c_int, sgs: c_int, split: c_int };
+
+var mma_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var mma_logged = false;
+const MmaKey = struct { n: c_int, k: c_int, m: c_int, dt: mlx.mlx_dtype, geom: MmaGeom };
+var mma_cfg_cache: std.AutoHashMapUnmanaged(MmaKey, mlx.mlx_fast_metal_kernel_config) = .{};
+
+fn mmaConfig(key: MmaKey) !mlx.mlx_fast_metal_kernel_config {
+    if (mma_cfg_cache.get(key)) |c| return c;
+    const g = key.geom;
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const out_dt: mlx.mlx_dtype = if (g.split > 1) .float32 else key.dt;
+    const out_shape = [_]c_int{ g.split * key.m, key.n };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 2, out_dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divExact(key.n, 8 * g.rb * g.sgs) * 32 * g.sgs, g.split, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32 * g.sgs, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OT", out_dt));
+    inline for (.{ .{ "M", key.m }, .{ "K", key.k }, .{ "N", key.n }, .{ "RB", g.rb }, .{ "SGS", g.sgs }, .{ "SPLIT", g.split }, .{ "NB", @divFloor(key.m + 7, 8) } }) |kv|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
+    try mma_cfg_cache.put(std.heap.c_allocator, key, config);
+    return config;
+}
+
+/// `x @ w.T` for 1..MMA_MAX_ROWS rows over a ternary 2-bit group-128 weight
+/// (biases == -scales) on simdgroup MMAs at geometry `geom`, or null.
+pub fn qmmMmaAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, bneg: bool, geom: MmaGeom, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!bneg or bits != 2 or group_size != 128 or bi.ctx == null or !enabled()) return null;
+    const dt = mlx.mlx_array_dtype(x);
+    if (!supportedDtypes(dt, sc, bi)) return null;
+    const xs = mlx.getShape(x);
+    const ws = mlx.getShape(w);
+    if (xs.len == 0 or xs.len > 8 or ws.len != 2) return null;
+    var m: c_int = 1;
+    for (xs[0 .. xs.len - 1]) |d| m *= d;
+    const k = xs[xs.len - 1];
+    const n = ws[0];
+    if (m < 1 or m > MMA_MAX_ROWS or ws[1] * 16 != k or @rem(n, 8 * geom.rb * geom.sgs) != 0 or @rem(k, 128 * geom.split) != 0) return null;
+    if (mma_kernel == null) {
+        const in_names = [_][*:0]const u8{ "x", "w", "scales" };
+        const out_names = [_][*:0]const u8{"y"};
+        const in_vec = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const kk = mlx.mlx_fast_metal_kernel_new("msv_qmv2_mma", in_vec, out_vec, MMA_SOURCE, "#include <metal_simdgroup_matrix>\n", true, false);
+        if (kk.ctx == null) return error.MetalKernelCompileFailed;
+        mma_kernel = kk;
+    }
+    const inputs = [_]mlx.mlx_array{ x, w, sc };
+    const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(in_vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    if (!mma_logged) {
+        mma_logged = true;
+        log.info("[qmv2] MMA verify lane engaged: M={d} N={d} K={d} (MLX_SERVE_QMV_H2=0 restores stock)\n", .{ m, n, k });
+    }
+    const cfg = try mmaConfig(.{ .n = n, .k = k, .m = m, .dt = dt, .geom = geom });
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, mma_kernel.?, in_vec, cfg, s));
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+    var out_shape: [8]c_int = undefined;
+    @memcpy(out_shape[0..xs.len], xs);
+    out_shape[xs.len - 1] = n;
+    var r = mlx.mlx_array_new();
+    if (geom.split == 1) {
+        try mlx.check(mlx.mlx_reshape(&r, y, &out_shape, xs.len, s));
+        return r;
+    }
+    const parts = [_]c_int{ geom.split, m, n };
+    var y3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y3);
+    try mlx.check(mlx.mlx_reshape(&y3, y, &parts, 3, s));
+    var summed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(summed);
+    try mlx.check(mlx.mlx_sum_axis(&summed, y3, 0, false, s));
+    var cast = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cast);
+    try mlx.check(mlx.mlx_astype(&cast, summed, dt, s));
+    try mlx.check(mlx.mlx_reshape(&r, cast, &out_shape, xs.len, s));
+    return r;
+}
+
 /// The 2-bit dispatch for one quantized matmul: the device generation's plan,
 /// or null (caller keeps stock qmm). `legacy_ok` = a Hadamard pack, the only
 /// packs the pre-plan kernels were measured on.
@@ -320,6 +483,7 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
             // A generic-bias weight of a Hadamard pack keeps the bias-aware kernel.
             return if (legacy_ok) qmv(x, w, sc, bi, bits, group_size, s) else null;
         },
+        .mma => |geom| return qmmMmaAt(x, w, sc, bi, bits, group_size, bneg, geom, s),
         .legacy => {
             if (!legacy_ok) return null;
             if (try qmv(x, w, sc, bi, bits, group_size, s)) |y| return y;
@@ -353,7 +517,7 @@ fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx
     return out;
 }
 
-test "qmv2: no worse than stock quantized_matmul against f32 truth (bf16 + f16, M 1..8, every geometry, both bias layouts)" {
+test "qmv2: no worse than stock quantized_matmul against f32 truth (bf16 + f16, M 1..16, every geometry, both bias layouts)" {
     // Ternary codes with bias == -scale, as the Hadamard packs ship them, plus
     // a generic affine bias; x carries outliers that stress the half2 range.
     const s = mlx.gpuStream();
@@ -411,7 +575,7 @@ test "qmv2: no worse than stock quantized_matmul against f32 truth (bf16 + f16, 
             try mlx.check(mlx.mlx_transpose(&w_tt, w_t, s));
 
             var m: c_int = 1;
-            while (m <= MAX_ROWS) : (m += 1) {
+            while (m <= MMA_MAX_ROWS) : (m += 1) {
                 const mu: usize = @intCast(m);
                 const xv = try std.testing.allocator.alloc(f32, mu * ku);
                 defer std.testing.allocator.free(xv);
@@ -436,10 +600,14 @@ test "qmv2: no worse than stock quantized_matmul against f32 truth (bf16 + f16, 
                 const es = try errVsTruth(stock, truth, mu, nu, s);
                 defer std.testing.allocator.free(es);
                 const plain = if (m == 1) try qmv(x, wq, sc, bi, 2, 128, s) else null;
-                var outs = [_]?mlx.mlx_array{ plain, null, null, null };
-                for ([_]Geom{ R4G2, R4G8, R2G8 }, 1..) |geom, gi| {
+                var outs = [_]?mlx.mlx_array{ plain, null, null, null, null, null, null };
+                if (m <= MAX_ROWS) for ([_]Geom{ R4G2, R4G8, R2G8, R2G4 }, 1..) |geom, gi| {
                     outs[gi] = try qmvRowsAt(x, wq, sc, bi, 2, 128, bneg, geom, s);
                     // The ternary kernel needs bias == -scale; nothing else may decline.
+                    try std.testing.expectEqual(bneg, outs[gi] != null);
+                };
+                for ([_]MmaGeom{ MMA_G16, .{ .rb = 2, .sgs = 2, .split = 3 } }, 5..) |geom, gi| {
+                    outs[gi] = try qmmMmaAt(x, wq, sc, bi, 2, 128, bneg, geom, s);
                     try std.testing.expectEqual(bneg, outs[gi] != null);
                 }
                 for (outs) |maybe| {
@@ -463,9 +631,18 @@ test "qmv2: no worse than stock quantized_matmul against f32 truth (bf16 + f16, 
 test "qmv2.planFor: measured generations get their geometry, everything else keeps legacy" {
     // M1 (g13): R4 G2 at every width.
     for (1..MAX_ROWS + 1) |m| try std.testing.expectEqual(Plan{ .rows = R4G2 }, planFor(13, false, .bfloat16, @intCast(m), 17408, 5120));
-    // M4 (g16): R4 G2 odd, R2 G8 even.
+    // Only M4 verifies 8 rows on the MMA lane.
+    try std.testing.expect(mmaVerifiesWide(16, false));
+    for ([_]u32{ 13, 14, 15, 17 }) |gen| try std.testing.expect(!mmaVerifiesWide(gen, false));
+    try std.testing.expect(!mmaVerifiesWide(16, true));
+    // M4 (g16): R2 G4 at one row, R4 G2 odd, R2 G8 even, then the MMA kernel from 5 rows to 16.
+    try std.testing.expectEqual(Plan{ .rows = R2G4 }, planFor(16, false, .float16, 1, 34816, 5120));
     try std.testing.expectEqual(Plan{ .rows = R4G2 }, planFor(16, false, .float16, 3, 17408, 5120));
     try std.testing.expectEqual(Plan{ .rows = R2G8 }, planFor(16, false, .float16, 4, 17408, 5120));
+    for ([_]c_int{ 5, 8, 9, 16 }) |m| try std.testing.expectEqual(Plan{ .mma = MMA_G16 }, planFor(16, false, .float16, m, 17408, 5120));
+    try std.testing.expectEqual(Plan.stock, planFor(16, false, .float16, MMA_MAX_ROWS + 1, 17408, 5120));
+    try std.testing.expectEqual(Plan.stock, planFor(16, false, .float16, 8, 1024, 5120));
+    try std.testing.expectEqual(Plan.stock, planFor(17, false, .float16, MAX_ROWS + 1, 17408, 5120));
     // M5 (g17): stock at M = 5 and at M = 1 below the MLP width or in bf16.
     try std.testing.expectEqual(Plan.stock, planFor(17, false, .float16, 5, 17408, 5120));
     try std.testing.expectEqual(Plan.stock, planFor(17, false, .bfloat16, 1, 17408, 5120));
@@ -500,12 +677,12 @@ test "qmv2.qmm: routing per generation; legacy is the old dispatch byte for byte
     defer _ = mlx.mlx_array_free(wq);
     const sc32 = mlx.mlx_array_new_data(scv.ptr, &[_]c_int{ n, @divExact(k, 128) }, 2, .float32);
     defer _ = mlx.mlx_array_free(sc32);
-    const xv = try std.testing.allocator.alloc(f32, @intCast(MAX_ROWS * k));
+    const xv = try std.testing.allocator.alloc(f32, @intCast(MMA_MAX_ROWS * k));
     defer std.testing.allocator.free(xv);
     for (xv) |*e| e.* = rnd.floatNorm(f32);
     defer @import("transformer.zig").device_gen_override = null;
 
-    const Case = struct { gen: u32, dt: mlx.mlx_dtype, m: c_int, bneg: bool, legacy_ok: bool, want: enum { none, qmv, r4g8, r4g2 } };
+    const Case = struct { gen: u32, dt: mlx.mlx_dtype, m: c_int, bneg: bool, legacy_ok: bool, want: enum { none, qmv, r4g8, r4g2, mma } };
     const cases = [_]Case{
         // Unmeasured generation: qmv at M = 1, R4 G8 f16 at M = 2..3, Hadamard packs only.
         .{ .gen = 14, .dt = .float16, .m = 1, .bneg = true, .legacy_ok = true, .want = .qmv },
@@ -519,6 +696,9 @@ test "qmv2.qmm: routing per generation; legacy is the old dispatch byte for byte
         .{ .gen = 13, .dt = .float16, .m = 1, .bneg = false, .legacy_ok = true, .want = .qmv },
         .{ .gen = 13, .dt = .float16, .m = 2, .bneg = false, .legacy_ok = true, .want = .none },
         .{ .gen = 13, .dt = .float16, .m = 1, .bneg = false, .legacy_ok = false, .want = .none },
+        // M4: the MMA kernel from 5 rows, ternary weights only.
+        .{ .gen = 16, .dt = .float16, .m = 12, .bneg = true, .legacy_ok = true, .want = .mma },
+        .{ .gen = 16, .dt = .float16, .m = 6, .bneg = false, .legacy_ok = true, .want = .none },
         // M5: stock at bf16 M = 1.
         .{ .gen = 17, .dt = .bfloat16, .m = 1, .bneg = true, .legacy_ok = false, .want = .none },
     };
@@ -545,6 +725,7 @@ test "qmv2.qmm: routing per generation; legacy is the old dispatch byte for byte
             .qmv => try qmv(x, wq, sc, bi, 2, 128, s),
             .r4g8 => try qmvRowsAt(x, wq, sc, bi, 2, 128, true, R4G8, s),
             .r4g2 => try qmvRowsAt(x, wq, sc, bi, 2, 128, true, R4G2, s),
+            .mma => try qmmMmaAt(x, wq, sc, bi, 2, 128, true, MMA_G16, s),
         };
         defer if (want) |w| {
             _ = mlx.mlx_array_free(w);

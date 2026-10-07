@@ -132,24 +132,14 @@ final class AgentResolutionTests: XCTestCase {
         XCTAssertEqual(r.reasoningBudgetOverride, 1024)
     }
 
-    func testReasoningEffortLevelsMapToTheServersOwnBudgets() {
-        // The editor shows effort levels; the wire stays `reasoning_budget`,
-        // in the server's own `effortBudget` denominations (low 512 /
-        // medium 2048 / high 8192; unlimited = -1). Sending `reasoning_effort`
-        // instead would also flip thinking on/off, which the Capabilities
-        // tri-state owns.
-        XCTAssertEqual(AgentReasoningEffort.low.budgetTokens, 512)
-        XCTAssertEqual(AgentReasoningEffort.medium.budgetTokens, 2048)
-        XCTAssertEqual(AgentReasoningEffort.high.budgetTokens, 8192)
-        XCTAssertEqual(AgentReasoningEffort.unlimited.budgetTokens, -1)
-
-        // Stored numbers from older builds — and whatever the app default is —
-        // land on the nearest level instead of leaving the picker unselected.
-        XCTAssertEqual(AgentReasoningEffort.nearest(to: -1), .unlimited)
-        XCTAssertEqual(AgentReasoningEffort.nearest(to: 512), .low)
-        XCTAssertEqual(AgentReasoningEffort.nearest(to: 1024), .low)
-        XCTAssertEqual(AgentReasoningEffort.nearest(to: 4096), .medium)
-        XCTAssertEqual(AgentReasoningEffort.nearest(to: 32768), .high)
+    func testSharedBudgetEditorKeepsExactStoredCounts() {
+        for budget in [-1, 0, 512, 1024, 4096, 12345, 32768] {
+            var a = agent { $0.reasoningBudget = budget }
+            let profile = GenerationDefaults(agent: a)
+            profile.apply(to: &a)
+            let resolved = AgentResolution.resolve(agent: a, defaults: defaults())
+            XCTAssertEqual(resolved.reasoningBudgetOverride, budget)
+        }
     }
 
     func testEmptySystemPromptYieldsNoPrefix() {

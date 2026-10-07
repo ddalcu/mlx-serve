@@ -251,7 +251,7 @@ const U2V_SOURCE =
     \\const uint part = lane & 3u;
     \\const uint h = (lane >> 2) & 3u;
     \\const uint cl = lane >> 4;
-    \\const uint j = threadgroup_position_in_grid.x * 16u + sgi * 2u + cl;
+    \\const uint j = threadgroup_position_in_grid.x * uint(SGS * 2) + sgi * 2u + cl;
     \\constexpr int VPW = 32 / BITS;
     \\constexpr int R_by_p = R / VPW;
     \\constexpr int R_by_gs = R / GS;
@@ -271,7 +271,7 @@ const U2V_SOURCE =
     \\}
     \\float xnv[ROWS];
     \\for (int r = 0; r < ROWS; ++r) xnv[r] = float(xn_in[(size_t)r * (size_t)(HC * H) + wrow]);
-    \\for (uint e = tid; e < uint(ROWS * R); e += 256) {
+    \\for (uint e = tid; e < uint(ROWS * R); e += uint(SGS * 32)) {
     \\  const int r = int(e) / R;
     \\  const int k = int(e) % R;
     \\  float tsum = 0.0f;
@@ -425,6 +425,13 @@ fn upVectorized(rows: c_int, hc: c_int, r: c_int, bits: u32, gs: c_int) bool {
     return true;
 }
 
+/// Simdgroups per threadgroup of the vectorized up launch, two columns each. One row has the least work per column, so the
+/// widest threadgroup hides the weight loads best there; more rows already fill the time. The arithmetic order does not
+/// depend on this, so a row sums the same at every row count whichever width serves it.
+fn upvSgs(rows: c_int) c_int {
+    return if (rows == 1) 16 else 8;
+}
+
 /// The up launch's 16-byte weight loads need a 16-byte-aligned buffer. A lazy weight has no data pointer yet, so it is
 /// evaluated here: the launch must not depend on whether an earlier read already did, or one row would sum in
 /// a different order from the same row read before the weights were resident.
@@ -507,7 +514,7 @@ pub fn read(
         const up = try config(&.{ .{ rows * hidden, dt }, .{ rows * hc, dt } }, .{ 32 * COLS_TG, @divExact(hidden, COLS_TG), rows }, 32 * COLS_TG, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "COLS", COLS_TG } }, dt);
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(up);
         const upv: ?mlx.mlx_fast_metal_kernel_config = if (upVectorized(rows, hc, R, bits, gs))
-            try config(&.{ .{ rows * hidden, dt }, .{ rows * hc, dt } }, .{ 256 * @divExact(hidden, 16), 1, 1 }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "ROWS", rows } }, dt)
+            try config(&.{ .{ rows * hidden, dt }, .{ rows * hc, dt } }, .{ 32 * upvSgs(rows) * @divExact(hidden, 2 * upvSgs(rows)), 1, 1 }, 32 * upvSgs(rows), &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "ROWS", rows }, .{ "SGS", upvSgs(rows) } }, dt)
         else
             null;
         if (armed[armed_next]) |old| {

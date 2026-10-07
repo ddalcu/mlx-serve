@@ -65,10 +65,10 @@ TOKENS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin
 CONTENT=$(echo "$RESULT" | python3 -c "import sys,json; m=json.load(sys.stdin)['choices'][0]['message']; print(m.get('content','')[:200])" 2>/dev/null)
 echo "  completion_tokens: $TOKENS"
 echo "  content: '$CONTENT'"
-if [ "$TOKENS" -gt 2 ] 2>/dev/null; then
+if [ -n "$(echo "$CONTENT" | sed 's/<pad>//g' | xargs)" ]; then
     echo "  PASS"
 else
-    echo "  FAIL: tools param without history produces <=2 tokens"
+    echo "  FAIL: tools param without history produces empty content"
 fi
 echo ""
 

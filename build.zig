@@ -850,11 +850,11 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
 
     // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
-    // C11 for pthread_once-based one-time backend init.
+    // C++ for llama.cpp's C++-linked NextN staging calls (MTP).
     module.addIncludePath(b.path("lib/llama_shim"));
     module.addCSourceFile(.{
-        .file = b.path("lib/llama_shim/llama_shim.c"),
-        .flags = &.{ "-O2", "-std=c11", "-Wno-unused-parameter" },
+        .file = b.path("lib/llama_shim/llama_shim.cpp"),
+        .flags = &.{ "-O2", "-std=c++17", "-Wno-unused-parameter" },
     });
 }
 

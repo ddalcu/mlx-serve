@@ -129,6 +129,14 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 
 pub const Qwen4NormConvention = enum { delta, folded };
 
+/// Llama 3.x `rope_type: "llama3"` (HF `_compute_llama3_parameters`).
+pub const Llama3Rope = struct {
+    factor: f32,
+    low_freq_factor: f32 = 1.0,
+    high_freq_factor: f32 = 4.0,
+    original_max_position_embeddings: f32 = 8192.0,
+};
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
@@ -161,6 +169,7 @@ pub const ModelConfig = struct {
     rope_scaling_factor: f32 = 1.0,
     rope_proportional: bool = false, // Gemma 4: full attention uses proportional RoPE
     rope_proportional_factor: f32 = 1.0,
+    rope_llama3: ?Llama3Rope = null,
 
     // Sliding window attention
     has_sliding_window: bool = true,
@@ -990,6 +999,7 @@ pub const ModelConfig = struct {
     /// marker gives it a fresh root. Null keeps every other arch's root.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
+        if (self.rope_llama3 != null) return "llama3-rope-v1";
         // A pool's completing indexer row stores the pool's key in its gate half.
         if (self.isGlm5()) return "glm5-pooled-keys-v1";
         return null;
@@ -3993,7 +4003,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.has_pre_ff_norm = false;
         config.has_qk_norm = false;
         config.rope_scaling_factor = 1.0;
+        config.rope_llama3 = try parseLlama3Rope(cfg_obj);
         config.rope_local_base_freq = config.rope_theta;
+        // Every layer attends the whole context, as in mlx-lm's llama/qwen2/mistral:
+        // the struct default is Gemma's 5-sliding-to-1-global pattern at 1024.
+        config.has_sliding_window = false;
         // Llama-family models (qwen2, llama, mistral) usually omit `head_dim`;
         // the HF default is hidden_size / num_attention_heads. Without this the
         // stale 256 sentinel (line 53) would corrupt attention for any such
@@ -4047,6 +4061,20 @@ fn jsonU32(v: std.json.Value) !u32 {
 fn jsonField(obj: std.json.ObjectMap, key: []const u8) ?std.json.Value {
     const v = obj.get(key) orelse return null;
     return if (v == .null) null else v;
+}
+
+/// `rope_scaling` (or v5's `rope_parameters`) when it names the llama3 schedule.
+fn parseLlama3Rope(cfg_obj: std.json.ObjectMap) !?Llama3Rope {
+    const rs = jsonField(cfg_obj, "rope_scaling") orelse jsonField(cfg_obj, "rope_parameters") orelse return null;
+    if (rs != .object) return null;
+    const t = jsonField(rs.object, "rope_type") orelse jsonField(rs.object, "type") orelse return null;
+    if (t != .string or !std.mem.eql(u8, t.string, "llama3")) return null;
+    var r = Llama3Rope{ .factor = try jsonFloat(jsonField(rs.object, "factor") orelse return error.InvalidConfigField) };
+    if (jsonField(rs.object, "low_freq_factor")) |v| r.low_freq_factor = try jsonFloat(v);
+    if (jsonField(rs.object, "high_freq_factor")) |v| r.high_freq_factor = try jsonFloat(v);
+    if (jsonField(rs.object, "original_max_position_embeddings")) |v| r.original_max_position_embeddings = try jsonFloat(v);
+    if (r.factor <= 0 or r.high_freq_factor <= r.low_freq_factor) return error.InvalidConfigField;
+    return r;
 }
 
 fn jsonFloat(v: std.json.Value) !f32 {
@@ -8256,6 +8284,37 @@ test "parseConfigFromJson: YaRN derives factor from the window when the block om
     try testing.expectApproxEqAbs(@as(f32, 8.0), c.yarn_factor, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.2079441541679836), c.yarn_attention_factor, 1e-6);
     try testing.expectEqual(@as(u32, 2_097_152), c.contextCap());
+}
+
+test "parseConfigFromJson: Llama 3.x llama3 rope_scaling is read, and keys it changes get their own SSD root" {
+    const llama32 =
+        \\{"model_type":"llama","hidden_size":3072,"num_hidden_layers":28,"num_attention_heads":24,
+        \\ "num_key_value_heads":8,"intermediate_size":8192,"vocab_size":128256,"rope_theta":500000.0,
+        \\ "rope_scaling":{"factor":32.0,"high_freq_factor":4.0,"low_freq_factor":1.0,
+        \\   "original_max_position_embeddings":8192,"rope_type":"llama3"}}
+    ;
+    const c = try parseConfigFromJson(testing.allocator, llama32);
+    const l3 = c.rope_llama3 orelse return error.TestExpectedLlama3Rope;
+    try testing.expectEqual(@as(f32, 32.0), l3.factor);
+    try testing.expectEqual(@as(f32, 1.0), l3.low_freq_factor);
+    try testing.expectEqual(@as(f32, 4.0), l3.high_freq_factor);
+    try testing.expectEqual(@as(f32, 8192.0), l3.original_max_position_embeddings);
+    try testing.expectEqual(@as(f32, 1.0), c.rope_scaling_factor);
+    try testing.expectEqualStrings("llama3-rope-v1", c.cacheLayoutNamespace().?);
+    // No `sliding_window` key: every layer attends the whole context (the Gemma
+    // default made 5 of 6 layers 1024-token windows and broke prompts past 1k).
+    try testing.expect(!c.has_sliding_window);
+    for (0..28) |li| try testing.expect(c.isGlobalLayer(@intCast(li)));
+
+    // The rest of the Llama family, which reads its attention through the same branch.
+    for ([_][]const u8{ "llama", "mistral", "qwen2", "qwen3", "k2_horizon" }) |mt| {
+        var buf: [256]u8 = undefined;
+        const cfg = try std.fmt.bufPrint(&buf, "{{\"model_type\":\"{s}\",\"hidden_size\":64,\"num_hidden_layers\":12,\"num_attention_heads\":4,\"vocab_size\":100}}", .{mt});
+        const plain = try parseConfigFromJson(testing.allocator, cfg);
+        try testing.expect(plain.rope_llama3 == null);
+        try testing.expect(plain.cacheLayoutNamespace() == null);
+        for (0..12) |li| try testing.expect(plain.isGlobalLayer(@intCast(li)));
+    }
 }
 
 test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fails the load" {

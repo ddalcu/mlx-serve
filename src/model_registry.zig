@@ -52,18 +52,6 @@ const MtpModel = mtp_mod.MtpModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
 const TokenizeCache = tokenize_cache_mod.TokenizeCache;
 
-/// One slot in `LoadedModel.llama_sessions` (Iteration 3-5 of the perf
-/// plan / Phase 5 #1). Each entry wraps a libllama context. The KV
-/// state and the resident-token mirror live inside the session; we add
-/// `last_used_ns` for LRU eviction.
-pub const LlamaSessionEntry = struct {
-    session: *arch_llama.LlamaSession,
-    /// Bumped on every successful pick. Lowest = LRU. Monotonic — the
-    /// scheduler bumps it under the same lock that guards
-    /// `llama_sessions`, so reads/writes never race.
-    last_used_ns: i64 = 0,
-};
-
 /// Lifecycle of an entry. State transitions are guarded by `ModelRegistry.mutex`;
 /// the inference thread writes, connection threads read under the same lock and
 /// wait on `state_cond` for transitions.
@@ -231,13 +219,13 @@ pub const LoadedModel = struct {
     ds4_engine: ?*arch_ds4.Ds4Engine = null,
     /// The ONE ds4 session per model (a 131k-context session is ~13 GB of
     /// buffers, so one per request starved the box under concurrency). Created
-    /// on first prefill, driven by one slot at a time (`session_busy`), freed
+    /// on first prefill, driven by one slot at a time (`session_claims`), freed
     /// with the engine.
     ds4_session: ?*arch_ds4.Ds4Session = null,
 
     /// Embedded llama.cpp engine (generic GGUF via libllama). Like `ds4_engine`,
     /// when non-null the MLX fields stay null and request handlers route through
-    /// `LlamaEngine` / `LlamaSession`. Mutually exclusive with the safetensors
+    /// `LlamaEngine` / `llama_ctx`. Mutually exclusive with the safetensors
     /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
     llama_engine: ?*arch_llama.LlamaEngine = null,
     /// Whether lib/mlx-serve-gguf would claim this (unloaded) entry; answered
@@ -255,45 +243,20 @@ pub const LoadedModel = struct {
     video_engine: ?*gen_mod.VideoEngine = null,
     mesh_engine: ?*gen_mod.MeshEngine = null,
     decision_engine: ?*gen_mod.DecisionEngine = null,
-    /// Model-wide serialization gate for media generation — mirrors
-    /// `session_busy`. A gen runs to completion on the inference thread
+    /// Model-wide serialization gate for media generation. A gen runs to completion on the inference thread
     /// (the sole mlx caller), so gen-vs-gen is already serial; this flag makes
     /// the in-flight state visible (set around the gen job).
     gen_busy: bool = false,
 
-    /// Persistent llama.cpp sessions (Iteration 3-5 / Phase 5 #1): one or
-    /// more KV contexts, picked by best prompt-prefix match in
-    /// `runPrefillLlama`. With `--llama-cache-entries 1` (default for
-    /// backwards compat) this degenerates to the old single-session
-    /// behavior — one entry, every request fights for it. With N > 1 the
-    /// scheduler keeps the N most-recently-used sessions alive and
-    /// dispatches each incoming prompt to the entry whose resident KV
-    /// shares the longest prefix.
-    ///
-    /// `session_busy` remains a model-wide gate — `max_concurrent=1`
-    /// today means only one llama request runs at a time anyway, and
-    /// adding per-entry concurrency would require an inference-thread
-    /// refactor we intentionally don't ship tonight.
-    ///
-    /// Sessions are freed BEFORE `llama_engine` in `deinit` because each
-    /// holds a context bound to the engine's model.
-    llama_sessions: std.ArrayListUnmanaged(LlamaSessionEntry) = .empty,
-    /// Cap on resident llama sessions. Mirrored from
-    /// `LoadParams.llama_cache_entries` at load time. 0 falls back to 1
-    /// for safety — every llama prefill needs at least one session.
-    llama_cache_max_entries: u32 = 1,
-    /// Model-wide claim on the persistent engine session (llama pool or
-    /// `ds4_session`): one request drives it at a time, taken in
-    /// `Scheduler.submit`, released in `complete`.
-    session_busy: bool = false,
-    /// Phase 5 #2: ggml types for the K and V halves of the llama.cpp KV
-    /// cache. 0 = libllama default (F16). Non-zero values are pulled from
-    /// `LoadParams.llama_kv_type_{k,v}` at load time and read by
-    /// `runPrefillLlama` when creating the persistent session. Mutating
-    /// these after a session has been created has no effect — the values
-    /// are baked into the libllama context at create-time.
-    llama_kv_type_k: i32 = 0,
-    llama_kv_type_v: i32 = 0,
+    /// The llama.cpp context: one sequence per concurrent request, each
+    /// keeping its prompt KV for prefix reuse (`runPrefillLlama` picks by best
+    /// prefix match). Created at load, freed BEFORE `llama_engine` (it is bound
+    /// to the engine's model).
+    llama_ctx: ?*arch_llama.LlamaContext = null,
+    /// Requests holding a persistent engine session (a llama sequence or the
+    /// ds4 session), taken in `Scheduler.submit`, released in `complete`, both
+    /// under the scheduler's `queue_mu`. Bounded by `sessionCapacity`.
+    session_claims: u32 = 0,
 
     // ── Bookkeeping. Updated under `ModelRegistry.mutex`. ──
 
@@ -370,6 +333,14 @@ pub const LoadedModel = struct {
         return marker;
     }
 
+    /// Requests that may hold an engine session at once: one per llama
+    /// sequence, one for ds4; null for every other engine (no claim).
+    pub fn sessionCapacity(self: *const LoadedModel) ?u32 {
+        if (self.llama_ctx) |ctx| return @intCast(ctx.seqs.len);
+        if (self.ds4_engine != null) return 1;
+        return null;
+    }
+
     /// Free all owned state. Safe to call regardless of `state` — null
     /// model fields are skipped. Mlx-allocating fields are freed in
     /// drafter → vision → transformer → weights order to mirror the
@@ -378,9 +349,11 @@ pub const LoadedModel = struct {
     /// stream); the caller arranges this via `unloadResident` invoked
     /// from the inference thread before registry teardown.
     pub fn deinit(self: *LoadedModel) void {
-        for (self.llama_sessions.items) |entry| entry.session.free();
-        self.llama_sessions.deinit(self.allocator);
-        self.session_busy = false;
+        if (self.llama_ctx) |ctx| {
+            ctx.free();
+            self.llama_ctx = null;
+        }
+        self.session_claims = 0;
         if (self.ds4_session) |session| {
             session.free();
             self.ds4_session = null;
@@ -556,9 +529,11 @@ pub const LoadedModel = struct {
     /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
     /// mlx frees happen on the inference thread.
     pub fn unloadResident(self: *LoadedModel) void {
-        for (self.llama_sessions.items) |entry| entry.session.free();
-        self.llama_sessions.clearRetainingCapacity();
-        self.session_busy = false;
+        if (self.llama_ctx) |ctx| {
+            ctx.free();
+            self.llama_ctx = null;
+        }
+        self.session_claims = 0;
         if (self.ds4_session) |session| {
             session.free();
             self.ds4_session = null;
@@ -885,13 +860,15 @@ pub const ModelRegistry = struct {
     /// Exists for models OUTSIDE the --model-dir scan: the app auto-downloads
     /// a small embedding encoder and registers it here no matter which org
     /// dir the chat model (and thus --model-dir) points at. `id` null names
-    /// the entry after the dir's basename.
+    /// the entry after the basename (a `.gguf` file without its extension, as
+    /// `--model` names it).
     pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8, id: ?[]const u8) ![]const u8 {
         var trimmed = abs_path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         const base = std.fs.path.basename(trimmed);
         if (base.len == 0) return error.InvalidModelPath;
-        const reg_id = id orelse base;
+        const stem = if (std.mem.endsWith(u8, base, ".gguf") and base.len > ".gguf".len) base[0 .. base.len - ".gguf".len] else base;
+        const reg_id = id orelse stem;
 
         // Fast path: already registered (discovered, --model, or a previous
         // register-by-path). No filesystem touch.
@@ -1553,6 +1530,32 @@ test "ModelRegistry: registerByPath rejects a nonexistent directory" {
     defer reg.deinit();
     try testing.expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model", null));
     try testing.expectError(error.InvalidModelPath, reg.registerByPath(io, "/", null));
+}
+
+test "ModelRegistry: registerByPath takes a .gguf file, named by its stem as --model names it" {
+    // The app picks GGUF quants one FILE at a time (per-quant subfolders, split
+    // shards); a load that only took folders failed, and the first chat 404'd.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/IQ3_S");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/IQ3_S/Next-IQ3_S-00001-of-00002.gguf", .data = "GGUF" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/IQ3_S/mmproj-F16.gguf", .data = "GGUF" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+
+    const file = try std.fmt.allocPrint(testing.allocator, "{s}/repo/IQ3_S/Next-IQ3_S-00001-of-00002.gguf", .{root});
+    defer testing.allocator.free(file);
+    const id = try reg.registerByPath(io, file, null);
+    try testing.expectEqualStrings("Next-IQ3_S-00001-of-00002", id);
+    try testing.expectEqualStrings("gguf", reg.peek(id).?.arch_hint);
+    try testing.expectEqual(reg.peek(id).?, reg.peekByPath(file).?);
+
+    const sidecar = try std.fmt.allocPrint(testing.allocator, "{s}/repo/IQ3_S/mmproj-F16.gguf", .{root});
+    defer testing.allocator.free(sidecar);
+    try testing.expectError(error.UnsupportedArch, reg.registerByPath(io, sidecar, null));
 }
 
 test "LoadedModel: a reload frees the CPU state the previous load left behind" {

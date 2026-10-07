@@ -855,10 +855,7 @@ struct VideoGenView: View {
     /// What the server's recipe actually runs: turbo forces it off, so every
     /// plan/estimate call reads THIS, never `!bestQuality` alone.
     private var effectiveFast: Bool { !bestQuality && !turboEngaged }
-    /// The steps slider under turbo offers the LoRA's own trained range.
-    private var effectiveStepsRange: ClosedRange<Int> {
-        turboEngaged ? 4...16 : model.stepsRange
-    }
+    private var effectiveStepsRange: ClosedRange<Int> { model.stepsRange(turbo: turbo) }
 
     /// Whether a few-step adapter is driving this render: the engine-owned
     /// Turbo toggle, or any attached Style LoRA. The REF2VA pack has no Turbo
@@ -2226,7 +2223,7 @@ struct VideoGenView: View {
         mode = s.mode
         // A quality tier describes a FULL render — its step counts are the
         // non-turbo schedule's — so picking one turns turbo off rather than
-        // clamping the tier's 30 steps into turbo's 16-step ceiling.
+        // clamping the tier's 30 steps into turbo's 8-step ceiling.
         turbo = false
         // Clamp into the backend's range: a preset switch carrying a value the
         // new model's slider cannot show leaves the control off-scale.

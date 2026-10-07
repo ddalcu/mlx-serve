@@ -111,8 +111,8 @@ door, an engine, impacts, UI blips).
 
 | field | notes |
 |---|---|
-| `prompt` | required: the source, the material, the space, the character ("heavy wooden door creaking open slowly in a stone hall") |
-| `duration_seconds` | 0-120 (default 10); the WAV is exactly this long |
+| `prompt` | required: the source, the action and how it ends, the space ("heavy wooden door slamming shut in a stone hall, fast decay"); adding `TrackType: SFX` steers it toward a clean effect |
+| `duration_seconds` | up to 120 (default 10, an ambience length): set it to the sound's real length, 0.3-2 for a click, hit or footstep, 2-5 for a door or explosion, 10+ for ambiences; the WAV is exactly this long |
 | `steps` | 1-50 (default 8, what the model is distilled for) |
 | `seed` | reproducible sound: same seed + prompt + length = same bytes |
 

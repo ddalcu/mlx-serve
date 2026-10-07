@@ -189,6 +189,17 @@ print(json.dumps({"c":c,"rc":rc}))' 2>/dev/null)
         check "thinking off: content" "$([[ -n "$c" ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"
     fi
 
+    # 3b. a ~3k-token prompt still reads its first line: a window or rope wrong only
+    # past 1-2k tokens answers short prompts fine (Llama 3.x 1024-token windows).
+    r=$(post /v1/chat/completions "$(python3 -c '
+import json
+fill = "".join(f"Line {i}: the quick brown fox jumps over the lazy dog near the river bank.\n" for i in range(160))
+p = "My favourite number is 4417.\n" + fill + "What is my favourite number? Reply with the number only."
+print(json.dumps({"model": "m", "messages": [{"role": "user", "content": p}], "max_tokens": 60, "temperature": 0, "enable_thinking": False}))')")
+    # A model that thinks with thinking off (LFM2.5-8B-A1B) quotes the line in its reasoning: either proves it read it.
+    c=$(echo "$r" | J '(d["choices"][0]["message"].get("content") or "") + (d["choices"][0]["message"].get("reasoning_content") or "")')
+    check "long prompt: answers from its first line" "$(echo "$c" | grep -q 4417 && echo 0 || echo 1)" "prompt=$(echo "$r" | J 'd["usage"]["prompt_tokens"]') '${c:0:80}'"
+
     # 4. tools: 200 + valid args when the model calls
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Use the tool to get the weather in Paris.\"}],\"tools\":$TOOLS,\"max_tokens\":300,\"temperature\":0}")
     local tcn; tcn=$(echo "$r" | J 'len(d["choices"][0]["message"].get("tool_calls") or [])')

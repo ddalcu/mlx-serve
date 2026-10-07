@@ -76,6 +76,9 @@ final class DownloadManagerLayoutTests: XCTestCase {
         // with "deepseek-v4-flash", so unfiltered it classifies as a
         // servable chat quant via ggufModelType.
         XCTAssertTrue(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-DSpark-support.gguf"))
+        // llama.cpp's head-only MTP export (`convert --mtp`), e.g. unsloth's MTP/ folder.
+        XCTAssertTrue(DownloadManager.isGgufSidecar("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"))
+        XCTAssertTrue(DownloadManager.isGgufSidecar("MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf"))
         // Real chat quants stay servable — including names that merely
         // contain the letters without the delimited token.
         XCTAssertFalse(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"))

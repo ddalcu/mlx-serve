@@ -104,11 +104,13 @@ enum ChatModelSelection {
 
     /// Whether the server's id for the resident model names the model we
     /// picked. Registry ids are either the discovered `org/name` or, for a
-    /// register-by-path load, the directory basename — which for a Hugging Face
-    /// snapshot is the commit hash. Anything else is a different model.
+    /// register-by-path load, the basename — the commit hash for a Hugging Face
+    /// snapshot, the file stem for a `.gguf`. Anything else is a different model.
     private static func isTheSameModel(_ picked: LocalModel?, asResident name: String) -> Bool {
         guard let picked else { return false }
-        return picked.name == name || (picked.path as NSString).lastPathComponent == name
+        let base = (picked.path as NSString).lastPathComponent
+        return picked.name == name || base == name
+            || (base.lowercased().hasSuffix(".gguf") && (base as NSString).deletingPathExtension == name)
     }
 }
 

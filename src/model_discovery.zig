@@ -741,7 +741,8 @@ pub fn isMtpGgufBasename(basename: []const u8) bool {
     // (`DeepSeek-V4-Flash-DSpark-support.gguf`) — ds4 loads either via the
     // same --mtp slot and classifies by tensors. Swift mirror:
     // DownloadManager.isGgufSidecar — keep in sync.
-    return asciiContainsIgnoreCase(basename, "-mtp-") or asciiContainsIgnoreCase(basename, "-mtp.") or
+    return std.ascii.startsWithIgnoreCase(basename, "mtp-") or // llama.cpp convert --mtp
+        asciiContainsIgnoreCase(basename, "-mtp-") or asciiContainsIgnoreCase(basename, "-mtp.") or
         asciiContainsIgnoreCase(basename, "-dspark-") or asciiContainsIgnoreCase(basename, "-dspark.");
 }
 
@@ -753,25 +754,48 @@ pub fn isGgufSidecarBasename(basename: []const u8) bool {
 }
 
 /// Full path to the ds4 MTP draft-head GGUF sitting beside `model_file_path`
-/// (the primary quant), or null when there is none. The primary's parent
-/// directory is scanned for a `-MTP-` GGUF. Caller owns the returned slice.
-/// Used to auto-enable ds4 speculative decode: the app downloads the MTP file
-/// into the same folder as the chosen quant, and the engine finds it here.
+/// (the primary quant), or null when there is none. Caller owns the returned
+/// slice. Used to auto-enable ds4 speculative decode: the app downloads the MTP
+/// file into the same folder as the chosen quant, and the engine finds it here.
 pub fn findDs4MtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
     const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
-    // openDirAbsolute asserts (→ ReleaseFast UB) on a non-absolute path.
+    return firstMtpGgufIn(io, allocator, dir_path, std.fs.path.basename(model_file_path));
+}
+
+/// Full path to an MTP draft-head GGUF for the llama.cpp engine, or null: the
+/// model's own folder first, then an `MTP/` folder inside it or beside it
+/// (unsloth keeps each quant in its own folder and the heads in `MTP/`).
+/// Caller owns the returned slice.
+pub fn findLlamaMtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
+    const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
+    const skip = std.fs.path.basename(model_file_path);
+    if (firstMtpGgufIn(io, allocator, dir_path, skip)) |p| return p;
+    for ([_]?[]const u8{ dir_path, std.fs.path.dirname(dir_path) }) |base| {
+        const mtp_dir = std.fs.path.join(allocator, &.{ base orelse continue, "MTP" }) catch return null;
+        defer allocator.free(mtp_dir);
+        if (firstMtpGgufIn(io, allocator, mtp_dir, skip)) |p| return p;
+    }
+    return null;
+}
+
+/// The first MTP draft-head GGUF in `dir_path` by name, other than `skip`.
+fn firstMtpGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, skip: []const u8) ?[]u8 {
+    // openDir asserts (→ ReleaseFast UB) on a non-absolute path.
     if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return null;
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
     defer dir.close(io);
+    var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+    var best: ?[]const u8 = null;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (!isMtpGgufBasename(entry.name)) continue;
-        if (std.mem.eql(u8, entry.name, std.fs.path.basename(model_file_path))) continue;
+        if (!isMtpGgufBasename(entry.name) or std.mem.eql(u8, entry.name, skip)) continue;
+        if (best != null and !std.mem.lessThan(u8, entry.name, best.?)) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
-        if (st.kind != .file) continue;
-        return std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch return null;
+        if (st.kind != .file or entry.name.len > name_buf.len) continue;
+        @memcpy(name_buf[0..entry.name.len], entry.name);
+        best = name_buf[0..entry.name.len];
     }
-    return null;
+    return std.fs.path.join(allocator, &.{ dir_path, best orelse return null }) catch null;
 }
 
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1102,6 +1126,15 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
 
     var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return error.ModelDirNotFound;
     defer dir.close(io);
+
+    // A `.gguf` FILE is a model of its own: the app picks GGUF quants one file
+    // at a time (a per-quant folder, a split's first shard), as `--model` does.
+    if (std.mem.endsWith(u8, base, ".gguf")) {
+        if (isGgufSidecarBasename(base) or gguf_meta.fileDeclaresPooling(io, dir, base)) return error.UnsupportedArch;
+        const st = dir.statFile(io, base, .{}) catch return error.ModelDirNotFound;
+        if (st.kind != .file) return error.ModelDirNotFound;
+        return .{ .model_type = try allocator.dupe(u8, "gguf"), .bytes_on_disk = @intCast(st.size) };
+    }
 
     // GGUF first — same precedence as tryAddModel and `--model` routing.
     gguf: {
@@ -1780,6 +1813,42 @@ test "findDs4MtpSidecar never returns the model file itself" {
     try testing.expectEqualStrings("Flash-Next-MTP-Q8.gguf", std.fs.path.basename(found));
 }
 
+test "findLlamaMtpSidecar: an mtp- head beside the model, in MTP/ inside, or in MTP/ next to its quant folder" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+
+    // unsloth's layout: quants in per-quant folders, heads in a sibling MTP/.
+    try tmp.dir.createDirPath(io, "repo/UD-Q4_K_XL");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/UD-Q4_K_XL/Next-UD-Q4_K_XL-00001-of-00002.gguf", .data = "x" });
+    const model = try std.fmt.allocPrint(allocator, "{s}/repo/UD-Q4_K_XL/Next-UD-Q4_K_XL-00001-of-00002.gguf", .{root});
+    defer allocator.free(model);
+    try testing.expectEqual(@as(?[]u8, null), findLlamaMtpSidecar(io, allocator, model));
+
+    try tmp.dir.createDirPath(io, "repo/MTP");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/MTP/mtp-Next-shared-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/MTP/README.md", .data = "x" });
+    {
+        const found = findLlamaMtpSidecar(io, allocator, model) orelse return error.TestExpectedSidecar;
+        defer allocator.free(found);
+        try testing.expectEqualStrings("mtp-Next-shared-Q8_0.gguf", std.fs.path.basename(found));
+    }
+
+    // A flat repo: the head beside the quant wins over any MTP/ folder.
+    try tmp.dir.createDirPath(io, "flat/MTP");
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat/Qwen-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat/mtp-Qwen-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat/MTP/mtp-Qwen-BF16.gguf", .data = "x" });
+    const flat = try std.fmt.allocPrint(allocator, "{s}/flat/Qwen-Q8_0.gguf", .{root});
+    defer allocator.free(flat);
+    const found = findLlamaMtpSidecar(io, allocator, flat) orelse return error.TestExpectedSidecar;
+    defer allocator.free(found);
+    try testing.expectEqualStrings("mtp-Qwen-Q8_0.gguf", std.fs.path.basename(found));
+}
+
 test "resolveGgufFile: deterministic pick, mmproj filtering, precise errors" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -2005,6 +2074,10 @@ test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
     // isMtpGgufBasename is the specific predicate the engine uses to FIND the
     // draft head (a subset of the sidecar filter).
     try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
+    // llama.cpp's convert `--mtp` names a head-only file with an `mtp-` prefix.
+    try testing.expect(isMtpGgufBasename("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"));
+    try testing.expect(isGgufSidecarBasename("MTP-Qwen3.8-Flash-Next-Q4_K_M.gguf"));
+    try testing.expect(!isMtpGgufBasename("mtpfoo-Q8_0.gguf"));
     try testing.expect(!isMtpGgufBasename("mmproj-F16.gguf"));
     try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
 

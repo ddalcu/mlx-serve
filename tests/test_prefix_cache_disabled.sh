@@ -2,9 +2,11 @@
 # Usage: test_prefix_cache_disabled.sh MODEL [PORT] [extra server flags...]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-model="${1:?pass a local model directory}"
+source tests/_lib_models.sh
+model="${1:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit)}"
+[ -n "$model" ] || { echo "SKIP test_prefix_cache_disabled: no model (pass <model-dir>)"; exit 0; }
 port="${2:-19286}"
-shift "$(( $# >= 2 ? 2 : 1 ))"
+shift "$(( $# >= 2 ? 2 : $# ))"
 python3 - "${BINARY:-./zig-out/bin/mlx-serve}" "$model" "$port" "$@" <<'PY'
 import json
 import subprocess

@@ -24,7 +24,9 @@ Open an issue with:
 4. **Draft while working, publish when ready.** Open as draft early so nobody duplicates you. Move to ready for review only when 1-3 are done.
 5. **Keep it simple.** One fix or feature per PR, smallest change that does the job, match surrounding style, no new plumbing to make something testable, no comments that restate code, no new dependencies. Read `CLAUDE.md` and the matching `docs/gotchas/*.md` before touching a subsystem. Read "Diff hygiene" below; a PR that fails it gets sent back before anyone reads the code.
 6. **Numbers name what they beat.** A perf claim is an llmprobe cell (`./tests/bench.sh`) against a named arm, same session, with the engagement line from the log. See `.claude/skills/bench/SKILL.md` and "Showing the numbers" below.
-7. **Agents: use Claude Fable 5** if you can. Any model is welcome, but the PR meets 1-6 regardless of who wrote it.
+7. **Agents: use Claude** if you can. Any model is welcome, but the PR meets 1-6 regardless of who wrote it.
+8. **Dont break other hardware numbers** Try your best not to do harm for other M series chips, we maintain compatability with M1,2,3,4,5,6
+9. **Dont regress on other models** Sometimes when you tune a knob, it will detune somewhere else, make sure to cross check, download the other models and test them as well. (ex: Qwen 27b vs Qwen 9b) (within reason)
 
 ## Showing the numbers
 

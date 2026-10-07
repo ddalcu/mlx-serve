@@ -372,6 +372,18 @@ pub const Registry = struct {
         } else try self.by_width.put(self.allocator, width, shared);
     }
 
+    /// Binds a row-joined weight to the one sign vector all `parts` read.
+    /// False (nothing bound) when they read different vectors or none.
+    pub fn alias(self: *Registry, joined: mlx.mlx_array, parts: []const mlx.mlx_array) !bool {
+        const first = self.get(parts[0]) orelse return false;
+        for (parts[1..]) |p| {
+            const sg = self.get(p) orelse return false;
+            if (sg.ctx != first.ctx) return false;
+        }
+        try self.map.put(self.allocator, @intFromPtr(joined.ctx), first);
+        return true;
+    }
+
     /// The one sign vector every rotated weight of `width` reads, or null.
     pub fn signsFor(self: *const Registry, width: c_int) ?mlx.mlx_array {
         if (self.width_conflict.contains(width)) return null;
@@ -514,6 +526,14 @@ test "rht: two distinct sign vectors at one width dedup the pool and disable sig
     try std.testing.expectEqual(@as(usize, 2), reg.pool.count());
     try std.testing.expect(reg.signsFor(@intCast(n)) == null);
     try std.testing.expect(reg.get(ws[2]) != null);
+
+    // A joined weight reads its parts' vector only when they share one.
+    const joined = mlx.mlx_array_new_data(&sg1, &w_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(joined);
+    try std.testing.expect(!try reg.alias(joined, &.{ ws[0], ws[2] }));
+    try std.testing.expect(reg.get(joined) == null);
+    try std.testing.expect(try reg.alias(joined, &.{ ws[0], ws[1] }));
+    try std.testing.expectEqual(reg.get(ws[0]).?.ctx, reg.get(joined).?.ctx);
 }
 
 test "rht: normRotate matches add -> rms_norm -> transform" {

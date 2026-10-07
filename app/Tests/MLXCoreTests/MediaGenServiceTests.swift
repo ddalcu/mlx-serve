@@ -207,6 +207,14 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertTrue(VideoModelPreset.all.contains { $0.id == VideoModelPreset.minimaxH3Ref2VA.id })
     }
 
+    func testTurboStepsStayInsideTheDistillationsTrainedRange() {
+        // Bar: Turbo offers 4-8 on every pack that has it; anything else keeps its own range.
+        XCTAssertEqual(VideoModelPreset.minimaxH3.stepsRange(turbo: true), 4...8)
+        XCTAssertEqual(VideoModelPreset.minimaxH3Q4.stepsRange(turbo: true), 4...8)
+        XCTAssertEqual(VideoModelPreset.minimaxH3.stepsRange(turbo: false), VideoModelPreset.minimaxH3.stepsRange)
+        XCTAssertEqual(VideoModelPreset.minimaxH3Ref2VA.stepsRange(turbo: true), VideoModelPreset.minimaxH3Ref2VA.stepsRange)
+    }
+
     func testTurboAndChainingAreFl2vaOnlyAndGateTheirFields() {
         // Capability side: both ride fl2va machinery (the LoRA is untested on
         // the REF2VA DiT; a reference has no keyframe row to chain through),

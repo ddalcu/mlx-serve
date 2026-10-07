@@ -151,6 +151,8 @@ const Expect = struct {
     /// what it receives — fragmentary content writes a corrupt file
     /// "successfully").
     tool_arg_absent: ?[]const u8 = null,
+    /// Expect this key in the first call's arguments to be a JSON object.
+    tool_object_key: ?[]const u8 = null,
     /// Expected name of the LAST parsed tool call (pins per-call name repair
     /// in multi-call outputs — e.g. the Inkling marker-echoed payload name).
     last_tool_name: ?[]const u8 = null,
@@ -170,6 +172,11 @@ const edit_tool_schema =
 /// oldText/newText — which is what makes a buried `path` provably misplaced.
 const pi_edit_tool_schema =
     \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]},"description":"One or more targeted replacements."}},"required":["path","edits"]}}}]
+;
+
+/// fx's shell tool: `request` is a discriminated union (no top-level "type").
+const fx_shell_tool_schema =
+    \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"request":{"oneOf":[{"type":"object","properties":{"action":{"const":"run"},"command":{"type":"string"}},"required":["action","command"]},{"type":"object","properties":{"action":{"const":"cancel"}},"required":["action"]}]}},"required":["request"]}}}]
 ;
 
 /// Weather tool with a boolean arg — used by the LIVE Hy3 capture to pin the
@@ -799,6 +806,16 @@ const corpus = [_]Expect{
         .tool_arg_key = "command",
         .tool_arg_value = "ls -la",
     },
+    .{
+        // #748: the `>` after the function name is missing, so a `>`-scan ran
+        // into the next tag and shipped the name `read_file\n</parameter`.
+        .family = "hermes",
+        .name = "function name with a missing > ends at the line break",
+        .raw = "<tool_call>\n<function=read_file\n<parameter=path>\n./notes.md\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "./notes.md",
+    },
     // ── Schema-declared argument types (value-spelling inference class) ──────
     // Class: the tag formats carry NO type information, so the parser infers it
     // from the value's SPELLING (`isJsonLiteral`) — and guesses wrong in both
@@ -873,6 +890,17 @@ const corpus = [_]Expect{
         .tools_json = edit_tool_schema,
         .tool_bool_key = "replace_all",
         .tool_bool_value = true,
+    },
+    .{
+        // A container param declared as a oneOf union has no top-level "type":
+        // fx's `shell.request` shipped as a JSON STRING and fx refused every call.
+        .family = "qwen",
+        .name = "object param declared as a oneOf union is not left a string",
+        .raw = "<tool_call>\n<function=shell>\n<parameter=request>\n{\"action\": \"run\", \"command\": \"ls\"}\n</parameter>\n" ++
+            "</function>\n</tool_call>",
+        .tool_name = "shell",
+        .tools_json = fx_shell_tool_schema,
+        .tool_object_key = "request",
     },
     // ── Misplaced required param (buried-`path` class) ──────────────────────
     // Class: a weak model that has internalized "the edit object holds everything
@@ -1904,6 +1932,10 @@ test "format corpus: recorded model outputs across families" {
                 if (std.mem.indexOf(u8, tc.name, "<|") != null) {
                     try fail(entry, "tool NAME carries a channel marker", tc.name);
                 }
+                // A tool name never spans a line or a tag (#748).
+                if (tc.name.len == 0 or std.mem.indexOfAny(u8, tc.name, "\n\r<>") != null) {
+                    try fail(entry, "tool NAME is empty or carries a line break or markup", tc.name);
+                }
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch {
                     try fail(entry, "tool arguments are not valid JSON", tc.arguments);
                     unreachable;
@@ -1942,6 +1974,12 @@ test "format corpus: recorded model outputs across families" {
                 if (val != .bool or val.bool != entry.tool_bool_value.?) {
                     try fail(entry, "boolean arg is not the expected JSON boolean", cs[0].arguments);
                 }
+            }
+            if (entry.tool_object_key) |key| {
+                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
+                defer parsed.deinit();
+                const val = parsed.value.object.get(key);
+                if (val == null or val.? != .object) try fail(entry, "arg is not a JSON object", cs[0].arguments);
             }
             if (entry.tool_arg_absent) |key| {
                 const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});

@@ -293,12 +293,25 @@ struct ChatAudio: Identifiable, Codable, Equatable {
 struct ChatVideo: Identifiable, Codable, Equatable {
     let id: UUID
     let name: String // original filename, for the attachment chip
-    let frames: [Data] // JPEG bytes, one per sampled frame
+    /// The folder of frame JPEGs under `~/.mlx-serve/attachments/`, when there is one.
+    var path: String?
+    var frames: [Data] // JPEG bytes, one per sampled frame; empty when the folder is gone
 
-    init(name: String, frames: [Data]) {
+    enum CodingKeys: String, CodingKey { case id, name, path }
+
+    init(name: String, frames: [Data], path: String? = nil) {
         self.id = UUID()
         self.name = name
         self.frames = frames
+        self.path = path
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        frames = path.map { AttachmentStore.videoFrames(at: $0) } ?? []
     }
 
     var frameCount: Int { frames.count }

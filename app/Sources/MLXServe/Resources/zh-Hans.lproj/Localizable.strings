@@ -2,6 +2,47 @@
    Keys are the English source strings; anything not listed here
    falls back to English. */
 
+"All parameters" = "全部参数";
+"Off: %@ · On: custom value" = "关：%@ · 开：自定义值";
+" · Force: ignore client override" = " · 强制：忽略客户端覆盖";
+"Off: %@" = "关：%@";
+"On: use custom value" = "开：使用自定义值";
+"Force: ignore client override" = "强制：忽略客户端覆盖";
+"Server default" = "服务器默认值";
+"Mixed" = "混合";
+"Force" = "强制";
+"Selective" = "严格筛选";
+"Lower values favor predictable replies; higher values add variety. 0 is greedy." = "较低值使回复更可预测；较高值增加多样性。0 使用贪心采样。";
+"Keep the smallest token pool covering this probability. 1 keeps all tokens." = "保留覆盖该概率的最小 token 集合。1 保留所有 token。";
+"Discourage tokens already used, regardless of how often they appeared. 0 disables the penalty." = "降低已使用 token 的概率，不考虑出现次数。0 禁用惩罚。";
+"Min-p" = "最低相对概率（Min-p）";
+"Minimum probability relative to the most likely token. 0 disables min-p." = "相对于最可能 token 的最低概率。0 禁用 min-p。";
+"Generation Defaults" = "生成默认值";
+"Generation defaults" = "生成默认值";
+"Ignore client override" = "忽略客户端覆盖";
+"Inherit" = "继承";
+"Global" = "全局";
+"Model default" = "模型默认值";
+"Max output tokens" = "最大输出 token 数";
+"Thinking budget" = "思考预算";
+"Frequency penalty" = "频率惩罚";
+"Reload settings" = "重新加载设置";
+"Server generation defaults for all clients — next request, no restart." = "面向所有客户端的服务器生成默认值 —— 下一次请求生效，无需重启。";
+"Defaults for app chats and external API clients. Model rules override global rules. Applies to the next request." = "用于应用聊天和外部 API 客户端的默认值。模型规则覆盖全局规则。下一次请求生效。";
+"Applies to the next request without reloading. Model rules replace global values and their client-override policy." = "下一次请求生效，无需重新加载。模型规则替代全局值及其客户端覆盖策略。";
+"Generation defaults apply to the next request. Load settings apply when the model loads." = "生成默认值在下一次请求生效。加载设置在模型加载时生效。";
+"The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here." = "已保存的生成策略包含无效或不受支持的字段。原内容会保留；请先修正 model-settings.json，再在此编辑。";
+"Keeps only the k most likely next tokens. Lower values narrow choices; 0 disables this filter." = "仅保留下一步最可能的 k 个 token。较低值缩小候选范围；0 禁用此筛选。";
+"1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding." = "1 禁用重复惩罚。非中性惩罚可能禁用投机解码和批量解码。";
+"Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control." = "使用此引擎现有的频率惩罚映射。重复惩罚和频率惩罚共用一个采样器控制项。";
+"0 uses remaining context. Context and memory limits still apply." = "0 使用剩余上下文。上下文和内存限制仍然适用。";
+"API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. Effort words map against this budget." = "API：reasoning_budget_tokens。-1 表示无限制；0 立即结束思考。推理强度词按此预算换算。";
+"Explicit client thinking or effort wins unless locked." = "未锁定时，以客户端明确指定的思考或努力级别为准。";
+"Mapped to the model's template vocabulary. Numeric thinking budget is a separate control." = "映射到模型模板的词汇。数值思考预算是独立控制项。";
+"Client values win unless Ignore client override is checked." = "未勾选“忽略客户端覆盖”时，以客户端值为准。";
+"This resets every section — Server, Speculative Decoding, Performance, Generation Defaults, Voice, Agent Sandbox and Messaging — not just the one you're looking at. Your Telegram bot token is kept, since only @BotFather can reissue it. Generation defaults apply to the next request; launch flags apply after Restart Now." = "这会重置所有区块 —— 服务器、投机解码、性能、生成默认值、语音、Agent 沙盒和消息 —— 而不只是当前区块。Telegram 机器人令牌会保留，因为只有 @BotFather 才能重新签发。生成默认值在下一次请求生效；启动参数在点击“立即重启”后生效。";
+" Generation defaults apply to the next request without a restart. Per-model rules are kept." = " 生成默认值在下一次请求生效，无需重启。每模型规则会保留。";
+
 " (Turbo)" = " （Turbo）";
 " (our estimate)" = " （我们的估算）";
 " (with its built-in draft head)" = " （自带草稿头）";
@@ -774,7 +815,7 @@
 "How closely the picture follows the attached soundtrack. LTX default: 7.0." = "画面贴合所附音轨的程度。LTX 默认：7.0。";
 "How hard the video is pushed to match your clip — lip sync, timing, performance. 7.0 is the LTX default. Lower drifts from the audio; higher locks to it and can look stiff." = "视频向你的音频片段对齐的强度 —— 唇形同步、时间轴、表演。7.0 是 LTX 的默认值。调低会逐渐偏离音频；调高会紧贴音频，可能显得僵硬。";
 "How large each reference image is fed to the model. Maximum detail keeps identity better and is several times slower — every reference token is re-read on every sampling step." = "每张参考图送入模型的尺寸。最高细节能更好地保持人物一致性，但会慢上数倍 —— 每个采样步都要重新读取全部参考 Token。";
-"How many independent llama.cpp KV contexts to keep resident. 1 = legacy single-session (every flip between long prompts evicts the other). >1 keeps the N most-recently-used prompts hot — alternating multi-doc workloads stop cold-prefilling on every flip." = "常驻多少个独立的 llama.cpp KV 上下文。1 = 传统的单会话（每次在长提示词之间切换都会换出另一个）。>1 会保留最近使用的 N 个提示词为热状态 —— 交替处理多份文档的工作负载就不必在每次切换时冷预填充。";
+"How many requests llama.cpp decodes at once, in one batch, each keeping its own prompt cache warm. Agent clients send several requests together; with 1 they wait in line. Each sequence holds a full context of KV memory from the moment the model loads, so lower it if a large context does not fit. Passes --llama-cache-entries." = "llama.cpp 同时在一个批次中解码多少个请求，每个请求各自保留热的提示词缓存。Agent 客户端会同时发送多个请求；设为 1 时它们只能排队。每个序列从模型加载起就占用一整个上下文的 KV 内存，所以大上下文放不下时请调低。对应 --llama-cache-entries。";
 "How many models the server keeps resident before it evicts the least-recently-used one to make room for the next. Switching models in the composer's picker never explicitly unloads the old one — it relies on this cap. Set to 1 so every switch unloads the previous model first, freeing its memory immediately. Passes --max-resident-models." = "服务器在换出最久未使用的模型为新模型腾出空间之前，会常驻多少个模型。在输入框的模型选择器中切换模型从不会显式卸载旧模型 —— 它依赖这个上限。设为 1 后，每次切换都会先卸载上一个模型，立即释放它的内存。会传递 --max-resident-models。";
 "How many of the steps follow the source. 1 keeps it all the way; lower lets the caption take over for the last steps." = "有多少步跟随源音频。1 表示全程跟随；数值更低时，最后几步由描述文本主导。";
 "How many times this repo has been pulled from HuggingFace" = "该仓库从 HuggingFace 拉取的次数";
@@ -1481,7 +1522,7 @@
 "Server settings" = "服务器设置";
 "Server-launch flags. Restart the server to apply changes." = "服务器启动参数。重启服务器后生效。";
 "Serves decode from quantized copies of attention weights that ship un-quantized (bf16): 8-bit for most layers, 4-bit for the last fifth, where quantization error matters far less. Models like poolside Laguna decode ~25% faster overall. Slightly lossy: replies can differ in wording from the exact bf16 decode, but measured answers stay the same quality (prompt reading and speculative checks keep the exact weights). Flipping this ON (rather than leaving it untouched) also enables DeepSeek-V4's compressor-input requant — ~7% faster decode there, with rare wording-level artifacts. Models with fully quantized attention are unaffected. Turn off for bit-exact bf16 decoding." = "用注意力权重的量化副本来做解码，而这些权重本身以未量化（bf16）的形式提供：大多数层用 8-bit，最后五分之一用 4-bit，那里的量化误差影响小得多。像 poolside Laguna 这样的模型整体解码快约 25%。略有损失：回复措辞可能与精确的 bf16 解码不同，但实测答案质量不变（提示词读取和投机校验仍使用精确权重）。把它打开（而不是保持不动）还会启用 DeepSeek-V4 的 compressor 输入重新量化 —— 那里的解码快约 7%，偶有措辞层面的瑕疵。注意力已完全量化的模型不受影响。要按位精确的 bf16 解码请关闭它。";
-"Session cache entries" = "会话缓存条目数";
+"Parallel sequences" = "并行序列数";
 "Sessions" = "会话";
 "Set by %@" = "由 %@ 设置";
 "Set by source image…" = "按源图片设置…";
@@ -2106,3 +2147,8 @@
 "Number of sessions behind this result" = "此结果所依据的会话数";
 "Server-measured timings. Context check indicates whether the answer used the planted constant." = "时间由服务器测量。上下文验证表示回答是否使用了预先放入上下文的常量。";
 "Median per context length. Samples is the number of sessions behind each result." = "每个上下文长度取中位数。样本数为各项结果所依据的会话数。";
+"MTP draft tokens" = "MTP 草稿 Token 数";
+"For a GGUF with an MTP head (its own, or an mtp-*.gguf file beside it, as in unsloth's MTP folder), guess this many tokens ahead and check them in one pass: a faster reply with the same output. Drafts only while one request is decoding; with company the batch is faster. 0 turns it off and skips loading the head. Passes --llama-mtp-drafts." = "对带有 MTP 头的 GGUF（自带的，或旁边的 mtp-*.gguf 文件，例如 unsloth 的 MTP 文件夹），提前猜测这么多个 Token，并在一次传递中校验：回复更快，输出不变。只在单个请求解码时起草；有其他请求同时进行时，批处理更快。设为 0 关闭，并且不加载该头。对应 --llama-mtp-drafts。";
+"Prefill batch size" = "预填充批大小";
+"How many prompt tokens llama.cpp processes per GPU pass. Larger batches read long prompts faster, mostly on MoE models, and take more scratch memory. Default is llama.cpp's 512. Passes --llama-ubatch." = "llama.cpp 每次 GPU 传递处理多少个提示词 Token。批次越大，读取长提示词越快（主要是 MoE 模型），也占用更多临时内存。默认是 llama.cpp 的 512。对应 --llama-ubatch。";
+"Default (512)" = "默认（512）";

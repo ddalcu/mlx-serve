@@ -23,6 +23,7 @@ const log = @import("../log.zig");
 
 pub const Error = error{
     EngineOpenFailed,
+    SplitGgufUnsupported,
     SessionCreateFailed,
     SessionSyncFailed,
     SessionEvalFailed,
@@ -250,6 +251,17 @@ pub fn ggufDeclaresEmbeddedMtp(io: std.Io, allocator: std.mem.Allocator, path: [
     return info.embedded_mtp;
 }
 
+/// ds4 reads ONE file and exit()s the process on a missing tensor, so a split
+/// GGUF (its shard 1 may hold no tensors at all) is refused here by name (#586).
+fn refuseSplitGguf(allocator: std.mem.Allocator, path: []const u8) Error!void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var info = gguf_meta.readFromFile(io, allocator, path) catch return;
+    defer info.deinit(allocator);
+    if (info.split_count <= 1) return;
+    log.err("[ds4] {s} is one shard of a {d}-file split GGUF, and the ds4 engine reads one file: serve it with --engine llama, or merge the shards (llama-gguf-split --merge)\n", .{ path, info.split_count });
+    return Error.SplitGgufUnsupported;
+}
+
 pub fn dsparkEffective(requested: bool, has_support_gguf: bool) bool {
     return requested and has_support_gguf;
 }
@@ -264,6 +276,7 @@ pub const Ds4Engine = struct {
     embedded_mtp: bool,
 
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*Ds4Engine {
+        try refuseSplitGguf(allocator, model_path);
         try ensureMetalKernels(allocator);
 
         const path_z = allocator.dupeSentinel(u8, model_path, 0) catch return Error.OutOfMemory;
@@ -344,6 +357,16 @@ pub const Ds4Engine = struct {
 
     pub fn eosToken(self: *Ds4Engine) i32 {
         return @intCast(ffi.ds4_token_eos(self.handle));
+    }
+
+    /// ds4's own end-of-generation set: EOS, end-of-text and, on GLM, the
+    /// role markers that open the next turn (`<|user|>`, `<|observation|>`).
+    pub fn isStop(self: *Ds4Engine, token: i32) bool {
+        return ffi.ds4_token_is_stop(self.handle, token);
+    }
+
+    pub fn vocabSize(self: *Ds4Engine) u32 {
+        return @intCast(ffi.ds4_engine_vocab_size(self.handle));
     }
 
     pub fn assistantToken(self: *Ds4Engine) i32 {

@@ -87,6 +87,18 @@ const ChatConfig = chat_mod.ChatConfig;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 
+/// Launch settings of the embedded llama.cpp engine (`--llama-*`).
+pub const LlamaSettings = struct {
+    /// Sequences per model: requests decoded together in one batch, each
+    /// keeping its own prompt KV for prefix reuse.
+    seqs: u32 = 4,
+    kv_quant: arch_llama.LlamaKvQuant = .off,
+    /// Physical prefill batch; 0 = libllama's default.
+    ubatch: u32 = 0,
+    /// Draft tokens per MTP round when the model ships a head; 0 = off.
+    mtp_drafts: u32 = 2,
+};
+
 /// Phase A1: model-load plan executed on the scheduler's inference thread.
 ///
 /// mlx 0.31.2 uses thread-local GPU streams: every `mlx_*` op binds to the
@@ -190,19 +202,9 @@ pub const LoadParams = struct {
     /// handful of repeated prompts, and full chat conversations bump
     /// this counter anyway via LRU as new turns arrive.
     tokenize_cache_entries: u32 = 4,
-    /// Iteration 3-5 (perf-plan Phase 5 #1): maximum resident llama.cpp
-    /// sessions per model. 1 = legacy single-session behavior (every
-    /// llama prefill fights one KV slot). > 1 keeps the N
-    /// most-recently-used prompts hot in independent contexts so
-    /// alternating multi-doc agent loads don't cold-prefill every flip.
-    llama_cache_entries: u32 = 4,
-    /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache.
-    /// 0 = libllama default (F16); other values match `ggml_type` enum
-    /// (Q8_0=8, Q4_0=2). Wired through `Scheduler.doLoadOnInferenceThread`
-    /// to the LoadedModel; consumed at first request when the session is
-    /// created in `runPrefillLlama`.
-    llama_kv_type_k: i32 = 0,
-    llama_kv_type_v: i32 = 0,
+    /// Embedded llama.cpp engine settings (`--llama-*`), applied when a GGUF
+    /// model's context is created at load.
+    llama: LlamaSettings = .{},
     /// When non-empty, the load routes through the embedded ds4 engine
     /// instead of the MLX safetensors path. `model_dir` is expected to point
     /// at a `.gguf` file (or a directory containing one); the inference
@@ -481,26 +483,32 @@ pub const Slot = struct {
     legacy_gen: ?Generator,
 
     /// ds4 session for this slot, BORROWED from `model.ds4_session` (one
-    /// persistent session per model, claimed via `session_busy`) — never
+    /// persistent session per model, claimed via `session_claims`) — never
     /// freed here. Mutually exclusive with `legacy_gen` (the MLX path).
     ds4_session: ?*arch_ds4.Ds4Session = null,
     /// Per-request RNG state for ds4 sampling. ds4's sampler takes the seed
     /// by pointer so we keep it on the slot.
     ds4_rng: u64 = 0,
 
-    /// llama.cpp session for this slot. BORROWED from the slot's
-    /// `model.llama_session` (a persistent per-model context reused across
-    /// requests for prompt-prefix KV reuse) — NOT owned, so `Slot.deinit` must
-    /// not free it. Mutually exclusive with `legacy_gen` and `ds4_session`.
-    llama_session: ?*arch_llama.LlamaSession = null,
+    /// llama.cpp sequence this slot decodes on, BORROWED from
+    /// `model.llama_ctx` (reused across requests for prompt-prefix KV reuse)
+    /// and marked `busy` while held. Mutually exclusive with `legacy_gen` and
+    /// `ds4_session`.
+    llama_seq: ?*arch_llama.LlamaSeq = null,
+    /// The sampled token not yet fed to `llama_seq`: every decode samples its
+    /// rows at once, since the next decode on the context discards them.
+    llama_next: i32 = -1,
+    /// MTP rounds, draft tokens offered and accepted, for `[spec-stats]`.
+    llama_mtp_rounds: u32 = 0,
+    llama_mtp_drafted: u32 = 0,
+    llama_mtp_accepted: u32 = 0,
     /// DiffusionGemma canvas-denoising runner. Created in
     /// `runPrefillDiffusion` for `config.isDiffusion()` models; owns the
     /// dequantized embedding table; freed in `Slot.deinit`. Mutually
     /// exclusive with `legacy_gen` (the autoregressive MLX path).
     diffusion: ?*diffusion_mod.Runner = null,
-    /// True when this slot claimed `model.session_busy` in `submit`. The
-    /// single persistent context serves one request at a time; the claim is
-    /// released in `complete()`. Tracked per-slot so only the holder releases.
+    /// True when this slot holds one of `model.session_claims` from `submit`
+    /// (one per ds4 session or llama sequence); released in `complete()`.
     holds_session: bool = false,
     /// Per-request RNG state for llama.cpp sampling (passed by pointer, like ds4).
     llama_rng: u64 = 0,
@@ -709,7 +717,7 @@ pub const Slot = struct {
             .ds4_session = null,
             .diffusion = null,
             .ds4_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
-            .llama_session = null,
+            .llama_seq = null,
             .llama_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
             .prompt_ids = prompt_owned,
             .full_prompt = full_prompt_owned,
@@ -795,14 +803,11 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
-        // ds4_session / llama_session are borrowed from the model (persistent
+        // ds4_session / llama_seq are borrowed from the model (persistent
         // across requests) — never freed here. The claim on them is released
-        // in Scheduler.complete; the sessions die with the model.
+        // in Scheduler.complete; they die with the model.
         self.ds4_session = null;
-        // llama_session is borrowed from model.llama_session (persistent across
-        // requests) — do NOT free it here. The claim on it is released in
-        // Scheduler.complete; the session itself is freed with the model.
-        self.llama_session = null;
+        self.llama_seq = null;
         if (self.diffusion) |runner| {
             runner.deinit();
             self.allocator.destroy(runner);
@@ -1221,14 +1226,8 @@ pub const LoadRequest = struct {
     /// `LoadParams.tokenize_cache_entries`; both paths feed
     /// `doLoadOnInferenceThread`.
     tokenize_cache_entries: u32 = 4,
-    /// Iteration 3-5: llama.cpp multi-session cap. Mirrors
-    /// `LoadParams.llama_cache_entries`.
-    llama_cache_entries: u32 = 4,
-    /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache. 0 keeps
-    /// libllama default (F16); Q8_0=8, Q4_0=2. Threaded onto the LoadedModel
-    /// at load time.
-    llama_kv_type_k: i32 = 0,
-    llama_kv_type_v: i32 = 0,
+    /// Mirrors `LoadParams.llama`.
+    llama: LlamaSettings = .{},
 
     /// Victims to evict before the load (LRU-selected by the planner). Each is
     /// already marked `.evicting` with refcount == 0 by the conn thread under
@@ -1373,16 +1372,13 @@ pub const Scheduler = struct {
     /// Launch-flag MTP + embedded-llama.cpp settings, retained (same rationale
     /// as the prefix-cache fields above) so COLD-LOADED models — on-demand
     /// `/v1/load-model`, model switches — honor `--no-mtp` / `--mtp-max-depth` /
-    /// `--llama-cache-entries` / `--llama-kv-quant` like the `--model` primary.
-    /// Pre-plumbing, the cold-load `LoadRequest` used its struct defaults
-    /// (mtp on, default depth, 4 llama sessions, F16 KV), silently ignoring
+    /// the `--llama-*` flags like the `--model` primary. Pre-plumbing, the
+    /// cold-load `LoadRequest` used its struct defaults, silently ignoring
     /// these flags on every on-demand load and model switch.
     mtp_enabled: bool,
     mtp_head_kv_quant: bool,
     mtp_depth: u32,
-    llama_cache_entries: u32,
-    llama_kv_type_k: i32,
-    llama_kv_type_v: i32,
+    llama: LlamaSettings,
     /// Launch-flag ds4 speculative settings, retained for cold loads (same
     /// class as `mtp_enabled` above — `--no-ds4-mtp` / `--dspark` must
     /// survive an on-demand GGUF load, not just the `--model` primary).
@@ -1523,7 +1519,7 @@ pub const Scheduler = struct {
     submit_cond: std.Io.Condition,
     /// Signaled when a persistent engine session (llama) is released in
     /// `complete()`, waking a `submit()` blocked waiting to claim it. Guarded by
-    /// `queue_mu` together with `LoadedModel.session_busy`.
+    /// `queue_mu` together with `LoadedModel.session_claims`.
     session_cond: std.Io.Condition,
 
     inference_thread: ?std.Thread,
@@ -1588,9 +1584,7 @@ pub const Scheduler = struct {
             .mtp_enabled = params.mtp_enabled,
             .mtp_head_kv_quant = params.mtp_head_kv_quant,
             .mtp_depth = params.mtp_depth,
-            .llama_cache_entries = params.llama_cache_entries,
-            .llama_kv_type_k = params.llama_kv_type_k,
-            .llama_kv_type_v = params.llama_kv_type_v,
+            .llama = params.llama,
             .ds4_mtp = params.ds4_mtp,
             .ds4_dspark = params.ds4_dspark,
             .ds4_ssd_streaming = params.ds4_ssd_streaming,
@@ -1817,34 +1811,39 @@ pub const Scheduler = struct {
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
 
-        // Persistent-session engines (llama, ds4) reuse one KV context across
-        // requests, so only one request may drive it at a time. Block here until
-        // the model's session is free, then claim it (released in `complete`).
-        // This serializes concurrent embedded-engine requests without spinning
-        // the inference thread, and lets the next request reuse the previous
-        // one's prompt KV.
-        if (params.model.llama_engine != null or params.model.ds4_engine != null) {
-            while (params.model.session_busy and !self.shutdown.load(.acquire)) {
+        // Persistent-session engines reuse their KV across requests, and each
+        // session (ds4's one, or one llama sequence) serves one request at a
+        // time. Block here until one is free, then claim it (released in
+        // `complete`), so waiting requests never spin the inference thread.
+        if (params.model.sessionCapacity()) |cap| {
+            while (params.model.session_claims >= cap and !self.shutdown.load(.acquire)) {
                 self.session_cond.waitUncancelable(self.io, &self.queue_mu);
             }
             if (self.shutdown.load(.acquire)) return error.Shutdown;
-            params.model.session_busy = true;
+            params.model.session_claims += 1;
             slot.holds_session = true;
         }
 
         self.pending.append(self.allocator, slot) catch |err| {
             // Release the session claim before bubbling the error — the caller
             // never gets the slot, so `complete` won't run for it.
-            if (slot.holds_session) {
-                params.model.session_busy = false;
-                slot.holds_session = false;
-                self.session_cond.broadcast(self.io);
-            }
+            if (slot.holds_session) self.releaseSessionLocked(slot);
             return err;
         };
         self.in_flight += 1;
         self.queue_cond.broadcast(self.io);
         return slot;
+    }
+
+    /// Give back the slot's session claim and its llama sequence. Caller holds
+    /// `queue_mu`. A pass still running this slot is the inference thread's,
+    /// which is also the only thread that picks a sequence, so freeing it here
+    /// cannot hand it to another request mid-tick.
+    fn releaseSessionLocked(self: *Scheduler, slot: *Slot) void {
+        slot.model.session_claims -= 1;
+        slot.holds_session = false;
+        if (slot.llama_seq) |seq| seq.busy = false;
+        self.session_cond.broadcast(self.io);
     }
 
     /// Hand the slot off to the inference thread for cleanup, and notify any
@@ -1884,15 +1883,10 @@ pub const Scheduler = struct {
             }
         }
 
-        // Release the persistent llama session claim (if this slot held it) so
-        // the next queued llama request can claim it AND reuse the KV prefix the
-        // session now holds. Done before enqueueing cleanup so a waiting
-        // submitter can proceed immediately.
-        if (slot.holds_session) {
-            slot.model.session_busy = false;
-            slot.holds_session = false;
-            self.session_cond.broadcast(self.io);
-        }
+        // Release the session claim (if this slot held it) so the next queued
+        // request can claim it AND reuse the KV prefix it now holds. Done before
+        // enqueueing cleanup so a waiting submitter can proceed immediately.
+        if (slot.holds_session) self.releaseSessionLocked(slot);
 
         // Out of every list, so no new pass can take it; wait out the one that has it,
         // before the cleanup queue owns (and may free) the slot.
@@ -2124,14 +2118,12 @@ pub const Scheduler = struct {
             // Cold loads honor the launch-flag MTP + embedded-llama.cpp
             // settings too (same reason as prefix-cache above) — pre-plumbing
             // these were LoadRequest defaults, so --no-mtp / --mtp-max-depth /
-            // --llama-cache-entries / --llama-kv-quant were silently dropped
-            // on every on-demand load and model switch.
+            // --llama-* were silently dropped on every on-demand load and
+            // model switch.
             .mtp_enabled = self.mtp_enabled,
             .mtp_head_kv_quant = self.mtp_head_kv_quant,
             .mtp_depth = self.mtp_depth,
-            .llama_cache_entries = self.llama_cache_entries,
-            .llama_kv_type_k = self.llama_kv_type_k,
-            .llama_kv_type_v = self.llama_kv_type_v,
+            .llama = self.llama,
             .ds4_mtp = self.ds4_mtp,
             .ds4_dspark = self.ds4_dspark,
             .ds4_ssd_streaming = self.ds4_ssd_streaming,
@@ -2799,10 +2791,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;
-    chat_config.default_enable_thinking = o.enable_thinking;
-    chat_config.default_reasoning_effort = o.reasoning_effort;
     o.chat_template_kwargs = null;
-    o.reasoning_effort = null;
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -2905,10 +2894,11 @@ fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
         };
         defer info.deinit(allocator);
         const e = gguf_meta.preferredEngine(info);
-        log.info("[gguf] engine: {s} (arch={s}, ds4-lora={})\n", .{
+        log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, shards={d})\n", .{
             @tagName(e),
             info.architecture orelse "?",
             info.has_ds4_lora_rank,
+            info.split_count,
         });
         break :blk e;
     };
@@ -3099,10 +3089,32 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
 /// and mark ready. The stub config carries the effective context length so the
 /// server's memory estimate and `runPrefillLlama` size the session correctly.
 fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    const ls: LlamaSettings = params.llama;
     log.info("[llama] opening engine: {s}\n", .{params.llama_path});
-    const engine = try arch_llama.LlamaEngine.open(sch.allocator, params.llama_path, .{});
+    // An `mtp-*.gguf` head beside the model wins over the trunk's own NextN heads.
+    const mtp_path: ?[]u8 = if (ls.mtp_drafts > 0) model_discovery.findLlamaMtpSidecar(sch.io, sch.allocator, params.llama_path) else null;
+    defer if (mtp_path) |p| sch.allocator.free(p);
+    if (mtp_path) |p| log.info("[llama] MTP draft head: {s}\n", .{p});
+    const engine = try arch_llama.LlamaEngine.open(sch.allocator, params.llama_path, .{
+        .mtp_path = mtp_path,
+        .load_mtp = ls.mtp_drafts > 0,
+    });
     errdefer engine.close();
     log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
+
+    // The stub config carries the per-sequence context (--ctx-size or 8192).
+    const llama_ctx = try engine.createContext(.{
+        .ctx_size = @intCast(params.config.max_position_embeddings),
+        .n_seq = ls.seqs,
+        .type_k = ls.kv_quant.ggmlType(),
+        .type_v = ls.kv_quant.ggmlType(),
+        .ubatch = ls.ubatch,
+        .mtp_drafts = ls.mtp_drafts,
+    });
+    errdefer llama_ctx.free();
+    log.info("[llama] context: {d} sequences x {d} tokens, KV {s}, MTP drafts {d}\n", .{
+        llama_ctx.seqs.len, params.config.max_position_embeddings, ls.kv_quant.label(), llama_ctx.mtpDrafts(),
+    });
 
     // Make sure the stub config's EOS set includes the engine's EOS so the
     // streaming/non-streaming stop checks fire.
@@ -3122,6 +3134,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     const entry = params.entry;
     entry.llama_engine = engine;
+    entry.llama_ctx = llama_ctx;
     entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
@@ -3143,18 +3156,6 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.tokenize_cache_entries,
         );
     }
-    // Iteration 3-5: cap for the llama.cpp multi-session LRU. The MLX
-    // load path sets this further down; for llama we exit early at the
-    // top of doLoadOnInferenceThread, so it has to land here.
-    entry.llama_cache_max_entries = if (params.llama_cache_entries > 0)
-        params.llama_cache_entries
-    else
-        1;
-    // Phase 5 #2: ggml KV-quant types — same reason as above; the
-    // MLX path's assignment is never reached on the llama branch.
-    entry.llama_kv_type_k = params.llama_kv_type_k;
-    entry.llama_kv_type_v = params.llama_kv_type_v;
-
     const bytes_resident: u64 = if (entry.bytes_on_disk) |b| b else 0;
 
     sch.registry.mutex.lockUncancelable(sch.io);
@@ -3584,14 +3585,13 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // Needles are ++-split so this test's own source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");
     inline for (.{
-        "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
-        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
-        "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
-        "llama_cache_entries",       "llama_kv_type_k",       "llama_kv_type_v",
-        "ds4_mtp",                   "ds4_dspark",            "ds4_ssd_streaming",
-        "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
-        "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
-        "prefix_cache_mem_resolver",
+        "kv_quant_config",           "prefix_cache_capacity",     "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride",     "ssm_checkpoint_max",
+        "mtp_enabled",               "mtp_head_kv_quant",         "mtp_depth",
+        "llama",                     "ds4_mtp",                   "ds4_dspark",
+        "ds4_ssd_streaming",         "no_drafter",                "draft_block_size",
+        "draft_block_size_explicit", "ane_prefill",               "ane_chunk_resolver",
+        "ane_headroom_resolver",     "prefix_cache_mem_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -4215,7 +4215,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 return err;
             };
             dflash_ptr = d;
-            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+            const wide_lane = dflash_mod.wideVerifyLaneAvailable() or xfm_ptr.ternaryWideVerify();
             const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand(), d.selector != null and xfm_ptr.specTreeSupported());
             sch.drafter_block_size = dflash_mod.resolveBlockSize(
                 d.config.block_size,
@@ -4771,18 +4771,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.tokenize_cache_entries,
         );
     }
-    // Iteration 3-5: cap for the llama.cpp multi-session LRU. Always
-    // clamp to ≥1 so `runPrefillLlama` can grow the cache even if a
-    // bug or a 0-default leaks through.
-    entry.llama_cache_max_entries = if (params.llama_cache_entries > 0)
-        params.llama_cache_entries
-    else
-        1;
-    // Phase 5 #2: thread KV-quant types onto the LoadedModel so
-    // runPrefillLlama uses them when creating the persistent session.
-    entry.llama_kv_type_k = params.llama_kv_type_k;
-    entry.llama_kv_type_v = params.llama_kv_type_v;
-
     // Commit the same validated weight estimate used by the eviction gate
     // and preflight (zero means no disk estimate), plus a GPU-resident n-gram table.
     const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config);
@@ -6112,6 +6100,12 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
+    if (slot.llama_mtp_rounds > 0) log.info("  [spec-stats] mode=llama-mtp attempts={d} accepts={d} drafted={d} per_draft_pct={d:.1}%\n", .{
+        slot.llama_mtp_rounds,
+        slot.llama_mtp_accepted,
+        slot.llama_mtp_drafted,
+        100.0 * @as(f64, @floatFromInt(slot.llama_mtp_accepted)) / @as(f64, @floatFromInt(@max(slot.llama_mtp_drafted, 1))),
+    });
     if (slot.legacy_gen) |*g| {
         g.logSpecStats();
         // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
@@ -6203,110 +6197,68 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
     slot.state = .decoding;
 }
 
-/// llama.cpp prefill: drive a persistent per-model session, reusing the KV from
-/// the previous request's shared prompt prefix (LM-Studio-style prompt caching).
-/// `submit` guarantees a single slot owns the session at a time, so the resident
-/// KV is exactly the prior request's prompt+generation. `sync` diffs the new
-/// prompt against it, trims the divergent tail, and decodes only the suffix.
-/// `cached_tokens` reports the reused prefix length; `prompt_tokens` stays the
-/// full prompt so prefill tok/s reflects only the uncached suffix.
-fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine) !void {
+/// Chat templates open every prompt with a fixed prologue (system header, BOS,
+/// role markers: Gemma 12 tokens, Qwen 8, Llama 4). A shared prefix this short
+/// is not worth taking another conversation's sequence for.
+const LLAMA_MIN_PREFIX_TO_CLAIM: usize = 16;
+
+/// The free sequence a prompt should decode on: the one sharing the longest
+/// prefix past the chat-template prologue, else the least recently used. Null
+/// only when every sequence is busy, which the submit-time claim rules out.
+pub fn pickLlamaSeq(seqs: []const arch_llama.LlamaSeq, prompt: []const i32) ?usize {
+    var best: ?usize = null;
+    var best_shared: usize = LLAMA_MIN_PREFIX_TO_CLAIM - 1;
+    var lru: ?usize = null;
+    for (seqs, 0..) |*seq, i| {
+        if (seq.busy) continue;
+        const shared = arch_llama.commonPrefixLen(seq.resident.items, prompt);
+        if (shared > best_shared) {
+            best_shared = shared;
+            best = i;
+        }
+        if (lru == null or seq.last_used_ns < seqs[lru.?].last_used_ns) lru = i;
+    }
+    return best orelse lru;
+}
+
+/// llama.cpp prefill: claim a sequence of the model's context, sync it to the
+/// prompt (reusing the KV prefix a previous request left there), and sample the
+/// first token. `cached_tokens` reports the reused prefix; `prompt_tokens` stays
+/// the full prompt so prefill tok/s reflects only the uncached suffix.
+fn runPrefillLlama(sch: *Scheduler, slot: *Slot) !void {
+    const ctx = slot.model.llama_ctx orelse return error.ModelNotLoaded;
     const i32_prompt = try slot.allocator.alloc(i32, slot.full_prompt.len);
     defer slot.allocator.free(i32_prompt);
     for (slot.full_prompt, 0..) |t, i| i32_prompt[i] = @intCast(t);
 
-    // Size to the stub config's context length (main.zig sets it from the user's
-    // --ctx-size or the GGUF's trained context). 0 → libllama uses the model
-    // default (its trained context).
-    const ctx_size: i32 = if (slot.model.config) |c| @intCast(c.max_position_embeddings) else 0;
-
-    // Phase 5 #1 (Iteration 3-5): pick the best matching entry out of the
-    // LRU. The "best" = longest common prefix between the incoming prompt
-    // and the entry's resident KV mirror; ties (including the all-zero
-    // case) go to the least-recently-used entry so a brand-new prompt
-    // doesn't keep clobbering the same slot.
-    const max_entries = if (slot.model.llama_cache_max_entries > 0)
-        slot.model.llama_cache_max_entries
-    else
-        1;
-
-    // Chat templates produce a fixed leading prefix (system header, BOS,
-    // role markers) that's identical across requests — for Qwen3-style
-    // it's ~3-10 tokens. Treating that as a "hit" would let request B
-    // claim request A's slot just to save a handful of tokens, evicting
-    // A's content-bearing KV. Require a higher floor before we count a
-    // resident entry as a meaningful match. The value 16 sits above
-    // every chat template's pure prologue in this codebase (Gemma=12,
-    // Qwen=8, Llama=4) and below any real user-message overlap.
-    const min_prefix_to_claim: usize = 16;
-
-    var best_idx: ?usize = null;
-    var best_shared: usize = 0;
-    var lru_idx: ?usize = null;
-    var lru_used: i64 = std.math.maxInt(i64);
-    for (slot.model.llama_sessions.items, 0..) |entry, i| {
-        const shared = arch_llama.commonPrefixLen(entry.session.resident.items, i32_prompt);
-        // Strict >: ties leave the lower-indexed entry in `best_idx`, which
-        // is fine — we still need the prefix-match candidate. The
-        // separately tracked `lru_idx` handles the cold-miss path.
-        if (shared > best_shared) {
-            best_shared = shared;
-            best_idx = i;
-        }
-        if (entry.last_used_ns < lru_used) {
-            lru_used = entry.last_used_ns;
-            lru_idx = i;
-        }
-    }
-
-    // Promote the best match only when it crosses the chat-template floor;
-    // otherwise fall through to growth / LRU eviction.
-    if (best_shared < min_prefix_to_claim) best_idx = null;
-
-    var pick_idx: usize = undefined;
-    if (best_idx) |i| {
-        pick_idx = i;
-    } else if (slot.model.llama_sessions.items.len < max_entries) {
-        // Grow the cache — every prefill so far missed; allocate a new
-        // session and append it.
-        const type_k = slot.model.llama_kv_type_k;
-        const type_v = slot.model.llama_kv_type_v;
-        const created = if (type_k != 0 or type_v != 0)
-            try engine.createSessionWithKvQuant(ctx_size, type_k, type_v)
-        else
-            try engine.createSession(ctx_size);
-        errdefer created.free();
-        try slot.model.llama_sessions.append(slot.allocator, .{ .session = created, .last_used_ns = 0 });
-        pick_idx = slot.model.llama_sessions.items.len - 1;
-        log.info("[llama-cache] created session #{d} (cap={d})\n", .{ pick_idx, max_entries });
-    } else {
-        // Full + no prefix match — evict the LRU entry by resetting its KV
-        // in place. Keeps the libllama context alive (re-allocating per
-        // miss would be expensive) but drops the resident-token mirror so
-        // the next sync starts from zero.
-        pick_idx = lru_idx.?;
-        slot.model.llama_sessions.items[pick_idx].session.reset();
-        log.info("[llama-cache] evicted LRU session #{d}\n", .{pick_idx});
-    }
-
-    const entry_ptr = &slot.model.llama_sessions.items[pick_idx];
-    entry_ptr.last_used_ns = @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds);
-    const sess = entry_ptr.session;
-
-    // `syncWithFallback` does the prefix-trim + suffix decode and, on any
-    // libllama transient (the "failed to find a memory slot" class — see
-    // `LlamaSession.syncWithFallback`), resets the session and retries once
-    // cold. Either we serve the request with a clean response or we surface
-    // the error after leaving the session in a known-good state.
-    const cached = sess.syncWithFallback(i32_prompt) catch |err| {
-        sess.reset();
-        return err;
+    // Under the lock `complete` releases sequences under: a request already
+    // completed (cancelled mid-admission) must not take one.
+    const seq = blk: {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        if (!slot.holds_session) return error.Cancelled;
+        const seq = &ctx.seqs[pickLlamaSeq(ctx.seqs, i32_prompt) orelse return error.NoFreeLlamaSequence];
+        seq.busy = true;
+        seq.last_used_ns = @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds);
+        slot.llama_seq = seq;
+        break :blk seq;
     };
 
-    slot.llama_session = sess;
+    const cached = try seq.syncWithFallback(i32_prompt);
+    slot.llama_next = seq.sample(llamaSampling(slot), &slot.llama_rng);
+    if (slot.llama_next < 0) return error.LlamaSampleFailed;
     slot.prompt_tokens = @intCast(slot.full_prompt.len);
     slot.cached_tokens = @intCast(cached);
     slot.state = .decoding;
+}
+
+fn llamaSampling(slot: *const Slot) arch_llama.Sampling {
+    return .{
+        .temperature = slot.sampling.temperature,
+        .top_k = @intCast(slot.sampling.top_k),
+        .top_p = slot.sampling.top_p,
+        .min_p = slot.sampling.min_p orelse 0.0,
+    };
 }
 
 /// ds4 decode tick: argmax (temp ≤ 0) or sample, check EOS, push token,
@@ -6334,7 +6286,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     const tok_u32: u32 = @intCast(next_id);
 
     // EOS handling — match the MLX path: do NOT emit the stop token.
-    if (next_id == engine.eosToken() or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
+    if (engine.isStop(next_id) or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
         finishSlot(sch, slot, "stop");
         return;
     }
@@ -6361,7 +6313,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         for (spec_buf[0..n_usize]) |t| {
             const t_u32: u32 = @intCast(t);
             // EOS may appear mid-batch — stop, and never emit it.
-            if (t == engine.eosToken() or generate_mod.isEosId(t_u32, slot.eos_token_ids)) {
+            if (engine.isStop(t) or generate_mod.isEosId(t_u32, slot.eos_token_ids)) {
                 finishSlot(sch, slot, "stop");
                 return;
             }
@@ -6414,45 +6366,143 @@ test "ds4MtpShouldEngage: >1 draft tokens + greedy (legacy MTP and DSpark)" {
     try std.testing.expect(!ds4MtpShouldEngage(0, 0.7, true));
 }
 
-/// llama.cpp decode tick: argmax (temp < 0.01, matching the MLX greedy
-/// threshold) or sample, check EOS, push token, `eval(token)` to extend the
-/// session, and stop on max_tokens. One token per call.
-fn runLlamaDecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_llama.LlamaSession) !void {
+/// Emit one llama.cpp token: an end-of-generation token stops the slot (never
+/// emitted, like the MLX path), and so does reaching `max_tokens`. True when
+/// the slot keeps decoding.
+fn emitLlamaToken(sch: *Scheduler, slot: *Slot, tok: i32) bool {
     const engine = slot.model.llama_engine.?;
-    const next_id: i32 = if (slot.sampling.temperature < 0.01)
-        session.argmax()
-    else
-        session.sample(
-            slot.sampling.temperature,
-            @intCast(slot.sampling.top_k),
-            slot.sampling.top_p,
-            slot.sampling.min_p orelse 0.0,
-            &slot.llama_rng,
-        );
-
-    if (next_id < 0) {
-        slot.markError("llama_sample_failed");
-        return;
-    }
-    const tok_u32: u32 = @intCast(next_id);
-
-    // EOS / end-of-generation — like the MLX path, do NOT emit the stop token.
-    if (engine.isEog(next_id) or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
+    const tok_u32: u32 = @intCast(tok);
+    if (engine.isEog(tok) or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
         finishSlot(sch, slot, "stop");
-        return;
+        return false;
     }
-
     slot.pushToken(tok_u32);
     if (tok_u32 != 0) slot.was_pad_only = false;
     slot.completion_tokens += 1;
-
-    // Advance the KV by feeding the freshly-sampled token.
-    try session.eval(next_id);
-
     if (slot.completion_tokens >= slot.max_tokens) {
         finishSlot(sch, slot, "length");
+        return false;
+    }
+    return true;
+}
+
+/// Run each model's llama.cpp slots as one group. A group that fails fails
+/// its own slots only, never another model's.
+fn runLlamaGroups(sch: *Scheduler, slots: []*Slot) void {
+    std.sort.pdq(*Slot, slots, {}, struct {
+        fn lt(_: void, a: *Slot, b: *Slot) bool {
+            return @intFromPtr(a.model) < @intFromPtr(b.model);
+        }
+    }.lt);
+    var i: usize = 0;
+    while (i < slots.len) {
+        var j = i + 1;
+        while (j < slots.len and slots[j].model == slots[i].model) j += 1;
+        runLlamaDecodeTick(sch, slots[i..j]) catch |err| {
+            log.err("[llama] decode tick failed: {s}\n", .{@errorName(err)});
+            for (slots[i..j]) |s| s.markError(@errorName(err));
+        };
+        i = j;
+    }
+}
+
+/// llama.cpp decode tick for one model's slots: each emits the token it
+/// sampled last round, then every slot still decoding feeds it in ONE batched
+/// step and samples its next. A slot decoding alone on a context with an MTP
+/// head runs an MTP round instead: with company, drafts cost more batch rows
+/// than they save.
+fn runLlamaDecodeTick(sch: *Scheduler, slots: []*Slot) !void {
+    var live_buf: [MAX_BATCH_GROUP]*Slot = undefined;
+    var seqs: [MAX_BATCH_GROUP]*arch_llama.LlamaSeq = undefined;
+    var toks: [MAX_BATCH_GROUP]i32 = undefined;
+    var n: usize = 0;
+    for (slots) |slot| {
+        if (!emitLlamaToken(sch, slot, slot.llama_next)) continue;
+        live_buf[n] = slot;
+        seqs[n] = slot.llama_seq.?;
+        toks[n] = slot.llama_next;
+        n += 1;
+    }
+    if (n == 0) return;
+    const live = live_buf[0..n];
+    const ctx = live[0].model.llama_ctx.?;
+
+    const drafts = llamaDraftsThisTick(n, ctx.mtpDrafts(), live[0].max_tokens - live[0].completion_tokens);
+    if (drafts > 0) {
+        const slot = live[0];
+        var buf: [MAX_LLAMA_DRAFTS + 1]i32 = undefined;
+        const got = try seqs[0].specStep(toks[0], drafts, llamaSampling(slot), &slot.llama_rng, &buf);
+        slot.llama_mtp_rounds += 1;
+        slot.llama_mtp_drafted += drafts;
+        slot.llama_mtp_accepted += @intCast(got.len - 1);
+        for (got[0 .. got.len - 1]) |t| {
+            if (!emitLlamaToken(sch, slot, t)) return;
+        }
+        slot.llama_next = got[got.len - 1];
         return;
     }
+
+    try ctx.step(seqs[0..n], toks[0..n]);
+    if (n >= 2 and !llama_batched_logged) {
+        llama_batched_logged = true;
+        log.info("[batched] llama.cpp decode engaged (seqs={d})\n", .{n});
+    }
+    for (live, seqs[0..n]) |slot, seq| {
+        slot.llama_next = seq.sample(llamaSampling(slot), &slot.llama_rng);
+        if (slot.llama_next < 0) slot.markError("llama_sample_failed");
+    }
+}
+
+var llama_batched_logged = false;
+
+/// Draft tokens one MTP round can carry (`--llama-mtp-drafts` is clamped to it).
+pub const MAX_LLAMA_DRAFTS = 8;
+
+/// Draft tokens a llama.cpp MTP round takes this tick, 0 = plain decode. Only a
+/// slot decoding alone drafts (with company, the drafts' extra batch rows cost
+/// more than they save), and never past its token budget.
+pub fn llamaDraftsThisTick(live: usize, mtp_drafts: u32, remaining: u32) u32 {
+    if (live != 1) return 0;
+    return @min(mtp_drafts, remaining, MAX_LLAMA_DRAFTS);
+}
+
+test "llamaDraftsThisTick: a solo slot drafts within its budget, company decodes plain" {
+    try std.testing.expectEqual(@as(u32, 2), llamaDraftsThisTick(1, 2, 100));
+    try std.testing.expectEqual(@as(u32, 1), llamaDraftsThisTick(1, 2, 1));
+    try std.testing.expectEqual(@as(u32, 0), llamaDraftsThisTick(2, 2, 100));
+    try std.testing.expectEqual(@as(u32, 0), llamaDraftsThisTick(1, 0, 100));
+    try std.testing.expectEqual(@as(u32, MAX_LLAMA_DRAFTS), llamaDraftsThisTick(1, 64, 100));
+}
+
+test "pickLlamaSeq: longest shared prefix past the prologue, else least recently used, never a busy one" {
+    const gpa = std.testing.allocator;
+    var seqs: [3]arch_llama.LlamaSeq = undefined;
+    for (&seqs, 0..) |*q, i| q.* = .{ .ctx = undefined, .id = @intCast(i) };
+    defer for (&seqs) |*q| q.resident.deinit(gpa);
+    var prompt: [40]i32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i);
+
+    // Every sequence empty: the least recently used one.
+    seqs[0].last_used_ns = 30;
+    seqs[1].last_used_ns = 10;
+    seqs[2].last_used_ns = 20;
+    try std.testing.expectEqual(@as(?usize, 1), pickLlamaSeq(&seqs, &prompt));
+
+    // A template-prologue-sized overlap does not claim another conversation's KV.
+    try seqs[2].resident.appendSlice(gpa, prompt[0 .. LLAMA_MIN_PREFIX_TO_CLAIM - 1]);
+    try std.testing.expectEqual(@as(?usize, 1), pickLlamaSeq(&seqs, &prompt));
+
+    // A real shared prefix does, and the longest wins.
+    try seqs[0].resident.appendSlice(gpa, prompt[0..20]);
+    try seqs[2].resident.appendSlice(gpa, prompt[LLAMA_MIN_PREFIX_TO_CLAIM - 1 .. 30]);
+    try std.testing.expectEqual(@as(?usize, 2), pickLlamaSeq(&seqs, &prompt));
+
+    // A busy sequence is never picked, however well it matches.
+    seqs[2].busy = true;
+    try std.testing.expectEqual(@as(?usize, 0), pickLlamaSeq(&seqs, &prompt));
+    seqs[0].busy = true;
+    seqs[1].busy = true;
+    try std.testing.expectEqual(@as(?usize, null), pickLlamaSeq(&seqs, &prompt));
 }
 
 /// DiffusionGemma prefill: refresh the slot ctx, build the per-slot
@@ -6917,8 +6967,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     if (slot.model.ds4_engine) |engine| {
         return runPrefillDs4(sch, slot, engine);
     }
-    if (slot.model.llama_engine) |engine| {
-        return runPrefillLlama(sch, slot, engine);
+    if (slot.model.llama_engine != null) {
+        return runPrefillLlama(sch, slot);
     }
     // DiffusionGemma: generation is a canvas-denoising loop, not
     // autoregressive decode — no Generator. The encoder prefill fills the
@@ -7421,7 +7471,14 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var batchable_n: usize = 0;
     var mtp_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var mtp_n: usize = 0;
+    var llama_buf: [MAX_BATCH_GROUP]*Slot = undefined;
+    var llama_n: usize = 0;
     for (active) |s| {
+        if (s.llama_seq != null and llama_n < llama_buf.len) {
+            llama_buf[llama_n] = s;
+            llama_n += 1;
+            continue;
+        }
         const why = sch.batchVerdict(s);
         if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
@@ -7471,6 +7528,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         }
     }
     try runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
+    runLlamaGroups(sch, llama_buf[0..llama_n]);
     if (batchable_n == 0) {
         if (sch.metrics) |m| m.batched_group_size.set(0);
         return;
@@ -7805,11 +7863,14 @@ fn toolForceTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tf = gen.sampling.tool_force orelse return false;
     const d = tf.due(gen.generated_ids.items, gen.completion_tokens, gen.max_tokens) orelse return false;
     tf.fired = true;
-    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, d.tokens.len + 1)) {
+    // The model's own next token is published first: a call it already opened is not opened twice.
+    const tokens = if (try gen.upcomingToken() == d.tokens[0]) d.tokens[1..] else d.tokens;
+    if (tokens.len == 0) return false;
+    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, tokens.len + 1)) {
         log.warn("[tool-choice] no room to force the call (max_tokens {d})\n", .{gen.max_tokens});
         return false;
     }
-    if (try commitForcedTick(sch, slot, gen, d.tokens, .tool_choice)) {
+    if (try commitForcedTick(sch, slot, gen, tokens, .tool_choice)) {
         log.info("[tool-choice] call opener forced at {d} generated tokens{s}\n", .{ gen.generated_ids.items.len, if (d.closes_thought) " (thought closed for it)" else "" });
     }
     return true;
@@ -7866,8 +7927,9 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     if (slot.ds4_session) |session| {
         return runDs4DecodeTick(sch, slot, session);
     }
-    if (slot.llama_session) |session| {
-        return runLlamaDecodeTick(sch, slot, session);
+    if (slot.llama_seq != null) {
+        var one = [_]*Slot{slot};
+        return runLlamaDecodeTick(sch, &one);
     }
     if (slot.diffusion) |runner| {
         return runDiffusionDecodeTick(sch, slot, runner);
@@ -10866,7 +10928,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     slot.allocator = testing.allocator;
     slot.model = &model;
     slot.ds4_session = null;
-    slot.llama_session = null;
+    slot.llama_seq = null;
     slot.diffusion = null;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;

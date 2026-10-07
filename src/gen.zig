@@ -2561,10 +2561,11 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     {
         var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
         var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
-        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales, server_mod.peerIsLoopback(conn)) catch |err| switch (err) {
             error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
             error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
             error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
+            error.LoraPathsLocalOnly => return sendError(conn, 403, LORA_LOCAL_ONLY_MSG),
             error.OutOfMemory => return err,
         };
         defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
@@ -3722,10 +3723,11 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // the engine sums every attached delta on each linear.
     var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
     var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
-    const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+    const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales, server_mod.peerIsLoopback(conn)) catch |err| switch (err) {
         error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
         error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
         error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
+        error.LoraPathsLocalOnly => return sendError(conn, 403, LORA_LOCAL_ONLY_MSG),
         error.OutOfMemory => return err,
     };
     defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
@@ -3913,7 +3915,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             error.LoraNoMatch => "a LoRA has no modules matching MiniMax-H3's DiT — wrong architecture for this adapter?",
             error.BadLoraPath => "'lora_paths' must be absolute paths to .safetensors files",
             error.TooManyLoras => "too many LoRA adapters (max 8, and turbo takes one of the slots)",
-            error.TurboLoraIncomplete => "turbo_lora.safetensors is incomplete — re-download minimax_h3_turbo_4step_ckpt500.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
+            error.TurboLoraIncomplete => "turbo_lora.safetensors ships modules MiniMax-H3's DiT does not have — replace it with minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
             else => null,
         };
         if (named) |msg| {
@@ -3983,10 +3985,11 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     {
         var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
         var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
-        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales, server_mod.peerIsLoopback(conn)) catch |err| switch (err) {
             error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
             error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
             error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
+            error.LoraPathsLocalOnly => return sendError(conn, 403, LORA_LOCAL_ONLY_MSG),
             error.OutOfMemory => return err,
         };
         defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
@@ -4985,7 +4988,12 @@ fn extractLoraScales(body: []const u8, buf: []f32) ?[]f32 {
     return extractFloatArrayField(body, "lora_scales", buf);
 }
 
-const LoraFieldsError = error{ TooManyLoraPaths, BadLoraPathsJson, BadLoraScalesJson, OutOfMemory };
+const LoraFieldsError = error{ TooManyLoraPaths, BadLoraPathsJson, BadLoraScalesJson, LoraPathsLocalOnly, OutOfMemory };
+
+/// A LoRA path names a file on the server's disk, so only a client on this
+/// machine may send one: from anyone else, "missing" vs "not a LoRA" answers
+/// whether a host path exists (#540).
+const LORA_LOCAL_ONLY_MSG = "'lora_paths' name files on the server's disk and are accepted only from the server's own machine";
 
 /// Parse the LoRA fields common to image and video requests: the array form
 /// (`lora_paths` + optional `lora_scales`) or the original single-adapter
@@ -4995,12 +5003,13 @@ const LoraFieldsError = error{ TooManyLoraPaths, BadLoraPathsJson, BadLoraScales
 /// their resolved scales into `scale_buf`. Returns 0 with both buffers
 /// untouched when neither field is present — the "detach whatever was
 /// attached" case. Missing `lora_scales` entries default to 1.0, matching
-/// mflux's `resolve_scales`.
+/// mflux's `resolve_scales`. `local`: the client is on this machine.
 fn parseLoraFields(
     allocator: std.mem.Allocator,
     body: []const u8,
     path_bufs: *[lora_mod.MAX_LORAS][]u8,
     scale_buf: *[lora_mod.MAX_LORAS]f32,
+    local: bool,
 ) LoraFieldsError!usize {
     var n: usize = 0;
     errdefer for (path_bufs[0..n]) |p| allocator.free(p);
@@ -5018,6 +5027,7 @@ fn parseLoraFields(
         n = 1;
     }
     if (n == 0) return 0;
+    if (!local) return error.LoraPathsLocalOnly;
 
     if (std.mem.indexOf(u8, body, "\"lora_scales\"") != null) {
         var sbuf: [lora_mod.MAX_LORAS]f32 = undefined;
@@ -5387,6 +5397,24 @@ test "openaiEditFormToJson: OpenAI multipart becomes our edit request" {
     try testing.expectEqual(@as(i64, 7), p6.value.object.get("seed").?.integer);
     try testing.expectEqual(@as(f64, 2.5), p6.value.object.get("guidance_scale").?.float);
     try testing.expectEqualStrings("blurry", p6.value.object.get("negative_prompt").?.string);
+}
+
+test "parseLoraFields: a LoRA path is accepted only from this machine (#540)" {
+    const a = testing.allocator;
+    var paths: [lora_mod.MAX_LORAS][]u8 = undefined;
+    var scales: [lora_mod.MAX_LORAS]f32 = undefined;
+    const bodies = [_][]const u8{
+        "{\"lora_paths\":[\"/etc/hosts\",\"/x.safetensors\"],\"lora_scales\":[0.5]}",
+        "{\"lora_path\":\"/etc/hosts\"}",
+    };
+    for (bodies) |body| {
+        try testing.expectError(error.LoraPathsLocalOnly, parseLoraFields(a, body, &paths, &scales, false));
+        const n = try parseLoraFields(a, body, &paths, &scales, true);
+        defer for (paths[0..n]) |p| a.free(p);
+        try testing.expectEqualStrings("/etc/hosts", paths[0]);
+    }
+    // No LoRA fields detaches, from anyone.
+    try testing.expectEqual(@as(usize, 0), try parseLoraFields(a, "{\"prompt\":\"p\"}", &paths, &scales, false));
 }
 
 test "openaiEditFormToJson: everything we can't honor is an explicit error" {

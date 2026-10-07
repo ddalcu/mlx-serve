@@ -56,7 +56,7 @@ curl http://localhost:11234/v1/responses \
 - `GET /` —— 内置 Web 控制台：聊天演练场、Monitor、图像与音频工具、API 参考
 - `GET /health` —— 健康检查
 - `GET /v1/models` —— 列出已加载的模型，含能力与引擎信息
-- `POST /v1/completions` —— 文本补全
+- `POST /v1/completions` —— 文本补全；`prompt` 可以是字符串或 token id（`[1, 2, 3]`，lm-eval 就这样发送），每个请求一个 prompt。不支持 `echo: true`：prompt token 没有 logprobs
 - `POST /v1/embeddings` —— 文本嵌入（BERT、EmbeddingGemma，以及 Qwen3-Embedding 这类末位 Token 池化模型；池化方式跟随检查点的 sentence-transformers 元数据，`dimensions` 会截断并重新归一化）
 - `POST /v1/images/generations`、`POST /v1/images/edits` —— 图像生成与按指令编辑；edits 端点采用 OpenAI SDK 的 multipart 形态（`client.images.edit`），包括用重复的 `image[]` 传多张参考图
 - `POST /v1/audio/speech` —— Qwen3-TTS（`ref_audio` 克隆音色）或 Kokoro（`voice` 从 54 种音色中挑选或混合），输出 WAV
@@ -69,4 +69,4 @@ curl http://localhost:11234/v1/responses \
 - `GET /metrics`、`GET /metrics.json` —— Prometheus + JSON（需要 `--metrics`）
 - `GET /v1/responses/{id}`、`DELETE /v1/responses/{id}` —— 获取 / 删除已存储的响应
 
-每个媒体端点都接受 `"stream": true`，以获得以 base64 `complete` 载荷收尾的 SSE 进度。视频流还接受 `"preview": true`，在每个去噪步骤给出一张廉价的 JPEG（默认关闭；cached-velocity 的 H3 步骤不带预览）。媒体 LoRA 在各处都只用一套文法：`lora_paths` + `lora_scales`，最多 8 个，依次叠加。
+每个媒体端点都接受 `"stream": true`，以获得以 base64 `complete` 载荷收尾的 SSE 进度。视频流还接受 `"preview": true`，在每个去噪步骤给出一张廉价的 JPEG（默认关闭；cached-velocity 的 H3 步骤不带预览）。媒体 LoRA 在各处都只用一套文法：`lora_paths` + `lora_scales`，最多 8 个，依次叠加。这些路径是服务器磁盘上的文件，所以只有服务器本机上的客户端可以发送；来自其他客户端（局域网共享、`--api-key`）的请求一旦带上它们就返回 403。

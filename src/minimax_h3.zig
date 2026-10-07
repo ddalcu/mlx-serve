@@ -2487,9 +2487,7 @@ pub const Model = struct {
         try mlx.check(mlx.mlx_eval(vec));
     }
 
-    /// Every linear a LoRA may target, in ONE list, so attach and the
-    /// completeness check below cannot disagree about what "all of them" is.
-    /// The 259 modules the Turbo LoRA ships: 50 blocks x (qkv, out, fc1, fc2,
+    /// Every linear a LoRA may target: 50 blocks x (qkv, out, fc1, fc2,
     /// adaln) + 2 refiner blocks x (qkv, out, fc1, fc2) + the final adaln.
     pub const LORA_TARGETS: u32 = 259;
 
@@ -2498,9 +2496,9 @@ pub const Model = struct {
     /// model. Must run BEFORE `precomputeAdaln` — the adaln delta has to be
     /// in place while the tables are built, since the weights are freed after.
     /// Returns per-file attachment counts (index = position in the stack), so
-    /// the caller can hold a file to its own expectation: a Turbo file that
-    /// attaches to fewer than `LORA_TARGETS` modules is a broken artifact, not
-    /// a smaller speedup, while a style LoRA targeting a subset is ordinary.
+    /// the caller can hold a file to its own expectation: a Turbo file must
+    /// attach every module it ships (`turboAttachComplete`), while a style LoRA
+    /// targeting a subset is ordinary.
     pub fn attachLoras(self: *Model, stack: *const lora_mod.Stack) ![lora_mod.MAX_LORAS]u32 {
         var counts: [lora_mod.MAX_LORAS]u32 = @splat(0);
         var buf: [96]u8 = undefined;
@@ -3930,6 +3928,13 @@ fn wantedLoras(paths: GenPaths, req: GenRequest, out_paths: *[lora_mod.MAX_LORAS
     return n;
 }
 
+/// A Turbo file is whole when EVERY module it ships attaches: distillations train different
+/// subsets (Lightx2v's skips the AdaLN projections larryvrh's trains), while a module that finds
+/// no linear means a file for another layout.
+pub fn turboAttachComplete(attached: u32, shipped: usize) bool {
+    return attached == shipped;
+}
+
 /// Loads every wanted adapter into `stack` and binds it to `model`, holding each file to its own
 /// expectation: engagement is COUNTED and logged, because a rejected or half-matching adapter is
 /// otherwise a silent no-op that looks exactly like a working one.
@@ -3952,10 +3957,9 @@ fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *Model
             i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
             if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
         });
-        // The Turbo file names every target; anything less is a broken artifact, not a smaller
-        // speedup. A style LoRA legitimately targets a subset, but matching NOTHING means the
-        // file is for another architecture and the user would wait an hour for an unchanged render.
-        if (is_turbo and n < Model.LORA_TARGETS) return error.TurboLoraIncomplete;
+        // A style LoRA legitimately targets a subset, but matching NOTHING means the file is for
+        // another architecture and the user would wait an hour for an unchanged render.
+        if (is_turbo and !turboAttachComplete(n, stack.files[i].entries.len)) return error.TurboLoraIncomplete;
         if (n == 0) return error.LoraNoMatch;
     }
 }
@@ -6891,6 +6895,12 @@ test "minimax h3: resolveSpeed — turbo forces the recipe off, env still strong
     c = resolveSpeed(null, true, "0.05", "2");
     try testing.expectEqual(@as(f64, 0.05), c.step_cache);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
+}
+
+test "minimax h3: a Turbo file is held to the modules it ships, not to one exporter's list" {
+    try testing.expect(turboAttachComplete(Model.LORA_TARGETS, Model.LORA_TARGETS));
+    try testing.expect(turboAttachComplete(208, 208)); // Lightx2v: no AdaLN projections
+    try testing.expect(!turboAttachComplete(200, 208)); // ships modules this DiT does not have
 }
 
 test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-order otherwise" {

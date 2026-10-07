@@ -22,11 +22,13 @@ trap cleanup EXIT
 for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 1; done
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL server did not become healthy"; tail -20 "$LOG"; exit 1; }
 EXCERPT=$(head -c 5000 src/pld_index.zig | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+PIDS=()
 for i in $(seq 1 $STREAMS); do
     printf '{"model":"m","stream":true,"max_tokens":128,"temperature":0.7,"messages":[{"role":"user","content":"Reviewer %d of %d. Explain this Zig excerpt and list three improvements:\\n\\n%s"}]}' "$i" "$STREAMS" "$(echo "$EXCERPT" | sed 's/^"//; s/"$//')" > "$OUT/req$i.json"
     curl -s --max-time 600 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d @"$OUT/req$i.json" > "$OUT/resp$i.sse" &
+    PIDS+=($!)
 done
-wait
+wait "${PIDS[@]}"  # a bare wait also waits on the server
 FAIL=0
 for i in $(seq 1 $STREAMS); do
     n=$(/usr/bin/grep -c '"content":"' "$OUT/resp$i.sse" 2>/dev/null || echo 0)

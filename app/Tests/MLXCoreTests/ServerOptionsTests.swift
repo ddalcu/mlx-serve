@@ -55,7 +55,9 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.prefixCacheMem, "")          // server.zig prefix_cache_mem_bytes (auto)
         XCTAssertEqual(d.tokenizeCacheEntries, 4)     // server.zig tokenize_cache_entries
         XCTAssertEqual(d.llamaKvQuant, .off)          // server.zig llama_kv_quant
-        XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
+        XCTAssertEqual(d.llamaCacheEntries, 4)        // scheduler.zig LlamaSettings.seqs
+        XCTAssertEqual(d.llamaMtpDrafts, 2)           // scheduler.zig LlamaSettings.mtp_drafts
+        XCTAssertEqual(d.llamaUbatch, 0)              // scheduler.zig LlamaSettings.ubatch (libllama default)
         XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
         XCTAssertEqual(d.ssdStreaming, false)         // main.zig ds4_ssd_streaming
         // Deliberate divergence from main.zig's metrics_enabled=false: the tray
@@ -206,6 +208,17 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-cache-entries", value: "1"))
         opts.llamaCacheEntries = 8
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-cache-entries", value: "8"))
+    }
+
+    func testLlamaMtpDraftsAndUbatchEmitOnlyOffTheirDefaults() {
+        let args = ServerOptions().toCLIArgs()
+        XCTAssertFalse(args.contains("--llama-mtp-drafts"))
+        XCTAssertFalse(args.contains("--llama-ubatch"))
+        var opts = ServerOptions()
+        opts.llamaMtpDrafts = 0   // off: the server must hear it, its default drafts
+        opts.llamaUbatch = 2048
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-mtp-drafts", value: "0"))
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-ubatch", value: "2048"))
     }
 
     func testTokenizeCacheEntriesOmittedAtDefault() {
@@ -461,32 +474,27 @@ final class ServerOptionsTests: XCTestCase {
 }
 
 extension ServerOptionsTests {
-    /// The Settings temperature must reach third-party clients (Claude Code
-    /// omits sampling params entirely, so the server-launch default is the
-    /// only channel). Top-p rides along; top-k 0 means "no opinion" and must
-    /// be OMITTED so the model's generation_config.json recommendation
-    /// (Qwen 3.6: top_k=20, Gemma 4: 64) stays in effect.
-    func testSamplingDefaultsReachLaunchArgs() {
+    /// Generation profiles are hot-read rather than pinned into launch flags.
+    func testSamplingDefaultsDoNotPinLaunchArgs() {
         var opts = ServerOptions()
         opts.defaultTemperature = 0.7
         opts.defaultTopP = 0.95
         opts.defaultTopK = 0
         let args = opts.toCLIArgs()
-        XCTAssertTrue(contains(args, flag: "--temp", value: "0.7"))
-        XCTAssertTrue(contains(args, flag: "--top-p", value: "0.95"))
+        XCTAssertFalse(args.contains("--temp"))
+        XCTAssertFalse(args.contains("--top-p"))
         XCTAssertFalse(args.contains("--top-k"))
 
         opts.defaultTopK = 40
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--top-k", value: "40"))
+        XCTAssertFalse(opts.toCLIArgs().contains("--top-k"))
     }
 
-    /// Changing a sampling default must trip the restart detector — these now
-    /// affect the launched process, not just the app's own request bodies.
-    func testSamplingDefaultsAffectRestartDetection() {
+    /// Generation settings apply to the next request without restarting.
+    func testSamplingDefaultsDoNotAffectRestartDetection() {
         let base = ServerOptions()
         var changed = base
         changed.defaultTemperature = 0.42
-        XCTAssertFalse(base.serverLaunchEquals(changed))
+        XCTAssertTrue(base.serverLaunchEquals(changed))
     }
 }
 
@@ -517,6 +525,8 @@ extension ServerOptionsTests {
         o.ssdStreaming = true
         o.llamaKvQuant = .q8
         o.llamaCacheEntries = 2   // off the default (4) so the round-trip moves it
+        o.llamaMtpDrafts = 4
+        o.llamaUbatch = 1024
         o.tokenizeCacheEntries = 16
         o.idleEvictSecs = 1800
         o.defaultMaxTokens = 8192
@@ -539,12 +549,10 @@ extension ServerOptionsTests {
         XCTAssertEqual(o, decoded, "a field missing from the custom init(from:) would revert to its default here")
     }
 
-    /// Slider arithmetic leaves float dirt (0.8 − 0.1 = 0.7000000000000001);
-    /// argv must carry the clean decimal (seen verbatim in `ps` output live).
-    func testSamplingFlagFormattingIsClean() {
+    func testSamplingMigrationKeepsNumericPrecision() {
         var opts = ServerOptions()
         opts.defaultTemperature = 0.8 - 0.1
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--temp", value: "0.7"))
+        XCTAssertEqual(GenerationDefaults.legacy(opts).rules["temperature"]?.value, .number(opts.defaultTemperature))
     }
 }
 

@@ -5,6 +5,7 @@ const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const generation_settings = @import("generation_settings.zig");
 const mtp_mod = @import("mtp.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const drafter_mod = @import("drafter.zig");
@@ -574,8 +575,8 @@ pub const ServerConfig = struct {
     /// values so external clients like Claude Code — which send no sampling
     /// params at all — inherit them). null = flag not given; resolution falls
     /// through to the model's generation_config.json recommendation, then the
-    /// hardcoded fallback. Explicit request body fields always win. See
-    /// `resolveSamplingDefault`.
+    /// hardcoded fallback. Request fields and generation-defaults rules outrank
+    /// them (`resolveSampling`).
     default_temperature: ?f32 = null,
     default_top_p: ?f32 = null,
     default_top_k: ?u32 = null,
@@ -585,11 +586,36 @@ pub const ServerConfig = struct {
     default_max_tokens: u32 = 0,
 };
 
-/// Sampling-default resolution chain: request body > CLI launch flag >
-/// model generation_config.json > hardcoded fallback. An explicit request
+const Sampling = struct { temperature: f32, top_p: f32, top_k: u32, min_p: ?f32, repeat_penalty: f32, presence_penalty: f32 };
+
+/// Sampling for one request: a forced generation-defaults rule > request body > rule >
+/// CLI launch flag > model generation_config.json > hardcoded fallback. An explicit request
 /// value of 0 (greedy / disabled) is a value, not an omission.
-fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T, fallback: T) T {
-    return request orelse cli orelse gen_config orelse fallback;
+fn resolveSampling(gen: generation_settings.Profile, root: std.json.ObjectMap, config: *const model_mod.ModelConfig) Sampling {
+    return .{
+        .temperature = gen.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature orelse config.gen_temperature orelse 1.0),
+        .top_p = gen.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p orelse config.gen_top_p orelse 1.0),
+        .top_k = gen.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k orelse config.gen_top_k orelse 0),
+        .min_p = gen.resolveOpt(f32, .min_p, parseJsonFloatOpt(root, "min_p", 0.0, 1.0), config.gen_min_p),
+        .repeat_penalty = requestRepeatPenalty(root, gen),
+        .presence_penalty = gen.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0.0),
+    };
+}
+
+/// A zero rule means remaining context; an omitted rule uses the surface's fallback.
+fn generationMaxTokens(gen: generation_settings.Profile, v: ?std.json.Value, fallback: u32) u32 {
+    const req = resolveRequestMaxTokens(v, 0);
+    const cap = gen.resolve(u32, .max_tokens, if (req > 0) req else null, fallback);
+    return if (cap == 0 and gen.rules.get(.max_tokens) != null) AUTO_MAX_TOKENS_SENTINEL else cap;
+}
+
+var g_generation_settings: model_settings_mod.Cache = .{ .path = "" };
+var g_generation_settings_path: [std.fs.max_path_bytes]u8 = undefined;
+
+/// A request's generation defaults: the model's rules over the global file's, re-read when
+/// either file changes.
+fn requestProfile(io: std.Io, lm: *const LoadedModel) generation_settings.Profile {
+    return .overlay(g_generation_settings.generationDefaults(io, null), g_model_aliases.generationDefaults(io, lm.path));
 }
 
 /// The per-request `enable_mtp` default, for a request that omitted the field.
@@ -1094,23 +1120,10 @@ test "PldDefaults: ServerConfig built from it reports the CLI values" {
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
 
-/// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
-/// sessions per loaded GGUF model. 1 is the legacy single-session
-/// behavior (a flip between two long-doc prompts evicts the other on
-/// every turn — and even sequential shared-prefix requests reported
-/// cached_tokens=0). N > 1 enables the best-prefix-match LRU so
-/// alternating multi-doc / agent workloads stay warm. Sessions are
-/// created lazily, so unused slots cost nothing.
-pub var llama_cache_entries: u32 = 4;
-
-/// Phase 5 (performance-plan) #2: KV-cache quantization for the embedded
-/// llama.cpp engine. `off` = F16 (libllama default); `q8` halves the KV
-/// bytes (Q8_0, near-lossless); `q4` quarters them (Q4_0, some quality
-/// impact). Non-default settings automatically enable flash attention in
-/// the shim because llama.cpp's plain SDPA only supports F16/F32 KV.
-/// Set via `--llama-kv-quant {off,q8,q4}`. Applies to every llama.cpp
-/// session created after this is set (i.e., from the next model load).
-pub var llama_kv_quant: arch_llama.LlamaKvQuant = .off;
+/// Embedded llama.cpp engine settings: `--llama-cache-entries` (sequences per
+/// model), `--llama-kv-quant`, `--llama-ubatch`, `--llama-mtp-drafts`. Read when
+/// a GGUF model loads.
+pub var llama_settings: scheduler_mod.LlamaSettings = .{};
 
 /// Plan 01 — continuous batching: maximum concurrent in-flight requests sharing
 /// the inference thread's batched-decode pass. Set via `--max-concurrent N`.
@@ -1585,6 +1598,32 @@ fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
 }
 
+/// The `tool_calls` array of one streamed chat-completions delta: name, id and
+/// the full arguments in ONE delta, every string escaped.
+fn streamToolCallDelta(allocator: std.mem.Allocator, index: usize, id: []const u8, name: []const u8, arguments: []const u8) ![]u8 {
+    const esc_name = try jsonEscape(allocator, name);
+    defer allocator.free(esc_name);
+    const esc_args = try jsonEscape(allocator, arguments);
+    defer allocator.free(esc_args);
+    return std.fmt.allocPrint(allocator,
+        \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":{s},"arguments":{s}}}}}]
+    , .{ index, id, esc_name, esc_args });
+}
+
+test "streamed tool-call delta escapes the name and arguments (#748)" {
+    const allocator = std.testing.allocator;
+    const name = "read_file\n</parameter \"x\" \\";
+    const args = "{\"path\":\"a\\nb\"}";
+    const delta = try streamToolCallDelta(allocator, 0, "call_1_0", name, args);
+    defer allocator.free(delta);
+    try std.testing.expect(std.mem.indexOfScalar(u8, delta, '\n') == null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, delta, .{});
+    defer parsed.deinit();
+    const function = parsed.value.array.items[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings(name, function.get("name").?.string);
+    try std.testing.expectEqualStrings(args, function.get("arguments").?.string);
+}
+
 /// A repetition-loop cut may land inside an otherwise recognizable tool call.
 /// Never emit that buffer as executable work: unlike a genuine max-token cut,
 /// this intentional stop must not ask clients to recover by compacting/retrying.
@@ -1834,6 +1873,8 @@ pub fn serve(
     defer global_registry = null;
     g_model_aliases.alloc = scheduler.registry.allocator;
     g_model_aliases.path = model_settings_mod.defaultPath(&g_model_aliases_path);
+    g_generation_settings.alloc = scheduler.registry.allocator;
+    g_generation_settings.path = model_settings_mod.homeFile(&g_generation_settings_path, "generation-settings.json");
 
     // Prefix cache lives on LoadedModel and may retain idle prefixes in RAM, SSD, or both.
     if (scheduler.hot_prefix_cache != null) {
@@ -6664,7 +6705,7 @@ fn renderModelEntry(
         const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
         const drafter_loaded = entry.drafter != null or entry.dflash != null;
-        const mtp_loaded = entry.mtp != null;
+        const mtp_loaded = entry.mtp != null or if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
         else
@@ -7406,6 +7447,8 @@ fn renderPropsBody(
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
 fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
+    // llama.cpp batches its own sequences (`runLlamaDecodeTick`).
+    if (entry.llama_ctx) |c| return if (c.seqs.len > 1) .ok else .embedded_engine;
     if (entry.ds4_engine != null or entry.llama_engine != null) return .embedded_engine;
     const cfg = entry.config orelse return .arch;
     return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
@@ -7474,7 +7517,7 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
 
 fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
     const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else .mlx;
-    const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else false;
+    const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else if (lm.llama_ctx) |c| c.mtpDrafts() > 0 else false;
     return embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
 }
 
@@ -7483,7 +7526,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const kv = configuredKvQuantFor(config);
     return .{
         .engine = "mlx",
-        .kv_quant = if (lm.llama_engine != null) @tagName(llama_kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
+        .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = server_config.kv_attn_mode,
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
@@ -8186,9 +8229,20 @@ fn implicitEffortBudget(template: []const u8, markers_atomic: bool, default_budg
     return responses_mod.effortBudget("low", default_budget);
 }
 
-fn implicitEffortBudgetFor(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) i32 {
-    const cc = lm.chat_config orelse return server_config.default_reasoning_budget;
-    return implicitEffortBudget(cc.chat_template, thinkMarkersAtomic(allocator, lm, tok), server_config.default_reasoning_budget);
+fn implicitEffortBudgetFor(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, default_budget: i32) i32 {
+    const cc = lm.chat_config orelse return default_budget;
+    return implicitEffortBudget(cc.chat_template, thinkMarkersAtomic(allocator, lm, tok), default_budget);
+}
+
+/// The request's `--reasoning-budget`: the generation-defaults budget rule replaces the flag,
+/// and effort words map against it exactly as they map against the flag.
+fn defaultReasoningBudget(gen: generation_settings.Profile) i32 {
+    return gen.value(i32, .reasoning_budget) orelse server_config.default_reasoning_budget;
+}
+
+/// A forced budget rule replaces whatever the request and its effort word decided.
+fn forcedReasoningBudget(gen: generation_settings.Profile, budget: i32) i32 {
+    return if (gen.forced(.reasoning_budget)) gen.value(i32, .reasoning_budget).? else budget;
 }
 
 test "implicitEffortBudget: silence on the Qwen3.8 family gets low's budget" {
@@ -8265,29 +8319,9 @@ fn parseAnthropicOutputConfig(root: std.json.ObjectMap) AnthropicOutputConfig {
     return out;
 }
 
-/// Resolve thinking for a chat request. An EXPLICIT client signal always wins —
-/// the vendor `enable_thinking` bool, or an OpenAI `reasoning_effort` string
-/// ("none" being an explicit OFF). Only a request that names NEITHER falls
-/// through to the arch default (`ModelConfig.defaultEnableThinking`).
-///
-/// The two knobs stay OR'd when both are present, as they always were.
-fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
-    const et: ?bool = if (requestField(root, "enable_thinking")) |v|
-        (if (v == .bool) v.bool else null)
-    else
-        null;
-    return thinkingFrom(et, effort_cfg, arch_default);
-}
-
 fn thinkingFrom(enable: ?bool, effort: ?ReasoningEffort, fallback: bool) bool {
     if (enable == null and effort == null) return fallback;
     return (enable orelse false) or (if (effort) |e| e.enable else false);
-}
-
-/// The model's `chat_template_kwargs` `reasoning_effort`, read like a request's.
-fn modelEffort(cc: *const chat_mod.ChatConfig, default_budget: i32, word_only: bool) ?ReasoningEffort {
-    const word = cc.default_reasoning_effort orelse return null;
-    return reasoningEffortFromWord(word, default_budget, word_only);
 }
 
 /// The model's effort word fills in only when thinking ended up on and the request named none.
@@ -8298,13 +8332,30 @@ fn modelEffortIfThinking(model: ?ReasoningEffort, thinking: bool) ?ReasoningEffo
 
 const ChatThinking = struct { enable: bool, effort: ?ReasoningEffort };
 
-/// Request first; the model's `chat_template_kwargs` thinking keys act as a
-/// default request, consulted only when the request names neither; then the arch.
-fn resolveChatThinking(root: std.json.ObjectMap, cc: *const chat_mod.ChatConfig, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
-    const model = modelEffort(cc, default_budget, word_only);
-    const request = parseReasoningEffort(root, default_budget, word_only);
-    const enable = resolveEnableThinking(root, request, thinkingFrom(cc.default_enable_thinking, model, arch_default));
-    return .{ .enable = enable, .effort = request orelse modelEffortIfThinking(model, enable) };
+/// An EXPLICIT client signal wins (`enable_thinking`, or an effort word, "none" being an
+/// explicit OFF; the two stay OR'd). The generation-defaults rules (the model's
+/// `chat_template_kwargs` thinking keys among them) act as a default request, consulted only
+/// when the request names neither; then the arch. A forced thinking or effort rule replaces the
+/// request's switches.
+fn resolveThinking(gen: generation_settings.Profile, enable: ?bool, request: ?ReasoningEffort, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
+    const ignore = gen.forced(.enable_thinking) or gen.forced(.reasoning_effort);
+    const req_effort = if (ignore) null else request;
+    const model: ?ReasoningEffort = if (gen.value(generation_settings.Effort, .reasoning_effort)) |e|
+        reasoningEffortFromWord(@tagName(e), default_budget, word_only)
+    else
+        null;
+    const on = if (gen.forced(.enable_thinking))
+        gen.value(bool, .enable_thinking).?
+    else if (gen.forced(.reasoning_effort))
+        model.?.enable
+    else
+        thinkingFrom(enable, req_effort, thinkingFrom(gen.value(bool, .enable_thinking), model, arch_default));
+    return .{ .enable = on, .effort = req_effort orelse modelEffortIfThinking(model, on) };
+}
+
+fn resolveChatThinking(root: std.json.ObjectMap, gen: generation_settings.Profile, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
+    const enable: ?bool = if (requestField(root, "enable_thinking")) |v| (if (v == .bool) v.bool else null) else null;
+    return resolveThinking(gen, enable, parseReasoningEffort(root, default_budget, word_only), arch_default, default_budget, word_only);
 }
 
 const SchemaThinkingPolicy = enum {
@@ -8455,6 +8506,49 @@ fn hashTextValue(v: std.json.Value) ?u64 {
         else => {},
     }
     return if (n == 0) null else h.final();
+}
+
+const CompletionPrompt = union(enum) {
+    text: []const u8,
+    /// Caller frees.
+    ids: []u32,
+    invalid: []const u8,
+    missing,
+};
+
+/// `/v1/completions` `prompt`: a string or token ids (OpenAI's `int[]`, what lm-eval
+/// sends), either also as a one-item list. A real batch is a named 400, like `n`.
+fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab_size: u32) !CompletionPrompt {
+    const val = v orelse return .missing;
+    switch (val) {
+        .null => return .missing,
+        .string => |s| return .{ .text = s },
+        .array => |arr| {
+            if (arr.items.len == 0) return .{ .invalid = "'prompt' is empty" };
+            if (arr.items[0] == .string or arr.items[0] == .array) {
+                if (arr.items.len > 1) return .{ .invalid = "batched prompts are not supported: send one prompt per request" };
+                return parseCompletionPrompt(allocator, arr.items[0], vocab_size);
+            }
+            const ids = try allocator.alloc(u32, arr.items.len);
+            for (arr.items, ids) |item, *id| {
+                if (item != .integer or item.integer < 0 or item.integer >= vocab_size) {
+                    allocator.free(ids);
+                    return .{ .invalid = "'prompt' token ids must be integers inside the model's vocabulary" };
+                }
+                id.* = @intCast(item.integer);
+            }
+            return .{ .ids = ids };
+        },
+        else => return .{ .invalid = "'prompt' must be a string or a list of token ids" },
+    }
+}
+
+/// Prompt-token logprobs are not computed, so an echo would hand lm-eval an empty
+/// sum it reads as perplexity 1; refused by name instead.
+fn echoRejectReason(root: std.json.ObjectMap) ?[]const u8 {
+    const v = root.get("echo") orelse return null;
+    if (v != .bool or !v.bool) return null;
+    return "'echo' is not supported: the prompt is not echoed and its tokens carry no logprobs";
 }
 
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
@@ -8687,7 +8781,9 @@ fn handleChatCompletions(
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
     // or <= 0 → auto (peg to remaining context).
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
-    const max_tokens: u32 = resolveRequestMaxTokens(
+    const gen = requestProfile(stream.io, lm);
+    const max_tokens: u32 = generationMaxTokens(
+        gen,
         requested_max_tokens,
         omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
@@ -8696,14 +8792,15 @@ fn handleChatCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const sampled = resolveSampling(gen, root, config);
+    const temperature = sampled.temperature;
+    const top_p = sampled.top_p;
+    const top_k = sampled.top_k;
+    const min_p = sampled.min_p;
 
-    const repeat_penalty = requestRepeatPenalty(root);
+    const repeat_penalty = sampled.repeat_penalty;
 
-    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const presence_penalty = sampled.presence_penalty;
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -8881,17 +8978,18 @@ fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const thinking = resolveChatThinking(root, chat_config, config.defaultEnableThinking(tools_json != null), server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
+    const default_budget = defaultReasoningBudget(gen);
+    const thinking = resolveChatThinking(root, gen, config.defaultEnableThinking(tools_json != null), default_budget, effortWordOnly(allocator, lm, tok));
     const effort_cfg = thinking.effort;
     var enable_thinking = thinking.enable;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
-    const effort_budget: i32 = if (effort_cfg) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok);
-    const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
+    const effort_budget: i32 = if (effort_cfg) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget);
+    const reasoning_budget: i32 = forcedReasoningBudget(gen, if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
         else => effort_budget,
-    } else effort_budget;
+    } else effort_budget);
 
     // Wave 1.A: per-request KV-quant override. When unset, falls back to the
     // process-level --kv-quant default carried on the scheduler. Cross-scheme
@@ -9267,6 +9365,11 @@ fn handleCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
     }
+    if (echoRejectReason(root)) |reason| {
+        log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Legacy-completions `logprobs` is an INTEGER (how many alternatives per
     // token), not chat's bool + `top_logprobs`. It was parsed nowhere and the
@@ -9278,20 +9381,24 @@ fn handleCompletions(
         else => 0,
     } else 0;
 
-    // Extract prompt (required)
-    const prompt_text = if (root.get("prompt")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
-
-    if (prompt_text == null) {
-        log.warn("POST /v1/completions -> 400 (missing prompt)\n", .{});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'prompt' is a required field", 400);
-        return;
+    // An embedded engine's stub config keeps the default vocab; its ids are the engine's.
+    const vocab_size: u32 = if (lm.ds4_engine) |e| e.vocabSize() else if (lm.llama_engine) |e| @intCast(e.nVocab()) else config.vocab_size;
+    const prompt = try parseCompletionPrompt(allocator, root.get("prompt"), vocab_size);
+    defer if (prompt == .ids) allocator.free(prompt.ids);
+    switch (prompt) {
+        .missing, .invalid => {
+            const reason = if (prompt == .invalid) prompt.invalid else "'prompt' is a required field";
+            log.warn("POST /v1/completions -> 400 ({s})\n", .{reason});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        },
+        .text, .ids => {},
     }
 
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
-    const max_tokens: u32 = resolveRequestMaxTokens(
+    const gen = requestProfile(stream.io, lm);
+    const max_tokens: u32 = generationMaxTokens(
+        gen,
         requested_max_tokens,
         omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
@@ -9300,13 +9407,14 @@ fn handleCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const sampled = resolveSampling(gen, root, config);
+    const temperature = sampled.temperature;
+    const top_p = sampled.top_p;
+    const top_k = sampled.top_k;
+    const min_p = sampled.min_p;
 
-    const repeat_penalty = requestRepeatPenalty(root);
-    const presence_penalty_c = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const repeat_penalty = sampled.repeat_penalty;
+    const presence_penalty_c = sampled.presence_penalty;
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -9364,15 +9472,22 @@ fn handleCompletions(
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
-    const preview_len = @min(prompt_text.?.len, 80);
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
     log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream });
-    log.info("  > \"{s}{s}\"\n", .{ prompt_text.?[0..preview_len], if (prompt_text.?.len > 80) "..." else "" });
+    switch (prompt) {
+        .text => |t| log.info("  > \"{s}{s}\"\n", .{ t[0..@min(t.len, 80)], if (t.len > 80) "..." else "" }),
+        .ids => |ids| log.info("  > [{d} token ids]\n", .{ids.len}),
+        else => unreachable,
+    }
 
     // Tokenize prompt directly (no chat template). ds4-backed models
     // tokenize through the engine's GGUF vocab; MLX models go through
-    // the loaded BPE tokenizer.
-    const prompt_ids = try encodeText(allocator, lm, tok, prompt_text.?, true);
+    // the loaded BPE tokenizer. Token ids are taken as sent.
+    const prompt_ids = switch (prompt) {
+        .text => |t| try encodeText(allocator, lm, tok, t, true),
+        .ids => |ids| try allocator.dupe(u32, ids),
+        else => unreachable,
+    };
     defer allocator.free(prompt_ids);
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
@@ -11656,20 +11771,7 @@ fn handleStreamingGeneration(
             for (tool_calls, 0..) |tc, i| {
                 const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
                 defer allocator.free(tc_id);
-
-                // Escape the full arguments string for embedding in JSON
-                const escaped_args = try jsonEscape(allocator, tc.arguments);
-                defer allocator.free(escaped_args);
-                // Strip outer quotes from jsonEscape result (it wraps in "...")
-                const args_inner = if (escaped_args.len >= 2 and escaped_args[0] == '"')
-                    escaped_args[1 .. escaped_args.len - 1]
-                else
-                    escaped_args;
-
-                // First delta: name + id + full arguments (clients accumulate these)
-                const first_delta = try std.fmt.allocPrint(allocator,
-                    \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]
-                , .{ i, tc_id, tc.name, args_inner });
+                const first_delta = try streamToolCallDelta(allocator, i, tc_id, tc.name, tc.arguments);
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = try lps.take() });
             }
@@ -12408,7 +12510,7 @@ test "apiKeyGateApplies: strict removes exactly the loopback exemption" {
     try std.testing.expect(apiKeyGateApplies(true, true, false));
 }
 
-fn peerIsLoopback(conn: *const Conn) bool {
+pub fn peerIsLoopback(conn: *const Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
 }
 
@@ -13735,11 +13837,15 @@ fn formatLogprobsObject(
 /// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
 /// OpenAI's `frequency_penalty` (0-2) is read as `repeat_penalty` 1 + x; an explicit
 /// `repeat_penalty` wins.
-fn requestRepeatPenalty(root: std.json.ObjectMap) f32 {
+/// Forced generation-defaults rules outrank both; unforced ones fill the request's silence.
+fn requestRepeatPenalty(root: std.json.ObjectMap, gen: generation_settings.Profile) f32 {
+    if (gen.forced(.repeat_penalty)) return gen.value(f32, .repeat_penalty).?;
+    if (gen.forced(.frequency_penalty)) return 1.0 + gen.value(f32, .frequency_penalty).?;
     const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
     if (repeat > 0) return repeat;
-    const frequency = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-    return if (frequency > 0) 1.0 + frequency else 1.0;
+    if (parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0)) |frequency| return 1.0 + frequency;
+    if (gen.value(f32, .repeat_penalty)) |r| if (r != 1.0) return r;
+    return 1.0 + (gen.value(f32, .frequency_penalty) orelse 0.0);
 }
 
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
@@ -15120,8 +15226,8 @@ fn handleAnthropicMessages(
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.
-    const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
-    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else launchMaxTokensDefault();
+    const gen = requestProfile(stream.io, lm);
+    const max_tokens: u32 = generationMaxTokens(gen, root.get("max_tokens"), launchMaxTokensDefault());
     // For the request log line only. This surface 400s on a missing budget, so
     // the origin here is never `.auto`.
     const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault());
@@ -15363,10 +15469,11 @@ fn handleAnthropicMessages(
     // model's generation_config.json — Claude Code omits ALL of them, and the
     // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
     // intended envelope (model card wants top_k=20, top_p=0.95).
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const sampled = resolveSampling(gen, root, config);
+    const temperature = sampled.temperature;
+    const top_p = sampled.top_p;
+    const top_k = sampled.top_k;
+    const min_p = sampled.min_p;
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Tools
@@ -15430,24 +15537,16 @@ fn handleAnthropicMessages(
     // than paying for it and discarding it); a PRESENT object decides
     // explicitly, exactly as before.
     const word_only = effortWordOnly(allocator, lm, tok);
-    const model_effort = modelEffort(chat_config, server_config.default_reasoning_budget, word_only);
-    var enable_thinking = if (root.get("thinking") == null)
-        thinkingFrom(chat_config.default_enable_thinking, model_effort, config.defaultEnableThinking(root.get("tools") != null))
-    else
-        false;
-    var reasoning_budget: i32 = server_config.default_reasoning_budget;
-    var budget_explicit = false;
+    const default_budget = defaultReasoningBudget(gen);
+    var thinking_on: ?bool = null;
+    var budget_tokens: ?i32 = null;
     if (root.get("thinking")) |think_val| {
+        thinking_on = false;
         if (think_val == .object) {
             const think_type = if (think_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-            if (std.mem.eql(u8, think_type, "enabled") or std.mem.eql(u8, think_type, "adaptive")) {
-                enable_thinking = true;
-            }
+            thinking_on = std.mem.eql(u8, think_type, "enabled") or std.mem.eql(u8, think_type, "adaptive");
             if (think_val.object.get("budget_tokens")) |bt| {
-                if (bt == .integer) {
-                    reasoning_budget = clampJsonI32(bt.integer);
-                    budget_explicit = true;
-                }
+                if (bt == .integer) budget_tokens = clampJsonI32(bt.integer);
             }
         }
     }
@@ -15455,7 +15554,7 @@ fn handleAnthropicMessages(
     // `output_config` (Claude Code's spelling; see parseAnthropicOutputConfig).
     // The effort word is an explicit thinking signal, so it displaces the arch
     // default and OR's with a present `thinking` object — the OpenAI surface's
-    // resolveEnableThinking rule. An explicit `budget_tokens` outranks the
+    // resolveThinking rule. An explicit `budget_tokens` outranks the
     // budget derived from the word; the word itself rides through to templates
     // that read it (qwen3.8's preamble, dsv4's).
     const output_cfg = parseAnthropicOutputConfig(root);
@@ -15463,16 +15562,12 @@ fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
         return;
     }
-    var effort_word: ?[]const u8 = null;
-    if (output_cfg.effort) |word| {
-        const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, word_only);
-        effort_word = cfg.effort;
-        if (!budget_explicit) reasoning_budget = cfg.budget;
-        enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
-    } else if (modelEffortIfThinking(model_effort, enable_thinking)) |cfg| {
-        effort_word = cfg.effort;
-        if (!budget_explicit) reasoning_budget = cfg.budget;
-    } else if (!budget_explicit) reasoning_budget = implicitEffortBudgetFor(allocator, lm, tok);
+    const request_effort = if (output_cfg.effort) |word| reasoningEffortFromWord(word, default_budget, word_only) else null;
+    const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(root.get("tools") != null), default_budget, word_only);
+    var enable_thinking = thinking.enable;
+    const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
+    const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse
+        if (thinking.effort) |cfg| cfg.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget));
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
 
@@ -15673,8 +15768,8 @@ fn handleAnthropicMessages(
         .top_p = top_p,
         .top_k = top_k,
         .min_p = min_p,
-        .repeat_penalty = 1.0,
-        .presence_penalty = 0.0,
+        .repeat_penalty = sampled.repeat_penalty,
+        .presence_penalty = sampled.presence_penalty,
         .seed = seed,
     };
 
@@ -17188,15 +17283,16 @@ fn handleResponsesInner(
         const r = resolveRequestMaxTokens(v, 0);
         break :blk if (r > 0) r else null;
     };
-    const max_tokens: u32 = req_max_output_tokens orelse
-        (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
+    const gen = requestProfile(stream.io, lm);
+    const max_tokens: u32 = generationMaxTokens(gen, root.get("max_output_tokens") orelse root.get("max_tokens"), if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
+    const sampled = resolveSampling(gen, root, config);
+    const temperature = sampled.temperature;
+    const top_p = sampled.top_p;
+    const top_k = sampled.top_k;
+    const min_p = sampled.min_p;
     const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-    const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
-    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const repeat_penalty = sampled.repeat_penalty;
+    const presence_penalty = sampled.presence_penalty;
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
@@ -17257,16 +17353,19 @@ fn handleResponsesInner(
     // Budget precedence as on chat: explicit reasoning_budget_tokens > the
     // effort word's budget (`reasoningEffortFromWord`) > --reasoning-budget,
     // with the Qwen3.8 implicit-low budget when thinking names no effort.
-    const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
-    var enable_thinking = reasoning_cfg.enable;
-    const effort_budget: i32 = if (reasoning_cfg.effort) |word|
-        reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok)).budget
-    else
-        implicitEffortBudgetFor(allocator, lm, tok);
-    const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
+    const default_budget = defaultReasoningBudget(gen);
+    const word_only = effortWordOnly(allocator, lm, tok);
+    const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), default_budget);
+    const reasoning_named = if (root.get("reasoning")) |v| v == .object else false;
+    const request_effort = if (reasoning_cfg.effort) |word| reasoningEffortFromWord(word, default_budget, word_only) else null;
+    const thinking = resolveThinking(gen, if (reasoning_named) reasoning_cfg.enable else null, request_effort, false, default_budget, word_only);
+    var enable_thinking = thinking.enable;
+    const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
+    const effort_budget: i32 = if (thinking.effort) |cfg| cfg.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget);
+    const reasoning_budget: i32 = forcedReasoningBudget(gen, if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
         else => effort_budget,
-    } else effort_budget;
+    } else effort_budget);
 
     // ── tools ──
     var tools_json: ?[]const u8 = null;
@@ -17383,7 +17482,7 @@ fn handleResponsesInner(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, effort_word, false);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !active_has_tools and enable_thinking) {
@@ -17401,7 +17500,7 @@ fn handleResponsesInner(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, effort_word, false);
             log.info("[grammar] reasoning protocol unsupported for this model/prompt; rerendered with thinking off\n", .{});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -20931,13 +21030,10 @@ test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls throug
 }
 
 test "llama cache default keeps shared prefixes warm" {
-    // With the legacy default of 1, every llama.cpp request evicted the
-    // single KV session — even two SEQUENTIAL requests sharing an 8 KB
-    // prefix reported cached_tokens=0 (caught live by llmprobe
-    // cache-hit-reported on the E4B GGUF, 2026-06-10). 4 sessions keep
-    // interleaved agent roots warm; sessions are created lazily so idle
-    // slots cost nothing.
-    try testing.expect(llama_cache_entries >= 4);
+    // With one sequence, interleaved requests evict each other's prompt KV:
+    // even two SEQUENTIAL requests sharing an 8 KB prefix reported
+    // cached_tokens=0. 4 keep interleaved agent roots warm and decoding together.
+    try testing.expect(llama_settings.seqs >= 4);
 }
 
 test "prefix cache default capacity covers interleaved agent flows" {
@@ -21363,6 +21459,48 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
 }
 
+test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 400 (#659)" {
+    const allocator = std.testing.allocator;
+    const Want = union(enum) { text: []const u8, ids: []const u32, invalid, missing };
+    const cases = [_]struct { body: []const u8, want: Want }{
+        .{ .body = "{\"prompt\":\"hi\"}", .want = .{ .text = "hi" } },
+        .{ .body = "{\"prompt\":[\"hi\"]}", .want = .{ .text = "hi" } },
+        .{ .body = "{\"prompt\":[1,2,3]}", .want = .{ .ids = &.{ 1, 2, 3 } } },
+        .{ .body = "{\"prompt\":[[5,6]]}", .want = .{ .ids = &.{ 5, 6 } } },
+        .{ .body = "{\"prompt\":[[1],[2]]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[\"a\",\"b\"]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[1,-2]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[1,100]}", .want = .invalid },
+        .{ .body = "{}", .want = .missing },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = try parseCompletionPrompt(allocator, parsed.value.object.get("prompt"), 100);
+        defer if (got == .ids) allocator.free(got.ids);
+        switch (case.want) {
+            .text => |t| try std.testing.expectEqualStrings(t, got.text),
+            .ids => |ids| try std.testing.expectEqualSlices(u32, ids, got.ids),
+            .invalid => try std.testing.expect(got == .invalid),
+            .missing => try std.testing.expect(got == .missing),
+        }
+    }
+}
+
+test "echoRejectReason: echo is refused by name, never silently dropped (#659)" {
+    const allocator = std.testing.allocator;
+    for ([_]struct { body: []const u8, rejected: bool }{
+        .{ .body = "{}", .rejected = false },
+        .{ .body = "{\"echo\":false}", .rejected = false },
+        .{ .body = "{\"echo\":true}", .rejected = true },
+    }) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.rejected, echoRejectReason(parsed.value.object) != null);
+    }
+}
+
 test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { body: []const u8, rejected: bool }{
@@ -21549,7 +21687,7 @@ test "reasoningEffortFromWord: none disables, words budget exactly like the Open
     try std.testing.expectEqual(@as(i32, -1), consumed.budget);
 }
 
-test "resolveEnableThinking: an explicit request value outranks the arch default, silence takes it" {
+test "resolveChatThinking: an explicit request value outranks the arch default, silence takes it" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { body: []const u8, arch: bool, want: bool }{
         // Silent request → the arch default, either way.
@@ -21572,24 +21710,26 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        const effort = parseReasoningEffort(parsed.value.object, -1, false);
-        try std.testing.expectEqual(case.want, resolveEnableThinking(parsed.value.object, effort, case.arch));
+        try std.testing.expectEqual(case.want, resolveChatThinking(parsed.value.object, .{}, case.arch, -1, false).enable);
     }
 }
 
-test "resolveChatThinking: the request decides, the model's chat_template_kwargs fill its silence, then the arch" {
+test "resolveChatThinking: the request decides, the generation-defaults rules fill its silence or force it, then the arch" {
     const allocator = std.testing.allocator;
-    var cc = chat_mod.ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
-    const Case = struct { body: []const u8, model_on: ?bool = null, model_effort: ?[]const u8 = null, arch: bool = false, want: bool, effort: ?[]const u8 = null };
+    const Case = struct { body: []const u8, model_on: ?bool = null, model_effort: ?generation_settings.Effort = null, force: bool = false, arch: bool = false, want: bool, effort: ?[]const u8 = null };
     const cases = [_]Case{
         .{ .body = "{}", .arch = true, .want = true },
         .{ .body = "{}", .model_on = true, .want = true },
         .{ .body = "{}", .model_on = false, .arch = true, .want = false },
-        .{ .body = "{}", .model_effort = "high", .want = true, .effort = "high" },
-        .{ .body = "{}", .model_effort = "none", .arch = true, .want = false },
-        .{ .body = "{\"enable_thinking\":false}", .model_effort = "high", .want = false },
-        .{ .body = "{\"enable_thinking\":true}", .model_effort = "high", .want = true, .effort = "high" },
-        .{ .body = "{\"reasoning_effort\":\"low\"}", .model_effort = "high", .want = true, .effort = "low" },
+        .{ .body = "{}", .model_effort = .high, .want = true, .effort = "high" },
+        .{ .body = "{}", .model_effort = .none, .arch = true, .want = false },
+        .{ .body = "{\"enable_thinking\":false}", .model_effort = .high, .want = false },
+        .{ .body = "{\"enable_thinking\":true}", .model_effort = .high, .want = true, .effort = "high" },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .model_effort = .high, .want = true, .effort = "low" },
+        // A forced rule replaces the request's switches, effort word included.
+        .{ .body = "{\"enable_thinking\":false,\"reasoning_effort\":\"none\"}", .model_on = true, .force = true, .want = true },
+        .{ .body = "{\"enable_thinking\":true,\"reasoning_effort\":\"high\"}", .model_on = false, .force = true, .arch = true, .want = false },
+        .{ .body = "{\"enable_thinking\":false}", .model_effort = .low, .force = true, .want = true, .effort = "low" },
         // vLLM's spelling; the top-level field wins over it.
         .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":false}}", .model_on = true, .want = false },
         .{ .body = "{\"chat_template_kwargs\":{\"reasoning_effort\":\"medium\"}}", .want = true, .effort = "medium" },
@@ -21598,11 +21738,37 @@ test "resolveChatThinking: the request decides, the model's chat_template_kwargs
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        cc.default_enable_thinking = case.model_on;
-        cc.default_reasoning_effort = case.model_effort;
-        const got = resolveChatThinking(parsed.value.object, &cc, case.arch, -1, false);
+        var gen = generation_settings.Profile{};
+        if (case.model_on) |on| gen.set(.enable_thinking, .{ .boolean = on }, case.force);
+        if (case.model_effort) |e| gen.set(.reasoning_effort, .{ .effort = e }, case.force);
+        const got = resolveChatThinking(parsed.value.object, gen, case.arch, -1, false);
         try std.testing.expectEqual(case.want, got.enable);
         if (case.effort) |w| try std.testing.expectEqualStrings(w, got.effort.?.effort.?) else try std.testing.expect(got.effort == null);
+    }
+}
+
+test "resolveThinking: forced effort outranks unforced thinking defaults" {
+    inline for (.{ false, true }) |arch_default| {
+        inline for (.{ false, true }) |word_only| {
+            var gen = generation_settings.Profile{};
+            gen.set(.enable_thinking, .{ .boolean = true }, false);
+            gen.set(.reasoning_effort, .{ .effort = .none }, true);
+            const off = resolveThinking(gen, false, reasoningEffortFromWord("high", -1, word_only), arch_default, -1, word_only);
+            try std.testing.expect(!off.enable);
+            try std.testing.expect(off.effort == null);
+
+            gen.set(.enable_thinking, .{ .boolean = false }, false);
+            gen.set(.reasoning_effort, .{ .effort = .low }, true);
+            const on = resolveThinking(gen, false, reasoningEffortFromWord("none", -1, word_only), arch_default, -1, word_only);
+            try std.testing.expect(on.enable);
+            try std.testing.expectEqualStrings("low", on.effort.?.effort.?);
+
+            gen.set(.enable_thinking, .{ .boolean = false }, true);
+            try std.testing.expect(!resolveThinking(gen, true, null, arch_default, -1, word_only).enable);
+            gen.set(.enable_thinking, .{ .boolean = true }, true);
+            gen.set(.reasoning_effort, .{ .effort = .none }, true);
+            try std.testing.expect(resolveThinking(gen, false, null, arch_default, -1, word_only).enable);
+        }
     }
 }
 
@@ -21639,17 +21805,71 @@ test "every JSON grammar mask site consults the fallback or deferral policy" {
     try std.testing.expectEqual(masks, calls);
 }
 
-test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
-    // Request value always wins.
-    try std.testing.expectEqual(@as(f32, 0.2), resolveSamplingDefault(f32, 0.2, 0.7, 1.0, 1.0));
-    // Omitted in request -> CLI launch flag (the app passes Settings here).
-    try std.testing.expectEqual(@as(f32, 0.7), resolveSamplingDefault(f32, null, 0.7, 1.0, 1.0));
-    // No CLI flag -> the model's generation_config.json recommendation.
-    try std.testing.expectEqual(@as(u32, 20), resolveSamplingDefault(u32, null, null, 20, 0));
-    // Nothing anywhere -> hardcoded fallback (pre-existing behavior).
-    try std.testing.expectEqual(@as(f32, 1.0), resolveSamplingDefault(f32, null, null, null, 1.0));
-    // Explicit request 0 (greedy) must not be treated as omitted.
-    try std.testing.expectEqual(@as(f32, 0.0), resolveSamplingDefault(f32, 0.0, 0.7, 1.0, 1.0));
+test "resolveSampling: forced rule > request > rule > generation_config > fallback" {
+    const a = std.testing.allocator;
+    const zeros = try std.json.parseFromSlice(std.json.Value, a, "{\"temperature\":0,\"top_k\":0,\"min_p\":0,\"frequency_penalty\":0}", .{});
+    defer zeros.deinit();
+    const config = model_mod.ModelConfig{ .gen_temperature = 0.8, .gen_top_p = 0.95, .gen_top_k = 40, .gen_min_p = 0.1 };
+    var got = resolveSampling(.{}, .empty, &config);
+    try std.testing.expectEqual(@as(f32, 0.8), got.temperature);
+    try std.testing.expectEqual(@as(u32, 40), got.top_k);
+    try std.testing.expectEqual(@as(?f32, 0.1), got.min_p);
+    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+    got = resolveSampling(.{}, .empty, &.{});
+    try std.testing.expectEqual(@as(f32, 1.0), got.temperature);
+    try std.testing.expectEqual(@as(?f32, null), got.min_p);
+    var gen = generation_settings.Profile{};
+    gen.set(.temperature, .{ .number = 0.25 }, false);
+    gen.set(.min_p, .{ .number = 0.05 }, true);
+    gen.set(.repeat_penalty, .{ .number = 1.5 }, false);
+    got = resolveSampling(gen, .empty, &config);
+    try std.testing.expectEqual(@as(f32, 0.25), got.temperature);
+    try std.testing.expectEqual(@as(f32, 1.5), got.repeat_penalty);
+    // An explicit zero is a value: it beats an unforced rule, never a forced one.
+    got = resolveSampling(gen, zeros.value.object, &config);
+    try std.testing.expectEqual(@as(f32, 0.0), got.temperature);
+    try std.testing.expectEqual(@as(u32, 0), got.top_k);
+    try std.testing.expectEqual(@as(?f32, 0.05), got.min_p);
+    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+    gen.set(.repeat_penalty, .{ .number = 1.0 }, false);
+    gen.set(.frequency_penalty, .{ .number = 0.5 }, false);
+    try std.testing.expectEqual(@as(f32, 1.5), resolveSampling(gen, .empty, &config).repeat_penalty);
+    gen.set(.repeat_penalty, .{ .number = 1.2 }, true);
+    try std.testing.expectEqual(@as(f32, 1.2), resolveSampling(gen, zeros.value.object, &config).repeat_penalty);
+}
+
+test "generationMaxTokens: an auto request (0, negative, omitted) takes the rule, a forced rule takes everything" {
+    var gen = generation_settings.Profile{};
+    try std.testing.expectEqual(@as(u32, 7), generationMaxTokens(gen, .{ .integer = -1 }, 7));
+    try std.testing.expectEqual(@as(u32, 64), generationMaxTokens(gen, .{ .integer = 64 }, 7));
+    gen.set(.max_tokens, .{ .number = 12 }, false);
+    try std.testing.expectEqual(@as(u32, 12), generationMaxTokens(gen, .{ .integer = -1 }, 7));
+    try std.testing.expectEqual(@as(u32, 12), generationMaxTokens(gen, null, 7));
+    try std.testing.expectEqual(@as(u32, 64), generationMaxTokens(gen, .{ .integer = 64 }, 7));
+    gen.set(.max_tokens, .{ .number = 0 }, false); // 0 = auto
+    try std.testing.expectEqual(AUTO_MAX_TOKENS_SENTINEL, generationMaxTokens(gen, null, 7));
+    try std.testing.expectEqual(@as(u32, 64), generationMaxTokens(gen, .{ .integer = 64 }, 0));
+    gen.set(.max_tokens, .{ .number = 0 }, true);
+    for ([_]?std.json.Value{ null, .{ .integer = 0 }, .{ .integer = -1 }, .{ .integer = 64 } }) |value| {
+        const cap = generationMaxTokens(gen, value, 0);
+        try std.testing.expectEqual(AUTO_MAX_TOKENS_SENTINEL, cap);
+        try std.testing.expectEqual(@as(u32, 8092), clampMaxTokens(cap, 100, 8192));
+    }
+    try std.testing.expectEqual(@as(u32, 0), generationMaxTokens(.{}, null, 0));
+    gen.set(.max_tokens, .{ .number = 12 }, true);
+    try std.testing.expectEqual(@as(u32, 12), generationMaxTokens(gen, .{ .integer = 64 }, 7));
+}
+
+test "reasoning budget: the rule stands in for --reasoning-budget, forced it replaces the request's" {
+    var gen = generation_settings.Profile{};
+    try std.testing.expectEqual(server_config.default_reasoning_budget, defaultReasoningBudget(gen));
+    gen.set(.reasoning_budget, .{ .number = 1024 }, false);
+    try std.testing.expectEqual(@as(i32, 1024), defaultReasoningBudget(gen));
+    // xhigh maps to the default budget, so an unforced rule caps it; medium keeps its own.
+    try std.testing.expectEqual(@as(i32, 1024), reasoningEffortFromWord("xhigh", defaultReasoningBudget(gen), false).budget);
+    try std.testing.expectEqual(@as(i32, 8192), forcedReasoningBudget(gen, reasoningEffortFromWord("medium", 1024, false).budget));
+    gen.set(.reasoning_budget, .{ .number = 16 }, true);
+    try std.testing.expectEqual(@as(i32, 16), forcedReasoningBudget(gen, 32000));
 }
 
 test "detokenizeResponseJson escapes arbitrary token bytes (control-byte class)" {

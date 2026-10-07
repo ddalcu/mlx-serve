@@ -85,6 +85,18 @@ final class ChatModelSelectionTests: XCTestCase {
         XCTAssertFalse(state.isLoading)
     }
 
+    func testAGgufQuantShowsItsOwnLabelNotTheFileStemTheServerNamesItBy() {
+        // A `.gguf` file loaded by path is registered under its file stem, so
+        // a split shard read as "…1 Of 00002" in the pill while the tray was right.
+        let m = local("/models/SC117/Next-GGUF/IQ3_S/Next-IQ3_S-00001-of-00002.gguf", "SC117/Next-GGUF")
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: "Next-IQ3_S-00001-of-00002",
+                                                 loadingPath: nil,
+                                                 selectedPath: m.path,
+                                                 models: [m])
+        XCTAssertEqual(state.name, m.displayLabel)
+    }
+
     func testAResidentModelWeDidNotPickKeepsTheServersOwnName() {
         // Another surface (a gen pane, a task) can leave a different model
         // resident. We have no local label for it, and borrowing the selected

@@ -55,7 +55,7 @@ enum MultimodalContent {
             ]
         }
 
-        for vid in videos {
+        for vid in videos where !vid.frames.isEmpty {
             let frameUrls = vid.frames.map { "data:image/jpeg;base64,\($0.base64EncodedString())" }
             blocks.append([
                 "type": "video_url",

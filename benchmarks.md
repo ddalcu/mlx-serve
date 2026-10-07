@@ -8,10 +8,10 @@
 
 ## Decode tok/s by release
 
-| Model | 26.8.6 | 26.8.11 | 26.9.1 | 26.9.2 | 26.9.3 | 26.9.5 | 26.9.6 | 26.10.1 | speedup |
-|---|---|---|---|---|---|---|---|---|---|
-| Gemma 4 E4B 4b | 115 | 117 | 114 | 116 | 118 pld | 116 pld | 118 pld | 129 pld | +12% |
-| Gemma 4 26B-A4B 4b | 116 | 120 | 120 | 120 | 118 | 115 pld | 119 pld | 126 pld | +9% |
-| Qwen3.6 35B-A3B 4b (MTP) | 191 mtp | · | · | 259 mtp | 236 mtp | 239 mtp | 241 mtp | 238 mtp | +25% |
-| Qwen3.8 27B 4b (ddalcu) | · | 70 mtp | 71 mtp | 68 mtp | 73 mtp | 70 mtp | 72 mtp | 92 dflash | +31% |
-| Qwen3.8 Flash-Next mixed 4-8b | · | 70 mtp | 68 mtp | 80 mtp | 80 mtp | 83 mtp | 82 mtp | 88 mtp | +26% |
+| Model | 26.8.6 | 26.8.11 | 26.9.1 | 26.9.2 | 26.9.3 | 26.9.5 | 26.9.6 | 26.10.1 | 26.10.2 | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Gemma 4 E4B 4b | 115 | 117 | 114 | 116 | 118 pld | 116 pld | 118 pld | 129 pld | 127 pld | +10% |
+| Gemma 4 26B-A4B 4b | 116 | 120 | 120 | 120 | 118 | 115 pld | 119 pld | 126 pld | · | +9% |
+| Qwen3.6 35B-A3B 4b (MTP) | 191 mtp | · | · | 259 mtp | 236 mtp | 239 mtp | 241 mtp | 238 mtp | · | +25% |
+| Qwen3.8 27B 4b (ddalcu) | · | 70 mtp | 71 mtp | 68 mtp | 73 mtp | 70 mtp | 72 mtp | 92 dflash | 104 dflash | +49% |
+| Qwen3.8 Flash-Next mixed 4-8b | · | 70 mtp | 68 mtp | 80 mtp | 80 mtp | 83 mtp | 82 mtp | 88 mtp | 90 mtp | +29% |

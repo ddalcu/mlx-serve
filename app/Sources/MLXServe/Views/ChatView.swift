@@ -3583,9 +3583,10 @@ struct ChatDetailView: View {
     private var videoSupported: Bool { server.chatModelInfo?.supportsVideo ?? false }
 
     /// Convert pending videos to a ChatVideo array, clearing the list.
+    /// Written on SEND like the pictures (`AttachmentStore.storedVideo`).
     private func consumePendingVideos() -> [ChatVideo]? {
         guard !pendingVideos.isEmpty else { return nil }
-        let videos = pendingVideos
+        let videos = pendingVideos.map { AttachmentStore.storedVideo($0) }
         pendingVideos = []
         return videos
     }
@@ -4037,7 +4038,7 @@ struct ChatDetailView: View {
         }
 
         chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
+                           images: attachedImages, videos: attachedVideos, audio: attachedAudio,
                            config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
         // Your own message always wins: sending from halfway up the history used
