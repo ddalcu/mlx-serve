@@ -3873,6 +3873,43 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // the GPU running to the end with every queued request behind it.
     var sctx = videoStreamCtx(conn, allocator, body, want_stream);
     const prog: ?sse.Progress = sctx.progress();
+    // The load gate bills the model, not the request: a canvas this Mac cannot hold must be
+    // refused here, before any stage loads, since the Metal OOM mid-step is uncatchable.
+    {
+        const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo, null, if (std.c.getenv("MINIMAX_H3_ATTN_BCAST")) |v| std.mem.sliceTo(v, 0) else null);
+        const cfg = minimax_h3.Config{};
+        const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, cfg.num_layers) * cfg.hidden_size * 2 else 0;
+        const dit = h3DitResidentBytes(packFileBytes(io, allocator, engine.model_dir, "transformer.safetensors"), minimax_h3.adalnPrecomputeOn()) +
+            (if (turbo) packFileBytes(io, allocator, engine.model_dir, "turbo_lora.safetensors") else 0);
+        const rows = h3RequestRows(width, height, shape.frame_count, @intCast(n_kf));
+        const need = h3RequestBytes(dit, rows, bcast_row);
+        var active: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        const avail = h3AvailBytes(metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active) + engine.resident.bytes;
+        if (dit > 0 and avail > 0 and need > avail) {
+            const gb = struct {
+                fn f(b: u64) f64 {
+                    return @as(f64, @floatFromInt(b)) / (1024.0 * 1024.0 * 1024.0);
+                }
+            }.f;
+            var buf: [320]u8 = undefined;
+            const with_cache = bcast_row > 0;
+            const msg = std.fmt.bufPrint(&buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
+                width,
+                height,
+                shape.frame_count,
+                gb(need),
+                gb(dit),
+                gb(need - dit),
+                rows,
+                if (with_cache) " with the fast recipe's attention cache" else "",
+                gb(avail),
+                if (with_cache) ", or \"turbo\", which keeps no attention cache" else "",
+            }) catch "the canvas does not fit in memory: use a smaller canvas or fewer frames";
+            return sendError(conn, 400, msg);
+        }
+    }
+
     if (want_stream) try conn.writeAll(sse.headers);
 
     const paths = try engine.paths(allocator);
@@ -4675,6 +4712,24 @@ pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u
     const generating = @max(dit_resident, vaes);
     if (te == 0 and generating == 0) return 0; // unknown dir → never block
     return stagedPeakBytes(0, &.{ te, generating + H3_ACTIVATION_BYTES });
+}
+
+/// Sequence rows one window puts through the DiT: video latents on the 32-pixel grid, stereo
+/// audio latents, and a frame of rows per keyframe. Prompt and reference rows ride the margin.
+pub fn h3RequestRows(width: u32, height: u32, frames: u32, keyframes: u32) u64 {
+    const shape = minimax_h3.temporalShape(frames);
+    const frame_rows: u64 = (height / (minimax_h3.VAE_SPATIAL * minimax_h3.PATCH_H)) * (width / (minimax_h3.VAE_SPATIAL * minimax_h3.PATCH_W));
+    return (shape.latent_t + keyframes) * frame_rows + 2 * @as(u64, shape.audio_t);
+}
+
+/// What one denoising run holds above the resident DiT, per sequence row (process footprint on an
+/// M5 Pro, 8.9k-37.7k rows): the per-step transients, plus the fast recipe's per-block attention
+/// cache (`bcast_row_bytes` = layers x hidden x bf16) while that recipe is on.
+pub const H3_ROW_BYTES: u64 = 384 * 1024;
+const H3_REQUEST_BASE_BYTES: u64 = 1 << 30;
+
+pub fn h3RequestBytes(dit_resident: u64, rows: u64, bcast_row_bytes: u64) u64 {
+    return dit_resident + H3_REQUEST_BASE_BYTES + rows * (H3_ROW_BYTES + bcast_row_bytes);
 }
 
 /// What MiniMax-H3 holds when it keeps every piece loaded between requests: the text encoder, the
@@ -6417,6 +6472,26 @@ test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint 
     );
     try std.testing.expect(real < 29 * GB); // fits the 48 GB Mac's auto cap
     try std.testing.expect(real > 24 * GB); // and stays above the measured peak
+}
+
+test "h3 request rows: latent frames on the 32-pixel grid, stereo audio, one frame of rows per keyframe" {
+    try std.testing.expectEqual(@as(u64, 12846), h3RequestRows(768, 448, 124, 0)); // live: 12854 rows with 8 prompt tokens
+    try std.testing.expectEqual(@as(u64, 37710), h3RequestRows(1344, 768, 124, 0)); // live: 37719 with 9
+    try std.testing.expectEqual(@as(u64, 12846 + 2 * 336), h3RequestRows(768, 448, 124, 2));
+}
+
+test "h3 request bill stays above the measured peaks and refuses the canvas that died (#764)" {
+    const GB: u64 = 1 << 30;
+    const dit = h3DitResidentBytes(18_698_813_290, true); // the 4-bit FL2VA pack
+    const lora: u64 = 779_849_816;
+    const bcast: u64 = 50 * 5376 * 2;
+    // Process peaks measured on an M5 Pro 48 GB at 124 frames.
+    try std.testing.expect(h3RequestBytes(dit + lora, 37718, 0) >= 26 * GB); // 1344x768 turbo: 26 GB
+    try std.testing.expect(h3RequestBytes(dit + lora, 37718, 0) < 28 * GB);
+    try std.testing.expect(h3RequestBytes(dit, 19292, bcast) >= 28 * GB); // 960x544 fast recipe: 28 GB
+    try std.testing.expect(h3RequestBytes(dit, 19292, bcast) < 31 * GB); // and a 48 GB Mac with 31.5 GB free still serves it
+    // 1536x672 with two keyframes under the fast recipe died with 32.58 GB available.
+    try std.testing.expect(h3RequestBytes(dit, h3RequestRows(1536, 672, 124, 2), bcast) > 33 * GB);
 }
 
 test "h3 DiT term sheds the AdaLN weights precompute frees — unless it is off" {
