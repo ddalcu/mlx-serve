@@ -2529,6 +2529,8 @@ block for the attention broadcast: `num_layers x hidden_size` bf16 a row, ~525 K
 /32 grid and the transport cap, never memory.
 
 Fix: `h3RequestRows` (latent frames x the 32-pixel grid + stereo audio + a frame per keyframe)
-and `h3RequestBytes` (resident DiT + base + rows x per-row bytes, plus the broadcast term when
-`resolveSpeed` turns it on) bill the request before any stage loads; `handleVideoH3` refuses it
-by name, quoting the need and the free memory. Guards: `h3 request rows`, `h3 request bill`.
+and `h3ActivationBytes` (base + rows x per-row bytes, plus the broadcast term when `resolveSpeed`
+turns it on) bill the request before any stage loads. The same term prices the resident set in
+`h3ResidentFor`, so a warm engine yields to a canvas it cannot hold, and `handleVideoH3` refuses
+the staged plan by name, quoting the need and the free memory. Guards: `h3 request rows`,
+`h3 request bill`, `h3 residency is priced on the request's activations`.
