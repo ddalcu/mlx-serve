@@ -208,7 +208,8 @@ struct VideoGenView: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(minWidth: 340, idealWidth: 380)
+            // Without maxWidth the pane sizes to its content and re-solves on every keystroke.
+            .frame(minWidth: 340, idealWidth: 380, maxWidth: .infinity)
 
             VStack(spacing: 12) {
                 previewArea
