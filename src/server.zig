@@ -3520,17 +3520,9 @@ pub fn applyMlxCacheLimit() void {
     log.info("[mem] MLX buffer-pool cap {d} MB (was {d} MB)\n", .{ cap >> 20, prev >> 20 });
 }
 
-/// Impure wrapper: current GPU allocation ceiling from live MLX + system
-/// counters. `mlx_footprint` = active (in-use) + cache (reclaimable) so an
-/// idle machine's ceiling stays ≈ the static device max (no auto-context
-/// regression), while external pressure — reflected in `getAvailableMemBytes`
-/// (total − wired − compressed − internal-anon) — tightens it. See
-/// `physicalMemoryCeiling`.
-/// The ceiling term that does not move with instantaneous free RAM: Metal's recommended
-/// working set (or the wired limit). The load-time hot-cache clamp bills against this and
-/// nothing else: two boots 11 minutes apart resolved the same ask to 1076 and 9757 MB off the
-/// live term. Request-time admission still reads live memory.
-/// Stands in for the machine's working-set limit: tests (CI runners have 7 GB) and `applyGpuCeilingEnv`.
+/// Stands in for the machine's working-set limit (Metal's recommended working set
+/// or the wired limit): tests (CI runners have 7 GB) and `applyGpuCeilingEnv`.
+/// Load-time bills price this static term (stable across boots); request-time admission reads live RAM.
 pub var static_ceiling_override: ?u64 = null;
 
 pub fn staticGpuMemoryCeiling() u64 {
