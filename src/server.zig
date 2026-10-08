@@ -5650,7 +5650,10 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
 /// failure the operator can act on. One helper for the three slot-drain sites.
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
-    if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
+    if (slot.errorNameIs("PrefillDoesNotFit")) {
+        prefill_refusal = if (slot.refused_bill) |bill| .{ .tokens = slot.full_prompt.len, .needed = bill[0], .available = bill[1] } else null;
+        return error.PrefillDoesNotFit;
+    }
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     return error.GenerationFailed;
 }
@@ -5673,6 +5676,19 @@ fn memoryRefusalMessage(
 /// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
 /// estimator the guard uses, re-asked after the hot cache gave back everything it could.
 const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+
+/// The figures of the `PrefillDoesNotFit` this connection thread last drained, read once by
+/// `mapGenerationError`: the error name alone cannot carry them past `slotFailure`.
+threadlocal var prefill_refusal: ?struct { tokens: usize, needed: u64, available: u64 } = null;
+
+/// `PREFILL_NOFIT_MSG` with the figures the refusal compared, worded like the guard's 400 so a client
+/// reads both refusals the same way. The bare message when no figures were drained.
+fn prefillNoFitMessage(buf: []u8) []const u8 {
+    const refusal = prefill_refusal orelse return PREFILL_NOFIT_MSG;
+    prefill_refusal = null;
+    const mb = 1024 * 1024;
+    return std.fmt.bufPrint(buf, "This prompt ({d} tokens) does not fit in GPU memory even after freeing the prefix cache: it requires ~{d}MB GPU memory but only ~{d}MB is available. It was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine.", .{ refusal.tokens, refusal.needed / mb, refusal.available / mb }) catch PREFILL_NOFIT_MSG;
+}
 
 /// A generation failure as the wire sees it: one status, one message, both dialects' type.
 pub const GenErrorWire = struct {
@@ -5702,7 +5718,7 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .code = 400,
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
-            .message = PREFILL_NOFIT_MSG,
+            .message = prefillNoFitMessage(buf),
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -5761,7 +5777,7 @@ const ErrorSurface = union(enum) {
 /// stream gets the same response its non-streaming twin would; past it the same `type` and
 /// `message` ride the surface's terminal `error` event.
 fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
-    var msg_buf: [192]u8 = undefined;
+    var msg_buf: [320]u8 = undefined;
     const w = mapGenerationError(err, &msg_buf);
 
     if (!stream.sse_headers_sent) {
@@ -6281,8 +6297,8 @@ pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: u
     return .{ bill.needed, bill.available };
 }
 
-/// The inference thread's refusal, quoting the numbers it compared.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) void {
+/// The inference thread's refusal, quoting the numbers it compared; returns {needed, available} for the client.
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) [2]u64 {
     // The same warm inputs the probe was refused on, the checkout decision included.
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
@@ -6305,6 +6321,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         bill.evictable / mb,
         pinnedResidentBytes(bill) / mb,
     });
+    return .{ bill.needed, bill.available };
 }
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool, enable_mtp: bool, media_bytes: u64) !bool {
@@ -18886,7 +18903,7 @@ fn handleResponsesWebSocket(
         handleResponses(allocator, stream, body, lm) catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
             // Best-effort error frame; same mapping as every HTTP surface.
-            var ws_err_buf: [192]u8 = undefined;
+            var ws_err_buf: [320]u8 = undefined;
             const ws_wire = mapGenerationError(err, &ws_err_buf);
             wsSendErrorTurn(allocator, &ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message) catch {};
             // Restore borrowed prev entry back to local cache on failure.
@@ -23727,6 +23744,21 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
     while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "PrefillDoesNotFit quotes the figures the inference thread refused on, once" {
+    const t = std.testing;
+    const mb = 1024 * 1024;
+    var buf: [320]u8 = undefined;
+    prefill_refusal = .{ .tokens = 12447, .needed = 1733 * mb, .available = 77 * mb };
+    const w = mapGenerationError(error.PrefillDoesNotFit, &buf);
+    try t.expectEqual(@as(u32, 400), w.code);
+    try t.expect(std.mem.indexOf(u8, w.message, "This prompt (12447 tokens) does not fit in GPU memory") != null);
+    // The guard's wording, so a client parses both refusals with one pattern.
+    try t.expect(std.mem.indexOf(u8, w.message, "requires ~1733MB GPU memory but only ~77MB is available") != null);
+    // Read once: the next refusal without figures on this thread gets the bare message.
+    try t.expect(prefill_refusal == null);
+    try t.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
 }
 
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {

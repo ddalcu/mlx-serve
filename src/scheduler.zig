@@ -416,8 +416,8 @@ pub var prefill_chunk_widen_ok: ?*const fn (
     u64,
 ) bool = null;
 
-/// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) void = null;
+/// Logs the numbers the estimator compared on a refusal and returns them, {needed, available} bytes.
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) [2]u64 = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
@@ -568,6 +568,9 @@ pub const Slot = struct {
     out_idx: usize,
     finished: bool,
     error_code: ?[]const u8,
+    /// {needed, available} bytes the inference thread compared when it refused this prefill, so the
+    /// client's `PrefillDoesNotFit` can quote them as the connection thread's refusal does.
+    refused_bill: ?[2]u64 = null,
     finish_reason: []const u8,
     /// Set ONLY by the degenerate-tail guard. The wire reason is "stop" so a
     /// client does not mistake the guard for output/context exhaustion; this
@@ -7370,7 +7373,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (!report.admitted) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
                     if (prefill_admission_refused_log) |report_fn| {
-                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                        slot.refused_bill = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.
