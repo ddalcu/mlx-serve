@@ -1292,6 +1292,15 @@ let gemmaModelOptions: [GemmaModelOption] = [
         sizeEstimate: "~130 GB, needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
+    // DeepSeek-V4.1-Flash (deepseek_v41) on mlx-stream: the trunk loads once, the EXL3
+    // experts stream from SSD and the Engram tables (~200 GB) stay on disk.
+    GemmaModelOption(
+        id: "deepseek-v41-flash-exl3",
+        displayName: "DeepSeek-V4.1-Flash (streaming repack, EXL3 3.0 bpw)",
+        repoId: "OpensourceWTF/DeepSeek-V4.1-Flash-streaming-repack-exl3-3.0bpw",
+        sizeEstimate: "~426 GB on disk (experts stream from SSD), needs 128 GB RAM",
+        minHostRamBytes: 128 * (UInt64(1) << 30)
+    ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
     GemmaModelOption(
         id: "hy3-oq2e",

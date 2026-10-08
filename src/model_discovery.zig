@@ -47,6 +47,7 @@ const supported_model_types = [_][]const u8{
     "nemotron_h",
     "bert",
     "deepseek_v4",
+    "deepseek_v41", // DeepSeek-V4.1-Flash (src/deepseek_v41.zig; the EXL3 repack on mlx-stream)
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
@@ -2136,6 +2137,7 @@ test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
     // its path is answered 404 instead of cold-loading it.
     try testing.expect(isSupportedModelType("glm5_next"));
     try testing.expect(isSupportedModelType("glm5_next_text"));
+    try testing.expect(isSupportedModelType("deepseek_v41"));
 }
 
 test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {

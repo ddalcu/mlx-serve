@@ -2513,3 +2513,24 @@ Fix: `probeModelDir` accepts a `.gguf` file (refusing mmproj/tokenizer/MTP sidec
 embedding GGUFs), and `registerByPath` names it by its stem, as `--model` does; the pill
 counts that stem as the picked model. Guards: `registerByPath takes a .gguf file`,
 `tests/test_llama_gguf.sh` [8], `testAGgufQuantShowsItsOwnLabelNotTheFileStemTheServerNamesItBy`.
+
+## MiniMax-H3 admitted a canvas it could not hold and died mid-step (#764)
+
+Defect: on a 48 GB M5 Pro, a 1536x672 x 124-frame H3 run loaded the text encoder and the DiT,
+then failed on the first denoising step with an uncatchable Metal `Insufficient Memory`;
+960x544 at the same length ran fine. The preflight printed the same `media peak ~18.05 GB`
+for every request.
+
+Cause: the only gate was the per-model one, `h3PeakBytes`, which bills a flat
+`H3_ACTIVATION_BYTES` measured at 768x448. The per-step working set grows with the packed
+sequence (measured ~384 KiB a row), and the default fast recipe keeps an attention output per
+block for the attention broadcast: `num_layers x hidden_size` bf16 a row, ~525 KiB. At
+~40k rows that is 46 GB against 32 GB free; `handleVideoH3` checked the prompt, the LoRAs, the
+/32 grid and the transport cap, never memory.
+
+Fix: `h3RequestRows` (latent frames x the 32-pixel grid + stereo audio + a frame per keyframe)
+and `h3ActivationBytes` (base + rows x per-row bytes, plus the broadcast term when `resolveSpeed`
+turns it on) bill the request before any stage loads. The same term prices the resident set in
+`h3ResidentFor`, so a warm engine yields to a canvas it cannot hold, and `handleVideoH3` refuses
+the staged plan by name, quoting the need and the free memory. Guards: `h3 request rows`,
+`h3 request bill`, `h3 residency is priced on the request's activations`.

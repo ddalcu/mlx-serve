@@ -261,14 +261,15 @@ class DownloadManager: ObservableObject {
         // to load while `mlx-serve pull` (a denylist) got it. Torch/flax shadow
         // weights stay out on both sides — same rule as `cli.shouldDownload`,
         // keep them in sync.
-        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin"]
+        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin", "u32"]
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
             // Depth gate. Variant: exactly the named subfolder's own files
             // (`4bit/config.json`), never anything deeper. Chat default:
             // top-level files + the pack's `drafter/` + the MTP sidecar (native
-            // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`). Media (recursive): keep nested
+            // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`) + DeepSeek-V4.1's
+            // `engram/` tables (same list as `cli.shouldDownload`). Media (recursive): keep nested
             // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
             // speech_tokenizer).
             if let folder = selection.packFolder {
@@ -278,7 +279,7 @@ class DownloadManager: ObservableObject {
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
-                    || path == "optiq/mtp.safetensors" else { return nil }
+                    || path.hasPrefix("engram/") || path == "optiq/mtp.safetensors" else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }

@@ -65,6 +65,7 @@ let supportedModelTypes: Set<String> = [
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
+    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/deepseek_v41.zig), the EXL3 repack on mlx-stream
     "gpt_oss",
 ]
 

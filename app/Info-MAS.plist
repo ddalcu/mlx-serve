@@ -18,6 +18,7 @@
 	<array>
 		<string>en</string>
 		<string>zh-Hans</string>
+		<string>ko</string>
 	</array>
 	<key>CFBundleName</key>
 	<string>MLX-Serve</string>

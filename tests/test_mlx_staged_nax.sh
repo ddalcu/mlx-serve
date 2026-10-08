@@ -16,6 +16,8 @@
 #   4. libmlxc.dylib links the staged libmlx, not /opt/homebrew's bottle
 #   5. the .version stamp exists (build-mlx.sh provenance)
 #   6. if zig-out/bin/mlx-serve is built: it links no Homebrew mlx/mlx-c
+#   7. ... and when it loads @rpath/libmlx.dylib itself (the mlx-stream shims), its own rpaths reach libmlx in both
+#      shipped layouts, so the packaging scripts need not rewire it
 #
 # Usage: ./tests/test_mlx_staged_nax.sh
 
@@ -94,6 +96,16 @@ if [ -f "$BIN" ]; then
     ok "mlx-serve minos is $BIN_MINOS"
   else
     fail "mlx-serve minos is '$BIN_MINOS' — must be >= 26.2 (build.zig os_version_min must match the libmlx floor)"
+  fi
+  if otool -L "$BIN" | grep -q "@rpath/libmlx.dylib"; then
+    RPATHS=$(otool -l "$BIN" | awk '/LC_RPATH/{f=1} f && / path /{print $2; f=0}')
+    for want in "@executable_path/../Frameworks" "@executable_path/lib"; do
+      if echo "$RPATHS" | grep -qx "$want"; then
+        ok "mlx-serve reaches libmlx through rpath $want"
+      else
+        fail "mlx-serve loads @rpath/libmlx.dylib but has no rpath $want (the app keeps it in Frameworks/, the CLI zip in lib/)"
+      fi
+    done
   fi
 else
   echo "  NOTE: $BIN not built — linkage + minos checks skipped (build with: zig build -Doptimize=ReleaseFast)"

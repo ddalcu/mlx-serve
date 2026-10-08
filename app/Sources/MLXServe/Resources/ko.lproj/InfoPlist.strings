@@ -1,0 +1,7 @@
+/* MLX-Serve 한국어 — Info.plist 문구 */
+
+"CFBundleDisplayName" = "MLX-Serve";
+"NSAppleEventsUsageDescription" = "MLX-Serve는 에이전트 모드에서 AppleScript로 Safari 및 기타 앱을 제어합니다.";
+"NSLocalNetworkUsageDescription" = "MLX-Serve는 설정에서 LAN 공유를 켠 경우에만 로컬 네트워크를 사용합니다. Bonjour로 공유하도록 선택한 모델을 알리고 다른 Mac이 공유한 모델을 찾습니다. 어떤 데이터도 네트워크 밖으로 나가지 않습니다.";
+"NSMicrophoneUsageDescription" = "MLX-Serve는 멀티모달 모델(예: Gemma 4 12B)이 사용자의 음성을 듣고 응답할 수 있도록 마이크 오디오를 녹음합니다.";
+"NSSpeechRecognitionUsageDescription" = "MLX-Serve는 음성 모드에서 Apple의 기기 내 음성 인식을 사용하여 인터넷 연결 없이도 손을 쓰지 않고 모델과 대화할 수 있게 합니다. 오디오는 Mac에서만 받아쓰며, 이 앱은 기기 내 인식을 강제하여 음성을 Apple 서버로 절대 보내지 않습니다. (위 문구는 이 권한에 대한 Apple의 표준 안내입니다.)";

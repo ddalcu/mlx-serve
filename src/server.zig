@@ -14,6 +14,8 @@ const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
 const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
+const dsv41_mod = @import("deepseek_v41.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
@@ -629,11 +631,10 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
     return mtp_loaded or dsv4_stages;
 }
 
-/// Does this model serve DeepSeek-V4 with DSpark draft stages loaded?
+/// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
 fn dsv4DraftStages(lm: *LoadedModel) bool {
     const x = lm.transformer orelse return false;
-    const d = x.dsv4 orelse return false;
-    return d.n_mtp > 0;
+    return x.dsparkStages() > 0;
 }
 
 /// Can this model run an MTP-flagged request speculatively? Either a qwen
@@ -3332,6 +3333,7 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
+    if (config.dsv41_stream) return mlx_stream.contextLength(config);
     if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
     // Not pinned yet (a discovery stub that was never loaded): compute from
@@ -5433,6 +5435,10 @@ pub fn dsv4PrefillMemoryNeeded(seq: u64, layers: u64, latent: u64, hidden: u64, 
     return (kv_bytes + gather + 3 * mlp + PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4;
 }
 
+pub fn dsv41PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
+    return dsv41_mod.prefillBytes(config, seq, chunk, PREFILL_RUNTIME_FLOOR_BYTES);
+}
+
 /// Per-TOKEN bytes of prefill working set that live OUTSIDE the MLP envelope,
 /// because the arch runs streams the envelope does not model. MEASURED as the
 /// slope of peak-above-steady-state against the prefill chunk (M4 Max,
@@ -5870,6 +5876,8 @@ pub fn prefillNeededAtChunk(
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
+    if (config.dsv41_stream) return 0; // billed at construction (`mlx_stream.loadBytes`)
+    if (config.isDsv41()) return dsv41PrefillMemoryNeeded(config, seq, chunk);
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         (seq +| @min(@as(u64, max_tokens), transformer_mod.KVCache.RESERVE_GEN_HEADROOM)) *| config.drafter_ctx_bytes_per_token;
@@ -9629,8 +9637,11 @@ fn handleNonStreamingCompletion(
         "null";
     defer if (!std.mem.eql(u8, lp_json, "null")) allocator.free(lp_json);
 
+    // The usage object is chat completions' (`formatChatUsage`): prompt_tokens_details.cached_tokens always present.
+    const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
+    defer allocator.free(usage_obj);
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}}}
     , .{
         nowMs(stream.io),
         nowSecs(stream.io),
@@ -9639,9 +9650,7 @@ fn handleNonStreamingCompletion(
         lp_json,
         finish_reason,
         finishDetailsField(finish_reason, result.finish_details),
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.prompt_tokens + result.completion_tokens,
+        usage_obj,
     });
     defer allocator.free(response);
 
@@ -9843,9 +9852,11 @@ fn handleStreamingCompletion(
         // Usage rides its own empty-choices chunk (OpenAI's stream_options
         // shape) — never the finish chunk, so the ending is stated once.
         if (include_usage) {
+            const usage_obj = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
+            defer allocator.free(usage_obj);
             const usage_chunk = try std.fmt.allocPrint(allocator,
-                \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-            , .{ cmpl_id, created_ts, model_name, total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
+                \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{s}}}
+            , .{ cmpl_id, created_ts, model_name, usage_obj });
             defer allocator.free(usage_chunk);
             logHttpSseData(usage_chunk);
             try stream.writeAllNoFlush("data: ");
@@ -22693,6 +22704,31 @@ test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, no
     try t.expect(dsv4PrefillMemoryNeeded(40960, 43, 512, 4096, 12288, 512, 641) > 6 * 1024 * 1024 * 1024);
 }
 
+test "dsv41PrefillMemoryNeeded: state per compressed token, the chunk's stream, one span's transients" {
+    const t = std.testing;
+    const config = try model_mod.parseConfigFromJson(t.allocator, model_mod.dsv41_release_config);
+    const gb: u64 = 1 << 30;
+    const bill = struct {
+        fn f(cfg: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
+            return dsv41PrefillMemoryNeeded(cfg, seq, chunk);
+        }
+    }.f;
+    // A short prompt is the runtime floor and one span, nowhere near a
+    // dense 40-layer 512-wide KV bill.
+    try t.expect(bill(&config, 64, 4096) < gb);
+    // The chunk's stream rides every layer: a wider chunk costs its rows.
+    const d4 = bill(&config, 32768, 4096);
+    const d8 = bill(&config, 32768, 8192);
+    try t.expect(d8 > d4 + 4096 * 4 * 5120 * 2 * 2);
+    // 1M tokens of context: ~3.2 KB per token of compressed caches plus the
+    // [span, entries] index scores, bounded, never [span, heads, entries].
+    const far = bill(&config, 1 << 20, 4096);
+    try t.expect(far > (1 << 20) * 3200);
+    try t.expect(far < 16 * gb);
+    // The one estimator the guard reads.
+    try t.expectEqual(far, prefillNeededAtChunk(&config, 1 << 20, 256, 16, 4096, .{}));
+}
+
 test "checkAttentionMemory routes deepseek_v4 through its own estimator with the REAL sub-chunk" {
     // The estimator existing proves nothing if the call site keeps handing
     // dsv4 to the generic bill (the attn_keys scan-test class). Needles are
@@ -23047,6 +23083,7 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
         \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
     , with_details);
 }
+
 
 test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
     const a = testing.allocator;

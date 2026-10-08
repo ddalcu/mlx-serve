@@ -264,7 +264,7 @@ pub fn isTorchShadowBin(path: []const u8) bool {
 
 pub fn shouldDownload(path: []const u8) bool {
     if (std.mem.indexOfScalar(u8, path, '/')) |_| {
-        const sidecar_dirs = [_][]const u8{ "mtp/", "drafter/", "g2p/", "speech_tokenizer/" };
+        const sidecar_dirs = [_][]const u8{ "mtp/", "drafter/", "g2p/", "speech_tokenizer/", "engram/" };
         for (sidecar_dirs) |d| {
             if (std.mem.startsWith(u8, path, d)) break;
         } else return false;
@@ -950,6 +950,12 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(!shouldDownload("pytorch_model-00001-of-00002.bin"));
     try testing.expect(!shouldDownload("consolidated.pth"));
     try testing.expect(!shouldDownload("flax_model.msgpack"));
+    // DeepSeek-V4.1 repack: Engram tables in `engram/`, the token map a `.u32`.
+    try testing.expect(shouldDownload("engram/engram-L1.bin"));
+    try testing.expect(shouldDownload("engram-token-map.u32"));
+    try testing.expect(shouldDownload("experts.bin"));
+    try testing.expect(!shouldDownload("receipts/convert.json"));
+    try testing.expect(!shouldDownload("encoding/encoding.py"));
 }
 
 test "cli: a media pack's pull keeps its component folders (#362)" {

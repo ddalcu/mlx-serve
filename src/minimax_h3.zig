@@ -3552,9 +3552,9 @@ pub const GenRequest = struct {
     seed: u64 = 0,
     shift_video: f64 = SIGMA_SHIFT_VIDEO,
     shift_audio: f64 = SIGMA_SHIFT_AUDIO,
-    /// Fast recipe switch: null/true = ON (the default), false = full-quality
-    /// per-step compute (every forward, dense attention branch every step).
-    fast: ?bool = null,
+    /// The recipe `resolveSpeed` picked from the request's `fast`, `turbo` and the env; the
+    /// caller bills its attention cache before the run, so both read one answer.
+    speed: SpeedConfig = resolveSpeed(null, false, null, null),
     /// Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): 4-8 step
     /// sampling instead of ~30. Requires `paths.turbo_lora`; forces the fast
     /// recipe OFF (its slow-drift premise is false at giant steps) and switches
@@ -4419,8 +4419,8 @@ fn generateOne(
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
-        const speed = resolveSpeed(req.fast, req.turbo, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
-        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any}, turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.fast, req.turbo });
+        const speed = req.speed;
+        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.turbo });
         const bcast_k: u32 = speed.bcast_k;
         var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
@@ -5143,7 +5143,7 @@ test "minimax h3 live: generates a clip" {
 }
 
 /// libc getenv, matching generate.zig's allocator-free env idiom.
-fn envStr(name: [:0]const u8) ?[]const u8 {
+pub fn envStr(name: [:0]const u8) ?[]const u8 {
     const raw = std.c.getenv(name.ptr) orelse return null;
     const slice = std.mem.sliceTo(raw, 0);
     return if (slice.len == 0) null else slice;

@@ -183,6 +183,24 @@ pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_m
 
 // IO
 pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
+pub const mlx_io_reader = extern struct { ctx: ?*anyopaque = null };
+/// A custom reader's callbacks over its own descriptor (mlx/c/io_types.h `mlx_io_vtable`).
+pub const mlx_io_vtable = extern struct {
+    is_open: *const fn (?*anyopaque) callconv(.c) bool,
+    good: *const fn (?*anyopaque) callconv(.c) bool,
+    tell: *const fn (?*anyopaque) callconv(.c) usize,
+    seek: *const fn (?*anyopaque, i64, c_int) callconv(.c) void,
+    read: *const fn (?*anyopaque, [*]u8, usize) callconv(.c) void,
+    read_at_offset: *const fn (?*anyopaque, [*]u8, usize, usize) callconv(.c) void,
+    write: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+    label: *const fn (?*anyopaque) callconv(.c) [*:0]const u8,
+    free: *const fn (?*anyopaque) callconv(.c) void,
+};
+pub extern "c" fn mlx_io_reader_new(desc: ?*anyopaque, vtable: mlx_io_vtable) mlx_io_reader;
+pub extern "c" fn mlx_io_reader_free(io: mlx_io_reader) c_int;
+pub extern "c" fn mlx_load_safetensors_reader(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, in_stream: mlx_io_reader, s: mlx_stream) c_int;
+pub extern "c" fn mlx_einsum(res: *mlx_array, subscripts: [*:0]const u8, operands: mlx_vector_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_slice_update_dynamic(res: *mlx_array, src: mlx_array, update: mlx_array, start: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_save_safetensors(file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) c_int;
 
 // ── Ops ──
@@ -255,6 +273,12 @@ pub extern "c" fn mlx_var_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepd
 pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_view(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_to_fp8(res: *mlx_array, x: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_from_fp8(res: *mlx_array, x: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_bitwise_and(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_left_shift(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_right_shift(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_array_equal(res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) c_int;
@@ -288,6 +312,7 @@ pub extern "c" fn mlx_gather_qmm(res: *mlx_array, x: mlx_array, w: mlx_array, sc
 pub extern "c" fn mlx_gather_mm(res: *mlx_array, a: mlx_array, b: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, sorted_indices: bool, s: mlx_stream) c_int;
 
 // Dequantize (fallback)
+pub extern "c" fn mlx_from_fp8(res: *mlx_array, x: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
 pub extern "c" fn mlx_dequantize(res: *mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, dtype: mlx_optional_dtype, s: mlx_stream) c_int;
 
 // Quantize (affine group-wise). Returns a vector_array of [q, scales, biases].

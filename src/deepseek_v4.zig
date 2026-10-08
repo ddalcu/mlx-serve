@@ -1284,7 +1284,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
 /// tok/s, 0.5 → 29.9, 0.9 (the reference default) → 25.3. The reference's
 /// engine has a far cheaper per-forward floor, which is what makes the same
 /// threshold pay there. Port, measure, let the number pick the default.
-fn dsparkConfThreshold() f32 {
+pub fn dsparkConfThreshold() f32 {
     var p: f32 = 0;
     if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_CONF")) |v| {
         p = std.fmt.parseFloat(f32, std.mem.span(v)) catch 0;

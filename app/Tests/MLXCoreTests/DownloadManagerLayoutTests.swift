@@ -145,6 +145,24 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(paths.contains("flax_model.msgpack"))
     }
 
+    /// DeepSeek-V4.1's repack keeps its Engram tables in `engram/` and its token map as a `.u32`;
+    /// same rule as `cli.shouldDownload`.
+    func testSelectNeededFilesIncludesDsv41EngramAndTokenMap() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 4_000],
+            ["path": "experts.bin", "type": "file", "size": 204_535_234_560],
+            ["path": "engram-token-map.u32", "type": "file", "size": 517_120],
+            ["path": "engram/engram-manifest.json", "type": "file", "size": 2_000],
+            ["path": "engram/engram-L1.bin", "type": "file", "size": 101_377_628_352],
+            ["path": "engram/engram-residents.safetensors", "type": "file", "size": 90_000_000],
+            ["path": "receipts/convert.json", "type": "file", "size": 1_000],
+            ["path": "encoding/encoding.py", "type": "file", "size": 40_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+        XCTAssertEqual(paths, ["config.json", "experts.bin", "engram-token-map.u32", "engram/engram-manifest.json",
+                               "engram/engram-L1.bin", "engram/engram-residents.safetensors"])
+    }
+
     /// oMLX OptiQ repos ship the MTP head as `optiq/mtp.safetensors` (a sibling
     /// of mlx-serve's `mtp/` layout) alongside `optiq/optiq_vision.safetensors`.
     /// The head must be pulled (server auto-loads it, delta-norms folded at load)

@@ -279,6 +279,17 @@ and associated regression tests in `src/generate.zig` and `src/scheduler.zig`
 are adapted from Sushi commit 09e6d4792e6178b864b809299d53dbd05cd054cd.
 
 --------------------------------------------------------------------------------
+mlx-stream
+https://github.com/davidtai/mlx-stream
+Copyright (c) 2026 David Tai
+Licensed under the MIT License (the permission and warranty terms in LICENSE).
+
+`lib/mlx-stream`, built into the macOS server: DeepSeek-V4.1's EXL3 streaming
+repack (its arch, Metal kernels, EXL3 decoder and SSD expert streamer). Its own
+NOTICE lists the material it incorporates (MLX's steel headers, ExLlamaV3's
+EXL3 format).
+
+--------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)
 https://github.com/maderix/h3.c-ane
 https://github.com/maderix/ANE
@@ -647,6 +658,14 @@ and they are listed because they made that work possible.
   * DeepSeek's `inference/model.py` and `encoding_dsv4.py`, shipped with the
     DeepSeek-V4-Flash release, the reference for the `deepseek_v4` architecture
     and its chat template.
+  * DeepSeek's `inference/model.py`, `inference/engram.py` and
+    `encoding/encoding.py` (MIT), shipped with the DeepSeek-V4.1-Flash release,
+    the reference for the `deepseek_v41` architecture, its Engram hash, its
+    Engram token map (`src/fixtures/dsv41_engram_token_map.bin`, derived from
+    the tokenizer by `build_compressed_token_map`) and its chat template. PipeNetwork's `deepseek-v41-mlx` kernel stub runs that
+    reference on CPU as the parity oracle (`tests/dump_dsv41_fixtures.py`).
+    The Engram hash multipliers reproduce NumPy's `default_rng` (BSD-3-Clause:
+    SeedSequence, PCG64, bounded integers) in `src/dsv41_engram.zig`.
   * The diffusers `minimax-music3-integration` branch (Apache-2.0, The MiniMax
     Team + The HuggingFace Team), the reference for the `minimax_music3`
     architecture: its prompt-normalization contract, the hierarchical AR loop,

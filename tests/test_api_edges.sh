@@ -150,6 +150,12 @@ FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J
 req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"The capital of France is\",\"max_tokens\":32,\"temperature\":0,\"ignore_eos\":true}"
 FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J 'd["usage"]["completion_tokens"]')
 [[ "$FR" == length && "$NT" == 32 ]] && ok "ignore_eos on /v1/completions runs to max_tokens" || bad "ignore_eos completions" "fr=$FR tokens=$NT"
+# /v1/completions usage is chat completions' shape: prompt_tokens_details.cached_tokens, streamed or not.
+CT=$(echo "$BODY" | J 'd["usage"]["prompt_tokens_details"]["cached_tokens"]')
+[[ "$CT" =~ ^[0-9]+$ ]] && ok "/v1/completions usage carries cached_tokens" || bad "/v1/completions cached_tokens" "$(echo "$BODY" | head -c 200)"
+CT=$(curl -s -m 120 -X POST "$BASE/v1/completions" -H 'Content-Type: application/json' --data-binary '{"model":"m","prompt":"The capital of France is","max_tokens":8,"temperature":0,"stream":true,"stream_options":{"include_usage":true}}' \
+    | python3 -c 'import sys,json; print(next(json.loads(l[6:])["usage"]["prompt_tokens_details"]["cached_tokens"] for l in sys.stdin if l.startswith("data: {") and "\"usage\"" in l))' 2>/dev/null)
+[[ "$CT" =~ ^[0-9]+$ ]] && ok "/v1/completions streamed usage carries cached_tokens" || bad "/v1/completions streamed cached_tokens" "got '$CT'"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"max_tokens\":32,\"temperature\":0}"
 FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J 'd["usage"]["completion_tokens"]')
 [[ "$FR" == stop && "$NT" -lt 32 ]] && ok "without ignore_eos, EOS still stops early" || bad "eos still stops" "fr=$FR tokens=$NT"

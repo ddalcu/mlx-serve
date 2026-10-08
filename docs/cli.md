@@ -67,7 +67,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--mtp-max-depth N` | auto | Maximum MTP draft depth (1..8); every planner choice stays within the bounds. Equal min/max pins the depth, replacing `MLX_SERVE_MTP_FORCE_DEPTH`. `--mtp-depth` is the old spelling of this flag. Native head count and remaining tokens can shorten a round. |
 | `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
-| `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model) |
+| `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model). DeepSeek-V4.1 runs the stages its pack ships unless `--no-mtp` |
 | `--ssd-streaming` | off | ds4 / DeepSeek-V4-Flash GGUF only: stream expert weights from SSD instead of holding the whole model in RAM |
 | `--prefill-chunk N` | `8192` | Max tokens forwarded per prefill chunk (auto-capped further per model); lower it to cut prefill peak memory |
 | `--no-decode-attn-quant` | on | Disable the decode-only requant of dense bf16 attention weights (the "Fast decode for bf16-attention models" toggle) |

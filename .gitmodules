@@ -17,3 +17,7 @@
 [submodule "lib/mlx-serve-gguf"]
 	path = lib/mlx-serve-gguf
 	url = https://github.com/ddalcu/mlx-serve-gguf
+[submodule "lib/mlx-stream"]
+	path = lib/mlx-stream
+	url = https://github.com/davidtai/mlx-stream
+	branch = main

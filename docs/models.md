@@ -12,6 +12,7 @@
 | **Muse-Glimmer** | `muse_glimmer` | Meta's Muse-Glimmer-30B ([4-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit) / [8-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit), DFlash draft companion built in, up to 75 tok/s on M4 Max) | Harmony channels + ATEM tools | Muse ViT (images) |
 | **Ling 3.0** | `bailing_hybrid` | inclusionAI Ling 3.0, e.g. `rapid-mlx/Ling-3.0-tiny-MLX-4bit` (4.2 GB, KDA + MLA hybrid MoE) | GLM tags, thinking default on | -- |
 | **DeepSeek V4 Flash** | `deepseek_v4` | DeepSeek-V4-Flash-0731 (284B-A13B, 1M ctx) — **native MLX** for safetensors builds, embedded [ds4](https://github.com/antirez/ds4) for `.gguf` | DSV4 + DSML tools | -- |
+| **DeepSeek V4.1 Flash** | `deepseek_v41` | DeepSeek-V4.1-Flash: the MLX packs (pipenetwork's REAP50, Jundot's oQ) and the OpensourceWTF EXL3 streaming repack on mlx-stream (experts stream from SSD; a 128 GB Mac serves it). Engram tables stay on disk | V4.1 DSML tools, thinking default on, effort low/medium/high/max | -- |
 | **Inkling Small** | `inkling_mm_model` | Thinking Machines Inkling Small (276B-A12B MoE, 2-bit) | role-less channel messages | -- |
 | **Hunyuan 3** | `hy_v3` | `Hy3-295B-Instruct` (295B-A21B MoE, 2-bit) | Hunyuan tags | -- |
 | **Laguna** | `laguna` | poolside Laguna S 2.1 / XS (117.6B-A8.5B MoE coder, nvfp4) | GLM tags, pre-opened think | -- |

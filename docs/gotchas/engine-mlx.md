@@ -5634,3 +5634,16 @@ Guard: `dflash: a load-time quantized linear no longer pins its bf16 source in t
 - Guard: `scheduler.decode-end checkpoint: taken only where the live state is the committed
   prefix`, `prefix_cache.spec adoption: a decode-end restore one row past the history carries
   that row`; `tests/test_cache_reuses_generated_tokens.sh` with a hybrid `CACHE_GEN_TEST_MODEL`.
+## A compiled region re-read its captured weights from disk on every call (2026-10-07)
+
+Defect: DeepSeek-V4.1 on pipenetwork's REAP50 pack (152 GiB of weights) spent five minutes in its warm-up, then ran out of GPU memory at about 200 GiB active.
+Cause: the per-layer decode regions are `mlx_compile`d closures that read their layer's weights from the model instead of taking them as inputs. The weights were still lazy safetensors loads when the first call traced them, so the compiled tape held the `Load` nodes: every call read each weight from disk into a fresh buffer, and the model's own arrays never received data.
+Fix: `deepseek_v41.evalWeights` evaluates every array the model reads at the end of `init`, one layer per eval.
+Guard: `dsv41 init: every weight the model reads is evaluated before a region traces it` (DSV41_TINY). A closure that captures arrays needs them evaluated before its first call.
+
+## A pack near the RAM size was compressed while it loaded, then killed (2026-10-07)
+
+Defect: the full Jundot oQ3e pack (231 GiB resident on a 256 GB Mac, preflight passed) died with `Killed: 9` during its load, and macOS showed "out of application memory".
+Cause: V4.1 evaluates its weights at init, before any GPU work. MLX's own reader left every shard's pages in the file cache beside the buffers, and buffers enter the residency set only once a wired limit is set and become resident (wired) only when a command buffer runs: until then they are ordinary pages, and the kernel compressed them (148 GB) instead of dropping the cache.
+Fix: V4.1 packs load through `nocache_reader` (F_NOCACHE, page-aligned stages), and `deepseek_v41.wireLoaded` applies the residency policy and runs a one-op command buffer after each layer: wired memory climbs with the load (233 GB), nothing is compressed.
+Guard: `nocache reader: tensors load byte-identical to MLX's own reader`; live, `test_dsv41.sh` on the full pack with a compressor watchdog. Tell: `vm_stat` wired flat at a few GB while the footprint climbs.

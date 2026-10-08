@@ -121,6 +121,8 @@ pub fn build(b: *std.Build) void {
     // src/ane_stub.c on Linux. The stub selection reads this option, NOT `ios`
     // — `ios` keeps its own meaning (low-mem policy, sandboxing assumptions).
     build_options.addOption(bool, "macos_engines", true);
+    // DeepSeek-V4.1's EXL3 repack through mlx-stream (macOS only; Linux and iOS build the stub).
+    build_options.addOption(bool, "mlx_stream", true);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
@@ -205,6 +207,7 @@ pub fn build(b: *std.Build) void {
     addLlamaLib(b, mod);
     addGgufModule(b, mod, target, optimize);
     addExl3Module(b, mod, target, optimize);
+    addMlxStreamModule(b, mod, target, optimize);
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -276,6 +279,7 @@ pub fn build(b: *std.Build) void {
     addLlamaLib(b, test_mod);
     addGgufModule(b, test_mod, target, optimize);
     addExl3Module(b, test_mod, target, optimize);
+    addMlxStreamModule(b, test_mod, target, optimize);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -314,6 +318,18 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    {
+        const t = addMlxStreamTests(b, target, optimize, test_filter, macos_sdk_frameworks, "src/tests.zig", "mlx-stream-test");
+        test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        const run = b.addRunArtifact(t);
+        test_step.dependOn(&run.step);
+        b.step("mlx-stream-test", "Run the mlx-stream plugin's tests").dependOn(&run.step);
+        // Its own binary (the last test checks that nothing in it created a Metal device), outside `zig build test`:
+        // it recompiles every plugin file's tests.
+        const conf = b.addRunArtifact(addMlxStreamTests(b, target, optimize, null, macos_sdk_frameworks, "src/conformance.zig", "mlx-stream-conformance"));
+        conf.setEnvironmentVariable("MLX_DEFAULT_DEVICE", "cpu");
+        b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite (CPU lane, no device)").dependOn(&conf.step);
+    }
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
@@ -393,6 +409,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "macos_engines", false);
+    build_options.addOption(bool, "mlx_stream", false);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
@@ -589,6 +606,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     // member named 'mas'/...").
     ios_options.addOption(bool, "mas", true);
     ios_options.addOption(bool, "macos_engines", false);
+    ios_options.addOption(bool, "mlx_stream", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
@@ -791,6 +809,69 @@ fn ggufRoot(b: *std.Build) std.Build.LazyPath {
     const dir = b.option([]const u8, "gguf-dir", "mlx-serve-gguf checkout to build against (default: lib/mlx-serve-gguf)");
     gguf_root = if (dir) |d| .{ .cwd_relative = b.pathJoin(&.{ d, "src/root.zig" }) } else b.path("lib/mlx-serve-gguf/src/root.zig");
     return gguf_root.?;
+}
+
+/// mlx-stream (its own repo, `-Dmlx-stream-dir=/abs/path`): DeepSeek-V4.1's EXL3
+/// streaming repack on the plugin's own arch and kernels (`src/arch/mlx_stream.zig`).
+/// Its contract types are its own `sdk` module; both reach the host through `mlx_host`.
+fn addMlxStreamModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    host.addImport("mlx_stream", mlxStreamPkg(b, host, mlxStreamDir(b), "src/root.zig", target, optimize, false));
+}
+
+fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inject: bool) *std.Build.Module {
+    const sdk = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ dir, "sdk/root.zig" }) },
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    const m = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ dir, root }) },
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "mlx_host", .module = host }, .{ .name = "sdk", .module = sdk } },
+    });
+    // The read pool (pthreads, pread into slot rows), its MTLSharedEvent signal (non-ARC objc), and the MLX
+    // event / alloc shims, which include the staged MLX's private headers and link libmlx.
+    const csrc = b.pathJoin(&.{ dir, "csrc" });
+    const c: []const []const u8 = if (inject) &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } else &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    const cxx: []const []const u8 = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" };
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_lookahead4_exl3.c" }) }, .flags = c });
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_event_shim.mm" }) }, .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_event_shim.cpp" }) }, .flags = cxx });
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_alloc_shim.cpp" }) }, .flags = cxx });
+    m.addIncludePath(.{ .cwd_relative = csrc });
+    m.addIncludePath(b.path("lib/mlx/include"));
+    m.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
+    m.addIncludePath(b.path("lib/mlxc-src"));
+    m.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
+    // The shims make the server load @rpath/libmlx.dylib itself: the app bundle keeps it in Contents/Frameworks/, the
+    // CLI zip in lib/ beside the binary.
+    m.addRPath(.{ .cwd_relative = "@executable_path/../Frameworks" });
+    m.addRPath(.{ .cwd_relative = "@executable_path/lib" });
+    return m;
+}
+
+/// One of the plugin's own test roots (src/tests.zig, src/conformance.zig) over the host surface plugins import
+/// (`src/plugin_host.zig`), with the read pool's scripted faults.
+fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: ?[]const u8, frameworks: ?[]const u8, root: []const u8, name: []const u8) *std.Build.Step.Compile {
+    const host = b.createModule(.{ .root_source_file = b.path("src/plugin_host.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
+    addMlxLib(b, host);
+    if (frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
+    for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
+    const m = mlxStreamPkg(b, host, mlxStreamDir(b), root, target, optimize, true);
+    return b.addTest(.{ .name = name, .root_module = m, .filters = if (filter) |f| &.{f} else &.{} });
+}
+
+/// The plugin checkout: `-Dmlx-stream-dir`, else the `lib/mlx-stream` submodule. `b.option` may be declared
+/// once; the graphs share this answer.
+var mlx_stream_dir: ?[]const u8 = null;
+fn mlxStreamDir(b: *std.Build) []const u8 {
+    if (mlx_stream_dir == null) mlx_stream_dir = b.option([]const u8, "mlx-stream-dir", "mlx-stream checkout to build DeepSeek-V4.1's EXL3 repack from (default: lib/mlx-stream)") orelse
+        b.pathJoin(&.{ b.root.root_dir.path orelse ".", "lib/mlx-stream" });
+    return mlx_stream_dir.?;
 }
 
 /// lib/sushi: EXL3 routed experts, Sushi's `sushi_exl3` module. It reaches

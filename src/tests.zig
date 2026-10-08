@@ -4,6 +4,7 @@
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
 pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
+pub const mtp_acceptance = @import("mtp_acceptance.zig");
 pub const log = @import("log.zig");
 
 test {
@@ -40,6 +41,7 @@ test {
     _ = @import("moe_fp4.zig");
     _ = @import("mimo_mtp.zig");
     _ = @import("glm_mtp.zig");
+    _ = @import("sushi_pack.zig");
     _ = @import("dec_attn.zig");
     _ = @import("nax_attention.zig");
     _ = @import("glm5_next.zig");
@@ -67,6 +69,9 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
+    _ = @import("dsv41_engram.zig");
+    _ = @import("nocache_reader.zig");
+    _ = @import("deepseek_v41.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");

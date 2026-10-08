@@ -425,6 +425,22 @@ const corpus = [_]Expect{
         .last_tool_arg_value = "b.txt",
     },
     .{
+        // DeepSeek-V4.1 spells every DSML tag name with a leading space.
+        .family = "dsv41-dsml",
+        .name = "V4.1 spaced DSML tags after thinking",
+        .raw = "The user wants weather.</think>I'll check.\n\n<｜DSML｜ calls>\n" ++
+            "<｜DSML｜ invoke name=\"get_weather\">\n" ++
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n" ++
+            "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n" ++
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        .thinking = true,
+        .opened_by_template = true,
+        .reasoning_contains = "wants weather",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+    },
+    .{
         .family = "dsv4-dsml",
         .name = "server-cut DSML value ships completed pairs, never the fragment",
         .raw = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n" ++

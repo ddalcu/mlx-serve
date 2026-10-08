@@ -307,7 +307,7 @@ struct VoiceGenView: View {
         Button { toggleDictation() } label: {
             HStack(spacing: 5) {
                 Image(systemName: dictating ? "microphone.fill" : "microphone")
-                Text(dictating ? "Listening…" : "Speak it")
+                Text(L10n.text(dictating ? "Listening…" : "Speak it"))
                 if dictating { Image(systemName: "stop.fill") }
             }
             .font(.app(.caption))

@@ -35,6 +35,7 @@ pub const panic = std.debug.simple_panic;
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
 pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
+pub const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const model_discovery = @import("model_discovery.zig");

@@ -4,6 +4,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
+const sushi_pack = @import("sushi_pack.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
@@ -326,6 +327,9 @@ pub const ModelConfig = struct {
     /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the
     /// config does.
     ngram_table_path: ?[]const u8 = null,
+    /// deepseek_v41: the pack's directory, where its Engram tables sit beside
+    /// the weights. Set by `parseConfig`.
+    dsv41_dir: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
     // softplus(fp32) → per-head scalar × attn output (reshaped [..,H,D]) before
@@ -439,6 +443,33 @@ pub const ModelConfig = struct {
     dsv4_dspark_markov_rank: u32 = 0,
     dsv4_dspark_target_layers: [8]u8 = @splat(0),
     dsv4_n_dspark_target_layers: u32 = 0,
+
+    // DeepSeek-V4.1 (deepseek_v41) on top of the dsv4_* block: only the
+    // `kv_sources` layers compress KV and only the `index_sources` run an
+    // indexer; every other compressed layer reads the latest source at or
+    // above it. The candidate source pools its scores into blocks that later
+    // index sources mask with. Engram adds an n-gram table lookup to the
+    // stream before its layers; the DSpark head has its own MoE size.
+    dsv41_kv_sources: u64 = 0, // bit i = layer i
+    dsv41_index_sources: u64 = 0,
+    dsv41_candidate_source: i32 = -1,
+    dsv41_candidate_topk_blocks: u32 = 0,
+    dsv41_candidate_block_size: u32 = 0,
+    dsv41_engram_layers: [4]u8 = @splat(0),
+    dsv41_engram_rows: [4]u64 = @splat(0),
+    dsv41_n_engram_layers: u32 = 0,
+    dsv41_engram_max_ngram: u32 = 0,
+    dsv41_engram_vocab_size: u64 = 0,
+    dsv41_engram_n_heads: u32 = 0,
+    dsv41_engram_head_dim: u32 = 0,
+    dsv41_engram_pad_id: u32 = 0,
+    dsv41_engram_compressed_vocab: u32 = 0,
+    dsv41_dspark_experts: u32 = 0,
+    dsv41_dspark_top_k: u32 = 0,
+    /// The pack's routed experts are an EXL3 bank (`experts.bin`, the OpensourceWTF
+    /// streaming repack): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its
+    /// weights. Set by `parseConfig`.
+    dsv41_stream: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -698,6 +729,7 @@ pub const ModelConfig = struct {
     /// freezing at `index_topk`. A checkpoint declaring no ratios stays dense —
     /// an arch we cannot bound must never be billed as though we had.
     pub fn prefillAttnKeys(self: *const ModelConfig, seq: u64) u64 {
+        if (self.isDsv41()) return @min(seq, @as(u64, self.sliding_window) + self.dsv4_index_topk + 1);
         if (!std.mem.eql(u8, self.model_type, "deepseek_v4")) return seq;
         const n = @min(self.dsv4_n_compress_ratios, self.dsv4_compress_ratios.len);
         if (n == 0) return seq;
@@ -887,6 +919,18 @@ pub const ModelConfig = struct {
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        // DeepSeek-V4.1 grows only its KV sources' compressed latents and index
+        // keys (bf16); the window is a fixed ring per slot.
+        if (self.isDsv41()) {
+            var sum: u64 = 0;
+            for (0..self.num_hidden_layers) |l| {
+                const r: u64 = self.dsv4_compress_ratios[l];
+                if (r == 0 or (self.dsv41_kv_sources >> @intCast(l)) & 1 == 0) continue;
+                sum += self.head_dim / r;
+                if ((self.dsv41_index_sources >> @intCast(l)) & 1 != 0) sum += self.dsv4_index_head_dim / r;
+            }
+            return sum * 2;
+        }
         // GLM-5-Next stores one latent row plus the indexer's key and gate per token.
         if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * (self.dsa_kv_lora_rank + 2 * self.dsa_index_head_dim) * 2;
         // An arch that declares its own V width (MiMo) also varies KV heads per
@@ -1041,6 +1085,10 @@ pub const ModelConfig = struct {
 
     pub fn isGlm5(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "glm5_next");
+    }
+
+    pub fn isDsv41(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
 
     pub fn isMimo(self: *const ModelConfig) bool {
@@ -1350,6 +1398,8 @@ pub const ModelConfig = struct {
         if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
         // glm5_next: the template opens `<think>` on every assistant turn too.
         if (self.isGlm5()) return true;
+        // deepseek_v41: DeepSeek's template defaults `thinking_mode` to thinking.
+        if (self.isDsv41()) return true;
 
         return false;
     }
@@ -1486,6 +1536,8 @@ pub const ModelConfig = struct {
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
+        if (self.dsv41_dir) |p| allocator.free(p);
+        self.dsv41_dir = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
     }
@@ -1507,6 +1559,12 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
+    if (config.isDsv41()) {
+        config.dsv41_dir = try allocator.dupe(u8, model_dir);
+        const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
+        defer allocator.free(bank);
+        config.dsv41_stream = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
+    }
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
@@ -2030,6 +2088,13 @@ fn refuseUnconvertedMimo(cfg_obj: std.json.ObjectMap) !void {
         log.err("mimo_v2: this is the original release; convert it first with tests/convert_mimo_v2.py\n", .{});
         return error.UnconvertedMimoCheckpoint;
     }
+}
+
+/// A Sushi pack's `expert_quant` makes its routed experts EXL3 banks.
+fn parseSushiExperts(root: std.json.ObjectMap, config: *ModelConfig) !void {
+    if (jsonField(root, "expert_quant") == null) return;
+    config.exl3 = try sushi_exl3.parseExpertQuant(root);
+    try sushi_exl3.admitTopK(config.num_experts_per_tok);
 }
 
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
@@ -2958,6 +3023,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (jsonField(cfg_obj, "hc_eps")) |v| config.dsv4_hc_eps = try jsonFloat(v);
         // The GLM-5-Next vision tower is not wired.
         config.has_vision = false;
+        try parseSushiExperts(root, &config);
     } else if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "mimo_v2_flash")) {
         // Xiaomi MiMo-V2.6-Flash (309B-A15B) in the mlx-lm layout (tests/convert_mimo_v2.py,
         // the community packs); `mimo_v2_flash` is MiMo-V2-Flash and TensorFold's V2.6 label.
@@ -2966,7 +3032,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // layers 8 KV heads at theta 1e4 with sinks; K 192 / V 128, RoPE on the
         // first int(192 * 0.334) = 64 channels. Experts: laguna's sigmoid routing
         // with a selection-only bias and no shared expert; dense layers lead.
-        try refuseUnconvertedMimo(cfg_obj);
+        // A Sushi pack's `quant_method: fp8` describes its trunk; its experts are EXL3.
+        if (jsonField(root, "expert_quant") == null) try refuseUnconvertedMimo(cfg_obj);
         config.model_type = "mimo_v2";
         config.weight_prefix = "model";
         config.norm_has_offset = false;
@@ -3033,6 +3100,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.rope_scaling_factor = 1.0;
         // The MiMo-ViT tower is not wired: the generic vision_config block must not arm SigLIP.
         config.has_vision = false;
+        try parseSushiExperts(root, &config);
     } else if (std.mem.eql(u8, model_type, "hy_v3")) {
         // Tencent Hunyuan 3 (Hy3, 295B-A21B MoE; July 2026). Pure
         // full-attention MoE that rides the qwen3_moe forward arms: GQA with
@@ -3545,13 +3613,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 return error.UnsupportedInklingConfig;
             }
         }
-    } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
+    } else if (std.mem.eql(u8, model_type, "deepseek_v4") or std.mem.eql(u8, model_type, "deepseek_v41")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
         // inference/{model,kernel}.py (torch). Loaded from OUR converted
         // mixed-quant mirror (tests/convert_dsv4_weights.py) — bare
-        // inference-style tensor names, stacked expert banks.
-        config.model_type = "deepseek_v4";
+        // inference-style tensor names, stacked expert banks. V4.1 shares
+        // these fields and adds the dsv41_* block below.
+        const is_v41 = std.mem.eql(u8, model_type, "deepseek_v41");
+        config.model_type = if (is_v41) "deepseek_v41" else "deepseek_v4";
         config.weight_prefix = ""; // release ships bare names (embed.weight, layers.N....)
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -3649,25 +3719,25 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // refuse to load, not run silently wrong.
         if (jsonField(cfg_obj, "scoring_func")) |v| {
             if (v == .string and !std.mem.eql(u8, v.string, "sqrtsoftplus")) {
-                log.err("deepseek_v4: scoring_func '{s}' not supported (sqrtsoftplus only)\n", .{v.string});
-                return error.UnsupportedDsv4Config;
+                log.err("{s}: scoring_func '{s}' not supported (sqrtsoftplus only)\n", .{ config.model_type, v.string });
+                return if (is_v41) error.UnsupportedDsv41Config else error.UnsupportedDsv4Config;
             }
         }
         if (jsonField(cfg_obj, "topk_method")) |v| {
             if (v == .string and !std.mem.eql(u8, v.string, "noaux_tc")) {
-                log.err("deepseek_v4: topk_method '{s}' not supported (noaux_tc only)\n", .{v.string});
-                return error.UnsupportedDsv4Config;
+                log.err("{s}: topk_method '{s}' not supported (noaux_tc only)\n", .{ config.model_type, v.string });
+                return if (is_v41) error.UnsupportedDsv41Config else error.UnsupportedDsv4Config;
             }
         }
         if (jsonField(cfg_obj, "n_shared_experts")) |v| {
             if (v == .integer and v.integer != 1) {
-                log.err("deepseek_v4: n_shared_experts {d} not supported (exactly 1)\n", .{v.integer});
-                return error.UnsupportedDsv4Config;
+                log.err("{s}: n_shared_experts {d} not supported (exactly 1)\n", .{ config.model_type, v.integer });
+                return if (is_v41) error.UnsupportedDsv41Config else error.UnsupportedDsv4Config;
             }
         }
         if (config.num_key_value_heads != 1) {
-            log.err("deepseek_v4: num_key_value_heads {d} not supported (single shared KV latent)\n", .{config.num_key_value_heads});
-            return error.UnsupportedDsv4Config;
+            log.err("{s}: num_key_value_heads {d} not supported (single shared KV latent)\n", .{ config.model_type, config.num_key_value_heads });
+            return if (is_v41) error.UnsupportedDsv41Config else error.UnsupportedDsv4Config;
         }
         // The July-31 release supersedes the preview, and the preview's
         // single next-token MTP module is no longer supported — its draft
@@ -3678,8 +3748,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // layers with no DSpark descriptor; say so instead of loading a model
         // whose draft weights we would silently ignore.
         if (config.dsv4_mtp_layers > 0 and config.dsv4_dspark_block_size == 0) {
-            log.err("deepseek_v4: this is the superseded PREVIEW checkpoint (num_nextn_predict_layers={d}, no dspark_* config). Use DeepSeek-V4-Flash-0731 or later.\n", .{config.dsv4_mtp_layers});
-            return error.UnsupportedDsv4Config;
+            log.err("{s}: this is the superseded PREVIEW checkpoint (num_nextn_predict_layers={d}, no dspark_* config). Use DeepSeek-V4-Flash-0731 or later.\n", .{ config.model_type, config.dsv4_mtp_layers });
+            return if (is_v41) error.UnsupportedDsv41Config else error.UnsupportedDsv4Config;
+        }
+        if (is_v41) {
+            // Text-only: the vision tower is never loaded.
+            config.has_vision = false;
+            try parseDsv41Fields(cfg_obj, &config);
         }
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
@@ -4048,6 +4123,105 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     return config;
 }
 
+/// V4.1's fields beyond the shared dsv4 block, refused by name where the
+/// forward could not serve them: every compressed layer must find a source of
+/// its own ratio at or above it (the reference reads whichever source ran
+/// last, so a mismatch would silently attend over the wrong cache).
+fn parseDsv41Fields(cfg_obj: std.json.ObjectMap, config: *ModelConfig) !void {
+    const refuse = struct {
+        fn f(comptime fmt: []const u8, args: anytype) error{UnsupportedDsv41Config} {
+            log.err("deepseek_v41: " ++ fmt ++ "\n", args);
+            return error.UnsupportedDsv41Config;
+        }
+    }.f;
+    const n_layers = config.num_hidden_layers;
+    if (n_layers == 0 or n_layers > 64 or config.dsv4_n_compress_ratios < n_layers) return refuse("{d} layers with {d} compress ratios", .{ n_layers, config.dsv4_n_compress_ratios });
+    if (config.dsv4_hc_mult != 4) return refuse("hc_mult {d} (only 4 is served)", .{config.dsv4_hc_mult});
+    const layerMask = struct {
+        fn f(obj: std.json.ObjectMap, key: []const u8, n: u32) !u64 {
+            var mask: u64 = 0;
+            const v = jsonField(obj, key) orelse return 0;
+            for ((try jsonValue(.array, v)).items) |item| {
+                const l = try jsonU32(item);
+                if (l >= n) return refuse("{s} names layer {d} of {d}", .{ key, l, n });
+                mask |= @as(u64, 1) << @intCast(l);
+            }
+            return mask;
+        }
+    }.f;
+    config.dsv41_kv_sources = try layerMask(cfg_obj, "kv_source_layer_ids", n_layers);
+    config.dsv41_index_sources = try layerMask(cfg_obj, "index_source_layer_ids", n_layers);
+    if (jsonField(cfg_obj, "candidate_source_layer_id")) |v| config.dsv41_candidate_source = std.math.cast(i32, try jsonValue(.integer, v)) orelse return error.InvalidConfigField;
+    if (jsonField(cfg_obj, "candidate_topk_blocks")) |v| config.dsv41_candidate_topk_blocks = try jsonU32(v);
+    if (jsonField(cfg_obj, "candidate_block_size")) |v| config.dsv41_candidate_block_size = try jsonU32(v);
+
+    const ratios = config.dsv4_compress_ratios[0..n_layers];
+    const has = struct {
+        fn f(mask: u64, l: usize) bool {
+            return (mask >> @intCast(l)) & 1 != 0;
+        }
+    }.f;
+    var last_kv: ?usize = null;
+    var last_owner: ?usize = null;
+    var last_index: ?usize = null;
+    for (ratios, 0..) |r, l| {
+        if (r > 2) return refuse("layer {d}: compress ratio {d} (modes 0, 1, 2 are served)", .{ l, r });
+        const kv = has(config.dsv41_kv_sources, l);
+        const ix = has(config.dsv41_index_sources, l);
+        if (r == 0) {
+            if (kv or ix) return refuse("layer {d}: a source without compression", .{l});
+            continue;
+        }
+        if (kv) last_kv = l;
+        if (kv and ix) last_owner = l;
+        if (ix) last_index = l;
+        const src = last_kv orelse return refuse("layer {d}: no KV source at or above it", .{l});
+        if (ratios[src] != r) return refuse("layer {d} (ratio {d}) would read layer {d}'s ratio-{d} cache", .{ l, r, src, ratios[src] });
+        if (ix) {
+            const owner = last_owner orelse return refuse("layer {d}: no index-key owner at or above it", .{l});
+            if (ratios[owner] != r) return refuse("layer {d} would score layer {d}'s keys", .{ l, owner });
+        } else if (last_index == null) return refuse("layer {d}: no index source at or above it", .{l});
+    }
+    if (config.dsv41_candidate_source >= 0) {
+        const c: usize = @intCast(config.dsv41_candidate_source);
+        if (c >= n_layers or !has(config.dsv41_index_sources, c)) return refuse("candidate source {d} is not an index source", .{c});
+        if (config.dsv41_candidate_topk_blocks == 0 or config.dsv41_candidate_block_size == 0) return refuse("candidate source without blocks", .{});
+    }
+
+    if (jsonField(cfg_obj, "engram_layer_ids")) |v| {
+        const items = (try jsonValue(.array, v)).items;
+        if (items.len > config.dsv41_engram_layers.len) return refuse("{d} engram layers", .{items.len});
+        for (items, 0..) |item, i| {
+            const l = try jsonU32(item);
+            if (l >= n_layers) return refuse("engram layer {d} of {d}", .{ l, n_layers });
+            config.dsv41_engram_layers[i] = @intCast(l);
+        }
+        config.dsv41_n_engram_layers = @intCast(items.len);
+    }
+    if (config.dsv41_n_engram_layers > 0) {
+        const rows_v = jsonField(cfg_obj, "engram_num_embeddings") orelse return refuse("engram without engram_num_embeddings", .{});
+        const rows = (try jsonValue(.array, rows_v)).items;
+        if (rows.len != config.dsv41_n_engram_layers) return refuse("{d} engram tables for {d} layers", .{ rows.len, config.dsv41_n_engram_layers });
+        for (rows, 0..) |item, i| config.dsv41_engram_rows[i] = std.math.cast(u64, try jsonValue(.integer, item)) orelse return error.InvalidConfigField;
+        if (jsonField(cfg_obj, "engram_max_ngram_size")) |x| config.dsv41_engram_max_ngram = try jsonU32(x);
+        if (jsonField(cfg_obj, "engram_vocab_size")) |x| config.dsv41_engram_vocab_size = std.math.cast(u64, try jsonValue(.integer, x)) orelse return error.InvalidConfigField;
+        if (jsonField(cfg_obj, "engram_n_heads")) |x| config.dsv41_engram_n_heads = try jsonU32(x);
+        if (jsonField(cfg_obj, "engram_head_dim")) |x| config.dsv41_engram_head_dim = try jsonU32(x);
+        if (jsonField(cfg_obj, "engram_pad_token_id")) |x| config.dsv41_engram_pad_id = try jsonU32(x);
+        if (jsonField(cfg_obj, "engram_compressed_vocab_size")) |x| config.dsv41_engram_compressed_vocab = try jsonU32(x);
+        if (config.dsv41_engram_max_ngram < 2 or config.dsv41_engram_max_ngram > 8 or
+            config.dsv41_engram_n_heads == 0 or config.dsv41_engram_n_heads > 16 or
+            config.dsv41_engram_head_dim == 0 or config.dsv41_engram_head_dim % 32 != 0 or
+            config.dsv41_engram_compressed_vocab == 0 or config.dsv41_engram_vocab_size == 0)
+            return refuse("engram geometry ({d}-grams, {d} heads x {d})", .{ config.dsv41_engram_max_ngram, config.dsv41_engram_n_heads, config.dsv41_engram_head_dim });
+    }
+    if (jsonField(cfg_obj, "dspark_n_routed_experts")) |v| config.dsv41_dspark_experts = try jsonU32(v);
+    if (jsonField(cfg_obj, "dspark_num_experts_per_tok")) |v| config.dsv41_dspark_top_k = try jsonU32(v);
+    for (config.dsv4_dspark_target_layers[0..config.dsv4_n_dspark_target_layers]) |l| {
+        if (l >= n_layers) return refuse("DSpark target layer {d} of {d}", .{ l, n_layers });
+    }
+}
+
 fn jsonValue(comptime tag: std.meta.Tag(std.json.Value), v: std.json.Value) !@TypeOf(@field(@as(std.json.Value, undefined), @tagName(tag))) {
     if (v != tag) return error.InvalidConfigField;
     return @field(v, @tagName(tag));
@@ -4119,6 +4293,13 @@ pub const Weights = struct {
             _ = mlx.mlx_array_free(p.*);
             p.* = arr;
         }
+    }
+
+    /// Drop `name` and free its array (a loader that copied it elsewhere lets the original go).
+    pub fn remove(self: *Weights, name: []const u8) void {
+        const kv = self.map.fetchRemove(name) orelse return;
+        _ = mlx.mlx_array_free(kv.value);
+        self.allocator.free(kv.key);
     }
 
     pub fn count(self: *const Weights) u32 {
@@ -4203,10 +4384,34 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false };
+/// `dsv41` also reads past the page cache (`nocache_reader`): its weights all load at init, and a pack near the
+/// RAM size would have them compressed under the file cache.
+/// `index_owners`: a tensor two shards carry loads from the shard the index names.
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+
+pub const Owners = std.StringHashMapUnmanaged([]const u8);
+
+/// tensor -> shard from the index's `weight_map`, strings owned by `arena`.
+pub fn indexOwners(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) ?Owners {
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", arena, .limited(64 * 1024 * 1024)) catch return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch return null;
+    if (parsed != .object) return null;
+    const wm = parsed.object.get("weight_map") orelse return null;
+    if (wm != .object) return null;
+    var out: Owners = .empty;
+    var it = wm.object.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* != .string) continue;
+        // An owner shard that is not on disk claims nothing.
+        _ = dir.statFile(io, e.value_ptr.string, .{}) catch continue;
+        out.put(arena, e.key_ptr.*, e.value_ptr.string) catch return null;
+    }
+    return out;
+}
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
+    if (config.dsv41_stream) return Weights.init(allocator); // mlx-stream loads its own
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
     if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
@@ -4214,8 +4419,9 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4() });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null });
     errdefer weights.deinit();
+    if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
         defer reportF16Narrowing();
         resolveWeightPrefix(config, &weights);
@@ -4223,7 +4429,33 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         defer _ = mlx.mlx_stream_free(s);
         try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
     }
+    if (config.exl3 != null) {
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        try sushi_pack.adapt(config, &weights, s);
+    }
     return weights;
+}
+
+/// deepseek_v41 serves text only and reads its Engram tables from disk per
+/// lookup (~100 GB a layer), so neither the vision tower nor those tables
+/// enter the weight map.
+fn dsv41DropsKey(key: []const u8) bool {
+    return dsv41VisionKey(key) or std.mem.indexOf(u8, key, ".engram.embed.") != null;
+}
+
+pub fn dsv41VisionKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "vision.") or std.mem.startsWith(u8, key, "aligner.") or std.mem.startsWith(u8, key, "image_");
+}
+
+/// The repack keeps the Engram projections beside its tables, under `engram/`.
+fn loadDsv41Residents(io: std.Io, allocator: std.mem.Allocator, weights: *Weights, model_dir: []const u8) !void {
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/engram/engram-residents.safetensors", .{model_dir}, 0);
+    defer allocator.free(path);
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    try loadSafetensorsFile(allocator, weights, path, s, .{});
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -4275,6 +4507,10 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     var referenced = model_discovery.indexShardSet(io, dir);
     defer if (referenced) |*r| model_discovery.freeShardSet(r);
 
+    var owners_arena = std.heap.ArenaAllocator.init(allocator);
+    defer owners_arena.deinit();
+    var owners: ?Owners = if (opts.index_owners) indexOwners(io, owners_arena.allocator(), dir) else null;
+
     var file_count: u32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -4294,7 +4530,10 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFile(allocator, &weights, path, s, opts);
+        var shard_opts = opts;
+        shard_opts.shard = entry.name;
+        if (owners) |*o| shard_opts.owners = o;
+        try loadSafetensorsFile(allocator, &weights, path, s, shard_opts);
         file_count += 1;
     }
 
@@ -4434,7 +4673,10 @@ pub fn loadSafetensorsFile(
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
 
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
+    if (opts.dsv41 and comptime builtin.os.tag.isDarwin())
+        try @import("nocache_reader.zig").loadSafetensors(&tensor_map, &meta_map, path, s)
+    else
+        try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
 
     const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
@@ -4451,7 +4693,10 @@ pub fn loadSafetensorsFile(
 
         const key_str = std.mem.span(key.?);
 
-        if (!shouldKeepWeightKey(key_str, load_vision) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str))) {
+        const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
+        if (foreign or !shouldKeepWeightKey(key_str, load_vision) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
+            (opts.dsv41 and dsv41DropsKey(key_str)))
+        {
             _ = mlx.mlx_array_free(value);
             continue;
         }
@@ -4471,10 +4716,14 @@ pub fn loadSafetensorsFile(
             if (ndim == 1) narrowed_1d += 1;
         }
 
-        const owned_key = try allocator.dupe(u8, key_str);
+        // oMLX's V4.1 packs nest the text model under `language_model.`: kept under the release's names.
+        const name = if (opts.dsv41 and std.mem.startsWith(u8, key_str, dsv41_text_prefix)) key_str[dsv41_text_prefix.len..] else key_str;
+        const owned_key = try allocator.dupe(u8, name);
         try weights.map.put(owned_key, final_value);
     }
 }
+
+pub const dsv41_text_prefix = "language_model.";
 
 fn foldQwen4Norm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const one = mlx.mlx_array_new_float(1.0);
@@ -5224,6 +5473,10 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     const goss = ModelConfig{ .model_type = "gpt_oss" };
     try testing.expect(goss.defaultEnableThinking(false));
     try testing.expect(goss.defaultEnableThinking(true));
+    // deepseek_v41: DeepSeek's own template defaults `thinking_mode` to thinking.
+    const v41 = ModelConfig{ .model_type = "deepseek_v41" };
+    try testing.expect(v41.defaultEnableThinking(false));
+    try testing.expect(v41.defaultEnableThinking(true));
 }
 
 test "defaultEnableThinking: the checkpoint's own generation_config default outranks the arch allowlist" {
@@ -5913,6 +6166,41 @@ test "ModelConfig: mimo_v2 source release is refused with the converter's name" 
     try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, src));
 }
 
+test "ModelConfig: a Sushi pack's expert_quant selects EXL3 experts on mimo_v2 and glm5_next" {
+    const eq = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14},";
+    const glm = try parseConfigFromJson(testing.allocator, eq ++ glm5_next_pack_json[1..]);
+    try testing.expectEqual(@as(u32, 40), glm.exl3.?.rate.n);
+    try testing.expectEqual(sushi_exl3.format.Window.w14, glm.exl3.?.window);
+    try testing.expect((try parseConfigFromJson(testing.allocator, glm5_next_pack_json)).exl3 == null);
+
+    // The pack's `quant_method: fp8` names its trunk, so the release refusal does not fire.
+    const fp8 = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json,
+        \\"quantization_config": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    ,
+        \\"quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    );
+    defer testing.allocator.free(fp8);
+    const with_eq = try std.mem.concat(testing.allocator, u8, &.{ eq, fp8[1..] });
+    defer testing.allocator.free(with_eq);
+    const mimo = try parseConfigFromJson(testing.allocator, with_eq);
+    try testing.expect(mimo.isMimo());
+    try testing.expectEqual(sushi_exl3.format.Codebook.mcg, mimo.exl3.?.codebook);
+    try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, fp8));
+}
+
+test "indexOwners: the index names the shard a duplicated tensor loads from, an absent shard claims nothing" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "affine.safetensors", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"lm_head.weight\":\"affine.safetensors\",\"x.weight\":\"gone.safetensors\"}}" });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const owners = indexOwners(io, arena.allocator(), tmp.dir).?;
+    try testing.expectEqualStrings("affine.safetensors", owners.get("lm_head.weight").?);
+    try testing.expect(owners.get("x.weight") == null);
+}
+
 test "ModelConfig: mimo_v2_flash (MiMo-V2-Flash, TensorFold/Vontra V2.6 packs) parses as mimo_v2" {
     const flash = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json, "\"model_type\": \"mimo_v2\"", "\"model_type\": \"mimo_v2_flash\"");
     defer testing.allocator.free(flash);
@@ -6522,6 +6810,151 @@ test "ModelConfig parses deepseek_v4 (DeepSeek-V4-Flash-0731 mirror)" {
     const eos = config.eosTokenSlice();
     try testing.expectEqual(@as(usize, 1), eos.len);
     try testing.expectEqual(@as(u32, 1), eos[0]);
+}
+
+/// DeepSeek's V4.1-Flash release config (rev dba1be0a), text_config abridged
+/// to the keys the engine reads, vision_config dropped (text-only).
+pub const dsv41_release_config =
+    \\{"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41",
+    \\ "bos_token_id": 0, "eos_token_id": 1,
+    \\ "text_config": {"model_type": "deepseek_v41_text", "vocab_size": 129280, "hidden_size": 5120,
+    \\  "moe_intermediate_size": 2304, "num_hidden_layers": 40, "num_attention_heads": 64,
+    \\  "num_key_value_heads": 1, "head_dim": 512, "qk_rope_head_dim": 64, "q_lora_rank": 1280,
+    \\  "o_lora_rank": 1024, "o_groups": 8, "hidden_act": "silu", "swiglu_limit": 10.0,
+    \\  "rms_norm_eps": 1e-20, "max_position_embeddings": 1048576, "rope_theta": 10000,
+    \\  "rope_scaling": {"rope_type": "yarn", "factor": 16, "beta_fast": 32, "beta_slow": 1,
+    \\   "original_max_position_embeddings": 65536},
+    \\  "n_routed_experts": 384, "n_shared_experts": 1, "num_experts_per_tok": 6,
+    \\  "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc", "norm_topk_prob": true,
+    \\  "routed_scaling_factor": 1.5, "sliding_window": 128,
+    \\  "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    \\  "compress_rope_theta": 160000, "kv_source_layer_ids": [2, 8, 14, 20],
+    \\  "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36], "index_n_heads": 32,
+    \\  "index_head_dim": 128, "index_topk": 512, "candidate_source_layer_id": 20,
+    \\  "candidate_topk_blocks": 2048, "candidate_block_size": 8, "hc_mult": 4,
+    \\  "hc_sinkhorn_iters": 20, "hc_eps": 1e-06, "engram_layer_ids": [1, 14],
+    \\  "engram_num_embeddings": [384006168, 384016682], "engram_max_ngram_size": 4,
+    \\  "engram_vocab_size": 16000000, "engram_n_heads": 8, "engram_head_dim": 256,
+    \\  "engram_pad_token_id": 2, "engram_compressed_vocab_size": 99092,
+    \\  "num_nextn_predict_layers": 3, "dspark_block_size": 5, "dspark_noise_token_id": 128799,
+    \\  "dspark_target_layer_ids": [37, 38, 39], "dspark_markov_rank": 256,
+    \\  "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3},
+    \\ "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32}}
+;
+
+test "ModelConfig parses deepseek_v41 (DeepSeek-V4.1-Flash release)" {
+    const config = try parseConfigFromJson(testing.allocator, dsv41_release_config);
+    try testing.expectEqualStrings("deepseek_v41", config.model_type);
+    try testing.expectEqualStrings("", config.weight_prefix);
+    try testing.expect(!config.has_vision); // the tower is not served
+    try testing.expectEqual(@as(u32, 5120), config.hidden_size);
+    try testing.expectEqual(@as(u32, 40), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 512), config.head_dim);
+    try testing.expectEqual(@as(u32, 384), config.num_experts);
+    try testing.expectEqual(@as(u32, 6), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 2304), config.moe_intermediate_size);
+    try testing.expectApproxEqAbs(@as(f32, 1.5), config.router_scaling_factor, 1e-6);
+    try testing.expectEqual(@as(u32, 1280), config.dsv4_q_lora_rank);
+    try testing.expectEqual(@as(u32, 32), config.dsv4_index_n_heads);
+    try testing.expectEqual(@as(u32, 43), config.dsv4_n_compress_ratios);
+    try testing.expectEqual(@as(u8, 2), config.dsv4_compress_ratios[19]);
+    try testing.expectEqual(@as(u8, 1), config.dsv4_compress_ratios[20]);
+    try testing.expectEqual(@as(u32, 0), config.dsv4_hash_layers);
+    try testing.expectEqual(@as(u64, (1 << 2) | (1 << 8) | (1 << 14) | (1 << 20)), config.dsv41_kv_sources);
+    try testing.expectEqual(@as(u64, (1 << 2) | (1 << 8) | (1 << 14) | (1 << 20) | (1 << 24) | (1 << 28) | (1 << 32) | (1 << 36)), config.dsv41_index_sources);
+    try testing.expectEqual(@as(i32, 20), config.dsv41_candidate_source);
+    try testing.expectEqual(@as(u32, 2048), config.dsv41_candidate_topk_blocks);
+    try testing.expectEqual(@as(u32, 8), config.dsv41_candidate_block_size);
+    try testing.expectEqual(@as(u32, 2), config.dsv41_n_engram_layers);
+    try testing.expectEqual(@as(u8, 14), config.dsv41_engram_layers[1]);
+    try testing.expectEqual(@as(u64, 384016682), config.dsv41_engram_rows[1]);
+    try testing.expectEqual(@as(u32, 4), config.dsv41_engram_max_ngram);
+    try testing.expectEqual(@as(u64, 16000000), config.dsv41_engram_vocab_size);
+    try testing.expectEqual(@as(u32, 8), config.dsv41_engram_n_heads);
+    try testing.expectEqual(@as(u32, 256), config.dsv41_engram_head_dim);
+    try testing.expectEqual(@as(u32, 2), config.dsv41_engram_pad_id);
+    try testing.expectEqual(@as(u32, 99092), config.dsv41_engram_compressed_vocab);
+    try testing.expectEqual(@as(u32, 5), config.dsv4_dspark_block_size);
+    try testing.expectEqual(@as(u8, 37), config.dsv4_dspark_target_layers[0]);
+    try testing.expectEqual(@as(u32, 128), config.dsv41_dspark_experts);
+    try testing.expectEqual(@as(u32, 3), config.dsv41_dspark_top_k);
+    try testing.expect(config.rope_yarn);
+    try testing.expectEqual(@as(u32, 65536), config.yarn_orig_max_pos);
+    // A single-flight arch that never batches decode.
+    try testing.expect(!config.supportsBatchedGdnDecode());
+}
+
+test "deepseek_v41 bills its compressed caches per token, the window per slot" {
+    const config = try parseConfigFromJson(testing.allocator, dsv41_release_config);
+    // KV sources 2/8/14 keep a 512-wide latent per two tokens and 20 one per
+    // token; the same four own index keys (128 wide), all bf16.
+    try testing.expectEqual(@as(u64, 2 * (3 * 256 + 512 + 3 * 64 + 128)), config.kvBytesPerToken());
+    // Every layer reads its 128-token window plus top-512 compressed entries.
+    try testing.expectEqual(@as(u64, 128 + 512 + 1), config.prefillAttnKeys(1 << 20));
+    try testing.expectEqual(@as(u64, 32), config.prefillAttnKeys(32));
+}
+
+test "parseConfig: a deepseek_v41 pack with an EXL3 bank is mlx-stream's, and the host loads none of its weights" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = dsv41_release_config });
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var plain = try parseConfig(io, testing.allocator, dir);
+    defer plain.deinit(testing.allocator);
+    try testing.expect(!plain.dsv41_stream);
+    try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
+    var repack = try parseConfig(io, testing.allocator, dir);
+    defer repack.deinit(testing.allocator);
+    try testing.expect(repack.dsv41_stream);
+    var w = try loadModelWeights(io, testing.allocator, dir, &repack, false);
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 0), w.count());
+}
+
+test "loadWeightsOpt deepseek_v41: tensors nested under language_model. (oMLX's packs) load under the release's names" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const hdr = "{\"language_model.norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}," ++
+        "\"vision.norm.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[8,16]}}";
+    var shard: [8 + hdr.len + 16]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &shard });
+    var buf: [512]u8 = undefined;
+    var w = try loadWeightsOpt(io, testing.allocator, buf[0..try tmp.dir.realPath(io, &buf)], .{ .dsv41 = true });
+    defer w.deinit();
+    try testing.expect(w.get("norm.weight") != null);
+    try testing.expectEqual(@as(u32, 1), w.count());
+}
+
+test "ModelConfig deepseek_v41: shapes the forward does not implement are refused by name" {
+    const Case = struct { from: []const u8, to: []const u8 };
+    const cases = [_]Case{
+        .{ .from = "\"num_key_value_heads\": 1", .to = "\"num_key_value_heads\": 2" },
+        .{ .from = "\"sqrtsoftplus\"", .to = "\"softmax\"" },
+        .{ .from = "\"noaux_tc\"", .to = "\"greedy\"" },
+        // compress mode 3 (any ratio above 2)
+        .{ .from = "[0, 0, 2, 2,", .to = "[0, 0, 3, 3," },
+        // layer 2 compresses but no KV source sits at or above it
+        .{ .from = "\"kv_source_layer_ids\": [2, 8, 14, 20]", .to = "\"kv_source_layer_ids\": [8, 14, 20]" },
+        // the ratio-1 layers would read a ratio-2 source
+        .{ .from = "\"kv_source_layer_ids\": [2, 8, 14, 20]", .to = "\"kv_source_layer_ids\": [2, 8, 14]" },
+        // candidate source that is not an index source
+        .{ .from = "\"candidate_source_layer_id\": 20", .to = "\"candidate_source_layer_id\": 21" },
+        .{ .from = "\"hc_mult\": 4", .to = "\"hc_mult\": 2" },
+    };
+    for (cases) |c| {
+        const json = try std.mem.replaceOwned(u8, testing.allocator, dsv41_release_config, c.from, c.to);
+        defer testing.allocator.free(json);
+        try testing.expect(!std.mem.eql(u8, json, dsv41_release_config));
+        testing.expectError(error.UnsupportedDsv41Config, parseConfigFromJson(testing.allocator, json)) catch |e| {
+            std.debug.print("not refused: {s} -> {s}\n", .{ c.from, c.to });
+            return e;
+        };
+    }
 }
 
 test "prefillAttnKeys: dense archs bill the whole prompt, deepseek_v4 bills its sparse bound" {

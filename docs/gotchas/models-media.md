@@ -2039,3 +2039,10 @@ Defect: Llama-3.2-3B answered a 1k-token prompt and returned whitespace at 1.8k 
 Cause: two. `ModelConfig.has_sliding_window` defaults to Gemma's layout (5 sliding layers to 1 global, window 1024), and the llama-family branch never cleared it; Llama 3.x configs have no `sliding_window` key, so 5 of every 6 layers saw only the last 1024 tokens. And `rope_scaling` `rope_type: "llama3"` was read as nothing (the branch resets the factor to 1), so the low frequencies ran 32x fast.
 Fix: the llama family (llama, mistral, qwen2, qwen3, k2_horizon) is full attention in every layer, as in mlx-lm; `Llama3Rope` feeds HF's frequencies to `mlx_fast_rope`. The keys change, so llama3 packs get their own SSD cache root. Next-token logprobs now match mlx-lm within 0.1 nats at 3.8k tokens.
 Guard: `parseConfigFromJson: Llama 3.x llama3 rope_scaling …` (model.zig), `computeLlama3Freqs` golden values (transformer.zig), and the smoke matrix's ~3k-token `long prompt` check, which every short check had missed.
+
+## A Sushi MiMo pack loaded a stale bf16 copy of o_proj and the head (2026-10-07)
+
+Defect: `MiMo-V2.6-Flash-Sushi-2.3bpw` died in warmup (`quantized_matmul` "weight should be uint32 but received bfloat16"), then, once the biases bound, on a 1024-wide embedding.
+Cause: the pack's source shard still carries bf16 `o_proj`, `embed_tokens` and `lm_head` beside the affine triples in their own shards, and the loader kept whichever file the directory listed last; separately, a config with no `quantization` block (`quant_bits == 0`) made embed/head/o_proj biases read as dense.
+Fix: an EXL3 pack loads each duplicated tensor from the shard its index names (`indexOwners`); embed and head are dense by dtype, not by `quant_bits`; `getLayerBias` probes when there is no block.
+Guard: `indexOwners: the index names the shard…` (model.zig) and `sushi pack: a tensor another shard owns is not billed` (sushi_pack.zig).

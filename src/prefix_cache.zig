@@ -728,7 +728,7 @@ pub const HotPrefixCache = struct {
         // the KVCache — a snapshot restore would advance cache.step without
         // rebuilding that state. Off until dsv4 state rides the ssm-entry
         // machinery (needsSsmEntries class).
-        if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return false;
+        if (std.mem.eql(u8, config.model_type, "deepseek_v4") or config.isDsv41()) return false;
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
@@ -3033,6 +3033,8 @@ test "HotPrefixCache: shouldUse rejects deepseek_v4 (module-owned decode state)"
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "deepseek_v4";
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
+    cfg.model_type = "deepseek_v41";
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
 
