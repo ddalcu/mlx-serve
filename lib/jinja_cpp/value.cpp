@@ -275,6 +275,8 @@ const func_builtins & global_builtins() {
         }},
         {"namespace", [](const func_args & args) -> value {
             auto out = mk_val<value_object>();
+            // A namespace is not a dict: `ns.items` is its attribute, never dict.items() (Python Jinja's Namespace).
+            out->has_builtins = false;
             for (const auto & arg : args.get_args()) {
                 if (!is_val<value_kwarg>(arg)) {
                     throw raised_exception("namespace() arguments must be kwargs");

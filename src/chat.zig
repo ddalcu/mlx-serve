@@ -10025,6 +10025,27 @@ test "renderChatTemplate: |min picks the smaller element, |max the larger" {
     try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
 }
 
+test "renderChatTemplate: a namespace attribute named like a dict method is the attribute" {
+    // `ns.items` resolved to dict.items(), `+` raised, and the render fell back to the generic format.
+    const allocator = testing.allocator;
+    const tpl =
+        \\{%- set ns = namespace(items=[]) -%}
+        \\{%- for message in messages -%}{%- set ns.items = ns.items + [message.content] -%}{%- endfor -%}
+        \\ITEMS={{ ns.items | join(',') }}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .content = "there" } };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "ITEMS=hi,there") != null);
+}
+
 test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" {
     // Env-gated: HY3_MODEL_DIR=<dir containing chat_template.jinja>. Renders
     // the actual shipped template with system + tools + a tool round and
