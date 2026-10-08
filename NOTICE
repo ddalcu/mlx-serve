@@ -280,7 +280,7 @@ are adapted from Sushi commit 09e6d4792e6178b864b809299d53dbd05cd054cd.
 
 --------------------------------------------------------------------------------
 mlx-stream
-https://github.com/davidtai/mlx-stream (pinned from https://github.com/ddalcu/mlx-stream)
+https://github.com/davidtai/mlx-stream
 Copyright (c) 2026 David Tai
 Licensed under the MIT License (the permission and warranty terms in LICENSE).
 

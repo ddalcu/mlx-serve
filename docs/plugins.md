@@ -139,7 +139,7 @@ share code: each serves a different arch, and their kernels are tuned to it.
 
 ## Example: mlx-stream (arch seam)
 
-[mlx-stream](https://github.com/davidtai/mlx-stream) (pinned from our fork, `ddalcu/mlx-stream`) serves
+[mlx-stream](https://github.com/davidtai/mlx-stream) (pinned from its `main`) serves
 DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk). It owns the model: the arch, its Metal
 kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
 resume of one conversation, its weight loading past the page cache and its memory bill. Its `sdk` module (`sdk/`)
@@ -195,5 +195,5 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
 ## Status
 
 - On main: the format seam (mlx-serve-gguf); the weight-encoding seam (EXL3 from sushi).
-- With DeepSeek-V4.1: the arch seam (mlx-stream, `lib/mlx-stream` at `ddalcu/mlx-stream` branch `mlx-serve`), its
+- With DeepSeek-V4.1: the arch seam (mlx-stream, `lib/mlx-stream` at `davidtai/mlx-stream` `main`), its
   suite in `zig build test`. mlx-serve-gguf's suite runs only in its own repository today.

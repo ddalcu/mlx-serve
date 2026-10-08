@@ -14,7 +14,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`). `lib/mlx-stream` (ddalcu fork): V4.1's EXL3 repack.
+Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`). `lib/mlx-stream` (davidtai): V4.1's EXL3 repack.
 
 ## Layout (`src/`)
 
