@@ -633,6 +633,8 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
 
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
 fn dsv4DraftStages(lm: *LoadedModel) bool {
+    if (lm.config) |cfg| if (cfg.mtp_override == false) return false;
+    if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| if (v[0] == '0') return false;
     const x = lm.transformer orelse return false;
     return x.dsparkStages() > 0;
 }
@@ -7492,6 +7494,7 @@ const PropsSettings = struct {
     /// 0 = auto.
     mtp_depth: u32,
     mtp_adaptive: bool,
+    native_speculation: ?struct { lane: []const u8, block_size: u32, sampled: bool } = null,
     /// 0 = no ceiling.
     max_mtp_ctx: u32,
     drafter: []const u8,
@@ -7532,18 +7535,24 @@ fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv = configuredKvQuantFor(config);
+    const native = if (lm.transformer) |x| x.dsv41_ext else null;
     return .{
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = server_config.kv_attn_mode,
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
-        .mtp_loaded = mtpCapable(lm),
+        .mtp_loaded = lm.mtp != null or (if (lm.transformer) |x| x.dsparkStages() > 0 else false),
         .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
+        .native_speculation = if (native) |m| .{
+            .lane = mlx_stream.laneName(m),
+            .block_size = mlx_stream.blockSize(m),
+            .sampled = generate_mod.Generator.dsparkStochEnabledFromEnv(if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_STOCH")) |v| std.mem.span(v) else null),
+        } else null,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = server_config.default_enable_pld, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
@@ -7564,14 +7573,20 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    var mtp_buf: [512]u8 = undefined;
+    const mtp_json = if (st.native_speculation) |native|
+        try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":null,\"acceptance_param\":null,\"greedy_tail\":null,\"depth\":null,\"adaptive\":null,\"max_ctx\":{d},\"native\":{{\"lane\":\"{s}\",\"block_size\":{d},\"sampled_acceptance\":\"{s}\"}}}}", .{
+            st.mtp_loaded, st.mtp_default_on, st.max_mtp_ctx, native.lane, native.block_size, if (native.sampled and native.block_size > 0) "stochastic" else "off",
+        })
+    else
+        try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}}", .{
+            st.mtp_loaded, st.mtp_default_on, mtp_acceptance_mod.name(st.mtp_acceptance), param, st.mtp_greedy_tail, st.mtp_depth, st.mtp_adaptive, st.max_mtp_ctx,
+        });
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{s},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
-        st.mtp_loaded,                              st.mtp_default_on,
-        mtp_acceptance_mod.name(st.mtp_acceptance), param,
-        st.mtp_greedy_tail,                         st.mtp_depth,
-        st.mtp_adaptive,                            st.max_mtp_ctx,
+        mtp_json,
         st.drafter,                                 st.pld.enable,
         st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
@@ -17766,7 +17781,7 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.shapesLogits(), 0, requestHasCompany());
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -18126,7 +18141,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.shapesLogits(), 0, requestHasCompany());
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         const use_pld = spec.use_pld;
@@ -20901,6 +20916,33 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expect(ep.value.object.get("mtp").?.object.get("acceptance_param").? == .null);
 }
 
+test "settingsPropsJson: native lane configuration is not generic MTP or request engagement" {
+    for ([_]bool{ false, true }) |enabled| {
+        const frag = try settingsPropsJson(testing.allocator, .{
+            .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto,
+            .decode_attn_quant = false, .prefill_chunk = 8192,
+            .mtp_loaded = true, .mtp_default_on = enabled,
+            .mtp_acceptance = .exact, .mtp_greedy_tail = true, .mtp_depth = 6,
+            .mtp_adaptive = true, .max_mtp_ctx = 0,
+            .native_speculation = .{ .lane = "dspark typical 0.3", .block_size = 5, .sampled = true },
+            .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1,
+            .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0,
+        });
+        defer testing.allocator.free(frag);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+        defer parsed.deinit();
+        const mtp = parsed.value.object.get("mtp").?.object;
+        try testing.expect(mtp.get("loaded").?.bool);
+        try testing.expectEqual(enabled, mtp.get("default_on").?.bool);
+        for ([_][]const u8{ "acceptance", "acceptance_param", "greedy_tail", "depth", "adaptive" }) |key|
+            try testing.expect(mtp.get(key).? == .null);
+        const native = mtp.get("native").?.object;
+        try testing.expectEqualStrings("dspark typical 0.3", native.get("lane").?.string);
+        try testing.expectEqual(@as(i64, 5), native.get("block_size").?.integer);
+        try testing.expectEqualStrings("stochastic", native.get("sampled_acceptance").?.string);
+    }
+}
+
 test "settingsPropsJson: /props names the greedy tail" {
     for ([_]bool{ false, true }) |tail| {
         const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
@@ -23055,6 +23097,39 @@ test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
     try t.expect(defaultEnableMtp(true, false));
     // DSpark: dsv4's own stages, loaded without a qwen head.
     try t.expect(defaultEnableMtp(false, true));
+}
+
+test "native speculation: resolved opt-out gates capability and API defaults" {
+    var cfg = model_mod.ModelConfig{};
+    var native: dsv41_mod.Dsv41Model = undefined;
+    native.n_mtp = 3;
+    var xfm: Transformer = undefined;
+    xfm.config = cfg;
+    xfm.dsv4 = null;
+    xfm.dsv41 = &native;
+    xfm.dsv41_ext = null;
+    xfm.dense_attn_proj = false;
+    var lm: LoadedModel = undefined;
+    lm.config = &cfg;
+    lm.transformer = &xfm;
+    lm.mtp = null;
+    lm.llama_engine = null;
+    lm.dflash = null;
+    lm.drafter = null;
+    lm.mtp_depth = 6;
+    for ([_]?bool{ null, true, false }) |setting| {
+        cfg.mtp_override = setting;
+        xfm.config.mtp_override = setting;
+        try testing.expectEqual(setting != false, mtpCapable(&lm));
+        try testing.expectEqual(setting != false, defaultEnableMtp(false, dsv4DraftStages(&lm)));
+        const frag = try settingsPropsJson(testing.allocator, mlxPropsSettings(&lm));
+        defer testing.allocator.free(frag);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+        defer parsed.deinit();
+        const mtp = parsed.value.object.get("mtp").?.object;
+        try testing.expect(mtp.get("loaded").?.bool);
+        try testing.expectEqual(setting != false, mtp.get("default_on").?.bool);
+    }
 }
 
 test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {

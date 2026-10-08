@@ -144,7 +144,7 @@ pub const LoadParams = struct {
     /// checkpoint could carry its own, so the opt-out needs its own bit.
     no_drafter: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
-    mtp_enabled: bool = true,
+    mtp_enabled: ?bool = null,
     mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
@@ -1193,7 +1193,7 @@ pub const LoadRequest = struct {
     /// would silently drop `--dspark` on every on-demand GGUF load).
     ds4_dspark: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
-    mtp_enabled: bool = true,
+    mtp_enabled: ?bool = null,
     mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
@@ -1378,7 +1378,7 @@ pub const Scheduler = struct {
     /// the `--llama-*` flags like the `--model` primary. Pre-plumbing, the
     /// cold-load `LoadRequest` used its struct defaults, silently ignoring
     /// these flags on every on-demand load and model switch.
-    mtp_enabled: bool,
+    mtp_enabled: ?bool,
     mtp_head_kv_quant: bool,
     mtp_depth: u32,
     llama: LlamaSettings,
@@ -2783,11 +2783,11 @@ const GgufRoute = struct {
 /// Both load construction sites (here and main.zig's startup load) stamp the
 /// per-model settings onto the config the bills and defaults read.
 /// The kwargs strings MOVE to the freshly loaded `chat_config` (same allocator).
-/// `mtp_flag` false (`--no-mtp`) stamps the head off so the memory bills skip it.
-pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *model_settings.Override, mtp_flag: bool) void {
+/// An explicit MTP launch flag outranks the model's setting.
+pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *model_settings.Override, mtp_flag: ?bool) void {
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
-    config.mtp_override = o.mtp orelse if (mtp_flag) null else false;
+    config.mtp_override = mtp_flag orelse o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.int8_prefill_override = o.int8_prefill;
@@ -4052,7 +4052,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const gb = 1024.0 * 1024.0 * 1024.0;
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
-        const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
+        const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.mtp_enabled orelse params.config.mtp_override orelse true);
         const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
         const avail_bytes = availForLoad(weights_bytes);
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
@@ -4117,9 +4117,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // caches in serve mode honor this independently in `Slot.init`; this
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
-    // Per-model settings (stamped on the config at BOTH construction sites) outrank the flags.
+    // MTP's explicit launch flag wins; otherwise use the model's setting and default.
     const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
-    const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
+    const mtp_enabled = params.mtp_enabled orelse params.config.mtp_override orelse true;
     const tail_override = params.config.mtp_greedy_tail_override;
     if (mtp_enabled and (tail_override != null or generate_mod.mtp_greedy_tail_default)) log.info("[mtp] greedy tail {s} ({s})\n", .{
         if (generate_mod.mtpGreedyTailFor(tail_override)) "on" else "off",
@@ -7418,7 +7418,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         sampling,
         slot.eos_token_ids,
         .{
-            .pld_enabled = use_pld or dsv4_spec_intent,
+            .pld_enabled = use_pld,
             .drafter_enabled = use_drafter,
             .drafter = if (use_drafter) slot.drafter else null,
             .drafter_block_size = slot.drafter_block_size,
@@ -7433,7 +7433,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.enable_thinking,
                 slot.model.config.?.isMoe(),
             ),
-            .mtp_enabled = use_mtp,
+            .mtp_enabled = use_mtp or dsv4_spec_intent,
             .mtp_acceptance = slot.model.config.?.mtpAcceptance(generate_mod.mtp_acceptance_default),
             .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(slot.model.config.?.mtp_greedy_tail_override),
             .mtp = if (use_mtp) slot.mtp else null,
@@ -11429,13 +11429,16 @@ test "takeMergeable: merges the contiguous run of same-model decision jobs withi
     try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
 }
 
-test "applyModelSettings: --no-mtp stamps the head off unless the model's own setting names it" {
+test "applyModelSettings: explicit MTP flags outrank model settings" {
     var cc = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
-    for ([_]struct { flag: bool, setting: ?bool, want: ?bool }{
+    for ([_]struct { flag: ?bool, setting: ?bool, want: ?bool }{
         .{ .flag = false, .setting = null, .want = false },
-        .{ .flag = false, .setting = true, .want = true },
-        .{ .flag = true, .setting = null, .want = null },
-        .{ .flag = true, .setting = false, .want = false },
+        .{ .flag = false, .setting = true, .want = false },
+        .{ .flag = true, .setting = null, .want = true },
+        .{ .flag = true, .setting = false, .want = true },
+        .{ .flag = null, .setting = null, .want = null },
+        .{ .flag = null, .setting = false, .want = false },
+        .{ .flag = null, .setting = true, .want = true },
     }) |c| {
         var cfg = ModelConfig{};
         var o = model_settings.Override{ .mtp = c.setting };

@@ -1125,10 +1125,10 @@ and only then realizes the token and advances the grammar. Byte-identical
 greedy output; Flash Next schema decode 49 -> 53 tok/s = the serial plain rate
 (spec decode stays off under a grammar, so MTP's 65-70 is not the bar).
 
-Trap met on the way: a per-model `"mtp": true` in `model-settings.json`
-overrides `--no-mtp` on the command line, so a "plain" arm launched with the
-flag was still spec-decoding. Send `enable_mtp:false` per request, or read
-the `[spec-stats]` lines, before calling an arm serial.
+An explicit `--mtp` / `--no-mtp` outranks the model's `mtp` setting on startup
+and cold loads; absent a flag, the setting wins over the auto-load default.
+`enable_mtp:false` opts out per request, but `true` cannot re-enable a model
+disabled at launch. Guard: `applyModelSettings` precedence matrix.
 
 ## `--no-drafter` did not survive a model switch, and two flags before it didn't either (2026-08-11)
 

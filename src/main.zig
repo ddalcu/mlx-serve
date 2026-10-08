@@ -191,9 +191,8 @@ fn printUsage(io: std.Io) void {
         \\                        it DOWN). Pass to override.
         \\  --no-drafter        Never load a speculative-decoding drafter, including
         \\                      one shipped inside the checkpoint (drafter/ subdir)
-        \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
-        \\                        when the model dir ships mtp/weights.safetensors;
-        \\                        priority: MTP > drafter > PLD).
+        \\  --no-mtp            Disable native MTP / DSpark drafting, overriding
+        \\                        the model's mtp setting.
         \\  --ple-gpu           Qwen3.8-Flash-Next: gather the n-gram table on the
         \\                        GPU. Keeps the whole ~30 GB table resident beside
         \\                        the weights for a few % faster prefill/decode;
@@ -210,8 +209,8 @@ fn printUsage(io: std.Io) void {
         \\                        declines by name where the copy does not fit.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
-        \\  --mtp               No-op: a loaded MTP head drafts by default,
-        \\                        dense or MoE (--no-mtp turns it off).
+        \\  --mtp               Enable native MTP / DSpark when available,
+        \\                        overriding the model's mtp setting.
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV).
@@ -584,7 +583,7 @@ pub fn main(init: std.process.Init) !void {
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
-    var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
+    var enable_mtp: ?bool = null; // explicit flag > model setting > auto-load
     var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
     var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TOKENV3")) |v| std.mem.span(v) else null;
@@ -771,7 +770,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
-            // The default now; still accepted so existing launch lines work.
+            enable_mtp = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
@@ -1223,8 +1222,8 @@ pub fn main(init: std.process.Init) !void {
         const chosen = chooseGgufEngine(io, allocator, model_dir, engine_override);
         if (serve_mode) {
             switch (chosen) {
-                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
-                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
+                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, enable_mtp),
+                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, enable_mtp),
             }
             return;
         }
@@ -1321,7 +1320,7 @@ pub fn main(init: std.process.Init) !void {
         if (gen_mod.detectModality(io, allocator, model_dir)) |modality| {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, enable_mtp);
             return;
         }
     }
@@ -1576,8 +1575,8 @@ pub fn main(init: std.process.Init) !void {
         // file or in-checkpoint tensors in the trunk shards).
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
-        if (enable_mtp) mtp_graft.ensure(allocator, io, model_dir, config);
-        if (enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
+        if (config.mtp_override orelse true) mtp_graft.ensure(allocator, io, model_dir, config);
+        if ((config.mtp_override orelse true) and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
             if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
@@ -1869,6 +1868,7 @@ fn runGenServe(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
+    mtp_enabled: ?bool,
 ) !void {
     log.info("mlx-serve {s} (native {s} engine)\n", .{ VERSION, @tagName(modality) });
     log.info("[args] model: {s}\n", .{model_dir});
@@ -1925,6 +1925,7 @@ fn runGenServe(
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = 0,
+        .mtp_enabled = mtp_enabled,
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
@@ -1955,7 +1956,7 @@ fn runGenServe(
 /// value so its LoadParams cannot leave any of them at a struct default.
 const SpecLoadFlags = struct {
     no_drafter: bool,
-    mtp_enabled: bool,
+    mtp_enabled: ?bool,
     mtp_depth: u32,
     draft_block_size: u32,
     draft_block_size_explicit: bool,
@@ -2124,6 +2125,7 @@ fn runDs4Serve(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
+    mtp_enabled: ?bool,
 ) !void {
     var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
     defer settings.deinit(allocator);
@@ -2289,6 +2291,7 @@ fn runDs4Serve(
         .prefix_cache_mem_bytes = 0,
         // Iteration 2: tokenize cache for ds4 too.
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
+        .mtp_enabled = mtp_enabled,
         .ds4_path = gguf_path_owned,
         .ds4_ssd_streaming = ds4_ssd_streaming,
         .ds4_mtp = ds4_mtp,
@@ -2421,6 +2424,7 @@ fn runLlamaServe(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
+    mtp_enabled: ?bool,
 ) !void {
     const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
         logResolveGgufError(model_dir, err);
@@ -2563,6 +2567,7 @@ fn runLlamaServe(
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
+        .mtp_enabled = mtp_enabled,
         .llama = server_mod.llama_settings,
         .llama_path = gguf_path_owned,
         .ds4_mtp = ds4_mtp,

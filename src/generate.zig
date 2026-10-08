@@ -2551,7 +2551,10 @@ pub const Generator = struct {
             // machinery this arch cannot roll back.
             const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.dsv41_ext.?);
             const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
-            const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
+            const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
+                DsparkArm.off
+            else
+                dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
             // mlx-stream's lane samples a sampled request itself, from the request's own settings.
             const lane_sampling: ?mlx_stream.SamplingParams = if (dspark_env_off or arm == .off) null else .{
                 .temperature = sampling.temperature,
