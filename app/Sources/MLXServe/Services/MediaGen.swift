@@ -1391,14 +1391,36 @@ struct Model3DModelPreset: Identifiable, Hashable {
     static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
 }
 
-/// Which music ENGINE a checkpoint drives. The two families share the
+/// Which music ENGINE a checkpoint drives. The families share the
 /// endpoint and nothing else: ACE-Step reads the whole musical-metadata knob
-/// set, MiniMax Music 3 rejects every one of those fields BY NAME and
-/// requires lyrics — so the family gates the FIELDS (request body + sidecar),
+/// set, MiniMax Music 3 and YuE2 reject every one of those fields BY NAME and
+/// require lyrics — so the family gates the FIELDS (request body + sidecar),
 /// not just the pane's controls.
 enum MusicEngineFamily {
     case acestep
     case minimaxMusic3
+    case yue2
+}
+
+/// Whether YuE2 plans an ABC score before it sings (server `cot`). Raw values
+/// are the wire spelling.
+enum MusicPlan: String, CaseIterable, Codable {
+    case full, melody, off
+
+    var label: String {
+        switch self {
+        case .full: return "Melody + chords"
+        case .melody: return "Melody only"
+        case .off: return "No score"
+        }
+    }
+    var hint: String {
+        switch self {
+        case .full: return "The model writes a chord-annotated score first, then plays it. Best songs, and you can edit the score."
+        case .melody: return "A melody-only score, without chords. The right choice for a cover: paste the original melody below."
+        case .off: return "Straight to audio with no score. Fastest, and the least coherent."
+        }
+    }
 }
 
 /// Music-generation checkpoints (ACE-Step + MiniMax Music 3, the music arms
@@ -1442,10 +1464,15 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// MiniMax's card; its example caption reads "BPM: 96. Key: C major."").
     /// The pane used to hide them on Music 3 along with the two genuinely
     /// unsupported knobs, which read as "this model can't do tempo".
-    var supportsTempoAndKey: Bool { true }
-    /// Music 3 is lyric-conditioned; the server 400s empty lyrics. ACE-Step
-    /// defaults empty lyrics to "[Instrumental]".
-    var requiresLyrics: Bool { family == .minimaxMusic3 }
+    /// YuE2 has no tempo or key field and no caption text for them: the score
+    /// carries both, and the server names the fields a 400.
+    var supportsTempoAndKey: Bool { family != .yue2 }
+    /// Music 3 and YuE2 are lyric-conditioned; the server 400s empty lyrics.
+    /// ACE-Step defaults empty lyrics to "[Instrumental]".
+    var requiresLyrics: Bool { family != .acestep }
+    /// A wordless track: ACE-Step marks it, Music 3 asks in text. YuE2 has no
+    /// such mode, and the server names `instrumental` a 400.
+    var supportsInstrumental: Bool { family != .yue2 }
     /// Server-valid duration bounds (ACE [10,600]; Music 3 [1,360], floored
     /// at 5 for a usable slider).
     var durationRange: ClosedRange<Double> {
@@ -1456,8 +1483,11 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// ACE-Step Turbo is distillation-fixed at 8 and the server IGNORES the
     /// field there, so exposing it would be a control that visibly does
     /// nothing. `fixedSteps` stays the per-checkpoint default either way.
-    var supportsSteps: Bool { family == .minimaxMusic3 }
-    var stepsRange: ClosedRange<Int> { 4...100 }
+    var supportsSteps: Bool { family != .acestep }
+    var stepsRange: ClosedRange<Int> { family == .yue2 ? 1...100 : 4...100 }
+    /// YuE2's score: the plan mode and the ABC text that replaces the model's
+    /// own. Gates the controls AND the `cot`/`abc` fields.
+    var supportsScore: Bool { family == .yue2 }
     /// Reference audio (server `ref_audio`, #259): ACE-Step feeds a 30 s
     /// window of the clip's VAE latent into its timbre slot — ONE pooled
     /// token among hundreds of lyric/text tokens, so it is style/timbre
@@ -1514,8 +1544,22 @@ struct MusicModelPreset: Identifiable, Hashable {
         description: "MiniMax's full-song model: an 8B language model writes the music frame by frame from your style prompt and lyrics, then a diffusion decoder renders it. Slower than ACE-Step, strongest vocals."
     )
 
+    /// YuE2 3B, 8-bit — plans a score, writes semantic codec tokens, then
+    /// flow-matches 48 kHz stereo acoustics. Weights are CC BY-NC 4.0.
+    static let yue2_3B_8bit = MusicModelPreset(
+        id: "yue2-3b-8bit",
+        name: "YuE2 3B (8-bit)",
+        repo: "ddalcu/YuE2-3B-MLX-Serve-8bit",
+        family: .yue2,
+        approxRAMGB: 10,
+        approxDownloadGB: 4.5,
+        fixedSteps: 32,
+        supportsLyrics: true,
+        description: "Full songs with vocals in English and Chinese, planned from an editable score: it writes the melody and chords first, then sings them in 48 kHz stereo. Non-commercial license (CC BY-NC 4.0)."
+    )
+
     /// Catalog, best-first per family.
-    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit]
+    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit, .yue2_3B_8bit]
 }
 
 /// Text-to-audio checkpoints (Stable Audio 3), served on
@@ -1541,10 +1585,10 @@ struct SoundModelPreset: Identifiable, Hashable {
     static let stableAudio3SmallSFX = SoundModelPreset(
         id: "stable-audio-3-small-sfx",
         name: "Stable Audio 3 Small SFX",
-        repo: "stabilityai/stable-audio-3-small-sfx",
+        repo: "ddalcu/Stable-Audio-3-Small-SFX-MLX-Serve",
         approxRAMGB: 5,
         approxDownloadGB: 3.5,
-        description: "Sound effects and ambiences from a description — footsteps, rain, engines, impacts — up to two minutes, in about a second. Stability AI gates the download: accept its license on Hugging Face and sign in with a token first."
+        description: "Sound effects and ambiences from a description — footsteps, rain, engines, impacts — up to two minutes, in about a second. Mirror of Stability AI's Stable Audio 3 Small SFX (Stability AI Community License), no Hugging Face login needed."
     )
 
     static let all: [SoundModelPreset] = [.stableAudio3SmallSFX]
@@ -1570,7 +1614,7 @@ extension MusicGenRequest {
     /// answer so they cannot disagree about what is sendable.
     static func lyricsSatisfied(model: MusicModelPreset, lyrics: String,
                                 instrumental: Bool) -> Bool {
-        if !model.requiresLyrics || instrumental { return true }
+        if !model.requiresLyrics || (instrumental && model.supportsInstrumental) { return true }
         return !lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
@@ -1602,6 +1646,15 @@ enum MusicOptions {
         "[bridge]", "[instrumental]", "[solo]", "[outro]",
     ]
     static let sectionTagHint: String = sectionTags.joined(separator: " ")
+
+    /// The tags YuE2's model card writes its lyrics with, capitalized.
+    static let yue2SectionTags: [String] = [
+        "[Intro]", "[Verse]", "[Pre-Chorus]", "[Chorus]", "[Interlude]", "[Bridge]", "[Outro]",
+    ]
+
+    static func sectionTagHint(for family: MusicEngineFamily) -> String {
+        (family == .yue2 ? yue2SectionTags : sectionTags).joined(separator: " ")
+    }
 
     /// What the server accepts for `bpm`. The pane used to offer only the ten
     /// anchors below, so 92 was unaskable while the chat tool could send it.
@@ -1686,8 +1739,98 @@ struct MusicPrompt: Codable, Equatable, Identifiable {
     /// so the caption is the ONLY place its tempo, key and arrangement can be
     /// stated, and a one-liner leaves every one of those to the model.
     static func builtinStyles(for family: MusicEngineFamily) -> [MusicPrompt] {
-        family == .minimaxMusic3 ? music3Styles : builtinStyles
+        switch family {
+        case .acestep: return builtinStyles
+        case .minimaxMusic3: return music3Styles
+        case .yue2: return yue2Styles
+        }
     }
+
+    /// Lyrics starters per family: YuE2 was trained on capitalized section
+    /// tags ([Verse], [Pre-Chorus]) where the others take lowercase.
+    static func builtinLyrics(for family: MusicEngineFamily) -> [MusicPrompt] {
+        family == .yue2 ? yue2Lyrics : builtinLyrics
+    }
+
+    /// YuE2 takes a comma-separated tag line: language or genre first, then
+    /// instruments, mood and the lead vocal. Three are the model card's own.
+    static let yue2Styles: [MusicPrompt] = [
+        MusicPrompt(title: "City pop",
+            body: "City Pop, upbeat, danceable, groovy bass, electric guitar, synth, energetic, joyful, neon city night"),
+        MusicPrompt(title: "Jazz-funk",
+            body: "Jazz-funk, warm lead vocal, Rhodes piano, electric bass, tight drums"),
+        MusicPrompt(title: "Jazz ballad",
+            body: "Jazz, expressive lead vocal, piano, tenor saxophone, upright bass, brushed drums, no guitar, spacious modern harmony"),
+        MusicPrompt(title: "Indie pop",
+            body: "English, indie pop, bright acoustic guitar, soft drums, warm lead vocal"),
+    ]
+
+    /// The model card's own demo lyrics (今晚不眠), and a short English song
+    /// in the same shape.
+    static let yue2Lyrics: [MusicPrompt] = [
+        MusicPrompt(title: "Short song (English)", body: """
+            [Verse]
+            Soft morning light is touching the window
+            Coffee on the table and the radio low
+            I hear your footsteps coming down the hall
+            Every little moment feels like it is all
+
+            [Chorus]
+            Stay with the rhythm, let it carry us home
+            We are not alone, we are not alone
+            Sing it to the sky and it will sing right back
+            Stay with the rhythm, never look back
+
+            [Outro]
+            Stay with the rhythm, let it carry us home
+            """),
+        MusicPrompt(title: "今晚不眠 (Mandarin)", body: """
+            [Intro]
+
+            [Verse]
+            路灯眨着眼睛 偷看谁的身影
+            街道哼着小调 节奏多轻盈
+            晚风染成霓虹 吹乱发际线
+            脚步踩着鼓点 不需要终点
+
+            [Pre-Chorus]
+            旋转的唱片 划破了寂静
+            气泡在上升 快乐在飞行
+            把烦恼抛去 别再去在意
+            这里的空气 充满了魔力
+
+            [Chorus]
+            今晚不眠 快乐无限
+            城市在狂欢 我们在中间
+            自由摇摆 光芒盛开
+            跟着这节拍 把心打开
+
+            今晚不眠 快乐无限
+            城市在狂欢 我们在中间
+            自由摇摆 光芒盛开
+            跟着这节拍 把心打开
+
+            [Interlude]
+
+            [Bridge]
+            像橘子汽水 充满了微醺的甜
+            像流星划过 点亮了夜的天
+            不需要理由 只要你感觉
+            这一刻就是 永恒的瞬间
+
+            [Chorus]
+            今晚不眠 快乐无限
+            城市在狂欢 我们在中间
+            自由摇摆 光芒盛开
+            跟着这节拍 把心打开
+
+            [Outro]
+            霓虹色的风 吹向那梦
+            摇摆
+            闪耀
+            Yeah
+            """),
+    ]
 
     /// Built-in style-prompt starters (genre / mood / instrumentation).
     static let builtinStyles: [MusicPrompt] = [
@@ -2301,6 +2444,11 @@ struct MusicGenRequest {
     var steps: Int? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// YuE2: whether the model plans a score first, and the ABC text that
+    /// replaces its own plan (empty = let it write one). Only sent where
+    /// `supportsScore`.
+    var plan: MusicPlan = .full
+    var score: String = ""
     /// Max-quality opt-out of the server's fast recipe ("fast": false — every
     /// forward dense, ~2.8x slower at 768p, "just a smidge better").
     var bestQuality: Bool = false

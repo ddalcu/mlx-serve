@@ -23,6 +23,7 @@ const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
+const yue2 = @import("yue2.zig");
 const stable_audio = @import("stable_audio.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
@@ -107,7 +108,7 @@ pub const media_model_types = [_][]const u8{
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
     "laya",      "kev",        "clef",           "d1",
-    "stable_audio3",
+    "stable_audio3", "yue2",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -118,6 +119,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
+    if (std.mem.eql(u8, model_type, "yue2")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
@@ -155,6 +157,7 @@ pub const GenRoute = enum {
 pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "acestep")) return .music;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
+    if (std.mem.eql(u8, model_type, "yue2")) return .yue2;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .sound;
     return .tts;
@@ -169,6 +172,7 @@ pub const AudioBackendKind = enum {
     tts,
     music,
     music3,
+    yue2,
     kokoro,
     /// Stable Audio 3: text-to-audio on /v1/audio/sound-generations ("sound").
     sound,
@@ -176,7 +180,7 @@ pub const AudioBackendKind = enum {
     /// Music-generation backends serve /v1/audio/music-generations and
     /// advertise "music" beside "audio"; the TTS arms never do.
     pub fn servesMusic(self: AudioBackendKind) bool {
-        return self == .music or self == .music3;
+        return self == .music or self == .music3 or self == .yue2;
     }
 };
 
@@ -899,6 +903,7 @@ pub const AudioBackend = union(enum) {
     tts: tts.Synthesizer,
     music: *acestep.Engine,
     music3: *music3.Engine,
+    yue2: *yue2.Engine,
     kokoro: *kokoro.Engine,
     sound: *stable_audio.Engine,
 };
@@ -926,6 +931,11 @@ pub const AudioEngine = struct {
             log.info("[audio] MiniMax Music 3 engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .yue2) {
+            self.backend = .{ .yue2 = try yue2.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] YuE2 engine ready\n", .{});
+            return self;
+        }
         if (mt != null and audioBackendKindForType(mt.?) == .sound) {
             self.backend = .{ .sound = try stable_audio.Engine.load(io, allocator, model_dir) };
             log.info("[audio] Stable Audio 3 engine ready\n", .{});
@@ -948,6 +958,7 @@ pub const AudioEngine = struct {
             .tts => |*synth| synth.deinit(),
             .music => |e| e.deinit(),
             .music3 => |e| e.deinit(),
+            .yue2 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
             .sound => |e| e.deinit(),
         }
@@ -2706,7 +2717,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const synth = switch (engine.backend) {
         .tts => |*t| t,
-        .music, .music3 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
+        .music, .music3, .yue2 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
         .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
@@ -2893,6 +2904,7 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     switch (engine.backend) {
         .music => |m| return handleMusicAcestep(allocator, conn, body, m),
         .music3 => |m| return handleMusic3(allocator, conn, body, m),
+        .yue2 => |m| return handleYue2(allocator, conn, body, m),
         .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
         .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
     }
@@ -2953,7 +2965,7 @@ fn jsonWholeNumber(v: std.json.Value) ?i64 {
 pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const sa = switch (engine.backend) {
         .sound => |e| e,
-        .music, .music3 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
+        .music, .music3, .yue2 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
         .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
     };
     const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (a description of the sound)");
@@ -2986,6 +2998,11 @@ pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 
 /// A generated WAV: raw `audio/wav`, or the base64 SSE `complete` event.
 fn sendWav(allocator: std.mem.Allocator, conn: *Conn, wav: []const u8, want_stream: bool) !void {
+    return sendWavWith(allocator, conn, wav, want_stream, "");
+}
+
+/// `extra` is a JSON fragment (`,"key":value`) spliced into the streaming `complete` event.
+fn sendWavWith(allocator: std.mem.Allocator, conn: *Conn, wav: []const u8, want_stream: bool, extra: []const u8) !void {
     if (want_stream) {
         const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
         const b64 = try allocator.alloc(u8, b64_len);
@@ -2993,7 +3010,9 @@ fn sendWav(allocator: std.mem.Allocator, conn: *Conn, wav: []const u8, want_stre
         _ = std.base64.standard.Encoder.encode(b64, wav);
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
-        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\"");
+        try out.appendSlice(allocator, extra);
+        try out.appendSlice(allocator, ",\"data\":\"");
         try out.appendSlice(allocator, b64);
         try out.appendSlice(allocator, "\"}\n\n");
         try conn.writeAll(out.items);
@@ -3285,6 +3304,94 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     defer allocator.free(wav);
     log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
     return sendWav(allocator, conn, wav, want_stream);
+}
+
+/// `POST /v1/audio/music-generations` on YuE2: `{"model", "prompt" (style tags, REQUIRED),
+/// "lyrics" (REQUIRED; `[Verse]`-style section tags on their own lines), "cot" ("full" default |
+/// "melody" | "off": whether the model plans an ABC score first), "abc" (your own or edited
+/// score, replaces the planning; needs cot melody|full), "seed", "duration_seconds" (an UPPER
+/// bound, default 360 — the model ends the song itself), "steps" (flow-matching midpoint steps,
+/// default 32, 1-100), "cfg_scale" (0-20, default 1.0; 1.01 for cot off), "stream"}`. Response
+/// mirrors the other music backends; the streaming `complete` event also carries the score as
+/// `abc`. ACE-Step's musical-metadata, reference-audio and cover fields are named 400s.
+fn handleYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *yue2.Engine) !void {
+    for ([_][]const u8{ "bpm", "keyscale", "timesignature", "vocal_language", "ref_audio", "src_audio", "task", "instrumental" }) |field| {
+        if (std.mem.indexOf(u8, body, field) == null) continue;
+        const present = extractJsonString(body, field) != null or extractJsonInt(body, field) != null or sse.bodyWantsTrue(body, field);
+        if (present) {
+            var msg: [200]u8 = undefined;
+            const m = std.fmt.bufPrint(&msg, "'{s}' is not supported by YuE2 (style and lyrics go in 'prompt' and 'lyrics'; a cover needs your own melody score in 'abc')", .{field}) catch "unsupported field";
+            return sendError(conn, 400, m);
+        }
+    }
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style tags: genre, instruments, mood, vocal)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+    const raw_lyrics = extractJsonString(body, "lyrics") orelse return sendError(conn, 400, "missing 'lyrics' (YuE2 is lyric-conditioned; structure tags like [Verse] go on their own lines)");
+    const lyrics = try jsonUnescape(allocator, raw_lyrics);
+    defer allocator.free(lyrics);
+    if (std.mem.trim(u8, lyrics, " \t\r\n").len == 0) return sendError(conn, 400, "empty 'lyrics'");
+
+    const cot = if (extractJsonString(body, "cot")) |c| (yue2.Cot.parse(c) orelse return sendError(conn, 400, "'cot' must be one of full, melody, off")) else yue2.Cot.full;
+    var abc: ?[]u8 = null;
+    defer if (abc) |t| allocator.free(t);
+    if (extractJsonString(body, "abc")) |raw| {
+        abc = try jsonUnescape(allocator, raw);
+        if (std.mem.trim(u8, abc.?, " \t\r\n").len == 0) return sendError(conn, 400, "empty 'abc'");
+        if (cot == .off) return sendError(conn, 400, "'abc' needs 'cot' melody or full — cot off renders without a score");
+    }
+    const seconds: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse yue2.MAX_SECONDS);
+    if (seconds < yue2.MIN_SECONDS or seconds > yue2.MAX_SECONDS) return sendError(conn, 400, "'duration_seconds' must be in [5,360]");
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse yue2.DEFAULT_STEPS);
+    if (steps < 1 or steps > yue2.MAX_STEPS) return sendError(conn, 400, "'steps' must be in [1,100]");
+    var cfg_scale: ?f32 = null;
+    if (extractJsonFloat(body, "cfg_scale")) |g| {
+        if (!(g >= 0 and g <= yue2.MAX_CFG)) return sendError(conn, 400, "'cfg_scale' must be in [0,20]");
+        cfg_scale = @floatCast(g);
+    }
+
+    const req = yue2.Request{
+        .style = prompt,
+        .lyrics = lyrics,
+        .cot = cot,
+        .abc = abc,
+        .seed = extractJsonInt(body, "seed") orelse 831001,
+        .cfg_scale = cfg_scale,
+        .steps = steps,
+        .max_frames = seconds * yue2.FRAME_RATE,
+    };
+    // A clean named 400 before any SSE byte goes out, not a mid-stream error.
+    if (!try engine.fits(allocator, req)) return sendError(conn, 400, "style + lyrics + score leave no room in the 24576-token context");
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[yue2] generating: cot={s} up to {d}s steps={d} seed={d} lyrics={d}ch abc={} stream={}\n", .{ @tagName(cot), seconds, steps, req.seed, lyrics.len, abc != null, want_stream });
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const song = engine.generate(allocator, req, prog) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[yue2] generation cancelled by client\n", .{});
+            return;
+        }
+        log.err("[yue2] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "music generation failed");
+            return;
+        }
+        return sendError(conn, 500, "music generation failed");
+    };
+    defer allocator.free(song.wav);
+    defer if (song.abc) |t| allocator.free(t);
+    log.info("[yue2] -> {d} WAV bytes\n", .{song.wav.len});
+    var extra: std.ArrayList(u8) = .empty;
+    defer extra.deinit(allocator);
+    if (song.abc) |score| {
+        try extra.appendSlice(allocator, ",\"abc\":");
+        try chat_mod.appendJsonString(allocator, &extra, score);
+    }
+    return sendWavWith(allocator, conn, song.wav, want_stream, extra.items);
 }
 
 /// POST /v1/video/generations — base64 RGB8 frames (or SSE progress + complete).
@@ -4716,6 +4823,11 @@ pub const H3_ACTIVATION_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// bf16 frame-hidden buffer (~0.6 GB), and DiT/vocoder window transients.
 pub const MUSIC3_GEN_BUFFER_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
+/// YuE2's non-weight working set at the 9000-frame cap: two AR K/V caches (~115 KB a token each,
+/// ~4 GB with a long score), then the NAR prefix K/V (~1.5 GB) + canvas activations and one f32
+/// VAE tile (~3 GB). The stages run one after another; billed at the larger.
+pub const YUE2_GEN_BUFFER_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
 /// The DiT term of the H3 bill. `precompute` mirrors
 /// MINIMAX_H3_ADALN_PRECOMPUTE: with it off the modulation weights are never
 /// freed and the whole file stays resident, so the shed size would under-bill
@@ -4850,6 +4962,11 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         const sum = sumSafetensorsIn(io, dir);
         if (sum == 0) return 0; // unknown dir -> never block
         return sum + MUSIC3_GEN_BUFFER_BYTES;
+    }
+    if (std.mem.eql(u8, model_type, "yue2")) {
+        const sum = sumSafetensorsIn(io, dir);
+        if (sum == 0) return 0; // unknown dir -> never block
+        return sum + YUE2_GEN_BUFFER_BYTES;
     }
     if (std.mem.eql(u8, model_type, "AudioVideo")) {
         // Both variants ship; only one is ever loaded. Subtract the smaller so
@@ -5662,12 +5779,14 @@ test "GenRoute: speech + music share the audio modality slot" {
 test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(audioBackendKindForType("acestep") == .music);
     try testing.expect(audioBackendKindForType("minimax_music3") == .music3);
+    try testing.expect(audioBackendKindForType("yue2") == .yue2);
     try testing.expect(audioBackendKindForType("qwen3_tts") == .tts);
     try testing.expect(audioBackendKindForType("gemma4") == .tts);
     // Both music engines serve /v1/audio/music-generations and advertise the
     // "music" capability; TTS backends never do.
     try testing.expect(AudioBackendKind.music.servesMusic());
     try testing.expect(AudioBackendKind.music3.servesMusic());
+    try testing.expect(AudioBackendKind.yue2.servesMusic());
     try testing.expect(!AudioBackendKind.tts.servesMusic());
     try testing.expect(!AudioBackendKind.kokoro.servesMusic());
 }
@@ -5695,6 +5814,20 @@ test "stable_audio3 is a sound backend on its own route, with named bounds" {
         const msg = parseSoundParams(a, c[0]).bad;
         try testing.expect(std.mem.indexOf(u8, msg, c[1]) != null);
     }
+}
+
+test "estimatePeakResidentBytes: yue2 bills the sum plus its generation working set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const b100: [100]u8 = @splat('x');
+    const b40: [40]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &b100 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "vae.safetensors", .data = &b40 });
+    try std.testing.expectEqual(@as(u64, 140) + YUE2_GEN_BUFFER_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "yue2"));
+    var empty = std.testing.tmpDir(.{ .iterate = true });
+    defer empty.cleanup();
+    try std.testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, empty.dir, "yue2"));
 }
 
 test "estimatePeakResidentBytes: minimax_music3 bills the sum plus its AR working set" {

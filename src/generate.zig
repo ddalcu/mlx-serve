@@ -22,6 +22,7 @@ const mimo_mtp = @import("mimo_mtp.zig");
 const glm_mtp = @import("glm_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const round_cost = @import("round_cost.zig");
+const dflash_policy = @import("dflash_policy.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const ane_mod = @import("ane.zig");
@@ -118,7 +119,7 @@ pub const SpecDisableReason = enum {
     tool_choice,
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
-    /// A DFlash slot gained company: it decodes plain so it can join the batched group.
+    /// A speculating slot gained company: it decodes plain so it can join the batched group.
     company,
 };
 
@@ -1451,6 +1452,23 @@ test "every speculative decoder caps accepted drafts before commit" {
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
 /// never idles between token generation steps.
+/// A request's round-policy state (`dflash_policy.zig`).
+const DflashPol = struct {
+    calib: dflash_policy.Calibration = .{},
+    drafting: dflash_policy.Drafting = .{},
+    /// Verify exactly this many rows (t1 included) whenever the draft has them; 0 = the policy chooses.
+    /// `MLX_SERVE_DFLASH_ROWS`: how width costs and accepts are measured.
+    pin_rows: u32 = 0,
+    /// What a plain tick costs on this machine at this context, from this request's own pipelined ticks.
+    /// The shared round-cost table is no source: its plain cell folds transition ticks and, once stale,
+    /// takes one outlier at half weight.
+    plain: dflash_policy.PlainCost = .{},
+    /// How copied continuations have fared.
+    copy: dflash_policy.CopyStats = .{},
+    /// Since the last pipelined plain tick ended; null once any other kind of round has run.
+    plain_watch: ?io_util.Stopwatch = null,
+};
+
 pub const Generator = struct {
     /// The verify forward's inputs for a draft tree of `parents` (row 0 the root,
     /// -1) at `depth`: the GDN tree table and each row's ancestor path.
@@ -1622,6 +1640,22 @@ pub const Generator = struct {
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
     dflash_attempted: u64 = 0,
+    /// Round policy (`dflash_policy.zig`); null = the fixed block and the sticky yield gate.
+    dflash_pol: ?DflashPol = null,
+    /// Stats: rounds drafted from the context (no assistant forward), the tokens they proposed and the ones kept.
+    dflash_copies: u64 = 0,
+    dflash_copy_drafted: u64 = 0,
+    dflash_copy_accepted: u64 = 0,
+    /// Stats: rounds that verified one row (no drafts), whether or not the assistant drafted for them.
+    dflash_plain: u64 = 0,
+    /// The round's wall time bills a draft nobody verified, so it says nothing about the width's cost.
+    dflash_unobserved: bool = false,
+    /// Per-position acceptance and verify widths (`[spec-stats]`).
+    dflash_stats: dflash_policy.PositionStats = .{},
+    /// Plain-round captures not yet appended to the assistant context: one array per target layer
+    /// per round, oldest first. One append later costs what one token's does, so a plain stretch pays none.
+    dflash_pending: std.ArrayList(mlx.mlx_array) = .empty,
+    dflash_pending_rounds: u32 = 0,
     /// Tree rounds that verified a context copy: consecutive ones that kept
     /// none of it, and rounds left without copies after four of those.
     dflash_copy_misses: u8 = 0,
@@ -1946,6 +1980,15 @@ pub const Generator = struct {
         return on;
     }
 
+    /// The round policy (`dflash_policy.zig`) drives DFlash on a sparse target whose verify rows cost
+    /// (GLM-5.3); every other arch keeps the fixed block until it is A/B'd on its own.
+    /// `MLX_SERVE_DFLASH_POLICY=0` restores the fixed block and the sticky yield gate.
+    pub fn dflashPolicyFor(config: *const model_mod.ModelConfig) bool {
+        if (!config.isGlm5()) return false;
+        const raw = std.c.getenv("MLX_SERVE_DFLASH_POLICY") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(raw), "0");
+    }
+
     pub fn dflashGateWarmup() u64 {
         const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
         if (n < 1 or n > 64) return DFLASH_GATE_WARMUP;
@@ -2063,6 +2106,8 @@ pub const Generator = struct {
         StepTrace.report();
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
+        var acc_buf: [128]u8 = undefined;
+        var rows_buf: [160]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.dspark_enabled and self.dspark_attempted > 0) {
@@ -2132,9 +2177,9 @@ pub const Generator = struct {
             });
             return;
         }
-        if (self.dflash != null and self.dflash_attempted > 0) {
+        if (self.dflash != null and self.dflash_attempted + self.dflash_plain > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
-                @as(f64, @floatFromInt(self.dflash_attempted));
+                @as(f64, @floatFromInt(@max(self.dflash_attempted, 1)));
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
             // Under the chooser the width varies per round: drafts proposed
             // is the histogram's sum, not attempts x a fixed block.
@@ -2145,7 +2190,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d} plain={d} skipped={d} probes={d} copies={d}/{d}/{d} acc_pos={s} rows_hist={s}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
@@ -2164,6 +2209,14 @@ pub const Generator = struct {
                     if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
                     if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
                     if (self.dflash_chooser) |ch| ch.trial.trials else 0,
+                    self.dflash_plain,
+                    if (self.dflash_pol) |pol| pol.drafting.skipped else 0,
+                    if (self.dflash_pol) |pol| pol.drafting.probes else 0,
+                    self.dflash_copies,
+                    self.dflash_copy_drafted,
+                    self.dflash_copy_accepted,
+                    self.dflash_stats.formatAcc(&acc_buf),
+                    self.dflash_stats.formatRows(&rows_buf),
                 },
             );
             return;
@@ -2301,6 +2354,9 @@ pub const Generator = struct {
         /// M5/block-16 calibration to the effective draft width and lowers it
         /// for requests whose resolved mode has thinking enabled.
         dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
+        /// Drive the DFlash rounds with `dflash_policy` (a sparse target, where a verify row costs):
+        /// plain rounds replace the sticky serial fallback and the rows verified follow the draft's confidence.
+        dflash_policy: bool = false,
         /// Enable the Qwen native MTP head. When set, `mtp` must be non-null
         /// and `bind()`-ed to `xfm`. Prefill builds the head's committed-
         /// history KV cache chunk-by-chunk (full-hidden capture) and the
@@ -2481,6 +2537,11 @@ pub const Generator = struct {
         return if (stoch_enabled) .stochastic else .off;
     }
 
+    /// Shared by dispatch and /props; this disables drafting, not resident stages.
+    pub fn dsparkEnabled() bool {
+        return if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] != '0' else true;
+    }
+
     /// Stochastic-DSpark kill switch — MLX_SERVE_DSV4_DSPARK_STOCH=0
     /// restores the greedy-only chokepoint gate for A/Bs.
     var dspark_stoch_cache: ?bool = null;
@@ -2550,7 +2611,7 @@ pub const Generator = struct {
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
             const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.dsv41_ext.?);
-            const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
+            const dspark_env_off = !dsparkEnabled();
             const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
                 DsparkArm.off
             else
@@ -3434,7 +3495,8 @@ pub const Generator = struct {
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
                 .dflash_block_size = dflash_bs,
-                .dflash_chooser = if (dflash_active and dflashChooserEnabled())
+                .dflash_pol = if (dflash_active and options.dflash_policy) .{ .pin_rows = @intCast(@min(readEnvUsize("MLX_SERVE_DFLASH_ROWS", 0), dflash_policy.MAX_ROWS)) } else null,
+                .dflash_chooser = if (dflash_active and dflashChooserEnabled() and !options.dflash_policy)
                     round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
                 else
                     null,
@@ -3779,6 +3841,10 @@ pub const Generator = struct {
             dc.deinit();
             self.dflash_ctx = null;
         }
+        for (self.dflash_pending.items) |a| _ = mlx.mlx_array_free(a);
+        self.dflash_pending.deinit(allocator);
+        self.dflash_pending = .empty;
+        self.dflash_pending_rounds = 0;
         if (self.mtp_hist_stash) |*st| {
             st.deinit();
             self.mtp_hist_stash = null;
@@ -5169,8 +5235,9 @@ pub const Generator = struct {
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
     /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        // The budget's last token is the previous verify's: emit it without a round.
-        if (!self.done and !self.spec_disabled_runtime and self.max_tokens -| self.completion_tokens == 1) {
+        // The budget's last token is the previous verify's: emit it without a round. (A pipelined plain
+        // stretch has no such token: its last one comes out of `next`.)
+        if (!self.done and !self.spec_disabled_runtime and self.max_tokens -| self.completion_tokens == 1 and !self.has_pending_logits and !self.has_pending_token) {
             if (try self.checkStop()) return null;
             const tokens = try allocator.alloc(u32, 1);
             errdefer allocator.free(tokens);
@@ -5192,13 +5259,14 @@ pub const Generator = struct {
         // the "no spec" candidate a width chooser needs).
         const dflash_gen_before = self.generated_ids.items.len;
         self.dflash_round_width = 0;
-        const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted;
+        self.dflash_unobserved = false;
+        const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted + self.dflash_plain;
         defer {
             const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
             const emitted = self.generated_ids.items.len - dflash_gen_before;
             const post_warmup = dflash_rounds_before >= dflashGateWarmup();
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
-            self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
+            self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0 and !self.dflash_unobserved, false);
             if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
         }
         if (self.done) return null;
@@ -5218,6 +5286,15 @@ pub const Generator = struct {
             const tokens = try allocator.alloc(u32, 1);
             tokens[0] = tok_opt.?;
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+        }
+
+        // The round policy: a plain tick runs on the serial pipeline; every other round starts from the drained state.
+        var policy_draft = true;
+        if (self.dflash_pol) |*pol| {
+            policy_draft = pol.drafting.shouldDraft();
+            if (!policy_draft and self.dflashCanPipeline()) return try self.dflashPlainPipelined(allocator);
+            pol.plain_watch = null;
+            if (self.has_pending_logits or self.has_pending_token) return try self.dflashLeavePipeline(allocator);
         }
 
         // Per-round width: the chooser's argmax over measured tokens/ms
@@ -5245,8 +5322,11 @@ pub const Generator = struct {
                 }
             }
         }
+        // The round policy replaces the chooser and the serial fallback: a round with no drafts is the verify
+        // forward at one row, so DFlash resumes whenever drafting pays again.
+        if (self.dflash_pol != null and !policy_draft) round_width = 0;
         self.dflash_round_width = round_width;
-        if (round_width == 0) {
+        if (round_width == 0 and self.dflash_pol == null) {
             const tok_opt = try self.next(allocator);
             if (tok_opt == null) return null;
             const tokens = try allocator.alloc(u32, 1);
@@ -5260,8 +5340,9 @@ pub const Generator = struct {
         const s = xfm.s;
         const model = self.dflash.?;
         const dctx = &self.dflash_ctx.?;
-        const bs: u32 = round_width + 1;
-        const m: u32 = bs - 1;
+        // Drafts the assistant proposes (0 = a plain round) and drafts the verify carries: the policy may keep fewer.
+        const m_draft: u32 = round_width;
+        var m: u32 = m_draft;
         const t1: u32 = self.next_token_id;
         // On the moe/GDN path positions come from moe_seq_offset (cache.step
         // is a bookkeeping counter the model never reads there — same rule as
@@ -5275,7 +5356,9 @@ pub const Generator = struct {
         const hybrid_path = self.xfm.hybrid_layers != null;
         const anchor_pos: usize = if (moe_path or hybrid_path) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
         const kv_step_snap = self.ctx.cache.step;
-        std.debug.assert(dctx.absLen() == anchor_pos);
+        // A drafted round reads the whole context: whatever the plain rounds parked joins it first.
+        if (m_draft > 0) try self.dflashFlushPending(allocator);
+        std.debug.assert(dctx.absLen() + self.dflash_pending_rounds == anchor_pos);
 
         const tracing = dflashTraceEnabled();
         var ph: io_util.Stopwatch = undefined;
@@ -5296,6 +5379,8 @@ pub const Generator = struct {
         // drawn with the verify row's key, rows kept only while they match.
         const serial = self.sampling.keyed and self.sampling.temperature > 0.01 and self.sampling.seed != null;
         const stochastic = self.sampling.temperature > 0.01 and !serial;
+        if (m_draft == 0) return try self.dflashPlainRound(allocator, t1, serial, stochastic);
+        if (self.dflash_pol != null) if (try self.dflashCopyRound(allocator, t1, anchor_pos, kv_step_snap, serial, stochastic, tracing, &ph, dflash_kv_watch)) |res| return res;
         // DFlash2 path selector: when the sidecar ships one, drafts come from
         // the pairwise-scored path trace instead of per-position argmax /
         // block sampling. Greedy requests keep the byte-equality bar (a
@@ -5311,7 +5396,7 @@ pub const Generator = struct {
         // is what the head is for — dropping it drafts every position from
         // an uncorrected distribution the sidecar was never trained to emit.
         const use_markov = model.markov != null and dflashMarkovEnabled();
-        const tree_round = use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported();
+        const tree_round = use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported() and self.dflash_pol == null;
         // A continuation the context backs long enough to fill the tree is
         // verified as the round's chain, with no assistant forward.
         if (tree_round and self.dflash_copy_silent > 0) {
@@ -5331,7 +5416,7 @@ pub const Generator = struct {
         // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
         // ALL rows starting at the anchor — so DSpark needs only m noise rows
         // for the same m drafts and the same verify width.
-        const noise_rows: u32 = if (model.config.anchor_row_drafts) m else bs;
+        const noise_rows: u32 = if (model.config.anchor_row_drafts) m_draft else m_draft + 1;
         const noise_ids = try allocator.alloc(i32, noise_rows);
         defer allocator.free(noise_ids);
         noise_ids[0] = @intCast(t1);
@@ -5361,7 +5446,7 @@ pub const Generator = struct {
         {
             const row0: c_int = if (model.config.anchor_row_drafts) 0 else 1;
             const start = [_]c_int{ 0, row0, 0 };
-            const stop = [_]c_int{ 1, row0 + @as(c_int, @intCast(m)), dl_shape[2] };
+            const stop = [_]c_int{ 1, row0 + @as(c_int, @intCast(m_draft)), dl_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&draft_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
         }
@@ -5461,9 +5546,20 @@ pub const Generator = struct {
                 self.prng.random(),
                 s,
             );
+            // The policy verifies the rows the selector's confidence pays for; none at all makes this a plain round.
+            if (self.dflash_pol != null) {
+                m = self.dflashPolicyRows(&sel_path.?, m_draft) - 1;
+                self.dflash_round_width = m;
+                if (m == 0) {
+                    self.dflash_unobserved = true;
+                    const plain = try self.dflashPlainRound(allocator, t1, serial, stochastic);
+                    self.dflashRecordDrafted(1, dflash_kv_watch.read());
+                    return plain;
+                }
+            }
             const ids_i32 = try allocator.alloc(i32, m);
             defer allocator.free(ids_i32);
-            for (sel_path.?.ids, ids_i32) |v, *d| d.* = @intCast(v);
+            for (sel_path.?.ids[0..m], ids_i32) |v, *d| d.* = @intCast(v);
             const row_shape = [_]c_int{ 1, @intCast(m) };
             const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(host_arr);
@@ -5494,6 +5590,64 @@ pub const Generator = struct {
             self.dflash_trace.add(.head, ph.read());
             ph.reset();
         }
+
+        return try self.dflashVerify(allocator, .{
+            .t1 = t1,
+            .m = m,
+            .m_draft = m_draft,
+            .anchor_pos = anchor_pos,
+            .kv_step_snap = kv_step_snap,
+            .serial = serial,
+            .stochastic = stochastic,
+            .tracing = tracing,
+            .ph = &ph,
+            .watch = dflash_kv_watch,
+            .draft_ids = draft_ids,
+            .sel_path = if (sel_path) |*sp| sp else null,
+            .draft_q = draft_q,
+        });
+    }
+
+    /// What a DFlash round's verify needs from its draft: the drafts as an int32 `[1, m]` array, the selector's
+    /// path (its confidences and q) when there is one, and the density they were drawn from when sampled.
+    const VerifyIn = struct {
+        t1: u32,
+        m: u32,
+        m_draft: u32,
+        anchor_pos: usize,
+        kv_step_snap: usize,
+        serial: bool,
+        stochastic: bool,
+        tracing: bool,
+        ph: *io_util.Stopwatch,
+        watch: io_util.Stopwatch,
+        draft_ids: mlx.mlx_array,
+        sel_path: ?*dflash_mod.SelectedPath,
+        draft_q: mlx.mlx_array,
+    };
+
+    /// Phases 2-4 of a DFlash round: verify `[t1, drafts]` with the layer taps, accept, roll back and commit.
+    fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn) !DrafterStepResult {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const model = self.dflash.?;
+        const dctx = &self.dflash_ctx.?;
+        const moe_path = xfm.moe_layers != null;
+        const hybrid_path = xfm.hybrid_layers != null;
+        const t1 = r.t1;
+        const m = r.m;
+        const m_draft = r.m_draft;
+        const anchor_pos = r.anchor_pos;
+        const kv_step_snap = r.kv_step_snap;
+        const serial = r.serial;
+        const stochastic = r.stochastic;
+        const tracing = r.tracing;
+        const ph = r.ph;
+        const dflash_kv_watch = r.watch;
+        const draft_ids = r.draft_ids;
+        const sel_path = r.sel_path;
+        const draft_q = r.draft_q;
+        const bs: u32 = m + 1;
 
         // ── Phase 2: verify input [t1, drafts...] — [1, bs] int32, lazy ──
         const t1_i32: i32 = @intCast(t1);
@@ -5587,8 +5741,8 @@ pub const Generator = struct {
         }
         var drafts = try allocator.alloc(u32, m);
         errdefer allocator.free(drafts);
-        if (sel_path) |*sp| {
-            @memcpy(drafts, sp.ids);
+        if (sel_path) |sp| {
+            @memcpy(drafts, sp.ids[0..m]);
         } else {
             try mlx.check(mlx.mlx_array_eval(draft_ids));
             const draft_data = mlx.mlx_array_data_int32(draft_ids) orelse return error.MlxArrayDataNull;
@@ -5607,10 +5761,10 @@ pub const Generator = struct {
                     const q_row = try sliceProbRow(draft_q, k, s);
                     defer _ = mlx.mlx_array_free(q_row);
                     break :blk specAcceptProb(p_draft, try probAt(q_row, drafts[k], s));
-                } else if (sel_path) |*sp| blk: {
+                } else if (sel_path) |sp| blk: {
                     // Selector-sampled draft: q is the traced step's own
                     // candidate softmax — exact, no GPU read.
-                    const kk = sp.cand_ids.len / @as(usize, m);
+                    const kk = sp.cand_ids.len / @as(usize, m_draft);
                     break :blk specAcceptProb(p_draft, sp.q.?[@as(usize, k) * kk + sp.chosen_idx[k]]);
                 } else @min(1.0, p_draft);
                 const u: f32 = self.prng.random().float(f32);
@@ -5649,8 +5803,8 @@ pub const Generator = struct {
                     // sampled draft, and wrong silently.
                     const q_row = if (draft_q.ctx != null)
                         try sliceProbRow(draft_q, accepted, s)
-                    else if (sel_path) |*sp|
-                        try selectorQRow(sp, accepted, m, vl_shape[2], s)
+                    else if (sel_path) |sp|
+                        try selectorQRow(sp, accepted, m_draft, vl_shape[2], s)
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
@@ -5751,6 +5905,17 @@ pub const Generator = struct {
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
         if (self.dflash_chooser) |*ch| ch.observe(m, accepted, MTP_EV_EMA_BETA);
+        self.dflash_stats.record(m, accepted);
+        if (self.dflash_pol) |*pol| {
+            if (sel_path) |sp| {
+                for (sp.conf[0..m], 0..) |c, k| {
+                    if (k > accepted) break;
+                    pol.calib.observe(c, k < accepted);
+                }
+                if (log.enabled(.debug)) self.logDflashRound(sp.conf[0..m_draft], m, accepted);
+            }
+        }
+        self.dflashRecordDrafted(n_commit, dflash_kv_watch.read());
         // The calibrated sticky gate stays as the bootstrap that gets serial
         // MEASURED (the chooser picks serial only from a measured w0 cell).
         self.checkDflashRuntimeGate();
@@ -5768,6 +5933,286 @@ pub const Generator = struct {
             .tokens = tokens,
             .accepted_tokens = accepted,
         };
+    }
+
+    var dflash_copy_off_cache: ?bool = null;
+    /// `MLX_SERVE_DFLASH_COPY=0` drafts only from the assistant (the A/B arm for copied continuations).
+    fn dflashCopyOff() bool {
+        if (dflash_copy_off_cache) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_DFLASH_COPY");
+        const off = raw != null and raw.?[0] == '0';
+        dflash_copy_off_cache = off;
+        return off;
+    }
+
+    /// Longest copied continuation a round verifies: the fused row kernels reach 16 rows.
+    const DFLASH_COPY_MAX: u32 = dflash_policy.MAX_DRAFTS;
+
+    /// A round whose drafts are the context's own continuation after `t1` (an echo, an edit, a repeated block):
+    /// no assistant forward, and as many rows as the cost ladder and the copies' record pay for.
+    fn dflashCopyRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, anchor_pos: usize, kv_step_snap: usize, serial: bool, stochastic: bool, tracing: bool, ph: *io_util.Stopwatch, watch: io_util.Stopwatch) !?DrafterStepResult {
+        if (dflashCopyOff()) return null;
+        const pol = &self.dflash_pol.?;
+        const idx = try self.mtpLookupIndex(allocator);
+        const found = idx.matchBest(t1, DFLASH_COPY_MAX) orelse return null;
+        if (found.suffix < mtp_lookup.MIN_SUFFIX or found.draft.len == 0) return null;
+        var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+        const avail: usize = @min(found.draft.len, p.len, @as(usize, self.max_tokens -| self.completion_tokens -| 1));
+        if (avail == 0) return null;
+        @memset(p[0..avail], pol.copy.probability(found.suffix));
+        const costs = dflash_policy.priorCosts(pol.plain.ms);
+        const rows = self.dflashRowsFor(p[0..avail], &costs);
+        if (rows < 2) return null;
+        const m: u32 = rows - 1;
+        var ids: [dflash_policy.MAX_DRAFTS]i32 = undefined;
+        for (found.draft[0..m], ids[0..m]) |t, *d| d.* = @intCast(t);
+        const draft_ids = mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, @intCast(m) }, 2, .int32);
+        defer _ = mlx.mlx_array_free(draft_ids);
+        self.dflash_round_width = m;
+        const suffix = found.suffix;
+        const res = try self.dflashVerify(allocator, .{
+            .t1 = t1,
+            .m = m,
+            .m_draft = m,
+            .anchor_pos = anchor_pos,
+            .kv_step_snap = kv_step_snap,
+            .serial = serial,
+            .stochastic = stochastic,
+            .tracing = tracing,
+            .ph = ph,
+            .watch = watch,
+            .draft_ids = draft_ids,
+            .sel_path = null,
+            .draft_q = .{ .ctx = null },
+        });
+        pol.copy.observe(suffix, m, res.accepted_tokens);
+        log.debug("  [dflash-copy] suffix={d} avail={d} drafts={d} accepted={d}\n", .{ suffix, avail, m, res.accepted_tokens });
+        self.dflash_copies += 1;
+        self.dflash_copy_drafted += m;
+        self.dflash_copy_accepted += res.accepted_tokens;
+        return res;
+    }
+
+    /// Parked captures per target layer before a plain stretch appends them anyway (a stretch the
+    /// policy's backoff allows is at most 32 rounds; this bounds the parked arrays whatever the caller does).
+    const DFLASH_PENDING_MAX: u32 = 32;
+
+    /// A plain DFlash round: t1 through the trunk alone, the verify forward at one row. Its captures
+    /// are parked in `dflash_pending` and join the assistant context with the next drafted round's append.
+    fn dflashPlainRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, serial: bool, stochastic: bool) !DrafterStepResult {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const model = self.dflash.?;
+        self.dflash_round_width = 0;
+
+        const t1_i32: i32 = @intCast(t1);
+        const t1_arr = mlx.mlx_array_new_data(&t1_i32, &[_]c_int{ 1, 1 }, 2, .int32);
+        defer _ = mlx.mlx_array_free(t1_arr);
+        const caps = try allocator.alloc(mlx.mlx_array, model.config.target_layer_ids.len);
+        defer {
+            for (caps) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(caps);
+        }
+        for (caps) |*a| a.* = mlx.mlx_array_new();
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = caps };
+        self.ctx.capture_layers = &cl;
+        self.ctx.capture_ssm_seq = false; // one row never rolls back
+        const forward = xfm.forwardWith(&self.ctx, t1_arr);
+        self.ctx.capture_layers = null;
+        const logits = try forward;
+        defer _ = mlx.mlx_array_free(logits);
+
+        // The captures are no dependency of the logits: evaluate them with the next token, or the
+        // forward's streams stay alive behind them.
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        for (caps) |c| _ = mlx.mlx_vector_array_append_value(eval_vec, c);
+        var picked: CommittedArgmax = .{};
+        defer picked.deinit();
+        const next_pending: u32 = blk: {
+            if (stochastic) {
+                const probs = try probsAtLastPos(logits, self.sampling, s);
+                defer _ = mlx.mlx_array_free(probs);
+                try mlx.check(mlx.mlx_async_eval(eval_vec));
+                break :blk try sampleFromProbs(probs, s);
+            }
+            picked = if (serial) try self.verifySerialSamples(logits, 1) else try verifyArgmax(logits, self.sampling.suppress_mask, s);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, picked.lazy());
+            try mlx.check(mlx.mlx_async_eval(eval_vec));
+            try mlx.check(mlx.mlx_array_eval(picked.lazy()));
+            break :blk @intCast((try picked.ids(1))[0]);
+        };
+        if (serial) self.sampling.draw = self.generated_ids.items.len + 2;
+
+        try self.dflashPark(allocator, caps);
+
+        const tokens = try allocator.alloc(u32, 1);
+        errdefer allocator.free(tokens);
+        tokens[0] = t1;
+        try self.generated_ids.append(allocator, t1);
+        self.dflash_plain += 1;
+        self.dflash_stats.record(0, 0);
+        self.next_token_id = next_pending;
+        self.advanceStep(1);
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+        }
+        return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+    }
+
+    /// Park one forward's captures (and take them over: the caller's handles are left empty).
+    fn dflashPark(self: *Generator, allocator: std.mem.Allocator, caps: []mlx.mlx_array) !void {
+        try self.dflash_pending.appendSlice(allocator, caps);
+        for (caps) |*a| a.* = .{ .ctx = null };
+        self.dflash_pending_rounds += 1;
+        if (self.dflash_pending_rounds >= DFLASH_PENDING_MAX) try self.dflashFlushPending(allocator);
+    }
+
+    /// Whether a plain tick can ride the serial pipeline (`next`'s fast path).
+    fn dflashCanPipeline(self: *const Generator) bool {
+        return self.logprobs_n == 0 and !self.sampling.penalized() and self.sampling.constraint == null and self.step + 1 < self.max_tokens;
+    }
+
+    /// A plain tick on the serial pipeline: `next` overlaps the following forward with the host's work,
+    /// which a round of its own cannot. Its forwards carry the DFlash taps, parked like a plain round's.
+    fn dflashPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        const model = self.dflash.?;
+        const caps = try allocator.alloc(mlx.mlx_array, model.config.target_layer_ids.len);
+        defer {
+            for (caps) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(caps);
+        }
+        for (caps) |*a| a.* = mlx.mlx_array_new();
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = caps };
+        self.ctx.capture_layers = &cl;
+        defer self.ctx.capture_layers = null;
+        self.ctx.capture_ssm_seq = false; // one row never rolls back
+        // The stretch starts from the DFlash invariant (t1 not in the cache): forward it as `next`'s own bootstrap
+        // would, here with the taps, so `next` finds the pipeline seeded and runs only its lookahead.
+        if (!self.has_pending_logits and !self.has_pending_token) {
+            const t1_i32: i32 = @intCast(self.next_token_id);
+            const t1_arr = mlx.mlx_array_new_data(&t1_i32, &[_]c_int{ 1, 1 }, 2, .int32);
+            defer _ = mlx.mlx_array_free(t1_arr);
+            self.pending_logits = try self.xfm.forwardWith(&self.ctx, t1_arr);
+            self.has_pending_logits = true;
+            try self.dflashEvalPark(allocator, caps);
+        }
+        const tok = (try self.next(allocator)) orelse return null;
+        // The lookahead's forward (none on the budget's last token) is already queued; its taps are small work behind it.
+        if (caps[0].ctx != null) try self.dflashEvalPark(allocator, caps);
+        const tokens = try allocator.alloc(u32, 1);
+        tokens[0] = tok;
+        self.dflash_plain += 1;
+        self.dflash_stats.record(0, 0);
+        // Consecutive pipelined ticks are the machine's plain period; the first of a stretch has no predecessor.
+        const pol = &self.dflash_pol.?;
+        if (pol.plain_watch) |*w| pol.plain.sample(@as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms));
+        pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
+        return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+    }
+
+    /// Evaluate a forward's taps (they are no dependency of its logits) and park them.
+    fn dflashEvalPark(self: *Generator, allocator: std.mem.Allocator, caps: []mlx.mlx_array) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (caps) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
+        try mlx.check(mlx.mlx_async_eval(vec));
+        try self.dflashPark(allocator, caps);
+        for (caps) |*a| a.* = mlx.mlx_array_new();
+    }
+
+    /// A drafted round after a pipelined stretch: land on the spec entry invariant, one token of the stretch emitted.
+    fn dflashLeavePipeline(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        switch (try self.drainPipelineForSpec(allocator)) {
+            .drained => |tok| {
+                const tokens = try allocator.alloc(u32, 1);
+                tokens[0] = tok;
+                self.dflash_unobserved = true;
+                return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+            },
+            .stopped => return null,
+            .already_clean, .stay_disabled => return error.PipelineHalfState,
+        }
+    }
+
+    /// Append the plain rounds' parked captures to the assistant context as one block.
+    fn dflashFlushPending(self: *Generator, allocator: std.mem.Allocator) !void {
+        const rounds = self.dflash_pending_rounds;
+        if (rounds == 0) return;
+        const model = self.dflash.?;
+        const dctx = &self.dflash_ctx.?;
+        const n_t = model.config.target_layer_ids.len;
+        const merged = try allocator.alloc(mlx.mlx_array, n_t);
+        defer {
+            for (merged) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(merged);
+        }
+        for (merged) |*a| a.* = mlx.mlx_array_new();
+        for (merged, 0..) |*out, t| {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (0..rounds) |r| _ = mlx.mlx_vector_array_append_value(vec, self.dflash_pending.items[r * n_t + t]);
+            try mlx.check(mlx.mlx_concatenate_axis(out, vec, 1, self.xfm.s));
+        }
+        try dflash_mod.appendContext(model, dctx, merged, dctx.absLen());
+        for (self.dflash_pending.items) |a| _ = mlx.mlx_array_free(a);
+        self.dflash_pending.clearRetainingCapacity();
+        self.dflash_pending_rounds = 0;
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        dctx.appendEvalArrays(eval_vec);
+        try mlx.check(mlx.mlx_async_eval(eval_vec));
+    }
+
+    /// The assistant context's length once the parked captures are counted: the trunk's cursor, always.
+    pub fn dflashContextLen(self: *const Generator) usize {
+        return self.dflash_ctx.?.absLen() + self.dflash_pending_rounds;
+    }
+
+    /// Bring the assistant context to the position `covers` (the committed prefix): parked captures appended, and a
+    /// pipelined lookahead's position dropped. A prefix-cache commit pairs the two only when they end together.
+    pub fn dflashSettle(self: *Generator, allocator: std.mem.Allocator, covers: usize) !void {
+        const dctx = if (self.dflash_ctx) |*d| d else return;
+        try self.dflashFlushPending(allocator);
+        if (dctx.absLen() > covers and covers >= dctx.base_pos) try dctx.cache.truncate(covers - dctx.base_pos, self.xfm.s);
+    }
+
+    /// Tell the drafting backoff what a drafted round bought: the plain rounds its tokens would have cost, and what it took.
+    fn dflashRecordDrafted(self: *Generator, tokens: usize, wall_ns: u64) void {
+        const pol = if (self.dflash_pol) |*p| p else return;
+        const wall_ms = @as(f32, @floatFromInt(wall_ns)) / @as(f32, std.time.ns_per_ms);
+        pol.drafting.record(@as(f32, @floatFromInt(tokens)) * self.dflashPlainMs(), wall_ms);
+    }
+
+    /// ms of a plain round for this request (policy rounds only).
+    fn dflashPlainMs(self: *const Generator) f32 {
+        return self.dflash_pol.?.plain.ms;
+    }
+
+    /// Rows to verify (t1 included) for drafts with acceptance probabilities `p`: the pin, else the best tokens per ms.
+    fn dflashRowsFor(self: *const Generator, p: []const f32, costs: *const dflash_policy.Costs) u32 {
+        const pol = &self.dflash_pol.?;
+        if (pol.pin_rows > 0) return @min(pol.pin_rows, @as(u32, @intCast(p.len)) + 1);
+        return dflash_policy.chooseRows(p, costs).rows;
+    }
+
+    /// Rows to verify (t1 included) for a draft whose per-position confidence the selector reports.
+    fn dflashPolicyRows(self: *Generator, sel: *const dflash_mod.SelectedPath, m_draft: u32) u32 {
+        const pol = &self.dflash_pol.?;
+        var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+        for (sel.conf[0..m_draft], p[0..m_draft]) |c, *out| out.* = pol.calib.probability(c);
+        const costs = dflash_policy.priorCosts(self.dflashPlainMs());
+        return self.dflashRowsFor(p[0..m_draft], &costs);
+    }
+
+    /// `[dflash-round]`: what the selector was sure of against what the target kept (the calibration's raw material).
+    fn logDflashRound(self: *const Generator, conf: []const f32, rows_drafts: u32, accepted: u32) void {
+        _ = self;
+        var buf: [160]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        for (conf, 0..) |c, k| w.print("{s}{d:.2}", .{ if (k == 0) "" else "/", c }) catch break;
+        log.debug("  [dflash-round] verified={d}/{d} accepted={d} conf={s}\n", .{ rows_drafts, conf.len, accepted, w.buffered() });
     }
 
     var dflash_tree_logged = false;
@@ -6020,10 +6465,11 @@ pub const Generator = struct {
         return DrafterStepResult{ .tokens = tokens, .accepted_tokens = accepted };
     }
 
-    /// Sticky like every DFlash serial switch: plain rounds do not extend the assistant context.
-    pub fn dflashYieldToCompany(self: *Generator) void {
-        if (self.dflash == null or self.spec_disabled_runtime) return;
-        log.info("  dflash=disabled (company: decoding plain in the batched group)\n", .{});
+    /// Decode plain in the batched group. Sticky for DFlash (plain rounds do not extend the
+    /// assistant context); PLD's periodic re-enable check resumes once the slot is solo.
+    pub fn yieldSpecToCompany(self: *Generator, mode: []const u8) void {
+        if (self.spec_disabled_runtime) return;
+        log.info("  {s}=disabled (company: decoding plain in the batched group)\n", .{mode});
         self.spec_disabled_runtime = true;
         self.spec_disable_reason = .company;
     }
@@ -6034,7 +6480,7 @@ pub const Generator = struct {
     /// ticks use the regular pipelined decoder through `nextDflash`'s entry
     /// fallback.
     fn checkDflashRuntimeGate(self: *Generator) void {
-        if (self.spec_disabled_runtime) return;
+        if (self.spec_disabled_runtime or self.dflash_pol != null) return;
         if (!dflashGateShouldDisable(
             self.dflash_attempted,
             self.dflash_accepted_tokens,
@@ -14351,6 +14797,19 @@ pub fn computeEmbeddingsBatch(
     xfm: *Transformer,
     seqs: []const []const u32,
 ) ![][]f32 {
+    return computeEmbeddingsBatchWith(allocator, xfm, seqs, null);
+}
+
+/// `computeEmbeddingsBatch` for ONE sequence carrying image/video placeholders: `vision` holds the soft-token
+/// rows [1, n, hidden] of every item in prompt order, spliced in at the placeholder ids.
+pub fn computeEmbeddingsBatchWith(
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    seqs: []const []const u32,
+    vision: ?mlx.mlx_array,
+) ![][]f32 {
+    // The rows are consumed in sequence order by one scatter: they belong to a single prompt.
+    if (vision != null and seqs.len != 1) return error.MultimodalNeedsOneSequence;
     const results = try allocator.alloc([]f32, seqs.len);
     var filled: usize = 0;
     errdefer {
@@ -14377,7 +14836,7 @@ pub fn computeEmbeddingsBatch(
         };
         if (sub.len > 1) mask = try buildKeyPadMask(allocator, pb.lengths, pb.max_len, xfm.s);
 
-        const hidden = try xfm.forwardEmbeddingMasked(input, mask);
+        const hidden = try xfm.forwardEmbeddingMasked(input, mask, vision);
         defer _ = mlx.mlx_array_free(hidden);
 
         // Sentence-transformers pipeline order: pool (per the checkpoint's
@@ -18810,8 +19269,450 @@ test "gatherTokenPool: mean mode is not a gather — callers must dispatch it to
     try testing.expectError(error.InvalidPoolingMode, gatherTokenPool(testing.allocator, hidden, &lengths, .mean, s));
 }
 
+fn rowCosine(a: []const f32, b: []const f32) f64 {
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (a, b) |x, y| {
+        dot += @as(f64, x) * y;
+        na += @as(f64, x) * x;
+        nb += @as(f64, y) * y;
+    }
+    return dot / (@sqrt(na) * @sqrt(nb));
+}
+
+/// The tiny EmbeddingGemma 2 checkpoint (`tests/dump_embeddinggemma2_fixtures.py tiny`) written to a temp dir and loaded.
+const Eg2Tiny = struct {
+    tmp: std.testing.TmpDir,
+    config: model_mod.ModelConfig,
+    weights: model_mod.Weights,
+
+    fn open(allocator: std.mem.Allocator, io: std.Io) !Eg2Tiny {
+        return openWith(allocator, io, false);
+    }
+
+    /// With the image tower's tensors, as a server that serves images loads them.
+    fn openWithVision(allocator: std.mem.Allocator, io: std.Io) !Eg2Tiny {
+        return openWith(allocator, io, true);
+    }
+
+    fn openWith(allocator: std.mem.Allocator, io: std.Io, vision: bool) !Eg2Tiny {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/embedding_gemma2_tiny_config.json") });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = @embedFile("fixtures/embedding_gemma2_tiny.safetensors") });
+        var path_buf: [512]u8 = undefined;
+        const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+        var config = try model_mod.parseConfig(io, allocator, path);
+        var weights = if (vision) try model_mod.loadWeightsWithVision(io, allocator, path) else try model_mod.loadWeights(io, allocator, path);
+        errdefer weights.deinit();
+        model_mod.resolveWeightPrefix(&config, &weights);
+        return .{ .tmp = tmp, .config = config, .weights = weights };
+    }
+
+    fn deinit(self: *Eg2Tiny) void {
+        self.weights.deinit();
+        self.tmp.cleanup();
+    }
+};
+
+test "EmbeddingGemma 2: forward and pooled embeddings match the transformers reference on a tiny checkpoint" {
+    // Random weights in the release's layout (full-attention layers wider, inclusive band radius 2,
+    // projection-only per-layer inputs, layer scalars) and HF's float32 outputs. The 12-token rows cross the
+    // band, so an exclusive radius moves their embedding to cosine 0.84.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+
+    var fx = try Eg2Tiny.open(allocator, io);
+    defer fx.deinit();
+    var xfm = try Transformer.init(io, allocator, fx.config, &fx.weights);
+    defer xfm.deinit();
+
+    const Expected = struct {
+        sequences: []const []const u32,
+        norm: []const []const []const f32,
+        embedding: []const []const f32,
+    };
+    const parsed = try std.json.parseFromSlice(Expected, allocator, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const want = parsed.value;
+
+    // The production path: one padded, key-masked batch, pooled, projected, normalized.
+    const batch = try computeEmbeddingsBatch(allocator, &xfm, want.sequences);
+    defer {
+        for (batch) |r| allocator.free(r);
+        allocator.free(batch);
+    }
+    for (batch, want.embedding, 0..) |got, ref, i| {
+        try testing.expectEqual(ref.len, got.len);
+        const cos = rowCosine(got, ref);
+        testing.expect(cos > 0.998) catch |e| {
+            std.debug.print("row {d}: embedding cosine {d:.6}\n", .{ i, cos });
+            return e;
+        };
+    }
+
+    // A shipped pack's head is bf16, and normalizing its bf16 output leaves the norm off 1: the projection
+    // hands the normalization f32.
+    const head_f32 = xfm.dense0_w;
+    var head_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head_bf16);
+    try mlx.check(mlx.mlx_astype(&head_bf16, head_f32, .bfloat16, xfm.s));
+    xfm.dense0_w = head_bf16;
+    defer xfm.dense0_w = head_f32;
+    const bf16_head = try computeEmbeddingsBatch(allocator, &xfm, want.sequences);
+    defer {
+        for (bf16_head) |r| allocator.free(r);
+        allocator.free(bf16_head);
+    }
+    for (bf16_head, 0..) |row, i| {
+        var sumsq: f64 = 0;
+        for (row) |x| sumsq += @as(f64, x) * x;
+        testing.expect(@abs(@sqrt(sumsq) - 1.0) < 1e-5) catch |e| {
+            std.debug.print("row {d}: norm {d:.6} with a bf16 head\n", .{ i, @sqrt(sumsq) });
+            return e;
+        };
+    }
+
+    // Each row alone has no padding to hide behind; its final-normed token states are the pre-projection
+    // hidden the pooling reads, so the layers are checked row by row rather than only through the mean.
+    for (want.sequences, want.norm, 0..) |seq, ref_rows, i| {
+        var ids: [32]i32 = undefined;
+        for (seq, 0..) |t, k| ids[k] = @intCast(t);
+        const shape = [_]c_int{ 1, @intCast(seq.len) };
+        const input = mlx.mlx_array_new_data(&ids, &shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(input);
+        const hidden = try xfm.forwardEmbeddingMasked(input, null, null);
+        defer _ = mlx.mlx_array_free(hidden);
+        var f32_hidden = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32_hidden);
+        try mlx.check(mlx.mlx_astype(&f32_hidden, hidden, .float32, xfm.s));
+        try mlx.check(mlx.mlx_array_eval(f32_hidden));
+        const data = mlx.mlx_array_data_float32(f32_hidden).?;
+        for (ref_rows, 0..) |ref, t| {
+            const cos = rowCosine(data[t * ref.len ..][0..ref.len], ref);
+            testing.expect(cos > 0.995) catch |e| {
+                std.debug.print("row {d} token {d}: state cosine {d:.6}\n", .{ i, t, cos });
+                return e;
+            };
+        }
+    }
+}
+
+const vision_mod = @import("vision.zig");
+
+/// The soft-token budget the tiny fixture's image and clip were processed at (70 is the smallest a processor accepts).
+const eg2_fixture_budget: u32 = 70;
+
+/// The media half of the tiny fixture's reference outputs (`tests/dump_embeddinggemma2_fixtures.py`).
+const Eg2Media = struct {
+    media: struct {
+        image: struct { h: u32, w: u32, rgb: []const u8, target: [2]u32, tokens: u32, soft: []const []const f32 },
+        image_big: struct { budget: u32, target: [2]u32, tokens: u32, soft: []const []const f32 },
+        frames: struct { h: u32, w: u32, rgb: []const []const u8, target: [2]u32, tokens: u32, soft: []const []const f32 },
+        image_ids: []const u32,
+        image_embedding: []const f32,
+        text_image_ids: []const u32,
+        text_image_embedding: []const f32,
+        video_ids: []const u32,
+        video_embedding: []const f32,
+        mixed_ids: []const u32,
+        mixed_embedding: []const f32,
+    },
+};
+
+/// The fixture's image through the production preprocessing at `budget` soft tokens.
+fn eg2FixtureImage(allocator: std.mem.Allocator, b64: []const u8, h: u32, w: u32, budget: u32) !vision_mod.UnitImage {
+    const rgb = try allocator.alloc(u8, @as(usize, h) * w * 3);
+    defer allocator.free(rgb);
+    try std.base64.standard.Decoder.decode(rgb, b64);
+    return vision_mod.budgetPixels(allocator, rgb, h, w, 16, 3, budget);
+}
+
+fn eg2ImageRows(allocator: std.mem.Allocator, enc: *vision_mod.VisionEncoder, m: anytype, budget: u32, target: [2]u32) !mlx.mlx_array {
+    const img = try eg2FixtureImage(allocator, m.rgb, m.h, m.w, budget);
+    defer allocator.free(img.pixels);
+    try testing.expectEqual(target[0], img.h);
+    try testing.expectEqual(target[1], img.w);
+    const shape = [_]c_int{ 1, 3, @intCast(img.h), @intCast(img.w) };
+    const pixels = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(pixels);
+    return enc.forward(pixels);
+}
+
+/// A video as the scheduler hands it to the tower: every frame's CHW pixels back to back, viewed as patch rows.
+fn eg2VideoRows(allocator: std.mem.Allocator, enc: *vision_mod.VisionEncoder, m: anytype) !mlx.mlx_array {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(allocator);
+    var grid_h: u32 = 0;
+    var grid_w: u32 = 0;
+    for (m.rgb) |frame_b64| {
+        const img = try eg2FixtureImage(allocator, frame_b64, m.h, m.w, eg2_fixture_budget);
+        defer allocator.free(img.pixels);
+        try bytes.appendSlice(allocator, img.pixels);
+        grid_h = img.h / 16;
+        grid_w = img.w / 16;
+    }
+    const frames: u32 = @intCast(m.rgb.len);
+    const rows: c_int = @intCast(frames * grid_h * grid_w);
+    const shape = [_]c_int{ rows, 768 };
+    const patches = mlx.mlx_array_new_data(bytes.items.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches);
+    return enc.forwardVideoPatches(patches, frames, grid_h, grid_w);
+}
+
+/// The reference's soft-token rows, one list after another, as the [1, n, hidden] array the splice reads.
+fn eg2ReferenceRows(allocator: std.mem.Allocator, lists: []const []const []const f32) !mlx.mlx_array {
+    var flat = std.ArrayList(f32).empty;
+    defer flat.deinit(allocator);
+    var n: usize = 0;
+    for (lists) |rows| for (rows) |row| {
+        try flat.appendSlice(allocator, row);
+        n += 1;
+    };
+    const shape = [_]c_int{ 1, @intCast(n), @intCast(flat.items.len / n) };
+    return mlx.mlx_array_new_data(flat.items.ptr, &shape, 3, .float32);
+}
+
+fn eg2Concat(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
+test "EmbeddingGemma 2: the image tower yields the reference's soft tokens" {
+    // At the checkpoint's own budget and at twice it: a grid larger than `default_output_length` has no padded
+    // shape to fit and must simply run.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+
+    var fx = try Eg2Tiny.openWithVision(allocator, io);
+    defer fx.deinit();
+    var enc = try vision_mod.VisionEncoder.init(allocator, fx.config, &fx.weights);
+    defer enc.deinit();
+    const parsed = try std.json.parseFromSlice(Eg2Media, allocator, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const media = parsed.value.media;
+
+    const Case = struct { budget: u32, target: [2]u32, tokens: u32, soft: []const []const f32 };
+    const cases = [_]Case{
+        .{ .budget = eg2_fixture_budget, .target = media.image.target, .tokens = media.image.tokens, .soft = media.image.soft },
+        .{ .budget = media.image_big.budget, .target = media.image_big.target, .tokens = media.image_big.tokens, .soft = media.image_big.soft },
+    };
+    for (cases) |want| {
+        const rows = try eg2ImageRows(allocator, &enc, media.image, want.budget, want.target);
+        defer _ = mlx.mlx_array_free(rows);
+        var f32_rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32_rows);
+        try mlx.check(mlx.mlx_astype(&f32_rows, rows, .float32, enc.s));
+        try mlx.check(mlx.mlx_array_eval(f32_rows));
+        const shape = mlx.getShape(f32_rows);
+        try testing.expectEqual(@as(c_int, 1), shape[0]);
+        try testing.expectEqual(@as(c_int, @intCast(want.tokens)), shape[1]);
+        try testing.expectEqual(@as(c_int, @intCast(fx.config.hidden_size)), shape[2]);
+        const data = mlx.mlx_array_data_float32(f32_rows).?;
+        for (want.soft, 0..) |ref, t| {
+            const cos = rowCosine(data[t * ref.len ..][0..ref.len], ref);
+            testing.expect(cos > 0.999) catch |e| {
+                std.debug.print("budget {d}, soft token {d}: cosine {d:.6}\n", .{ want.budget, t, cos });
+                return e;
+            };
+        }
+    }
+}
+
+test "EmbeddingGemma 2: the tower's soft tokens are the same padded and masked (Gemma 4) as unpadded and fused" {
+    // Gemma 4 pads every image to its one budget and masks the padding out of eager attention; EmbeddingGemma 2
+    // runs the bare grid through the fused kernel. Masked padding is a no-op, so the two arms of the one tower
+    // must agree, and a break in either shows here without a Gemma 4 checkpoint.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+
+    var fx = try Eg2Tiny.openWithVision(allocator, io);
+    defer fx.deinit();
+    var as_gemma4 = fx.config;
+    as_gemma4.model_type = "gemma4";
+    var padded = try vision_mod.VisionEncoder.init(allocator, as_gemma4, &fx.weights);
+    defer padded.deinit();
+    var bare = try vision_mod.VisionEncoder.init(allocator, fx.config, &fx.weights);
+    defer bare.deinit();
+    const parsed = try std.json.parseFromSlice(Eg2Media, allocator, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const m = parsed.value.media;
+
+    const a = try eg2ImageRows(allocator, &padded, m.image, eg2_fixture_budget, m.image.target);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try eg2ImageRows(allocator, &bare, m.image, eg2_fixture_budget, m.image.target);
+    defer _ = mlx.mlx_array_free(b);
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_astype(&a32, a, .float32, padded.s));
+    try mlx.check(mlx.mlx_astype(&b32, b, .float32, bare.s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    try mlx.check(mlx.mlx_array_eval(b32));
+    try testing.expectEqual(mlx.getShape(a32)[1], mlx.getShape(b32)[1]);
+    const hidden: usize = @intCast(mlx.getShape(a32)[2]);
+    const rows: usize = @intCast(mlx.getShape(a32)[1]);
+    const da = mlx.mlx_array_data_float32(a32).?;
+    const db = mlx.mlx_array_data_float32(b32).?;
+    for (0..rows) |t| {
+        const cos = rowCosine(da[t * hidden ..][0..hidden], db[t * hidden ..][0..hidden]);
+        testing.expect(cos > 0.99999) catch |e| {
+            std.debug.print("soft token {d}: padded vs bare cosine {d:.6}\n", .{ t, cos });
+            return e;
+        };
+    }
+}
+
+test "EmbeddingGemma 2: image, video and mixed prompts embed like the reference" {
+    // The reference splices each modality's rows at its placeholder ids; here one scatter takes every item's
+    // rows in PROMPT order, and the mixed prompt puts the video before the image on purpose.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+
+    var fx = try Eg2Tiny.openWithVision(allocator, io);
+    defer fx.deinit();
+    var xfm = try Transformer.init(io, allocator, fx.config, &fx.weights);
+    defer xfm.deinit();
+    var enc = try vision_mod.VisionEncoder.init(allocator, fx.config, &fx.weights);
+    defer enc.deinit();
+    const parsed = try std.json.parseFromSlice(Eg2Media, allocator, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const m = parsed.value.media;
+
+    const image = try eg2ImageRows(allocator, &enc, m.image, eg2_fixture_budget, m.image.target);
+    defer _ = mlx.mlx_array_free(image);
+    const video = try eg2VideoRows(allocator, &enc, m.frames);
+    defer _ = mlx.mlx_array_free(video);
+    try testing.expectEqual(@as(c_int, @intCast(m.frames.rgb.len * m.frames.tokens)), mlx.getShape(video)[1]);
+    const video_then_image = try eg2Concat(&.{ video, image }, xfm.s);
+    defer _ = mlx.mlx_array_free(video_then_image);
+
+    const cases = [_]struct { name: []const u8, ids: []const u32, rows: mlx.mlx_array, want: []const f32 }{
+        .{ .name = "image", .ids = m.image_ids, .rows = image, .want = m.image_embedding },
+        .{ .name = "text+image", .ids = m.text_image_ids, .rows = image, .want = m.text_image_embedding },
+        .{ .name = "video", .ids = m.video_ids, .rows = video, .want = m.video_embedding },
+        .{ .name = "video then image", .ids = m.mixed_ids, .rows = video_then_image, .want = m.mixed_embedding },
+    };
+    for (cases) |c| {
+        const seqs = [_][]const u32{c.ids};
+        const got = try computeEmbeddingsBatchWith(allocator, &xfm, &seqs, c.rows);
+        defer {
+            for (got) |r| allocator.free(r);
+            allocator.free(got);
+        }
+        const cos = rowCosine(got[0], c.want);
+        testing.expect(cos > 0.99) catch |e| {
+            std.debug.print("{s}: embedding cosine {d:.6}\n", .{ c.name, cos });
+            return e;
+        };
+    }
+
+    // The reference's own soft tokens through the same splice and trunk: this leg has no tower in it, so it holds
+    // the float32 bar the text rows do (the tower casts its inputs to bf16, which a random toy amplifies), and it
+    // can tell the prompt's row order from the kinds' (mean pooling alone hardly can).
+    const image_seq = [_][]const u32{m.image_ids};
+    const mixed_seq = [_][]const u32{m.mixed_ids};
+    const ref_image = try eg2ReferenceRows(allocator, &.{m.image.soft});
+    defer _ = mlx.mlx_array_free(ref_image);
+    const ref_ordered = try eg2ReferenceRows(allocator, &.{ m.frames.soft, m.image.soft });
+    defer _ = mlx.mlx_array_free(ref_ordered);
+    const ref_swapped = try eg2ReferenceRows(allocator, &.{ m.image.soft, m.frames.soft });
+    defer _ = mlx.mlx_array_free(ref_swapped);
+    var exact_cos: [3]f64 = undefined;
+    for ([_]struct { seq: []const []const u32, rows: mlx.mlx_array, want: []const f32 }{
+        .{ .seq = &image_seq, .rows = ref_image, .want = m.image_embedding },
+        .{ .seq = &mixed_seq, .rows = ref_ordered, .want = m.mixed_embedding },
+        .{ .seq = &mixed_seq, .rows = ref_swapped, .want = m.mixed_embedding },
+    }, 0..) |c, k| {
+        const got = try computeEmbeddingsBatchWith(allocator, &xfm, c.seq, c.rows);
+        defer {
+            for (got) |r| allocator.free(r);
+            allocator.free(got);
+        }
+        exact_cos[k] = rowCosine(got[0], c.want);
+    }
+    try testing.expect(exact_cos[0] > 0.9995);
+    try testing.expect(exact_cos[1] > 0.9995);
+    try testing.expect(exact_cos[2] < exact_cos[1] - 0.0005);
+
+    // A prompt whose placeholders outnumber the rows would wrap the scatter silently; two sequences cannot share rows.
+    const two = [_][]const u32{ m.image_ids, m.image_ids };
+    try testing.expectError(error.MultimodalNeedsOneSequence, computeEmbeddingsBatchWith(allocator, &xfm, &two, image));
+}
+
+test "EmbeddingGemma 2: a tower missing a tensor is a load error, a missing tower is not" {
+    // A pack with its tower cut to pieces would otherwise crash the server at load; a text-only pack (no tower at
+    // all) is the benign opt-out the loader already handles.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+    {
+        var fx = try Eg2Tiny.openWithVision(testing.allocator, io);
+        defer fx.deinit();
+        fx.weights.remove("vision_tower.encoder.layers.1.self_attn.k_proj.linear.weight");
+        try testing.expectError(error.MissingWeight, vision_mod.VisionEncoder.init(testing.allocator, fx.config, &fx.weights));
+    }
+    {
+        var fx = try Eg2Tiny.open(testing.allocator, io);
+        defer fx.deinit();
+        try testing.expectError(error.MissingVisionWeights, vision_mod.VisionEncoder.init(testing.allocator, fx.config, &fx.weights));
+    }
+}
+
+test "EmbeddingGemma 2: a checkpoint missing its head or per-layer-input weights is a load error" {
+    // Without the head the server would hand out 512-wide un-projected vectors under an arch that promises 768,
+    // and a layer without its input block or scalar would crash the first forward.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (mlx.noGpuBackend()) return;
+    // init leaks its partial layer slice on an error return; an arena takes it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "language_model.embedding_projection.weight",
+        "language_model.ple.per_layer_model_projection.weight",
+        "language_model.ple.per_layer_projection_norm.weight",
+        "language_model.layers.3.ple_block.per_layer_projection.weight",
+        "language_model.layers.2.layer_scalar",
+    }) |name| {
+        var fx = try Eg2Tiny.open(testing.allocator, io);
+        defer fx.deinit();
+        fx.weights.remove(name);
+        try testing.expectError(error.MissingWeight, Transformer.init(io, arena.allocator(), fx.config, &fx.weights));
+    }
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "native speculation: shared DSpark environment policy" {
+    const name = "MLX_SERVE_DSV4_DSPARK";
+    const saved = if (std.c.getenv(name)) |value|
+        try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
+    else
+        null;
+    defer {
+        if (saved) |value| {
+            _ = setenv(name, value, 1);
+            testing.allocator.free(value);
+        } else {
+            _ = unsetenv(name);
+        }
+    }
+    try testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    try testing.expect(Generator.dsparkEnabled());
+    for ([_][:0]const u8{ "", "1", "0", "0disabled" }) |value| {
+        try testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+        try testing.expectEqual(value.len == 0 or value[0] != '0', Generator.dsparkEnabled());
+    }
+}
 
 // ── Allocator-cache clear cadence (issue #110) ───────────────────────────────
 
@@ -19596,6 +20497,161 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         try testing.expectEqual(want, got.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
+}
+
+const PolicyArm = struct {
+    /// A DFlash2 assistant (selector confidence) instead of the v1 block drafter.
+    v2: bool,
+    /// Verify exactly this many rows whenever the draft has them (0 = the policy chooses).
+    pin_rows: u32 = 0,
+    /// Pre-train the calibration to trust every draft, so the policy verifies the whole block.
+    trust: bool = false,
+    sampled: bool = false,
+    /// A prompt that ends mid-repeat, so the first round copies the context's continuation.
+    copy: bool = false,
+};
+
+/// Ten distinct ids repeated, then the first nine again: `COPY_PATTERN[9]` as t1 continues the repeat.
+const COPY_PATTERN = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17 };
+
+/// One request through `nextDflash` under the round policy on the tiny fixture pair, three plain
+/// rounds first: the trunk and assistant cursors agree after EVERY round whatever mix of plain and
+/// drafted rounds ran, and a greedy stream is the serial stream. Returns the generator's stats.
+fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+
+    var tmp_asst = std.testing.tmpDir(.{});
+    defer tmp_asst.cleanup();
+    var asst_buf: [512]u8 = undefined;
+    const asst_path = asst_buf[0..try tmp_asst.dir.realPath(io, &asst_buf)];
+    if (arm.v2) try dflash_mod.TinyFix.writeAssistant2(io, tmp_asst.dir, asst_path, s, false) else try dflash_mod.TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
+
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
+    defer dm.deinit();
+    try dm.bind(&xfm);
+
+    var tok_dummy: Tokenizer = undefined; // never read by the Generator
+    const copy_prompt = COPY_PATTERN ++ COPY_PATTERN ++ COPY_PATTERN[0..9].*;
+    const plain_prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    const prompt: []const u32 = if (arm.copy) &copy_prompt else &plain_prompt;
+    var copy_serial: [16]u32 = undefined;
+    if (arm.copy) {
+        var sx = try Transformer.init(io, allocator, config, &weights);
+        defer sx.deinit();
+        var sg = try Generator.initWithOptions(io, allocator, &sx, &tok_dummy, prompt, 16, SamplingParams{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+        defer sg.deinit(allocator);
+        sg.next_token_id = COPY_PATTERN[9];
+        for (&copy_serial) |*t| t.* = (try sg.next(allocator)).?;
+    }
+    const reference: []const u32 = if (arm.copy) &copy_serial else serial;
+    const sampling = if (arm.sampled) SamplingParams{ .temperature = 1.0, .seed = 7 } else SamplingParams{ .temperature = 0.0 };
+    const want: u32 = 16;
+    var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, prompt, want, sampling, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_policy = true,
+    });
+    defer gen.deinit(allocator);
+    const pol = &gen.dflash_pol.?;
+    pol.pin_rows = arm.pin_rows;
+    pol.drafting.owed = if (arm.copy) 0 else 3;
+    if (arm.copy) gen.next_token_id = COPY_PATTERN[9];
+    const plain_rounds: usize = if (arm.copy) 0 else 3;
+    if (arm.trust) for (0..10) |b| for (0..40) |_| pol.calib.observe((@as(f32, @floatFromInt(b)) + 0.5) / 10.0, true);
+
+    var got = std.ArrayList(u32).empty;
+    defer got.deinit(allocator);
+    var round: usize = 0;
+    while (true) : (round += 1) {
+        const plain_before = gen.dflash_plain;
+        const attempts_before = gen.dflash_attempted;
+        const last = gen.max_tokens -| gen.completion_tokens == 1;
+        const res = (try gen.nextDflash(allocator)) orelse break;
+        defer allocator.free(res.tokens);
+        try got.appendSlice(allocator, res.tokens);
+        if (round < plain_rounds) {
+            try testing.expectEqual(@as(usize, 1), res.tokens.len);
+            try testing.expectEqual(plain_before + 1, gen.dflash_plain);
+            try testing.expectEqual(attempts_before, gen.dflash_attempted);
+        }
+        // A plain stretch rides the serial pipeline: one lookahead token is in the trunk's cache, unemitted.
+        const lookahead: usize = if (gen.has_pending_logits or gen.has_pending_token) 1 else 0;
+        try testing.expectEqual(prompt.len + gen.generated_ids.items.len - gen.unforwarded_tail + lookahead, gen.ctx.cache.step);
+        // The assistant context reaches the trunk's cursor, appended or still parked.
+        try testing.expectEqual(gen.ctx.cache.step, gen.dflashContextLen());
+        // A drafted round appends whatever the plain ones left parked.
+        if (gen.dflash_attempted != attempts_before) try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
+        _ = last;
+    }
+    try testing.expect(gen.dflash_plain >= plain_rounds);
+    if (arm.copy) try testing.expect(gen.dflash_copies > 0);
+    try testing.expect(!gen.spec_disabled_runtime);
+    try testing.expectEqual(@as(usize, want), got.items.len);
+    if (!arm.sampled) for (reference, got.items) |a, b| try testing.expectEqual(a, b);
+    // The scheduler settles the context to the committed prefix, whatever lookahead the run ended on.
+    const committed = prompt.len + gen.generated_ids.items.len - gen.unforwarded_tail;
+    try gen.dflashSettle(allocator, committed);
+    try testing.expectEqual(committed, gen.dflash_ctx.?.absLen());
+    return gen.dflash_stats;
+}
+
+test "dflash: the round policy runs plain rounds between drafted ones, the stream stays serial's" {
+    // A plain round is the verify forward at one row (no assistant forward): it must advance the trunk
+    // and the assistant context exactly like a drafted round, so DFlash can resume after any stretch of
+    // them; a draft the policy verifies only in part must not shift the accept, rollback or q indexing.
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var tok_dummy: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    var serial: [16]u32 = undefined;
+    {
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, SamplingParams{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+        defer gen.deinit(allocator);
+        for (&serial) |*t| t.* = (try gen.next(allocator)).?;
+    }
+
+    // The v1 block drafter verifies its whole block.
+    const v1 = try policyArm(.{ .v2 = false }, &serial);
+    try testing.expect(v1.rows[4] > 0);
+    // The DFlash2 selector: two rows of a three-draft block, then the whole block once it is trusted.
+    const two = try policyArm(.{ .v2 = true, .pin_rows = 2 }, &serial);
+    try testing.expect(two.rows[2] > 0 and two.rows[3] == 0 and two.rows[4] == 0);
+    const trusted = try policyArm(.{ .v2 = true, .trust = true }, &serial);
+    try testing.expect(trusted.rows[4] > 0);
+    // A copied continuation (no assistant forward) is verified like any draft.
+    _ = try policyArm(.{ .v2 = false, .copy = true }, &serial);
+    _ = try policyArm(.{ .v2 = false, .copy = true, .sampled = true }, &serial);
+    // Sampled requests: the Leviathan accept reads q at the draft's own stride, whatever was kept.
+    _ = try policyArm(.{ .v2 = true, .pin_rows = 2, .sampled = true }, &serial);
+    _ = try policyArm(.{ .v2 = true, .trust = true, .sampled = true }, &serial);
 }
 
 // Hermetic Nemotron-H MTP round loop: a tiny hybrid trunk (Mamba2 +

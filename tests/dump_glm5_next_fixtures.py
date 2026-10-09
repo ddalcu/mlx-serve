@@ -9,7 +9,9 @@ with random weights, runs it in bf16 (the engine's numerics), and writes:
                               bf16 except layer 0's q/k/v (5/8/5-bit, `mix_kda_quant`),
                               plus the MTP head (`language_model.mtp.0.*`)
   <out>/fixture.safetensors   input_ids, logits_full (one forward), logits_step
-                              (prefill then one-token decode through the reference cache)
+                              (prefill then one-token decode through the reference cache),
+                              cap_ids + cap_l<i>: the mean of the four hyper-connection streams
+                              after each tapped layer, what a DFlash2 drafter reads
   <out>/mtp_fixture.safetensors  the trunk's final-normed rows and the MTP drafter's logits for the same sequence
 
 The pack round-trips through the reference's own `sanitize` (asserted), so the
@@ -85,6 +87,9 @@ TEXT = dict(
                         "short_conv_kernel_size": 4},
 )
 
+
+# Layers whose stream mean the DFlash capture test reads: both KDA and DSA kinds, the last one before the head.
+CAP_IDS = (1, 3, 5, 6)
 
 SEL_TIE = 0.10  # the test's bar; keep the two in step
 GAIN = 0.5
@@ -171,6 +176,21 @@ def mix_kda_quant(params, published):
     params["model.layers.0.self_attn.qkv_proj.weight"] = mx.concatenate(deq, axis=0)
 
 
+def layer_means(lm, ids, cap_ids):
+    """The mean of the hyper-connection streams after each tapped layer, in one forward without a
+    cache: SGLang's `hc_contract` of the target hiddens (the reference model itself exposes only the
+    final normed hidden, so this walks its own layers the way `Glm5NextTextModel.__call__` does)."""
+    m = lm.model
+    h = mx.repeat(m.embed_tokens(ids)[:, :, None], m.config.hc_mult, axis=2)
+    topk = None
+    out = {}
+    for i, layer in enumerate(m.layers):
+        h, topk = layer(h, None, None, topk)
+        if i in cap_ids:
+            out[i] = h.mean(axis=2).astype(mx.float32)
+    return out
+
+
 def check_round_trip(lm, params, published):
     stripped = {k[len("language_model."):] if not k.startswith("language_model.model.") else k: v
                 for k, v in published.items() if ".mtp." not in k}
@@ -234,6 +254,8 @@ def main():
     logits_full = lm(ids).logits.astype(mx.float32)
     sel_gap = np.min(np.stack(_SEL_GAPS), axis=0) if _SEL_GAPS else np.full(args.len, np.inf)
     _SEL_GAPS.clear()
+    caps = layer_means(lm, ids, CAP_IDS)
+    _SEL_GAPS.clear()
 
     cache = lm.make_cache()
     steps = [lm(ids[:, : args.prefill], cache=cache).logits]
@@ -268,6 +290,8 @@ def main():
         "input_ids": ids, "logits_full": logits_full, "logits_step": logits_step,
         "prefill": mx.array([args.prefill], dtype=mx.int32),
         "sel_gap": mx.array(sel_gap.astype(np.float32)),
+        "cap_ids": mx.array(list(CAP_IDS), dtype=mx.int32),
+        **{f"cap_l{i}": v for i, v in caps.items()},
     })
     mx.save_safetensors(str(out / "mtp_fixture.safetensors"),
                         {"input_ids": ids, "hidden": hidden, "mtp_logits": mtp_logits,

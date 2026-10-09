@@ -39,7 +39,7 @@ for pack in "${PACKS[@]}"; do
     HOME="$WORK" "$BIN" --model "$pack" --serve --host 127.0.0.1 --port "$PORT" > "$WORK/server.log" 2>&1 &
     SRV=$!
     for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | grep -q '"id"' && break; sleep 1; done
-    "$PY" - "$pack" "$PORT" src/server.zig src/chat.zig app/Sources/MLXServe/AppState.swift src/html/app.js <<'PY' || fail=1
+    "$PY" - "$pack" "$PORT" src/server.zig src/chat.zig app/Sources/MLXServe/AppState.swift src/html/index.html <<'PY' || fail=1
 import difflib, json, sys, urllib.request
 from tokenizers import Tokenizer
 pack, port, files = sys.argv[1], sys.argv[2], sys.argv[3:]

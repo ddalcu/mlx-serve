@@ -156,7 +156,7 @@ struct ServerOptions: Codable, Equatable {
     /// Disk budget when `enablePrefixCacheDisk` is on. `10GB`, `2GB`, etc.
     var prefixCacheDisk: String = "10GB"
     /// Registry residency cap (`--max-resident-mem`), in GiB. 0 = Auto, the
-    /// server's own default of 80% of the wired limit at startup. This is the
+    /// server's own default (the GPU working-set limit). This is the
     /// gate that decides whether a cold load is admitted AT ALL, and it runs
     /// BEFORE the memory pre-flight — so `skipMemPreflight` cannot overturn
     /// it, and without this field a model the auto cap refuses was unloadable
@@ -1151,7 +1151,7 @@ extension ServerOptions {
             needsRestart: true),
         "maxResidentMemGB": .init(
             title: "Model memory cap",
-            explainer: "Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = 80% of what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem.",
+            explainer: "Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem.",
             needsRestart: true),
         "maxResidentModels": .init(
             title: "Max models loaded at once",

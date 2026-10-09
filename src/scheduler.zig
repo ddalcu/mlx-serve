@@ -144,7 +144,7 @@ pub const LoadParams = struct {
     /// checkpoint could carry its own, so the opt-out needs its own bit.
     no_drafter: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
-    mtp_enabled: ?bool = null,
+    mtp_enabled: bool = true,
     mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
@@ -550,7 +550,7 @@ pub const Slot = struct {
     planner_price_transition: bool = false,
     planner_last_width: u8 = 255,
     planner_force_plain: bool = false,
-    dflash_company_ticks: u8 = 0,
+    company_ticks: u8 = 0,
     mtp_publish_ns: u64 = 0,
     mtp_publish_gap_ms: f32 = 0,
 
@@ -1136,6 +1136,9 @@ pub const EmbedRequest = struct {
     model: *model_registry_mod.LoadedModel,
     /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
     token_seqs: []const []const u32,
+    /// The soft-token rows [1, n, hidden] of the ONE prompt's images and video, in prompt order. The request
+    /// owns them: the inference thread frees them when the forward is done.
+    vision_embeddings: ?mlx.mlx_array = null,
     /// Output: one pooled L2-normalized embedding per input on success.
     /// Rows + outer slice owned by `allocator`; caller frees.
     results: ?[][]f32 = null,
@@ -1193,7 +1196,7 @@ pub const LoadRequest = struct {
     /// would silently drop `--dspark` on every on-demand GGUF load).
     ds4_dspark: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
-    mtp_enabled: ?bool = null,
+    mtp_enabled: bool = true,
     mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
@@ -1378,7 +1381,7 @@ pub const Scheduler = struct {
     /// the `--llama-*` flags like the `--model` primary. Pre-plumbing, the
     /// cold-load `LoadRequest` used its struct defaults, silently ignoring
     /// these flags on every on-demand load and model switch.
-    mtp_enabled: ?bool,
+    mtp_enabled: bool,
     mtp_head_kv_quant: bool,
     mtp_depth: u32,
     llama: LlamaSettings,
@@ -2357,16 +2360,7 @@ pub const Scheduler = struct {
         // re-enable check resumes the moment concurrency drops back to one.
         // Pinned by `a spec_disabled_runtime slot is batchable, and that is the
         // documented trade` below — flip either half deliberately, not by accident.
-        return gen.spec_disabled_runtime or specTickMode(
-            slot.enable_mtp,
-            gen.mtp != null,
-            slot.enable_drafter,
-            gen.drafter != null,
-            gen.dflash != null,
-            slot.enable_pld,
-            gen.pld_enabled,
-            gen.dspark_enabled,
-        ) == .regular;
+        return gen.spec_disabled_runtime or slotSpecMode(slot, gen) == .regular;
     }
 
     /// Does this slot owe a module-head release? One single-slot tick lands it.
@@ -2783,11 +2777,11 @@ const GgufRoute = struct {
 /// Both load construction sites (here and main.zig's startup load) stamp the
 /// per-model settings onto the config the bills and defaults read.
 /// The kwargs strings MOVE to the freshly loaded `chat_config` (same allocator).
-/// An explicit MTP launch flag outranks the model's setting.
-pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *model_settings.Override, mtp_flag: ?bool) void {
+/// `mtp_flag` false (`--no-mtp`) stamps the head off unless the model overrides it.
+pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *model_settings.Override, mtp_flag: bool) void {
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
-    config.mtp_override = mtp_flag orelse o.mtp;
+    config.mtp_override = o.mtp orelse if (mtp_flag) null else false;
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.int8_prefill_override = o.int8_prefill;
@@ -4052,7 +4046,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const gb = 1024.0 * 1024.0 * 1024.0;
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
-        const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.mtp_enabled orelse params.config.mtp_override orelse true);
+        const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
         const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
         const avail_bytes = availForLoad(weights_bytes);
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
@@ -4117,9 +4111,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // caches in serve mode honor this independently in `Slot.init`; this
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
-    // MTP's explicit launch flag wins; otherwise use the model's setting and default.
+    // Per-model settings (stamped on the config at BOTH construction sites) outrank the flags.
     const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
-    const mtp_enabled = params.mtp_enabled orelse params.config.mtp_override orelse true;
+    const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
     const tail_override = params.config.mtp_greedy_tail_override;
     if (mtp_enabled and (tail_override != null or generate_mod.mtp_greedy_tail_default)) log.info("[mtp] greedy tail {s} ({s})\n", .{
         if (generate_mod.mtpGreedyTailFor(tail_override)) "on" else "off",
@@ -4403,7 +4397,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 }
                 log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
             }
-            ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            // Rows past 16 are a prefill chunk unless `_KV` says a context stands behind them (verify widths up to 32).
+            const prefill_rows = rows > 16 and kv_pre == 0;
+            ctx.capture_ssm_seq = rows > 1 and rows <= 32 and !prefill_rows and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
             // MLX_SERVE_DECODE_FWD_UBENCH_TREE=1 at 16 rows: verify a fixed draft
             // tree (a 9-row trunk, siblings at depths 1-4, their children), as a round does.
             const tree_parents = [16]i32{ -1, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 9, 10, 11 };
@@ -4415,7 +4411,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // Prefill widths: every forward starts from an empty cache (else each
             // one attends over the previous ones' rows) and skips the lm_head,
             // which a real intermediate chunk never evaluates.
-            const prefill_rows = rows > 16 and kv_pre == 0;
             ctx.skip_lm_head = prefill_rows;
             log.info("[fwd-ubench] rows={d} capture={} prefill={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, prefill_rows });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
@@ -5293,7 +5288,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         _ = s.in_pass.fetchSub(1, .acq_rel);
     };
 
-    dflashYieldTick(active.items);
+    specYieldTick(active.items);
 
     // 4. Decode tick. Charge the full wall-clock tick time to each
     //    participating slot — for batched ticks this matches the per-slot
@@ -5496,7 +5491,12 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 /// the global xfm.cache before every sub-batch, and wakes the conn thread.
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     const xfm_ptr = req.model.transformer.?;
-    const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
+    // Held in a local: the request lives on the waiting thread's stack and is gone once `done` is observed.
+    const vision = req.vision_embeddings;
+    defer if (vision) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    const results = generate_mod.computeEmbeddingsBatchWith(req.allocator, xfm_ptr, req.token_seqs, vision) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
@@ -5696,10 +5696,17 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
             _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
         }
     }
+    var prev_mem_limit: usize = 0;
+    const gen_mem_limit = genMemoryLimit(mlx.cudaAvailable(), sch.gen_reserve_bytes);
+    if (gen_mem_limit) |lim| _ = mlx.mlx_set_memory_limit(&prev_mem_limit, lim);
     if (reqs.len == 1) req.run(req.ctx) else {
         var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;
         for (reqs, ctxs[0..reqs.len]) |r, *c| c.* = r.ctx;
         req.merge.?.run_many(ctxs[0..reqs.len]);
+    }
+    if (gen_mem_limit != null) {
+        var tmp: usize = 0;
+        _ = mlx.mlx_set_memory_limit(&tmp, prev_mem_limit);
     }
     if (small_ram) {
         var tmp: usize = 0;
@@ -5720,6 +5727,13 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
         r.done_cond.broadcast(sch.io);
         r.done_mu.unlock(sch.io);
     }
+}
+
+/// MLX memory limit for a media job, null = keep MLX's own. MLX only waits on
+/// in-flight work (whose graphs pin their inputs) once active memory passes this
+/// limit; CUDA's default is 95% of VRAM, so a diffusion step fills the card.
+fn genMemoryLimit(cuda: bool, est_peak: u64) ?usize {
+    return if (cuda) @intCast(est_peak) else null;
 }
 
 /// Clear MLX's allocator cache after a job holding `cached` bytes: always for
@@ -5885,6 +5899,8 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             }
         }
     }
+    // Plain DFlash rounds park their captures; they join the context before it is paired with the prefix.
+    gen_ptr.dflashSettle(slot.allocator, total_len) catch |err| log.warn("[hot-cache] dflash context settle failed: {s} — not committed\n", .{@errorName(err)});
     // A runtime fallback leaves the dormant assistant context at its last
     // speculative boundary while serial decode continues growing the trunk.
     // Only pair the assistant payload with this prefix when both end at the
@@ -6740,25 +6756,33 @@ const InterleaveCtx = struct {
     chunk_sw: io_util.Stopwatch,
 };
 
-/// Ticks a DFlash slot must see company before it gives up speculation for the batch.
-const DFLASH_COMPANY_TICKS: u8 = 2;
+/// Ticks a speculating slot must see company before it gives up speculation for the batch.
+const COMPANY_YIELD_TICKS: u8 = 2;
 
 pub fn companyStreak(streak: u8, has_company: bool) u8 {
     return if (has_company) streak +| 1 else 0;
 }
 
-/// The first request of a burst was admitted alone, so it armed DFlash and ticks serial
-/// beside the group; once company is steady it yields.
-fn dflashYieldTick(active: []const *Slot) void {
+/// Spec modes that give way to the batched group once a slot has company: the DFlash
+/// family everywhere, PLD on CUDA, where a batched tick costs about one plain step.
+pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool) bool {
+    return mode == .dflash or mode == .dspark or (mode == .pld and cuda);
+}
+
+/// The first request of a burst was admitted alone, so it armed speculation and ticks
+/// serial beside the group; once company is steady it yields.
+fn specYieldTick(active: []const *Slot) void {
     for (active) |s| {
         const gen = if (s.legacy_gen) |*g| g else continue;
-        if (gen.dflash == null or gen.spec_disabled_runtime) continue;
+        if (gen.spec_disabled_runtime) continue;
+        const mode = slotSpecMode(s, gen);
+        if (!yieldsToCompany(mode, mlx.cudaAvailable())) continue;
         var company = false;
         for (active) |o| {
             if (o != s and o.model == s.model) company = true;
         }
-        s.dflash_company_ticks = companyStreak(s.dflash_company_ticks, company);
-        if (s.dflash_company_ticks >= DFLASH_COMPANY_TICKS) gen.dflashYieldToCompany();
+        s.company_ticks = companyStreak(s.company_ticks, company);
+        if (s.company_ticks >= COMPANY_YIELD_TICKS) gen.yieldSpecToCompany(@tagName(mode));
     }
 }
 
@@ -7424,6 +7448,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .drafter_block_size = slot.drafter_block_size,
             .dflash_enabled = use_dflash,
             .dflash = if (use_dflash) slot.dflash else null,
+            .dflash_policy = use_dflash and generate_mod.Generator.dflashPolicyFor(slot.model.config.?),
             // The dflash-resolved block rides the shared drafter_block_size.
             .dflash_block_size = slot.drafter_block_size,
             // Use the resolved thinking mode and normalize the M5/block-16
@@ -7740,7 +7765,7 @@ pub const SpecInitWiring = struct {
     use_pld: bool,
     /// The request's spec INTENT, forwarded to the Generator chokepoint for a
     /// module-owned arch that has its OWN draft mode (dsv4 → DSpark). Rides
-    /// `pld_enabled` alongside `use_pld`.
+    /// `mtp_enabled` alongside `use_mtp`.
     native_intent: bool,
 };
 
@@ -7863,6 +7888,20 @@ pub fn specTickMode(
     if (slot_enable_drafter and gen_has_drafter) return .drafter;
     if (slot_enable_pld and gen_pld_enabled) return .pld;
     return .regular;
+}
+
+/// `specTickMode` for a slot and its generator.
+fn slotSpecMode(slot: *const Slot, gen: *const Generator) SpecTickMode {
+    return specTickMode(
+        slot.enable_mtp,
+        gen.mtp != null,
+        slot.enable_drafter,
+        gen.drafter != null,
+        gen.dflash != null,
+        slot.enable_pld,
+        gen.pld_enabled,
+        gen.dspark_enabled,
+    );
 }
 
 /// Drive one Generator step (regular / PLD / drafter) and push emitted
@@ -10132,7 +10171,7 @@ test "the batched gate reads DISPATCH, not the armed spec flags" {
     const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
     const hbody = src[hs..he];
     try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime") != null);
-    try testing.expect(std.mem.indexOf(u8, hbody, "specTickMode(") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "slotSpecMode(") != null);
 
     // The dispatch answer itself: a live MTP slot never ticks regular, an
     // unarmed one always does.
@@ -11278,6 +11317,16 @@ test "companyStreak: only consecutive ticks with company count" {
     try testing.expectEqual(@as(u8, 0), companyStreak(1, false));
 }
 
+test "yieldsToCompany: the DFlash family everywhere, PLD only on CUDA" {
+    for ([_]SpecTickMode{ .dflash, .dspark }) |m| {
+        try testing.expect(yieldsToCompany(m, false));
+        try testing.expect(yieldsToCompany(m, true));
+    }
+    try testing.expect(yieldsToCompany(.pld, true));
+    try testing.expect(!yieldsToCompany(.pld, false));
+    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true));
+}
+
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {
     try testing.expectEqual(@as(u32, 8192), companyPrefillChunk(8192, 0));
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1));
@@ -11366,6 +11415,12 @@ test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chun
     try testing.expectEqual(@as(u32, 1), interleaveTicksFor(8000 * ms, 0));
 }
 
+test "a media job on CUDA throttles MLX at its estimated peak; Metal keeps MLX's limit" {
+    try testing.expectEqual(@as(?usize, 4 << 30), genMemoryLimit(true, 4 << 30));
+    try testing.expectEqual(@as(?usize, 0), genMemoryLimit(true, 0));
+    try testing.expectEqual(@as(?usize, null), genMemoryLimit(false, 4 << 30));
+}
+
 test "a media job always clears the allocator cache, a decision job only from 256 MiB" {
     try testing.expect(shouldClearCache(false, 0));
     try testing.expect(!shouldClearCache(true, (256 << 20) - 1));
@@ -11429,16 +11484,15 @@ test "takeMergeable: merges the contiguous run of same-model decision jobs withi
     try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
 }
 
-test "applyModelSettings: explicit MTP flags outrank model settings" {
+test "applyModelSettings: model MTP setting outranks the launch default" {
     var cc = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
-    for ([_]struct { flag: ?bool, setting: ?bool, want: ?bool }{
+    for ([_]struct { flag: bool, setting: ?bool, want: ?bool }{
         .{ .flag = false, .setting = null, .want = false },
-        .{ .flag = false, .setting = true, .want = false },
-        .{ .flag = true, .setting = null, .want = true },
-        .{ .flag = true, .setting = false, .want = true },
-        .{ .flag = null, .setting = null, .want = null },
-        .{ .flag = null, .setting = false, .want = false },
-        .{ .flag = null, .setting = true, .want = true },
+        .{ .flag = false, .setting = true, .want = true },
+        .{ .flag = false, .setting = false, .want = false },
+        .{ .flag = true, .setting = null, .want = null },
+        .{ .flag = true, .setting = false, .want = false },
+        .{ .flag = true, .setting = true, .want = true },
     }) |c| {
         var cfg = ModelConfig{};
         var o = model_settings.Override{ .mtp = c.setting };

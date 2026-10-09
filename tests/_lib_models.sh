@@ -46,9 +46,14 @@ model_gb() {
 }
 
 # Metal's working set: iogpu.wired_limit_mb when it is raised, else the macOS
-# default of about 3/4 of RAM.
+# default of about 3/4 of RAM. Linux: the first NVIDIA GPU's memory.
 gpu_budget_gb() {
     local mb
+    if [[ "$(uname)" == Linux ]]; then
+        mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+        echo $(( ${mb:-0} / 1024 ))
+        return
+    fi
     mb=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null)
     [[ "${mb:-0}" -gt 0 ]] || mb=$(( $(sysctl -n hw.memsize) / 1048576 * 3 / 4 ))
     echo $(( mb / 1024 ))

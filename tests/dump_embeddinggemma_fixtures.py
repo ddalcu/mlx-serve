@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Dump reference EmbeddingGemma sentence embeddings for the mlx-serve parity check.
 
-Reference = sentence-transformers (Transformer -> mean pool -> dense.0 ->
-dense.1 -> normalize), NO prompt prefix (default_prompt_name is null, and the
+Reference = sentence-transformers in float32 (Transformer -> mean pool ->
+dense head -> normalize), NO prompt prefix (default_prompt_name is null, and the
 /v1/embeddings surface serves raw text).
 
 Run (downloads torch + the fp32 checkpoint on first use):
@@ -11,6 +11,11 @@ Run (downloads torch + the fp32 checkpoint on first use):
 
 google/embeddinggemma-300m is gated on HF; the unsloth/embeddinggemma-300m
 mirror is the ungated default here (same weights).
+
+EmbeddingGemma 2 (`--model google/embeddinggemma-2`) needs sentence-transformers
+>= 6.1 and transformers >= 5.18 with torchvision (its processor imports the
+Gemma 4 image code). Its last sentence is long enough to cross the 512-position
+sliding band.
 
 Compare against a running mlx-serve with the 8-bit MLX conversion loaded:
     python3 tests/dump_embeddinggemma_fixtures.py --compare http://127.0.0.1:11297 \
@@ -34,12 +39,14 @@ SENTENCES = [
     "def mean(xs): return sum(xs) / len(xs)",
     "A single word",
 ]
+# ~1000 tokens of distinct sentences: positions farther apart than the 512 band must still agree.
+SENTENCES.append(" ".join(f"Item {i}: {SENTENCES[i % 7]}" for i in range(60)))
 
 
 def dump(model_id: str, out_path: str) -> None:
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(model_id)
+    model = SentenceTransformer(model_id, model_kwargs={"dtype": "float32"})
     # prompt="" forces raw text (no task prefix) regardless of config defaults.
     vecs = model.encode(SENTENCES, prompt="", normalize_embeddings=True)
     with open(out_path, "w") as f:

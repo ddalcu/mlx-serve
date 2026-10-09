@@ -48,7 +48,9 @@ enum AgentPrompt {
     /// so a third engine gets a correct line without new prose.
     static func musicEngineNote(_ model: MusicModelPreset) -> String {
         var note = "\n\n# Music engine\nThe Music window is set to “\(model.name)”, so that is what `generate_music` runs. "
-        if model.requiresLyrics {
+        if model.supportsScore {
+            note += "It requires `lyrics` — a call without them fails — and cannot make a wordless track. Write original words with capitalized section tags ([Verse], [Chorus]) on their own lines, and put the genre, instruments and lead vocal in `prompt` as comma-separated tags. "
+        } else if model.requiresLyrics {
             note += "It requires `lyrics` — a call without them fails. Write original words with section tags ([verse], [chorus]) on their own lines; for an instrumental send the tags with no words under them. "
         } else {
             note += "`lyrics` are optional — omit them for an instrumental. "

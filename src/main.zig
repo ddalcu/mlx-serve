@@ -191,8 +191,9 @@ fn printUsage(io: std.Io) void {
         \\                        it DOWN). Pass to override.
         \\  --no-drafter        Never load a speculative-decoding drafter, including
         \\                      one shipped inside the checkpoint (drafter/ subdir)
-        \\  --no-mtp            Disable native MTP / DSpark drafting, overriding
-        \\                        the model's mtp setting.
+        \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
+        \\                        when the model dir ships mtp/weights.safetensors;
+        \\                        priority: MTP > drafter > PLD).
         \\  --ple-gpu           Qwen3.8-Flash-Next: gather the n-gram table on the
         \\                        GPU. Keeps the whole ~30 GB table resident beside
         \\                        the weights for a few % faster prefill/decode;
@@ -209,8 +210,8 @@ fn printUsage(io: std.Io) void {
         \\                        declines by name where the copy does not fit.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
-        \\  --mtp               Enable native MTP / DSpark when available,
-        \\                        overriding the model's mtp setting.
+        \\  --mtp               No-op: a loaded MTP head drafts by default,
+        \\                        dense or MoE (--no-mtp turns it off).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV).
@@ -402,8 +403,8 @@ fn printUsage(io: std.Io) void {
         \\                        ensureLoaded evicts LRU before exceeding.
         \\  --max-resident-mem <n>{{KB,MB,GB}}|auto
         \\                      Summed resident-bytes cap across all loaded
-        \\                        models. Default 'auto' = 80% of MLX wired
-        \\                        limit at startup. Pass 0 to disable.
+        \\                        models. Default 'auto' = the GPU working-set
+        \\                        limit. Pass 0 to disable.
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
@@ -462,6 +463,7 @@ pub fn main(init: std.process.Init) !void {
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
+    mlx.exportCudaHome();
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
     @import("prefix_cache.zig").warmEnvCaches();
@@ -583,7 +585,8 @@ pub fn main(init: std.process.Init) !void {
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
-    var enable_mtp: ?bool = null; // explicit flag > model setting > auto-load
+    var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
+    var mtp_forced = false;
     var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
     var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TOKENV3")) |v| std.mem.span(v) else null;
@@ -600,7 +603,7 @@ pub fn main(init: std.process.Init) !void {
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
     var max_resident_models: u32 = 3;
-    var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
+    var max_resident_mem: u64 = 0; // 0 = auto (the GPU working-set limit)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
@@ -770,7 +773,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
-            enable_mtp = true;
+            // The default now; still accepted so existing launch lines work,
+            // and the way to opt in on CUDA.
+            mtp_forced = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
@@ -971,7 +976,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and i + 1 < args.len) {
             // Plan 05 Phase D: cap on summed resident bytes. Accepts the
             // same suffixes as --prefix-cache-mem. Special string "auto"
-            // (or default 0) → 80% of mlx_set_wired_limit at server start.
+            // (or default 0) → the GPU working-set limit.
             i += 1;
             if (std.mem.eql(u8, args[i], "auto")) {
                 max_resident_mem = 0;
@@ -1043,6 +1048,9 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    // MTP verify rounds cost more than they save without the Metal verify
+    // kernels: plain decode is faster on CUDA unless `--mtp` asks for it.
+    if (!mtp_forced and mlx.cudaAvailable()) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
@@ -1170,8 +1178,8 @@ pub fn main(init: std.process.Init) !void {
         }
         // Above every serve dispatch (GGUF/headless/media return early below).
         if (server_mod.shouldWarnOpenBind(host_explicit, server_mod.g_lan_share_spec != null, host)) {
-            log.warn("Listening on {s}:{d} — reachable by every device on the network this Mac is on.\n", .{ host, port });
-            log.warn("Restrict to this Mac with --host 127.0.0.1 (a future version will make that the default).\n", .{});
+            log.warn("Listening on {s}:{d} — reachable by every device on the network this machine is on.\n", .{ host, port });
+            log.warn("Restrict to this machine with --host 127.0.0.1 (a future version will make that the default).\n", .{});
         }
     }
 
@@ -1222,8 +1230,8 @@ pub fn main(init: std.process.Init) !void {
         const chosen = chooseGgufEngine(io, allocator, model_dir, engine_override);
         if (serve_mode) {
             switch (chosen) {
-                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, enable_mtp),
-                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, enable_mtp),
+                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
+                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
             }
             return;
         }
@@ -1320,7 +1328,7 @@ pub fn main(init: std.process.Init) !void {
         if (gen_mod.detectModality(io, allocator, model_dir)) |modality| {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, enable_mtp);
+            try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
             return;
         }
     }
@@ -1417,24 +1425,8 @@ pub fn main(init: std.process.Init) !void {
         const discovery_for_registry = discovery_storage;
         discovery_storage = null; // ownership moves to the registry
 
-        // Plan 05 Phase D: compute the effective max_resident_mem. When the
-        // user didn't pass an explicit cap, derive 80% of mlx's wired limit
-        // (mlx_set_wired_limit returns a value the platform considers safe
-        // for sustained GPU work). The wired limit was already applied in
-        // the inference thread's load path; here we mirror that calculation
-        // so the registry's eviction gate stays in sync. 0 disables the cap.
-        const effective_max_resident_mem: u64 = if (max_resident_mem_explicit)
-            max_resident_mem
-        else blk: {
-            var dev = mlx.mlx_device{ .ctx = null };
-            _ = mlx.mlx_get_default_device(&dev);
-            var info = mlx.mlx_device_info_new();
-            defer _ = mlx.mlx_device_info_free(info);
-            if (mlx.mlx_device_info_get(&info, dev) != 0) break :blk 0;
-            var max_rec: usize = 0;
-            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) break :blk 0;
-            break :blk @as(u64, max_rec) * 4 / 5;
-        };
+        // Without an explicit cap the registry gate is Metal's working-set limit. 0 disables it.
+        const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
         if (effective_max_resident_mem > 0) {
             log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
                 max_resident_models,
@@ -1575,8 +1567,8 @@ pub fn main(init: std.process.Init) !void {
         // file or in-checkpoint tensors in the trunk shards).
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
-        if (config.mtp_override orelse true) mtp_graft.ensure(allocator, io, model_dir, config);
-        if ((config.mtp_override orelse true) and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
+        if (enable_mtp) mtp_graft.ensure(allocator, io, model_dir, config);
+        if (enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
             if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
@@ -1824,19 +1816,10 @@ fn runDs4Offline(
     log.info("[ds4] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
 }
 
-/// Registry resident-memory cap: the user's explicit value, or 80% of mlx's
-/// wired limit at startup (mirrors the MLX serve block). 0 = query failed →
-/// unlimited (the count cap still applies).
+/// Registry resident-memory cap: the user's explicit value, or Metal's working-set limit.
+/// 0 = query failed → unlimited (the count cap still applies).
 fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
-    if (explicit) return val;
-    var dev = mlx.mlx_device{ .ctx = null };
-    _ = mlx.mlx_get_default_device(&dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) != 0) return 0;
-    var max_rec: usize = 0;
-    if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) return 0;
-    return @as(u64, max_rec) * 4 / 5;
+    return model_registry_mod.ModelRegistry.residentMemCap(explicit, val, mlx.maxRecommendedWorkingSet());
 }
 
 fn dirBasename(path: []const u8) []const u8 {
@@ -1868,7 +1851,6 @@ fn runGenServe(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
-    mtp_enabled: ?bool,
 ) !void {
     log.info("mlx-serve {s} (native {s} engine)\n", .{ VERSION, @tagName(modality) });
     log.info("[args] model: {s}\n", .{model_dir});
@@ -1925,7 +1907,6 @@ fn runGenServe(
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = 0,
-        .mtp_enabled = mtp_enabled,
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
@@ -1956,7 +1937,7 @@ fn runGenServe(
 /// value so its LoadParams cannot leave any of them at a struct default.
 const SpecLoadFlags = struct {
     no_drafter: bool,
-    mtp_enabled: ?bool,
+    mtp_enabled: bool,
     mtp_depth: u32,
     draft_block_size: u32,
     draft_block_size_explicit: bool,
@@ -2125,7 +2106,6 @@ fn runDs4Serve(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
-    mtp_enabled: ?bool,
 ) !void {
     var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
     defer settings.deinit(allocator);
@@ -2291,7 +2271,6 @@ fn runDs4Serve(
         .prefix_cache_mem_bytes = 0,
         // Iteration 2: tokenize cache for ds4 too.
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        .mtp_enabled = mtp_enabled,
         .ds4_path = gguf_path_owned,
         .ds4_ssd_streaming = ds4_ssd_streaming,
         .ds4_mtp = ds4_mtp,
@@ -2424,7 +2403,6 @@ fn runLlamaServe(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
-    mtp_enabled: ?bool,
 ) !void {
     const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
         logResolveGgufError(model_dir, err);
@@ -2567,7 +2545,6 @@ fn runLlamaServe(
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        .mtp_enabled = mtp_enabled,
         .llama = server_mod.llama_settings,
         .llama_path = gguf_path_owned,
         .ds4_mtp = ds4_mtp,

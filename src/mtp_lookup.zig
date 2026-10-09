@@ -16,6 +16,8 @@ pub const MAX_DRAFT_STRONG: u32 = 14;
 /// quote's first rounds at the short cap.
 pub const STRONG_SUFFIX: u32 = 16;
 const SUFFIX_CAP: u32 = 64;
+/// Earlier occurrences `matchBest` compares.
+const CANDIDATES: u32 = 8;
 /// Per-draft MTP head cost, in `verifyCost` units; lookup drafts are free.
 const MTP_DRAFT_COST: f32 = 0.75;
 
@@ -63,6 +65,8 @@ pub const Index = struct {
     toks: std.ArrayList(u32) = .empty,
     /// n-gram -> position of the token after its latest occurrence.
     next: std.AutoHashMapUnmanaged(u128, u32) = .empty,
+    /// Position of the token after an earlier occurrence of the same n-gram, by position of the later one.
+    prev: std.ArrayList(u32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Index {
         return .{ .allocator = allocator };
@@ -71,6 +75,7 @@ pub const Index = struct {
     pub fn deinit(self: *Index) void {
         self.toks.deinit(self.allocator);
         self.next.deinit(self.allocator);
+        self.prev.deinit(self.allocator);
     }
 
     pub fn extend(self: *Index, ids: []const u32) !void {
@@ -80,9 +85,14 @@ pub const Index = struct {
             const n = self.toks.items.len;
             if (n <= NGRAM) continue;
             const g = self.toks.items[n - 1 - NGRAM .. n - 1];
-            try self.next.put(self.allocator, key(g[0], g[1], g[2], g[3]), @intCast(n - 1));
+            const gop = try self.next.getOrPut(self.allocator, key(g[0], g[1], g[2], g[3]));
+            try self.prev.resize(self.allocator, n);
+            self.prev.items[n - 1] = if (gop.found_existing) gop.value_ptr.* else none;
+            gop.value_ptr.* = @intCast(n - 1);
         }
     }
+
+    const none: u32 = std.math.maxInt(u32);
 
     /// Continuation after the latest earlier occurrence of the last NGRAM-1
     /// committed tokens plus `t1` (not yet committed).
@@ -100,6 +110,37 @@ pub const Index = struct {
             if (toks[a] != (if (b == toks.len) t1 else toks[b])) break;
         }
         return .{ .draft = toks[p..@min(p + max_draft, toks.len)], .suffix = suffix };
+    }
+
+    /// `match` over the last `CANDIDATES` occurrences of the n-gram: the one that agrees furthest back wins,
+    /// the latest among equals. An edit that left the latest occurrence on the wrong copy still finds the right one.
+    pub fn matchBest(self: *const Index, t1: u32, max_draft: u32) ?Match {
+        const toks = self.toks.items;
+        if (toks.len < NGRAM - 1 or max_draft == 0) return null;
+        const t = toks[toks.len - (NGRAM - 1) ..];
+        var p: usize = self.next.get(key(t[0], t[1], t[2], t1)) orelse return null;
+        var best: ?Match = null;
+        var seen: u32 = 0;
+        while (seen < CANDIDATES) : (seen += 1) {
+            const suffix = agreement(toks, p, t1);
+            if (best == null or suffix > best.?.suffix) best = .{ .draft = toks[p..@min(p + max_draft, toks.len)], .suffix = suffix };
+            if (suffix >= SUFFIX_CAP or p >= self.prev.items.len or self.prev.items[p] == none) break;
+            p = self.prev.items[p];
+        }
+        return best;
+    }
+
+    /// Tokens before `p` that agree with the committed tail (plus `t1`), capped.
+    fn agreement(toks: []const u32, p: usize, t1: u32) u32 {
+        var suffix: u32 = 0;
+        var a: usize = p;
+        var b: usize = toks.len + 1;
+        while (suffix < SUFFIX_CAP and a > 0) : (suffix += 1) {
+            a -= 1;
+            b -= 1;
+            if (toks[a] != (if (b == toks.len) t1 else toks[b])) break;
+        }
+        return suffix;
     }
 
     fn key(a: u32, b: u32, c: u32, d: u32) u128 {
@@ -204,4 +245,21 @@ test "lookup gate: measured prices on both sides decide" {
     var dear = Costs{ .mtp_ms = 21.45 };
     dear.lookup_ms[11] = 200.0;
     try testing.expectEqual(@as(u32, 0), gate(strong, 100, 9.0, 1.0, 3, false, dear));
+}
+
+test "lookup: matchBest takes the earlier occurrence that agrees further back over the latest one" {
+    var ix = Index.init(testing.allocator);
+    defer ix.deinit();
+    try ix.extend(&.{ 9, 9, 9, 1, 2, 3, 4, 50, 51, 52, 53, 54, 7, 1, 2, 3, 4, 60, 61, 70, 9, 9, 9, 1, 2, 3 });
+    const latest = ix.match(4, 4).?;
+    try testing.expectEqual(@as(u32, 60), latest.draft[0]);
+    try testing.expectEqual(@as(u32, 4), latest.suffix);
+    const best = ix.matchBest(4, 4).?;
+    try testing.expectEqual(@as(u32, 50), best.draft[0]);
+    try testing.expectEqual(@as(u32, 7), best.suffix);
+    // Alone, or with the latest already best, it is the latest.
+    var one = Index.init(testing.allocator);
+    defer one.deinit();
+    try one.extend(&.{ 1, 2, 3, 4, 5, 6, 1, 2, 3 });
+    try testing.expectEqual(one.match(4, 3).?.draft[0], one.matchBest(4, 3).?.draft[0]);
 }

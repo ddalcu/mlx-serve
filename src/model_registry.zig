@@ -1324,6 +1324,20 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// Registry resident-memory cap: the explicit value, else Metal's whole working-set limit
+    /// (the load preflight enforces it too, so a model that fits it must not be refused here).
+    pub fn residentMemCap(explicit: bool, val: u64, gpu_limit: u64) u64 {
+        return if (explicit) val else gpu_limit;
+    }
+
+    test "the auto resident-memory cap is the full GPU working-set limit" {
+        const gib: u64 = 1 << 30;
+        // A 190 GB model on a 223 GB limit loads; an explicit cap (or 0 = off) still wins.
+        try std.testing.expect(190 * gib <= residentMemCap(false, 0, 223 * gib));
+        try std.testing.expectEqual(@as(u64, 100 * gib), residentMemCap(true, 100 * gib, 223 * gib));
+        try std.testing.expectEqual(@as(u64, 0), residentMemCap(true, 0, 223 * gib));
+    }
+
     /// Map a stored load-failure name back to the typed error `ensureLoaded`
     /// surfaces. A memory-preflight refusal keeps its identity so the HTTP
     /// layer answers with a named 503 instead of the generic "Model load

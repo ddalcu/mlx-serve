@@ -28,6 +28,7 @@ zig-out/
 /lib/.mlx-build/
 # Linux counterpart staging work dir (scripts/build-mlx-linux.sh)
 /.work-mlx-linux/
+/.work-mlx-linux-cuda/
 /lib/jinja_cpp/libjinja-linux.a
 
 # Swift / app build. No leading slash, so it also catches the stray root
@@ -96,3 +97,6 @@ tests/soak_log.csv
 /tests/agent_eval/out/
 runs/*
 data
+
+# Studio web console (app-web/): dev tooling output only
+app-web/node_modules/

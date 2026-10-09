@@ -40,7 +40,8 @@ final class DrafterGemsTests: XCTestCase {
         // The MoE Gemma regresses with a drafter; a drafter never pulls itself; GGUF has no drafter path.
         for repo in ["mlx-community/gemma-4-26b-a4b-it-4bit", GemmaVariant.E4B.drafterRepoId, DrafterGems.museAssistantRepo,
                      "LiquidAI/LFM2.5-2.6B-DSpark", "mlx-community/LFM2.5-VL-1.6B-4bit",
-                     DrafterGems.qwen38DFlash2Repo, "unsloth/Qwen3.8-27B-GGUF", "mlx-community/gemma-3-12b-it-4bit"] {
+                     DrafterGems.qwen38DFlash2Repo, DrafterGems.glmDFlash2Repo, "unsloth/Qwen3.8-27B-GGUF",
+                     "mlx-community/gemma-3-12b-it-4bit"] {
             XCTAssertEqual(DrafterGems.gems(forRepoId: repo, packFiles: nil, localDrafter: false, mtpAvailable: false), [], repo)
         }
     }
@@ -49,6 +50,49 @@ final class DrafterGemsTests: XCTestCase {
         let gems = DrafterGems.gems(forRepoId: "LiquidAI/LFM2.5-2.6B-MLX-8bit", packFiles: nil, localDrafter: true, mtpAvailable: true)
         XCTAssertEqual(kinds(gems), [.mtp, .packDrafter])
         XCTAssertEqual(DrafterGems.defaultGem(gems)?.kind, .packDrafter)
+    }
+
+    func testAGlmFlashPackOffersIncoaisDFlash2AfterMtpButNeverFillsTheSocketWithIt() {
+        let mtp = DrafterGem(kind: .mtp, repo: "", subfolder: nil, sizeGB: 0)
+        let glm = DrafterGem(kind: .dflash2, repo: DrafterGems.glmDFlash2Repo, subfolder: nil, sizeGB: 2.34)
+        for repo in ["TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP", "zai-org/GLM-5.3-Flash"] {
+            let gems = DrafterGems.gems(forRepoId: repo, packFiles: nil, localDrafter: false, mtpAvailable: true)
+            XCTAssertEqual(gems, [mtp, glm], repo)
+            XCTAssertNil(DrafterGems.defaultGem(gems), "MTP beats it on prose, long context and bursts: offered, never auto-filled")
+        }
+        XCTAssertEqual(DrafterGems.gems(forRepoId: "TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP", packFiles: nil, localDrafter: false, mtpAvailable: false), [glm])
+
+        // A pack that ships its own drafter/ offers that one instead.
+        let own = DrafterGems.gems(forRepoId: "ddalcu/GLM-5.3-Flash-MLX-Serve-4bit", packFiles: nil, localDrafter: true, mtpAvailable: true)
+        XCTAssertEqual(kinds(own), [.mtp, .packDrafter])
+
+        // The socket binds the DFlash engine and writes the drafter's directory.
+        XCTAssertTrue(DrafterSocket.gem(glm).bindsDflash(localDrafter: false))
+        var o = ModelOverride()
+        DrafterSocket.gem(glm).write(into: &o, gemPath: "/d/glm")
+        XCTAssertEqual(o.drafter, "/d/glm")
+        XCTAssertNil(o.mtp)
+
+        // GGUF runs on ds4 (its own MTP); other GLMs have no drafter.
+        for repo in ["unsloth/GLM-5.3-Flash-GGUF", "TensorFold/GLM-5.2-MLX-4bit", "mlx-community/GLM-5.3-4bit"] {
+            XCTAssertEqual(DrafterGems.gems(forRepoId: repo, packFiles: nil, localDrafter: false, mtpAvailable: false), [], repo)
+        }
+    }
+
+    func testTheMenuNamesTheLicenseWhereItAsksForADownload() {
+        let glm = DrafterGem(kind: .dflash2, repo: DrafterGems.glmDFlash2Repo, subfolder: nil, sizeGB: 2.34)
+        let zlab = DrafterGem(kind: .dflash2, repo: DrafterGems.qwen38DFlash2Repo, subfolder: nil, sizeGB: 3.85)
+        XCTAssertEqual(SpeculationSocketRow.menuLabel(glm, onDisk: false, fits: true), "DFlash2 drafter (download 2.3 GB, non-commercial license)")
+        XCTAssertEqual(SpeculationSocketRow.menuLabel(glm, onDisk: true, fits: true), "DFlash2 drafter")
+        XCTAssertEqual(SpeculationSocketRow.menuLabel(glm, onDisk: false, fits: false), "DFlash2 drafter (2.3 GB, does not fit in memory)")
+        XCTAssertFalse(SpeculationSocketRow.menuLabel(zlab, onDisk: false, fits: true).contains("license"), "only the CC BY-NC-ND drafter carries a note")
+        XCTAssertNil(DrafterGem(kind: .mtp, repo: "", subfolder: nil, sizeGB: 0).licenseNote)
+    }
+
+    func testAGemDownloadTakesTheConfigAndWeightsAndNothingElse() {
+        let incoai = [entry("README.md", 2_619), entry("assets/dflash2-figure.png", 286_889),
+                      entry("config.json", 1_273), entry("model.safetensors", 2_342_169_800)]
+        XCTAssertEqual(DownloadManager.selectNeededFiles(from: incoai).map(\.0), ["config.json", "model.safetensors"])
     }
 
     // MARK: - Socket <-> settings

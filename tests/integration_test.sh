@@ -109,12 +109,12 @@ echo -e "${YELLOW}Starting server on port $PORT...${NC}"
 "$BINARY" --model "$MODEL_DIR" --serve --port "$PORT" --log-level warn --ctx-size 4096 ${MLX_SERVE_TEST_EXTRA_ARGS:-} &
 SERVER_PID=$!
 
-# Wait for health
-for i in $(seq 1 30); do
+# Wait for health (a cold CUDA start on a small card takes ~45 s)
+for i in $(seq 1 120); do
     if curl -s "$BASE/health" 2>/dev/null | grep -q '"ok"'; then
         break
     fi
-    if [ $i -eq 30 ]; then
+    if [ $i -eq 120 ] || ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo -e "${RED}Server failed to start${NC}"
         exit 1
     fi

@@ -430,61 +430,66 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .optimize = optimize,
     });
 
-    const mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libcpp = true,
-        .imports = &.{
-            .{ .name = "build_options", .module = build_options.createModule() },
-            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
-            .{ .name = "opencode2_plugin", .module = opencode2_plugin },
-            .{ .name = "agent_skills", .module = agent_skills },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
-            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
-        },
-    });
+    // The server and its unit tests (`zig build test`, root src/tests.zig) share one module setup.
+    var mods: [2]*std.Build.Module = undefined;
+    for (&mods, [_][]const u8{ "src/main.zig", "src/tests.zig" }) |*slot, root| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(root),
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+            .imports = &.{
+                .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
+                .{ .name = "opencode2_plugin", .module = opencode2_plugin },
+                .{ .name = "agent_skills", .module = agent_skills },
+                .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
+                .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
+                .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
+            },
+        });
 
-    // Jinja2 template engine — same vendored sources as the macOS graph, built
-    // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
-    addGgufModule(b, mod, target, optimize);
-    addExl3Module(b, mod, target, optimize);
-    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
-    mod.addIncludePath(b.path("lib/jinja_cpp"));
+        // Jinja2 template engine — same vendored sources as the macOS graph, built
+        // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
+        addGgufModule(b, mod, target, optimize);
+        addExl3Module(b, mod, target, optimize);
+        mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
+        mod.addIncludePath(b.path("lib/jinja_cpp"));
 
-    // stb_image (JPEG/PNG decode) + stb_image_write (PNG encode), xatlas
-    // (UV unwrap for Hunyuan3D texture paint) — portable C/C++.
-    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
-    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
-    mod.addIncludePath(b.path("lib"));
-    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    mod.addIncludePath(b.path("lib/xatlas"));
-    mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    mod.addIncludePath(b.path("lib/fqms"));
+        // stb_image (JPEG/PNG decode) + stb_image_write (PNG encode), xatlas
+        // (UV unwrap for Hunyuan3D texture paint) — portable C/C++.
+        mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+        mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
+        mod.addIncludePath(b.path("lib"));
+        mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+        mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+        mod.addIncludePath(b.path("lib/xatlas"));
+        mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+        mod.addIncludePath(b.path("lib/fqms"));
 
-    // ANE offload C ABI → unavailable stubs on Linux (src/ane_stub.c); ane.zig
-    // compiles unchanged and gates itself off via available() == false.
-    mod.addCSourceFile(.{ .file = b.path("src/ane_stub.c"), .flags = &.{"-O2"} });
+        // ANE offload C ABI → unavailable stubs on Linux (src/ane_stub.c); ane.zig
+        // compiles unchanged and gates itself off via available() == false.
+        mod.addCSourceFile(.{ .file = b.path("src/ane_stub.c"), .flags = &.{"-O2"} });
 
-    // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
-    addMlxLib(b, mod);
-    // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
-    // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
-    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
-    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/mlx/lib" });
+        // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
+        addMlxLib(b, mod);
+        // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
+        // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
+        mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
+        mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/mlx/lib" });
 
-    // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
-    mod.linkSystemLibrary("webp", .{});
+        // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
+        mod.linkSystemLibrary("webp", .{});
 
-    // Bonjour/mDNS peer discovery (src/lan.zig) via Avahi's dns_sd compat lib
-    // (Arch: avahi ships /usr/lib/libdns_sd.so; Debian: libavahi-compat-libdnssd-dev).
-    mod.linkSystemLibrary("dns_sd", .{ .use_pkg_config = .no });
+        // Bonjour/mDNS peer discovery (src/lan.zig) via Avahi's dns_sd compat lib
+        // (Arch: avahi ships /usr/lib/libdns_sd.so; Debian: libavahi-compat-libdnssd-dev).
+        mod.linkSystemLibrary("dns_sd", .{ .use_pkg_config = .no });
+        slot.* = mod;
+    }
 
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
-        .root_module = mod,
+        .root_module = mods[0],
     });
     b.installArtifact(exe);
 
@@ -493,6 +498,14 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run mlx-serve");
     run_step.dependOn(&run_cmd.step);
+
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    const unit_tests = b.addTest(.{
+        .root_module = mods[1],
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/

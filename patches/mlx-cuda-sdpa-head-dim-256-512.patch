@@ -1,0 +1,257 @@
+MLX's CUDA backend has no fused attention past head dim 128: the vector
+kernel takes 64/96/128 and cuDNN is capped at 128, so Gemma 4 (256 sliding,
+512 global) and the Qwen3.5 family (256) run every attention call on the
+unfused fallback, which materializes the score matrix. This patch:
+
+- runs the vector kernel (1..3 query rows) at head dims 256 and 512, with
+  vectorized per-lane row loads (one 16-byte load instead of eight scalar
+  ones) and __launch_bounds__(1024) so the 512 variants fit the 1024-thread
+  block's register budget;
+- lets cuDNN take head dim 256 on sm_120 (verified with cuDNN 9.27), which
+  serves prefill-sized blocks 2-3x faster than the fallback;
+- keeps cuDNN off 2..15 query rows: its graph is cached per shape, so a
+  speculative-verify block over a growing kv cache rebuilt it every step
+  (milliseconds of encode per attention layer).
+
+Upstream PR pending (the user submits it); drop this file and its step in
+build-mlx-linux.sh once lib/mlx-src includes it.
+
+diff --git a/mlx/backend/cuda/scaled_dot_product_attention.cpp b/mlx/backend/cuda/scaled_dot_product_attention.cpp
+index 286d500..9e9c7f0 100644
+--- a/mlx/backend/cuda/scaled_dot_product_attention.cpp
++++ b/mlx/backend/cuda/scaled_dot_product_attention.cpp
+@@ -334,14 +334,24 @@ bool supports_sdpa_cudnn(
+     return false;
+   }
+ 
++  // A graph is built per shape, so a few query rows over a growing kv cache
++  // (speculative verify) rebuild it every step, at a cost of milliseconds.
++  // Those widths take the vector kernel or the unfused fallback instead.
++  if (q.shape(2) > 1 && q.shape(2) < 16) {
++    return false;
++  }
++
+   // cuDNN does not support bottom right mask when T_q > T_kv.
+   if (do_causal && (q.shape(2) > k.shape(2))) {
+     return false;
+   }
+ 
+-  // D_qk and D_v must be a multiple of 8 with maximum value 128.
+-  if ((q.shape(-1) % 8 != 0) || (q.shape(-1) > 128) || (v.shape(-1) % 8 != 0) ||
+-      (v.shape(-1) > 128)) {
++  // D_qk and D_v must be a multiple of 8 with maximum value 128, or 256 on
++  // Blackwell consumer GPUs (sm_120, verified with cuDNN 9.27).
++  int max_head_dim =
++      cu::device(s.device).compute_capability_major() >= 12 ? 256 : 128;
++  if ((q.shape(-1) % 8 != 0) || (q.shape(-1) > max_head_dim) ||
++      (v.shape(-1) % 8 != 0) || (v.shape(-1) > max_head_dim)) {
+     return false;
+   }
+ 
+diff --git a/mlx/backend/cuda/scaled_dot_product_attention.cu b/mlx/backend/cuda/scaled_dot_product_attention.cu
+index 6fafb0b..c645fc6 100644
+--- a/mlx/backend/cuda/scaled_dot_product_attention.cu
++++ b/mlx/backend/cuda/scaled_dot_product_attention.cu
+@@ -21,6 +21,24 @@ namespace cg = cooperative_groups;
+ 
+ #define PRAGMA_LOOP_UNROLL #pragma unroll
+ 
++// Reads this lane's N contiguous elements of a row as floats, with vector
++// loads when N is a power of two (head dim 96 has N = 3).
++template <int N, typename T>
++__device__ inline void load_lane_row(const T* row, int lane_idx, float* out) {
++  if constexpr ((N & (N - 1)) == 0) {
++    auto v = load_vector<N>(row, lane_idx);
++    PRAGMA_LOOP_UNROLL
++    for (int i = 0; i < N; i++) {
++      out[i] = static_cast<float>(v[i]);
++    }
++  } else {
++    PRAGMA_LOOP_UNROLL
++    for (int i = 0; i < N; i++) {
++      out[i] = static_cast<float>(row[N * lane_idx + i]);
++    }
++  }
++}
++
+ struct AttnParams {
+   int B;
+   int H;
+@@ -39,7 +57,7 @@ struct AttnParams {
+ };
+ 
+ template <typename T, bool do_causal, int D>
+-__global__ void kernel_sdpav_1pass(
++__global__ void __launch_bounds__(1024) kernel_sdpav_1pass(
+     const T* Q,
+     const T* K,
+     const T* V,
+@@ -97,9 +115,10 @@ __global__ void kernel_sdpav_1pass(
+       q_seq_idx * params.O_strides[2]; // Sequence
+ 
+   // Read the query and 0 the output accumulator
++  load_lane_row<v_per_thread>(Q, lane_idx, q);
+   PRAGMA_LOOP_UNROLL
+   for (int i = 0; i < v_per_thread; i++) {
+-    q[i] = scale_log2 * static_cast<U>(Q[v_per_thread * lane_idx + i]);
++    q[i] *= scale_log2;
+   }
+ 
+   PRAGMA_LOOP_UNROLL
+@@ -123,10 +142,7 @@ __global__ void kernel_sdpav_1pass(
+ 
+     if (use_key) {
+       // Read the key
+-      PRAGMA_LOOP_UNROLL
+-      for (int j = 0; j < v_per_thread; j++) {
+-        k[j] = K[v_per_thread * lane_idx + j];
+-      }
++      load_lane_row<v_per_thread>(K, lane_idx, k);
+ 
+       // Compute the i-th score
+       U score = 0.f;
+@@ -146,11 +162,11 @@ __global__ void kernel_sdpav_1pass(
+       max_score = new_max;
+       sum_exp_score = sum_exp_score * factor + exp_score;
+ 
+-      // Update the output accumulator
++      // Update the output accumulator (the key's registers now hold V)
++      load_lane_row<v_per_thread>(V, lane_idx, k);
+       PRAGMA_LOOP_UNROLL
+       for (int j = 0; j < v_per_thread; j++) {
+-        o[j] = o[j] * factor +
+-            exp_score * static_cast<U>(V[v_per_thread * lane_idx + j]);
++        o[j] = o[j] * factor + exp_score * k[j];
+       }
+     }
+ 
+@@ -262,9 +278,10 @@ __global__ void kernel_sdpav_2pass_1(
+   maxs += p_offset;
+ 
+   // Read the query and 0 the output accumulator
++  load_lane_row<v_per_thread>(Q, lane_idx, q);
+   PRAGMA_LOOP_UNROLL
+   for (int i = 0; i < v_per_thread; i++) {
+-    q[i] = scale_log2 * static_cast<U>(Q[v_per_thread * lane_idx + i]);
++    q[i] *= scale_log2;
+   }
+ 
+   PRAGMA_LOOP_UNROLL
+@@ -288,10 +305,7 @@ __global__ void kernel_sdpav_2pass_1(
+ 
+     if (use_key) {
+       // Read the key
+-      PRAGMA_LOOP_UNROLL
+-      for (int j = 0; j < v_per_thread; j++) {
+-        k[j] = K[v_per_thread * lane_idx + j];
+-      }
++      load_lane_row<v_per_thread>(K, lane_idx, k);
+ 
+       // Compute the i-th score
+       U score = 0.f;
+@@ -311,11 +325,11 @@ __global__ void kernel_sdpav_2pass_1(
+       max_score = new_max;
+       sum_exp_score = sum_exp_score * factor + exp_score;
+ 
+-      // Update the output accumulator
++      // Update the output accumulator (the key's registers now hold V)
++      load_lane_row<v_per_thread>(V, lane_idx, k);
+       PRAGMA_LOOP_UNROLL
+       for (int j = 0; j < v_per_thread; j++) {
+-        o[j] = o[j] * factor +
+-            exp_score * static_cast<U>(V[v_per_thread * lane_idx + j]);
++        o[j] = o[j] * factor + exp_score * k[j];
+       }
+     }
+ 
+@@ -371,7 +385,7 @@ __global__ void kernel_sdpav_2pass_1(
+ }
+ 
+ template <typename T, bool do_causal, int D>
+-__global__ void kernel_sdpav_2pass_2(
++__global__ void __launch_bounds__(1024) kernel_sdpav_2pass_2(
+     const float* partials,
+     const float* sums,
+     const float* maxs,
+@@ -460,6 +474,12 @@ void dispatch_headdim(int n, F&& f) {
+     case 128:
+       f(std::integral_constant<int, 128>{});
+       break;
++    case 256:
++      f(std::integral_constant<int, 256>{});
++      break;
++    case 512:
++      f(std::integral_constant<int, 512>{});
++      break;
+   }
+ }
+ 
+@@ -674,7 +694,8 @@ bool supports_sdpa_vector(
+   const int key_sequence_length = k.shape(2);
+ 
+   const bool sdpa_supported_head_dim = query_head_dim == value_head_dim &&
+-      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128);
++      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
++       query_head_dim == 256 || query_head_dim == 512);
+ 
+   const bool supported_vector_config =
+       sdpa_supported_head_dim && query_sequence_length < 4;
+diff --git a/tests/cuda_tests.cpp b/tests/cuda_tests.cpp
+index d441dfb..b9a3905 100644
+--- a/tests/cuda_tests.cpp
++++ b/tests/cuda_tests.cpp
+@@ -127,3 +127,54 @@ TEST_CASE("test lru cache thrashing check counts consecutive misses") {
+   };
+   CHECK_THROWS(cycle());
+ }
++
++TEST_CASE("test fused sdpa at head dims 256 and 512") {
++  // 1..3 query rows take the vector kernel (one and two pass), prefill-sized
++  // blocks at head dim 256 take cuDNN on sm_120; each must match an fp32
++  // reference built from plain ops.
++  auto reference = [](array q, array k, array v, float scale, bool causal) {
++    int gqa = q.shape(1) / k.shape(1);
++    int qL = q.shape(2), kL = k.shape(2);
++    k = repeat(astype(k, float32), gqa, 1);
++    v = repeat(astype(v, float32), gqa, 1);
++    auto s = matmul(astype(q, float32) * scale, swapaxes(k, -1, -2));
++    if (causal) {
++      auto rows = reshape(arange(qL) + (kL - qL), {qL, 1});
++      auto cols = reshape(arange(kL), {1, kL});
++      s = where(rows >= cols, s, array(-INFINITY));
++    }
++    return matmul(softmax(s, -1), v);
++  };
++  int cc_major = 0;
++  REQUIRE_EQ(
++      cudaDeviceGetAttribute(
++          &cc_major, cudaDevAttrComputeCapabilityMajor, 0),
++      cudaSuccess);
++  for (int D : {256, 512}) {
++    for (int qL : {1, 3, 64}) {
++      if (qL == 64 && (D != 256 || cc_major < 12)) {
++        continue;
++      }
++      for (int kL : {qL == 64 ? 64 : 37, 1500}) {
++        for (bool causal : {false, true}) {
++          auto q = random::normal({1, 8, qL, D}, bfloat16);
++          // Keys and values as views into a longer cache, like a decode.
++          auto k = slice(
++              random::normal({1, 2, kL + 16, D}, bfloat16),
++              {0, 0, 0, 0},
++              {1, 2, kL, D});
++          auto v = slice(
++              random::normal({1, 2, kL + 16, D}, bfloat16),
++              {0, 0, 0, 0},
++              {1, 2, kL, D});
++          float scale = 1.0f / std::sqrt(static_cast<float>(D));
++          auto out = fast::scaled_dot_product_attention(
++              q, k, v, scale, causal ? "causal" : "", {}, {}, true);
++          auto expected = reference(q, k, v, scale, causal);
++          CHECK(allclose(astype(out, float32), expected, 2e-2, 2e-2)
++                    .item<bool>());
++        }
++      }
++    }
++  }
++}

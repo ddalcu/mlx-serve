@@ -43,8 +43,10 @@ pub const VisionPreproc = struct {
     /// Clef's Pillow RGB conversion discards alpha instead of compositing it.
     composite_alpha: bool = true,
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
-    /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
+    /// `gemma_budget` (Gemma 4's own processor, as EmbeddingGemma 2 uses it: a CHW image of any
+    /// aspect ratio sized to `max_tokens` soft tokens), or one of the patch-grid towers
+    /// (each with its own resize + patch order).
+    mode: enum { gemma, qwen, muse, lfm2, gemma_budget } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -62,6 +64,8 @@ pub const VisionPreproc = struct {
     max_tiles: u32 = 0,
     use_thumbnail: bool = false,
     pixels_tolerance: f32 = 0,
+    /// gemma_budget video: the most frames kept from a client's list.
+    max_frames: u32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.

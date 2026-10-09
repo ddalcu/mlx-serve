@@ -123,6 +123,21 @@ NUM="$(secs "$TMP/num.wav")"; NONUM="$(secs "$TMP/nonum.wav")"
 python3 -c "import sys;sys.exit(0 if float('$NUM')>float('$NONUM')+0.15 else 1)" \
   && ok "[8] '42' adds speech (${NUM}s vs ${NONUM}s)" || bad "[8] number vanished (${NUM}s vs ${NONUM}s)"
 
+echo "== [8b] many distinct lengths: every request answers, the server lives =="
+# Each length is a new conv shape. MLX's CUDA conv-plan cache threw once its
+# lifetime misses passed 256 (about the 7th request), and the unchecked eval
+# after it then crashed the server reading a buffer that was never filled.
+WORDS="one two three four five six seven eight nine ten"
+GOOD=0
+for i in $(seq 1 40); do
+  TEXT="$(echo $WORDS $WORDS $WORDS $WORDS | cut -d' ' -f1-$i)"
+  SPEED="$(python3 -c "print(0.7 + ($i % 7) * 0.1)")"
+  speech "{\"model\":\"$ID\",\"input\":\"$TEXT.\",\"speed\":$SPEED}" > "$TMP/len.wav"
+  head -c 4 "$TMP/len.wav" | grep -q RIFF && GOOD=$((GOOD+1))
+done
+check "[8b] 40 distinct-length requests return WAV" "$GOOD" "40"
+check "[8b] server still alive" "$(curl -s -o /dev/null -w '%{http_code}' "localhost:$PORT/health")" "200"
+
 echo "== [9] unload =="
 curl -s -X POST "localhost:$PORT/v1/unload-model" -H 'content-type: application/json' \
   -d "{\"model\":\"$ID\"}" >/dev/null && ok "[9] unloads" || bad "[9] unload failed"

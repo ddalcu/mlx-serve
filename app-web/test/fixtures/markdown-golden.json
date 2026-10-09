@@ -1,0 +1,662 @@
+[
+ {
+  "md": "Hello world",
+  "html": "<p>Hello world</p>\n"
+ },
+ {
+  "md": "line one\nline two\nline three",
+  "html": "<p>line one\nline two\nline three</p>\n"
+ },
+ {
+  "md": "hard break with spaces  \nnext line",
+  "html": "<p>hard break with spaces<br>\nnext line</p>\n"
+ },
+ {
+  "md": "hard break with backslash\\\nnext line",
+  "html": "<p>hard break with backslash<br>\nnext line</p>\n"
+ },
+ {
+  "md": "first paragraph\n\nsecond paragraph\n\n\n\nthird paragraph",
+  "html": "<p>first paragraph</p>\n<p>second paragraph</p>\n<p>third paragraph</p>\n"
+ },
+ {
+  "md": "  leading spaces are trimmed",
+  "html": "<p>leading spaces are trimmed</p>\n"
+ },
+ {
+  "md": "trailing spaces are trimmed   ",
+  "html": "<p>trailing spaces are trimmed</p>\n"
+ },
+ {
+  "md": "",
+  "html": ""
+ },
+ {
+  "md": "\n\n",
+  "html": ""
+ },
+ {
+  "md": "tab\tseparated\ttext",
+  "html": "<p>tab\tseparated\ttext</p>\n"
+ },
+ {
+  "md": "# Heading 1\n## Heading 2\n### Heading 3\n#### Heading 4\n##### Heading 5\n###### Heading 6",
+  "html": "<h1>Heading 1</h1>\n<h2>Heading 2</h2>\n<h3>Heading 3</h3>\n<h4>Heading 4</h4>\n<h5>Heading 5</h5>\n<h6>Heading 6</h6>\n"
+ },
+ {
+  "md": "####### seven hashes is a paragraph",
+  "html": "<p>####### seven hashes is a paragraph</p>\n"
+ },
+ {
+  "md": "#hashtag is not a heading",
+  "html": "<p>#hashtag is not a heading</p>\n"
+ },
+ {
+  "md": "# Closing hashes ##\n\n## With trailing spaces   ##   ",
+  "html": "<h1>Closing hashes</h1>\n<h2>With trailing spaces</h2>\n"
+ },
+ {
+  "md": "# \n## \n###",
+  "html": "<h1></h1>\n<h2></h2>\n<h3></h3>\n"
+ },
+ {
+  "md": "Setext one\n==========\n\nSetext two\n----------",
+  "html": "<h1>Setext one</h1>\n<h2>Setext two</h2>\n"
+ },
+ {
+  "md": "Multi line\nsetext heading\n===",
+  "html": "<h1>Multi line\nsetext heading</h1>\n"
+ },
+ {
+  "md": "text\n---\nmore text",
+  "html": "<h2>text</h2>\n<p>more text</p>\n"
+ },
+ {
+  "md": "# Heading with *emphasis* and `code` and [a link](https://example.com)",
+  "html": "<h1>Heading with <em>emphasis</em> and <code>code</code> and <a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">a link</a></h1>\n"
+ },
+ {
+  "md": " # indented heading\n   ## three spaces",
+  "html": "<h1>indented heading</h1>\n<h2>three spaces</h2>\n"
+ },
+ {
+  "md": "    # four spaces is code",
+  "html": "<pre><code># four spaces is code\n</code></pre>\n"
+ },
+ {
+  "md": "*em* _em_ **strong** __strong__ ***both*** ___both___",
+  "html": "<p><em>em</em> <em>em</em> <strong>strong</strong> <strong>strong</strong> <em><strong>both</strong></em> <em><strong>both</strong></em></p>\n"
+ },
+ {
+  "md": "snake_case_name and 2*3*4 and a*b*c",
+  "html": "<p>snake_case_name and 2<em>3</em>4 and a<em>b</em>c</p>\n"
+ },
+ {
+  "md": "**bold**text and text**bold** and _under_score",
+  "html": "<p><strong>bold</strong>text and text<strong>bold</strong> and _under_score</p>\n"
+ },
+ {
+  "md": "This is *em with **strong** inside* text",
+  "html": "<p>This is <em>em with <strong>strong</strong> inside</em> text</p>\n"
+ },
+ {
+  "md": "**strong with *em* inside**",
+  "html": "<p><strong>strong with <em>em</em> inside</strong></p>\n"
+ },
+ {
+  "md": "* not emphasis * and ** not strong **",
+  "html": "<ul>\n<li>not emphasis * and ** not strong **</li>\n</ul>\n"
+ },
+ {
+  "md": "unmatched * star and unmatched ** double and __ under",
+  "html": "<p>unmatched * star and unmatched ** double and __ under</p>\n"
+ },
+ {
+  "md": "**unclosed strong",
+  "html": "<p>**unclosed strong</p>\n"
+ },
+ {
+  "md": "*unclosed em",
+  "html": "<p>*unclosed em</p>\n"
+ },
+ {
+  "md": "~~strike~~ and ~single~ and ~~~triple~~~",
+  "html": "<p><s>strike</s> and ~single~ and ~<s>triple</s>~</p>\n"
+ },
+ {
+  "md": "***bold italic***text",
+  "html": "<p><em><strong>bold italic</strong></em>text</p>\n"
+ },
+ {
+  "md": "*a*b*c*",
+  "html": "<p><em>a</em>b<em>c</em></p>\n"
+ },
+ {
+  "md": "**a**b**c**",
+  "html": "<p><strong>a</strong>b<strong>c</strong></p>\n"
+ },
+ {
+  "md": "a * b * c",
+  "html": "<p>a * b * c</p>\n"
+ },
+ {
+  "md": "_a_b_ and __a__b__",
+  "html": "<p><em>a_b</em> and <strong>a__b</strong></p>\n"
+ },
+ {
+  "md": "**bold**, *em*; (**paren**) \"**quoted**\" '*single*'",
+  "html": "<p><strong>bold</strong>, <em>em</em>; (<strong>paren</strong>) &quot;<strong>quoted</strong>&quot; '<em>single</em>'</p>\n"
+ },
+ {
+  "md": "*foo**bar**baz*",
+  "html": "<p><em>foo<strong>bar</strong>baz</em></p>\n"
+ },
+ {
+  "md": "**foo*bar*baz**",
+  "html": "<p><strong>foo<em>bar</em>baz</strong></p>\n"
+ },
+ {
+  "md": "***strong** in em*",
+  "html": "<p><em><strong>strong</strong> in em</em></p>\n"
+ },
+ {
+  "md": "***em* in strong**",
+  "html": "<p><strong><em>em</em> in strong</strong></p>\n"
+ },
+ {
+  "md": "*(**foo**)*",
+  "html": "<p><em>(<strong>foo</strong>)</em></p>\n"
+ },
+ {
+  "md": "**foo \"*bar*\" foo**",
+  "html": "<p><strong>foo &quot;<em>bar</em>&quot; foo</strong></p>\n"
+ },
+ {
+  "md": "foo *bar\n\nbaz*",
+  "html": "<p>foo *bar</p>\n<p>baz*</p>\n"
+ },
+ {
+  "md": "snake_case_ident and _leading and trailing_",
+  "html": "<p>snake_case_ident and <em>leading and trailing</em></p>\n"
+ },
+ {
+  "md": "`code` and ``double `tick` code`` and ` spaced `",
+  "html": "<p><code>code</code> and <code>double `tick` code</code> and <code>spaced</code></p>\n"
+ },
+ {
+  "md": "`<b>html</b>` and `a < b && c > d`",
+  "html": "<p><code>&lt;b&gt;html&lt;/b&gt;</code> and <code>a &lt; b &amp;&amp; c &gt; d</code></p>\n"
+ },
+ {
+  "md": "unclosed `backtick",
+  "html": "<p>unclosed `backtick</p>\n"
+ },
+ {
+  "md": "```inline fence``` in a line",
+  "html": "<p><code>inline fence</code> in a line</p>\n"
+ },
+ {
+  "md": "`` ` ``",
+  "html": "<p><code>`</code></p>\n"
+ },
+ {
+  "md": "`a\nb`",
+  "html": "<p><code>a b</code></p>\n"
+ },
+ {
+  "md": "[link](https://example.com) and [http](http://example.com/path?q=1&r=2#frag)",
+  "html": "<p><a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">link</a> and <a href=\"http://example.com/path?q=1&amp;r=2#frag\" rel=\"noopener noreferrer\" target=\"_blank\">http</a></p>\n"
+ },
+ {
+  "md": "[titled](https://example.com \"Title text\")",
+  "html": "<p><a href=\"https://example.com\" title=\"Title text\" rel=\"noopener noreferrer\" target=\"_blank\">titled</a></p>\n"
+ },
+ {
+  "md": "[parens](https://example.com/a_(b)_c)",
+  "html": "<p><a href=\"https://example.com/a_(b)_c\" rel=\"noopener noreferrer\" target=\"_blank\">parens</a></p>\n"
+ },
+ {
+  "md": "[angle](<https://example.com/with space>)",
+  "html": "<p><a href=\"https://example.com/with%20space\" rel=\"noopener noreferrer\" target=\"_blank\">angle</a></p>\n"
+ },
+ {
+  "md": "[js](javascript:alert(1))",
+  "html": "<p>[js](javascript:alert(1))</p>\n"
+ },
+ {
+  "md": "[data](data:text/html,hi) [mail](mailto:a@b.test) [rel](/relative) [anchor](#anchor) [proto](//host/path) [ftp](ftp://host/file)",
+  "html": "<p>[data](data:text/html,hi) [mail](mailto:a@b.test) [rel](/relative) [anchor](#anchor) [proto](//host/path) [ftp](ftp://host/file)</p>\n"
+ },
+ {
+  "md": "[**bold link**](https://example.com) and [`code link`](https://example.com)",
+  "html": "<p><a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\"><strong>bold link</strong></a> and <a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\"><code>code link</code></a></p>\n"
+ },
+ {
+  "md": "<https://example.com/auto> and <http://example.com>",
+  "html": "<p><a href=\"https://example.com/auto\" rel=\"noopener noreferrer\" target=\"_blank\">https://example.com/auto</a> and <a href=\"http://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">http://example.com</a></p>\n"
+ },
+ {
+  "md": "<mailto:a@b.test> and <foo@bar.com>",
+  "html": "<p>&lt;mailto:a@b.test&gt; and &lt;foo@bar.com&gt;</p>\n"
+ },
+ {
+  "md": "[unbalanced](https://example.com",
+  "html": "<p>[unbalanced](https://example.com</p>\n"
+ },
+ {
+  "md": "[only text] and [another]",
+  "html": "<p>[only text] and [another]</p>\n"
+ },
+ {
+  "md": "[a [nested] bracket](https://example.com)",
+  "html": "<p><a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">a [nested] bracket</a></p>\n"
+ },
+ {
+  "md": "plain https://example.com/not-linked url",
+  "html": "<p>plain https://example.com/not-linked url</p>\n"
+ },
+ {
+  "md": "[link](https://example.com)text and text[link](https://example.com)",
+  "html": "<p><a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">link</a>text and text<a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">link</a></p>\n"
+ },
+ {
+  "md": "[a](https://example.com)[b](https://example.org)",
+  "html": "<p><a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">a</a><a href=\"https://example.org\" rel=\"noopener noreferrer\" target=\"_blank\">b</a></p>\n"
+ },
+ {
+  "md": "[quotes](https://example.com 'single title')",
+  "html": "<p><a href=\"https://example.com\" title=\"single title\" rel=\"noopener noreferrer\" target=\"_blank\">quotes</a></p>\n"
+ },
+ {
+  "md": "[dquote](https://example.com/\"quoted\")",
+  "html": "<p><a href=\"https://example.com/%22quoted%22\" rel=\"noopener noreferrer\" target=\"_blank\">dquote</a></p>\n"
+ },
+ {
+  "md": "![alt text](https://example.com/image.png)",
+  "html": "<p>alt text</p>\n"
+ },
+ {
+  "md": "![tracking](https://example.test/pixel)",
+  "html": "<p>tracking</p>\n"
+ },
+ {
+  "md": "![bad](javascript:alert(1)) and ![rel](/x.png)",
+  "html": "<p>![bad](javascript:alert(1)) and ![rel](/x.png)</p>\n"
+ },
+ {
+  "md": "![**bold alt**](https://example.com/i.png)",
+  "html": "<p>**bold alt**</p>\n"
+ },
+ {
+  "md": "<script>alert(1)</script>",
+  "html": "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n"
+ },
+ {
+  "md": "<b>bold</b> and <i>italic</i> inline",
+  "html": "<p>&lt;b&gt;bold&lt;/b&gt; and &lt;i&gt;italic&lt;/i&gt; inline</p>\n"
+ },
+ {
+  "md": "<div>\nblock html\n</div>",
+  "html": "<p>&lt;div&gt;\nblock html\n&lt;/div&gt;</p>\n"
+ },
+ {
+  "md": "<!-- comment -->",
+  "html": "<p>&lt;!-- comment --&gt;</p>\n"
+ },
+ {
+  "md": "text <br> more <img src=x onerror=alert(1)> end",
+  "html": "<p>text &lt;br&gt; more &lt;img src=x onerror=alert(1)&gt; end</p>\n"
+ },
+ {
+  "md": "&amp; &lt;tag&gt; &quot;quoted&quot;",
+  "html": "<p>&amp; &lt;tag&gt; &quot;quoted&quot;</p>\n"
+ },
+ {
+  "md": "5 < 6 > 4 & done \"quote\" 'single'",
+  "html": "<p>5 &lt; 6 &gt; 4 &amp; done &quot;quote&quot; 'single'</p>\n"
+ },
+ {
+  "md": "&#35; &#x23; &copy; not-an-entity &bogus;",
+  "html": "<p># # © not-an-entity &amp;bogus;</p>\n"
+ },
+ {
+  "md": "\\*not em\\* \\_not em\\_ \\`not code\\`",
+  "html": "<p>*not em* _not em_ `not code`</p>\n"
+ },
+ {
+  "md": "\\# not heading\n\n1\\. not list\n\n\\- not list",
+  "html": "<p># not heading</p>\n<p>1. not list</p>\n<p>- not list</p>\n"
+ },
+ {
+  "md": "\\<not html\\> and \\[not link\\](url)",
+  "html": "<p>&lt;not html&gt; and [not link](url)</p>\n"
+ },
+ {
+  "md": "back\\slash and \\\\double and trailing\\",
+  "html": "<p>back\\slash and \\double and trailing\\</p>\n"
+ },
+ {
+  "md": "- one\n- two\n- three",
+  "html": "<ul>\n<li>one</li>\n<li>two</li>\n<li>three</li>\n</ul>\n"
+ },
+ {
+  "md": "* one\n* two\n* three",
+  "html": "<ul>\n<li>one</li>\n<li>two</li>\n<li>three</li>\n</ul>\n"
+ },
+ {
+  "md": "+ one\n+ two",
+  "html": "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n"
+ },
+ {
+  "md": "1. first\n2. second\n3. third",
+  "html": "<ol>\n<li>first</li>\n<li>second</li>\n<li>third</li>\n</ol>\n"
+ },
+ {
+  "md": "1) first\n2) second",
+  "html": "<ol>\n<li>first</li>\n<li>second</li>\n</ol>\n"
+ },
+ {
+  "md": "3. start at three\n4. four",
+  "html": "<ol start=\"3\">\n<li>start at three</li>\n<li>four</li>\n</ol>\n"
+ },
+ {
+  "md": "- a\n\n- b\n\n- c",
+  "html": "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n<li>\n<p>c</p>\n</li>\n</ul>\n"
+ },
+ {
+  "md": "- a\n- b\n\n- c",
+  "html": "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n<li>\n<p>c</p>\n</li>\n</ul>\n"
+ },
+ {
+  "md": "- parent\n  - child one\n  - child two\n    - grandchild\n- sibling",
+  "html": "<ul>\n<li>parent\n<ul>\n<li>child one</li>\n<li>child two\n<ul>\n<li>grandchild</li>\n</ul>\n</li>\n</ul>\n</li>\n<li>sibling</li>\n</ul>\n"
+ },
+ {
+  "md": "1. parent\n   1. child\n   2. child\n2. next",
+  "html": "<ol>\n<li>parent\n<ol>\n<li>child</li>\n<li>child</li>\n</ol>\n</li>\n<li>next</li>\n</ol>\n"
+ },
+ {
+  "md": "- item\n\n  second paragraph of item\n- next",
+  "html": "<ul>\n<li>\n<p>item</p>\n<p>second paragraph of item</p>\n</li>\n<li>\n<p>next</p>\n</li>\n</ul>\n"
+ },
+ {
+  "md": "- item with code:\n\n  ```js\n  const x = 1;\n  ```\n- next",
+  "html": "<ul>\n<li>\n<p>item with code:</p>\n<section class=\"code-block\"><header><span>js</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>const x = 1;\n</code></pre></section></li>\n<li>\n<p>next</p>\n</li>\n</ul>\n"
+ },
+ {
+  "md": "1. item\n   ```\n   code\n   ```\n2. next",
+  "html": "<ol>\n<li>item<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>code\n</code></pre></section></li>\n<li>next</li>\n</ol>\n"
+ },
+ {
+  "md": "-no space is text",
+  "html": "<p>-no space is text</p>\n"
+ },
+ {
+  "md": "-\n  empty item start",
+  "html": "<ul>\n<li>empty item start</li>\n</ul>\n"
+ },
+ {
+  "md": "- \n- empty items",
+  "html": "<ul>\n<li></li>\n<li>empty items</li>\n</ul>\n"
+ },
+ {
+  "md": "paragraph\n- list right after\n- paragraph",
+  "html": "<p>paragraph</p>\n<ul>\n<li>list right after</li>\n<li>paragraph</li>\n</ul>\n"
+ },
+ {
+  "md": "paragraph\n1. ordered right after one",
+  "html": "<p>paragraph</p>\n<ol>\n<li>ordered right after one</li>\n</ol>\n"
+ },
+ {
+  "md": "paragraph\n2. ordered starting at two does not interrupt",
+  "html": "<p>paragraph\n2. ordered starting at two does not interrupt</p>\n"
+ },
+ {
+  "md": "- a\n  continued line\n- b\n lazy",
+  "html": "<ul>\n<li>a\ncontinued line</li>\n<li>b\nlazy</li>\n</ul>\n"
+ },
+ {
+  "md": "- level one\n    - four spaces nested\n- again",
+  "html": "<ul>\n<li>level one\n<ul>\n<li>four spaces nested</li>\n</ul>\n</li>\n<li>again</li>\n</ul>\n"
+ },
+ {
+  "md": "1. one\n1. one again\n1. and again",
+  "html": "<ol>\n<li>one</li>\n<li>one again</li>\n<li>and again</li>\n</ol>\n"
+ },
+ {
+  "md": "10. ten\n11. eleven",
+  "html": "<ol start=\"10\">\n<li>ten</li>\n<li>eleven</li>\n</ol>\n"
+ },
+ {
+  "md": "- [ ] todo\n- [x] done",
+  "html": "<ul>\n<li>[ ] todo</li>\n<li>[x] done</li>\n</ul>\n"
+ },
+ {
+  "md": "* * *\n\n- - -\n\n_ _ _",
+  "html": "<hr>\n<hr>\n<hr>\n"
+ },
+ {
+  "md": "- a\n\n\n- b",
+  "html": "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n</ul>\n"
+ },
+ {
+  "md": "- a\n  > quote in item\n- b",
+  "html": "<ul>\n<li>a\n<blockquote>\n<p>quote in item</p>\n</blockquote>\n</li>\n<li>b</li>\n</ul>\n"
+ },
+ {
+  "md": "1. a\n\n   b\n\n2. c",
+  "html": "<ol>\n<li>\n<p>a</p>\n<p>b</p>\n</li>\n<li>\n<p>c</p>\n</li>\n</ol>\n"
+ },
+ {
+  "md": "* first\n+ second list\n- third list",
+  "html": "<ul>\n<li>first</li>\n</ul>\n<ul>\n<li>second list</li>\n</ul>\n<ul>\n<li>third list</li>\n</ul>\n"
+ },
+ {
+  "md": "- **bold** item\n- `code` item\n- [link](https://example.com) item",
+  "html": "<ul>\n<li><strong>bold</strong> item</li>\n<li><code>code</code> item</li>\n<li><a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">link</a> item</li>\n</ul>\n"
+ },
+ {
+  "md": "> quote",
+  "html": "<blockquote>\n<p>quote</p>\n</blockquote>\n"
+ },
+ {
+  "md": "> line one\n> line two",
+  "html": "<blockquote>\n<p>line one\nline two</p>\n</blockquote>\n"
+ },
+ {
+  "md": "> line one\nlazy continuation",
+  "html": "<blockquote>\n<p>line one\nlazy continuation</p>\n</blockquote>\n"
+ },
+ {
+  "md": "> outer\n>> inner\n> back",
+  "html": "<blockquote>\n<p>outer</p>\n<blockquote>\n<p>inner\nback</p>\n</blockquote>\n</blockquote>\n"
+ },
+ {
+  "md": "> # heading in quote\n> - list in quote\n> ```\n> code\n> ```",
+  "html": "<blockquote>\n<h1>heading in quote</h1>\n<ul>\n<li>list in quote</li>\n</ul>\n<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>code\n</code></pre></section></blockquote>\n"
+ },
+ {
+  "md": "> quote\n\nparagraph after\n\n> second quote",
+  "html": "<blockquote>\n<p>quote</p>\n</blockquote>\n<p>paragraph after</p>\n<blockquote>\n<p>second quote</p>\n</blockquote>\n"
+ },
+ {
+  "md": ">no space after marker",
+  "html": "<blockquote>\n<p>no space after marker</p>\n</blockquote>\n"
+ },
+ {
+  "md": "> a\n>\n> b",
+  "html": "<blockquote>\n<p>a</p>\n<p>b</p>\n</blockquote>\n"
+ },
+ {
+  "md": "```\nplain fence\n```",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>plain fence\n</code></pre></section>"
+ },
+ {
+  "md": "```js\nconst a = 1;\nconsole.log(a);\n```",
+  "html": "<section class=\"code-block\"><header><span>js</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>const a = 1;\nconsole.log(a);\n</code></pre></section>"
+ },
+ {
+  "md": "```python title=\"x.py\"\nprint('hi')\n```",
+  "html": "<section class=\"code-block\"><header><span>python</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>print('hi')\n</code></pre></section>"
+ },
+ {
+  "md": "~~~\ntilde fence\n~~~",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>tilde fence\n</code></pre></section>"
+ },
+ {
+  "md": "````\nfour ticks contain ```\nthree\n````",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>four ticks contain ```\nthree\n</code></pre></section>"
+ },
+ {
+  "md": "```\nunclosed fence streams on",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>unclosed fence streams on</code></pre></section>"
+ },
+ {
+  "md": "```js\nconst partial =",
+  "html": "<section class=\"code-block\"><header><span>js</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>const partial =</code></pre></section>"
+ },
+ {
+  "md": "```\n\n\n```",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>\n\n</code></pre></section>"
+ },
+ {
+  "md": "```\ncode with <html> & \"quotes\"\n```",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>code with &lt;html&gt; &amp; &quot;quotes&quot;\n</code></pre></section>"
+ },
+ {
+  "md": "text before\n```\ncode\n```\ntext after",
+  "html": "<p>text before</p>\n<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>code\n</code></pre></section><p>text after</p>\n"
+ },
+ {
+  "md": "   ```\n   indented fence\n   ```",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>indented fence\n</code></pre></section>"
+ },
+ {
+  "md": "```\n    keep indentation\n\ttab line\n```",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>    keep indentation\n\ttab line\n</code></pre></section>"
+ },
+ {
+  "md": "    indented code\n    second line",
+  "html": "<pre><code>indented code\nsecond line\n</code></pre>\n"
+ },
+ {
+  "md": "    code\n\n    after blank",
+  "html": "<pre><code>code\n\nafter blank\n</code></pre>\n"
+ },
+ {
+  "md": "paragraph\n    still paragraph continuation",
+  "html": "<p>paragraph\nstill paragraph continuation</p>\n"
+ },
+ {
+  "md": "```\nunterminated backticks `` inside\n```\n\nafter",
+  "html": "<section class=\"code-block\"><header><span></span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>unterminated backticks `` inside\n</code></pre></section><p>after</p>\n"
+ },
+ {
+  "md": "``` js\nspace before info\n```",
+  "html": "<section class=\"code-block\"><header><span>js</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>space before info\n</code></pre></section>"
+ },
+ {
+  "md": "```js\nfirst\n```\n```ts\nsecond\n```",
+  "html": "<section class=\"code-block\"><header><span>js</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>first\n</code></pre></section><section class=\"code-block\"><header><span>ts</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>second\n</code></pre></section>"
+ },
+ {
+  "md": "---\n\ntext\n\n***\n\n___",
+  "html": "<hr>\n<p>text</p>\n<hr>\n<hr>\n"
+ },
+ {
+  "md": "text\n\n---\n\ntext",
+  "html": "<p>text</p>\n<hr>\n<p>text</p>\n"
+ },
+ {
+  "md": "--\n\n-- -\n\n***bold***",
+  "html": "<p>--</p>\n<hr>\n<p><em><strong>bold</strong></em></p>\n"
+ },
+ {
+  "md": "| a | b |\n| - | - |\n| 1 | 2 |",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table></div>"
+ },
+ {
+  "md": "| left | center | right |\n|:-----|:------:|------:|\n| l | c | r |\n| longer cell | x | y |",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th class=\"align-left\">left</th>\n<th class=\"align-center\">center</th>\n<th class=\"align-right\">right</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td class=\"align-left\">l</td>\n<td class=\"align-center\">c</td>\n<td class=\"align-right\">r</td>\n</tr>\n<tr>\n<td class=\"align-left\">longer cell</td>\n<td class=\"align-center\">x</td>\n<td class=\"align-right\">y</td>\n</tr>\n</tbody>\n</table></div>"
+ },
+ {
+  "md": "a | b\n--|--\n1 | 2",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table></div>"
+ },
+ {
+  "md": "| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td></td>\n</tr>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table></div>"
+ },
+ {
+  "md": "| **bold** | `code` | [link](https://example.com) |\n|---|---|---|\n| *em* | ~~del~~ | text |",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th><strong>bold</strong></th>\n<th><code>code</code></th>\n<th><a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">link</a></th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td><em>em</em></td>\n<td><s>del</s></td>\n<td>text</td>\n</tr>\n</tbody>\n</table></div>"
+ },
+ {
+  "md": "| esc \\| pipe | x |\n|---|---|\n| a \\| b | c |",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th>esc | pipe</th>\n<th>x</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>a | b</td>\n<td>c</td>\n</tr>\n</tbody>\n</table></div>"
+ },
+ {
+  "md": "before\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nafter",
+  "html": "<p>before</p>\n<div class=\"markdown-table\"><table><thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table></div><p>after</p>\n"
+ },
+ {
+  "md": "| only header |\n|---|",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th>only header</th>\n</tr>\n</thead>\n</table></div>"
+ },
+ {
+  "md": "| a | b |\n|---|\n| 1 | 2 |",
+  "html": "<p>| a | b |\n|---|\n| 1 | 2 |</p>\n"
+ },
+ {
+  "md": "| a | b |\n|---|---|\n| 1 | 2 |\ntrailing paragraph line",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n<tr>\n<td>trailing paragraph line</td>\n<td></td>\n</tr>\n</tbody>\n</table></div>"
+ },
+ {
+  "md": "| h1 | h2 |\n| :-: | --: |\n| a | b |\n\n| h3 |\n|---|\n| c |",
+  "html": "<div class=\"markdown-table\"><table><thead>\n<tr>\n<th class=\"align-center\">h1</th>\n<th class=\"align-right\">h2</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td class=\"align-center\">a</td>\n<td class=\"align-right\">b</td>\n</tr>\n</tbody>\n</table></div><div class=\"markdown-table\"><table><thead>\n<tr>\n<th>h3</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>c</td>\n</tr>\n</tbody>\n</table></div>"
+ },
+ {
+  "md": "# Title\n\nSome intro text with **bold** and `code`.\n\n## Steps\n\n1. Install it:\n   ```bash\n   npm install thing\n   ```\n2. Run it\n3. Profit\n\n> Note: this is important.\n\n| Name | Value |\n|------|-------|\n| a | 1 |\n\nDone.",
+  "html": "<h1>Title</h1>\n<p>Some intro text with <strong>bold</strong> and <code>code</code>.</p>\n<h2>Steps</h2>\n<ol>\n<li>Install it:<section class=\"code-block\"><header><span>bash</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>npm install thing\n</code></pre></section></li>\n<li>Run it</li>\n<li>Profit</li>\n</ol>\n<blockquote>\n<p>Note: this is important.</p>\n</blockquote>\n<div class=\"markdown-table\"><table><thead>\n<tr>\n<th>Name</th>\n<th>Value</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>a</td>\n<td>1</td>\n</tr>\n</tbody>\n</table></div><p>Done.</p>\n"
+ },
+ {
+  "md": "Here's a list:\n\n- Item one\n- Item two\n  - Sub item\n\nAnd a [link](https://example.com).",
+  "html": "<p>Here's a list:</p>\n<ul>\n<li>Item one</li>\n<li>Item two\n<ul>\n<li>Sub item</li>\n</ul>\n</li>\n</ul>\n<p>And a <a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">link</a>.</p>\n"
+ },
+ {
+  "md": "Sure! Here is the code:\n\n```python\ndef f(x):\n    return x * 2\n```\n\nThis function doubles `x`.",
+  "html": "<p>Sure! Here is the code:</p>\n<section class=\"code-block\"><header><span>python</span><button type=\"button\" data-copy-code><span class=\"icon i-copy\" aria-hidden=\"true\"></span><span data-i18n=\"Copy\">Copy</span></button></header><pre><code>def f(x):\n    return x * 2\n</code></pre></section><p>This function doubles <code>x</code>.</p>\n"
+ },
+ {
+  "md": "你好，世界！**加粗**和`代码`。\n\n- 列表一\n- 列表二\n\n这是一个[链接](https://example.com)。",
+  "html": "<p>你好，世界！<strong>加粗</strong>和<code>代码</code>。</p>\n<ul>\n<li>列表一</li>\n<li>列表二</li>\n</ul>\n<p>这是一个<a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">链接</a>。</p>\n"
+ },
+ {
+  "md": "Emoji 🎉 and unicode ünïcödé and RTL مرحبا and combining é.",
+  "html": "<p>Emoji 🎉 and unicode ünïcödé and RTL مرحبا and combining é.</p>\n"
+ },
+ {
+  "md": "1. **Bold start:** text\n2. *Italic start:* text\n3. `Code start:` text",
+  "html": "<ol>\n<li><strong>Bold start:</strong> text</li>\n<li><em>Italic start:</em> text</li>\n<li><code>Code start:</code> text</li>\n</ol>\n"
+ },
+ {
+  "md": "Price: $5 and $10, 50% off, #1 pick, user@example.com, a_b_c, 3 * 4 = 12",
+  "html": "<p>Price: $5 and $10, 50% off, #1 pick, user@example.com, a_b_c, 3 * 4 = 12</p>\n"
+ },
+ {
+  "md": "Line with trailing backslash\\\n\nNext paragraph",
+  "html": "<p>Line with trailing backslash\\</p>\n<p>Next paragraph</p>\n"
+ },
+ {
+  "md": "Term\n: definition-like line",
+  "html": "<p>Term\n: definition-like line</p>\n"
+ },
+ {
+  "md": "Footnote[^1] reference\n\n[^1]: not supported",
+  "html": "<p>Footnote[^1] reference</p>\n<p>[^1]: not supported</p>\n"
+ },
+ {
+  "md": "[ref]: https://example.com\n\nUse [ref] here",
+  "html": "<p>Use <a href=\"https://example.com\" rel=\"noopener noreferrer\" target=\"_blank\">ref</a> here</p>\n"
+ }
+]

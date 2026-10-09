@@ -479,6 +479,30 @@ extension MediaBundle {
         )
     }
 
+    /// YuE2: a flat converted dir — the 3B trunk and the Oobleck VAE decoder
+    /// folded in beside it (`model.safetensors` + `vae.safetensors`), their
+    /// configs and the tiktoken ranks. `vae.safetensors` is the completeness
+    /// marker the server checks too: the upstream repo ships no decoder.
+    static func yue2(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "yue2:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: [
+                        "model.safetensors", "vae.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "model.safetensors", "vae.safetensors",
+                        "vae_config.json", "qwen.tiktoken",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// Stable Audio 3, Stability's own repo as published: `model_config.json`
     /// (no `config.json`), `model.safetensors`, and T5Gemma in a subdir that
     /// is also the server's completion marker. The thumbnail stays behind.
@@ -610,6 +634,7 @@ extension MusicModelPreset {
         switch family {
         case .acestep: return .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         case .minimaxMusic3: return .music3(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        case .yue2: return .yue2(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         }
     }
 }

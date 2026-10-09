@@ -186,11 +186,11 @@ Sibling of the multipart-`model` bug above, same root cause: **model resolution 
 Third in the same family as the two stories above: **model resolution runs before dispatch**, and `GET /` sat on the far side of it. `handleStatusPage(allocator, stream, lm)` took a `*LoadedModel` and rendered 21 `std.fmt` slots off it — id, arch, quant bits/group, layers/hidden/heads/kv, head dim, vocab, context, model max, active + peak MB, capability pills. With no default model the arm was never reached and the root answered `503 {"error":"No default model configured"}`. That is the boot mode the app always uses, and since `mlx-serve serve` / bare `--serve` started discovering the shared models root and loading on demand, it is the default way the server starts at all — so the first page a person opens was an error object.
 - **The page also documented 22 of 31 endpoints.** The API reference is hand-written prose; the entire Ollama `/api/*` surface (chat, generate, tags, show, ps, pull, version, embed, embeddings) had never been added to it. Nothing could notice, because "is the reference complete?" was an inspection, not a test.
 - **Fix**: `GET /` moved up beside `/health` and `/v1/models`, above resolution, and `handleStatusPage` lost its `lm` parameter entirely. Everything model-shaped is now fetched client-side from `/v1/models` (which already returns id, capabilities, state, bytes, meta per entry) and `/props` (live memory). That is not just a workaround for the 503 — the page is now a model PICKER, so it has to render before anything is loaded by construction, and the picker follows loads and unloads without a refresh.
-- **The `std.fmt` trap that shapes the whole file layout.** `index.html` is `@embedFile`d as a FORMAT STRING, so every literal `{`/`}` inside it must be doubled — which is why a page with real CSS and JS cannot be one file. `metrics.js` already had the answer: inject it as a RUNTIME `{s}` argument, because std.fmt does not re-parse runtime args. `app.css` and `app.js` follow the same pattern, and the slot count dropped from 21 to 6. Do not inline CSS or JS back into `index.html`.
+- **The page is no longer a format string.** It was `@embedFile`d as a `std.fmt` template (every literal `{`/`}` doubled, CSS and JS injected as runtime `{s}` args, 21 slots down to 6). It is now ONE file built from `app-web/` and sent byte for byte, so there is no template to keep apart from its assets.
 - **Guards** (three layers, because the page has three failure modes):
-  - `the index page documents every endpoint the server serves` (server.zig) — every `ROUTE_PATHS` entry must appear in `@embedFile("html/index.html")`. Red today with the nine `/api/*` paths. Same shape as the `ROUTE_PATHS`↔dispatch-chain guard, and it makes "are we missing endpoints?" un-repeatable rather than re-inspectable.
-  - `tests/test_index_page.sh` — headless over an EMPTY `--model-dir` (no checkpoint, seconds): `GET /` → 200 `text/html`, the tab/control markup is present, every endpoint path is in the served bytes, and the `#mlx-metrics` mount appears with `--metrics` and not without. Red-on-revert: 1/20 with the arm moved back below resolution.
-  - `tests/html_console_test.mjs` — the pure decision layer (capability filtering per picker, SSE frame cutting across split chunks, request/form construction, auth passthrough), plus a static cross-check that every id `app.js` reaches for exists in `index.html` and every rendered control is read by `app.js`. That last one covers the class no HTTP assertion can see: a typo'd id makes `$('chat-sned')` return null, the listener is never attached, and the button is silently dead while the page still renders, still serves, and still passes every byte-level check.
+  - `the index page documents every endpoint the server serves` (server.zig) — every `ROUTE_PATHS` entry must appear in `@embedFile("html/index.html")` (CI has no Node, so this is the guard that runs there); `app-web/test/api-reference.test.ts` checks the exact rows both ways.
+  - `tests/test_index_page.sh` — headless over an EMPTY `--model-dir` (no checkpoint, seconds): `GET /` → 200 `text/html`, the bytes served ARE `src/html/index.html`, `/metrics.json` 503 without `--metrics` and 200 with. Red-on-revert: 1/20 with the arm moved back below resolution.
+  - `app-web/test/` (`npm test`) — the console's own suite: request/SSE logic, every pane against a mock server, a hostile-input corpus on every text surface. It covers the class no HTTP assertion can see: a control that never works while the page still renders, serves and passes every byte-level check.
 - **Note on media**: edit capability is not API-visible — both Mage-Flow-Turbo and Mage-Flow-Edit-Turbo report `capabilities: ["image"]`, ship byte-identical configs, and the server itself gates on the directory NAME (`mage_flow.dirIsEdit`). The console mirrors that rule client-side rather than inventing one. An explicit `image_edit` capability on `/v1/models` would replace both halves; it is a server API change, not console work.
 
 ### The console is a chat with tools, not a page of forms — and the live runs wrote the rules (2026-07-25)
@@ -201,8 +201,8 @@ Everything below was found by driving the real page in a real browser over CDP a
 - **A tool's `model` enum and its resolution must be the same list.** The edit tool enumerated every image model while resolution merely *preferred* an edit-capable one — and an explicit choice beats a preference, so the model picked `Mage-Flow-Turbo` straight out of the enum and the edit 400'd. Offering a choice that is guaranteed to fail is the same class as advertising a capability you don't have. `editableIds` is now one list feeding both, pinned by a test that resolves every id the enum offers and asserts it comes back unchanged.
 - **Rank candidates by how likely they are to WORK.** Two Qwen3-TTS checkpoints on disk, the bf16 one an incomplete download (config + tokenizer, no safetensors). It sorted first, so every "say this out loud" spent a load attempt on it — `NoWeightFiles`, "Model load failed" — before a retry found the sibling. The pre-load tell is in `/v1/models` already: discovery sums the checkpoint's `*.safetensors`, so `bytes_on_disk: null` means the shards are missing. `rankedIds` orders resident (free, and provably loadable) → sized → unsized → `error`, and a failed tool call refreshes the model list so a retry inside the same turn ranks past the entry the registry just marked. The picker deliberately does NOT reorder: it refreshes every 15 s and would shuffle under the cursor.
 - **Whatever the system prompt leaves out, the model invents.** With only paths and one-line descriptions in the prompt, "how do I edit an image?" produced `curl -X POST https://your-ollama-ip-address/api/v1/images/edits -F "ref1=<base64>"` — wrong host, wrong path prefix, invented field names. The prompt now carries `location.origin` and a short true list of real request fields. Listing accepted and rejected fields in one sentence was not enough either: the model presented `mask`, `n`, `response_format:"url"` as available options, so rejections are now a separate, explicitly-labelled clause. And "give me a curl for the edit endpoint" was answered by GENERATING A PICTURE until the prompt said in as many words that questions are answered in text with no tool call at all.
-- **The API reference has one source.** The prompt's endpoint list is scraped from the API tab's own rendered markup (`#tab-api .ep`), so the page and the assistant cannot disagree, and the Zig drift guard (every `ROUTE_PATHS` entry appears in `index.html`) covers both at once.
-- **Current guards**: `tests/html_console_test.mjs` checks Studio’s bundled decision layer and control wiring; `tests/test_index_page.sh` pins Chat as the landing view, the media panes, unified Monitoring/Sessions, endpoint documentation and the metrics marker.
+- **The API reference has one source** (`apiReference` in `app-web/src/lib/core/console.ts`): the API pane and the chat's system prompt both read it, so the page and the assistant cannot disagree, and the drift guards above cover both at once.
+- **Current guards**: `app-web/test/` for the console's behavior; `tests/test_index_page.sh` for what the server serves.
 
 ### Third pass: a sidebar, persisted chats, and the metric a client cannot measure (2026-07-25)
 Layout moved to a sidebar — **New chat / Monitor / API**, plus **Recents** — and chat became the landing view: a greeting and a centred composer that turns into a transcript on the first send. It is ONE composer element in two layouts (`.panel.empty` flips it), because two composers is two sets of listeners and one of them always rots. Temperature and max-tokens went away; model choice and Extended thinking live in the composer's pill menu, both remembered in localStorage.
@@ -1125,10 +1125,10 @@ and only then realizes the token and advances the grammar. Byte-identical
 greedy output; Flash Next schema decode 49 -> 53 tok/s = the serial plain rate
 (spec decode stays off under a grammar, so MTP's 65-70 is not the bar).
 
-An explicit `--mtp` / `--no-mtp` outranks the model's `mtp` setting on startup
-and cold loads; absent a flag, the setting wins over the auto-load default.
-`enable_mtp:false` opts out per request, but `true` cannot re-enable a model
-disabled at launch. Guard: `applyModelSettings` precedence matrix.
+Trap met on the way: a per-model `"mtp": true` in `model-settings.json`
+overrides `--no-mtp` on the command line, so a "plain" arm launched with the
+flag was still spec-decoding. Send `enable_mtp:false` per request, or read
+the `[spec-stats]` lines, before calling an arm serial.
 
 ## `--no-drafter` did not survive a model switch, and two flags before it didn't either (2026-08-11)
 
@@ -2492,12 +2492,11 @@ PROXY's origin root, not the mount that served the page — the mount answers `/
 (it strips the prefix on the way in, so the server never learns it) and 404s `/v1/models`. And
 silently: that 404 body is HTML, `res.json()` throws, the catch assigns `MODELS = []`.
 
-Fix: `apiPrefix(pathname)` — in `src/html/api.js`, the first script of the page's boot slot, so
-`app.js` and `metrics.js` bind the ONE implementation — is that mount: a last segment holding a dot
+Fix: `apiPrefix(pathname)` (`app-web/src/lib/core/console.ts`) is that mount: a last segment holding a dot
 is a file, anything else a directory. Every fetch, the API reference's own links and the base URL the
 chat system prompt hands the model resolve through it.
-Guard: `console and Monitoring share mount-prefix resolution, without query keys`
-in `tests/metrics_panel_test.mjs`; requests use Studio’s selected server base URL.
+Guard: `console and Monitoring share the same resolution, without query keys`
+in `app-web/test/connection.test.ts`.
 
 ## A GGUF picked by its file 404'd on the first chat (2026-10-06)
 
