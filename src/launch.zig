@@ -13,7 +13,7 @@
 //! `/v1/models`, derive each model's budget from its ADVERTISED context
 //! (AgentBudget's formula: output = clamp(ctx/2, 1024, 65536) — never a
 //! hardcoded window), write the agent's config, and exec it through a login
-//! zsh so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
+//! shell (`loginShell`) so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
 
 const std = @import("std");
 const log = @import("log.zig");
@@ -600,12 +600,29 @@ fn resolveOpencode2Bin(detected: ?OpenCodeVersion, legacy_installed: ?bool) ?[]c
     return null;
 }
 
+/// The login shell the agent runs under (a login shell = the user's real PATH):
+/// `$SHELL` when it speaks POSIX sh, as the script body does, else bash, else sh.
+/// macOS always has /bin/zsh; a Linux box may have only bash, or fish as `$SHELL`.
+pub fn loginShellFor(shell_env: ?[]const u8, has_bash: bool) [:0]const u8 {
+    if (shell_env) |sh| {
+        const base = std.fs.path.basename(sh);
+        if (std.mem.eql(u8, base, "zsh")) return "zsh";
+        if (std.mem.eql(u8, base, "bash")) return "bash";
+    }
+    return if (has_bash) "bash" else "sh";
+}
+
+fn loginShell() [:0]const u8 {
+    const env: ?[]const u8 = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else null;
+    return loginShellFor(env, std.c.access("/bin/bash", std.c.X_OK) == 0 or std.c.access("/usr/bin/bash", std.c.X_OK) == 0);
+}
+
 /// Run one command through the same login shell the real launch execs
 /// through, so PATH resolution (nvm, Homebrew) is identical for detection
 /// and launch. Captured stdout comes back owned by the caller.
 fn runLoginShell(allocator: std.mem.Allocator, io: std.Io, cmd: []const u8) !struct { ok: bool, out: []u8 } {
     const result = std.process.run(allocator, io, .{
-        .argv = &.{ "/bin/zsh", "-l", "-c", cmd },
+        .argv = &.{ loginShell(), "-l", "-c", cmd },
         .stdout_limit = .limited(64 * 1024),
     }) catch return error.LoginShellFailed;
     allocator.free(result.stderr);
@@ -701,7 +718,7 @@ fn appendModelArg(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []
     return out.appendSlice(allocator, arg);
 }
 
-/// The script body run through `/bin/zsh -l -c` (login shell = the user's
+/// The script body run through `<loginShell()> -l -c` (login shell = the user's
 /// real PATH). Configs are written by `writeConfigs` BEFORE this runs; the
 /// script only exports env and execs the agent — same split as the app's
 /// prepareConfig / scriptBody.
@@ -1395,13 +1412,14 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     log.info("launching {s} with {s} ({d}K context) via {s}\n", .{
         @tagName(parsed.kind), chosen.id, chosen.budget.context / 1024, base_url,
     });
+    const shell = loginShell();
     var child = std.process.spawn(io, .{
-        .argv = &.{ "/bin/zsh", "-l", "-c", script },
+        .argv = &.{ shell, "-l", "-c", script },
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch {
-        log.err("could not start /bin/zsh\n", .{});
+        log.err("could not start {s}\n", .{shell});
         std.process.exit(1);
     };
     const term = child.wait(io) catch std.process.exit(1);
@@ -2031,4 +2049,12 @@ test "zcode config escapes arbitrary model ids and declares server budgets and w
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE") != null);
     try t.expect(std.mem.indexOf(u8, script, "zcode '--prompt' 'it'\\''s a prompt'") != null);
+}
+
+test "loginShellFor: the user's POSIX shell, else bash, else sh" {
+    try std.testing.expectEqualStrings("zsh", loginShellFor("/bin/zsh", true));
+    try std.testing.expectEqualStrings("bash", loginShellFor("/usr/bin/bash", false));
+    // fish and nushell cannot parse the POSIX script body.
+    try std.testing.expectEqualStrings("bash", loginShellFor("/usr/bin/fish", true));
+    try std.testing.expectEqualStrings("sh", loginShellFor(null, false));
 }

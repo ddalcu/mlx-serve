@@ -805,8 +805,9 @@ the TE stage is one forward over a few hundred prompt rows. A shared
 allocates — which, with the TE at 26.28 GiB, is exactly what kept the 8-bit pack
 refused even after the first two fixes.
 
-So: `max(te, max(dit_resident, vaes) + H3_ACTIVATION_BYTES)`, with the allowance
-at 6 GiB against a measured 4.0–5.0.
+So: `max(te, max(dit_resident, vaes) + allowance)`, the allowance first a flat
+6 GiB against a measured 4.0–5.0, now the smallest request's 1 GiB
+(`H3_REQUEST_BASE_BYTES`) since `handleVideoH3` prices each canvas (#764 below).
 
 `h3DitResidentBytes` takes `precompute` as a PARAMETER and the caller reads
 `minimax_h3.adalnPrecomputeOn()` — the same predicate `generate` branches on. A
@@ -2520,8 +2521,8 @@ then failed on the first denoising step with an uncatchable Metal `Insufficient 
 960x544 at the same length ran fine. The preflight printed the same `media peak ~18.05 GB`
 for every request.
 
-Cause: the only gate was the per-model one, `h3PeakBytes`, which bills a flat
-`H3_ACTIVATION_BYTES` measured at 768x448. The per-step working set grows with the packed
+Cause: the only gate was the per-model one, `h3PeakBytes`, which billed a flat
+6 GiB of activations measured at 768x448. The per-step working set grows with the packed
 sequence (measured ~384 KiB a row), and the default fast recipe keeps an attention output per
 block for the attention broadcast: `num_layers x hidden_size` bf16 a row, ~525 KiB. At
 ~40k rows that is 46 GB against 32 GB free; `handleVideoH3` checked the prompt, the LoRAs, the
@@ -2531,5 +2532,7 @@ Fix: `h3RequestRows` (latent frames x the 32-pixel grid + stereo audio + a frame
 and `h3ActivationBytes` (base + rows x per-row bytes, plus the broadcast term when `resolveSpeed`
 turns it on) bill the request before any stage loads. The same term prices the resident set in
 `h3ResidentFor`, so a warm engine yields to a canvas it cannot hold, and `handleVideoH3` refuses
-the staged plan by name, quoting the need and the free memory. Guards: `h3 request rows`,
-`h3 request bill`, `h3 residency is priced on the request's activations`.
+the staged plan by name, quoting the need and the free memory. The per-model gate then bills
+only the smallest request's base, and on CUDA the request's DiT is billed to RAM (managed
+memory pages to the host), its activations to the GPU (`h3CanvasBill`). Guards: `h3 request
+rows`, `h3 request bill`, `h3 residency is priced on the request's activations`, `h3CanvasBill`.

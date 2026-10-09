@@ -1242,10 +1242,7 @@ pub fn main(init: std.process.Init) !void {
             }
             return;
         }
-        const prompt_text = prompt orelse {
-            log.err("GGUF offline mode requires --prompt <text>\n", .{});
-            std.process.exit(2);
-        };
+        const prompt_text = prompt.?; // offline mode only runs with --prompt
         switch (chosen) {
             .ds4 => try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature, ctx_size),
             .llama => try runLlamaOffline(io, allocator, model_dir, prompt_text, max_tokens, temperature),
@@ -1590,7 +1587,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
+        const user_prompt = prompt.?; // offline mode only runs with --prompt
         const messages = [_]chat_mod.Message{
             .{ .role = "user", .content = user_prompt },
         };
@@ -1760,7 +1757,7 @@ fn runDs4Offline(
     var engine = ds4_arch.Ds4Engine.open(allocator, gguf_path, .{
         .warm_weights = true,
         .ssd_streaming = ds4_ssd_streaming,
-        .prefill_chunk = if (generate_mod.prefill_chunk_explicit) @intCast(generate_mod.prefill_chunk_override) else 0,
+        .prefill_chunk = generate_mod.explicitPrefillChunkU32(),
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
         .mtp_margin = 3.0,

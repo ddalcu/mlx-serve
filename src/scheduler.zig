@@ -3012,7 +3012,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const engine = try arch_ds4.Ds4Engine.open(sch.allocator, params.ds4_path, .{
         .warm_weights = true,
         .ssd_streaming = params.ds4_ssd_streaming,
-        .prefill_chunk = if (generate_mod.prefill_chunk_explicit) @intCast(generate_mod.prefill_chunk_override) else 0,
+        .prefill_chunk = generate_mod.explicitPrefillChunkU32(),
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
         .mtp_margin = DS4_MTP_MARGIN,

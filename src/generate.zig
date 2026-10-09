@@ -57,6 +57,12 @@ pub const WIDE_PREFILL_CHUNK: usize = 16384;
 /// without this flag the default 8192 is indistinguishable from a request.
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 pub var prefill_chunk_explicit: bool = false;
+
+/// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
+pub fn explicitPrefillChunkU32() u32 {
+    if (!prefill_chunk_explicit) return 0;
+    return std.math.cast(u32, prefill_chunk_override) orelse std.math.maxInt(u32);
+}
 pub var prefill_trace_force: bool = false;
 
 /// Set once by the serve CLI before request construction. Direct callers may
@@ -23508,4 +23514,19 @@ test "MTP depth bounds: warmup, group fill and native head caps constrain the fi
     gen.mtp_depth = 3; // Native multi-head cap resolved at initialization.
     depth_bounds.active = .{ .min = 5, .max = 5 };
     try testing.expectEqual(@as(u32, 3), gen.mtpRoundPlan().m_hi);
+}
+
+test "explicitPrefillChunkU32: unset is 0, a flag past u32 clamps instead of overflowing" {
+    const saved = .{ prefill_chunk_explicit, prefill_chunk_override };
+    defer {
+        prefill_chunk_explicit = saved[0];
+        prefill_chunk_override = saved[1];
+    }
+    prefill_chunk_explicit = false;
+    try std.testing.expectEqual(@as(u32, 0), explicitPrefillChunkU32());
+    prefill_chunk_explicit = true;
+    prefill_chunk_override = 256;
+    try std.testing.expectEqual(@as(u32, 256), explicitPrefillChunkU32());
+    prefill_chunk_override = 5_000_000_000;
+    try std.testing.expectEqual(std.math.maxInt(u32), explicitPrefillChunkU32());
 }

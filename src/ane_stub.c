@@ -114,7 +114,8 @@ uint64_t msv_volume_free_for_use(const char *path) {
 // Avahi's libdns_sd compat layer (Linux Bonjour) does not implement
 // DNSServiceGetAddrInfo, so resolve the peer's host with getaddrinfo (nss-mdns /
 // systemd-resolved answer .local) and deliver every IPv4 answer synchronously:
-// *ref stays NULL and lan.zig's pump sees the reply already done.
+// *ref stays NULL and lan.zig's pump sees the reply already done. The call blocks
+// the LAN thread for the resolver's own timeout, not pumpUntil's deadline.
 typedef void (*mlxserve_addr_reply)(void *ref, unsigned int flags, unsigned int interface, int err,
                                      const char *hostname, const struct sockaddr *address,
                                      unsigned int ttl, void *ctx);
