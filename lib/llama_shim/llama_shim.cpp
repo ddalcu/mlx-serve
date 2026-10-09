@@ -8,12 +8,14 @@
 
 #include "llama.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 // llama.cpp's staging API for MTP (src/llama-ext.h, not in the xcframework's
@@ -61,6 +63,13 @@ static pthread_once_t g_backend_once = PTHREAD_ONCE_INIT;
 
 static void backend_init_once(void) {
     llama_backend_init();
+    // The Linux release loads its backends (CUDA, CPU) as plugins, which
+    // ggml looks for beside the executable; ours sit beside libllama.
+    Dl_info info;
+    if (ggml_backend_reg_count() == 0 && dladdr((void *)llama_backend_init, &info)) {
+        std::string dir(info.dli_fname);
+        ggml_backend_load_all_from_path(dir.substr(0, dir.rfind('/')).c_str());
+    }
 }
 
 static void copy_err(char *err, size_t errlen, const char *msg) {

@@ -4022,21 +4022,22 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             (if (turbo) packFileBytes(io, allocator, engine.model_dir, "turbo_lora.safetensors") else 0);
         var active: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
-        const avail = h3AvailBytes(metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active);
-        if (dit > 0 and avail > 0 and dit + activations > avail) {
+        const bill = h3CanvasBill(dit, activations, metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active, mlx.cudaAvailable());
+        if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             var buf: [320]u8 = undefined;
             const with_cache = bcast_row > 0;
-            const msg = std.fmt.bufPrint(&buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
+            const msg = std.fmt.bufPrint(&buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
                 width,
                 height,
                 shape.frame_count,
-                @as(f64, @floatFromInt(dit + activations)) / gb,
+                @as(f64, @floatFromInt(bill.need)) / gb,
                 @as(f64, @floatFromInt(dit)) / gb,
+                if (mlx.cudaAvailable()) " paged to RAM" else "",
                 @as(f64, @floatFromInt(activations)) / gb,
                 rows,
                 if (with_cache) " with the fast recipe's attention cache" else "",
-                @as(f64, @floatFromInt(avail)) / gb,
+                @as(f64, @floatFromInt(bill.avail)) / gb,
                 if (with_cache) ", or \"turbo\", which keeps no attention cache" else "",
             }) catch "the canvas does not fit in memory: use a smaller canvas or fewer frames";
             return sendError(conn, 400, msg);
@@ -4804,20 +4805,6 @@ pub fn ltxPeakBytes(dir_sum: u64, spare_transformer: u64, text_encoder: u64) u64
 /// safe.
 pub const H3_DIT_RESIDENT_PCT: u64 = 65;
 
-/// Transients the two GENERATING stages carry on top of their weights: the
-/// packed [text|cond|audio|video] sequence's activations while sampling, and
-/// the VAE decode's frame buffers. Measured 4.0-5.0 GiB at 768x448 / 124f
-/// (process peak minus self-reported DiT residency, both packs); billed at 6.
-/// It scales with pixels x frames, which a per-MODEL load gate cannot see —
-/// bounding a specific request is not something this estimator can do, and
-/// the old formula's incidental margin was the same order.
-///
-/// The TEXT-ENCODER stage gets none of it: that is one forward over a few
-/// hundred prompt rows, so a shared "+ activations" on the max of all three
-/// stages bills the biggest stage for transients it never allocates — which
-/// is what refused the 8-bit pack on every Mac under ~96 GB.
-pub const H3_ACTIVATION_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-
 /// MiniMax Music 3's non-weight working set at the request caps: batch-2 KV
 /// cache for 36 layers at 9000 frames + 5000 prompt tokens (~4.1 GB), the
 /// bf16 frame-hidden buffer (~0.6 GB), and DiT/vocoder window transients.
@@ -4843,12 +4830,15 @@ pub fn h3DitResidentBytes(dit_file: u64, precompute: bool) u64 {
 /// load — so the peak is the BIGGEST stage, never a sum. The two VAEs are one
 /// stage: the video decoder is still resident when the audio one loads.
 /// `dit_resident` is post-AdaLN-precompute (`h3DitResidentBytes`), which the
-/// file size overstates by ~39%.
+/// file size overstates by ~39%. The generating stages carry the smallest
+/// request's transients; `handleVideoH3` prices each request's own (they scale
+/// with pixels x frames, which a per-model gate cannot see). The text encoder
+/// is one forward over a few hundred prompt rows and carries none.
 pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u64 {
     const vaes = video_vae + audio_vae;
     const generating = @max(dit_resident, vaes);
     if (te == 0 and generating == 0) return 0; // unknown dir → never block
-    return stagedPeakBytes(0, &.{ te, generating + H3_ACTIVATION_BYTES });
+    return stagedPeakBytes(0, &.{ te, generating + H3_REQUEST_BASE_BYTES });
 }
 
 /// Sequence rows one window puts through the DiT: video latents on the 32-pixel grid, stereo
@@ -4889,6 +4879,15 @@ pub fn h3AvailBytes(host_avail: u64, gpu_limit: u64, gpu_active: u64) u64 {
     if (host_avail == 0) return 0;
     if (gpu_limit == 0) return host_avail;
     return @min(host_avail, gpu_limit -| gpu_active);
+}
+
+/// What a staged DiT run is checked against: the bytes it needs and the bytes that hold them.
+/// CUDA keeps file-loaded weights in managed memory that pages to host RAM, so there the DiT is
+/// billed to RAM and only the activations to the GPU.
+pub fn h3CanvasBill(dit: u64, activations: u64, host_avail: u64, gpu_limit: u64, gpu_active: u64, weights_page: bool) struct { need: u64, avail: u64 } {
+    if (!weights_page) return .{ .need = dit + activations, .avail = h3AvailBytes(host_avail, gpu_limit, gpu_active) };
+    if (dit > host_avail) return .{ .need = dit, .avail = host_avail };
+    return .{ .need = activations, .avail = if (gpu_limit == 0) host_avail else gpu_limit -| gpu_active };
 }
 
 /// Headroom kept free beyond the resident set: an eighth of the RAM it does not need, floored.
@@ -6609,7 +6608,7 @@ test "LTX bills ONE transformer variant, plus the text encoder its dir cannot se
 
 test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint ones" {
     const GB: u64 = 1024 * 1024 * 1024;
-    const act = H3_ACTIVATION_BYTES;
+    const act = H3_REQUEST_BASE_BYTES;
     // Three disjoint stages: the TE is freed before the DiT loads, the DiT is
     // freed before the VAEs load. Billing any two together refuses a Mac that
     // would work — the VAEs used to be added to the DiT term.
@@ -6634,6 +6633,11 @@ test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint 
     );
     try std.testing.expect(real < 29 * GB); // fits the 48 GB Mac's auto cap
     try std.testing.expect(real > 24 * GB); // and stays above the measured peak
+
+    // The 4-bit pack's files: the text encoder is the biggest stage (measured 14.23 GB resident
+    // vs the DiT's 11.44 at 832x480 x 22 frames), not the DiT plus a worst-case canvas.
+    const te4: u64 = 15_804_791_921;
+    try std.testing.expectEqual(te4, h3PeakBytes(te4, h3DitResidentBytes(18_698_813_290, true) + 779_849_816, 5_207_808_496, 605_254_808));
 }
 
 test "h3 request rows: latent frames on the 32-pixel grid, stereo audio, one frame of rows per keyframe" {
@@ -6670,7 +6674,7 @@ test "h3 residency is priced on the request's activations, so a warm set yields 
     // ...and releases it for a 1344x768 fast-recipe request; the flat term kept it and the run OOMed.
     const big = h3ResidentBytes(te, dit_file, vaes, lora, h3ActivationBytes(h3RequestRows(1344, 768, 124, 0), bcast));
     try std.testing.expect(!h3KeepResident(60 * GB, 0, big, margin));
-    try std.testing.expect(h3KeepResident(60 * GB, 0, h3ResidentBytes(te, dit_file, vaes, lora, H3_ACTIVATION_BYTES), margin));
+    try std.testing.expect(h3KeepResident(60 * GB, 0, h3ResidentBytes(te, dit_file, vaes, lora, h3ActivationBytes(0, 0)), margin));
 }
 
 test "h3 DiT term sheds the AdaLN weights precompute frees — unless it is off" {
@@ -6714,14 +6718,14 @@ test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
     tmp.dir.deleteFile(io, "transformer-distilled.safetensors") catch {};
 
     // H3: max(TE 300, DiT 500*65% + activations, VAEs 120+30 + activations).
-    try std.testing.expectEqual(325 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    try std.testing.expectEqual(325 + H3_REQUEST_BASE_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
 
     // A pack shipping the Turbo LoRA bills it on the DiT term (it is resident
     // ALONGSIDE the DiT and precompute does not free it), whenever present —
     // the gate estimate is per-model, not per-request.
     const b80: [80]u8 = @splat('x');
     try tmp.dir.writeFile(io, .{ .sub_path = "turbo_lora.safetensors", .data = &b80 });
-    try std.testing.expectEqual(405 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    try std.testing.expectEqual(405 + H3_REQUEST_BASE_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
     tmp.dir.deleteFile(io, "turbo_lora.safetensors") catch {};
     // Any other media type: the plain sum over the dir (the safe default —
     // a backend without a declared residency plan must not under-bill).
@@ -6851,6 +6855,20 @@ test "h3 residency: free memory is the tighter of host RAM and the GPU working-s
     try std.testing.expectEqual(100 * gb, h3AvailBytes(100 * gb, 0, 40 * gb)); // no GPU limit known
     try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(0, 192 * gb, 0)); // host unknown never keeps
     try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(100 * gb, 192 * gb, 200 * gb)); // over the limit
+}
+
+test "h3CanvasBill: unified memory bills DiT + activations; CUDA bills the DiT to RAM, activations to the GPU" {
+    const gb: u64 = 1 << 30;
+    const mac = h3CanvasBill(12 * gb, 6 * gb, 20 * gb, 16 * gb, 1 * gb, false);
+    try std.testing.expectEqual(18 * gb, mac.need);
+    try std.testing.expectEqual(15 * gb, mac.avail);
+    // 16 GB card, 21 GB RAM free: 832x480 x 124 frames (12 GB DiT, 6.4 GB rows) fits.
+    const cuda = h3CanvasBill(12 * gb, 6 * gb, 21 * gb, 16 * gb, 1 * gb, true);
+    try std.testing.expectEqual(6 * gb, cuda.need);
+    try std.testing.expectEqual(15 * gb, cuda.avail);
+    // A DiT bigger than free RAM is what binds there.
+    const ram = h3CanvasBill(25 * gb, 6 * gb, 21 * gb, 16 * gb, 1 * gb, true);
+    try std.testing.expect(ram.need > ram.avail);
 }
 
 test "h3 residency: the margin scales with RAM and never drops below 10 GiB" {

@@ -61,8 +61,8 @@ const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
@@ -3010,9 +3010,9 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (mtp_path) |p| log.info("[ds4] MTP draft head: {s}\n", .{p});
 
     const engine = try arch_ds4.Ds4Engine.open(sch.allocator, params.ds4_path, .{
-        .backend = .metal,
         .warm_weights = true,
         .ssd_streaming = params.ds4_ssd_streaming,
+        .prefill_chunk = if (generate_mod.prefill_chunk_explicit) @intCast(generate_mod.prefill_chunk_override) else 0,
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
         .mtp_margin = DS4_MTP_MARGIN,
@@ -3692,10 +3692,17 @@ test "coldLoadVision honors the process-wide vision opt-out" {
 /// Memory a load of `need` bytes can use. A resident media cache is opportunistic, so a load that
 /// would be refused makes it let go first and the figure is read again.
 fn availForLoad(need: u64) u64 {
-    var avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+    var avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
     if (memInsufficientForLoad(need, avail) and gen_mod.releaseMediaResidency() > 0)
-        avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+        avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
     return avail;
+}
+
+/// The GPU ceiling on loaded weights. MLX's CUDA backend keeps file-loaded arrays in managed
+/// memory that pages to host RAM, so there RAM is the bound (and an allocation failure is a
+/// catchable error, not Metal's process-killing OOM); 0 = none.
+fn loadGpuLimit() u64 {
+    return if (mlx.cudaAvailable()) 0 else mlx.maxRecommendedWorkingSet();
 }
 
 fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {

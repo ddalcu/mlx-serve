@@ -29,7 +29,10 @@ zig-out/
 # Linux counterpart staging work dir (scripts/build-mlx-linux.sh)
 /.work-mlx-linux/
 /.work-mlx-linux-cuda/
+/.work-mlx-linux-cpu/
 /lib/jinja_cpp/libjinja-linux.a
+# ds4 CUDA library (scripts/build-ds4-linux.sh)
+/lib/ds4-linux/
 
 # Swift / app build. No leading slash, so it also catches the stray root
 # .build/ SwiftPM drops when a swift command is run from the repo root.

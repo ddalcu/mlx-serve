@@ -22,8 +22,8 @@ const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
-const ds4_arch = if (build_options.macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const llama_arch = if (build_options.macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const ds4_arch = if (build_options.embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_options.embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
@@ -41,15 +41,15 @@ pub const VERSION: []const u8 = build_options.version;
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
 
-// The embedded llama.cpp engine only links on macOS builds (macos_engines);
+// The embedded llama.cpp engine links on macOS and Linux builds (embedded_engines);
 // elsewhere the stub engine replaces it, so the libllama symbols above are
 // not referenced and `--version` reports these placeholders instead.
 fn ggmlEngineVersion() []const u8 {
-    if (comptime !build_options.macos_engines) return "unavailable (no embedded llama.cpp)";
+    if (comptime !build_options.embedded_engines) return "unavailable (no embedded llama.cpp)";
     return std.mem.span(ggml_version());
 }
 fn ggmlEngineCommit() []const u8 {
-    if (comptime !build_options.macos_engines) return "";
+    if (comptime !build_options.embedded_engines) return "";
     return std.mem.span(ggml_commit());
 }
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -120,7 +120,7 @@ fn printUsage(io: std.Io) void {
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
-        \\  --serve             Start HTTP server mode
+        \\  --serve             Start HTTP server mode (the default unless --prompt)
         \\  --host <ip>         Bind address (default: 0.0.0.0 — open to the local
         \\                      network; a future version will default to 127.0.0.1)
         \\  --port <n>          Bind port (default: 11234)
@@ -137,7 +137,7 @@ fn printUsage(io: std.Io) void {
         \\  --embedding-max-length <n>  Per-input token ceiling for /v1/embeddings
         \\                      (default auto = the model's declared window; over-limit
         \\                      inputs get a 400 naming index/count/limit, never truncation)
-        \\  --prompt <text>     Run single prompt (interactive mode)
+        \\  --prompt <text>     Run one prompt offline and exit (no server)
         \\  --stream            Stream tokens as they are generated (with --prompt)
         \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
         \\                      mode, the default for requests that omit the field
@@ -299,6 +299,8 @@ fn printUsage(io: std.Io) void {
         \\                        so one layer's attention scores stay within
         \\                        budget; this flag is the ceiling, not a floor.
         \\                        Lower it if a long prompt spikes memory.
+        \\                        Also ds4's graph prefill chunk (lower it to
+        \\                        stream experts on a small GPU).
         \\  --prefill-decode-share <s>
         \\                      Target fraction of wall time (0..0.9) the
         \\                        decoding streams keep while another request
@@ -1085,6 +1087,8 @@ pub fn main(init: std.process.Init) !void {
         serve_mode = true;
     }
     if (use_default_models_root) serve_mode = true;
+    // Offline mode is one --prompt; without one, serving is the default (--serve stays accepted).
+    if (prompt == null) serve_mode = true;
     // An unspecified `--model-dir` falls back to the shared models root that
     // `pull`/`list`/the app already agree on. Gated so `--model <path> --serve`
     // still serves exactly the one model it named (cli.shouldDefaultModelsRoot).
@@ -1222,7 +1226,10 @@ pub fn main(init: std.process.Init) !void {
     // containing one) bypasses the MLX safetensors path entirely. Both offline
     // (`--prompt`) and serve (`--serve`) modes are wired; serve constructs a stub
     // LoadedModel whose request handlers route through the engine.
-    mlx_gguf.enabled = mlx_gguf_enabled and engine_override == null;
+    // Its kernels are Metal-only; on CUDA llama.cpp serves the same files faster.
+    if (mlx_gguf_enabled and !mlx.metalKernelsAvailable())
+        log.warn("[gguf] --mlx-gguf needs Metal kernels; GGUFs go to llama.cpp/ds4 on this backend\n", .{});
+    mlx_gguf.enabled = mlx_gguf_enabled and engine_override == null and mlx.metalKernelsAvailable();
     const mlx_gguf_path = mlx_gguf.servablePath(io, allocator, model_dir);
     defer if (mlx_gguf_path) |p| allocator.free(p);
     if (mlx_gguf_path != null) log.info("[gguf] engine: mlx (lib/mlx-serve-gguf)\n", .{});
@@ -1751,9 +1758,9 @@ fn runDs4Offline(
     if (mtp_path) |p| log.info("[ds4] MTP draft head: {s}\n", .{p});
 
     var engine = ds4_arch.Ds4Engine.open(allocator, gguf_path, .{
-        .backend = .metal,
         .warm_weights = true,
         .ssd_streaming = ds4_ssd_streaming,
+        .prefill_chunk = if (generate_mod.prefill_chunk_explicit) @intCast(generate_mod.prefill_chunk_override) else 0,
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
         .mtp_margin = 3.0,

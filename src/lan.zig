@@ -869,6 +869,7 @@ fn monoMs() i64 {
 
 /// One dns_sd ref pumped until its callback flips `done` or the deadline hits.
 fn pumpUntil(ref: DNSServiceRef, done: *const bool, timeout_ms: i64) bool {
+    if (done.*) return true; // answered synchronously (the Linux GetAddrInfo in ane_stub.c)
     const fd = DNSServiceRefSockFD(ref);
     if (fd < 0) return false;
     const deadline = monoMs() + timeout_ms;
@@ -1027,6 +1028,15 @@ pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []
 // ─────────────────────────────────────────────────────────────────────────────
 
 const t = std.testing;
+
+test "lan: peer address lookup answers on Linux, where Avahi lacks GetAddrInfo" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var addr: AddrOut = .{};
+    var aref: DNSServiceRef = null;
+    try std.testing.expectEqual(@as(i32, 0), DNSServiceGetAddrInfo(&aref, 0, 0, kDNSServiceProtocol_IPv4, "localhost", onAddr, &addr));
+    try std.testing.expect(pumpUntil(aref, &addr.done, 1000));
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &addr.ip4s[0]);
+}
 
 test "lan: headerValueCI finds a header case-insensitively and trims the value" {
     const head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-MLX-LAN-Token: deadbeefcafef00d\r\n";
