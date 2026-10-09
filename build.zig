@@ -476,9 +476,9 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         addLlamaLib(b, mod);
         // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
         // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
-        for ([_][]const u8{ "mlx", "llama" }) |lib| {
-            mod.addRPath(.{ .cwd_relative = b.fmt("$ORIGIN/../../lib/{s}/lib", .{lib}) });
-            mod.addRPath(.{ .cwd_relative = b.fmt("$ORIGIN/../../../lib/{s}/lib", .{lib}) });
+        for ([_][]const u8{ "mlx/lib", "llama/lib", "ds4-linux" }) |dir| {
+            mod.addRPath(.{ .cwd_relative = b.fmt("$ORIGIN/../../lib/{s}", .{dir}) });
+            mod.addRPath(.{ .cwd_relative = b.fmt("$ORIGIN/../../../lib/{s}", .{dir}) });
         }
 
         // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
@@ -541,7 +541,7 @@ fn verifyMlxStageLinux(b: *std.Build) void {
     };
     // The embedded engines (ds4 on CUDA, llama.cpp's CUDA release).
     for ([_][2][]const u8{
-        .{ "lib/ds4-linux/libds4.a", "git submodule update --init lib/ds4 && ./scripts/build-ds4-linux.sh" },
+        .{ "lib/ds4-linux/libds4.so", "git submodule update --init lib/ds4 && ./scripts/build-ds4-linux.sh" },
         .{ "lib/llama/lib/libllama.so", "./scripts/fetch-llama.sh" },
     }) |stage| {
         buildRootHandle(b).access(b.graph.io, stage[0], .{}) catch {
@@ -781,28 +781,13 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
 }
 
-/// ds4 on its CUDA backend: scripts/build-ds4-linux.sh archives upstream's
-/// library objects (nvcc) into lib/ds4-linux/libds4.a.
+/// ds4 on its CUDA backend: scripts/build-ds4-linux.sh links upstream's library objects
+/// (nvcc) into lib/ds4-linux/libds4.so, with its GNU C++ runtime and CUDA libraries inside.
 fn addDs4LinuxLib(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("lib/ds4"));
-    module.addObjectFile(b.path("lib/ds4-linux/libds4.a"));
+    module.addLibraryPath(b.path("lib/ds4-linux"));
+    module.linkSystemLibrary("ds4", .{ .use_pkg_config = .no });
     module.addCSourceFile(.{ .file = b.path("src/ds4_layout_check.c"), .flags = &.{"-std=c99"} });
-    // The CUDA toolkit's home: Arch packages /opt/cuda, NVIDIA's repos /usr/local/cuda.
-    for ([_][]const u8{ "/opt/cuda/lib64", "/usr/local/cuda/lib64" }) |dir| {
-        buildRootHandle(b).access(b.graph.io, dir, .{}) catch continue;
-        module.addLibraryPath(.{ .cwd_relative = dir });
-    }
-    module.linkSystemLibrary("cudart", .{ .use_pkg_config = .no });
-    module.linkSystemLibrary("cublas", .{ .use_pkg_config = .no });
-    // nvcc's host compiler is g++, so the archive needs g++'s runtimes, linked by path:
-    // libstdc++ (zig's `-lstdc++` would swap in its own libc++), and on aarch64 libgcc,
-    // home of gcc's outline atomics (__aarch64_cas4_sync & co.) that zig's compiler-rt lacks.
-    module.addObjectFile(gccFile(b, "libstdc++.so"));
-    if (module.resolved_target.?.result.cpu.arch == .aarch64) module.addObjectFile(gccFile(b, "libgcc.a"));
-}
-
-fn gccFile(b: *std.Build, name: []const u8) std.Build.LazyPath {
-    return .{ .cwd_relative = std.mem.trim(u8, b.run(&.{ "g++", b.fmt("-print-file-name={s}", .{name}) }), " \n") };
 }
 
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and

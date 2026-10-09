@@ -14,7 +14,7 @@ name: Linux
 # cache cannot carry it across commits, and restored libraries are new files to it.
 #
 # The tarball keeps the repo layout the binary's $ORIGIN rpaths expect
-# (zig-out/bin/mlx-serve next to lib/mlx/lib and lib/llama/lib). Running it
+# (zig-out/bin/mlx-serve next to lib/mlx/lib, lib/llama/lib, lib/ds4-linux). Running it
 # needs an NVIDIA driver >= 580 (CUDA 13), the CUDA 13 toolkit (MLX JIT-compiles
 # kernels against its headers) and cuDNN 9, plus OpenBLAS/LAPACKE, libwebp and
 # the Avahi dns_sd compat library.
@@ -139,7 +139,7 @@ jobs:
 
       - name: Package
         run: |
-          tar czf mlx-serve-linux-${{ matrix.name }}-cuda13.tar.gz zig-out/bin/mlx-serve lib/mlx/lib lib/llama/lib LICENSE LICENSE-APACHE-2.0 NOTICE
+          tar czf mlx-serve-linux-${{ matrix.name }}-cuda13.tar.gz zig-out/bin/mlx-serve lib/mlx/lib lib/llama/lib lib/ds4-linux/libds4.so LICENSE LICENSE-APACHE-2.0 NOTICE
 
       - uses: actions/upload-artifact@v4
         with:
