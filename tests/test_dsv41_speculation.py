@@ -64,6 +64,16 @@ for path, body in bodies.items():
                                 if event.get("type") in ("response.completed", "response.incomplete")]
                     assert terminal and terminal[-1].get("error") is None, result
                     assert terminal[-1]["status"] in ("completed", "incomplete"), result
+                elif path == "/v1/messages":
+                    assert any(event.get("type") == "message_stop" for event in events), result
+                    assert any(event.get("type") == "message_delta" and
+                               event.get("delta", {}).get("stop_reason") in
+                               ("end_turn", "max_tokens", "tool_use", "stop_sequence", "pause_turn", "refusal")
+                               for event in events), result
+                else:
+                    assert "data: [DONE]" in result.splitlines(), result
+                    assert any(choice.get("finish_reason") in ("stop", "length", "tool_calls")
+                               for event in events for choice in event.get("choices", [])), result
             else:
                 payload = json.loads(result)
                 assert payload.get("error") is None, result
