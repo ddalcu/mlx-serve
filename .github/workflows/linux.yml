@@ -1,8 +1,10 @@
 name: Linux
 
-# Linux/CUDA build of the mlx-serve server for RTX 20-50 series (Turing sm_75,
-# Ampere/Ada sm_86, Blackwell sm_120 + PTX), via scripts/build-linux.sh — the
-# same one-shot script a developer runs. GitHub's runners have no GPU, so this
+# Linux/CUDA builds of the mlx-serve server, via scripts/build-linux.sh — the
+# same one-shot script a developer runs:
+#   x64:   RTX 20-50 series (Turing sm_75, Ampere/Ada sm_86, Blackwell sm_120)
+#   arm64: GH200 (sm_90), Jetson Thor (sm_110), DGX Spark / GB10 (sm_121)
+# GitHub's runners have no GPU, so this
 # is a compile-and-link gate plus a downloadable build, not a runtime test.
 #
 # Every slow input is cached by what produced it: the stage scripts stamp their
@@ -28,16 +30,34 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CUDA_ARCH: "75;86;120"
-  # Portable CPU code: the runner's own CPU features must not leak into the build.
-  ZIG_CPU: x86_64_v3
-  NATIVE_CPU_FLAG: -march=x86-64-v3
   APT_PACKAGES: cuda-toolkit-13 cudnn9-cuda-13 cmake liblapacke-dev libopenblas-dev libwebp-dev libavahi-compat-libdnssd-dev
 
 jobs:
   cuda:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ZIG_CPU / NATIVE_CPU_FLAG: portable CPU code, so the runner's own CPU features stay out.
+          - name: x64
+            runner: ubuntu-24.04
+            cuda_repo: x86_64
+            cuda_arch: "75;86;120"
+            zig_cpu: x86_64_v3
+            cpu_flag: -march=x86-64-v3
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            cuda_repo: sbsa
+            cuda_arch: "90;110;121"
+            zig_cpu: baseline
+            cpu_flag: -march=armv8.2-a+dotprod
+    name: cuda (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
+    env:
+      CUDA_ARCH: ${{ matrix.cuda_arch }}
+      ZIG_CPU: ${{ matrix.zig_cpu }}
+      NATIVE_CPU_FLAG: ${{ matrix.cpu_flag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,19 +85,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: lib/mlx
-          key: mlx-linux-cuda-${{ steps.pins.outputs.mlx }}-${{ steps.pins.outputs.arch }}-${{ hashFiles('patches/mlx*.patch', 'scripts/build-mlx-linux.sh') }}
+          key: mlx-linux-${{ matrix.name }}-${{ steps.pins.outputs.mlx }}-${{ steps.pins.outputs.arch }}-${{ hashFiles('patches/mlx*.patch', 'scripts/build-mlx-linux.sh') }}
 
       - name: Cache ds4 stage
         uses: actions/cache@v4
         with:
           path: lib/ds4-linux
-          key: ds4-linux-cuda-${{ steps.pins.outputs.ds4 }}-${{ steps.pins.outputs.arch }}-${{ env.NATIVE_CPU_FLAG }}-${{ hashFiles('scripts/build-ds4-linux.sh') }}
+          key: ds4-linux-${{ matrix.name }}-${{ steps.pins.outputs.ds4 }}-${{ steps.pins.outputs.arch }}-${{ env.NATIVE_CPU_FLAG }}-${{ hashFiles('scripts/build-ds4-linux.sh') }}
 
       - name: Cache llama.cpp stage
         uses: actions/cache@v4
         with:
           path: lib/llama
-          key: llama-linux-cuda-${{ hashFiles('scripts/fetch-llama.sh') }}
+          key: llama-linux-${{ matrix.name }}-${{ hashFiles('scripts/fetch-llama.sh') }}
 
       - name: Cache Zig toolchain
         uses: actions/cache@v4
@@ -96,12 +116,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/apt-archives
-          key: apt-ubuntu2404-${{ hashFiles('.github/workflows/linux.yml') }}
-          restore-keys: apt-ubuntu2404-
+          key: apt-ubuntu2404-${{ matrix.name }}-${{ hashFiles('.github/workflows/linux.yml') }}
+          restore-keys: apt-ubuntu2404-${{ matrix.name }}-
 
       - name: Install CUDA 13, cuDNN and build dependencies
         run: |
-          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${{ matrix.cuda_repo }}/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           mkdir -p ~/apt-archives/partial
@@ -119,9 +139,9 @@ jobs:
 
       - name: Package
         run: |
-          tar czf mlx-serve-linux-x64-cuda13.tar.gz zig-out/bin/mlx-serve lib/mlx/lib lib/llama/lib LICENSE LICENSE-APACHE-2.0 NOTICE
+          tar czf mlx-serve-linux-${{ matrix.name }}-cuda13.tar.gz zig-out/bin/mlx-serve lib/mlx/lib lib/llama/lib LICENSE LICENSE-APACHE-2.0 NOTICE
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mlx-serve-linux-x64-cuda13
-          path: mlx-serve-linux-x64-cuda13.tar.gz
+          name: mlx-serve-linux-${{ matrix.name }}-cuda13
+          path: mlx-serve-linux-${{ matrix.name }}-cuda13.tar.gz
