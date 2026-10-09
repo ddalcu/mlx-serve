@@ -794,10 +794,15 @@ fn addDs4LinuxLib(b: *std.Build, module: *std.Build.Module) void {
     }
     module.linkSystemLibrary("cudart", .{ .use_pkg_config = .no });
     module.linkSystemLibrary("cublas", .{ .use_pkg_config = .no });
-    // nvcc's host compiler is g++: the archive references libstdc++, which zig's
-    // `-lstdc++` would swap for its own libc++, so link it by path.
-    const libstdcxx = std.mem.trim(u8, b.run(&.{ "g++", "-print-file-name=libstdc++.so" }), " \n");
-    module.addObjectFile(.{ .cwd_relative = libstdcxx });
+    // nvcc's host compiler is g++, so the archive needs g++'s runtimes, linked by path:
+    // libstdc++ (zig's `-lstdc++` would swap in its own libc++), and on aarch64 libgcc,
+    // home of gcc's outline atomics (__aarch64_cas4_sync & co.) that zig's compiler-rt lacks.
+    module.addObjectFile(gccFile(b, "libstdc++.so"));
+    if (module.resolved_target.?.result.cpu.arch == .aarch64) module.addObjectFile(gccFile(b, "libgcc.a"));
+}
+
+fn gccFile(b: *std.Build, name: []const u8) std.Build.LazyPath {
+    return .{ .cwd_relative = std.mem.trim(u8, b.run(&.{ "g++", b.fmt("-print-file-name={s}", .{name}) }), " \n") };
 }
 
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and
