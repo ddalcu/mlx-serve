@@ -1066,6 +1066,8 @@ test "an MLX memory failure is classified as a memory error, an argument error i
 
 test "the latch turns an mlx-c error into a Zig error instead of exiting, once" {
     const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = takeError(&stale); // an earlier test's latch would shadow this one's
     try t.expect(!errorPending());
     try checkError();
 

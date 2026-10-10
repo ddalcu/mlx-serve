@@ -2205,7 +2205,7 @@ pub const Engine = struct {
         var rest = phonemes;
         while (rest.len > 0) {
             const cut = phonemeWindow(rest, self.model.cfg.bert_max_pos - 2);
-            const piece: ?[]f32 = self.model.synthesize(rest[0..cut], voice, speed, seed) catch |err| switch (err) {
+            const piece: ?[]f32 = if (!hasSpeakable(rest[0..cut])) null else self.model.synthesize(rest[0..cut], voice, speed, seed) catch |err| switch (err) {
                 error.EmptyKokoroInput => null, // a window of marks and spaces only
                 else => return err,
             };
@@ -2247,6 +2247,26 @@ pub fn phonemeWindow(phonemes: []const u8, max_cps: usize) usize {
 // ════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+
+/// Whether `phonemes` holds a sound: the vocab encodes marks too, and a run of them alone
+/// synthesizes silence.
+fn hasSpeakable(phonemes: []const u8) bool {
+    const view = std.unicode.Utf8View.init(phonemes) catch return true;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| switch (cp) {
+        ' ', '.', ',', '!', '?', ';', ':', '"', '(', ')', '—', '…', '«', '»', '“', '”', '¡', '¿' => {},
+        else => return true,
+    };
+    return false;
+}
+
+test "kokoro: hasSpeakable is false for marks and spaces alone" {
+    try testing.expect(hasSpeakable("hˈɛloʊ."));
+    try testing.expect(hasSpeakable("ə"));
+    try testing.expect(!hasSpeakable("!!! ... ???"));
+    try testing.expect(!hasSpeakable("— … «» “” ¡¿ ;:,"));
+    try testing.expect(!hasSpeakable(""));
+}
 
 test "kokoro: phonemeWindow cuts long input at the last sentence, clause or word mark that fits" {
     try testing.expectEqual(@as(usize, 6), phonemeWindow("hˈɛ.", 10)); // fits whole

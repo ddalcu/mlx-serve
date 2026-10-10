@@ -7006,6 +7006,8 @@ test "a base64 WebP reference reaches the media backends as a PNG with the same 
 }
 
 test "jobFailureStatus: a memory failure is a 503, any other failure a 500" {
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale); // an earlier test's latch would shadow this one's
     try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.OutOfMemory));
     try std.testing.expectEqual(@as(u16, 500), jobFailureStatus(error.MlxError));
     var buf: [256]u8 = undefined;

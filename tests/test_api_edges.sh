@@ -225,6 +225,7 @@ req POST /api/chat '{"model":"m","messages":[{"role":"user","content":"weather i
 [[ "$R" == 200 ]] && ok "/api/chat with tools answers" || bad "/api/chat tools" "$R"
 req POST /api/show '{"name":"zzz"}';                                   expect_status 404 "/api/show unknown model"
 req POST /detokenize '{"tokens":[-1, 1099511627776]}';               expect_status 400 "detokenize ids outside the vocabulary"
+req POST /v1/load-model '{"model":42}';                                expect_status 400 "load-model: a non-string model is refused, not the default loaded"
 req POST /v1/completions '{"model":"m","prompt":"","max_tokens":4}';        expect_status 400 "completions: empty prompt (generating from it killed the server)"
 
 echo "=== Responses API ==="

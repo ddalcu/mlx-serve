@@ -7,7 +7,7 @@ import XCTest
 /// writes `~/.mlx-serve` and the user defaults. Run the built bundle directly
 /// (SwiftPM itself stalls under a redirected home):
 /// `swift build --build-tests && MLX_SERVE_LIVE_TOOLS_GATE=1 CFFIXED_USER_HOME=$(mktemp -d)
-///  xcrun xctest -XCTest MLXCoreTests.ToolsToggleLiveTests .build/debug/MLXCorePackageTests.xctest`
+///  xcrun xctest -XCTest MLXCoreTests.ToolsToggleLiveTests .build/out/Products/Debug/MLXCoreTests.xctest`
 @MainActor
 final class ToolsToggleLiveTests: XCTestCase {
 
@@ -165,6 +165,33 @@ final class ToolsToggleLiveTests: XCTestCase {
         XCTAssertTrue(offered[0].contains("shell"), "Tools were on for round 1")
         XCTAssertFalse(offered[2].contains("shell"), "round 3 offers no built-ins: \(offered[2])")
         XCTAssertTrue(offered[3].isEmpty, "the resumed turn runs with Tools off: \(offered[3])")
+    }
+
+    func testStopDuringASlowToolDropsItsLateResult() async throws {
+        let (dir, _) = try workspace()
+        let started = (dir as NSString).appendingPathComponent("started")
+        let finished = (dir as NSString).appendingPathComponent("finished")
+        let port = try startServer(script: [
+            ["tool": "shell", "args": ["command": "touch started; sleep 3; touch finished; echo late"]],
+            ["content": "after stop"],
+        ])
+        let appState = AppState()
+        appState.server.port = port
+        appState.server.status = .running   // the fake answers in its place
+        let id = makeSession(appState: appState, dir: dir)
+        let engine = appState.chatEngine
+
+        engine.runTurn(sessionId: id, userText: "run the slow thing",
+                       images: nil, videos: nil, audio: nil,
+                       config: config(tools: true, mcp: false, dir: dir),
+                       approval: { _ in true })
+        try await waitUntil(20, "the tool to start") { FileManager.default.fileExists(atPath: started) }
+        engine.stop(sessionId: id)
+        try await waitUntil(20, "the tool to finish") { FileManager.default.fileExists(atPath: finished) }
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        XCTAssertTrue(toolOutputs(appState, id).isEmpty, "a result after Stop landed: \(toolOutputs(appState, id))")
+        XCTAssertEqual(try offeredTools().count, 1, "no request may follow Stop")
     }
 
     // MARK: - Fake server

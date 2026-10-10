@@ -396,6 +396,16 @@ pub const Conn = struct {
         };
     }
 
+    /// Waits up to `ms` for bytes to read; false when none came. Bytes the reader already
+    /// buffered count as readable.
+    fn awaitReadable(c: *Conn, ms: i64) bool {
+        if (c.reader().bufferedLen() > 0) return true;
+        if (ms <= 0) return false;
+        var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const n = std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return true;
+        return n > 0;
+    }
+
     /// Longest `close` waits for the peer to hang up before releasing the socket anyway.
     const CLOSE_WAIT_MS: i64 = 5 * 60 * 1000;
 
@@ -2290,15 +2300,26 @@ const RawRequest = struct {
 };
 
 /// Reads one request: the head (up to 16 KB), then its `Content-Length` body. Null when no
-/// complete head arrived or the body is over the route's cap (the 413 is already sent).
+/// complete head arrived, the client stalled, or the body is over the route's cap (the 413 is
+/// already sent).
 /// Bytes past the declared body are dropped: one request per connection.
 fn readRequest(allocator: std.mem.Allocator, stream: *Conn) !?RawRequest {
+    return readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS);
+}
+
+/// A client gets this long between bytes of its request, and in all for its head: an idle or
+/// dripping connection otherwise holds its thread forever.
+const REQUEST_READ_LIMIT_MS: i64 = 30_000;
+
+fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64) !?RawRequest {
+    const head_deadline = nowMsMonotonic(stream.io) + limit_ms;
     var hdr_buf: [16 * 1024]u8 = undefined;
     var total_read: usize = 0;
     var content_length: ?usize = null;
     var header_end_pos: usize = 0;
 
     while (total_read < hdr_buf.len) {
+        if (!stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io))) return null;
         const n = try stream.read(hdr_buf[total_read..]);
         if (n == 0) break;
         total_read += n;
@@ -2329,7 +2350,7 @@ fn readRequest(allocator: std.mem.Allocator, stream: *Conn) !?RawRequest {
         // Closing with body bytes unread resets the connection, and the client
         // can lose the 413 before reading it: read what is left, up to the chat cap.
         var left = @min(total_size, max_request_bytes) -| total_read;
-        while (left > 0) {
+        while (left > 0 and stream.awaitReadable(limit_ms)) {
             const n = stream.read(hdr_buf[0..@min(left, hdr_buf.len)]) catch break;
             if (n == 0) break;
             left -= n;
@@ -2350,6 +2371,10 @@ fn readRequest(allocator: std.mem.Allocator, stream: *Conn) !?RawRequest {
     total_read = @min(total_read, total_size);
     @memcpy(buf[0..total_read], hdr_buf[0..total_read]);
     while (total_read < total_size) {
+        if (!stream.awaitReadable(limit_ms)) {
+            allocator.free(buf);
+            return null;
+        }
         const n = try stream.read(buf[total_read..total_size]);
         if (n == 0) break;
         total_read += n;
@@ -7292,9 +7317,15 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     if (std.json.parseFromSlice(std.json.Value, allocator, request_body, .{})) |parsed| {
         parsed_body = parsed;
         if (parsed.value == .object) {
-            if (parsed.value.object.get("model")) |m| {
-                if (m == .string) requested_id = m.string;
-            }
+            if (parsed.value.object.get("model")) |m| switch (m) {
+                .string => |s| requested_id = s,
+                .null => {},
+                // Loading the default for an id the client misspelled as a number reads as success.
+                else => {
+                    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'model' must be a string", 400);
+                    return;
+                },
+            };
             if (parsed.value.object.get("default")) |d| {
                 if (d == .bool) make_default = d.bool;
             }
@@ -20184,6 +20215,41 @@ fn readRequestOver(request: []const u8, body_out: []u8, reply_out: []u8) !struct
     const body = r.buf[r.header_end..r.len];
     @memcpy(body_out[0..body.len], body);
     return .{ .body = body_out[0..body.len], .reply = reply };
+}
+
+/// Runs `readRequestWithin(limit_ms)` against a client that sends `sent`, then one byte per
+/// `drip_ms` (0 = nothing more), and never finishes; true when the reader gave up on its own.
+fn readerGivesUp(sent: []const u8, limit_ms: i64, drip_ms: u64) !bool {
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    defer conn.close();
+    _ = std.c.send(sv[1], sent.ptr, sent.len, 0);
+
+    var done = std.atomic.Value(bool).init(false);
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn, limit: i64, d: *std.atomic.Value(bool)) void {
+            if (readRequestWithin(testing.allocator, c, limit) catch null) |r| testing.allocator.free(r.buf);
+            d.store(true, .release);
+        }
+    }.run, .{ &conn, limit_ms, &done });
+    var waited: u64 = 0;
+    while (!done.load(.acquire) and waited < 2000) : (waited += 10) {
+        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+        if (drip_ms > 0 and waited % drip_ms == 0) _ = std.c.send(sv[1], "x", 1, 0);
+    }
+    const gave_up = done.load(.acquire);
+    _ = std.c.close(sv[1]);
+    reader.join();
+    return gave_up;
+}
+
+test "readRequest: a client that stalls its head or body, or drips its head, is dropped, not held forever" {
+    const head = "POST /v1/chat/completions HTTP/1.1\r\n";
+    try testing.expect(try readerGivesUp(head, 200, 0));
+    try testing.expect(try readerGivesUp(head, 300, 50));
+    try testing.expect(try readerGivesUp(head ++ "Content-Length: 100\r\n\r\n{}", 200, 0));
 }
 
 test "readRequest: bytes past Content-Length are dropped, a wrapping Content-Length is a 413" {

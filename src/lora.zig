@@ -1488,6 +1488,8 @@ test "loadFile rejects a MISSING file before mlx can kill the process" {
 
 test "loadFile: a file that is not safetensors fails without leaving an MLX error for the next request" {
     mlx.installErrorHandler();
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale); // an earlier test's latch would shadow this one's
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -2375,22 +2375,29 @@ pub const HotPrefixCache = struct {
                 .head_pos_base = mm.head_pos_base,
                 .head_marks = mm.head_marks.slice(),
             } else null;
-            const ok = d.appendCommitWithSpec(
-                pending.snapshot.entries,
-                pending.snapshot.step,
-                pending.snapshot.config,
-                pending.tokens,
-                pending.has_tools,
-                pending.ssm_cps,
-                p_dflash,
-                p_mtp,
-                s,
-            ) catch |err| {
-                log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
-                return;
-            };
-            // `.partial` is the only outcome with more to write.
-            if (!ok.nothingPending()) self.disk_dirty = true;
+            // The snapshot dies with this call and RAM may hold only a trim, so a bounded append
+            // repeats until the snapshot is whole: no later flush can resume it.
+            const max_passes = pending.tokens.len / @max(d.chunk_tokens, 1) + 2;
+            var passes: usize = 0;
+            while (passes < max_passes) : (passes += 1) {
+                const ok = d.appendCommitWithSpec(
+                    pending.snapshot.entries,
+                    pending.snapshot.step,
+                    pending.snapshot.config,
+                    pending.tokens,
+                    pending.has_tools,
+                    pending.ssm_cps,
+                    p_dflash,
+                    p_mtp,
+                    s,
+                ) catch |err| {
+                    log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                // `.partial` is the only outcome with more to write.
+                if (ok.nothingPending()) return;
+            }
+            self.disk_dirty = true;
             return;
         }
         if (self.entries.items.len == 0) return;
@@ -7569,6 +7576,35 @@ test "SSD-first: the disk flush carries the full prefix while RAM keeps a trim" 
         try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
         try testing.expect(hc.disk.?.entries.items[0].kv_len < tokens.len);
     }
+}
+
+test "SSD-first: a flush bounded to one chunk still lands the whole snapshot before freeing it (#797)" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 1200);
+    var probe = try cache.snapshot();
+    const row_bytes = HotPrefixCache.snapshotRowBytes(&probe);
+    probe.deinit();
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, row_bytes * 768);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-ssd-bounded", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.max_flush_bytes = 1; // one chunk per append
+
+    _ = try hc.commit(&cache, &tokens, false);
+    try testing.expect(hc.entries.items[0].tokens.len < tokens.len); // RAM holds only a trim
+    hc.flushPendingDisk(s);
+    try testing.expect(hc.pending_disk == null);
+    try testing.expectEqual(@as(u32, tokens.len), hc.disk.?.entries.items[0].kv_len);
 }
 
 test "SSD-first companion: a restore adopts the entry's buffer when its capacity suffices" {

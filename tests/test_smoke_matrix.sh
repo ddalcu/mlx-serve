@@ -134,7 +134,7 @@ run_checks() { # $1 thinking yes/no, $2 has_spec yes/no
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"temperature\":0}")
     rc=$(echo "$r" | J 'd["usage"]["prompt_tokens_details"]["cached_tokens"]')
     # llama.cpp cannot roll recurrent state back one token, so a hybrid GGUF re-prefills an identical prompt.
-    if [[ "$model" == *.gguf ]] && grep -q 'llama_memory_recurrent' "$OUT/$CELL.server.log"; then
+    if [[ "$model" == *.gguf ]] && grep -q 'recurrent state cannot roll back' "$OUT/$CELL.server.log"; then
         skip "prefix cache: repeat reports cached_tokens>0" "recurrent GGUF re-prefills a full match"
     else
     check "prefix cache: repeat reports cached_tokens>0" "$([[ "${rc:-0}" -gt 0 ]] && echo 0 || echo 1)" "cached=$rc"; fi
@@ -207,7 +207,9 @@ print(json.dumps({"model": "m", "messages": [{"role": "user", "content": p}], "m
         local nm args; nm=$(echo "$r" | J 'd["choices"][0]["message"]["tool_calls"][0]["function"]["name"]')
         args=$(echo "$r" | J 'json.loads(d["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]).get("city","")')
         check "tools: call names declared tool with city" "$([[ "$nm" == get_weather && -n "$args" ]] && echo 0 || echo 1)" "$nm($args)"
-        check "tools: finish_reason tool_calls" "$([[ "$(echo "$r" | J 'd["choices"][0]["finish_reason"]')" == tool_calls ]] && echo 0 || echo 1)"
+        # A call that ran into max_tokens reports "length": the cap is the honest reason it stopped.
+        local fr ct; fr=$(echo "$r" | J 'd["choices"][0]["finish_reason"]'); ct=$(echo "$r" | J 'd["usage"]["completion_tokens"]')
+        check "tools: finish_reason tool_calls (length at the cap)" "$([[ "$fr" == tool_calls || ( "$fr" == length && "${ct:-0}" -ge 300 ) ]] && echo 0 || echo 1)" "$fr after $ct tokens"
     else
         c=$(echo "$r" | J 'd["choices"][0]["message"]["content"] or ""')
         check "tools: answered without call (200, no markup leak)" "$([[ -n "$c" ]] && ! echo "$c" | grep -Eq '<tool_call>|<function=' && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"

@@ -11660,6 +11660,8 @@ test "takeMergeable: merges the contiguous run of same-model decision jobs withi
 }
 
 test "runGenJobs: a latch the job raised is dropped, one from before the job stays" {
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale); // an earlier test's latch would shadow this one's
     const job = struct {
         fn oom(_: *anyopaque) void {
             mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");

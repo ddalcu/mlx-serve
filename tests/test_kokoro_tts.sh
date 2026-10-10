@@ -99,6 +99,7 @@ BODY_BADVOICE="{\"model\":\"$ID\",\"input\":\"hi\",\"voice\":\"nope\"}"
 BODY_BADBLEND="{\"model\":\"$ID\",\"input\":\"hi\",\"voice\":\"af_heart,nope\"}"
 BODY_BADSPEED="{\"model\":\"$ID\",\"input\":\"hi\",\"speed\":99}"
 BODY_EMPTY="{\"model\":\"$ID\",\"input\":\"\"}"
+BODY_MARKS="{\"model\":\"$ID\",\"input\":\"!!! ... ???\"}"
 BODY_MUSIC="{\"model\":\"$ID\",\"prompt\":\"jazz\"}"
 BODY_CHAT="{\"model\":\"$ID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
 
@@ -107,6 +108,7 @@ expect_code "[6] unknown voice"          400 "$BODY_BADVOICE"
 expect_code "[6] blend w/ one bad voice" 400 "$BODY_BADBLEND"
 expect_code "[6] speed out of range"     400 "$BODY_BADSPEED"
 expect_code "[6] empty input"            400 "$BODY_EMPTY"
+expect_code "[6] punctuation only"       400 "$BODY_MARKS"
 expect_code "[6] music endpoint on TTS"  400 "$BODY_MUSIC" /v1/audio/music-generations
 expect_code "[6] chat on a TTS model"    400 "$BODY_CHAT"  /v1/chat/completions
 

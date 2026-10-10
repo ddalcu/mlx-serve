@@ -274,7 +274,7 @@ Request parsing + media:
 - **A client-supplied PATH is proven on OUR side of the mlx boundary** (`lora.loadFile` stat → 400) and accepted only from LOOPBACK (`parseLoraFields(…, local)` → 403, #540: missing vs not-a-LoRA is a host-file oracle). `/v1/images/edits` forwards the LoRA fields (#268).
 - **Hand-written error text is not JSON**: escape at the SINK (`jsonEscapeMessage`), truncate on a UTF-8 boundary. NO model-byte string is guaranteed UTF-8 — sanitizing lives INSIDE every escaper (`chat.utf8Next`); logprobs `bytes` keeps exact bytes.
 - **A list of owned buffers is freed in ONE place**: a per-item `defer free` in a send loop plus the handler's defer over the same list double-freed when a send failed (client gone mid-flush; `flush_text` on chat + messages).
-- **A body is exactly its `Content-Length`** (`readRequest`; extra head bytes overran the heap, a 2^64 length wrapped) and nests at most `MAX_JSON_DEPTH` (recursive schema walkers overflowed a thread stack); zero prompt tokens are refused at `Scheduler.submit`; a client string spliced raw into a template is vetted first (`echoModelName`).
+- **A body is exactly its `Content-Length`, read within `REQUEST_READ_LIMIT_MS` of silence** (`readRequest`, `awaitReadable`: a socket timeout panics std's reader; extra head bytes overran the heap, a 2^64 length wrapped) and nests at most `MAX_JSON_DEPTH` (recursive schema walkers overflowed a thread stack); zero prompt tokens are refused at `Scheduler.submit`; a client string spliced raw into a template is vetted first (`echoModelName`).
 
 Sampling + logprobs + streams:
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey` + `SamplingParams.draw`).
