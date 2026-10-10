@@ -105,29 +105,20 @@ jobs:
           path: .zig-toolchain
           key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
 
-      # CUDA (+ its cached .debs) and the build do not fit the runner's default free space.
+      # CUDA and the build do not fit the runner's default free space.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
 
-      # The .debs (~4 GB of CUDA + cuDNN) are cached; installing them still runs every time.
-      - name: Cache CUDA packages
-        uses: actions/cache@v4
-        with:
-          path: ~/apt-archives
-          key: apt-ubuntu2404-${{ matrix.name }}-${{ hashFiles('.github/workflows/linux.yml') }}
-          restore-keys: apt-ubuntu2404-${{ matrix.name }}-
-
+      # Not cached: the .debs are ~4 GB per arch, and two of them pushed the repo past
+      # GitHub's 10 GB cache limit, evicting the MLX stage (an hour to rebuild).
       - name: Install CUDA 13, cuDNN and build dependencies
         run: |
           curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${{ matrix.cuda_repo }}/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          mkdir -p ~/apt-archives/partial
-          sudo apt-get install -y --no-install-recommends -o Dir::Cache::archives="$HOME/apt-archives" \
-            -o APT::Keep-Downloaded-Packages=true $APT_PACKAGES
-          sudo chown -R "$USER" ~/apt-archives
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
           echo /usr/local/cuda/bin >> "$GITHUB_PATH"
 
       - name: Build
