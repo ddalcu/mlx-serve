@@ -36110,6 +36110,32 @@ fn projectWithConfig(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array
     return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, s);
 }
 
+/// The verify lanes cover 2..7 rows everywhere and take 8+ only with a NAX or shader tile,
+/// so by default simd_qmm starts at 8 rows where there is no tile and stays off where there is.
+/// MLX_SERVE_SIMD_QMM_DECODE=N overrides (0 = off).
+fn simdQmmDecodeMinRows(raw: ?[*:0]const u8, tile: VqmmTile) c_int {
+    if (raw) |r| return std.fmt.parseInt(c_int, std.mem.sliceTo(r, 0), 10) catch 0;
+    return if (tile == .off) 8 else 0;
+}
+
+var simd_qmm_decode_env: ?c_int = null;
+/// Affine projections of N to simd_qmm.MAX_ROWS rows go through simd_qmm with no drafter
+/// bound (batched decode widths). N comes from `simdQmmDecodeMinRows`.
+fn simdQmmDecode(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    const min_rows = simd_qmm_decode_env orelse blk: {
+        const v = simdQmmDecodeMinRows(std.c.getenv("MLX_SERVE_SIMD_QMM_DECODE"), verifyQmmTile());
+        simd_qmm_decode_env = v;
+        if (v > 0) log.info("[simd_qmm] batched projections of {d}..{d} rows\n", .{ v, simd_qmm.MAX_ROWS });
+        break :blk v;
+    };
+    if (min_rows <= 0) return null;
+    const xs = mlx.getShape(x);
+    var rows: c_int = 1;
+    for (xs[0 .. xs.len - 1]) |d| rows *= d;
+    if (rows < min_rows) return null;
+    return simd_qmm.qmm(x, w, sc, bi, bits, group_size, s);
+}
+
 /// Nemotron-H MoE block (mlx-lm `NemotronHMoE`): `groupLimitedRouting` over
 /// the sigmoid router, ReLU^2 routed experts (one token: in-place `gatherQmv`
 /// reads, `nemotronMoeDecodeExperts`; else the sorted gather_qmm path), the
@@ -44622,6 +44648,10 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
             s,
         ));
         return result;
+    }
+
+    if (bi.ctx != null) {
+        if (try simdQmmDecode(x, w, sc, bi, bits, group_size, s)) |y| return y;
     }
 
     // Legacy heuristic for mixed checkpoints whose config declares affine but
@@ -74476,6 +74506,15 @@ test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter,
     try testing.expectEqual(@as(usize, @intCast(R)), cache2.seqLen(0));
     std.debug.print("[glm5 mtp fixture] history + {d} single rows: min cos {d:.5}, decided misses {d}\n", .{ R - t_pre, worst, misses });
     try testing.expect(one_shot_ok and worst > 0.995 and misses == 0);
+}
+
+test "simd_qmm decode rows: from 8 where the verify lanes stop at 7, off beside a tile, env overrides" {
+    try testing.expectEqual(@as(c_int, 8), simdQmmDecodeMinRows(null, .off));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(null, .nax));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(null, .shader));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows("0", .off));
+    try testing.expectEqual(@as(c_int, 6), simdQmmDecodeMinRows("6", .nax));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows("x", .off));
 }
 
 test "Metal-only kernels decline on a stream without them, so the MLX-op path runs" {
