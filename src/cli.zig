@@ -522,22 +522,16 @@ fn wantedFile(resolved: Resolved, path: []const u8, media: bool) bool {
 
 /// The quant group a GGUF file belongs to: its path without the split suffix
 /// (`-00001-of-00003`) and extension, so the parts of one split model group together.
-/// Null for what is not a model to pick: a sidecar (`ggufSidecar`), a vision
-/// projector (mmproj) or an importance matrix (imatrix).
+/// Null for what is not a model to pick: a sidecar discovery skips (MTP head, mmproj,
+/// tokenizer: `model_discovery.isGgufSidecarBasename`) or an importance matrix (imatrix).
 pub fn ggufGroup(path: []const u8) ?[]const u8 {
-    if (!std.mem.endsWith(u8, path, ".gguf") or ggufSidecar(path)) return null;
     const base = std.fs.path.basename(path);
-    if (std.ascii.startsWithIgnoreCase(base, "mmproj") or std.ascii.startsWithIgnoreCase(base, "imatrix")) return null;
+    if (!std.mem.endsWith(u8, path, ".gguf") or model_discovery.isGgufSidecarBasename(base) or std.ascii.startsWithIgnoreCase(base, "imatrix")) return null;
     const stem = path[0 .. path.len - ".gguf".len];
     const of = std.mem.lastIndexOf(u8, stem, "-of-") orelse return stem;
     const dash = std.mem.lastIndexOfScalar(u8, stem[0..of], '-') orelse return stem;
     for (stem[dash + 1 .. of]) |c| if (!std.ascii.isDigit(c)) return stem;
     return stem[0..dash];
-}
-
-/// An MTP draft head (`mtp-*.gguf`), which serving loads beside the trunk.
-fn ggufSidecar(path: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(std.fs.path.basename(path), "mtp-");
 }
 
 /// The one MTP draft head to pull beside the chosen group: the one quantized like it
@@ -546,7 +540,7 @@ fn pickMtpSidecar(files: []const RepoFile, group: []const u8) []const u8 {
     const quant = group[(std.mem.lastIndexOfScalar(u8, group, '-') orelse 0)..];
     var best: ?RepoFile = null;
     for (files) |f| {
-        if (!ggufSidecar(f.path)) continue;
+        if (!model_discovery.isMtpGgufBasename(std.fs.path.basename(f.path))) continue;
         if (std.ascii.endsWithIgnoreCase(f.path[0 .. f.path.len - ".gguf".len], quant)) return f.path;
         if (best == null or f.size < best.?.size) best = f;
     }
@@ -569,11 +563,15 @@ fn chooseGgufGroup(allocator: std.mem.Allocator, io: std.Io, files: []const Repo
         };
         groups.items[i].bytes += f.size;
     }
-    if (groups.items.len <= 1 and quant.len == 0) return null;
+    // No GGUF: a tag names no quant here (an MLX repo's `:8bit`), so it is ignored as before.
+    if (groups.items.len == 0 or (groups.items.len == 1 and quant.len == 0)) return null;
 
+    // An exact quant token (`-Q6_K`) wins, so `:Q6_K` is not ambiguous beside `Q6_K_L`;
+    // a substring of the name is the fallback.
     var matches = std.ArrayList(usize).empty;
     defer matches.deinit(allocator);
-    for (groups.items, 0..) |g, i| if (quant.len == 0 or std.ascii.findIgnoreCase(g.key, quant) != null) try matches.append(allocator, i);
+    for (groups.items, 0..) |g, i| if (quant.len == 0 or endsWithQuant(g.key, quant)) try matches.append(allocator, i);
+    if (matches.items.len == 0) for (groups.items, 0..) |g, i| if (std.ascii.findIgnoreCase(g.key, quant) != null) try matches.append(allocator, i);
     if (matches.items.len == 1) return groups.items[matches.items[0]].key;
 
     if (quant.len > 0) reporter.say("{s} matches {d} of the repo's GGUF quants:", .{ quant, matches.items.len }) else reporter.say("this repo ships {d} GGUF quants:", .{groups.items.len});
@@ -592,6 +590,13 @@ fn chooseGgufGroup(allocator: std.mem.Allocator, io: std.Io, files: []const Repo
         const n = std.fmt.parseInt(usize, std.mem.trim(u8, line, " \t\r"), 10) catch continue;
         if (n >= 1 and n <= matches.items.len) return groups.items[matches.items[n - 1]].key;
     }
+}
+
+/// `key` (a `ggufGroup`) ends with `quant` as its own `-`/`.`-delimited token.
+fn endsWithQuant(key: []const u8, quant: []const u8) bool {
+    if (key.len <= quant.len or !std.ascii.endsWithIgnoreCase(key, quant)) return false;
+    const sep = key[key.len - quant.len - 1];
+    return sep == '-' or sep == '.';
 }
 
 /// A media pack keeps its components in folders (FLUX's transformer/ and vae/,
@@ -1383,6 +1388,7 @@ test "ggufGroup: split parts group together, quants apart, mmproj never" {
     try testing.expect(ggufGroup("mmproj-F16.gguf") == null);
     try testing.expect(ggufGroup("imatrix_unsloth.gguf") == null);
     try testing.expect(ggufGroup("mtp-M-Q4_0.gguf") == null);
+    try testing.expect(ggufGroup("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf") == null);
     // One MTP head rides along with the picked quant; other quants and heads do not.
     const r: Resolved = .{ .repo = "o/r", .gguf_group = "M-Q4_K_M", .gguf_mtp = "MTP/mtp-M-Q4_0.gguf" };
     try testing.expect(wantedFile(r, "M-Q4_K_M.gguf", false));
@@ -1390,6 +1396,18 @@ test "ggufGroup: split parts group together, quants apart, mmproj never" {
     try testing.expect(!wantedFile(r, "MTP/mtp-M-BF16.gguf", false));
     try testing.expect(!wantedFile(r, "M-Q8_0.gguf", false));
     try testing.expect(ggufGroup("config.json") == null);
+}
+
+test "chooseGgufGroup: an exact quant tag wins over a longer one; no GGUF ignores the tag" {
+    const io = std.testing.io;
+    var p1 = "M-Q6_K.gguf".*;
+    var p2 = "M-Q6_K_L.gguf".*;
+    const files = [_]RepoFile{ .{ .path = &p1, .size = 1 }, .{ .path = &p2, .size = 1 } };
+    try testing.expectEqualStrings("M-Q6_K", (try chooseGgufGroup(testing.allocator, io, &files, "q6_k", stderr_reporter)).?);
+    try testing.expectEqualStrings("M-Q6_K_L", (try chooseGgufGroup(testing.allocator, io, &files, "Q6_K_L", stderr_reporter)).?);
+    var p3 = "model.safetensors".*;
+    const mlx = [_]RepoFile{.{ .path = &p3, .size = 1 }};
+    try testing.expect((try chooseGgufGroup(testing.allocator, io, &mlx, "8bit", stderr_reporter)) == null);
 }
 
 test "pickMtpSidecar: the head quantized like the trunk, else the smallest" {
