@@ -2376,7 +2376,11 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
             return null;
         }
         const n = try stream.read(buf[total_read..total_size]);
-        if (n == 0) break;
+        // The client hung up mid-body (an aborted upload): there is no request to answer.
+        if (n == 0) {
+            allocator.free(buf);
+            return null;
+        }
         total_read += n;
     }
     return .{ .buf = buf, .len = total_read, .header_end = header_end_pos };
@@ -3001,6 +3005,19 @@ fn ollamaQuantOf(id: []const u8) []const u8 {
     if (std.ascii.findIgnoreCase(id, "q4") != null) return "Q4";
     if (std.ascii.findIgnoreCase(id, "q8") != null) return "Q8";
     return "";
+}
+
+/// `meta.quantization` as a JSON value: `"8-bit"`, or null when the root config declares no
+/// width (media packs, bf16 and per-module mixed packs).
+fn quantizationJson(buf: *[16]u8, bits: u32) []const u8 {
+    if (bits == 0) return "null";
+    return std.fmt.bufPrint(buf, "\"{d}-bit\"", .{bits}) catch "null";
+}
+
+test "quantizationJson: a declared width is N-bit, an undeclared one is null" {
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("\"8-bit\"", quantizationJson(&buf, 8));
+    try testing.expectEqualStrings("null", quantizationJson(&buf, 0));
 }
 
 /// Which backend serves this entry — surfaced as `meta.engine` in /v1/models
@@ -6857,6 +6874,7 @@ fn renderModelEntry(
     io: std.Io,
     entry: *LoadedModel,
 ) ![]u8 {
+    var quant_buf: [16]u8 = undefined;
     if (entry.state == .ready and entry.config != null and entry.chat_config != null) {
         const config = entry.config.?;
         const chat_config = entry.chat_config.?;
@@ -6940,7 +6958,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6960,7 +6978,7 @@ fn renderModelEntry(
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
-            config.quant_bits,
+            quantizationJson(&quant_buf, config.quant_bits),
             ctx_str,
             config.max_position_embeddings,
             embed_limit_str,
@@ -7102,11 +7120,11 @@ fn renderModelEntry(
 
     // Dimensions/context/quant/MoE — emitted only when config.json was readable.
     const dims_part: []const u8 = if (sm.found) blk: {
-        break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":\"{d}-bit\",\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},\"mtp_available\":{s},", .{
+        break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":{s},\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},\"mtp_available\":{s},", .{
             sm.vocab_size,
             sm.hidden_size,
             sm.num_hidden_layers,
-            sm.quant_bits,
+            quantizationJson(&quant_buf, sm.quant_bits),
             sm.max_position_embeddings,
             sm.max_position_embeddings,
             if (sm.is_moe) "true" else "false",
@@ -12607,7 +12625,19 @@ fn logHttpRequest(method: []const u8, path: []const u8, body: []const u8) void {
 fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u8) void {
     if (!log.isDebug()) return;
     log.debug("[http] <- {s} {s} body={d}b\n", .{ status, content_type, body.len });
-    logHttpBody("[http] response body", body);
+    if (responseBodyLogged(content_type)) logHttpBody("[http] response body", body);
+}
+
+/// The console page is half a megabyte of our own HTML and says nothing about a request;
+/// API responses (JSON, text) are what a post-mortem reads.
+fn responseBodyLogged(content_type: []const u8) bool {
+    return !std.mem.startsWith(u8, content_type, "text/html");
+}
+
+test "responseBodyLogged: API bodies are logged, the console page is not" {
+    try testing.expect(responseBodyLogged("application/json"));
+    try testing.expect(responseBodyLogged("text/plain; charset=utf-8"));
+    try testing.expect(!responseBodyLogged("text/html; charset=utf-8"));
 }
 
 /// The `Access-Control-Allow-Headers` value each SSE surface advertises.
@@ -20252,7 +20282,7 @@ test "readRequest: a client that stalls its head or body, or drips its head, is 
     try testing.expect(try readerGivesUp(head ++ "Content-Length: 100\r\n\r\n{}", 200, 0));
 }
 
-test "readRequest: bytes past Content-Length are dropped, a wrapping Content-Length is a 413" {
+test "readRequest: bytes past Content-Length are dropped, a short body is no request, a wrapping Content-Length is a 413" {
     var body_buf: [64]u8 = undefined;
     var reply_buf: [1024]u8 = undefined;
     const extra: [4000]u8 = @splat('x');
@@ -20261,6 +20291,11 @@ test "readRequest: bytes past Content-Length are dropped, a wrapping Content-Len
 
     const none = try readRequestOver("GET /health HTTP/1.1\r\n\r\n" ++ extra, &body_buf, &reply_buf);
     try testing.expectEqualStrings("", none.body.?);
+
+    // A client that hangs up mid-body sent no request: nothing is parsed, nothing answered.
+    const cut = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 100\r\n\r\n{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hel", &body_buf, &reply_buf);
+    try testing.expect(cut.body == null);
+    try testing.expectEqualStrings("", cut.reply);
 
     const huge = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n{}", &body_buf, &reply_buf);
     try testing.expect(huge.body == null);
@@ -20281,9 +20316,27 @@ test "readRequest: a head that expects 100-continue gets it before the body is r
     var body_buf: [64]u8 = undefined;
     var reply_buf: [256]u8 = undefined;
     // curl sends this for bodies over 1 MB and waits a second for the 100 before sending them.
-    const r = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\nabc", &body_buf, &reply_buf);
-    try testing.expectEqualStrings("abc", r.body.?);
-    try testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", r.reply);
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    defer conn.close();
+    const client = try std.Thread.spawn(.{}, struct {
+        fn run(fd: std.posix.fd_t, reply: []u8) void {
+            const head = "POST /v1/chat/completions HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n";
+            _ = std.c.send(fd, head, head.len, 0);
+            const got = std.c.recv(fd, reply.ptr, reply.len, 0); // the body waits for the 100
+            if (got > 0) _ = std.c.send(fd, "0123456789", 10, 0);
+            _ = std.c.shutdown(fd, 1);
+        }
+    }.run, .{ sv[1], &reply_buf });
+    const raw = try readRequest(testing.allocator, &conn);
+    client.join();
+    _ = std.c.close(sv[1]);
+    const r = raw orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(r.buf);
+    try testing.expectEqualStrings("0123456789", r.buf[r.header_end..r.len]);
+    try testing.expect(std.mem.startsWith(u8, &reply_buf, "HTTP/1.1 100 Continue\r\n\r\n"));
     const whole = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{}", &body_buf, &reply_buf);
     try testing.expectEqualStrings("", whole.reply); // the body already arrived
 }

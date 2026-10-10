@@ -45,9 +45,52 @@ def final_text(messages):
     return "", ""
 
 
+class State:
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.ours = 0  # compactions this script followed with CONTINUE
+        self.compacting = False  # a compaction is running; the aborted run's agent_end is not the end
+        self.final = ("", "")
+        self.idle_since = None
+
+
+def on_event(st, ev):
+    """The commands one pi event calls for. pi compacts on its own too, and a manual compact aborts
+    whatever runs, so only a compaction that FINISHED is followed by CONTINUE."""
+    t = ev.get("type")
+    if t == "turn_end":
+        usage = (ev.get("message") or {}).get("usage") or {}
+        if (not st.compacting and ev.get("toolResults") and st.ours < MAX_COMPACTIONS
+                and context_tokens(usage) > st.threshold):
+            st.compacting = True
+            print(f"[pi_rpc] compacting at {context_tokens(usage)} tokens ({st.ours + 1})", file=sys.stderr)
+            return [{"type": "compact"}]
+    elif t == "compaction_start":
+        st.compacting = True
+        st.idle_since = None
+    elif t == "compaction_end":
+        if ev.get("aborted"):
+            return []  # superseded by the compaction that aborted it
+        st.compacting = False
+        if ev.get("willRetry"):
+            return []  # pi resumes the turn itself
+        if ev.get("errorMessage") or st.ours >= MAX_COMPACTIONS:
+            print(f"[pi_rpc] compaction ended: {ev.get('errorMessage') or 'limit reached'}", file=sys.stderr)
+            st.idle_since = time.time()
+            return []
+        st.ours += 1
+        return [{"type": "prompt", "message": CONTINUE}]
+    elif t == "agent_start":
+        st.idle_since = None
+    elif t == "agent_end" and not st.compacting:
+        st.final = final_text(ev.get("messages") or [])
+        st.idle_since = time.time()
+    return []
+
+
 def main():
     prompt = open(sys.argv[1]).read()
-    threshold = compact_threshold(sys.argv[sys.argv.index("--model") + 1])
+    st = State(compact_threshold(sys.argv[sys.argv.index("--model") + 1]))
     proc = subprocess.Popen(["pi", "--mode", "rpc", *sys.argv[2:]], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, text=True, bufsize=1)
 
@@ -56,17 +99,13 @@ def main():
         proc.stdin.flush()
 
     send({"type": "prompt", "message": prompt})
-    ours = 0
-    compacting = False  # one of ours is in flight; the aborted run's agent_end is not the end
-    final = ("", "")
-    idle_since = None
     lines = queue.Queue()
     threading.Thread(target=lambda: [lines.put(l) for l in proc.stdout] + [lines.put(None)], daemon=True).start()
     while True:
         try:
             line = lines.get(timeout=0.2)
         except queue.Empty:
-            if idle_since and time.time() - idle_since > SETTLE_S:
+            if st.idle_since and time.time() - st.idle_since > SETTLE_S:
                 break
             continue
         if line is None:
@@ -75,33 +114,13 @@ def main():
             ev = json.loads(line)
         except ValueError:
             continue
-        t = ev.get("type")
-        if t == "turn_end":
-            usage = (ev.get("message") or {}).get("usage") or {}
-            if (not compacting and ev.get("toolResults") and ours < MAX_COMPACTIONS
-                    and context_tokens(usage) > threshold):
-                compacting = True
-                ours += 1
-                print(f"[pi_rpc] compacting at {context_tokens(usage)} tokens ({ours})", file=sys.stderr)
-                send({"type": "compact"})
-        elif t == "compaction_start":
-            idle_since = None
-        elif t == "compaction_end":
-            if compacting:
-                compacting = False
-                send({"type": "prompt", "message": CONTINUE})
-            elif not ev.get("willRetry"):
-                idle_since = time.time()
-        elif t == "agent_start":
-            idle_since = None
-        elif t == "agent_end" and not compacting:
-            final = final_text(ev.get("messages") or [])
-            idle_since = time.time()
+        for cmd in on_event(st, ev):
+            send(cmd)
     proc.stdin.close()
     proc.terminate()
-    text, stop = final
+    text, stop = st.final
     print(text)
-    print(f"[pi_rpc] compactions={ours} stop={stop}", file=sys.stderr)
+    print(f"[pi_rpc] compactions={st.ours} stop={stop}", file=sys.stderr)
     return 1 if stop in ("error", "aborted") else 0
 
 
