@@ -50,6 +50,9 @@ struct ChatSession: Identifiable, Codable {
     var agentId: UUID?
     /// Tools this chat has switched OFF in the Tools menu, by wire name.
     var disabledTools: [String]
+    /// Its sidebar group (nil = the root) and dragged position (`SidebarChatRows.Placement`).
+    var groupId: UUID?
+    var sidebarPosition: Int?
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -67,6 +70,8 @@ struct ChatSession: Identifiable, Codable {
         self.useMCP = false
         self.agentId = nil
         self.disabledTools = []
+        self.groupId = nil
+        self.sidebarPosition = nil
     }
 
     /// Resolve stored names to tools, silently dropping any this build no longer
@@ -79,6 +84,7 @@ struct ChatSession: Identifiable, Codable {
         case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
         case disabledTools
         case reasoningEffort
+        case groupId, sidebarPosition
     }
 
     init(from decoder: Decoder) throws {
@@ -111,6 +117,8 @@ struct ChatSession: Identifiable, Codable {
         // Absent (every session saved before the Tools menu) → nothing disabled,
         // i.e. exactly the behaviour that build had.
         disabledTools = try c.decodeIfPresent([String].self, forKey: .disabledTools) ?? []
+        groupId = try c.decodeIfPresent(UUID.self, forKey: .groupId)
+        sidebarPosition = try c.decodeIfPresent(Int.self, forKey: .sidebarPosition)
     }
 
     /// Shared default cwd for all chat sessions — a SETTING since 2026-07-20

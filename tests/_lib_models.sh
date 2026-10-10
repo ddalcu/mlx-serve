@@ -40,8 +40,11 @@ find_model() {
 
 # On-disk size in whole GB, rounded up, following symlinked shards.
 model_gb() {
-    local kb
+    local kb ngram
     kb=$(du -skL "$1" 2>/dev/null | cut -f1)
+    # qwen4_exp's n-gram table is mmapped and read by row, never wired: it is not GPU weight.
+    ngram=$(du -skL "$1/ngram_table.bin" 2>/dev/null | cut -f1)
+    kb=$(( ${kb:-0} - ${ngram:-0} ))
     echo $(( (${kb:-0} + 1048575) / 1048576 ))
 }
 

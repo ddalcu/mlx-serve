@@ -21,7 +21,7 @@ final class ChatStoreTests: XCTestCase {
     private var backupPath: String { (dir as NSString).appendingPathComponent("chat-history.migrated.json") }
 
     private func open() throws -> ChatStore {
-        try ChatStore(path: dbPath, legacyHistoryPath: legacyPath)
+        try ChatStore(path: dbPath, legacyHistoryPath: legacyPath, legacySidebar: nil)
     }
 
     /// Reopens the file, so a check reads the disk and not the store's memory.
@@ -67,6 +67,7 @@ final class ChatStoreTests: XCTestCase {
         s.useMCP = true
         s.agentId = UUID()
         s.disabledTools = ["shell", "browse"]
+        s.sidebarPosition = 7
 
         var user = ChatMessage(role: .user, content: "A \"quoted\" line, a NUL \u{0} and an emoji 🎉")
         user.images = [ChatImage(data: Data(), path: "/tmp/a.png")]
@@ -111,8 +112,12 @@ final class ChatStoreTests: XCTestCase {
     // MARK: - Round trip
 
     func testEveryFieldOfAChatAndItsMessagesSurvivesTheRoundTrip() throws {
-        let original = everything()
-        try open().save([original])
+        let store = try open()
+        var groups = SidebarGroups()
+        var original = everything()
+        original.groupId = groups.create("Work")
+        SidebarStore(database: store.database).saveGroups(groups)
+        store.save([original])
         XCTAssertEqual(try json(reloaded()), try json([original]))
     }
 
@@ -289,6 +294,25 @@ final class ChatStoreTests: XCTestCase {
         a.messages[1].tokensPerSecond = 40
         store.save([a])
         XCTAssertEqual(try reloaded().first?.messages.last?.content, "reply")
+    }
+
+    /// Nothing streams at launch: a reply cut off by a quit or a crash comes back finished, and stays so.
+    func testAMessageSavedMidStreamLoadsFinished() throws {
+        var a = chat("A", messages: 1)
+        var reply = ChatMessage(role: .assistant, content: "half")
+        reply.isStreaming = true
+        a.messages.append(reply)
+        try open().save([a])
+
+        let store = try open()
+        let loaded = store.load()
+        XCTAssertEqual(loaded.first?.messages.map(\.isStreaming), [false, false])
+        store.save(loaded)
+        var body = ""
+        try store.database.query("SELECT body FROM chat_messages WHERE id = ?", [.text(reply.id.uuidString)]) {
+            body = $0.text(0) ?? ""
+        }
+        XCTAssertTrue(body.contains("\"isStreaming\":false"), body)
     }
 
     /// A second message with an id already in the chat never costs the first one its row.

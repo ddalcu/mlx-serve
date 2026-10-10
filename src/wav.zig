@@ -124,7 +124,8 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Decoded {
     }
 
     const payload = data orelse return error.NoDataChunk;
-    if (channels == 0 or sample_rate == 0) return error.BadWav;
+    // Telephony to hi-res: callers resample to the model's rate, so a made-up rate is a made-up allocation.
+    if (channels == 0 or sample_rate < 8000 or sample_rate > 384000) return error.BadWav;
 
     const pcm: []f32 = switch (format) {
         1 => switch (bits) {
@@ -322,6 +323,23 @@ test "decode rejects unsupported codec (mu-law)" {
     defer a.free(bad);
     std.mem.writeInt(u16, bad[20..22], 7, .little); // mu-law
     try std.testing.expectError(error.UnsupportedWavFormat, decode(a, bad));
+}
+
+test "decode refuses a sample rate no recording has" {
+    // Callers resample to the model's rate: `sample_rate` 1 asked for 48000x the input's samples.
+    const a = std.testing.allocator;
+    const samples = [_]f32{ 0.0, 0.5 };
+    const wav = try encodePcm16Mono(a, &samples, 8000);
+    defer a.free(wav);
+    var bad = try a.dupe(u8, wav);
+    defer a.free(bad);
+    for ([_]u32{ 1, 7999, 384001, std.math.maxInt(u32) }) |rate| {
+        std.mem.writeInt(u32, bad[24..28], rate, .little);
+        try std.testing.expectError(error.BadWav, decode(a, bad));
+    }
+    std.mem.writeInt(u32, bad[24..28], 384000, .little);
+    const ok = try decode(a, bad);
+    a.free(ok.pcm);
 }
 
 test "resampleLinear 2:1 on a stereo ramp keeps every other frame" {

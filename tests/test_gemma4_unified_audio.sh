@@ -37,12 +37,12 @@ assert_contains() { if grep -qi "$2" <<< "$3"; then ok "$1"; else bad "$1" "miss
 
 # Synthesize a distinctive phrase → raw float32-LE 16 kHz mono PCM.
 PHRASE="the quick brown fox jumps over the lazy dog"
-AIFF="$(mktemp -t g4say).aiff"; PCM="$(mktemp -t g4pcm).f32"
+AIFF="$(mktemp -t g4say.XXXXXX).aiff"; PCM="$(mktemp -t g4pcm.XXXXXX).f32"
 say -o "$AIFF" "$PHRASE" 2>/dev/null
 if command -v ffmpeg >/dev/null 2>&1; then
     ffmpeg -y -i "$AIFF" -ar 16000 -ac 1 -f f32le "$PCM" >/dev/null 2>&1
 else
-    WAV="$(mktemp -t g4wav).wav"
+    WAV="$(mktemp -t g4wav.XXXXXX).wav"
     afconvert -f WAVE -d LEF32@16000 -c 1 "$AIFF" "$WAV" >/dev/null 2>&1
     # Strip the WAV header to the raw 'data' chunk payload.
     "$PY" - "$WAV" "$PCM" <<'PY' 2>/dev/null

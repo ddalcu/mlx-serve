@@ -396,6 +396,16 @@ pub const Conn = struct {
         };
     }
 
+    /// Waits up to `ms` for bytes to read; false when none came. Bytes the reader already
+    /// buffered count as readable.
+    fn awaitReadable(c: *Conn, ms: i64) bool {
+        if (c.reader().bufferedLen() > 0) return true;
+        if (ms <= 0) return false;
+        var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const n = std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return true;
+        return n > 0;
+    }
+
     /// Longest `close` waits for the peer to hang up before releasing the socket anyway.
     const CLOSE_WAIT_MS: i64 = 5 * 60 * 1000;
 
@@ -853,7 +863,7 @@ pub fn maxRequestBytesFor(target: []const u8) usize {
 fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
     const mb = 1024 * 1024;
     return std.fmt.bufPrint(buf, "Request body too large: {d} MB exceeds this endpoint's {d} MB limit", .{
-        (got + mb - 1) / mb, cap / mb,
+        got / mb + @intFromBool(got % mb != 0), cap / mb,
     }) catch "Request body too large";
 }
 
@@ -1757,7 +1767,12 @@ fn parseToolCallsForRequest(
     return calls;
 }
 
+/// Connection threads race the first `/v1/responses` requests to the lazy init.
+var global_response_store_init: std.Io.Mutex = .init;
+
 fn getOrInitResponseStore(io: std.Io, gpa: std.mem.Allocator) *responses_mod.ResponseStore {
+    global_response_store_init.lockUncancelable(io);
+    defer global_response_store_init.unlock(io);
     if (global_response_store == null) {
         global_response_store = responses_mod.ResponseStore.init(io, gpa, RESPONSE_STORE_CAP);
         global_response_store_gpa = gpa;
@@ -1778,10 +1793,51 @@ fn deinitGlobalResponseStore() void {
 /// same port and silently takes the connections. The kernel checks the flag on
 /// the socket already bound, so clearing it after bind is enough.
 fn listenExclusive(io: std.Io, addr: std.Io.net.IpAddress) !std.Io.net.Server {
+    if (comptime builtin.os.tag == .linux) return listenExclusiveLinux(addr);
     var server = try addr.listen(io, .{ .reuse_address = true });
     errdefer server.deinit(io);
     try std.posix.setsockopt(server.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 0)));
     return server;
+}
+
+/// Linux joins a socket to its SO_REUSEPORT group at bind, so clearing the flag afterwards still
+/// let a second server bind the port and take half its connections. Only SO_REUSEADDR is set:
+/// a restart binds over TIME_WAIT connections, a live listener refuses it.
+fn listenExclusiveLinux(addr: std.Io.net.IpAddress) !std.Io.net.Server {
+    const linux = std.os.linux;
+    var sa: extern union { in: linux.sockaddr.in, in6: linux.sockaddr.in6, any: linux.sockaddr } = undefined;
+    var len: linux.socklen_t = undefined;
+    const family: c_uint = switch (addr) {
+        .ip4 => |a| blk: {
+            sa = .{ .in = .{ .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.bytes) } };
+            len = @sizeOf(linux.sockaddr.in);
+            break :blk linux.AF.INET;
+        },
+        .ip6 => |a| blk: {
+            sa = .{ .in6 = .{ .port = std.mem.nativeToBig(u16, a.port), .flowinfo = a.flow, .addr = a.bytes, .scope_id = 0 } };
+            len = @sizeOf(linux.sockaddr.in6);
+            break :blk linux.AF.INET6;
+        },
+    };
+    const fd = std.c.socket(family, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (fd < 0) return error.SystemResources;
+    errdefer _ = std.c.close(fd);
+    const one: c_int = 1;
+    if (std.c.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, &one, @sizeOf(c_int)) != 0) return error.Unexpected;
+    switch (std.posix.errno(std.c.bind(fd, &sa.any, len))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        .ACCES => return error.AccessDenied,
+        else => return error.Unexpected,
+    }
+    if (std.c.listen(fd, std.Io.net.default_kernel_backlog) != 0) return error.Unexpected;
+    if (std.c.getsockname(fd, &sa.any, &len) != 0) return error.Unexpected;
+    var bound = addr;
+    switch (bound) {
+        .ip4 => |*a| a.port = std.mem.bigToNative(u16, sa.in.port),
+        .ip6 => |*a| a.port = std.mem.bigToNative(u16, sa.in6.port),
+    }
+    return .{ .socket = .{ .handle = fd, .address = bound }, .options = {} };
 }
 
 /// Start the HTTP server on the given host and port.
@@ -2206,27 +2262,64 @@ fn handleConnectionThread(args: *ConnThreadArgs) void {
     args.allocator.destroy(args);
 }
 
-fn handleConnection(
-    allocator: std.mem.Allocator,
-    stream: *Conn,
-) !void {
-    // Plan 05: resolve which model this request targets. The registry was
-    // set up in `serve()`; per-POST routing happens after we read the body
-    // and parse out the optional `"model"` field. For Phase C we use the
-    // default model for everything (only one is loaded), but the plumbing
-    // is in place for Phase D's hot-load path.
-    const registry = global_registry orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Server not ready", 503);
-        return;
-    };
-    // Read HTTP headers first (up to 16KB), then allocate for the full body based on Content-Length.
+/// Deepest JSON nesting a request may carry. Tool schemas and template kwargs are walked and
+/// re-serialized recursively on a connection thread's stack: 50000 levels overflowed it.
+const MAX_JSON_DEPTH = 4096;
+
+/// Deepest `[`/`{` nesting in `body`, brackets inside strings skipped. A plain byte scan, so it
+/// also bounds bodies the JSON parser would reject.
+fn jsonNestingDepth(body: []const u8) usize {
+    var depth: usize = 0;
+    var max: usize = 0;
+    var in_str = false;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (in_str) {
+            if (c == '\\') i += 1 else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '[', '{' => {
+                depth += 1;
+                max = @max(max, depth);
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+    return max;
+}
+
+const RawRequest = struct {
+    /// Owned; `buf[0..len]` is the head plus as much of the body as arrived.
+    buf: []u8,
+    len: usize,
+    header_end: usize,
+};
+
+/// Reads one request: the head (up to 16 KB), then its `Content-Length` body. Null when no
+/// complete head arrived, the client stalled, or the body is over the route's cap (the 413 is
+/// already sent).
+/// Bytes past the declared body are dropped: one request per connection.
+fn readRequest(allocator: std.mem.Allocator, stream: *Conn) !?RawRequest {
+    return readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS);
+}
+
+/// A client gets this long between bytes of its request, and in all for its head: an idle or
+/// dripping connection otherwise holds its thread forever.
+const REQUEST_READ_LIMIT_MS: i64 = 30_000;
+
+fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64) !?RawRequest {
+    const head_deadline = nowMsMonotonic(stream.io) + limit_ms;
     var hdr_buf: [16 * 1024]u8 = undefined;
     var total_read: usize = 0;
     var content_length: ?usize = null;
     var header_end_pos: usize = 0;
 
-    // Phase 1: Read until we have complete headers
     while (total_read < hdr_buf.len) {
+        if (!stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io))) return null;
         const n = try stream.read(hdr_buf[total_read..]);
         if (n == 0) break;
         total_read += n;
@@ -2237,15 +2330,9 @@ fn handleConnection(
             break;
         }
     }
+    if (header_end_pos == 0) return null;
 
-    if (header_end_pos == 0) {
-        // No complete headers found
-        return;
-    }
-
-    // Phase 2: Allocate buffer for full request and read remaining body
-    const cl = content_length orelse 0;
-    const total_size = header_end_pos + cl;
+    const total_size = header_end_pos +| (content_length orelse 0);
     // The cap is per ROUTE, so peek the path off the request line we already
     // have — media bodies carry base64 frames and dwarf any JSON chat body.
     const req_path = blk: {
@@ -2263,25 +2350,56 @@ fn handleConnection(
         // Closing with body bytes unread resets the connection, and the client
         // can lose the 413 before reading it: read what is left, up to the chat cap.
         var left = @min(total_size, max_request_bytes) -| total_read;
-        while (left > 0) {
+        while (left > 0 and stream.awaitReadable(limit_ms)) {
             const n = stream.read(hdr_buf[0..@min(left, hdr_buf.len)]) catch break;
             if (n == 0) break;
             left -= n;
         }
-        return;
+        return null;
     }
 
-    const buf = try allocator.alloc(u8, total_size);
-    defer allocator.free(buf);
-    @memcpy(buf[0..total_read], hdr_buf[0..total_read]);
+    // curl asks before a body over 1 MB and otherwise waits a second for the answer.
+    if (total_read < total_size) if (findHeaderValue(hdr_buf[0 .. header_end_pos - 4], "expect")) |v| {
+        if (std.ascii.eqlIgnoreCase(v, "100-continue")) {
+            try stream.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+            try stream.flush();
+        }
+    };
 
+    const buf = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(buf);
+    total_read = @min(total_read, total_size);
+    @memcpy(buf[0..total_read], hdr_buf[0..total_read]);
     while (total_read < total_size) {
+        if (!stream.awaitReadable(limit_ms)) {
+            allocator.free(buf);
+            return null;
+        }
         const n = try stream.read(buf[total_read..total_size]);
         if (n == 0) break;
         total_read += n;
     }
+    return .{ .buf = buf, .len = total_read, .header_end = header_end_pos };
+}
 
-    const request = buf[0..total_read];
+fn handleConnection(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+) !void {
+    // Plan 05: resolve which model this request targets. The registry was
+    // set up in `serve()`; per-POST routing happens after we read the body
+    // and parse out the optional `"model"` field. For Phase C we use the
+    // default model for everything (only one is loaded), but the plumbing
+    // is in place for Phase D's hot-load path.
+    const registry = global_registry orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Server not ready", 503);
+        return;
+    };
+    const raw = (try readRequest(allocator, stream)) orelse return;
+    defer allocator.free(raw.buf);
+    const total_read = raw.len;
+    const header_end_pos = raw.header_end;
+    const request = raw.buf[0..total_read];
     const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse return;
     const first_line = request[0..first_line_end];
 
@@ -2296,6 +2414,10 @@ fn handleConnection(
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, raw_path, request_body);
+    if (multipart.boundaryFromContentType(request_content_type) == null and jsonNestingDepth(request_body) > MAX_JSON_DEPTH) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request JSON nests deeper than 4096 levels", 400);
+        return;
+    }
     stream.noteRequestHeaders(request[0..header_end_pos]);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
@@ -3869,7 +3991,32 @@ pub fn billedPrefillChunk(
     chunk_override: u32,
 ) u32 {
     if (chunk_override > 0) return chunk_override;
-    return resolvePrefillChunk(config, kv_bits, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
+    return @min(resolvePrefillChunk(config, kv_bits, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask), autoPrefillChunkCap(mlx.cudaAvailable()));
+}
+
+/// On CUDA a chunk past 2048 rows measured no faster (Llama 3.2 3B, RTX 5060 Ti: 4400 vs 4396
+/// tok/s) while its prefill peak grew ~2.2 MB a row against 14k keys, which the reserve does not
+/// bill; long prompts then ran the card out of memory. An explicit `--prefill-chunk` still wins.
+pub fn autoPrefillChunkCap(cuda: bool) u32 {
+    return if (cuda) 2048 else std.math.maxInt(u32);
+}
+
+test "the auto prefill chunk stops at 2048 rows on CUDA only" {
+    try std.testing.expectEqual(@as(u32, 2048), autoPrefillChunkCap(true));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), autoPrefillChunkCap(false));
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_hidden_layers = 28;
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 8;
+    cfg.head_dim = 128;
+    cfg.hidden_size = 3072;
+    cfg.intermediate_size = 8192;
+    cfg.intermediate_size_declared = true;
+    cfg.quant_bits = 4;
+    const roomy: u64 = 1 << 40;
+    const chunk = billedPrefillChunk(&cfg, 16, roomy, 2 << 30, 0, 0, 0);
+    try std.testing.expect(chunk <= autoPrefillChunkCap(mlx.cudaAvailable()));
+    try std.testing.expectEqual(@as(u32, 4096), billedPrefillChunk(&cfg, 16, roomy, 2 << 30, 0, 0, 4096));
 }
 
 /// The context KV the chunk sizer must leave standing: the pinned context's bill under an
@@ -5732,6 +5879,13 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .anthropic_type = "invalid_request_error",
             .message = prefillNoFitMessage(buf),
         },
+        error.EmptyPrompt => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "the prompt encodes to no tokens",
+        },
         // Backstop for a forward that returns fewer rows than the prompt: the request's shape, not a fault.
         error.PromptLogprobsUnavailable => .{
             .status_line = "400 Bad Request",
@@ -5796,6 +5950,11 @@ const ErrorSurface = union(enum) {
 /// The error arm for every generative surface, streaming or not: before the SSE head the
 /// stream gets the same response its non-streaming twin would; past it the same `type` and
 /// `message` ride the surface's terminal `error` event.
+/// A client that hung up mid-stream (`WriteFailed`) is not a server error.
+fn logStreamError(err: anyerror) void {
+    if (err == error.WriteFailed) log.debug("  -> client disconnected mid-stream\n", .{}) else log.err("  -> streaming error: {}\n", .{err});
+}
+
 fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
     var msg_buf: [320]u8 = undefined;
     const w = mapGenerationError(err, &msg_buf);
@@ -7158,9 +7317,15 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     if (std.json.parseFromSlice(std.json.Value, allocator, request_body, .{})) |parsed| {
         parsed_body = parsed;
         if (parsed.value == .object) {
-            if (parsed.value.object.get("model")) |m| {
-                if (m == .string) requested_id = m.string;
-            }
+            if (parsed.value.object.get("model")) |m| switch (m) {
+                .string => |s| requested_id = s,
+                .null => {},
+                // Loading the default for an id the client misspelled as a number reads as success.
+                else => {
+                    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'model' must be a string", 400);
+                    return;
+                },
+            };
             if (parsed.value.object.get("default")) |d| {
                 if (d == .bool) make_default = d.bool;
             }
@@ -7220,6 +7385,10 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     const lm = scheduler.ensureLoaded(requested_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+            return;
+        },
+        error.NotLoaded => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", "Requested model is not currently loaded", 503);
             return;
         },
         error.NoDefaultModel => {
@@ -7903,7 +8072,7 @@ fn handleEmbeddings(
     }
     const root = parsed.value.object;
 
-    const model_name = if (root.get("model")) |m| (if (m == .string) m.string else config.model_type) else config.model_type;
+    const model_name = echoModelName(root, config.model_type);
 
     // OpenAI `dimensions` (text-embedding-3 semantics): keep the first N
     // components, L2-renormalize. Anything not a positive integer is a 400 —
@@ -8296,19 +8465,20 @@ fn handleDetokenize(
         return;
     }
 
-    var ids = std.ArrayList(u32).empty;
-    defer ids.deinit(allocator);
-    for (tokens_val.array.items) |item| {
-        if (item == .integer) try ids.append(allocator, @intCast(item.integer));
+    const ids = try allocator.alloc(u32, tokens_val.array.items.len);
+    defer allocator.free(ids);
+    if (!parseTokenIds(tokens_val.array.items, tokenVocabSize(lm), ids)) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'tokens' must be integers inside the model's vocabulary", 400);
+        return;
     }
 
-    const text = try decodeTokens(allocator, lm, tok, ids.items, false);
+    const text = try decodeTokens(allocator, lm, tok, ids, false);
     defer allocator.free(text);
 
     const result = try detokenizeResponseJson(allocator, text);
     defer allocator.free(result);
 
-    log.debug("POST /detokenize -> {d} tokens -> {d} chars\n", .{ ids.items.len, text.len });
+    log.debug("POST /detokenize -> {d} tokens -> {d} chars\n", .{ ids.len, text.len });
     try sendResponse(stream, "200 OK", "application/json", result);
 }
 
@@ -8651,6 +8821,32 @@ fn hashTextValue(v: std.json.Value) ?u64 {
     return if (n == 0) null else h.final();
 }
 
+/// The `model` a response echoes: the client's own string, as SDKs expect, unless it cannot
+/// sit verbatim inside a JSON string (the response templates splice it unescaped).
+fn echoModelName(root: std.json.ObjectMap, fallback: []const u8) []const u8 {
+    const v = root.get("model") orelse return fallback;
+    if (v != .string or !std.unicode.utf8ValidateSlice(v.string)) return fallback;
+    for (v.string) |c| if (c < 0x20 or c == '"' or c == '\\') return fallback;
+    return v.string;
+}
+
+/// The vocabulary a request's token ids index. An embedded engine's stub config keeps the
+/// default vocab; its ids are the engine's, and an id past its vocab aborts inside llama.cpp.
+fn tokenVocabSize(lm: *const LoadedModel) u32 {
+    if (lm.ds4_engine) |e| return e.vocabSize();
+    if (lm.llama_engine) |e| return @intCast(e.nVocab());
+    return if (lm.config) |c| c.vocab_size else 0;
+}
+
+/// Client token ids into `out` (same length); false unless every item is an integer in [0, vocab_size).
+fn parseTokenIds(items: []const std.json.Value, vocab_size: u32, out: []u32) bool {
+    for (items, out) |item, *id| {
+        if (item != .integer or item.integer < 0 or item.integer >= vocab_size) return false;
+        id.* = @intCast(item.integer);
+    }
+    return true;
+}
+
 const CompletionPrompt = union(enum) {
     text: []const u8,
     /// Caller frees.
@@ -8673,12 +8869,9 @@ fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab
                 return parseCompletionPrompt(allocator, arr.items[0], vocab_size);
             }
             const ids = try allocator.alloc(u32, arr.items.len);
-            for (arr.items, ids) |item, *id| {
-                if (item != .integer or item.integer < 0 or item.integer >= vocab_size) {
-                    allocator.free(ids);
-                    return .{ .invalid = "'prompt' token ids must be integers inside the model's vocabulary" };
-                }
-                id.* = @intCast(item.integer);
+            if (!parseTokenIds(arr.items, vocab_size, ids)) {
+                allocator.free(ids);
+                return .{ .invalid = "'prompt' token ids must be integers inside the model's vocabulary" };
             }
             return .{ .ids = ids };
         },
@@ -9042,10 +9235,7 @@ fn handleChatCompletions(
     }
 
     // Parse model name from request (use for response, fallback to config)
-    const model_name = if (root.get("model")) |v|
-        (if (v == .string) v.string else config.model_type)
-    else
-        config.model_type;
+    const model_name = echoModelName(root, config.model_type);
 
     // Track allocations from response_format injection so we can free them
     var rf_allocs = std.ArrayList([]const u8).empty;
@@ -9485,7 +9675,7 @@ fn handleChatCompletions(
     mm.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
         handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
-            log.err("  -> streaming error: {}\n", .{err});
+            logStreamError(err);
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9552,9 +9742,7 @@ fn handleCompletions(
         return;
     };
 
-    // An embedded engine's stub config keeps the default vocab; its ids are the engine's.
-    const vocab_size: u32 = if (lm.ds4_engine) |e| e.vocabSize() else if (lm.llama_engine) |e| @intCast(e.nVocab()) else config.vocab_size;
-    const prompt = try parseCompletionPrompt(allocator, root.get("prompt"), vocab_size);
+    const prompt = try parseCompletionPrompt(allocator, root.get("prompt"), tokenVocabSize(lm));
     defer if (prompt == .ids) allocator.free(prompt.ids);
     switch (prompt) {
         .missing, .invalid => {
@@ -9604,10 +9792,7 @@ fn handleCompletions(
         }
     }
 
-    const model_name = if (root.get("model")) |v|
-        (if (v == .string) v.string else config.model_type)
-    else
-        config.model_type;
+    const model_name = echoModelName(root, config.model_type);
 
     const include_usage = if (root.get("stream_options")) |so| blk: {
         if (so != .object) break :blk false;
@@ -9717,7 +9902,7 @@ fn handleCompletions(
 
     if (is_stream) {
         handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
-            log.err("  -> streaming error: {}\n", .{err});
+            logStreamError(err);
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
@@ -11567,8 +11752,13 @@ fn handleStreamingGeneration(
                         }
                     },
                     .flush_text => {
+                        // Freed here, not per item: a failed send returns mid-loop, and the
+                        // handler's own defer would free the already-sent items a second time.
+                        defer {
+                            for (token_texts.items) |tt| allocator.free(tt);
+                            token_texts.clearRetainingCapacity();
+                        }
                         for (token_texts.items) |tt| {
-                            defer allocator.free(tt);
                             // Skip bare channel/think tags that leak without a full block
                             if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
@@ -11584,7 +11774,6 @@ fn handleStreamingGeneration(
                             content_started = true;
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis }, null, null, null, .{ .logprobs_json = try lps.take() });
                         }
-                        token_texts.clearRetainingCapacity();
                     },
                 }
             }
@@ -12940,11 +13129,10 @@ fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     if (findHeaderValueCI(raw_headers, "x-api-key")) |xk| {
         if (constTimeEql(xk, key)) return true;
     }
-    if (queryParamValue(raw_path, "api_key")) |q| {
-        if (constTimeEql(q, key)) return true;
-    }
-    if (queryParamValue(raw_path, "key")) |q| {
-        if (constTimeEql(q, key)) return true;
+    // Percent-decoded: the login form sends the key back URL-encoded.
+    var qbuf: [512]u8 = undefined;
+    inline for (.{ "api_key", "key" }) |name| {
+        if (queryDecoded(&qbuf, raw_path, name)) |q| if (constTimeEql(q, key)) return true;
     }
     return false;
 }
@@ -13032,6 +13220,11 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     try std.testing.expect(!apiKeyAuthorized("Authorization: Bearer wrong\r\n", "/"));
     try std.testing.expect(!apiKeyAuthorized("x-api-key: nope\r\n", "/"));
     try std.testing.expect(!apiKeyAuthorized("", "/v1/models"));
+
+    // The login form percent-encodes the key it sends back (a base64 key has + / =).
+    g_api_key = "a+b/c=";
+    try std.testing.expect(apiKeyAuthorized("", "/?api_key=a%2Bb%2Fc%3D"));
+    try std.testing.expect(!apiKeyAuthorized("", "/?api_key=a%2Bb"));
 
     // No key configured ⇒ always authorized (open mode)
     g_api_key = null;
@@ -13582,7 +13775,7 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
 pub const not_enough_memory_message =
     "Not enough memory to load model: it would exceed the resident-model budget and no loaded model can be evicted. " ++
     "Unload the model you are chatting with (tray > Models > eject), " ++
-    "or raise or disable the cap with --max-resident-mem <size>|0. " ++
+    "or raise a cap: --max-resident-models <n>, --max-resident-mem <size>|0. " ++
     "The server log names the exact figures and the current cap.";
 
 /// #144: the memory PREFLIGHT refusal (free RAM can't hold weights + warmup
@@ -16048,7 +16241,7 @@ fn handleAnthropicMessages(
     const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse
         if (thinking.effort) |cfg| cfg.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget));
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
-    const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
+    const model_name = echoModelName(root, config.model_type);
 
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
     const kv_quant_override = parseKvQuantOverride(root);
@@ -16304,7 +16497,7 @@ fn handleAnthropicMessages(
     mm.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
         handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
-            log.err("  -> streaming error: {}\n", .{err});
+            logStreamError(err);
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
@@ -16906,8 +17099,12 @@ fn handleAnthropicStreaming(
                         think_closed = true;
                     },
                     .flush_text => {
+                        // Freed here, not per item: see the chat stream's flush.
+                        defer {
+                            for (token_texts.items) |tt| allocator.free(tt);
+                            token_texts.clearRetainingCapacity();
+                        }
                         for (token_texts.items) |tt| {
-                            defer allocator.free(tt);
                             // Skip bare think/channel tags that leak without a block
                             if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
@@ -16925,7 +17122,6 @@ fn handleAnthropicStreaming(
                             }
                             try emitAnthropicTextDelta(allocator, stream, block_index, vis);
                         }
-                        token_texts.clearRetainingCapacity();
                     },
                 }
             }
@@ -17477,6 +17673,7 @@ fn endAnthropicThinking(allocator: std.mem.Allocator, stream: *Conn, index: *u32
 fn handleResponsesGet(allocator: std.mem.Allocator, stream: *Conn, id: []const u8) !void {
     const store = getOrInitResponseStore(stream.io, allocator);
     if (store.get(id)) |sr| {
+        defer sr.release();
         try sendResponse(stream, "200 OK", "application/json", sr.body_json);
     } else {
         try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Response not found", 404);
@@ -17605,9 +17802,12 @@ fn handleResponsesCompact(
         null;
 
     var prev_messages: ?[]const chat_mod.Message = null;
+    var prev_sr: ?*responses_mod.StoredResponse = null;
+    defer if (prev_sr) |p| p.release();
     if (prev_id) |pid| {
         const store = getOrInitResponseStore(stream.io, allocator);
         if (store.get(pid)) |sr| {
+            prev_sr = sr;
             prev_messages = sr.history;
         } else {
             try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "previous_response_id not found", 404);
@@ -17780,7 +17980,7 @@ fn handleResponsesInner(
         else => 0,
     } else 0;
     const max_tool_calls_echo: ?u32 = if (root.get("max_tool_calls")) |v| switch (v) {
-        .integer => |i| if (i >= 0) @as(?u32, @intCast(i)) else null,
+        .integer => |i| if (i >= 0) @as(?u32, @intCast(@min(i, std.math.maxInt(u32)))) else null,
         else => null,
     } else null;
     const truncation_echo: []const u8 = if (root.get("truncation")) |v|
@@ -17890,16 +18090,16 @@ fn handleResponsesInner(
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
     // ── model name ──
-    const model_name = if (root.get("model")) |v|
-        (if (v == .string) v.string else config.model_type)
-    else
-        config.model_type;
+    const model_name = echoModelName(root, config.model_type);
 
     // ── previous response — fetch stored history ──
     var prev_messages: ?[]const chat_mod.Message = null;
+    var prev_sr: ?*responses_mod.StoredResponse = null;
+    defer if (prev_sr) |p| p.release();
     if (prev_id) |pid| {
         const store = getOrInitResponseStore(stream.io, allocator);
         if (store.get(pid)) |sr| {
+            prev_sr = sr;
             prev_messages = sr.history;
         } else {
             try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "previous_response_id not found", 404);
@@ -18809,13 +19009,13 @@ fn handleResponsesInner(
 const WsConnT = ws_mod.WsConn(Conn);
 
 /// Connection-local cache for `store: false` continuations on a WS session.
-/// Each entry owns its arena (StoredResponse.deinit frees both).
+/// Each entry holds one reference (StoredResponse.release frees the last).
 const WsLocalCache = struct {
     map: std.StringHashMapUnmanaged(*responses_mod.StoredResponse) = .{},
     gpa: std.mem.Allocator,
 
     fn put(self: *WsLocalCache, sr: *responses_mod.StoredResponse) !void {
-        if (self.map.fetchRemove(sr.id)) |kv| kv.value.deinit();
+        if (self.map.fetchRemove(sr.id)) |kv| kv.value.release();
         try self.map.put(self.gpa, sr.id, sr);
     }
 
@@ -18824,12 +19024,12 @@ const WsLocalCache = struct {
     }
 
     fn evict(self: *WsLocalCache, id: []const u8) void {
-        if (self.map.fetchRemove(id)) |kv| kv.value.deinit();
+        if (self.map.fetchRemove(id)) |kv| kv.value.release();
     }
 
     fn deinit(self: *WsLocalCache) void {
         var it = self.map.valueIterator();
-        while (it.next()) |sr_ptr| sr_ptr.*.deinit();
+        while (it.next()) |sr_ptr| sr_ptr.*.release();
         self.map.deinit(self.gpa);
     }
 };
@@ -18961,6 +19161,10 @@ fn handleResponsesWebSocket(
             else => continue,
         }
 
+        if (jsonNestingDepth(msg.payload) > MAX_JSON_DEPTH) {
+            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Request JSON nests deeper than 4096 levels");
+            continue;
+        }
         // Parse the request payload — must be {"type":"response.create", ...}
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, msg.payload, .{}) catch {
             try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Invalid JSON in request body");
@@ -19000,7 +19204,7 @@ fn handleResponsesWebSocket(
                 prev_in_local = true;
             } else {
                 const store = getOrInitResponseStore(stream.io, allocator);
-                if (store.get(pid) == null) {
+                if (store.get(pid)) |sr| sr.release() else {
                     local_cache.evict(pid);
                     try wsSendErrorTurn(allocator, &ws_conn, 404, "previous_response_not_found", "previous_response_id not found");
                     continue;
@@ -19064,9 +19268,8 @@ fn handleResponsesWebSocket(
             // Restore borrowed prev entry back to local cache on failure.
             if (did_borrow_to_global and prev_id_owned != null) {
                 const store = getOrInitResponseStore(stream.io, allocator);
-                if (store.map.fetchRemove(prev_id_owned.?)) |kv| {
-                    store.lru.remove(&kv.value.list_node);
-                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
+                if (store.take(prev_id_owned.?)) |taken| {
+                    local_cache.map.put(local_cache.gpa, taken.id, taken) catch {};
                 }
             }
             continue;
@@ -19078,14 +19281,13 @@ fn handleResponsesWebSocket(
         // (failed/incomplete), evict the chain root from local cache.
         if (did_borrow_to_global and prev_id_owned != null) {
             const store = getOrInitResponseStore(stream.io, allocator);
-            if (store.map.fetchRemove(prev_id_owned.?)) |kv| {
-                store.lru.remove(&kv.value.list_node);
+            if (store.take(prev_id_owned.?)) |taken| {
                 const turn_failed = bridge.captured_status != null and !std.mem.eql(u8, bridge.captured_status.?, "completed");
                 if (turn_failed) {
                     // Compliance: a failed continuation evicts the chain root.
-                    kv.value.deinit();
+                    taken.release();
                 } else {
-                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
+                    local_cache.map.put(local_cache.gpa, taken.id, taken) catch {};
                 }
             }
         }
@@ -19099,9 +19301,8 @@ fn handleResponsesWebSocket(
         if (!want_user_store) {
             if (bridge.captured_resp_id) |rid| {
                 const store = getOrInitResponseStore(stream.io, allocator);
-                if (store.map.fetchRemove(rid)) |kv| {
-                    store.lru.remove(&kv.value.list_node);
-                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
+                if (store.take(rid)) |taken| {
+                    local_cache.map.put(local_cache.gpa, taken.id, taken) catch {};
                 }
             }
         }
@@ -19881,7 +20082,7 @@ fn storeResponse(
         .history = history,
         .arena = arena,
     };
-    errdefer sr.deinit();
+    errdefer sr.release();
 
     const store = getOrInitResponseStore(io, gpa);
     try store.put(sr);
@@ -19991,6 +20192,100 @@ test "listenExclusive: a second server cannot bind a port that is already listen
     var first = try listenExclusive(testing.io, .{ .ip4 = std.Io.net.Ip4Address.loopback(0) });
     defer first.deinit(testing.io);
     try testing.expectError(error.AddressInUse, listenExclusive(testing.io, first.socket.address));
+}
+
+/// Sends `request` (then EOF) over a socketpair and runs `readRequest` on the server end;
+/// returns the body it read, or null, plus whatever the server wrote back.
+fn readRequestOver(request: []const u8, body_out: []u8, reply_out: []u8) !struct { body: ?[]const u8, reply: []const u8 } {
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    defer conn.close();
+    try testing.expectEqual(@as(isize, @intCast(request.len)), std.c.send(sv[1], request.ptr, request.len, 0));
+    _ = std.c.shutdown(sv[1], 1);
+
+    const raw = try readRequest(testing.allocator, &conn);
+    try conn.flush();
+    const got = std.c.recv(sv[1], reply_out.ptr, reply_out.len, std.c.MSG.DONTWAIT);
+    const reply = reply_out[0..@intCast(@max(got, 0))];
+    const r = raw orelse return .{ .body = null, .reply = reply };
+    defer testing.allocator.free(r.buf);
+    const body = r.buf[r.header_end..r.len];
+    @memcpy(body_out[0..body.len], body);
+    return .{ .body = body_out[0..body.len], .reply = reply };
+}
+
+/// Runs `readRequestWithin(limit_ms)` against a client that sends `sent`, then one byte per
+/// `drip_ms` (0 = nothing more), and never finishes; true when the reader gave up on its own.
+fn readerGivesUp(sent: []const u8, limit_ms: i64, drip_ms: u64) !bool {
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    defer conn.close();
+    _ = std.c.send(sv[1], sent.ptr, sent.len, 0);
+
+    var done = std.atomic.Value(bool).init(false);
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn, limit: i64, d: *std.atomic.Value(bool)) void {
+            if (readRequestWithin(testing.allocator, c, limit) catch null) |r| testing.allocator.free(r.buf);
+            d.store(true, .release);
+        }
+    }.run, .{ &conn, limit_ms, &done });
+    var waited: u64 = 0;
+    while (!done.load(.acquire) and waited < 2000) : (waited += 10) {
+        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+        if (drip_ms > 0 and waited % drip_ms == 0) _ = std.c.send(sv[1], "x", 1, 0);
+    }
+    const gave_up = done.load(.acquire);
+    _ = std.c.close(sv[1]);
+    reader.join();
+    return gave_up;
+}
+
+test "readRequest: a client that stalls its head or body, or drips its head, is dropped, not held forever" {
+    const head = "POST /v1/chat/completions HTTP/1.1\r\n";
+    try testing.expect(try readerGivesUp(head, 200, 0));
+    try testing.expect(try readerGivesUp(head, 300, 50));
+    try testing.expect(try readerGivesUp(head ++ "Content-Length: 100\r\n\r\n{}", 200, 0));
+}
+
+test "readRequest: bytes past Content-Length are dropped, a wrapping Content-Length is a 413" {
+    var body_buf: [64]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    const extra: [4000]u8 = @splat('x');
+    const short = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}" ++ extra, &body_buf, &reply_buf);
+    try testing.expectEqualStrings("{}", short.body.?);
+
+    const none = try readRequestOver("GET /health HTTP/1.1\r\n\r\n" ++ extra, &body_buf, &reply_buf);
+    try testing.expectEqualStrings("", none.body.?);
+
+    const huge = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n{}", &body_buf, &reply_buf);
+    try testing.expect(huge.body == null);
+    try testing.expect(std.mem.startsWith(u8, huge.reply, "HTTP/1.1 413"));
+}
+
+test "jsonNestingDepth: brackets inside strings never count" {
+    try testing.expectEqual(@as(usize, 0), jsonNestingDepth("42"));
+    try testing.expectEqual(@as(usize, 3), jsonNestingDepth("{\"a\":[{\"b\":1}]}"));
+    try testing.expectEqual(@as(usize, 1), jsonNestingDepth("{\"a\":\"[[[{{{\"}"));
+    try testing.expectEqual(@as(usize, 1), jsonNestingDepth("[\"\\\"[[\"]")); // escaped quote stays in the string
+    const open: [5000]u8 = @splat('[');
+    const close: [5000]u8 = @splat(']');
+    try testing.expectEqual(@as(usize, 5000), jsonNestingDepth(&(open ++ close)));
+}
+
+test "readRequest: a head that expects 100-continue gets it before the body is read" {
+    var body_buf: [64]u8 = undefined;
+    var reply_buf: [256]u8 = undefined;
+    // curl sends this for bodies over 1 MB and waits a second for the 100 before sending them.
+    const r = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\nabc", &body_buf, &reply_buf);
+    try testing.expectEqualStrings("abc", r.body.?);
+    try testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", r.reply);
+    const whole = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{}", &body_buf, &reply_buf);
+    try testing.expectEqualStrings("", whole.reply); // the body already arrived
 }
 
 test "findContentLength parses header" {
@@ -22281,6 +22576,45 @@ test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 4
     }
 }
 
+test "echoModelName: a client model name the templates cannot splice falls back to the model type" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, want: []const u8 }{
+        .{ .body = "{\"model\":\"gpt-4\"}", .want = "gpt-4" },
+        .{ .body = "{\"model\":\"org\\/repo\"}", .want = "org/repo" },
+        .{ .body = "{\"model\":\"漢字\"}", .want = "漢字" },
+        .{ .body = "{}", .want = "qwen3" },
+        .{ .body = "{\"model\":5}", .want = "qwen3" },
+        .{ .body = "{\"model\":\"a\\u0000b\"}", .want = "qwen3" },
+        .{ .body = "{\"model\":\"a\\\"b\"}", .want = "qwen3" },
+        .{ .body = "{\"model\":\"a\\\\b\"}", .want = "qwen3" },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.want, echoModelName(parsed.value.object, "qwen3"));
+    }
+}
+
+test "parseTokenIds: only integers inside the vocabulary reach the decoder" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        .{ .body = "[]", .ok = true },
+        .{ .body = "[0,99]", .ok = true },
+        .{ .body = "[-1]", .ok = false },
+        .{ .body = "[100]", .ok = false },
+        .{ .body = "[1099511627776]", .ok = false },
+        .{ .body = "[1.5]", .ok = false },
+        .{ .body = "[\"a\",null]", .ok = false },
+    };
+    var out: [4]u32 = undefined;
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        try std.testing.expectEqual(case.ok, parseTokenIds(items, 100, out[0..items.len]));
+    }
+}
+
 test "promptLogprobsRejectReason: only a prefill that returns every row can score the prompt" {
     try std.testing.expect(promptLogprobsRejectReason(.{}) == null);
     try std.testing.expect(promptLogprobsRejectReason(.{ .engine_backed = true }) != null);
@@ -24064,6 +24398,12 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         try t.expectEqual(@as(u32, 400), w.code);
         try t.expectEqualStrings("invalid_request_error", w.openai_type);
         try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    }
+    {
+        // A prompt that encodes to no tokens is refused before a slot exists.
+        const w = mapGenerationError(error.EmptyPrompt, &buf);
+        try t.expectEqual(@as(u32, 400), w.code);
+        try t.expectEqualStrings("invalid_request_error", w.openai_type);
     }
     {
         // Anything else keeps its name in the message, at a mapped status.

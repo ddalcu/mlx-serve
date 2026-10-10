@@ -48,8 +48,10 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
 sleep 1
 
 # Isolated HOME so the test never touches the user's real kv-cache.
-SCRATCH_HOME=$(mktemp -d)
-HYBRID_HOME=$(mktemp -d)
+# On the real disk: /tmp can be a small tmpfs (Linux), where the SSD tier rightly refuses to store.
+mkdir -p "$HOME/claude-tmp"
+SCRATCH_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk.XXXXXX")
+HYBRID_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk-hybrid.XXXXXX")
 LOGFILE=$(mktemp)
 SERVER_PID=""
 cleanup() {
@@ -315,7 +317,7 @@ echo "== 8. a restore wider than the fd limit, and a failed restore's fallback =
 # RLIMIT_NOFILE smaller than its chunk count, and an unreadable chunk must
 # fall back to a cold prefill that answers 200.
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
-FD_HOME=$(mktemp -d)
+FD_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk-fd.XXXXXX")
 SCRATCH_HOME="$FD_HOME"
 KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
 LONG_PROMPT=$(python3 -c "

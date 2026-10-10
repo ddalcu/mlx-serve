@@ -34,7 +34,7 @@ if [ -z "${MINIMAX_H3_MODEL:-}" ] && [ -z "$LTX_VAE_DIR" ]; then
   exit 0
 fi
 
-log="$(mktemp -t mlxserve-preview)"
+log="$(mktemp -t mlxserve-preview.XXXXXX)"
 trap 'rm -f "$log"' EXIT
 zig build test -Dtest-filter="Latent2RGB preview resembles" 2>&1 | tee "$log"
 

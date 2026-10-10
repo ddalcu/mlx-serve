@@ -350,7 +350,7 @@ Teaches any agent to wire user code to our HTTP APIs (chat, embeddings, media, d
 ### Swift logs
 - `print()` invisible when launched via `open` — run binary directly or write to file
 - Every agent request dumped to `~/.mlx-serve/last-agent-request.json`; replay via curl
-- Chat history in `~/.mlx-serve/mlx-serve.db` (SQLite: `chat_sessions`, `chat_messages` with each message as JSON in `body`)
+- Chat history in `~/.mlx-serve/mlx-serve.db` (SQLite: `chat_sessions`, `chat_messages` with each message as JSON in `body`; the sidebar in `sidebar_groups`, `terminal_sessions` and each row's `group_id`/`position`)
 
 ### Reproducing
 - Tool calling: curl with `stream: false` first, then `stream: true`

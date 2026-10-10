@@ -142,8 +142,8 @@ pub fn servesRows(rows: qwen4.RowDtype) bool {
 /// `model_bytes` the weights already resident. Null = the host gather. An embedded pack's
 /// shards are copied into one buffer, so the gate runs before anything is allocated.
 pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
-    if (mlx.noGpuBackend()) {
-        log.info("[qwen4] ple gather: cpu (no GPU backend)\n", .{});
+    if (mlx.noGpuBackend() or !mlx.metalKernelsAvailable()) {
+        log.info("[qwen4] ple gather: cpu (no Metal kernels: the GPU gather is one)\n", .{});
         return null;
     }
     if (!servesRows(table.rowDtype())) {
