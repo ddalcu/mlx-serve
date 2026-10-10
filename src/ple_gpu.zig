@@ -132,12 +132,22 @@ fn gb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1073741824.0;
 }
 
+/// The kernel rounds rows to bf16, so f16 rows (a JANG pack's) are only exact from the host gather:
+/// such a table never takes the GPU arm and is never billed as resident (`scheduler.pleTableBill`).
+pub fn servesRows(rows: qwen4.RowDtype) bool {
+    return rows == .bf16;
+}
+
 /// Load-time arm choice for `table`; logs one line naming the arm. `on` is `--ple-gpu`,
 /// `model_bytes` the weights already resident. Null = the host gather. An embedded pack's
 /// shards are copied into one buffer, so the gate runs before anything is allocated.
 pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
     if (mlx.noGpuBackend()) {
         log.info("[qwen4] ple gather: cpu (no GPU backend)\n", .{});
+        return null;
+    }
+    if (!servesRows(table.rowDtype())) {
+        log.info("[qwen4] ple gather: cpu (f16 rows; the GPU kernel emits bf16)\n", .{});
         return null;
     }
     const b: Budget = .{
@@ -460,6 +470,21 @@ test "ple gpu: an embedded sharded table, weight scale included, embeds like the
         try testing.expectEqual(table.embedded.?.scale, tbl.scale);
         try expectArmsEqual(tbl, &h, &table, &[_]u32{ 3, 4 }, &ids);
     }
+}
+
+test "ple gpu: jangh4 f16 rows stay on the host gather where every other gate passes" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const h = try qwen4.NgramHash.init(TEST_VOCAB, 3, 1, 2, 1, 1234, 0, TEST_EOS);
+    try qwen4_ple.writeJangFixture(&td, .valid, .{ .multipliers = h.multipliers[0..3], .vocab = h.vocab[0..2], .offsets = h.offsets[0..2] }, 3);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var table = try qwen4.NgramTable.openEmbedded(path_buf[0..try td.dir.realPath(io, &path_buf)], qwen4_ple.JANG_FIXTURE_SPEC);
+    defer table.close();
+    const roomy: Budget = .{ .page = std.heap.pageSize(), .max_buffer = 1 << 40, .working_set = 1 << 40, .model_bytes = 0 };
+    try testing.expectEqual(Arm.gpu, chooseArm(true, table.bits, 0, @intCast(table.embedded.?.repackedLen()), roomy));
+    try testing.expect(load(&table, true, 0) == null);
 }
 
 test "ple gpu: a declined embedded table keeps the host gather" {

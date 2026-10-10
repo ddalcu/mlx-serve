@@ -5670,3 +5670,10 @@ Defect: the first copy chain of 15 drafts killed the server with a SIGBUS in the
 Cause: `@min(p.len, MAX_DRAFTS)` with a comptime 15 has type `u4`, so `n + 2` overflowed at 15; ReleaseFast has no overflow check and the fall-through `unreachable` ran off the function.
 Fix: the result is typed (`const n: usize = @min(...)`) in `chooseRows` and `PositionStats.record`, and `chooseRows` ends in a real fallback.
 Guard: `chooseRows: a fifteen-draft chain is priced through its last row` and `PositionStats: the widest copied chain records without overflow`. A silent exit of a ReleaseFast server: read `~/Library/Logs/DiagnosticReports/*.ips` first.
+
+## A JANG pack's f16 PLE rows turned the bf16 residual stream f32 (2026-10-09)
+
+Defect: on the JANGH4 bundle every prompt past 96 tokens failed with `error.Jangtq2Dtype` on an M5: the NAX expert GEMM was handed an f32 activation.
+Cause: the bundle's n-gram rows are f16 (exact, as its reference runtime feeds them), but this engine runs the bundle in bf16, its F16 PLE key/value scales narrowed at load (`narrowsLoadedF16`). MLX promotes f16 against bf16 to f32 (`quantized_matmul` promotes x with the scales), so the PLE block ran in f32 and `h + ple` widened the residual stream for every layer after it.
+Fix: `pleForward` casts its output back to the stream's dtype; the block's arithmetic is unchanged. It is the f32-scalar class with a 16-bit operand: the caller casts back.
+Guard: `qwen4 PLE: a JANG pack's f16 rows leave the residual stream bf16, prefill and batched decode` (red before: expected bfloat16, found float32).

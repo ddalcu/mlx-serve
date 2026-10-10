@@ -319,6 +319,9 @@ pub const ModelConfig = struct {
     ngram_seed: u64 = 1234,
     split_ngram_parts: u32 = 128,
     embedded_ple_payload_bytes: ?u64 = null,
+    /// The dtype the embedded table's rows gather in (`qwen4_ple.Layout.rowDtype`); f16 rows never take
+    /// the `--ple-gpu` arm (`ple_gpu.servesRows`).
+    embedded_ple_rows: qwen4_exp.RowDtype = .bf16,
     qwen4_norm_convention: ?Qwen4NormConvention = null,
     indexer_n_heads: u32 = 0, // 0 = dense attention
     indexer_head_dim: u32 = 0,
@@ -1587,6 +1590,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
             config.embedded_ple_payload_bytes = info.payload_bytes;
+            config.embedded_ple_rows = info.rows;
         }
     }
 
@@ -9287,6 +9291,28 @@ test "unmarked embedded qwen4 defers norm convention until weights load" {
     defer accepted.deinit(testing.allocator);
     try testing.expectEqual(Qwen4NormConvention.delta, accepted.qwen4_norm_convention.?);
     try testing.expectEqual(@as(?u64, 120), accepted.embedded_ple_payload_bytes);
+}
+
+test "parseConfig: a JANG pack's in-shard table gathers f16 rows" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try qwen4_ple.writeJangFixture(&td, .valid, .{ .multipliers = &.{ 7, -9, 11 }, .vocab = &.{ 2, 3 }, .offsets = &.{ 0, 2 } }, 5);
+    const json =
+        \\{"model_type":"qwen4_exp","hidden_size":64,"num_hidden_layers":2,
+        \\"num_attention_heads":1,"num_key_value_heads":1,"head_dim":64,
+        \\"vocab_size":1,"ple_layer_ids":[2],"ple_embed_dim":64,
+        \\"ngram_size":3,"heads_per_ngram":1,"ngram_vocab_size_base":2,
+        \\"make_ngram_vocab_size_divisible_by":1,"split_ngram_parts":3,
+        \\"indexer_n_heads":1,"indexer_head_dim":4,"indexer_budget":8,"indexer_compress_ratio":2}
+    ;
+    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try td.dir.realPath(io, &path);
+    var config = try parseConfig(io, testing.allocator, path[0..len]);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u64, 5 * (32 + 2 + 2)), config.embedded_ple_payload_bytes);
+    try testing.expectEqual(qwen4_exp.RowDtype.f16, config.embedded_ple_rows);
 }
 
 test "local oQ Qwen4 metadata defers convention until loaded weights" {
