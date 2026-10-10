@@ -3845,6 +3845,9 @@ test "waitForUnload: only a load an unload just freed room for waits" {
     try std.testing.expect(!waitForUnload(180 * GB, 66 * GB, .{}, now)); // no unload yet
     try std.testing.expect(!waitForUnload(180 * GB, 66 * GB, .{ .at_ms = now - 60_000, .bytes = 150 * GB }, now)); // long settled
     try std.testing.expect(!waitForUnload(500 * GB, 66 * GB, freed, now)); // even the freed bytes cannot fit it
+    var taken = freed;
+    taken.consume(150 * GB); // a load committed into the freed room
+    try std.testing.expect(!waitForUnload(180 * GB, 66 * GB, taken, now));
 }
 
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {
@@ -5092,6 +5095,32 @@ pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) 
 }
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.
+/// One bounded SSD flush per resident model that still owes one; returns whether any still does.
+/// Inference thread only: unloads run here too, so the collected pointers stay valid.
+fn flushOwedDiskSlices(sch: *Scheduler) bool {
+    var owed: [16]struct { hc: *prefix_cache_mod.HotPrefixCache, s: mlx.mlx_stream } = undefined;
+    var n: usize = 0;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        if (n == owed.len) break;
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        const hc = if (entry.prefix_cache) |*h| h else continue;
+        if (!hc.disk_dirty or hc.disk == null) continue;
+        const xf = entry.transformer orelse continue;
+        owed[n] = .{ .hc = hc, .s = xf.s };
+        n += 1;
+    }
+    sch.registry.mutex.unlock(sch.io);
+    var still = false;
+    for (owed[0..n]) |o| {
+        o.hc.flushPendingDisk(o.s);
+        still = still or o.hc.disk_dirty;
+    }
+    return still;
+}
+
 fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     return sch.pending.items.len > 0 or
         sch.decoding.items.len > 0 or
@@ -5276,7 +5305,15 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
         if (mode == .main) {
+            var disk_owed = true;
             while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
+                // Idle: land owed SSD slices before parking, so a later commit rarely finds one.
+                if (disk_owed) {
+                    sch.queue_mu.unlock(sch.io);
+                    disk_owed = flushOwedDiskSlices(sch);
+                    sch.queue_mu.lockUncancelable(sch.io);
+                    continue;
+                }
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(false);
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);

@@ -476,6 +476,9 @@ pub const HotPrefixCache = struct {
     ssd_idle_mem: u64 = 0,
     /// The live-cache state of the most recent commit, flushed instead of the (possibly trimmed) RAM entry.
     pending_disk: ?PendingDiskFlush = null,
+    /// An earlier session's pending snapshot a newer commit displaced before it landed whole;
+    /// flushes finish it first, one slice each, so no commit pays for its write.
+    finishing_disk: ?PendingDiskFlush = null,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
 
@@ -499,10 +502,16 @@ pub const HotPrefixCache = struct {
             freeEntryOwnedState(self.allocator, e);
         }
         self.entries.deinit(self.allocator);
-        if (self.pending_disk) |*p| p.deinit(self.allocator);
-        self.pending_disk = null;
+        self.dropPendingSnapshots();
         if (self.disk) |*d| d.deinit();
         self.disk = null;
+    }
+
+    fn dropPendingSnapshots(self: *HotPrefixCache) void {
+        if (self.pending_disk) |*p| p.deinit(self.allocator);
+        self.pending_disk = null;
+        if (self.finishing_disk) |*p| p.deinit(self.allocator);
+        self.finishing_disk = null;
     }
 
     /// Free everything an Entry owns: token buffer, KV snapshot, SSM
@@ -1501,7 +1510,7 @@ pub const HotPrefixCache = struct {
         if (!checkoutEligible(
             self.ssd_first,
             restoreMoveEnabled(),
-            self.pending_disk != null,
+            self.pending_disk != null or self.finishing_disk != null,
             e.tokens.len,
             shared,
             prompt_len,
@@ -1520,7 +1529,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items) |*e| {
             if (e.last_used != used) continue;
             if (e.checked_out_by != null) return false;
-            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, self.last_restored_shared, prompt_len, true)) return false;
+            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null or self.finishing_disk != null, e.tokens.len, self.last_restored_shared, prompt_len, true)) return false;
             e.checked_out_by = slot_id;
             log.info("  [hot-cache] checked out {d}-token entry to the slot (the share does not fit; the append donates in place)\n", .{e.tokens.len});
             return true;
@@ -2158,16 +2167,17 @@ pub const HotPrefixCache = struct {
         mtp: ?DflashCommit,
     ) void {
         if (self.pending_disk) |*old| {
-            // A commit that extends the pending prefix covers it; another session's would drop the
-            // old snapshot's unwritten tail with it, so that one is finished first.
-            if (self.disk) |*d| if (old.has_tools != has_tools or !std.mem.startsWith(u32, tokens, old.tokens)) {
-                var passes: usize = old.tokens.len / @max(d.chunk_tokens, 1) + 2;
-                while (passes > 0) : (passes -= 1) {
-                    const out = appendPending(d, old, mlx.gpuStream()) orelse break;
-                    if (out.nothingPending()) break;
+            // A commit that extends the pending prefix covers it; another session's is parked for
+            // the flushes to finish. At most one waits: an older one still parked is dropped.
+            if (old.has_tools != has_tools or !std.mem.startsWith(u32, tokens, old.tokens)) {
+                if (self.finishing_disk) |*f| {
+                    log.info("  [disk-cache] dropped an unfinished {d}-token snapshot for a newer session's\n", .{f.tokens.len});
+                    f.deinit(self.allocator);
                 }
-            };
-            old.deinit(self.allocator);
+                self.finishing_disk = old.*;
+            } else {
+                old.deinit(self.allocator);
+            }
             self.pending_disk = null;
         }
         var snap = source_cache.snapshot() catch |err| {
@@ -2386,6 +2396,16 @@ pub const HotPrefixCache = struct {
         if (!self.disk_dirty) return;
         self.disk_dirty = false;
         const d = if (self.disk) |*dd| dd else return;
+        // A parked snapshot first; the commit that displaced it is still owed, so stay dirty.
+        if (self.finishing_disk) |*f| {
+            self.disk_dirty = true;
+            const out = appendPending(d, f, s);
+            if (out == null or out.? != .partial) {
+                f.deinit(self.allocator);
+                self.finishing_disk = null;
+            }
+            return;
+        }
         // Flush the live state captured at commit, not what the RAM entry retained after its trim:
         // one bounded slice per flush, the snapshot kept until it lands whole.
         if (self.pending_disk) |*pending| {
@@ -2971,10 +2991,7 @@ pub const HotPrefixCache = struct {
         // Suspect state must die on both tiers.
         if (self.disk) |*d| d.invalidateAll();
         self.disk_dirty = false;
-        if (self.pending_disk) |*p| {
-            p.deinit(self.allocator);
-            self.pending_disk = null;
-        }
+        self.dropPendingSnapshots();
         if (self.entries.items.len == 0) return;
         log.info("  [hot-cache] invalidating all {d} entries: {s}\n", .{ self.entries.items.len, reason });
         for (self.entries.items) |*e| {
@@ -2990,7 +3007,8 @@ pub const HotPrefixCache = struct {
     /// requests remain untouched (improvement over the legacy nuke-everything).
     pub fn invalidateLatest(self: *HotPrefixCache, reason: []const u8) void {
         if (self.disk) |*d| d.invalidateNewest();
-        self.disk_dirty = false;
+        // The parked snapshot is an earlier, healthy session's: it still lands.
+        self.disk_dirty = self.finishing_disk != null;
         if (self.pending_disk) |*p| {
             p.deinit(self.allocator);
             self.pending_disk = null;
@@ -7616,7 +7634,14 @@ test "SSD-first: a bounded flush keeps its snapshot and lands it whole over late
     try testing.expectEqual(@as(u32, tokens.len), hc.disk.?.entries.items[0].kv_len);
 }
 
-test "SSD-first: a different session's commit finishes the pending snapshot before replacing it (#797)" {
+fn testDiskLen(d: *const kv_disk_cache.DiskTier, first_token: u32) u32 {
+    for (d.entries.items) |e| {
+        if (e.tokens.len > 0 and e.tokens[0] == first_token) return e.kv_len;
+    }
+    return 0;
+}
+
+test "SSD-first: a different session's commit parks the pending snapshot; later flushes land both whole, one chunk each (#797)" {
     const s = mlx.gpuStream();
     var a_tokens: [1200]u32 = undefined;
     for (&a_tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -7636,13 +7661,21 @@ test "SSD-first: a different session's commit finishes the pending snapshot befo
 
     _ = try hc.commit(&cache, &a_tokens, false);
     hc.flushPendingDisk(s); // one slice of A
-    _ = try hc.commit(&cache, &b_tokens, false); // B replaces the pending A
     const d = &hc.disk.?;
-    var a_len: u32 = 0;
-    for (d.entries.items) |e| {
-        if (e.tokens.len > 0 and e.tokens[0] == a_tokens[0]) a_len = e.kv_len;
+    const a_sliced = testDiskLen(d, a_tokens[0]);
+    try testing.expect(a_sliced < a_tokens.len);
+    _ = try hc.commit(&cache, &b_tokens, false); // B's commit writes nothing of A
+    try testing.expectEqual(a_sliced, testDiskLen(d, a_tokens[0]));
+    var written: u32 = a_sliced;
+    var flushes: usize = 0;
+    while ((hc.pending_disk != null or hc.finishing_disk != null) and flushes < 64) : (flushes += 1) {
+        hc.flushPendingDisk(s);
+        const now = testDiskLen(d, a_tokens[0]) + testDiskLen(d, b_tokens[0]);
+        try testing.expect(now - written <= 128); // the readback bound holds per flush
+        written = now;
     }
-    try testing.expectEqual(@as(u32, a_tokens.len), a_len); // A was not left short
+    try testing.expectEqual(@as(u32, a_tokens.len), testDiskLen(d, a_tokens[0]));
+    try testing.expectEqual(@as(u32, b_tokens.len), testDiskLen(d, b_tokens[0]));
 }
 
 test "SSD-first companion: a restore adopts the entry's buffer when its capacity suffices" {

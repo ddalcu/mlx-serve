@@ -39,7 +39,15 @@ const log = @import("log.zig");
 pub var load_generation = std.atomic.Value(u64).init(0);
 
 /// The last unload: when (monotonic ms) and how many resident bytes it freed. Inference thread only.
-pub const UnloadMark = struct { at_ms: i64 = 0, bytes: u64 = 0 };
+pub const UnloadMark = struct {
+    at_ms: i64 = 0,
+    bytes: u64 = 0,
+
+    /// A load committed into the freed room: those bytes are no longer coming back.
+    pub fn consume(self: *UnloadMark, bytes: u64) void {
+        self.bytes -|= bytes;
+    }
+};
 pub var last_unload: UnloadMark = .{};
 
 pub fn monotonicMs() i64 {
@@ -1238,6 +1246,7 @@ pub const ModelRegistry = struct {
         _ = load_generation.fetchAdd(1, .monotonic);
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
+        last_unload.consume(bytes_resident);
         entry.state = .ready;
         entry.error_name = null;
         self.lru_clock += 1;
