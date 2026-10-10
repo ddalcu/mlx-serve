@@ -734,11 +734,11 @@ pub const ImageEngine = struct {
     /// Steps for a request: a checkpoint's own sampling grid, else the
     /// request's count, else the distilled backends' few-step default or an
     /// undistilled checkpoint's own recommendation.
-    pub fn resolveSteps(self: *const ImageEngine, requested: ?u32) u32 {
-        const steps = requested orelse 0;
+    /// 0 = the backend's default, the same as an omitted count.
+    pub fn resolveSteps(self: *const ImageEngine, steps: u32) u32 {
         return switch (self.backend) {
             .qwen_image => |q| q.stepsFor(steps),
-            else => if (requested == null) 4 else steps,
+            else => if (steps == 0) 4 else steps,
         };
     }
 
@@ -2374,10 +2374,10 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    const req_steps = imageStepsRequest(extractJsonInt(body, "steps")) catch
+    const req_steps = stepsRequest(extractJsonInt(body, "steps"), 0, 0, 100) catch
         return sendError(conn, 400, "'steps' must be in [0,100] (0 = the model's default)");
     var steps: u32 = engine.resolveSteps(req_steps);
-    if (req_steps) |n| if (n != 0 and n != steps) log.info("[image] {d} steps requested, the checkpoint's own grid runs {d}\n", .{ n, steps });
+    if (req_steps != 0 and req_steps != steps) log.info("[image] {d} steps requested, the checkpoint's own grid runs {d}\n", .{ req_steps, steps });
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -3274,8 +3274,8 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
     if (duration < music3.MIN_DURATION_S or duration > music3.MAX_DURATION_S)
         return sendError(conn, 400, "'duration_seconds' must be in [1,360]");
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse music3.DEFAULT_STEPS);
-    if (steps < 4 or steps > 100) return sendError(conn, 400, "'steps' must be in [4,100]");
+    const steps = stepsRequest(extractJsonInt(body, "steps"), music3.DEFAULT_STEPS, 4, 100) catch
+        return sendError(conn, 400, "'steps' must be in [4,100]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
 
     // Pre-validate the prompt budget BEFORE any SSE bytes go out, so the cap
@@ -3356,8 +3356,8 @@ fn handleYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engin
     }
     const seconds: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse yue2.MAX_SECONDS);
     if (seconds < yue2.MIN_SECONDS or seconds > yue2.MAX_SECONDS) return sendError(conn, 400, "'duration_seconds' must be in [5,360]");
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse yue2.DEFAULT_STEPS);
-    if (steps < 1 or steps > yue2.MAX_STEPS) return sendError(conn, 400, "'steps' must be in [1,100]");
+    const steps = stepsRequest(extractJsonInt(body, "steps"), yue2.DEFAULT_STEPS, 1, yue2.MAX_STEPS) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
     var cfg_scale: ?f32 = null;
     if (extractJsonFloat(body, "cfg_scale")) |g| {
         if (!(g >= 0 and g <= yue2.MAX_CFG)) return sendError(conn, 400, "'cfg_scale' must be in [0,20]");
@@ -3901,7 +3901,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
 
     const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
     const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse (if (turbo) @as(u64, 4) else 30));
+    const steps = stepsRequest(extractJsonInt(body, "steps"), if (turbo) 4 else 30, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
     const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
     const requested_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 56);
 
@@ -4136,8 +4137,10 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     const cfg_audio: ?f32 = if (extractJsonFloat(body, "cfg_audio_scale")) |v| @floatCast(v) else null;
     const stg: ?f32 = if (extractJsonFloat(body, "stg_scale")) |v| @floatCast(v) else null;
     const guiders = videoGuiderDefaults(pipeline, cfg_video, cfg_audio, stg);
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse guiders.stage1_steps_default);
-    const stage2_steps: u32 = @intCast(extractJsonInt(body, "stage2_steps") orelse 0);
+    const steps = stepsRequest(extractJsonInt(body, "steps"), guiders.stage1_steps_default, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
+    const stage2_steps = stepsRequest(extractJsonInt(body, "stage2_steps"), 0, 0, 100) catch
+        return sendError(conn, 400, "'stage2_steps' must be in [0,100] (0 = the pipeline's default)");
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     const preview_req = sse.parsePreview(body);
@@ -4483,7 +4486,8 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
         return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
     defer allocator.free(img.pix);
 
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
+    const steps = stepsRequest(extractJsonInt(body, "steps"), 30, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
     const res: u32 = @intCast(extractJsonInt(body, "octree_resolution") orelse 256);
     if (res < 64 or res > 512) return sendError(conn, 400, "'octree_resolution' must be in [64,512]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
@@ -5110,20 +5114,21 @@ fn parseSize(size: []const u8) ?struct { w: u32, h: u32 } {
     return .{ .w = w, .h = h };
 }
 
-/// A request's image `steps`, bounded like every other media endpoint's: a client
-/// integer never reaches a cast or a schedule allocation unchecked.
-fn imageStepsRequest(requested: ?u64) error{StepsOutOfRange}!?u32 {
-    const n = requested orelse return null;
-    if (n > 100) return error.StepsOutOfRange;
+/// A request's step count: `default` when omitted, else held to [lo, hi] BEFORE any
+/// cast, so a client integer never reaches a narrowing cast or a schedule unchecked.
+fn stepsRequest(requested: ?u64, default: u32, lo: u32, hi: u32) error{StepsOutOfRange}!u32 {
+    const n = requested orelse return default;
+    if (n < lo or n > hi) return error.StepsOutOfRange;
     return @intCast(n);
 }
 
-test "imageStepsRequest: an omitted count stays omitted, 0..100 passes, anything above is refused" {
-    try std.testing.expectEqual(@as(?u32, null), try imageStepsRequest(null));
-    try std.testing.expectEqual(@as(?u32, 0), try imageStepsRequest(0));
-    try std.testing.expectEqual(@as(?u32, 100), try imageStepsRequest(100));
-    try std.testing.expectError(error.StepsOutOfRange, imageStepsRequest(101));
-    try std.testing.expectError(error.StepsOutOfRange, imageStepsRequest(5_000_000_000));
+test "stepsRequest: omitted takes the default, the range is checked before the cast" {
+    try std.testing.expectEqual(@as(u32, 30), try stepsRequest(null, 30, 1, 100));
+    try std.testing.expectEqual(@as(u32, 1), try stepsRequest(1, 30, 1, 100));
+    try std.testing.expectEqual(@as(u32, 100), try stepsRequest(100, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(0, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(101, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(5_000_000_000, 30, 1, 100));
 }
 
 fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
