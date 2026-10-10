@@ -135,11 +135,9 @@ final class SettingsSectionResetTests: XCTestCase {
 
     // MARK: - Sections with nothing to reset
 
-    /// Model Folders' custom path lives on `DownloadManager`, not `ServerOptions`,
-    /// and Updates has no settings at all — offering a dead "Reset" button on
-    /// those panes would be a lie.
+    /// Updates has no settings at all — offering a dead "Reset" button there
+    /// would be a lie.
     func testSectionsWithNoFieldsAreNotResettable() {
-        XCTAssertFalse(SettingsReset.isResettable(.modelFolders))
         XCTAssertFalse(SettingsReset.isResettable(.updates))
         XCTAssertTrue(SettingsReset.isResettable(.server))
         XCTAssertTrue(SettingsReset.isResettable(.voice))

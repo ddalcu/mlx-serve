@@ -16,7 +16,7 @@ bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 [ -d "$MODEL" ] || { echo "SKIP: model not found at $MODEL"; exit 0; }
 [ -x ./zig-out/bin/mlx-serve ] || { echo "FAIL: build with -Doptimize=ReleaseFast first"; exit 1; }
 
-LOG=$(mktemp -t mlxerr).log
+LOG=$(mktemp -t mlxerr.XXXXXX).log
 # Chunk 2, not 1, so real forward work precedes the fault.
 MLX_SERVE_MLX_FAULT_CHUNK=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
@@ -64,7 +64,7 @@ kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 
 # The decode checkpoint: a decode-time failure used to finish 200 and become the next request's 503.
 echo "[4] an MLX error during DECODE fails that request, not the next one"
-LOG2=$(mktemp -t mlxerr2).log
+LOG2=$(mktemp -t mlxerr2.XXXXXX).log
 MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG2" 2>&1 &
 SRV=$!
@@ -88,7 +88,7 @@ fi
 # The streaming half: the SSE head is already on the wire, so the bar is the terminal `error` event.
 echo "[6] a decode-time MLX error on a STREAMING request sends the mapped SSE error"
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
-LOG3=$(mktemp -t mlxerr3).log
+LOG3=$(mktemp -t mlxerr3.XXXXXX).log
 MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG3" 2>&1 &
 SRV=$!
@@ -119,10 +119,11 @@ CTX=$(curl -s -m 10 "$BASE/v1/models" | python3 -c "import json,sys; d=json.load
 if [ "${CTX:-0}" -lt 65536 ]; then
   echo "  SKIP: model context $CTX < 65536 — no room for a 45k-token prompt"
 else
-LONG=$(python3 -c "print(('The quick brown fox jumps over the lazy dog. ' * 9000)[:180000])")
-CODE6=$(python3 - "$BASE" "$LONG" <<'PY2'
+# Built in Python: one 180 KB argv string is past Linux's 128 KB per-argument limit.
+CODE6=$(python3 - "$BASE" <<'PY2'
 import json,sys,urllib.request,urllib.error
-base,long_text=sys.argv[1:3]
+base=sys.argv[1]
+long_text=('The quick brown fox jumps over the lazy dog. ' * 9000)[:180000]
 body={"model":"mlx-serve","messages":[{"role":"user","content":long_text+"\n\nReply with one word."}],
       "temperature":0,"stream":False}   # NO max_tokens field on purpose
 req=urllib.request.Request(base+"/v1/chat/completions",data=json.dumps(body).encode(),

@@ -645,7 +645,8 @@ const PrefetchPool = struct {
             a.destroy(p);
         }
         for (0..N) |i| {
-            p.threads[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{ p, i });
+            // Past std's 256 KiB thread-local signal stack: glibc carves static TLS out of the thread's stack.
+            p.threads[i] = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, worker, .{ p, i });
             started += 1;
         }
         return p;

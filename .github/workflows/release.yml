@@ -41,6 +41,8 @@ jobs:
     runs-on: macos-26
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
 
     steps:
       - uses: actions/checkout@v4
@@ -576,3 +578,34 @@ jobs:
             mlx-serve-bin-macos-arm64.tar.gz
             MLX-Serve.dmg
           retention-days: 7
+
+  # The Linux/CUDA tarballs are the ones linux.yml already built for this commit
+  # (it runs on every push to main): downloaded and attached, never rebuilt.
+  linux-assets:
+    needs: build
+    if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Attach the Linux builds of this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          # Waits out a run still building, for up to two hours.
+          for _ in $(seq 120); do
+            runs=$(gh run list --workflow linux.yml --commit "$GITHUB_SHA" --json databaseId,status,conclusion)
+            id=$(jq -r '[.[] | select(.conclusion == "success")][0].databaseId // empty' <<<"$runs")
+            [ -n "$id" ] && break
+            if ! jq -e 'any(.[]; .status != "completed")' <<<"$runs" >/dev/null; then
+              echo "No successful linux.yml run for $GITHUB_SHA. Run 'gh workflow run linux.yml --ref $TAG', then re-run this job." >&2
+              exit 1
+            fi
+            sleep 60
+          done
+          [ -n "$id" ] || { echo "linux.yml is still running for $GITHUB_SHA after two hours; re-run this job when it finishes." >&2; exit 1; }
+          gh run download "$id" --pattern 'mlx-serve-linux-*-cuda13' --dir linux
+          gh release upload "$TAG" linux/*/mlx-serve-linux-*-cuda13.tar.gz --clobber

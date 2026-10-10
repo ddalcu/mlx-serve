@@ -16,22 +16,10 @@ final class StartupModelChoiceTests: XCTestCase {
 
     // MARK: - Start the server vs load a model
 
-    func testAutoStartOffStartsNothing() {
+    /// The server starts with no model unless preloading is on.
+    func testWithoutPreloadTheServerStartsHeadless() {
         XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: false,
-                                      loadModelAtStart: true,
-                                      mode: .pinned,
-                                      pinnedPath: "/models/qwen",
-                                      lastUsed: "/models/qwen",
-                                      installedPaths: installed),
-            .doNothing)
-    }
-
-    /// Auto-start alone brings the server up with no model.
-    func testAutoStartAloneIsHeadless() {
-        XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: true,
-                                      loadModelAtStart: false,
+            StartupModelChoice.launch(loadModelAtStart: false,
                                       mode: .pinned,
                                       pinnedPath: "/models/qwen",
                                       lastUsed: "/models/gemma",
@@ -41,8 +29,7 @@ final class StartupModelChoiceTests: XCTestCase {
 
     func testPinnedModeLoadsThePinnedModel() {
         XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: true,
-                                      loadModelAtStart: true,
+            StartupModelChoice.launch(loadModelAtStart: true,
                                       mode: .pinned,
                                       pinnedPath: "/models/gemma",
                                       lastUsed: "/models/qwen",
@@ -74,16 +61,14 @@ final class StartupModelChoiceTests: XCTestCase {
     /// The same stored preference follows the last-used model at start time.
     func testLastUsedModeResolvesAtStartTime() {
         XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: true,
-                                      loadModelAtStart: true,
+            StartupModelChoice.launch(loadModelAtStart: true,
                                       mode: .lastUsed,
                                       pinnedPath: nil,
                                       lastUsed: "/models/qwen",
                                       installedPaths: installed),
             .load(path: "/models/qwen"))
         XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: true,
-                                      loadModelAtStart: true,
+            StartupModelChoice.launch(loadModelAtStart: true,
                                       mode: .lastUsed,
                                       pinnedPath: nil,
                                       lastUsed: "/models/gemma",
@@ -118,8 +103,7 @@ final class StartupModelChoiceTests: XCTestCase {
     /// A fresh install starts headless rather than picking a model for the user.
     func testNoLastUsedStartsHeadlessRatherThanPickingSomething() {
         XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: true,
-                                      loadModelAtStart: true,
+            StartupModelChoice.launch(loadModelAtStart: true,
                                       mode: .lastUsed,
                                       pinnedPath: nil,
                                       lastUsed: nil,
@@ -130,8 +114,7 @@ final class StartupModelChoiceTests: XCTestCase {
     /// An uninstalled model never reaches `--model`.
     func testUninstalledLastUsedStartsHeadless() {
         XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: true,
-                                      loadModelAtStart: true,
+            StartupModelChoice.launch(loadModelAtStart: true,
                                       mode: .lastUsed,
                                       pinnedPath: nil,
                                       lastUsed: "/models/deleted",
@@ -141,8 +124,7 @@ final class StartupModelChoiceTests: XCTestCase {
 
     func testUninstalledPinStartsHeadless() {
         XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: true,
-                                      loadModelAtStart: true,
+            StartupModelChoice.launch(loadModelAtStart: true,
                                       mode: .pinned,
                                       pinnedPath: "/models/deleted",
                                       lastUsed: "/models/qwen",
@@ -153,8 +135,7 @@ final class StartupModelChoiceTests: XCTestCase {
     /// A Mac with nothing chat-pickable at all.
     func testEmptyLibraryStartsHeadless() {
         XCTAssertEqual(
-            StartupModelChoice.launch(autoStart: true,
-                                      loadModelAtStart: true,
+            StartupModelChoice.launch(loadModelAtStart: true,
                                       mode: .lastUsed,
                                       pinnedPath: nil,
                                       lastUsed: "/models/qwen",
@@ -223,14 +204,12 @@ final class StartupModelChoiceTests: XCTestCase {
 
     /// LAN duty at launch loads only what the plan chose.
     func testLanDutyAtLaunchLoadsNothingUnlessTheStartupChoiceAskedFor() {
-        XCTAssertEqual(StartupModelChoice.lanStartPath(plan: .doNothing), "")
         XCTAssertEqual(StartupModelChoice.lanStartPath(plan: .headless), "")
         XCTAssertEqual(StartupModelChoice.lanStartPath(plan: .load(path: "/models/qwen")),
                        "/models/qwen")
     }
 
     func testAPlanNamesTheModelItLoads() {
-        XCTAssertNil(Launch.doNothing.modelPath)
         XCTAssertNil(Launch.headless.modelPath)
         XCTAssertEqual(Launch.load(path: "/models/gemma").modelPath, "/models/gemma")
     }

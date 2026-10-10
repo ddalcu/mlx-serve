@@ -84,6 +84,19 @@ check(rel_with.get("draft") in (True, "true"),
 check("prerelease" not in rel_with,
       "the workflow never sets the prerelease flag itself (manual, by design)")
 
+# The Linux tarballs are linux.yml's build of the same commit, attached to the
+# draft: never rebuilt here, never on a PR or a dry run.
+linux = wf["jobs"].get("linux-assets", {})
+linux_text = str(linux)
+check(linux.get("needs") == "build", "linux-assets runs after the draft exists")
+check("pull_request" in str(linux.get("if", "")) and "dry_run" in str(linux.get("if", "")),
+      "linux-assets gated off for pull_request and dry_run")
+check("gh run download" in linux_text and "gh release upload" in linux_text,
+      "linux-assets downloads linux.yml's artifacts and uploads them")
+check("build-linux.sh" not in linux_text, "linux-assets never rebuilds")
+check("steps.version.outputs.tag" in str(job.get("outputs", {}).get("tag", "")),
+      "build job exports the release tag")
+
 # Notarization must RUN on PRs — its gate may exclude dry_run but never PRs.
 for n in ("Notarize CLI", "Notarize app bundle"):
     check("pull_request" not in step_if(n),

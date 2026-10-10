@@ -961,8 +961,13 @@ pub const StoredResponse = struct {
     arena: std.heap.ArenaAllocator,
 
     list_node: std.DoublyLinkedList.Node = .{},
+    /// One per holder: the store (or a WebSocket's cache) holds the first, and every
+    /// `ResponseStore.get` adds one, so an eviction or DELETE never frees a history in use.
+    refs: std.atomic.Value(u32) = .init(1),
 
-    pub fn deinit(self: *StoredResponse) void {
+    /// Drops one holder's reference; the last one frees the entry.
+    pub fn release(self: *StoredResponse) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         var arena = self.arena;
         const gpa = arena.child_allocator;
         arena.deinit();
@@ -989,7 +994,7 @@ pub const ResponseStore = struct {
         while (node) |n| {
             const next = n.next;
             const sr: *StoredResponse = @fieldParentPtr("list_node", n);
-            sr.deinit();
+            sr.release();
             node = next;
         }
         self.map.deinit(self.gpa);
@@ -1006,7 +1011,7 @@ pub const ResponseStore = struct {
         if (self.map.fetchRemove(sr.id)) |kv| {
             const old = kv.value;
             self.lru.remove(&old.list_node);
-            old.deinit();
+            old.release();
         }
 
         if (self.map.count() >= self.cap) {
@@ -1015,7 +1020,7 @@ pub const ResponseStore = struct {
                 const tail: *StoredResponse = @fieldParentPtr("list_node", tail_node);
                 _ = self.map.remove(tail.id);
                 self.lru.remove(tail_node);
-                tail.deinit();
+                tail.release();
             }
         }
 
@@ -1023,14 +1028,24 @@ pub const ResponseStore = struct {
         self.lru.prepend(&sr.list_node);
     }
 
-    /// Returns a borrowed reference (do not free). Touches LRU.
+    /// A new reference the caller `release`s. Touches LRU.
     pub fn get(self: *ResponseStore, id: []const u8) ?*StoredResponse {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const sr = self.map.get(id) orelse return null;
+        _ = sr.refs.fetchAdd(1, .monotonic);
         self.lru.remove(&sr.list_node);
         self.lru.prepend(&sr.list_node);
         return sr;
+    }
+
+    /// Removes `id` and hands it to the caller, who owns it from here.
+    pub fn take(self: *ResponseStore, id: []const u8) ?*StoredResponse {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const kv = self.map.fetchRemove(id) orelse return null;
+        self.lru.remove(&kv.value.list_node);
+        return kv.value;
     }
 
     /// Returns true if removed.
@@ -1039,7 +1054,7 @@ pub const ResponseStore = struct {
         defer self.mu.unlock(self.io);
         const kv = self.map.fetchRemove(id) orelse return false;
         self.lru.remove(&kv.value.list_node);
-        kv.value.deinit();
+        kv.value.release();
         return true;
     }
 };
@@ -1695,6 +1710,13 @@ fn makeTestStored(gpa: std.mem.Allocator, id: []const u8) !*StoredResponse {
     return sr;
 }
 
+/// Presence check that returns the reference `get` took.
+fn has(store: *ResponseStore, id: []const u8) bool {
+    const sr = store.get(id) orelse return false;
+    sr.release();
+    return true;
+}
+
 test "ResponseStore basic put/get/delete" {
     const gpa = testing.allocator;
     var store = ResponseStore.init(testing.io, gpa, 4);
@@ -1703,10 +1725,10 @@ test "ResponseStore basic put/get/delete" {
     const sr = try makeTestStored(gpa, "resp_1");
     try store.put(sr);
 
-    try testing.expect(store.get("resp_1") != null);
-    try testing.expect(store.get("missing") == null);
+    try testing.expect(has(&store, "resp_1"));
+    try testing.expect(!has(&store, "missing"));
     try testing.expectEqual(true, store.delete("resp_1"));
-    try testing.expect(store.get("resp_1") == null);
+    try testing.expect(!has(&store, "resp_1"));
 }
 
 test "ResponseStore evicts LRU at cap" {
@@ -1721,7 +1743,36 @@ test "ResponseStore evicts LRU at cap" {
         try store.put(sr);
     }
     // Cap is 2, inserted 3 — first one should be evicted
-    try testing.expect(store.get("id_0") == null);
-    try testing.expect(store.get("id_1") != null);
-    try testing.expect(store.get("id_2") != null);
+    try testing.expect(!has(&store, "id_0"));
+    try testing.expect(has(&store, "id_1"));
+    try testing.expect(has(&store, "id_2"));
+}
+
+test "ResponseStore.take hands the entry over and leaves the LRU consistent" {
+    const gpa = testing.allocator;
+    var store = ResponseStore.init(testing.io, gpa, 2);
+    defer store.deinit();
+    try store.put(try makeTestStored(gpa, "a"));
+    try store.put(try makeTestStored(gpa, "b"));
+    const a = store.take("a").?;
+    defer a.release();
+    try testing.expect(store.take("a") == null);
+    try testing.expect(!has(&store, "a"));
+    // The cap now counts one entry, and eviction walks a list that no longer holds `a`.
+    try store.put(try makeTestStored(gpa, "c"));
+    try store.put(try makeTestStored(gpa, "d"));
+    try testing.expect(!has(&store, "b"));
+    try testing.expect(has(&store, "c") and has(&store, "d"));
+}
+
+test "ResponseStore: a history held through get outlives a DELETE and an eviction" {
+    const gpa = testing.allocator;
+    var store = ResponseStore.init(testing.io, gpa, 1);
+    defer store.deinit();
+    try store.put(try makeTestStored(gpa, "a"));
+    const held = store.get("a").?;
+    try testing.expect(store.delete("a"));
+    try store.put(try makeTestStored(gpa, "b"));
+    try testing.expectEqualStrings("a", held.id);
+    held.release();
 }

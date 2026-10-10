@@ -22,7 +22,6 @@ final class ToolsToggleLiveTests: XCTestCase {
               NSHomeDirectory() != String(cString: pw.pointee.pw_dir) else {
             throw XCTSkip("needs CFFIXED_USER_HOME: AppState must not touch the real home")
         }
-        UserDefaults.standard.set(false, forKey: "autoStartServer")
         _ = NSApplication.shared   // AppState's launch wiring reads NSApp
     }
 
@@ -104,7 +103,7 @@ final class ToolsToggleLiveTests: XCTestCase {
             ["tool": "shell", "args": ["command": "rm -rf test-folder"]],
             ["content": "done"],
         ])
-        let appState = AppState()
+        let appState = AppState(startServerAtLaunch: false)
         appState.server.port = port
         appState.server.status = .running   // the fake answers in its place
         let id = makeSession(appState: appState, dir: dir)
@@ -132,7 +131,7 @@ final class ToolsToggleLiveTests: XCTestCase {
             ["content": "ok", "delay": 2],
             ["content": "resumed"],
         ])
-        let appState = AppState()
+        let appState = AppState(startServerAtLaunch: false)
         appState.server.port = port
         appState.server.status = .running   // the fake answers in its place
         let id = makeSession(appState: appState, dir: dir)
@@ -181,7 +180,7 @@ final class ToolsToggleLiveTests: XCTestCase {
     func testAStopMidStreamWritesNothingMore() async throws {
         let (dir, _) = try workspace()
         let port = try startServer(script: [["content": "too late", "delay": 2]])
-        let appState = AppState()
+        let appState = AppState(startServerAtLaunch: false)
         appState.server.port = port
         appState.server.status = .running   // the fake answers in its place
         let id = makeSession(appState: appState, dir: dir)
@@ -202,7 +201,7 @@ final class ToolsToggleLiveTests: XCTestCase {
         let (dir, _) = try workspace()
         let late = (dir as NSString).appendingPathComponent("late.txt")
         let port = try startServer(script: [["tool": "shell", "args": ["command": "touch late.txt"]], ["content": "done"]])
-        let appState = AppState()
+        let appState = AppState(startServerAtLaunch: false)
         appState.server.port = port
         appState.server.status = .running   // the fake answers in its place
         let id = makeSession(appState: appState, dir: dir)
@@ -230,7 +229,7 @@ final class ToolsToggleLiveTests: XCTestCase {
             ["tool": "shell", "args": ["command": "sleep 3; echo late-result"]],
             ["content": "fresh answer"],
         ])
-        let appState = AppState()
+        let appState = AppState(startServerAtLaunch: false)
         appState.server.port = port
         appState.server.status = .running   // the fake answers in its place
         let id = makeSession(appState: appState, dir: dir)

@@ -74,7 +74,6 @@ enum StartupModelChoice {
     // MARK: - The launch gate
 
     enum Launch: Equatable {
-        case doNothing
         /// Server up, nothing resident; models load on demand.
         case headless
         /// Server up with `--model <path>`.
@@ -97,13 +96,11 @@ enum StartupModelChoice {
         plan.modelPath ?? ""
     }
 
-    static func launch(autoStart: Bool,
-                       loadModelAtStart: Bool,
+    static func launch(loadModelAtStart: Bool,
                        mode: Mode,
                        pinnedPath: String?,
                        lastUsed: String?,
                        installedPaths: [String]) -> Launch {
-        guard autoStart else { return .doNothing }
         guard loadModelAtStart else { return .headless }
         guard let path = resolved(mode: mode,
                                   pinnedPath: pinnedPath,

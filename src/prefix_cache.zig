@@ -476,6 +476,9 @@ pub const HotPrefixCache = struct {
     ssd_idle_mem: u64 = 0,
     /// The live-cache state of the most recent commit, flushed instead of the (possibly trimmed) RAM entry.
     pending_disk: ?PendingDiskFlush = null,
+    /// An earlier session's pending snapshot a newer commit displaced before it landed whole;
+    /// flushes finish it first, one slice each, so no commit pays for its write.
+    finishing_disk: ?PendingDiskFlush = null,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
 
@@ -499,10 +502,16 @@ pub const HotPrefixCache = struct {
             freeEntryOwnedState(self.allocator, e);
         }
         self.entries.deinit(self.allocator);
-        if (self.pending_disk) |*p| p.deinit(self.allocator);
-        self.pending_disk = null;
+        self.dropPendingSnapshots();
         if (self.disk) |*d| d.deinit();
         self.disk = null;
+    }
+
+    fn dropPendingSnapshots(self: *HotPrefixCache) void {
+        if (self.pending_disk) |*p| p.deinit(self.allocator);
+        self.pending_disk = null;
+        if (self.finishing_disk) |*p| p.deinit(self.allocator);
+        self.finishing_disk = null;
     }
 
     /// Free everything an Entry owns: token buffer, KV snapshot, SSM
@@ -1217,8 +1226,12 @@ pub const HotPrefixCache = struct {
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
-                const restored = d.restoreIntoHybrid(target_cache, ssm_entries, hm.idx, disk_cp, s) catch |err| {
+                const disk_floor: u32 = @intCast(ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS);
+                const restored = d.restoreIntoHybridCovered(target_cache, ssm_entries, hm.idx, disk_cp, disk_floor, s) catch |err| {
                     log.warn("  [disk-cache] hybrid restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                    // An unreadable file fails the same way on every later lookup; a coverage miss
+                    // (no checkpoint, QSA gap) can still serve a shorter prefix, so it stays.
+                    if (err == error.MlxError) _ = d.poisonId(d.entries.items[hm.idx].id, @errorName(err));
                     // A failed restore can leave the cache AND ssm entries
                     // half-rebuilt; reset both before the fall-through.
                     target_cache.truncate(0, s) catch {};
@@ -1265,6 +1278,7 @@ pub const HotPrefixCache = struct {
             const sw = io_util.Stopwatch.init(d.io);
             d.restorePrefixInto(target_cache, dm.idx, @intCast(final_len), s) catch |err| {
                 log.warn("  [disk-cache] restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                if (err == error.MlxError) _ = d.poisonId(d.entries.items[dm.idx].id, @errorName(err));
                 // A failed restore can leave a half-rebuilt cache; reset it.
                 target_cache.truncate(0, s) catch {};
                 break :disk;
@@ -1496,7 +1510,7 @@ pub const HotPrefixCache = struct {
         if (!checkoutEligible(
             self.ssd_first,
             restoreMoveEnabled(),
-            self.pending_disk != null,
+            self.pending_disk != null or self.finishing_disk != null,
             e.tokens.len,
             shared,
             prompt_len,
@@ -1515,7 +1529,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items) |*e| {
             if (e.last_used != used) continue;
             if (e.checked_out_by != null) return false;
-            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, self.last_restored_shared, prompt_len, true)) return false;
+            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null or self.finishing_disk != null, e.tokens.len, self.last_restored_shared, prompt_len, true)) return false;
             e.checked_out_by = slot_id;
             log.info("  [hot-cache] checked out {d}-token entry to the slot (the share does not fit; the append donates in place)\n", .{e.tokens.len});
             return true;
@@ -2153,7 +2167,17 @@ pub const HotPrefixCache = struct {
         mtp: ?DflashCommit,
     ) void {
         if (self.pending_disk) |*old| {
-            old.deinit(self.allocator);
+            // A commit that extends the pending prefix covers it; another session's is parked for
+            // the flushes to finish. At most one waits: an older one still parked is dropped.
+            if (old.has_tools != has_tools or !std.mem.startsWith(u32, tokens, old.tokens)) {
+                if (self.finishing_disk) |*f| {
+                    log.info("  [disk-cache] dropped an unfinished {d}-token snapshot for a newer session's\n", .{f.tokens.len});
+                    f.deinit(self.allocator);
+                }
+                self.finishing_disk = old.*;
+            } else {
+                old.deinit(self.allocator);
+            }
             self.pending_disk = null;
         }
         var snap = source_cache.snapshot() catch |err| {
@@ -2340,6 +2364,29 @@ pub const HotPrefixCache = struct {
         return "partial copy";
     }
 
+    /// One bounded append of a pending snapshot; null when it failed (logged).
+    fn appendPending(d: *kv_disk_cache.DiskTier, pending: *PendingDiskFlush, s: mlx.mlx_stream) ?kv_disk_cache.PersistOutcome {
+        const p_dflash: ?kv_disk_cache.SpecCommit = if (pending.dflash) |*df| .{
+            .entries = df.snapshot.entries,
+            .step = df.snapshot.step,
+            .config = df.snapshot.config,
+            .base_pos = df.base_pos,
+        } else null;
+        const p_mtp: ?kv_disk_cache.SpecCommit = if (pending.mtp) |*mm| .{
+            .entries = mm.snapshot.entries,
+            .step = mm.snapshot.step,
+            .config = mm.snapshot.config,
+            .base_pos = mm.base_pos,
+            .head_aux = if (mm.head_aux) |*ha| ha else null,
+            .head_pos_base = mm.head_pos_base,
+            .head_marks = mm.head_marks.slice(),
+        } else null;
+        return d.appendCommitWithSpec(pending.snapshot.entries, pending.snapshot.step, pending.snapshot.config, pending.tokens, pending.has_tools, pending.ssm_cps, p_dflash, p_mtp, s) catch |err| {
+            log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
+            return null;
+        };
+    }
+
     /// Flush the most recent commit to the SSD tier. Called by the scheduler
     /// AFTER `markFinished` (the client already has its response) — the
     /// chunk-append is bounded (partial tail + new chunks) but synchronous on
@@ -2349,43 +2396,26 @@ pub const HotPrefixCache = struct {
         if (!self.disk_dirty) return;
         self.disk_dirty = false;
         const d = if (self.disk) |*dd| dd else return;
-        // Flush the live state captured at commit, not what the RAM entry retained after its trim.
+        // A parked snapshot first; the commit that displaced it is still owed, so stay dirty.
+        if (self.finishing_disk) |*f| {
+            self.disk_dirty = true;
+            const out = appendPending(d, f, s);
+            if (out == null or out.? != .partial) {
+                f.deinit(self.allocator);
+                self.finishing_disk = null;
+            }
+            return;
+        }
+        // Flush the live state captured at commit, not what the RAM entry retained after its trim:
+        // one bounded slice per flush, the snapshot kept until it lands whole.
         if (self.pending_disk) |*pending| {
-            defer {
+            const out = appendPending(d, pending, s);
+            if (out != null and out.? == .partial) {
+                self.disk_dirty = true;
+            } else {
                 pending.deinit(self.allocator);
                 self.pending_disk = null;
             }
-            const p_dflash: ?kv_disk_cache.SpecCommit = if (pending.dflash) |*df| .{
-                .entries = df.snapshot.entries,
-                .step = df.snapshot.step,
-                .config = df.snapshot.config,
-                .base_pos = df.base_pos,
-            } else null;
-            const p_mtp: ?kv_disk_cache.SpecCommit = if (pending.mtp) |*mm| .{
-                .entries = mm.snapshot.entries,
-                .step = mm.snapshot.step,
-                .config = mm.snapshot.config,
-                .base_pos = mm.base_pos,
-                .head_aux = if (mm.head_aux) |*a| a else null,
-                .head_pos_base = mm.head_pos_base,
-                .head_marks = mm.head_marks.slice(),
-            } else null;
-            const ok = d.appendCommitWithSpec(
-                pending.snapshot.entries,
-                pending.snapshot.step,
-                pending.snapshot.config,
-                pending.tokens,
-                pending.has_tools,
-                pending.ssm_cps,
-                p_dflash,
-                p_mtp,
-                s,
-            ) catch |err| {
-                log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
-                return;
-            };
-            // `.partial` is the only outcome with more to write.
-            if (!ok.nothingPending()) self.disk_dirty = true;
             return;
         }
         if (self.entries.items.len == 0) return;
@@ -2961,10 +2991,7 @@ pub const HotPrefixCache = struct {
         // Suspect state must die on both tiers.
         if (self.disk) |*d| d.invalidateAll();
         self.disk_dirty = false;
-        if (self.pending_disk) |*p| {
-            p.deinit(self.allocator);
-            self.pending_disk = null;
-        }
+        self.dropPendingSnapshots();
         if (self.entries.items.len == 0) return;
         log.info("  [hot-cache] invalidating all {d} entries: {s}\n", .{ self.entries.items.len, reason });
         for (self.entries.items) |*e| {
@@ -2980,7 +3007,8 @@ pub const HotPrefixCache = struct {
     /// requests remain untouched (improvement over the legacy nuke-everything).
     pub fn invalidateLatest(self: *HotPrefixCache, reason: []const u8) void {
         if (self.disk) |*d| d.invalidateNewest();
-        self.disk_dirty = false;
+        // The parked snapshot is an earlier, healthy session's: it still lands.
+        self.disk_dirty = self.finishing_disk != null;
         if (self.pending_disk) |*p| {
             p.deinit(self.allocator);
             self.pending_disk = null;
@@ -3784,6 +3812,50 @@ test "HotPrefixCache: dflash + mtp snapshots survive the SSD tier across a resta
         try testing.expectEqual(@as(usize, 0), dfl3.step);
         try testing.expectEqual(@as(usize, 42), dbase3); // untouched
     }
+}
+
+test "HotPrefixCache: an SSD entry that fails to restore is poisoned, not retried" {
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-bad", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        _ = try hc.commit(&cache, &tokens, false);
+        hc.flushPendingDisk(s);
+    }
+    // A chunk whose bytes rotted at the same size: the scan's size check passes, the load fails.
+    var path_buf: [64]u8 = undefined;
+    const chunk = try std.fmt.bufPrint(&path_buf, "fp-bad/e1/c000000.safetensors", .{});
+    const st = try tmp.dir.statFile(io, chunk, .{});
+    const junk = try testing.allocator.alloc(u8, @intCast(st.size));
+    defer testing.allocator.free(junk);
+    @memset(junk, 0xff);
+    try tmp.dir.writeFile(io, .{ .sub_path = chunk, .data = junk });
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-bad", 0, 128);
+    defer hc2.deinit();
+    const id = hc2.disk.?.entries.items[0].id;
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 0), res.matched);
+    try testing.expect(hc2.disk.?.entryPoisoned(id));
+    mlx.dropLatchedErrorUnless(false);
 }
 
 test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {
@@ -7522,6 +7594,90 @@ test "SSD-first: the disk flush carries the full prefix while RAM keeps a trim" 
     }
 }
 
+/// SSD-first tier over a tmp dir with one KV chunk per flush; the caller frees `tmp` and `hc`.
+fn testBoundedSsdFirst(tmp: *std.testing.TmpDir, buf: []u8, row_bytes: u64) !HotPrefixCache {
+    const root_len = try tmp.dir.realPath(std.testing.io, buf);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, row_bytes * 768);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, std.testing.io, buf[0..root_len], "fp-ssd-bounded", 0, 128);
+    hc.disk.?.max_flush_bytes = 1; // one chunk per append
+    return hc;
+}
+
+test "SSD-first: a bounded flush keeps its snapshot and lands it whole over later flushes, one chunk each (#797)" {
+    const s = mlx.gpuStream();
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 1200);
+    var probe = try cache.snapshot();
+    const row_bytes = HotPrefixCache.snapshotRowBytes(&probe);
+    probe.deinit();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var hc = try testBoundedSsdFirst(&tmp, &buf, row_bytes);
+    defer hc.deinit();
+
+    _ = try hc.commit(&cache, &tokens, false);
+    try testing.expect(hc.entries.items[0].tokens.len < tokens.len); // RAM holds only a trim
+    var landed: u32 = 0;
+    var flushes: usize = 0;
+    while (hc.pending_disk != null and flushes < 32) : (flushes += 1) {
+        hc.flushPendingDisk(s);
+        const now = hc.disk.?.entries.items[0].kv_len;
+        try testing.expect(now - landed <= 128); // the readback bound holds per flush
+        landed = now;
+    }
+    try testing.expect(flushes > 1);
+    try testing.expectEqual(@as(u32, tokens.len), hc.disk.?.entries.items[0].kv_len);
+}
+
+fn testDiskLen(d: *const kv_disk_cache.DiskTier, first_token: u32) u32 {
+    for (d.entries.items) |e| {
+        if (e.tokens.len > 0 and e.tokens[0] == first_token) return e.kv_len;
+    }
+    return 0;
+}
+
+test "SSD-first: a different session's commit parks the pending snapshot; later flushes land both whole, one chunk each (#797)" {
+    const s = mlx.gpuStream();
+    var a_tokens: [1200]u32 = undefined;
+    for (&a_tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var b_tokens: [1200]u32 = undefined;
+    for (&b_tokens, 0..) |*t, i| t.* = @intCast(i + 50_000);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 1200);
+    var probe = try cache.snapshot();
+    const row_bytes = HotPrefixCache.snapshotRowBytes(&probe);
+    probe.deinit();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var hc = try testBoundedSsdFirst(&tmp, &buf, row_bytes);
+    defer hc.deinit();
+
+    _ = try hc.commit(&cache, &a_tokens, false);
+    hc.flushPendingDisk(s); // one slice of A
+    const d = &hc.disk.?;
+    const a_sliced = testDiskLen(d, a_tokens[0]);
+    try testing.expect(a_sliced < a_tokens.len);
+    _ = try hc.commit(&cache, &b_tokens, false); // B's commit writes nothing of A
+    try testing.expectEqual(a_sliced, testDiskLen(d, a_tokens[0]));
+    var written: u32 = a_sliced;
+    var flushes: usize = 0;
+    while ((hc.pending_disk != null or hc.finishing_disk != null) and flushes < 64) : (flushes += 1) {
+        hc.flushPendingDisk(s);
+        const now = testDiskLen(d, a_tokens[0]) + testDiskLen(d, b_tokens[0]);
+        try testing.expect(now - written <= 128); // the readback bound holds per flush
+        written = now;
+    }
+    try testing.expectEqual(@as(u32, a_tokens.len), testDiskLen(d, a_tokens[0]));
+    try testing.expectEqual(@as(u32, b_tokens.len), testDiskLen(d, b_tokens[0]));
+}
+
 test "SSD-first companion: a restore adopts the entry's buffer when its capacity suffices" {
     // A grow is not in place, so a restore must land in the donor's buffer (which already
     // carries the previous turn's reservation) rather than allocate the entry's whole size.
@@ -7636,6 +7792,12 @@ test "SSD-first: an idle entry spills to disk and leaves RAM; the active session
     }
 }
 
+/// The idle-spill path's premise: an entry only in RAM, its pending snapshot already gone.
+fn testDropPending(hc: *HotPrefixCache) void {
+    if (hc.pending_disk) |*p| p.deinit(testing.allocator);
+    hc.pending_disk = null;
+}
+
 test "SSD-first: an in-flight write does not stall the tick — the entry is re-checked next pass" {
     // The durability check must not drain the writer on the inference thread: an entry whose
     // files are still staged is not evictable on this pass, and the next pass evicts.
@@ -7667,6 +7829,8 @@ test "SSD-first: an in-flight write does not stall the tick — the entry is re-
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
     _ = try hc.commit(&cache, &tok_a, false);
+
+    testDropPending(&hc); // the spill path: A only in RAM
     _ = try hc.commit(&cache, &tok_b, false);
 
     hc.disk.?.writer.?.setPaused(true);
@@ -7878,6 +8042,8 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         hc.disk.?.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
 
         _ = try hc.commit(&cache, &tokens_a, false);
+
+        testDropPending(&hc); // the spill path: A only in RAM
         _ = try hc.commit(&cache, &tokens_b, false);
         hc.spillIdleEntries(s);
         try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
@@ -7900,6 +8066,7 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         defer hc.deinit();
         hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
         _ = try hc.commit(&cache, tokens_a[0..400], false);
+        testDropPending(&hc); // the spill path: A only in RAM
         _ = try hc.commit(&cache, tokens_b[0..400], false);
         hc.spillIdleEntries(s);
         try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
@@ -7922,6 +8089,7 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         defer hc.deinit();
         hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
         _ = try hc.commit(&cache, &tokens_a, false);
+        testDropPending(&hc); // the spill path: A only in RAM
         _ = try hc.commit(&cache, &tokens_b, false);
         for (hc.entries.items) |*e| {
             if (std.mem.eql(u32, e.tokens, &tokens_a)) e.snapshot.entries[1].offset = 300;
@@ -7959,6 +8127,8 @@ test "SSD-first: a PARTIAL copy is not a copy — the idle entry stays resident"
     hc.disk.?.max_flush_bytes = 1;
 
     _ = try hc.commit(&cache, &tokens_a, false);
+
+    testDropPending(&hc); // the spill path: A only in RAM
     _ = try hc.commit(&cache, &tokens_b, false);
     hc.spillIdleEntries(s);
     hc.disk.?.drainWriter();
@@ -8868,6 +9038,8 @@ test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry �
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
     _ = try hc.commit(&cache, &tok_a, false);
+
+    testDropPending(&hc); // the spill path: A only in RAM
     _ = try hc.commit(&cache, &tok_b, false);
 
     // Pass N: the writer is held, so A's files stay staged.
@@ -8947,6 +9119,8 @@ test "SSD-first: a write failure inside the SAME pass still keeps the entry resi
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
     _ = try hc.commit(&cache, &tok_a, false);
+
+    testDropPending(&hc); // the spill path: A only in RAM
     _ = try hc.commit(&cache, &tok_b, false);
     hc.disk.?.writer.?.injectFailure("c000002", .submit);
     hc.spillIdleEntries(s);
@@ -8991,6 +9165,8 @@ test "SSD-first: a spill pass probes the volume only for a store, never for a co
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
     _ = try hc.commit(&cache, &tok_a, false);
+
+    testDropPending(&hc); // the spill path: A only in RAM
     _ = try hc.commit(&cache, &tok_b, false);
     _ = try hc.commit(&cache, &tok_c, false);
 
@@ -9052,6 +9228,8 @@ test "SSD-first: the durability check STATS the chunks — a truncated file is n
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
     _ = try hc.commit(&cache, &tok_a, false);
+
+    testDropPending(&hc); // the spill path: A only in RAM
     _ = try hc.commit(&cache, &tok_b, false);
 
     // Pass 1 stages A with the writer held; pass 2, after the files land, is the healthy control.

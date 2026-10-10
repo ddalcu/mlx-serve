@@ -38,6 +38,18 @@ brew install --cask mlx-serve  # the app (recommended)
 brew install mlx-serve         # CLI + server only, no GUI
 ```
 
+To upgrade, name the package (the app also updates itself from its menu):
+
+```bash
+brew update
+brew upgrade --cask mlx-serve  # the app
+brew upgrade mlx-serve         # the CLI
+```
+
+### Linux (NVIDIA)
+
+Every release attaches `mlx-serve-linux-x64-cuda13.tar.gz` (RTX 20–50 series) and `mlx-serve-linux-arm64-cuda13.tar.gz` (GH200, Jetson Thor, DGX Spark). They need an NVIDIA driver ≥ 580, the CUDA 13 toolkit, cuDNN 9, OpenBLAS/LAPACKE, libwebp and the Avahi dns_sd compat library. Unpack into an empty folder (the tarball has no top-level directory) and run `zig-out/bin/mlx-serve`; it finds its libraries next to itself.
+
 ### Prefer the terminal?
 
 Ollama-style, if that's your habit:

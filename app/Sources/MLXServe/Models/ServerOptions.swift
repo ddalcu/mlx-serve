@@ -1014,11 +1014,11 @@ extension ServerOptions {
     static let serverFlagFields: [String: ServerOptionField] = [
         "host": .init(
             title: "Host",
-            explainer: "Bind address. 0.0.0.0 lets other devices on your network reach the server; 127.0.0.1 is local-only. The app itself connects via 127.0.0.1, so pick an address that includes localhost.",
+            explainer: "0.0.0.0 lets other devices on your network connect; 127.0.0.1 keeps the server on this Mac.",
             needsRestart: true),
         "port": .init(
             title: "Port",
-            explainer: "HTTP port the server listens on (default 11234). Change if it conflicts with another local service.",
+            explainer: "The port the server listens on; change it only if another app uses it.",
             needsRestart: true),
         "ctxSize": .init(
             title: "Context size",
@@ -1026,176 +1026,176 @@ extension ServerOptions {
             needsRestart: true),
         "noVision": .init(
             title: "Disable vision",
-            explainer: "Skip loading the SigLIP image encoder. Saves ~3 GB of memory on text-only workloads.",
+            explainer: "Skip loading image support to save about 3 GB of memory.",
             needsRestart: true),
         "logLevel": .init(
             title: "Log level",
-            explainer: "Server log verbosity. Use 'debug' to capture Jinja errors, KV cache hits and per-request token counts.",
+            explainer: "How much detail goes into the server log; use debug when troubleshooting.",
             needsRestart: true),
         "logToFile": .init(
             title: "Log to file",
-            explainer: "Write the server log to ~/.mlx-serve/logs/mlx-serve-<port>.log (32 MB rotation, one file per port). This is the file to check after a crash — the in-app log viewer only holds what arrived while the app was running.",
+            explainer: "Save the server log to ~/.mlx-serve/logs so you can check it after a crash.",
             needsRestart: true),
         "requestTimeout": .init(
             title: "Request timeout (s)",
-            explainer: "Max seconds a single HTTP request is allowed to take. 0 = unlimited. Long agent loops may need 600+.",
+            explainer: "How long one request may run, in seconds; 0 means no limit.",
             needsRestart: true),
         "enableMetrics": .init(
             title: "Metrics panel",
-            explainer: "Expose Prometheus metrics at /metrics and a live throughput/latency/GPU/memory panel on the server index page. Zero cost when off.",
+            explainer: "Show live speed and memory charts on the server's web page.",
             needsRestart: true),
         "apiKey": .init(
             title: "API key",
-            explainer: "Require this key for requests from OTHER machines (the OpenAI/Anthropic/Ollama APIs + index page + metrics). Sent as Authorization: Bearer, x-api-key, HTTP Basic, or ?api_key=. Localhost is trusted, so this app never needs it — it protects the server when exposed on the network. Blank = no auth.",
+            explainer: "A key other devices must send to use this server; this Mac never needs it.",
             needsRestart: true),
         "lanShareEnabled": .init(
             title: "Share my models on this network",
-            explainer: "Advertise this Mac over Bonjour and let other Macs on your local network run inference on the models you share below. Only inference is exposed — model management, metrics, and the status page stay private to this Mac.",
+            explainer: "Let other Macs on your network use the models you share.",
             needsRestart: true),
         "lanShareAll": .init(
             title: "Share all models",
-            explainer: "Share everything in your library (chat AND image/audio/video/3D). Turn off to pick individual models.",
+            explainer: "Share every model, or turn off to choose which ones.",
             needsRestart: true),
         "lanName": .init(
             title: "Shown to others as",
-            explainer: "The name other Macs see next to your shared models. Blank = this Mac's hostname.",
+            explainer: "The name other Macs see; leave blank to use this Mac's name.",
             needsRestart: true),
         "lanDiscoverEnabled": .init(
             title: "Use models shared by other Macs",
-            explainer: "Discover models other mlx-serve hosts share on this network. They appear in the model pickers as \u{201C}model · peer\u{201D} and run on the hosting Mac — nothing to download.",
+            explainer: "Show models other Macs share, which run on their Mac.",
             needsRestart: true),
         "toolAutocorrect": .init(
             title: "Tool-call auto-correct",
-            explainer: "Coerce tool-call arguments to the types the tool schema declares (e.g. a model sending Python's \"False\" or a list-as-string) so strict clients like Claude Code stop rejecting them with \"expected boolean, provided string\". Recommended on. Turn off to pass the model's arguments through exactly as written.",
+            explainer: "Fix tool-call arguments that don't match the types the tool expects.",
             needsRestart: true),
         "enableMTP": .init(
             title: "Multi-Token Prediction (recommended)",
-            explainer: "Qwen 3.5 / 3.8 models that ship a trained MTP head guess several of the next tokens at once and check them all in a single pass — typically a big speed-up on replies, with output identical to normal decoding. It switches on by itself for models that have the head, and does nothing for models that don't, so there's rarely a reason to turn it off.",
+            explainer: "Makes supported Qwen models reply faster with the same output.",
             needsRestart: true),
         "mtpDepth": .init(
             title: "Tokens guessed ahead",
-            explainer: "How many tokens the MTP head guesses per step. Automatic (recommended) tunes this live — it guesses deeper while the model keeps accepting the guesses and backs off when it doesn't. Pick a fixed number only if you're measuring performance.",
+            explainer: "How far ahead MTP guesses; Automatic adjusts it as it goes.",
             needsRestart: true),
         "enableDSpark": .init(
             title: "DSpark draft stages (DeepSeek‑V4)",
-            explainer: "DeepSeek‑V4‑Flash ships its own 3‑stage speculative draft (DSpark). Enabling it loads about 11 GB of extra draft weights at startup, so it stays off unless you turn it on — and the server still refuses when the Mac doesn't have the memory for model + draft + working room, serving normally instead. For DeepSeek‑V4 GGUF files this arms the embedded ds4 engine's DSpark runtime instead, using the DSpark support GGUF downloaded beside the model (nothing happens without that file). Only affects DeepSeek‑V4 models; greedy (temperature 0) requests only.",
+            explainer: "Faster DeepSeek-V4 replies for about 11 GB of extra memory.",
             needsRestart: true),
         "anePrefill": .init(
             title: "Neural Engine prefill boost",
-            explainer: "Runs part of long-prompt processing on the Apple Neural Engine in parallel with the GPU, so big prompts start answering sooner — measured 19–26% faster prompt processing at 16k–32k tokens on an M4 Max with Qwen family models (4, 6 and 8-bit builds alike). Reply speed is unchanged. The server checks the exact fit at load and declines by name when this Mac can't hold it. First load of a model adds a one-time compile of about 1–2 minutes. Models it can't accelerate simply serve normally. Not recommended on M5-family Macs yet: their GPUs carry neural accelerator (NAX) cores that already speed up prompt processing, so the Neural Engine's extra help shrinks to little or nothing there.",
+            explainer: "Read long prompts faster with the Neural Engine (little gain on M5 Macs); the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: about 1 GB more for a small model, up to 11 GB for a 27B. Disk: roughly as much again for its compiled copy."),
         "aneImage": .init(
             title: "Neural Engine image boost",
-            explainer: "Runs part of image generation on the Neural Engine alongside the GPU. Measured 1.30x on an M4 Max and 1.77x on an M1 Pro with Krea — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. The split is solved per Mac and model at the first request, which adds a one-time compile of about a minute. Off by default; the server declines by name when this Mac cannot hold it.",
+            explainer: "Generate images faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 5–7 GB more while Krea is loaded, plus up to 4 GB during the one-time build. Disk: 3.5–6.6 GB once; every image size shares it."),
         "aneVideo": .init(
             title: "Neural Engine video boost",
-            explainer: "Runs part of video generation on the Neural Engine alongside the GPU. Measured 1.22x per denoise step on an M4 Max with MiniMax-H3. The split is solved per Mac and model; H3 rebuilds it per request (about 30 s cold, 8 s warm), so it pays on long renders. Blocks that carry a LoRA (the Turbo recipe) stay on the GPU. Off by default; the server declines by name when this Mac cannot hold it.",
+            explainer: "Generate videos faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 7–10 GB more while MiniMax-H3 is loaded, plus up to 3.6 GB while it builds, on every request. Disk: 5–9 GB once; every resolution and frame count shares it."),
         "aneAudio": .init(
             title: "Neural Engine music boost",
-            explainer: "Runs part of music generation on the Neural Engine alongside the GPU. Measured 1.33x on an M4 Max, 1.58x on an M4 base — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. Off by default; the server declines by name when this Mac cannot hold it.",
+            explainer: "Generate music faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
-            explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content. On models with a native MTP head, MTP takes priority and PLD stays dormant — except MoE models (e.g. 35B-A3B), where PLD is the default speedup.",
+            explainer: "Speeds up replies that repeat text from the conversation, like code edits.",
             needsRestart: true),
         "pldDraftLen": .init(
             title: "PLD draft length",
-            explainer: "Maximum draft tokens proposed per PLD step (default 5). Higher = bigger speedup when matches hit, more wasted work when they miss.",
+            explainer: "How many tokens to copy ahead with each guess.",
             needsRestart: true),
         "pldKeyLen": .init(
             title: "PLD key length",
-            explainer: "N-gram match key length for PLD lookup (default 3). Shorter keys = more matches, lower precision.",
+            explainer: "How many matching tokens it takes to start a guess.",
             needsRestart: true),
         "maxConcurrent": .init(
             title: "Concurrent requests",
-            explainer: "Queue depth for in-flight chat requests. Concurrent requests always decode together; whether they share one forward pass depends on the loaded model (shown below). Dense and Qwen3.5/3.8 models batch, other MoE and hybrid models take turns.",
+            explainer: "How many requests the server works on at once.",
             needsRestart: true),
         "decodeAttnQuant": .init(
             title: "Fast decode for bf16-attention models (recommended)",
-            explainer: "Serves decode from quantized copies of attention weights that ship un-quantized (bf16): 8-bit for most layers, 4-bit for the last fifth, where quantization error matters far less. Models like poolside Laguna decode ~25% faster overall. Slightly lossy: replies can differ in wording from the exact bf16 decode, but measured answers stay the same quality (prompt reading and speculative checks keep the exact weights). Flipping this ON (rather than leaving it untouched) also enables DeepSeek-V4's compressor-input requant — ~7% faster decode there, with rare wording-level artifacts. Models with fully quantized attention are unaffected. Turn off for bit-exact bf16 decoding.",
+            explainer: "Faster replies on models with unquantized attention, with slightly different wording.",
             needsRestart: true),
         "kvQuant": .init(
             title: "KV cache quantization",
-            explainer: "A memory-for-speed trade, not a free upgrade: shrinks KV-cache RAM (8-bit ≈ 2× smaller, 4-bit ≈ 4×) but makes decode ~10% slower at typical contexts — and slower still on long ones, since every generated token pays a dequantize step. Turn on when memory is the constraint (long contexts or big models on a 16 GB Mac); leave OFF for maximum tokens/sec if you have plenty of RAM.",
+            explainer: "Uses less memory for long chats but replies about 10% slower, so leave it off if you have plenty of memory.",
             needsRestart: true),
         "hotPrefixCacheEnabled": .init(
             title: "Hot prefix cache",
-            explainer: "Keep completed KV prefixes in RAM for fastest repeated turns. Turn off to keep only the live request KV in memory; with SSD prefix cache enabled, prefixes still persist across turns and restarts and restore from disk.",
+            explainer: "Keep recent conversations in memory so follow-ups start faster.",
             needsRestart: true),
         "prefixCacheEntries": .init(
             title: "Prefix cache entries",
-            explainer: "How many separate KV snapshots to retain in RAM while Hot prefix cache is on. Auto-capped on RAM-limited Macs; SSD persistence is controlled separately.",
+            explainer: "How many conversations to keep in memory.",
             needsRestart: true),
         "prefixCacheMem": .init(
             title: "Prefix cache memory cap",
-            explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Empty = Auto: 2GB, or enough for one full-length conversation on long-context hybrid models, so their longest chats restore instead of re-reading the tail.",
+            explainer: "The most memory the conversation cache may use; leave blank to choose automatically.",
             needsRestart: true),
         "pleGpu": .init(
             title: "Keep n-gram table in memory (Qwen3.8-Flash-Next)",
-            explainer: "Qwen3.8-Flash-Next looks up rows in a ~30 GB n-gram table on every token. Off (default): the table stays on disk and only the rows a prompt needs are read, so it costs almost no memory. On: the whole table is loaded into GPU memory beside the weights, for a few percent faster prompt processing and up to ~15% faster replies at long context. On a Mac without ~30 GB to spare, the first request after a load can stall for a minute or more while the table is pulled in. Other models ignore this setting.",
+            explainer: "Faster long-context Qwen3.8 Flash Next replies for about 30 GB of extra memory.",
             needsRestart: true,
             cost: "Memory: about 30 GB more while Qwen3.8-Flash-Next is loaded."),
         "enablePrefixCacheDisk": .init(
             title: "SSD prefix cache",
-            explainer: "Persist seen KV prefixes to disk (~/.mlx-serve/kv-cache) so they survive restarts + RAM evictions — turns a cold 30-50s long-context first-token wait into a fast SSD read. OFF by default because it can use many gigabytes of disk.",
+            explainer: "Save conversations to disk so they pick up quickly after a restart.",
             needsRestart: true),
         "prefixCacheDisk": .init(
             title: "SSD cache size",
-            explainer: "Disk budget for the SSD prefix cache when enabled. Accepts '10GB', '2GB', etc. LRU-evicted to this cap. Only used when 'SSD prefix cache' is on.",
+            explainer: "The most disk space the SSD cache may use.",
             needsRestart: true),
         "maxResidentMemGB": .init(
             title: "Model memory cap",
-            explainer: "Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem.",
+            explainer: "The most memory loaded models may use before one is unloaded.",
             needsRestart: true),
         "maxResidentModels": .init(
             title: "Max models loaded at once",
-            explainer: "How many models the server keeps resident before it evicts the least-recently-used one to make room for the next. Switching models in the composer's picker never explicitly unloads the old one — it relies on this cap. Set to 1 so every switch unloads the previous model first, freeing its memory immediately. Passes --max-resident-models.",
+            explainer: "How many models stay loaded before the oldest is unloaded.",
             needsRestart: true),
         "idleEvictSecs": .init(
             title: "Unload idle models",
-            explainer: "Free a model's memory once it has served nothing for this long; the next request reloads it. Off by default. Turn it on when something else needs the RAM between sessions. The trade is paid on the next request: a cold load (seconds to a minute for a large model) plus a full re-prefill of the conversation, and if the memory is gone by then the reload is refused and that request fails. A model with a request in flight is never evicted. Passes --idle-evict-secs.",
+            explainer: "Unload a model after it sits unused this long; your next message reloads it.",
             needsRestart: true),
         "osReserveGiB": .init(
             title: "Keep a memory reserve for macOS",
-            explainer: "Free RAM the server leaves out of its plans so macOS always has room. Auto is an eighth of your RAM (2 to 8 GB). A smaller size, or Off, gives models more context and admits more requests at once, but on a small Mac under heavy load less reserve can freeze or restart the machine.",
+            explainer: "Memory kept free for macOS and your other apps.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",
-            explainer: "Bypass the safety check that refuses to load an MLX model when free RAM looks too low for its weights plus warmup headroom. The check is conservative — macOS reclaims file cache as the model loads — so turn this on if a load you know fits is being refused. A genuine over-commit can hard-crash the server. Passes --skip-mem-preflight.",
+            explainer: "Load models even when memory looks too low, which can crash the server.",
             needsRestart: true),
         "mlxGguf": .init(
             title: "Serve GGUF files on MLX (experimental)",
-            explainer: "Let mlx-serve-gguf serve the .gguf files it supports on MLX itself, with the MLX prefix cache and spec decode, instead of handing every .gguf to llama.cpp. Files it cannot serve still go to llama.cpp or ds4. Experimental: turn it off if a GGUF model misbehaves. Passes --mlx-gguf.",
+            explainer: "Run supported .gguf files on the MLX engine instead of llama.cpp (experimental).",
             needsRestart: true),
         "llamaKvQuant": .init(
             title: "KV cache quantization",
-            explainer: "llama.cpp's KV-quant scheme (ggml Q8_0 / Q4_0). Same trade as the MLX version: less KV RAM, slower decode — leave off for maximum tokens/sec if you have plenty of RAM. Distinct kernels from the MLX KV-quant; auto-enables flash-attn on the server side when non-default.",
+            explainer: "Uses less memory for llama.cpp models but replies slower, so leave it off if you have plenty of memory.",
             needsRestart: true),
         "llamaCacheEntries": .init(
             title: "Parallel sequences",
-            explainer: "How many requests llama.cpp decodes at once, in one batch, each keeping its own prompt cache warm. Agent clients send several requests together; with 1 they wait in line. Each sequence holds a full context of KV memory from the moment the model loads, so lower it if a large context does not fit. Passes --llama-cache-entries.",
+            explainer: "How many requests llama.cpp answers at once, each with its own memory.",
             needsRestart: true),
         "llamaMtpDrafts": .init(
             title: "MTP draft tokens",
-            explainer: "For a GGUF with an MTP head (its own, or an mtp-*.gguf file beside it, as in unsloth's MTP folder), guess this many tokens ahead and check them in one pass: a faster reply with the same output. Drafts only while one request is decoding; with company the batch is faster. 0 turns it off and skips loading the head. Passes --llama-mtp-drafts.",
+            explainer: "How many tokens to guess ahead for GGUF models with an MTP head; 0 turns it off.",
             needsRestart: true),
         "llamaUbatch": .init(
             title: "Prefill batch size",
-            explainer: "How many prompt tokens llama.cpp processes per GPU pass. Larger batches read long prompts faster, mostly on MoE models, and take more scratch memory. Default is llama.cpp's 512. Passes --llama-ubatch.",
+            explainer: "How much of a prompt llama.cpp reads at a time; larger is faster but uses more memory.",
             needsRestart: true),
         "ssdStreaming": .init(
             title: "SSD weight streaming",
-            explainer: "Stream DeepSeek-V4-Flash expert weights from SSD instead of holding the whole model in RAM (skips full residency + warmup). Turn on when the model is larger than available memory — it loads instead of OOMing, trading some decode speed for the disk reads. ds4 / DeepSeek-V4-Flash only; ignored by the MLX and llama.cpp engines. Passes --ssd-streaming.",
+            explainer: "Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory.",
             needsRestart: true),
         "tokenizeCacheEntries": .init(
             title: "Tokenize cache entries",
-            explainer: "Per-LoadedModel LRU of chat-template render+tokenize results. Skips re-rendering identical message lists on warm reuse — drops warm tokenize_ms from ~240 ms to ~0 on long-prompt repeats. Applies to all engines. 0 disables.",
+            explainer: "Remember recent prompts so repeats start faster; 0 turns it off.",
             needsRestart: true),
     ]
 

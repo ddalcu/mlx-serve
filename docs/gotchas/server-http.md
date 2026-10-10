@@ -2553,3 +2553,95 @@ an unreachable limit (`thinkBoundBudget`). A second loop, an answer-side loop, o
 `max_tokens` keeps the ordinary cut.
 Guard: `loop recovery:` tests in `scheduler.zig`, `thinkBoundBudget` test in `server.zig`.
 
+
+## Bytes past `Content-Length` corrupted the heap (2026-10-10)
+
+Defect: a body longer than its declared `Content-Length` (or a `Content-Length` near 2^64) made
+the server answer the wrong body, then crash minutes later on an unrelated request (a WebSocket
+frame was the first victim in the chaos run). ReleaseFast logs nothing.
+
+Cause: the head was read in 16 KB gulps and copied whole into a buffer sized `head + Content-Length`;
+any extra bytes in the gulp overran it, and `head + Content-Length` wrapped for a near-2^64 length.
+
+Fix: `readRequest` keeps only the declared bytes and adds saturating, so a wrapping length meets the
+413 cap. A `/v1/completions` prompt that encodes to no tokens was the second crash of that run:
+`Scheduler.submit` refuses an empty prompt by name for every surface.
+Guard: `readRequest: bytes past Content-Length are dropped, a wrapping Content-Length is a 413`
+(server.zig), `a streaming fault answers with the SAME mapped error` (`EmptyPrompt`).
+
+## A refused load failed the NEXT request (2026-10-10)
+
+Defect: after `/v1/load-model` on a pack with a corrupt `.safetensors`, or an image request whose
+`lora_paths` named a file that is not safetensors (`/etc/passwd`), the request itself got its error,
+and the next unrelated chat or vision request answered 500 "generation failed".
+
+Cause: MLX's error handler latches every failure; the load's catch and `lora.loadFile` returned the
+error without dropping the latch, so the next prefill's `checkError` found it.
+
+Fix: both sites drop the latch they raised (`dropLatchedErrorUnless(had_error)`), the rule every
+swallowed MLX failure already follows. Guard: `loadFile: a file that is not safetensors fails without
+leaving an MLX error for the next request` (lora.zig).
+
+A media or decision job had the same leak: its handler answered the failure (a 500 even for a Metal
+OOM) and left the latch for the next chat. `runGenJobs` drops what the job raised, and the handlers
+answer a memory failure 503 (`jobFailureStatus`). Guards: `runGenJobs: a latch the job raised is
+dropped…` (scheduler.zig), `jobFailureStatus…` (gen.zig).
+
+## Model churn: six models under a cap of three, and nameless "Model load failed" (2026-10-10)
+
+Defect: 16 clients spread over seven small models (cap 3) left six models resident, and a few
+requests a minute answered 500 "Model load failed" with no error name and nothing in the log.
+
+Cause: the eviction planner counted `.ready` models only, so concurrent cold loads each saw room
+for themselves. And a model that finished loading had refcount 0 until its requester woke and took
+the registry lock: in that gap another load's planner evicted it (or an explicit unload claimed it),
+and the requester read a non-ready entry as a failed load.
+
+Fix: the planner counts other `.loading` entries (`countLoadingLocked`); `ensureLoaded` takes the
+requester's reference when it claims the load (`pinned`, dropped on every error), and an explicit
+unload that wins the race is the 503 "not currently loaded". The refusal log names both caps.
+Guard: `planEvictions: another model still loading counts against the model cap` (model_registry.zig).
+
+## A Stop click mid-flush crashed the server (2026-10-10)
+
+Defect: eight agent clients on Qwen3.8 Flash Next (tools, thinking, random mid-stream disconnects)
+crashed the server within ten minutes: `POINTER_BEING_FREED_WAS_NOT_ALLOCATED` in
+`handleStreamingGeneration`. Small models ran 20-minute storms clean: the window needs several held
+tokens flushing at once while the client hangs up.
+
+Cause: the tools path buffers token texts in `token_texts`; the `.flush_text` arm freed each one with
+a per-iteration `defer` while sending it. A failed send (`WriteFailed`) returned from the handler with
+the list not cleared, and the handler's own defer freed every item again. `/v1/messages` had the same
+arm.
+
+Fix: both arms free and clear the whole list in one arm-scoped defer; the loop body only sends.
+Guard: live only — eight concurrent tool-using streams with random disconnects on Flash Next, 20
+minutes clean (it crashed in ten before the fix).
+
+## A load right after an unload was refused for memory it was about to get (2026-10-10)
+
+Defect: unload GLM-5.3 (174 GB), load it again at once: 503 "only 66 GB is available". A few
+seconds later the same load passed. Under model churn this refused a thousand loads in 15 minutes.
+
+Cause: the unload frees the weights and clears MLX's cache, but the OS unwires 150 GB of pages over
+one to two seconds after that (`vm_stat` wired: 151 GB at the 200, 36 GB a second later, 5 GB after
+two). The preflight read the OS figure once, mid-release. Waiting on the GPU stream does not help:
+the pages are already out of MLX's hands.
+
+Fix: `availForLoad` hands a too-low reading to `settledAvail`, which re-reads every 100 ms while the
+figure still climbs by more than 64 MB, up to 5 s; five flat readings keep the refusal.
+Guard: `settledAvail: a refused reading waits while freed memory still reaches the OS` (scheduler.zig).
+
+## A deeply nested tool schema overflowed a connection thread's stack (2026-10-10)
+
+Defect: a chat request whose tool `parameters` nested an object 50,000 levels deep killed the
+server (SIGBUS in a stack guard page). 10,000 levels answered, in 9 s.
+
+Cause: `std.json` parses with an explicit stack, but re-serializing the tool definitions for the
+template (`chat.fillOptionalToolDefKeys` → `Stringify`) recurses once per level, as do the schema
+walkers behind it, on a thread stack.
+
+Fix: every non-multipart body (and every Responses WebSocket frame) is scanned once for its deepest
+`[`/`{` outside strings (`jsonNestingDepth`) and refused past `MAX_JSON_DEPTH` (4096: above the
+3000-deep contract in `test_api_edges.sh`, far below the overflow).
+Guard: `jsonNestingDepth: brackets inside strings never count` (server.zig).

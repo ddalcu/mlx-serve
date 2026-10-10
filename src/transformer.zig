@@ -36403,9 +36403,10 @@ fn nemotronMoeDecodeExperts(res: *mlx.mlx_array, x_flat: mlx.mlx_array, nm: *con
         return;
     }
 
+    // Batch dims (T, 1) broadcast against the (T, K) indices; (T) alone only does at T == 1.
     var x_rep = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x_rep);
-    try mlx.check(mlx.mlx_reshape(&x_rep, x_flat, &[_]c_int{ t_count, 1, d_dim }, 3, s));
+    try mlx.check(mlx.mlx_reshape(&x_rep, x_flat, &[_]c_int{ t_count, 1, 1, d_dim }, 4, s));
     var inds_tk = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(inds_tk);
     try mlx.check(mlx.mlx_reshape(&inds_tk, inds, &[_]c_int{ t_count, k_count }, 2, s));
@@ -43603,9 +43604,23 @@ pub fn prefillDqGemmEnabled() bool {
     if (prefill_dq_gemm_override) |v| return v;
     if (prefill_dq_gemm_env_cached) |v| return v;
     const raw = std.c.getenv("MLX_SERVE_PREFILL_DQ_GEMM");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    // Off by default on CUDA: there it measured slower than stock qmm (3845 vs 4400 tok/s,
+    // Llama 3.2 3B, RTX 5060 Ti) and its bf16 weight transients stacked ~5 GB into the prefill peak.
+    const enabled = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else !mlx.cudaAvailable();
     prefill_dq_gemm_env_cached = enabled;
     return enabled;
+}
+
+test "prefillDqGemm defaults on where it was measured a win, off on CUDA" {
+    const saved = .{ prefill_dq_gemm_override, prefill_dq_gemm_env_cached };
+    defer {
+        prefill_dq_gemm_override = saved[0];
+        prefill_dq_gemm_env_cached = saved[1];
+    }
+    prefill_dq_gemm_override = null;
+    prefill_dq_gemm_env_cached = null;
+    if (std.c.getenv("MLX_SERVE_PREFILL_DQ_GEMM") != null) return error.SkipZigTest;
+    try std.testing.expectEqual(!mlx.cudaAvailable(), prefillDqGemmEnabled());
 }
 
 /// Test seam: engagement is counted, never inferred from output equality.
@@ -48205,7 +48220,8 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
         const g1 = mlx.mlx_array_data_float32(got_one) orelse return error.MlxArrayDataNull;
         for (0..D) |d| max_err_one = @max(max_err_one, @abs(out[d] - g1[d]));
     }
-    try t.expect(nemotron_gqmv_engaged);
+    // Off Metal the kernel declines and the composed gather_qmm path must meet the same bar.
+    try t.expectEqual(mlx.metalKernelsAvailable(), nemotron_gqmv_engaged);
     try t.expect(std.math.isFinite(max_err) and std.math.isFinite(max_err_one));
     try t.expect(max_ref > 0.1);
     try t.expect(max_err < 1e-3 * max_ref);
@@ -52696,7 +52712,8 @@ test "qmatmulBits keeps row-axis MTP kernels out of plain batched projections" {
             try mlx.check(mlx.mlx_array_eval(y));
             if (msv_qmv_rows_kernel != null) std.debug.print("generic projection invoked MTP row-axis kernel: rows={d} bits={d}\n", .{ rows, bits });
             try testing.expect(msv_qmv_rows_kernel == null);
-            const expected = (try verifyQmm(s, x, w, sc, bi, bits, 64)) orelse blk: {
+            // The dispatch order of qmatmulBits: simd_qmm takes 8+ rows where no verify tile does.
+            const expected = (try simdQmmDecode(x, w, sc, bi, bits, 64, s)) orelse (try verifyQmm(s, x, w, sc, bi, bits, 64)) orelse blk: {
                 var stock = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_quantized_matmul(&stock, x, w, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", s));
                 break :blk stock;
@@ -53353,6 +53370,8 @@ test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefil
 test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other widths from 2048" {
     // Measured on the M4 Max: 2-bit qmm loses to dequant+GEMM from 384 rows
     // (+5%, +10% at 1024); the 2048 floor stays for the widths it was tuned on.
+    prefill_dq_gemm_override = true; // the row floors, whatever the platform default
+    defer prefill_dq_gemm_override = null;
     const s = mlx.gpuStream();
     const K: c_int = 256;
     const N: c_int = 128;
