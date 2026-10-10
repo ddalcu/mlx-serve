@@ -21,7 +21,7 @@
 - **基于提示词的技能** —— 把带 YAML frontmatter 的 `.md` 文件放进 `~/.mlx-serve/skills/`，即可教给 Agent 由关键词触发的自定义能力；或者在聊天框里输入 `/` 挑一个技能，在任何聊天中按名字运行它，无论是否处于 Agent 模式。
 - **引擎感知的设置窗口**（Cmd+,）—— 每一项服务器启动参数与每个请求的默认值，分区只显示与你已加载引擎相关的旋钮（MLX vs GGUF vs ds4）。
 - **服务器管理** —— 启动 / 停止、实时日志缓冲、参数变更后提示重启的横幅。
-- **图像 / 视频 / 音乐 / 语音 / 3D 生成** —— FLUX.2、Krea-2、Mage-Flow、LTX-Video 2.3 / 2.5、MiniMax-H3、ACE-Step、MiniMax Music 3、Qwen3-TTS、Kokoro 和 Hunyuan3D，全部通过 mlx-serve zig 服务器原生运行。
+- **图像 / 视频 / 音乐 / 语音 / 3D 生成** —— FLUX.2、Krea-2、Mage-Flow、LTX-Video 2.3 / 2.5、MiniMax-H3、ACE-Step、MiniMax Music 3、YuE2、Qwen3-TTS、Kokoro 和 Hunyuan3D，全部通过 mlx-serve zig 服务器原生运行。
 
 ## 图像 / 视频 / 音乐 / 语音 / 3D 生成
 
@@ -50,12 +50,14 @@
 | 图像 | FLUX.2-klein 4B 4-bit（mflux，预量化约 5 GB） | FLUX.2-klein 9B（10 GB）、Krea-2-Turbo、Mage-Flow Turbo / Edit 8-bit（8.5 / 9.1 GB） | 8 / 12 / 16 GB |
 | 视频 | LTX-Video 2.5 4-bit（36 GB，自带文本编码器） | LTX-Video 2.5 8-bit（59 GB，更锐利 + 扩散解码器）、LTX-Video 2.3 Q4（约 50 GB）、MiniMax-H3（Hailuo 3.0）4-bit / 8-bit，一趟同时生成视频**和**匹配的音轨 | LTX 24 GB RAM；H3 26 GB（40 GB）或 44 GB（69 GB） |
 | 语音 | Qwen3-TTS 1.7b（语音克隆） | Qwen3-TTS 0.6b、Kokoro-82M（54 种音色，约 345 MB） | 8 GB RAM，首次运行约 3.5 GB 下载 |
-| 音乐 | ACE-Step 1.5 XL Turbo 8-bit（快，8 步） | MiniMax Music 3 8-bit（演唱你的歌词，歌曲最长 6 min，人声最强） | ACE 8 GB RAM，约 6.2 GB 下载；Music 3 约 20 GB RAM，13.6 GB 下载 |
+| 音乐 | ACE-Step 1.5 XL Turbo 8-bit（快，8 步） | MiniMax Music 3 8-bit（演唱你的歌词，歌曲最长 6 min，人声最强）、YuE2 3B 8-bit（先写可编辑的乐谱；非商用许可） | ACE 8 GB RAM，约 6.2 GB 下载；Music 3 约 20 GB RAM，13.6 GB 下载；YuE2 约 10 GB RAM，4.5 GB 下载 |
 | 3D | Hunyuan3D-2.1 8-bit（形状 + PBR 纹理） | — | 16 GB RAM |
 
 > 41 GB 的 LTX 2.3 快照**同时**带有两种 transformer 变体（1 阶段蒸馏版 + 2 阶段 dev 版，每个约 11 GB）外加一个 7.6 GB 的蒸馏 LoRA，因此你可以在 Fast/Good/Quality/Super 之间离线切换，无需重新下载。
 
 > LTX-Video 2.5 自带文本编码器，所以首次使用时没有额外的 8 GB 下载。8-bit 包保住了 4-bit 包丢掉的细节，并新增一个 **Diffusion decoder** 开关（Lightricks 自家发布的片段所用、通过 API 指定 `"decoder": "diffusion"` 的那个解码器），让纹理和边缘更锐利。默认画布和帧阶梯按 Mac 定制；两阶段档位按所选尺寸的一半去噪再放大。
+
+> YuE2 在演唱之前会先规划一份乐谱（ABC 记谱）：音乐页的 **Score** 框选择规划方式（旋律 + 和弦、仅旋律、不要乐谱），并接受你自己写的或改过的乐谱（**Use last score** 会用刚生成那首歌的乐谱填充；每首歌的乐谱也会以 `.abc` 保存在 WAV 旁边）。它需要歌词，标签首字母大写，如 `[Verse]`，没有纯器乐开关，风格提示是用逗号分隔的标签行。
 
 > MiniMax Music 3 需要歌词；`[verse]` 和 `[chorus]` 这类结构标签各占一行。ACE-Step 的速度、调性、拍号和语言控件在它上面不存在，所以把这些信息写进描述文本里。当你向聊天要一首歌时，内置的 **music3** 技能会按该模型训练时所用的描述格式来写。
 

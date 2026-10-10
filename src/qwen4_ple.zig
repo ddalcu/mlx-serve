@@ -174,8 +174,12 @@ pub const EmbeddedTable = struct {
         for (self.shards) |shard| for (shard.parts, 0..) |t, p| {
             const fd = self.files[t.file].fd;
             const out = dst[@intCast(base[p] + shard.first * row_len[p])..][0..t.len];
-            _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
-            defer _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 0));
+            // F_NOCACHE is Darwin-only; Linux reads through the page cache.
+            const nocache = comptime @import("builtin").os.tag.isDarwin();
+            if (nocache) _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
+            defer if (nocache) {
+                _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 0));
+            };
             var done: usize = 0;
             while (done < out.len) {
                 const want = @min(out.len - done, 1 << 30);

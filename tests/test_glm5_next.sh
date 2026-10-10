@@ -2,6 +2,7 @@
 # GLM-5.3-Flash (glm5_next) live end-to-end on an MLX pack (TensorFold's GLM-5.3-Flash-MLX-*):
 #
 #   GLM5_PACK=~/.mlx-serve/models/TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP ./tests/test_glm5_next.sh
+#   (add GLM5_DRAFTER=~/.mlx-serve/models/incoai/GLM-5.3-Flash-DFlash2 for [10])
 #
 #   [0] advertised as glm5_next      [4] tool round-trip renders the template, not the fallback
 #   [1] short answer, thinking off   [5] needle past the indexer's 2048-token budget (sparse path)
@@ -9,6 +10,9 @@
 #       low effort thinks less       [7] streaming carries no think/tool markup
 #   [3] parallel tool calls             [8] the pack's MTP head loads and drafts
 #                                       [9] concurrent requests share one batched forward
+#   [10] with GLM5_DRAFTER=<incoai/GLM-5.3-Flash-DFlash2> (second boot): the DFlash2 round policy engages on
+#        predictable text, stays armed on novel text (plain rounds, never the sticky serial fallback), and
+#        leaves the answer, the stream, a tool call and concurrent requests unchanged
 #
 # Hermetic counterparts: the config-parse tests in model.zig, the effort and tool-history
 # render tests in chat.zig, and the `glm5_next fixture` + `glm5_next MTP fixture` parity
@@ -146,6 +150,92 @@ check "[9] needle recovered under batching" "$CONC" "needle=741952"
 check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] glm batched decode engaged"
 
 check_absent "[log] no MLX error" "$(cat "$LOG")" "[mlx]"
+
+# [10] The DFlash2 drafter on top. Its own boot: the first server's memory goes back first, the pack is 170 GB.
+if [ -n "${GLM5_DRAFTER:-}" ]; then
+    [ -f "$GLM5_DRAFTER/config.json" ] || { echo "FAIL: $GLM5_DRAFTER/config.json not found"; exit 1; }
+    kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true
+    LOG1="$LOG"; PORT=$((PORT + 1)); BASE="http://127.0.0.1:$PORT"; LOG=$(mktemp /tmp/glm5_test_serve_dflash.XXXXXX)
+    HOME="$SCRATCH_HOME" "$BIN" --model "$MODEL" --drafter "$GLM5_DRAFTER" --serve --host 127.0.0.1 --port "$PORT" --ctx-size 32768 > "$LOG" 2>&1 &
+    SERVER_PID=$!
+    for _ in $(seq 1 300); do
+        grep -q "Model ready (loaded on inference thread)" "$LOG" && break
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo "FAIL: DFlash server died during load"; tail -20 "$LOG"; exit 1; fi
+        sleep 3
+    done
+    grep -q "Model ready (loaded on inference thread)" "$LOG" || { echo "FAIL: DFlash server did not load"; tail -20 "$LOG"; exit 1; }
+    check "[10] DFlash2 drafter loaded" "$(cat "$LOG")" "DFlash drafter ready"
+
+    content() { python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'; }
+    # The request's own [spec-stats] line is the newest one once it has finished.
+    last_stats() { sleep 1; grep -F "[spec-stats] mode=dflash" "$LOG" | tail -1; }
+    CODE='{"max_tokens":300,"temperature":0,"enable_thinking":false,"messages":[{"role":"user","content":"Write a Python function that checks whether a string is a palindrome, with a docstring and three unit tests. Output only the code."}]}'
+    CODE_OFF='{"max_tokens":300,"temperature":0,"enable_thinking":false,"enable_drafter":false,"enable_mtp":false,"messages":[{"role":"user","content":"Write a Python function that checks whether a string is a palindrome, with a docstring and three unit tests. Output only the code."}]}'
+
+    D1=$(chat "$CODE" | content); ST1=$(last_stats)
+    check "[10] predictable text drafts and verifies" "$ST1" "mode=dflash attempts="
+    case "$ST1" in *"attempts=0 "*) echo "FAIL [10] no round was ever drafted on predictable text"; fail=$((fail+1));; *) echo "PASS [10] rounds were drafted on predictable text"; pass=$((pass+1));; esac
+    check "[10] per-position acceptance is reported" "$ST1" "acc_pos="
+    check "[10] verify widths are reported" "$ST1" "rows_hist="
+    check "[10] the policy never falls back for good" "$ST1" "runtime_disabled=false"
+
+    D_OFF=$(chat "$CODE_OFF" | content)
+    [ "${D1:0:150}" = "${D_OFF:0:150}" ] && { echo "PASS [10] drafter on == plain serial over the first 150 characters (greedy)"; pass=$((pass+1)); } || { echo "FAIL [10] greedy answer moved with the drafter"; echo "  on : ${D1:0:150}"; echo "  off: ${D_OFF:0:150}"; fail=$((fail+1)); }
+
+    SD=$(curl -s -N -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$(echo "$CODE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["stream"]=True; print(json.dumps(d))')" | grep '^data: {' | python3 -c '
+import json, sys
+c = []
+for line in sys.stdin:
+    for ch in json.loads(line[6:]).get("choices", []):
+        c.append(ch.get("delta", {}).get("content") or "")
+print("".join(c))')
+    [ "${SD:0:150}" = "${D1:0:150}" ] && { echo "PASS [10] stream == non-stream over the first 150 characters"; pass=$((pass+1)); } || { echo "FAIL [10] streamed answer differs from the non-streamed one"; echo "  stream: ${SD:0:150}"; echo "  plain : ${D1:0:150}"; fail=$((fail+1)); }
+
+    NOVEL=$(chat '{"max_tokens":400,"temperature":0,"enable_thinking":false,"messages":[{"role":"user","content":"Write a short story, about 300 words, of a lighthouse keeper who finds a message in a bottle."}]}')
+    ST2=$(last_stats)
+    check "[10] novel text answers" "$NOVEL" "lighthouse"
+    check "[10] novel text stays armed" "$ST2" "runtime_disabled=false"
+    case "$ST2" in *"plain=0 "*) echo "FAIL [10] no plain round on novel text (the policy never stepped back)"; fail=$((fail+1));; *) echo "PASS [10] plain rounds carry novel text"; pass=$((pass+1));; esac
+
+    T10=$(chat '{"max_tokens":2000,"temperature":0,"messages":[{"role":"user","content":"What is the weather in Paris and in Tokyo right now? Use the tool."}],"tools":'"$TOOLS"'}')
+    check "[10] tool calls under DFlash" "$T10" '"tool_calls"'
+    check "[10] Paris call" "$T10" "Paris"
+    check "[10] Tokyo call" "$T10" "Tokyo"
+    check_absent "[10] no tool markup" "$T10" "<tool_call>"
+
+    DIGITS10=$(chat "$NEEDLE" | python3 -c 'import json,re,sys; print(re.sub(r"\D", "", json.load(sys.stdin)["choices"][0]["message"]["content"]))')
+    check "[10] needle recovered at ~8k tokens" "$DIGITS10" "741952"
+    B10=$(chat "$NEEDLE")
+    CACHED10=$(echo "$B10" | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"]["prompt_tokens_details"]["cached_tokens"])')
+    [ "$CACHED10" -gt 0 ] && { echo "PASS [10] prefix cache engaged beside the drafter ($CACHED10 tokens)"; pass=$((pass+1)); } || { echo "FAIL [10] 0 cached tokens"; fail=$((fail+1)); }
+    D10=$(echo "$B10" | python3 -c 'import json,re,sys; print(re.sub(r"\D", "", json.load(sys.stdin)["choices"][0]["message"]["content"]))')
+    check "[10] the answer survives the cache hit" "$D10" "741952"
+
+    # Company: a burst decodes beside the drafter; whichever slot armed it yields (the log line is the engagement when it did).
+    CONC10=$(python3 - "$PORT" <<'PY'
+import json, sys, threading, urllib.request
+port = sys.argv[1]
+reqs = [("Count from 1 to 30, separated by single spaces, and write nothing else.", 30, 150),
+        ("Count from 1 to 45, separated by single spaces, and write nothing else.", 45, 220),
+        ("Count from 1 to 60, separated by single spaces, and write nothing else.", 60, 300)]
+out = {}
+def run(i):
+    msg, n, mt = reqs[i]
+    body = {"max_tokens": mt, "temperature": 0, "enable_thinking": False, "messages": [{"role": "user", "content": msg}]}
+    r = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    c = json.load(urllib.request.urlopen(r, timeout=900))["choices"][0]["message"]["content"].split()
+    out[i] = c[:n] == [str(k) for k in range(1, n + 1)]
+ts = [threading.Thread(target=run, args=(i,)) for i in range(len(reqs))]
+[t.start() for t in ts]; [t.join() for t in ts]
+print("count30=%s count45=%s count60=%s" % (out[0], out[1], out[2]))
+PY
+)
+    check "[10] 30-count stream correct beside the drafter" "$CONC10" "count30=True"
+    check "[10] 45-count stream correct beside the drafter" "$CONC10" "count45=True"
+    check "[10] 60-count stream correct beside the drafter" "$CONC10" "count60=True"
+    check_absent "[10] no MLX error with the drafter" "$(cat "$LOG")" "[mlx]"
+fi
+
 echo
 echo "glm5_next integration: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

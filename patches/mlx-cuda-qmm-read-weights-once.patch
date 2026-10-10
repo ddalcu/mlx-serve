@@ -1,0 +1,159 @@
+MLX's CUDA quantized matmul read the weights once per row of x for a few
+rows, and once per batch of x always:
+
+- On GPUs with qmm_sm80 (sm_80 and later, sm_120 included) it ran qmv for
+  M*B < 8. qmv launches one block row per row of x, so every row streams the
+  whole weight matrix again: 2..7 rows (speculative verify) cost about M
+  times one row. qmm_sm80 reads the weights once for all rows and from two
+  rows is as fast as qmv at one (sm_120: a 6-row 4096x12288 4-bit matmul
+  485 -> 94 us). Use qmv for a single row only, as the sm90 branch does.
+- x of shape [B, M, K] against a 2D weight ran as B problems of M rows, each
+  a full pass over the weights: batched decode ([B, 1, K]) cost B single
+  steps. Fold the batches into rows (a view, x is row-contiguous) so one
+  pass serves them all.
+
+Upstream PR pending (the user submits it); drop this file and its step in
+build-mlx-linux.sh once lib/mlx-src includes it.
+
+diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
+index 5c3e255..68012cb 100644
+--- a/mlx/backend/cuda/quantized/quantized.cpp
++++ b/mlx/backend/cuda/quantized/quantized.cpp
+@@ -4,6 +4,7 @@
+ #include "mlx/backend/cuda/device.h"
+ #include "mlx/backend/cuda/quantized/qmm/qmm.h"
+ #include "mlx/backend/cuda/quantized/quantized_utils.h"
++#include "mlx/backend/gpu/copy.h"
+ #include "mlx/dtype_utils.h"
+ #include "mlx/fast_primitives.h"
+ #include "mlx/primitives.h"
+@@ -19,6 +20,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+ 
+   array x = ensure_row_contiguous(inputs[0], encoder, s);
+   const array& w = inputs[1];
++  out.set_data(cu::malloc_async(out.nbytes(), encoder));
++  // A 2D weight is shared by every batch of x: fold the batches into rows so
++  // the kernels read the weights once for all of them (batched decode feeds
++  // [B, 1, K]).
++  array y = out;
++  if (w.ndim() == 2 && x.ndim() > 2) {
++    x = reshape_in_eval(x, {int(x.size() / x.shape(-1)), x.shape(-1)}, s);
++    y = reshape_in_eval(out, {int(out.size() / out.shape(-1)), out.shape(-1)}, s);
++  }
+   const array& scales = inputs[2];
+   std::optional<array> biases;
+   if (inputs.size() > 3) {
+@@ -31,7 +41,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+         w,
+         scales,
+         biases,
+-        out,
++        y,
+         transpose_,
+         bits_,
+         group_size_,
+@@ -45,11 +55,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   bool can_use_qmv = supports(supports_qmv) || can_use_fp_qmv;
+ 
+   auto call_qmm_sm90 = [&]() {
+-    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+-    qmm_sm90(x, w, scales, *biases, out, bits_, group_size_, encoder, s);
++    qmm_sm90(x, w, scales, *biases, y, bits_, group_size_, encoder, s);
+   };
+   auto call_qmm_sm80 = [&]() {
+-    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+     qmm_sm80(
+         x,
+         w,
+@@ -57,14 +65,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+         biases,
+         std::nullopt,
+         std::nullopt,
+-        out,
++        y,
+         bits_,
+         group_size_,
+         mode_,
+         encoder);
+   };
+   auto call_qmm_naive = [&]() {
+-    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+     qmm_naive(
+         x,
+         w,
+@@ -73,7 +80,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+         std::nullopt,
+         std::nullopt,
+         std::nullopt,
+-        out,
++        y,
+         transpose_,
+         bits_,
+         group_size_,
+@@ -81,16 +88,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+         encoder);
+   };
+   auto call_qmv = [&]() {
+-    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+     if (can_use_fp_qmv) {
+-      fp_qmv(x, w, scales, out, bits_, group_size_, encoder, s);
++      fp_qmv(x, w, scales, y, bits_, group_size_, encoder, s);
+     } else {
+       qmv(x,
+           w,
+           scales,
+           biases,
+           std::nullopt,
+-          out,
++          y,
+           bits_,
+           group_size_,
+           mode_,
+@@ -98,10 +104,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+     }
+   };
+ 
+-  int M = out.ndim() > 1 ? out.shape(-2) : 1;
+-  int N = out.shape(-1);
++  int M = y.ndim() > 1 ? y.shape(-2) : 1;
++  int N = y.shape(-1);
+   int K = x.shape(-1);
+-  int B = out.size() / (M * N);
++  int B = y.size() / (M * N);
+ 
+   if (can_use_qmm_sm90) {
+     if (can_use_qmv && (M == 1 && B == 1 && N <= 16384 && K <= 16384)) {
+@@ -113,7 +119,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   }
+ 
+   if (can_use_qmm_sm80) {
+-    if (can_use_qmv && (M * B < 8)) {
++    if (can_use_qmv && (M * B == 1)) {
+       call_qmv();
+     } else {
+       call_qmm_sm80();
+diff --git a/tests/cuda_tests.cpp b/tests/cuda_tests.cpp
+index b9a3905..fee796e 100644
+--- a/tests/cuda_tests.cpp
++++ b/tests/cuda_tests.cpp
+@@ -178,3 +178,20 @@ TEST_CASE("test fused sdpa at head dims 256 and 512") {
+     }
+   }
+ }
++
++TEST_CASE("test quantized matmul over a few rows") {
++  // Rows 2..7 run the tiled kernel (one weight read for all rows) where the
++  // GPU has it; each row must match a dequantized reference, batched x too.
++  for (int bits : {4, 8}) {
++    auto w = random::normal({384, 512}, bfloat16);
++    auto q = quantize(w, 64, bits);
++    auto w_dq = astype(dequantize(q[0], q[1], q[2], 64, bits), float32);
++    for (Shape x_shape : {Shape{1, 512}, Shape{2, 512}, Shape{5, 512},
++                          Shape{7, 512}, Shape{2, 3, 512}}) {
++      auto x = random::normal(x_shape, bfloat16);
++      auto out = quantized_matmul(x, q[0], q[1], q[2], true, 64, bits);
++      auto expected = matmul(astype(x, float32), transpose(w_dq));
++      CHECK(allclose(astype(out, float32), expected, 2e-2, 2e-1).item<bool>());
++    }
++  }
++}

@@ -1786,7 +1786,7 @@
 "Tools are confined to this path. Use an absolute path. Suggestion: ~/.mlx-serve/workspace (the default cwd for all MCP servers)." = "工具被限制在此路径内。请使用绝对路径。建议：~/.mlx-serve/workspace（所有 MCP 服务器的默认工作目录）。";
 "Tools · %@" = "工具 · %@";
 "Tools — run a tool-calling loop" = "工具 —— 运行工具调用循环";
-"Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = 80% of what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem." = "服务器用已加载模型占用的内存上限，达到后就换出其中一个 —— 若无可换出者则拒绝加载。自动 = Metal 为这台 Mac 建议值的 80%。当空闲服务器上明明放得下的模型却被以“not enough memory”拒绝时，就把它调高；日志里的拒绝信息会写明所用的估算值。会传递 --max-resident-mem。";
+"Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem." = "服务器用已加载模型占用的内存上限，达到后就换出其中一个 —— 若无可换出者则拒绝加载。自动 = Metal 为这台 Mac 建议的值。当空闲服务器上明明放得下的模型却被以“not enough memory”拒绝时，就把它调高；日志里的拒绝信息会写明所用的估算值。会传递 --max-resident-mem。";
 "Transcript of reference (optional)" = "参考音频的文字稿（可选）";
 "Trap" = "陷阱乐";
 "Try Again" = "重试";

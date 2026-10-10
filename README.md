@@ -109,7 +109,7 @@ Numbers and charts in [Performance](#performance).
 - **The whole modern serving surface:** streaming, tools with schema-driven auto-repair, JSON-schema constrained decoding, logprobs, vision, thinking as `reasoning_content`.
 - **Works with your coding agent:** Claude Code, pi, oh-my-pi, OpenCode, OpenCode 2, Codex, hermes, aider, fx, Grok, and editors like Zed. One-click from the app or `mlx-serve launch <agent>` in the terminal, both preconfigured with the server's real context window. Setup for every tool in [docs/integrations.md](docs/integrations.md).
 - **Fast:** speculative decoding four ways (PLD, model-shipped draft companions, the Gemma 4 drafter, native Qwen MTP), custom Metal kernels, continuous batching, KV-cache quantization, prefix and tokenize caches. Numbers in [docs/performance.md](docs/performance.md).
-- **Built-in web console:** open `http://localhost:11234` in a browser for a chat playground, live monitor, image and audio tools, and the API reference.
+- **Built-in web console:** open `http://localhost:11234` in a browser for chat, image, audio and video generation, a Library of your results, live monitoring and the API reference.
 - **LAN model sharing:** use another Mac's models over Bonjour with zero config; even Claude Code pointed at `localhost` can run on the Studio's 27B.
 - **Media generation:** image, video, music, speech with voice cloning, and 3D, natively on MLX, from the same server.
 - **No Python:** a single ~7 MB Zig binary. The app ships everything signed and notarized.

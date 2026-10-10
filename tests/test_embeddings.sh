@@ -16,6 +16,10 @@
 #   4. generation endpoints reject encoder-only models with a 400
 #   4c. a decoder-arch embedder (Qwen3-Embedding) matches singles across
 #      sub-batches and survives them (skipped when the model is missing)
+#   4d. EmbeddingGemma 2: a batch whose long row crosses the sliding band
+#      matches its singles with finite vectors, the card's retrieval example
+#      ranks Mars first, `dimensions` truncates; `messages` carries images and
+#      video (sizes, token counts, order, refusals) (skipped when the model is missing)
 #   5. hot-load: a chat-model server embeds via "model": "<encoder-id>"
 #      (skipped when the chat model is missing)
 #
@@ -23,6 +27,7 @@
 #   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
 #   - EMBED_TEST_MODEL or ~/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit
 #   - (check 4c only) QWEN3_EMBED_TEST_MODEL or ~/.mlx-serve/models/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ
+#   - (check 4d only) EG2_TEST_MODEL or ~/.mlx-serve/models/google/embeddinggemma-2
 #   - (check 5 only) CHAT_TEST_MODEL or ~/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4
 #
 # Usage: ./tests/test_embeddings.sh [port]
@@ -178,6 +183,10 @@ print(f"dimsbig {1 if code_big == 400 else 0} code={code_big}")
 
 code_zero, _ = post({"model": "mlx-serve", "input": text, "dimensions": 0})
 print(f"dimszero {1 if code_zero == 400 else 0} code={code_zero}")
+
+# `messages` carries images and video: only a multimodal embedder takes it, and says so.
+code_msg, body_msg = post({"model": "mlx-serve", "messages": [{"role": "user", "content": text}]})
+print(f"messages400 {1 if code_msg == 400 and 'multimodal' in json.dumps(body_msg) else 0} code={code_msg}")
 EOF
 check "dimensions=64: truncated + L2-renormalized first-64 of the full vector" \
     "$(awk '/^dims64/{print $2}' /tmp/test_embeddings_dims.out)" \
@@ -188,6 +197,9 @@ check "dimensions beyond the model's width returns 400" \
 check "dimensions=0 returns 400" \
     "$(awk '/^dimszero/{print $2}' /tmp/test_embeddings_dims.out)" \
     "$(grep '^dimszero' /tmp/test_embeddings_dims.out)"
+check "messages on a text-only encoder returns 400 naming the multimodal models" \
+    "$(awk '/^messages400/{print $2}' /tmp/test_embeddings_dims.out)" \
+    "$(grep '^messages400' /tmp/test_embeddings_dims.out)"
 
 # --- 4. generation rejected on encoder-only ---
 GEN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 30 "$BASE/v1/chat/completions" \
@@ -218,9 +230,10 @@ check "ready encoder advertises meta.embedding_max_length (auto = model window)"
     "$([ -n "$META_LIMIT" ] && [ "$META_LIMIT" -gt 0 ] && echo 1 || echo 0)" "got '$META_LIMIT'"
 
 # Over-window input: an explicit structured 400 naming the input index and
-# both counts — never a silent truncation (issue #117). 600 words > any
-# BERT-class 512 window; the index must identify the SECOND input.
-LONG_INPUT=$(python3 -c "print(' '.join(['tokenized']*600))")
+# both counts — never a silent truncation (issue #117). A word is at least one
+# token, so window+100 words is past the model's window; the index must
+# identify the SECOND input.
+LONG_INPUT=$(python3 -c "print(' '.join(['tokenized']*($META_LIMIT + 100)))")
 OVER_RESP=$(embed "[\"short one\", \"$LONG_INPUT\"]")
 check "over-limit input earns a 400 naming index + counts (issue #117)" \
     "$(echo "$OVER_RESP" | grep -q 'Input at index 1 exceeds the maximum embedding input length' && echo 1 || echo 0)" \
@@ -302,6 +315,162 @@ EOF
     check "server still answers after the multi-sub-batch requests" \
         "$(awk '/^alive/{print $2}' /tmp/test_embeddings_qwen3.out)" \
         "$(tail -3 /tmp/test_embeddings_qwen3.log)"
+    stop_server
+fi
+
+# --- 4d. EmbeddingGemma 2 (bidirectional Gemma 4 trunk, sliding band + full layers) ---
+# A batch pads its short rows out to the long one. Past the band radius (512) a padded query sees
+# only padding in the sliding layers, and a NaN row there reaches the real rows through V in every
+# later layer: the long row below crosses the band, and every vector must come back finite.
+EG2_MODEL="${EG2_TEST_MODEL:-$HOME/.mlx-serve/models/google/embeddinggemma-2}"
+echo "=== /v1/embeddings: EmbeddingGemma 2 ==="
+if [ ! -d "$EG2_MODEL" ]; then
+    echo -e "  ${YELLOW}SKIP${NC} EmbeddingGemma 2 not found at $EG2_MODEL"
+else
+    start_server /tmp/test_embeddings_eg2.log --model "$EG2_MODEL" --log-level info
+    python3 - "$BASE" > /tmp/test_embeddings_eg2.out <<'EOF'
+import json, math, sys, urllib.request, urllib.error
+
+base = sys.argv[1]
+def call(path, body=None):
+    req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        return 200, json.load(urllib.request.urlopen(req, timeout=300))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+def embed(inputs, **kw):
+    code, r = call("/v1/embeddings", {"model": "mlx-serve", "input": inputs, **kw})
+    return code, ([d["embedding"] for d in sorted(r["data"], key=lambda d: d["index"])] if code == 200 else r)
+def cos(a, b):
+    return sum(x*y for x, y in zip(a, b)) / math.sqrt(sum(x*x for x in a) * sum(y*y for y in b))
+finite = lambda v: all(math.isfinite(x) for x in v)
+
+_, models = call("/v1/models")
+m = next(m for m in models["data"] if m.get("state") == "ready")
+ok = (m["meta"]["architecture"] == "embedding_gemma2" and "embeddings" in m["capabilities"]
+      and m["context_length"] == 8192 and m["meta"]["embedding_max_length"] == 8192
+      and m["input_modalities"] == ["text", "image", "video"])
+print(f"meta {1 if ok else 0} {m['meta']['architecture']} ctx={m['context_length']} modalities={m['input_modalities']}")
+
+short = ["task: search result | query: Which planet is known as the Red Planet?",
+         "title: none | text: Venus is often called Earth's twin because of its similar size and proximity.",
+         "title: none | text: Mars, known for its reddish appearance, is often referred to as the Red Planet."]
+long_text = " ".join(f"item{i} {w}" for i, w in zip(range(400), ["ka", "lo", "mi", "ren", "tu", "vas"] * 80))
+_, ntok = call("/tokenize", {"content": long_text})
+code, vs = embed(short)
+unit = code == 200 and all(len(v) == 768 and abs(math.sqrt(sum(x*x for x in v)) - 1) < 1e-3 for v in vs)
+print(f"shape {1 if unit else 0} code={code}")
+
+# The model card's own retrieval example: the query is closer to Mars than to Venus.
+print(f"ranking {1 if unit and cos(vs[0], vs[2]) > cos(vs[0], vs[1]) else 0}")
+
+# Mixed batch: the long row crosses the radius-512 band and pads the short rows past it.
+code, batch = embed(short + [long_text])
+singles = [embed([t])[1][0] for t in short + [long_text]] if code == 200 else []
+worst = min((cos(a, b) for a, b in zip(batch, singles)), default=float("nan")) if code == 200 else float("nan")
+good = code == 200 and all(finite(v) for v in batch) and worst >= 0.999 and len(ntok["tokens"]) > 600
+print(f"batch {1 if good else 0} worst-cosine={worst:.5f} long-tokens={len(ntok['tokens'])}")
+
+# Matryoshka: the first N components, renormalized.
+code, d256 = embed(short[:1], dimensions=256)
+tn = math.sqrt(sum(x*x for x in vs[0][:256]))
+mrl = code == 200 and len(d256[0]) == 256 and max(abs(a - b / tn) for a, b in zip(d256[0], vs[0][:256])) < 1e-4
+print(f"dims256 {1 if mrl else 0}")
+
+# Past the trained window: a structured 400 naming the input, never a truncation.
+code, r = embed(["short one", " ".join(["tokenized"] * 9000)])
+msg = json.dumps(r)
+print(f"overlimit {1 if code == 400 and 'index 1' in msg and '8192' in msg else 0} code={code}")
+code, _ = call("/v1/chat/completions", {"model": "mlx-serve", "messages": [{"role": "user", "content": "hi"}]})
+print(f"chat400 {1 if code == 400 else 0} code={code}")
+
+# ── images and video through `messages` ──
+import base64, struct, zlib
+def png(w, h, px):
+    raw = b"".join(b"\0" + bytes(c for x in range(w) for c in px(x, y)) for y in range(h))
+    chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    return "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")).decode()
+sky = png(160, 96, lambda x, y: (30 + y, 90 + y // 2, 200 - x // 2))
+brick = png(120, 120, lambda x, y: (180 + (x * y) % 40, 60 + (x // 8 % 2) * 50, 40))
+def soft_tokens(h, w, budget):  # the processor's target size (sides in multiples of 48 that fit the budget), as pooled patches
+    side = 48
+    f = math.sqrt(budget * 9 * 256 / (h * w))
+    return int(f * h // side) * int(f * w // side)
+text = lambda s: {"type": "text", "text": s}
+image = lambda url: {"type": "image_url", "image_url": {"url": url}}
+video = lambda frames: {"type": "video_url", "video_url": {"frames": frames}}
+def mm(*parts, **kw):
+    return call("/v1/embeddings", {"model": "mlx-serve", **kw, "messages": [{"role": "user", "content": list(parts)}]})
+vec = lambda r: r[1]["data"][0]["embedding"]
+used = lambda r: r[1]["usage"]["prompt_tokens"] if r[0] == 200 else r[1]
+
+res = mm(image(sky))
+v_sky = vec(res) if res[0] == 200 else []
+want = 2 + 2 + soft_tokens(96, 160, 280)
+print(f"mm_shape {1 if res[0] == 200 and len(v_sky) == 768 and abs(math.sqrt(sum(x*x for x in v_sky)) - 1) < 1e-3 and used(res) == want else 0} code={res[0]} tokens={used(res)} want={want}")
+v_again, v_brick = vec(mm(image(sky))), vec(mm(image(brick)))
+print(f"mm_stable {1 if v_again == v_sky and cos(v_sky, v_brick) < 0.99 else 0} different-image-cosine={cos(v_sky, v_brick):.4f}")
+
+# Order is part of the input: text before the image is not text after it.
+before, after = vec(mm(text("a picture of "), image(sky))), vec(mm(image(sky), text(" a picture of")))
+print(f"mm_order {1 if cos(before, after) < 0.9999 and cos(before, v_sky) < 0.9999 else 0} cosine={cos(before, after):.5f}")
+
+# Plain text through `messages` is the text path (same <bos> … <eos> wrap, same vector).
+t_msg, t_in = vec(mm(text("Mars, known for its reddish appearance"))), embed(["Mars, known for its reddish appearance"])[1][0]
+print(f"mm_text {1 if cos(t_msg, t_in) > 0.99999 else 0} cosine={cos(t_msg, t_in):.6f}")
+
+# Video: a wrapped block per frame at the frame budget; more frames than the cap are cut to the cap.
+frame_tokens = 2 + soft_tokens(64, 96, 140)
+clip3 = mm(video([png(96, 64, lambda x, y: (x * 2, y * 3, 128))] * 3))
+clip40 = mm(video([png(96, 64, lambda x, y, i=i: (x * 2, y * 3, 3 * i)) for i in range(40)]))
+print(f"mm_video {1 if used(clip3) == 2 + 3 * frame_tokens and used(clip40) == 2 + 32 * frame_tokens else 0} tokens={used(clip3)}/{2 + 3 * frame_tokens} {used(clip40)}/{2 + 32 * frame_tokens}")
+
+# Refusals are named, and nothing is half-served.
+def refused(r, needle):
+    return r[0] == 400 and needle in json.dumps(r[1])
+audio = {"type": "input_audio", "input_audio": {"data": "AAAA"}}
+bad = [
+    refused(call("/v1/embeddings", {"model": "mlx-serve", "input": "x", "messages": [{"role": "user", "content": "y"}]}), "not both"),
+    refused(mm(image("data:image/png;base64,AAAA")), "could not be decoded"),
+    refused(mm(audio), "audio"),
+    refused(call("/v1/embeddings", {"model": "mlx-serve", "messages": []}), "non-empty"),
+    refused(mm(video([])), "frames"),
+]
+print(f"mm_refused {1 if all(bad) else 0} {bad}")
+
+# Past the window: 40 images are ~10k tokens; refused up front, before any of them reaches the tower.
+over = mm(*[image(sky)] * 40)
+print(f"mm_limit {1 if refused(over, 'index 0') and '8192' in json.dumps(over[1]) else 0} code={over[0]}")
+EOF
+    check "EmbeddingGemma 2 advertises embeddings, an 8192 window and text, image and video input" \
+        "$(awk '/^meta/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^meta' /tmp/test_embeddings_eg2.out)"
+    check "768-wide unit vectors for a retrieval batch" \
+        "$(awk '/^shape/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^shape' /tmp/test_embeddings_eg2.out)"
+    check "the card's retrieval example ranks Mars above Venus" \
+        "$(awk '/^ranking/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^ranking' /tmp/test_embeddings_eg2.out)"
+    check "a batch with a row past the sliding band: finite, and every row matches its single (cosine >= 0.999)" \
+        "$(awk '/^batch/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^batch' /tmp/test_embeddings_eg2.out)"
+    check "dimensions=256 keeps the first 256 components, renormalized" \
+        "$(awk '/^dims256/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^dims256' /tmp/test_embeddings_eg2.out)"
+    check "an input past the 8192 window earns a 400 naming its index" \
+        "$(awk '/^overlimit/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^overlimit' /tmp/test_embeddings_eg2.out)"
+    check "chat completion on EmbeddingGemma 2 returns 400" \
+        "$(awk '/^chat400/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^chat400' /tmp/test_embeddings_eg2.out)"
+    check "an image through messages: a 768-wide unit vector, <bos><boi>…<eoi><eos> tokens at the processor's size" \
+        "$(awk '/^mm_shape/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^mm_shape' /tmp/test_embeddings_eg2.out)"
+    check "the same image embeds identically twice; a different image does not" \
+        "$(awk '/^mm_stable/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^mm_stable' /tmp/test_embeddings_eg2.out)"
+    check "text before an image and text after it are different inputs" \
+        "$(awk '/^mm_order/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^mm_order' /tmp/test_embeddings_eg2.out)"
+    check "text-only messages embed exactly like the same text as input" \
+        "$(awk '/^mm_text/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^mm_text' /tmp/test_embeddings_eg2.out)"
+    check "video: one wrapped block per frame; 40 frames are cut to the 32-frame cap" \
+        "$(awk '/^mm_video/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^mm_video' /tmp/test_embeddings_eg2.out)"
+    check "input+messages, a bad image, audio, empty messages and empty frames are refused by name" \
+        "$(awk '/^mm_refused/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^mm_refused' /tmp/test_embeddings_eg2.out)"
+    check "40 images past the window earn a 400 naming the length before the tower runs" \
+        "$(awk '/^mm_limit/{print $2}' /tmp/test_embeddings_eg2.out)" "$(grep '^mm_limit' /tmp/test_embeddings_eg2.out)"
     stop_server
 fi
 

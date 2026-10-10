@@ -1,0 +1,82 @@
+{
+  "architectures": [
+    "EmbeddingGemma2Model"
+  ],
+  "model_type": "embedding_gemma2",
+  "dtype": "float32",
+  "text_config": {
+    "vocab_size": 48,
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_hidden_layers": 6,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "max_position_embeddings": 64,
+    "rms_norm_eps": 1e-06,
+    "pad_token_id": 0,
+    "eos_token_id": 1,
+    "bos_token_id": 2,
+    "sliding_window": 2,
+    "hidden_size_per_layer_input": 8,
+    "embedding_dim": 12,
+    "rope_parameters": {
+      "full_attention": {
+        "rope_theta": 1000000.0,
+        "rope_type": "default"
+      },
+      "sliding_attention": {
+        "rope_theta": 10000.0,
+        "rope_type": "default"
+      }
+    },
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ],
+    "model_type": "embedding_gemma2_text",
+    "dtype": "float32",
+    "per_layer_config": {
+      "02": {
+        "head_dim": 16,
+        "num_key_value_heads": 1
+      },
+      "05": {
+        "head_dim": 16,
+        "num_key_value_heads": 1
+      }
+    }
+  },
+  "vision_config": {
+    "hidden_size": 24,
+    "intermediate_size": 48,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 3,
+    "num_key_value_heads": 3,
+    "head_dim": 8,
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "position_embedding_size": 96,
+    "rms_norm_eps": 1e-06,
+    "use_clipped_linears": false,
+    "standardize": false,
+    "rope_parameters": {
+      "rope_theta": 100.0,
+      "rope_type": "axial"
+    },
+    "model_type": "gemma4_vision",
+    "default_output_length": 70,
+    "global_head_dim": 8
+  },
+  "image_token_id": 40,
+  "video_token_id": 41,
+  "audio_token_id": 42,
+  "boi_token_id": 43,
+  "eoi_token_id": 44,
+  "vision_soft_tokens_per_image": 70
+}

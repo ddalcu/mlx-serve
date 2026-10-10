@@ -1320,7 +1320,7 @@ fn f0NtrainForward(
 /// channel. Returns `[1, 2F]` — the channel axis is squeezed out.
 fn f0NBranch(comp: *const ltx.Component, buf: []u8, stack: []const u8, proj: []const u8, h: mlx.mlx_array, style: mlx.mlx_array, s: S) !mlx.mlx_array {
     var x = retain(h);
-    errdefer _ = mlx.mlx_array_free(x);
+    defer _ = mlx.mlx_array_free(x);
     for (0..3) |i| {
         var pfx: [128]u8 = undefined;
         const p = try std.fmt.bufPrint(&pfx, "{s}.{d}", .{ stack, i });
@@ -1328,7 +1328,6 @@ fn f0NBranch(comp: *const ltx.Component, buf: []u8, stack: []const u8, proj: []c
         _ = mlx.mlx_array_free(x);
         x = y;
     }
-    defer _ = mlx.mlx_array_free(x);
 
     const projected = try ltxa.conv1d(
         x,
@@ -1625,7 +1624,7 @@ fn istft(allocator: std.mem.Allocator, mag: mlx.mlx_array, phase: mlx.mlx_array,
     defer _ = mlx.mlx_array_free(frames_arr);
     try mlx.check(mlx.mlx_fft_irfft(&frames_arr, cplx, @intCast(n_fft), 2, mlx.MLX_FFT_NORM_BACKWARD, s));
 
-    _ = mlx.mlx_array_eval(frames_arr);
+    try mlx.check(mlx.mlx_array_eval(frames_arr));
     const shape = mlx.getShape(frames_arr);
     const n_frames: usize = @intCast(shape[1]);
     const data = mlx.mlx_array_data_float32(frames_arr) orelse return error.KokoroIstftReadFailed;
@@ -1664,7 +1663,7 @@ fn generatorForward(
     );
     defer _ = mlx.mlx_array_free(har_wave);
 
-    _ = mlx.mlx_array_eval(har_wave);
+    try mlx.check(mlx.mlx_array_eval(har_wave));
     const har_len: usize = @intCast(mlx.getShape(har_wave)[1]);
     const har_data = mlx.mlx_array_data_float32(har_wave) orelse return error.KokoroSourceReadFailed;
 
@@ -1678,7 +1677,7 @@ fn generatorForward(
     defer _ = mlx.mlx_array_free(har);
 
     var x = retain(x_in);
-    errdefer _ = mlx.mlx_array_free(x);
+    defer _ = mlx.mlx_array_free(x);
 
     const n_up = cfg.upsample_rates.len;
     for (0..n_up) |i| {
@@ -1782,7 +1781,6 @@ fn generatorForward(
         _ = mlx.mlx_array_free(x);
         x = post;
     }
-    defer _ = mlx.mlx_array_free(x);
 
     // Channels split into magnitude (exp) and phase (sin).
     const bins: c_int = @intCast(n_fft / 2 + 1);
@@ -1915,7 +1913,7 @@ fn copyToHost(a: std.mem.Allocator, arr: mlx.mlx_array, s: S) ![]f32 {
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
     try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
-    _ = mlx.mlx_array_eval(f);
+    try mlx.check(mlx.mlx_array_eval(f));
     var n: c_int = 1;
     for (mlx.getShape(arr)) |d| n *= d;
     const src = mlx.mlx_array_data_float32(f) orelse return error.KokoroReadFailed;
@@ -2109,7 +2107,7 @@ pub const Model = struct {
         };
         defer _ = mlx.mlx_array_free(dur_logits);
 
-        _ = mlx.mlx_array_eval(dur_logits);
+        try mlx.check(mlx.mlx_array_eval(dur_logits));
         const logit_data = mlx.mlx_array_data_float32(dur_logits) orelse return error.KokoroDurationReadFailed;
         const durations = try predictedDurations(a, logit_data[0 .. ids.len * self.cfg.max_dur], ids.len, self.cfg.max_dur, speed);
         defer a.free(durations);

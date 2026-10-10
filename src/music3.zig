@@ -2457,7 +2457,7 @@ pub const Engine = struct {
             var wc = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wc);
             try mlx.check(mlx.mlx_contiguous(&wc, wave, false, s));
-            evalA(wc);
+            try mlx.check(mlx.mlx_array_eval(wc));
             if (probe) log.info("[music3-prof] window {d}: vocode {d} ms\n", .{ k + 1, pclk.lapUs() / 1000 });
             const n_samp: usize = @intCast(mlx.getShape(wc)[1]);
             const data = mlx.mlx_array_data_float32(wc) orelse return error.NoData;
@@ -2622,7 +2622,7 @@ fn readF32Data(arr: mlx.mlx_array, out: []f32) !void {
     const f = try astype(arr, .float32, cpu);
     defer _ = mlx.mlx_array_free(f);
     try mlx.check(mlx.mlx_contiguous(&c, f, false, cpu));
-    evalA(c);
+    try mlx.check(mlx.mlx_array_eval(c));
     const d = mlx.mlx_array_data_float32(c) orelse return error.NoData;
     @memcpy(out, d[0..out.len]);
 }

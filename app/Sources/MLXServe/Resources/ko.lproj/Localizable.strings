@@ -1615,7 +1615,7 @@
 "Create speech" = "음성 생성";
 "Chinese" = "중국어";
 "2. Copy the token it gives you and paste it above." = "2. 받은 토큰을 복사해 위에 붙여 넣으세요.";
-"Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = 80% of what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem." = "서버가 모델 하나를 내보내기 전까지(또는 내보낼 모델이 없어 로드를 거부하기 전까지) 로드된 모델에 할당할 총 RAM입니다. 자동 = 이 Mac에 대해 Metal이 권장하는 값의 80%. 충분히 들어갈 모델이 유휴 서버에서 \"not enough memory\"로 거부되면 값을 높이세요. 로그의 거부 메시지에 사용된 추정치가 표시됩니다. --max-resident-mem을 전달합니다.";
+"Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem." = "서버가 모델 하나를 내보내기 전까지(또는 내보낼 모델이 없어 로드를 거부하기 전까지) 로드된 모델에 할당할 총 RAM입니다. 자동 = 이 Mac에 대해 Metal이 권장하는 값. 충분히 들어갈 모델이 유휴 서버에서 \"not enough memory\"로 거부되면 값을 높이세요. 로그의 거부 메시지에 사용된 추정치가 표시됩니다. --max-resident-mem을 전달합니다.";
 "Requires the aider CLI: curl -LsSf https://aider.chat/install.sh | sh" = "aider CLI 필요: curl -LsSf https://aider.chat/install.sh | sh";
 "Zoom in" = "확대";
 "An upper bound — the model may end the song earlier." = "상한값입니다 — 모델이 곡을 더 일찍 끝낼 수 있습니다.";

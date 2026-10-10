@@ -450,10 +450,13 @@ struct SpeculationSocketRow: View {
         DrafterGems.fits(g, modelGB: modelGB, memory: .current())
     }
 
-    private func itemLabel(_ g: DrafterGem) -> String {
-        if onDisk(g) { return g.label }
+    private func itemLabel(_ g: DrafterGem) -> String { Self.menuLabel(g, onDisk: onDisk(g), fits: fits(g)) }
+
+    static func menuLabel(_ g: DrafterGem, onDisk: Bool, fits: Bool) -> String {
+        if onDisk { return g.label }
         let size = SystemMemoryInfo.preciseGB(g.sizeGB)
-        return fits(g) ? "\(g.label) (download \(size))" : "\(g.label) (\(size), does not fit in memory)"
+        let terms = g.licenseNote.map { ", \($0)" } ?? ""
+        return fits ? "\(g.label) (download \(size)\(terms))" : "\(g.label) (\(size), does not fit in memory)"
     }
 
     private func pick(_ g: DrafterGem) {

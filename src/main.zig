@@ -22,8 +22,8 @@ const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
-const ds4_arch = if (build_options.macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const llama_arch = if (build_options.macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const ds4_arch = if (build_options.embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_options.embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
@@ -41,15 +41,15 @@ pub const VERSION: []const u8 = build_options.version;
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
 
-// The embedded llama.cpp engine only links on macOS builds (macos_engines);
+// The embedded llama.cpp engine links on macOS and Linux builds (embedded_engines);
 // elsewhere the stub engine replaces it, so the libllama symbols above are
 // not referenced and `--version` reports these placeholders instead.
 fn ggmlEngineVersion() []const u8 {
-    if (comptime !build_options.macos_engines) return "unavailable (no embedded llama.cpp)";
+    if (comptime !build_options.embedded_engines) return "unavailable (no embedded llama.cpp)";
     return std.mem.span(ggml_version());
 }
 fn ggmlEngineCommit() []const u8 {
-    if (comptime !build_options.macos_engines) return "";
+    if (comptime !build_options.embedded_engines) return "";
     return std.mem.span(ggml_commit());
 }
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -120,7 +120,7 @@ fn printUsage(io: std.Io) void {
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
-        \\  --serve             Start HTTP server mode
+        \\  --serve             Start HTTP server mode (the default unless --prompt)
         \\  --host <ip>         Bind address (default: 0.0.0.0 — open to the local
         \\                      network; a future version will default to 127.0.0.1)
         \\  --port <n>          Bind port (default: 11234)
@@ -137,7 +137,7 @@ fn printUsage(io: std.Io) void {
         \\  --embedding-max-length <n>  Per-input token ceiling for /v1/embeddings
         \\                      (default auto = the model's declared window; over-limit
         \\                      inputs get a 400 naming index/count/limit, never truncation)
-        \\  --prompt <text>     Run single prompt (interactive mode)
+        \\  --prompt <text>     Run one prompt offline and exit (no server)
         \\  --stream            Stream tokens as they are generated (with --prompt)
         \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
         \\                      mode, the default for requests that omit the field
@@ -299,6 +299,8 @@ fn printUsage(io: std.Io) void {
         \\                        so one layer's attention scores stay within
         \\                        budget; this flag is the ceiling, not a floor.
         \\                        Lower it if a long prompt spikes memory.
+        \\                        Also ds4's graph prefill chunk (lower it to
+        \\                        stream experts on a small GPU).
         \\  --prefill-decode-share <s>
         \\                      Target fraction of wall time (0..0.9) the
         \\                        decoding streams keep while another request
@@ -403,8 +405,8 @@ fn printUsage(io: std.Io) void {
         \\                        ensureLoaded evicts LRU before exceeding.
         \\  --max-resident-mem <n>{{KB,MB,GB}}|auto
         \\                      Summed resident-bytes cap across all loaded
-        \\                        models. Default 'auto' = 80% of MLX wired
-        \\                        limit at startup. Pass 0 to disable.
+        \\                        models. Default 'auto' = the GPU working-set
+        \\                        limit. Pass 0 to disable.
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
@@ -463,6 +465,7 @@ pub fn main(init: std.process.Init) !void {
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
+    mlx.exportCudaHome();
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
     @import("prefix_cache.zig").warmEnvCaches();
@@ -585,6 +588,7 @@ pub fn main(init: std.process.Init) !void {
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
+    var mtp_forced = false;
     var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
     var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TOKENV3")) |v| std.mem.span(v) else null;
@@ -601,7 +605,7 @@ pub fn main(init: std.process.Init) !void {
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
     var max_resident_models: u32 = 3;
-    var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
+    var max_resident_mem: u64 = 0; // 0 = auto (the GPU working-set limit)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
@@ -771,7 +775,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
-            // The default now; still accepted so existing launch lines work.
+            // The default now; still accepted so existing launch lines work,
+            // and the way to opt in on CUDA.
+            mtp_forced = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
@@ -972,7 +978,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and i + 1 < args.len) {
             // Plan 05 Phase D: cap on summed resident bytes. Accepts the
             // same suffixes as --prefix-cache-mem. Special string "auto"
-            // (or default 0) → 80% of mlx_set_wired_limit at server start.
+            // (or default 0) → the GPU working-set limit.
             i += 1;
             if (std.mem.eql(u8, args[i], "auto")) {
                 max_resident_mem = 0;
@@ -1044,6 +1050,9 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    // MTP verify rounds cost more than they save without the Metal verify
+    // kernels: plain decode is faster on CUDA unless `--mtp` asks for it.
+    if (!mtp_forced and mlx.cudaAvailable()) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
@@ -1078,6 +1087,8 @@ pub fn main(init: std.process.Init) !void {
         serve_mode = true;
     }
     if (use_default_models_root) serve_mode = true;
+    // Offline mode is one --prompt; without one, serving is the default (--serve stays accepted).
+    if (prompt == null) serve_mode = true;
     // An unspecified `--model-dir` falls back to the shared models root that
     // `pull`/`list`/the app already agree on. Gated so `--model <path> --serve`
     // still serves exactly the one model it named (cli.shouldDefaultModelsRoot).
@@ -1171,8 +1182,8 @@ pub fn main(init: std.process.Init) !void {
         }
         // Above every serve dispatch (GGUF/headless/media return early below).
         if (server_mod.shouldWarnOpenBind(host_explicit, server_mod.g_lan_share_spec != null, host)) {
-            log.warn("Listening on {s}:{d} — reachable by every device on the network this Mac is on.\n", .{ host, port });
-            log.warn("Restrict to this Mac with --host 127.0.0.1 (a future version will make that the default).\n", .{});
+            log.warn("Listening on {s}:{d} — reachable by every device on the network this machine is on.\n", .{ host, port });
+            log.warn("Restrict to this machine with --host 127.0.0.1 (a future version will make that the default).\n", .{});
         }
     }
 
@@ -1215,7 +1226,10 @@ pub fn main(init: std.process.Init) !void {
     // containing one) bypasses the MLX safetensors path entirely. Both offline
     // (`--prompt`) and serve (`--serve`) modes are wired; serve constructs a stub
     // LoadedModel whose request handlers route through the engine.
-    mlx_gguf.enabled = mlx_gguf_enabled and engine_override == null;
+    // Its kernels are Metal-only; on CUDA llama.cpp serves the same files faster.
+    if (mlx_gguf_enabled and !mlx.metalKernelsAvailable())
+        log.warn("[gguf] --mlx-gguf needs Metal kernels; GGUFs go to llama.cpp/ds4 on this backend\n", .{});
+    mlx_gguf.enabled = mlx_gguf_enabled and engine_override == null and mlx.metalKernelsAvailable();
     const mlx_gguf_path = mlx_gguf.servablePath(io, allocator, model_dir);
     defer if (mlx_gguf_path) |p| allocator.free(p);
     if (mlx_gguf_path != null) log.info("[gguf] engine: mlx (lib/mlx-serve-gguf)\n", .{});
@@ -1228,10 +1242,7 @@ pub fn main(init: std.process.Init) !void {
             }
             return;
         }
-        const prompt_text = prompt orelse {
-            log.err("GGUF offline mode requires --prompt <text>\n", .{});
-            std.process.exit(2);
-        };
+        const prompt_text = prompt.?; // offline mode only runs with --prompt
         switch (chosen) {
             .ds4 => try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature, ctx_size),
             .llama => try runLlamaOffline(io, allocator, model_dir, prompt_text, max_tokens, temperature),
@@ -1418,24 +1429,8 @@ pub fn main(init: std.process.Init) !void {
         const discovery_for_registry = discovery_storage;
         discovery_storage = null; // ownership moves to the registry
 
-        // Plan 05 Phase D: compute the effective max_resident_mem. When the
-        // user didn't pass an explicit cap, derive 80% of mlx's wired limit
-        // (mlx_set_wired_limit returns a value the platform considers safe
-        // for sustained GPU work). The wired limit was already applied in
-        // the inference thread's load path; here we mirror that calculation
-        // so the registry's eviction gate stays in sync. 0 disables the cap.
-        const effective_max_resident_mem: u64 = if (max_resident_mem_explicit)
-            max_resident_mem
-        else blk: {
-            var dev = mlx.mlx_device{ .ctx = null };
-            _ = mlx.mlx_get_default_device(&dev);
-            var info = mlx.mlx_device_info_new();
-            defer _ = mlx.mlx_device_info_free(info);
-            if (mlx.mlx_device_info_get(&info, dev) != 0) break :blk 0;
-            var max_rec: usize = 0;
-            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) break :blk 0;
-            break :blk @as(u64, max_rec) * 4 / 5;
-        };
+        // Without an explicit cap the registry gate is Metal's working-set limit. 0 disables it.
+        const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
         if (effective_max_resident_mem > 0) {
             log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
                 max_resident_models,
@@ -1592,7 +1587,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
+        const user_prompt = prompt.?; // offline mode only runs with --prompt
         const messages = [_]chat_mod.Message{
             .{ .role = "user", .content = user_prompt },
         };
@@ -1760,9 +1755,9 @@ fn runDs4Offline(
     if (mtp_path) |p| log.info("[ds4] MTP draft head: {s}\n", .{p});
 
     var engine = ds4_arch.Ds4Engine.open(allocator, gguf_path, .{
-        .backend = .metal,
         .warm_weights = true,
         .ssd_streaming = ds4_ssd_streaming,
+        .prefill_chunk = generate_mod.explicitPrefillChunkU32(),
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
         .mtp_margin = 3.0,
@@ -1825,19 +1820,10 @@ fn runDs4Offline(
     log.info("[ds4] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
 }
 
-/// Registry resident-memory cap: the user's explicit value, or 80% of mlx's
-/// wired limit at startup (mirrors the MLX serve block). 0 = query failed →
-/// unlimited (the count cap still applies).
+/// Registry resident-memory cap: the user's explicit value, or Metal's working-set limit.
+/// 0 = query failed → unlimited (the count cap still applies).
 fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
-    if (explicit) return val;
-    var dev = mlx.mlx_device{ .ctx = null };
-    _ = mlx.mlx_get_default_device(&dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) != 0) return 0;
-    var max_rec: usize = 0;
-    if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) return 0;
-    return @as(u64, max_rec) * 4 / 5;
+    return model_registry_mod.ModelRegistry.residentMemCap(explicit, val, mlx.maxRecommendedWorkingSet());
 }
 
 fn dirBasename(path: []const u8) []const u8 {
