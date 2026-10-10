@@ -120,6 +120,8 @@ pub const Resolved = struct {
     quant: []const u8 = "",
     /// Set by `pullRepo`: the chosen GGUF group (`ggufGroup`); its files are pulled, no other .gguf.
     gguf_group: []const u8 = "",
+    /// Set by `pullRepo` with `gguf_group`: the one MTP draft head pulled beside it (`pickMtpSidecar`).
+    gguf_mtp: []const u8 = "",
 };
 
 /// Short name / repo ref → HF repo id. Accepts:
@@ -466,6 +468,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     const media = isMediaListing(allocator, files, config_json);
     var r = resolved;
     if (r.gguf_file.len == 0) r.gguf_group = try chooseGgufGroup(allocator, io, files, r.quant, reporter) orelse "";
+    if (r.gguf_group.len > 0) r.gguf_mtp = pickMtpSidecar(files, r.gguf_group);
 
     var wanted: usize = 0;
     var total_bytes: u64 = 0;
@@ -513,7 +516,7 @@ fn wantedFile(resolved: Resolved, path: []const u8, media: bool) bool {
         return std.mem.eql(u8, path, resolved.gguf_file);
     }
     if (resolved.gguf_group.len > 0 and std.mem.endsWith(u8, path, ".gguf"))
-        return ggufSidecar(path) or std.mem.eql(u8, ggufGroup(path) orelse return false, resolved.gguf_group);
+        return std.mem.eql(u8, path, resolved.gguf_mtp) or std.mem.eql(u8, ggufGroup(path) orelse return false, resolved.gguf_group);
     return if (media) shouldDownloadFile(path) else shouldDownload(path);
 }
 
@@ -532,9 +535,22 @@ pub fn ggufGroup(path: []const u8) ?[]const u8 {
     return stem[0..dash];
 }
 
-/// An MTP draft head (`mtp-*.gguf`), which serving loads beside whichever quant is pulled.
+/// An MTP draft head (`mtp-*.gguf`), which serving loads beside the trunk.
 fn ggufSidecar(path: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(std.fs.path.basename(path), "mtp-");
+}
+
+/// The one MTP draft head to pull beside the chosen group: the one quantized like it
+/// (same last `-` token: `...-Q4_K_M`), else the smallest. Repos ship several (BF16 to Q4).
+fn pickMtpSidecar(files: []const RepoFile, group: []const u8) []const u8 {
+    const quant = group[(std.mem.lastIndexOfScalar(u8, group, '-') orelse 0)..];
+    var best: ?RepoFile = null;
+    for (files) |f| {
+        if (!ggufSidecar(f.path)) continue;
+        if (std.ascii.endsWithIgnoreCase(f.path[0 .. f.path.len - ".gguf".len], quant)) return f.path;
+        if (best == null or f.size < best.?.size) best = f;
+    }
+    return if (best) |b| b.path else "";
 }
 
 /// Picks the GGUF quant to pull when the repo ships more than one: the tag's
@@ -1367,10 +1383,21 @@ test "ggufGroup: split parts group together, quants apart, mmproj never" {
     try testing.expect(ggufGroup("mmproj-F16.gguf") == null);
     try testing.expect(ggufGroup("imatrix_unsloth.gguf") == null);
     try testing.expect(ggufGroup("mtp-M-Q4_0.gguf") == null);
-    // The MTP sidecar rides along with whichever quant is picked; other quants do not.
-    const r: Resolved = .{ .repo = "o/r", .gguf_group = "M-Q4_K_M" };
+    // One MTP head rides along with the picked quant; other quants and heads do not.
+    const r: Resolved = .{ .repo = "o/r", .gguf_group = "M-Q4_K_M", .gguf_mtp = "MTP/mtp-M-Q4_0.gguf" };
     try testing.expect(wantedFile(r, "M-Q4_K_M.gguf", false));
-    try testing.expect(wantedFile(r, "mtp-M-Q4_0.gguf", false));
+    try testing.expect(wantedFile(r, "MTP/mtp-M-Q4_0.gguf", false));
+    try testing.expect(!wantedFile(r, "MTP/mtp-M-BF16.gguf", false));
     try testing.expect(!wantedFile(r, "M-Q8_0.gguf", false));
     try testing.expect(ggufGroup("config.json") == null);
+}
+
+test "pickMtpSidecar: the head quantized like the trunk, else the smallest" {
+    var p1 = "MTP/mtp-M-BF16.gguf".*;
+    var p2 = "MTP/mtp-M-Q4_K_M.gguf".*;
+    var p3 = "MTP/mtp-M-Q8_0.gguf".*;
+    const files = [_]RepoFile{ .{ .path = &p1, .size = 7000 }, .{ .path = &p2, .size = 2600 }, .{ .path = &p3, .size = 4000 } };
+    try testing.expectEqualStrings("MTP/mtp-M-Q8_0.gguf", pickMtpSidecar(&files, "Q8_0/M-Q8_0"));
+    try testing.expectEqualStrings("MTP/mtp-M-Q4_K_M.gguf", pickMtpSidecar(&files, "M-UD-IQ1_M"));
+    try testing.expectEqualStrings("", pickMtpSidecar(files[0..0], "M-Q4_K_M"));
 }
