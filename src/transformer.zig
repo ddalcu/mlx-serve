@@ -74787,6 +74787,29 @@ test "Metal-only kernels decline on a stream without them, so the MLX-op path ru
 
 // ── JANGH bundles (jangh.zig) ──
 
+test "jangh bank: a bound layer's switch slots reach the jangtq2 kernels as its gate, up and down" {
+    var arrs: [6]mlx.mlx_array = undefined;
+    for (&arrs, 0..) |*a, i| a.* = mlx.mlx_array_new_int(@intCast(i));
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for ([_]bool{ false, true }) |rotated| {
+        const mw = std.mem.zeroInit(MoeMlpWeights, .{
+            .switch_gate_w = arrs[0],
+            .switch_gate_s = arrs[1],
+            .switch_up_w = arrs[2],
+            .switch_up_s = arrs[3],
+            .switch_down_w = arrs[4],
+            .switch_down_s = arrs[5],
+            .tq2 = jangh.Layer{ .gate_up_bits = 4, .down_bits = 6, .rotated = rotated },
+        });
+        const bank = jangtq2Bank(&mw);
+        const got = [_]mlx.mlx_array{ bank.gate.packed_w, bank.gate.scales, bank.up.packed_w, bank.up.scales, bank.down.packed_w, bank.down.scales };
+        for (arrs, got) |want, g| try testing.expectEqual(want.ctx, g.ctx);
+        try testing.expectEqual(rotated, bank.rotated);
+    }
+}
+
 test "jangh bundle: layer 0, the PLE and the MTP head bind from the loaded map (QWEN4_JANGH_TEST_MODEL)" {
     const raw = std.c.getenv("QWEN4_JANGH_TEST_MODEL") orelse return error.SkipZigTest;
     const path = std.mem.span(raw);

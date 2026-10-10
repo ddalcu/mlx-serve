@@ -622,6 +622,74 @@ test "jangh names: the bundle's roots map onto the layout the qwen4_exp loader r
     try testing.expectError(error.NameTooLong, runtimeName(&tiny, "lm_head.weight"));
 }
 
+/// `from, from + 1, ...` shaped `shape`, as `dtype`.
+fn testRamp(shape: []const c_int, from: usize, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_arange(&flat, @floatFromInt(from), @floatFromInt(from + n), 1, dtype, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, flat, shape.ptr, shape.len, s));
+    return out;
+}
+
+fn expectSameArray(want: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    try testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, want, got, false, s));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try testing.expect(same);
+}
+
+test "jangh adapt: the PLE conv binds as [C, K, 1] and the MTP head's fused gate_up splits gate-first" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const e = 2;
+    const inter = 3;
+    const config: ModelConfig = .{ .hc_count = 2, .hidden_size = 3, .ple_layer_idx = 1, .ple_conv_kernel = 4, .num_experts = e, .moe_intermediate_size = inter };
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    const conv = "language_model.model.layers.1.ple.conv1d.weight";
+    try putNew(&weights, conv, try testRamp(&.{ 6, 4 }, 0, .bfloat16, s));
+    const mtp = "language_model.mtp.layers.0.mlp.";
+    const leaves = [_][]const u8{ "weight", "scales", "biases" };
+    const dtypes = [_]mlx.mlx_dtype{ .uint32, .bfloat16, .bfloat16 };
+    var halves: [leaves.len][2]mlx.mlx_array = @splat(@splat(.{}));
+    defer for (halves) |pair| for (pair) |h| {
+        _ = mlx.mlx_array_free(h);
+    };
+    var downs: [leaves.len]mlx.mlx_array = undefined;
+    var nb: [128]u8 = undefined;
+    for (leaves, dtypes, &halves, &downs, 0..) |leaf, dtype, *pair, *down, li| {
+        for (pair, 0..) |*h, half| h.* = try testRamp(&.{ e, inter, 2 }, (2 * li + half) * e * inter * 2, dtype, s);
+        // Each expert's fused rows: its gate rows, then its up rows.
+        const parts = mlx.mlx_vector_array_new_data(pair, 2);
+        defer _ = mlx.mlx_vector_array_free(parts);
+        var fused = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&fused, parts, 1, s));
+        try putNew(&weights, try std.fmt.bufPrint(&nb, mtp ++ "experts.gate_up_proj.{s}", .{leaf}), fused);
+        down.* = try testRamp(&.{ e, inter, 2 }, 0, dtype, s);
+        try putNew(&weights, try std.fmt.bufPrint(&nb, mtp ++ "experts.down_proj.{s}", .{leaf}), down.*);
+    }
+
+    try adapt(&config, &weights, s);
+    try testing.expectEqual(@as(u32, 1 + 3 * leaves.len), weights.count());
+    const want_conv = try testRamp(&.{ 6, 4, 1 }, 0, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(want_conv);
+    try expectSameArray(want_conv, weights.get(conv).?, s);
+    for (leaves, halves, downs) |leaf, pair, down| {
+        for ([_][]const u8{ "gate_proj", "up_proj" }, pair) |proj, want| {
+            try expectSameArray(want, weights.get(try std.fmt.bufPrint(&nb, mtp ++ "switch_mlp.{s}.{s}", .{ proj, leaf })).?, s);
+        }
+        try testing.expectEqual(down.ctx, weights.get(try std.fmt.bufPrint(&nb, mtp ++ "switch_mlp.down_proj.{s}", .{leaf})).?.ctx);
+    }
+}
+
 /// One tensor as a shard header describes it.
 const Info = struct { dtype: []const u8, shape: []const i64 };
 
