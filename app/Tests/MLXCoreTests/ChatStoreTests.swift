@@ -21,7 +21,7 @@ final class ChatStoreTests: XCTestCase {
     private var backupPath: String { (dir as NSString).appendingPathComponent("chat-history.migrated.json") }
 
     private func open() throws -> ChatStore {
-        try ChatStore(path: dbPath, legacyHistoryPath: legacyPath)
+        try ChatStore(path: dbPath, legacyHistoryPath: legacyPath, legacySidebar: nil)
     }
 
     /// Reopens the file, so a check reads the disk and not the store's memory.
@@ -67,6 +67,7 @@ final class ChatStoreTests: XCTestCase {
         s.useMCP = true
         s.agentId = UUID()
         s.disabledTools = ["shell", "browse"]
+        s.sidebarPosition = 7
 
         var user = ChatMessage(role: .user, content: "A \"quoted\" line, a NUL \u{0} and an emoji 🎉")
         user.images = [ChatImage(data: Data(), path: "/tmp/a.png")]
@@ -111,8 +112,12 @@ final class ChatStoreTests: XCTestCase {
     // MARK: - Round trip
 
     func testEveryFieldOfAChatAndItsMessagesSurvivesTheRoundTrip() throws {
-        let original = everything()
-        try open().save([original])
+        let store = try open()
+        var groups = SidebarGroups()
+        var original = everything()
+        original.groupId = groups.create("Work")
+        SidebarStore(database: store.database).saveGroups(groups)
+        store.save([original])
         XCTAssertEqual(try json(reloaded()), try json([original]))
     }
 

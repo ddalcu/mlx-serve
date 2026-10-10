@@ -1042,10 +1042,7 @@ struct ChatSidebar: View {
                             sessions: [SidebarChatRows.Row],
                             visible: [UUID], all: [UUID], chats: [UUID]) {
         let agentIds = Set(SidebarSessionGroups.split(appState.visibleChatSessions).agents.map(\.id))
-        let rows = SidebarChatRows.merge(chats: appState.visibleChatSessions,
-                                         terminals: terminals.sessions.sessions,
-                                         order: appState.sidebarOrder)
-        let parts = appState.sidebarGroups.partition(rows)
+        let parts = appState.sidebarGroups.partition(appState.sidebarRows)
         let agents = parts.ungrouped.filter { agentIds.contains($0.id) }
         let sessions = parts.ungrouped.filter { !agentIds.contains($0.id) }
         let shown = agents + parts.groups.flatMap { $0.group.collapsed ? [] : $0.rows } + sessions
@@ -1204,7 +1201,7 @@ struct ChatSidebar: View {
             switch sheet {
             case .create(let ids):
                 SidebarGroupSheet(title: "New Group", action: "Create", name: "") {
-                    appState.sidebarGroups.create($0, with: ids)
+                    appState.createSidebarGroup(named: $0, with: ids)
                 }
             case .rename(let id, let name):
                 SidebarGroupSheet(title: "Rename Group", action: "Rename", name: name) {
@@ -1501,21 +1498,21 @@ struct ChatSidebar: View {
         .contextMenu {
             Button { groupSheet = .rename(group.id, group.name) } label: { Text("Rename Group…")
                 .font(.app(.body)) }
-            Button(role: .destructive) { appState.sidebarGroups.delete(group.id) } label: { Text("Delete Group")
+            Button(role: .destructive) { appState.deleteSidebarGroup(group.id) } label: { Text("Delete Group")
                 .font(.app(.body)) }
         }
     }
 
     private func groupDrop(_ group: UUID?) -> SidebarGroupDrop {
-        SidebarGroupDrop(dragging: $draggingRowId) { appState.sidebarGroups.assign([$0], to: group) }
+        SidebarGroupDrop(dragging: $draggingRowId) { appState.moveToSidebarGroup([$0], group: group) }
     }
 
     /// "Move to Group" for a row, or for the multi-selection it sits in.
     @ViewBuilder
     private func groupMenu(for ids: Set<UUID>, current: UUID?) -> some View {
         Menu("Move to Group") {
-            ForEach(appState.sidebarGroups.groups) { group in
-                Button { appState.sidebarGroups.assign(ids, to: group.id) } label: { Text(group.name)
+            ForEach(appState.sidebarGroups.ordered) { group in
+                Button { appState.moveToSidebarGroup(ids, group: group.id) } label: { Text(group.name)
                     .font(.app(.body)) }
                     .disabled(ids.count == 1 && group.id == current)
             }
@@ -1524,7 +1521,7 @@ struct ChatSidebar: View {
                 .font(.app(.body)) }
         }
         if current != nil {
-            Button { appState.sidebarGroups.assign(ids, to: nil) } label: { Text("Remove from Group")
+            Button { appState.moveToSidebarGroup(ids, group: nil) } label: { Text("Remove from Group")
                 .font(.app(.body)) }
         }
         Divider()
@@ -1560,7 +1557,7 @@ struct ChatSidebar: View {
         Menu {
             Button {
                 appState.showConversation()
-                appState.sidebarGroups.assign([appState.newChatSession()], to: group)
+                appState.newChatSession(group: group)
             } label: {
                 Label("New Chat", systemImage: "square.and.pencil").font(.app(.body))
             }
@@ -1726,7 +1723,7 @@ struct ChatSidebar: View {
             Button { beginRename(session.id, current: session.title) } label: { Text("Rename…")
                 .font(.app(.body)) }
             groupMenu(for: inSelection ? appState.sidebarSelection : [session.id],
-                      current: appState.sidebarGroups.group(of: session.id))
+                      current: session.groupId)
             if inSelection {
                 Button(role: .destructive) {
                     requestDeleteChats(appState.sidebarSelection, keyboard: false)
@@ -1803,7 +1800,7 @@ struct ChatSidebar: View {
         .contextMenu {
             Button { beginRename(t.id, current: t.displayName) } label: { Text("Rename…")
                 .font(.app(.body)) }
-            groupMenu(for: [t.id], current: appState.sidebarGroups.group(of: t.id))
+            groupMenu(for: [t.id], current: t.groupId)
             if t.isInOwnWindow {
                 Button { showTerminal(t.id) } label: { Text("Show Window")
                     .font(.app(.body)) }

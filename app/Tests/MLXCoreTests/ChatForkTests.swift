@@ -151,6 +151,16 @@ final class ChatForkTests: XCTestCase {
         XCTAssertEqual(fork.messages.map(\.content), ["one"])
     }
 
+    /// A branch stays in its source's sidebar group, on top of it like any new row.
+    func testTheForkStaysInTheSourcesGroup() {
+        var source = ChatSession(title: "x")
+        source.groupId = UUID()
+        source.sidebarPosition = 3
+        let fork = ChatFork.session(from: source, messages: [user("one")])
+        XCTAssertEqual(fork.groupId, source.groupId)
+        XCTAssertNil(fork.sidebarPosition)
+    }
+
     /// The attached folder is NOT inherited: its security-scoped bookmark is
     /// keyed by the source session's id, so the path would come across without
     /// the grant that makes it readable — a folder chip pointing at something
