@@ -1,0 +1,280 @@
+MLX's CUDA quantized matmul has two kernels for a few rows of x: qmv, which
+streams the whole weight matrix once per row, and the tiled qmm_sm80, which
+reads it once but dequantizes into a tensor-core GEMM. On a GPU with little
+compute per byte of memory bandwidth (GB10, sm_121) the tiled kernel costs
+over twice a single row at any width, so a speculative-verify forward of 2..8
+rows is slower than decoding its tokens one at a time.
+
+This adds a rows variant of qmv: each warp dequantizes its row of w once and
+takes its dot product with every row of x, in float32. Two or three rows cost
+about what one does; each further row adds scalar compute only.
+
+Off by default: MLX_CUDA_QMV_MAX_ROWS=<1..8> sets how many rows of one batch
+take it (2D weights, no gather).
+
+Drop this file and its step in build-mlx-linux.sh once lib/mlx-src includes
+it.
+
+diff --git a/docs/src/usage/environment_variables.rst b/docs/src/usage/environment_variables.rst
+index 4641411d9..2660de4f6 100644
+--- a/docs/src/usage/environment_variables.rst
++++ b/docs/src/usage/environment_variables.rst
+@@ -175,6 +175,12 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
+    Set the CUDA backward scaled dot-product attention cache capacity. The
+    default is ``64``.
+ 
++.. envvar:: MLX_CUDA_QMV_MAX_ROWS
++
++   Rows of one batch (``1`` to ``8``) that a CUDA quantized matmul runs through
++   the mat-vec kernel, which past one row reads the weights once for all of
++   them. The default is ``1``.
++
+ .. envvar:: MLX_ENABLE_CACHE_THRASHING_CHECK
+ 
+    Detect consecutive CUDA cache misses (more than twice the capacity with no
+diff --git a/mlx/backend/cuda/quantized/qmm/qmm.h b/mlx/backend/cuda/quantized/qmm/qmm.h
+index 6991baad1..77921b5be 100644
+--- a/mlx/backend/cuda/quantized/qmm/qmm.h
++++ b/mlx/backend/cuda/quantized/qmm/qmm.h
+@@ -118,6 +118,10 @@ bool supports_qmv(
+     QuantizationMode mode,
+     cu::Device& device);
+ 
++// Rows of one batch that qmv serves with a single read of the weights
++// (MLX_CUDA_QMV_MAX_ROWS, 1 to 8, default 1).
++int qmv_max_rows();
++
+ void qmv(
+     const array& x,
+     const array& w,
+diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
+index 63c847844..0423afd37 100644
+--- a/mlx/backend/cuda/quantized/qmm/qmv.cu
++++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
+@@ -8,8 +8,16 @@
+ #include <cooperative_groups.h>
+ #include <cooperative_groups/reduce.h>
+ 
++#include <algorithm>
++#include <cstdlib>
++
+ namespace mlx::core {
+ 
++int qmv_max_rows() {
++  const char* v = std::getenv("MLX_CUDA_QMV_MAX_ROWS");
++  return v ? std::clamp(std::atoi(v), 1, 8) : 1;
++}
++
+ namespace cu {
+ 
+ namespace cg = cooperative_groups;
+@@ -208,6 +216,105 @@ __global__ void qmv_kernel(
+       x, w, scales, biases, global_scale, out, row, w_batch, n, k);
+ }
+ 
++// 2..8 rows of x against one weight matrix: each warp dequantizes its row of w
++// once and takes its dot product with every row of x.
++template <
++    int ROWS,
++    int rows_per_block,
++    int elems_per_thread,
++    int group_size,
++    bool has_bias,
++    bool has_residue_k,
++    typename T,
++    typename Q,
++    typename S>
++__global__ void qmv_rows_kernel(
++    const T* x,
++    const Q* w,
++    const S* scales,
++    const T* biases,
++    T* out,
++    int n,
++    int k) {
++  auto block = cg::this_thread_block();
++  auto warp = cg::tiled_partition<WARP_SIZE>(block);
++
++  int row = block.group_index().x * rows_per_block + warp.meta_group_rank();
++  if (row >= n) {
++    return;
++  }
++
++  constexpr int bits = cute::sizeof_bits_v<Q>;
++  auto w_step = [&](int idx) { return idx * cuda::std::min(8, bits) / 8; };
++  int groups_per_row = k / group_size;
++  w += static_cast<int64_t>(row) * w_step(k);
++  scales += static_cast<int64_t>(row) * groups_per_row;
++  if constexpr (has_bias) {
++    biases += static_cast<int64_t>(row) * groups_per_row;
++  }
++
++  float sums[ROWS] = {};
++
++  auto dequant_dot_tile = [&](int idx) {
++    constexpr int N = elems_per_thread;
++    S scale = scales[idx / group_size];
++    auto w_vec =
++        *(reinterpret_cast<const cutlass::Array<Q, N>*>(w + w_step(idx)));
++    cutlass::NumericArrayConverter<T, Q, N> converter_tq;
++    cutlass::Array<T, N> w_dq = converter_tq(w_vec);
++    if constexpr (has_bias) {
++      T bias = biases[idx / group_size];
++      if constexpr (cuda::std::is_same_v<T, float>) {
++#pragma unroll
++        for (int i = 0; i < N; ++i) {
++          w_dq[i] = w_dq[i] * T(scale) + bias;
++        }
++      } else {
++        w_dq = w_dq * T(scale) + bias;
++      }
++    } else {
++      w_dq = w_dq * T(scale);
++    }
++    float w_f[N];
++#pragma unroll
++    for (int i = 0; i < N; ++i) {
++      w_f[i] = static_cast<float>(w_dq[i]);
++    }
++#pragma unroll
++    for (int m = 0; m < ROWS; ++m) {
++      auto x_vec = *(reinterpret_cast<const cutlass::Array<T, N>*>(
++          x + static_cast<int64_t>(m) * k + idx));
++      float dot{0};
++#pragma unroll
++      for (int i = 0; i < N; ++i) {
++        dot = fmaf(static_cast<float>(x_vec[i]), w_f[i], dot);
++      }
++      sums[m] += dot;
++    }
++  };
++
++  constexpr int elems_per_warp = WARP_SIZE * elems_per_thread;
++  for (int r = 0; r < k / elems_per_warp; ++r) {
++    int idx = warp.thread_rank() * elems_per_thread + r * elems_per_warp;
++    dequant_dot_tile(idx);
++  }
++  if constexpr (has_residue_k) {
++    int rest = k % elems_per_warp;
++    int idx = warp.thread_rank() * elems_per_thread + k - rest;
++    if (idx < k) {
++      dequant_dot_tile(idx);
++    }
++  }
++
++#pragma unroll
++  for (int m = 0; m < ROWS; ++m) {
++    float sum = cg::reduce(warp, sums[m], cg::plus<float>{});
++    if (warp.thread_rank() == 0) {
++      out[static_cast<int64_t>(m) * n + row] = static_cast<T>(sum);
++    }
++  }
++}
++
+ template <
+     int rows_per_block,
+     int elems_per_thread,
+@@ -283,6 +390,51 @@ void qmv(
+   void* args[] = {
+       &x, &w, &scales, &biases, &global_scale, &out, &n, &k, &broadcast_w};
+ 
++  if (m >= 2 && m <= qmv_max_rows() && l == 1 && !global_scale) {
++    dim3 row_blocks{uint32_t(cuda::ceil_div(n, rows_per_block)), 1, 1};
++    void* row_args[] = {&x, &w, &scales, &biases, &out, &n, &k};
++    dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
++      auto launch = [&]<int ROWS>() {
++        auto* kernel = &qmv_rows_kernel<
++            ROWS,
++            rows_per_block,
++            elems_per_thread,
++            group_size,
++            has_bias,
++            has_residue_k.value,
++            T,
++            Q,
++            S>;
++        launch_kernel(
++            reinterpret_cast<void*>(kernel), row_blocks, block_dims, row_args);
++      };
++      switch (m) {
++        case 2:
++          launch.template operator()<2>();
++          break;
++        case 3:
++          launch.template operator()<3>();
++          break;
++        case 4:
++          launch.template operator()<4>();
++          break;
++        case 5:
++          launch.template operator()<5>();
++          break;
++        case 6:
++          launch.template operator()<6>();
++          break;
++        case 7:
++          launch.template operator()<7>();
++          break;
++        default:
++          launch.template operator()<8>();
++          break;
++      }
++    });
++    return;
++  }
++
+   dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
+     auto* kernel = &qmv_kernel<
+         rows_per_block,
+diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
+index 68012cbf3..2ad9fd017 100644
+--- a/mlx/backend/cuda/quantized/quantized.cpp
++++ b/mlx/backend/cuda/quantized/quantized.cpp
+@@ -119,7 +119,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   }
+ 
+   if (can_use_qmm_sm80) {
+-    if (can_use_qmv && (M * B == 1)) {
++    if (can_use_qmv && (M * B == 1 || (B == 1 && M <= qmv_max_rows()))) {
+       call_qmv();
+     } else {
+       call_qmm_sm80();
+diff --git a/tests/cuda_tests.cpp b/tests/cuda_tests.cpp
+index fee796ee1..9f9d86c25 100644
+--- a/tests/cuda_tests.cpp
++++ b/tests/cuda_tests.cpp
+@@ -11,6 +11,7 @@
+ #include <cuda_runtime.h>
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <limits>
+ 
+ using namespace mlx::core;
+@@ -195,3 +196,26 @@ TEST_CASE("test quantized matmul over a few rows") {
+     }
+   }
+ }
++
++#ifndef _WIN32
++TEST_CASE("test quantized matmul rows kernel") {
++  // MLX_CUDA_QMV_MAX_ROWS sends 2..8 rows through the mat-vec rows kernel;
++  // each row must match a dequantized reference, a ragged K too.
++  setenv("MLX_CUDA_QMV_MAX_ROWS", "8", 1);
++  for (int bits : {4, 8}) {
++    for (int k : {512, 1088}) {
++      auto w = random::normal({384, k}, bfloat16);
++      auto q = quantize(w, 64, bits);
++      auto w_dq = astype(dequantize(q[0], q[1], q[2], 64, bits), float32);
++      for (int m : {2, 3, 5, 8}) {
++        auto x = random::normal({m, k}, bfloat16);
++        auto out = quantized_matmul(x, q[0], q[1], q[2], true, 64, bits);
++        auto expected = matmul(astype(x, float32), transpose(w_dq));
++        CHECK(
++            allclose(astype(out, float32), expected, 2e-2, 2e-1).item<bool>());
++      }
++    }
++  }
++  unsetenv("MLX_CUDA_QMV_MAX_ROWS");
++}
++#endif
