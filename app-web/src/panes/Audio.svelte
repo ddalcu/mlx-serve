@@ -47,7 +47,7 @@
   });
   $effect(() => () => {
     ws.flush();
-    ws.stopActivity();
+    ws.leave();
     if (ws.clipUrl) URL.revokeObjectURL(ws.clipUrl);
     ws.clipUrl = "";
   });

@@ -152,6 +152,12 @@ class ServerManager: ObservableObject {
         running && launchedModelPath.isEmpty && !chatResident && !selectedModelPath.isEmpty
     }
 
+    /// Whether `ensureDefaultChatModel` would load the selected model first.
+    func chatLoadNeeded(selectedModelPath: String) -> Bool {
+        Self.shouldEnsureChatDefault(running: status == .running, launchedModelPath: currentModelPath,
+                                     chatResident: residentChatModel != nil, selectedModelPath: selectedModelPath)
+    }
+
     /// Called by chat surfaces (chat window / quick launcher via
     /// ChatTurnEngine, the avatar) before a turn: when the running server was
     /// started headless for media generation, hot-load the user's selected
@@ -160,10 +166,7 @@ class ServerManager: ObservableObject {
     /// default, so the alias-addressed request that follows resolves).
     /// Failures are left to the request itself to surface.
     func ensureDefaultChatModel(selectedModelPath: String) async {
-        guard Self.shouldEnsureChatDefault(running: status == .running,
-                                           launchedModelPath: currentModelPath,
-                                           chatResident: residentChatModel != nil,
-                                           selectedModelPath: selectedModelPath) else { return }
+        guard chatLoadNeeded(selectedModelPath: selectedModelPath) else { return }
         if (try? await loadModel(id: selectedModelPath)) != nil {
             // Recorded here, not in `loadModel`: this hot-load passes no `setDefault`.
             StartupModelChoice.recordLoaded(path: selectedModelPath)

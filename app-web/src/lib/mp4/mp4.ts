@@ -72,13 +72,44 @@ function audioSpecificConfig(rate: number, channels: number): Part {
   return be(1, (2 << 3) | (index >> 1), ((index & 1) << 7) | (channels << 3));
 }
 
+/**
+ * The AudioSpecificConfig in an encoder's description. Chrome hands over the config itself;
+ * WebKit hands over a whole ES_Descriptor (tag 3), whose DecoderSpecificInfo (tag 5) holds it.
+ */
+function specificConfig(description: Uint8Array | undefined): Uint8Array | undefined {
+  if (!description?.length) return undefined;
+  if (description[0] !== 0x03) return description;
+  let at = 0;
+  const header = () => {
+    const tag = description[at++];
+    let length = 0;
+    for (let i = 0; i < 4; i++) {
+      const b = description[at++] ?? 0;
+      length = (length << 7) | (b & 0x7f);
+      if (!(b & 0x80)) break;
+    }
+    return { tag, length };
+  };
+  while (at < description.length) {
+    const { tag, length } = header();
+    if (tag === 0x05) return description.subarray(at, at + length);
+    if (tag === 0x03) {
+      const flags = description[at + 2] ?? 0;
+      at += 3 + (flags & 0x80 ? 2 : 0) + (flags & 0x20 ? 2 : 0);
+      if (flags & 0x40) at += 1 + (description[at] ?? 0);
+    } else if (tag === 0x04) at += 13;
+    else at += length;
+  }
+  return undefined;
+}
+
 function audioEntry(audio: AudioTrack): { entry: Part; preSkip: number; scale: number } {
   const head = (type: string, rate: number, config: Part) =>
     box(type, zeros(6), be(2, 1), zeros(8), be(2, audio.channels, 16, 0, 0), be(4, rate * 65536), config);
   if (audio.codec === "aac") {
     if (!AAC_RATES.includes(audio.sampleRate) || !audio.chunks.length)
       throw new StudioError("unsupported", t("AAC sample rate or output is unsupported."));
-    const asc = audio.description?.length ? audio.description : audioSpecificConfig(audio.sampleRate, audio.channels);
+    const asc = specificConfig(audio.description) ?? audioSpecificConfig(audio.sampleRate, audio.channels);
     const esds = full(
       "esds",
       0,

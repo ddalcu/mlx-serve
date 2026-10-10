@@ -40,14 +40,14 @@ export abstract class MediaRun<R extends Saved = Saved> {
     return run;
   }
 
-  /** Progress events from the server stream, ignored once this run is no longer the current one. */
-  protected progress(run: AbortController, extra?: (event: Record<string, unknown>) => void) {
+  /** Progress events from the server stream, ignored once this run is no longer the current one. `prefix` leads the message. */
+  protected progress(run: AbortController, extra?: (event: Record<string, unknown>) => void, prefix = "") {
     return (e: Record<string, unknown>) => {
       if (this.run !== run) return;
       extra?.(e);
       this.step = typeof e.step === "number" ? e.step : 0;
       this.total = typeof e.total === "number" ? e.total : this.total;
-      this.message = typeof e.stage === "string" ? `${e.stage}…` : t("Generating…");
+      this.message = prefix + (typeof e.stage === "string" ? `${e.stage}…` : t("Generating…"));
     };
   }
 

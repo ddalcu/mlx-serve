@@ -22,7 +22,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 |---|---|
 | `main.zig` | Entry, CLI flags + subcommands (`run/pull/list/serve/launch`) |
 | `cli.zig` | Ollama-grade CLI: alias → HF repo, resumable pull into `~/.mlx-serve/models/<org>/<repo>`, `list`, `run` REPL |
-| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider/fx/grok/zcode): reads `/v1/models` (ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, links the `skills/mlx-serve` skill, starts the app if the server is down. Swift twin: `CLILauncher` + `AgentConfigs`. Detail: reference.md "row detail" |
+| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider/fx/grok/zcode): reads `/v1/models` (ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, links the `skills/mlx-serve` skill, starts the app if the server is down. `GET /launch?agent=` serves the same files as a `curl … | sh` script for another machine (the console's Code Launcher, `remoteScript`). Swift twin: `CLILauncher` + `AgentConfigs`. Detail: reference.md "row detail" |
 | `mlx.zig` | mlx-c FFI |
 | `model.zig` | Config parse + safetensors loading |
 | `tokenizer.zig` | BPE; single special-token splitter (first-byte-bucketed); per-model `digit_group` |

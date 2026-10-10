@@ -190,6 +190,7 @@ test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
 
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
+const launch_mod = @import("launch.zig");
 const providers_mod = @import("providers.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
@@ -793,6 +794,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/api/version",
     "/detokenize",
     "/health",
+    "/launch",
     "/metrics",
     "/metrics.json",
     "/props",
@@ -907,11 +909,16 @@ fn resolveRequestModelId(registry: *ModelRegistry, aliases: *model_settings_mod.
 /// dispatch can't disagree about which model a request names.
 /// `?model=<id>` for bodiless GETs (`/props`), percent-decoded into `buf`.
 fn queryModel(buf: []u8, raw_path: []const u8) ?[]const u8 {
+    return queryDecoded(buf, raw_path, "model");
+}
+
+/// A non-empty query parameter, percent-decoded into `buf`.
+fn queryDecoded(buf: []u8, raw_path: []const u8, name: []const u8) ?[]const u8 {
     const q = raw_path[(std.mem.indexOfScalar(u8, raw_path, '?') orelse return null) + 1 ..];
     var it = std.mem.splitScalar(u8, q, '&');
     while (it.next()) |kv| {
-        if (!std.mem.startsWith(u8, kv, "model=") or kv.len == "model=".len) continue;
-        const v = kv["model=".len..];
+        if (kv.len <= name.len + 1 or !std.mem.startsWith(u8, kv, name) or kv[name.len] != '=') continue;
+        const v = kv[name.len + 1 ..];
         if (v.len > buf.len) return null;
         @memcpy(buf[0..v.len], v);
         return std.Uri.percentDecodeInPlace(buf[0..v.len]);
@@ -2399,6 +2406,10 @@ fn handleConnection(
         // remote stubs into `@a@b` re-export chains (live 2026-07-21).
         try handleModels(allocator, stream, lanGateApplies(stream) or
             (g_lan != null and isTunneledRequest(request[0..header_end_pos])));
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/launch")) {
+        try handleLaunchScript(allocator, stream, raw_path, request[0..header_end_pos], lanGateApplies(stream));
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/responses/")) {
@@ -6957,6 +6968,66 @@ fn handleModels(
     /// remote stubs (mirroring a peer's peer invites multi-hop loops).
     lan_filtered: bool,
 ) !void {
+    const body = renderModelsBody(allocator, stream.io, lan_filtered) catch |err| switch (err) {
+        error.RegistryNotReady => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503),
+        else => return err,
+    };
+    defer allocator.free(body);
+    try sendModelsResponse(stream, body);
+}
+
+/// `GET /launch?agent=<name>[&model=<id>]`: a shell script that configures a
+/// coding agent for this server and starts it (`curl -fsSL … | sh`, from the
+/// console's Code Launcher). The agent targets the host the request reached.
+fn handleLaunchScript(allocator: std.mem.Allocator, stream: *Conn, raw_path: []const u8, raw_headers: []const u8, lan_filtered: bool) !void {
+    if (launchRefusal(apiKeyGateApplies(g_api_key != null, g_api_key_strict, peerIsLoopback(stream)))) |reason|
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+    const kind = launch_mod.AgentKind.fromName(queryParamValue(raw_path, "agent") orelse "");
+    if (kind == null or !launch_mod.webLaunchable(kind.?))
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "agent must be one of: claude, pi, omp, opencode2, grok", 400);
+    var url_buf: [300]u8 = undefined;
+    var base_buf: [300]u8 = undefined;
+    const base_url = launchBaseUrl(&url_buf, queryDecoded(&base_buf, raw_path, "base"), findHeaderValueCI(raw_headers, "host") orelse "") orelse
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "base must be http(s)://host[:port][/path] and the Host header a plain host[:port]", 400);
+    const body = renderModelsBody(allocator, stream.io, lan_filtered) catch |err| switch (err) {
+        error.RegistryNotReady => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503),
+        else => return err,
+    };
+    defer allocator.free(body);
+    var models = try launch_mod.parseChatEntries(allocator, body);
+    defer models.deinit();
+    var model_buf: [1024]u8 = undefined;
+    const entry = launch_mod.pickEntry(models.entries, queryModel(&model_buf, raw_path)) orelse
+        return sendErrorResponse(allocator, stream, "404 Not Found", "invalid_request_error", "no such chat model on this server", 404);
+    const script = try launch_mod.remoteScript(allocator, kind.?, base_url, entry.id, entry.budget, models.entries);
+    defer allocator.free(script);
+    try sendResponse(stream, "200 OK", "text/plain; charset=utf-8", script);
+}
+
+/// The agents' configs carry a placeholder key, so a script fetched past the `--api-key`
+/// gate would start an agent that 401s on every request.
+fn launchRefusal(key_gated: bool) ?[]const u8 {
+    return if (key_gated) "the Code Launcher does not carry this server's --api-key: run `mlx-serve launch <agent>` with the key on that machine" else null;
+}
+
+/// The script's server URL: the console's own `base` (scheme and path prefix kept, the
+/// reverse-proxy case), else `http://<Host>`. Both are held to bytes that cannot break
+/// out of the script's quoting.
+fn launchBaseUrl(buf: []u8, base: ?[]const u8, host: []const u8) ?[]const u8 {
+    if (base) |b| {
+        const rest = if (std.mem.startsWith(u8, b, "https://")) b["https://".len..] else if (std.mem.startsWith(u8, b, "http://")) b["http://".len..] else return null;
+        const trimmed = std.mem.trimEnd(u8, rest, "/");
+        if (trimmed.len == 0) return null;
+        for (trimmed) |c| if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, ".-:[]/_~", c) != null)) return null;
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ b[0 .. b.len - rest.len], trimmed }) catch null;
+    }
+    if (host.len == 0) return null;
+    for (host) |c| if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, ".-:[]", c) != null)) return null;
+    return std.fmt.bufPrint(buf, "http://{s}", .{host}) catch null;
+}
+
+/// The `/v1/models` body.
+fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool) ![]u8 {
     // Plan 05 Phase E: emit every registry entry (loaded + unloaded), not
     // just the default model + flat discovery list. Default model is sorted
     // first so single-model clients reading `data[0]` continue to work.
@@ -6964,10 +7035,7 @@ fn handleModels(
     // us; each rendered entry is at most a few hundred bytes. This handler
     // does NOT route through `scheduler.ensureLoaded` — listing metadata
     // shouldn't trigger a cold load of the default model.
-    const registry = global_registry orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
-        return;
-    };
+    const registry = global_registry orelse return error.RegistryNotReady;
 
     var entries_buf = std.ArrayList(u8).empty;
     defer entries_buf.deinit(allocator);
@@ -6978,10 +7046,10 @@ fn handleModels(
     defer ordered.deinit(allocator);
     var alias_buf: [std.fs.max_path_bytes]u8 = undefined;
     // Any re-read happens here, not under the registry lock below.
-    g_model_aliases.refreshNow(stream.io);
+    g_model_aliases.refreshNow(io);
     {
-        registry.mutex.lockUncancelable(stream.io);
-        defer registry.mutex.unlock(stream.io);
+        registry.mutex.lockUncancelable(io);
+        defer registry.mutex.unlock(io);
         try ordered.ensureTotalCapacity(allocator, registry.entries.count());
         var it = registry.entries.valueIterator();
         while (it.next()) |entry_ptr| ordered.appendAssumeCapacity(entry_ptr.*);
@@ -6999,9 +7067,9 @@ fn handleModels(
         for (ordered.items) |entry| {
             if (lan_filtered and !g_lan.?.sharedAllows(entry.id)) continue;
             if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
-            const json = try renderModelEntry(allocator, stream.io, entry);
+            const json = try renderModelEntry(allocator, io, entry);
             defer allocator.free(json);
-            try appendAliasedRow(allocator, &entries_buf, json, g_model_aliases.aliasForPath(stream.io, entry.path, &alias_buf));
+            try appendAliasedRow(allocator, &entries_buf, json, g_model_aliases.aliasForPath(io, entry.path, &alias_buf));
         }
     }
 
@@ -7010,11 +7078,9 @@ fn handleModels(
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
     if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
 
-    const body = try std.fmt.allocPrint(allocator,
+    return std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{s}]}}
     , .{entries_buf.items});
-    defer allocator.free(body);
-    try sendModelsResponse(stream, body);
 }
 
 /// A `/v1/models` row with its Model Settings `alias` as the first field; `id`
@@ -21518,6 +21584,26 @@ test "queryModel: GET /props?model=<id> routes to that model, percent-decoded" {
     try testing.expectEqualStrings("mlx-community/Qwen3.5-0.8B", queryModel(&buf, "/props?x=1&model=mlx-community%2FQwen3.5-0.8B").?);
     try testing.expect(queryModel(&buf, "/props") == null);
     try testing.expect(queryModel(&buf, "/props?models=a") == null);
+}
+
+test "launchBaseUrl: a served launch script targets the Host the request reached, never a quote-breaking one" {
+    var buf: [300]u8 = undefined;
+    try testing.expectEqualStrings("http://192.168.1.20:11234", launchBaseUrl(&buf, null, "192.168.1.20:11234").?);
+    try testing.expectEqualStrings("http://[::1]:8080", launchBaseUrl(&buf, null, "[::1]:8080").?);
+    for ([_][]const u8{ "", "h'; rm -rf ~;'", "h:1/x", "h $(id)", "h\"" }) |bad| try testing.expect(launchBaseUrl(&buf, null, bad) == null);
+}
+
+test "launchBaseUrl: the console's own base keeps its scheme and path prefix, and is held to the same quoting bar" {
+    var buf: [300]u8 = undefined;
+    try testing.expectEqualStrings("https://mac.tail1.ts.net/mlx-serve", launchBaseUrl(&buf, "https://mac.tail1.ts.net/mlx-serve/", "ignored").?);
+    try testing.expectEqualStrings("http://10.0.0.5:11234", launchBaseUrl(&buf, "http://10.0.0.5:11234", "").?);
+    for ([_][]const u8{ "", "ftp://h", "h:1", "https://h/'$(id)'", "http://h/a b", "https://h\"", "http://" }) |bad|
+        try testing.expect(launchBaseUrl(&buf, bad, "h:1") == null);
+}
+
+test "launchRefusal: under --api-key a gated request is refused by name, a loopback one is served" {
+    try testing.expect(launchRefusal(true) != null);
+    try testing.expect(launchRefusal(false) == null);
 }
 
 test "settingsPropsJson: /props names the effective serving settings a benchmark ran under" {

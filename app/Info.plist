@@ -48,7 +48,7 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>MLX-Serve uses your local network only when LAN Sharing is enabled in Settings: to advertise the models you chose to share and to discover models other Macs share, over Bonjour. Nothing leaves your network.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>MLX-Serve records audio from your microphone so multimodal models (like Gemma 4 12B) can listen to and respond to your voice.</string>
+	<string>Needed for Voice mode and recording audio prompts. macOS also asks for this when the app plays audio; playback never records.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>MLX-Serve uses Apple's on-device speech recognition in Voice mode so you can talk to the model hands-free, even with no internet. Your audio is transcribed locally on your Mac; this app forces on-device recognition and never sends your speech to Apple's servers. (The wording above is Apple's standard text for this permission.)</string>
 </dict>

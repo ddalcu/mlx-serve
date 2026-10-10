@@ -50,6 +50,7 @@ const server_mod = @import("server.zig");
 const multipart = @import("multipart.zig");
 const discovery = @import("model_discovery.zig");
 const stb = @import("stb");
+const webp = @import("webp");
 
 const Conn = server_mod.Conn;
 
@@ -730,10 +731,15 @@ pub const ImageEngine = struct {
         return self.backend == .flux or self.backend == .qwen_image;
     }
 
-    /// Steps for a request that names none: the distilled backends' few-step
-    /// default, or an undistilled checkpoint's own recommendation.
-    pub fn defaultSteps(self: *const ImageEngine) u32 {
-        return if (self.backend == .qwen_image) qwen_image.DEFAULT_STEPS else 4;
+    /// Steps for a request: a checkpoint's own sampling grid, else the
+    /// request's count, else the distilled backends' few-step default or an
+    /// undistilled checkpoint's own recommendation.
+    /// 0 = the backend's default, the same as an omitted count.
+    pub fn resolveSteps(self: *const ImageEngine, steps: u32) u32 {
+        return switch (self.backend) {
+            .qwen_image => |q| q.stepsFor(steps),
+            else => if (steps == 0) 4 else steps,
+        };
     }
 
     /// Reconcile the engine's attached LoRA stack with the request: an empty
@@ -2368,7 +2374,10 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    var steps: u32 = @intCast(extractJsonInt(body, "steps") orelse engine.defaultSteps());
+    const req_steps = stepsRequest(extractJsonInt(body, "steps"), 0, 0, 100) catch
+        return sendError(conn, 400, "'steps' must be in [0,100] (0 = the model's default)");
+    var steps: u32 = engine.resolveSteps(req_steps);
+    if (req_steps != 0 and req_steps != steps) log.info("[image] {d} steps requested, the checkpoint's own grid runs {d}\n", .{ req_steps, steps });
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -2412,13 +2421,15 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             if (!(sv > 0.0 and sv <= 1.0)) return sendError(conn, 400, "'strength' must be in (0,1]");
             strength = @floatCast(sv);
         }
-        const img_bytes = base64DecodeAlloc(allocator, raw_img) catch
+        const img_bytes = imageB64Alloc(allocator, raw_img) catch
             return sendError(conn, 400, "invalid base64 in 'image'");
         defer allocator.free(img_bytes);
         if (edit_mode and engine.editUsesRawBytes()) {
             // Byte-based edit backend: keep the source bytes; the engine does
             // its own preprocessing (MageFlow's target-size VAE resize + VLM
             // resize, Qwen's tower/VAE encode — raw bytes, so alpha survives).
+            if (imageNativeSize(img_bytes) == null)
+                return sendError(conn, 400, "could not decode 'image' (PNG/JPEG/WebP supported)");
             edit_byte_bufs[0] = try allocator.dupe(u8, img_bytes);
             edit_byte_n = 1;
             if (engine.backend == .qwen_image) {
@@ -2503,10 +2514,12 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
                     "too many reference images ('ref_images' takes at most 9 beside 'image')"
                 else
                     "too many reference images ('ref_images' takes at most 3 beside 'image')");
-            const ref_bytes = base64DecodeAlloc(allocator, raw_ref) catch
+            const ref_bytes = imageB64Alloc(allocator, raw_ref) catch
                 return sendError(conn, 400, "invalid base64 in 'ref_images'");
             defer allocator.free(ref_bytes);
             if (engine.editUsesRawBytes()) {
+                if (imageNativeSize(ref_bytes) == null)
+                    return sendError(conn, 400, "could not decode a 'ref_images' entry (PNG/JPEG/WebP supported)");
                 edit_byte_bufs[edit_byte_n] = try allocator.dupe(u8, ref_bytes);
                 edit_byte_n += 1;
                 // Qwen output aspect follows the LAST condition image.
@@ -3261,8 +3274,8 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
     if (duration < music3.MIN_DURATION_S or duration > music3.MAX_DURATION_S)
         return sendError(conn, 400, "'duration_seconds' must be in [1,360]");
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse music3.DEFAULT_STEPS);
-    if (steps < 4 or steps > 100) return sendError(conn, 400, "'steps' must be in [4,100]");
+    const steps = stepsRequest(extractJsonInt(body, "steps"), music3.DEFAULT_STEPS, 4, 100) catch
+        return sendError(conn, 400, "'steps' must be in [4,100]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
 
     // Pre-validate the prompt budget BEFORE any SSE bytes go out, so the cap
@@ -3343,8 +3356,8 @@ fn handleYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engin
     }
     const seconds: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse yue2.MAX_SECONDS);
     if (seconds < yue2.MIN_SECONDS or seconds > yue2.MAX_SECONDS) return sendError(conn, 400, "'duration_seconds' must be in [5,360]");
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse yue2.DEFAULT_STEPS);
-    if (steps < 1 or steps > yue2.MAX_STEPS) return sendError(conn, 400, "'steps' must be in [1,100]");
+    const steps = stepsRequest(extractJsonInt(body, "steps"), yue2.DEFAULT_STEPS, 1, yue2.MAX_STEPS) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
     var cfg_scale: ?f32 = null;
     if (extractJsonFloat(body, "cfg_scale")) |g| {
         if (!(g >= 0 and g <= yue2.MAX_CFG)) return sendError(conn, 400, "'cfg_scale' must be in [0,20]");
@@ -3655,7 +3668,7 @@ fn parseH3Refs(
             const bytes = jsonB64Alloc(allocator, b64) catch
                 return std.fmt.bufPrint(err_buf, "'ref_images'[{d}] is not valid base64", .{pend.images.items.len}) catch
                     "a 'ref_images' entry is not valid base64";
-            try pend.images.append(allocator, bytes);
+            try pend.images.append(allocator, try webpAsPng(allocator, bytes));
         }
         if (it.bad) return "'ref_images' must be an array of base64 PNG/JPEG strings";
     }
@@ -3676,7 +3689,7 @@ fn parseH3Refs(
                 const bytes = jsonB64Alloc(allocator, b64) catch
                     return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].frames[{d}] is not valid base64", .{ vi, frames.items.len }) catch
                         "a 'ref_videos' frame is not valid base64";
-                try frames.append(allocator, bytes);
+                try frames.append(allocator, try webpAsPng(allocator, bytes));
             }
             if (fit.bad)
                 return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].frames must be an array of base64 PNG/JPEG strings", .{vi}) catch
@@ -3888,7 +3901,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
 
     const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
     const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse (if (turbo) @as(u64, 4) else 30));
+    const steps = stepsRequest(extractJsonInt(body, "steps"), if (turbo) 4 else 30, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
     const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
     const requested_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 56);
 
@@ -3939,7 +3953,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             const b64 = try jsonUnescape(allocator, raw_img);
             defer allocator.free(b64);
             if (b64.len > 0) {
-                const img_bytes = base64DecodeAlloc(allocator, b64) catch
+                const img_bytes = imageB64Alloc(allocator, b64) catch
                     return sendError(conn, 400, "keyframe image is not valid base64");
                 defer allocator.free(img_bytes);
                 const decodeAt = struct {
@@ -4123,8 +4137,10 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     const cfg_audio: ?f32 = if (extractJsonFloat(body, "cfg_audio_scale")) |v| @floatCast(v) else null;
     const stg: ?f32 = if (extractJsonFloat(body, "stg_scale")) |v| @floatCast(v) else null;
     const guiders = videoGuiderDefaults(pipeline, cfg_video, cfg_audio, stg);
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse guiders.stage1_steps_default);
-    const stage2_steps: u32 = @intCast(extractJsonInt(body, "stage2_steps") orelse 0);
+    const steps = stepsRequest(extractJsonInt(body, "steps"), guiders.stage1_steps_default, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
+    const stage2_steps = stepsRequest(extractJsonInt(body, "stage2_steps"), 0, 0, 100) catch
+        return sendError(conn, 400, "'stage2_steps' must be in [0,100] (0 = the pipeline's default)");
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     const preview_req = sse.parsePreview(body);
@@ -4240,7 +4256,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
             defer allocator.free(b64);
             if (b64.len > 0) {
-                if (base64DecodeAlloc(allocator, b64)) |img_bytes| {
+                if (imageB64Alloc(allocator, b64)) |img_bytes| {
                     defer allocator.free(img_bytes);
                     const enc_h = (height / 32) * 32;
                     const enc_w = (width / 32) * 32;
@@ -4281,7 +4297,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         defer allocator.free(b64);
         if (b64.len > 0) {
             const ve = if (engine.vae_encoder) |*e| e else return sendError(conn, 400, "last frame conditioning needs vae_encoder.safetensors — download it into the model dir");
-            const img_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "last_frame_image: invalid base64");
+            const img_bytes = imageB64Alloc(allocator, b64) catch return sendError(conn, 400, "last_frame_image: invalid base64");
             defer allocator.free(img_bytes);
             if (num_frames < 9) return sendError(conn, 400, "last_frame_image needs at least 9 frames (one latent frame cannot hold an anchor and still generate)");
             const enc_h = (height / 32) * 32;
@@ -4463,14 +4479,15 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
     const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
     defer allocator.free(b64);
     if (b64.len == 0) return sendError(conn, 400, "empty 'image'");
-    const img_bytes = base64DecodeAlloc(allocator, b64) catch
+    const img_bytes = imageB64Alloc(allocator, b64) catch
         return sendError(conn, 400, "invalid base64 in 'image'");
     defer allocator.free(img_bytes);
     const img = decodeImageRgba(allocator, img_bytes) orelse
         return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
     defer allocator.free(img.pix);
 
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
+    const steps = stepsRequest(extractJsonInt(body, "steps"), 30, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
     const res: u32 = @intCast(extractJsonInt(body, "octree_resolution") orelse 256);
     if (res < 64 or res > 512) return sendError(conn, 400, "'octree_resolution' must be in [64,512]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
@@ -4755,7 +4772,7 @@ const QwenImageEditPlan = struct { steps: u32, prefix_cache: bool };
 
 /// Prefer cached edits, but preserve requests that fit only without the cache.
 fn planQwenImageEdit(steps: u32, cache_enabled: bool, base_bill: u64, prefix_bill: u64, headroom: u64) !QwenImageEditPlan {
-    const resolved_steps = qwen_image.resolveSteps(steps);
+    const resolved_steps = qwen_image.resolveSteps(null, steps);
     if (base_bill -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES > headroom)
         return error.QwenImageEditMemoryBudget;
     return .{
@@ -5097,6 +5114,23 @@ fn parseSize(size: []const u8) ?struct { w: u32, h: u32 } {
     return .{ .w = w, .h = h };
 }
 
+/// A request's step count: `default` when omitted, else held to [lo, hi] BEFORE any
+/// cast, so a client integer never reaches a narrowing cast or a schedule unchecked.
+fn stepsRequest(requested: ?u64, default: u32, lo: u32, hi: u32) error{StepsOutOfRange}!u32 {
+    const n = requested orelse return default;
+    if (n < lo or n > hi) return error.StepsOutOfRange;
+    return @intCast(n);
+}
+
+test "stepsRequest: omitted takes the default, the range is checked before the cast" {
+    try std.testing.expectEqual(@as(u32, 30), try stepsRequest(null, 30, 1, 100));
+    try std.testing.expectEqual(@as(u32, 1), try stepsRequest(1, 30, 1, 100));
+    try std.testing.expectEqual(@as(u32, 100), try stepsRequest(100, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(0, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(101, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(5_000_000_000, 30, 1, 100));
+}
+
 fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
     var key_pat_buf: [64]u8 = undefined;
     const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
@@ -5372,6 +5406,24 @@ fn base64DecodeAlloc(allocator: std.mem.Allocator, b64: []const u8) ![]u8 {
     errdefer allocator.free(out);
     try dec.decode(out, b64);
     return out;
+}
+
+/// Base64-decode an image for the media backends, which all read through
+/// stb_image: a WebP comes back re-encoded as a lossless PNG (alpha kept),
+/// anything else exactly as sent.
+fn imageB64Alloc(allocator: std.mem.Allocator, b64: []const u8) ![]u8 {
+    return webpAsPng(allocator, try base64DecodeAlloc(allocator, b64));
+}
+
+/// Takes ownership of `bytes`.
+fn webpAsPng(allocator: std.mem.Allocator, bytes: []u8) ![]u8 {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    const rgba = webp.WebPDecodeRGBA(bytes.ptr, bytes.len, &w, &h) orelse return bytes;
+    defer webp.WebPFree(rgba);
+    defer allocator.free(bytes);
+    const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    return png_mod.encodeRgba(allocator, rgba[0..n], @intCast(w), @intCast(h));
 }
 
 /// Decode a 16-bit PCM mono WAV → f32 samples in [-1, 1]. Scans the RIFF
@@ -6875,4 +6927,39 @@ test "h3 residency: the margin scales with RAM and never drops below 10 GiB" {
     const gb: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(10 * gb, h3ResidentMargin(64 * gb));
     try std.testing.expectEqual(16 * gb, h3ResidentMargin(256 * gb));
+}
+
+test "a base64 WebP reference reaches the media backends as a PNG with the same pixels" {
+    const a = std.testing.allocator;
+    // cwebp -lossless -exact of a 3x2 RGBA PNG (one pixel fully transparent).
+    const webp_bytes = [_]u8{
+        0x52, 0x49, 0x46, 0x46, 0x4e, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+        0x56, 0x50, 0x38, 0x4c, 0x41, 0x00, 0x00, 0x00, 0x2f, 0x02, 0x40, 0x00,
+        0x10, 0x2f, 0x40, 0x90, 0x6d, 0xb3, 0xcc, 0x61, 0x5e, 0xf7, 0x77, 0xb9,
+        0x07, 0x99, 0xb4, 0x4d, 0xe9, 0x39, 0xff, 0x7a, 0x66, 0xad, 0x8a, 0x1a,
+        0x10, 0x80, 0x1c, 0x15, 0xbc, 0xf5, 0x2f, 0x69, 0x14, 0xb6, 0x6d, 0x83,
+        0x94, 0xf6, 0x35, 0x9d, 0xbe, 0x80, 0x83, 0xf8, 0xea, 0x7a, 0xeb, 0xd6,
+        0xdb, 0x03, 0x08, 0x48, 0xc8, 0x94, 0x3c, 0xf2, 0x45, 0x44, 0xff, 0x23,
+        0x16, 0x00,
+    };
+    const want = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 10, 20, 30, 255, 200, 100, 50, 255, 1, 2, 3, 4 };
+    var b64: [std.base64.standard.Encoder.calcSize(webp_bytes.len)]u8 = undefined;
+    const out = try imageB64Alloc(a, std.base64.standard.Encoder.encode(&b64, &webp_bytes));
+    defer a.free(out);
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const px = stb.stbi_load_from_memory(out.ptr, @intCast(out.len), &w, &h, &ch, 4) orelse return error.TestUnexpectedResult;
+    defer stb.stbi_image_free(px);
+    try std.testing.expectEqual(@as(c_int, 3), w);
+    try std.testing.expectEqual(@as(c_int, 2), h);
+    try std.testing.expectEqualSlices(u8, &want, px[0..want.len]);
+
+    // Anything stb already reads passes through byte for byte.
+    const png_bytes = try png_mod.encodeRgba(a, &want, 3, 2);
+    defer a.free(png_bytes);
+    var b64_png: [256]u8 = undefined;
+    const same = try imageB64Alloc(a, std.base64.standard.Encoder.encode(&b64_png, png_bytes));
+    defer a.free(same);
+    try std.testing.expectEqualSlices(u8, png_bytes, same);
 }

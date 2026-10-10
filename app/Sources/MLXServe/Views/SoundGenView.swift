@@ -41,7 +41,7 @@ struct SoundGenView: View {
 
             VStack(spacing: 12) {
                 previewArea
-                AudioHistoryShelf(title: "History", paths: service.recent,
+                AudioHistoryShelf(paths: service.recent,
                                   playingPath: clipPlayer.playingPath,
                                   onPlay: { clipPlayer.play($0) }, onStop: { clipPlayer.stop() })
                 Button {
@@ -63,7 +63,6 @@ struct SoundGenView: View {
             }
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        .onDisappear { clipPlayer.stop() }
         .onChange(of: snapshot) { _, s in if !hydrating { s.save() } }
         .onChange(of: service.phase) { _, phase in
             if case .running = phase { clipPlayer.stop() }

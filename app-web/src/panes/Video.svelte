@@ -8,7 +8,8 @@
   import { download } from "../lib/download";
   import { t } from "../lib/i18n/i18n";
   import { videoPrompts } from "../lib/state/video-presets";
-  import { qualities } from "../lib/state/video-state.svelte";
+  import { lengthLabel } from "../lib/core/storyboard";
+  import { maxSteps, qualities, sizeLabel, stepsAdvice } from "../lib/state/video-state.svelte";
   import type { MediaKey } from "../lib/state/video-workspace.svelte";
   import SpeechDialog from "./video/SpeechDialog.svelte";
   import TipsDialog from "./video/TipsDialog.svelte";
@@ -26,6 +27,8 @@
   const validation = $derived(ws.validation);
   const names = { images: "Picture", videos: "Video", audios: "Audio" } as const;
   const lockedAudio = $derived(!!ws.inputs.audio && d.mode === "one_stage");
+  const storyboard = $derived(ws.storyboardOn);
+  const shotRange = $derived(ws.shotRange);
   const modeLabel = $derived(ws.inputs.audio && d.mode === "one_stage" ? t("2-stage (audio)") : d.mode.replace("one_stage", "1-stage").replace("two_stage_hq", "2-stage HQ").replace("two_stage", "2-stage"));
 
   let prompt = $state<HTMLTextAreaElement>();
@@ -142,13 +145,21 @@
       <ModelChooser id="video-model" models={ws.models} selected={d.model} status={connection.status} detail={p?.h3 ? t("Video · audio · references") : t("Text to video · Image to video")} server={connection.serverName()} onchoose={(id) => ws.chooseModel(id)} />
       <section class="image-section">
         <div class="image-heading">
-          <label for="video-prompt">{t("Prompt")}</label>
+          <label for="video-prompt">{storyboard ? t("Story") : t("Prompt")}</label>
           <button type="button" id="video-enhance" class="chip" disabled={working || !d.prompt.trim()} onclick={() => (dialog = "rewrite")}><Icon name="sparkles" />{t("Enhance…")}</button>
-          <Menu id="video-templates" label={t("Templates")} onchoose={(id) => (id === "tips" ? (dialog = "tips") : (ws.d.prompt = examples[Number(id)]?.body || ws.d.prompt))}>
-            {#each examples as x, i}<button type="button" role="menuitem" tabindex="-1" data-value={String(i)}>{t(x.title)}</button>{/each}
-            <button type="button" role="menuitem" tabindex="-1" data-value="tips">{t("Prompt tips…")}</button>
-          </Menu>
+          {#if !storyboard}
+            <Menu id="video-templates" label={t("Templates")} onchoose={(id) => (id === "tips" ? (dialog = "tips") : (ws.d.prompt = examples[Number(id)]?.body || ws.d.prompt))}>
+              {#each examples as x, i}<button type="button" role="menuitem" tabindex="-1" data-value={String(i)}>{t(x.title)}</button>{/each}
+              <button type="button" role="menuitem" tabindex="-1" data-value="tips">{t("Prompt tips…")}</button>
+            </Menu>
+          {/if}
         </div>
+        {#if p && !p.references}
+          <div class="segmented" role="group" aria-label={t("Length")} id="video-length-mode">
+            <button type="button" aria-pressed={!d.storyboard} onclick={() => (ws.d.storyboard = false)}>{t("Single clip")}</button>
+            <button type="button" aria-pressed={d.storyboard} onclick={() => (ws.d.storyboard = true)}>{t("Storyboard")}</button>
+          </div>
+        {/if}
         <textarea
           id="video-prompt"
           bind:this={prompt}
@@ -156,13 +167,33 @@
           style:height="{height(d.promptHeight)}px"
           onpointerup={() => prompt && (ws.d.promptHeight = height(prompt.getBoundingClientRect().height))}
           oninput={() => (ws.error = "")}
-          placeholder={p?.h3
+          placeholder={storyboard
+            ? t("Describe the whole story. Enhance turns it into shots, or add them below.")
+            : p?.h3
             ? p.references
               ? t("MiniMax-H3 REF2VA expects six labelled sections in order — subject_definitions:, summary:, retention_analysis: (what to DO with each reference), detailed_description:, overall_soundscape:, non_diegetic_music:. Refer to attachments as") + " <Picture 1>, <Video 1>, <Audio 1>" + t(". Click Templates above.")
               : t("MiniMax-H3 expects three labelled fields — integrated_multimodal_description: (the shot, its style, action and camera movement), overall_soundscape: (ambience and physical sound), non_diegetic_music: (score only the audience hears, or N/A). Click Templates above for the exact shape.")
             : t("Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Put spoken dialogue in quotes to make characters talk. Click Templates above for a starting point.")}
         ></textarea>
       </section>
+      {#if storyboard}
+        <section class="image-section video-shots" id="video-shots">
+          <h3>{t("Shots")} <small>{t("%@ shots · %@", [d.shots.length, lengthLabel(ws.storyboardSeconds)])}</small></h3>
+          {#each ws.d.shots as shot, i (shot.id)}
+            <div class="video-shot">
+              <header>
+                <strong>{t("Shot %@", [i + 1])}</strong>
+                <output>{lengthLabel(Math.min(shotRange[1], Math.max(shotRange[0], shot.seconds)))}</output>
+                <button type="button" aria-label={t("Remove shot %@", [i + 1])} onclick={() => ws.removeShot(shot.id)}><Icon name="trash" /></button>
+              </header>
+              <input type="range" aria-label={t("Shot %@ length", [i + 1])} min={shotRange[0]} max={Math.max(shotRange[0] + 1, shotRange[1])} step="1" disabled={shotRange[0] >= shotRange[1]} bind:value={shot.seconds} />
+              <textarea aria-label={t("Shot %@ prompt", [i + 1])} bind:value={shot.prompt}></textarea>
+            </div>
+          {/each}
+          <button type="button" id="video-add-shot" class="chip" onclick={() => ws.addShot()}>{t("Add shot")}</button>
+          <p class="field-note">{t("Each shot generates on its own, starting from the last frame of the one before, so describe the characters and place again in every shot. Enhance writes the shots from your story. In the browser a shot is at most %@ s at this size: one response has to fit the 256 MiB raw-frame limit.", [shotRange[1]])}</p>
+        </section>
+      {/if}
       <details id="video-media" bind:open={ws.d.media}>
         <summary>{t("Media inputs for generation")}</summary>
         <div class="video-media">
@@ -197,7 +228,7 @@
               <p class="field-note">{t("Clips are sampled at 24 fps, up to the chosen length. Every reference adds work to each step.")}</p>
             </section>
           {/if}
-          {#if p?.audio}
+          {#if p?.audio && !storyboard}
             {@render well("audio", t("Speech & sound"), "audio/*")}
             <div class="video-audio-tools">
               <button type="button" id="video-record" onclick={() => void ws.record()}>{ws.recording ? t("Stop recording") : t("Record")}</button>
@@ -217,8 +248,9 @@
         <span>×</span>
         <label>{t("Clip height")}<input type="number" id="video-height" bind:value={ws.d.height} onchange={() => ws.clamp()} /></label>
         <Menu id="video-presets" label={t("Presets")} onchoose={(value) => ws.setSize(value)}>
-          {#each p?.sizes || [] as [w, h]}
-            <button type="button" role="menuitem" tabindex="-1" data-value="{w}x{h}">{w} × {h} ({w === h ? "square" : w! > h! ? "landscape" : "portrait"})</button>
+          {#each p?.sizes || [] as row}
+            {@const [w, h] = row}
+            <button type="button" role="menuitem" tabindex="-1" data-value="{w}x{h}">{sizeLabel(row)}</button>
           {/each}
           {#if ws.inputs.first}<button type="button" role="menuitem" tabindex="-1" data-value="source">{t("Set by starting frame…")}</button>{/if}
         </Menu>
@@ -233,8 +265,9 @@
         <Menu id="video-quality" label={t(ws.quality)} onchoose={(q) => ws.setQuality(q)}>
           {#each qualities as q}<button type="button" role="menuitemradio" tabindex="-1" aria-checked={q === ws.quality} data-value={q}>{t(q)}</button>{/each}
         </Menu>
-        <p class="field-note" id="video-quality-note">{t("%@ steps · %@", [d.steps, p?.audio ? d.mode.replaceAll("_", "-") : p?.h3 ? t("native audio") : ""])}</p>
+        <p class="field-note" id="video-quality-note">{ws.qualityNote}</p>
       </section>
+      {#if !storyboard}
       <label class="video-slider">
         {t("Frames")}<output id="video-frames-value">{t("%@ (~%@ s)", [d.frames, (d.frames / 24).toFixed(1)])}</output>
         <input
@@ -249,10 +282,12 @@
         />
       </label>
       <p class="field-note">{p?.h3 && d.frames < 107 ? t("Below the model’s stated 4–15 s range; useful for short tests.") : t("24 frames per second.")}</p>
+      {/if}
       <details id="video-advanced" bind:open={ws.d.advanced}>
         <summary>{t("Advanced options")}</summary>
         <div class="video-advanced">
-          {@render slider("steps", t("Steps"), 4, p?.turbo && d.turbo ? 16 : 50)}
+          {@render slider("steps", t("Steps"), 4, maxSteps(ws.model, d))}
+          {#if stepsAdvice(ws.model, d)}<p class="field-note" id="video-steps-advice">{stepsAdvice(ws.model, d)}</p>{/if}
           {#if p?.audio}
             {@render slider("cfg", t("CFG scale"), 1, 10, 0.5, working || lockedAudio)}
             {@render slider("stg", t("STG scale"), 0, 4, 0.5, working || lockedAudio)}
@@ -274,7 +309,7 @@
                   : "Refine steps: 0 = Auto (3)."}
             </p>
           {/if}
-          {#if p?.chain}{@render slider("windows", t("Chained windows"), 1, 6)}{/if}
+          {#if p?.chain && !storyboard}{@render slider("windows", t("Chained windows"), 1, 6)}{/if}
           <label>{t("Seed")}<input type="number" id="video-seed" min="0" bind:value={ws.d.seed} /></label>
           {#if p?.turbo}
             {@render toggle("turbo", t("Turbo (distilled 4-step sampling)"))}
@@ -347,23 +382,19 @@
 {#if dialog === "tips"}<TipsDialog h3={!!p?.h3} references={!!p?.references} onclose={() => (dialog = "")} />{/if}
 {#if dialog === "speech"}<SpeechDialog {app} onclose={() => (dialog = "")} />{/if}
 {#if dialog === "rewrite"}
-  {@const format = p?.h3
-    ? p.references
-      ? "subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, non_diegetic_music"
-      : "integrated_multimodal_description, overall_soundscape, non_diegetic_music"
-    : "4–8 cinematographer sentences with camera, action, lighting and sound"}
   <RewriteDialog
     {connection}
-    title={t("Rewrite video prompt")}
+    title={ws.storyboardOn ? t("Write storyboard") : t("Rewrite video prompt")}
     class="audio-rewrite"
     text={d.prompt}
-    system={`Rewrite this video prompt for a ${(d.frames / 24).toFixed(1)} second clip. Format: ${format}. Return only the prompt.`}
-    request={d.prompt}
-    maxTokens={1800}
+    compose={(seconds) => ws.rewriteRequest(seconds)}
+    clip={ws.enhanceLength}
+    note={(seconds) => ws.enhanceNote(seconds)}
+    applyError={(text, seconds) => ws.rewriteError(text, seconds)}
     textLabel={t("Rewritten prompt")}
     reviewed={t("Review the prompt, then Apply.")}
     noModel={t("No chat model is available on this server.")}
-    onapply={(text) => (ws.d.prompt = text)}
+    onapply={(text, seconds) => ws.applyRewrite(text, seconds)}
     onclose={() => (dialog = "")}
   />
 {/if}

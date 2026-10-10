@@ -23,6 +23,21 @@ function curlExample(base: string, models: Model[]) {
   return `curl ${shellQuote(base + "/v1/chat/completions")} \\\n  -H 'Content-Type: application/json' \\\n  -d ${shellQuote(JSON.stringify({ model, messages: [{ role: "user", content: "Hello!" }], stream: true }))}`;
 }
 
+/** The Code Launcher's agents, as `GET /launch?agent=` names them. */
+const launchAgents = [
+  ["claude", "Claude Code"],
+  ["pi", "pi"],
+  ["omp", "omp"],
+  ["opencode2", "OpenCode 2"],
+  ["grok", "Grok"],
+] as const;
+/** Run on the agent's machine: the server writes the agent's config for itself and starts it.
+ *  `base` rides along so the agent targets the URL this page reached, path prefix and https included. */
+function launchCommand(base: string, agent: string, model?: string) {
+  const query = `agent=${encodeURIComponent(agent)}` + (model ? `&model=${encodeURIComponent(model)}` : "") + `&base=${encodeURIComponent(base)}`;
+  return `curl -fsSL ${shellQuote(`${base}/launch?${query}`)} | sh`;
+}
+
 const apiReference = [
   { method: "GET", path: "/", description: N("MLX Serve Studio web console") },
   {
@@ -244,6 +259,11 @@ const apiReference = [
   },
   {
     method: "GET",
+    path: "/launch",
+    description: N("Shell script that configures a coding agent for this server and starts it (?agent=claude|pi|omp|opencode2|grok&model=<id>&base=<url>)"),
+  },
+  {
+    method: "GET",
     path: "/metrics",
     description: N(
       "Prometheus metrics, text exposition format (enable with --metrics)",
@@ -258,4 +278,4 @@ const apiReference = [
   },
 ];
 
-export { apiPrefix, pageServer, pageApiKey, curlExample, apiReference };
+export { apiPrefix, pageServer, pageApiKey, curlExample, launchAgents, launchCommand, apiReference };
