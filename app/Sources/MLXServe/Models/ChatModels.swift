@@ -740,13 +740,9 @@ struct SpecCostInfo: Equatable {
 struct MemoryInfo {
     var activeBytes: Int64
     var peakBytes: Int64
-    /// RAM available for a new allocation, computed server-side with the SAME
-    /// formula as the model-load pre-flight (`status.getAvailableMemBytes` =
-    /// total − wired − compressor). This is reclaimable-available, not unused:
-    /// it counts file cache and pageable memory that macOS evicts under
-    /// allocation pressure, so it's typically much larger than "free". 0 when the
-    /// server build predates the field — the tray hides the line then. Distinct
-    /// axis from `activeBytes` (the MLX GPU-allocator footprint).
+    /// RAM available for a new allocation — the server's pre-flight number
+    /// (`status.getAvailableMemBytes`): reclaimable, not "free". 0 on older
+    /// server builds (tray hides the line); distinct axis from `activeBytes`.
     var availableBytes: Int64
     var maxSafeContext: Int
     /// MLX's reclaimable buffer pool — memory the server process HOLDS but is

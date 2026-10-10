@@ -3728,22 +3728,9 @@ test "effectiveAvailableBytes prefers the per-process jetsam headroom when prese
 
 fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     if (weights_bytes == 0 or avail_bytes == 0) return false;
-    // Headroom over the weights for warmup compute buffers + a baseline KV cache.
-    // `avail_bytes` (status.getAvailableMemBytes) now excludes the resident anon
-    // set — an already-loaded model counts as used while file cache counts as free
-    // — so this margin can be generous without wrongly refusing a fresh load.
-    // CAVEAT: the KV cache scales with --ctx-size, which this guard doesn't see;
-    // a very large context can still exceed this margin (follow-up: plumb ctx +
-    // kv_quant to size KV precisely). Bypass with --skip-mem-preflight.
-    // The proportional term is CAPPED: headroom pays for warmup buffers and a
-    // baseline KV cache, and neither scales with a MoE's TOTAL weights (our
-    // 109.7 GB DeepSeek-V4 mirror activates 13B). Uncapped, weights/8 demanded
-    // 14.7 GB on that model — 124.4 GB total — which a 128 GB Mac cannot have,
-    // so the guard refused the flagship checkpoint on exactly the hardware its
-    // model card names, while --skip-mem-preflight booted it repeatedly and
-    // served 6.7K-token prefills with ~8.6 GB to spare. 6 GB keeps the original
-    // margin for every model under 48 GB (where it was tuned) and stays inside
-    // the measured envelope above it.
+    // Headroom over the weights for warmup buffers + a baseline KV cache (see
+    // `loadRequirementBytes`). `avail_bytes` (status.getAvailableMemBytes) is
+    // what the OS grants a new wiring, never total − used. --skip-mem-preflight bypasses.
     return avail_bytes < loadRequirementBytes(weights_bytes);
 }
 
@@ -3928,13 +3915,16 @@ test "a sidecar bills its loaded width, and only an in-dir one is dropped to fit
 test "memInsufficientForLoad: headroom + unknown-query guards" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
-    // A 6.9 GB 4-bit model with ~10 GB genuinely available — file cache is
-    // excluded from the new anon-aware available figure (computeAvailableBytes),
-    // so this is what a 16 GB Mac actually reports pre-load. Needs ~8.8 GB
+    // A 6.9 GB 4-bit model with ~10 GB available (free + speculative + the file
+    // cache the OS will grant) — what a 16 GB Mac reports pre-load. Needs ~8.8 GB
     // (weights + weights/8 + 1 GB for warmup + baseline KV) → loads.
     try std.testing.expect(!memInsufficientForLoad(6900 * MB, 10 * GB));
     // Restart-into-pressure: 42 GB weights, only 44 GB free → needs ~46, refuse.
     try std.testing.expect(memInsufficientForLoad(42 * GB, 44 * GB));
+    // #45 end-to-end: a prior 7 GB model resident in the anon set leaves 3 GB of
+    // reclaimable classes — the guard must refuse the second 7 GB load, or warmup
+    // dies in an uncatchable Metal OOM instead of this 400.
+    try std.testing.expect(memInsufficientForLoad(7 * GB, 3 * GB));
     // Plenty of headroom → allow.
     try std.testing.expect(!memInsufficientForLoad(42 * GB, 86 * GB));
     // Exactly weights, no headroom → refuse.

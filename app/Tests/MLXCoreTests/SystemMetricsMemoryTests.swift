@@ -10,40 +10,55 @@ final class SystemMetricsMemoryTests: XCTestCase {
     func testMirrorsServerFormula() {
         let page: UInt64 = 16384
         let ppg = gib / page
-        // 16 GB: 3 wired + 1 compressed + 2 anon, no purgeable → 10 available.
+        // free_count already contains speculative, and it is file-backed inside external.
         XCTAssertEqual(
-            SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, wirePages: 3 * ppg,
-                compressorPages: 1 * ppg, internalPages: 2 * ppg, purgeablePages: 0, pageSize: page),
-            10 * gib)
+            SystemMetrics.computeAvailableForModel(totalBytes: 128 * gib, freePages: 8 * ppg,
+                speculativePages: 2 * ppg, externalPages: 26 * ppg, wirePages: 83 * ppg,
+                compressorPages: 1 * ppg, pageSize: page),
+            32 * gib)
     }
 
-    func testPurgeableIsReclaimed() {
+    func testWiredHeadroomCapsTheSum() {
         let page: UInt64 = 16384
         let ppg = gib / page
-        // 2 GB of the 9 GB anon set is purgeable → available 5 GB, not 3 GB.
+        // wired pages (GPU, shared cache) hide inside the file-backed class: the cap binds.
         XCTAssertEqual(
-            SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, wirePages: 3 * ppg,
-                compressorPages: 1 * ppg, internalPages: 9 * ppg, purgeablePages: 2 * ppg, pageSize: page),
-            5 * gib)
+            SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 6 * ppg,
+                speculativePages: 0, externalPages: 6 * ppg, wirePages: 9 * ppg,
+                compressorPages: 1 * ppg, pageSize: page),
+            6 * gib)
+    }
+
+    func testHeavyAnonResidentCollapsesTheSum() {
+        let page: UInt64 = 16384
+        let ppg = gib / page
+        // #45: a resident 7 GB anon model consumed the free/external pages — only 3 GB of the reclaimable classes remain.
+        XCTAssertEqual(
+            SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 2 * ppg,
+                speculativePages: 0, externalPages: 1 * ppg, wirePages: 3 * ppg,
+                compressorPages: 1 * ppg, pageSize: page),
+            3 * gib)
     }
 
     func testDegenerateQueriesReturnZero() {
         let page: UInt64 = 16384
         let ppg = gib / page
-        XCTAssertEqual(SystemMetrics.computeAvailableForModel(totalBytes: 0, wirePages: 1,
-            compressorPages: 1, internalPages: 1, purgeablePages: 0, pageSize: page), 0)
-        // used ≥ total
-        XCTAssertEqual(SystemMetrics.computeAvailableForModel(totalBytes: 8 * gib, wirePages: 4 * ppg,
-            compressorPages: 0, internalPages: 5 * ppg, purgeablePages: 0, pageSize: page), 0)
+        // failed query (total 0) → 0; the meter's never-blocks contract.
+        XCTAssertEqual(SystemMetrics.computeAvailableForModel(totalBytes: 0, freePages: 1,
+            speculativePages: 1, externalPages: 1, wirePages: 1, compressorPages: 1, pageSize: page), 0)
+        // no headroom: wired + compressor filling the box → 0.
+        XCTAssertEqual(SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 6 * ppg,
+            speculativePages: 0, externalPages: 6 * ppg, wirePages: 16 * ppg, compressorPages: 0, pageSize: page), 0)
     }
 
-    func testPurgeableNeverUnderflows() {
+    func testSpeculativeNeverUnderflows() {
         let page: UInt64 = 16384
         let ppg = gib / page
-        // purgeable > internal must not wrap; treated as full internal reclaimed.
+        // speculative > free must not wrap; the external side carries the sum.
         XCTAssertEqual(
-            SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, wirePages: 3 * ppg,
-                compressorPages: 1 * ppg, internalPages: 1 * ppg, purgeablePages: 5 * ppg, pageSize: page),
-            12 * gib)
+            SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 1 * ppg,
+                speculativePages: 5 * ppg, externalPages: 4 * ppg, wirePages: 0,
+                compressorPages: 0, pageSize: page),
+            4 * gib)
     }
 }
