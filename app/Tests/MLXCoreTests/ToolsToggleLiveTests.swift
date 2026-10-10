@@ -1,7 +1,7 @@
 import XCTest
 @testable import MLXCore
 
-/// The Tools switch through the REAL turn engine, against a scripted
+/// The Tools switch and Stop through the REAL turn engine, against a scripted
 /// OpenAI-compatible server. Opt-in (`MLX_SERVE_LIVE_TOOLS_GATE=1`) and only
 /// under a redirected home (`CFFIXED_USER_HOME`), because `AppState` reads and
 /// writes `~/.mlx-serve` and the user defaults. Run the built bundle directly
@@ -166,31 +166,89 @@ final class ToolsToggleLiveTests: XCTestCase {
         XCTAssertTrue(offered[3].isEmpty, "the resumed turn runs with Tools off: \(offered[3])")
     }
 
-    func testStopDuringASlowToolDropsItsLateResult() async throws {
+    // MARK: - Stop
+
+    private func messages(_ appState: AppState, _ id: UUID) -> [ChatMessage] {
+        appState.chatSessions.first { $0.id == id }?.messages ?? []
+    }
+
+    private func requestCount() -> Int {
+        ((try? String(contentsOfFile: requestLog, encoding: .utf8)) ?? "").split(separator: "\n").count
+    }
+
+    /// Stopped while the reply streams: the chat stays exactly as Stop left it.
+    func testAStopMidStreamWritesNothingMore() async throws {
         let (dir, _) = try workspace()
-        let started = (dir as NSString).appendingPathComponent("started")
-        let finished = (dir as NSString).appendingPathComponent("finished")
+        let port = try startServer(script: [["content": "too late", "delay": 2]])
+        let appState = AppState(startServerAtLaunch: false)
+        appState.server.port = port
+        appState.server.status = .running   // the fake answers in its place
+        let id = makeSession(appState: appState, dir: dir)
+
+        appState.chatEngine.runTurn(sessionId: id, userText: "hello", images: nil, videos: nil, audio: nil,
+                                    config: config(tools: true, mcp: false, dir: dir), approval: { _ in true })
+        try await waitUntil(20, "the request") { requestCount() == 1 }
+        appState.chatEngine.stop(sessionId: id)
+        let stopped = messages(appState, id)
+
+        try await Task.sleep(nanoseconds: 3_000_000_000)
+        XCTAssertEqual(messages(appState, id), stopped)
+        XCTAssertEqual(requestCount(), 1, "no retry after Stop")
+    }
+
+    /// A call the approval lets through only after Stop is not run, and nothing is written.
+    func testACallApprovedAfterStopNeverRuns() async throws {
+        let (dir, _) = try workspace()
+        let late = (dir as NSString).appendingPathComponent("late.txt")
+        let port = try startServer(script: [["tool": "shell", "args": ["command": "touch late.txt"]], ["content": "done"]])
+        let appState = AppState(startServerAtLaunch: false)
+        appState.server.port = port
+        appState.server.status = .running   // the fake answers in its place
+        let id = makeSession(appState: appState, dir: dir)
+        var asked = false
+
+        appState.chatEngine.runTurn(sessionId: id, userText: "touch it", images: nil, videos: nil, audio: nil,
+                                    config: config(tools: true, mcp: false, dir: dir), approval: { _ in
+            asked = true
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            return true
+        })
+        try await waitUntil(20, "the approval") { asked }
+        appState.chatEngine.stop(sessionId: id)
+        let stopped = messages(appState, id)
+
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: late), "the call ran after Stop")
+        XCTAssertEqual(messages(appState, id), stopped)
+    }
+
+    /// The issue's case: a slow tool returns after Stop, while the next turn has already answered.
+    func testAStoppedTurnsLateToolResultNeverLandsInTheNextTurn() async throws {
+        let (dir, _) = try workspace()
         let port = try startServer(script: [
-            ["tool": "shell", "args": ["command": "touch started; sleep 3; touch finished; echo late"]],
-            ["content": "after stop"],
+            ["tool": "shell", "args": ["command": "sleep 3; echo late-result"]],
+            ["content": "fresh answer"],
         ])
         let appState = AppState(startServerAtLaunch: false)
         appState.server.port = port
         appState.server.status = .running   // the fake answers in its place
         let id = makeSession(appState: appState, dir: dir)
         let engine = appState.chatEngine
+        let tools = config(tools: true, mcp: false, dir: dir)
 
-        engine.runTurn(sessionId: id, userText: "run the slow thing",
-                       images: nil, videos: nil, audio: nil,
-                       config: config(tools: true, mcp: false, dir: dir),
-                       approval: { _ in true })
-        try await waitUntil(20, "the tool to start") { FileManager.default.fileExists(atPath: started) }
+        engine.runTurn(sessionId: id, userText: "run it", images: nil, videos: nil, audio: nil,
+                       config: tools, approval: { _ in true })
+        try await waitUntil(20, "the tool call") { messages(appState, id).contains { $0.isAgentSummary } }
         engine.stop(sessionId: id)
-        try await waitUntil(20, "the tool to finish") { FileManager.default.fileExists(atPath: finished) }
-        try await Task.sleep(nanoseconds: 1_000_000_000)
+        engine.runTurn(sessionId: id, userText: "again", images: nil, videos: nil, audio: nil,
+                       config: tools, approval: { _ in true })
+        try await waitUntil(20, "the next turn") { engine.activeTurnSessionIds.isEmpty && requestCount() == 2 }
 
-        XCTAssertTrue(toolOutputs(appState, id).isEmpty, "a result after Stop landed: \(toolOutputs(appState, id))")
-        XCTAssertEqual(try offeredTools().count, 1, "no request may follow Stop")
+        try await Task.sleep(nanoseconds: 4_000_000_000)   // past the stopped call's 3 s
+        let after = messages(appState, id)
+        XCTAssertEqual(toolOutputs(appState, id), [], "the stopped call's result landed")
+        XCTAssertEqual(after.last?.content, "fresh answer")
+        XCTAssertFalse(after.contains { $0.isStreaming })
     }
 
     // MARK: - Fake server

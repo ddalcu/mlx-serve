@@ -95,8 +95,11 @@ final class ChatStore {
             try database.query("SELECT \(columns) FROM chat_sessions ORDER BY created_at DESC, rowid DESC") { row in
                 do {
                     var session = try Self.session(from: row)
-                    session.messages = messages[session.id.uuidString] ?? []
-                    saved[session.id] = (try Self.columnValues(of: session), session.messages)
+                    let stored = messages[session.id.uuidString] ?? []
+                    saved[session.id] = (try Self.columnValues(of: session), stored)
+                    // Nothing streams at launch: a reply cut off by a quit or a
+                    // crash comes back finished, and the next save stores it so.
+                    session.messages = stored.map { var m = $0; m.isStreaming = false; return m }
                     sessions.append(session)
                 } catch {
                     Self.log("skipped chat \(row.text(0) ?? "?"): \(error)")
