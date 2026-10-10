@@ -813,6 +813,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     break
                 }
             }
+            try Task.checkCancellation()   // a cancelled stream ends rather than throws
             applyStreamBatch(coalescer.drain(), to: sessionId)   // flush the trailing batch
         } catch is CancellationError {
             // Stopped by user (`stop(sessionId:)`) or superseded by a new
@@ -871,6 +872,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // same dir the agent's built-in tools use. Per-entry `cwd` in mcp.json still wins.
                 self.mcpManager.defaultCwd = config.workingDirectory
                 await self.mcpManager.startEnabled()
+                // Stopped while servers started: end the turn without a word.
+                if Task.isCancelled { self.endTurn(sessionId: sessionId, token: token); return }
                 // Surface startup failures inline in chat — otherwise they're hidden behind the
                 // marketplace gear icon and the user just sees "MCP doesn't seem to do anything".
                 if !self.mcpManager.startErrors.isEmpty {
@@ -1149,6 +1152,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         break
                     }
                 }
+                // A cancelled stream ENDS rather than throws, so Stop is checked
+                // here and after every wait below, before anything is written.
+                try Task.checkCancellation()
                 // Flush the trailing batch so the message content is complete
                 // before the post-stream truncation/pad checks read it back.
                 self.applyStreamBatch(coalescer.drain(), to: sessionId)
@@ -1167,6 +1173,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             } catch is CancellationError {
                 throw CancellationError()
             }
+            try Task.checkCancellation()
             appState.updateLastMessage(in: sessionId, streaming: false)
 
             // A repetition-loop cut ENDS the turn, ahead of every recovery path
@@ -1349,6 +1356,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // one decision, made when the agent was configured, instead of a
                 // dialog per call.
                 let approved = config.autoApprove ? true : await approval(tc)
+                try Task.checkCancellation()
                 guard approved else {
                     let denied = AgentEngine.ToolResult(
                         id: tc.id,
@@ -1394,6 +1402,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     // Re-read: Tools can go off while this round streamed.
                     allowedTools: config.revokingTools(ledger.toolsRevoked(session: sessionId)).dispatchTools
                 )
+                try Task.checkCancellation()
                 roundOutputs.append(result.output)
                 if let handle = result.backgroundHandle { roundHandles.append(handle) }
 
