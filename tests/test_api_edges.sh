@@ -249,6 +249,47 @@ PY
 for i in 1 2 3; do req GET /health; done
 expect_status 200 "short Content-Length: server alive"
 
+echo "=== nesting depth ==="
+# A tool schema 50000 levels deep overflowed a connection thread's stack. Bodies past
+# MAX_JSON_DEPTH (4096) are a 400; the deepest accepted body, deep inside a tool's
+# parameters, must walk and re-serialize without crashing. Built here: past Linux's argv limit.
+DEPTHS=$(python3 -I - "$PORT" <<'PY'
+import json, sys, urllib.request, urllib.error
+port = sys.argv[1]
+def depth(b):
+    d = m = 0; s = False; i = 0
+    while i < len(b):
+        c = b[i]
+        if s:
+            if c == "\\": i += 1
+            elif c == '"': s = False
+        elif c == '"': s = True
+        elif c in "[{": d += 1; m = max(m, d)
+        elif c in "]}": d = max(d - 1, 0)
+        i += 1
+    return m
+def body(n):
+    head = '{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"x":{"type":"array","default":'
+    b = head + "[" * n + "]" * n + "}}}}}]}"
+    return b, depth(b)
+out = []
+for want in (50000, 4096, 4097):
+    b, got = body(want - 7)
+    assert got == want, (want, got)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", b.encode(), {"Content-Type": "application/json"})
+    try: code = urllib.request.urlopen(req, timeout=120).status
+    except urllib.error.HTTPError as e: code = e.code
+    except Exception: code = 0
+    out.append(str(code))
+print(" ".join(out))
+PY
+)
+read -r D50000 D4096 D4097 <<< "$DEPTHS"
+[[ "$D50000" == 400 ]] && ok "50000-deep body: 400" || bad "50000-deep body" "$D50000"
+[[ "$D4097" == 400 ]] && ok "4097-deep body: 400 (one past MAX_JSON_DEPTH)" || bad "4097-deep body" "$D4097"
+[[ "$D4096" =~ ^[24][0-9][0-9]$ ]] && ok "4096-deep tool schema: answered ($D4096), no crash" || bad "4096-deep tool schema" "$D4096"
+req GET /health; expect_status 200 "nesting depth: server alive"
+
 echo "=== alive ==="
 req GET /health; expect_status 200 "server alive after every edge"
 grep -qE "\[mlx\] error|panic|Segmentation|free\(\)|double free|corrupted|Aborted" "$WORK/server.log" && bad "no MLX error / crash line in the log" || ok "no MLX error / crash line in the log"

@@ -38,6 +38,16 @@ const log = @import("log.zig");
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
 
+/// The last unload: when (monotonic ms) and how many resident bytes it freed. Inference thread only.
+pub const UnloadMark = struct { at_ms: i64 = 0, bytes: u64 = 0 };
+pub var last_unload: UnloadMark = .{};
+
+pub fn monotonicMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
 const Transformer = transformer_mod.Transformer;
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -622,6 +632,7 @@ pub const LoadedModel = struct {
             self.drafter_path = "";
         }
         self.drafter_block_size = 0;
+        if (self.bytes_resident > 0) last_unload = .{ .at_ms = monotonicMs(), .bytes = self.bytes_resident };
         self.bytes_resident = 0;
         // The prefill-chunk pin was resolved from LIVE memory at load, so it
         // can be stale-narrow (pinned while a since-evicted model was

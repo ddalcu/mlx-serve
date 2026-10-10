@@ -3752,8 +3752,25 @@ test "coldLoadVision honors the process-wide vision opt-out" {
 /// would be refused makes it let go first and the figure is read again.
 fn availForLoad(io: std.Io, need: u64) u64 {
     var avail = loadAvail(io);
-    if (memInsufficientForLoad(need, avail) and gen_mod.releaseMediaResidency() > 0) avail = loadAvail(io);
+    if (memInsufficientForLoad(need, avail)) {
+        const released = gen_mod.releaseMediaResidency();
+        if (released > 0) {
+            model_registry_mod.last_unload = .{ .at_ms = model_registry_mod.monotonicMs(), .bytes = released };
+            avail = loadAvail(io);
+        }
+    }
+    if (!waitForUnload(need, avail, model_registry_mod.last_unload, model_registry_mod.monotonicMs())) return avail;
     return settledAvail(need, avail, io, loadAvail, pauseLoadAvail);
+}
+
+/// How long after an unload its memory may still be reaching the OS.
+const UNLOAD_SETTLE_MS: i64 = 10_000;
+
+/// Whether a load refused at `avail` waits for memory still coming back: only right after an
+/// unload whose bytes could close the gap. Any other refusal is instant, since the wait stalls every stream.
+fn waitForUnload(need: u64, avail: u64, mark: model_registry_mod.UnloadMark, now_ms: i64) bool {
+    if (mark.bytes == 0 or now_ms - mark.at_ms > UNLOAD_SETTLE_MS) return false;
+    return !memInsufficientForLoad(need, avail +| mark.bytes);
 }
 
 fn loadAvail(_: std.Io) u64 {
@@ -3818,6 +3835,16 @@ test "settledAvail: a refused reading waits while freed memory still reaches the
     var fits = Seq{ .vals = &.{0} };
     try std.testing.expectEqual(200 * GB, settledAvail(10 * GB, 200 * GB, &fits, Seq.measure, Seq.pause));
     try std.testing.expectEqual(@as(usize, 0), fits.i);
+}
+
+test "waitForUnload: only a load an unload just freed room for waits" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const now: i64 = 100_000;
+    const freed: model_registry_mod.UnloadMark = .{ .at_ms = now - 500, .bytes = 150 * GB };
+    try std.testing.expect(waitForUnload(180 * GB, 66 * GB, freed, now));
+    try std.testing.expect(!waitForUnload(180 * GB, 66 * GB, .{}, now)); // no unload yet
+    try std.testing.expect(!waitForUnload(180 * GB, 66 * GB, .{ .at_ms = now - 60_000, .bytes = 150 * GB }, now)); // long settled
+    try std.testing.expect(!waitForUnload(500 * GB, 66 * GB, freed, now)); // even the freed bytes cannot fit it
 }
 
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {

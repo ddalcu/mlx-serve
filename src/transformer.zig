@@ -52712,7 +52712,8 @@ test "qmatmulBits keeps row-axis MTP kernels out of plain batched projections" {
             try mlx.check(mlx.mlx_array_eval(y));
             if (msv_qmv_rows_kernel != null) std.debug.print("generic projection invoked MTP row-axis kernel: rows={d} bits={d}\n", .{ rows, bits });
             try testing.expect(msv_qmv_rows_kernel == null);
-            const expected = (try verifyQmm(s, x, w, sc, bi, bits, 64)) orelse blk: {
+            // The dispatch order of qmatmulBits: simd_qmm takes 8+ rows where no verify tile does.
+            const expected = (try simdQmmDecode(x, w, sc, bi, bits, 64, s)) orelse (try verifyQmm(s, x, w, sc, bi, bits, 64)) orelse blk: {
                 var stock = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_quantized_matmul(&stock, x, w, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", s));
                 break :blk stock;
