@@ -146,32 +146,60 @@ class AppState: ObservableObject {
     /// Sandbox terminals (pi / hermes / shell in the guest): rows of the
     /// Chats section, owned here so closing the chat window ends nothing.
     lazy var terminals = TerminalSessionStore(server: server,
-                                              options: { [unowned self] in self.serverOptions })
-    /// The sidebar's dragged order over conversations and terminals (ids in
-    /// visual order). Empty = newest first. Persisted.
-    @Published var sidebarOrder: [UUID] = (UserDefaults.standard.stringArray(forKey: "sidebarRowOrder") ?? [])
-        .compactMap(UUID.init) {
-        didSet {
-            UserDefaults.standard.set(sidebarOrder.map(\.uuidString), forKey: "sidebarRowOrder")
-        }
+                                              options: { [unowned self] in self.serverOptions },
+                                              store: sidebarStore)
+
+    /// The sidebar's user-made groups (Move to Group). Each row names its own
+    /// group; a change that moves rows goes through the doors below.
+    @Published var sidebarGroups = SidebarGroups() {
+        didSet { sidebarStore?.saveGroups(sidebarGroups) }
     }
 
-    /// The sidebar's user-made groups (Move to Group). Persisted.
-    @Published var sidebarGroups: SidebarGroups = UserDefaults.standard.data(forKey: "sidebarGroups")
-        .flatMap { try? JSONDecoder().decode(SidebarGroups.self, from: $0) } ?? SidebarGroups() {
-        didSet {
-            UserDefaults.standard.set(try? JSONEncoder().encode(sidebarGroups), forKey: "sidebarGroups")
-        }
+    /// Conversations and terminals in sidebar order, before the split into groups.
+    var sidebarRows: [SidebarChatRows.Row] {
+        SidebarChatRows.merge(chats: visibleChatSessions, terminals: terminals.sessions.sessions)
     }
 
-    /// Drag-to-reorder: `visible` is the whole panel in its current visual
-    /// order, so the result is a complete order and stale ids self-prune.
+    func sidebarGroup(of row: UUID) -> UUID? {
+        chatSessions.first { $0.id == row }?.groupId ?? terminals.sessions.session(row)?.groupId
+    }
+
+    /// Drag-to-reorder: `visible` is the whole panel in its current visual order.
     func moveSidebarRow(_ id: UUID, onto target: UUID, visible: [UUID]) {
-        var groups = sidebarGroups
-        groups.join(id, groupOf: target)
-        if groups != sidebarGroups { sidebarGroups = groups }
-        let next = SidebarChatRows.moved(id, onto: target, in: visible)
-        if next != visible { sidebarOrder = next }
+        let rows = Dictionary(uniqueKeysWithValues: sidebarRows.map { ($0.id, $0) })
+        setSidebarPlacements(SidebarChatRows.dropped(id, onto: target, in: visible.compactMap { rows[$0] }))
+    }
+
+    /// Move to Group, a drop on a group's heading, nil = out of every group.
+    /// The rows land among the group's undragged ones, by date.
+    func moveToSidebarGroup(_ ids: some Sequence<UUID>, group: UUID?) {
+        let moving = Set(ids).filter { sidebarGroup(of: $0) != group }
+        setSidebarPlacements(Dictionary(uniqueKeysWithValues: moving.map { ($0, .init(group: group, position: nil)) }))
+    }
+
+    func createSidebarGroup(named name: String, with ids: some Sequence<UUID>) {
+        guard let group = sidebarGroups.create(name) else { return }
+        moveToSidebarGroup(ids, group: group)
+    }
+
+    /// Its rows and subgroups move up to its parent; nothing in it is deleted.
+    func deleteSidebarGroup(_ id: UUID) {
+        let parent = sidebarGroups.parent(of: id)
+        setSidebarPlacements(SidebarChatRows.dissolving(id, into: parent, rows: sidebarRows))
+        sidebarGroups.delete(id)
+    }
+
+    private func setSidebarPlacements(_ placements: [UUID: SidebarChatRows.Placement]) {
+        guard !placements.isEmpty else { return }
+        var changed = false
+        for i in chatSessions.indices {
+            guard let p = placements[chatSessions[i].id] else { continue }
+            chatSessions[i].groupId = p.group
+            chatSessions[i].sidebarPosition = p.position
+            changed = true
+        }
+        if changed { saveChatHistory() }
+        terminals.setPlacements(placements)
     }
 
     /// "Rename…" on a sidebar row (a chat or a terminal): the sidebar's one
@@ -412,7 +440,7 @@ class AppState: ObservableObject {
         DispatchQueue.main.async { [self] in
             guard let workspace = terminalWorkspace(askingFor: agent?.displayName) else { return }
             let id = terminals.start(agent: agent, workspace: workspace)
-            sidebarGroups.assign([id], to: group)
+            moveToSidebarGroup([id], group: group)
             showTerminal(id)
         }
     }
@@ -424,7 +452,7 @@ class AppState: ObservableObject {
         DispatchQueue.main.async { [self] in
             guard let workspace = terminalWorkspace(askingFor: cli == .shell ? nil : cli.displayName) else { return }
             let id = terminals.startHost(cli: cli, workspace: workspace)
-            sidebarGroups.assign([id], to: group)
+            moveToSidebarGroup([id], group: group)
             showTerminal(id)
         }
     }
@@ -536,6 +564,7 @@ class AppState: ObservableObject {
     /// The chats on disk (`~/.mlx-serve/mlx-serve.db`). Nil when the file could
     /// not be opened: nothing is then written over it.
     private var chatStore: ChatStore?
+    private var sidebarStore: SidebarStore?
 
     init() {
         // Defaults to ON when the key is absent — `UserDefaults.bool` would
@@ -600,7 +629,6 @@ class AppState: ObservableObject {
             }
         }
         loadChatHistory()
-        sidebarGroups.retain(only: Set(chatSessions.map(\.id) + terminals.sessions.sessions.map(\.id)))
         // Start background task scheduling (catch-up + timer arming). Notifications
         // route back here to resume paused runs / deep-link into the Tasks window.
         TaskNotifier.shared.appState = self
@@ -863,7 +891,8 @@ class AppState: ObservableObject {
     }
     var visibleChatSessions: [ChatSession] { Self.sidebarSessions(from: chatSessions) }
 
-    func newChatSession(agentId: UUID? = nil) -> UUID {
+    @discardableResult
+    func newChatSession(agentId: UUID? = nil, group: UUID? = nil) -> UUID {
         // An agent's thread is called "New agent" until it has something to be
         // named after — the sidebar lists it under Agents, where "New Chat"
         // would describe the wrong thing.
@@ -873,6 +902,7 @@ class AppState: ObservableObject {
         // then remembers its own choice (ChatSession.useMCP/enableThinking).
         session.useMCP = mcpMode
         session.agentId = agentId
+        session.groupId = group
         chatSessions.insert(session, at: 0)
         activeChatId = session.id
         saveChatHistory()
@@ -1320,16 +1350,21 @@ class AppState: ObservableObject {
     /// Writes what changed since the last save. Task-run and bridge sessions are
     /// never written: their transcripts live elsewhere (`ChatStore.save`).
     func saveChatHistory() {
+        sidebarStore?.retryUnsavedGroups()
         chatStore?.save(chatSessions)
     }
 
     private func loadChatHistory() {
         do {
-            chatStore = try ChatStore()
+            let store = try ChatStore(legacySidebar: LegacySidebar(defaults: .standard))
+            chatStore = store
+            sidebarStore = SidebarStore(database: store.database)
+            LegacySidebar.retire(from: .standard, backupPath: LegacySidebar.backupPath)
         } catch {
             NSLog("[chats] %@", "could not open \(ChatStore.defaultPath): \(error)")
         }
         chatSessions = chatStore?.load() ?? []
+        sidebarGroups = sidebarStore?.loadGroups() ?? SidebarGroups()
         activeChatId = chatSessions.first?.id
     }
 
