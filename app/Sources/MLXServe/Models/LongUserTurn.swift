@@ -46,7 +46,14 @@ enum LongUserTurn {
 /// of reading that belongs to the visit.
 @MainActor
 final class FoldStore {
+    private struct Block: Hashable {
+        let message: UUID
+        let index: Int
+    }
+
     private var expanded: Set<UUID> = []
+    /// Unfolded code blocks, by their reply and their place in it.
+    private var expandedBlocks: Set<Block> = []
 
     func isExpanded(_ id: UUID) -> Bool { expanded.contains(id) }
 
@@ -54,5 +61,15 @@ final class FoldStore {
         if value { expanded.insert(id) } else { expanded.remove(id) }
     }
 
-    func clear() { expanded.removeAll() }
+    func isExpanded(_ id: UUID, block: Int) -> Bool { expandedBlocks.contains(Block(message: id, index: block)) }
+
+    func set(_ id: UUID, block: Int, expanded value: Bool) {
+        let key = Block(message: id, index: block)
+        if value { expandedBlocks.insert(key) } else { expandedBlocks.remove(key) }
+    }
+
+    func clear() {
+        expanded.removeAll()
+        expandedBlocks.removeAll()
+    }
 }

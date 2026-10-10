@@ -2185,3 +2185,5 @@
 "News, benchmarks and plans, with questions and bug reports welcome." = "소식, 벤치마크, 계획을 볼 수 있고 질문과 버그 신고도 환영합니다.";
 "Web UI" = "웹 UI";
 "Open the web UI in your browser" = "브라우저에서 웹 UI를 엽니다";
+"Streaming" = "생성 중";
+"%lld lines total" = "총 %lld줄";

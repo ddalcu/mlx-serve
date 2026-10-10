@@ -91,6 +91,7 @@
 "%lld bytes" = "%lld 字节";
 "%lld discarded" = "%lld 个被丢弃";
 "%lld frames · ~%.1fs" = "%lld 帧 · ~%.1fs";
+"%lld lines total" = "共 %lld 行";
 "%lld model on disk" = "%lld 个模型在磁盘上";
 "%lld model%@" = "%lld 个模型";
 "%lld models" = "%lld 个模型";
@@ -1573,6 +1574,7 @@
 "Stopped after %lld rung%@; the drift check was skipped." = "在完成 %lld 个档位后停止；已跳过漂移检查。";
 "Stopped — the model started repeating itself and the server cut the reply. Try rephrasing, or ask for a smaller piece of the task." = "已停止 —— 模型开始重复自己，服务器截断了回复。试试换个说法，或者让它只做任务中更小的一块。";
 "Stopping after the current request…" = "将在当前请求完成后停止…";
+"Streaming" = "正在生成";
 "Strong" = "强";
 "Strong at coding and multi-step agent work like using tools." = "擅长编码，以及使用工具这类多步 Agent 工作。";
 "Style LoRAs" = "风格 LoRA";

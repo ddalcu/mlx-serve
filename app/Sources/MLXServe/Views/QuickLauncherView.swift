@@ -95,7 +95,7 @@ struct QuickLauncherView: View {
                     if answer.content.isEmpty && answer.isStreaming {
                         GeneratingIndicator()
                     } else {
-                        MarkdownText(answer.content)
+                        MarkdownText(answer.content, streaming: answer.isStreaming)
                             .textSelection(.enabled)
                     }
                 }
