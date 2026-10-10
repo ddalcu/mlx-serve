@@ -296,6 +296,25 @@ final class ChatStoreTests: XCTestCase {
         XCTAssertEqual(try reloaded().first?.messages.last?.content, "reply")
     }
 
+    /// Nothing streams at launch: a reply cut off by a quit or a crash comes back finished, and stays so.
+    func testAMessageSavedMidStreamLoadsFinished() throws {
+        var a = chat("A", messages: 1)
+        var reply = ChatMessage(role: .assistant, content: "half")
+        reply.isStreaming = true
+        a.messages.append(reply)
+        try open().save([a])
+
+        let store = try open()
+        let loaded = store.load()
+        XCTAssertEqual(loaded.first?.messages.map(\.isStreaming), [false, false])
+        store.save(loaded)
+        var body = ""
+        try store.database.query("SELECT body FROM chat_messages WHERE id = ?", [.text(reply.id.uuidString)]) {
+            body = $0.text(0) ?? ""
+        }
+        XCTAssertTrue(body.contains("\"isStreaming\":false"), body)
+    }
+
     /// A second message with an id already in the chat never costs the first one its row.
     func testADuplicateMessageIdNeverDeletesTheOriginal() throws {
         var a = chat("A", messages: 2)

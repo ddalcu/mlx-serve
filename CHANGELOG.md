@@ -129,6 +129,7 @@ Estimated from the measured per-step cost:
 - App: an attached video reaches the model, with Tools on or off, and its frames are saved as files instead of inside the chat history; with Tools on, a message that is only a picture, recording or clip reaches the model too (#429).
 - App: the agent sees a tool result in full until it has answered it, so reading a large file no longer sends it into a loop of ever-smaller re-reads (#605).
 - App: `readFile` and `editFile` count lines ending in CR or CRLF and keep the file's own line endings (#736); an agent's own Apple voice is used in voice mode, and Settings ▸ Voice picks the app's own Apple voice again (#417); Option types characters in the built-in terminal, so `@` works on Swiss and other layouts (#692).
+- App: a stopped agent turn writes nothing more into the chat, so a slow tool that returns after Stop no longer lands its result in the next turn and a call approved after Stop does not run; a reply cut off by a quit or crash comes back finished instead of keeping its progress row (#787).
 
 ---
 
