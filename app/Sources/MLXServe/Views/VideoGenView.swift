@@ -117,10 +117,12 @@ struct VideoGenView: View {
     /// wells to share a row. False until its first `onGeometryChange`, which
     /// stacks them for one frame — the narrow answer either way.
     @State private var keyframesSideBySide: Bool = false
-    /// Whether the form is wide enough for the Quality tiers as segments.
-    /// Measured on the section, never judged by `ViewThatFits`: a segmented
-    /// picker accepts any width and squeezes, so it always "fits".
-    @State private var qualityFitsSegments: Bool = true
+    /// The Quality section's width, quantised to 8pt, and the segmented
+    /// picker's natural width. Segments only where they fit unsqueezed: a
+    /// squeezed segmented control reports its natural width again on the next
+    /// text edit and pushes the whole column past its pane.
+    @State private var qualitySectionWidth: CGFloat = 0
+    @State private var qualitySegmentsWidth: CGFloat = 0
 
     /// Set when `hydrate` dropped a reference whose file is gone: the tiles
     /// after it renumbered, so a prompt that names them now points elsewhere.
@@ -464,12 +466,6 @@ struct VideoGenView: View {
             chainWindows: chainWindows, preferring: quality)
     }
 
-    /// What five segments need: the four tier names plus Custom, at the
-    /// segmented control's own per-segment padding. "Super Quality" is the
-    /// wide one, and shortening it is not on the table — the tiers are named
-    /// the same in every Create pane.
-    private static let qualitySegmentsMinWidth: CGFloat = 380
-
     /// Reads the DERIVED tier and writes by applying one. Custom is unwritable
     /// by construction, so the guard is a formality rather than a policy.
     private var qualitySelection: Binding<QualitySelection> {
@@ -486,10 +482,10 @@ struct VideoGenView: View {
     private var qualitySection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Quality").font(.app(.headline).weight(.semibold))
-            // Measured, not `ViewThatFits`: see `qualityFitsSegments`. Five
+            // Measured, not `ViewThatFits`: see `qualitySegmentsWidth`. Five
             // segments degrade to a menu rather than shortening the tier names
             // this pane shares with every other Create pane.
-            qualityPicker(segmented: qualityFitsSegments)
+            qualityPicker(segmented: qualitySectionWidth >= qualitySegmentsWidth)
             Text(qualityHint)
                 .font(.app(.caption))
                 .foregroundStyle(.secondary)
@@ -497,8 +493,12 @@ struct VideoGenView: View {
         // Measure the SECTION at the column's width, never the picker: the
         // menu variant is `fixedSize` and would never re-fit.
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onGeometryChange(for: Bool.self) { $0.size.width >= Self.qualitySegmentsMinWidth }
-            action: { qualityFitsSegments = $0 }
+        .onGeometryChange(for: CGFloat.self) { ($0.size.width / 8).rounded(.down) * 8 }
+            action: { qualitySectionWidth = $0 }
+        .background(alignment: .topLeading) {
+            qualityPicker(segmented: true).fixedSize().hidden()
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { qualitySegmentsWidth = $0 }
+        }
     }
 
     @ViewBuilder
