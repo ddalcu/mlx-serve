@@ -3,10 +3,11 @@ import Foundation
 /// The chat history in `~/.mlx-serve/mlx-serve.db`: a row per chat, a row per
 /// message holding the message's JSON. A save writes only what changed, each
 /// chat in its own transaction, and never touches a row it could not read.
+/// Owns the connection and the schema; `SidebarStore` shares both.
 final class ChatStore {
 
     struct Column {
-        enum Kind { case text, bool, json }
+        enum Kind { case text, integer, bool, json }
         let key: String
         let name: String
         let kind: Kind
@@ -27,6 +28,8 @@ final class ChatStore {
         Column(key: "reasoningEffort", name: "reasoning_effort", kind: .text),
         Column(key: "useMCP", name: "use_mcp", kind: .bool),
         Column(key: "disabledTools", name: "disabled_tools", kind: .json),
+        Column(key: "groupId", name: "group_id", kind: .text),
+        Column(key: "sidebarPosition", name: "position", kind: .integer),
     ]
 
     /// Messages have their own table; a session carrying either of the others
@@ -41,9 +44,12 @@ final class ChatStore {
     /// Each chat as it was when it last reached the disk.
     private var saved: [UUID: (columns: [SQLiteDatabase.Value], messages: [ChatMessage])] = [:]
 
-    init(path: String = ChatStore.defaultPath, legacyHistoryPath: String? = ChatStore.legacyHistoryPath) throws {
+    /// `legacySidebar`: what older builds kept in UserDefaults, imported once.
+    /// Required, so no caller can migrate a database past it without the import.
+    init(path: String = ChatStore.defaultPath, legacyHistoryPath: String? = ChatStore.legacyHistoryPath,
+         legacySidebar: LegacySidebar?) throws {
         database = try Self.open(path)
-        try migrate(legacyHistoryPath: legacyHistoryPath)
+        try migrate(legacyHistoryPath: legacyHistoryPath, legacySidebar: legacySidebar)
     }
 
     /// A file that is not a database is moved aside and a new one started: its
@@ -224,16 +230,15 @@ final class ChatStore {
         return decoder
     }()
 
-    /// The session's own encoding, read column by column, so every default and
+    /// A row's own encoding, read column by column, so every default and
     /// backfill its decoder applies keeps applying.
-    private static func columnValues(of session: ChatSession) throws -> [SQLiteDatabase.Value] {
-        var withoutMessages = session
-        withoutMessages.messages = []
-        let object = try JSONSerialization.jsonObject(with: encoder.encode(withoutMessages)) as? [String: Any] ?? [:]
-        return try sessionColumns.map { column in
+    static func columnValues(of value: some Encodable, columns: [Column]) throws -> [SQLiteDatabase.Value] {
+        let object = try JSONSerialization.jsonObject(with: encoder.encode(value)) as? [String: Any] ?? [:]
+        return try columns.map { column in
             switch (column.kind, object[column.key]) {
             case (_, nil), (_, is NSNull): return .null
             case (.bool, let value as Bool): return .integer(value ? 1 : 0)
+            case (.integer, let value as NSNumber): return .integer(value.intValue)
             case (.json, let value?):
                 let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
                 return .text(String(decoding: data, as: UTF8.self))
@@ -243,17 +248,30 @@ final class ChatStore {
         }
     }
 
-    private static func session(from row: SQLiteDatabase.Row) throws -> ChatSession {
-        var object: [String: Any] = ["messages": []]
-        for (index, column) in sessionColumns.enumerated() {
+    /// The row's columns, in the order given, back through the type's decoder.
+    static func decode<T: Decodable>(_ type: T.Type, from row: SQLiteDatabase.Row, columns: [Column],
+                                     adding extra: [String: Any] = [:]) throws -> T {
+        var object = extra
+        for (index, column) in columns.enumerated() {
             guard let text = row.text(Int32(index)) else { continue }
             switch column.kind {
             case .text: object[column.key] = text
+            case .integer: object[column.key] = row.integer(Int32(index))
             case .bool: object[column.key] = row.integer(Int32(index)) != 0
             case .json: object[column.key] = try JSONSerialization.jsonObject(with: Data(text.utf8))
             }
         }
-        return try decoder.decode(ChatSession.self, from: JSONSerialization.data(withJSONObject: object))
+        return try decoder.decode(type, from: JSONSerialization.data(withJSONObject: object))
+    }
+
+    private static func columnValues(of session: ChatSession) throws -> [SQLiteDatabase.Value] {
+        var withoutMessages = session
+        withoutMessages.messages = []
+        return try columnValues(of: withoutMessages, columns: sessionColumns)
+    }
+
+    private static func session(from row: SQLiteDatabase.Row) throws -> ChatSession {
+        try decode(ChatSession.self, from: row, columns: sessionColumns, adding: ["messages": []])
     }
 
     /// id, role, created_at, body. Throws rather than write a body that will not load.
@@ -268,7 +286,7 @@ final class ChatStore {
 
     // MARK: - Schema
 
-    private static let schema = """
+    static let schemaV1 = """
         CREATE TABLE chat_sessions (
             id                   TEXT PRIMARY KEY,
             title                TEXT NOT NULL,
@@ -296,23 +314,58 @@ final class ChatStore {
         CREATE INDEX chat_messages_by_session ON chat_messages (session_id, seq);
         """
 
-    /// Version 1 creates the tables and imports `chat-history.json` in ONE
-    /// transaction, so a crash midway leaves nothing and the next launch redoes
-    /// it. The old file is then renamed to `chat-history.migrated.json`.
-    private func migrate(legacyHistoryPath: String?) throws {
-        guard try database.userVersion() < 1 else {
-            if let legacyHistoryPath, FileManager.default.fileExists(atPath: legacyHistoryPath) {
-                Self.log("\(legacyHistoryPath) found beside an already migrated database; left as is, not imported")
-            }
-            return
+    /// The sidebar: groups in groups, and a row's place on the row itself. A
+    /// deleted group only lets go, it never takes a chat or terminal with it.
+    static let schemaV2 = """
+        CREATE TABLE sidebar_groups (
+            id        TEXT PRIMARY KEY,
+            name      TEXT NOT NULL,
+            parent_id TEXT REFERENCES sidebar_groups (id) ON DELETE SET NULL,
+            position  INTEGER NOT NULL,
+            collapsed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX sidebar_groups_by_parent ON sidebar_groups (parent_id, position);
+        ALTER TABLE chat_sessions ADD COLUMN group_id TEXT REFERENCES sidebar_groups (id) ON DELETE SET NULL;
+        ALTER TABLE chat_sessions ADD COLUMN position INTEGER;
+        CREATE INDEX chat_sessions_by_group ON chat_sessions (group_id, position);
+        CREATE TABLE terminal_sessions (
+            id          TEXT PRIMARY KEY,
+            label       TEXT NOT NULL,
+            auto_name   TEXT NOT NULL,
+            custom_name TEXT,
+            agent_id    TEXT,
+            workspace   TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            theme_id    TEXT,
+            created_at  TEXT NOT NULL,
+            group_id    TEXT REFERENCES sidebar_groups (id) ON DELETE SET NULL,
+            position    INTEGER
+        );
+        CREATE INDEX terminal_sessions_by_group ON terminal_sessions (group_id, position);
+        """
+
+    static let version = 2
+
+    /// Every step the file is missing runs in ONE transaction, so a crash
+    /// midway leaves nothing and the next launch redoes it. Version 1 imports
+    /// `chat-history.json` (then renamed to `chat-history.migrated.json`),
+    /// version 2 the sidebar older builds kept in UserDefaults.
+    private func migrate(legacyHistoryPath: String?, legacySidebar: LegacySidebar?) throws {
+        let current = try database.userVersion()
+        if current >= 1, let legacyHistoryPath, FileManager.default.fileExists(atPath: legacyHistoryPath) {
+            Self.log("\(legacyHistoryPath) found beside an already migrated database; left as is, not imported")
         }
+        guard current < Self.version else { return }
         var imported = false
         try database.transaction {
             // Read again under the write lock: another process may have migrated since.
-            guard try database.userVersion() < 1 else { return }
-            try database.execute(Self.schema)
-            if let legacyHistoryPath { imported = try importLegacy(from: legacyHistoryPath) }
-            try database.setUserVersion(1)
+            let version = try database.userVersion()
+            guard version < Self.version else { return }
+            if version < 1 { try database.execute(Self.schemaV1) }
+            try database.execute(Self.schemaV2)
+            if version < 1, let legacyHistoryPath { imported = try importLegacy(from: legacyHistoryPath) }
+            if let legacySidebar { try SidebarStore(database: database).importLegacy(legacySidebar) }
+            try database.setUserVersion(Self.version)
         }
         guard imported, let legacyHistoryPath else { return }
         let backup = (legacyHistoryPath as NSString).deletingPathExtension + ".migrated.json"
@@ -354,7 +407,7 @@ final class ChatStore {
         NSLog("[chats] %@", message)
     }
 
-    private static func inAppFolder(_ name: String) -> String {
+    static func inAppFolder(_ name: String) -> String {
         let dir = NSString(string: "~/.mlx-serve").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         return (dir as NSString).appendingPathComponent(name)
