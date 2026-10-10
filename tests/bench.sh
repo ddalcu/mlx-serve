@@ -71,6 +71,7 @@ TARGETS=(
     "qwen38-27b|ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
     "qwen38-27b-iq|ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw"
     "qwen38-flash-next|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+    "qwen38-flash-next-iq|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw"
     "mimo-v26-flash|ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8"
     "glm53-flash|TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP"
 )

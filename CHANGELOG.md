@@ -75,6 +75,20 @@ Estimated from the measured per-step cost:
 - **Full quality:** Turbo off, Max quality on (`"fast": false`), 30 steps.
 
 ### Fixes
+- **A client that disconnects mid-answer can no longer crash the server.** A streamed chat or `/v1/messages` request with tools could free the same buffered text twice when the client hung up (an agent's Stop button) at the moment held-back text was flushed; under eight concurrent agents on Qwen3.8 Flash Next this crashed the server within ten minutes.
+- **Hardened against malformed and hostile requests.** A request carrying more bytes than its `Content-Length` (or a `Content-Length` near 2^64) could corrupt memory and crash the server minutes later; such bodies are now cut at the declared length or refused with a 413. A `/v1/completions` prompt that encodes to no tokens, out-of-vocabulary ids on `/detokenize`, oversized `max_tool_calls` or Kokoro `seed` values, a tool schema nested tens of thousands of levels deep (a stack overflow; request JSON past 4096 levels is now a 400), and a reference or source WAV declaring an impossible sample rate (which asked for hundreds of gigabytes when resampled) are now refused or clamped instead of crashing.
+- Responses stay valid JSON when a client sends a model name with quotes or control characters, and a JSON `null` for an unset image field (`ref_images`, `lora_paths`) no longer turns a plain image request into a 400.
+- `/v1/responses` follow-ups (`previous_response_id`) are safe while the stored response is deleted or evicted, and WebSocket sessions no longer race other requests on the response store.
+- Switching straight to a large model right after unloading another no longer fails with "not enough free memory": the unloaded model's memory takes a second or two to reach the OS (150 GB on an M5 Ultra), and the load now waits for it instead of refusing.
+- Several models loading at once now respect `--max-resident-models`, a model that just finished loading can no longer be evicted before its own request runs (a nameless "Model load failed" 500 under model churn), and a refused load names both caps (it blamed `--max-resident-mem` for a model-count limit).
+- A failed load of a corrupt model, or an image request naming a LoRA file that is not safetensors, no longer makes the next unrelated request fail with "generation failed"; an SSD prompt-cache entry that cannot be read is dropped after one try instead of on every request.
+- An image, audio, video, 3D or decision request that runs out of GPU memory answers 503 instead of 500, and no longer makes the next chat request fail.
+- Qwen3.8 Flash Next resumes from an earlier saved point when an SSD prompt-cache entry's attention history falls short of its latest one, instead of re-reading the whole prompt (seen under 16 concurrent agents).
+- The `--api-key` login page accepts keys containing `+`, `/` or `=` (base64-style keys never logged in).
+- Request bodies over 1 MB sent with curl (and other clients that send `Expect: 100-continue`) no longer wait an extra second before the server reads them.
+- Kokoro speaks long text: input past about 500 phonemes (a short paragraph) failed with a 500 and is now synthesized sentence by sentence, up to OpenAI's 4,096-character limit; text with nothing to speak is a 400.
+- MiniMax-H3 clips past about 75,000 packed rows (such as 1344x768 at 260 frames) no longer come out black.
+- App: stopping an agent turn while a tool runs no longer drops the tool's late result into the chat.
 - A repetition loop inside a model's thinking now closes the thought and lets it answer; the turn used to end with no answer and no tool call, which agents read as done.
 - A prompt refused with `400 PrefillDoesNotFit` names the GPU memory it needed and the memory that was available.
 - A model the GPU can hold is no longer refused at load: `--max-resident-mem` now defaults to Metal's working-set limit instead of 80% of it.
@@ -127,6 +141,9 @@ Estimated from the measured per-step cost:
 - App: an attached video reaches the model, with Tools on or off, and its frames are saved as files instead of inside the chat history; with Tools on, a message that is only a picture, recording or clip reaches the model too (#429).
 - App: the agent sees a tool result in full until it has answered it, so reading a large file no longer sends it into a loop of ever-smaller re-reads (#605).
 - App: `readFile` and `editFile` count lines ending in CR or CRLF and keep the file's own line endings (#736); an agent's own Apple voice is used in voice mode, and Settings ▸ Voice picks the app's own Apple voice again (#417); Option types characters in the built-in terminal, so `@` works on Swiss and other layouts (#692).
+- On NVIDIA GPUs, MoE models such as LFM2-8B-A1B and Ling 3.0, and Prism's Bonsai 2 packs, answer instead of failing every request, and seeded sampling works on Nemotron-H and Qwen3.5 models.
+- On Linux, media models load when they fit: weights are counted against RAM and the working set against GPU memory, so MiniMax Music 3 runs on a 16 GB card without `--skip-mem-preflight`.
+- On Linux, a second server started on a port that is already in use now stops with "already in use"; it used to bind anyway and take half the first server's connections.
 
 ---
 

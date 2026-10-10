@@ -670,7 +670,12 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, pathz, s));
+    // The caller turns a bad file into a 400; its latch must not fail the next request.
+    const had_error = mlx.errorPending();
+    mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, pathz, s)) catch |err| {
+        mlx.dropLatchedErrorUnless(had_error);
+        return err;
+    };
     const file_scale = fileAlphaScale(allocator, meta_map);
     log.info("[lora] {s}: scale {d:.4}{s}\n", .{
         std.fs.path.basename(path),
@@ -1479,4 +1484,19 @@ test "loadFile rejects a MISSING file before mlx can kill the process" {
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, buf[0..root_len], .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "rel/lora.safetensors", .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "", .generic));
+}
+
+test "loadFile: a file that is not safetensors fails without leaving an MLX error for the next request" {
+    mlx.installErrorHandler();
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "not.safetensors", .data = "root:x:0:0:root:/root:/bin/sh\n" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &pbuf);
+    const path = try std.fmt.allocPrint(a, "{s}/not.safetensors", .{pbuf[0..root_len]});
+    defer a.free(path);
+    try std.testing.expectError(error.MlxError, loadFile(a, path, .flux2));
+    try std.testing.expect(!mlx.errorPending());
 }

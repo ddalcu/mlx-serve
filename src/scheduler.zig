@@ -1826,6 +1826,8 @@ pub const Scheduler = struct {
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        // Every decode path reads the prompt's last token; `""` on a BOS-less vocab encodes to none.
+        if (params.prompt_ids.len == 0) return error.EmptyPrompt;
         const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
         const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
         errdefer slot.deinit();
@@ -2031,6 +2033,10 @@ pub const Scheduler = struct {
         // slice handed to the LoadRequest stays valid while we block on `done`.
         var victims_buf: [16]*LoadedModel = undefined;
         var n_victims: usize = 0;
+        // The requester's reference, taken when the load is claimed: a model that turns `.ready`
+        // with no reference is another load's free eviction victim before this thread wakes.
+        var pinned = false;
+        errdefer if (pinned) self.registry.releaseStatus(entry);
 
         // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
         // other load should block on our filesystem.
@@ -2075,6 +2081,8 @@ pub const Scheduler = struct {
 
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
+            _ = entry.refcount.fetchAdd(1, .acq_rel);
+            pinned = true;
 
             // Estimate post-load bytes (see `gateEstimateBytes` for why a media
             // entry cannot be billed by its directory's size).
@@ -2098,12 +2106,13 @@ pub const Scheduler = struct {
                 // idle server the cause is always the static cap (#126), and
                 // the flag that moves it is not otherwise discoverable.
                 const gb = 1024.0 * 1024.0 * 1024.0;
-                log.err("Refusing to load {s}: needs ~{d:.2} GB but --max-resident-mem is {d:.2} GB ({d:.2} GB already resident across {d} model(s), none evictable). Raise or disable the cap with --max-resident-mem <size>|0.\n", .{
+                log.err("Refusing to load {s}: needs ~{d:.2} GB with {d:.2} GB resident across {d} model(s), none evictable, against --max-resident-models {d} and --max-resident-mem {d:.2} GB (0 = off). Unload a model or raise a cap.\n", .{
                     entry.id,
                     @as(f64, @floatFromInt(estimated)) / gb,
-                    @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
                     @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
                     self.registry.countLoadedLocked(),
+                    self.registry.max_resident_models,
+                    @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
                 });
                 self.registry.markUnloadedLocked(entry); // releases the reservation
                 self.registry.mutex.unlock(self.io);
@@ -2194,11 +2203,12 @@ pub const Scheduler = struct {
         // Success — inference thread installed cpu_state onto the entry.
         owned_active = false;
 
-        // Re-acquire under mutex and refcount the ready entry.
+        // Already refcounted (`pinned`), so no other load evicted it; only an explicit
+        // unload can have claimed it since `markReady`, and that is a 503, not a failed load.
         self.registry.mutex.lockUncancelable(self.io);
-        defer self.registry.mutex.unlock(self.io);
-        if (entry.state != .ready) return error.LoadFailed;
-        _ = entry.refcount.fetchAdd(1, .acq_rel);
+        const ready = entry.state == .ready;
+        self.registry.mutex.unlock(self.io);
+        if (!ready) return error.NotLoaded;
         return entry;
     }
 
@@ -3267,7 +3277,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         const peak = gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, backend_type);
         const cuda = mlx.cudaAvailable();
         const bill = mediaBill(peak, if (cuda) gen_mod.sumSafetensorsAt(sch.io, params.model_dir) else 0, cuda);
-        const avail = availForLoad(bill.ram);
+        const avail = availForLoad(sch.io, bill.ram);
         const gb = 1024.0 * 1024.0 * 1024.0;
         log.info("[preflight] media peak ~{d:.2} GB (staged residency), available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(peak)) / gb,
@@ -3740,10 +3750,36 @@ test "coldLoadVision honors the process-wide vision opt-out" {
 /// it bind below free RAM, and weights past it OOM in warmup instead of refusing by name.
 /// Memory a load of `need` bytes can use. A resident media cache is opportunistic, so a load that
 /// would be refused makes it let go first and the figure is read again.
-fn availForLoad(need: u64) u64 {
-    var avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
-    if (memInsufficientForLoad(need, avail) and gen_mod.releaseMediaResidency() > 0)
-        avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+fn availForLoad(io: std.Io, need: u64) u64 {
+    var avail = loadAvail(io);
+    if (memInsufficientForLoad(need, avail) and gen_mod.releaseMediaResidency() > 0) avail = loadAvail(io);
+    return settledAvail(need, avail, io, loadAvail, pauseLoadAvail);
+}
+
+fn loadAvail(_: std.Io) u64 {
+    return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+}
+
+fn pauseLoadAvail(io: std.Io) void {
+    std.Io.sleep(io, .fromMilliseconds(100), .real) catch {};
+}
+
+/// Memory an unload just freed reaches the OS over a second or two (150 GB of wired weights on an
+/// M5 Ultra): a reading too low for the load is re-read every pause while it still climbs, for at
+/// most 5 s; five readings without growth leave the refusal standing.
+fn settledAvail(need: u64, first: u64, ctx: anytype, comptime measure: fn (@TypeOf(ctx)) u64, comptime pause: fn (@TypeOf(ctx)) void) u64 {
+    const step: u64 = 64 << 20; // below this the reading is noise, not memory coming back
+    var avail = first;
+    var flat: u32 = 0;
+    var reads: u32 = 0;
+    while (memInsufficientForLoad(need, avail) and flat < 5 and reads < 50) : (reads += 1) {
+        pause(ctx);
+        const next = measure(ctx);
+        if (next > avail +| step) {
+            avail = next;
+            flat = 0;
+        } else flat += 1;
+    }
     return avail;
 }
 
@@ -3757,6 +3793,31 @@ fn loadGpuLimit() u64 {
 fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
     const avail = if (proc_avail > 0) proc_avail else host_avail;
     return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
+}
+
+test "settledAvail: a refused reading waits while freed memory still reaches the OS" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const Seq = struct {
+        vals: []const u64,
+        i: usize = 0,
+        fn measure(self: *@This()) u64 {
+            const v = self.vals[@min(self.i, self.vals.len - 1)];
+            self.i += 1;
+            return v;
+        }
+        fn pause(_: *@This()) void {}
+    };
+    // An unload's 150 GB unwires over a few readings: the load fits once it lands.
+    var climbing = Seq{ .vals = &.{ 80 * GB, 140 * GB, 200 * GB, 230 * GB } };
+    try std.testing.expectEqual(200 * GB, settledAvail(180 * GB, 66 * GB, &climbing, Seq.measure, Seq.pause));
+    // Nothing being freed: the refusal stands after five flat readings, not five seconds.
+    var flat = Seq{ .vals = &.{66 * GB} };
+    try std.testing.expectEqual(66 * GB, settledAvail(180 * GB, 66 * GB, &flat, Seq.measure, Seq.pause));
+    try std.testing.expectEqual(@as(usize, 5), flat.i);
+    // A load that already fits never waits.
+    var fits = Seq{ .vals = &.{0} };
+    try std.testing.expectEqual(200 * GB, settledAvail(10 * GB, 200 * GB, &fits, Seq.measure, Seq.pause));
+    try std.testing.expectEqual(@as(usize, 0), fits.i);
 }
 
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {
@@ -4111,7 +4172,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
         const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
-        const avail_bytes = availForLoad(weights_bytes);
+        const avail_bytes = availForLoad(sch.io, weights_bytes);
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(model_bytes)) / gb,
             @as(f64, @floatFromInt(avail_bytes)) / gb,
@@ -5622,8 +5683,11 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // Step 2: the actual load. On error, mark .error_state and signal done
     // (conn thread frees pre-parsed CPU state — ownership stays on req on
     // the failure path).
+    const had_error = mlx.errorPending();
     doLoadOnInferenceThread(sch, req) catch |err| {
         log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
+        // The load's own MLX error is reported here; latched, it would fail the next request.
+        mlx.dropLatchedErrorUnless(had_error);
         sch.registry.mutex.lockUncancelable(sch.io);
         if (err == error.InsufficientMemory) {
             // A memory-preflight refusal is transient, not a property of the
@@ -5762,11 +5826,7 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     var prev_mem_limit: usize = 0;
     const gen_mem_limit = genMemoryLimit(mlx.cudaAvailable(), sch.gen_reserve_bytes);
     if (gen_mem_limit) |lim| _ = mlx.mlx_set_memory_limit(&prev_mem_limit, lim);
-    if (reqs.len == 1) req.run(req.ctx) else {
-        var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;
-        for (reqs, ctxs[0..reqs.len]) |r, *c| c.* = r.ctx;
-        req.merge.?.run_many(ctxs[0..reqs.len]);
-    }
+    runGenJobs(reqs);
     if (gen_mem_limit != null) {
         var tmp: usize = 0;
         _ = mlx.mlx_set_memory_limit(&tmp, prev_mem_limit);
@@ -5789,6 +5849,19 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
         r.done = true;
         r.done_cond.broadcast(sch.io);
         r.done_mu.unlock(sch.io);
+    }
+}
+
+/// A latch the job raised is its own failure, already answered by its handler; left set, it
+/// would fail the next chat request.
+fn runGenJobs(reqs: []*GenRequest) void {
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    const req = reqs[0];
+    if (reqs.len == 1) req.run(req.ctx) else {
+        var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;
+        for (reqs, ctxs[0..reqs.len]) |r, *c| c.* = r.ctx;
+        req.merge.?.run_many(ctxs[0..reqs.len]);
     }
 }
 
@@ -11586,6 +11659,28 @@ test "takeMergeable: merges the contiguous run of same-model decision jobs withi
     try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
 }
 
+test "runGenJobs: a latch the job raised is dropped, one from before the job stays" {
+    const job = struct {
+        fn oom(_: *anyopaque) void {
+            mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+        }
+        fn ok(_: *anyopaque) void {}
+    };
+    var dummy: u8 = 0;
+    const m: *model_registry_mod.LoadedModel = @ptrFromInt(0x1000);
+    var failing: GenRequest = .{ .ctx = &dummy, .run = job.oom, .model = m };
+    var reqs = [_]*GenRequest{&failing};
+    runGenJobs(&reqs);
+    try testing.expect(!mlx.errorPending());
+
+    var clean: GenRequest = .{ .ctx = &dummy, .run = job.ok, .model = m };
+    reqs[0] = &clean;
+    mlx.latchErrorForTest("earlier failure");
+    runGenJobs(&reqs);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("earlier failure", mlx.takeError(&buf).?);
+}
+
 test "applyModelSettings: model MTP setting outranks the launch default" {
     var cc = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
     for ([_]struct { flag: bool, setting: ?bool, want: ?bool }{
@@ -11608,9 +11703,9 @@ test "availForLoad: only a load that would be refused makes media residency let 
     held.bytes = 1000;
     @import("minimax_h3.zig").registerResident(&held);
     defer @import("minimax_h3.zig").unregisterResident(&held);
-    _ = availForLoad(1); // fits anywhere: the cache stays
+    _ = availForLoad(testing.io, 1); // fits anywhere: the cache stays
     try std.testing.expectEqual(@as(u64, 1000), held.bytes);
-    _ = availForLoad(1 << 50); // can never fit: the cache is released before the refusal
+    _ = availForLoad(testing.io, 1 << 50); // can never fit: the cache is released before the refusal
     try std.testing.expectEqual(@as(u64, 0), held.bytes);
 }
 

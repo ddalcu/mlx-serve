@@ -224,6 +224,8 @@ req POST /api/generate '{"model":"m","prompt":"The capital of France is","raw":t
 req POST /api/chat '{"model":"m","messages":[{"role":"user","content":"weather in Paris?"}],"stream":false,"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"options":{"num_predict":60,"temperature":0}}'
 [[ "$R" == 200 ]] && ok "/api/chat with tools answers" || bad "/api/chat tools" "$R"
 req POST /api/show '{"name":"zzz"}';                                   expect_status 404 "/api/show unknown model"
+req POST /detokenize '{"tokens":[-1, 1099511627776]}';               expect_status 400 "detokenize ids outside the vocabulary"
+req POST /v1/completions '{"model":"m","prompt":"","max_tokens":4}';        expect_status 400 "completions: empty prompt (generating from it killed the server)"
 
 echo "=== Responses API ==="
 req POST /v1/responses '{"model":"m"}';                                expect_status 400 "responses: no input"
@@ -233,9 +235,22 @@ req POST /v1/responses '{"model":"m","input":"Give a person with name and age.",
 echo "$BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=[c["text"] for o in d["output"] if o["type"]=="message" for c in o["content"]][0]; j=json.loads(t); assert isinstance(j["age"],int)' 2>/dev/null && ok "responses: text.format json_schema enforced" || bad "responses json_schema" "$(echo "$BODY" | head -c 160)"
 req POST /v1/messages "{\"model\":\"m\",\"messages\":[$U]}";           expect_status 400 "messages: max_tokens required"
 
+echo "=== framing ==="
+# A body longer than its Content-Length arrives in the header read: the excess overflowed the
+# request buffer (heap corruption, the process aborted on the next free).
+python3 -I - "$PORT" <<'PY'
+import json, socket, sys
+body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hello world"}], "max_tokens": 4}).encode()
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=30)
+s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 5\r\nConnection: close\r\n\r\n" + body + b"x" * 8000)
+while s.recv(65536): pass
+PY
+for i in 1 2 3; do req GET /health; done
+expect_status 200 "short Content-Length: server alive"
+
 echo "=== alive ==="
 req GET /health; expect_status 200 "server alive after every edge"
-grep -qE "\[mlx\] error|panic|Segmentation" "$WORK/server.log" && bad "no MLX error / crash line in the log" || ok "no MLX error / crash line in the log"
+grep -qE "\[mlx\] error|panic|Segmentation|free\(\)|double free|corrupted|Aborted" "$WORK/server.log" && bad "no MLX error / crash line in the log" || ok "no MLX error / crash line in the log"
 
 echo
 echo "api-edges: $PASS passed, $FAIL failed  (log: $WORK/server.log)"

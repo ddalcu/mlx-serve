@@ -95,7 +95,8 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs. Brew: webp ≥ 1.6.0.
-- Linux/CUDA: `./scripts/build-linux.sh` from a fresh checkout (checks prereqs, submodules, Zig; detects the GPU arch, `CUDA_ARCH="75;86;120"` for RTX 20-50; aarch64 too: GH200, Thor, DGX Spark) runs `build-mlx-linux.sh` (applies `patches/mlx-cuda-*.patch`), `build-ds4-linux.sh`, `fetch-llama.sh`, then `zig build -Doptimize=ReleaseFast`. MLX's kernel JIT needs the toolkit headers via `CUDA_HOME` (`mlx.exportCudaHome` fills in `/opt/cuda`). Run tests with `-Dtest-filter`: the unfiltered suite does not compile on Linux.
+- Linux/CUDA: `./scripts/build-linux.sh` from a fresh checkout (checks prereqs, submodules, Zig; detects the GPU arch, `CUDA_ARCH="75;86;120"` for RTX 20-50; aarch64 too: GH200, Thor, DGX Spark) runs `build-mlx-linux.sh` (applies `patches/mlx-cuda-*.patch`), `build-ds4-linux.sh`, `fetch-llama.sh`, then `zig build -Doptimize=ReleaseFast`. MLX's kernel JIT needs the toolkit headers via `CUDA_HOME` (`mlx.exportCudaHome` fills in `/opt/cuda`; tests need it exported by hand). On CUDA the Metal-kernel tests fail by design.
+- **On CUDA a Mac-tuned fast path is re-measured before it stays on**: `prefillDqGemm` ran 13% slower there and stacked ~5 GB into the prefill peak (default off on CUDA), and a chunk past 2048 bought no speed for GBs of peak (`autoPrefillChunkCap`).
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
 
 ## Testing — TDD is mandatory
@@ -272,6 +273,8 @@ Request parsing + media:
 - **A dispatch field must be readable from every body SHAPE** (`parseModelFromRequest(body, content_type)`); header parameter lookups key at a boundary (`name=` vs `filename=`); binary bodies are not logged (`bodyIsText`); request ints clamp (`parseRequestSeed`, `clampJsonI32`).
 - **A client-supplied PATH is proven on OUR side of the mlx boundary** (`lora.loadFile` stat → 400) and accepted only from LOOPBACK (`parseLoraFields(…, local)` → 403, #540: missing vs not-a-LoRA is a host-file oracle). `/v1/images/edits` forwards the LoRA fields (#268).
 - **Hand-written error text is not JSON**: escape at the SINK (`jsonEscapeMessage`), truncate on a UTF-8 boundary. NO model-byte string is guaranteed UTF-8 — sanitizing lives INSIDE every escaper (`chat.utf8Next`); logprobs `bytes` keeps exact bytes.
+- **A list of owned buffers is freed in ONE place**: a per-item `defer free` in a send loop plus the handler's defer over the same list double-freed when a send failed (client gone mid-flush; `flush_text` on chat + messages).
+- **A body is exactly its `Content-Length`** (`readRequest`; extra head bytes overran the heap, a 2^64 length wrapped) and nests at most `MAX_JSON_DEPTH` (recursive schema walkers overflowed a thread stack); zero prompt tokens are refused at `Scheduler.submit`; a client string spliced raw into a template is vetted first (`echoModelName`).
 
 Sampling + logprobs + streams:
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey` + `SamplingParams.draw`).
@@ -300,7 +303,7 @@ Loading + residency:
 - **Embedded engines**: one ds4 session per model, one llama.cpp sequence per request (`llama_ctx`, `session_claims`); ds4 in-checkpoint MTP only when the GGUF declares `nextn_predict_layers` (`embedded_mtp`); the `Tokenizer` is a STUB — count via `server.encodeText`, stop on the ENGINE's set (`isEog`/`isStop`, #667); embeddings refuse by NAME; a llama trim is FALLIBLE (cold-prefill on refusal). Guard: `tests/test_ds4_serve.sh`.
 - **An embedding SUB-BATCH is its own forward** (cache reset per sub-batch). Guard: `tests/test_embeddings.sh` [4c].
 - **A READY model never advertises LESS than its stub** (`readyHasChat`). Default bind 0.0.0.0 WARNS (`shouldWarnOpenBind`).
-- **One port, one server** (`listenExclusive`): std's `reuse_address` also sets SO_REUSEPORT (a second instance stole the port); the flag is cleared after bind, a late bind fails `AddressInUse`.
+- **One port, one server** (`listenExclusive`): std's `reuse_address` also sets SO_REUSEPORT (a second instance stole the port); macOS clears it after bind, Linux (which joins the reuseport group AT bind) never sets it (`listenExclusiveLinux`).
 
 Memory bills + admission:
 - **KV is billed per CACHING LAYER at the arch's OWN K/V widths** (`kvBytesPerToken` ← `attnCacheLayerCount`; only `.attention` blocks of a `layer_block_types` hybrid; sliding rings in `slotFixedKvBytes`); STORED and SCORED widths are two parameters (`prefillScoreHeadDim`).
@@ -338,8 +341,9 @@ Prefix cache (RAM + SSD):
 - **An in-place SSD commit bills by MEASURE** (`nonChunkBytes` after − before, #573): the per-term delta in `appendSsmOnly` under-billed whole checkpoint lists in ReleaseFast builds and the tier outgrew its cap. Its guard is red only under `zig build test -Doptimize=ReleaseFast`.
 
 MLX errors + threads:
-- **An MLX failure is CATCHABLE** (#353, `installErrorHandler`): `checkError` per chunk, `checkErrorDecode` per tick, a latched error never 200s; a swallowed failure DROPS its latch (`dropLatchedErrorUnless(had_error)`); never hand a null `mlx_array` to the tensor-map insert. Guard: `tests/test_mlx_error_recovery.sh`.
+- **An MLX failure is CATCHABLE** (#353, `installErrorHandler`): `checkError` per chunk, `checkErrorDecode` per tick, a latched error never 200s; a swallowed failure DROPS its latch (`dropLatchedErrorUnless(had_error)`, media jobs in `runGenJobs`); never hand a null `mlx_array` to the tensor-map insert. Guard: `tests/test_mlx_error_recovery.sh`.
 - **Threads**: detach every conn thread; drain (`active_conn_threads` + `cancelAllInFlight`) BEFORE `scheduler.deinit`; handler sampling state outlives every pass (`Slot.in_pass`); an adopted spec cache has ONE owner (#266); sleep inhibition follows the inference-thread wait (#251, `tests/test_sleep_inhibit.sh`).
+- **On Linux a thread's static TLS comes out of its stack**: std's 256 KiB thread-local signal stack made a 64 KiB `stack_size` an EINVAL that Zig treats as `unreachable`; explicit stacks are 1 MiB.
 - **A weight is LAZY until evaluated**: force-eval at init; `mlx_compile` re-runs a CAPTURED lazy load per call.
 - **Ownership by PROVENANCE, never content** (`{slice, owned}`).
 

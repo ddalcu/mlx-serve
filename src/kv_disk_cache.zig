@@ -527,7 +527,7 @@ pub const DiskTier = struct {
         _ = self;
         e.poisoned = true;
         @memset(e.chunk_bytes, 0);
-        log.warn("  [disk-cache] e{d} write failed ({s}) — entry invalidated\n", .{ e.id, err_name });
+        log.warn("  [disk-cache] e{d} unusable ({s}) — entry invalidated\n", .{ e.id, err_name });
     }
 
     fn poisonAll(self: *DiskTier, err_name: []const u8) usize {
@@ -773,8 +773,12 @@ pub const DiskTier = struct {
         var qsa_overlay: ?transformer_mod.SSMCheckpoint = null;
         defer if (qsa_overlay) |*q| q.deinit(self.allocator);
         if ((want_rows > 0 or e.qsa_history_rows > 0) and !snap_has_pooled) {
-            var hist = self.loadQsaHistoryFile(e.id, ssm_entries.len) catch return error.DiskCacheQsaHistoryGap;
+            var hist = self.loadQsaHistoryFile(e.id, ssm_entries.len) catch |err| {
+                log.warn("  [disk-cache] e{d} ssm@{d}: QSA history unreadable ({s}; meta rows {d})\n", .{ e.id, cp_pos, @errorName(err), e.qsa_history_rows });
+                return error.DiskCacheQsaHistoryGap;
+            };
             if (!transformer_mod.checkpointQsaCoversPos(&cp, &hist, cp_pos)) {
+                log.warn("  [disk-cache] e{d} ssm@{d}: QSA history of {d} rows does not cover it (kv_len {d})\n", .{ e.id, cp_pos, transformer_mod.checkpointQsaAuxRows(&hist), e.kv_len });
                 hist.deinit(self.allocator);
                 return error.DiskCacheQsaHistoryGap;
             }
@@ -786,6 +790,7 @@ pub const DiskTier = struct {
                     var latest_cp = latest_cp_val;
                     if (transformer_mod.checkpointHasQsaPooled(&latest_cp)) {
                         if (!transformer_mod.checkpointQsaCoversPos(&cp, &latest_cp, cp_pos)) {
+                            log.warn("  [disk-cache] e{d} ssm@{d}: the pooled bank at ssm@{d} does not cover it\n", .{ e.id, cp_pos, latest });
                             latest_cp.deinit(self.allocator);
                             return error.DiskCacheQsaHistoryGap;
                         }
@@ -793,7 +798,10 @@ pub const DiskTier = struct {
                     } else {
                         latest_cp.deinit(self.allocator);
                     }
-                } else |_| return error.DiskCacheQsaHistoryGap;
+                } else |err| {
+                    log.warn("  [disk-cache] e{d} ssm@{d}: newest checkpoint ssm@{d} unreadable ({s})\n", .{ e.id, cp_pos, latest, @errorName(err) });
+                    return error.DiskCacheQsaHistoryGap;
+                }
             }
         }
         if (test_qsa_overlay_mismatch) {
@@ -820,6 +828,29 @@ pub const DiskTier = struct {
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
         return cp_pos;
+    }
+
+    /// `restoreIntoHybrid` at the highest checkpoint in [floor, cp_pos] whose QSA history
+    /// covers it: a history shorter than the entry's newest checkpoints still serves the older ones.
+    pub fn restoreIntoHybridCovered(
+        self: *DiskTier,
+        cache: *KVCache,
+        ssm_entries: []transformer_mod.SSMCacheEntry,
+        idx: usize,
+        cp_pos: u32,
+        floor: u32,
+        s: mlx.mlx_stream,
+    ) !u32 {
+        var pos = cp_pos;
+        while (true) {
+            // A gap fails before the cache or the entries are touched, so the next try starts clean.
+            return self.restoreIntoHybrid(cache, ssm_entries, idx, pos, s) catch |err| {
+                if (err != error.DiskCacheQsaHistoryGap) return err;
+                pos = self.highestSsmPosAtOrBelow(idx, pos - 1) orelse return err;
+                if (pos < floor) return err;
+                continue;
+            };
+        }
     }
 
     /// Largest persisted SSM checkpoint position ≤ `limit` for entry `idx`;
@@ -4656,6 +4687,72 @@ test "DiskTier: a v7 entry with missing or short qsa.safetensors misses before K
     }
 }
 
+test "DiskTier: a QSA history short of the chosen checkpoint restores the highest one it covers" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-walk", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var plain = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&plain);
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &plain, 64, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &plain, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    // The persisted history covers only the first 128 rows.
+    var src128 = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src128);
+    const aux128 = [_]c_int{ 1, 128, 8 };
+    const pooled128 = [_]c_int{ 1, 32, 8 };
+    src128[2].aux_state = makeArange(s, &aux128, 700.0);
+    src128[2].qsa_pooled = makeArange(s, &pooled128, 800.0);
+    src128[2].qsa_ratio = 4;
+    var cps128 = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+    };
+    defer for (&cps128) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps128, &src128, s);
+    const dir_rel = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, tier.entries.items[0].id });
+    defer testing.allocator.free(dir_rel);
+    _ = try tier.writeQsaHistoryFile(dir_rel, &cps128[0], s);
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectError(error.DiskCacheQsaHistoryGap, tier.restoreIntoHybridCovered(&cache2, &dst, 0, 256, 129, s));
+    try testing.expectEqual(@as(usize, 0), cache2.step);
+    try testing.expectEqual(@as(u32, 128), try tier.restoreIntoHybridCovered(&cache2, &dst, 0, 256, 1, s));
+    try testing.expectEqual(@as(usize, 128), cache2.step);
+    try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
+}
+
 test "DiskTier: a history tensor shorter than cp_pos is a miss, not a short hit" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -6252,7 +6349,7 @@ test "volumeSpace: free is what the OS grants, never less than statfs' f_bavail"
     const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
     const granted = msv_volume_free_for_use("/");
     try testing.expect(granted > 0);
-    try testing.expect(vs.free + slack >= @as(u64, st.f_bsize) * st.f_bavail);
+    try testing.expect(vs.free + slack >= @as(u64, @intCast(@max(st.f_bsize, 0))) * st.f_bavail);
     if (granted <= vs.total) try testing.expect(@max(granted, vs.free) - @min(granted, vs.free) < slack);
 }
 

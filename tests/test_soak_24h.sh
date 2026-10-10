@@ -243,7 +243,8 @@ echo "  samples:   $N_SAMPLES"
 echo "  RSS drift: ${DRIFT}% (threshold ${DRIFT_THRESHOLD_PCT}%)"
 
 FAIL=0
-OK=$(python3 -c "print(1 if abs(${DRIFT}) <= ${DRIFT_THRESHOLD_PCT} else 0)")
+# Growth is the leak; a footprint that shrinks (pools returned, caches trimmed) is not.
+OK=$(python3 -c "print(1 if ${DRIFT} <= ${DRIFT_THRESHOLD_PCT} else 0)")
 if [ "$OK" != "1" ]; then
     echo -e "${RED}FAIL${NC} RSS drift ${DRIFT}% exceeded threshold ${DRIFT_THRESHOLD_PCT}%"
     FAIL=1

@@ -1171,7 +1171,7 @@ fn sendDecisionError(conn: *Conn, engine: *DecisionEngine, err: anyerror) !void 
     };
     if (named) |msg| return sendError(conn, 400, msg);
     log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
-    return sendError(conn, 500, "decision forward failed");
+    return sendError(conn, jobFailureStatus(err), "decision forward failed");
 }
 
 /// One queued `/v1/decisions` request.
@@ -2503,7 +2503,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 
     // Extra in-context references (edit mode only): each keeps its own aspect
     // ratio like the primary and rides at its own t offset in the DiT.
-    if (std.mem.indexOf(u8, body, "\"ref_images\"") != null) {
+    if (jsonFieldSet(body, "ref_images")) {
         if (!edit_mode) return sendError(conn, 400, "'ref_images' requires mode:\"edit\"");
         var it = iterJsonStringArray(body, "ref_images") orelse
             return sendError(conn, 400, "invalid 'ref_images' (must be a JSON array of base64 strings)");
@@ -2560,7 +2560,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
     var wbuf: [16]f32 = undefined;
     var cond_weights: ?[]const f32 = null;
-    if (std.mem.indexOf(u8, body, "\"cond_weights\"") != null) {
+    if (jsonFieldSet(body, "cond_weights")) {
         const wl = extractCondWeights(body, &wbuf) orelse
             return sendError(conn, 400, "invalid 'cond_weights' (numbers, comma/space separated, or a JSON array)");
         if (wl.len != engine.condWeightCount()) {
@@ -2701,7 +2701,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             sse.sendError(conn, "generation failed");
             return;
         }
-        return sendError(conn, 500, "generation failed");
+        return sendError(conn, jobFailureStatus(err), "generation failed");
     };
     defer _ = mlx.mlx_array_free(img);
 
@@ -2750,7 +2750,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         defer allocator.free(samples);
         const was_cached = synth.warmSpeaker(samples) catch |err| {
             log.err("[audio] warm_only failed: {}\n", .{err});
-            return sendError(conn, 500, "speaker embedding failed");
+            return sendError(conn, jobFailureStatus(err), "speaker embedding failed");
         };
         log.info("[audio] warm_only: speaker embedding {s}\n", .{if (was_cached) "already cached" else "cached"});
         return sendBytesJson(conn, allocator, if (was_cached)
@@ -2807,12 +2807,15 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             sse.sendError(conn, "synthesis failed");
             return;
         }
-        return sendError(conn, 500, "synthesis failed");
+        return sendError(conn, jobFailureStatus(err), "synthesis failed");
     };
     defer allocator.free(wav);
     log.info("[audio] -> {d} WAV bytes\n", .{wav.len});
     return sendWav(allocator, conn, wav, want_stream);
 }
+
+/// OpenAI's `input` limit for `/v1/audio/speech`; longer text is spoken window by window up to it.
+const KOKORO_MAX_INPUT = 4096;
 
 /// `POST /v1/audio/speech` on a Kokoro checkpoint.
 ///
@@ -2831,6 +2834,7 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     const text = try jsonUnescape(allocator, input);
     defer allocator.free(text);
     if (text.len == 0) return sendError(conn, 400, "empty 'input'");
+    if ((std.unicode.utf8CountCodepoints(text) catch text.len) > KOKORO_MAX_INPUT) return sendError(conn, 400, "'input' is longer than 4096 characters");
 
     if (extractJsonString(body, "ref_audio")) |raw| {
         if (raw.len > 0) return sendError(conn, 400, "this model does not support voice cloning; use 'voice' to pick or blend a built-in voice");
@@ -2857,7 +2861,7 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     const speed: f32 = @floatCast(extractJsonFloat(body, "speed") orelse 1.0);
     if (!(speed > 0.0) or speed > 5.0) return sendError(conn, 400, "'speed' must be in (0, 5]");
 
-    const seed: u64 = if (extractJsonFloat(body, "seed")) |v| @intFromFloat(@max(0, v)) else 0;
+    const seed: u64 = extractJsonInt(body, "seed") orelse 0;
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[kokoro] {d} chars voice={s} speed={d:.2} stream={}\n", .{ text.len, voice, speed, want_stream });
@@ -2865,11 +2869,12 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
 
     const out = engine.synthesizeWav(text, voice, speed, seed) catch |err| {
         log.err("[kokoro] synthesis failed: {}\n", .{err});
+        const msg = if (err == error.EmptyKokoroInput) "'input' has no speakable text" else "synthesis failed";
         if (want_stream) {
-            sse.sendError(conn, "synthesis failed");
+            sse.sendError(conn, msg);
             return;
         }
-        return sendError(conn, 500, "synthesis failed");
+        return sendError(conn, if (err == error.EmptyKokoroInput) 400 else 500, msg);
     };
     defer allocator.free(out);
     log.info("[kokoro] -> {d} WAV bytes\n", .{out.len});
@@ -3002,7 +3007,7 @@ pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             sse.sendError(conn, "sound generation failed");
             return;
         }
-        return sendError(conn, 500, "sound generation failed");
+        return sendError(conn, jobFailureStatus(err), "sound generation failed");
     };
     defer allocator.free(wav);
     log.info("[sa3] -> {d} WAV bytes\n", .{wav.len});
@@ -3063,7 +3068,7 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
         if (b < 30 or b > 300) return sendError(conn, 400, "'bpm' must be in [30,300]");
         bpm = @intCast(b);
     }
-    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
+    const duration: u32 = extractJsonU32(body, "duration_seconds") orelse 60;
     if (duration < acestep.MIN_DURATION_S or duration > acestep.MAX_DURATION_S)
         return sendError(conn, 400, "'duration_seconds' must be in [10,600]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
@@ -3186,7 +3191,7 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
             sse.sendError(conn, "music generation failed");
             return;
         }
-        return sendError(conn, 500, "music generation failed");
+        return sendError(conn, jobFailureStatus(err), "music generation failed");
     };
     defer allocator.free(wav);
     log.info("[music] -> {d} WAV bytes\n", .{wav.len});
@@ -3271,7 +3276,7 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     defer allocator.free(caption);
     const caption_grew = caption.len != prompt.len;
 
-    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
+    const duration: u32 = extractJsonU32(body, "duration_seconds") orelse 60;
     if (duration < music3.MIN_DURATION_S or duration > music3.MAX_DURATION_S)
         return sendError(conn, 400, "'duration_seconds' must be in [1,360]");
     const steps = stepsRequest(extractJsonInt(body, "steps"), music3.DEFAULT_STEPS, 4, 100) catch
@@ -3312,7 +3317,7 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
             sse.sendError(conn, "music generation failed");
             return;
         }
-        return sendError(conn, 500, "music generation failed");
+        return sendError(conn, jobFailureStatus(err), "music generation failed");
     };
     defer allocator.free(wav);
     log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
@@ -3354,7 +3359,7 @@ fn handleYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engin
         if (std.mem.trim(u8, abc.?, " \t\r\n").len == 0) return sendError(conn, 400, "empty 'abc'");
         if (cot == .off) return sendError(conn, 400, "'abc' needs 'cot' melody or full — cot off renders without a score");
     }
-    const seconds: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse yue2.MAX_SECONDS);
+    const seconds: u32 = extractJsonU32(body, "duration_seconds") orelse yue2.MAX_SECONDS;
     if (seconds < yue2.MIN_SECONDS or seconds > yue2.MAX_SECONDS) return sendError(conn, 400, "'duration_seconds' must be in [5,360]");
     const steps = stepsRequest(extractJsonInt(body, "steps"), yue2.DEFAULT_STEPS, 1, yue2.MAX_STEPS) catch
         return sendError(conn, 400, "'steps' must be in [1,100]");
@@ -3393,7 +3398,7 @@ fn handleYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engin
             sse.sendError(conn, "music generation failed");
             return;
         }
-        return sendError(conn, 500, "music generation failed");
+        return sendError(conn, jobFailureStatus(err), "music generation failed");
     };
     defer allocator.free(song.wav);
     defer if (song.abc) |t| allocator.free(t);
@@ -3899,12 +3904,12 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     if (turbo and !engine.hasTurboLora(io, allocator))
         return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
-    const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
-    const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
+    const width: u32 = extractJsonU32(body, "width") orelse 256;
+    const height: u32 = extractJsonU32(body, "height") orelse 256;
     const steps = stepsRequest(extractJsonInt(body, "steps"), if (turbo) 4 else 30, 1, 100) catch
         return sendError(conn, 400, "'steps' must be in [1,100]");
     const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
-    const requested_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 56);
+    const requested_frames: u32 = extractJsonU32(body, "num_frames") orelse 56;
 
     if (width % 32 != 0 or height % 32 != 0)
         return sendError(conn, 400, "width and height must be multiples of 32");
@@ -3916,7 +3921,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // path. `num_frames` is PER WINDOW; the response reports the delivered
     // (joined) count. Needs the FL2VA pack — a reference has no keyframe row
     // to chain through — so the REF2VA partition is refused by name.
-    const chain_windows: u32 = @intCast(extractJsonInt(body, "chain_windows") orelse 1);
+    const chain_windows: u32 = extractJsonU32(body, "chain_windows") orelse 1;
     if (chain_windows < 1 or chain_windows > 6)
         return sendError(conn, 400, "chain_windows must be 1-6");
     if (chain_windows > 1 and engine.supports_refs)
@@ -3996,9 +4001,9 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         for (refs.items) |*m| m.deinit();
         refs.deinit(allocator);
     }
-    const has_ref_fields = std.mem.indexOf(u8, body, "\"ref_images\"") != null or
-        std.mem.indexOf(u8, body, "\"ref_videos\"") != null or
-        std.mem.indexOf(u8, body, "\"ref_audios\"") != null;
+    const has_ref_fields = jsonFieldSet(body, "ref_images") or
+        jsonFieldSet(body, "ref_videos") or
+        jsonFieldSet(body, "ref_audios");
     if (has_ref_fields and !engine.supports_refs)
         return sendError(conn, 400, "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
     if (has_ref_fields) {
@@ -4111,7 +4116,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         // Mid-stream the headers are already out, so an error must be an SSE
         // event, not a status line the client will never parse.
         if (want_stream) return sse.sendError(conn, "MiniMax-H3 generation failed");
-        return sendError(conn, 500, "MiniMax-H3 generation failed");
+        return sendError(conn, jobFailureStatus(e), "MiniMax-H3 generation failed");
     };
     defer res.deinit();
 
@@ -4124,9 +4129,9 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     defer allocator.free(prompt);
     if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
 
-    const num_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 9);
-    const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
-    const width: u32 = @intCast(extractJsonInt(body, "width") orelse 384);
+    const num_frames: u32 = extractJsonU32(body, "num_frames") orelse 9;
+    const height: u32 = extractJsonU32(body, "height") orelse 256;
+    const width: u32 = extractJsonU32(body, "width") orelse 384;
     if (videoRgbTransportReason(num_frames, width, height)) |reason|
         return sendError(conn, 400, reason);
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
@@ -4227,7 +4232,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
                 if (err == error.AudioTooShort)
                     return sendError(conn, 400, "audio: clip too short (needs at least ~50 ms)");
                 log.err("[video] audio conditioning encode failed: {}\n", .{err});
-                return sendError(conn, 500, "audio: conditioning encode failed");
+                return sendError(conn, jobFailureStatus(err), "audio: conditioning encode failed");
             };
             log.info("[video] audio-to-video: {d} tokens (budget {d}) from {d} Hz {d}ch clip\n", .{ mlx.getShape(audio_cond.?)[1], max_tokens, dec.sample_rate, dec.channels });
         }
@@ -4373,7 +4378,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             conn.writeAll("data: {\"type\":\"error\",\"message\":\"generation failed\"}\n\n") catch {};
             return;
         }
-        return sendError(conn, 500, "generation failed");
+        return sendError(conn, jobFailureStatus(err), "generation failed");
     };
     defer frames.deinit(allocator);
     log.info("[video] -> {d}f {d}x{d} ({d} rgb bytes)\n", .{ frames.frames, frames.height, frames.width, frames.rgb.len });
@@ -4488,7 +4493,7 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
 
     const steps = stepsRequest(extractJsonInt(body, "steps"), 30, 1, 100) catch
         return sendError(conn, 400, "'steps' must be in [1,100]");
-    const res: u32 = @intCast(extractJsonInt(body, "octree_resolution") orelse 256);
+    const res: u32 = extractJsonU32(body, "octree_resolution") orelse 256;
     if (res < 64 or res > 512) return sendError(conn, 400, "'octree_resolution' must be in [64,512]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
     var guidance: f32 = 5.0;
@@ -4531,7 +4536,7 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
             sse.sendError(conn, "generation failed");
             return;
         }
-        return sendError(conn, 500, "generation failed");
+        return sendError(conn, jobFailureStatus(err), "generation failed");
     };
     defer allocator.free(glb_bytes);
     log.info("[mesh] -> {d} GLB bytes\n", .{glb_bytes.len});
@@ -5084,6 +5089,13 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     try conn.writeAll(body);
 }
 
+/// A media or decision job that ran out of memory hit the machine's capacity, not a server fault: 503, like chat.
+fn jobFailureStatus(err: anyerror) u16 {
+    if (err == error.OutOfMemory) return 503;
+    const latched = mlx.peekErrorName() orelse return 500;
+    return if (std.mem.eql(u8, latched, "OutOfMemory")) 503 else 500;
+}
+
 // ── Minimal JSON parsing helpers (top-level keys only) ──
 
 fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
@@ -5131,6 +5143,22 @@ test "stepsRequest: omitted takes the default, the range is checked before the c
     try std.testing.expectError(error.StepsOutOfRange, stepsRequest(5_000_000_000, 30, 1, 100));
 }
 
+/// `key` is in the body with a value other than `null` (clients send null for an unset field).
+fn jsonFieldSet(body: []const u8, key: []const u8) bool {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return false;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return false;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) i += 1;
+    return !std.mem.startsWith(u8, body[i..], "null");
+}
+
+test "jsonFieldSet: a null value is an unset field" {
+    try std.testing.expect(jsonFieldSet("{\"ref_images\":[\"a\"]}", "ref_images"));
+    try std.testing.expect(!jsonFieldSet("{\"ref_images\": null}", "ref_images"));
+    try std.testing.expect(!jsonFieldSet("{\"prompt\":\"x\"}", "ref_images"));
+}
+
 fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
     var key_pat_buf: [64]u8 = undefined;
     const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
@@ -5141,6 +5169,13 @@ fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
     while (i < body.len and (std.ascii.isDigit(body[i]))) i += 1;
     if (i == start) return null;
     return std.fmt.parseInt(u64, body[start..i], 10) catch null;
+}
+
+/// `extractJsonInt` saturated to u32: a value past the range reaches the caller's bound check
+/// as the largest u32 (a named 400) instead of an out-of-range cast.
+fn extractJsonU32(body: []const u8, key: []const u8) ?u32 {
+    const v = extractJsonInt(body, key) orelse return null;
+    return std.math.cast(u32, v) orelse std.math.maxInt(u32);
 }
 
 /// Parse a JSON number (int or float) for `key`. Accepts a leading sign, digits,
@@ -5244,7 +5279,7 @@ fn parseLoraFields(
     var n: usize = 0;
     errdefer for (path_bufs[0..n]) |p| allocator.free(p);
 
-    if (std.mem.indexOf(u8, body, "\"lora_paths\"") != null) {
+    if (jsonFieldSet(body, "lora_paths")) {
         var it = iterJsonStringArray(body, "lora_paths") orelse return error.BadLoraPathsJson;
         while (it.next()) |raw| {
             if (n >= lora_mod.MAX_LORAS) return error.TooManyLoraPaths;
@@ -5259,7 +5294,7 @@ fn parseLoraFields(
     if (n == 0) return 0;
     if (!local) return error.LoraPathsLocalOnly;
 
-    if (std.mem.indexOf(u8, body, "\"lora_scales\"") != null) {
+    if (jsonFieldSet(body, "lora_scales")) {
         var sbuf: [lora_mod.MAX_LORAS]f32 = undefined;
         const sl = extractLoraScales(body, &sbuf) orelse return error.BadLoraScalesJson;
         const m = @min(sl.len, n);
@@ -5971,6 +6006,12 @@ test "extractJsonFloat parses cfg scales (int + float + sign)" {
     try testing.expectEqual(@as(?f64, 3.5), extractJsonFloat("{\"cfg_scale\":3.5,\"x\":1}", "cfg_scale"));
     try testing.expectEqual(@as(?f64, 7), extractJsonFloat("{\"cfg_audio_scale\": 7}", "cfg_audio_scale"));
     try testing.expectEqual(@as(?f64, null), extractJsonFloat("{\"prompt\":\"hi\"}", "cfg_scale"));
+}
+
+test "extractJsonU32 saturates a value past u32 so the caller's bound check refuses it" {
+    try testing.expectEqual(@as(?u32, 256), extractJsonU32("{\"width\": 256}", "width"));
+    try testing.expectEqual(@as(?u32, std.math.maxInt(u32)), extractJsonU32("{\"width\": 99999999999}", "width"));
+    try testing.expectEqual(@as(?u32, null), extractJsonU32("{\"width\": -5}", "width"));
 }
 
 test "extractJsonInt parses seed/steps" {
@@ -6962,4 +7003,16 @@ test "a base64 WebP reference reaches the media backends as a PNG with the same 
     const same = try imageB64Alloc(a, std.base64.standard.Encoder.encode(&b64_png, png_bytes));
     defer a.free(same);
     try std.testing.expectEqualSlices(u8, png_bytes, same);
+}
+
+test "jobFailureStatus: a memory failure is a 503, any other failure a 500" {
+    try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.OutOfMemory));
+    try std.testing.expectEqual(@as(u16, 500), jobFailureStatus(error.MlxError));
+    var buf: [256]u8 = undefined;
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.MlxError));
+    _ = mlx.takeError(&buf);
+    mlx.latchErrorForTest("[gather] index out of range");
+    try std.testing.expectEqual(@as(u16, 500), jobFailureStatus(error.MlxError));
+    _ = mlx.takeError(&buf);
 }

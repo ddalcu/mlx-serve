@@ -1217,8 +1217,12 @@ pub const HotPrefixCache = struct {
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
-                const restored = d.restoreIntoHybrid(target_cache, ssm_entries, hm.idx, disk_cp, s) catch |err| {
+                const disk_floor: u32 = @intCast(ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS);
+                const restored = d.restoreIntoHybridCovered(target_cache, ssm_entries, hm.idx, disk_cp, disk_floor, s) catch |err| {
                     log.warn("  [disk-cache] hybrid restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                    // An unreadable file fails the same way on every later lookup; a coverage miss
+                    // (no checkpoint, QSA gap) can still serve a shorter prefix, so it stays.
+                    if (err == error.MlxError) _ = d.poisonId(d.entries.items[hm.idx].id, @errorName(err));
                     // A failed restore can leave the cache AND ssm entries
                     // half-rebuilt; reset both before the fall-through.
                     target_cache.truncate(0, s) catch {};
@@ -1265,6 +1269,7 @@ pub const HotPrefixCache = struct {
             const sw = io_util.Stopwatch.init(d.io);
             d.restorePrefixInto(target_cache, dm.idx, @intCast(final_len), s) catch |err| {
                 log.warn("  [disk-cache] restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                if (err == error.MlxError) _ = d.poisonId(d.entries.items[dm.idx].id, @errorName(err));
                 // A failed restore can leave a half-rebuilt cache; reset it.
                 target_cache.truncate(0, s) catch {};
                 break :disk;
@@ -3784,6 +3789,50 @@ test "HotPrefixCache: dflash + mtp snapshots survive the SSD tier across a resta
         try testing.expectEqual(@as(usize, 0), dfl3.step);
         try testing.expectEqual(@as(usize, 42), dbase3); // untouched
     }
+}
+
+test "HotPrefixCache: an SSD entry that fails to restore is poisoned, not retried" {
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-bad", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        _ = try hc.commit(&cache, &tokens, false);
+        hc.flushPendingDisk(s);
+    }
+    // A chunk whose bytes rotted at the same size: the scan's size check passes, the load fails.
+    var path_buf: [64]u8 = undefined;
+    const chunk = try std.fmt.bufPrint(&path_buf, "fp-bad/e1/c000000.safetensors", .{});
+    const st = try tmp.dir.statFile(io, chunk, .{});
+    const junk = try testing.allocator.alloc(u8, @intCast(st.size));
+    defer testing.allocator.free(junk);
+    @memset(junk, 0xff);
+    try tmp.dir.writeFile(io, .{ .sub_path = chunk, .data = junk });
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-bad", 0, 128);
+    defer hc2.deinit();
+    const id = hc2.disk.?.entries.items[0].id;
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 0), res.matched);
+    try testing.expect(hc2.disk.?.entryPoisoned(id));
+    mlx.dropLatchedErrorUnless(false);
 }
 
 test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {

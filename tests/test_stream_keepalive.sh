@@ -61,7 +61,7 @@ MAX_GAP_S=${MAX_GAP_S:-15}
 # anything, so the surface SKIPs instead of passing vacuously.
 MIN_BUFFER_S=${MIN_BUFFER_S:-8}
 
-LOG=$(mktemp -t keepalive-server)
+LOG=$(mktemp -t keepalive-server.XXXXXX)
 # The probe generates ~2.4k tokens; a pinned context keeps an auto-sized one
 # (small when free memory is low at boot) from cutting the call short.
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 --log-level info --ctx-size 8192 >"$LOG" 2>&1 &

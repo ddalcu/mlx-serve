@@ -1114,6 +1114,17 @@ pub const ModelRegistry = struct {
         return n;
     }
 
+    /// Entries mid-load other than `exclude_id`. Caller holds `mutex`.
+    fn countLoadingLocked(self: *const ModelRegistry, exclude_id: []const u8) u32 {
+        var n: u32 = 0;
+        var it = self.entries.valueIterator();
+        while (@constCast(&it).next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state == .loading and !std.mem.eql(u8, entry.id, exclude_id)) n += 1;
+        }
+        return n;
+    }
+
     /// Phase D: subtract `bytes` from the resident accounting. Caller holds
     /// `mutex`. Used after `unloadResident()` to keep `current_resident_bytes`
     /// in sync with the actual GPU footprint.
@@ -1301,9 +1312,9 @@ pub const ModelRegistry = struct {
             // Resident-after-plan = current minus what these victims free, plus
             // every in-flight reservation (including this load's own estimate).
             const projected_mem = (@max(self.current_resident_bytes, live_bytes) -| freed) + self.reserved_bytes;
-            // Count: .ready+.evicting now, minus the victims we'll drop, plus
-            // this load (currently `.loading`, becomes resident).
-            const projected_count = self.countLoadedLocked() - @as(u32, @intCast(n)) + 1;
+            // Count: .ready+.evicting now and every other load in flight, minus the
+            // victims we'll drop, plus this load (currently `.loading`, becomes resident).
+            const projected_count = self.countLoadedLocked() + self.countLoadingLocked(exclude_id) - @as(u32, @intCast(n)) + 1;
             const mem_ok = self.max_resident_mem == 0 or projected_mem <= self.max_resident_mem;
             const count_ok = projected_count <= self.max_resident_models;
             if (mem_ok and count_ok) return n;
@@ -2118,6 +2129,21 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0));
+}
+
+test "planEvictions: another model still loading counts against the model cap" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    _ = try makeReadyStub(reg, "a", 10);
+    _ = try beginLoad(reg, "b", 10); // in flight: becomes the second resident model
+    const c = try beginLoad(reg, "c", 10);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    // a + b + c would be three models under a cap of two: `a` has to go.
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqualStrings("a", buf[0].id);
 }
 
 test "reservation: released back to zero on markReady / markUnloaded" {

@@ -1167,6 +1167,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             } catch is CancellationError {
                 throw CancellationError()
             }
+            // A cancelled consumer ends the stream quietly instead of throwing.
+            try Task.checkCancellation()
             appState.updateLastMessage(in: sessionId, streaming: false)
 
             // A repetition-loop cut ENDS the turn, ahead of every recovery path
@@ -1349,6 +1351,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // one decision, made when the agent was configured, instead of a
                 // dialog per call.
                 let approved = config.autoApprove ? true : await approval(tc)
+                try Task.checkCancellation()
                 guard approved else {
                     let denied = AgentEngine.ToolResult(
                         id: tc.id,
@@ -1394,6 +1397,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     // Re-read: Tools can go off while this round streamed.
                     allowedTools: config.revokingTools(ledger.toolsRevoked(session: sessionId)).dispatchTools
                 )
+                // A tool cannot be interrupted; a result that lands after Stop belongs to no turn.
+                try Task.checkCancellation()
                 roundOutputs.append(result.output)
                 if let handle = result.backgroundHandle { roundHandles.append(handle) }
 
