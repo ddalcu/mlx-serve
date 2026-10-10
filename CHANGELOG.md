@@ -5,13 +5,21 @@
 ### Highlights
 
 - **Tell a story, get a film.** Video storyboards turn a story into a run of shots, each one picking up where the last ended, joined into a single clip up to two minutes long. Describe it in a sentence and Enhance writes the shots for you, even from a first frame you attach.
+
 - **Your Mac is a music and sound studio.** YuE2 writes whole songs with vocals from your lyrics and a style, and shows you the score so you can change the melody. Stable Audio 3 makes sound effects in about a second. AI Radio plays an endless station on any theme, composing each track while the last one plays, on MLX-Amp, a classic skinned player with a live spectrum.
+
 - **Pictures in about 8 seconds.** Qwen-Image-2.1-Turbo paints a 1024x1024 image in about 8 seconds on an M5 Ultra, and Enhance turns a few words into a rich, detailed prompt.
+
 - **Chat never waits for the art.** Agents and chats keep answering while the same server paints, speaks, composes, films or sculpts in 3D. Two coding agents kept replying within a second while an image, speech, music and a textured 3D model rendered beside them.
+
 - **The newest frontier models, at home.** DeepSeek-V4.1-Flash (even on a 128 GB Mac, streaming its experts from the SSD on @davidtai's mlx-stream), GLM-5.3-Flash, MiMo-V2.6-Flash and Kolibri-1 (thanks @albinekb) run locally with thinking and tool calls, and EmbeddingGemma 2 understands text, images and video for search.
+
 - **MLX-serve comes to Linux.** NVIDIA DGX Spark and cards from the RTX 20 to the 50 series run MLX models and media generation, and one script builds everything from a fresh checkout. Same exact MLX models that run on Mac + embedded DS4 and Llama.cpp 0.6.0 for GGUF.
+
 - **MLX Serve Web.** The built-in web page is now one place to chat, make images, audio and video, browse your library and watch the server live, and it opens with no model loaded. Its Code Launcher hands you one command that sets up Claude Code, pi, omp, OpenCode or Grok on another computer, pointed at this server. Thanks @alinselea.
+
 - **Faster where you feel it.** Qwen3.8 Flash Next decodes faster on its own and keeps batching at long context and with images (thanks @STRML), and its first prompt after a load no longer stalls (thanks @beamivalice). oMLX's Flash Next packs run at 172 tok/s on an M5 Ultra (133 in oMLX itself). Textured 3D models finish in about a minute instead of ten, MiniMax-H3 Turbo videos render twice as fast, Qwen-Image edits with reference pictures run faster (thanks @Anionex), Bonsai 2 27B nearly doubles its speed on M4 Macs, and Nemotron-3 answers short prompts sooner (thanks @sbusso). GGUF models now answer several requests at once and draft ahead, and M1 to M3 Macs serving 8 to 16 chats at once decode up to 1.75x faster (thanks @ursk).
+
 - **Rock solid under pressure.** Before this release we spent days trying to break mlx-serve: hostile requests, thousands of agent turns at once, models loaded and unloaded under traffic, cache files corrupted on purpose. We fixed every crash we found, five of which could take the server down, and every way a failed request could spoil the next one. Qwen3.8 Flash Next then served 16 agents at once for 50 minutes without a single failed request.
 
 ### Fixes
