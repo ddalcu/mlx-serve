@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const EmbeddedSpec = struct { rows: u64, dim: u32, shards: u32, layer_index: u32 = 1 };
-pub const EmbeddedInfo = struct { payload_bytes: u64, rows: RowDtype };
+pub const EmbeddedInfo = struct { payload_bytes: u64 };
 const prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.";
 const layer_prefix = "language_model.model.layers.";
 const scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale";
@@ -9,7 +9,7 @@ const Part = enum(u2) { weight, scales, biases };
 
 /// The two checkpoint spellings of the sharded table, told apart by which one the index lists. oMLX packs:
 /// 4-bit rows, BF16 scales/biases, an optional global `weight_scale`. JANG packs (JANGH4): MLX-affine 8-bit
-/// rows with F16 scales/biases, served as f16 rows, beside the hash constants the converter recorded.
+/// rows with F16 scales/biases, beside the hash constants the converter recorded.
 pub const Layout = enum {
     omlx,
     jang,
@@ -29,10 +29,12 @@ pub const Layout = enum {
     }
 
     fn scalesDtype(self: Layout) []const u8 {
-        return switch (self) {
-            .omlx => "BF16",
-            .jang => "F16",
-        };
+        return if (self.f16Scales()) "F16" else "BF16";
+    }
+
+    /// True when the scales and biases are F16, the dtype the host and GPU row dequant read them in.
+    pub fn f16Scales(self: Layout) bool {
+        return self == .jang;
     }
 
     fn bits(self: Layout) u32 {
@@ -41,18 +43,7 @@ pub const Layout = enum {
             .jang => 8,
         };
     }
-
-    /// The dtype a gathered row is served in: a JANG pack's are f16 like its scales (the dtype vMLX feeds
-    /// the PLE block), every other table's bf16.
-    pub fn rowDtype(self: Layout) RowDtype {
-        return switch (self) {
-            .omlx => .bf16,
-            .jang => .f16,
-        };
-    }
 };
-
-pub const RowDtype = enum { bf16, f16 };
 
 /// A JANG pack's I64 hash constants beside the table (`language_model.layers.N.ple.<name>`);
 /// `NgramTable.verifyHashBuffers` compares them with the runtime hash.
@@ -480,7 +471,7 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
 pub fn inspectEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedInfo {
     var table = (try openEmbedded(model_dir, expected)) orelse return null;
     defer table.close();
-    return .{ .payload_bytes = table.payload_bytes, .rows = table.layout.rowDtype() };
+    return .{ .payload_bytes = table.payload_bytes };
 }
 
 pub const FixtureVariant = enum { valid, missing, duplicate, extra, dtype, bounds, overlap, scale_unit, scale_scalar, scale_nonunit, scale_dtype, scale_shape, scale_overlap };
@@ -769,7 +760,6 @@ test "jangh4 embedded PLE reads 8-bit F16 shards at vMLX's row r / per" {
     const path = try jangFixturePath(&td, .valid, &path_buf);
     const info = (try inspectEmbedded(path, JANG_FIXTURE_SPEC)).?;
     try std.testing.expectEqual(@as(u64, 5 * (32 + 2 + 2)), info.payload_bytes);
-    try std.testing.expectEqual(RowDtype.f16, info.rows);
     var t = (try openEmbedded(path, JANG_FIXTURE_SPEC)).?;
     defer t.close();
     try std.testing.expectEqual(Layout.jang, t.layout);

@@ -23288,7 +23288,7 @@ pub const Transformer = struct {
         return cfg.exl3 == null or rows <= sushi_exl3.kernels.DECODE_ROWS_MAX;
     }
 
-    /// Host-side n-gram gather: `[B, S, ple_embed_dim]` (`NgramTable.rowDtype`) for this chunk's
+    /// Host-side n-gram gather: `[B, S, ple_embed_dim]` bf16 for this chunk's
     /// token ids, advancing the token history. Serial: `entry`'s history over
     /// `[1, S]`. Batched (`ctx.batch_slots`): `[N, 1]`, each row hashed
     /// against ITS slot's history (`slots[i].ssm_entries[layer]`), ONE gather
@@ -23318,15 +23318,14 @@ pub const Transformer = struct {
         if (ctx.batch_slots == null and st.gpu != null and mlx.streamIsGpu(self.s)) {
             return self.pleEmbeddingGpu(ctx, st.gpu.?, token_ids, entry, layer, seq_len, capture, &shape);
         }
-        // Packed on the host in the upload dtype (bf16 RNE, or a JANG pack's exact f16) so the
-        // upload is one copy — no mid-graph eval, no GPU sync inside the layer loop.
-        const dt = pleUploadDtype(st);
+        // Packed bf16 on the host (RNE) so the upload is one copy — no
+        // mid-graph eval, no GPU sync inside the layer loop.
         const pk = try self.allocator.alloc(u16, n * emb_dim);
         defer self.allocator.free(pk);
         if (ctx.ple_defer and pleDeferrable(&self.config, n)) {
             if (ctx.ple_pending != null) return error.PlePendingAlreadySet;
             @memset(pk, 0);
-            const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, dt);
+            const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
             errdefer _ = mlx.mlx_array_free(emb);
             var emb_ref = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(emb_ref);
@@ -23337,26 +23336,8 @@ pub const Transformer = struct {
             ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len, .capture = capture };
             return emb;
         }
-        try self.pleGatherPacked(ctx, token_ids, entry, layer, seq_len, pk, capture);
-        return mlx.mlx_array_new_data(pk.ptr, &shape, 3, dt);
-    }
-
-    /// The dtype the host gather uploads the n-gram rows in (`NgramTable.rowDtype`).
-    fn pleUploadDtype(st: *const qwen4_mod.Qwen4State) mlx.mlx_dtype {
-        return switch (st.table.rowDtype()) {
-            .bf16 => .bfloat16,
-            .f16 => .float16,
-        };
-    }
-
-    /// A deferred PLE leaf's host buffer, in either upload dtype.
-    fn pleLeafBits(emb: mlx.mlx_array) ![]u16 {
-        const p: [*]const u16 = switch (mlx.mlx_array_dtype(emb)) {
-            .bfloat16 => mlx.mlx_array_data_bfloat16(emb) orelse return error.PleLeafUnreadable,
-            .float16 => @ptrCast(mlx.mlx_array_data_float16(emb) orelse return error.PleLeafUnreadable),
-            else => return error.PleLeafUnreadable,
-        };
-        return @constCast(p)[0..mlx.mlx_array_size(emb)];
+        try self.pleGatherBf16(ctx, token_ids, entry, layer, seq_len, pk, capture);
+        return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
     }
 
     /// GPU arm of a serial forward: the kernel reads the ids itself, lazy or not, so the build
@@ -23402,7 +23383,9 @@ pub const Transformer = struct {
         if (p.gpu) {
             try self.pleSettleFromArray(p.token_ids, p.entry, p.capture);
         } else {
-            try self.pleGatherPacked(ctx, p.token_ids, p.entry, p.layer, p.seq_len, try pleLeafBits(p.emb), p.capture);
+            const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
+            const out: [*]u16 = @constCast(dst);
+            try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
         }
         ctx.ple_pending = null;
         releasePlePending(p);
@@ -23438,7 +23421,9 @@ pub const Transformer = struct {
                 defer self.allocator.free(host);
                 _ = pleAdvanceSerial(self.qwen4.?, p.entry, host, p.capture);
             } else {
-                try self.pleFillFromIds(ctx, ids[k], p.entry, p.layer, p.seq_len, try pleLeafBits(p.emb), p.capture);
+                const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
+                const out: [*]u16 = @constCast(dst);
+                try self.pleFillFromIds(ctx, ids[k], p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)], p.capture);
             }
             k += 1;
             ctx.ple_pending = null;
@@ -23487,11 +23472,11 @@ pub const Transformer = struct {
     }
 
     /// The host side of the n-gram PLE embedding: token ids → hashed rows →
-    /// gathered + packed (`NgramTable.packRows`) into `pk` (`[n][emb_dim]`), advancing the
+    /// gathered + bf16-packed into `pk` (`[n][emb_dim]`), advancing the
     /// entry's n-gram history. `capture` comes from `pleClaimSpecCapture` at
     /// BUILD time (never re-read off `spec_capture_ssm`, which a deferred
     /// flush sees already cleared).
-    fn pleGatherPacked(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
+    fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
         const ids_c = try self.pleEvalIds(token_ids);
         defer _ = mlx.mlx_array_free(ids_c);
         return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
@@ -23593,7 +23578,7 @@ pub const Transformer = struct {
         st.table.gather(rows, host, @intCast(ctx.moe_seq_offset.*));
         if (diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
         std.debug.assert(pk.len == host.len);
-        st.table.packRows(host, pk);
+        for (host, pk) |v, *o| o.* = qwen4_mod.bf16Rne(v);
     }
 
     /// The history a serial entry's next ids hash against: all eos for a fresh sequence.
@@ -23729,16 +23714,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_array_set(&entry.spec_ple_input, cat));
         }
         var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_add(&out, gv, conv_act, self.s));
-        // A JANG pack's f16 rows against bf16 weights ran this block in f32: the stream keeps its dtype.
-        if (mlx.mlx_array_dtype(out) != mlx.mlx_array_dtype(stream)) {
-            var cast = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(cast);
-            try mlx.check(mlx.mlx_astype(&cast, out, mlx.mlx_array_dtype(stream), self.s));
-            _ = mlx.mlx_array_free(out);
-            out = cast;
-        }
         if (qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_out, out);
         return out;
     }
@@ -73421,8 +73397,8 @@ const PleArmFixture = struct {
         self.bind(hash);
     }
 
-    /// The rig over a JANG-layout table (`qwen4_ple.writeJangFixture`: two heads, 5 rows, f16 scales),
-    /// whose f16 rows only the host gather serves.
+    /// The rig over a JANG-layout table (`qwen4_ple.writeJangFixture`: two heads, 5 rows, F16 scales and
+    /// biases) on the host gather.
     fn initJang(self: *PleArmFixture) !void {
         const qwen4_ple = @import("qwen4_ple.zig");
         const hash = try qwen4_mod.NgramHash.init(1000, 3, 1, 2, 1, 1234, 0, 999);
@@ -73647,7 +73623,7 @@ test "qwen4 PLE gpu arm: without --ple-gpu the load wraps no table buffer and a 
     try testing.expect(on.gpu != null and on.st.table.gpu_owns_map);
 }
 
-/// `table.packRows` of the rows `ids` hash to after the `history` tokens: the bits a PLE leaf uploads.
+/// The bf16 (RNE) bits of the rows `ids` hash to after the `history` tokens: what a PLE leaf uploads.
 fn plePackedRows(st: *const qwen4_mod.Qwen4State, history: []const u32, ids: []const u32) ![]u16 {
     const a = testing.allocator;
     const rows = try a.alloc(i64, ids.len * st.hash.n_heads);
@@ -73658,25 +73634,21 @@ fn plePackedRows(st: *const qwen4_mod.Qwen4State, history: []const u32, ids: []c
     defer a.free(host);
     for (rows, 0..) |r, i| st.table.row(@intCast(r), host[i * dim ..][0..dim]);
     const out = try a.alloc(u16, host.len);
-    st.table.packRows(host, out);
+    for (host, out) |v, *o| o.* = qwen4_mod.bf16Rne(v);
     return out;
 }
 
-fn expectPleLeaf(emb: mlx.mlx_array, dtype: mlx.mlx_dtype, want: []const u16) !void {
+fn expectPleLeaf(emb: mlx.mlx_array, want: []const u16) !void {
     try mlx.check(mlx.mlx_array_eval(emb));
-    try testing.expectEqual(dtype, mlx.mlx_array_dtype(emb));
-    const bits: [*]const u16 = switch (dtype) {
-        .float16 => @ptrCast(mlx.mlx_array_data_float16(emb) orelse return error.MlxArrayDataNull),
-        else => mlx.mlx_array_data_bfloat16(emb) orelse return error.MlxArrayDataNull,
-    };
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(emb));
+    const bits = mlx.mlx_array_data_bfloat16(emb) orelse return error.MlxArrayDataNull;
     try testing.expectEqualSlices(u16, want, bits[0..mlx.mlx_array_size(emb)]);
 }
 
-test "qwen4 PLE host gather: the leaf is the table's row dtype holding packRows' bits, eager, deferred, group and batched" {
-    // f16 for a JANG pack (what vMLX's PLELayer._embed feeds the block), bf16 for every other table.
-    for ([_]mlx.mlx_dtype{ .float16, .bfloat16 }) |dtype| {
+test "qwen4 PLE host gather: a JANG table's leaf, like every table's, is bf16 holding its rows' bits, eager, deferred, group and batched" {
+    for ([_]bool{ true, false }) |jang| {
         var fx: PleArmFixture = undefined;
-        if (dtype == .float16) try fx.initJang() else try fx.init(false);
+        if (jang) try fx.initJang() else try fx.init(false);
         defer fx.deinit();
         const x = fx.xfm();
         const st = x.qwen4.?;
@@ -73699,13 +73671,13 @@ test "qwen4 PLE host gather: the leaf is the table's row dtype holding packRows'
             var ctx = fx.ctx();
             const e = try x.pleEmbedding(&ctx, arr, &eager, 0, @intCast(w));
             defer _ = mlx.mlx_array_free(e);
-            try expectPleLeaf(e, dtype, want);
+            try expectPleLeaf(e, want);
             ctx.ple_defer = true;
             const d = try x.pleEmbedding(&ctx, arr, &deferred, 0, @intCast(w));
             defer _ = mlx.mlx_array_free(d);
             try testing.expect(ctx.ple_pending != null);
             try x.flushDeferredPle(&ctx);
-            try expectPleLeaf(d, dtype, want);
+            try expectPleLeaf(d, want);
             buf[0..2].* = history;
             history = buf[w..][0..2].*;
             try testing.expectEqualSlices(u32, &history, eager.ple_prev[0..2]);
@@ -73738,7 +73710,7 @@ test "qwen4 PLE host gather: the leaf is the table's row dtype holding packRows'
                 try testing.expect(c.ple_pending == null);
                 const want = try plePackedRows(st, &fresh, ids);
                 defer testing.allocator.free(want);
-                try expectPleLeaf(l, dtype, want);
+                try expectPleLeaf(l, want);
             }
         }
 
@@ -73771,15 +73743,10 @@ test "qwen4 PLE host gather: the leaf is the table's row dtype holding packRows'
                 defer _ = mlx.mlx_array_free(leaf);
                 try testing.expectEqual(defer_leaf, bctx.ple_pending != null);
                 if (defer_leaf) try x.flushDeferredPle(&bctx);
-                try expectPleLeaf(leaf, dtype, want);
+                try expectPleLeaf(leaf, want);
             }
         }
     }
-    // A leaf in any other dtype is refused, never filled through a mismatched accessor.
-    const f32_data = [_]f32{ 0, 1 };
-    const f32_leaf = mlx.mlx_array_new_data(&f32_data, &[_]c_int{2}, 1, .float32);
-    defer _ = mlx.mlx_array_free(f32_leaf);
-    try testing.expectError(error.PleLeafUnreadable, Transformer.pleLeafBits(f32_leaf));
 }
 
 test "checkQwen4Table: the billed payload, the hash's geometry and a JANG pack's recorded hash constants" {
@@ -73843,7 +73810,7 @@ const Qwen4LadderRig = struct {
         try self.build();
     }
 
-    /// Over a JANG-layout table: f16 rows into the bf16 trunk.
+    /// Over a JANG-layout table (F16 scales and biases).
     fn initJang(self: *Qwen4LadderRig) !void {
         try self.fx.initJang();
         try self.build();
@@ -74068,7 +74035,7 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
     }
 }
 
-test "qwen4 PLE: a JANG pack's f16 rows leave the residual stream bf16, prefill and batched decode" {
+test "qwen4 PLE: a JANG pack's rows leave the residual stream bf16, prefill and batched decode" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
     defer qwen4_standin_override = null;
@@ -74076,7 +74043,6 @@ test "qwen4 PLE: a JANG pack's f16 rows leave the residual stream bf16, prefill 
     try rig.initJang();
     defer rig.deinit();
     const alloc = testing.allocator;
-    try testing.expectEqual(mlx.mlx_dtype.float16, Transformer.pleUploadDtype(rig.fx.xfm().qwen4.?));
     var slots: [2]*Qwen4TestSlot = undefined;
     var made: usize = 0;
     defer for (slots[0..made]) |sl| sl.deinit(alloc);

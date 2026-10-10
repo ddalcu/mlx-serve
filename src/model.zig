@@ -325,9 +325,6 @@ pub const ModelConfig = struct {
     ngram_seed: u64 = 1234,
     split_ngram_parts: u32 = 128,
     embedded_ple_payload_bytes: ?u64 = null,
-    /// The dtype the embedded table's rows gather in (`qwen4_ple.Layout.rowDtype`); f16 rows never take
-    /// the `--ple-gpu` arm (`ple_gpu.servesRows`).
-    embedded_ple_rows: qwen4_exp.RowDtype = .bf16,
     qwen4_norm_convention: ?Qwen4NormConvention = null,
     indexer_n_heads: u32 = 0, // 0 = dense attention
     indexer_head_dim: u32 = 0,
@@ -1599,7 +1596,6 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
             config.embedded_ple_payload_bytes = info.payload_bytes;
-            config.embedded_ple_rows = info.rows;
         }
     }
 
@@ -9446,7 +9442,7 @@ test "unmarked embedded qwen4 defers norm convention until weights load" {
     try testing.expectEqual(@as(?u64, 120), accepted.embedded_ple_payload_bytes);
 }
 
-test "parseConfig: a JANG pack's in-shard table gathers f16 rows" {
+test "parseConfig: a JANG pack's in-shard table sets the embedded payload" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
@@ -9465,7 +9461,6 @@ test "parseConfig: a JANG pack's in-shard table gathers f16 rows" {
     var config = try parseConfig(io, testing.allocator, path[0..len]);
     defer config.deinit(testing.allocator);
     try testing.expectEqual(@as(?u64, 5 * (32 + 2 + 2)), config.embedded_ple_payload_bytes);
-    try testing.expectEqual(qwen4_exp.RowDtype.f16, config.embedded_ple_rows);
 }
 
 test "local oQ Qwen4 metadata defers convention until loaded weights" {

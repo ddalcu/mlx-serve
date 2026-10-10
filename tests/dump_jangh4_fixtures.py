@@ -2,11 +2,14 @@
 bundle, reading only the rows and layer it needs. `<out>/ple/` holds the n-gram PLE rows: a token sequence replayed
 chunk by chunk through PLELayer._embed over the file-backed table (prefetch ticket at decode widths), the row ids its
 hasher produced, and table rows at every shard edge, the padding rows and random rows (FileBackedQuantizedNGramTable
-.gather_mlx). `<out>/moe-block/` holds layer 0's SparseMoeBlock with TQSwitchGLU installed as vMLX's loader installs
-it, run in mlx-serve's dtypes (bf16 activations, the shared expert's F16 scales narrowed to BF16), plus vMLX's routing
-and its routed sum. Regenerate with `PYTHONPATH=<vmlx checkout> python tests/dump_jangh4_fixtures.py --bundle <JANGH4
-dir> --out <dir>`; then `JANGH4_PLE_FIXTURE=<dir>/ple`, and `QWEN4_JANGH_TEST_MODEL=<bundle>
-JANGH4_MOE_BLOCK_FIXTURE=<dir>/moe-block`, run the gated tests (`zig build test-build -Dtest-filter=jangh`).
+.gather_mlx). vMLX's rows are float16 (MLX dequantizes in the F16 scales' dtype); the fixture holds the same rows
+dequantized in float32 and rounded once to bfloat16 (RNE), mlx-serve's rows, checked to round to vMLX's float16 rows.
+`<out>/moe-block/` holds layer 0's SparseMoeBlock with TQSwitchGLU installed as vMLX's loader installs it, run in
+mlx-serve's dtypes (bf16 activations, the shared expert's F16 scales narrowed to BF16), plus vMLX's routing and its
+routed sum. Regenerate with `PYTHONPATH=<vmlx checkout> python tests/dump_jangh4_fixtures.py --bundle <JANGH4 dir>
+--out <dir>`, then build the gated tests and run the binary (`zig build test` caches a passing env-gated run):
+`zig build test-build -Dtest-filter=jangh && JANGH4_PLE_FIXTURE=<dir>/ple QWEN4_JANGH_TEST_MODEL=<bundle>
+JANGH4_MOE_BLOCK_FIXTURE=<dir>/moe-block ./zig-out/tests/test`.
 """
 from __future__ import annotations
 
@@ -114,6 +117,23 @@ def boundary_rows(per: int, n_shards: int, total_vocab: int, padded: int, rng: n
     return np.array(rows, dtype=np.int64)
 
 
+def f32_rows(table: FileBackedQuantizedNGramTable, rows: np.ndarray) -> mx.array:
+    """The table rows `rows` names, read by vMLX's shard readers and dequantized in float32: MLX's affine dequantize
+    runs in the scales' dtype, so the F16 scales and biases are widened first."""
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    out = mx.zeros((rows.size, table.head_dim), dtype=mx.float32)
+    shard_of = rows // table.per
+    for s in np.unique(shard_of):
+        sel = np.flatnonzero(shard_of == s)
+        shard = table.shards[int(s)]
+        assert shard.mode == "affine" and shard.storage_bits == shard.logical_bits
+        packed, scales, biases = shard.read_rows(rows[sel] % table.per)
+        out[mx.array(sel.astype(np.uint32))] = mx.dequantize(
+            mx.array(packed), mx.array(scales).astype(mx.float32), mx.array(biases).astype(mx.float32),
+            group_size=shard.group_size, bits=shard.logical_bits)
+    return out
+
+
 def ple_fixture(config: dict, bit_map: dict, weight_map: dict) -> None:
     out = OUT / "ple"
     out.mkdir(parents=True, exist_ok=True)
@@ -166,13 +186,19 @@ def ple_fixture(config: dict, bit_map: dict, weight_map: dict) -> None:
     probe_vals = table.gather_mlx(probe)
     mx.eval(probe_vals)
     assert probe_vals.dtype == mx.float16 and probe_vals.shape == (len(probe), head_dim)
+    # mlx-serve rounds the float32 dequant once to bf16; re-rounding vMLX's f16 rows would differ wherever an f16
+    # element is a bf16 tie.
+    emb_f32 = f32_rows(table, rows).reshape(emb.shape)
+    probe_f32 = f32_rows(table, probe)
+    for f32, served in ((emb_f32, emb), (probe_f32, probe_vals)):
+        assert np.array_equal(np.array(f32.astype(mx.float16)).view(np.uint16), np.array(served).view(np.uint16))
     mx.save_safetensors(str(out / "ple_fixture.safetensors"), {
         "tokens": mx.array(seq[None, :]),
         "chunks": mx.array(np.array(chunks, dtype=np.int32)[None, :]),
         "row_ids": mx.array(rows.astype(np.int64)),
-        "emb": emb,
+        "emb": emb_f32.astype(mx.bfloat16),
         "probe_rows": mx.array(probe[None, :]),
-        "probe_vals": probe_vals,
+        "probe_vals": probe_f32.astype(mx.bfloat16),
     })
     manifest = {"bundle": str(BUNDLE), "fixture": "ple_fixture.safetensors", "mlx": mx.__version__,
                 "key_format": key_format, "n_shards": n_shards, "rows_per_shard": int(per),
