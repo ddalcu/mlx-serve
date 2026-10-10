@@ -110,6 +110,7 @@ Estimated from the measured per-step cost:
 - Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
 - Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
 - GLM-5.3, Llama 3, LFM2.5 and K2 prompts are now tokenized exactly as their reference tokenizer does on code: camelCase identifiers (`indexOf`, `UserDefaults`) and `//!` comments were split into extra tokens.
+- Whitespace now tokenizes as the reference tokenizer does: on Qwen, Llama 3, GLM-5.3, LFM2.5, Muse and DeepSeek-V4 a blank line holding spaces (indented code, Markdown) no longer costs an extra token and the full-width space of Chinese text (U+3000) and the no-break space are no longer read as punctuation, and on DeepSeek-V4, Hunyuan and Spark-X2.5 the indentation before a number or Chinese text is no longer split.
 - A streamed reply no longer sends the start of a stop string that spans several tokens before cutting at it; streamed and non-streamed replies now end on the same byte.
 - `frequency_penalty` now applies on `/v1/completions`, as it already did on chat.
 - Deleting a provider in Settings no longer crashes the app.
