@@ -46,22 +46,10 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 /// commit time instead of claim time.
 pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 
-/// One media item's rows in a prompt: its first placeholder row and its
-/// pixel/PCM hash. Placeholder ids are identical across items, so state at and
-/// after `start` is keyed on `key`.
-pub const MediaSpan = struct { start: u32, key: u64 };
-
-/// First position where state under two span lists can differ; maxInt when
-/// they agree. Rows before the first span that differs are text.
-pub fn mediaSharedBound(a: []const MediaSpan, b: []const MediaSpan) usize {
-    const n = @min(a.len, b.len);
-    for (a[0..n], b[0..n]) |x, y| {
-        if (x.start != y.start or x.key != y.key) return @min(x.start, y.start);
-    }
-    if (a.len > n) return a[n].start;
-    if (b.len > n) return b[n].start;
-    return std.math.maxInt(usize);
-}
+/// Media span identity lives at the disk tier (its v9 records carry spans);
+/// re-exported here — the RAM tier and every caller speak this name.
+pub const MediaSpan = kv_disk_cache.MediaSpan;
+pub const mediaSharedBound = kv_disk_cache.mediaSharedBound;
 
 /// The spans whose rows lie inside `[0, len)`.
 fn spansBelow(spans: []const MediaSpan, len: usize) []const MediaSpan {
@@ -339,6 +327,8 @@ const PendingDiskFlush = struct {
     snapshot: KVCacheSnapshot,
     tokens: []u32,
     has_tools: bool,
+    /// v9: the media spans the token record was committed under (owned).
+    media: []MediaSpan = &.{},
     ssm_cps: ?[]SSMCheckpoint = null,
     dflash: ?DflashSnap = null,
     mtp: ?DflashSnap = null,
@@ -346,6 +336,7 @@ const PendingDiskFlush = struct {
     fn deinit(self: *PendingDiskFlush, allocator: std.mem.Allocator) void {
         self.snapshot.deinit();
         allocator.free(self.tokens);
+        allocator.free(self.media);
         if (self.ssm_cps) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
             allocator.free(cps);
@@ -434,6 +425,11 @@ pub const HotPrefixCache = struct {
     /// every turn of an agent conversation — gains one checkpoint per turn for
     /// the life of the session. 0 = unlimited.
     ssm_checkpoint_max: u32 = 0,
+    /// How many LOW checkpoint positions merge/shed thinning must never remove
+    /// (#794): a request that forked below a coarse grid's first multiple needs
+    /// the shallow anchor. 0 = plain thinning. The scheduler wires the
+    /// long-context gate to the same constant as `DiskTier.ssm_low_anchors`.
+    ssm_low_anchors: usize = 0,
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
     current_kv_bytes: u64,
@@ -655,16 +651,6 @@ pub const HotPrefixCache = struct {
             picked = i;
         }
         return picked;
-    }
-
-    /// The token record the SSD tier may hold. Its keys are token-only, so it stops at the first
-    /// media item; a hybrid restores only from a checkpoint, so it stops at the last one below that.
-    fn diskTokens(self: *const HotPrefixCache, tokens: []const u32, spans: []const MediaSpan, cps: ?[]const SSMCheckpoint) []const u32 {
-        const first = firstSpanStart(spans) orelse return tokens;
-        if (!self.hybrid) return tokens[0..@min(first, tokens.len)];
-        const list = cps orelse return tokens[0..0];
-        const i = boundaryCheckpointIndex(list, first) orelse return tokens[0..0];
-        return tokens[0..@min(list[i].pos, tokens.len)];
     }
 
     /// The rows a restore will deliver, which is not the rows it matched: a hybrid restore is
@@ -1182,13 +1168,16 @@ pub const HotPrefixCache = struct {
         // the tier persists per-position SSM checkpoints beside the KV chunks
         // and restores both.
         if (self.disk) |*d| disk: {
-            // A media-carrying request still restores the pure-text prefix
-            // before its first media row: disk entries are text-only by
-            // construction (the flush refuses entries with media). The cap is
-            // load-bearing even when tokens match past it: a restored row at a
-            // placeholder must come from the vision splice, never from disk.
-            const disk_limit: u32 = @intCast(@min(firstSpanStart(media) orelse prompt_ids.len, prompt_ids.len));
-            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse {
+            // v9: the tier's records are (tokens, spans). The clamp moved
+            // per-entry — `bestMatch` bounds each candidate at
+            // `mediaSharedBound(entry.media, media)`: a request whose spans
+            // agree reads its media rows back, one that diverges stops below
+            // the first item whose start or pixel key differs, and a text turn
+            // clamps at every media entry's first item exactly like the old
+            // tier-wide `disk_limit` did. A row AT a placeholder is restored
+            // only under an agreeing span list — the same pixels, so the
+            // restored row IS what the vision splice would have produced.
+            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config, media) orelse {
                 // Silent no-entry misses are why a 40 GB disk tier looked
                 // dead in a live post-mortem (2026-09-07): nothing in the
                 // log ever said the tier was consulted and found nothing.
@@ -1196,7 +1185,9 @@ pub const HotPrefixCache = struct {
                     log.debug("  [disk-cache] lookup miss: {d} entries on disk, none share a token prefix under this (tools, quant) key\n", .{d.entryCount()});
                 break :disk;
             };
-            const usable: u32 = @min(dm.usable, disk_limit);
+            // `dm.usable` is already clamped to the entry's kv_len (see
+            // DiskTier.bestMatch) and to the per-entry media bound.
+            const usable: u32 = dm.usable;
 
             if (target_ssm_entries) |ssm_entries| {
                 // Hybrid: compare EFFECTIVE restorable positions — the largest
@@ -1213,7 +1204,7 @@ pub const HotPrefixCache = struct {
                     break :blk cp.pos;
                 } else 0;
                 // A stored entry can carry a checkpoint at exactly this prompt's length; restoring it leaves nothing to forward.
-                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @min(disk_limit, @as(u32, @intCast(prompt_ids.len -| 1)))) orelse break :disk;
+                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @as(u32, @intCast(prompt_ids.len -| 1)), media) orelse break :disk;
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
@@ -1236,7 +1227,9 @@ pub const HotPrefixCache = struct {
                 target_moe_seq_offset.* = restored;
                 self.last_restored_disk_id = d.entries.items[hm.idx].id;
                 const ms = sw.read() / std.time.ns_per_ms;
-                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d})\n", .{ restored, prompt_ids.len, ms, disk_cp });
+                // The donor identity and the raw match values ride along:
+                // without them a shallow restore is unattributable.
+                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (entry e{d} ssm@{d}, prefix match {d}, media match {d})\n", .{ restored, prompt_ids.len, ms, d.entries.items[hm.idx].id, disk_cp, hm.usable, dm.usable });
                 const disk_mtp = diskRestoreSpec(d, hm.idx, mtp_target, restored, s, .mtp);
                 return .{
                     .matched = restored,
@@ -1271,7 +1264,7 @@ pub const HotPrefixCache = struct {
             };
             target_moe_seq_offset.* = final_len;
             const ms = sw.read() / std.time.ns_per_ms;
-            log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms });
+            log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms (entry e{d}, match {d})\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms, d.entries.items[dm.idx].id, dm.usable });
             const disk_mtp = diskRestoreSpec(d, dm.idx, mtp_target, final_len, s, .mtp);
             return .{
                 .matched = final_len,
@@ -1625,14 +1618,18 @@ pub const HotPrefixCache = struct {
         // An item's key applies only to rows the entry covers: a cancelled
         // prefill that stopped before an item commits without it.
         var eff_media = spansBelow(media, tokens.len);
-        // Taken before the budget trim can drop the first item. The spec snapshots cover rows
-        // past the cut, so a media turn persists the trunk only.
-        const disk_tokens = self.diskTokens(tokens, eff_media, ssm_cps);
+        // Taken before the budget trim moves the record: the disk side persists
+        // the full media-keyed prefix (v9); the per-request depth is clamped at
+        // lookup by `mediaSharedBound`. The spec snapshots describe rows past
+        // the first item under NO media key gate, so only a text-only commit
+        // rides them to the tier.
+        const disk_tokens = tokens;
+        const disk_media = spansBelow(eff_media, disk_tokens.len);
         const disk_spec = eff_media.len == 0;
 
         // Record what the live cache holds now, before any byte-budget trim.
         if (self.ssd_first and self.disk != null and disk_tokens.len > 0) {
-            self.capturePendingDisk(source_cache, disk_tokens, has_tools, ssm_cps, if (disk_spec) dflash else null, if (disk_spec) mtp else null);
+            self.capturePendingDisk(source_cache, disk_tokens, has_tools, disk_media, ssm_cps, if (disk_spec) dflash else null, if (disk_spec) mtp else null);
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
         // KVCache deinit then frees nothing. Function scope on purpose.
@@ -1738,7 +1735,7 @@ pub const HotPrefixCache = struct {
                     {
                         // The resident entry already covers the trim target;
                         // the candidate's EXTRA tokens still belong on disk.
-                        self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, eff_cps);
+                        self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps);
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -1828,7 +1825,7 @@ pub const HotPrefixCache = struct {
             if (!trimmed_ok) {
                 // RAM decline is not a value verdict: offer the candidate to
                 // the SSD tier before discarding it.
-                self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, eff_cps);
+                self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps);
                 var discarded_snap = new_snap;
                 discarded_snap.deinit();
                 if (new_dflash) |*d| d.deinit();
@@ -2104,12 +2101,14 @@ pub const HotPrefixCache = struct {
     /// holds pixel-keyed rows. Best-effort: a failed write costs nothing the
     /// RAM decline hadn't already lost, and a byte-capped write continues
     /// from the next commit of the same conversation (chunks are
-    /// content-deduped by token range).
+    /// content-deduped by token range). Since v9 a media candidate rides too:
+    /// `media` carries the spans the record was keyed under (clamped to it).
     fn spillDeclinedToDisk(
         self: *HotPrefixCache,
         snap: *const KVCacheSnapshot,
         tokens: []const u32,
         has_tools: bool,
+        media: []const MediaSpan,
         cps: ?[]SSMCheckpoint,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
@@ -2120,6 +2119,9 @@ pub const HotPrefixCache = struct {
             return;
         }
         if (tokens.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+        // Spans at/after the record cover no persisted row — carrying one past
+        // the record would make the tier reject the manifest at scan.
+        const rec_media = spansBelow(media, tokens.len);
         // A decline-spill runs after the client is gone: the per-flush cap
         // exists to bound the stall a LIVE next request pays, and capping
         // here stranded most of each retry's work (live 2026-09-07: 512 MB
@@ -2129,7 +2131,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = d.appendCommit(snap.entries, snap.step, snap.config, tokens, has_tools, cps, mlx.gpuStream()) catch |err| {
+        const outcome = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, null, null, mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2148,6 +2150,7 @@ pub const HotPrefixCache = struct {
         source_cache: *const KVCache,
         tokens: []const u32,
         has_tools: bool,
+        media: []const MediaSpan,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
@@ -2160,13 +2163,23 @@ pub const HotPrefixCache = struct {
             log.warn("  [disk-cache] live snapshot failed: {s} — flushing the RAM entry instead\n", .{@errorName(err)});
             return;
         };
+        // Dupe the spans FIRST: a media record must never reach the tier with
+        // an empty list (token-only matching would then read placeholders as
+        // text). OOM here drops the pending capture whole — the RAM entry is
+        // still the source of truth, same as any failed capture.
+        const media_owned = self.allocator.dupe(MediaSpan, media) catch {
+            snap.deinit();
+            return;
+        };
         var rec: PendingDiskFlush = .{
             .snapshot = snap,
             .tokens = self.allocator.dupe(u32, tokens) catch {
+                self.allocator.free(media_owned);
                 snap.deinit();
                 return;
             },
             .has_tools = has_tools,
+            .media = media_owned,
         };
         if (ssm_cps) |cps| {
             rec.ssm_cps = cloneCheckpointsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
@@ -2242,15 +2255,18 @@ pub const HotPrefixCache = struct {
             if (e.checked_out_by != null) continue;
             // Counted against the allowance before the vision skip: it occupies RAM either way.
             idle_bytes +|= e.kv_bytes;
-            // Media entries never spill: a token-only disk key is ambiguous.
-            if (e.media.len != 0) continue;
-            const specs = entrySpecCommits(e);
+            // v9: media entries spill too — the tier's record carries the spans,
+            // so the media-keyed rows are no longer ambiguous on disk. The spec
+            // payloads describe rows past the first item under NO media key
+            // gate, so they stay text-only rides (same rule as the commit path).
+            const specs: EntrySpecs = if (e.media.len == 0) entrySpecCommits(e) else .{};
             const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
                 e.snapshot.step,
                 e.snapshot.config,
                 e.tokens,
                 e.has_tools,
+                e.media,
                 e.ssm_checkpoints,
                 specs.dflash,
                 specs.mtp,
@@ -2262,7 +2278,7 @@ pub const HotPrefixCache = struct {
             // Only `.persisted`: a silent skip or a `.partial` copy is not a copy.
             if (outcome != .persisted) continue;
             // `.persisted` is the write path's claim; the index has to agree.
-            const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config) orelse {
+            const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config, e.media) orelse {
                 log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix — entry stays resident\n", .{});
                 continue;
             };
@@ -2312,15 +2328,19 @@ pub const HotPrefixCache = struct {
         }
     }
 
-    /// Least-recently-used idle entry (never the active session, never a vision entry).
+    /// Least-recently-used idle entry (never the active session). Since v9 a
+    /// media entry is ordinary durable-LRU prey once its media-keyed copy is
+    /// durable (pass 2's `durable_only` already proves it); an UNPERSISTED media
+    /// entry stays exempt from the non-durable shed — that single RAM copy is
+    /// the only home of its media-suffix state until the tier holds one.
     fn oldestIdleIndex(self: *HotPrefixCache, newest_used: u64, durable_only: bool) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
             if (e.last_used == newest_used) continue;
-            if (e.media.len != 0) continue;
             if (e.checked_out_by != null) continue;
             if (durable_only and !e.spill_durable) continue;
+            if (!durable_only and e.media.len != 0 and !e.spill_durable) continue;
             if (e.last_used < best_used) {
                 best_used = e.last_used;
                 best = i;
@@ -2376,6 +2396,7 @@ pub const HotPrefixCache = struct {
                 pending.snapshot.config,
                 pending.tokens,
                 pending.has_tools,
+                pending.media,
                 pending.ssm_cps,
                 p_dflash,
                 p_mtp,
@@ -2399,17 +2420,21 @@ pub const HotPrefixCache = struct {
         // reads the same buffers the commit captured.
         // v4: the spec snapshots (dflash context / MTP history) ride along —
         // eligibility was enforced at commitWithState, so the disk tier
-        // persists exactly what the RAM entry holds. A media entry persists
-        // the text before its first item, trunk only.
+        // persists exactly what the RAM entry holds. Since v9 a media entry
+        // persists the full media-keyed record (matching clamps the depth per
+        // request); its spec payloads stay behind.
         const specs: EntrySpecs = if (newest.media.len == 0) entrySpecCommits(newest) else .{};
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
+        const flush_tokens = newest.tokens;
+        const flush_media = spansBelow(newest.media, flush_tokens.len);
         const complete = d.appendCommitWithSpec(
             newest.snapshot.entries,
             newest.snapshot.step,
             newest.snapshot.config,
-            self.diskTokens(newest.tokens, newest.media, newest.ssm_checkpoints),
+            flush_tokens,
             newest.has_tools,
+            flush_media,
             newest.ssm_checkpoints,
             dflash_spec,
             mtp_spec,
@@ -2505,10 +2530,11 @@ pub const HotPrefixCache = struct {
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
-            const drop = transformer_mod.ssmCheckpointDropIndex(
+            const drop = transformer_mod.ssmCheckpointDropIndexLowAnchored(
                 merged.items,
                 self.cp_thin,
                 boundaryCheckpointIndex(merged.items, media_start),
+                self.ssm_low_anchors,
             );
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
@@ -2628,10 +2654,11 @@ pub const HotPrefixCache = struct {
         var n = cps.len;
         var shed: usize = 0;
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
-            const drop = transformer_mod.ssmCheckpointDropIndex(
+            const drop = transformer_mod.ssmCheckpointDropIndexLowAnchored(
                 cps[0..n],
                 self.cp_thin,
                 boundaryCheckpointIndex(cps[0..n], firstSpanStart(newest.media)),
+                self.ssm_low_anchors,
             );
             const freed = ssmCheckpointBytes(&cps[drop]);
             if (checkpointHasQsaPooled(&cps[drop])) {
@@ -7993,24 +8020,24 @@ test "DiskTier.holdsFullPrefix: the INDEX must agree before a RAM copy is discar
     var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-holds", 0, 128);
     defer tier.deinit();
 
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     tier.drainWriter();
-    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, true, cache.config));
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, true, cache.config, &.{}));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, .{ .scheme = .affine, .bits = 4, .group_size = 64 }, &.{}));
 
     // A truncated tail chunk, the shape `scan` records after a kill -9.
     const cb = tier.entries.items[0].chunk_bytes;
     const keep = cb[cb.len - 1];
     cb[cb.len - 1] = 0;
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
     cb[cb.len - 1] = keep;
-    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
 
     tier.entries.items[0].kv_len = 400;
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
 }
 
 test "SSD-first: one resident session makes reclaimableBytes truthfully ZERO" {
@@ -8433,7 +8460,7 @@ test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flush
         const kv = d.entries.items[0].kv_len;
         try testing.expect(kv >= last_kv);
         if (hc.disk_dirty) try testing.expectEqual(@as(u32, 0), kv % 128);
-        const m = d.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+        const m = d.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
         try testing.expectEqual(kv, m.usable);
         last_kv = kv;
     }
@@ -8888,8 +8915,8 @@ test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry �
     // The failure names its entry, so a restore from it misses.
     try testing.expectEqual(@as(usize, 1), hc.disk.?.harvestWriteFailures());
     try testing.expect(hc.disk.?.entries.items[0].poisoned);
-    try testing.expect(hc.disk.?.bestMatch(&tok_a, false, cache.config) == null);
-    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
+    try testing.expect(hc.disk.?.bestMatch(&tok_a, false, cache.config, &.{}) == null);
+    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config, &.{}));
 
     // Pass N+1: A is not durable; the dead directory is reclaimed and the rebuild is staged.
     hc.disk.?.writer.?.setPaused(true);
@@ -8954,7 +8981,7 @@ test "SSD-first: a write failure inside the SAME pass still keeps the entry resi
     try testing.expect(hc.disk.?.writeErrors() > 0);
     try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
     try testing.expectEqual(@as(usize, 2), hc.entryCount());
-    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
+    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config, &.{}));
 }
 
 test "SSD-first: a spill pass probes the volume only for a store, never for a copy already on disk" {
@@ -9202,22 +9229,40 @@ test "a restore names its entry, and a commit that extends it in place keeps the
     try testing.expectEqual(id, hc.entries.items[0].id);
 }
 
-test "an image turn persists the text before its first item to the SSD tier" {
+test "an image turn persists its full media-keyed prefix to the SSD tier" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tokens: [3072]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     const media = [_]MediaSpan{.{ .start = 2600, .key = 0xABCD }};
-    // `want` = the rows on disk; a hybrid's record stops at its last checkpoint below the item.
-    const Arm = struct { ssd_first: bool = false, mem: u64 = 0, cps: ?[]const usize = null, want: u32 };
+    // v9: the tier record is the WHOLE media-keyed prefix — KV rows past the first
+    // item included — and the depth is decided when a request matches it. So each
+    // arm states three numbers: `want_kv` rows on disk, `want_media` for a re-send
+    // whose spans agree (the media rows come back), `want_text` for the same tokens
+    // re-sent as a text turn (clamped at this entry's first item, the old floor).
+    const Arm = struct {
+        ssd_first: bool = false,
+        mem: u64 = 0,
+        cps: ?[]const usize = null,
+        want_kv: u32,
+        want_media: u32,
+        want_text: u32,
+    };
     const arms = [_]Arm{
-        .{ .ssd_first = true, .want = 2600 },
-        .{ .want = 2600 },
-        .{ .mem = 16 * 1024, .want = 2600 }, // a RAM decline that spills
-        .{ .cps = &.{ 1024, 2048, 3000 }, .want = 2048 },
-        .{ .ssd_first = true, .cps = &.{ 2048, 3000 }, .want = 2048 },
-        .{ .cps = &.{3000}, .want = 0 },
+        // Non-hybrid: an agreeing re-send reads every row; a restore that covers
+        // the whole prompt still holds back its last row (one token must forward).
+        .{ .ssd_first = true, .want_kv = 3072, .want_media = 3071, .want_text = 2600 },
+        .{ .want_kv = 3072, .want_media = 3071, .want_text = 2600 },
+        .{ .mem = 16 * 1024, .want_kv = 3072, .want_media = 3071, .want_text = 2600 }, // a RAM decline that spills
+        // Hybrid: the record keeps the checkpoints above the item too, so an
+        // agreeing re-send resumes at the media-suffix checkpoint (3000) instead of
+        // the pre-item floor; a text re-send still stops below the item.
+        .{ .cps = &.{ 1024, 2048, 3000 }, .want_kv = 3072, .want_media = 3000, .want_text = 2048 },
+        .{ .ssd_first = true, .cps = &.{ 2048, 3000 }, .want_kv = 3072, .want_media = 3000, .want_text = 2048 },
+        // A record whose only checkpoint sits ABOVE the item cannot serve a text
+        // turn at all: honest miss, never a wrong restore.
+        .{ .cps = &.{3000}, .want_kv = 3072, .want_media = 3000, .want_text = 0 },
     };
     for (arms) |arm| {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -9243,24 +9288,129 @@ test "an image turn persists the text before its first item to the SSD tier" {
             _ = try hc.commitWithMediaState(&cache, &tokens, false, &media, 0, cps, null, null, tokens.len);
             hc.flushPendingDisk(s);
         }
-        // A cold RAM tier (idle unload, restart) restores the text; the disk holds no image row
-        // even for a prompt whose spans would not cap the match.
-        for ([_][]const MediaSpan{ &media, &.{} }) |lookup_media| {
+        // A cold RAM tier (idle unload, restart) holds nothing of its own: the record
+        // and reads it back whole when the spans agree; a text re-send stops below the item.
+        const Lookup = struct { media: []const MediaSpan, want: u32 };
+        const lookups = [_]Lookup{
+            .{ .media = &media, .want = arm.want_media },
+            .{ .media = &.{}, .want = arm.want_text },
+        };
+        for (lookups) |lk| {
             var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
             hc2.ssd_first = arm.ssd_first;
             hc2.hybrid = arm.cps != null;
             hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media", 0, 1024);
             defer hc2.deinit();
-            try testing.expectEqual(@as(usize, @intFromBool(arm.want > 0)), hc2.disk.?.entryCount());
-            if (arm.want > 0) try testing.expectEqual(arm.want, hc2.disk.?.entries.items[0].kv_len);
+            // Every arm leaves exactly one record: the full media-keyed prefix,
+            // stamped with the spans it was keyed under.
+            try testing.expectEqual(@as(usize, 1), hc2.disk.?.entryCount());
+            try testing.expectEqual(arm.want_kv, hc2.disk.?.entries.items[0].kv_len);
+            try testing.expectEqualSlices(MediaSpan, &media, hc2.disk.?.entries.items[0].media);
             var dst = try KVCache.init(testing.allocator, 3);
             defer dst.deinit();
             var ssm = pcEmptySsm();
             defer pcFreeHybrid(&ssm);
             var moe: usize = 0;
-            const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, if (arm.cps != null) &ssm else null, s, &tokens, false, lookup_media, null, null, null, false);
-            try testing.expectEqual(@as(usize, arm.want), res.matched);
-            if (arm.cps != null and arm.want > 0) try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm[0].conv_state, 0, s));
+            const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, if (arm.cps != null) &ssm else null, s, &tokens, false, lk.media, null, null, null, false);
+            try testing.expectEqual(@as(usize, lk.want), res.matched);
+            if (arm.cps != null and lk.want > 0) try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm[0].conv_state, 0, s));
         }
+    }
+}
+
+// v9 end-to-end: a media turn persists its FULL media-keyed prefix (KV rows
+// and the checkpoints above the items included); the per-request depth is a
+// matching-time clamp at mediaSharedBound. Same spans → the media-suffix
+// checkpoint; divergent pixels or a text-only re-send → the pre-item floor.
+test "HotPrefixCache v9: a media turn persists media-keyed deep state; same spans restore past the first item" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    // The item sits at 400; the entry keeps a checkpoint BELOW it (300) and one
+    // above (512). An agreeing re-send resumes at 512, any divergence can only
+    // resume at 300 — the sub-item checkpoint is the honest floor.
+    const spans = [_]MediaSpan{.{ .start = 400, .key = 0xA0 }};
+
+    // Session 1: hybrid media commit (floor checkpoint at 300, a media-suffix
+    // checkpoint at 512) + the post-markFinished flush the scheduler makes.
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.hybrid = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-media", 0, 128);
+        defer hc.deinit();
+
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 600);
+
+        var src300 = pcBuildHybrid(s, 100.0, 500.0);
+        defer pcFreeHybrid(&src300);
+        var src512 = pcBuildHybrid(s, 300.0, 700.0);
+        defer pcFreeHybrid(&src512);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src300, 300, s);
+        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+        _ = try hc.commitWithMediaState(&cache, &tokens, false, &spans, 0, cps, null, null, 600);
+        try testing.expect(hc.disk_dirty);
+        hc.flushPendingDisk(s);
+        try testing.expect(!hc.disk_dirty);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        // The tier record is the FULL media-keyed prefix, not the old floor.
+        try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
+        try testing.expectEqualSlices(MediaSpan, &spans, hc.disk.?.entries.items[0].media);
+    }
+
+    // Session 2 ("restart"): fresh RAM, same root.
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.hybrid = true;
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-media", 0, 128);
+        defer hc2.deinit();
+        try testing.expectEqual(@as(usize, 0), hc2.entryCount());
+        try testing.expectEqual(@as(usize, 1), hc2.disk.?.entryCount());
+
+        // Same spans re-sent: the media-suffix checkpoint (512) restores —
+        // the user-facing win: an unchanged image turn replays near the tail.
+        var cache_d = try KVCache.init(testing.allocator, 3);
+        defer cache_d.deinit();
+        var ssm_d = pcEmptySsm();
+        defer pcFreeHybrid(&ssm_d);
+        var moe_d: usize = 0;
+        const res_d = try hc2.lookupAndRestoreWithMedia(&cache_d, &moe_d, &ssm_d, s, &tokens, false, &spans, null, null, null, false);
+        try testing.expectEqual(@as(usize, 512), res_d.matched);
+        try testing.expectEqual(@as(usize, 512), cache_d.step);
+        try testing.expectEqual(@as(usize, 512), moe_d);
+        try testing.expectEqual(@as(f32, 300.0), pcSsmVal(ssm_d[0].conv_state, 0, s));
+        try testing.expectEqual(@as(f32, 700.0), pcSsmVal(ssm_d[0].ssm_state, 0, s));
+
+        // Same tokens, different pixels: only the pre-item checkpoint (300) —
+        // a wrong-restore would show the 300/700 state here.
+        var cache_x = try KVCache.init(testing.allocator, 3);
+        defer cache_x.deinit();
+        var ssm_x = pcEmptySsm();
+        defer pcFreeHybrid(&ssm_x);
+        var moe_x: usize = 0;
+        const res_x = try hc2.lookupAndRestoreWithMedia(&cache_x, &moe_x, &ssm_x, s, &tokens, false, &.{.{ .start = 400, .key = 0xA1 }}, null, null, null, false);
+        try testing.expectEqual(@as(usize, 300), res_x.matched);
+        try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm_x[0].conv_state, 0, s));
+        try testing.expectEqual(@as(f32, 500.0), pcSsmVal(ssm_x[0].ssm_state, 0, s));
+
+        // A text-only re-send of the same tokens: also the floor (300) — the
+        // old tier-wide pre-media cap, now per-entry.
+        var cache_t = try KVCache.init(testing.allocator, 3);
+        defer cache_t.deinit();
+        var ssm_t = pcEmptySsm();
+        defer pcFreeHybrid(&ssm_t);
+        var moe_t: usize = 0;
+        const res_t = try hc2.lookupAndRestoreWithMedia(&cache_t, &moe_t, &ssm_t, s, &tokens, false, &.{}, null, null, null, false);
+        try testing.expectEqual(@as(usize, 300), res_t.matched);
+        try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm_t[0].conv_state, 0, s));
     }
 }

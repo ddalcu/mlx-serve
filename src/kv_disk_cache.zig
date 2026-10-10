@@ -58,6 +58,24 @@ const log = @import("log.zig");
 
 const KVCache = transformer_mod.KVCache;
 
+/// One media item's rows in a prompt: its first placeholder row and its
+/// pixel/PCM hash. Placeholder ids are identical across items, so state at and
+/// after `start` is keyed on `key`. Lives at the disk layer so the tier's
+/// per-entry identity can carry spans; `prefix_cache` re-exports it.
+pub const MediaSpan = struct { start: u32, key: u64 };
+
+/// First position where state under two span lists can differ; maxInt when
+/// they agree. Rows before the first span that differs are text.
+pub fn mediaSharedBound(a: []const MediaSpan, b: []const MediaSpan) usize {
+    const n = @min(a.len, b.len);
+    for (a[0..n], b[0..n]) |x, y| {
+        if (x.start != y.start or x.key != y.key) return @min(x.start, y.start);
+    }
+    if (a.len > n) return a[n].start;
+    if (b.len > n) return b[n].start;
+    return std.math.maxInt(usize);
+}
+
 /// Restoring from disk only happens when it beats the best RAM match by at
 /// least this many tokens — a disk read + rebuild is only worth it when it
 /// replaces a meaningful amount of prefill.
@@ -216,6 +234,11 @@ pub const IndexEntry = struct {
     qsa_history_bytes: u64 = 0,
     qsa_history_rows: u32 = 0,
     inherited_qsa: bool = false,
+    /// v9: media items inside `tokens` (ascending by start; empty = a text-only
+    /// record). A media entry's KV rows past a placeholder are keyed on the
+    /// spans, not the tokens alone: matching, supersede and chunk share clamp at
+    /// `mediaSharedBound`. Owned.
+    media: []MediaSpan = &.{},
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
     last_used: u64,
 };
@@ -309,6 +332,47 @@ pub const Match = struct {
 /// restorable checkpoint position (≤ usable) that won it the race.
 pub const HybridMatch = struct { idx: usize, usable: u32, cp: u32 };
 
+/// Why the hybrid lookup skipped an entry that DID share a long token prefix:
+/// nothing persisted is restorable below `usable`, so the request falls to a
+/// shallower donor (or a cold prefill). Reported for matches at or above
+/// `HYBRID_SKIP_DIAG_MIN_TOKENS`, where the skip costs a full re-prefill.
+pub const HybridSkipDiagnosis = struct {
+    entry_id: u64,
+    /// Raw token-prefix share, before the kv_len / lookup-limit / media clamps.
+    shared: u32,
+    /// The share a restore could have rebuilt (what the entry lost the race at).
+    usable: u32,
+    /// The entry's lowest persisted checkpoint; null = no checkpoints on disk.
+    /// This is the grid floor the request diverged below.
+    lowest_cp: ?u32,
+};
+
+/// Below this shared-prefix length a checkpoint-less skip is routine noise (a
+/// short probe grazing a deep entry); at or above it the skip costs a full
+/// re-prefill and has to reach the log.
+pub const HYBRID_SKIP_DIAG_MIN_TOKENS: u32 = 8192;
+
+/// The diagnosis for an entry the hybrid lookup is about to skip for want of a
+/// checkpoint at or below `usable`; null when the match is too short to report.
+/// Pure (no log, no tier state) so a test can assert the diagnosis path without
+/// capturing stderr.
+pub fn hybridSkipDiagnosis(e: *const IndexEntry, shared: usize, usable: u32, min_tokens: u32) ?HybridSkipDiagnosis {
+    if (shared < min_tokens) return null;
+    return .{
+        .entry_id = e.id,
+        .shared = @intCast(shared),
+        .usable = usable,
+        .lowest_cp = if (e.ssm_positions.len > 0) e.ssm_positions[0] else null,
+    };
+}
+
+/// The low grid points that checkpoint thinning must never remove (recipe
+/// §6.3). With a 16-checkpoint cap over a 383k entry the grid is ~25k apart; if
+/// thinning also migrates the floor upward, a request that diverges below it
+/// (early prompt injection, a re-sent header) has NO anchor left and restores
+/// nothing. The two lowest positions are the shallow-divergence anchor pair.
+pub const SSM_DISK_LOW_ANCHORS: usize = 2;
+
 fn nbytesOf(a: mlx.mlx_array) u64 {
     return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
 }
@@ -370,6 +434,12 @@ pub const DiskTier = struct {
     cp_thin: transformer_mod.ThinPolicy = .oldest,
     /// How many checkpoint positions one entry may keep on disk; the default is the previous cap.
     ssm_max_per_entry: usize = SSM_DISK_MAX_PER_ENTRY_LEGACY,
+    /// How many LOW checkpoint positions the thin must never remove. Default
+    /// 0 = the pure span-preserving spread, which is what the spacing tests
+    /// price; the gated long-context wiring (#794) sets
+    /// `SSM_DISK_LOW_ANCHORS` so a request that diverges early in the prompt
+    /// still finds a shallow anchor instead of restoring nothing.
+    ssm_low_anchors: usize = 0,
     /// SSD-first background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
@@ -615,6 +685,7 @@ pub const DiskTier = struct {
         self.allocator.free(e.chunk_bytes);
         self.allocator.free(e.ssm_positions);
         self.allocator.free(e.ssm_bytes);
+        self.allocator.free(e.media);
     }
 
     /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a budget
@@ -658,12 +729,17 @@ pub const DiskTier = struct {
 
     /// Longest usable shared prefix across persisted entries with a matching
     /// (has_tools, quant) key. Same filter semantics as the RAM cache: a
-    /// cross-config restore would hand SDPA a wrong buffer layout.
+    /// cross-config restore would hand SDPA a wrong buffer layout. An entry's
+    /// shared prefix also clamps at `mediaSharedBound(entry.media, media)`: a
+    /// re-sent turn with agreeing spans reads its media rows back, a divergent
+    /// list stops below the first item whose start or pixel key differs, and a
+    /// text turn (`media` empty) clamps at every media entry's first item.
     pub fn bestMatch(
         self: *const DiskTier,
         prompt_ids: []const u32,
         has_tools: bool,
         quant: kv_quant.KVQuantConfig,
+        media: []const MediaSpan,
     ) ?Match {
         var best_idx: ?usize = null;
         var best_usable: u32 = 0;
@@ -671,7 +747,7 @@ pub const DiskTier = struct {
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
-            const max_shared = @min(e.tokens.len, prompt_ids.len);
+            const max_shared = @min(@min(e.tokens.len, prompt_ids.len), mediaSharedBound(e.media, media));
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
             const usable: u32 = @intCast(@min(shared, e.kv_len));
@@ -688,26 +764,48 @@ pub const DiskTier = struct {
     /// highest SSM checkpoint at or below the usable prefix — not by the raw
     /// usable length (the RAM tier's #312 lesson: a longer raw match whose
     /// checkpoints sit past the divergence restores nothing, and must not
-    /// shadow a shorter entry with a higher restorable position). Entries
-    /// with no checkpoint at or below their usable prefix are skipped.
+    /// shadow a shorter entry with a higher restorable position). Entries with
+    /// no checkpoint at or below their usable prefix are skipped. The shared
+    /// prefix clamps at `mediaSharedBound(entry.media, media)` exactly as on
+    /// the pure-attention side.
     pub fn bestHybridMatch(
         self: *const DiskTier,
         prompt_ids: []const u32,
         has_tools: bool,
         quant: kv_quant.KVQuantConfig,
         limit: u32,
+        media: []const MediaSpan,
     ) ?HybridMatch {
         var best: ?HybridMatch = null;
+        // One aggregated info line per lookup for the deep matches the loop had
+        // to skip (the deepest plus a count): the observation an operator needs
+        // when restore depth collapses, without the per-entry log a deep-entry
+        // index would print on every lookup.
+        var skipped: usize = 0;
+        var deepest_skip: ?HybridSkipDiagnosis = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
-            const max_shared = @min(e.tokens.len, prompt_ids.len);
+            const max_shared = @min(@min(e.tokens.len, prompt_ids.len), mediaSharedBound(e.media, media));
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
             const usable: u32 = @intCast(@min(@min(shared, e.kv_len), @as(usize, limit)));
-            const cp = self.highestSsmPosAtOrBelow(i, usable) orelse continue;
+            const cp = self.highestSsmPosAtOrBelow(i, usable) orelse {
+                if (hybridSkipDiagnosis(e, shared, usable, HYBRID_SKIP_DIAG_MIN_TOKENS)) |diag| {
+                    skipped += 1;
+                    if (deepest_skip == null or diag.usable > deepest_skip.?.usable) deepest_skip = diag;
+                }
+                continue;
+            };
             if (best == null or cp > best.?.cp) best = .{ .idx = i, .usable = usable, .cp = cp };
+        }
+        if (deepest_skip) |dd| {
+            if (dd.lowest_cp) |low| {
+                log.info("  [disk-cache] {d} deep prefix matches skipped for want of a checkpoint at or below the match — deepest e{d}: {d}-token match (usable {d}), lowest grid cp {d}\n", .{ skipped, dd.entry_id, dd.shared, dd.usable, low });
+            } else {
+                log.info("  [disk-cache] {d} deep prefix matches skipped for want of a checkpoint at or below the match — deepest e{d}: {d}-token match (usable {d}), no checkpoints on disk\n", .{ skipped, dd.entry_id, dd.shared, dd.usable });
+            }
         }
         return best;
     }
@@ -1123,7 +1221,7 @@ pub const DiskTier = struct {
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         s: mlx.mlx_stream,
     ) !PersistOutcome {
-        return self.appendCommitWithSpec(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s);
+        return self.appendCommitWithSpec(kv_entries, step, config, tokens, has_tools, &.{}, ssm_checkpoints, null, null, s);
     }
 
     /// `appendCommit` with an explicit per-call flush bound (bytes): the loop stops after the
@@ -1139,12 +1237,17 @@ pub const DiskTier = struct {
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
-        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, null, null, s, flush_bound);
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, &.{}, ssm_checkpoints, null, null, s, flush_bound);
     }
 
     /// `appendCommit` plus the v4 spec snapshots (dflash assistant context /
-    /// MTP committed history). Eligibility is enforced UPSTREAM, same as the
-    /// RAM tier: the caller passes only what `commitWithState` was handed.
+    /// MTP committed history) and the turn's media spans (v9 disk identity).
+    /// Eligibility is enforced UPSTREAM, same as the RAM tier: the caller
+    /// passes only what `commitWithState` was handed. The entry's record then
+    /// carries (tokens, spans); supersede, extend, chunk share and the
+    /// full-prefix promise all clamp at `mediaSharedBound`, so a later turn
+    /// with a different pixel key can never inherit its rows off a list that
+    /// disagrees below them.
     pub fn appendCommitWithSpec(
         self: *DiskTier,
         kv_entries: []const transformer_mod.KVCacheEntry,
@@ -1152,12 +1255,13 @@ pub const DiskTier = struct {
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
+        media: []const MediaSpan,
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
     ) !PersistOutcome {
-        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, s, self.max_flush_bytes);
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, media, ssm_checkpoints, dflash_snap, mtp_snap, s, self.max_flush_bytes);
     }
 
     fn appendCommitWithSpecBounded(
@@ -1167,6 +1271,7 @@ pub const DiskTier = struct {
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
+        media: []const MediaSpan,
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
@@ -1232,6 +1337,12 @@ pub const DiskTier = struct {
             if (!std.meta.eql(e.quant, config)) continue;
             if (e.tokens.len >= tokens.len) {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
+                    // v9: supersede / incremental-resume requires the media
+                    // lists to agree across the WHOLE committed record — the
+                    // same u32 tokens can sit under different pixels, and rows
+                    // already on disk under a divergent list are not this
+                    // commit's state.
+                    if (mediaSharedBound(e.media, media) < tokens.len) continue;
                     if (e.kv_len >= kv_target) {
                         if (!self.ssmWorkPending(e, ssm_checkpoints, @intCast(e.tokens.len)) and
                             !specWorkPending(e, dflash_snap, mtp_snap))
@@ -1248,6 +1359,10 @@ pub const DiskTier = struct {
                     extend_idx = i;
                 }
             } else if (std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
+                // v9: extending an entry keeps its on-disk chunks, so its span
+                // list must agree with this commit's across everything the
+                // entry has already persisted a record for.
+                if (mediaSharedBound(e.media, media) < e.tokens.len) continue;
                 // This commit extends `e` — reuse its directory and chunks.
                 extend_idx = i;
             }
@@ -1280,7 +1395,7 @@ pub const DiskTier = struct {
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
         // turn diverges inside the generated span and used to rewrite every chunk. SSD-first only.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config) else null;
+        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -1362,7 +1477,8 @@ pub const DiskTier = struct {
         }
 
         const prefix_rows: u32 = if (donor) |d|
-            @intCast(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)))
+            @intCast(@min(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)),
+                mediaSharedBound(self.entries.items[d.idx].media, media)))
         else
             kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
@@ -1421,6 +1537,7 @@ pub const DiskTier = struct {
             .qsa_history_bytes = if (qsa_res.inherited) inherited_qsa_bytes else qsa_res.bytes,
             .qsa_history_rows = if (qsa_res.inherited) inherited_qsa_rows else qsa_res.rows,
             .inherited_qsa = qsa_res.inherited,
+            .media = try self.allocator.dupe(MediaSpan, media),
             .last_used = self.bump(),
         };
         errdefer {
@@ -1445,6 +1562,7 @@ pub const DiskTier = struct {
             self.allocator.free(e.chunk_bytes);
             self.allocator.free(e.ssm_positions);
             self.allocator.free(e.ssm_bytes);
+            self.allocator.free(e.media);
             e.* = new_entry;
         } else {
             // meta.json is the commit point: written last, atomically.
@@ -1485,11 +1603,14 @@ pub const DiskTier = struct {
         tokens: []const u32,
         has_tools: bool,
         config: kv_quant.KVQuantConfig,
+        media: []const MediaSpan,
     ) bool {
-        return self.fullPrefixEntryId(kv_entries, step, tokens, has_tools, config) != null;
+        return self.fullPrefixEntryId(kv_entries, step, tokens, has_tools, config, media) != null;
     }
 
-    /// `holdsFullPrefix`, returning the entry's id so the caller can ask `entryWritesPending`.
+    /// `holdsFullPrefix`, returning the entry's id so the caller can ask
+    /// `entryWritesPending`. The record must carry a span list agreeing
+    /// across `tokens` (`media` empty = a text turn).
     pub fn fullPrefixEntryId(
         self: *const DiskTier,
         kv_entries: []const transformer_mod.KVCacheEntry,
@@ -1497,6 +1618,7 @@ pub const DiskTier = struct {
         tokens: []const u32,
         has_tools: bool,
         config: kv_quant.KVQuantConfig,
+        media: []const MediaSpan,
     ) ?u64 {
         const target = persistTargetLen(kv_entries, step, tokens.len);
         if (target == 0) return null;
@@ -1506,6 +1628,7 @@ pub const DiskTier = struct {
             if (!std.meta.eql(e.quant, config)) continue;
             if (e.tokens.len < tokens.len) continue;
             if (!std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) continue;
+            if (mediaSharedBound(e.media, media) < tokens.len) continue;
             if (e.kv_len < target) continue;
             const want: usize = (@as(usize, e.kv_len) + self.chunk_tokens - 1) / self.chunk_tokens;
             if (e.chunk_bytes.len < want) continue;
@@ -2110,8 +2233,11 @@ pub const DiskTier = struct {
             if (std.mem.indexOfScalar(u32, set.items, p) == null) try set.append(self.allocator, p);
         }
         std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
+        // Only the span-preserving policies get anchors; the legacy `.oldest`
+        // retention (the highest N) is left exactly as it was.
+        const anchors = if (self.cp_thin == .oldest) 0 else self.ssm_low_anchors;
         while (set.items.len > self.ssm_max_per_entry) {
-            _ = set.orderedRemove(transformer_mod.positionDropIndex(set.items, self.cp_thin));
+            _ = set.orderedRemove(transformer_mod.positionDropIndexLowAnchored(set.items, self.cp_thin, anchors));
         }
         return set.toOwnedSlice(self.allocator);
     }
@@ -2613,14 +2739,18 @@ pub const DiskTier = struct {
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
     /// the legacy arm or under `MLX_SERVE_SSD_CHUNK_SHARE=0`.
-    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
+    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: []const MediaSpan) ?ChunkDonor {
         if (!self.ssd_first or !chunkShareEnabled()) return null;
+        // `media` (v9): chunks may only be linked below the point where the two
+        // span lists can diverge — above it the donor's rows describe different
+        // pixels, not this commit's state.
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
-            const shared: u64 = @min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len));
+            const shared: u64 = @min(@min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)),
+                @as(u64, e.kv_len)), @as(u64, mediaSharedBound(e.media, media)));
             const whole: u32 = @intCast(shared / self.chunk_tokens);
             const usable: u32 = @min(whole, @as(u32, @intCast(e.chunk_bytes.len)));
             if (usable == 0) continue;
@@ -2765,6 +2895,11 @@ pub const DiskTier = struct {
     /// claim: an older reader accepts only 2..4, so stamping v6 unconditionally made a binary
     /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
     fn metaVersionFor(e: IndexEntry) u8 {
+        // v9 = media-keyed identity: an older reader must NOT load these into
+        // token-only matching (it would restore past a placeholder under a
+        // possibly different image), so a media entry claims a version the old
+        // reader gate rejects.
+        if (e.media.len > 0) return 9;
         if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) return 8;
         if (e.inherited_chunks > 0) return 6;
         if (e.spec_mtp) |m| if (m.head) |h| return if (h.mark_count > 0) 8 else 5;
@@ -2814,6 +2949,20 @@ pub const DiskTier = struct {
             if (e.spec_dflash) |sm| try writeSpecMetaJson(a, out, "dflash", sm);
             if (e.spec_mtp) |sm| try writeSpecMetaJson(a, out, "mtp", sm);
             try out.appendSlice(a, "}");
+        }
+        // v9: media spans as [[start,key],...] — the entry's media identity.
+        if (e.media.len > 0) {
+            try out.appendSlice(a, ",\"media\":[");
+            for (e.media, 0..) |sp, i| {
+                if (i > 0) try out.appendSlice(a, ",");
+                // Signed decimal: the JSON reader yields a SIGNED integer, and a
+                // pixel hash is a full u64 (high bit set about half the time). An
+                // unsigned print makes those metas unparseable — the entry would
+                // be dropped at scan. `loadEntry` bit-casts it back, so the u64
+                // bits round-trip exactly.
+                try out.print(a, "[{d},{d}]", .{ sp.start, @as(i64, @bitCast(sp.key)) });
+            }
+            try out.appendSlice(a, "]");
         }
         try out.appendSlice(a, "}");
     }
@@ -2942,7 +3091,10 @@ pub const DiskTier = struct {
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
         // adds optional spec snapshots; v5 the qwen4_exp MTP head's QSA half; v6 inherited
         // chunks. All restore; a lower-version entry just carries none of the newer state.
-        if (version < 2 or version > 8) return null;
+        // v9 adds media spans (meta "media"). A v9 entry read by an older binary
+        // fails that binary's gate and is dropped — the honest outcome for
+        // media-keyed rows, never a token-only restore past a placeholder.
+        if (version < 2 or version > 9) return null;
         // v6: the leading `inherited_chunks` chunk files are hard links into a donor's.
         const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
@@ -3138,6 +3290,42 @@ pub const DiskTier = struct {
             spec_bytes = rec_bytes;
             total += rec_bytes;
         }
+        // v9: media spans [[start,key],...] — the key is the u64 pixel hash
+        // printed as its SIGNED decimal (bit-exact round-trip past 2^63). An
+        // unreadable, empty, out-of-order, or version-inconsistent list drops
+        // the WHOLE entry: loading a media record as text-only would let
+        // token-prefix matching restore rows past a placeholder under a
+        // possibly different image — a wrong restore, the one failure mode
+        // worse than slow. Spans at/above kv_len stay loaded: the token record
+        // reaches them in the supersede gate even while an incremental flush
+        // has not persisted their rows yet.
+        var media: []MediaSpan = &[_]MediaSpan{};
+        var media_ok = false;
+        media_parse: {
+            const mv = obj.get("media") orelse break :media_parse;
+            if (mv != .array or mv.array.items.len == 0) break :media_parse;
+            if (version < 9) break :media_parse; // a media list on a pre-v9 stamp is a lie
+            var list = std.ArrayList(MediaSpan).empty;
+            defer list.deinit(self.allocator);
+            for (mv.array.items) |sp_v| {
+                if (sp_v != .array or sp_v.array.items.len != 2 or
+                    sp_v.array.items[0] != .integer or sp_v.array.items[1] != .integer) break :media_parse;
+                const st = std.math.cast(u32, sp_v.array.items[0].integer) orelse break :media_parse;
+                if (@as(u64, st) >= n_tokens) break :media_parse; // span past the token record
+                if (list.items.len > 0 and st <= list.items[list.items.len - 1].start) break :media_parse;
+                list.append(self.allocator, .{ .start = st, .key = @bitCast(sp_v.array.items[1].integer) }) catch break :media_parse;
+            }
+            media = self.allocator.dupe(MediaSpan, list.items) catch break :media_parse;
+            media_ok = true;
+        }
+        if ((obj.contains("media") or version == 9) and !media_ok) {
+            log.info("  [disk-cache] e{d}: media record unreadable — dropping the entry (never restore text-only past an item)\n", .{id});
+            self.allocator.free(tokens);
+            self.allocator.free(chunk_bytes);
+            self.allocator.free(ssm_positions);
+            self.allocator.free(ssm_bytes);
+            return null;
+        }
 
         return .{
             .e = .{
@@ -3157,6 +3345,7 @@ pub const DiskTier = struct {
                 .qsa_history_bytes = qsa_history_bytes,
                 .qsa_history_rows = qsa_history_rows,
                 .inherited_qsa = inherited_qsa,
+                .media = media,
                 .last_used = 0,
             },
             .mtime = stat.mtime.nanoseconds,
@@ -3588,7 +3777,7 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
 
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 600), m.usable);
 
     var cache2 = try KVCache.init(testing.allocator, 3);
@@ -3617,8 +3806,8 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
     }
 
     // Mismatched key never matches.
-    try testing.expect(tier2.bestMatch(&tokens, true, kv_quant.KVQuantConfig.dense) == null);
-    try testing.expect(tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.affine(4)) == null);
+    try testing.expect(tier2.bestMatch(&tokens, true, kv_quant.KVQuantConfig.dense, &.{}) == null);
+    try testing.expect(tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.affine(4), &.{}) == null);
 }
 
 test "DiskTier: a sliding ring is never persisted (its rows start past position 0)" {
@@ -3829,7 +4018,7 @@ test "DiskTier: affine-quant cache round-trips all six buffers" {
 
     var cache2 = try KVCache.initWithConfig(testing.allocator, 2, qcfg);
     defer cache2.deinit();
-    const m = tier.bestMatch(&tokens, false, qcfg).?;
+    const m = tier.bestMatch(&tokens, false, qcfg, &.{}).?;
     try testing.expectEqual(@as(u32, 520), m.usable);
     const restored = try tier.restoreInto(&cache2, m.idx, s);
     try testing.expectEqual(@as(u32, 520), restored);
@@ -4812,7 +5001,7 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links qsa.safetensors"
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
     };
     defer freeHybridEntries(&dst);
-    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 256), try tier.restoreIntoHybrid(&cache2, &dst, m.idx, 256, s));
     try testing.expect(dst[2].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 256), dst[2].qsa_hist_rows);
@@ -4892,7 +5081,7 @@ test "DiskTier: an inherited QSA history is dropped on extend past the common pr
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
     };
     defer freeHybridEntries(&dst);
-    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 560), try tier.restoreIntoHybrid(&cache2, &dst, m.idx, 560, s));
     try testing.expect(dst[2].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 560), dst[2].qsa_hist_rows);
@@ -5112,6 +5301,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         .{ .entries = dfl.entries, .step = dfl.step, .config = dfl.config, .base_pos = 0 },
         .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
@@ -5123,7 +5313,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
 
     var loaded = tier2.loadSpecSnap(m.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
@@ -5165,7 +5355,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     var tokens_b: [600]u32 = undefined;
     for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
     _ = try tier2.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, null, s);
-    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expect(tier2.loadSpecSnap(mb.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) == null);
 
     // v3 entry (written by an older binary): rewrite the manifest to v3 with
@@ -5195,7 +5385,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
     defer tier3.deinit();
     try testing.expectEqual(@as(usize, 2), tier3.entryCount());
-    const m3 = tier3.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m3 = tier3.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 600), m3.usable);
     try testing.expect(tier3.loadSpecSnap(m3.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) == null);
     var cache3 = try KVCache.init(testing.allocator, 2);
@@ -5230,6 +5420,7 @@ test "DiskTier: a dense MTP sidecar is rewritten at affine-8 on the next commit"
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp_dense.entries, .step = mtp_dense.step, .config = mtp_dense.config, .base_pos = 0 },
@@ -5248,6 +5439,7 @@ test "DiskTier: a dense MTP sidecar is rewritten at affine-8 on the next commit"
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp_q.entries, .step = mtp_q.step, .config = mtp_q.config, .base_pos = 0 },
@@ -5286,6 +5478,7 @@ test "DiskTier: a quantized MTP sidecar is rewritten to dense on the next commit
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp_q.entries, .step = mtp_q.step, .config = mtp_q.config, .base_pos = 0 },
@@ -5303,6 +5496,7 @@ test "DiskTier: a quantized MTP sidecar is rewritten to dense on the next commit
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp_dense.entries, .step = mtp_dense.step, .config = mtp_dense.config, .base_pos = 0 },
@@ -5485,6 +5679,7 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{
@@ -5500,7 +5695,7 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
 
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head", 0, 128);
     defer tier2.deinit();
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
     defer loaded.snap.deinit();
@@ -5523,12 +5718,13 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
         cache.config,
         &tokens_b,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
         s,
     );
-    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     var kv_only = tier2.loadSpecSnap(mb.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
     defer kv_only.snap.deinit();
@@ -5578,6 +5774,7 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{
@@ -5595,7 +5792,7 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
     // A pooled bank without its raw history is not restorable: KV half only, head declined.
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
     defer tier2.deinit();
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
     defer loaded.snap.deinit();
@@ -5735,6 +5932,7 @@ test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{
@@ -5748,7 +5946,7 @@ test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
         s,
     );
 
-    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     var loaded = tier.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
     defer loaded.snap.deinit();
@@ -5807,6 +6005,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{
@@ -5824,7 +6023,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
     // A restart: the positions come back through meta.json, the rows through the sidecar.
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head-marks", 0, 128);
     defer tier2.deinit();
-    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(tier2.entries.items[m.idx]));
     var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
@@ -5849,6 +6048,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
         cache.config,
         &tokens_b,
         false,
+        &.{},
         null,
         null,
         .{
@@ -5861,7 +6061,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
         },
         s,
     );
-    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u8, 5), DiskTier.metaVersionFor(tier2.entries.items[mb.idx]));
     var no_marks = tier2.loadSpecSnap(mb.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
         return error.TestExpectedSpecSnap;
@@ -6669,7 +6869,7 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whol
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 2), tier2.entryCount());
     try testing.expectEqual(tier.total_bytes, tier2.total_bytes);
-    const m = tier2.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier2.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     try testing.expectEqual(@as(u32, 600), m.usable);
     var out = try KVCache.init(testing.allocator, 3);
     defer out.deinit();
@@ -6967,6 +7167,7 @@ test "DiskTier: an ssm/spec-only append bills the SPEC sidecar's byte delta" {
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
@@ -7041,6 +7242,218 @@ test "DiskTier: the manifest stamps the LOWEST version that describes the entry"
     e.qsa_history_rows = 256;
     e.qsa_history_bytes = 4096;
     try t.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(e));
+
+    // v9: media always lifts the claim to 9 — an older reader must NOT run
+    // token-only matching over media rows.
+    var media9 = [_]MediaSpan{.{ .start = 100, .key = 0xA0 }};
+    e.media = &media9;
+    try t.expectEqual(@as(u8, 9), DiskTier.metaVersionFor(e));
+}
+
+// ── v9: media-keyed disk identity ──
+
+test "DiskTier v9: media spans round-trip through meta and clamp matching per entry" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // The second key carries the high bit, like half of all pixel hashes: the
+    // meta round-trip has to prove it survives the JSON trip.
+    const spans = [_]MediaSpan{ .{ .start = 100, .key = 0xA0 }, .{ .start = 300, .key = 0x8000_0000_0000_00B0 } };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    const dense = kv_quant.KVQuantConfig.dense;
+
+    // Restart: the v9 meta carries the spans back, and claims v9 so a pre-v9
+    // binary drops the entry instead of token-only matching past a placeholder.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-media", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqualSlices(MediaSpan, &spans, tier2.entries.items[0].media);
+    {
+        const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/fp-media/e{d}/meta.json", .{ base, tier2.entries.items[0].id });
+        defer testing.allocator.free(meta_path);
+        const meta = readFileAlloc(testing.allocator, io, meta_path, 64 * 1024).?;
+        defer testing.allocator.free(meta);
+        try testing.expect(std.mem.indexOf(u8, meta, "\"v\":9") != null);
+        // The u64 key is written as its signed decimal (the reader's integer is
+        // signed), so the needle has to be built the same way.
+        const key_needle = try std.fmt.allocPrint(testing.allocator, "\"media\":[[100,160],[300,{d}]]", .{@as(i64, @bitCast(spans[1].key))});
+        defer testing.allocator.free(key_needle);
+        try testing.expect(std.mem.indexOf(u8, meta, key_needle) != null);
+    }
+
+    // Identical span list: full depth.
+    const deep = tier2.bestMatch(&tokens, false, dense, &spans).?;
+    try testing.expectEqual(@as(u32, 600), deep.usable);
+    // A re-sent later item with different pixels: clamps at its start.
+    try testing.expectEqual(@as(u32, 300), tier2.bestMatch(&tokens, false, dense, &.{ spans[0], .{ .start = 300, .key = 0xB1 } }).?.usable);
+    // The same image at a different placeholder row: clamps at the earlier start.
+    try testing.expectEqual(@as(u32, 96), tier2.bestMatch(&tokens, false, dense, &.{ .{ .start = 96, .key = 0xA0 }, spans[1] }).?.usable);
+    // A re-sent list missing the second item: clamps at that item's start.
+    try testing.expectEqual(@as(u32, 300), tier2.bestMatch(&tokens, false, dense, &.{spans[0]}).?.usable);
+    // A new item appended below the stored ones: clamps at the new start.
+    try testing.expectEqual(@as(u32, 450), tier2.bestMatch(&tokens, false, dense, &.{ spans[0], spans[1], .{ .start = 450, .key = 0xC0 } }).?.usable);
+    // A text-only request: clamps at the FIRST item — the old tier-wide cap.
+    try testing.expectEqual(@as(u32, 100), tier2.bestMatch(&tokens, false, dense, &.{}).?.usable);
+    // The legacy wrapper keeps its meaning for older call sites.
+    try testing.expectEqual(@as(u32, 100), tier2.bestMatch(&tokens, false, dense, &.{}).?.usable);
+
+    // The deep match serves the media rows themselves: spot-check KV values
+    // across both boundaries against the original cache.
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    try tier2.restorePrefixInto(&cache2, deep.idx, deep.usable, s);
+    for ([_]u32{ 0, 99, 100, 299, 300, 450, 599 }) |pos| {
+        const want = try cacheValueAt(&cache, 1, pos, 5, s);
+        const got = try cacheValueAt(&cache2, 1, pos, 5, s);
+        try testing.expectEqual(want, got);
+    }
+}
+
+test "DiskTier v9: supersede and extend are media-gated; chunk share clamps at divergence" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-sg", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    // 768 rows: the 768-token records below need their KV actually present,
+    // or every entry truncates to the 640 rows the live cache holds.
+    try fillCache(&cache, s, 3, 768, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const span_a = MediaSpan{ .start = 512, .key = 0xAA };
+    const span_b = MediaSpan{ .start = 512, .key = 0xBB };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{span_a}, null, null, null, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+
+    // The identical token record under different pixels is a DIFFERENT entry:
+    // supersede must not no-op the commit (its rows describe another image).
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{span_b}, null, null, null, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    // Under the same span list it is superseded again: still 2 entries.
+    const sup = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{span_a}, null, null, null, s);
+    try testing.expectEqual(PersistOutcome.persisted, sup);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+
+    // A continuation under A grows the A record in place (extend, media gate
+    // open) — never a second entry.
+    var cont_a: [768]u32 = undefined;
+    for (&cont_a, 0..) |*t, i| t.* = if (i < 640) tokens[i] else @intCast(50_000 + i);
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &cont_a, false, &.{span_a}, null, null, null, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    // Chunk share, same span list: a twin commit diverging INSIDE the tail at
+    // 740 hard-links all 5 whole chunks below the token divergence.
+    var twin_a: [768]u32 = cont_a;
+    twin_a[740] = 555_001;
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &twin_a, false, &.{span_a}, null, null, null, s);
+    // The same tokens under B's pixels: rows 512.. up describe a different
+    // image, so the share clamps to the 4 whole chunks below the span start.
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &twin_a, false, &.{span_b}, null, null, null, s);
+    var inherited_a: ?u32 = null;
+    var inherited_b: ?u32 = null;
+    for (tier.entries.items) |*e| {
+        if (e.tokens.len != 768) continue;
+        if (e.media.len != 1) continue;
+        if (e.tokens[740] == 555_001 and e.media[0].key == 0xAA) inherited_a = e.inherited_chunks;
+        if (e.tokens[740] == 555_001 and e.media[0].key == 0xBB) inherited_b = e.inherited_chunks;
+    }
+    try testing.expectEqual(@as(?u32, 5), inherited_a);
+    try testing.expectEqual(@as(?u32, 4), inherited_b);
+
+    // Extend gate (fresh root): a commit that grows a B record must extend
+    // the B entry, never the token-prefix-matching A entry…
+    var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-media-ex", 0, 128);
+    defer tier3.deinit();
+    _ = try tier3.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{span_b}, null, null, null, s);
+    var ext: [700]u32 = undefined;
+    for (&ext, 0..) |*t, i| t.* = if (i < 640) tokens[i] else @intCast(70_000 + i);
+    // …the A entry shares the 640-token prefix but its span list diverges at
+    // 512, so this media-B commit under span A must NOT extend it either:
+    // it lands as a second entry.
+    _ = try tier3.appendCommitWithSpec(cache.entries, cache.step, cache.config, &ext, false, &.{span_a}, null, null, null, s);
+    try testing.expectEqual(@as(usize, 2), tier3.entryCount());
+    // The same growth under span B now extends the B entry (media gate open).
+    var ext_b: [760]u32 = undefined;
+    for (&ext_b, 0..) |*t, i| t.* = if (i < 640) tokens[i] else @intCast(71_000 + i);
+    _ = try tier3.appendCommitWithSpec(cache.entries, cache.step, cache.config, &ext_b, false, &.{span_b}, null, null, null, s);
+    try testing.expectEqual(@as(usize, 2), tier3.entryCount());
+    var grew = false;
+    for (tier3.entries.items) |*e| {
+        if (e.tokens.len == 760 and e.media.len == 1 and e.media[0].key == 0xBB) grew = true;
+    }
+    try testing.expect(grew);
+}
+
+test "DiskTier v9 scan: a media list on a pre-v9 stamp, or a v9 stamp without one, drops the entry" {
+    // The wrong-restore class, guarded at load: a media record whose spans
+    // cannot be read must never be matched by tokens alone.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-meta", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const spans = [_]MediaSpan{.{ .start = 100, .key = 0xA0 }};
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s);
+    const id = tier.entries.items[0].id;
+    const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/fp-media-meta/e{d}/meta.json", .{ base, id });
+    defer testing.allocator.free(meta_path);
+    const orig = readFileAlloc(testing.allocator, io, meta_path, 64 * 1024).?;
+    defer testing.allocator.free(orig);
+    // Sanity: the entry as written loads.
+    if (tier.loadEntry(id)) |l| {
+        var e = l.e;
+        tier.freeIndexEntryOwned(&e);
+        try testing.expectEqual(@as(usize, 1), e.media.len);
+    } else return error.TestUnexpectedResult;
+    const cases = [_]struct { find: []const u8, replace: []const u8 }{
+        // A media list under a pre-v9 stamp is a lie: a v8 reader would
+        // token-only match the media rows. Reject the whole entry.
+        .{ .find = "\"v\":9", .replace = "\"v\":8" },
+        // v9 without the spans it claims: same failure mode, same verdict.
+        .{ .find = ",\"media\":[[100,160]]", .replace = "" },
+        // Malformed span shapes never load as text-only either.
+        .{ .find = "[[100,160]", .replace = "[[100]]" },
+        .{ .find = "[[100,160]", .replace = "[[600,160]]" }, // span at/after the token record
+    };
+    for (cases) |c| {
+        const patched = try std.mem.replaceOwned(u8, testing.allocator, orig, c.find, c.replace);
+        defer testing.allocator.free(patched);
+        try testing.expect(!std.mem.eql(u8, patched, orig));
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = patched });
+        try testing.expect(tier.loadEntry(id) == null);
+    }
 }
 
 test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING_ROWS ring; v>8 is refused" {
@@ -7203,9 +7616,9 @@ test "DiskTier: a failed background write INVALIDATES the entry it belonged to (
     try testing.expectEqual(@as(usize, 1), tier.harvestWriteFailures());
     try testing.expect(tier.entries.items[0].poisoned);
     for (tier.entries.items[0].chunk_bytes) |b| try testing.expectEqual(@as(u64, 0), b);
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
-    try testing.expect(tier.fullPrefixEntryId(cache.entries, cache.step, &tokens, false, cache.config) == null);
-    try testing.expect(tier.bestMatch(&tokens, false, cache.config) == null);
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
+    try testing.expect(tier.fullPrefixEntryId(cache.entries, cache.step, &tokens, false, cache.config, &.{}) == null);
+    try testing.expect(tier.bestMatch(&tokens, false, cache.config, &.{}) == null);
     try testing.expect(!tier.entryWholeOnDisk(dead_id));
     // Attribution happens once.
     try testing.expectEqual(@as(usize, 0), tier.harvestWriteFailures());
@@ -7220,7 +7633,7 @@ test "DiskTier: a failed background write INVALIDATES the entry it belonged to (
     try testing.expect(live.id != dead_id);
     try testing.expect(!live.poisoned);
     try testing.expect(tier.entryWholeOnDisk(live.id));
-    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config, &.{}));
 
     var back = try KVCache.init(testing.allocator, 2);
     defer back.deinit();
@@ -7251,10 +7664,10 @@ test "DiskTier: a poisoned entry is invisible to the hybrid lookup too" {
     defer for (&cps) |*cp| cp.deinit(testing.allocator);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
 
-    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600) != null);
+    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600, &.{}) != null);
     tier.entries.items[0].poisoned = true;
-    try testing.expect(tier.bestMatch(&tokens, false, cache.config) == null);
-    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600) == null);
+    try testing.expect(tier.bestMatch(&tokens, false, cache.config, &.{}) == null);
+    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600, &.{}) == null);
 }
 
 test "DiskTier: a manifest scalar that does not fit its field drops the record, never casts" {
@@ -7285,6 +7698,7 @@ test "DiskTier: a manifest scalar that does not fit its field drops the record, 
         cache.config,
         &tokens,
         false,
+        &.{},
         null,
         null,
         .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
@@ -7379,7 +7793,7 @@ test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable 
         defer for (&cps) |*cp| cp.deinit(testing.allocator);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
         try testing.expectEqual(@as(usize, N), tier.entries.items[0].ssm_positions.len);
-        const warm = tier.bestHybridMatch(&tokens, false, cache.config, tokens.len).?;
+        const warm = tier.bestHybridMatch(&tokens, false, cache.config, tokens.len, &.{}).?;
         try testing.expectEqual(@as(u32, N * 128), warm.cp);
     }
 
@@ -7387,7 +7801,7 @@ test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable 
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
     try testing.expectEqual(@as(usize, N), tier2.entries.items[0].ssm_positions.len);
-    const cold = tier2.bestHybridMatch(&tokens, false, kv_quant.KVQuantConfig.dense, tokens.len).?;
+    const cold = tier2.bestHybridMatch(&tokens, false, kv_quant.KVQuantConfig.dense, tokens.len, &.{}).?;
     try testing.expectEqual(@as(u32, N * 128), cold.cp);
     try testing.expectEqual(@as(u32, N * 128), cold.usable);
 }
@@ -7411,7 +7825,7 @@ test "DiskTier: a restore wider than the fd limit closes each chunk as it goes" 
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     tier.drainEntry(tier.entries.items[m.idx].id);
 
     const saved = try std.posix.getrlimit(.NOFILE);
@@ -7450,7 +7864,7 @@ test "DiskTier: a failed restore drops the latch it raised and keeps a foreign o
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 13);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
     const id = tier.entries.items[m.idx].id;
     tier.drainEntry(id);
     var path_buf: [1024]u8 = undefined;
@@ -7527,7 +7941,7 @@ test "DiskTier: in-place commits keep an entry's bytes equal to the files it own
     var mtp = try KVCache.init(testing.allocator, 1);
     defer mtp.deinit();
     try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
-    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, &more, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, &.{}, &more, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
     try testing.expect(tier.entries.items[0].spec_bytes > 0);
     try testing.expectEqual(@as(usize, 5), tier.entries.items[0].ssm_positions.len);
     try testing.expectEqual(try Owned.bytes(&tier, &tier.entries.items[0]), tier.entries.items[0].bytes);
@@ -7540,4 +7954,292 @@ test "DiskTier: in-place commits keep an entry's bytes equal to the files it own
     try testing.expect(e.qsa_history_bytes > 0);
     try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
     try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
+test "mediaSharedBound: a repeated pixel key in a superset does not collapse the bound" {
+    // A pixel key may legally repeat across spans: the comparison is
+    // positional, so it must walk past the reuse and clamp only where a
+    // start/key pair actually differs.
+    const K1: u64 = 8_376_670_522_757_638_769;
+    const K2: u64 = 0xB2;
+    const a = [_]MediaSpan{ .{ .start = 100, .key = K1 }, .{ .start = 300, .key = K2 } };
+    const b = [_]MediaSpan{ .{ .start = 100, .key = K1 }, .{ .start = 300, .key = K2 }, .{ .start = 500, .key = K1 } };
+
+    // The superset's extra item REUSES an earlier key: the bound is that item's
+    // start, not a collapse back to the first K1 occurrence.
+    try testing.expectEqual(@as(usize, 500), mediaSharedBound(&a, &b));
+    try testing.expectEqual(@as(usize, 500), mediaSharedBound(&b, &a));
+    // Identical lists agree everywhere.
+    try testing.expectEqual(std.math.maxInt(usize), mediaSharedBound(&a, &a));
+    try testing.expectEqual(std.math.maxInt(usize), mediaSharedBound(&b, &b));
+    // A repeat that sits behind a real divergence still clamps at the divergence.
+    const c = [_]MediaSpan{ .{ .start = 100, .key = K1 }, .{ .start = 300, .key = 0xB9 }, .{ .start = 500, .key = K1 } };
+    try testing.expectEqual(@as(usize, 300), mediaSharedBound(&a, &c));
+    // A text turn still clamps at the first item.
+    try testing.expectEqual(@as(usize, 100), mediaSharedBound(&a, &.{}));
+}
+
+test "hybrid lookup: a long match with no checkpoint below the fork is skipped, and says why" {
+    // A deep entry that shares a long token prefix but has no checkpoint at or
+    // below the shared prefix must lose the race to a shallower entry with a
+    // restorable checkpoint, and the skip must be reportable: a 222k-token entry
+    // matches 31944 tokens with its grid starting at 32768, so nothing it
+    // persisted is restorable; the 122k entry (fork at 31794, 8192 grid) wins
+    // with cp@24576.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-skipdiag", 0, 1024);
+    defer tier.deinit();
+
+    const fork: usize = 31_944; // deep entry: first differing token
+    const v8_fork: usize = 31_794; // shallow entry: an older injection offset
+    const req_len: usize = 40_000;
+
+    const req = try testing.allocator.alloc(u32, req_len);
+    defer testing.allocator.free(req);
+    for (req, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // The deep donor: identical up to `fork`, checkpoints from 32768 upward.
+    const deep_tokens = try testing.allocator.alloc(u32, 222_972);
+    for (deep_tokens[0..fork], req[0..fork]) |*d, r| d.* = r;
+    for (deep_tokens[fork..], fork..) |*d, i| d.* = @intCast(i + 500_000);
+    const deep_cp = try testing.allocator.alloc(u32, 3);
+    deep_cp[0] = 32_768;
+    deep_cp[1] = 49_152;
+    deep_cp[2] = 65_536;
+
+    // The shallow donor: v8-style 8192 grid, forked 150 tokens earlier.
+    const v8_tokens = try testing.allocator.alloc(u32, 122_880);
+    for (v8_tokens[0..v8_fork], req[0..v8_fork]) |*d, r| d.* = r;
+    for (v8_tokens[v8_fork..], v8_fork..) |*d, i| d.* = @intCast(i + 900_000);
+    const v8_cp = try testing.allocator.alloc(u32, 4);
+    v8_cp[0] = 8_192;
+    v8_cp[1] = 16_384;
+    v8_cp[2] = 24_576;
+    v8_cp[3] = 32_768;
+
+    try tier.entries.append(testing.allocator, try syntheticEntry(1_372, deep_tokens, deep_cp));
+    try tier.entries.append(testing.allocator, try syntheticEntry(1_369, v8_tokens, v8_cp));
+
+    const hm = tier.bestHybridMatch(req[0..req_len], false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &.{}).?;
+    try testing.expectEqual(@as(usize, 1), hm.idx); // the v8 entry, not the deep one
+    try testing.expectEqual(@as(u32, 24_576), hm.cp);
+    try testing.expectEqual(@as(u32, @intCast(v8_fork)), hm.usable);
+    // The skipped entry still reports the grid floor the request fell below.
+    const deep_e = &tier.entries.items[0];
+    const diag = hybridSkipDiagnosis(deep_e, fork, @intCast(fork), HYBRID_SKIP_DIAG_MIN_TOKENS).?;
+    try testing.expectEqual(@as(u64, 1_372), diag.entry_id);
+    try testing.expectEqual(@as(u32, @intCast(fork)), diag.shared);
+    try testing.expectEqual(@as(u32, @intCast(fork)), diag.usable);
+    try testing.expectEqual(@as(?u32, 32_768), diag.lowest_cp);
+    // A checkpoint-less entry reports a null floor rather than a bogus one (the
+    // log line says "no checkpoints on disk", not "the grid starts at 0")...
+    const cpless_tokens = try testing.allocator.alloc(u32, fork);
+    var cpless = try syntheticEntry(1_444, cpless_tokens, &[_]u32{});
+    defer freeSyntheticEntry(&cpless);
+    try testing.expectEqual(@as(?u32, null), hybridSkipDiagnosis(&cpless, fork, @intCast(fork), HYBRID_SKIP_DIAG_MIN_TOKENS).?.lowest_cp);
+    // ...and a match below the reporting threshold stays silent (a short probe
+    // grazing a deep entry is normal traffic, not a lost deep restore).
+    try testing.expect(hybridSkipDiagnosis(deep_e, 4_096, 4_096, HYBRID_SKIP_DIAG_MIN_TOKENS) == null);
+}
+
+test "a persisted 75k entry keeps the dense low grid points 24576 and 32768" {
+    // Gated generation delivers the first 65536 at 8192 spacing; turn appends
+    // add end-of-prompt snapshots on top. Retention still caps one entry at
+    // SSM_DISK_MAX_PER_ENTRY=16 — the dense low points must SURVIVE the
+    // thinning next to the anchor pair (replace-and-retain, not net-new), so a
+    // prompt that forked below the coarse grid still finds a deep cp on disk.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-densegrid", 0, 1024);
+    defer tier.deinit();
+    tier.cp_thin = .min_span_recency;
+    tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+    tier.ssm_low_anchors = SSM_DISK_LOW_ANCHORS;
+
+    // 8 dense grid points through 65536 + 10 per-turn end snapshots to 75302 = 18.
+    const L: u32 = 75_332;
+    const generated = [_]u32{
+        8_192,  16_384, 24_576, 32_768, 40_960, 49_152, 57_344, 65_536,
+        66_560, 67_584, 68_608, 69_632, 70_656, 71_680, 72_704, 73_728,
+        74_752, 75_302,
+    };
+    const kept = try tier.ssmTargetPositions(&generated, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(kept);
+    // Disk red line: never more than the per-entry cap.
+    try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), kept.len);
+    // The dense low grid survives: 24576 and 32768 are both on disk, the anchor
+    // pair holds the floor, and the newest snapshot is always kept.
+    try testing.expect(std.mem.indexOfScalar(u32, kept, 24_576) != null);
+    try testing.expect(std.mem.indexOfScalar(u32, kept, 32_768) != null);
+    try testing.expectEqual(@as(u32, 8_192), kept[0]);
+    try testing.expectEqual(@as(u32, 16_384), kept[1]);
+    try testing.expectEqual(@as(u32, 75_302), kept[kept.len - 1]);
+}
+
+test "a fork below a coarse grid's first multiple restores at 24576 once the dense low grid is persisted" {
+    // The skip case with the fix in place: a request forking at 30060 against
+    // a deep entry that persists the 8192-spaced low grid. `highestSsmPosAtOrBelow`
+    // answers 24576 instead of null, the entry is no longer skipped, and the
+    // restore depth is the dense anchor rather than nothing.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-fork24576", 0, 1024);
+    defer tier.deinit();
+
+    const fork: usize = 30_060;
+    const req_len: usize = 90_573;
+
+    const req = try testing.allocator.alloc(u32, req_len);
+    defer testing.allocator.free(req);
+    for (req, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // The same session, one turn later, persisted on the dense low grid.
+    const deep_tokens = try testing.allocator.alloc(u32, 74_880);
+    for (deep_tokens[0..fork], req[0..fork]) |*d, r| d.* = r;
+    for (deep_tokens[fork..], fork..) |*d, i| d.* = @intCast(i + 500_000);
+    const deep_cp = try testing.allocator.alloc(u32, 6);
+    deep_cp[0] = 8_192;
+    deep_cp[1] = 16_384;
+    deep_cp[2] = 24_576;
+    deep_cp[3] = 32_768;
+    deep_cp[4] = 40_960;
+    deep_cp[5] = 65_536;
+
+    try tier.entries.append(testing.allocator, try syntheticEntry(1_459, deep_tokens, deep_cp));
+
+    // The predicate the skip hinged on: 24576 at or below 30060, not null.
+    try testing.expectEqual(@as(?u32, 24_576), tier.highestSsmPosAtOrBelow(0, @intCast(fork)));
+
+    const hm = tier.bestHybridMatch(req[0..req_len], false, kv_quant.KVQuantConfig.dense, @intCast(req_len - 1), &.{}).?;
+    try testing.expectEqual(@as(usize, 0), hm.idx);
+    try testing.expectEqual(@as(u32, 24_576), hm.cp);
+    try testing.expectEqual(@as(u32, @intCast(fork)), hm.usable);
+}
+
+/// Release what a `syntheticEntry` owns when it never made it into the tier (an
+/// appended entry is released by `DiskTier.deinit` instead).
+fn freeSyntheticEntry(e: *IndexEntry) void {
+    testing.allocator.free(e.tokens);
+    testing.allocator.free(e.chunk_bytes);
+    testing.allocator.free(e.ssm_positions);
+    testing.allocator.free(e.ssm_bytes);
+    testing.allocator.free(e.media);
+}
+
+/// An in-memory `IndexEntry` for lookup-only tests: every owned slice comes from
+/// `testing.allocator` so `DiskTier.deinit` frees exactly what it owns.
+fn syntheticEntry(id: u64, tokens: []u32, ssm_positions: []u32) !IndexEntry {
+    const chunk_bytes = try testing.allocator.alloc(u64, 1);
+    chunk_bytes[0] = 0;
+    const ssm_bytes = try testing.allocator.alloc(u64, ssm_positions.len);
+    @memset(ssm_bytes, 0);
+    return .{
+        .id = id,
+        .tokens = tokens,
+        .kv_len = @intCast(tokens.len),
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 0,
+        .chunk_bytes = chunk_bytes,
+        .ssm_positions = ssm_positions,
+        .ssm_bytes = ssm_bytes,
+        .media = try testing.allocator.alloc(MediaSpan, 0),
+        .last_used = id,
+    };
+}
+
+test "DiskTier: checkpoint thinning never removes the low grid anchors" {
+    // When the cap forces drops, an unanchored thin migrates the grid floor
+    // upward and leaves a request that diverged early with no anchor at all.
+    // The two lowest grid points survive every thin (#794); the legacy
+    // `.oldest` retention is untouched.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-lowanchor", 0, 128);
+    defer tier.deinit();
+    tier.cp_thin = .min_span_recency;
+    tier.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+    tier.ssm_low_anchors = SSM_DISK_LOW_ANCHORS; // the gated wiring's setting
+
+    // An 8192-token grid, deep enough to force 30 removals.
+    const GRID: u32 = 8_192;
+    const N: usize = 46;
+    var positions: [N]u32 = undefined;
+    for (&positions, 0..) |*p, i| p.* = @as(u32, @intCast((i + 1) * GRID));
+    const L: u32 = @intCast(N * @as(usize, GRID));
+
+    const kept = try tier.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY, kept.len);
+    // The anchor pair: 8192 and 16384, the only restore points for a shallow fork.
+    try testing.expectEqual(@as(u32, GRID), kept[0]);
+    try testing.expectEqual(@as(u32, 2 * GRID), kept[1]);
+    // The newest checkpoint still anchors the warm-turn end.
+    try testing.expectEqual(@as(u32, @intCast(N * @as(usize, GRID))), kept[kept.len - 1]);
+    // Every other survivor is interior — the anchors did not simply push the
+    // whole set down one notch.
+    for (kept[2..]) |p| try testing.expect(p > 2 * GRID);
+
+    // Repeated thins keep the anchors: the grid floor cannot creep upward turn
+    // after turn, which is what emptied e1372's low grid.
+    const round2 = try tier.ssmTargetPositions(kept, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(round2);
+    try testing.expectEqual(@as(u32, GRID), round2[0]);
+    try testing.expectEqual(@as(u32, 2 * GRID), round2[1]);
+
+    // Anchors at 0 reproduce the plain selection for every short list: the scan
+    // must not start at index 0, where the span's `k-1` underflows (the bug that
+    // crashed the hot-cache thinning tests when the parameter first landed).
+    var n: usize = 3;
+    while (n <= 8) : (n += 1) {
+        for ([_]transformer_mod.ThinPolicy{ .min_span, .min_span_recency, .oldest }) |policy| {
+            try testing.expectEqual(
+                transformer_mod.positionDropIndex(positions[0..n], policy),
+                transformer_mod.positionDropIndexLowAnchored(positions[0..n], policy, 0),
+            );
+        }
+        if (n >= 4) {
+            const anchored = transformer_mod.positionDropIndexLowAnchored(positions[0..n], .min_span, 2);
+            try testing.expect(anchored >= 2); // nothing below the anchors goes
+            try testing.expect(anchored < n - 1); // and never the newest
+        }
+    }
+
+    // The legacy arm keeps the highest N, exactly as before (opt-in change).
+    var legacy = try DiskTier.init(testing.allocator, io, base, "fp-lowanchor-legacy", 0, 128);
+    defer legacy.deinit();
+    try testing.expectEqual(transformer_mod.ThinPolicy.oldest, legacy.cp_thin);
+    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(old_kept);
+    try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, old_kept.len);
+    try testing.expectEqualSlices(u32, positions[positions.len - SSM_DISK_MAX_PER_ENTRY_LEGACY ..], old_kept);
+
+    // The knob is what moved the survivors: at 0 the same policy thins the
+    // interior exactly as the spacing tests price it, and 16384 does NOT survive.
+    var unanchored = try DiskTier.init(testing.allocator, io, base, "fp-lowanchor-off", 0, 128);
+    defer unanchored.deinit();
+    unanchored.cp_thin = .min_span_recency;
+    unanchored.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
+    const spread = try unanchored.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    defer testing.allocator.free(spread);
+    try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), spread.len);
+    try testing.expectEqual(@as(u32, GRID), spread[0]); // index 0 always survived
+    try testing.expect(std.mem.indexOfScalar(u32, spread, 2 * GRID) == null);
 }

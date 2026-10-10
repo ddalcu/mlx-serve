@@ -24834,8 +24834,8 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
 
     // A qwen3_5 slot keeps the flat bound, hook and all.
     try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptive));
-    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive));
-    try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive));
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive, false));
+    try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive, false));
 
     const cfg = qwen4RequestTestConfig();
     per_request_chunk_override = true;
@@ -24846,7 +24846,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
     if (unpinned) {
         try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
-        try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg), false));
     }
     try t.expect(!scheduler_mod.adaptiveChunkWidthFor(null));
     scheduler_mod.prefill_chunk_adaptive_enabled = null;
@@ -24867,7 +24867,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     const off = adaptivePrefillChunkEnabled(&other);
     try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, off));
     try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(2048, off));
-    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off));
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off, false));
 
     const cfg = qwen4RequestTestConfig();
     try t.expect(cfg.perRequestPrefillChunk());
@@ -24878,7 +24878,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
     try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
     try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
-    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true, false));
     // An operator pin turns the scaling back off.
     adaptive_chunk_override = false;
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));

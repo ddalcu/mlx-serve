@@ -4807,6 +4807,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
         entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated()) .min_span_recency else .min_span;
+        // Same gate, same constant as the disk tier below (#794):
+        // merge/shed thinning never migrates the grid floor upward on the long-context line,
+        // so the dense low anchors survive from generation all the way to disk.
+        entry.prefix_cache.?.ssm_low_anchors = if (params.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
@@ -4848,6 +4852,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
+            // Same gate: the long-context thin keeps the two lowest checkpoints so a
+            // prompt that forked early (a client-side injection block) still has a
+            // shallow restore anchor; every other arch keeps the plain spread.
+            entry.prefix_cache.?.disk.?.ssm_low_anchors = if (params.config.longCtxGated() or !ram_prefix_cache)
+                kv_disk_cache.SSM_DISK_LOW_ANCHORS
+            else
+                0;
         }
         // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
         // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.
@@ -7560,6 +7571,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp and !use_dflash,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
+            .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,
             .ssm_checkpoint_pos_offset = hot_matched,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.

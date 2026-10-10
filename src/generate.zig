@@ -1223,17 +1223,29 @@ pub fn nextChunkEnd(
     ssm_cp_offset: usize,
     // Is the per-chunk adaptive width live for this prefill? Only then does the merge bound scale.
     adaptive_width: bool,
+    // Does this arch get the dense low anchors? Same gate as the checkpoint-retention
+    // `ssm_low_anchors` (`longCtxGated`, #794). A non-gated arch keeps its previous
+    // stride-boundary chunking byte-for-byte: a coarsened stride must not buy
+    // extra MoE chunks (each one re-streams the expert weights).
+    dense_low_grid: bool,
 ) usize {
     var end = @min(pos + default_chunk, prefix_len);
     if (want_ssm_cp and ssm_cp_stride > 0) {
         const abs_pos = pos + ssm_cp_offset;
         const abs_end = end + ssm_cp_offset;
         const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
-        if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
-            // A stride boundary lands inside this chunk — end exactly on it
-            // (never tail-merge past it; the boundary IS the snapshot point).
-            return next_boundary_abs - ssm_cp_offset;
-        }
+        // A stride boundary lands inside this chunk — end exactly on it
+        // (never tail-merge past it; the boundary IS the snapshot point).
+        var cut_abs: usize = if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) next_boundary_abs else 0;
+        // A dense low anchor inside the chunk cuts there too: a snapshot may only
+        // stamp an evaluated position, and an anchor earlier than the stride
+        // boundary must win the cut or a wide chunk jumps over it. 0 for a
+        // non-gated arch, and whenever stride <= 8192 — there the grid already
+        // has this spacing and fine-stride chunking stays byte-identical.
+        const low_anchor = if (dense_low_grid) ssmLowAnchorEnd(pos, end, ssm_cp_offset, ssm_cp_stride) else @as(usize, 0);
+        if (low_anchor > pos and low_anchor < end and (cut_abs == 0 or low_anchor + ssm_cp_offset < cut_abs))
+            cut_abs = low_anchor + ssm_cp_offset;
+        if (cut_abs != 0) return cut_abs - ssm_cp_offset;
     }
     if (end < prefix_len and prefix_len - end < tailMergeMaxFor(default_chunk, adaptive_width)) {
         // Absorb a tiny tail instead of paying a full graph build + eval
@@ -1279,6 +1291,39 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     if (!want_ssm_cp) return 0;
     if (prefix_len <= SSM_SNAPSHOT_BACKOFF) return if (restored) prefix_len else 0;
     return SSM_SNAPSHOT_BACKOFF;
+}
+
+/// Under `longCtxGated` the chunk loop lays dense checkpoint anchors every 8192
+/// through the first 65536, whatever stride the request coarsened to (#794): a
+/// deep entry's grid then always answers `highestSsmPosAtOrBelow` for a fork
+/// inside the low band. At stride <= 8192 the grid already has this spacing, so
+/// every path below is a no-op there. Every other arch passes `dense_low_grid`
+/// false and keeps its previous grid.
+pub const SSM_GRID_LOW_DENSE_STRIDE: usize = 8192;
+pub const SSM_GRID_LOW_DENSE_TOP: usize = 65_536;
+
+/// PURE: must the chunk loop snapshot a chunk that ends exactly at absolute
+/// position `abs_end`? The stride multiples, plus the dense low anchors when
+/// `dense_low_grid`. A snapshot may only stamp a position the chunk actually
+/// evaluated, so the anchors are realised by cutting the chunk at them in
+/// `nextChunkEnd` — never by stamping a future state at an earlier position.
+pub fn ssmCapturePos(stride: usize, abs_end: usize, dense_low_grid: bool) bool {
+    if (stride == 0) return false;
+    if (abs_end % stride == 0) return true;
+    return dense_low_grid and abs_end % SSM_GRID_LOW_DENSE_STRIDE == 0 and abs_end <= SSM_GRID_LOW_DENSE_TOP;
+}
+
+/// PURE: end the chunk at the first dense low anchor strictly inside
+/// `(pos, end)` (relatives to `prompt_ids[0]`, i.e. what `nextChunkEnd`
+/// returns). 0 when there is none or the stride is already dense — chunk
+/// boundaries stay byte-identical at stride <= 8192.
+pub fn ssmLowAnchorEnd(pos: usize, end: usize, offset: usize, stride: usize) usize {
+    if (stride <= SSM_GRID_LOW_DENSE_STRIDE) return 0;
+    const abs_pos = pos + offset;
+    const abs_end = end + offset;
+    const a: usize = (abs_pos / SSM_GRID_LOW_DENSE_STRIDE + 1) * SSM_GRID_LOW_DENSE_STRIDE;
+    if (a > SSM_GRID_LOW_DENSE_TOP or a <= abs_pos or a >= abs_end) return 0;
+    return a - offset;
 }
 
 /// Effective SSM-checkpoint stride for a model, given the base (configured)
@@ -1377,11 +1422,12 @@ pub fn prefillChunkCount(
     ssm_cp_stride: usize,
     ssm_cp_offset: usize,
     adaptive_width: bool,
+    dense_low_grid: bool,
 ) usize {
     var pos: usize = 0;
     var n: usize = 0;
     while (pos < prefix_len) {
-        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width);
+        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid);
         pos = end;
         n += 1;
     }
@@ -2419,6 +2465,11 @@ pub const Generator = struct {
         /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
         /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
         ssm_checkpoint_max: u32 = 16,
+        /// Protect the first N positions (the lowest grid points) when thinning
+        /// the capture list to its cap: they are the only restore anchor for a
+        /// request that forked below a coarse grid's first multiple (#794).
+        /// 0 = the plain thinning (upstream behaviour, byte-identical).
+        ssm_low_anchors: usize = 0,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
         /// scheduler restored some prefix and now forwards only the tail),
@@ -2780,6 +2831,10 @@ pub const Generator = struct {
         // length so the snapshots stamp positions valid in the full original
         // sequence, not relative offsets inside the tail-only prefill.
         const ssm_cp_offset: usize = options.ssm_checkpoint_pos_offset;
+        // Gate for the dense low grid (#794): the same predicate as the
+        // checkpoint-retention `ssm_low_anchors` wiring. A non-gated arch keeps the
+        // coarsened stride's own boundary chunking — the grid adds it no chunks.
+        const dense_low_grid: bool = xfm.config.longCtxGated();
 
         // Qwen native MTP: build the head's committed-history KV cache during
         // prefill. Entry j pairs (trunk hidden at prompt position j, token at
@@ -2968,7 +3023,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -3115,7 +3170,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
+                if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -3136,7 +3191,12 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
+                                ssm_checkpoints.items,
+                                cp_thin,
+                                null,
+                                options.ssm_low_anchors,
+                            ),
                         );
                         dropped.deinit(allocator);
                     }
@@ -3253,7 +3313,12 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
+                                ssm_checkpoints.items,
+                                cp_thin,
+                                null,
+                                options.ssm_low_anchors,
+                            ),
                         );
                         dropped.deinit(allocator);
                     }
@@ -16758,7 +16823,7 @@ fn walkChunkEnds(
     var n: usize = 0;
     while (pos < prefix_len and n < out.len) {
         const w = widths[@min(n, widths.len - 1)];
-        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset, true);
+        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset, true, false);
         out[n] = end;
         n += 1;
         pos = end;
@@ -16852,8 +16917,8 @@ test "tailMergeMax: the tail a chunk may absorb scales with the width" {
         try t.expect(tailMergeMax(w) * 8 <= w);
     }
 
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
 }
 
 test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
@@ -16869,15 +16934,15 @@ test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
     try t.expectEqual(tailMergeMaxFor(4096, false), tailMergeMaxFor(4096, true));
     try t.expectEqual(tailMergeMaxFor(8192, false), tailMergeMaxFor(8192, true));
 
-    try t.expectEqual(@as(usize, 812), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 1324), nextChunkEnd(0, 1324, 1024, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 1024), nextChunkEnd(0, 1324, 1024, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 812), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 1324), nextChunkEnd(0, 1324, 1024, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 1024), nextChunkEnd(0, 1324, 1024, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true, false));
 
-    try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
 }
 
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
@@ -16886,39 +16951,142 @@ test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
     // FULL graph + eval-barrier + cache-clear for one token — pure overhead.
     // Without checkpoint alignment, remainders under the merge floor extend
     // the current chunk instead.
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0, false, false));
     // A substantial remainder stays its own chunk.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0, false, false));
     // Mid-prompt chunks are untouched.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0, false, false));
     // With SSM-checkpoint alignment active, a tiny tail STILL merges: the old
     // 1-token trailing chunk existed only to lay a snapshot one token before
     // the always-on end-of-prompt snapshot — pure overhead. A boundary strictly
     // INSIDE the chunk still wins over merging (next case).
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false));
-    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false, false));
+    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false, false));
 }
 
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     const PREFILL_CHUNK: usize = 8192;
     // Non-hybrid (or checkpointing off): a sub-PREFILL_CHUNK prompt is ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0, false, false));
     // Tail merge: one token past a chunk boundary is still ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0, false, false));
     // Mechanically, a raw fine stride still splits an 851-token prefill into 4
     // chunks (851 spans boundaries 256/512/768) — which is why
     // effectiveSsmCheckpointStride coarsens every stride to the prefill chunk:
     // per-chunk costs (expert re-streaming on MoE, sub-dq-gemm-floor GEMMs +
     // fixed overhead everywhere) taxed cold prefill 17-25%.
-    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0, false));
+    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0, false, false));
     // Boundary alignment is ABSOLUTE (warm path passes an offset): a tail-only
     // prefill starting mid-sequence still snaps to global strides. offset=2000,
     // prefix tail of 200 (abs 2000..2200), stride 256 -> boundary 2048/2304? only
     // 2048 falls inside (2000..2200) -> 2 chunks.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false, false));
+}
+
+test "the gated dense low grid anchors the first 65536 under a coarse stride" {
+    // Gated on `longCtxGated` (#794): the capture predicate is stride multiples
+    // plus the 8192 anchors under the dense low top, so a deep entry's grid
+    // always answers a restore point for a fork inside the low band.
+    try testing.expect(ssmCapturePos(32_768, 8_192, true));
+    try testing.expect(ssmCapturePos(32_768, 24_576, true));
+    try testing.expect(ssmCapturePos(32_768, 32_768, true)); // stride multiple — same point as before
+    try testing.expect(ssmCapturePos(32_768, 65_536, true)); // the top itself still counts
+    try testing.expect(!ssmCapturePos(32_768, 40_959, true));
+    try testing.expect(!ssmCapturePos(32_768, 73_728, true)); // the high band keeps the coarse spacing
+    try testing.expect(!ssmCapturePos(0, 8_192, false)); // checkpointing off stays off
+    // A stride at or under 8192 (v8's dense grid) captures EXACTLY what it always
+    // did: the dense rule adds no point to a grid that already has this spacing.
+    for ([_]usize{ 256, 512, 1024, 2048, 4096, 8192 }) |fine| {
+        var x: usize = 0;
+        while (x <= 70_000) : (x += 1_023) {
+            try testing.expectEqual(x % fine == 0, ssmCapturePos(fine, x, true));
+        }
+    }
+    // Chunking drives the grid: a cold 40k prefill at width 4096 under stride
+    // 32768 (the production boot's coarsening) now snapshots exactly the four low
+    // points — driven through `nextChunkEnd`, the same fn the real prefill loop
+    // runs. (A prompt ending within the tail-merge floor of a multiple merges
+    // that boundary into the always-on end-of-prompt snapshot instead — the
+    // end snapshot at `prefix_len - 30` covers every fork the swallowed point
+    // could have served.)
+    var grid: [64]u32 = undefined;
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (true) {
+        const end = nextChunkEnd(pos, 40_000, 4_096, true, 32_768, 0, false, true);
+        if (ssmCapturePos(32_768, end, true)) {
+            grid[n] = @intCast(end);
+            n += 1;
+        }
+        pos = end;
+        if (pos >= 40_000) break;
+    }
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqual(@as(u32, 8_192), grid[0]);
+    try testing.expectEqual(@as(u32, 16_384), grid[1]);
+    try testing.expectEqual(@as(u32, 24_576), grid[2]);
+    try testing.expectEqual(@as(u32, 32_768), grid[3]);
+    // The coarse-stride prefill chunks EXACTLY like the v8 fine grid for this
+    // prompt: same boundaries, so the dense anchors cost zero extra chunks.
+    try testing.expectEqual(
+        prefillChunkCount(40_000, 4_096, true, 8_192, 0, false, true),
+        prefillChunkCount(40_000, 4_096, true, 32_768, 0, false, true),
+    );
+    // A chunk WIDER than the anchor spacing gets cut at the anchor (the snapshot
+    // may only stamp evaluated positions): a 32k-wide chunk from 6k ends at 8192.
+    try testing.expectEqual(@as(usize, 8_192), nextChunkEnd(6_000, 40_000, 32_768, true, 32_768, 0, false, true));
+    try testing.expectEqual(@as(usize, 16_384), nextChunkEnd(8_192, 40_000, 32_768, true, 32_768, 0, false, true));
+    // Inside the dense band the FIRST anchor wins the cut, ahead of any later
+    // stride boundary: a 32k-wide chunk from 40k ends at 40960, not 65536.
+    try testing.expectEqual(@as(usize, 40_960), nextChunkEnd(40_000, 100_000, 32_768, true, 32_768, 0, false, true));
+    // Past the top the cut stops and the high band keeps the coarse stride alone.
+    try testing.expectEqual(@as(usize, 98_304), nextChunkEnd(65_536, 100_000, 32_768, true, 32_768, 0, false, true));
+    // Fine strides never get an extra cut: the helper answers 0 at every stride
+    // the dense rule is inactive for, whatever the chunk geometry.
+    for ([_]usize{ 0, 256, 512, 1024, 2048, 4096, 8192 }) |fine| {
+        var p: usize = 1_234;
+        while (p < 70_000) : (p += 3_037) {
+            try testing.expectEqual(@as(usize, 0), ssmLowAnchorEnd(p, p + 4_096, 61, fine));
+        }
+    }
+}
+
+test "the dense low grid is gated: a non-gated arch at width 16384 keeps main's chunk count" {
+    // Same gate as the retention `ssm_low_anchors`: a non-gated hybrid whose
+    // stride coarsened to 16384 keeps its stride-boundary chunking — a warm
+    // restore landing off the 8192 grid must not get its chunks cut at every
+    // multiple below 65536 (each extra MoE chunk re-streams the experts).
+    // `main`'s chunk loop, re-derived here: cut at a stride boundary inside
+    // the chunk, else absorb a tail under `TAIL_MERGE_MAX`.
+    const t = testing;
+    const stride = effectiveSsmCheckpointStride(2048, 16_384);
+    try t.expectEqual(@as(usize, 16_384), stride);
+    const offset = 4_096; // off the anchor grid: a warm restore mid-sequence
+    const prefix_len: usize = 100_000 - offset;
+    var main_chunks: usize = 0;
+    var pos: usize = 0;
+    while (pos < prefix_len) {
+        var end: usize = @min(pos + stride, prefix_len);
+        const abs_pos: usize = pos + offset;
+        const abs_end: usize = end + offset;
+        const nb: usize = ((abs_pos / stride) + 1) * stride;
+        if (nb > abs_pos and nb < abs_end) end = nb - offset;
+        if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) end = prefix_len;
+        main_chunks += 1;
+        pos = end;
+    }
+    // Ungated: the count is main's, at fixed and adaptive width alike.
+    try t.expect(main_chunks > 0);
+    try t.expectEqual(main_chunks, prefillChunkCount(prefix_len, stride, true, stride, offset, false, false));
+    try t.expectEqual(main_chunks, prefillChunkCount(prefix_len, stride, true, stride, offset, true, false));
+    // Gated (the long-context line): the anchor cuts are paid — the first
+    // wide chunk is cut at abs 8192, and the anchor point captures.
+    try t.expectEqual(@as(usize, 4_096), nextChunkEnd(0, prefix_len, stride, true, stride, offset, false, true));
+    try t.expect(!ssmCapturePos(stride, 8_192, false));
+    try t.expect(ssmCapturePos(stride, 8_192, true));
 }
 
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
@@ -17129,10 +17297,10 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, PREFILL_CHUNK));
     // End-to-end: an 851-tok prefill is 1 chunk (was 4 at the raw 256 stride
     // on dense hybrids — the llm_context_benchmarks small-prompt regression).
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
     // An 8K prefill splits only at the (memory-bound) chunk size, never
     // finer: 2 chunks at chunk 4096, not 33.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
 }
 
 test "vision prefill checkpoints SSM state only when it chunks like text" {
@@ -17150,14 +17318,14 @@ test "vision prefill checkpoints SSM state only when it chunks like text" {
     try testing.expect(!vision_checkpoints);
     try testing.expectEqual(
         prefix_len,
-        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false),
+        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false, false),
     );
 
     const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
     try testing.expect(text_checkpoints);
     try testing.expectEqual(
         @as(usize, checkpoint_stride),
-        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false),
+        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false, false),
     );
 }
 

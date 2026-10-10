@@ -2461,12 +2461,21 @@ Cause: restore already served the text before the first media item, but every di
 skipped media entries outright: the SSD-first capture in `commitWithMediaState`, both
 `spillDeclinedToDisk` call sites, and the plain `flushPendingDisk`.
 
-Fix: the writers persist `HotPrefixCache.diskTokens`, the record cut at the first item (the KV
-extent follows `tokens.len`, checkpoints past it are skipped). No spec snapshot rides a media
-turn, since it covers rows past the cut. The disk key stays token-only and never holds an image row.
-A hybrid restores only from an SSM checkpoint, so its record stops at the last checkpoint below
-the item (`HotPrefixCache.hybrid`, set at load) and nothing is written when there is none.
-Guard: `an image turn persists the text before its first item to the SSD tier`.
+Fix (v8): the writers persisted the record CUT at the first item — the disk key was token-only
+and never held an image row; a hybrid's record stopped at its last checkpoint below the item
+(`HotPrefixCache.hybrid`, set at load) and nothing was written when there was none. No spec
+snapshot rode a media turn, since it covers rows past the cut.
+
+Reversed in v9 (#782): the token-only floor made the state a media turn actually holds
+unaddressable, so deep image sessions could not persist past their first item. The disk
+identity is now (tokens, spans): the writers persist the FULL record — image rows included,
+keyed on each item's pixel key — and the clamp moved from commit time to match time
+(`mediaSharedBound` per entry): a re-sent turn with agreeing spans reads its media rows back
+near the prompt tail, a divergent span list stops below the first item whose start or pixel
+key differs, and a text turn stops at the entry's first item — exactly where the old commit
+floor sat. Spec payloads (dflash/MTP) still ride text-only turns. The AGENTS.md SSD-tier rule
+carries the v9 wording.
+Guard: `an image turn persists its full media-keyed prefix to the SSD tier`.
 
 ## A streamed Responses turn reported no prompt-cache hit
 

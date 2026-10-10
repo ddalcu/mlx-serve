@@ -9598,7 +9598,7 @@ pub const QsaHeadMarkSet = struct {
         self.dropAbove(pos);
         if (self.len > 0 and self.items[self.len - 1].pos == pos) self.dropAt(self.len - 1);
         if (self.len == QSA_HEAD_MARKS_MAX) {
-            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency, null));
+            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency, null, 0));
         }
         self.items[self.len] = .{ .pos = pos, .rows = rows };
         self.len += 1;
@@ -13940,19 +13940,31 @@ pub fn spanPreservingDropIndex(
     /// selected. When it is the only candidate the oldest goes instead — that one sits below
     /// it, so the protected position survives either way.
     protect: ?usize,
+    /// How many LOW positions are anchored as well (#794: thinning must not
+    /// migrate the grid floor upward). 0 = the plain policy; a caller that
+    /// wants the legacy drop-oldest behaviour also passes 0.
+    low_anchors: usize,
 ) usize {
     std.debug.assert(items.len > 0);
-    if (policy == .oldest) return 0;
-    if (items.len < 3) return 0;
+    const last = items.len - 1;
+    // The cap outranks the anchors: the newest position is never a drop candidate,
+    // so if every remaining index is anchored the lowest anchor gives way.
+    if (items.len <= low_anchors + 1) return @min(low_anchors, last);
+    if (policy == .oldest) return @min(low_anchors, last);
+    if (items.len < 3) return @min(low_anchors, last);
     // Recency bias: the newest quarter stays at capture density (a warm turn that edits near
     // the end restores from there); everything below it is thinned span-preservingly.
     const scan_end = if (policy == .min_span_recency and items.len >= RECENCY_DENSE_MIN)
         items.len - items.len / 4
     else
         items.len;
-    var best_at: usize = 1;
+    // Index 0 is never a candidate (the span is measured across k-1), so the scan
+    // starts one past the last anchor — and at 1 when nothing is anchored, which
+    // is the position the plain policies have always started from.
+    const scan_start = @max(low_anchors, 1);
+    var best_at: usize = scan_start;
     var best_span: usize = std.math.maxInt(usize);
-    var k: usize = 1;
+    var k: usize = scan_start;
     while (k + 1 < items.len and k < scan_end) : (k += 1) {
         if (protect) |p| if (k == p) continue;
         const span = posOf(&items[k + 1]) -| posOf(&items[k - 1]);
@@ -13961,8 +13973,16 @@ pub fn spanPreservingDropIndex(
             best_at = k;
         }
     }
+    // Nothing scannable (recency-protected or anchored): the oldest goes, which
+    // sits below every anchor, so the anchors still survive.
     if (best_span == std.math.maxInt(usize)) return 0;
     return best_at;
+}
+
+/// `spanPreservingDropIndex` over a bare ascending position list, with the first
+/// `low_anchors` positions protected from thinning.
+pub fn positionDropIndexLowAnchored(positions: []const u32, policy: ThinPolicy, low_anchors: usize) usize {
+    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null, low_anchors);
 }
 
 /// Shortest list that reserves a dense newest quarter.
@@ -13982,16 +14002,29 @@ fn usizePosOf(p: *const usize) usize {
 
 /// `spanPreservingDropIndex` over a checkpoint list.
 pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, protect: ?usize) usize {
-    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect);
+    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, 0);
+}
+
+/// `ssmCheckpointDropIndex` with the first `low_anchors` positions protected
+/// from thinning: generation-side retention must let the dense low grid anchors
+/// (#794) survive the per-prefill cap, or the persist-side `ssm_low_anchors`
+/// has nothing left to protect. 0 = the plain policy, byte-identical to before.
+pub fn ssmCheckpointDropIndexLowAnchored(
+    cps: []const SSMCheckpoint,
+    policy: ThinPolicy,
+    protect: ?usize,
+    low_anchors: usize,
+) usize {
+    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, low_anchors);
 }
 
 /// `spanPreservingDropIndex` over a bare ascending position list.
 pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null);
+    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null, 0);
 }
 
 pub fn positionDropIndexUsize(positions: []const usize, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(usize, positions, usizePosOf, policy, null);
+    return spanPreservingDropIndex(usize, positions, usizePosOf, policy, null, 0);
 }
 
 /// QSA indexer key history lives on full-attention layers: `aux_state` is
@@ -73169,7 +73202,7 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
     for ([_][4]u32{ .{ 0, 17, 4, 2560 }, .{ 3, 17, 4, 2560 }, .{ 1, 16, 4, 2560 }, .{ 1, 8704, 4, 2560 }, .{ 1, 17, 0, 2560 }, .{ 1, 17, 9, 2560 }, .{ 1, 17, 4, 64 }, .{ 1, 17, 4, 4097 }, .{ 1, 17, 4, 129 } }) |shape| {
         try testing.expect(!hp.eligible(@intCast(shape[0]), @intCast(shape[1]), shape[2], shape[3], inject, .bfloat16));
     }
-    try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), @import("generate.zig").nextChunkEnd(0, 8703, 8192, false, 0, 0, true));
+    try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), @import("generate.zig").nextChunkEnd(0, 8703, 8192, false, 0, 0, true, false));
 }
 
 test "hc prefill: incompatible read writes immediately" {
