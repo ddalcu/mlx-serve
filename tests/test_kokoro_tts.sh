@@ -10,7 +10,8 @@
 set -uo pipefail
 
 PORT="${1:-11439}"
-MODEL="${KOKORO_MODEL:-$HOME/.mlx-serve/models/hexgrad/Kokoro-82M-mlx-serve}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${KOKORO_MODEL:-$(find_model ddalcu/Kokoro-82M-MLX-Serve hexgrad/Kokoro-82M-mlx-serve || true)}"
 BIN="./zig-out/bin/mlx-serve"
 LOG="/tmp/kokoro-test-$PORT.log"
 TMP="$(mktemp -d)"
