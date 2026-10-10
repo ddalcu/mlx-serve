@@ -300,14 +300,46 @@ private struct SettingsVisibleRowCountKey: PreferenceKey {
 /// text the row renders, so what you read is what you can search for.
 struct SearchableRow<Content: View>: View {
     let searchText: [String]
+    /// Gap the row sits in, for the hairline drawn above it — nil draws no
+    /// line (a row in a sub-stack of its own, or one that draws its own).
+    /// Inside the filter, so a row the query hides takes its line with it.
+    var separatorGap: CGFloat? = nil
     @ViewBuilder var content: Content
 
     @Environment(\.settingsSearchQuery) private var query
 
     var body: some View {
         if SettingsSearch.matches(query: query, in: searchText) {
-            content.preference(key: SettingsVisibleRowCountKey.self, value: 1)
+            separated.preference(key: SettingsVisibleRowCountKey.self, value: 1)
         }
+    }
+
+    @ViewBuilder
+    private var separated: some View {
+        if let separatorGap { content.settingsRowSeparator(gap: separatorGap) }
+        else { content }
+    }
+}
+
+/// The hairline between two rows of a settings card — the line macOS System
+/// Settings draws, so a dense card reads as a list rather than a pile. It is
+/// the row's BACKGROUND, never its layout: the row keeps the height it had,
+/// and the line lands in the middle of the gap above it.
+private struct SettingsRowSeparator: ViewModifier {
+    let gap: CGFloat
+
+    func body(content: Content) -> some View {
+        content.background(alignment: .top) {
+            Divider()
+                .offset(y: -gap / 2)
+        }
+    }
+}
+
+extension View {
+    /// See `SettingsRowSeparator`.
+    func settingsRowSeparator(gap: CGFloat) -> some View {
+        modifier(SettingsRowSeparator(gap: gap))
     }
 }
 
@@ -580,6 +612,13 @@ private struct EngineAwareSections: View {
 
 // MARK: - Section frame
 
+/// Space between two rows of a settings card, and the card's own inset. The
+/// rows' hairlines are placed from these two numbers, so they move together.
+private enum SettingsCardMetrics {
+    static let gap: CGFloat = 18
+    static let inset: CGFloat = 16
+}
+
 private struct SettingsSection<Content: View>: View {
     /// Identity. The sidebar row and this header both read their text from it,
     /// so a section can never exist without a way to reach it (and its two
@@ -631,12 +670,19 @@ private struct SettingsSection<Content: View>: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            VStack(alignment: .leading, spacing: collapsed ? 0 : 18) {
+            VStack(alignment: .leading, spacing: collapsed ? 0 : SettingsCardMetrics.gap) {
                 content
             }
             .environment(\.settingsSearchQuery, filter.childQuery)
-            .padding(collapsed ? 0 : 16)
+            .padding(collapsed ? 0 : SettingsCardMetrics.inset)
             .background(collapsed ? Color.clear : Color(NSColor.controlBackgroundColor))
+            // The FIRST row's hairline lands in this inset — empty card
+            // ground, painted over, so a card never opens on a line. A
+            // filtered card whose surviving row is not the first is covered
+            // the same way.
+            .overlay(alignment: .top) {
+                if !collapsed { Color(NSColor.controlBackgroundColor).frame(height: SettingsCardMetrics.inset) }
+            }
             .clipShape(RoundedRectangle(cornerRadius: 10))
         }
         .onPreferenceChange(SettingsVisibleRowCountKey.self) { visibleRows = $0 }
@@ -659,10 +705,14 @@ private struct SettingsRow<Control: View>: View {
     /// The setting's memory/disk cost; orange and bold while it is switched on.
     var cost: String? = nil
     var costActive: Bool = false
+    /// A row drawn inside a card's own sub-stack passes that stack's spacing
+    /// instead; nil leaves the line off (a row that draws its own).
+    var separatorGap: CGFloat? = SettingsCardMetrics.gap
     @ViewBuilder var control: Control
 
     var body: some View {
-        SearchableRow(searchText: [title, explainer] + [cost].compactMap { $0 }) {
+        SearchableRow(searchText: [title, explainer] + [cost].compactMap { $0 },
+                      separatorGap: separatorGap) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
@@ -738,7 +788,8 @@ private struct ModelFoldersSectionContent: View {
         let roots = ModelRoots()
         let configured = roots.configuredDownloadRoot
         let unavailable = roots.downloadRootIsUnavailable
-        SearchableRow(searchText: ["Default folder", "download", Self.defaultExplainer]) {
+        SearchableRow(searchText: ["Default folder", "download", Self.defaultExplainer],
+                      separatorGap: SettingsCardMetrics.gap) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(L10n.text("Default folder"))
@@ -816,7 +867,8 @@ private struct ModelFoldersSectionContent: View {
         }()
         let hasPath = !(downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
-        return SearchableRow(searchText: ["Custom folder", Self.explainer]) {
+        return SearchableRow(searchText: ["Custom folder", Self.explainer],
+                             separatorGap: SettingsCardMetrics.gap) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(L10n.text("Custom folder"))
@@ -976,7 +1028,8 @@ private struct ProvidersSectionContent: View {
         // One searchable row: a section whose content publishes no row count
         // never collapses under the filter.
         SearchableRow(searchText: ["Providers", "OpenAI-compatible chat endpoints", "cloud API", "providers.json", "API key"]
-                      + formState.providerEntries.map(\.name)) {
+                      + formState.providerEntries.map(\.name),
+                      separatorGap: SettingsCardMetrics.gap) {
             providersBody
         }
     }
@@ -1533,7 +1586,7 @@ private struct ContextSizeRow: View {
         SearchableRow(searchText: [
             "Context size", ContextSizeDisplay.helpText,
             "Model max", "GPU-safe max", "In use",
-        ]) {
+        ], separatorGap: SettingsCardMetrics.gap) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
@@ -2335,7 +2388,8 @@ private struct WakePhraseSectionContent: View {
     private static let explainer = "What you say to call the assistant in hands-free mode."
 
     var body: some View {
-        SearchableRow(searchText: ["Wake phrase", "Hey Loki", Self.explainer]) {
+        SearchableRow(searchText: ["Wake phrase", "Hey Loki", Self.explainer],
+                      separatorGap: SettingsCardMetrics.gap) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(L10n.text("Wake phrase")).font(.app(.rowTitle).weight(.semibold))
                 TextField("Hey Loki", text: $appState.serverOptions.wakePhrase)
@@ -2383,25 +2437,29 @@ private struct VoiceCloneSectionContent: View {
     }
 
     var body: some View {
-        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"]) {
+        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"],
+                      separatorGap: SettingsCardMetrics.gap) {
             engineBody
         }
         // The clip control only makes sense for the backend that can USE it —
         // Kokoro has no cloning and asking it to clone is a named 400, so the
         // control is hidden rather than left dead (the image-preset rule).
         if appState.serverOptions.voiceEngine == .clone {
-            SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"]) {
+            SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"],
+                          separatorGap: SettingsCardMetrics.gap) {
                 clipBody
             }
         }
         if appState.serverOptions.voiceEngine == .kokoro {
             SearchableRow(searchText: ["Kokoro voice", "blend", "preview"]
-                          + AudioModelPreset.kokoroVoices) {
+                          + AudioModelPreset.kokoroVoices,
+                      separatorGap: SettingsCardMetrics.gap) {
                 kokoroBody
             }
         }
         if appState.serverOptions.voiceEngine == .system {
-            SearchableRow(searchText: ["System voice", "Apple voice"]) {
+            SearchableRow(searchText: ["System voice", "Apple voice"],
+                          separatorGap: SettingsCardMetrics.gap) {
                 systemVoiceBody
             }
         }
@@ -2744,7 +2802,8 @@ private struct MessagingSectionContent: View {
     var body: some View {
         // Live status pill (only meaningful once enabled).
         if telegram.enabled {
-            SearchableRow(searchText: ["Status", "Telegram bot bridge connection status"]) {
+            SearchableRow(searchText: ["Status", "Telegram bot bridge connection status"],
+                          separatorGap: SettingsCardMetrics.gap) {
                 HStack(spacing: 8) {
                     Text("Status")
                         .font(.app(.body))
@@ -2816,7 +2875,8 @@ private struct MessagingSectionContent: View {
         }
 
         // Allow-list / lock control.
-        SearchableRow(searchText: ["Locked to", "Reset lock", Self.lockExplainer]) {
+        SearchableRow(searchText: ["Locked to", "Reset lock", Self.lockExplainer],
+                      separatorGap: SettingsCardMetrics.gap) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text("Locked to")
