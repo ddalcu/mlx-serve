@@ -117,8 +117,9 @@ grep -q "edit ref 2" "$LOG" || { echo "FAIL: second reference never reached the 
 echo "PASS: multi-reference composition -> $d"
 
 # ── capabilities the app now HIDES must still be honest 400s on the wire ──
+# Body on stdin: Linux caps ONE argv string at 128 KB and the image is bigger.
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
-  -H 'Content-Type: application/json' -d "{\"prompt\":\"x\",\"image\":\"$SRC_B64\",\"strength\":0.5}")
+  -H 'Content-Type: application/json' -d @- <<<"{\"prompt\":\"x\",\"image\":\"$SRC_B64\",\"strength\":0.5}")
 [ "$code" = "400" ] || { echo "FAIL: variation on a no-img2img backend returned $code (want 400)"; exit 1; }
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
   -H 'Content-Type: application/json' -d '{"prompt":"x","lora_path":"/tmp/nope.safetensors"}')

@@ -23,6 +23,7 @@ const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
+const yue2 = @import("yue2.zig");
 const stable_audio = @import("stable_audio.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
@@ -107,7 +108,7 @@ pub const media_model_types = [_][]const u8{
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
     "laya",      "kev",        "clef",           "d1",
-    "stable_audio3",
+    "stable_audio3", "yue2",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -118,6 +119,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
+    if (std.mem.eql(u8, model_type, "yue2")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
@@ -155,6 +157,7 @@ pub const GenRoute = enum {
 pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "acestep")) return .music;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
+    if (std.mem.eql(u8, model_type, "yue2")) return .yue2;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .sound;
     return .tts;
@@ -169,6 +172,7 @@ pub const AudioBackendKind = enum {
     tts,
     music,
     music3,
+    yue2,
     kokoro,
     /// Stable Audio 3: text-to-audio on /v1/audio/sound-generations ("sound").
     sound,
@@ -176,7 +180,7 @@ pub const AudioBackendKind = enum {
     /// Music-generation backends serve /v1/audio/music-generations and
     /// advertise "music" beside "audio"; the TTS arms never do.
     pub fn servesMusic(self: AudioBackendKind) bool {
-        return self == .music or self == .music3;
+        return self == .music or self == .music3 or self == .yue2;
     }
 };
 
@@ -899,6 +903,7 @@ pub const AudioBackend = union(enum) {
     tts: tts.Synthesizer,
     music: *acestep.Engine,
     music3: *music3.Engine,
+    yue2: *yue2.Engine,
     kokoro: *kokoro.Engine,
     sound: *stable_audio.Engine,
 };
@@ -926,6 +931,11 @@ pub const AudioEngine = struct {
             log.info("[audio] MiniMax Music 3 engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .yue2) {
+            self.backend = .{ .yue2 = try yue2.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] YuE2 engine ready\n", .{});
+            return self;
+        }
         if (mt != null and audioBackendKindForType(mt.?) == .sound) {
             self.backend = .{ .sound = try stable_audio.Engine.load(io, allocator, model_dir) };
             log.info("[audio] Stable Audio 3 engine ready\n", .{});
@@ -948,6 +958,7 @@ pub const AudioEngine = struct {
             .tts => |*synth| synth.deinit(),
             .music => |e| e.deinit(),
             .music3 => |e| e.deinit(),
+            .yue2 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
             .sound => |e| e.deinit(),
         }
@@ -2706,7 +2717,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const synth = switch (engine.backend) {
         .tts => |*t| t,
-        .music, .music3 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
+        .music, .music3, .yue2 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
         .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
@@ -2893,6 +2904,7 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     switch (engine.backend) {
         .music => |m| return handleMusicAcestep(allocator, conn, body, m),
         .music3 => |m| return handleMusic3(allocator, conn, body, m),
+        .yue2 => |m| return handleYue2(allocator, conn, body, m),
         .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
         .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
     }
@@ -2953,7 +2965,7 @@ fn jsonWholeNumber(v: std.json.Value) ?i64 {
 pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const sa = switch (engine.backend) {
         .sound => |e| e,
-        .music, .music3 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
+        .music, .music3, .yue2 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
         .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
     };
     const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (a description of the sound)");
@@ -2986,6 +2998,11 @@ pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 
 /// A generated WAV: raw `audio/wav`, or the base64 SSE `complete` event.
 fn sendWav(allocator: std.mem.Allocator, conn: *Conn, wav: []const u8, want_stream: bool) !void {
+    return sendWavWith(allocator, conn, wav, want_stream, "");
+}
+
+/// `extra` is a JSON fragment (`,"key":value`) spliced into the streaming `complete` event.
+fn sendWavWith(allocator: std.mem.Allocator, conn: *Conn, wav: []const u8, want_stream: bool, extra: []const u8) !void {
     if (want_stream) {
         const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
         const b64 = try allocator.alloc(u8, b64_len);
@@ -2993,7 +3010,9 @@ fn sendWav(allocator: std.mem.Allocator, conn: *Conn, wav: []const u8, want_stre
         _ = std.base64.standard.Encoder.encode(b64, wav);
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
-        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\"");
+        try out.appendSlice(allocator, extra);
+        try out.appendSlice(allocator, ",\"data\":\"");
         try out.appendSlice(allocator, b64);
         try out.appendSlice(allocator, "\"}\n\n");
         try conn.writeAll(out.items);
@@ -3285,6 +3304,94 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     defer allocator.free(wav);
     log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
     return sendWav(allocator, conn, wav, want_stream);
+}
+
+/// `POST /v1/audio/music-generations` on YuE2: `{"model", "prompt" (style tags, REQUIRED),
+/// "lyrics" (REQUIRED; `[Verse]`-style section tags on their own lines), "cot" ("full" default |
+/// "melody" | "off": whether the model plans an ABC score first), "abc" (your own or edited
+/// score, replaces the planning; needs cot melody|full), "seed", "duration_seconds" (an UPPER
+/// bound, default 360 — the model ends the song itself), "steps" (flow-matching midpoint steps,
+/// default 32, 1-100), "cfg_scale" (0-20, default 1.0; 1.01 for cot off), "stream"}`. Response
+/// mirrors the other music backends; the streaming `complete` event also carries the score as
+/// `abc`. ACE-Step's musical-metadata, reference-audio and cover fields are named 400s.
+fn handleYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *yue2.Engine) !void {
+    for ([_][]const u8{ "bpm", "keyscale", "timesignature", "vocal_language", "ref_audio", "src_audio", "task", "instrumental" }) |field| {
+        if (std.mem.indexOf(u8, body, field) == null) continue;
+        const present = extractJsonString(body, field) != null or extractJsonInt(body, field) != null or sse.bodyWantsTrue(body, field);
+        if (present) {
+            var msg: [200]u8 = undefined;
+            const m = std.fmt.bufPrint(&msg, "'{s}' is not supported by YuE2 (style and lyrics go in 'prompt' and 'lyrics'; a cover needs your own melody score in 'abc')", .{field}) catch "unsupported field";
+            return sendError(conn, 400, m);
+        }
+    }
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style tags: genre, instruments, mood, vocal)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+    const raw_lyrics = extractJsonString(body, "lyrics") orelse return sendError(conn, 400, "missing 'lyrics' (YuE2 is lyric-conditioned; structure tags like [Verse] go on their own lines)");
+    const lyrics = try jsonUnescape(allocator, raw_lyrics);
+    defer allocator.free(lyrics);
+    if (std.mem.trim(u8, lyrics, " \t\r\n").len == 0) return sendError(conn, 400, "empty 'lyrics'");
+
+    const cot = if (extractJsonString(body, "cot")) |c| (yue2.Cot.parse(c) orelse return sendError(conn, 400, "'cot' must be one of full, melody, off")) else yue2.Cot.full;
+    var abc: ?[]u8 = null;
+    defer if (abc) |t| allocator.free(t);
+    if (extractJsonString(body, "abc")) |raw| {
+        abc = try jsonUnescape(allocator, raw);
+        if (std.mem.trim(u8, abc.?, " \t\r\n").len == 0) return sendError(conn, 400, "empty 'abc'");
+        if (cot == .off) return sendError(conn, 400, "'abc' needs 'cot' melody or full — cot off renders without a score");
+    }
+    const seconds: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse yue2.MAX_SECONDS);
+    if (seconds < yue2.MIN_SECONDS or seconds > yue2.MAX_SECONDS) return sendError(conn, 400, "'duration_seconds' must be in [5,360]");
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse yue2.DEFAULT_STEPS);
+    if (steps < 1 or steps > yue2.MAX_STEPS) return sendError(conn, 400, "'steps' must be in [1,100]");
+    var cfg_scale: ?f32 = null;
+    if (extractJsonFloat(body, "cfg_scale")) |g| {
+        if (!(g >= 0 and g <= yue2.MAX_CFG)) return sendError(conn, 400, "'cfg_scale' must be in [0,20]");
+        cfg_scale = @floatCast(g);
+    }
+
+    const req = yue2.Request{
+        .style = prompt,
+        .lyrics = lyrics,
+        .cot = cot,
+        .abc = abc,
+        .seed = extractJsonInt(body, "seed") orelse 831001,
+        .cfg_scale = cfg_scale,
+        .steps = steps,
+        .max_frames = seconds * yue2.FRAME_RATE,
+    };
+    // A clean named 400 before any SSE byte goes out, not a mid-stream error.
+    if (!try engine.fits(allocator, req)) return sendError(conn, 400, "style + lyrics + score leave no room in the 24576-token context");
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[yue2] generating: cot={s} up to {d}s steps={d} seed={d} lyrics={d}ch abc={} stream={}\n", .{ @tagName(cot), seconds, steps, req.seed, lyrics.len, abc != null, want_stream });
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const song = engine.generate(allocator, req, prog) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[yue2] generation cancelled by client\n", .{});
+            return;
+        }
+        log.err("[yue2] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "music generation failed");
+            return;
+        }
+        return sendError(conn, 500, "music generation failed");
+    };
+    defer allocator.free(song.wav);
+    defer if (song.abc) |t| allocator.free(t);
+    log.info("[yue2] -> {d} WAV bytes\n", .{song.wav.len});
+    var extra: std.ArrayList(u8) = .empty;
+    defer extra.deinit(allocator);
+    if (song.abc) |score| {
+        try extra.appendSlice(allocator, ",\"abc\":");
+        try chat_mod.appendJsonString(allocator, &extra, score);
+    }
+    return sendWavWith(allocator, conn, song.wav, want_stream, extra.items);
 }
 
 /// POST /v1/video/generations — base64 RGB8 frames (or SSE progress + complete).
@@ -3915,21 +4022,22 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             (if (turbo) packFileBytes(io, allocator, engine.model_dir, "turbo_lora.safetensors") else 0);
         var active: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
-        const avail = h3AvailBytes(metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active);
-        if (dit > 0 and avail > 0 and dit + activations > avail) {
+        const bill = h3CanvasBill(dit, activations, metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active, mlx.cudaAvailable());
+        if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             var buf: [320]u8 = undefined;
             const with_cache = bcast_row > 0;
-            const msg = std.fmt.bufPrint(&buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
+            const msg = std.fmt.bufPrint(&buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
                 width,
                 height,
                 shape.frame_count,
-                @as(f64, @floatFromInt(dit + activations)) / gb,
+                @as(f64, @floatFromInt(bill.need)) / gb,
                 @as(f64, @floatFromInt(dit)) / gb,
+                if (mlx.cudaAvailable()) " paged to RAM" else "",
                 @as(f64, @floatFromInt(activations)) / gb,
                 rows,
                 if (with_cache) " with the fast recipe's attention cache" else "",
-                @as(f64, @floatFromInt(avail)) / gb,
+                @as(f64, @floatFromInt(bill.avail)) / gb,
                 if (with_cache) ", or \"turbo\", which keeps no attention cache" else "",
             }) catch "the canvas does not fit in memory: use a smaller canvas or fewer frames";
             return sendError(conn, 400, msg);
@@ -4697,24 +4805,15 @@ pub fn ltxPeakBytes(dir_sum: u64, spare_transformer: u64, text_encoder: u64) u64
 /// safe.
 pub const H3_DIT_RESIDENT_PCT: u64 = 65;
 
-/// Transients the two GENERATING stages carry on top of their weights: the
-/// packed [text|cond|audio|video] sequence's activations while sampling, and
-/// the VAE decode's frame buffers. Measured 4.0-5.0 GiB at 768x448 / 124f
-/// (process peak minus self-reported DiT residency, both packs); billed at 6.
-/// It scales with pixels x frames, which a per-MODEL load gate cannot see —
-/// bounding a specific request is not something this estimator can do, and
-/// the old formula's incidental margin was the same order.
-///
-/// The TEXT-ENCODER stage gets none of it: that is one forward over a few
-/// hundred prompt rows, so a shared "+ activations" on the max of all three
-/// stages bills the biggest stage for transients it never allocates — which
-/// is what refused the 8-bit pack on every Mac under ~96 GB.
-pub const H3_ACTIVATION_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-
 /// MiniMax Music 3's non-weight working set at the request caps: batch-2 KV
 /// cache for 36 layers at 9000 frames + 5000 prompt tokens (~4.1 GB), the
 /// bf16 frame-hidden buffer (~0.6 GB), and DiT/vocoder window transients.
 pub const MUSIC3_GEN_BUFFER_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+/// YuE2's non-weight working set at the 9000-frame cap: two AR K/V caches (~115 KB a token each,
+/// ~4 GB with a long score), then the NAR prefix K/V (~1.5 GB) + canvas activations and one f32
+/// VAE tile (~3 GB). The stages run one after another; billed at the larger.
+pub const YUE2_GEN_BUFFER_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
 /// The DiT term of the H3 bill. `precompute` mirrors
 /// MINIMAX_H3_ADALN_PRECOMPUTE: with it off the modulation weights are never
@@ -4731,12 +4830,15 @@ pub fn h3DitResidentBytes(dit_file: u64, precompute: bool) u64 {
 /// load — so the peak is the BIGGEST stage, never a sum. The two VAEs are one
 /// stage: the video decoder is still resident when the audio one loads.
 /// `dit_resident` is post-AdaLN-precompute (`h3DitResidentBytes`), which the
-/// file size overstates by ~39%.
+/// file size overstates by ~39%. The generating stages carry the smallest
+/// request's transients; `handleVideoH3` prices each request's own (they scale
+/// with pixels x frames, which a per-model gate cannot see). The text encoder
+/// is one forward over a few hundred prompt rows and carries none.
 pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u64 {
     const vaes = video_vae + audio_vae;
     const generating = @max(dit_resident, vaes);
     if (te == 0 and generating == 0) return 0; // unknown dir → never block
-    return stagedPeakBytes(0, &.{ te, generating + H3_ACTIVATION_BYTES });
+    return stagedPeakBytes(0, &.{ te, generating + H3_REQUEST_BASE_BYTES });
 }
 
 /// Sequence rows one window puts through the DiT: video latents on the 32-pixel grid, stereo
@@ -4777,6 +4879,15 @@ pub fn h3AvailBytes(host_avail: u64, gpu_limit: u64, gpu_active: u64) u64 {
     if (host_avail == 0) return 0;
     if (gpu_limit == 0) return host_avail;
     return @min(host_avail, gpu_limit -| gpu_active);
+}
+
+/// What a staged DiT run is checked against: the bytes it needs and the bytes that hold them.
+/// CUDA keeps file-loaded weights in managed memory that pages to host RAM, so there the DiT is
+/// billed to RAM and only the activations to the GPU.
+pub fn h3CanvasBill(dit: u64, activations: u64, host_avail: u64, gpu_limit: u64, gpu_active: u64, weights_page: bool) struct { need: u64, avail: u64 } {
+    if (!weights_page) return .{ .need = dit + activations, .avail = h3AvailBytes(host_avail, gpu_limit, gpu_active) };
+    if (dit > host_avail) return .{ .need = dit, .avail = host_avail };
+    return .{ .need = activations, .avail = if (gpu_limit == 0) host_avail else gpu_limit -| gpu_active };
 }
 
 /// Headroom kept free beyond the resident set: an eighth of the RAM it does not need, floored.
@@ -4850,6 +4961,11 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         const sum = sumSafetensorsIn(io, dir);
         if (sum == 0) return 0; // unknown dir -> never block
         return sum + MUSIC3_GEN_BUFFER_BYTES;
+    }
+    if (std.mem.eql(u8, model_type, "yue2")) {
+        const sum = sumSafetensorsIn(io, dir);
+        if (sum == 0) return 0; // unknown dir -> never block
+        return sum + YUE2_GEN_BUFFER_BYTES;
     }
     if (std.mem.eql(u8, model_type, "AudioVideo")) {
         // Both variants ship; only one is ever loaded. Subtract the smaller so
@@ -5662,12 +5778,14 @@ test "GenRoute: speech + music share the audio modality slot" {
 test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(audioBackendKindForType("acestep") == .music);
     try testing.expect(audioBackendKindForType("minimax_music3") == .music3);
+    try testing.expect(audioBackendKindForType("yue2") == .yue2);
     try testing.expect(audioBackendKindForType("qwen3_tts") == .tts);
     try testing.expect(audioBackendKindForType("gemma4") == .tts);
     // Both music engines serve /v1/audio/music-generations and advertise the
     // "music" capability; TTS backends never do.
     try testing.expect(AudioBackendKind.music.servesMusic());
     try testing.expect(AudioBackendKind.music3.servesMusic());
+    try testing.expect(AudioBackendKind.yue2.servesMusic());
     try testing.expect(!AudioBackendKind.tts.servesMusic());
     try testing.expect(!AudioBackendKind.kokoro.servesMusic());
 }
@@ -5695,6 +5813,20 @@ test "stable_audio3 is a sound backend on its own route, with named bounds" {
         const msg = parseSoundParams(a, c[0]).bad;
         try testing.expect(std.mem.indexOf(u8, msg, c[1]) != null);
     }
+}
+
+test "estimatePeakResidentBytes: yue2 bills the sum plus its generation working set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const b100: [100]u8 = @splat('x');
+    const b40: [40]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &b100 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "vae.safetensors", .data = &b40 });
+    try std.testing.expectEqual(@as(u64, 140) + YUE2_GEN_BUFFER_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "yue2"));
+    var empty = std.testing.tmpDir(.{ .iterate = true });
+    defer empty.cleanup();
+    try std.testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, empty.dir, "yue2"));
 }
 
 test "estimatePeakResidentBytes: minimax_music3 bills the sum plus its AR working set" {
@@ -6476,7 +6608,7 @@ test "LTX bills ONE transformer variant, plus the text encoder its dir cannot se
 
 test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint ones" {
     const GB: u64 = 1024 * 1024 * 1024;
-    const act = H3_ACTIVATION_BYTES;
+    const act = H3_REQUEST_BASE_BYTES;
     // Three disjoint stages: the TE is freed before the DiT loads, the DiT is
     // freed before the VAEs load. Billing any two together refuses a Mac that
     // would work — the VAEs used to be added to the DiT term.
@@ -6501,6 +6633,11 @@ test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint 
     );
     try std.testing.expect(real < 29 * GB); // fits the 48 GB Mac's auto cap
     try std.testing.expect(real > 24 * GB); // and stays above the measured peak
+
+    // The 4-bit pack's files: the text encoder is the biggest stage (measured 14.23 GB resident
+    // vs the DiT's 11.44 at 832x480 x 22 frames), not the DiT plus a worst-case canvas.
+    const te4: u64 = 15_804_791_921;
+    try std.testing.expectEqual(te4, h3PeakBytes(te4, h3DitResidentBytes(18_698_813_290, true) + 779_849_816, 5_207_808_496, 605_254_808));
 }
 
 test "h3 request rows: latent frames on the 32-pixel grid, stereo audio, one frame of rows per keyframe" {
@@ -6537,7 +6674,7 @@ test "h3 residency is priced on the request's activations, so a warm set yields 
     // ...and releases it for a 1344x768 fast-recipe request; the flat term kept it and the run OOMed.
     const big = h3ResidentBytes(te, dit_file, vaes, lora, h3ActivationBytes(h3RequestRows(1344, 768, 124, 0), bcast));
     try std.testing.expect(!h3KeepResident(60 * GB, 0, big, margin));
-    try std.testing.expect(h3KeepResident(60 * GB, 0, h3ResidentBytes(te, dit_file, vaes, lora, H3_ACTIVATION_BYTES), margin));
+    try std.testing.expect(h3KeepResident(60 * GB, 0, h3ResidentBytes(te, dit_file, vaes, lora, h3ActivationBytes(0, 0)), margin));
 }
 
 test "h3 DiT term sheds the AdaLN weights precompute frees — unless it is off" {
@@ -6581,14 +6718,14 @@ test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
     tmp.dir.deleteFile(io, "transformer-distilled.safetensors") catch {};
 
     // H3: max(TE 300, DiT 500*65% + activations, VAEs 120+30 + activations).
-    try std.testing.expectEqual(325 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    try std.testing.expectEqual(325 + H3_REQUEST_BASE_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
 
     // A pack shipping the Turbo LoRA bills it on the DiT term (it is resident
     // ALONGSIDE the DiT and precompute does not free it), whenever present —
     // the gate estimate is per-model, not per-request.
     const b80: [80]u8 = @splat('x');
     try tmp.dir.writeFile(io, .{ .sub_path = "turbo_lora.safetensors", .data = &b80 });
-    try std.testing.expectEqual(405 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    try std.testing.expectEqual(405 + H3_REQUEST_BASE_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
     tmp.dir.deleteFile(io, "turbo_lora.safetensors") catch {};
     // Any other media type: the plain sum over the dir (the safe default —
     // a backend without a declared residency plan must not under-bill).
@@ -6718,6 +6855,20 @@ test "h3 residency: free memory is the tighter of host RAM and the GPU working-s
     try std.testing.expectEqual(100 * gb, h3AvailBytes(100 * gb, 0, 40 * gb)); // no GPU limit known
     try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(0, 192 * gb, 0)); // host unknown never keeps
     try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(100 * gb, 192 * gb, 200 * gb)); // over the limit
+}
+
+test "h3CanvasBill: unified memory bills DiT + activations; CUDA bills the DiT to RAM, activations to the GPU" {
+    const gb: u64 = 1 << 30;
+    const mac = h3CanvasBill(12 * gb, 6 * gb, 20 * gb, 16 * gb, 1 * gb, false);
+    try std.testing.expectEqual(18 * gb, mac.need);
+    try std.testing.expectEqual(15 * gb, mac.avail);
+    // 16 GB card, 21 GB RAM free: 832x480 x 124 frames (12 GB DiT, 6.4 GB rows) fits.
+    const cuda = h3CanvasBill(12 * gb, 6 * gb, 21 * gb, 16 * gb, 1 * gb, true);
+    try std.testing.expectEqual(6 * gb, cuda.need);
+    try std.testing.expectEqual(15 * gb, cuda.avail);
+    // A DiT bigger than free RAM is what binds there.
+    const ram = h3CanvasBill(25 * gb, 6 * gb, 21 * gb, 16 * gb, 1 * gb, true);
+    try std.testing.expect(ram.need > ram.avail);
 }
 
 test "h3 residency: the margin scales with RAM and never drops below 10 GiB" {

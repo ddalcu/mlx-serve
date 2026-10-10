@@ -98,6 +98,13 @@ pub fn parsePoolingSidecar(content: []const u8) !?PoolingMode {
     if (getBool(obj, "pooling_mode_lasttoken")) return .last_token;
     if (getBool(obj, "pooling_mode_cls_token")) return .cls;
     if (getBool(obj, "pooling_mode_mean_tokens")) return .mean;
+    // ST 6 names the mode in one string instead of a boolean per mode.
+    if (obj.get("pooling_mode")) |v| if (v == .string) {
+        if (std.mem.eql(u8, v.string, "mean")) return .mean;
+        if (std.mem.eql(u8, v.string, "cls")) return .cls;
+        if (std.mem.eql(u8, v.string, "lasttoken")) return .last_token;
+        return error.UnsupportedPoolingMode;
+    };
     // Declares pooling, but none we support → refuse rather than mean-pool.
     var it = obj.iterator();
     while (it.next()) |e| {
@@ -569,6 +576,11 @@ pub const ModelConfig = struct {
 
     // Vision encoder (Gemma 4 SigLIP)
     has_vision: bool = false,
+    /// EmbeddingGemma 2's processors (`processor_config.json`): soft tokens per image and per video FRAME, and
+    /// the most frames kept from a video. The processors' own defaults until the file says otherwise.
+    gv_image_tokens: u32 = 280,
+    gv_video_tokens: u32 = 70,
+    gv_video_frames: u32 = 32,
     vision_hidden_size: u32 = 768,
     vision_num_layers: u32 = 16,
     vision_num_heads: u32 = 12,
@@ -1150,6 +1162,12 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "inkling_mm_model");
     }
 
+    /// Google EmbeddingGemma 2 (`embedding_gemma2`): a bidirectional Gemma 4 text trunk with
+    /// projection-only per-layer inputs and an `embedding_projection` head.
+    pub fn isEmbeddingGemma2(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "embedding_gemma2");
+    }
+
     /// Qwen3.8-Flash-Next (`qwen4_exp`): the qwen3_5 GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
@@ -1303,7 +1321,7 @@ pub const ModelConfig = struct {
     pub fn attnScale(self: *const ModelConfig) f32 {
         if (self.qk_scale_factor > 0)
             return self.qk_scale_factor / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        if (std.mem.eql(u8, self.model_type, "gemma4")) return 1.0;
+        if (std.mem.eql(u8, self.model_type, "gemma4") or self.isEmbeddingGemma2()) return 1.0;
         return 1.0 / @sqrt(@as(f32, @floatFromInt(self.query_pre_attn_scalar)));
     }
 
@@ -1662,6 +1680,24 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.mv_max_image_tokens = vision_defaults.max_image_tokens orelse MUSE_MAX_IMAGE_TOKENS;
     }
 
+    if (config.isEmbeddingGemma2()) {
+        const processor_path = try std.fmt.allocPrint(allocator, "{s}/processor_config.json", .{model_dir});
+        defer allocator.free(processor_path);
+        if (std.Io.Dir.openFileAbsolute(io, processor_path, .{})) |processor_file| {
+            defer processor_file.close(io);
+            var processor_buf: [4096]u8 = undefined;
+            var processor_reader = processor_file.reader(io, &processor_buf);
+            if (processor_reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |processor_content| {
+                defer allocator.free(processor_content);
+                const budgets = parseSoftTokenBudgetsFromJson(allocator, processor_content);
+                config.gv_image_tokens = budgets.image orelse config.gv_image_tokens;
+                config.gv_video_tokens = budgets.video orelse config.gv_video_tokens;
+                config.gv_video_frames = budgets.max_frames orelse config.gv_video_frames;
+            } else |_| {}
+        } else |_| {}
+        log.info("[vision] EmbeddingGemma 2 processors: {d} soft tokens per image, {d} per video frame, at most {d} frames\n", .{ config.gv_image_tokens, config.gv_video_tokens, config.gv_video_frames });
+    }
+
     return config;
 }
 
@@ -1733,6 +1769,37 @@ pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessor
         return .{};
     }
     return defaults;
+}
+
+pub const SoftTokenBudgets = struct { image: ?u32 = null, video: ?u32 = null, max_frames: ?u32 = null };
+
+/// The soft-token budget each EmbeddingGemma 2 processor accepts; any other value makes the processor raise.
+fn validSoftTokenBudget(value: ?std.json.Value) ?u32 {
+    const n = positiveJsonU32(value) orelse return null;
+    return switch (n) {
+        70, 140, 280, 560, 1120 => n,
+        else => null,
+    };
+}
+
+/// `processor_config.json` of an EmbeddingGemma 2 checkpoint: the image and video processors' budgets and the
+/// video frame cap. A missing or unusable field stays null so the processors' defaults hold.
+pub fn parseSoftTokenBudgetsFromJson(allocator: std.mem.Allocator, content: []const u8) SoftTokenBudgets {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    const root = parsed.value.object;
+    var out = SoftTokenBudgets{};
+    if (root.get("image_processor")) |v| {
+        if (v == .object) out.image = validSoftTokenBudget(v.object.get("max_soft_tokens"));
+    }
+    if (root.get("video_processor")) |v| {
+        if (v == .object) {
+            out.video = validSoftTokenBudget(v.object.get("max_soft_tokens"));
+            out.max_frames = positiveJsonU32(v.object.get("max_frames"));
+        }
+    }
+    return out;
 }
 
 /// Pure parser for generation_config.json content. Total: malformed JSON or
@@ -2077,6 +2144,38 @@ fn mergeObjects(a: std.mem.Allocator, dst: *std.json.ObjectMap, src: std.json.Ob
         // Keys and values are arena-owned by the override document, which
         // outlives this merge.
         try dst.put(a, e.key_ptr.*, e.value_ptr.*);
+    }
+}
+
+/// EmbeddingGemma 2's context window as its model card states it. Kept in sync with
+/// `model_discovery.parseStubMeta`, which cannot import this file.
+pub const EMBEDDING_GEMMA2_WINDOW: u32 = 8192;
+
+/// `per_layer_config` gives the full-attention layers a head width and KV head count of their own. The loader
+/// keeps one such geometry (`global_head_dim`, `num_global_key_value_heads`), so entries that name a sliding
+/// layer, disagree with each other or leave a full layer out are refused. An absent block is HF's default.
+fn parseEmbeddingGemma2Geometry(cfg_obj: std.json.ObjectMap, config: *ModelConfig) !void {
+    if (config.num_hidden_layers > config.layer_is_global.len) return error.UnsupportedLayerGeometry;
+    config.global_head_dim = 512;
+    config.num_global_key_value_heads = 1;
+    const block = jsonField(cfg_obj, "per_layer_config") orelse return;
+    var listed: @TypeOf(config.layer_is_global) = @splat(false);
+    var first = true;
+    var it = (try jsonValue(.object, block)).iterator();
+    while (it.next()) |e| {
+        const layer = std.fmt.parseInt(u32, e.key_ptr.*, 10) catch return error.UnsupportedLayerGeometry;
+        if (layer >= config.num_hidden_layers or !config.isGlobalLayer(layer)) return error.UnsupportedLayerGeometry;
+        const entry = try jsonValue(.object, e.value_ptr.*);
+        const head_dim = try jsonU32(jsonField(entry, "head_dim") orelse return error.UnsupportedLayerGeometry);
+        const kv_heads = try jsonU32(jsonField(entry, "num_key_value_heads") orelse return error.UnsupportedLayerGeometry);
+        if (!first and (head_dim != config.global_head_dim or kv_heads != config.num_global_key_value_heads)) return error.UnsupportedLayerGeometry;
+        config.global_head_dim = head_dim;
+        config.num_global_key_value_heads = kv_heads;
+        listed[layer] = true;
+        first = false;
+    }
+    for (0..config.num_hidden_layers) |layer| {
+        if (!first and config.isGlobalLayer(@intCast(layer)) and !listed[layer]) return error.UnsupportedLayerGeometry;
     }
 }
 
@@ -2517,6 +2616,34 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // (transformer.zig:5677) already encodes that:
         //   `k_eq_v = config.attention_k_eq_v and isGlobalLayer(li)`.
         // So we leave the parsed flag intact.
+    } else if (std.mem.eql(u8, model_type, "embedding_gemma2")) {
+        // Google EmbeddingGemma 2: the Gemma 4 text trunk trained as a bidirectional encoder, with per-layer
+        // inputs derived from the embeddings alone (no `embed_tokens_per_layer`) and an `embedding_projection`
+        // head. The image tower is a Gemma 4 SigLIP tower; the audio tower is not served.
+        config.model_type = "embedding_gemma2";
+        config.weight_prefix = "language_model";
+        config.hidden_act = .gelu_approx;
+        config.norm_has_offset = false;
+        config.scale_embeddings = true;
+        config.has_pre_ff_norm = true;
+        config.has_qk_norm = true;
+        config.has_v_norm = true;
+        config.tie_word_embeddings = true;
+        config.is_encoder_only = true;
+        config.use_bidirectional_attention = true;
+        // The model card's window, not the trunk's 262144-position rope table.
+        config.max_position_embeddings = if (config.max_position_embeddings == 0) EMBEDDING_GEMMA2_WINDOW else @min(config.max_position_embeddings, EMBEDDING_GEMMA2_WINDOW);
+        try parseEmbeddingGemma2Geometry(cfg_obj, &config);
+        if (jsonField(root, "video_token_id")) |v| {
+            if (v == .integer) config.video_token_id = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "eos_token_id")) |v| switch (v) {
+            .integer => |i| config.addEosToken(std.math.cast(u32, i) orelse return error.InvalidConfigField),
+            .array => |arr| for (arr.items) |item| {
+                if (item == .integer) config.addEosToken(try jsonU32(item));
+            },
+            else => {},
+        };
     } else if (std.mem.eql(u8, model_type, "diffusion_gemma")) {
         // DiffusionGemma (block diffusion, June 2026). The trunk is the
         // Gemma 4 26B-A4B MoE decoder verbatim — same dual-FFN layer
@@ -4593,15 +4720,24 @@ pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool
 /// switch is the only way to attribute a future f16-checkpoint regression to
 /// it. The side-tensor arm predates this and is not switchable.
 var narrow_1d_env: ?bool = null;
+
+/// ON for Metal and CUDA: an f16 norm left beside bf16 activations widens the
+/// whole residual to f32. OFF for the Omarchy Vulkan backend, which has no
+/// bf16 GPU kernel.
+fn narrow1dDefault(darwin: bool, cuda: bool) bool {
+    return darwin or cuda;
+}
+
+test "f16 1-D tables narrow to bf16 on Metal and CUDA, not on Vulkan" {
+    try std.testing.expect(narrow1dDefault(true, false));
+    try std.testing.expect(narrow1dDefault(false, true));
+    try std.testing.expect(!narrow1dDefault(false, false));
+}
 fn narrow1dEnabled() bool {
     if (narrow_1d_env) |v| return v;
     const on = blk: {
         const raw = std.c.getenv("MLX_SERVE_F16_NARROW_1D") orelse
-            break :blk builtin.os.tag.isDarwin();
-        // Default ON for Metal (bf16 is the wired-format win there). The
-        // Omarchy Vulkan backend has no bf16 GPU kernel ("No GPU kernel
-        // exists for it"), so off Darwin the default is OFF unless the env
-        // explicitly forces it.
+            break :blk narrow1dDefault(builtin.os.tag.isDarwin(), mlx.cudaAvailable());
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     narrow_1d_env = on;
@@ -7119,6 +7255,188 @@ test "ModelConfig: use_bidirectional_attention marks an embedding encoder (Embed
     try testing.expect(!chat_config.is_encoder_only);
 }
 
+const embedding_gemma2_config_json =
+    \\{
+    \\  "architectures": ["EmbeddingGemma2Model"],
+    \\  "model_type": "embedding_gemma2",
+    \\  "audio_config": {"model_type": "gemma4_audio", "hidden_size": 1024, "output_proj_dims": 1536},
+    \\  "audio_token_id": 258881,
+    \\  "image_token_id": 258880,
+    \\  "text_config": {
+    \\    "model_type": "embedding_gemma2_text",
+    \\    "bos_token_id": 2, "eos_token_id": 1, "pad_token_id": 0,
+    \\    "embedding_dim": 768, "head_dim": 256, "hidden_activation": "gelu_pytorch_tanh",
+    \\    "hidden_size": 512, "hidden_size_per_layer_input": 512, "intermediate_size": 2048,
+    \\    "layer_types": [
+    \\      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+    \\      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+    \\      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+    \\      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"
+    \\    ],
+    \\    "max_position_embeddings": 262144,
+    \\    "num_attention_heads": 4, "num_hidden_layers": 24, "num_key_value_heads": 2,
+    \\    "per_layer_config": {
+    \\      "05": {"head_dim": 512, "num_key_value_heads": 1}, "11": {"head_dim": 512, "num_key_value_heads": 1},
+    \\      "17": {"head_dim": 512, "num_key_value_heads": 1}, "23": {"head_dim": 512, "num_key_value_heads": 1}
+    \\    },
+    \\    "rms_norm_eps": 1e-06,
+    \\    "rope_parameters": {
+    \\      "full_attention": {"rope_theta": 1000000.0, "rope_type": "default"},
+    \\      "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+    \\    },
+    \\    "sliding_window": 512, "vocab_size": 262144
+    \\  },
+    \\  "boi_token_id": 255999, "eoi_token_id": 258882,
+    \\  "video_token_id": 258884,
+    \\  "vision_config": {
+    \\    "model_type": "gemma4_vision", "hidden_size": 768, "intermediate_size": 3072, "num_hidden_layers": 16,
+    \\    "num_attention_heads": 12, "num_key_value_heads": 12, "head_dim": 64, "global_head_dim": 64,
+    \\    "patch_size": 16, "pooling_kernel_size": 3, "default_output_length": 280, "position_embedding_size": 10240,
+    \\    "use_clipped_linears": false, "standardize": false, "rms_norm_eps": 1e-06,
+    \\    "rope_parameters": {"rope_theta": 100.0, "rope_type": "axial"}
+    \\  },
+    \\  "quantization": {"group_size": 64, "bits": 8, "mode": "affine"}
+    \\}
+;
+
+test "ModelConfig: embedding_gemma2 is a bidirectional Gemma 4 trunk with projection-only per-layer inputs" {
+    const config = try parseConfigFromJson(testing.allocator, embedding_gemma2_config_json);
+    try testing.expect(config.isEmbeddingGemma2());
+    try testing.expectEqualStrings("language_model", config.weight_prefix);
+    // An encoder: /v1/embeddings accepts it, chat 400s it, and the input is wrapped <bos>…<eos>.
+    try testing.expect(config.is_encoder_only);
+    try testing.expect(config.use_bidirectional_attention);
+    try testing.expect(config.hasEmbeddingCapability());
+    try testing.expectEqual(PoolingMode.mean, config.effectivePooling());
+    try testing.expectEqual(@as(?u32, 2), config.bos_token_id);
+    try testing.expectEqual(@as(u32, 1), config.num_eos_tokens);
+    try testing.expectEqual(@as(u32, 1), config.eos_token_ids[0]);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+    // The trained window (model card), not the trunk's 262144 rope table.
+    try testing.expectEqual(@as(u32, 8192), config.max_position_embeddings);
+    // Gemma 4 trunk numerics: plain norms, QK/V norms, unit attention scale, sqrt(hidden) embeddings.
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(config.has_qk_norm and config.has_v_norm and config.has_pre_ff_norm);
+    try testing.expect(config.scale_embeddings);
+    try testing.expectEqual(@as(f32, 1.0), config.attnScale());
+    try testing.expectEqual(@as(u32, 512), config.hidden_size_per_layer_input);
+    try testing.expectEqual(@as(f32, 1_000_000.0), config.rope_theta);
+    try testing.expectEqual(@as(f32, 10_000.0), config.rope_local_base_freq);
+    try testing.expect(!config.rope_proportional);
+    // The window is the inclusive RADIUS of a symmetric band.
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 512), config.sliding_window);
+    // Five sliding layers then one full layer; the full layers are wider (hd 512, one KV head).
+    for (0..24) |i| {
+        const li: u32 = @intCast(i);
+        const full = i % 6 == 5;
+        try testing.expectEqual(full, config.isGlobalLayer(li));
+        try testing.expectEqual(@as(u32, if (full) 512 else 256), config.layerHeadDim(li));
+        try testing.expectEqual(@as(u32, if (full) 1 else 2), config.layerKVHeads(li));
+    }
+    // The image tower is a plain (unclipped, unstandardized) Gemma 4 SigLIP tower; the audio tower is not served.
+    try testing.expect(config.has_vision);
+    try testing.expectEqual(@as(u32, 768), config.vision_hidden_size);
+    try testing.expectEqual(@as(u32, 16), config.vision_num_layers);
+    try testing.expectEqual(@as(u32, 12), config.vision_num_heads);
+    try testing.expectEqual(@as(u32, 64), config.vision_head_dim);
+    try testing.expectEqual(@as(u32, 16), config.vision_patch_size);
+    try testing.expectEqual(@as(u32, 3), config.vision_pooling_kernel);
+    try testing.expectEqual(@as(u32, 10240), config.vision_position_embedding_size);
+    try testing.expectEqual(@as(f32, 100.0), config.vision_rope_theta);
+    try testing.expect(!config.vision_use_clipped_linears);
+    try testing.expectEqual(@as(u32, 258880), config.image_token_id);
+    try testing.expectEqual(@as(u32, 258884), config.video_token_id);
+    try testing.expectEqual(@as(u32, 255999), config.boi_token_id);
+    try testing.expectEqual(@as(u32, 258882), config.eoi_token_id);
+    // Without a processor_config.json the budgets are the processors' own defaults.
+    try testing.expectEqual(@as(u32, 280), config.gv_image_tokens);
+    try testing.expectEqual(@as(u32, 70), config.gv_video_tokens);
+    try testing.expectEqual(@as(u32, 32), config.gv_video_frames);
+}
+
+test "parseSoftTokenBudgetsFromJson reads the image and video processors of an EmbeddingGemma 2 processor_config" {
+    // The release's file: images 280 tokens, video frames 140, at most 32 frames.
+    const release =
+        \\{"image_processor": {"image_processor_type": "Gemma4ImageProcessor", "max_soft_tokens": 280, "patch_size": 16},
+        \\ "video_processor": {"max_soft_tokens": 140, "max_frames": 32, "fps": 1}, "processor_class": "EmbeddingGemma2Processor"}
+    ;
+    const got = parseSoftTokenBudgetsFromJson(testing.allocator, release);
+    try testing.expectEqual(@as(?u32, 280), got.image);
+    try testing.expectEqual(@as(?u32, 140), got.video);
+    try testing.expectEqual(@as(?u32, 32), got.max_frames);
+
+    // The processors accept only these budgets; anything else keeps the default instead of failing every request.
+    const odd = parseSoftTokenBudgetsFromJson(testing.allocator,
+        \\{"image_processor": {"max_soft_tokens": 300}, "video_processor": {"max_soft_tokens": 1121, "max_frames": 0}}
+    );
+    try testing.expectEqual(@as(?u32, null), odd.image);
+    try testing.expectEqual(@as(?u32, null), odd.video);
+    try testing.expectEqual(@as(?u32, null), odd.max_frames);
+    for ([_]u32{ 70, 140, 280, 560, 1120 }) |budget| {
+        var buf: [96]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf, "{{\"image_processor\": {{\"max_soft_tokens\": {d}}}}}", .{budget});
+        try testing.expectEqual(@as(?u32, budget), parseSoftTokenBudgetsFromJson(testing.allocator, json).image);
+    }
+    try testing.expectEqual(@as(?u32, null), parseSoftTokenBudgetsFromJson(testing.allocator, "not json").image);
+
+    // The file as Google ships it, audio feature extractor and all: a toy-sized buffer does not hold its parse.
+    const real = parseSoftTokenBudgetsFromJson(testing.allocator, @embedFile("fixtures/embedding_gemma2_processor_config.json"));
+    try testing.expectEqual(@as(?u32, 280), real.image);
+    try testing.expectEqual(@as(?u32, 140), real.video);
+    try testing.expectEqual(@as(?u32, 32), real.max_frames);
+}
+
+test "parseConfig: an EmbeddingGemma 2 directory's processor_config.json sets the image and video budgets" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = embedding_gemma2_config_json });
+    try tmp.dir.writeFile(io, .{ .sub_path = "processor_config.json", .data =
+        \\{"image_processor": {"max_soft_tokens": 560}, "video_processor": {"max_soft_tokens": 140, "max_frames": 16}}
+    });
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const config = try parseConfig(io, testing.allocator, path);
+    try testing.expectEqual(@as(u32, 560), config.gv_image_tokens);
+    try testing.expectEqual(@as(u32, 140), config.gv_video_tokens);
+    try testing.expectEqual(@as(u32, 16), config.gv_video_frames);
+}
+
+test "ModelConfig: embedding_gemma2 reads a list-shaped eos_token_id" {
+    // HF types it `int | list[int]`; the first id is the one input wrapping appends.
+    const json = try std.mem.replaceOwned(u8, testing.allocator, embedding_gemma2_config_json, "\"eos_token_id\": 1,", "\"eos_token_id\": [1, 106],");
+    defer testing.allocator.free(json);
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+    try testing.expectEqual(@as(u32, 1), config.eos_token_ids[0]);
+}
+
+test "ModelConfig: embedding_gemma2 keeps a smaller trained window than the card" {
+    const json = try std.mem.replaceOwned(u8, testing.allocator, embedding_gemma2_config_json, "\"max_position_embeddings\": 262144", "\"max_position_embeddings\": 64");
+    defer testing.allocator.free(json);
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 64), config.max_position_embeddings);
+}
+
+test "ModelConfig: embedding_gemma2 refuses per-layer geometry it does not model" {
+    // The loader reads one geometry for every full-attention layer and the base one for the rest.
+    const full = "\"head_dim\": 512, \"num_key_value_heads\": 1}";
+    const cases = [_]struct { from: []const u8, to: []const u8 }{
+        // a sliding layer with a geometry of its own
+        .{ .from = "\"05\": {", .to = "\"04\": {" ++ full ++ ", \"05\": {" },
+        // a full layer left on the base geometry
+        .{ .from = ", \"23\": {" ++ full, .to = "" },
+        // two full layers that disagree
+        .{ .from = "\"11\": {\"head_dim\": 512", .to = "\"11\": {\"head_dim\": 256" },
+    };
+    for (cases) |c| {
+        const json = try std.mem.replaceOwned(u8, testing.allocator, embedding_gemma2_config_json, c.from, c.to);
+        defer testing.allocator.free(json);
+        try testing.expectError(error.UnsupportedLayerGeometry, parseConfigFromJson(testing.allocator, json));
+    }
+}
+
 test "ModelConfig fills HF gemma3 defaults when text_config omits head counts" {
     // gemma-3-4b-it-4bit's text_config carries hidden_size/num_hidden_layers but
     // OMITS num_attention_heads/num_key_value_heads/head_dim, relying on the HF
@@ -8226,6 +8544,22 @@ test "pooling: sentence-transformers 1_Pooling sidecar parses all three modes" {
         \\{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}
     ;
     try testing.expectEqual(@as(?PoolingMode, .mean), try parsePoolingSidecar(mean));
+}
+
+test "pooling: a sentence-transformers 6 sidecar spells the mode as a string" {
+    // google/embeddinggemma-2's own 1_Pooling/config.json; the other spellings are ST 6's names for the modes.
+    const mean =
+        \\{"embedding_dimension": 768, "pooling_mode": "mean", "include_prompt": true}
+    ;
+    try testing.expectEqual(@as(?PoolingMode, .mean), try parsePoolingSidecar(mean));
+    try testing.expectEqual(@as(?PoolingMode, .cls), try parsePoolingSidecar("{\"pooling_mode\": \"cls\"}"));
+    try testing.expectEqual(@as(?PoolingMode, .last_token), try parsePoolingSidecar("{\"pooling_mode\": \"lasttoken\"}"));
+    // Modes we do not implement refuse the load, as the boolean spelling does.
+    for ([_][]const u8{ "max", "mean_sqrt_len", "weightedmean" }) |mode| {
+        var buf: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf, "{{\"pooling_mode\": \"{s}\"}}", .{mode});
+        try testing.expectError(error.UnsupportedPoolingMode, parsePoolingSidecar(json));
+    }
 }
 
 test "pooling: sidecar demanding an unsupported mode errors; non-pooling JSON is ignored" {

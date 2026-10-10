@@ -2,7 +2,7 @@
 # DeepSeek-V4.1-Flash (deepseek_v41: src/deepseek_v41.zig, the EXL3 repack on
 # mlx-stream) live end-to-end, env-gated on a pack (loading takes minutes and
 # wants the machine otherwise idle; DSV41_TEST_FLAGS adds server flags, e.g.
-# --no-mtp where the DSpark stages do not fit):
+# --no-mtp to disable drafting, without unloading mlx-stream's stages):
 #
 #   DSV41_TEST_MODEL=~/.mlx-serve/models/OpensourceWTF/DeepSeek-V4.1-Flash-streaming-repack-exl3-3.0bpw \
 #       ./tests/test_dsv41.sh
@@ -13,7 +13,7 @@
 # admission (module-owned decode state). DSV41_TEST_DSPARK=1 checks DSpark (on
 # by default): its rounds engaged, and a second, serial boot (--no-mtp) keeps
 # the same greedy bytes (the EXL3 repack on mlx-stream drafts with typical
-# acceptance, so there the serial boot only has to answer).
+# acceptance, so there the serial boot must answer without arming DSpark).
 # Hermetic counterparts: the DSV41_TINY fixture tests, `chat: the embedded V4.1
 # template ...`, and the format-corpus "dsv41-dsml" family.
 
@@ -82,6 +82,14 @@ post() { # path, body
     curl -s -m 900 "http://127.0.0.1:$PORT$1" -H 'Content-Type: application/json' -d "$2"
 }
 text_of() { python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'])"; }
+
+speculation_contract() { # enabled: default boot (1) or --no-mtp boot (0)
+    local native=()
+    [ -f "$MODEL/experts.bin" ] && native=(--native)
+    python3 "$(dirname "$0")/test_dsv41_speculation.py" \
+        --url "http://127.0.0.1:$PORT" --log "$LOG" --expect-enabled "$1" \
+        --model mlx-serve ${native[@]+"${native[@]}"}
+}
 
 boot
 
@@ -178,6 +186,7 @@ fi
 # [8] DSpark: the default boot drafted; a serial boot keeps its greedy bytes.
 if [ "${DSV41_TEST_DSPARK:-0}" = "1" ]; then
     check "dspark engaged" "$(grep '\[spec-stats\] mode=dspark' "$LOG" || true)" 'mode=dspark attempts='
+    speculation_contract 1
     # A sampled request drafts too (the host's sampler decides each round), and its seed reproduces it on the same
     # path: both runs cold (a resumed run drafts differently, and speculative sampling spends its draws per draft).
     SAMPLED='{"model":"mlx-serve","prompt":"<｜begin▁of▁sentence｜><｜User｜>Name three rivers in Europe and one fact about each.<｜Assistant｜></think>","max_tokens":96,"temperature":0.8,"top_p":0.95,"seed":7}'
@@ -192,6 +201,7 @@ if [ "${DSV41_TEST_DSPARK:-0}" = "1" ]; then
     fi
     cleanup; SERVER_PID=""
     boot --no-mtp
+    speculation_contract 0
     SERIAL=$(post /v1/completions "$SF_BODY" | text_of)
     if [ -f "$MODEL/experts.bin" ]; then
         # mlx-stream's lane accepts drafts by typical acceptance: greedy text may differ from serial.
@@ -202,6 +212,7 @@ if [ "${DSV41_TEST_DSPARK:-0}" = "1" ]; then
         echo "FAIL: dspark greedy != serial"; echo "  dspark: $(echo "$SOLO" | head -c 300)"; echo "  serial: $(echo "$SERIAL" | head -c 300)"; fail=$((fail+1))
     fi
     refuse "serial no MLX error" "$(cat "$LOG")" '[mlx]'
+    refuse "serial boot never drafts" "$(cat "$LOG")" 'spec=dspark ('
 else
     echo "[8] SKIP DSpark arm (DSV41_TEST_DSPARK=1 to run)"
 fi

@@ -24,12 +24,12 @@ struct ChatSession: Identifiable, Codable {
     var attachedFolderPath: String?
     /// Non-nil marks this session as the transient vehicle for an unattended task
     /// run (see TaskScheduler). Such sessions are filtered out of the chat sidebar
-    /// and never persisted to chat-history.json — their transcript lives under
+    /// and never persisted by `ChatStore` — their transcript lives under
     /// ~/.mlx-serve/tasks/<taskId>/<runId>/transcript.json instead.
     var taskRunId: UUID?
     /// True marks this as a transient vehicle for an external messaging bridge
     /// (e.g. the Telegram bot). Like task-run sessions these are kept out of the
-    /// chat sidebar and never persisted to chat-history.json — the conversation
+    /// chat sidebar and never persisted by `ChatStore` — the conversation
     /// lives on the messaging platform, not in the app's chat list.
     var isExternalBridge: Bool
     /// Per-session toolbar toggles. Persisted here (not as view `@State` or the
@@ -75,7 +75,7 @@ struct ChatSession: Identifiable, Codable {
         Set(names.compactMap(AgentToolKind.init(rawValue:)))
     }
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
         case disabledTools
         case reasoningEffort
@@ -178,8 +178,7 @@ struct ChatImage: Identifiable, Codable, Equatable {
     /// Optional so a history written before attachments moved to disk still
     /// DECODES: its `data` key is simply unknown here and `path` is absent, so
     /// the record survives and only its picture is gone. A required field would
-    /// throw instead, and `loadChatHistory`'s `?? []` turns one throw into an
-    /// EMPTY history — the whole file, not one image.
+    /// throw instead, and `ChatStore` would leave the whole message out.
     ///
     /// Also nil for bytes that were never meant to outlive the turn: a Telegram
     /// photo, whose session is never persisted at all, and a `browse`
@@ -1093,14 +1092,14 @@ struct LocalModel: Identifiable, Hashable {
     /// a base checkpoint whose architecture serves chat completions. Excludes
     /// drafters, media models (LTX "AudioVideo", FLUX/Krea, Qwen3-TTS,
     /// Hunyuan3D, AceStep), image classifiers ("vit"), and
-    /// embeddings-only "bert" encoders — those live under ~/.mlx-serve/models
+    /// embeddings-only "bert" and "embedding_gemma2" encoders — those live under ~/.mlx-serve/models
     /// as gen-pane / doc-RAG dependencies and load by path, never as the
     /// tray's primary model. The Model Browser's Downloaded tab still lists
     /// them (size + delete) and, since they ARE supported architectures,
     /// no longer flags them "Unsupported".
     var isChatPickable: Bool {
         guard defect == nil, !isDownloading else { return false }
-        return kind == .base && isSupportedArchitecture && modelType != "bert" && !isMediaModelType(modelType)
+        return kind == .base && isSupportedArchitecture && modelType != "bert" && modelType != "embedding_gemma2" && !isMediaModelType(modelType)
     }
 
     /// Likely tool/function-calling support (name heuristic, shared with the

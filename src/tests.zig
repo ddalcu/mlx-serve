@@ -64,6 +64,7 @@ test {
     _ = @import("model_settings.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
+    _ = @import("dflash_policy.zig");
     _ = @import("mtp.zig");
     _ = @import("round_cost.zig");
     _ = @import("mtp_group_planner.zig");
@@ -124,6 +125,7 @@ test {
     _ = @import("acestep.zig");
     _ = @import("music3.zig");
     _ = @import("stable_audio.zig");
+    _ = @import("yue2.zig");
     _ = @import("uvwrap.zig");
     _ = @import("mesh_simplify.zig");
     _ = @import("hunyuan3d_paint.zig");

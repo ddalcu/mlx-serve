@@ -1732,11 +1732,15 @@ pub const SelectedPath = struct {
     /// density q over the candidate set (zero everywhere else). Null on the
     /// greedy trace.
     q: ?[]f32,
+    /// [m] the chosen candidate's share of its step's softmax (temperature 1, or the
+    /// sampling temperature): how sure the selector is, which `dflash_policy` calibrates.
+    conf: []f32,
 
     pub fn deinit(self: *SelectedPath, allocator: std.mem.Allocator) void {
         allocator.free(self.ids);
         allocator.free(self.chosen_idx);
         allocator.free(self.cand_ids);
+        allocator.free(self.conf);
         if (self.q) |qv| allocator.free(qv);
     }
 };
@@ -2193,6 +2197,15 @@ fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
     }
 }
 
+/// `scores[i]`'s share of the softmax over `scores`.
+fn softmaxShare(scores: []const f32, i: usize) f32 {
+    var mx: f32 = -std.math.inf(f32);
+    for (scores) |sc| mx = @max(mx, sc);
+    var total: f32 = 0;
+    for (scores) |sc| total += @exp(sc - mx);
+    return @exp(scores[i] - mx) / total;
+}
+
 /// Reference `CandidateSelector.select`: top-k candidates per position by
 /// draft logit; score adjacent pairs `S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t),
 /// succ(b)>`; trace the best (or sampled) path from the anchor. All pairwise
@@ -2229,6 +2242,7 @@ pub fn selectPath(
         .chosen_idx = undefined,
         .cand_ids = undefined,
         .q = null,
+        .conf = undefined,
     };
     errdefer allocator.free(out.ids);
     out.chosen_idx = try allocator.alloc(u32, m);
@@ -2236,6 +2250,8 @@ pub fn selectPath(
     out.cand_ids = try allocator.alloc(i32, m * k);
     errdefer allocator.free(out.cand_ids);
     @memcpy(out.cand_ids, cand_data[0 .. m * k]);
+    out.conf = try allocator.alloc(f32, m);
+    errdefer allocator.free(out.conf);
     if (stochastic) out.q = try allocator.alloc(f32, m * k);
 
     var scores_buf: [64]f32 = undefined; // top_k is 16 on the real checkpoint
@@ -2278,6 +2294,7 @@ pub fn selectPath(
         }
         out.ids[t] = @intCast(cand_data[t * k + choice]);
         out.chosen_idx[t] = @intCast(choice);
+        out.conf[t] = if (stochastic) out.q.?[t * k + choice] else softmaxShare(scores, choice);
         prev_idx = choice;
     }
     return out;
@@ -2331,6 +2348,8 @@ fn toDrafterDtype(x: mlx.mlx_array, like: mlx.mlx_array, s: mlx.mlx_stream) !mlx
 pub fn encodeContext(model: *const DflashModel, captures: []const mlx.mlx_array) !mlx.mlx_array {
     const s = model.s;
     std.debug.assert(captures.len == model.config.target_layer_ids.len);
+    // `supportsLayerCapture` is a promise the trunk's forward must keep: an unfilled slot is a forward that ignores it.
+    for (captures) |c| if (c.ctx == null) return error.DflashCaptureMissing;
     var cat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cat);
     {
@@ -3345,6 +3364,31 @@ test "dflash: appendContext grows the cache; forwardBlock evicts its block K/V" 
     try testing.expectEqual(@as(usize, 9), ctx.cache.step);
 }
 
+test "dflash: a capture the trunk never filled is a named error, not an empty append" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+    try TinyFix.writeAssistant(io, tmp_dir.dir, dir_path, s);
+    var m = try loadDflash(io, allocator, s, dir_path);
+    defer m.deinit();
+    var ctx = try DflashCtx.init(allocator, &m, 0);
+    defer ctx.deinit();
+
+    const c0 = try TinyFix.capArr(6, 200, s);
+    defer _ = mlx.mlx_array_free(c0);
+    // What a forward that ignores `capture_layers` leaves in the slot.
+    const unfilled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(unfilled);
+    try testing.expectError(error.DflashCaptureMissing, appendContext(&m, &ctx, &[_]mlx.mlx_array{ c0, unfilled }, 0));
+    try testing.expectEqual(@as(usize, 0), ctx.cache.step);
+}
+
 /// Run the full context-append + block forward on `m` and return the block
 /// hidden as f32 — the comparison surface for weight-precision arms.
 fn tinyBlockHidden(m: *DflashModel, allocator: std.mem.Allocator, s: mlx.mlx_stream) ![]f32 {
@@ -3735,6 +3779,10 @@ test "dflash2: selectPath traces the pairwise-scored path, edges outvote unary l
     // token 1 → 5+1=6, token 6 → 4+6=10 — the EDGE flips the unary order.
     try testing.expectEqual(@as(u32, 6), path.ids[1]);
     try testing.expect(path.q == null);
+    // The selector's confidence in each step is the chosen candidate's softmax share:
+    // scores (12, 11) at position 0, (10, 6) at position 1.
+    try testing.expectApproxEqAbs(@as(f32, 0.7311), path.conf[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0.9820), path.conf[1], 1e-3);
 
     // Sampled arm: q is a proper distribution over each candidate row and
     // the drawn token's q is positive (the acceptance ratio's denominator).

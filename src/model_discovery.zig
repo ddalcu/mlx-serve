@@ -61,6 +61,7 @@ const supported_model_types = [_][]const u8{
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
+    "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk, text/image/video embeddings)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -88,6 +89,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
     // Stable Audio 3: same, for its T5Gemma subdir.
     if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
+    // YuE2: the upstream repo has no decoder; only a pack with the folded-in VAE can run.
+    if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
     return null;
 }
 
@@ -104,6 +107,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.eql(u8, model_type, "stable_audio3") or
+        std.mem.eql(u8, model_type, "yue2") or
         std.mem.eql(u8, model_type, "laya") or
         std.mem.eql(u8, model_type, "kev") or
         std.mem.eql(u8, model_type, "clef") or
@@ -626,6 +630,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "yue2") or
         std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
@@ -1324,7 +1329,11 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
         }.get;
         break :blk cfgBool(root, text_cfg, "use_bidirectional_attention");
     };
-    meta.is_encoder = std.mem.eql(u8, mt, "bert") or bidirectional;
+    const embedding_gemma2 = std.mem.eql(u8, mt, "embedding_gemma2");
+    meta.is_encoder = std.mem.eql(u8, mt, "bert") or bidirectional or embedding_gemma2;
+    // The model card's window, not the trunk's 262144 (model.zig EMBEDDING_GEMMA2_WINDOW).
+    const embedding_gemma2_window: u32 = 8192;
+    if (embedding_gemma2) meta.max_position_embeddings = if (meta.max_position_embeddings == 0) embedding_gemma2_window else @min(meta.max_position_embeddings, embedding_gemma2_window);
     meta.has_chat = has_chat_template and !meta.is_encoder;
     meta.has_embedding = meta.is_encoder;
     if (root.get("pooling_mode")) |v| {
@@ -1433,6 +1442,12 @@ test "the audio kind names every audio generation endpoint" {
     const ep = ModelKind.audio.genEndpoint().?;
     for ([_][]const u8{ "/v1/audio/speech", "/v1/audio/music-generations", "/v1/audio/sound-generations" }) |p|
         try testing.expect(std.mem.indexOf(u8, ep, p) != null);
+}
+
+test "yue2 classifies as audio media; a pack without the folded-in VAE is incomplete" {
+    try testing.expect(isMediaModelType("yue2"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("yue2"));
+    try testing.expectEqualStrings("vae.safetensors", requiredMediaMarker("yue2").?);
 }
 
 test "minimax_music3 classifies as audio media with the vocoder marker" {
@@ -2265,6 +2280,27 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         const m = parseStubMeta(a, "{\"model_type\":\"gemma3_text\",\"hidden_size\":768}", true);
         try testing.expect(!m.is_encoder);
         try testing.expect(m.has_chat);
+    }
+    // EmbeddingGemma 2 declares no bidirectional flag: its model_type IS the encoder. It ships a
+    // chat_template.jinja (media placeholder joiner), which does not make it a chat model, and a vision_config
+    // whose tower embeds images and video.
+    {
+        const json =
+            \\{"model_type":"embedding_gemma2","vision_config":{"hidden_size":768},"video_token_id":258884,
+            \\"text_config":{"model_type":"embedding_gemma2_text","vocab_size":262144,"hidden_size":512,
+            \\"num_hidden_layers":24,"max_position_embeddings":262144}}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.is_encoder);
+        try testing.expect(m.has_embedding);
+        try testing.expect(!m.has_chat);
+        try testing.expect(m.has_vision);
+        try testing.expect(m.has_video);
+        try testing.expectEqual(@as(u32, 512), m.hidden_size);
+        try testing.expectEqual(@as(u32, 24), m.num_hidden_layers);
+        // The trained window the loaded row reports (model.zig), not the trunk's 262144.
+        try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
+        try testing.expect(isSupportedModelType("embedding_gemma2"));
     }
     // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
     // root carries only model_type / vision_config / quantization. Reading the

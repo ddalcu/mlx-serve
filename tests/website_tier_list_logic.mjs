@@ -17,8 +17,7 @@ if (pure.length === script.length) { console.error("ASSERT FAIL: rendering marke
 
 // ── dead-control guard ────────────────────────────────────────────────────
 // A typo'd getElementById is a control that silently never works, and every
-// byte-level assertion in test_website_pages.sh still passes. Same check the
-// built-in console page runs against app.js (tests/html_console_test.mjs).
+// byte-level assertion in test_website_pages.sh still passes.
 {
   const ids = new Set();
   for (const m of html.matchAll(/\bid=(?:"([^"]+)"|([\w-]+))/g)) ids.add(m[1] || m[2]);

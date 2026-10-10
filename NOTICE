@@ -14,15 +14,6 @@ Apache License, Version 2.0
 ================================================================================
 
 --------------------------------------------------------------------------------
-mux.js 6.3.0
-https://github.com/videojs/mux.js/tree/v6.3.0
-Copyright (c) Brightcove
-Licensed under the Apache License, Version 2.0.
-
-MP4 generator lives in `src/html/app.js`. Converted to an ES module; the
-MAX_UINT32 constant is inlined. License text is included in the bundle.
-
---------------------------------------------------------------------------------
 Cloudflare Clef and mlx-community Clef MLX
 https://huggingface.co/Cloudflare/clef
 https://huggingface.co/mlx-community/clef-flash-4bit
@@ -196,74 +187,23 @@ MIT License
 ================================================================================
 
 --------------------------------------------------------------------------------
-markdown-it 15.0.2
-https://github.com/markdown-it/markdown-it/tree/15.0.2
-Copyright (c) 2014 Vitaly Puzrin, Alex Kocharin.
-Licensed under the MIT License.
+Svelte 5.57.2
+https://github.com/sveltejs/svelte/tree/svelte@5.57.2
+Copyright (c) 2016-2025 Svelte Contributors
+Licensed under the MIT License (the permission and warranty terms in LICENSE).
 
-Markdown renderer lives in `src/html/app.js`, including its license text.
-
---------------------------------------------------------------------------------
-mdurl 2.1.0
-https://github.com/markdown-it/mdurl/tree/2.1.0
-Copyright (c) 2015 Vitaly Puzrin, Alex Kocharin.
-Copyright Joyent, Inc. and other Node contributors. All rights reserved.
-Licensed under the MIT License.
-
-Vendored browser code lives in `src/html/app.js`, including its license text.
-Bundled with markdown-it 15.0.2; versions follow its release lockfile and
-embedded runtime marker.
+The Svelte runtime is compiled into `src/html/index.html`, the web console
+built from `app-web/`.
 
 --------------------------------------------------------------------------------
-linkify-it 6.1.0
-https://github.com/markdown-it/linkify-it/tree/6.1.0
-Copyright (c) 2015 Vitaly Puzrin.
-Licensed under the MIT License.
+MLX Serve Studio (the web console)
+https://github.com/ddalcu/mlx-serve/pull/755
+Contributed under the MIT License of this repository by Alin Selea (Studio, #755),
+Samuel Reed (the Monitoring panel, #701) and Pan Patryk (mount-prefix resolution,
+#698), with earlier console work by other contributors.
 
-Vendored browser code lives in `src/html/app.js`, including its license text.
-Bundled with markdown-it 15.0.2; versions follow its release lockfile and
-embedded runtime marker.
-
---------------------------------------------------------------------------------
-punycode.js 2.3.1
-https://github.com/mathiasbynens/punycode.js/tree/v2.3.1
-Copyright Mathias Bynens <https://mathiasbynens.be/>
-Licensed under the MIT License.
-
-Vendored browser code lives in `src/html/app.js`, including its license text.
-Bundled with markdown-it 15.0.2; versions follow its release lockfile and
-embedded runtime marker.
-
---------------------------------------------------------------------------------
-uc.micro 3.0.0
-https://github.com/markdown-it/uc.micro/tree/3.0.0
-Copyright Mathias Bynens <https://mathiasbynens.be/>
-Licensed under the MIT License.
-
-Vendored browser code lives in `src/html/app.js`, including its license text.
-Bundled with markdown-it 15.0.2; versions follow its release lockfile and
-embedded runtime marker.
-
---------------------------------------------------------------------------------
-Rolldown runtime 1.2.1
-https://github.com/rolldown/rolldown/tree/v1.2.1
-Copyright (c) 2024-present VoidZero Inc. & Contributors
-Licensed under the MIT License.
-
-Vendored browser code lives in `src/html/app.js`, including its license text.
-Bundled with markdown-it 15.0.2; versions follow its release lockfile and
-embedded runtime marker.
-
---------------------------------------------------------------------------------
-@oxc-project/runtime 0.142.0
-https://github.com/oxc-project/oxc
-Copyright (c) 2024-present VoidZero Inc. & Contributors
-Copyright (c) 2023 Boshen
-Licensed under the MIT License.
-
-Vendored browser code lives in `src/html/app.js`, including its license text.
-Bundled with markdown-it 15.0.2; versions follow its release lockfile and
-embedded runtime marker.
+`app-web/` re-implements Studio in Svelte and TypeScript: its client logic,
+presets, prompts, translations and layout are ported from Studio's modules.
 
 --------------------------------------------------------------------------------
 Sushi n-gram gather calibration and MTP depth bounds
@@ -538,23 +478,6 @@ Other licenses
 ================================================================================
 
 --------------------------------------------------------------------------------
-highlight.js 11.11.1
-https://github.com/highlightjs/highlight.js/tree/11.11.1
-Copyright (c) 2006, Ivan Sagalaev. All rights reserved.
-Licensed under the BSD 3-Clause License.
-
-Syntax highlighter lives in `src/html/app.js`, including its license text.
-
---------------------------------------------------------------------------------
-entities 8.0.0
-https://github.com/fb55/entities/tree/v8.0.0
-Copyright (c) Felix Böhm. All rights reserved.
-Licensed under the BSD 2-Clause License.
-
-HTML entity decoder bundled with markdown-it 15.0.2 lives in
-`src/html/app.js`, including its license text.
-
---------------------------------------------------------------------------------
 libwebp
 https://chromium.googlesource.com/webm/libwebp
 Copyright (c) 2010, Google Inc. All rights reserved.
@@ -586,29 +509,6 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 --------------------------------------------------------------------------------
-Lucide icons, revision 500620a2e8123f8d1db191538886dc0c223f69a9
-https://github.com/lucide-icons/lucide/tree/500620a2e8123f8d1db191538886dc0c223f69a9
-Copyright (c) 2026 Lucide Icons and Contributors
-Copyright (c) 2013-present Cole Bemis (Feather-derived icons).
-Licensed under the ISC License; Feather-derived portions use the MIT License.
-
-Unmodified SVG paths live in `src/html/app.js` and as icon data URLs in
-`src/html/app.css`. Both license texts are included with the vendored icons.
-The revision above is the exact vendored version (not an npm package).
-
-Permission to use, copy, modify, and/or distribute this software for any
-purpose with or without fee is hereby granted, provided that the above
-copyright notice and this permission notice appear in all copies.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-
---------------------------------------------------------------------------------
 Fast-Quadric-Mesh-Simplification
 https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification
 Copyright (c) 2015-2019 Spacerat and contributors
@@ -628,6 +528,18 @@ Licensed under the MIT License.
 SAME-S decoder from `optimized/mlx/models/defs`. The model WEIGHTS are not
 part of mlx-serve: they are the Stability AI Community License
 (https://stability.ai/license), T5Gemma the Gemma Terms of Use.
+
+--------------------------------------------------------------------------------
+YuE2 (m-a-p) and ahmadw/YuE2-3B-MLX
+https://huggingface.co/m-a-p/YuE2-3B
+https://huggingface.co/ahmadw/YuE2-3B-MLX
+Oobleck decoder: Copyright (c) 2023 Stability AI (stable-audio-tools), MIT.
+SnakeBeta: Copyright (c) 2022 NVIDIA CORPORATION (BigVGAN), MIT.
+
+`src/yue2.zig` follows the YuE2 inference protocol and the pack layout of
+ahmadw's MLX port, including the decoder those packs fold in. The model WEIGHTS
+are not part of mlx-serve: they are CC BY-NC 4.0 (non-commercial); credit YuE2,
+its model name and https://huggingface.co/m-a-p/YuE2-3B when you publish output.
 
 --------------------------------------------------------------------------------
 stb_image / stb_image_write

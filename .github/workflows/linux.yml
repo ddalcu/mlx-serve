@@ -1,0 +1,147 @@
+name: Linux
+
+# Linux/CUDA builds of the mlx-serve server, via scripts/build-linux.sh — the
+# same one-shot script a developer runs:
+#   x64:   RTX 20-50 series (Turing sm_75, Ampere/Ada sm_86, Blackwell sm_120)
+#   arm64: GH200 (sm_90), Jetson Thor (sm_110), DGX Spark / GB10 (sm_121)
+# GitHub's runners have no GPU, so this
+# is a compile-and-link gate plus a downloadable build, not a runtime test.
+#
+# Every slow input is cached by what produced it: the stage scripts stamp their
+# outputs with the same inputs the cache keys hash, so a hit skips the stage
+# (checkout gives sources fresh mtimes, so object-file caches would rebuild
+# anyway). A warm run compiles only mlx-serve itself: one LLVM module, so Zig's
+# cache cannot carry it across commits, and restored libraries are new files to it.
+#
+# The tarball keeps the repo layout the binary's $ORIGIN rpaths expect
+# (zig-out/bin/mlx-serve next to lib/mlx/lib, lib/llama/lib, lib/ds4-linux). Running it
+# needs an NVIDIA driver >= 580 (CUDA 13), the CUDA 13 toolkit (MLX JIT-compiles
+# kernels against its headers) and cuDNN 9, plus OpenBLAS/LAPACKE, libwebp and
+# the Avahi dns_sd compat library.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APT_PACKAGES: cuda-toolkit-13 cudnn9-cuda-13 cmake liblapacke-dev libopenblas-dev libwebp-dev libavahi-compat-libdnssd-dev
+
+jobs:
+  cuda:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ZIG_CPU / NATIVE_CPU_FLAG: portable CPU code, so the runner's own CPU features stay out.
+          - name: x64
+            runner: ubuntu-24.04
+            cuda_repo: x86_64
+            cuda_arch: "75;86;120"
+            zig_cpu: x86_64_v3
+            cpu_flag: -march=x86-64-v3
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            cuda_repo: sbsa
+            cuda_arch: "90;110;121"
+            zig_cpu: baseline
+            cpu_flag: -march=armv8.2-a+dotprod
+    name: cuda (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    env:
+      CUDA_ARCH: ${{ matrix.cuda_arch }}
+      ZIG_CPU: ${{ matrix.zig_cpu }}
+      NATIVE_CPU_FLAG: ${{ matrix.cpu_flag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The submodules' git data, keyed by their pinned commits (the gitlinks).
+      - name: Compute pins
+        id: pins
+        run: |
+          pin() { git ls-tree HEAD "$1" | awk '{print substr($3,1,12)}'; }
+          echo "submodules=$(git ls-tree HEAD lib | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          echo "mlx=$(pin lib/mlx-src)-$(pin lib/mlxc-src)" >> "$GITHUB_OUTPUT"
+          echo "ds4=$(pin lib/ds4)" >> "$GITHUB_OUTPUT"
+          echo "arch=$(echo "$CUDA_ARCH" | tr ';' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache submodules
+        uses: actions/cache@v4
+        with:
+          path: .git/modules
+          key: submodules-${{ steps.pins.outputs.submodules }}
+          restore-keys: submodules-
+
+      - name: Check out submodules
+        run: git submodule update --init --depth 1 --jobs 8
+
+      - name: Cache MLX stage
+        uses: actions/cache@v4
+        with:
+          path: lib/mlx
+          key: mlx-linux-${{ matrix.name }}-${{ steps.pins.outputs.mlx }}-${{ steps.pins.outputs.arch }}-${{ hashFiles('patches/mlx*.patch', 'scripts/build-mlx-linux.sh') }}
+
+      - name: Cache ds4 stage
+        uses: actions/cache@v4
+        with:
+          path: lib/ds4-linux
+          key: ds4-linux-${{ matrix.name }}-${{ steps.pins.outputs.ds4 }}-${{ steps.pins.outputs.arch }}-${{ env.NATIVE_CPU_FLAG }}-${{ hashFiles('scripts/build-ds4-linux.sh') }}
+
+      - name: Cache llama.cpp stage
+        uses: actions/cache@v4
+        with:
+          path: lib/llama
+          key: llama-linux-${{ matrix.name }}-${{ hashFiles('scripts/fetch-llama.sh') }}
+
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: .zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
+      # CUDA (+ its cached .debs) and the build do not fit the runner's default free space.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The .debs (~4 GB of CUDA + cuDNN) are cached; installing them still runs every time.
+      - name: Cache CUDA packages
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-ubuntu2404-${{ matrix.name }}-${{ hashFiles('.github/workflows/linux.yml') }}
+          restore-keys: apt-ubuntu2404-${{ matrix.name }}-
+
+      - name: Install CUDA 13, cuDNN and build dependencies
+        run: |
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${{ matrix.cuda_repo }}/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          mkdir -p ~/apt-archives/partial
+          sudo apt-get install -y --no-install-recommends -o Dir::Cache::archives="$HOME/apt-archives" \
+            -o APT::Keep-Downloaded-Packages=true $APT_PACKAGES
+          sudo chown -R "$USER" ~/apt-archives
+          echo /usr/local/cuda/bin >> "$GITHUB_PATH"
+
+      - name: Build
+        run: ./scripts/build-linux.sh
+
+      - name: Check every library resolves (libcuda.so.1 comes with the driver)
+        run: |
+          ! ldd zig-out/bin/mlx-serve | grep 'not found' | grep -v 'libcuda.so.1'
+
+      - name: Package
+        run: |
+          tar czf mlx-serve-linux-${{ matrix.name }}-cuda13.tar.gz zig-out/bin/mlx-serve lib/mlx/lib lib/llama/lib lib/ds4-linux/libds4.so LICENSE LICENSE-APACHE-2.0 NOTICE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlx-serve-linux-${{ matrix.name }}-cuda13
+          path: mlx-serve-linux-${{ matrix.name }}-cuda13.tar.gz

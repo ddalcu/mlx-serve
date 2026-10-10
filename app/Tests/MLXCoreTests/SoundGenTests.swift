@@ -60,7 +60,7 @@ final class SoundGenTests: XCTestCase {
         let b = SoundModelPreset.stableAudio3SmallSFX.bundle
         XCTAssertEqual(b.components.count, 1)
         let c = b.components[0]
-        XCTAssertEqual(c.repo, "stabilityai/stable-audio-3-small-sfx")
+        XCTAssertEqual(c.repo, "ddalcu/Stable-Audio-3-Small-SFX-MLX-Serve")
         for m in ["model_config.json", "model.safetensors", "t5gemma-b-b-ul2/model.safetensors", "t5gemma-b-b-ul2/tokenizer.json"] {
             XCTAssertTrue(c.readyMarkers.contains(m), m)
         }

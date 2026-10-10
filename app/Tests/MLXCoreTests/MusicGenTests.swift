@@ -17,8 +17,10 @@ final class MusicGenTests: XCTestCase {
             XCTAssertFalse(p.repo.isEmpty)
             XCTAssertGreaterThan(p.approxRAMGB, 0)
             // Steps are checkpoint facts: ACE Turbo is distillation-fixed at
-            // 8; Music 3 runs the reference 30-step flow-match schedule.
-            XCTAssertEqual(p.fixedSteps, p.family == .acestep ? 8 : 30)
+            // 8; Music 3 runs the reference 30-step flow-match schedule and
+            // YuE2 its 32 midpoint steps.
+            let want: [MusicEngineFamily: Int] = [.acestep: 8, .minimaxMusic3: 30, .yue2: 32]
+            XCTAssertEqual(p.fixedSteps, want[p.family], p.name)
         }
         // Published converted repo → the pane offers a one-click download
         // (a `local/` prefix would show the convert-locally hint instead).

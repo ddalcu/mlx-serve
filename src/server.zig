@@ -27,11 +27,11 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const ds4_ffi = if (@import("build_options").embedded_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const stb = @import("stb");
 const webp = @import("webp");
@@ -56,7 +56,7 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 var active_conn_threads = std.atomic.Value(u32).init(0);
 /// Set from main.zig before serve() is called when --metrics is on; null
 /// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
-/// routes. When null, `/metrics*` return 503 and the index page shows no panel.
+/// routes. When null, `/metrics*` return 503, which the console reads as "metrics off".
 pub var g_metrics: ?*instr.Metrics = null;
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
@@ -633,6 +633,8 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
 
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
 fn dsv4DraftStages(lm: *LoadedModel) bool {
+    if (lm.config) |cfg| if (cfg.mtp_override == false) return false;
+    if (!generate_mod.Generator.dsparkEnabled()) return false;
     const x = lm.transformer orelse return false;
     return x.dsparkStages() > 0;
 }
@@ -1169,10 +1171,6 @@ pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) 
 // and `LoadedModel.id`. Handlers read them off `lm`. `global_vision_encoder`
 // and `global_model_id` singletons were removed. The `discovered_models`
 // slice was also removed — `/v1/models` iterates `registry.entries` directly.
-
-/// Port the HTTP server is bound to. Used by the landing page's curl
-/// example so users can copy-paste a working command.
-var global_port: u16 = 0;
 
 /// Decode a slice of token IDs to bytes, routing through the ds4 engine when
 /// the loaded model is GGUF-backed (no MLX tokenizer in that case). Used by
@@ -1925,7 +1923,6 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
-    global_port = port;
     // Install signal handlers for graceful shutdown
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -2303,7 +2300,10 @@ fn handleConnection(
         !apiKeyAuthorized(request[0..header_end_pos], raw_path))
     {
         log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-        try sendUnauthorized(stream);
+        if (wantsLoginPage(method, path, request[0..header_end_pos]))
+            try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(request[0..header_end_pos], raw_path))
+        else
+            try sendUnauthorized(stream);
         return;
     }
 
@@ -2345,7 +2345,7 @@ fn handleConnection(
     // the model it now fetches from /v1/models + /props client-side.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
         log.debug("GET  / -> 200 (console)\n", .{});
-        try handleStatusPage(allocator, stream);
+        try handleStatusPage(stream);
         return;
     }
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
@@ -2362,7 +2362,7 @@ fn handleConnection(
         }
         return;
     }
-    // JSON feed — drives the live metrics panel on the index page. Behind the
+    // JSON feed — drives the console's Monitoring pane. Behind the
     // global API-key gate above when --api-key is set (same-origin browser
     // fetch inherits the page's Basic credentials).
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics.json")) {
@@ -5652,7 +5652,10 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
 /// failure the operator can act on. One helper for the three slot-drain sites.
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
-    if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
+    if (slot.errorNameIs("PrefillDoesNotFit")) {
+        prefill_refusal = if (slot.refused_bill) |bill| .{ .tokens = slot.full_prompt.len, .needed = bill[0], .available = bill[1] } else null;
+        return error.PrefillDoesNotFit;
+    }
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     return error.GenerationFailed;
 }
@@ -5675,6 +5678,19 @@ fn memoryRefusalMessage(
 /// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
 /// estimator the guard uses, re-asked after the hot cache gave back everything it could.
 const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+
+/// The figures of the `PrefillDoesNotFit` this connection thread last drained, read once by
+/// `mapGenerationError`: the error name alone cannot carry them past `slotFailure`.
+threadlocal var prefill_refusal: ?struct { tokens: usize, needed: u64, available: u64 } = null;
+
+/// `PREFILL_NOFIT_MSG` with the figures the refusal compared, worded like the guard's 400 so a client
+/// reads both refusals the same way. The bare message when no figures were drained.
+fn prefillNoFitMessage(buf: []u8) []const u8 {
+    const refusal = prefill_refusal orelse return PREFILL_NOFIT_MSG;
+    prefill_refusal = null;
+    const mb = 1024 * 1024;
+    return std.fmt.bufPrint(buf, "This prompt ({d} tokens) does not fit in GPU memory even after freeing the prefix cache: it requires ~{d}MB GPU memory but only ~{d}MB is available. It was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine.", .{ refusal.tokens, refusal.needed / mb, refusal.available / mb }) catch PREFILL_NOFIT_MSG;
+}
 
 /// A generation failure as the wire sees it: one status, one message, both dialects' type.
 pub const GenErrorWire = struct {
@@ -5704,7 +5720,7 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .code = 400,
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
-            .message = PREFILL_NOFIT_MSG,
+            .message = prefillNoFitMessage(buf),
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -5763,7 +5779,7 @@ const ErrorSurface = union(enum) {
 /// stream gets the same response its non-streaming twin would; past it the same `type` and
 /// `message` ride the surface's terminal `error` event.
 fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
-    var msg_buf: [192]u8 = undefined;
+    var msg_buf: [320]u8 = undefined;
     const w = mapGenerationError(err, &msg_buf);
 
     if (!stream.sse_headers_sent) {
@@ -6283,8 +6299,8 @@ pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: u
     return .{ bill.needed, bill.available };
 }
 
-/// The inference thread's refusal, quoting the numbers it compared.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) void {
+/// The inference thread's refusal, quoting the numbers it compared; returns {needed, available} for the client.
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) [2]u64 {
     // The same warm inputs the probe was refused on, the checkout decision included.
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
@@ -6307,6 +6323,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         bill.evictable / mb,
         pinnedResidentBytes(bill) / mb,
     });
+    return .{ bill.needed, bill.available };
 }
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool, enable_mtp: bool, media_bytes: u64) !bool {
@@ -6689,7 +6706,7 @@ fn renderModelEntry(
             .has_image_engine = entry.image_engine != null,
             .has_audio_engine = entry.audio_engine != null,
             .has_music_backend = if (entry.audio_engine) |ae| switch (ae.backend) {
-                .music, .music3 => true,
+                .music, .music3, .yue2 => true,
                 else => false,
             } else false,
             .has_sound_backend = if (entry.audio_engine) |ae| ae.backend == .sound else false,
@@ -7492,6 +7509,7 @@ const PropsSettings = struct {
     /// 0 = auto.
     mtp_depth: u32,
     mtp_adaptive: bool,
+    native_speculation: ?struct { lane: []const u8, block_size: u32, sampled: bool } = null,
     /// 0 = no ceiling.
     max_mtp_ctx: u32,
     drafter: []const u8,
@@ -7532,18 +7550,24 @@ fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv = configuredKvQuantFor(config);
+    const native = if (lm.transformer) |x| x.dsv41_ext else null;
     return .{
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = server_config.kv_attn_mode,
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
-        .mtp_loaded = mtpCapable(lm),
+        .mtp_loaded = lm.mtp != null or (if (lm.transformer) |x| x.dsparkStages() > 0 else false),
         .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
+        .native_speculation = if (native) |m| .{
+            .lane = mlx_stream.laneName(m),
+            .block_size = mlx_stream.blockSize(m),
+            .sampled = generate_mod.Generator.dsparkStochEnabledFromEnv(if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_STOCH")) |v| std.mem.span(v) else null),
+        } else null,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = server_config.default_enable_pld, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
@@ -7564,14 +7588,20 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    var mtp_buf: [512]u8 = undefined;
+    const mtp_json = if (st.native_speculation) |native|
+        try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":null,\"acceptance_param\":null,\"greedy_tail\":null,\"depth\":null,\"adaptive\":null,\"max_ctx\":{d},\"native\":{{\"lane\":\"{s}\",\"block_size\":{d},\"sampled_acceptance\":\"{s}\"}}}}", .{
+            st.mtp_loaded, st.mtp_default_on, st.max_mtp_ctx, native.lane, native.block_size, if (native.sampled and native.block_size > 0) "stochastic" else "off",
+        })
+    else
+        try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}}", .{
+            st.mtp_loaded, st.mtp_default_on, mtp_acceptance_mod.name(st.mtp_acceptance), param, st.mtp_greedy_tail, st.mtp_depth, st.mtp_adaptive, st.max_mtp_ctx,
+        });
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{s},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
-        st.mtp_loaded,                              st.mtp_default_on,
-        mtp_acceptance_mod.name(st.mtp_acceptance), param,
-        st.mtp_greedy_tail,                         st.mtp_depth,
-        st.mtp_adaptive,                            st.max_mtp_ctx,
+        mtp_json,
         st.drafter,                                 st.pld.enable,
         st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
@@ -7718,81 +7748,16 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-/// Render the built-in console at `GET /`: a chat playground, image
-/// generate/edit and audio tools, the live metrics panel, and the full API
-/// reference. Self-contained — no external assets, no CDN.
+/// The built-in console at `GET /`: one self-contained page built from
+/// `app-web/` (never edited by hand), served byte for byte.
 ///
-/// Takes NO model. Everything model-shaped (the picker, capabilities, memory)
-/// is fetched client-side from `/v1/models` + `/props`, which is what lets the
-/// page render on a server with nothing loaded — the default boot mode — and
-/// what makes the picker follow loads/unloads without a refresh.
-fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
-    const version_esc = try htmlEscape(allocator, build_options.version);
-    defer allocator.free(version_esc);
-
-    // Optional live-metrics panel: a mount div + the polling script (which also
-    // carries the panel markup and injects it into the mount). Rendered into
-    // the header's `{s}` slot — but ONLY when --metrics is on; off ⇒ empty
-    // string, so nothing polls a 503 feed.
-    const METRICS_SECTION = "\n<div id=mlx-metrics></div>\n<script>\n" ++ @embedFile("html/metrics.js") ++ "\n</script>\n";
-    const metrics_section: []const u8 = if (g_metrics != null) METRICS_SECTION else "";
-
-    // The page lives in src/html/index.html (@embedFile resolves relative to
-    // this source file, so no build.zig change) and is a std.fmt FORMAT
-    // STRING: every literal `{`/`}` in it must be doubled. That is exactly why
-    // the CSS and JS are separate files injected as RUNTIME `{s}` args —
-    // std.fmt does not re-parse a runtime argument, so app.css/app.js/
-    // metrics.js can be ordinary CSS and JavaScript. Don't inline them back.
-    // The console's three boot scripts share the page's single `<script>{s}`
-    // slot: api.js publishes `apiPrefix` (the mount the page was served under),
-    // which every later script — including the metrics panel rendered into the
-    // header below — resolves its requests through; theme.js sets the stored/OS
-    // theme before the stylesheet paints; i18n.js resolves the language (and
-    // <html lang>) before the body. They are concatenated here rather than given
-    // a second slot because std.fmt does not re-parse a runtime argument, so all
-    // three stay ordinary JavaScript.
-    const boot_script = try std.mem.concat(allocator, u8, &.{
-        @embedFile("html/api.js"),
-        "\n;\n",
-        @embedFile("html/theme.js"),
-        "\n;\n",
-        @embedFile("html/i18n.js"),
-    });
-    defer allocator.free(boot_script);
-    const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
-        // <title> version
-        version_esc,
-        // <script> — src/html/api.js + theme.js + i18n.js (before first paint)
-        boot_script,
-        // <style> — src/html/app.css
-        @embedFile("html/app.css"),
-        // header version
-        version_esc,
-        // optional live-metrics panel (empty when --metrics is off)
-        metrics_section,
-        // curl example port
-        global_port,
-        // <script> — src/html/app.js
-        @embedFile("html/app.js"),
-    });
-    defer allocator.free(body);
-    try sendResponse(stream, "200 OK", "text/html; charset=utf-8", body);
-}
-
-/// Minimal HTML escape — covers the five chars that matter inside element
-/// content + double-quoted attribute values. Caller frees.
-fn htmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(allocator);
-    for (input) |c| switch (c) {
-        '&' => try buf.appendSlice(allocator, "&amp;"),
-        '<' => try buf.appendSlice(allocator, "&lt;"),
-        '>' => try buf.appendSlice(allocator, "&gt;"),
-        '"' => try buf.appendSlice(allocator, "&quot;"),
-        '\'' => try buf.appendSlice(allocator, "&#39;"),
-        else => try buf.append(allocator, c),
-    };
-    return try buf.toOwnedSlice(allocator);
+/// Takes NO model. Everything model-shaped (the picker, capabilities, memory,
+/// version, whether metrics are on) is fetched client-side from `/v1/models`,
+/// `/props`, `/api/version` and `/metrics.json`, which is what lets the page
+/// render on a server with nothing loaded — the default boot mode — and what
+/// makes the picker follow loads/unloads without a refresh.
+fn handleStatusPage(stream: *Conn) !void {
+    try sendResponse(stream, "200 OK", "text/html; charset=utf-8", @embedFile("html/index.html"));
 }
 
 /// `<bos> ids <eos>` for bidirectional embedding models. Either special is
@@ -7854,7 +7819,6 @@ fn handleEmbeddings(
     };
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
-    const gen_mod = @import("generate.zig");
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", null);
         return;
@@ -7865,12 +7829,6 @@ fn handleEmbeddings(
         return;
     }
     const root = parsed.value.object;
-
-    // Parse input — can be a string or array of strings
-    const input_val = root.get("input") orelse {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing 'input' field", null);
-        return;
-    };
 
     const model_name = if (root.get("model")) |m| (if (m == .string) m.string else config.model_type) else config.model_type;
 
@@ -7886,6 +7844,21 @@ fn handleEmbeddings(
         }
         break :blk @intCast(v.integer);
     } else null;
+
+    // `messages` (vLLM's chat embeddings) is the form that carries images and video: one prompt, one embedding.
+    if (root.get("messages")) |messages_val| {
+        if (root.get("input") != null) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send either 'input' or 'messages', not both", null);
+            return;
+        }
+        return handleMessagesEmbedding(allocator, stream, lm, messages_val, req_dims, model_name);
+    }
+
+    // Parse input — can be a string or array of strings
+    const input_val = root.get("input") orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing 'input' field", null);
+        return;
+    };
 
     // Collect input texts
     var texts = std.ArrayList([]const u8).empty;
@@ -7913,12 +7886,6 @@ fn handleEmbeddings(
 
     log.info("POST /v1/embeddings ({d} inputs)\n", .{texts.items.len});
 
-    // Build response JSON
-    var resp_buf = std.ArrayList(u8).empty;
-    defer resp_buf.deinit(allocator);
-
-    try resp_buf.appendSlice(allocator, "{\"object\":\"list\",\"data\":[");
-
     // Tokenize every input up front so the whole request rides ONE scheduler
     // round-trip; the inference thread embeds the sequences in padded,
     // key-masked GPU batches (generate.EMBED_MAX_BATCH per forward) instead
@@ -7935,63 +7902,75 @@ fn handleEmbeddings(
             return;
         }
         const raw_ids = try tok.encode(allocator, text);
-        // Bidirectional embedding models (EmbeddingGemma) declare
-        // add_bos_token + add_eos_token; the SentencePiece encode path adds
-        // neither, so wrap here. BERT's [CLS]/[SEP] come from WordPiece itself.
-        const ids = if (config.use_bidirectional_attention) blk: {
-            defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
-                allocator,
-                raw_ids,
-                config.bos_token_id,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else if (config.effectivePooling() == .last_token) blk: {
-            // Last-token pooling models pool an APPENDED terminator: the
-            // Qwen3-Embedding tokenizer's TemplateProcessing post-processor
-            // adds <|endoftext|> (the config's eos_token_id) to every encode,
-            // and the reference pools THAT position — without it, we'd pool
-            // the final text token and quietly diverge from the model card.
-            defer allocator.free(raw_ids);
-            break :blk try wrapEncoderIds(
-                allocator,
-                raw_ids,
-                null,
-                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
-            );
-        } else raw_ids;
+        const ids = try wrapEmbeddingIds(allocator, config, raw_ids);
         total_tokens += ids.len;
         try seqs.append(allocator, ids);
     }
 
-    // Issue #117: enforce the effective per-input token ceiling BEFORE the
-    // forward pass — the server owns the exact tokenizer, so the counts here
-    // are authoritative. Over-limit is an explicit 400, never truncation.
-    const embed_limit = embedEffectiveLimit(embedding_max_length, config.max_position_embeddings);
-    if (embed_limit > 0) {
-        for (seqs.items, 0..) |ids, idx| {
-            if (ids.len > embed_limit) {
-                var msg_buf: [160]u8 = undefined;
-                const msg = embedOverflowMessage(&msg_buf, idx, ids.len, embed_limit);
-                log.warn("  embedding input {d} over limit: {d} > {d}\n", .{ idx, ids.len, embed_limit });
-                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
-                return;
-            }
+    var msg_buf: [160]u8 = undefined;
+    for (seqs.items, 0..) |ids, idx| {
+        if (embeddingLimitReject(&msg_buf, config, idx, ids.len)) |msg| {
+            log.warn("  embedding input {d} over limit: {d} tokens\n", .{ idx, ids.len });
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
+            return;
         }
     }
 
-    // Phase A: route through scheduler when available so the encoder
-    // forward pass runs on the inference thread (mlx 0.31.2 thread-local
-    // streams). Falls back to a direct call only in the offline path
-    // where no scheduler exists. `computeEmbeddingsBatch` resets the KV
-    // cache before every sub-batch on both paths.
-    const embeddings = if (global_scheduler) |sch| blk: {
+    const embeddings = (try embeddingRows(allocator, stream, lm, xfm, seqs.items, null)) orelse return;
+    defer {
+        for (embeddings) |e| allocator.free(e);
+        allocator.free(embeddings);
+    }
+    try sendEmbeddings(allocator, stream, embeddings, req_dims, model_name, total_tokens);
+}
+
+/// A tokenized input as the model's pipeline feeds it: bidirectional embedding models (EmbeddingGemma) declare
+/// add_bos_token + add_eos_token and the SentencePiece encode path adds neither, so wrap here (BERT's
+/// [CLS]/[SEP] come from WordPiece itself); a last-token pooler (Qwen3-Embedding) pools an APPENDED terminator,
+/// which its tokenizer's TemplateProcessing adds to every encode and the reference pools THAT position — without
+/// it we'd pool the final text token and quietly diverge from the model card. Frees `raw_ids`.
+fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, raw_ids: []u32) ![]u32 {
+    const eos: ?u32 = if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null;
+    if (config.use_bidirectional_attention) {
+        defer allocator.free(raw_ids);
+        return wrapEncoderIds(allocator, raw_ids, config.bos_token_id, eos);
+    }
+    if (config.effectivePooling() == .last_token) {
+        defer allocator.free(raw_ids);
+        return wrapEncoderIds(allocator, raw_ids, null, eos);
+    }
+    return raw_ids;
+}
+
+/// Issue #117: the effective per-input token ceiling is enforced BEFORE the forward pass — the server owns the
+/// exact tokenizer, so the counts are authoritative. The over-limit 400's text (an explicit refusal, never
+/// truncation), or null when `tokens` fits.
+fn embeddingLimitReject(buf: []u8, config: *const model_mod.ModelConfig, index: usize, tokens: usize) ?[]const u8 {
+    const limit = embedEffectiveLimit(embedding_max_length, config.max_position_embeddings);
+    if (limit == 0 or tokens <= limit) return null;
+    return embedOverflowMessage(buf, index, tokens, limit);
+}
+
+/// Phase A: route through scheduler when available so the encoder forward pass runs on the inference thread
+/// (mlx 0.31.2 thread-local streams). Falls back to a direct call only in the offline path where no scheduler
+/// exists. `computeEmbeddingsBatch` resets the KV cache before every sub-batch on both paths. `vision` (one
+/// prompt's soft tokens) passes to the request, whose inference-thread side frees it. Null after the 500.
+fn embeddingRows(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    lm: *LoadedModel,
+    xfm: *transformer_mod.Transformer,
+    seqs: []const []const u32,
+    vision: ?mlx.mlx_array,
+) !?[][]f32 {
+    if (global_scheduler) |sch| {
         var req = scheduler_mod.EmbedRequest{
             .model = lm,
-            .token_seqs = seqs.items,
+            .token_seqs = seqs,
+            .vision_embeddings = vision,
             .allocator = allocator,
         };
-        break :blk sch.computeEmbeddings(&req) catch |err| {
+        return sch.computeEmbeddings(&req) catch |err| {
             if (req.error_name) |e| {
                 log.err("  embedding error: {s}\n", .{e});
                 allocator.free(e);
@@ -7999,20 +7978,27 @@ fn handleEmbeddings(
                 log.err("  embedding error: {}\n", .{err});
             }
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
-            return;
+            return null;
         };
-    } else fallback: {
-        break :fallback gen_mod.computeEmbeddingsBatch(allocator, xfm, seqs.items) catch |err| {
-            log.err("  embedding error: {}\n", .{err});
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
-            return;
-        };
-    };
-    defer {
-        for (embeddings) |e| allocator.free(e);
-        allocator.free(embeddings);
     }
+    defer if (vision) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    return generate_mod.computeEmbeddingsBatchWith(allocator, xfm, seqs, vision) catch |err| {
+        log.err("  embedding error: {}\n", .{err});
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
+        return null;
+    };
+}
 
+fn sendEmbeddings(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    embeddings: []const []f32,
+    req_dims: ?usize,
+    model_name: []const u8,
+    total_tokens: usize,
+) !void {
     if (req_dims) |d| {
         const native = if (embeddings.len > 0) embeddings[0].len else 0;
         if (d > native) {
@@ -8022,6 +8008,12 @@ fn handleEmbeddings(
             return;
         }
     }
+
+    // Build response JSON
+    var resp_buf = std.ArrayList(u8).empty;
+    defer resp_buf.deinit(allocator);
+
+    try resp_buf.appendSlice(allocator, "{\"object\":\"list\",\"data\":[");
 
     for (embeddings, 0..) |full_embedding, idx| {
         const embedding = if (req_dims) |d| truncateEmbeddingDims(full_embedding, d) else full_embedding;
@@ -8058,7 +8050,77 @@ fn handleEmbeddings(
     try resp_buf.appendSlice(allocator, "}}");
 
     try sendResponse(stream, "200 OK", "application/json", resp_buf.items);
-    log.info("  <- {d} embeddings ({d} tokens)\n", .{ texts.items.len, total_tokens });
+    log.info("  <- {d} embeddings ({d} tokens)\n", .{ embeddings.len, total_tokens });
+}
+
+/// `POST /v1/embeddings` with `messages`: images, video and text as ONE prompt, ONE embedding. The soft tokens
+/// of every image and video enter the sequence at their placeholders, exactly where the reference's processor
+/// puts them (`<bos>` … `<eos>` around the lot).
+fn handleMessagesEmbedding(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    lm: *LoadedModel,
+    messages_val: std.json.Value,
+    req_dims: ?usize,
+    model_name: []const u8,
+) !void {
+    const xfm = lm.transformer.?;
+    const config = lm.config.?;
+    if (messages_val != .array or messages_val.array.items.len == 0) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' must be a non-empty array", null);
+        return;
+    }
+    if (!config.isEmbeddingGemma2()) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' is served by multimodal embedding models (EmbeddingGemma 2); this model takes 'input'", null);
+        return;
+    }
+
+    var media = RequestMedia.init(allocator);
+    defer media.deinit();
+    var built = try embeddingPrompt(allocator, lm.tokenizer.?, config, messages_val.array.items, &media, lm.vision_encoder != null);
+    defer built.deinit(allocator);
+    const prompt = switch (built) {
+        .ok => |p| p,
+        .reject => |why| {
+            log.warn("POST /v1/embeddings -> 400 ({s})\n", .{why});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, null);
+            return;
+        },
+    };
+
+    // Wrapped, with the placeholders still one id each; the expansion below replaces them with the soft-token runs.
+    var ids = try wrapEmbeddingIds(allocator, config, try allocator.dupe(u32, prompt.ids));
+    defer allocator.free(ids);
+    log.info("POST /v1/embeddings (messages: {d} media items)\n", .{prompt.items.len});
+
+    // The expanded length is known from the preprocessed sizes alone: refuse an over-limit prompt before the
+    // tower runs rather than after (the tower is the expensive half).
+    const expected = ids.len - prompt.items.len + mediaRunTokens(prompt.items, config);
+    var msg_buf: [160]u8 = undefined;
+    if (embeddingLimitReject(&msg_buf, config, 0, expected)) |msg| {
+        log.warn("  embedding prompt over limit: {d} tokens\n", .{expected});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
+        return;
+    }
+
+    var mm = prepareMultimodalItems(allocator, lm, config, prompt.items, &ids) catch |err| {
+        const failure = multimodalFailure(err);
+        log.warn("POST /v1/embeddings -> {d} ({s})\n", .{ failure.code, @errorName(err) });
+        try sendErrorResponse(allocator, stream, failure.status, failure.kind, failure.message, failure.code);
+        return;
+    };
+    defer mm.deinit(allocator);
+
+    const seqs = [_][]const u32{ids};
+    // The request owns the soft tokens from here on: its inference-thread side frees them.
+    const vision = mm.embeddings;
+    mm.embeddings = null;
+    const embeddings = (try embeddingRows(allocator, stream, lm, xfm, &seqs, vision)) orelse return;
+    defer {
+        for (embeddings) |e| allocator.free(e);
+        allocator.free(embeddings);
+    }
+    try sendEmbeddings(allocator, stream, embeddings, req_dims, model_name, ids.len);
 }
 
 /// OpenAI `dimensions` semantics (text-embedding-3 class): keep the first
@@ -12756,6 +12818,54 @@ fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     return false;
 }
 
+/// A browser opening the page (`GET /` that accepts HTML) without the key gets
+/// the login form: a Basic prompt is easy to miss and never returns once cancelled.
+fn wantsLoginPage(method: []const u8, path: []const u8, raw_headers: []const u8) bool {
+    if (!std.mem.eql(u8, method, "GET") or !std.mem.eql(u8, path, "/")) return false;
+    const accept = findHeaderValueCI(raw_headers, "accept") orelse return false;
+    return std.mem.indexOf(u8, accept, "text/html") != null;
+}
+
+/// The login form, saying so when a key was offered and refused. Script-free:
+/// a GET form back to the same path sends `?api_key=`, which the page then keeps.
+fn loginPage(raw_headers: []const u8, raw_path: []const u8) []const u8 {
+    const tried = findHeaderValueCI(raw_headers, "authorization") != null or
+        findHeaderValueCI(raw_headers, "x-api-key") != null or
+        queryParamValue(raw_path, "api_key") != null or
+        queryParamValue(raw_path, "key") != null;
+    return if (tried) loginPageHtml("<p class=err>That key was not accepted. Try again.</p>") else loginPageHtml("");
+}
+
+fn loginPageHtml(comptime note: []const u8) []const u8 {
+    return
+    \\<!doctype html>
+    \\<html lang="en"><head><meta charset="utf-8">
+    \\<meta name="viewport" content="width=device-width,initial-scale=1">
+    \\<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'">
+    \\<title>MLX Serve · API key required</title>
+    \\<style>
+    \\:root{color-scheme:light dark;font-family:system-ui,sans-serif}
+    \\body{margin:0;min-height:100vh;display:grid;place-items:center;background:Canvas;color:CanvasText}
+    \\main{width:min(22rem,calc(100vw - 2rem));padding:1.75rem;border:1px solid color-mix(in srgb,CanvasText 15%,transparent);border-radius:.75rem}
+    \\h1{font-size:1.15rem;margin:0 0 .5rem}p{margin:0 0 1rem;font-size:.9rem;opacity:.8}
+    \\.err{color:#d33;opacity:1}
+    \\input,button{box-sizing:border-box;width:100%;font:inherit;padding:.6rem .7rem;border-radius:.5rem}
+    \\input{border:1px solid color-mix(in srgb,CanvasText 30%,transparent);background:Canvas;color:CanvasText;margin-bottom:.75rem}
+    \\button{border:0;background:#0a6cff;color:#fff;cursor:pointer}
+    \\</style></head><body><main>
+    \\<h1>API key required</h1>
+    \\<p>This MLX Serve server requires an API key. Enter the key the server was started with.</p>
+    \\
+++ note ++
+    \\<form method="get">
+    \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
+    \\<button type="submit">Continue</button>
+    \\</form>
+    \\</main></body></html>
+    \\
+    ;
+}
+
 /// Send a 401 with a Basic-auth challenge so browsers prompt for the key on the
 /// index + metrics pages; API clients read the JSON error body.
 fn sendUnauthorized(stream: *Conn) !void {
@@ -12795,6 +12905,23 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     // No key configured ⇒ always authorized (open mode)
     g_api_key = null;
     try std.testing.expect(apiKeyAuthorized("", "/v1/chat/completions"));
+}
+
+test "a browser opening the page without the key gets a login form; API clients do not" {
+    const html = "Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\n";
+    try std.testing.expect(wantsLoginPage("GET", "/", html));
+    try std.testing.expect(!wantsLoginPage("GET", "/", "Accept: */*\r\n"));
+    try std.testing.expect(!wantsLoginPage("GET", "/v1/models", html));
+    try std.testing.expect(!wantsLoginPage("POST", "/", html));
+
+    const first = loginPage("", "/");
+    try std.testing.expect(std.mem.indexOf(u8, first, "name=\"api_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "method=\"get\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "<script") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "not accepted") == null);
+    // A key that was tried and failed says so, whichever way it came.
+    try std.testing.expect(std.mem.indexOf(u8, loginPage("", "/?api_key=bad"), "not accepted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loginPage("Authorization: Basic dTpi\r\n", "/"), "not accepted") != null);
 }
 
 test "resolveRequestModelId: an alias names its model; an id beats it; /api/ strips the tag" {
@@ -13159,14 +13286,9 @@ test "every streaming chat emitter carries logprobs (silently-ignored-field guar
 }
 
 test "the index page documents every endpoint the server serves (drift guard)" {
-    // The API reference on `GET /` is hand-written prose, so it drifts the
-    // moment a route ships without someone remembering the page: it documented
-    // 22 of 31 endpoints and had silently omitted the ENTIRE Ollama `/api/*`
-    // surface (nine paths) since that surface was added. "Are we missing
-    // endpoints?" has to be a test, not an inspection.
-    //
-    // Same shape as the ROUTE_PATHS↔dispatch-chain guard above: two lists that
-    // must agree, checked against the file rather than trusted.
+    // The API reference is static data in app-web (`apiReference`); a route
+    // added here and not there is missing from the built page. The finer check
+    // (exact rows, both directions) is app-web's own test, which CI does not run.
     const page = @embedFile("html/index.html");
     for (ROUTE_PATHS) |p| {
         // "/" is the page itself — trivially present and not worth documenting
@@ -13962,9 +14084,35 @@ fn expandMediaPlaceholders(
     return .{ .ids = try ids.toOwnedSlice(allocator), .media = media };
 }
 
+/// What EmbeddingGemma 2's media runs add to a prompt once their placeholders are expanded, from the
+/// preprocessed sizes alone: each image or video FRAME is its soft tokens between `<boi>` and `<eoi>`.
+fn mediaRunTokens(items: []const MediaItem, config: *const model_mod.ModelConfig) usize {
+    const side = @as(usize, config.vision_patch_size) * config.vision_pooling_kernel;
+    var total: usize = 0;
+    for (items) |item| switch (item) {
+        .image => |pieces| for (pieces) |img| {
+            total += 2 + (img.height / side) * (img.width / side);
+        },
+        .video => |clip| total += clip.grid_t * (2 + (clip.grid_h / config.vision_pooling_kernel) * (clip.grid_w / config.vision_pooling_kernel)),
+        .audio => {},
+    };
+    return total;
+}
+
 /// Qwen's template renders the `<|vision_start|>`/`<|vision_end|>` wrap
 /// itself; every other tower's run carries its own open/close tokens.
 fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: MediaItem, n: usize, config: *const model_mod.ModelConfig) !void {
+    // EmbeddingGemma 2 wraps every video FRAME like an image of its own.
+    if (item == .video and config.isEmbeddingGemma2()) {
+        const frames: usize = item.video.grid_t;
+        if (frames == 0) return;
+        for (0..frames) |_| {
+            try ids.append(allocator, config.boi_token_id);
+            try ids.appendNTimes(allocator, config.video_token_id, n / frames);
+            try ids.append(allocator, config.eoi_token_id);
+        }
+        return;
+    }
     const wrap = !config.qwen_vision;
     const open: u32, const pad: u32, const close: u32 = switch (item) {
         .image => |pieces| blk: {
@@ -14176,6 +14324,11 @@ const MultimodalPrompt = struct {
 fn prepareMultimodalPrompt(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, messages: []const chat_mod.Message, prompt_ids: *[]u32) !MultimodalPrompt {
     const items = try collectMediaItems(allocator, messages);
     defer allocator.free(items);
+    return prepareMultimodalItems(allocator, lm, config, items, prompt_ids);
+}
+
+/// `prepareMultimodalPrompt` for items a caller already put in placeholder order.
+fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
     if (items.len == 0) return .{};
     // Before the encode: a mismatch is the client's, and cheap to refuse.
     if (!placeholdersMatch(prompt_ids.*, items, config)) {
@@ -14258,6 +14411,13 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
             .pixels_tolerance = config.lv_pixels_tolerance,
         };
     }
+    if (config.isEmbeddingGemma2()) return .{
+        .mode = .gemma_budget,
+        .patch = config.vision_patch_size,
+        .merge = config.vision_pooling_kernel,
+        .max_tokens = config.gv_image_tokens,
+        .composite_alpha = false,
+    };
     if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
         .mode = if (config.muse_vision) .muse else .qwen,
@@ -14268,6 +14428,16 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
         .max_pixels = config.qv_max_pixels,
         .max_tokens = config.mv_max_image_tokens,
     };
+}
+
+/// The video processor's view of `visionPreprocFromConfig`: frames get their own, smaller, token budget.
+fn videoPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    var vp = visionPreprocFromConfig(config);
+    if (config.isEmbeddingGemma2()) {
+        vp.max_tokens = config.gv_video_tokens;
+        vp.max_frames = config.gv_video_frames;
+    }
+    return vp;
 }
 
 var vision_pixel_clamp_logged: bool = false;
@@ -14321,7 +14491,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     try std.testing.expectEqual(@as(u32, 2), gemma.width);
     try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
 
-    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen } }) |vp| {
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .gemma_budget } }) |vp| {
         try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
     }
 }
@@ -14745,6 +14915,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
 
+    if (vp.mode == .gemma_budget) {
+        const img = vision_mod.budgetPixels(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens) catch return null;
+        log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW ({d} soft tokens)\n", .{ src_w, src_h, img.w, img.h, (img.h / vp.patch / vp.merge) * (img.w / vp.patch / vp.merge) });
+        return .{ .pixels = img.pixels, .width = img.w, .height = img.h };
+    }
+
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
     // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
     // processor's pixel_values. `grid_h/grid_w` carry the full patch grid;
@@ -14838,6 +15014,163 @@ test "clef: transparent image RGB follows the checkpoint processor" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb.rgb[0..3]);
 }
 
+/// One frame of a client's `frames` array: a base64 image data URL.
+fn decodeFrameUrl(allocator: std.mem.Allocator, url: []const u8, composite_alpha: bool) ?DecodedRgb {
+    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
+    const b64 = url[sep + 8 ..];
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
+    const raw = allocator.alloc(u8, decoded_size) catch return null;
+    defer allocator.free(raw);
+    std.base64.standard.Decoder.decode(raw, b64) catch return null;
+    return decodeRgbOwned(allocator, raw, composite_alpha);
+}
+
+/// EmbeddingGemma 2's video processor on a client's frames: at most `vp.max_frames` of them, an even spread
+/// that keeps the first and last, each fitted to the frame budget at the size the first kept frame decides
+/// (a clip is one tensor in the reference). `grid_t` is the frame count and `pixels` the frames' float32 CHW
+/// back to back. Null when any kept frame is not a decodable image.
+fn decodeBudgetVideo(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
+    if (frame_urls.len == 0 or vp.max_frames == 0) return null;
+    const kept = @min(frame_urls.len, vp.max_frames);
+    var bytes: []u8 = &.{};
+    var size: vision_mod.Resized = undefined;
+    var frame_bytes: usize = 0;
+    var done = false;
+    defer if (!done and bytes.len > 0) allocator.free(bytes);
+    for (0..kept) |k| {
+        const rgb = decodeFrameUrl(allocator, frame_urls[vision_mod.sampledFrame(k, frame_urls.len, vp.max_frames)], vp.composite_alpha) orelse return null;
+        defer rgb.deinit(allocator);
+        if (k == 0) {
+            size = vision_mod.budgetSize(rgb.h, rgb.w, vp.patch, vp.merge, vp.max_tokens) orelse return null;
+            frame_bytes = 3 * @as(usize, size.h) * size.w * @sizeOf(f32);
+            bytes = allocator.alloc(u8, kept * frame_bytes) catch return null;
+        }
+        const frame = vision_mod.resizeToUnitChw(allocator, rgb.rgb, rgb.h, rgb.w, size.h, size.w) catch return null;
+        defer allocator.free(frame.pixels);
+        @memcpy(bytes[k * frame_bytes ..][0..frame_bytes], frame.pixels);
+    }
+    log.info("  Decoded {d} frames → {d} kept, {d}x{d} float32 CHW each ({d} soft tokens per frame)\n", .{
+        frame_urls.len, kept, size.w, size.h, (size.h / vp.patch / vp.merge) * (size.w / vp.patch / vp.merge),
+    });
+    done = true;
+    return .{ .pixels = bytes, .grid_t = @intCast(kept), .grid_h = size.h / vp.patch, .grid_w = size.w / vp.patch };
+}
+
+/// What a `messages` embedding request renders to: the text's ids with ONE placeholder id where each image or
+/// video sits, and the media in the same order (`placeholdersMatch` / `expandMediaPlaceholders` read exactly this).
+const EmbeddingPrompt = struct {
+    ids: []u32,
+    items: []MediaItem,
+};
+
+const EmbeddingPromptResult = union(enum) {
+    ok: EmbeddingPrompt,
+    reject: []const u8,
+
+    fn deinit(self: *EmbeddingPromptResult, allocator: std.mem.Allocator) void {
+        if (self.* == .ok) {
+            allocator.free(self.ok.ids);
+            allocator.free(self.ok.items);
+        }
+    }
+};
+
+const EMBED_PART_REJECT = "content parts must be text, image_url or video_url objects";
+const EMBED_NO_VISION_REJECT = "image and video parts need a model with a vision encoder: this one has none loaded (a text-only pack, or --no-vision)";
+const EMBED_AUDIO_REJECT = "audio parts are not served: this model's audio tower is not loaded";
+const EMBED_EMPTY_REJECT = "'messages' carry nothing to embed: add a text part, an image or a video";
+const VIDEO_DECODE_REJECT = "video could not be decoded: send 'frames', a non-empty array of base64 image data URLs (data:image/jpeg|png|webp;base64,...) with readable payloads; remote URLs are not fetched";
+
+/// `messages` the way the model's own chat template reads them for an embedding (EmbeddingGemma 2's is a bare
+/// concatenation): system turns first, then the rest in order; text parts verbatim, no separator invented; an
+/// image or video part stands as its placeholder id. Roles are otherwise ignored. A reject carries the named 400.
+fn embeddingPrompt(
+    allocator: std.mem.Allocator,
+    tok: anytype,
+    config: *const model_mod.ModelConfig,
+    messages: []const std.json.Value,
+    media: *RequestMedia,
+    can_see: bool,
+) !EmbeddingPromptResult {
+    var ids = std.ArrayList(u32).empty;
+    var items = std.ArrayList(MediaItem).empty;
+    var ok = false;
+    defer if (!ok) {
+        ids.deinit(allocator);
+        items.deinit(allocator);
+    };
+    const image_vp = visionPreprocFromConfig(config);
+    const video_vp = videoPreprocFromConfig(config);
+
+    for ([_]bool{ true, false }) |system_pass| for (messages) |message| {
+        if (message != .object) return .{ .reject = "'messages' entries must be objects" };
+        const role = message.object.get("role");
+        const is_system = role != null and role.? == .string and std.mem.eql(u8, role.?.string, "system");
+        if (is_system != system_pass) continue;
+        const content = message.object.get("content") orelse continue;
+        const parts: []const std.json.Value = switch (content) {
+            .null => &.{},
+            .string => |text| {
+                try appendEmbeddingText(allocator, tok, &ids, text);
+                continue;
+            },
+            .array => |arr| arr.items,
+            else => return .{ .reject = "'content' must be a string or an array of parts" },
+        };
+        for (parts) |part| {
+            const type_val = if (part == .object) part.object.get("type") else null;
+            if (type_val == null or type_val.? != .string) return .{ .reject = EMBED_PART_REJECT };
+            const kind = type_val.?.string;
+            if (std.mem.eql(u8, kind, "text")) {
+                const text = part.object.get("text") orelse return .{ .reject = EMBED_PART_REJECT };
+                if (text != .string) return .{ .reject = EMBED_PART_REJECT };
+                try appendEmbeddingText(allocator, tok, &ids, text.string);
+            } else if (std.mem.eql(u8, kind, "image_url")) {
+                if (!can_see) return .{ .reject = EMBED_NO_VISION_REJECT };
+                const holder = part.object.get("image_url") orelse return .{ .reject = IMAGE_DECODE_REJECT };
+                const url = if (holder == .object) holder.object.get("url") else null;
+                if (url == null or url.? != .string) return .{ .reject = IMAGE_DECODE_REJECT };
+                const slot = try media.openImages();
+                if (!appendImageUrlContent(allocator, media.images(slot), url.?.string, image_vp)) return .{ .reject = IMAGE_DECODE_REJECT };
+                try items.append(allocator, .{ .image = media.imagesSlice(slot).? });
+                try ids.append(allocator, config.image_token_id);
+            } else if (std.mem.eql(u8, kind, "video_url")) {
+                if (!can_see) return .{ .reject = EMBED_NO_VISION_REJECT };
+                const holder = part.object.get("video_url") orelse return .{ .reject = VIDEO_DECODE_REJECT };
+                const frames = if (holder == .object) holder.object.get("frames") else null;
+                if (frames == null or frames.? != .array or frames.?.array.items.len == 0) return .{ .reject = VIDEO_DECODE_REJECT };
+                var urls = std.ArrayList([]const u8).empty;
+                defer urls.deinit(allocator);
+                for (frames.?.array.items) |frame| {
+                    if (frame != .string) return .{ .reject = VIDEO_DECODE_REJECT };
+                    try urls.append(allocator, frame.string);
+                }
+                const slot = try media.openVideos();
+                appendVideoUrlContent(allocator, media.videos(slot), urls.items, video_vp);
+                const clips = media.videosSlice(slot) orelse return .{ .reject = VIDEO_DECODE_REJECT };
+                try items.append(allocator, .{ .video = &clips[0] });
+                try ids.append(allocator, config.video_token_id);
+            } else if (std.mem.eql(u8, kind, "input_audio") or std.mem.eql(u8, kind, "audio_url")) {
+                return .{ .reject = EMBED_AUDIO_REJECT };
+            } else return .{ .reject = EMBED_PART_REJECT };
+        }
+    };
+    if (ids.items.len == 0) return .{ .reject = EMBED_EMPTY_REJECT };
+
+    const out_ids = try ids.toOwnedSlice(allocator);
+    errdefer allocator.free(out_ids);
+    const out_items = try items.toOwnedSlice(allocator);
+    ok = true;
+    return .{ .ok = .{ .ids = out_ids, .items = out_items } };
+}
+
+fn appendEmbeddingText(allocator: std.mem.Allocator, tok: anytype, ids: *std.ArrayList(u32), text: []const u8) !void {
+    if (text.len == 0) return;
+    const encoded = try tok.encode(allocator, text);
+    defer allocator.free(encoded);
+    try ids.appendSlice(allocator, encoded);
+}
+
 /// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
 /// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
 /// this codebase, so frame extraction is the client's job — into ONE
@@ -14845,8 +15178,9 @@ test "clef: transparent image RGB follows the checkpoint processor" {
 /// from the FIRST frame and applied to every frame (a video's whole patch grid
 /// must be identical across frames), then grouped into `vp.tps`-sized temporal-
 /// patch groups — the last group pads by repeating its final frame, matching
-/// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
+/// HF's video processor. Qwen's clips; EmbeddingGemma 2's (`.gemma_budget`) are `decodeBudgetVideo`'s.
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
+    if (vp.mode == .gemma_budget) return decodeBudgetVideo(allocator, frame_urls, vp);
     if (vp.mode != .qwen or frame_urls.len == 0) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
@@ -14859,13 +15193,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         decoded.deinit(allocator);
     }
     for (frame_urls) |url| {
-        const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
-        const b64 = url[sep + 8 ..];
-        const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
-        const raw = allocator.alloc(u8, decoded_size) catch return null;
-        defer allocator.free(raw);
-        std.base64.standard.Decoder.decode(raw, b64) catch return null;
-        const rgb = decodeRgbOwned(allocator, raw, true) orelse return null;
+        const rgb = decodeFrameUrl(allocator, url, true) orelse return null;
         decoded.append(allocator, rgb) catch {
             rgb.deinit(allocator);
             return null;
@@ -17766,7 +18094,7 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.shapesLogits(), 0, requestHasCompany());
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -18126,7 +18454,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.shapesLogits(), 0, requestHasCompany());
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         const use_pld = spec.use_pld;
@@ -18590,7 +18918,7 @@ fn handleResponsesWebSocket(
         handleResponses(allocator, stream, body, lm) catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
             // Best-effort error frame; same mapping as every HTTP surface.
-            var ws_err_buf: [192]u8 = undefined;
+            var ws_err_buf: [320]u8 = undefined;
             const ws_wire = mapGenerationError(err, &ws_err_buf);
             wsSendErrorTurn(allocator, &ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message) catch {};
             // Restore borrowed prev entry back to local cache on failure.
@@ -20663,6 +20991,268 @@ test "expandMediaPlaceholders: an LFM2-VL tiled source is one item, every tile l
     try testing.expectEqual(@as(u32, 14), out.media[1].start);
 }
 
+/// A solid-colour image as the data URL a client sends (`frames` entries are the same thing).
+fn solidPngUrl(allocator: std.mem.Allocator, w: u32, h: u32, rgba: [4]u8) ![]u8 {
+    const png = @import("png.zig");
+    const px = try allocator.alloc(u8, @as(usize, w) * h * 4);
+    defer allocator.free(px);
+    for (0..@as(usize, w) * h) |i| @memcpy(px[i * 4 ..][0..4], &rgba);
+    const bytes = try png.encodeRgba(allocator, px, w, h);
+    defer allocator.free(bytes);
+    const prefix = "data:image/png;base64,";
+    const url = try allocator.alloc(u8, prefix.len + std.base64.standard.Encoder.calcSize(bytes.len));
+    @memcpy(url[0..prefix.len], prefix);
+    _ = std.base64.standard.Encoder.encode(url[prefix.len..], bytes);
+    return url;
+}
+
+fn eg2ProcessorConfig() model_mod.ModelConfig {
+    var config = model_mod.ModelConfig{ .model_type = "embedding_gemma2" };
+    config.vision_patch_size = 16;
+    config.vision_pooling_kernel = 3;
+    config.gv_image_tokens = 70;
+    config.gv_video_tokens = 70;
+    config.gv_video_frames = 32;
+    config.image_token_id = 9;
+    config.video_token_id = 10;
+    config.boi_token_id = 5;
+    config.eoi_token_id = 6;
+    return config;
+}
+
+test "EmbeddingGemma 2 preprocessing: images and video frames are fitted to their own soft-token budgets" {
+    var config = eg2ProcessorConfig();
+    config.gv_image_tokens = 280;
+    config.gv_video_tokens = 140;
+    const image = visionPreprocFromConfig(&config);
+    try testing.expectEqual(.gemma_budget, image.mode);
+    try testing.expectEqual(@as(u32, 16), image.patch);
+    try testing.expectEqual(@as(u32, 3), image.merge);
+    try testing.expectEqual(@as(u32, 280), image.max_tokens);
+    // The processor's PIL conversion drops alpha instead of compositing it.
+    try testing.expect(!image.composite_alpha);
+    const video = videoPreprocFromConfig(&config);
+    try testing.expectEqual(.gemma_budget, video.mode);
+    try testing.expectEqual(@as(u32, 140), video.max_tokens);
+    try testing.expectEqual(@as(u32, 32), video.max_frames);
+}
+
+test "EmbeddingGemma 2 images keep their aspect ratio, fill the budget, and lose their alpha" {
+    const a = testing.allocator;
+    var config = eg2ProcessorConfig();
+    const vp = visionPreprocFromConfig(&config);
+
+    // 4x6 at 70 tokens is 288x480 (the processor's table), not a fixed square.
+    const url = try solidPngUrl(a, 6, 4, .{ 255, 0, 0, 255 });
+    defer a.free(url);
+    const img = parseImageUrlContent(a, url, vp) orelse return error.Undecoded;
+    defer a.free(img.pixels);
+    try testing.expectEqual(@as(u32, 288), img.height);
+    try testing.expectEqual(@as(u32, 480), img.width);
+    try testing.expectEqual(@as(u32, 0), img.grid_h);
+    try testing.expectEqual(@as(usize, 3 * 288 * 480 * 4), img.pixels.len);
+    const px: []const f32 = @as([*]const f32, @ptrCast(@alignCast(img.pixels.ptr)))[0 .. 3 * 288 * 480];
+    const plane = 288 * 480;
+    try testing.expectEqual(@as(f32, 1.0), px[0]);
+    try testing.expectEqual(@as(f32, 0.0), px[plane]);
+    try testing.expectEqual(@as(f32, 0.0), px[2 * plane + plane - 1]);
+
+    // A fully transparent red pixel is red: PIL's convert("RGB") keeps the colour channels.
+    const clear = try solidPngUrl(a, 6, 4, .{ 255, 0, 0, 0 });
+    defer a.free(clear);
+    const seen = parseImageUrlContent(a, clear, vp) orelse return error.Undecoded;
+    defer a.free(seen.pixels);
+    const seen_px: []const f32 = @as([*]const f32, @ptrCast(@alignCast(seen.pixels.ptr)))[0 .. 3 * 288 * 480];
+    try testing.expectEqual(@as(f32, 1.0), seen_px[0]);
+    try testing.expectEqual(@as(f32, 0.0), seen_px[plane]);
+
+    // Garbage and zero-size payloads are not images.
+    try testing.expect(parseImageUrlContent(a, "data:image/png;base64,AAAA", vp) == null);
+}
+
+test "EmbeddingGemma 2 video: client frames become one clip, cut to the cap with an even spread" {
+    const a = testing.allocator;
+    var config = eg2ProcessorConfig();
+    config.gv_video_frames = 4;
+    const vp = videoPreprocFromConfig(&config);
+
+    // Ten frames whose red level is their index: the four kept are 0, 3, 6, 9 (np.linspace(0, 9, 4, dtype=int)).
+    var urls: [10][]u8 = undefined;
+    for (&urls, 0..) |*u, i| u.* = try solidPngUrl(a, 6, 4, .{ @intCast(i * 20), 0, 0, 255 });
+    defer for (urls) |u| a.free(u);
+    var frames: [10][]const u8 = undefined;
+    for (urls, 0..) |u, i| frames[i] = u;
+
+    var media = RequestMedia.init(a);
+    defer media.deinit();
+    const cut = try media.openVideos();
+    appendVideoUrlContent(a, media.videos(cut), &frames, vp);
+    const vid = (media.videosSlice(cut) orelse return error.Undecoded)[0];
+    try testing.expectEqual(@as(u32, 4), vid.grid_t);
+    try testing.expectEqual(@as(u32, 288 / 16), vid.grid_h);
+    try testing.expectEqual(@as(u32, 480 / 16), vid.grid_w);
+    const frame_floats: usize = 3 * 288 * 480;
+    try testing.expectEqual(@as(usize, 4 * frame_floats * 4), vid.pixels.len);
+    const px: []const f32 = @as([*]const f32, @ptrCast(@alignCast(vid.pixels.ptr)))[0 .. 4 * frame_floats];
+    for ([_]usize{ 0, 3, 6, 9 }, 0..) |source, k| {
+        const want = @as(f32, @floatFromInt(source * 20)) * (1.0 / 255.0);
+        try testing.expectApproxEqAbs(want, px[k * frame_floats], 1e-6);
+    }
+
+    // Fewer frames than the cap are all kept; a frame that is not an image fails the clip, never silently thins it.
+    const few = try media.openVideos();
+    appendVideoUrlContent(a, media.videos(few), frames[0..3], vp);
+    try testing.expectEqual(@as(u32, 3), (media.videosSlice(few) orelse return error.Undecoded)[0].grid_t);
+    const bad = try media.openVideos();
+    const broken = [_][]const u8{ frames[0], "data:image/png;base64,AAAA" };
+    appendVideoUrlContent(a, media.videos(bad), &broken, vp);
+    try testing.expect(media.videosSlice(bad) == null);
+}
+
+test "expandMediaPlaceholders: an EmbeddingGemma 2 video is one wrapped block per frame" {
+    var config = eg2ProcessorConfig();
+    // Three frames of 2x2 patches pool to one soft token each... here 4 per frame: 12 rows in all.
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 6, .grid_w = 6 };
+    const img = [_]chat_mod.ImageData{.{ .pixels = "", .width = 0, .height = 0 }};
+    const items = [_]MediaItem{ .{ .video = &clip }, .{ .image = &img } };
+    const prompt = [_]u32{ 1, 10, 7, 9, 2 };
+    const out = try expandMediaPlaceholders(testing.allocator, &prompt, &items, &.{ 12, 2 }, &.{ 11, 12 }, &config);
+    defer testing.allocator.free(out.ids);
+    defer testing.allocator.free(out.media);
+    const frame = [_]u32{ 5, 10, 10, 10, 10, 6 };
+    const want = [_]u32{1} ++ frame ++ frame ++ frame ++ [_]u32{7} ++ [_]u32{ 5, 9, 9, 6 } ++ [_]u32{2};
+    try testing.expectEqualSlices(u32, &want, out.ids);
+}
+
+/// A tokenizer for the prompt tests: one id per byte, so the ids spell the text.
+const ByteTokenizer = struct {
+    pub fn encode(_: ByteTokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        const out = try allocator.alloc(u32, text.len);
+        for (text, out) |c, *o| o.* = c;
+        return out;
+    }
+};
+
+fn promptFor(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u8, media: *RequestMedia, can_see: bool) !EmbeddingPromptResult {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    return embeddingPrompt(allocator, ByteTokenizer{}, config, parsed.value.array.items, media, can_see);
+}
+
+test "embeddingPrompt: a message's parts are one sequence, in order, system turns first" {
+    const a = testing.allocator;
+    var config = eg2ProcessorConfig();
+    config.image_token_id = 1000;
+    config.video_token_id = 1001;
+    var media = RequestMedia.init(a);
+    defer media.deinit();
+    const img = try solidPngUrl(a, 6, 4, .{ 10, 20, 30, 255 });
+    defer a.free(img);
+    const body = try std.fmt.allocPrint(a,
+        \\[{{"role":"user","content":[
+        \\   {{"type":"text","text":"ab"}},
+        \\   {{"type":"image_url","image_url":{{"url":"{s}"}}}},
+        \\   {{"type":"video_url","video_url":{{"frames":["{s}","{s}"]}}}},
+        \\   {{"type":"text","text":"cd"}}]}},
+        \\ {{"role":"system","content":"S"}},
+        \\ {{"role":"user","content":"e"}}]
+    , .{ img, img, img });
+    defer a.free(body);
+
+    var result = try promptFor(a, &config, body, &media, true);
+    defer result.deinit(a);
+    const prompt = switch (result) {
+        .ok => |p| p,
+        .reject => |why| {
+            std.debug.print("rejected: {s}\n", .{why});
+            return error.Rejected;
+        },
+    };
+    // The system turn leads (the model's own template renders it first); no separator is invented anywhere.
+    try testing.expectEqualSlices(u32, &.{ 'S', 'a', 'b', 1000, 1001, 'c', 'd', 'e' }, prompt.ids);
+    try testing.expectEqual(@as(usize, 2), prompt.items.len);
+    try testing.expectEqual(.image, std.meta.activeTag(prompt.items[0]));
+    try testing.expectEqual(@as(u32, 288), prompt.items[0].image[0].height);
+    try testing.expectEqual(.video, std.meta.activeTag(prompt.items[1]));
+    try testing.expectEqual(@as(u32, 2), prompt.items[1].video.grid_t);
+    // …and every item has the one placeholder `expandMediaPlaceholders` will look for.
+    try testing.expect(placeholdersMatch(prompt.ids, prompt.items, &config));
+}
+
+test "embeddingPrompt: a video before an image stays before it" {
+    const a = testing.allocator;
+    var config = eg2ProcessorConfig();
+    config.image_token_id = 1000;
+    config.video_token_id = 1001;
+    var media = RequestMedia.init(a);
+    defer media.deinit();
+    const img = try solidPngUrl(a, 6, 4, .{ 10, 20, 30, 255 });
+    defer a.free(img);
+    const body = try std.fmt.allocPrint(a,
+        \\[{{"role":"user","content":[
+        \\   {{"type":"video_url","video_url":{{"frames":["{s}"]}}}},
+        \\   {{"type":"image_url","image_url":{{"url":"{s}"}}}}]}}]
+    , .{ img, img });
+    defer a.free(body);
+    var result = try promptFor(a, &config, body, &media, true);
+    defer result.deinit(a);
+    const prompt = result.ok;
+    try testing.expectEqualSlices(u32, &.{ 1001, 1000 }, prompt.ids);
+    try testing.expectEqual(.video, std.meta.activeTag(prompt.items[0]));
+    try testing.expectEqual(.image, std.meta.activeTag(prompt.items[1]));
+}
+
+test "embeddingPrompt: what cannot be embedded is refused by name" {
+    const a = testing.allocator;
+    var config = eg2ProcessorConfig();
+    config.image_token_id = 1000;
+    config.video_token_id = 1001;
+    const img = try solidPngUrl(a, 6, 4, .{ 10, 20, 30, 255 });
+    defer a.free(img);
+    const with_image = try std.fmt.allocPrint(a, "[{{\"role\":\"user\",\"content\":[{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"{s}\"}}}}]}}]", .{img});
+    defer a.free(with_image);
+    const cases = [_]struct { body: []const u8, can_see: bool, why: []const u8 }{
+        .{ .body = with_image, .can_see = false, .why = "vision encoder" },
+        .{ .body = "[{\"role\":\"user\",\"content\":[{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"AAAA\"}}]}]", .can_see = true, .why = "audio" },
+        .{ .body = "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAAA\"}}]}]", .can_see = true, .why = "could not be decoded" },
+        .{ .body = "[{\"role\":\"user\",\"content\":[{\"type\":\"video_url\",\"video_url\":{\"frames\":[]}}]}]", .can_see = true, .why = "frames" },
+        .{ .body = "[{\"role\":\"user\",\"content\":[{\"type\":\"video_url\",\"video_url\":{\"frames\":[\"data:image/png;base64,AAAA\"]}}]}]", .can_see = true, .why = "frames" },
+        .{ .body = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}]", .can_see = true, .why = "nothing to embed" },
+        .{ .body = "[{\"role\":\"user\",\"content\":[{\"type\":\"file\"}]}]", .can_see = true, .why = "text, image_url or video_url" },
+        .{ .body = "[{\"role\":\"user\",\"content\":7}]", .can_see = true, .why = "content" },
+        .{ .body = "[7]", .can_see = true, .why = "objects" },
+    };
+    for (cases) |c| {
+        var media = RequestMedia.init(a);
+        defer media.deinit();
+        var result = try promptFor(a, &config, c.body, &media, c.can_see);
+        defer result.deinit(a);
+        switch (result) {
+            .ok => {
+                std.debug.print("accepted: {s}\n", .{c.body});
+                return error.Accepted;
+            },
+            .reject => |why| testing.expect(std.mem.indexOf(u8, why, c.why) != null) catch |e| {
+                std.debug.print("rejected with '{s}', wanted '{s}'\n", .{ why, c.why });
+                return e;
+            },
+        }
+    }
+}
+
+test "mediaRunTokens: the length check before the tower is the length the expansion produces" {
+    // An image of 288x480 pools to 6x10 soft tokens; a 3-frame clip of the same size is three wrapped blocks.
+    var config = eg2ProcessorConfig();
+    const image = [_]chat_mod.ImageData{.{ .pixels = "", .width = 480, .height = 288 }};
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 18, .grid_w = 30 };
+    const items = [_]MediaItem{ .{ .image = &image }, .{ .video = &clip } };
+    const prompt = [_]u32{ 2, 7, 9, 7, 10, 1 };
+    const out = try expandMediaPlaceholders(testing.allocator, &prompt, &items, &.{ 60, 180 }, &.{ 11, 12 }, &config);
+    defer testing.allocator.free(out.ids);
+    defer testing.allocator.free(out.media);
+    try testing.expectEqual(out.ids.len, prompt.len - items.len + mediaRunTokens(&items, &config));
+}
+
 test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {
     // 2 float32 samples = 8 bytes. base64 of 8 zero bytes = "AAAAAAAAAAA=".
     const eight_zeros = "AAAAAAAAAAA=";
@@ -20899,6 +21489,38 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
     defer ep.deinit();
     try testing.expect(ep.value.object.get("mtp").?.object.get("acceptance_param").? == .null);
+}
+
+test "settingsPropsJson: native lane configuration is not generic MTP or request engagement" {
+    for ([_]struct { enabled: bool, sampled: bool, stages: u32 }{
+        .{ .enabled = false, .sampled = true, .stages = 5 },
+        .{ .enabled = true, .sampled = true, .stages = 5 },
+        .{ .enabled = true, .sampled = false, .stages = 5 },
+        .{ .enabled = false, .sampled = true, .stages = 0 },
+    }) |case| {
+        const frag = try settingsPropsJson(testing.allocator, .{
+            .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto,
+            .decode_attn_quant = false, .prefill_chunk = 8192,
+            .mtp_loaded = case.stages > 0, .mtp_default_on = case.enabled,
+            .mtp_acceptance = .exact, .mtp_greedy_tail = true, .mtp_depth = 6,
+            .mtp_adaptive = true, .max_mtp_ctx = 0,
+            .native_speculation = .{ .lane = "dspark typical 0.3", .block_size = case.stages, .sampled = case.sampled },
+            .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1,
+            .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0,
+        });
+        defer testing.allocator.free(frag);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+        defer parsed.deinit();
+        const mtp = parsed.value.object.get("mtp").?.object;
+        try testing.expectEqual(case.stages > 0, mtp.get("loaded").?.bool);
+        try testing.expectEqual(case.enabled, mtp.get("default_on").?.bool);
+        for ([_][]const u8{ "acceptance", "acceptance_param", "greedy_tail", "depth", "adaptive" }) |key|
+            try testing.expect(mtp.get(key).? == .null);
+        const native = mtp.get("native").?.object;
+        try testing.expectEqualStrings("dspark typical 0.3", native.get("lane").?.string);
+        try testing.expectEqual(@as(i64, case.stages), native.get("block_size").?.integer);
+        try testing.expectEqualStrings(if (case.sampled and case.stages > 0) "stochastic" else "off", native.get("sampled_acceptance").?.string);
+    }
 }
 
 test "settingsPropsJson: /props names the greedy tail" {
@@ -23057,6 +23679,61 @@ test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
     try t.expect(defaultEnableMtp(false, true));
 }
 
+test "native speculation: resolved opt-out gates capability and API defaults" {
+    const Env = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const name = "MLX_SERVE_DSV4_DSPARK";
+    const saved = if (std.c.getenv(name)) |value|
+        try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
+    else
+        null;
+    defer {
+        if (saved) |value| {
+            _ = Env.setenv(name, value, 1);
+            testing.allocator.free(value);
+        } else {
+            _ = Env.unsetenv(name);
+        }
+    }
+    var cfg = model_mod.ModelConfig{};
+    var native: dsv41_mod.Dsv41Model = undefined;
+    native.n_mtp = 3;
+    var xfm: Transformer = undefined;
+    xfm.config = cfg;
+    xfm.dsv4 = null;
+    xfm.dsv41 = &native;
+    xfm.dsv41_ext = null;
+    xfm.dense_attn_proj = false;
+    var lm: LoadedModel = undefined;
+    lm.config = &cfg;
+    lm.transformer = &xfm;
+    lm.mtp = null;
+    lm.llama_engine = null;
+    lm.dflash = null;
+    lm.drafter = null;
+    lm.mtp_depth = 6;
+    for ([_]?[:0]const u8{ null, "1", "0" }) |env| {
+        try testing.expectEqual(@as(c_int, 0), if (env) |value| Env.setenv(name, value, 1) else Env.unsetenv(name));
+        const env_enabled = if (env) |value| value[0] != '0' else true;
+        for ([_]?bool{ null, true, false }) |setting| {
+            cfg.mtp_override = setting;
+            xfm.config.mtp_override = setting;
+            const enabled = setting != false and env_enabled;
+            try testing.expectEqual(enabled, mtpCapable(&lm));
+            try testing.expectEqual(enabled, defaultEnableMtp(false, dsv4DraftStages(&lm)));
+            const frag = try settingsPropsJson(testing.allocator, mlxPropsSettings(&lm));
+            defer testing.allocator.free(frag);
+            var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+            defer parsed.deinit();
+            const mtp = parsed.value.object.get("mtp").?.object;
+            try testing.expect(mtp.get("loaded").?.bool);
+            try testing.expectEqual(enabled, mtp.get("default_on").?.bool);
+        }
+    }
+}
+
 test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
     const t = std.testing;
     const a = t.allocator;
@@ -23169,6 +23846,21 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
     while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "PrefillDoesNotFit quotes the figures the inference thread refused on, once" {
+    const t = std.testing;
+    const mb = 1024 * 1024;
+    var buf: [320]u8 = undefined;
+    prefill_refusal = .{ .tokens = 12447, .needed = 1733 * mb, .available = 77 * mb };
+    const w = mapGenerationError(error.PrefillDoesNotFit, &buf);
+    try t.expectEqual(@as(u32, 400), w.code);
+    try t.expect(std.mem.indexOf(u8, w.message, "This prompt (12447 tokens) does not fit in GPU memory") != null);
+    // The guard's wording, so a client parses both refusals with one pattern.
+    try t.expect(std.mem.indexOf(u8, w.message, "requires ~1733MB GPU memory but only ~77MB is available") != null);
+    // Read once: the next refusal without figures on this thread gets the bare message.
+    try t.expect(prefill_refusal == null);
+    try t.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
 }
 
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {

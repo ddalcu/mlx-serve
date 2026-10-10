@@ -1,19 +1,12 @@
 #!/bin/bash
-# Guard: the built-in console at `GET /` must render on a server with NO model.
+# Guard: the built-in console at `GET /` is served on a server with NO model, byte for byte.
 #
-# `GET /` was dispatched AFTER model resolution and rendered one *LoadedModel,
-# so a headless boot — `mlx-serve serve` / `--serve --model-dir`, now the
-# default way the server starts and the only way the app launches it — answered
-# 503 {"error":"No default model configured"} at the root. The page is the
-# thing a person opens first, and it is also the model PICKER, so it has to
-# render before anything is loaded, by construction.
-#
-# Also pins the two properties a page rewrite can silently drop:
-#   * every endpoint the server serves is documented (the reference had been
-#     missing the whole Ollama /api/* surface);
-#   * the live-metrics mount is present with --metrics and absent without it
-#     (deliberately duplicates one test_metrics.sh assertion — that script
-#     needs a real checkpoint, this one doesn't).
+# `GET /` once rendered one *LoadedModel, so a headless boot answered 503 at the
+# root, the first page a person opens. The page is the model PICKER, so it has to
+# render before anything is loaded. It is also built from app-web/ and embedded
+# as is: the bytes on the wire must be src/html/index.html, nothing templated.
+# What the page does (panes, Markdown, i18n, Monitoring) is app-web's own test
+# suite (`cd app-web && npm test`); the metrics probe the page keys off is here.
 #
 # FULLY HERMETIC: an empty --model-dir discovers zero models, so no weights are
 # needed and the whole thing runs in seconds (same trick as
@@ -85,8 +78,7 @@ fi
 
 echo "Built-in console at GET / (port $PORT, no model)"
 
-# ── 1. It renders at all without a model ────────────────────────────────────
-echo "[1/3] headless GET /"
+echo "[1/2] headless GET /"
 if boot; then
     STATUS=$(curl -s -o "$BODY" -w '%{http_code}' "http://127.0.0.1:$PORT/")
     CT=$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/" | grep -i '^content-type:' | tr -d '\r')
@@ -94,53 +86,28 @@ if boot; then
         "$([ "$STATUS" = "200" ] && echo 1 || echo 0)"
     check "Content-Type is text/html" \
         "$(echo "$CT" | grep -qi 'text/html' && echo 1 || echo 0)"
-    check "no 'No default model configured' in the body" \
-        "$(grep -q 'No default model configured' "$BODY" && echo 0 || echo 1)"
+    check "the bytes served are src/html/index.html, untouched" \
+        "$(cmp -s "$BODY" src/html/index.html && echo 1 || echo 0)"
+    check "it is the console page (one #app mount)" \
+        "$(grep -q '<div id="app">' "$BODY" && echo 1 || echo 0)"
 
-    # ── 2. The console + the full endpoint reference are in the page ────────
-    echo "[2/3] console markup + endpoint coverage"
-    for pane in models monitoring api settings image video audio library; do
-        check "navigation destination '$pane' bundled" \
-            "$(grep -q "nav(\"$pane\"" "$BODY" && echo 1 || echo 0)"
-    done
-    for id in app content session-list chat-input chat-send image-files monitor-sessions; do
-        check "console mount/control '$id' present" \
-            "$(grep -q "id=\"$id\"" "$BODY" && echo 1 || echo 0)"
-    done
-    check "Chat is the initial view" \
-        "$(grep -q 'view = "chat"' "$BODY" && echo 1 || echo 0)"
-    check "unified Monitoring range picker present" \
-        "$(grep -q 'data-range' "$BODY" && echo 1 || echo 0)"
-    # Read the route table, then check the documentation, not route strings in JS.
-    check "every served endpoint has a documentation row" \
-        "$(python3 - "$BODY" <<'PYROUTES'
-import re, sys
-page = open(sys.argv[1]).read()
-source = open('src/server.zig').read()
-block = re.search(r'const ROUTE_PATHS = .*?\{(.*?)\n\};', source, re.S)
-routes = re.findall(r'"(/[^" ]*)"', block.group(1)) if block else []
-rows = set(re.findall(r'<td>(/[^<]*)</td>', page))
-print(int(len(routes) > 30 and all(path in rows for path in routes)))
-PYROUTES
-)"
-
-    check "no metrics panel mount without --metrics" \
-        "$(grep -q 'id=mlx-metrics' "$BODY" && echo 0 || echo 1)"
+    # The console reads "metrics off" from a 503 here, so the status code is its contract.
+    METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/metrics.json")
+    check "GET /metrics.json without --metrics → 503 (got $METRICS_STATUS)" \
+        "$([ "$METRICS_STATUS" = "503" ] && echo 1 || echo 0)"
     stop
 else
     check "headless boot" 0
 fi
 
-# ── 3. --metrics puts the live panel in the header ──────────────────────────
-echo "[3/3] --metrics panel mount"
+echo "[2/2] --metrics"
 if boot --metrics; then
     STATUS=$(curl -s -o "$BODY" -w '%{http_code}' "http://127.0.0.1:$PORT/")
-    check "page still 200 with --metrics (got $STATUS)" \
-        "$([ "$STATUS" = "200" ] && echo 1 || echo 0)"
-    check "metrics mount present with --metrics" \
-        "$(grep -q 'id=mlx-metrics' "$BODY" && echo 1 || echo 0)"
-    check "metrics-enabled boot injected" \
-        "$(grep -q 'dataset.studioMetrics = "enabled"' "$BODY" && echo 1 || echo 0)"
+    METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/metrics.json")
+    check "page is the same file with --metrics (got $STATUS)" \
+        "$([ "$STATUS" = "200" ] && cmp -s "$BODY" src/html/index.html && echo 1 || echo 0)"
+    check "GET /metrics.json with --metrics → 200 (got $METRICS_STATUS)" \
+        "$([ "$METRICS_STATUS" = "200" ] && echo 1 || echo 0)"
     stop
 else
     check "boot with --metrics" 0

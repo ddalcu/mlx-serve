@@ -1384,6 +1384,91 @@ pub fn loadTokenizerSlow(io: std.Io, allocator: std.mem.Allocator, model_dir: []
     return parseTokenizerContent(io, allocator, buf.items);
 }
 
+/// Load an OpenAI tiktoken rank file (`<base64 bytes> <rank>` per line, ranks
+/// dense from 0) as a byte-level BPE tokenizer, through the equivalent
+/// synthesized `tokenizer.json`. No special tokens: callers add control ids.
+pub fn loadTiktoken(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Tokenizer {
+    const file_bytes = try readFileAllocTok(io, allocator, path);
+    defer allocator.free(file_bytes);
+    const json = try tiktokenToTokenizerJson(allocator, file_bytes);
+    defer allocator.free(json);
+    return parseTokenizerContent(io, allocator, json);
+}
+
+/// Every split of a token whose halves are both tokens is a merge, ordered by
+/// the merged token's rank then its halves' (transformers' tiktoken converter).
+fn tiktokenToTokenizerJson(allocator: std.mem.Allocator, file_bytes: []const u8) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var toks: std.ArrayList([]const u8) = .empty;
+    var ranks = std.StringHashMap(u32).init(arena);
+    var lines = std.mem.splitScalar(u8, file_bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.BadTiktoken;
+        const dec = std.base64.standard.Decoder;
+        const bytes = try arena.alloc(u8, dec.calcSizeForSlice(line[0..sp]) catch return error.BadTiktoken);
+        dec.decode(bytes, line[0..sp]) catch return error.BadTiktoken;
+        const rank = std.fmt.parseInt(u32, line[sp + 1 ..], 10) catch return error.BadTiktoken;
+        if (rank != toks.items.len) return error.BadTiktoken;
+        try toks.append(arena, bytes);
+        try ranks.put(bytes, rank);
+    }
+
+    const b2u = buildBytesToUnicode();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const Emit = struct {
+        fn token(a: std.mem.Allocator, o: *std.ArrayList(u8), map: *const [256]u21, bytes: []const u8) !void {
+            var enc: std.ArrayList(u8) = .empty;
+            defer enc.deinit(a);
+            for (bytes) |b| {
+                var utf8: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(map[b], &utf8) catch unreachable;
+                try enc.appendSlice(a, utf8[0..n]);
+            }
+            try appendJsonEscapedTok(a, o, enc.items);
+        }
+    };
+    try out.appendSlice(allocator, "{\"pre_tokenizer\":{\"type\":\"ByteLevel\"},\"model\":{\"type\":\"BPE\",\"vocab\":{");
+    for (toks.items, 0..) |t, rank| {
+        if (rank > 0) try out.append(allocator, ',');
+        try out.append(allocator, '"');
+        try Emit.token(allocator, &out, &b2u, t);
+        try out.print(allocator, "\":{d}", .{rank});
+    }
+    try out.appendSlice(allocator, "},\"merges\":[");
+    var first = true;
+    for (toks.items) |t| {
+        const Cand = struct { l: u32, r: u32, at: usize };
+        var cands: std.ArrayList(Cand) = .empty;
+        for (1..t.len) |at| {
+            const l = ranks.get(t[0..at]) orelse continue;
+            const r = ranks.get(t[at..]) orelse continue;
+            try cands.append(arena, .{ .l = l, .r = r, .at = at });
+        }
+        std.mem.sort(Cand, cands.items, {}, struct {
+            fn lt(_: void, a: Cand, b: Cand) bool {
+                return if (a.l != b.l) a.l < b.l else a.r < b.r;
+            }
+        }.lt);
+        for (cands.items) |c| {
+            if (!first) try out.append(allocator, ',');
+            first = false;
+            try out.append(allocator, '"');
+            try Emit.token(allocator, &out, &b2u, t[0..c.at]);
+            try out.append(allocator, ' ');
+            try Emit.token(allocator, &out, &b2u, t[c.at..]);
+            try out.append(allocator, '"');
+        }
+    }
+    try out.appendSlice(allocator, "]}}");
+    return out.toOwnedSlice(allocator);
+}
+
 fn readFileAllocTok(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
@@ -2905,4 +2990,24 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     try testing.expectEqual(@as(?u32, 5), tok.markerCloserFor(4));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(6));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(1));
+}
+
+test "tiktoken rank file encodes through the merges it implies" {
+    const a = testing.allocator;
+    // a b c ab abc bc; "abc" has two splits, (a,bc) outranks (ab,c) on its left half.
+    const ranks = "YQ== 0\nYg== 1\nYw== 2\nYWI= 3\nYWJj 4\nYmM= 5\n";
+    const json = try tiktokenToTokenizerJson(a, ranks);
+    defer a.free(json);
+    var tok = try parseTokenizerContent(testing.io, a, json);
+    defer tok.deinit();
+    for ([_]struct { text: []const u8, want: []const u32 }{
+        .{ .text = "abc", .want = &.{4} },
+        .{ .text = "bc", .want = &.{5} },
+        .{ .text = "cab", .want = &.{ 2, 3 } },
+    }) |c| {
+        const ids = try tok.encode(a, c.text);
+        defer a.free(ids);
+        try testing.expectEqualSlices(u32, c.want, ids);
+    }
+    try testing.expectError(error.BadTiktoken, tiktokenToTokenizerJson(a, "YQ== 1\n"));
 }

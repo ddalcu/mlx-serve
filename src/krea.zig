@@ -2640,7 +2640,7 @@ pub const Engine = struct {
 pub fn imageToPng(allocator: std.mem.Allocator, img: mlx.mlx_array, s: S) ![]u8 {
     const cf = try contig(img, s);
     defer _ = mlx.mlx_array_free(cf);
-    _ = mlx.mlx_array_eval(cf);
+    try mlx.check(mlx.mlx_array_eval(cf));
     const sh = mlx.getShape(cf); // [1,C,H,W]
     if (sh.len != 4 or sh[0] != 1 or (sh[1] != 3 and sh[1] != 4)) return error.InvalidImageShape;
     const channels: usize = @intCast(sh[1]);

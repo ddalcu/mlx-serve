@@ -533,11 +533,9 @@ class AppState: ObservableObject {
         return controller
     }()
 
-    private let historyPath: String = {
-        let dir = NSString(string: "~/.mlx-serve").expandingTildeInPath
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        return (dir as NSString).appendingPathComponent("chat-history.json")
-    }()
+    /// The chats on disk (`~/.mlx-serve/mlx-serve.db`). Nil when the file could
+    /// not be opened: nothing is then written over it.
+    private var chatStore: ChatStore?
 
     init() {
         // Defaults to ON when the key is absent — `UserDefaults.bool` would
@@ -1319,24 +1317,19 @@ class AppState: ObservableObject {
 
     // MARK: - Persistence
 
+    /// Writes what changed since the last save. Task-run and bridge sessions are
+    /// never written: their transcripts live elsewhere (`ChatStore.save`).
     func saveChatHistory() {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = .prettyPrinted
-        // Transient task-run sessions live in `chatSessions` only while their run is
-        // in flight (the agent loop reads/appends through AppState). They are never
-        // persisted here — their transcript is saved out of line by TaskScheduler.
-        let persisted = chatSessions.filter { $0.taskRunId == nil && !$0.isExternalBridge }
-        guard let data = try? encoder.encode(persisted) else { return }
-        try? data.write(to: URL(fileURLWithPath: historyPath))
+        chatStore?.save(chatSessions)
     }
 
     private func loadChatHistory() {
-        guard FileManager.default.fileExists(atPath: historyPath),
-              let data = try? Data(contentsOf: URL(fileURLWithPath: historyPath)) else { return }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        chatSessions = (try? decoder.decode([ChatSession].self, from: data)) ?? []
+        do {
+            chatStore = try ChatStore()
+        } catch {
+            NSLog("[chats] %@", "could not open \(ChatStore.defaultPath): \(error)")
+        }
+        chatSessions = chatStore?.load() ?? []
         activeChatId = chatSessions.first?.id
     }
 

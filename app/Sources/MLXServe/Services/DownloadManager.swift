@@ -260,8 +260,9 @@ class DownloadManager: ObservableObject {
         // extension allowlist used to drop it, so app-downloaded packs failed
         // to load while `mlx-serve pull` (a denylist) got it. Torch/flax shadow
         // weights stay out on both sides — same rule as `cli.shouldDownload`,
-        // keep them in sync.
-        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin", "u32"]
+        // keep them in sync. `.tiktoken` is YuE2's tokenizer (rank file, no
+        // tokenizer.json): without it a downloaded pack never reaches ready.
+        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin", "u32", "tiktoken"]
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
@@ -357,6 +358,7 @@ class DownloadManager: ObservableObject {
         case "AudioVideo": return "connector.safetensors"
         case "minimax_h3": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
+        case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
         default: return nil

@@ -25,7 +25,7 @@ set -uo pipefail
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"
-HISTORY="$HOME/.mlx-serve/chat-history.json"
+HISTORY="$HOME/.mlx-serve/mlx-serve.db"
 LAST_REQ="$HOME/.mlx-serve/last-agent-request.json"
 LOG_FILE="/tmp/mlxcore-test.log"
 GREEN='\033[0;32m'
@@ -131,24 +131,21 @@ fi
 # ── Helper: get message count from chat history ──
 get_message_count() {
     python3 -c "
-import json
-with open('$HISTORY') as f:
-    sessions = json.load(f)
-if sessions:
-    print(len(sessions[0].get('messages', [])))
-else:
-    print(0)
+import sqlite3
+db = sqlite3.connect('file:$HISTORY?mode=ro', uri=True)
+newest = db.execute('SELECT id FROM chat_sessions ORDER BY created_at DESC, rowid DESC LIMIT 1').fetchone()
+print(db.execute('SELECT count(*) FROM chat_messages WHERE session_id = ?', newest).fetchone()[0] if newest else 0)
 " 2>/dev/null || echo 0
 }
 
 # ── Helper: get last assistant message ──
 get_last_assistant() {
     python3 -c "
-import json
-with open('$HISTORY') as f:
-    sessions = json.load(f)
-if sessions:
-    msgs = sessions[0].get('messages', [])
+import json, sqlite3
+db = sqlite3.connect('file:$HISTORY?mode=ro', uri=True)
+newest = db.execute('SELECT id FROM chat_sessions ORDER BY created_at DESC, rowid DESC LIMIT 1').fetchone()
+if newest:
+    msgs = [json.loads(body) for (body,) in db.execute('SELECT body FROM chat_messages WHERE session_id = ? ORDER BY seq', newest)]
     for m in reversed(msgs):
         if m.get('role') == 'assistant':
             content = m.get('content', '')

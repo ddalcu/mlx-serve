@@ -61,6 +61,7 @@ let supportedModelTypes: Set<String> = [
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
+    "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk; text, image and video embeddings)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
@@ -93,7 +94,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3", "clef", "d1",
+    "stable_audio3", "clef", "d1", "yue2",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -140,7 +141,7 @@ enum MediaModality: CaseIterable {
         if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
-        case "acestep", "minimax_music3": self = .music
+        case "acestep", "minimax_music3", "yue2": self = .music
         case "stable_audio3": self = .sound
         case "AudioVideo", "minimax_h3": self = .video
         default: return nil

@@ -269,6 +269,8 @@ const ResolveReply = *const fn (DNSServiceRef, u32, u32, i32, ?[*:0]const u8, ?[
 const AddrInfoReply = *const fn (DNSServiceRef, u32, u32, i32, ?[*:0]const u8, ?*const std.posix.sockaddr, u32, ?*anyopaque) callconv(.c) void;
 
 extern "c" fn DNSServiceRegister(ref: *DNSServiceRef, flags: u32, interface: u32, name: ?[*:0]const u8, regtype: [*:0]const u8, domain: ?[*:0]const u8, host: ?[*:0]const u8, port_be: u16, txt_len: u16, txt: ?*const anyopaque, cb: ?*const anyopaque, ctx: ?*anyopaque) i32;
+/// Linux's dns_sd is Avahi's compat layer, which fails every call (-65537) when avahi-daemon is down.
+const daemon_hint = if (@import("builtin").os.tag == .linux) " (is avahi-daemon running? systemctl enable --now avahi-daemon)" else "";
 extern "c" fn DNSServiceBrowse(ref: *DNSServiceRef, flags: u32, interface: u32, regtype: [*:0]const u8, domain: ?[*:0]const u8, cb: BrowseReply, ctx: ?*anyopaque) i32;
 extern "c" fn DNSServiceResolve(ref: *DNSServiceRef, flags: u32, interface: u32, name: [*:0]const u8, regtype: [*:0]const u8, domain: [*:0]const u8, cb: ResolveReply, ctx: ?*anyopaque) i32;
 extern "c" fn DNSServiceGetAddrInfo(ref: *DNSServiceRef, flags: u32, interface: u32, protocol: u32, hostname: [*:0]const u8, cb: AddrInfoReply, ctx: ?*anyopaque) i32;
@@ -489,7 +491,7 @@ pub const Lan = struct {
         name_z[l.name.len] = 0;
         const err = DNSServiceRegister(&l.reg_ref, 0, 0, @ptrCast(&name_z), SERVICE_TYPE, null, null, std.mem.nativeToBig(u16, l.port), @intCast(txt.len), txt.ptr, null, null);
         if (err != 0) {
-            log.warn("[lan] Bonjour registration failed ({d}); sharing not advertised\n", .{err});
+            log.warn("[lan] Bonjour registration failed ({d}); sharing not advertised{s}\n", .{ err, daemon_hint });
             l.reg_ref = null;
         } else {
             const n = if (l.share.?.all) "all models" else "selected models";
@@ -785,7 +787,7 @@ fn threadMain(l: *Lan) void {
             revive_at = now_ms + REVIVE_INTERVAL_MS;
             if (l.discover and browse_ref == null) {
                 if (DNSServiceBrowse(&browse_ref, 0, 0, SERVICE_TYPE, null, onBrowse, l) != 0) {
-                    log.warn("[lan] Bonjour browse failed to start; retrying in {d} s\n", .{@divTrunc(REVIVE_INTERVAL_MS, 1000)});
+                    log.warn("[lan] Bonjour browse failed to start; retrying in {d} s{s}\n", .{ @divTrunc(REVIVE_INTERVAL_MS, 1000), daemon_hint });
                     browse_ref = null;
                 } else {
                     log.info("[lan] discovering peers ({s})\n", .{SERVICE_TYPE});
@@ -869,6 +871,7 @@ fn monoMs() i64 {
 
 /// One dns_sd ref pumped until its callback flips `done` or the deadline hits.
 fn pumpUntil(ref: DNSServiceRef, done: *const bool, timeout_ms: i64) bool {
+    if (done.*) return true; // answered synchronously (the Linux GetAddrInfo in ane_stub.c)
     const fd = DNSServiceRefSockFD(ref);
     if (fd < 0) return false;
     const deadline = monoMs() + timeout_ms;
@@ -1027,6 +1030,15 @@ pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []
 // ─────────────────────────────────────────────────────────────────────────────
 
 const t = std.testing;
+
+test "lan: peer address lookup answers on Linux, where Avahi lacks GetAddrInfo" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var addr: AddrOut = .{};
+    var aref: DNSServiceRef = null;
+    try std.testing.expectEqual(@as(i32, 0), DNSServiceGetAddrInfo(&aref, 0, 0, kDNSServiceProtocol_IPv4, "localhost", onAddr, &addr));
+    try std.testing.expect(pumpUntil(aref, &addr.done, 1000));
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &addr.ip4s[0]);
+}
 
 test "lan: headerValueCI finds a header case-insensitively and trims the value" {
     const head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-MLX-LAN-Token: deadbeefcafef00d\r\n";

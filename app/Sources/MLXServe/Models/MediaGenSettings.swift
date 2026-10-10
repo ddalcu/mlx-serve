@@ -258,6 +258,9 @@ struct MusicGenSettings: Codable, Equatable {
     var seed: Int = -1
     var steps: Int? = nil
     var instrumental: Bool = false
+    /// YuE2's score plan and the hand-edited ABC (part of the draft).
+    var plan: MusicPlan = .full
+    var score: String = ""
     /// Advanced starts OPEN. Collapsed-by-default is why tempo, key, seed and
     /// steps read as missing features — they were one unlabeled chevron away.
     var showAdvanced: Bool = true
@@ -318,6 +321,8 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
         steps = try c.decodeIfPresent(Int.self, forKey: .steps)
         if let v = try c.decodeIfPresent(Bool.self, forKey: .instrumental) { instrumental = v }
+        if let v = try c.decodeIfPresent(MusicPlan.self, forKey: .plan) { plan = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .score) { score = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lyrics) { lyrics = v }

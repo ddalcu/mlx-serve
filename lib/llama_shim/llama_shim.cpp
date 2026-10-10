@@ -8,12 +8,14 @@
 
 #include "llama.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 // llama.cpp's staging API for MTP (src/llama-ext.h, not in the xcframework's
@@ -59,8 +61,25 @@ struct mlx_llama_ctx {
 
 static pthread_once_t g_backend_once = PTHREAD_ONCE_INIT;
 
+// llama.cpp and ggml log to stderr by default (the loader dumps every metadata key);
+// route them through mlx-serve's leveled log (src/arch/llama.zig). CONT continues a line.
+extern "C" void mlx_llama_log(bool warn, const char *text);
+static void log_to_mlx_serve(enum ggml_log_level level, const char *text, void *) {
+    static enum ggml_log_level last = GGML_LOG_LEVEL_INFO;
+    if (level != GGML_LOG_LEVEL_CONT) last = level;
+    mlx_llama_log(last >= GGML_LOG_LEVEL_WARN, text);
+}
+
 static void backend_init_once(void) {
+    llama_log_set(log_to_mlx_serve, nullptr);
     llama_backend_init();
+    // The Linux release loads its backends (CUDA, CPU) as plugins, which
+    // ggml looks for beside the executable; ours sit beside libllama.
+    Dl_info info;
+    if (ggml_backend_reg_count() == 0 && dladdr((void *)llama_backend_init, &info)) {
+        std::string dir(info.dli_fname);
+        ggml_backend_load_all_from_path(dir.substr(0, dir.rfind('/')).c_str());
+    }
 }
 
 static void copy_err(char *err, size_t errlen, const char *msg) {

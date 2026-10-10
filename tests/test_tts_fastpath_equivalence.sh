@@ -60,9 +60,14 @@ kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true; SRV=""
 
 grep -q "GPU-chained code predictor engaged" "$LOG_A" || { echo "FAIL: GPU predictor never engaged"; exit 1; }
 grep -q "KV-cached predictor steps engaged" "$LOG_A" || { echo "FAIL: KV-cached predictor never engaged"; exit 1; }
-grep -q "fused silu kernel engaged" "$LOG_A" || { echo "FAIL: fused SwiGLU never engaged"; exit 1; }
-grep -q "fused QK-norm+RoPE engaged" "$LOG_A" || { echo "FAIL: fused QK-norm+RoPE never engaged"; exit 1; }
-grep -q "fused residual+RMSNorm kernel engaged" "$LOG_A" || { echo "FAIL: fused residual+RMSNorm never engaged"; exit 1; }
+# The fused levers are Metal kernels: off Darwin (CUDA) they must decline.
+if [ "$(uname)" = Darwin ]; then
+  grep -q "fused silu kernel engaged" "$LOG_A" || { echo "FAIL: fused SwiGLU never engaged"; exit 1; }
+  grep -q "fused QK-norm+RoPE engaged" "$LOG_A" || { echo "FAIL: fused QK-norm+RoPE never engaged"; exit 1; }
+  grep -q "fused residual+RMSNorm kernel engaged" "$LOG_A" || { echo "FAIL: fused residual+RMSNorm never engaged"; exit 1; }
+elif grep -qE "fused silu kernel engaged|fused QK-norm\+RoPE engaged|fused residual\+RMSNorm kernel engaged" "$LOG_A"; then
+  echo "FAIL: a Metal-only fused lever engaged off Darwin"; exit 1
+fi
 echo "PASS: [1/4] all levers engaged on the default boot"
 
 # ── Boot B: banded levers killed, bit-exact levers on ──

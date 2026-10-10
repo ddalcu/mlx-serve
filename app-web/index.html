@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:,">
+<title>MLX Serve Studio</title>
+<script>
+// Runs before first paint: stored theme, accent and language, so the page never flashes the wrong ones.
+(function () {
+  var root = document.documentElement, pref = {}, get = function (key) { try { return localStorage.getItem(key); } catch (e) { return null; } };
+  try { pref = JSON.parse(get("studio.interface") || "{}") || {}; } catch (e) {}
+  root.dataset.theme = pref.theme === "light" || pref.theme === "dark" ? pref.theme : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  root.dataset.accent = typeof pref.accent === "string" ? pref.accent : "system";
+  var stored = get("mlx-serve-lang"), languages = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
+  root.lang = stored === "en" || stored === "zh-Hans" ? stored : languages.some(function (l) { return /^zh\b|^zh-/i.test(l); }) ? "zh-Hans" : "en";
+})();
+</script>
+</head>
+<body>
+<div id="app"></div>
+<noscript><h1>MLX Serve Studio</h1><p>Enable JavaScript to use Studio.</p></noscript>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

@@ -29,6 +29,10 @@ struct MusicGenView: View {
     @State private var seed: Int = -1
     @State private var steps: Int? = nil
     @State private var instrumental: Bool = false
+    /// YuE2: plan a score first, and the ABC that replaces the model's own.
+    @State private var plan: MusicPlan = .full
+    @State private var score: String = ""
+    @State private var scoreHeight: Double = 120
     /// Open by default — see MusicGenSettings.showAdvanced.
     @State private var showAdvanced: Bool = true
     @StateObject private var library = MusicPromptLibrary()
@@ -149,6 +153,7 @@ struct MusicGenView: View {
                     if sourceTask { sourceSection }
                     promptSection
                     lyricsSection
+                    if model.supportsScore { scoreSection }
                     if model.supportsReferenceAudio { referenceSection }
                     // No Duration in a source task: the clip is the length, and
                     // the Source well already says how long that is.
@@ -212,7 +217,9 @@ struct MusicGenView: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
-            Text("Genre, mood, instruments — e.g. \"upbeat synthwave with driving bass and dreamy pads\".")
+            Text(model.family == .yue2
+                 ? "Comma-separated tags: language or genre, instruments, mood, lead vocal — e.g. \"English, indie pop, bright acoustic guitar, soft drums, warm lead vocal\"."
+                 : "Genre, mood, instruments — e.g. \"upbeat synthwave with driving bass and dreamy pads\".")
                 .font(.app(.caption2)).foregroundStyle(.secondary)
         }
     }
@@ -226,17 +233,19 @@ struct MusicGenView: View {
                 // Music 3 refused outright — the server 400s an empty lyric
                 // block there, so this needed the `instrumental` field before a
                 // checkbox could work.
-                Toggle("Instrumental", isOn: $instrumental)
-                    .font(.app(.caption))
-                    .fixedSize()
-                    .help(L10n.text(model.family == .minimaxMusic3
-                          ? "Asks for a track with no singing. This model has no dedicated instrumental switch, so it is requested in text — it may still add wordless vocals."
-                          : "Generate music with no singing. The lyrics below are not used."))
+                if model.supportsInstrumental {
+                    Toggle("Instrumental", isOn: $instrumental)
+                        .font(.app(.caption))
+                        .fixedSize()
+                        .help(L10n.text(model.family == .minimaxMusic3
+                              ? "Asks for a track with no singing. This model has no dedicated instrumental switch, so it is requested in text — it may still add wordless vocals."
+                              : "Generate music with no singing. The lyrics below are not used."))
+                }
                 Spacer()
-                PromptEnhanceButton(disabled: lyrics.isBlank || instrumental) { rewriteKind = .lyrics }
+                PromptEnhanceButton(disabled: lyrics.isBlank || wordless) { rewriteKind = .lyrics }
                 lyricsExamplesMenu
             }
-            if instrumental {
+            if wordless {
                 // The box goes away, the words do not: `lyrics` is untouched
                 // and still persisted, so turning the switch back off returns
                 // the verse. Deleting it here is the failure mode the server's
@@ -258,7 +267,7 @@ struct MusicGenView: View {
                         )
                     if lyrics.isEmpty {
                         Text(model.requiresLyrics
-                             ? L10n.format("This model sings your lyrics. Section tags go on their own lines: %@", MusicOptions.sectionTagHint)
+                             ? L10n.format("This model sings your lyrics. Section tags go on their own lines: %@", MusicOptions.sectionTagHint(for: model.family))
                              : L10n.format("Leave empty, or tick Instrumental, for a track with no vocals. Section tags: %@", MusicOptions.sectionTagHint))
                             .font(.app(.body))
                             .foregroundStyle(.secondary.opacity(0.6))
@@ -268,6 +277,61 @@ struct MusicGenView: View {
                     }
                 }
                 lyricsResizeHandle
+            }
+        }
+    }
+
+    /// A wordless track is only a thing on models that have one.
+    private var wordless: Bool { instrumental && model.supportsInstrumental }
+
+    private var engineName: String {
+        switch model.family {
+        case .acestep: return "ACE-Step"
+        case .minimaxMusic3: return "MiniMax Music 3"
+        case .yue2: return "YuE2"
+        }
+    }
+
+    /// YuE2 writes a score (ABC notation) before it sings. The plan decides
+    /// whether it does; the text box lets you render your own — a cover from a
+    /// transcribed melody, or the last song's score with the chords changed.
+    private var scoreSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Score").font(.app(.headline).weight(.semibold))
+            Picker("", selection: $plan) {
+                ForEach(MusicPlan.allCases, id: \.self) { p in
+                    Text(L10n.text(p.label)).tag(p)
+                }
+            }
+            .labelsHidden().pickerStyle(.segmented)
+            Text(L10n.text(plan.hint)).font(.app(.caption2)).foregroundStyle(.secondary)
+            if plan != .off {
+                ZStack(alignment: .topLeading) {
+                    TextEditor(text: $score)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(height: scoreHeight)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
+                        )
+                    if score.isEmpty {
+                        Text("Leave empty and the model writes the score. Paste ABC notation to render your own.")
+                            .font(.app(.body))
+                            .foregroundStyle(.secondary.opacity(0.6))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 8)
+                            .allowsHitTesting(false)
+                    }
+                }
+                EditorResizeHandle(height: $scoreHeight, onCommit: {}, help: "Drag to resize the score box.")
+                HStack(spacing: 8) {
+                    Button { if let last = service.lastScore { score = last } } label: {
+                        Text("Use last score").font(.app(.caption))
+                    }
+                    .disabled(service.lastScore == nil)
+                    .help("Fills the box with the score the last song was rendered from, so you can change it and render again.")
+                    Button { score = "" } label: { Text("Clear").font(.app(.caption)) }
+                        .disabled(score.isEmpty)
+                }
             }
         }
     }
@@ -650,7 +714,7 @@ struct MusicGenView: View {
                 Spacer()
             }
             Slider(value: $durationSeconds, in: model.durationRange, step: 5)
-            if model.family == .minimaxMusic3 {
+            if model.family != .acestep {
                 Text("An upper bound — the model may end the song earlier.")
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             }
@@ -940,6 +1004,8 @@ struct MusicGenView: View {
         seed = s.seed
         steps = s.steps
         instrumental = s.instrumental
+        plan = s.plan
+        score = s.score
         showAdvanced = s.showAdvanced
         prompt = s.prompt
         lyrics = s.lyrics
@@ -967,6 +1033,8 @@ struct MusicGenView: View {
         s.seed = seed
         s.steps = steps
         s.instrumental = instrumental
+        s.plan = plan
+        s.score = score
         s.showAdvanced = showAdvanced
         s.prompt = prompt
         s.lyrics = lyrics
@@ -1013,7 +1081,7 @@ struct MusicGenView: View {
             // Named after the engine, because the two sets are not
             // interchangeable: ACE-Step reads a one-line genre description and
             // Music 3 a structured caption.
-            Section("Example templates for \(model.family == .minimaxMusic3 ? "MiniMax Music 3" : "ACE-Step")") {
+            Section("Example templates for \(engineName)") {
                 ForEach(MusicPrompt.builtinStyles(for: model.family)) { p in
                     Button { prompt = p.body } label: { Text(L10n.text(p.title))
                         .font(.app(.body)) }
@@ -1061,7 +1129,7 @@ struct MusicGenView: View {
                 }
             }
             Section("Example templates") {
-                ForEach(MusicPrompt.builtinLyrics) { p in
+                ForEach(MusicPrompt.builtinLyrics(for: model.family)) { p in
                     Button { lyrics = p.body } label: { Text(L10n.text(p.title))
                         .font(.app(.body)) }
                 }
@@ -1088,6 +1156,8 @@ struct MusicGenView: View {
             seed: seed,
             steps: steps,
             keepResident: keepResident,
+            plan: plan,
+            score: score,
             refAudioPath: refAudioURL?.path,
             task: task,
             srcAudioPath: srcAudioURL?.path,
