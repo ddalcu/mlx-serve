@@ -723,56 +723,10 @@ fn sortedHeader(arm: Prefill) ![:0]const u8 {
         .nax => @embedFile("kernels/jangtq2_nax.metal"),
         .steel => @embedFile("kernels/jangtq2_steel.metal"),
     };
-    const parts = [_][]const u8{ try mlxHeaders(arena.allocator(), files), CODEBOOK, @embedFile("kernels/jangtq2_loader.metal"), impl };
+    const parts = [_][]const u8{ try mlx_headers.inlined(arena.allocator(), files), CODEBOOK, @embedFile("kernels/jangtq2_loader.metal"), impl };
     const h = try std.mem.concatWithSentinel(std.heap.c_allocator, u8, &parts, 0);
     slot.* = h;
     return h;
-}
-
-/// kernels.py _mlx_headers: each file inlined in order, an `#include "mlx/..."` line replaced by
-/// that header's own expansion (empty once seen), `#pragma once` dropped. utils.h and everything it
-/// includes count as seen: the metal_kernel preamble already holds them.
-fn mlxHeaders(a: Allocator, files: []const []const u8) ![]u8 {
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var skipped: std.ArrayList(u8) = .empty;
-    try expandHeader(a, &skipped, "mlx/backend/metal/kernels/utils.h", &seen);
-    var out: std.ArrayList(u8) = .empty;
-    for (files) |f| {
-        try expandHeader(a, &out, try a.print("mlx/backend/metal/kernels/{s}", .{f}), &seen);
-        try out.append(a, '\n');
-    }
-    return out.items;
-}
-
-/// kernels.py _expand: the file's lines (Python splitlines) joined by '\n', without a final newline.
-fn expandHeader(a: Allocator, out: *std.ArrayList(u8), rel: []const u8, seen: *std.StringHashMapUnmanaged(void)) !void {
-    if (seen.contains(rel)) return;
-    try seen.put(a, rel, {});
-    const src = for (mlx_headers.kernel_headers) |h| {
-        if (std.mem.eql(u8, h.path, rel)) break h.src;
-    } else return error.Jangtq2HeaderMissing;
-    const body = if (std.mem.endsWith(u8, src, "\n")) src[0 .. src.len - 1] else src;
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    var first = true;
-    while (lines.next()) |line| {
-        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r\x0b\x0c"), "#pragma once")) continue;
-        if (!first) try out.append(a, '\n');
-        first = false;
-        if (includedPath(line)) |inc| try expandHeader(a, out, inc, seen) else try out.appendSlice(a, line);
-    }
-}
-
-/// The path of a `\s*#include\s+"(mlx/[^"]+)"` line.
-fn includedPath(line: []const u8) ?[]const u8 {
-    const ws = " \t\r\x0b\x0c";
-    const directive = std.mem.trimStart(u8, line, ws);
-    if (!std.mem.startsWith(u8, directive, "#include")) return null;
-    const after = directive["#include".len..];
-    const quoted = std.mem.trimStart(u8, after, ws);
-    if (quoted.len == after.len or !std.mem.startsWith(u8, quoted, "\"mlx/")) return null;
-    const end = std.mem.indexOfScalarPos(u8, quoted, 1, '"') orelse return null;
-    if (end == "\"mlx/".len) return null;
-    return quoted[1..end];
 }
 
 // ------------------------------------------------------------------ array helpers

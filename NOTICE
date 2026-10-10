@@ -178,6 +178,8 @@ ported from v1.6.77 (5f007e6d):
   * The JANGTQ v2 routed-expert kernels and their dispatch, TQSwitchGLU.routed
     (`src/jangtq2.zig`, `src/kernels/jangtq2_{loader,nax,steel}.metal`), from
     `vmlx_engine/jangh/kernels.py` and `vmlx_engine/jangh/switch.py`.
+  * Inlining MLX's kernel headers into a `metal_kernel` header
+    (`lib/mlx_steel_sources.zig`), from `vmlx_engine/jangh/kernels.py`.
   * The JANGH format contract, the map from the bundle's tensor names and the
     load-time tensor moves (`src/jangh.zig`), from `vmlx_engine/jangh/
     contract.py`, `vmlx_engine/jangh/payload.py` and
