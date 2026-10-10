@@ -22,6 +22,8 @@ const row_attn = @import("row_attn.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const sushi_pack = @import("sushi_pack.zig");
+const jangh = @import("jangh.zig");
+const jangtq2 = @import("jangtq2.zig");
 const qmv_nax2 = @import("qmv_nax2.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const qmm_int8 = @import("qmm_int8.zig");
@@ -15053,6 +15055,9 @@ pub const MoeMlpWeights = struct {
     router_global_scale: ?mlx.mlx_array = null,
     // One-expert views of the affine-4 banks the decode kernels bind (`moe_affine4.bindViews`).
     bank_views: ?moe_affine4.Views = null,
+    // JANGTQ2 codebook banks: switch_*_w hold `tq2_packed`, switch_*_s `tq2_scales`, switch_*_b
+    // nothing. Only their own kernels read them (`jangtq2Bank`); null = affine banks.
+    tq2: ?jangh.Layer = null,
 };
 
 const HybridMlpWeights = union(enum) {
@@ -17902,14 +17907,15 @@ pub const Transformer = struct {
             // The `0` is the PLE's ordinal among the config's injection points, not
             // `config.ple_layer_idx` (pinned by the oracle fixture with `ple_layer_ids=[2]`).
             try checkQsaCompressRatio(config.indexer_compress_ratio);
+            const source = try model_mod.qwen4NgramSource(&config);
             const st = try allocator.create(qwen4_mod.Qwen4State);
             errdefer allocator.destroy(st);
             st.* = .{
                 .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
-                .table = if (config.embedded_ple_payload_bytes != null)
-                    try qwen4_mod.NgramTable.openEmbedded(std.fs.path.dirname(config.ngram_table_path orelse return error.MissingNgramTable) orelse return error.MissingNgramTable, try model_mod.qwen4EmbeddedSpec(&config))
-                else
-                    try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
+                .table = switch (source) {
+                    .embedded => try qwen4_mod.NgramTable.openEmbedded(std.fs.path.dirname(config.ngram_table_path orelse return error.MissingNgramTable) orelse return error.MissingNgramTable, try model_mod.qwen4EmbeddedSpec(&config)),
+                    .external => try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
+                },
             };
             errdefer st.deinit();
             try checkQwen4Table(st, &config);
@@ -24671,6 +24677,8 @@ pub const Transformer = struct {
             return null;
         var mcfg = config;
         mcfg.weight_prefix = mtp_prefix;
+        // A JANGH bundle's MTP head keeps affine experts.
+        mcfg.jangtq2 = null;
         mcfg.num_hidden_layers = 1;
         mcfg.full_attention_interval = 1; // layer 0 is the full-attention layer
         mcfg.linear_attn_tail_from = 0;
@@ -33506,13 +33514,6 @@ pub const Transformer = struct {
         // Decode MoE-internals profiler (MLX_SERVE_DECODE_PROFILE=1, S==1 only).
         const moe_prof = decodeProfileEnabled() and mlx.getShape(expert_x)[1] == 1;
         var mclk: ProfClock = if (moe_prof) ProfClock.init() else undefined;
-        // Per-expert-weight params: mixed-precision MoE checkpoints vary bits
-        // (and, with non-affine modes, group size + mode) per weight — resolve
-        // each individually. gate/up consume the hidden dim; down consumes the
-        // expert intermediate dim.
-        const gate_qp = self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x));
-        const up_qp = self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x));
-        const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
 
         const router_logits = if (router_override) |given| blk: {
             var owned = mlx.mlx_array_new();
@@ -33605,6 +33606,44 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(norm_scores);
             norm_scores = scaled_scores;
         }
+
+        // Codebook rows are not affine groups: only the jangtq2 kernels read these banks.
+        if (mw.tq2 != null) {
+            if (moe_prof) {
+                try mlx.check(mlx.mlx_array_eval(inds));
+                try mlx.check(mlx.mlx_array_eval(norm_scores));
+                decode_prof.moe_router_ns += mclk.lap();
+            }
+            const y = try jangtq2.moe(self.s, expert_x, jangtq2Bank(mw), inds, norm_scores, cfg.jangtq2.?.swiglu_limit);
+            if (moe_prof) {
+                try mlx.check(mlx.mlx_array_eval(y));
+                decode_prof.moe_experts_ns += mclk.lap();
+            }
+            if (skip_shared) return y;
+            if (mw.shared_ungated) return self.moeAddUngatedShared(y, expert_x, mw);
+            if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
+            defer _ = mlx.mlx_array_free(y);
+            // At one decode row the router folded the shared gate's logit and `shared_down` is built: reuse
+            // both, as the affine arms do.
+            const result = if (shared_down) |sd|
+                try self.moeSharedGateTail(y, routed.gate_logit, sd)
+            else
+                try self.moeAddGatedShared(y, expert_x, mw, null);
+            errdefer _ = mlx.mlx_array_free(result);
+            if (moe_prof) {
+                try mlx.check(mlx.mlx_array_eval(result));
+                decode_prof.moe_shared_ns += mclk.lap();
+            }
+            return result;
+        }
+
+        // Per-expert-weight params: mixed-precision MoE checkpoints vary bits
+        // (and, with non-affine modes, group size + mode) per weight — resolve
+        // each individually. gate/up consume the hidden dim; down consumes the
+        // expert intermediate dim.
+        const gate_qp = self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x));
+        const up_qp = self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x));
+        const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
 
         if (cfg.isGlm5() and cfg.exl3 == null and !skip_shared and mlx.mlx_array_size(expert_x) <= @as(usize, glm5.MOE_DECODE_MAX_ROWS) * cfg.hidden_size) {
             if (try self.glmMoeDecode(expert_x, inds, norm_scores, mw, gate_qp, up_qp, down_qp)) |y| return y;
@@ -35674,8 +35713,10 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             // `maybeTransposeForBf16` calls below pre-transpose bf16 weights from
             // `[out, in]` → `[in, out]` so `qmatmulBits` can dispatch to plain
             // `mlx_matmul`; they no-op on already-quantized AND on empty handles.
-            // An EXL3 pack (lib/sushi) binds trellis/suh/svh in the same slots.
-            const leaf: [3][]const u8 = if (config.exl3 != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
+            // An EXL3 pack (lib/sushi) binds trellis/suh/svh in the same slots, a JANGH bundle its
+            // codebook rows and row scales (no third leaf: the empty name matches no tensor).
+            const tq2: ?jangh.Layer = if (config.jangtq2) |spec| spec.layers[li] else null;
+            const leaf: [3][]const u8 = if (config.exl3 != null) .{ "trellis", "suh", "svh" } else if (tq2 != null) .{ "tq2_packed", "tq2_scales", "" } else .{ "weight", "scales", "biases" };
             var exbuf: [64]u8 = undefined;
             lw.mlp = .{ .moe = .{
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
@@ -35704,6 +35745,10 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 .shared_expert_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.biases") orelse mlx.mlx_array_new(),
             } };
             if (config.exl3) |spec| try checkExl3Bank(&lw.mlp.moe, config, spec);
+            if (tq2) |layer| {
+                lw.mlp.moe.tq2 = layer;
+                try checkJangtq2Bank(&lw.mlp.moe, config, layer);
+            }
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
@@ -45346,6 +45391,30 @@ fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, la
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
         return error.MissingWeight;
+    };
+}
+
+/// A JANGH layer's banks at the widths its config entries declare, with no third leaf.
+fn checkJangtq2Bank(mw: *const MoeMlpWeights, config: ModelConfig, layer: jangh.Layer) !void {
+    const h = config.hidden_size;
+    const inter = config.moe_intermediate_size;
+    const projs = [_]struct { w: mlx.mlx_array, sc: mlx.mlx_array, b: mlx.mlx_array, in: u32, out: u32, bits: u8 }{
+        .{ .w = mw.switch_gate_w, .sc = mw.switch_gate_s, .b = mw.switch_gate_b, .in = h, .out = inter, .bits = layer.gate_up_bits },
+        .{ .w = mw.switch_up_w, .sc = mw.switch_up_s, .b = mw.switch_up_b, .in = h, .out = inter, .bits = layer.gate_up_bits },
+        .{ .w = mw.switch_down_w, .sc = mw.switch_down_s, .b = mw.switch_down_b, .in = inter, .out = h, .bits = layer.down_bits },
+    };
+    for (projs) |p| {
+        if (p.b.ctx != null or !jangh.bankAdmitted(p.w, p.sc, config.num_experts, p.out, p.in, p.bits)) return error.Jangtq2BankGeometry;
+    }
+}
+
+/// A bound JANGTQ2 layer's banks in the kernels' contract.
+fn jangtq2Bank(mw: *const MoeMlpWeights) jangtq2.Bank {
+    return .{
+        .gate = .{ .packed_w = mw.switch_gate_w, .scales = mw.switch_gate_s },
+        .up = .{ .packed_w = mw.switch_up_w, .scales = mw.switch_up_s },
+        .down = .{ .packed_w = mw.switch_down_w, .scales = mw.switch_down_s },
+        .rotated = mw.tq2.?.rotated,
     };
 }
 
@@ -74728,4 +74797,321 @@ test "Metal-only kernels decline on a stream without them, so the MLX-op path ru
     const rotated = try rht.transform(a, signs, 1024, false, s);
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_array_eval(rotated));
+}
+
+// ── JANGH bundles (jangh.zig) ──
+
+test "jangh bundle: layer 0, the PLE and the MTP head bind from the loaded map (QWEN4_JANGH_TEST_MODEL)" {
+    const raw = std.c.getenv("QWEN4_JANGH_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = std.mem.span(raw);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var config = try model_mod.parseConfig(io, allocator, path);
+    defer config.deinit(allocator);
+    const spec = config.jangtq2.?;
+    var weights = try model_mod.loadModelWeights(io, allocator, path, &config, false);
+    defer weights.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h: c_int = @intCast(config.hidden_size);
+    const inter: c_int = @intCast(config.moe_intermediate_size);
+    const streams: c_int = @intCast(config.hc_count * config.hidden_size);
+
+    // The MTP experts' split: each half is exactly its rows of the fused tensor as stored.
+    {
+        var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+        defer dir.close(io);
+        const index = try dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20));
+        const wm = (try std.json.parseFromSliceLeaky(std.json.Value, a, index, .{})).object.get("weight_map").?.object;
+        var fused_map = Weights.init(allocator);
+        defer fused_map.deinit();
+        const shard = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ path, wm.get("mtp.layers.0.mlp.experts.gate_up_proj.weight").?.string }, 0);
+        try model_mod.loadSafetensorsFile(allocator, &fused_map, shard, s, model_mod.loadOptsFor(&config, false));
+        for ([_][]const u8{ "weight", "scales", "biases" }) |leaf| {
+            const fused = fused_map.get(try std.fmt.allocPrint(a, "language_model.mtp.layers.0.mlp.experts.gate_up_proj.{s}", .{leaf})).?;
+            const sh = mlx.getShape(fused);
+            for ([_][]const u8{ "gate_proj", "up_proj" }, 0..) |proj, half| {
+                const r0: c_int = @as(c_int, @intCast(half)) * inter;
+                var view = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(view);
+                try mlx.check(mlx.mlx_slice(&view, fused, &.{ 0, r0, 0 }, 3, &.{ sh[0], r0 + inter, sh[2] }, 3, &.{ 1, 1, 1 }, 3, s));
+                const bound = weights.get(try std.fmt.allocPrint(a, "language_model.mtp.layers.0.mlp.switch_mlp.{s}.{s}", .{ proj, leaf })).?;
+                try testing.expect(try qsaArraysAllEqual(view, bound, s));
+            }
+        }
+    }
+
+    var name_buf: [256]u8 = undefined;
+    // Layer 0 through `initMoeLayers`: its banks bind as stored, with no third leaf and no affine views.
+    {
+        var one = config;
+        one.num_hidden_layers = 1;
+        one.ple_layer_idx = -1;
+        const ml = try initMoeLayers(allocator, one, &weights, &name_buf, s);
+        defer {
+            for (ml.owned_bf16) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(ml.owned_bf16);
+            for (ml.ssm_entries) |e| {
+                _ = mlx.mlx_array_free(e.conv_state);
+                _ = mlx.mlx_array_free(e.ssm_state);
+            }
+            allocator.free(ml.ssm_entries);
+            allocator.free(ml.moe_layers);
+        }
+        const mw = &ml.moe_layers[0].mlp.moe;
+        try testing.expectEqual(spec.layers[0], mw.tq2.?);
+        const leaves = [_]struct { w: mlx.mlx_array, sc: mlx.mlx_array, b: mlx.mlx_array, proj: []const u8 }{
+            .{ .w = mw.switch_gate_w, .sc = mw.switch_gate_s, .b = mw.switch_gate_b, .proj = "gate_proj" },
+            .{ .w = mw.switch_up_w, .sc = mw.switch_up_s, .b = mw.switch_up_b, .proj = "up_proj" },
+            .{ .w = mw.switch_down_w, .sc = mw.switch_down_s, .b = mw.switch_down_b, .proj = "down_proj" },
+        };
+        for (leaves) |l| {
+            try testing.expectEqual(weights.get(try std.fmt.allocPrint(a, "language_model.model.layers.0.mlp.switch_mlp.{s}.tq2_packed", .{l.proj})).?.ctx, l.w.ctx);
+            try testing.expectEqual(weights.get(try std.fmt.allocPrint(a, "language_model.model.layers.0.mlp.switch_mlp.{s}.tq2_scales", .{l.proj})).?.ctx, l.sc.ctx);
+            try testing.expect(l.b.ctx == null);
+        }
+        try testing.expect(mw.bank_views == null);
+        // The dense router and hyper-connections bind as transposed `[in, out]` plain-matmul operands.
+        try testing.expectEqualSlices(c_int, &.{ h, @intCast(config.num_experts) }, mlx.getShape(mw.router_w));
+        try testing.expect(mw.router_s.ctx == null);
+        const hc = ml.moe_layers[0].hc_attn.?;
+        try testing.expect(hc.down_s.ctx == null and hc.up_s.ctx == null);
+        try testing.expectEqualSlices(c_int, &.{ streams, @intCast(config.hc_lowrank) }, mlx.getShape(hc.down_w));
+    }
+
+    // A declared width the stored bank lacks, or narrowed row scales, refuse the bind (on the arena: an error leaks).
+    {
+        var wrong = config;
+        wrong.num_hidden_layers = 1;
+        wrong.ple_layer_idx = -1;
+        wrong.jangtq2.?.layers[0].down_bits = if (spec.layers[0].down_bits == 6) 4 else 6;
+        try testing.expectError(error.Jangtq2BankGeometry, initMoeLayers(a, wrong, &weights, &name_buf, s));
+        wrong.jangtq2.?.layers[0].down_bits = spec.layers[0].down_bits;
+        const scales_name = "language_model.model.layers.0.mlp.switch_mlp.up_proj.tq2_scales";
+        var kept = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kept);
+        try mlx.check(mlx.mlx_array_set(&kept, weights.get(scales_name).?));
+        var narrowed = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&narrowed, kept, .bfloat16, s));
+        weights.replace(scales_name, narrowed);
+        try testing.expectError(error.Jangtq2BankGeometry, initMoeLayers(a, wrong, &weights, &name_buf, s));
+        var restored = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&restored, kept));
+        weights.replace(scales_name, restored);
+    }
+
+    // The PLE's conv stored `[C, K]` binds as `[C, K, 1]`.
+    {
+        var owned: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (owned.items) |arr| _ = mlx.mlx_array_free(arr);
+            owned.deinit(allocator);
+        }
+        const ple = try loadPleWeights(&weights, &name_buf, config.weight_prefix, @intCast(config.ple_layer_idx), config.hc_count, config.hidden_size, &owned, allocator, s);
+        try testing.expectEqualSlices(c_int, &.{ streams, @intCast(config.ple_conv_kernel), 1 }, mlx.getShape(ple.conv_w));
+    }
+
+    // The MTP head binds its affine experts from the split, never as codebook banks.
+    {
+        var mtp = (try Transformer.loadQwen4Mtp(allocator, config, &weights, &name_buf, s)).?;
+        defer {
+            for (mtp.owned) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(mtp.owned);
+            mtp.cache.deinit();
+            _ = mlx.mlx_array_free(mtp.entry.conv_state);
+            _ = mlx.mlx_array_free(mtp.entry.ssm_state);
+            ssmFreeQsaState(&mtp.entry);
+            mtp.qsa_marks.deinit();
+        }
+        const mm = &mtp.layer.mlp.moe;
+        try testing.expect(mm.tq2 == null);
+        try testing.expectEqual(weights.get("language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight").?.ctx, mm.switch_gate_w.ctx);
+        try testing.expectEqual(weights.get("language_model.mtp.layers.0.mlp.switch_mlp.down_proj.biases").?.ctx, mm.switch_down_b.ctx);
+        const qp = computeQuantParams(&config, mm.switch_gate_w, mm.switch_gate_s, config.hidden_size);
+        try testing.expectEqual(QuantMode.affine, qp.mode);
+        try testing.expectEqual(@divExact(h * @as(c_int, @intCast(qp.bits)), 32), mlx.getShape(mm.switch_up_w)[2]);
+    }
+}
+
+/// One tensor of a reference file `tests/dump_jangh4_fixtures.py` writes, evaluated.
+fn janghFixtureTensor(map: mlx.mlx_map_string_to_array, name: [:0]const u8) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (mlx.mlx_map_string_to_array_get(&out, map, name.ptr) != 0) return error.FixtureTensorMissing;
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+/// `arr` as host f32 values (caller frees).
+fn janghHostF32(a: std.mem.Allocator, arr: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const d = mlx.mlx_array_data_float32(c) orelse return error.MlxArrayDataNull;
+    return a.dupe(f32, d[0..mlx.mlx_array_size(c)]);
+}
+
+/// Agreement of host values that are bf16: the most bf16 steps apart and the summed squares of a rel L2.
+const JanghDiff = struct {
+    n: usize = 0,
+    max_steps: u32 = 0,
+    num: f64 = 0,
+    den: f64 = 0,
+
+    fn add(d: *JanghDiff, got: []const f32, want: []const f32) !void {
+        for (got, want) |x, y| {
+            try testing.expect(std.math.isFinite(x));
+            d.n += 1;
+            d.max_steps = @max(d.max_steps, @abs(bf16Ordinal(x) - bf16Ordinal(y)));
+            d.num += (@as(f64, x) - y) * (@as(f64, x) - y);
+            d.den += @as(f64, y) * y;
+        }
+    }
+
+    /// A bf16 value's rank on the number line: neighbours differ by one, and both zeros are 0.
+    fn bf16Ordinal(v: f32) i32 {
+        const b: u16 = @truncate(@as(u32, @bitCast(v)) >> 16);
+        const mag: i32 = b & 0x7fff;
+        return if (b & 0x8000 != 0) -mag else mag;
+    }
+
+    fn relL2(d: JanghDiff) f64 {
+        return if (d.den == 0) 0 else @sqrt(d.num / d.den);
+    }
+};
+
+test "jangh bundle: layer 0's MoE block through moeMLP against vMLX's SparseMoeBlock (JANGH4_MOE_BLOCK_FIXTURE)" {
+    const raw = std.c.getenv("QWEN4_JANGH_TEST_MODEL") orelse return error.SkipZigTest;
+    const dir = std.c.getenv("JANGH4_MOE_BLOCK_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const manifest = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/manifest.json", .{std.mem.span(dir)}), a, .limited(1 << 20));
+    const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, manifest, .{})).object;
+    // The references' sorted-GEMM arm (NAX or steel) must be this GPU's.
+    if (root.get("nax").?.bool != naxAvailable()) return error.SkipZigTest;
+    const cases = root.get("cases").?.array.items;
+    try testing.expect(cases.len > 0);
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(raw));
+    defer config.deinit(allocator);
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(raw), &config, false);
+    defer weights.deinit();
+    var one = config;
+    one.num_hidden_layers = 1;
+    one.ple_layer_idx = -1;
+    var name_buf: [256]u8 = undefined;
+    const ml = try initMoeLayers(allocator, one, &weights, &name_buf, cpu);
+    defer {
+        for (ml.owned_bf16) |arr| _ = mlx.mlx_array_free(arr);
+        allocator.free(ml.owned_bf16);
+        for (ml.ssm_entries) |e| {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+        }
+        allocator.free(ml.ssm_entries);
+        allocator.free(ml.moe_layers);
+    }
+    const mw = &ml.moe_layers[0].mlp.moe;
+    try testing.expect(mw.tq2 != null and mw.shared_expert_gate_w != null);
+    // The MoE block's view of a Transformer: the trunk config on the GPU stream, every cache empty.
+    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
+    const xfm: *Transformer = @ptrCast(&xfm_bytes);
+    xfm.allocator = allocator;
+    xfm.s = mlx.gpuStream();
+    xfm.config = config;
+    const s = xfm.s;
+    const k: usize = config.num_experts_per_tok;
+    const ne: usize = config.num_experts;
+    const d: usize = config.hidden_size;
+
+    for (cases) |case| {
+        const file = case.object.get("file").?.string;
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ std.mem.span(dir), file }, 0);
+        var map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        var meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try mlx.check(mlx.mlx_load_safetensors(&map, &meta, path.ptr, cpu));
+        var t: [6]mlx.mlx_array = undefined;
+        var got_n: usize = 0;
+        defer for (t[0..got_n]) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
+        for ([_][:0]const u8{ "x", "gates", "inds", "scores", "routed", "out" }, 0..) |name, i| {
+            t[i] = try janghFixtureTensor(map, name);
+            got_n += 1;
+        }
+        const x, const gates, const v_inds, const v_scores, const v_routed, const v_out = t;
+        const tokens: usize = @intCast(mlx.getShape(x)[1]);
+
+        // The bound banks through the jangtq2 kernels on vMLX's own routing: TQSwitchGLU.routed bit for bit.
+        const routed = try jangtq2.moe(s, x, jangtq2Bank(mw), v_inds, v_scores, config.jangtq2.?.swiglu_limit);
+        defer _ = mlx.mlx_array_free(routed);
+        try testing.expect(try qsaArraysAllEqual(routed, v_routed, s));
+
+        // Our router picks vMLX's experts except at a bf16 tie with its lowest pick; scores may sit bf16 steps apart.
+        const logits = try xfm.moeRouterLogits(x, mw);
+        defer _ = mlx.mlx_array_free(logits);
+        const r = try xfm.computeMoeRouting(logits, null);
+        defer {
+            _ = mlx.mlx_array_free(r.inds);
+            _ = mlx.mlx_array_free(r.norm_scores);
+            if (r.gate_logit.ctx != null) _ = mlx.mlx_array_free(r.gate_logit);
+        }
+        var m_inds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(m_inds);
+        try mlx.check(mlx.mlx_astype(&m_inds, r.inds, .uint32, s));
+        try mlx.check(mlx.mlx_array_eval(m_inds));
+        try mlx.check(mlx.mlx_array_eval(r.norm_scores));
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(r.norm_scores));
+        const mi = (mlx.mlx_array_data_uint32(m_inds) orelse return error.MlxArrayDataNull)[0 .. tokens * k];
+        const ms = (mlx.mlx_array_data_bfloat16(r.norm_scores) orelse return error.MlxArrayDataNull)[0 .. tokens * k];
+        const vi = (mlx.mlx_array_data_uint32(v_inds) orelse return error.MlxArrayDataNull)[0 .. tokens * k];
+        const vs = (mlx.mlx_array_data_bfloat16(v_scores) orelse return error.MlxArrayDataNull)[0 .. tokens * k];
+        const vg = (mlx.mlx_array_data_bfloat16(gates) orelse return error.MlxArrayDataNull)[0 .. tokens * ne];
+        const Row = enum { same, stepped, tie };
+        const rows = try a.alloc(Row, tokens);
+        for (rows, 0..) |*row, tk| {
+            const v_row = vi[tk * k ..][0..k];
+            var lowest: f32 = std.math.inf(f32);
+            for (v_row) |e| lowest = @min(lowest, @as(f32, @bitCast(@as(u32, vg[tk * ne + e]) << 16)));
+            row.* = .same;
+            for (mi[tk * k ..][0..k], 0..) |e, j| {
+                const at = std.mem.indexOfScalar(u32, v_row, e) orelse {
+                    try testing.expectEqual(lowest, @as(f32, @bitCast(@as(u32, vg[tk * ne + e]) << 16)));
+                    row.* = .tie;
+                    continue;
+                };
+                if (row.* == .same and ms[tk * k + j] != vs[tk * k + at]) row.* = .stepped;
+            }
+        }
+
+        // The whole block as the trunk calls it, row by row against vMLX's in our dtypes.
+        const y = try xfm.moeMLP(x, mw);
+        defer _ = mlx.mlx_array_free(y);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
+        const yh = try janghHostF32(a, y, s);
+        const vh = try janghHostF32(a, v_out, s);
+        var by: std.EnumArray(Row, JanghDiff) = .initFill(.{});
+        for (rows, 0..) |row, tk| try by.getPtr(row).add(yh[tk * d ..][0..d], vh[tk * d ..][0..d]);
+        const same = by.get(.same);
+        const stepped = by.get(.stepped);
+        std.debug.print("[jangh-moe-block] {s}: routed exact; rel L2 of same-routing rows ({d}) {e:.2}, stepped-score rows ({d}) {e:.2}, tie rows ({d}) {e:.2}\n", .{ file, same.n / d, same.relL2(), stepped.n / d, stepped.relL2(), by.get(.tie).n / d, by.get(.tie).relL2() });
+        // Same-routing rows: within one bf16 step at decode widths (prefill: vMLX's joined shared gate/up rounds apart).
+        if (tokens <= jangtq2.DECODE_MAX_TOKENS) try testing.expect(same.max_steps <= 1);
+        // Rounding, not wiring: a wrong bank, score or shared term is off by tenths, as the tie rows are.
+        try testing.expect(same.relL2() < 1.0 / 64.0 and stepped.relL2() < 1.0 / 64.0);
+    }
 }

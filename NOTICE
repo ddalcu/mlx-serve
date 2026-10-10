@@ -178,6 +178,10 @@ ported from v1.6.77 (5f007e6d):
   * The JANGTQ v2 routed-expert kernels and their dispatch, TQSwitchGLU.routed
     (`src/jangtq2.zig`, `src/kernels/jangtq2_{loader,nax,steel}.metal`), from
     `vmlx_engine/jangh/kernels.py` and `vmlx_engine/jangh/switch.py`.
+  * The JANGH format contract, the map from the bundle's tensor names and the
+    load-time tensor moves (`src/jangh.zig`), from `vmlx_engine/jangh/
+    contract.py`, `vmlx_engine/jangh/payload.py` and
+    `vmlx_engine/models/qwen4_exp/loader.py`.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c; only what
 TQSwitchGLU.routed() runs for qwen4_exp is ported (not the prefill expert-tile
