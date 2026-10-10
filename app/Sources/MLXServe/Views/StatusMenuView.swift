@@ -430,10 +430,6 @@ struct StatusMenuView: View {
 
     private var serverFooterRow: some View {
         HStack {
-            Toggle("Start server with the app", isOn: $appState.autoStartServer)
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .help("Start the server when the app launches. Whether that start preloads a model is \"Preload the model when the server starts\" in Settings ▸ Server.")
             Spacer()
             // The engine the resident chat model runs on, as the SERVER
             // reports it; before a load, the file-type guess for the
@@ -954,7 +950,7 @@ struct StatusDot: View {
 
 struct EndpointsSection: View {
     let baseURL: String
-    /// Puts a "Metrics" button on the header row (the Browse-on-Download-
+    /// Puts a "Web UI" button on the header row (the Browse-on-Download-
     /// Models pattern). Callers gate it on `ServerOptions.enableMetrics` —
     /// the panel only exists when the server got `--metrics`.
     var showsMetricsButton: Bool = false
@@ -993,8 +989,8 @@ struct EndpointsSection: View {
         VStack(alignment: .leading, spacing: 4) {
             TrayDisclosureHeader(title: "Endpoints", isExpanded: $isExpanded) {
                 if showsMetricsButton {
-                    TrayAccessoryButton(title: "Metrics", icon: "chart.bar.xaxis",
-                                        help: "Open the live metrics panel in your browser") {
+                    TrayAccessoryButton(title: "Web UI", icon: "safari",
+                                        help: "Open the web UI in your browser") {
                         if let root = Self.rootURL(baseURL) {
                             NSWorkspace.shared.open(root)
                         }

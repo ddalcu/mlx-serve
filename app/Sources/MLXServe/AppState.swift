@@ -260,9 +260,8 @@ class AppState: ObservableObject {
     lazy var musicGen = MusicGenService()
     lazy var soundGen = SoundGenService()
     lazy var model3dGen = Model3DGenService()
-    @Published var autoStartServer: Bool {
-        didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
-    }
+    /// The server always starts with the app; tests that build an AppState opt out.
+    private let startServerAtLaunch: Bool
     /// Whether launch loads a model with the server (`StartupModelChoice.launch`).
     /// Default OFF, with no migration: auto-start alone must not read a checkpoint.
     @Published var loadModelAtStart: Bool {
@@ -566,14 +565,14 @@ class AppState: ObservableObject {
     private var chatStore: ChatStore?
     private var sidebarStore: SidebarStore?
 
-    init() {
+    init(startServerAtLaunch: Bool = true) {
+        self.startServerAtLaunch = startServerAtLaunch
         // Defaults to ON when the key is absent — `UserDefaults.bool` would
         // read a never-set key as false, which is why a fresh install used to
         // download a model and then sit there with the server stopped. Safe with
         // no model on disk: the launch gate below starts headless unless told to
         // load. No migration: existing users who never touched the toggle get
         // it turned on, which is the intent.
-        self.autoStartServer = UserDefaults.standard.object(forKey: "autoStartServer") as? Bool ?? true
         self.loadModelAtStart = UserDefaults.standard.bool(forKey: "loadModelAtStart")
         self.startupModelMode = UserDefaults.standard.string(forKey: "startupModelMode")
             .flatMap(StartupModelChoice.Mode.init(rawValue:)) ?? .default
@@ -694,10 +693,10 @@ class AppState: ObservableObject {
             showWelcome = true
         }
 
-        // Auto-start is headless unless "Preload the model when the server starts" resolves an installed
-        // model.
+        guard startServerAtLaunch else { return }
+        // The server starts headless unless "Preload the model when the server starts" resolves an
+        // installed model.
         let launchPlan = StartupModelChoice.launch(
-            autoStart: autoStartServer,
             loadModelAtStart: loadModelAtStart,
             mode: startupModelMode,
             pinnedPath: startupModelPinnedPath,
@@ -705,8 +704,6 @@ class AppState: ObservableObject {
             installedPaths: localModels.filter(\.isChatPickable).map(\.path)
         )
         switch launchPlan {
-        case .doNothing:
-            break
         case .headless:
             server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
         case .load(let path):
@@ -720,17 +717,15 @@ class AppState: ObservableObject {
         }
 
         // Fallback health detection — runs detached to avoid blocking MainActor
-        if autoStartServer {
-            let checkPort = server.port
-            let mgr = server
-            Task.detached {
-                let api = APIClient()
-                for _ in 0..<120 {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    if let ok = try? await api.checkHealth(port: checkPort), ok {
-                        await mgr.forceRunning()
-                        return
-                    }
+        let checkPort = server.port
+        let mgr = server
+        Task.detached {
+            let api = APIClient()
+            for _ in 0..<120 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if let ok = try? await api.checkHealth(port: checkPort), ok {
+                    await mgr.forceRunning()
+                    return
                 }
             }
         }

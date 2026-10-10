@@ -23,21 +23,21 @@ enum CommunityLinks {
         Item(
             id: "releases",
             title: "Release notes",
-            explainer: "What changed in each version, including the one you're running.",
+            explainer: "What's new in each version.",
             actionLabel: "View Releases ↗",
             url: URL(string: "https://github.com/\(UpdateChecker.repo)/releases")!
         ),
         Item(
             id: "star",
             title: "Star the project on GitHub",
-            explainer: "mlx-serve is free and open source. A star helps other people find it.",
+            explainer: "A star helps other people find mlx-serve.",
             actionLabel: "Open GitHub ↗",
             url: URL(string: "https://github.com/\(UpdateChecker.repo)")!
         ),
         Item(
             id: "x",
             title: "Follow @ddalcu on X",
-            explainer: "Release notes, benchmarks and what's coming next. Questions and bug reports are welcome there too.",
+            explainer: "News, benchmarks and plans, with questions and bug reports welcome.",
             actionLabel: "Open X ↗",
             url: URL(string: "https://x.com/ddalcu")!
         ),

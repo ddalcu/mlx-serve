@@ -10,13 +10,12 @@ import Foundation
 /// Case order IS render order — the sidebar lists them top to bottom exactly as
 /// the form lays them out.
 enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
-    case modelFolders
     case server
+    /// Every engine memory knob; the MLX-only rows inside it hide on GGUF/DSV4.
+    case memory
     case lanSharing
     case providers
     case specDecode
-    /// Every engine memory knob; the MLX-only rows inside it hide on GGUF/DSV4.
-    case memory
     /// The universal knobs AND the MLX-only ones, in one section: two adjacent
     /// cards both called "Performance" was a distinction only the maintainers
     /// cared about. The MLX-only rows inside it still hide when a GGUF/DSV4
@@ -46,7 +45,6 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     /// engine a knob applies to.
     var title: String {
         switch self {
-        case .modelFolders:      return "Model Folders"
         case .server:            return "Server"
         case .lanSharing:        return "LAN Sharing"
         case .providers:         return "Providers"
@@ -78,7 +76,6 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     /// SF Symbol for the sidebar row (free with the OS — no assets).
     var icon: String {
         switch self {
-        case .modelFolders:      return "folder"
         case .server:            return "server.rack"
         case .lanSharing:        return "antenna.radiowaves.left.and.right"
         case .providers:         return "cloud"
