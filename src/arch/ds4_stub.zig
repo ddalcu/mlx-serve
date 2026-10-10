@@ -57,6 +57,7 @@ pub const OpenOptions = struct {
     ssd_streaming_cache_experts: u32 = 0,
     ssd_streaming_cache_bytes: u64 = 0,
     ssd_streaming_preload_experts: u32 = 0,
+    prefill_chunk: u32 = 0,
 };
 
 pub const Ds4Snapshot = struct {

@@ -2037,6 +2037,9 @@ struct ChatDetailView: View {
     /// Read only to rebuild the transcript when it changes.
     @AppStorage(InterfacePrefKey.chatColumn) private var interfaceChatColumn = ChatColumnWidth.wide.rawValue
     @State private var inputText = ""
+    /// True while the input method holds an unconfirmed composition in the
+    /// composer — the binding stays blind to it, so this reports it.
+    @State private var composerHasMarkedText = false
     /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
     /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
     /// walk left running would resume in someone else's conversation. Stale
@@ -2900,6 +2903,9 @@ struct ChatDetailView: View {
                 if let note = steeringNote {
                     SteeringNoteRow(note: note, onPause: { pauseSteeringNote() })
                 }
+                if let note = chatEngine.steering.restoringNote(for: sessionId) {
+                    SteeringNoteRow(note: note, isPaused: true, onPause: { restoreSteeringNote() })
+                }
 
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
@@ -3173,6 +3179,12 @@ struct ChatDetailView: View {
                 inputFocused = true
             }
         }
+        .onChange(of: composerHasMarkedText) { _, marked in
+            if !marked { restoreSteeringNote() }
+        }
+        .onChange(of: chatEngine.steering.restoringNote(for: sessionId)) { _, _ in
+            restoreSteeringNote()
+        }
         // The keyboard arriving in the composer collapses the sidebar selection
         // to this chat. Keyed on the focus MIRROR rather than on the click, so
         // it covers every way the field ends up holding the keyboard — and the
@@ -3246,6 +3258,7 @@ struct ChatDetailView: View {
                           measuredHeight: $composerHeight,
                           isIdle: composerState == .idle,
                           canSteer: true,
+                          onMarkedTextChanged: { composerHasMarkedText = $0 },
                           onSend: { sendMessage() },
                           // Escape stops the reply being written. Handled here
                           // rather than as a hidden `.cancelAction` button so
@@ -3275,7 +3288,7 @@ struct ChatDetailView: View {
                 slashSelection = 0
             }
             .overlay(alignment: .topLeading) {
-                if inputText.isEmpty {
+                if ComposerKey.showsPlaceholder(inputText, hasMarkedText: composerHasMarkedText) {
                     Text(L10n.text(composerPlaceholder))
                         .font(.app(.body))
                         .foregroundStyle(.secondary)
@@ -3978,16 +3991,22 @@ struct ChatDetailView: View {
     /// typed there, so nothing fires while it is being rewritten; Return
     /// queues it again.
     private func pauseSteeringNote() {
-        guard let note = steeringNote else { return }
-        chatEngine.clearSteeringNote(for: sessionId)
-        inputText = SteeringNotes.joined(note, inputText)
+        chatEngine.pauseSteeringNote(for: sessionId)
+        restoreSteeringNote()
         inputFocused = true
+    }
+
+    private func restoreSteeringNote() {
+        guard let draft = chatEngine.restoreSteeringNote(
+            for: sessionId, into: inputText, hasMarkedText: composerHasMarkedText) else { return }
+        inputText = draft
     }
 
     /// A note whose turn ended while this chat was in another tab: nobody
     /// watched the state flip, so it is recovered on the way in.
     private func recoverSteeringNoteIfIdle() {
         if composerState == .idle { pauseSteeringNote() }
+        else { restoreSteeringNote() }
     }
 
     /// Names of MCP servers the user currently has enabled (disabled != true).
@@ -4113,7 +4132,7 @@ struct ChatDetailView: View {
                                caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
         // A waiting steering note is the newest thing said and not yet sent:
         // ↑ on an empty draft takes it back first, exactly as Pause does.
-        if direction == .up, steeringNote != nil,
+        if direction == .up, chatEngine.steering.composerNote(for: sessionId) != nil,
            inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             pauseSteeringNote()
             return true
@@ -6834,7 +6853,11 @@ enum ComposerLayout {
 /// idle, and is otherwise swallowed (never a stray newline mid-generation).
 /// `.steer`: the chat is generating, so the text becomes a note for the
 /// agent's next step rather than a second send.
-enum ComposerReturnAction: Equatable { case send, steer, newline, ignore }
+enum ComposerReturnAction: Equatable {
+    case send, steer, newline, ignore
+    /// The field is mid-input-method-composition; Return belongs to that.
+    case confirmMarkedText
+}
 
 /// What an Escape keypress does in the composer. `.pass` hands the key back to
 /// AppKit rather than swallowing it — with no turn to stop, Escape still has
@@ -6845,13 +6868,30 @@ enum ComposerEscapeAction: Equatable { case stop, pass }
 enum ComposerKeyCommand { case up, down, accept, cancel }
 
 enum ComposerKey {
-    /// `canSteer`: a busy chat takes the text as a steering note (the main
-    /// composer); the edit bubble leaves it false, so a blank draft's Return
-    /// is still swallowed.
-    static func onReturn(shift: Bool, isIdle: Bool, canSteer: Bool = false) -> ComposerReturnAction {
+    /// `hasMarkedText`: Enter is also the input method's confirm key, so a
+    /// mid-composition Return outranks every other arm. `canSteer`: a busy
+    /// chat steers instead of sending; the edit bubble leaves it false.
+    static func onReturn(shift: Bool, isIdle: Bool, canSteer: Bool = false,
+                         hasMarkedText: Bool = false) -> ComposerReturnAction {
+        if hasMarkedText { return .confirmMarkedText }
         if shift { return .newline }
         if isIdle { return .send }
         return canSteer ? .steer : .ignore
+    }
+
+    /// Whether an external write may replace what the field holds: mid
+    /// composition the binding is the STALE side, and assigning it drops the
+    /// unconfirmed string the user is looking at on every redraw.
+    static func shouldAdoptExternalText(field: String, bound: String,
+                                        hasMarkedText: Bool) -> Bool {
+        !hasMarkedText && field != bound
+    }
+
+    /// The empty-field example line, and only on a field the user actually
+    /// sees as empty: the binding carries no marked text, so emptiness
+    /// alone is blind to an in-progress composition.
+    static func showsPlaceholder(_ text: String, hasMarkedText: Bool) -> Bool {
+        text.isEmpty && !hasMarkedText
     }
 
     /// Escape stops the reply being written, and does nothing otherwise.
@@ -6881,7 +6921,7 @@ enum ComposerKey {
 /// string on every edit (janky on a big paste) and exposes no scroller (the
 /// mouse wheel does nothing past the line limit). TextKit handles large text
 /// natively and the scroll view gives real mouse-wheel scrolling.
-fileprivate struct GrowingTextEditor: NSViewRepresentable {
+struct GrowingTextEditor: NSViewRepresentable {
     @Binding var text: String
     @Binding var isFocused: Bool
     @Binding var measuredHeight: CGFloat
@@ -6890,6 +6930,10 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var maxLines: Int = 15
     var isIdle: Bool
     var canSteer: Bool = false
+    /// Fires when the input method starts or stops holding marked text in
+    /// the field. `text` never carries an unconfirmed string and
+    /// `textDidChange` waits for the commit, so the binding is blind here.
+    var onMarkedTextChanged: (Bool) -> Void = { _ in }
     var onSend: () -> Void
     /// Escape, from the responder chain. Defaults to nothing so a field that
     /// has no use for the key leaves it to AppKit.
@@ -6940,6 +6984,7 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         tv.string = text
         tv.onBecomeFocus = { [weak c = context.coordinator] in c?.setFocus(true) }
         tv.onResignFocus = { [weak c = context.coordinator] in c?.setFocus(false) }
+        tv.onMarkedTextChanged = { [weak c = context.coordinator] marked in c?.parent.onMarkedTextChanged(marked) }
 
         scroll.documentView = tv
         context.coordinator.textView = tv
@@ -6952,7 +6997,8 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         context.coordinator.parent = self
         // External text changes (e.g. cleared on send) without clobbering an
         // in-progress edit at the same value.
-        if tv.string != text {
+        if ComposerKey.shouldAdoptExternalText(field: tv.string, bound: text,
+                                               hasMarkedText: tv.hasMarkedText()) {
             tv.string = text
             // Caret to the END of whatever was just put in the field. Setting
             // `string` collapses the selection to the front, which after a
@@ -7040,11 +7086,15 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
                     collapsed && selection.location == length)
             }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
+            let marked = textView.hasMarkedText()
             // Return picks the highlighted command when the menu is open —
-            // it must not send a half-typed "/mus".
-            if parent.onKeyCommand(.accept) { return true }
+            // it must not send a half-typed "/mus", nor steal Enter from an
+            // input method mid-composition.
+            if !marked, parent.onKeyCommand(.accept) { return true }
             let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
-            switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle, canSteer: parent.canSteer) {
+            switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle,
+                                        canSteer: parent.canSteer,
+                                        hasMarkedText: marked) {
             case .newline:
                 textView.insertNewlineIgnoringFieldEditor(self)
                 return true
@@ -7055,6 +7105,10 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
                 return true
             case .ignore:
                 return true
+            case .confirmMarkedText:
+                // Return belongs to the input method: hand it to AppKit's
+                // default (what it does after committing is IME-dependent).
+                return false
             }
         }
 
@@ -7086,9 +7140,27 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
 
 /// NSTextView that reports focus transitions so SwiftUI's `inputFocused` mirror
 /// stays accurate — the Cmd+V "attach from clipboard" monitor reads it.
-fileprivate final class ComposerTextView: NSTextView {
+final class ComposerTextView: NSTextView {
     var onBecomeFocus: (() -> Void)?
     var onResignFocus: (() -> Void)?
+    /// The only channel by which SwiftUI learns about composition — every
+    /// input-method entry point reports the state AFTER the superclass ran,
+    /// which is when `hasMarkedText` flips.
+    var onMarkedTextChanged: ((Bool) -> Void)?
+    override func setMarkedText(_ markedString: Any, selectedRange: NSRange,
+                                replacementRange: NSRange) {
+        super.setMarkedText(markedString, selectedRange: selectedRange,
+                            replacementRange: replacementRange)
+        onMarkedTextChanged?(hasMarkedText())
+    }
+    override func unmarkText() {
+        super.unmarkText()
+        onMarkedTextChanged?(hasMarkedText())
+    }
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        super.insertText(insertString, replacementRange: replacementRange)
+        onMarkedTextChanged?(hasMarkedText())
+    }
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
         if ok { onBecomeFocus?() }

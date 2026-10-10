@@ -13,7 +13,7 @@
 //! `/v1/models`, derive each model's budget from its ADVERTISED context
 //! (AgentBudget's formula: output = clamp(ctx/2, 1024, 65536) — never a
 //! hardcoded window), write the agent's config, and exec it through a login
-//! zsh so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
+//! shell (`loginShell`) so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
 
 const std = @import("std");
 const log = @import("log.zig");
@@ -172,8 +172,7 @@ const opencode_reasoning =
 ;
 
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
-/// the user's own config, no file writes). Single-quoted in the script, so
-/// the JSON must stay single-quote-free.
+/// the user's own config, no file writes); the script shell-quotes it (`appendQuoted`).
 /// `pin_model` writes a top-level `"model"` — opencode 2's TUI has no
 /// `--model` flag, so the config is the only place to select one.
 /// `limit.output` is the room opencode keeps free before compacting (it
@@ -184,7 +183,11 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
-    if (pin_model) |m| try out.print(allocator, "\"model\": \"mlx/{s}\", ", .{m});
+    if (pin_model) |m| {
+        const v = try std.fmt.allocPrint(allocator, "mlx/{s}", .{m});
+        defer allocator.free(v);
+        try out.print(allocator, "\"model\": {f}, ", .{std.json.fmt(v, .{})});
+    }
     if (compaction) {
         var ctx: u64 = FALLBACK_BUDGET.context;
         for (entries) |e| {
@@ -201,10 +204,12 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
     , .{base_url});
     for (entries, 0..) |e, i| {
-        try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (mlx-serve)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}, {s}}}", .{
+        const name = try std.fmt.allocPrint(allocator, "{s} (mlx-serve)", .{e.id});
+        defer allocator.free(name);
+        try out.print(allocator, "{s}{f}: {{\"name\": {f},{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}, {s}}}", .{
             if (i == 0) "" else ", ",
-            e.id,
-            e.id,
+            std.json.fmt(e.id, .{}),
+            std.json.fmt(name, .{}),
             if (e.vision) " \"attachment\": true," else "",
             e.budget.context,
             compactionReserve(e.budget.context),
@@ -600,12 +605,31 @@ fn resolveOpencode2Bin(detected: ?OpenCodeVersion, legacy_installed: ?bool) ?[]c
     return null;
 }
 
+/// The login shell the agent runs under (a login shell = the user's real PATH): the
+/// user's own `$SHELL` binary when it speaks POSIX sh, as the script body does. Otherwise
+/// (fish, nushell) /bin/zsh on macOS, whose ~/.zprofile is where Homebrew's PATH lives,
+/// and bash, else sh, on Linux, which may have no zsh at all.
+pub fn loginShellFor(shell_env: ?[]const u8, macos: bool, has_bash: bool) []const u8 {
+    if (shell_env) |sh| {
+        const base = std.fs.path.basename(sh);
+        if (std.mem.eql(u8, base, "zsh") or std.mem.eql(u8, base, "bash")) return sh;
+    }
+    if (macos) return "/bin/zsh";
+    return if (has_bash) "bash" else "sh";
+}
+
+fn loginShell() []const u8 {
+    const env: ?[]const u8 = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else null;
+    const has_bash = std.c.access("/bin/bash", std.c.X_OK) == 0 or std.c.access("/usr/bin/bash", std.c.X_OK) == 0;
+    return loginShellFor(env, @import("builtin").os.tag == .macos, has_bash);
+}
+
 /// Run one command through the same login shell the real launch execs
 /// through, so PATH resolution (nvm, Homebrew) is identical for detection
 /// and launch. Captured stdout comes back owned by the caller.
 fn runLoginShell(allocator: std.mem.Allocator, io: std.Io, cmd: []const u8) !struct { ok: bool, out: []u8 } {
     const result = std.process.run(allocator, io, .{
-        .argv = &.{ "/bin/zsh", "-l", "-c", cmd },
+        .argv = &.{ loginShell(), "-l", "-c", cmd },
         .stdout_limit = .limited(64 * 1024),
     }) catch return error.LoginShellFailed;
     allocator.free(result.stderr);
@@ -697,11 +721,15 @@ fn needsShellQuoting(arg: []const u8) bool {
 /// shell-significant bytes, so ordinary ids keep the exact script bytes.
 fn appendModelArg(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
     try out.append(allocator, ' ');
+    return appendModelValue(out, allocator, arg);
+}
+
+fn appendModelValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
     if (needsShellQuoting(arg)) return appendQuoted(out, allocator, arg);
     return out.appendSlice(allocator, arg);
 }
 
-/// The script body run through `/bin/zsh -l -c` (login shell = the user's
+/// The script body run through `<loginShell()> -l -c` (login shell = the user's
 /// real PATH). Configs are written by `writeConfigs` BEFORE this runs; the
 /// script only exports env and execs the agent — same split as the app's
 /// prepareConfig / scriptBody.
@@ -732,10 +760,14 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export ANTHROPIC_API_KEY=
                 \\export ANTHROPIC_AUTH_TOKEN=mlx-serve
                 \\export CLAUDE_CODE_ATTRIBUTION_HEADER=0
-                \\export ANTHROPIC_DEFAULT_OPUS_MODEL={s}
-                \\export ANTHROPIC_DEFAULT_SONNET_MODEL={s}
-                \\export ANTHROPIC_DEFAULT_HAIKU_MODEL={s}
-                \\export CLAUDE_CODE_SUBAGENT_MODEL={s}
+                \\
+            , .{base_url});
+            for ([_][]const u8{ "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL" }) |name| {
+                try out.print(allocator, "export {s}=", .{name});
+                try appendModelValue(&out, allocator, model);
+                try out.append(allocator, '\n');
+            }
+            try out.print(allocator,
                 \\export CLAUDE_CODE_MAX_OUTPUT_TOKENS={d}
                 \\export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
                 \\export API_TIMEOUT_MS=3600000
@@ -743,7 +775,7 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\
-            , .{ base_url, model, model, model, model, budget.output });
+            , .{budget.output});
             // A long prefill and a long think on a local model outlast Claude Code's stream watchdogs; a fallback
             // re-sends the whole prompt as a non-stream request, which then times out and retries.
             // Claude Code assumes 200k for a model outside its catalog; declare the advertised context verbatim.
@@ -773,10 +805,12 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             try appendModelArg(&out, allocator, omp_model);
         },
         .opencode => {
+            try out.appendSlice(allocator, "export OPENCODE_CONFIG_CONTENT=");
+            try appendQuoted(&out, allocator, opencode_launch.?.config);
             try out.print(allocator,
-                \\export OPENCODE_CONFIG_CONTENT='{s}'
+                \\
                 \\{s} --model
-            , .{ opencode_launch.?.config, opencode_launch.?.bin });
+            , .{opencode_launch.?.bin});
             const oc_model = try std.fmt.allocPrint(allocator, "mlx/{s}", .{model});
             defer allocator.free(oc_model);
             try appendModelArg(&out, allocator, oc_model);
@@ -784,12 +818,14 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
         .opencode2 => {
             // The binary is the version-detected resolution, not a fixed
             // name: Homebrew ships v2 as `opencode`, `opencode2` is legacy.
+            try out.appendSlice(allocator, "export OPENCODE_CONFIG_CONTENT=");
+            try appendQuoted(&out, allocator, opencode_launch.?.config);
             try out.print(allocator,
-                \\export OPENCODE_CONFIG_CONTENT='{s}'
+                \\
                 \\export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
                 \\if ! command -v {s} >/dev/null 2>&1; then echo "{s} is not installed"; exit 127; fi
                 \\{s} --standalone
-            , .{ opencode_launch.?.config, opencode_launch.?.bin, opencode_launch.?.bin, opencode_launch.?.bin });
+            , .{ opencode_launch.?.bin, opencode_launch.?.bin, opencode_launch.?.bin });
         },
         .codex => {
             // PATH first, then the CLI the desktop app bundles (codex's
@@ -914,25 +950,40 @@ fn tryStartApp(allocator: std.mem.Allocator, io: std.Io) bool {
     };
 }
 
-const Models = struct {
+pub const Models = struct {
     arena: std.heap.ArenaAllocator,
     entries: []Entry,
 
-    fn deinit(self: *Models) void {
+    pub fn deinit(self: *Models) void {
         self.arena.deinit();
     }
 };
 
-/// Parse /v1/models into the chat-capable entries (media/embedding models
-/// never enter a coding agent's picker — same rule as the app's
-/// AgentModelEntry.chatEntries). Context comes from meta.context_length,
-/// falling back to the top-level twin.
 fn fetchChatEntries(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) !Models {
     const url = try std.fmt.allocPrint(allocator, "{s}/v1/models", .{base_url});
     defer allocator.free(url);
     const body = try curlGet(allocator, io, url);
     defer allocator.free(body);
+    return parseChatEntries(allocator, body);
+}
 
+/// The model a launch serves: `want` when it is a chat row (null when it is
+/// not), else the first loaded row, else the first (/v1/models lists the
+/// default first).
+pub fn pickEntry(entries: []const Entry, want: ?[]const u8) ?Entry {
+    if (want) |w| {
+        for (entries) |e| if (std.mem.eql(u8, e.id, w)) return e;
+        return null;
+    }
+    for (entries) |e| if (e.loaded) return e;
+    return if (entries.len > 0) entries[0] else null;
+}
+
+/// Parse /v1/models into the chat-capable entries (media/embedding models
+/// never enter a coding agent's picker — same rule as the app's
+/// AgentModelEntry.chatEntries). Context comes from meta.context_length,
+/// falling back to the top-level twin.
+pub fn parseChatEntries(allocator: std.mem.Allocator, body: []const u8) !Models {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -995,15 +1046,6 @@ fn fetchChatEntries(allocator: std.mem.Allocator, io: std.Io, base_url: []const 
 
 // ── Config writes ───────────────────────────────────────────────────────
 
-fn writeAgentFile(allocator: std.mem.Allocator, io: std.Io, subdir: []const u8, name: []const u8, content: []const u8) !void {
-    const dir_path = try std.fmt.allocPrint(allocator, "{s}/.mlx-serve/{s}", .{ homeDir(), subdir });
-    defer allocator.free(dir_path);
-    try std.Io.Dir.cwd().createDirPath(io, dir_path);
-    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{});
-    defer dir.close(io);
-    try dir.writeFile(io, .{ .sub_path = name, .data = content });
-}
-
 fn userOpencodeCliPath(allocator: std.mem.Allocator) ![]u8 {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const dir = std.mem.span(xdg);
@@ -1016,6 +1058,8 @@ fn userOpencodeCliPath(allocator: std.mem.Allocator) ![]u8 {
 /// that carries it (Claude has no skills dir we own; `--plugin-dir` loads it).
 const skill_dir = "skills/" ++ agent_skills.name;
 const claude_plugin_dir = "claude/plugin";
+const claude_plugin_json_path = claude_plugin_dir ++ "/.claude-plugin/plugin.json";
+const claude_plugin_json = "{\"name\": \"mlx-serve\", \"description\": \"Skills for the local mlx-serve server\"}\n";
 
 /// Where each agent discovers skills inside its dedicated config dir; opencode
 /// reads `skills.paths` from its inline config instead, aider has no skills.
@@ -1051,8 +1095,8 @@ pub fn installSkill(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     if (kind == .claude) {
         try dir.createDirPath(io, claude_plugin_dir ++ "/.claude-plugin");
         dir.writeFile(io, .{
-            .sub_path = claude_plugin_dir ++ "/.claude-plugin/plugin.json",
-            .data = "{\"name\": \"mlx-serve\", \"description\": \"Skills for the local mlx-serve server\"}\n",
+            .sub_path = claude_plugin_json_path,
+            .data = claude_plugin_json,
             .flags = .{ .exclusive = true },
         }) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -1068,84 +1112,130 @@ pub fn installSkill(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     };
 }
 
-/// Write the agent's config files (the app's prepareConfig twin). opencode
-/// carries its config inline and writes nothing.
+/// One file an agent reads, at `path` under $HOME.
+/// `merged`: the data merges onto the file's own contents, which a served script
+/// cannot read, so it writes the file only where there is none.
+pub const ConfigFile = struct { path: []const u8, data: []const u8, private: bool = false, merged: bool = false };
+
+/// What a merge keeps: the file's bytes, `{}` when it is missing or when
+/// there is no `io` (a script served to another machine keeps nothing).
+fn existingOrEmpty(a: std.mem.Allocator, io: ?std.Io, rel_or_abs: []const u8) ![]const u8 {
+    const i = io orelse return "{}";
+    const path = if (std.fs.path.isAbsolute(rel_or_abs)) rel_or_abs else try std.fmt.allocPrint(a, "{s}/{s}", .{ homeDir(), rel_or_abs });
+    return std.Io.Dir.cwd().readFileAlloc(i, path, a, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => "{}",
+        else => err,
+    };
+}
+
+/// The agent's config files (the app's prepareConfig twin), allocated in `a`
+/// (an arena). opencode carries its config inline, codex on the launch line.
+fn configFiles(a: std.mem.Allocator, io: ?std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) ![]ConfigFile {
+    var files = std.ArrayList(ConfigFile).empty;
+    switch (kind) {
+        .claude, .opencode, .codex => {},
+        .opencode2 => {
+            const existing = try existingOrEmpty(a, io, try userOpencodeCliPath(a));
+            try files.append(a, .{ .path = ".mlx-serve/opencode2/opencode/cli.json", .data = try mergeOpencode2CliJson(a, existing, base_url, null) });
+            inline for (opencode2_plugin.files) |f| {
+                try files.append(a, .{ .path = ".mlx-serve/opencode2/opencode/plugins/mlx-serve/" ++ f.name, .data = f.bytes });
+            }
+        },
+        .pi => {
+            try files.append(a, .{ .path = ".mlx-serve/pi/models.json", .data = try piModelsJson(a, base_url, entries) });
+            const existing = try existingOrEmpty(a, io, ".mlx-serve/pi/settings.json");
+            try files.append(a, .{ .path = ".mlx-serve/pi/settings.json", .data = try mergePiSettingsJson(a, existing, budget.context), .merged = true });
+        },
+        .omp => try files.append(a, .{ .path = ".mlx-serve/omp/models.yml", .data = try ompModelsYml(a, base_url, entries) }),
+        .hermes => {
+            try files.append(a, .{ .path = ".mlx-serve/hermes/config.yaml", .data = try hermesConfigYaml(a, base_url, model, entries) });
+            try files.append(a, .{ .path = ".mlx-serve/hermes/.env", .data = try hermesEnvFile(a, base_url) });
+        },
+        .zcode => try files.append(a, .{ .path = ".mlx-serve/zcode/provider_config.json", .data = try zcodeConfigJson(a, base_url, model, entries) }),
+        .aider => try files.append(a, .{ .path = ".mlx-serve/aider/model-metadata.json", .data = try aiderMetadataJson(a, entries) }),
+        .fx => {
+            const existing = try existingOrEmpty(a, io, ".fx/settings.json");
+            try files.append(a, .{ .path = ".fx/settings.json", .data = try mergeFxSettingsJson(a, existing, base_url, entries), .private = true, .merged = true });
+        },
+        .grok => try files.append(a, .{ .path = ".mlx-serve/grok/config.toml", .data = try grokConfigToml(a, base_url, model, entries) }),
+    }
+    return files.items;
+}
+
 fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) !void {
     const root = try std.fmt.allocPrint(allocator, "{s}/.mlx-serve", .{homeDir()});
     defer allocator.free(root);
     try installSkill(allocator, io, root, kind);
-    switch (kind) {
-        .claude, .opencode => {},
-        .opencode2 => {
-            const user_path = try userOpencodeCliPath(allocator);
-            defer allocator.free(user_path);
-            const existing = std.Io.Dir.cwd().readFileAlloc(io, user_path, allocator, .limited(1 << 20)) catch
-                try allocator.dupe(u8, "{}");
-            defer allocator.free(existing);
-            const json = try mergeOpencode2CliJson(allocator, existing, base_url, null);
-            defer allocator.free(json);
-            try writeAgentFile(allocator, io, "opencode2/opencode", "cli.json", json);
-            inline for (opencode2_plugin.files) |f| {
-                try writeAgentFile(allocator, io, "opencode2/opencode/plugins/mlx-serve", f.name, f.bytes);
-            }
-        },
-        .pi => {
-            const json = try piModelsJson(allocator, base_url, entries);
-            defer allocator.free(json);
-            try writeAgentFile(allocator, io, "pi", "models.json", json);
-            const settings_path = try std.fmt.allocPrint(allocator, "{s}/.mlx-serve/pi/settings.json", .{homeDir()});
-            defer allocator.free(settings_path);
-            const existing = std.Io.Dir.cwd().readFileAlloc(io, settings_path, allocator, .limited(1 << 20)) catch
-                try allocator.dupe(u8, "{}");
-            defer allocator.free(existing);
-            const settings = try mergePiSettingsJson(allocator, existing, budget.context);
-            defer allocator.free(settings);
-            try writeAgentFile(allocator, io, "pi", "settings.json", settings);
-        },
-        .omp => {
-            const yml = try ompModelsYml(allocator, base_url, entries);
-            defer allocator.free(yml);
-            try writeAgentFile(allocator, io, "omp", "models.yml", yml);
-        },
-        .codex => {}, // settings ride -c overrides on the launch line
-        .hermes => {
-            const yaml = try hermesConfigYaml(allocator, base_url, model, entries);
-            defer allocator.free(yaml);
-            try writeAgentFile(allocator, io, "hermes", "config.yaml", yaml);
-            const env = try hermesEnvFile(allocator, base_url);
-            defer allocator.free(env);
-            try writeAgentFile(allocator, io, "hermes", ".env", env);
-        },
-        .zcode => {
-            const json = try zcodeConfigJson(allocator, base_url, model, entries);
-            defer allocator.free(json);
-            try writeAgentFile(allocator, io, "zcode", "provider_config.json", json);
-        },
-        .aider => {
-            const json = try aiderMetadataJson(allocator, entries);
-            defer allocator.free(json);
-            try writeAgentFile(allocator, io, "aider", "model-metadata.json", json);
-        },
-        .fx => {
-            const dir_path = try std.fmt.allocPrint(allocator, "{s}/.fx", .{homeDir()});
-            defer allocator.free(dir_path);
-            var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
-            defer dir.close(io);
-            const existing = dir.readFileAlloc(io, "settings.json", allocator, .limited(1 << 20)) catch |err| switch (err) {
-                error.FileNotFound => try allocator.dupe(u8, "{}"),
-                else => return err,
-            };
-            defer allocator.free(existing);
-            const json = try mergeFxSettingsJson(allocator, existing, base_url, entries);
-            defer allocator.free(json);
-            try dir.writeFile(io, .{ .sub_path = "settings.json", .data = json, .flags = .{ .permissions = .fromMode(0o600) } });
-        },
-        .grok => {
-            const toml = try grokConfigToml(allocator, base_url, model, entries);
-            defer allocator.free(toml);
-            try writeAgentFile(allocator, io, "grok", "config.toml", toml);
-        },
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var home = try std.Io.Dir.cwd().createDirPathOpen(io, homeDir(), .{});
+    defer home.close(io);
+    for (try configFiles(arena.allocator(), io, kind, base_url, model, budget, entries)) |f| {
+        try home.createDirPath(io, std.fs.path.dirname(f.path).?);
+        try home.writeFile(io, .{ .sub_path = f.path, .data = f.data, .flags = if (f.private) .{ .permissions = .fromMode(0o600) } else .{} });
     }
+}
+
+// ── Served launch script (`GET /launch`) ────────────────────────────────
+
+/// Agents the web console offers. opencode2's merge base is the user's own
+/// opencode cli.json, which a served script cannot read: it starts from `{}`.
+pub fn webLaunchable(kind: AgentKind) bool {
+    return switch (kind) {
+        .claude, .pi, .omp, .opencode2, .grok => true,
+        else => false,
+    };
+}
+
+const heredoc_end = "MLX_SERVE_EOF";
+
+fn appendHeredoc(out: *std.ArrayList(u8), a: std.mem.Allocator, path: []const u8, data: []const u8, keep_existing: bool) !void {
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| if (std.mem.eql(u8, line, heredoc_end)) return error.HeredocCollision;
+    try out.print(a, "mkdir -p \"$HOME/{s}\"\n", .{std.fs.path.dirname(path).?});
+    if (keep_existing) try out.print(a, "[ -e \"$HOME/{s}\" ] || ", .{path});
+    try out.print(a, "cat > \"$HOME/{s}\" <<'" ++ heredoc_end ++ "'\n{s}{s}" ++ heredoc_end ++ "\n", .{
+        path, data, if (std.mem.endsWith(u8, data, "\n")) "" else "\n",
+    });
+}
+
+/// A v2 `opencode` first, else the legacy binary (`resolveOpencode2Bin`).
+const opencode2_bin_probe =
+    \\OC_BIN=opencode2
+    \\case "$(opencode --version 2>/dev/null)" in [2-9].*|v[2-9].*|[1-9][0-9].*|v[1-9][0-9].*) OC_BIN=opencode ;; esac
+    \\
+;
+
+/// A POSIX sh script that configures `kind` for `base_url` and starts it, for a
+/// machine that may not have mlx-serve (`curl -fsSL <server>/launch?agent=… | sh`):
+/// the files `launch` writes, then its launch script through a login shell on
+/// the terminal (stdin is the pipe).
+pub fn remoteScript(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out = std.ArrayList(u8).empty;
+    try out.print(a, "#!/bin/sh\n# mlx-serve: {s} via {s}\nset -e\n", .{ @tagName(kind), base_url });
+    for (agent_skills.files) |f| {
+        try appendHeredoc(&out, a, try std.fmt.allocPrint(a, ".mlx-serve/" ++ skill_dir ++ "/{s}", .{f.name}), f.bytes, true);
+    }
+    if (kind == .claude) try appendHeredoc(&out, a, ".mlx-serve/" ++ claude_plugin_json_path, claude_plugin_json, true);
+    if (agentSkillLink(kind)) |link| {
+        try out.print(a, "mkdir -p \"$HOME/.mlx-serve/{s}\"\n[ -e \"$HOME/.mlx-serve/{s}\" ] || [ -L \"$HOME/.mlx-serve/{s}\" ] || ln -s \"$HOME/.mlx-serve/" ++ skill_dir ++ "\" \"$HOME/.mlx-serve/{s}\"\n", .{ std.fs.path.dirname(link).?, link, link, link });
+    }
+    for (try configFiles(a, null, kind, base_url, model, budget, entries)) |f| try appendHeredoc(&out, a, f.path, f.data, f.merged);
+
+    const oc: ?OpenCodeLaunch = if (kind == .opencode2) .{ .config = try opencodeJson(a, base_url, entries, model, true), .bin = "$OC_BIN" } else null;
+    const run = try std.mem.concat(a, u8, &.{ if (kind == .opencode2) opencode2_bin_probe else "", try scriptFor(a, kind, base_url, model, budget, oc, &.{}) });
+    try out.appendSlice(a, "login=$(command -v zsh || command -v bash || echo sh)\ns=");
+    try appendQuoted(&out, a, run);
+    try out.appendSlice(a,
+        \\
+        \\if [ ! -t 0 ] && (: </dev/tty) 2>/dev/null; then exec "$login" -l -c "$s" </dev/tty; fi
+        \\exec "$login" -l -c "$s"
+        \\
+    );
+    return allocator.dupe(u8, out.items);
 }
 
 // ── Command entry ───────────────────────────────────────────────────────
@@ -1267,28 +1357,11 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     }
     defer models.deinit();
 
-    // Pick: --model must exist on the server; default = first loaded chat
-    // row (/v1/models sorts the default first), else the first chat row.
-    var pick: ?Entry = null;
-    if (parsed.model) |want| {
-        for (models.entries) |e| {
-            if (std.mem.eql(u8, e.id, want)) pick = e;
-        }
-        if (pick == null) {
-            log.err("model '{s}' is not on {s} — available:\n", .{ want, base_url });
-            for (models.entries) |e| log.err("  {s}\n", .{e.id});
-            std.process.exit(1);
-        }
-    } else {
-        for (models.entries) |e| {
-            if (e.loaded) {
-                pick = e;
-                break;
-            }
-        }
-        if (pick == null) pick = models.entries[0];
-    }
-    const chosen = pick.?;
+    const chosen = pickEntry(models.entries, parsed.model) orelse {
+        log.err("model '{s}' is not on {s} — available:\n", .{ parsed.model.?, base_url });
+        for (models.entries) |e| log.err("  {s}\n", .{e.id});
+        std.process.exit(1);
+    };
 
     // Detect the OpenCode generation before anything is written: the v2
     // profile ships different config files (cli.json + monitor plugin), so
@@ -1395,13 +1468,14 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     log.info("launching {s} with {s} ({d}K context) via {s}\n", .{
         @tagName(parsed.kind), chosen.id, chosen.budget.context / 1024, base_url,
     });
+    const shell = loginShell();
     var child = std.process.spawn(io, .{
-        .argv = &.{ "/bin/zsh", "-l", "-c", script },
+        .argv = &.{ shell, "-l", "-c", script },
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch {
-        log.err("could not start /bin/zsh\n", .{});
+        log.err("could not start {s}\n", .{shell});
         std.process.exit(1);
     };
     const term = child.wait(io) catch std.process.exit(1);
@@ -2031,4 +2105,86 @@ test "zcode config escapes arbitrary model ids and declares server budgets and w
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE") != null);
     try t.expect(std.mem.indexOf(u8, script, "zcode '--prompt' 'it'\\''s a prompt'") != null);
+}
+
+test "pickEntry: the asked model or nothing, else the first loaded row, else the first" {
+    const b = FALLBACK_BUDGET;
+    const entries = [_]Entry{
+        .{ .id = "a", .budget = b, .vision = false, .loaded = false },
+        .{ .id = "b", .budget = b, .vision = false, .loaded = true },
+    };
+    try t.expectEqualStrings("a", pickEntry(&entries, "a").?.id);
+    try t.expect(pickEntry(&entries, "zz") == null);
+    try t.expectEqualStrings("b", pickEntry(&entries, null).?.id);
+    try t.expectEqualStrings("a", pickEntry(entries[0..1], null).?.id);
+    try t.expect(pickEntry(&.{}, null) == null);
+}
+
+test "served launch script writes the agent's files, keeps an edited skill, and runs on the terminal" {
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = "m1", .budget = b, .vision = false, .loaded = true }};
+    const s = try remoteScript(t.allocator, .pi, "http://h:1", "m1", b, &entries);
+    defer t.allocator.free(s);
+    try t.expect(std.mem.startsWith(u8, s, "#!/bin/sh\n"));
+    try t.expect(std.mem.indexOf(u8, s, "[ -e \"$HOME/.mlx-serve/skills/mlx-serve/SKILL.md\" ] || cat > \"$HOME/.mlx-serve/skills/mlx-serve/SKILL.md\" <<'MLX_SERVE_EOF'\n") != null);
+    try t.expect(std.mem.indexOf(u8, s, "ln -s \"$HOME/.mlx-serve/skills/mlx-serve\" \"$HOME/.mlx-serve/pi/skills/mlx-serve\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, s, "\ncat > \"$HOME/.mlx-serve/pi/models.json\" <<'MLX_SERVE_EOF'\n") != null);
+    try t.expect(std.mem.indexOf(u8, s, "\"baseUrl\": \"http://h:1/v1\"") != null);
+    // The served script cannot read the settings it would merge into: an existing file is kept.
+    try t.expect(std.mem.indexOf(u8, s, "\n[ -e \"$HOME/.mlx-serve/pi/settings.json\" ] || cat > \"$HOME/.mlx-serve/pi/settings.json\"") != null);
+    try t.expect(std.mem.indexOf(u8, s, "pi --provider mlx --model m1") != null);
+    try t.expect(std.mem.endsWith(u8, s, "then exec \"$login\" -l -c \"$s\" </dev/tty; fi\nexec \"$login\" -l -c \"$s\"\n"));
+}
+
+test "served opencode2 script resolves its binary in the login shell and pins the model" {
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = "m1", .budget = b, .vision = false, .loaded = true }};
+    const s = try remoteScript(t.allocator, .opencode2, "http://h:1", "m1", b, &entries);
+    defer t.allocator.free(s);
+    try t.expect(std.mem.indexOf(u8, s, "s='OC_BIN=opencode2\ncase \"$(opencode --version") != null);
+    try t.expect(std.mem.indexOf(u8, s, "$OC_BIN --standalone") != null);
+    try t.expect(std.mem.indexOf(u8, s, "\"model\": \"mlx/m1\"") != null);
+    try t.expect(std.mem.indexOf(u8, s, "cat > \"$HOME/.mlx-serve/opencode2/opencode/plugins/mlx-serve/tui.tsx\"") != null);
+    try t.expect(std.mem.indexOf(u8, s, "\"metricsUrl\":\"http://h:1/metrics.json\"") != null);
+}
+
+test "a model id with shell or JSON bytes stays one value in the claude and opencode scripts" {
+    const id = "x'\"$(touch p)";
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = id, .budget = b, .vision = false, .loaded = true }};
+    const claude = try scriptFor(t.allocator, .claude, "http://h:1", id, b, null, &.{});
+    defer t.allocator.free(claude);
+    try t.expect(std.mem.indexOf(u8, claude, "export ANTHROPIC_DEFAULT_OPUS_MODEL='x'\\''\"$(touch p)'\n") != null);
+    try t.expect(std.mem.indexOf(u8, claude, "export CLAUDE_CODE_SUBAGENT_MODEL='x'\\''\"$(touch p)'\n") != null);
+
+    const json = try opencodeJson(t.allocator, "http://h:1", &entries, id, true);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("mlx/" ++ id, parsed.value.object.get("model").?.string);
+    try t.expect(parsed.value.object.get("provider").?.object.get("mlx").?.object.get("models").?.object.get(id) != null);
+
+    const oc = try scriptFor(t.allocator, .opencode2, "http://h:1", id, b, .{ .config = json, .bin = "opencode" }, &.{});
+    defer t.allocator.free(oc);
+    try t.expect(std.mem.indexOf(u8, oc, "\"model\": \"mlx/x'\\''\\\"$(touch p)\"") != null);
+}
+
+test "served launch script refuses a file that would end its heredoc" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(t.allocator);
+    try t.expectError(error.HeredocCollision, appendHeredoc(&out, t.allocator, "x/y", "a\nMLX_SERVE_EOF\nb", false));
+}
+
+test "only the console's agents are web-launchable" {
+    for ([_]AgentKind{ .claude, .pi, .omp, .opencode2, .grok }) |k| try t.expect(webLaunchable(k));
+    for ([_]AgentKind{ .opencode, .codex, .hermes, .aider, .fx, .zcode }) |k| try t.expect(!webLaunchable(k));
+}
+
+test "loginShellFor: the user's own POSIX shell binary, else zsh on macOS, else bash, else sh" {
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/bash", loginShellFor("/opt/homebrew/bin/bash", true, true));
+    try std.testing.expectEqualStrings("/bin/zsh", loginShellFor("/bin/zsh", false, false));
+    // fish and nushell cannot parse the POSIX script body: macOS keeps zsh (~/.zprofile's PATH).
+    try std.testing.expectEqualStrings("/bin/zsh", loginShellFor("/opt/homebrew/bin/fish", true, true));
+    try std.testing.expectEqualStrings("bash", loginShellFor("/usr/bin/fish", false, true));
+    try std.testing.expectEqualStrings("sh", loginShellFor(null, false, false));
 }

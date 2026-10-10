@@ -22,6 +22,8 @@ struct MusicGenView: View {
     /// Selected network model's routing id (`<model>@<peer>`); nil = local.
     @State private var lanModel: String? = nil
     @State private var durationSeconds: Double = 60
+    /// YuE2: no cap; the model ends the song after the last lyric.
+    @State private var autoLength = true
     @State private var vocalLanguage: String = "en"
     @State private var bpm: Int? = nil
     @State private var keyscale: String = ""
@@ -29,9 +31,16 @@ struct MusicGenView: View {
     @State private var seed: Int = -1
     @State private var steps: Int? = nil
     @State private var instrumental: Bool = false
+    /// YuE2: plan a score first, and the ABC that replaces the model's own.
+    @State private var plan: MusicPlan = .full
+    @State private var score: String = ""
+    @State private var scoreHeight: Double = 120
     /// Open by default — see MusicGenSettings.showAdvanced.
     @State private var showAdvanced: Bool = true
     @StateObject private var library = MusicPromptLibrary()
+    @State private var showPlaylist = true
+    @State private var confirmStopRadio = false
+    @AppStorage("aiRadio.theme") private var radioTheme = ""
     @State private var showSaveStyle = false
     @State private var showSaveLyrics = false
     @State private var saveTitle = ""
@@ -41,10 +50,11 @@ struct MusicGenView: View {
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: MusicGenRequest? = nil
     // The app-wide singleton, not a per-view instance: this view unmounts on
-    // navigation (see the tab-persistence note on AudioGenView), and a
-    // private player left playing when that happens is a leaked NSSound with
-    // no reachable Stop button — see .onDisappear below.
+    // navigation (see the tab-persistence note on AudioGenView), and a track
+    // keeps playing across that until Stop; a private player would be a leaked
+    // NSSound with no reachable Stop button.
     @ObservedObject private var clipPlayer = AudioClipPlayer.shared
+    @ObservedObject private var radio = AIRadio.shared
     // Kept across preset switches like the video pane's first frame; the
     // SERVICE gates the field on `supportsReferenceAudio`.
     @State private var refAudioURL: URL? = nil
@@ -86,7 +96,6 @@ struct MusicGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        .onDisappear { stopPlayback() }
         .onChange(of: model) { _, m in
             guard !hydrating else { return }
             durationSeconds = min(max(durationSeconds, m.durationRange.lowerBound), m.durationRange.upperBound)
@@ -98,9 +107,14 @@ struct MusicGenView: View {
         // fourteen is where the type-checker gives up.
         .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
-            // A new generation stops whatever is still playing.
-            if case .running = phase { stopPlayback() }
-            if case .completed(let path) = phase { play(path) }
+            if let path = MusicGenPlayback.trackToPlay(on: phase, radioOn: radio.isOn) { play(path) }
+        }
+        .alert("Stop AI Radio?", isPresented: $confirmStopRadio) {
+            Button(role: .destructive) { radio.stop(); stopPlayback() } label: { Text("Stop Radio").font(.app(.body)) }
+                .keyboardShortcut(.defaultAction)
+            Button(role: .cancel) {} label: { Text("Keep Playing").font(.app(.body)) }
+        } message: {
+            Text("The music stops and the track being composed is discarded.").font(.app(.body))
         }
         .alert("Save style prompt", isPresented: $showSaveStyle) {
             TextField("Name", text: $saveTitle)
@@ -149,6 +163,7 @@ struct MusicGenView: View {
                     if sourceTask { sourceSection }
                     promptSection
                     lyricsSection
+                    if model.supportsScore { scoreSection }
                     if model.supportsReferenceAudio { referenceSection }
                     // No Duration in a source task: the clip is the length, and
                     // the Source well already says how long that is.
@@ -166,20 +181,34 @@ struct MusicGenView: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .disabled(radio.isOn)
+            .opacity(radio.isOn ? 0.45 : 1)
+            .overlay(alignment: .top) {
+                if radio.isOn {
+                    Label("AI Radio is running. Settings are locked until you stop it.", systemImage: "lock.fill")
+                        .font(.app(.caption)).padding(8).frame(maxWidth: .infinity)
+                        .background(.regularMaterial)
+                }
+            }
             .frame(minWidth: 340, idealWidth: 380)
 
+            // One docked window: the deck on top, the playlist filling the rest.
             VStack(spacing: 12) {
-                previewArea
-                AudioHistoryShelf(
-                    title: "History",
-                    paths: service.recent,
-                    playingPath: clipPlayer.playingPath,
-                    onPlay: { play($0) },
-                    onStop: { stopPlayback() }
-                )
+                MlxAmpStretched { width, height in
+                    VStack(spacing: 0) {
+                        deck(width: width)
+                        if showPlaylist {
+                            MlxAmpPlaylist(width: width, height: max(MlxAmpPlaylist.minHeight, height - MlxAmpPlayer.height),
+                                           paths: service.recent, current: clipPlayer.playingPath, locked: radio.isOn,
+                                           onPlay: { play($0) }, onStop: { stopPlayback() })
+                        }
+                    }
+                }
                 outputFolderLink
             }
             .padding(16)
+            .onAppear { clipPlayer.queue = service.recent }
+            .onChange(of: service.recent) { _, recent in clipPlayer.queue = recent }
             // The preview gives way in a small window.
             .frame(minWidth: 280)
         }
@@ -212,7 +241,9 @@ struct MusicGenView: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
-            Text("Genre, mood, instruments — e.g. \"upbeat synthwave with driving bass and dreamy pads\".")
+            Text(model.family == .yue2
+                 ? "Comma-separated tags: language or genre, instruments, mood, lead vocal — e.g. \"English, indie pop, bright acoustic guitar, soft drums, warm lead vocal\"."
+                 : "Genre, mood, instruments — e.g. \"upbeat synthwave with driving bass and dreamy pads\".")
                 .font(.app(.caption2)).foregroundStyle(.secondary)
         }
     }
@@ -226,17 +257,19 @@ struct MusicGenView: View {
                 // Music 3 refused outright — the server 400s an empty lyric
                 // block there, so this needed the `instrumental` field before a
                 // checkbox could work.
-                Toggle("Instrumental", isOn: $instrumental)
-                    .font(.app(.caption))
-                    .fixedSize()
-                    .help(L10n.text(model.family == .minimaxMusic3
-                          ? "Asks for a track with no singing. This model has no dedicated instrumental switch, so it is requested in text — it may still add wordless vocals."
-                          : "Generate music with no singing. The lyrics below are not used."))
+                if model.supportsInstrumental {
+                    Toggle("Instrumental", isOn: $instrumental)
+                        .font(.app(.caption))
+                        .fixedSize()
+                        .help(L10n.text(model.family == .minimaxMusic3
+                              ? "Asks for a track with no singing. This model has no dedicated instrumental switch, so it is requested in text — it may still add wordless vocals."
+                              : "Generate music with no singing. The lyrics below are not used."))
+                }
                 Spacer()
-                PromptEnhanceButton(disabled: lyrics.isBlank || instrumental) { rewriteKind = .lyrics }
+                PromptEnhanceButton(disabled: lyrics.isBlank || wordless) { rewriteKind = .lyrics }
                 lyricsExamplesMenu
             }
-            if instrumental {
+            if wordless {
                 // The box goes away, the words do not: `lyrics` is untouched
                 // and still persisted, so turning the switch back off returns
                 // the verse. Deleting it here is the failure mode the server's
@@ -258,7 +291,7 @@ struct MusicGenView: View {
                         )
                     if lyrics.isEmpty {
                         Text(model.requiresLyrics
-                             ? L10n.format("This model sings your lyrics. Section tags go on their own lines: %@", MusicOptions.sectionTagHint)
+                             ? L10n.format("This model sings your lyrics. Section tags go on their own lines: %@", MusicOptions.sectionTagHint(for: model.family))
                              : L10n.format("Leave empty, or tick Instrumental, for a track with no vocals. Section tags: %@", MusicOptions.sectionTagHint))
                             .font(.app(.body))
                             .foregroundStyle(.secondary.opacity(0.6))
@@ -268,6 +301,61 @@ struct MusicGenView: View {
                     }
                 }
                 lyricsResizeHandle
+            }
+        }
+    }
+
+    /// A wordless track is only a thing on models that have one.
+    private var wordless: Bool { instrumental && model.supportsInstrumental }
+
+    private var engineName: String {
+        switch model.family {
+        case .acestep: return "ACE-Step"
+        case .minimaxMusic3: return "MiniMax Music 3"
+        case .yue2: return "YuE2"
+        }
+    }
+
+    /// YuE2 writes a score (ABC notation) before it sings. The plan decides
+    /// whether it does; the text box lets you render your own — a cover from a
+    /// transcribed melody, or the last song's score with the chords changed.
+    private var scoreSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Score").font(.app(.headline).weight(.semibold))
+            Picker("", selection: $plan) {
+                ForEach(MusicPlan.allCases, id: \.self) { p in
+                    Text(L10n.text(p.label)).tag(p)
+                }
+            }
+            .labelsHidden().pickerStyle(.segmented)
+            Text(L10n.text(plan.hint)).font(.app(.caption2)).foregroundStyle(.secondary)
+            if plan != .off {
+                ZStack(alignment: .topLeading) {
+                    TextEditor(text: $score)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(height: scoreHeight)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
+                        )
+                    if score.isEmpty {
+                        Text("Leave empty and the model writes the score. Paste ABC notation to render your own.")
+                            .font(.app(.body))
+                            .foregroundStyle(.secondary.opacity(0.6))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 8)
+                            .allowsHitTesting(false)
+                    }
+                }
+                EditorResizeHandle(height: $scoreHeight, onCommit: {}, help: "Drag to resize the score box.")
+                HStack(spacing: 8) {
+                    Button { if let last = service.lastScore { score = last } } label: {
+                        Text("Use last score").font(.app(.caption))
+                    }
+                    .disabled(service.lastScore == nil)
+                    .help("Fills the box with the score the last song was rendered from, so you can change it and render again.")
+                    Button { score = "" } label: { Text("Clear").font(.app(.caption)) }
+                        .disabled(score.isEmpty)
+                }
             }
         }
     }
@@ -634,25 +722,41 @@ struct MusicGenView: View {
 
     private var durationSection: some View {
         VStack(alignment: .leading, spacing: 2) {
-            // The box belongs NEXT to the label it edits. Right-justifying it
-            // against the pane margin puts a number and its name at opposite
-            // ends of a wide row with nothing between them to tie the two.
-            HStack(spacing: 6) {
-                Text("Duration").font(.app(.headline).weight(.semibold))
-                // Typed entry beside the slider: the slider steps by 5 and
-                // landing on 95 s by dragging is not a thing anyone should do.
-                NumberField(range: durationRangeInt,
-                            value: Binding(get: { Int(durationSeconds) },
-                                           set: { durationSeconds = Double($0) }),
-                            width: 52,
-                            help: "Seconds. \(durationRangeInt.lowerBound)–\(durationRangeInt.upperBound) for this model.")
-                Text("sec · \(formattedDuration)").font(.app(.caption2)).foregroundStyle(.secondary)
-                Spacer()
+            // YuE2 ends its own song after the last lyric; a length only caps it.
+            if model.supportsAutoLength {
+                Toggle(isOn: $autoLength) {
+                    Text("Length: Auto").font(.app(.headline).weight(.semibold))
+                }
+                .toggleStyle(.checkbox)
+                if autoLength {
+                    Text("The model ends the song after the last lyric.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
             }
-            Slider(value: $durationSeconds, in: model.durationRange, step: 5)
-            if model.family == .minimaxMusic3 {
-                Text("An upper bound — the model may end the song earlier.")
-                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            if !(model.supportsAutoLength && autoLength) {
+                // The box belongs NEXT to the label it edits. Right-justifying it
+                // against the pane margin puts a number and its name at opposite
+                // ends of a wide row with nothing between them to tie the two.
+                HStack(spacing: 6) {
+                    Text(model.supportsAutoLength ? "Limit" : "Duration").font(.app(.headline).weight(.semibold))
+                    // Typed entry beside the slider: the slider steps by 5 and
+                    // landing on 95 s by dragging is not a thing anyone should do.
+                    NumberField(range: durationRangeInt,
+                                value: Binding(get: { Int(durationSeconds) },
+                                               set: { durationSeconds = Double($0) }),
+                                width: 52,
+                                help: "Seconds. \(durationRangeInt.lowerBound)–\(durationRangeInt.upperBound) for this model.")
+                    Text("sec · \(formattedDuration)").font(.app(.caption2)).foregroundStyle(.secondary)
+                    Spacer()
+                }
+                Slider(value: $durationSeconds, in: model.durationRange, step: 5)
+                if model.supportsAutoLength {
+                    Text("A limit with a few seconds of grace — the model ends the song earlier when it can.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                } else if model.family != .acestep {
+                    Text("An upper bound — the model may end the song earlier.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -799,11 +903,20 @@ struct MusicGenView: View {
 
     private var actionRow: some View {
         HStack {
-            if service.isRunning {
-                Button(role: .destructive) { service.cancel() } label: {
-                    Label("Cancel", systemImage: "stop.circle").font(.app(.body)).frame(maxWidth: .infinity)
+            if radio.isOn {
+                Button {} label: {
+                    Label("AI Radio is on", systemImage: "dot.radiowaves.left.and.right").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .disabled(true)
+            } else if case .running(let step, let total, let message) = service.phase {
+                let progress = MusicGenPlayback.buttonProgress(step: step, total: total, message: message)
+                GeneratingBar(text: progress.text, fraction: progress.fraction)
+                Button(role: .destructive) { service.cancel() } label: {
+                    Image(systemName: "stop.fill").font(.app(.body))
+                }
+                .buttonStyle(.bordered)
+                .help("Cancel generation")
             } else {
                 Button { tryGenerate() } label: {
                     Label("Generate", systemImage: "music.note").font(.app(.body)).frame(maxWidth: .infinity)
@@ -831,83 +944,23 @@ struct MusicGenView: View {
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
     }
 
-    private var previewArea: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.15))
-            Group {
-                switch service.phase {
-                case .idle:
-                    ContentUnavailableView("No music yet", systemImage: "music.note",
-                                           description: Text("Describe a style, optionally add lyrics, and press Generate.").font(.app(.body)))
-                case .running(let step, let total, let message):
-                    VStack(spacing: 12) {
-                        if total == 0 {
-                            ProgressView().frame(width: 240)
-                        } else {
-                            ProgressView(value: Double(step), total: max(1, Double(total)))
-                                .progressViewStyle(.linear).frame(width: 240)
-                        }
-                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
-                    }
-                case .completed(let path):
-                    completedPreview(path: path)
-                case .failed(let msg):
-                    ContentUnavailableView {
-                        Label("Failed", systemImage: "exclamationmark.triangle").font(.app(.body))
-                    } description: {
-                        Text(msg)
-                    } actions: {
-                        Button { showLogWindow() } label: { Text("Show log")
-                            .font(.app(.body)) }
-                    }
-                }
-            }
+    /// The player shows whatever played last, generated or picked from History;
+    /// while generating or after a failure its title line says so.
+    private func deck(width: CGFloat) -> some View {
+        var status: MlxAmpPlayer.Status?
+        // The radio's progress lives in its own strip; the title keeps the track playing.
+        if let p = MusicGenPlayback.deckProgress(phase: service.phase, radioOn: radio.isOn,
+                                                 playing: clipPlayer.playingPath != nil) {
+            status = .busy(p.message, progress: p.progress)
+        } else if !radio.isOn, case .failed(let message) = service.phase {
+            status = .failed(message)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func completedPreview(path: String) -> some View {
-        // One control, two states: pausing left the shelf lit under a clip
-        // that had stopped making sound, so there is no pause any more.
-        let playing = clipPlayer.playingPath == path
-        return VStack(spacing: 12) {
-            trackGlyph(playing: playing)
-            Button {
-                playing ? clipPlayer.stop() : clipPlayer.play(path)
-            } label: {
-                Label(playing ? "Stop" : "Play", systemImage: playing ? "stop.fill" : "play.fill").font(.app(.body))
-            }
-            .buttonStyle(.bordered)
-            // The name and the way to reach the file belong together, centred
-            // under the track they describe.
-            HStack(spacing: 8) {
-                Text(URL(fileURLWithPath: path).lastPathComponent)
-                    .font(.app(.caption)).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.middle)
-                Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-                } label: { Image(systemName: "folder") }
-                .buttonStyle(.borderless).help("Reveal in Finder")
-            }
-        }
-        .padding(16)
-    }
-
-    /// There is no note-in-a-circle symbol, so the disc is drawn and the note
-    /// is PUNCHED out of it: `.destinationOut` clears what it covers, which
-    /// needs the stack to composite as one layer first. The hole is what
-    /// bounces.
-    private func trackGlyph(playing: Bool) -> some View {
-        ZStack {
-            Circle()
-                .fill(.tint)
-                .frame(width: 64, height: 64)
-            Image(systemName: "music.note.list")
-                .font(.app(.largeTitle))
-                .blendMode(.destinationOut)
-                .symbolEffect(.bounce.down.byLayer, options: .repeat(.continuous), isActive: playing)
-        }
-        .compositingGroup()
+        // Before anything has played, the deck holds the newest track so Play
+        // has something to start.
+        let path = clipPlayer.loadedPath ?? service.recent.first ?? ""
+        if path.isEmpty, status == nil, case .idle = service.phase { status = .busy(L10n.text("No music yet"), progress: nil) }
+        return MlxAmpPlayer(player: clipPlayer, radio: radio, width: width, path: path,
+                            showPlaylist: $showPlaylist, radioTheme: $radioTheme, onRadioStart: { startRadio() }, onRadioStop: { confirmStopRadio = true }, status: status, onShowLog: { showLogWindow() })
     }
 
     private func showLogWindow() {
@@ -932,6 +985,7 @@ struct MusicGenView: View {
         model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         durationSeconds = Double(s.durationSeconds)
+        autoLength = s.autoLength
         vocalLanguage = s.vocalLanguage
         keepResident = s.keepResident
         bpm = s.bpm
@@ -940,6 +994,8 @@ struct MusicGenView: View {
         seed = s.seed
         steps = s.steps
         instrumental = s.instrumental
+        plan = s.plan
+        score = s.score
         showAdvanced = s.showAdvanced
         prompt = s.prompt
         lyrics = s.lyrics
@@ -959,6 +1015,7 @@ struct MusicGenView: View {
         var s = MusicGenSettings()
         s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.durationSeconds = Int(durationSeconds)
+        s.autoLength = autoLength
         s.vocalLanguage = vocalLanguage
         s.keepResident = keepResident
         s.bpm = bpm
@@ -967,6 +1024,8 @@ struct MusicGenView: View {
         s.seed = seed
         s.steps = steps
         s.instrumental = instrumental
+        s.plan = plan
+        s.score = score
         s.showAdvanced = showAdvanced
         s.prompt = prompt
         s.lyrics = lyrics
@@ -1013,7 +1072,7 @@ struct MusicGenView: View {
             // Named after the engine, because the two sets are not
             // interchangeable: ACE-Step reads a one-line genre description and
             // Music 3 a structured caption.
-            Section("Example templates for \(model.family == .minimaxMusic3 ? "MiniMax Music 3" : "ACE-Step")") {
+            Section("Example templates for \(engineName)") {
                 ForEach(MusicPrompt.builtinStyles(for: model.family)) { p in
                     Button { prompt = p.body } label: { Text(L10n.text(p.title))
                         .font(.app(.body)) }
@@ -1061,7 +1120,7 @@ struct MusicGenView: View {
                 }
             }
             Section("Example templates") {
-                ForEach(MusicPrompt.builtinLyrics) { p in
+                ForEach(MusicPrompt.builtinLyrics(for: model.family)) { p in
                     Button { lyrics = p.body } label: { Text(L10n.text(p.title))
                         .font(.app(.body)) }
                 }
@@ -1074,8 +1133,8 @@ struct MusicGenView: View {
 
     // MARK: - Generate
 
-    private func tryGenerate() {
-        let req = MusicGenRequest(
+    private func currentRequest() -> MusicGenRequest {
+        MusicGenRequest(
             model: model,
             prompt: prompt,
             lyrics: lyrics,
@@ -1085,9 +1144,12 @@ struct MusicGenView: View {
             keyscale: keyscale,
             timesignature: timesignature,
             durationSeconds: Int(durationSeconds),
+            autoLength: autoLength,
             seed: seed,
             steps: steps,
             keepResident: keepResident,
+            plan: plan,
+            score: score,
             refAudioPath: refAudioURL?.path,
             task: task,
             srcAudioPath: srcAudioURL?.path,
@@ -1096,6 +1158,17 @@ struct MusicGenView: View {
             trackClasses: trackClasses,
             lanModelId: lanModel
         )
+    }
+
+    private func startRadio() {
+        guard !radioTheme.isBlank else { return }
+        persist()
+        radio.start(theme: radioTheme, template: currentRequest(), service: service, server: server,
+                    downloads: downloads, appState: appState)
+    }
+
+    private func tryGenerate() {
+        let req = currentRequest()
         persist()
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB
@@ -1106,5 +1179,58 @@ struct MusicGenView: View {
             return
         }
         service.generate(req, server: server, downloads: downloads)
+    }
+}
+
+/// What the Music pane does with playback while a song generates: the song that
+/// is playing keeps playing, and the new one takes over once it is done.
+enum MusicGenPlayback {
+    /// The track to switch to on a phase change; the radio plays its own.
+    static func trackToPlay(on phase: MusicGenService.Phase, radioOn: Bool) -> String? {
+        guard !radioOn, case .completed(let path) = phase else { return nil }
+        return path
+    }
+
+    /// The deck's generation readout, or nil while a song is playing: the deck
+    /// keeps showing that song, and the progress is on the Generate button.
+    static func deckProgress(phase: MusicGenService.Phase, radioOn: Bool,
+                             playing: Bool) -> (message: String, progress: Double?)? {
+        guard !radioOn, !playing, case .running(let step, let total, let message) = phase else { return nil }
+        return (message, total == 0 ? nil : Double(step) / Double(max(1, total)))
+    }
+
+    /// The Generate button while it runs; a total of 0 means the length is the model's to decide.
+    static func buttonProgress(step: Int, total: Int, message: String) -> (text: String, fraction: Double?) {
+        guard total > 0 else { return (message, nil) }
+        let fraction = min(1, Double(step) / Double(total))
+        return ("\(message) \(Int((fraction * 100).rounded()))%", fraction)
+    }
+}
+
+/// The Generate button turned into its own progress bar: the fill is how far
+/// the song is, the spinner says it is still working when there is no total.
+private struct GeneratingBar: View {
+    let text: String
+    let fraction: Double?
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.55))
+            if let fraction {
+                GeometryReader { g in
+                    RoundedRectangle(cornerRadius: 6).fill(Color.accentColor)
+                        .frame(width: g.size.width * fraction)
+                }
+            }
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small).environment(\.colorScheme, .dark)
+                Text(verbatim: text).font(.app(.body)).lineLimit(1).truncationMode(.tail)
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity)
+        }
+        .frame(height: 28)
+        .accessibilityElement(children: .combine)
     }
 }

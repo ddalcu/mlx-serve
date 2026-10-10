@@ -116,6 +116,12 @@ pub const aliases = [_]Alias{
 pub const Resolved = struct {
     repo: []const u8,
     gguf_file: []const u8 = "",
+    /// `org/repo:Q4_K_M`: the GGUF quant to pull from a repo that ships several.
+    quant: []const u8 = "",
+    /// Set by `pullRepo`: the chosen GGUF group (`ggufGroup`); its files are pulled, no other .gguf.
+    gguf_group: []const u8 = "",
+    /// Set by `pullRepo` with `gguf_group`: the one MTP draft head pulled beside it (`pickMtpSidecar`).
+    gguf_mtp: []const u8 = "",
 };
 
 /// Short name / repo ref → HF repo id. Accepts:
@@ -131,11 +137,13 @@ pub fn resolveShortName(name: []const u8) ?Resolved {
             break;
         }
     }
+    const tagged = n;
     n = ollama.stripTag(n);
     if (n.len == 0) return null;
     if (std.mem.indexOfScalar(u8, n, '/') != null) {
-        // Direct org/repo reference.
-        return .{ .repo = n };
+        // Direct org/repo reference; a tag picks a GGUF quant.
+        const tag = if (tagged.len > n.len) tagged[n.len + 1 ..] else "";
+        return .{ .repo = n, .quant = if (std.mem.eql(u8, tag, "latest")) "" else tag };
     }
     // Alias lookup: "name" or "name:tag" (tag was stripped above — redo the
     // split on the ORIGINAL string so alias tags still work).
@@ -458,12 +466,15 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     } else null;
     defer if (config_json) |c| allocator.free(c);
     const media = isMediaListing(allocator, files, config_json);
+    var r = resolved;
+    if (r.gguf_file.len == 0) r.gguf_group = try chooseGgufGroup(allocator, io, files, r.quant, reporter) orelse "";
+    if (r.gguf_group.len > 0) r.gguf_mtp = pickMtpSidecar(files, r.gguf_group);
 
     var wanted: usize = 0;
     var total_bytes: u64 = 0;
     var has_weights = false;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path, media)) continue;
+        if (!wantedFile(r, f.path, media)) continue;
         wanted += 1;
         total_bytes += f.size;
         if (std.mem.endsWith(u8, f.path, ".safetensors") or std.mem.endsWith(u8, f.path, ".gguf")) has_weights = true;
@@ -476,7 +487,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
 
     var idx: usize = 0;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path, media)) continue;
+        if (!wantedFile(r, f.path, media)) continue;
         idx += 1;
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
         defer allocator.free(dest_path);
@@ -504,7 +515,88 @@ fn wantedFile(resolved: Resolved, path: []const u8, media: bool) bool {
         // Single-artifact GGUF repos: just that file (plus nothing else).
         return std.mem.eql(u8, path, resolved.gguf_file);
     }
+    if (resolved.gguf_group.len > 0 and std.mem.endsWith(u8, path, ".gguf"))
+        return std.mem.eql(u8, path, resolved.gguf_mtp) or std.mem.eql(u8, ggufGroup(path) orelse return false, resolved.gguf_group);
     return if (media) shouldDownloadFile(path) else shouldDownload(path);
+}
+
+/// The quant group a GGUF file belongs to: its path without the split suffix
+/// (`-00001-of-00003`) and extension, so the parts of one split model group together.
+/// Null for what is not a model to pick: a sidecar discovery skips (MTP head, mmproj,
+/// tokenizer: `model_discovery.isGgufSidecarBasename`) or an importance matrix (imatrix).
+pub fn ggufGroup(path: []const u8) ?[]const u8 {
+    const base = std.fs.path.basename(path);
+    if (!std.mem.endsWith(u8, path, ".gguf") or model_discovery.isGgufSidecarBasename(base) or std.ascii.startsWithIgnoreCase(base, "imatrix")) return null;
+    const stem = path[0 .. path.len - ".gguf".len];
+    const of = std.mem.lastIndexOf(u8, stem, "-of-") orelse return stem;
+    const dash = std.mem.lastIndexOfScalar(u8, stem[0..of], '-') orelse return stem;
+    for (stem[dash + 1 .. of]) |c| if (!std.ascii.isDigit(c)) return stem;
+    return stem[0..dash];
+}
+
+/// The one MTP draft head to pull beside the chosen group: the one quantized like it
+/// (same last `-` token: `...-Q4_K_M`), else the smallest. Repos ship several (BF16 to Q4).
+fn pickMtpSidecar(files: []const RepoFile, group: []const u8) []const u8 {
+    const quant = group[(std.mem.lastIndexOfScalar(u8, group, '-') orelse 0)..];
+    var best: ?RepoFile = null;
+    for (files) |f| {
+        if (!model_discovery.isMtpGgufBasename(std.fs.path.basename(f.path))) continue;
+        if (std.ascii.endsWithIgnoreCase(f.path[0 .. f.path.len - ".gguf".len], quant)) return f.path;
+        if (best == null or f.size < best.?.size) best = f;
+    }
+    return if (best) |b| b.path else "";
+}
+
+/// Picks the GGUF quant to pull when the repo ships more than one: the tag's
+/// unique match, else the user's answer at a terminal, else a listed error.
+/// Null when there is nothing to choose (no GGUF, or one).
+fn chooseGgufGroup(allocator: std.mem.Allocator, io: std.Io, files: []const RepoFile, quant: []const u8, reporter: Reporter) !?[]const u8 {
+    var groups = std.ArrayList(struct { key: []const u8, bytes: u64 }).empty;
+    defer groups.deinit(allocator);
+    for (files) |f| {
+        const key = ggufGroup(f.path) orelse continue;
+        const i = for (groups.items, 0..) |g, i| {
+            if (std.mem.eql(u8, g.key, key)) break i;
+        } else blk: {
+            try groups.append(allocator, .{ .key = key, .bytes = 0 });
+            break :blk groups.items.len - 1;
+        };
+        groups.items[i].bytes += f.size;
+    }
+    // No GGUF: a tag names no quant here (an MLX repo's `:8bit`), so it is ignored as before.
+    if (groups.items.len == 0 or (groups.items.len == 1 and quant.len == 0)) return null;
+
+    // An exact quant token (`-Q6_K`) wins, so `:Q6_K` is not ambiguous beside `Q6_K_L`;
+    // a substring of the name is the fallback.
+    var matches = std.ArrayList(usize).empty;
+    defer matches.deinit(allocator);
+    for (groups.items, 0..) |g, i| if (quant.len == 0 or endsWithQuant(g.key, quant)) try matches.append(allocator, i);
+    if (matches.items.len == 0) for (groups.items, 0..) |g, i| if (std.ascii.findIgnoreCase(g.key, quant) != null) try matches.append(allocator, i);
+    if (matches.items.len == 1) return groups.items[matches.items[0]].key;
+
+    if (quant.len > 0) reporter.say("{s} matches {d} of the repo's GGUF quants:", .{ quant, matches.items.len }) else reporter.say("this repo ships {d} GGUF quants:", .{groups.items.len});
+    if (matches.items.len == 0) for (0..groups.items.len) |i| try matches.append(allocator, i);
+    for (matches.items, 1..) |gi, n| reporter.say("  {d}) {s}  ({d:.1} GB)", .{ n, std.fs.path.basename(groups.items[gi].key), @as(f64, @floatFromInt(groups.items[gi].bytes)) / 1e9 });
+
+    if (!(std.Io.File.stdin().isTty(io) catch false)) {
+        reporter.say("pick one: mlx-serve pull <org/repo>:<QUANT>  (e.g. :Q4_K_M)", .{});
+        return error.PullFailed;
+    }
+    var buf: [64]u8 = undefined;
+    var stdin_r = std.Io.File.stdin().reader(io, &buf);
+    while (true) {
+        reporter.say("quant number:", .{});
+        const line = (stdin_r.interface.takeDelimiter('\n') catch return error.PullFailed) orelse return error.PullFailed;
+        const n = std.fmt.parseInt(usize, std.mem.trim(u8, line, " \t\r"), 10) catch continue;
+        if (n >= 1 and n <= matches.items.len) return groups.items[matches.items[n - 1]].key;
+    }
+}
+
+/// `key` (a `ggufGroup`) ends with `quant` as its own `-`/`.`-delimited token.
+fn endsWithQuant(key: []const u8, quant: []const u8) bool {
+    if (key.len <= quant.len or !std.ascii.endsWithIgnoreCase(key, quant)) return false;
+    const sep = key[key.len - quant.len - 1];
+    return sep == '-' or sep == '.';
 }
 
 /// A media pack keeps its components in folders (FLUX's transformer/ and vae/,
@@ -909,6 +1001,8 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Direct org/repo passthrough, tag stripped, hf.co prefixes stripped.
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo:latest").?.repo);
+    try testing.expectEqualStrings("", resolveShortName("org/repo:latest").?.quant);
+    try testing.expectEqualStrings("IQ3_XXS", resolveShortName("hf.co/org/repo:IQ3_XXS").?.quant);
     try testing.expectEqualStrings("org/repo", resolveShortName("hf.co/org/repo").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("https://huggingface.co/org/repo").?.repo);
     // GGUF single-artifact alias carries its file restriction.
@@ -1285,4 +1379,43 @@ test "cli: list tree walk descends into symlinked model dirs" {
     }
     // 1 definition + 3 in this test + at least 2 call sites in the walk.
     try testing.expect(found >= 6);
+}
+
+test "ggufGroup: split parts group together, quants apart, mmproj never" {
+    try testing.expectEqualStrings("M-Q4_K_M", ggufGroup("M-Q4_K_M.gguf").?);
+    try testing.expectEqualStrings("Q8_0/M-Q8_0", ggufGroup("Q8_0/M-Q8_0-00001-of-00003.gguf").?);
+    try testing.expectEqualStrings("Q8_0/M-Q8_0", ggufGroup("Q8_0/M-Q8_0-00003-of-00003.gguf").?);
+    try testing.expect(ggufGroup("mmproj-F16.gguf") == null);
+    try testing.expect(ggufGroup("imatrix_unsloth.gguf") == null);
+    try testing.expect(ggufGroup("mtp-M-Q4_0.gguf") == null);
+    try testing.expect(ggufGroup("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf") == null);
+    // One MTP head rides along with the picked quant; other quants and heads do not.
+    const r: Resolved = .{ .repo = "o/r", .gguf_group = "M-Q4_K_M", .gguf_mtp = "MTP/mtp-M-Q4_0.gguf" };
+    try testing.expect(wantedFile(r, "M-Q4_K_M.gguf", false));
+    try testing.expect(wantedFile(r, "MTP/mtp-M-Q4_0.gguf", false));
+    try testing.expect(!wantedFile(r, "MTP/mtp-M-BF16.gguf", false));
+    try testing.expect(!wantedFile(r, "M-Q8_0.gguf", false));
+    try testing.expect(ggufGroup("config.json") == null);
+}
+
+test "chooseGgufGroup: an exact quant tag wins over a longer one; no GGUF ignores the tag" {
+    const io = std.testing.io;
+    var p1 = "M-Q6_K.gguf".*;
+    var p2 = "M-Q6_K_L.gguf".*;
+    const files = [_]RepoFile{ .{ .path = &p1, .size = 1 }, .{ .path = &p2, .size = 1 } };
+    try testing.expectEqualStrings("M-Q6_K", (try chooseGgufGroup(testing.allocator, io, &files, "q6_k", stderr_reporter)).?);
+    try testing.expectEqualStrings("M-Q6_K_L", (try chooseGgufGroup(testing.allocator, io, &files, "Q6_K_L", stderr_reporter)).?);
+    var p3 = "model.safetensors".*;
+    const mlx = [_]RepoFile{.{ .path = &p3, .size = 1 }};
+    try testing.expect((try chooseGgufGroup(testing.allocator, io, &mlx, "8bit", stderr_reporter)) == null);
+}
+
+test "pickMtpSidecar: the head quantized like the trunk, else the smallest" {
+    var p1 = "MTP/mtp-M-BF16.gguf".*;
+    var p2 = "MTP/mtp-M-Q4_K_M.gguf".*;
+    var p3 = "MTP/mtp-M-Q8_0.gguf".*;
+    const files = [_]RepoFile{ .{ .path = &p1, .size = 7000 }, .{ .path = &p2, .size = 2600 }, .{ .path = &p3, .size = 4000 } };
+    try testing.expectEqualStrings("MTP/mtp-M-Q8_0.gguf", pickMtpSidecar(&files, "Q8_0/M-Q8_0"));
+    try testing.expectEqualStrings("MTP/mtp-M-Q4_K_M.gguf", pickMtpSidecar(&files, "M-UD-IQ1_M"));
+    try testing.expectEqualStrings("", pickMtpSidecar(files[0..0], "M-Q4_K_M"));
 }

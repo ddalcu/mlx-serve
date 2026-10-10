@@ -140,6 +140,8 @@ final class MediaGenSettingsTests: XCTestCase {
         s.refImageSize = .max
         s.showMediaInputs = false
         s.showAdvanced = true
+        s.storyboardMode = true
+        s.storyboard = [StoryboardSegment(prompt: "a fox", seconds: 9)]
         var decoded = try JSONDecoder().decode(VideoGenSettings.self, from: try JSONEncoder().encode(s))
         // A row's id is not persisted (by design), so the stack is compared by
         // what it carries and then set aside for the whole-blob comparison.
@@ -156,7 +158,7 @@ final class MediaGenSettingsTests: XCTestCase {
             with: try JSONEncoder().encode(VideoGenSettings())) as! [String: Any]
         for key in ["prompt", "firstFramePath", "lastFramePath", "audioSource", "audioPath",
                     "speechText", "refImagePaths", "refVideoPaths", "refAudioPaths",
-                    "refImageSize", "showMediaInputs", "showAdvanced"] {
+                    "refImageSize", "showMediaInputs", "showAdvanced", "storyboardMode", "storyboard"] {
             obj.removeValue(forKey: key)
         }
         let decoded = try JSONDecoder().decode(

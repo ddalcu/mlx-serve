@@ -864,3 +864,15 @@ Defect: the trash button on the last Providers row crashed the app (`Array._chec
 ## Full-size pictures decoded in a view body stall the window
 
 Defect: window moves and typing stuttered while photos or generated media were on screen. Cause: drop wells, reference tiles, previews and chat attachment bubbles built full-size `NSImage`s on the main thread, several straight from `body`, which re-runs on every streamed token and progress tick. Fix: `MediaImage` downsamples with ImageIO off the main thread and caches the result by path, mtime, size and display size; video frames and WAV payloads decode their base64 off the main actor too. Guard: `MediaImageTests`.
+
+### Composer note recovery must wait for the IME
+
+Recovering a steering note while the composer held marked text lost the note:
+the engine cleared it, SwiftUI wrote it into the binding, the redraw guard
+refused to overwrite the composition, and the eventual commit overwrote the
+binding with only the field's text. Keep paused notes in a session-keyed
+restoring store owned by the engine; sending reads only the sending store.
+Restore after SwiftUI observes the end of composition and the committed
+binding is available. Window removal preserves the store; deleting a session
+prunes both stores, even without a running turn.
+Guards: `SteeringNotesTests`, `ComposerMarkedTextTests`.

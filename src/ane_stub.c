@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <netdb.h>
+#include <sys/socket.h>
 
 typedef struct MsvAneMlp MsvAneMlp;
 typedef struct MsvAneBank MsvAneBank;
@@ -110,14 +112,26 @@ uint64_t msv_volume_free_for_use(const char *path) {
 }
 
 // Avahi's libdns_sd compat layer (Linux Bonjour) does not implement
-// DNSServiceGetAddrInfo, so lan.zig's peer address resolution gets an
-// explicit NotSupported (-65537) instead of a link error. Peer BROWSE and
-// RESOLVE still work through the real Avahi symbols.
+// DNSServiceGetAddrInfo, so resolve the peer's host with getaddrinfo (nss-mdns /
+// systemd-resolved answer .local) and deliver every IPv4 answer synchronously:
+// *ref stays NULL and lan.zig's pump sees the reply already done. The call blocks
+// the LAN thread for the resolver's own timeout, not pumpUntil's deadline.
+typedef void (*mlxserve_addr_reply)(void *ref, unsigned int flags, unsigned int interface, int err,
+                                     const char *hostname, const struct sockaddr *address,
+                                     unsigned int ttl, void *ctx);
 int DNSServiceGetAddrInfo(void **ref, unsigned int flags, unsigned int interface,
                           unsigned int protocol, const char *hostname,
                           void *cb, void *ctx) {
-    (void)flags; (void)interface; (void)protocol; (void)hostname; (void)cb; (void)ctx;
+    (void)flags; (void)interface; (void)protocol;
     if (ref != NULL)
         *ref = NULL;
-    return -65537; /* kDNSServiceErr_NotSupported */
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(hostname, NULL, &hints, &res) != 0)
+        return -65554; /* kDNSServiceErr_NoSuchRecord */
+    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next)
+        ((mlxserve_addr_reply)cb)(NULL, ai->ai_next ? 0x1u /* MoreComing */ : 0u, 0, 0,
+                                  hostname, ai->ai_addr, 0, ctx);
+    freeaddrinfo(res);
+    return 0;
 }

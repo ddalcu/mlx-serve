@@ -80,7 +80,11 @@ extension AudioModelPreset {
 
 extension MusicModelPreset {
     var capabilityLabel: String {
-        family == .acestep ? "Fastest music (8-step Turbo)" : "Best for full songs with vocals"
+        switch family {
+        case .acestep: return "Fastest music (8-step Turbo)"
+        case .minimaxMusic3: return "Best for full songs with vocals"
+        case .yue2: return "Best for editable songs (score + vocals)"
+        }
     }
 }
 

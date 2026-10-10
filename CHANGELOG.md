@@ -1,8 +1,12 @@
 # Changelog
 
-## v26.10.2 — Many-User Fix - UNRELEASED - DEV
+## v26.10.2 — Another One - UNRELEASED - DEV
 
 ### New
+- **Video storyboards.** The app's Video tab and the web console make long clips as a list of shots, each with its own prompt and length and each starting from the last frame of the one before, joined into one mp4. Enhance turns a story and a target length (up to 2 minutes) into the shots and, with a chat model that can see images, writes them from the attached first frame; the app keeps every shot on disk as it finishes (LTX and MiniMax-H3 FL2VA).
+- **Qwen-Image-2.1-Turbo.** Qwen's 8-step distillation of Qwen-Image-2.1 renders a 1024x1024 image in about 8 seconds on an M5 Ultra, from `Qwen/Qwen-Image-2.1-Turbo` as published or the `ddalcu/Qwen-Image-2.1-Turbo-MLX-Serve-8bit` and `-4bit` packs (both in the app's Image tab); the checkpoint's own sampling schedule always runs, and the weights are non-commercial (Qwen Research License).
+- **YuE2 songs.** m-a-p's YuE2-3B writes a full song with vocals from a style prompt and lyrics (`POST /v1/audio/music-generations`, from the `ahmadw/YuE2-3B-MLX` packs), first planning an ABC score you can read, edit and hand back as `abc`; the Music tab has a score box beside the lyrics, and the weights are non-commercial (CC BY-NC 4.0).
+- **EmbeddingGemma 2.** Google's `google/embeddinggemma-2` and its `mlx-community` packs serve text, image and video embeddings on `/v1/embeddings` (768 dimensions, `dimensions` down to 128, inputs up to 8192 tokens, the model card's task prefix goes in the text; images and videos, sent as a list of frames, ride a `messages` request like vLLM's chat embeddings); audio inputs are not wired yet.
 - **Kolibri-1.** Aleph Alpha's 78B-A3.5B MoE runs from the MLX packs already on Hugging Face (such as `here-be-dragons-ai/Kolibri-1-MLX-3bit`), with text, tool calls and thinking set by `reasoning_effort`.
 - **MTP depth bounds.** `--mtp-min-depth` / `--mtp-max-depth` bound every speculative planner choice, equal values pin one depth in place of `MLX_SERVE_MTP_FORCE_DEPTH`, and `--mtp-depth` still works as `--mtp-max-depth`, with a warning (#737).
 - **ZCode.** `mlx-serve launch zcode` and the app's code launcher point Z.ai's ZCode agent (built from source) at the local server with every served chat model and its advertised context, keeping its data under `~/.mlx-serve/zcode` (#708). Thanks @beamivalice.
@@ -10,14 +14,26 @@
 - **Chat keeps answering while media renders.** An agent or chat session no longer freezes while the same server generates an image, speech, music, video or a 3D model: chat runs between generation steps, and the CPU-heavy parts of 3D generation run beside it. Two coding agents on Qwen3.8 27B kept their first token under a second while image, speech, music and a textured 3D model rendered on one M5 Ultra, and the images come out byte-identical to a solo run.
 - **Sushi's GLM-5.3-Flash and MiMo-V2.6-Flash packs load.** `GLM-5.3-Flash-Sushi-2.4bpw` and `MiMo-V2.6-Flash-Sushi-2.3bpw` serve text and tool calls with their EXL3 experts, MiMo keeping its FP8 attention as stored; neither pack's vision or MTP runs here, and MiMo decodes at about 15 tok/s without MTP.
 - **GLM-5.3-Flash.** TensorFold's MLX packs of GLM-5-Next run with text, thinking (with `reasoning_effort`) and tool calls, and the pack's own multi-token-prediction layer drafts ahead of the model (`--no-mtp` turns it off).
-- **Sound effects with Stable Audio 3.** `POST /v1/audio/sound-generations` turns a description into up to two minutes of 44.1 kHz stereo in about a second, from Stability's own `stabilityai/stable-audio-3-small-sfx` repo as downloaded; the app gets a Sound Effects tab in Audio and a `generate_sound` chat tool.
+- **GLM-5.3-Flash speculates with DFlash2.** incoai's `GLM-5.3-Flash-DFlash2` drafter (`--drafter`, or Model Settings ▸ Speculation ▸ Drafter in the app, which downloads it from incoai's own repo; its license is non-commercial and forbids redistribution) speeds up predictable text (a verbatim or lightly edited echo most of all, copied straight from the context), and on novel text the request steps back to plain decoding and tries again later, where it used to fall to serial for good.
+- **Sound effects with Stable Audio 3.** `POST /v1/audio/sound-generations` turns a description into up to two minutes of 44.1 kHz stereo in about a second, from Stability's published weights, mirrored ungated at `ddalcu/Stable-Audio-3-Small-SFX-MLX-Serve`; the app gets a Sound Effects tab in Audio and a `generate_sound` chat tool.
 - **DeepSeek-V4.1-Flash.** DeepSeek's new Flash runs from the MLX packs on Hugging Face (pipenetwork's REAP50, Jundot's oQ) and from the OpensourceWTF EXL3 streaming repack, which runs on mlx-stream and streams its experts from SSD, so a 128 GB Mac serves it. Thinking (`reasoning_effort` low to max), tool calls and DSpark drafting for greedy and sampled requests alike (on by default, `--no-mtp` turns it off); the Engram tables are read from disk as needed, and a follow-up turn resumes from the previous prompt.
+- **Native speculation controls.** mlx-stream DSpark honors resolved model and request opt-outs across every API, and `/props` reports its own lane and block size rather than generic MTP settings.
 - **MiMo-V2.6-Flash.** Xiaomi's 309B MoE runs on a 256 GB Mac, from the MLX packs already on Hugging Face or from the release via `tests/convert_mimo_v2.py`, whose packs also load in mlx-lm; text, thinking and tool calls, with the checkpoint's own MTP heads drafting (up to ~30% faster decode on code).
 - **Monitor history in the browser.** The console Monitor keeps its own history in the browser, computed from the server's counters: 1 hour of samples then one per minute up to 24 hours, kept across reloads, with failed, rejected and cancelled rates, per-model totals and a request table.
 - **fx and Grok join the launchers.** `mlx-serve launch fx` / `mlx-serve launch grok` and the app's Code menu start either agent against the local server, with every chat model and its real context window declared and no sign-in needed; your own fx default provider and `~/.grok` stay as they were.
 - **Sessions name their agent.** `/metrics.json` sessions now name the calling agent (`claude-code`, `opencode`, `codex`, `omp` or `other`) with a per-request id, and a `process_start_time_seconds` gauge lets monitors detect restarts.
 - **GGUF models answer several requests at once.** The llama.cpp engine now decodes up to `--llama-cache-entries` requests (default 4) together in one batch instead of one after another, each keeping its own prompt cache warm; agent clients that send requests in parallel stop queueing (#547).
 - **MTP for GGUF models.** A GGUF that ships an MTP head, its own or an `mtp-*.gguf` beside it (unsloth's `MTP/` folder for Qwen3.8 Flash Next), drafts ahead while one request is decoding, with the same output; `--llama-mtp-drafts` sets the draft count (default 2, `0` off) and `--llama-ubatch` the prefill batch, both in Settings → Engines → llama.cpp (#548).
+- **Linux with NVIDIA GPUs.** mlx-serve builds and runs on Linux through MLX's CUDA backend: `./scripts/build-linux.sh` builds everything from a fresh checkout for RTX 20 to 50 cards, MLX models and media generation run on the GPU, and GGUFs run through llama.cpp and ds4 as on the Mac (MTP is off by default there, `--mtp` turns it on).
+- **MLX Serve Studio.** The built-in console at `/` is rebuilt as one page with chat, image, audio and video tools, a Library, Monitoring and the API reference, served with no model loaded (#755). Thanks @alinselea.
+- **Code Launcher.** The console's Code Launcher gives you a `curl … | sh` line (`GET /launch?agent=`) that configures Claude Code, pi, omp, OpenCode 2 or Grok on another machine for this server and starts it on the model you picked.
+- **More decision models.** `POST /v1/decisions` serves LiquidAI's D1-3B packs (text) and Cloudflare's Clef and Clef-Flash (text and images) beside Laya and Kev, and the app has one Decisions pane for every family (#734).
+- **Generation defaults.** Settings sets global and per-model defaults (temperature, top_p, penalties, reasoning budget and more) that fill whatever a client leaves out, and a lock makes a default override the client's own value (`~/.mlx-serve/generation-settings.json`, `generation_defaults` in Model Settings) (#710).
+- **SSD-only prompt cache.** `--no-prefix-cache-ram` with `--prefix-cache-disk` keeps prompt caches on the SSD alone and holds no idle RAM for them; Qwen3.8 Flash Next works this way whenever the disk tier is on.
+- **MLX-Amp and AI Radio.** The Music tab plays through MLX-Amp, a classic skinned deck with a live spectrum and a playlist that costs next to no CPU, and AI Radio plays an endless station on a theme, writing and generating each track while the last one plays; generated audio exports to M4A.
+- **Enhance prompts.** The app's Image and Video tabs and the console rewrite a short prompt into a detailed one with the loaded chat model, showing the model load and its thinking while it works.
+- **Korean.** The app is translated into Korean, and Settings search finds settings by their translated names.
+- **MTP greedy tail.** Model Settings ▸ Speculation can draft the later MTP depths greedily (`--mtp-greedy-tail`).
 
 ### Speed
 - **oMLX's Qwen3.8 Flash Next packs run at full speed.** The fast paths built for our own pack now also serve oMLX's per-layer mixed widths. On an M5 Ultra, `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp` decodes at 172 tok/s with MTP (177 with `--ple-gpu`), against 133 for oMLX 0.7.0 on the same pack and 174 for our own pack.
@@ -25,6 +41,12 @@
 - **MiniMax-H3 Turbo renders are ~2x faster.** The Turbo adapter no longer runs in float32 and the DiT's per-layer glue is fused, so a Turbo step on an M5 Ultra drops from 18.8 s to 9.9 s at 864x480 (124 frames) and now costs the same as a step without Turbo.
 - **MiniMax-H3 video renders start sooner after the first one.** The text encoder, the DiT and the Turbo adapter now stay loaded between requests while the Mac has the memory for all of them, so a short Turbo clip takes about a quarter less time from the second render on; when memory is short the model is freed first and nothing else is affected.
 - Nemotron-3 Nano answers short prompts sooner on M5 Macs.
+- **Qwen3.8 Flash Next decodes faster on a single request.** Its MoE, hyper-connection and long-context attention steps run as fused one-token kernels (#725).
+- **Bonsai 2 27B with its DFlash2 drafter runs nearly twice as fast on M4 Macs** (#754).
+- Qwen3.8 Flash Next's first prompt after a load no longer stalls on a cold n-gram table: the server measures which read path is faster and switches once the table is warm (#687).
+- On hybrid models (Qwen3.5 and later, Nemotron-H), an agent's next tool round resumes the cache where the last reply ended instead of re-reading it (#759).
+- Several agents on Qwen3.8 Flash Next at long context keep batching when a short request joins them (#716), and agent streams carrying images keep their decode speed beside the others (#668).
+- Qwen-Image edits with reference images compute the references' attention once per request instead of at every step (#563).
 
 ### MiniMax-H3 settings on an M5 Ultra
 One prompt, seed 42, the 8-bit FL2VA pack (the 4-bit pack runs at the same speed); time from request to finished video.
@@ -53,6 +75,27 @@ Estimated from the measured per-step cost:
 - **Full quality:** Turbo off, Max quality on (`"fast": false`), 30 steps.
 
 ### Fixes
+- A repetition loop inside a model's thinking now closes the thought and lets it answer; the turn used to end with no answer and no tool call, which agents read as done.
+- A prompt refused with `400 PrefillDoesNotFit` names the GPU memory it needed and the memory that was available.
+- A model the GPU can hold is no longer refused at load: `--max-resident-mem` now defaults to Metal's working-set limit instead of 80% of it.
+- Switching models frees enough memory first: the eviction counts what a resident model actually holds, `--ple-gpu`'s n-gram table included.
+- With prefix caching off, no memory is set aside for it, so the context limit and prefill chunks grow to match (#695).
+- Restoring a hybrid model's fully cached prompt from the SSD no longer crashes (#713), and the SSD cache keeps the text before a conversation's first image, so image chats resume from disk too (#494).
+- `repeat_penalty`, `frequency_penalty` and `presence_penalty` apply on every decode path, speculative and batched included (#564), and `min_p` is read from the request and from a model's `generation_config.json` (#684).
+- Qwen3.6-35B-A3B and other models with 8 query heads per KV head no longer fail with a 500 when an 8-token speculative verify runs over a quantized KV cache (#682).
+- `json_schema` response formats resolve `$ref`s, cyclic ones included, and accept objects where a node declares no type (#751); a tool parameter typed `oneOf`/`anyOf` gets an object even when the model writes it as JSON text.
+- A system message in the middle of a conversation stays where the client put it on templates that render it there, so the prompt cache keeps working across turns.
+- `/v1/responses` streams a tool request's reasoning as it is generated, never splits a multi-byte character across two events (#722), and reports a streamed turn's prompt-cache hit and timings.
+- `/v1/messages` no longer counts cached tokens in `input_tokens`, as Anthropic reports them (#703).
+- A client that reads a stream slowly gets the whole response and a clean end instead of a connection reset (#673).
+- Headless `mlx-serve serve` keeps `--no-drafter`, `--no-mtp` and `--mtp-depth` (#712), and a `lora_paths` entry that is not a regular file is refused before the server opens it (#541).
+- Qwen-Image instruction edits honor a transparent background.
+- `mlx-serve launch opencode` picks the OpenCode 1 or 2 integration from `opencode --version`, since Homebrew ships OpenCode 2 as `opencode` (#723), and the app no longer freezes while it checks.
+- App: Settings ▸ memory reserve is Auto, Off or 2 to 8 GB (`--os-reserve-gib`) instead of an on/off switch (#709); voice mode listens in your preferred language rather than the app's (#669); the agent menus no longer open the browser every time (#718); the benchmark report is laid out afresh and its headline shows the decode peak beside the best case, each with its own context (#717); and the app recommends `ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw` for Flash Next.
+- The app's Japanese input method keeps its Enter: Return mid-composition only confirms the conversion instead of sending, steering or breaking the line, text being composed survives external redraws, the empty-field placeholder steps aside while you compose, and a steering note paused mid-composition returns to the composer once the conversion ends.
+- A prefill that fits is answered instead of a `400 PrefillDoesNotFit` on a Mac carrying a large resident model: the load preflight's available-memory figure subtracted a page class the wired pages are counted in twice, understating what the OS will grant (~21 GiB on a 128 GB box); the app's "Available RAM" reads the same with or without a loaded model.
+- The app keeps chats in `~/.mlx-serve/mlx-serve.db` instead of `chat-history.json`: a save writes only what changed and one unreadable chat no longer empties the sidebar; the old file is imported once and kept as `chat-history.migrated.json`, and an older build shows the history again only once that file is renamed back to `chat-history.json` (#767).
+- Image edits, video keyframes and 3D generation accept WebP images, and an edit reference the server cannot read is a 400 before the model runs; a WebP reference used to fail Mage-Flow and Qwen-Image edits halfway through with `ImageDecodeFailed`.
 - `mlx-serve launch omp` and the app send omp's thinking level as `reasoning_effort` (off as `none`) and offer every level up to `xhigh`; before, every level ran at the server default (#760).
 - MiniMax-H3 Turbo accepts any distillation built for its DiT: `turbo_lora.safetensors` must attach every module it ships rather than the bundled adapter's 259, so Lightx2v's distills (`lightx2v/Minimax-h3-Turbo`) run as Turbo with its exact audio step instead of being refused.
 - The app's Turbo steps slider stops at 8: Turbo turns the fast recipe off, so past 8 a Turbo render costs more than the regular 30-step one.
@@ -67,6 +110,7 @@ Estimated from the measured per-step cost:
 - Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
 - Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
 - GLM-5.3, Llama 3, LFM2.5 and K2 prompts are now tokenized exactly as their reference tokenizer does on code: camelCase identifiers (`indexOf`, `UserDefaults`) and `//!` comments were split into extra tokens.
+- Whitespace now tokenizes as the reference tokenizer does: on Qwen, Llama 3, GLM-5.3, LFM2.5, Muse and DeepSeek-V4 a blank line holding spaces (indented code, Markdown) no longer costs an extra token and the full-width space of Chinese text (U+3000) and the no-break space are no longer read as punctuation, and on DeepSeek-V4, Hunyuan and Spark-X2.5 the indentation before a number or Chinese text is no longer split.
 - A streamed reply no longer sends the start of a stop string that spans several tokens before cutting at it; streamed and non-streamed replies now end on the same byte.
 - `frequency_penalty` now applies on `/v1/completions`, as it already did on chat.
 - Deleting a provider in Settings no longer crashes the app.
@@ -80,7 +124,7 @@ Estimated from the measured per-step cost:
 - Llama 3.x models (3.1, 3.2, 3.3) read long prompts correctly: past about 1,000 tokens they answered with empty text, because most layers only looked at the last 1,024 tokens and the models' long-context RoPE schedule was ignored. Output now matches mlx-lm on long prompts.
 - GLM-5.3-Flash GGUFs on the ds4 engine stop at the end of their answer instead of writing the next user turn themselves (#667).
 - `mlx-serve pull` and Ollama `/api/pull` download media models whose weights live in folders (FLUX.2-klein, ACE-Step, LTX, MiniMax Music 3), and a repo with no weights to download fails instead of reporting success (#362).
-- `/v1/completions` accepts token-ID prompts (`[1, 2, 3]`, as lm-eval sends them); a batch of prompts and `echo: true` are refused by name instead of being misread or silently ignored (#659).
+- `/v1/completions` accepts token-ID prompts (`[1, 2, 3]`, as lm-eval sends them), and `echo: true` returns the prompt ahead of the completion with, under `logprobs`, every prompt token's logprob, as lm-eval's loglikelihood tasks read them; a batch of prompts, and `echo` with `stream`, are refused by name (#659).
 - App: an attached video reaches the model, with Tools on or off, and its frames are saved as files instead of inside the chat history; with Tools on, a message that is only a picture, recording or clip reaches the model too (#429).
 - App: the agent sees a tool result in full until it has answered it, so reading a large file no longer sends it into a loop of ever-smaller re-reads (#605).
 - App: `readFile` and `editFile` count lines ending in CR or CRLF and keep the file's own line endings (#736); an agent's own Apple voice is used in voice mode, and Settings ▸ Voice picks the app's own Apple voice again (#417); Option types characters in the built-in terminal, so `@` works on Swiss and other layouts (#692).

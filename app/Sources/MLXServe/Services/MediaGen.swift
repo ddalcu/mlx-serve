@@ -162,6 +162,7 @@ enum FluxVariant: String, Hashable, Codable {
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
     case qwenImage21      // Qwen-Image-2.1 block-causal DiT — served by the qwen_image backend; undistilled (40 steps, optional real CFG)
+    case qwenImage21Turbo // Qwen-Image-2.1-Turbo — same backend; its pack's 8-sigma grid sets the steps server-side
 }
 
 struct ImageQualitySettings: Hashable {
@@ -516,6 +517,47 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Qwen-Image 2.1 quantized to 4-bit for smaller Macs — the same 40-step model at about half the memory, with some loss of fine detail. Open (Apache-2.0)."
     )
 
+    /// The checkpoint's own 8-step sampling grid (`sample_sigmas`) decides
+    /// every tier: the server runs it whatever `steps` says.
+    private static let qwenImageTurboQuality: [QualityPreset: ImageQualitySettings] = [
+        .fast:         .init(steps: 8),
+        .good:         .init(steps: 8),
+        .quality:      .init(steps: 8),
+        .superQuality: .init(steps: 8),
+    ]
+
+    /// Qwen-Image-2.1-Turbo, same `--preset 32gb` recipe as the base pack.
+    static let qwenImage21Turbo_8bit = ImageModelPreset(
+        id: "ddalcu/qwen-image-2.1-turbo-8bit",
+        name: "Qwen-Image 2.1 Turbo 8-bit (~18 GB)",
+        variant: .qwenImage21Turbo,
+        configName: "qwen_image21",
+        repo: "ddalcu/Qwen-Image-2.1-Turbo-MLX-Serve-8bit",
+        approxDownloadGB: 18,
+        approxRAMGB: 22,
+        resolutions: qwenImageResolutions,
+        defaultResolution: qwenImageResolutions[0],
+        qualityProfiles: qwenImageTurboQuality,
+        defaultQuality: .good,
+        description: "Qwen-Image 2.1 distilled to 8 steps — the same strong prompt understanding and in-image text, in English and Chinese, in 8 steps instead of 40. Qwen Research License (non-commercial)."
+    )
+
+    /// The 4-bit Turbo pack (`--preset 16gb`) for 16 GB Macs.
+    static let qwenImage21Turbo_4bit = ImageModelPreset(
+        id: "ddalcu/qwen-image-2.1-turbo-4bit",
+        name: "Qwen-Image 2.1 Turbo 4-bit (~11 GB)",
+        variant: .qwenImage21Turbo,
+        configName: "qwen_image21",
+        repo: "ddalcu/Qwen-Image-2.1-Turbo-MLX-Serve-4bit",
+        approxDownloadGB: 11,
+        approxRAMGB: 13,
+        resolutions: qwenImageResolutions,
+        defaultResolution: qwenImageResolutions[0],
+        qualityProfiles: qwenImageTurboQuality,
+        defaultQuality: .good,
+        description: "Qwen-Image 2.1 Turbo quantized to 4-bit for smaller Macs — 8 steps at about half the memory, with some loss of fine detail. Qwen Research License (non-commercial)."
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
@@ -524,8 +566,10 @@ struct ImageModelPreset: Identifiable, Hashable {
         .flux2Klein9B_Q4,                              // 10
         .flux2Klein9BBase_Q4,                          // 10
         .qwenImage21_4bit,                             // 10
+        .qwenImage21Turbo_4bit,                        // 11
         .krea2Turbo,                                   // 15
         .qwenImage21_8bit,                             // 18
+        .qwenImage21Turbo_8bit,                        // 18
     ]
 }
 
@@ -1391,14 +1435,36 @@ struct Model3DModelPreset: Identifiable, Hashable {
     static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
 }
 
-/// Which music ENGINE a checkpoint drives. The two families share the
+/// Which music ENGINE a checkpoint drives. The families share the
 /// endpoint and nothing else: ACE-Step reads the whole musical-metadata knob
-/// set, MiniMax Music 3 rejects every one of those fields BY NAME and
-/// requires lyrics — so the family gates the FIELDS (request body + sidecar),
+/// set, MiniMax Music 3 and YuE2 reject every one of those fields BY NAME and
+/// require lyrics — so the family gates the FIELDS (request body + sidecar),
 /// not just the pane's controls.
 enum MusicEngineFamily {
     case acestep
     case minimaxMusic3
+    case yue2
+}
+
+/// Whether YuE2 plans an ABC score before it sings (server `cot`). Raw values
+/// are the wire spelling.
+enum MusicPlan: String, CaseIterable, Codable {
+    case full, melody, off
+
+    var label: String {
+        switch self {
+        case .full: return "Melody + chords"
+        case .melody: return "Melody only"
+        case .off: return "No score"
+        }
+    }
+    var hint: String {
+        switch self {
+        case .full: return "The model writes a chord-annotated score first, then plays it. Best songs, and you can edit the score."
+        case .melody: return "A melody-only score, without chords. The right choice for a cover: paste the original melody below."
+        case .off: return "Straight to audio with no score. Fastest, and the least coherent."
+        }
+    }
 }
 
 /// Music-generation checkpoints (ACE-Step + MiniMax Music 3, the music arms
@@ -1442,10 +1508,15 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// MiniMax's card; its example caption reads "BPM: 96. Key: C major."").
     /// The pane used to hide them on Music 3 along with the two genuinely
     /// unsupported knobs, which read as "this model can't do tempo".
-    var supportsTempoAndKey: Bool { true }
-    /// Music 3 is lyric-conditioned; the server 400s empty lyrics. ACE-Step
-    /// defaults empty lyrics to "[Instrumental]".
-    var requiresLyrics: Bool { family == .minimaxMusic3 }
+    /// YuE2 has no tempo or key field and no caption text for them: the score
+    /// carries both, and the server names the fields a 400.
+    var supportsTempoAndKey: Bool { family != .yue2 }
+    /// Music 3 and YuE2 are lyric-conditioned; the server 400s empty lyrics.
+    /// ACE-Step defaults empty lyrics to "[Instrumental]".
+    var requiresLyrics: Bool { family != .acestep }
+    /// A wordless track: ACE-Step marks it, Music 3 asks in text. YuE2 has no
+    /// such mode, and the server names `instrumental` a 400.
+    var supportsInstrumental: Bool { family != .yue2 }
     /// Server-valid duration bounds (ACE [10,600]; Music 3 [1,360], floored
     /// at 5 for a usable slider).
     var durationRange: ClosedRange<Double> {
@@ -1456,8 +1527,14 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// ACE-Step Turbo is distillation-fixed at 8 and the server IGNORES the
     /// field there, so exposing it would be a control that visibly does
     /// nothing. `fixedSteps` stays the per-checkpoint default either way.
-    var supportsSteps: Bool { family == .minimaxMusic3 }
-    var stepsRange: ClosedRange<Int> { 4...100 }
+    var supportsSteps: Bool { family != .acestep }
+    /// YuE2 ends its own song (an end token after the last lyric); its duration is only a cap, so
+    /// the pane can leave the cap off. ACE-Step and Music 3 make exactly the length asked.
+    var supportsAutoLength: Bool { family == .yue2 }
+    var stepsRange: ClosedRange<Int> { family == .yue2 ? 1...100 : 4...100 }
+    /// YuE2's score: the plan mode and the ABC text that replaces the model's
+    /// own. Gates the controls AND the `cot`/`abc` fields.
+    var supportsScore: Bool { family == .yue2 }
     /// Reference audio (server `ref_audio`, #259): ACE-Step feeds a 30 s
     /// window of the clip's VAE latent into its timbre slot — ONE pooled
     /// token among hundreds of lyric/text tokens, so it is style/timbre
@@ -1514,8 +1591,22 @@ struct MusicModelPreset: Identifiable, Hashable {
         description: "MiniMax's full-song model: an 8B language model writes the music frame by frame from your style prompt and lyrics, then a diffusion decoder renders it. Slower than ACE-Step, strongest vocals."
     )
 
+    /// YuE2 3B, 8-bit — plans a score, writes semantic codec tokens, then
+    /// flow-matches 48 kHz stereo acoustics. Weights are CC BY-NC 4.0.
+    static let yue2_3B_8bit = MusicModelPreset(
+        id: "yue2-3b-8bit",
+        name: "YuE2 3B (8-bit)",
+        repo: "ddalcu/YuE2-3B-MLX-Serve-8bit",
+        family: .yue2,
+        approxRAMGB: 10,
+        approxDownloadGB: 4.5,
+        fixedSteps: 32,
+        supportsLyrics: true,
+        description: "Full songs with vocals in English and Chinese, planned from an editable score: it writes the melody and chords first, then sings them in 48 kHz stereo. Non-commercial license (CC BY-NC 4.0)."
+    )
+
     /// Catalog, best-first per family.
-    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit]
+    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit, .yue2_3B_8bit]
 }
 
 /// Text-to-audio checkpoints (Stable Audio 3), served on
@@ -1541,10 +1632,10 @@ struct SoundModelPreset: Identifiable, Hashable {
     static let stableAudio3SmallSFX = SoundModelPreset(
         id: "stable-audio-3-small-sfx",
         name: "Stable Audio 3 Small SFX",
-        repo: "stabilityai/stable-audio-3-small-sfx",
+        repo: "ddalcu/Stable-Audio-3-Small-SFX-MLX-Serve",
         approxRAMGB: 5,
         approxDownloadGB: 3.5,
-        description: "Sound effects and ambiences from a description — footsteps, rain, engines, impacts — up to two minutes, in about a second. Stability AI gates the download: accept its license on Hugging Face and sign in with a token first."
+        description: "Sound effects and ambiences from a description — footsteps, rain, engines, impacts — up to two minutes, in about a second. Mirror of Stability AI's Stable Audio 3 Small SFX (Stability AI Community License), no Hugging Face login needed."
     )
 
     static let all: [SoundModelPreset] = [.stableAudio3SmallSFX]
@@ -1570,7 +1661,7 @@ extension MusicGenRequest {
     /// answer so they cannot disagree about what is sendable.
     static func lyricsSatisfied(model: MusicModelPreset, lyrics: String,
                                 instrumental: Bool) -> Bool {
-        if !model.requiresLyrics || instrumental { return true }
+        if !model.requiresLyrics || (instrumental && model.supportsInstrumental) { return true }
         return !lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
@@ -1602,6 +1693,15 @@ enum MusicOptions {
         "[bridge]", "[instrumental]", "[solo]", "[outro]",
     ]
     static let sectionTagHint: String = sectionTags.joined(separator: " ")
+
+    /// The tags YuE2's model card writes its lyrics with, capitalized.
+    static let yue2SectionTags: [String] = [
+        "[Intro]", "[Verse]", "[Pre-Chorus]", "[Chorus]", "[Interlude]", "[Bridge]", "[Outro]",
+    ]
+
+    static func sectionTagHint(for family: MusicEngineFamily) -> String {
+        (family == .yue2 ? yue2SectionTags : sectionTags).joined(separator: " ")
+    }
 
     /// What the server accepts for `bpm`. The pane used to offer only the ten
     /// anchors below, so 92 was unaskable while the chat tool could send it.
@@ -1686,8 +1786,98 @@ struct MusicPrompt: Codable, Equatable, Identifiable {
     /// so the caption is the ONLY place its tempo, key and arrangement can be
     /// stated, and a one-liner leaves every one of those to the model.
     static func builtinStyles(for family: MusicEngineFamily) -> [MusicPrompt] {
-        family == .minimaxMusic3 ? music3Styles : builtinStyles
+        switch family {
+        case .acestep: return builtinStyles
+        case .minimaxMusic3: return music3Styles
+        case .yue2: return yue2Styles
+        }
     }
+
+    /// Lyrics starters per family: YuE2 was trained on capitalized section
+    /// tags ([Verse], [Pre-Chorus]) where the others take lowercase.
+    static func builtinLyrics(for family: MusicEngineFamily) -> [MusicPrompt] {
+        family == .yue2 ? yue2Lyrics : builtinLyrics
+    }
+
+    /// YuE2 takes a comma-separated tag line: language or genre first, then
+    /// instruments, mood and the lead vocal. Three are the model card's own.
+    static let yue2Styles: [MusicPrompt] = [
+        MusicPrompt(title: "City pop",
+            body: "City Pop, upbeat, danceable, groovy bass, electric guitar, synth, energetic, joyful, neon city night"),
+        MusicPrompt(title: "Jazz-funk",
+            body: "Jazz-funk, warm lead vocal, Rhodes piano, electric bass, tight drums"),
+        MusicPrompt(title: "Jazz ballad",
+            body: "Jazz, expressive lead vocal, piano, tenor saxophone, upright bass, brushed drums, no guitar, spacious modern harmony"),
+        MusicPrompt(title: "Indie pop",
+            body: "English, indie pop, bright acoustic guitar, soft drums, warm lead vocal"),
+    ]
+
+    /// The model card's own demo lyrics (今晚不眠), and a short English song
+    /// in the same shape.
+    static let yue2Lyrics: [MusicPrompt] = [
+        MusicPrompt(title: "Short song (English)", body: """
+            [Verse]
+            Soft morning light is touching the window
+            Coffee on the table and the radio low
+            I hear your footsteps coming down the hall
+            Every little moment feels like it is all
+
+            [Chorus]
+            Stay with the rhythm, let it carry us home
+            We are not alone, we are not alone
+            Sing it to the sky and it will sing right back
+            Stay with the rhythm, never look back
+
+            [Outro]
+            Stay with the rhythm, let it carry us home
+            """),
+        MusicPrompt(title: "今晚不眠 (Mandarin)", body: """
+            [Intro]
+
+            [Verse]
+            路灯眨着眼睛 偷看谁的身影
+            街道哼着小调 节奏多轻盈
+            晚风染成霓虹 吹乱发际线
+            脚步踩着鼓点 不需要终点
+
+            [Pre-Chorus]
+            旋转的唱片 划破了寂静
+            气泡在上升 快乐在飞行
+            把烦恼抛去 别再去在意
+            这里的空气 充满了魔力
+
+            [Chorus]
+            今晚不眠 快乐无限
+            城市在狂欢 我们在中间
+            自由摇摆 光芒盛开
+            跟着这节拍 把心打开
+
+            今晚不眠 快乐无限
+            城市在狂欢 我们在中间
+            自由摇摆 光芒盛开
+            跟着这节拍 把心打开
+
+            [Interlude]
+
+            [Bridge]
+            像橘子汽水 充满了微醺的甜
+            像流星划过 点亮了夜的天
+            不需要理由 只要你感觉
+            这一刻就是 永恒的瞬间
+
+            [Chorus]
+            今晚不眠 快乐无限
+            城市在狂欢 我们在中间
+            自由摇摆 光芒盛开
+            跟着这节拍 把心打开
+
+            [Outro]
+            霓虹色的风 吹向那梦
+            摇摆
+            闪耀
+            Yeah
+            """),
+    ]
 
     /// Built-in style-prompt starters (genre / mood / instrumentation).
     static let builtinStyles: [MusicPrompt] = [
@@ -2012,7 +2202,7 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21: return 0
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo: return 0
         default: return 3
         }
     }
@@ -2024,7 +2214,7 @@ extension ImageModelPreset {
         switch variant {
         // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
         // with a ×16 VAE downsample and shares the same clamp server-side.
-        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21:
+        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
             return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
         // widest preset edge.
@@ -2070,7 +2260,7 @@ extension ImageModelPreset {
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
     var supportsLoRA: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo: return false
         default: return true
         }
     }
@@ -2080,10 +2270,14 @@ extension ImageModelPreset {
     /// 8 steps costs 2× and 12 costs 4× for a DIFFERENT image, not a better one.
     var stepsAreFixed: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return true
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21Turbo: return true
         default: return false
         }
     }
+
+    /// The pack's own sampling grid sets the step count server-side, so a
+    /// `steps` field would be a control that does nothing.
+    var stepsSetByCheckpoint: Bool { variant == .qwenImage21Turbo }
 
     /// The fixed step count for a distilled preset (its `.good` profile).
     var fixedSteps: Int { settings(.good).steps }
@@ -2294,6 +2488,9 @@ struct MusicGenRequest {
     var timesignature: String = ""
     /// Track length in seconds (server-valid 10–600).
     var durationSeconds: Int = 60
+    /// YuE2: send no cap, so the model ends the song after the last lyric instead of being cut at
+    /// `durationSeconds`. Ignored by models that make exactly the length asked.
+    var autoLength: Bool = false
     /// -1 = fresh random seed per generation.
     var seed: Int = -1
     /// Flow-match refinement passes; nil = the server's own default. Only sent
@@ -2301,6 +2498,11 @@ struct MusicGenRequest {
     var steps: Int? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// YuE2: whether the model plans a score first, and the ABC text that
+    /// replaces its own plan (empty = let it write one). Only sent where
+    /// `supportsScore`.
+    var plan: MusicPlan = .full
+    var score: String = ""
     /// Max-quality opt-out of the server's fast recipe ("fast": false — every
     /// forward dense, ~2.8x slower at 768p, "just a smidge better").
     var bestQuality: Bool = false

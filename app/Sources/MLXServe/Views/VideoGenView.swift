@@ -54,6 +54,9 @@ struct VideoGenView: View {
     @State private var stage2Steps: Int = 0
     @State private var cfgAudioScale: Double = 7.0
     @State private var chainWindows: Int = 1
+    /// Storyboard mode: `prompt` is the story, and `shots` are what generates.
+    @State private var storyboardMode: Bool = false
+    @State private var shots: [StoryboardSegment] = []
     @State private var seed: Int = 42
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
@@ -194,10 +197,11 @@ struct VideoGenView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     modelSection
                     promptSection
+                    if storyboardOn { storyboardSection }
                     mediaInputsSection
                     clipSizeSection
                     qualitySection
-                    framesSection
+                    if !storyboardOn { framesSection }
                     advancedSection
                     // Generate stands apart from the settings it acts on.
                     actionRow.padding(.top, 14)
@@ -222,7 +226,7 @@ struct VideoGenView: View {
             Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
                 .font(.app(.body)) }
             Button(role: .destructive) {
-                if let req = pendingRequest { service.generate(req, server: server) }
+                if let req = pendingRequest { run(req) }
                 pendingRequest = nil
             } label: { Text("Generate Anyway")
                 .font(.app(.body)) }
@@ -230,10 +234,25 @@ struct VideoGenView: View {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
         .sheet(isPresented: $showEnhance) {
-            PromptRewriteSheet(title: "Rewrite video prompt", clip: clipLengthRange,
-                               request: { PromptRewriter.video(text: prompt, format: model.promptFormat, seconds: $0) },
-                               onApplyClip: { numFrames = model.framesCovering(durationSeconds: Double($0)) ?? numFrames },
-                               onApply: { prompt = $0 })
+            PromptRewriteSheet(
+                title: storyboardOn ? "Write storyboard" : "Rewrite video prompt", clip: enhanceLength,
+                request: { seconds in
+                    let firstFrame = firstFrameImageURL.flatMap { try? Data(contentsOf: $0) }
+                    return plansStoryboard(seconds)
+                        ? PromptRewriter.storyboard(idea: prompt, format: model.promptFormat, totalSeconds: seconds,
+                                                    shotSeconds: Storyboard.plannedRange(shotSeconds), firstFrame: firstFrame)
+                        : PromptRewriter.video(text: prompt, format: model.promptFormat, seconds: seconds,
+                                               firstFrame: firstFrame)
+                },
+                onApplyClip: { seconds in
+                    guard !plansStoryboard(seconds) else { return }
+                    numFrames = model.framesCovering(durationSeconds: Double(seconds)) ?? numFrames
+                },
+                applyError: { text, seconds in
+                    plansStoryboard(seconds) && Storyboard.parse(text, seconds: shotSeconds).isEmpty
+                        ? L10n.text("No shots found. Each shot starts with a line like === SHOT 1 | 8s ===.") : nil
+                },
+                onApply: applyEnhanced)
                 .environmentObject(appState)
         }
     }
@@ -242,12 +261,22 @@ struct VideoGenView: View {
 
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if model.supportsStoryboard {
+                Picker("", selection: $storyboardMode) {
+                    Text("Single clip").font(.app(.body)).tag(false)
+                    Text("Storyboard").font(.app(.body)).tag(true)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .help("A storyboard is a long video made of shots, each starting from the last frame of the one before.")
+            }
             HStack(spacing: 8) {
-                Text("Prompt").font(.app(.headline).weight(.semibold))
+                (storyboardOn ? Text("Story") : Text("Prompt")).font(.app(.headline).weight(.semibold))
                 Spacer()
-                if let hint = promptHint { promptWarning(hint) }
+                // The story is free text for the planner; the format advice is for shots.
+                if !storyboardOn, let hint = promptHint { promptWarning(hint) }
                 PromptEnhanceButton(disabled: prompt.isBlank) { showEnhance = true }
-                templatesMenu
+                if !storyboardOn { templatesMenu }
             }
             // The header's hover bubble reaches over the editor below it, and
             // zIndex only orders SIBLINGS: without this the row is painted
@@ -272,7 +301,9 @@ struct VideoGenView: View {
                         RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                     )
                 if prompt.isEmpty {
-                    Text(L10n.text(H3PromptExamples.placeholder(for: model.promptFormat)))
+                    Text(L10n.text(storyboardOn
+                                   ? "Describe the whole story. Enhance turns it into shots, or add them below."
+                                   : H3PromptExamples.placeholder(for: model.promptFormat)))
                         .font(.app(.body))
                         .foregroundStyle(.secondary.opacity(0.6))
                         .padding(.horizontal, 5)
@@ -527,6 +558,11 @@ struct VideoGenView: View {
         // Turbo replaces the schedule the step count belongs to, so a bare
         // "4 steps" would read as a slow render nobody asked for.
         let turboNote = turboEngaged ? L10n.text(" (Turbo)") : ""
+        // A storyboard ignores the single-clip length: its shots set their own.
+        if storyboardOn {
+            return L10n.format("%@, %lld steps%@, %lld shots · %@", label, Int64(steps), turboNote,
+                               Int64(shots.count), Storyboard.lengthLabel(storyboardSeconds))
+        }
         return L10n.format("%@, %lld steps%@, %lld frames (~%.1fs)",
                            label, Int64(steps), turboNote, Int64(numFrames), durationSec)
     }
@@ -811,10 +847,128 @@ struct VideoGenView: View {
         }
     }
 
-    /// The Enhance sheet's clip-length slider: starts at the knob and tops out at the model's longest clip.
-    private var clipLengthRange: (initial: Int, max: Int) {
-        let maxSeconds = Int(Double(availableFrameOptions.last ?? numFrames) / Double(fps))
-        return (min(max(1, Int((Double(numFrames) / Double(fps)).rounded())), max(1, maxSeconds)), maxSeconds)
+    /// The Enhance sheet's length slider. On a model that can storyboard it
+    /// runs to two minutes, and past one shot Enhance writes the shots.
+    private var enhanceLength: PromptRewriteSheet.ClipLength {
+        guard model.supportsStoryboard else {
+            let maxSeconds = Int(Double(availableFrameOptions.last ?? numFrames) / Double(fps))
+            let initial = min(max(1, Int((Double(numFrames) / Double(fps)).rounded())), max(1, maxSeconds))
+            return .init(initial: initial, range: 1...max(1, maxSeconds))
+        }
+        let range = 1...Storyboard.longestPlannedStory
+        let initial = storyboardOn
+            ? (shots.isEmpty ? 60 : storyboardSeconds)
+            : Int((Double(numFrames) / Double(fps)).rounded())
+        let longest = Storyboard.plannedRange(shotSeconds).upperBound
+        return .init(initial: min(range.upperBound, max(1, initial)), range: range, note: { seconds in
+            guard plansStoryboard(seconds) else { return nil }
+            return L10n.format("Enhance writes a storyboard: about %lld shots of up to %lld s each.",
+                               Int64((seconds + longest - 1) / longest), Int64(longest))
+        })
+    }
+
+    // MARK: - Storyboard
+
+    private var storyboardOn: Bool { storyboardMode && model.supportsStoryboard }
+
+    /// Past one shot, or with the storyboard already on, Enhance plans shots.
+    private func plansStoryboard(_ seconds: Int) -> Bool {
+        model.supportsStoryboard && (storyboardMode || seconds > shotSeconds.upperBound)
+    }
+
+    /// The rungs a shot can use: this canvas's ladder, no longer than fits this Mac.
+    private var shotLadder: [Int] {
+        let opts = model.frameOptions(width: effectiveSize.width, height: effectiveSize.height)
+        let cap = RAMChecker.safeFrameCap(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                          available: RAMChecker.totalGB, fast: effectiveFast)
+        let fits = opts.filter { $0 <= cap }
+        return fits.isEmpty ? Array(opts.prefix(1)) : fits
+    }
+
+    private var shotSeconds: ClosedRange<Int> {
+        Storyboard.secondsRange(ladder: shotLadder, fps: fps, floorFrames: model.testedFrameFloor)
+    }
+
+    private func clampedSeconds(_ s: Int) -> Int { min(shotSeconds.upperBound, max(shotSeconds.lowerBound, s)) }
+
+    private var shotFrames: [Int] {
+        shots.map { Storyboard.frames(seconds: clampedSeconds($0.seconds), fps: fps, ladder: shotLadder) }
+    }
+
+    private var storyboardSeconds: Int {
+        Int((Double(Storyboard.deliveredFrames(shotFrames)) / Double(max(1, fps))).rounded())
+    }
+
+    private var storyboardReady: Bool { !shots.isEmpty && shots.allSatisfy { !$0.prompt.isBlank } }
+
+    private var storyboardSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Shots").font(.app(.headline).weight(.semibold))
+                Spacer()
+                if !shots.isEmpty {
+                    Text(verbatim: L10n.format("%lld shots · %@", Int64(shots.count), Storyboard.lengthLabel(storyboardSeconds)))
+                        .font(.app(.caption).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach($shots) { $shot in
+                shotCard($shot, index: shots.firstIndex { $0.id == shot.id } ?? 0)
+            }
+            Button {
+                shots.append(StoryboardSegment(seconds: Storyboard.plannedRange(shotSeconds).upperBound))
+            } label: {
+                Label("Add shot", systemImage: "plus").font(.app(.body))
+            }
+            .buttonStyle(.borderless)
+            Text("Each shot generates on its own, starting from the last frame of the one before, so describe the characters and place again in every shot. Enhance writes the shots from your story.")
+                .font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+    }
+
+    private func shotCard(_ shot: Binding<StoryboardSegment>, index: Int) -> some View {
+        let range = shotSeconds
+        let id = shot.wrappedValue.id
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(L10n.format("Shot %lld", Int64(index + 1))).font(.app(.caption).weight(.semibold))
+                Spacer()
+                Text(verbatim: Storyboard.lengthLabel(clampedSeconds(shot.wrappedValue.seconds)))
+                    .font(.app(.caption).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Button {
+                    shots.removeAll { $0.id == id }
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Remove this shot")
+            }
+            if range.lowerBound < range.upperBound {
+                Slider(value: Binding(get: { Double(clampedSeconds(shot.wrappedValue.seconds)) },
+                                      set: { shot.wrappedValue.seconds = Int($0.rounded()) }),
+                       in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
+                    .help("How long this shot runs. Longer shots mean fewer joins.")
+            }
+            TextEditor(text: shot.prompt)
+                .font(.app(.body))
+                .frame(height: 90)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// Enhance's text: a storyboard plan fills the shots (the story stays),
+    /// anything else is the clip's prompt.
+    private func applyEnhanced(_ text: String) {
+        let planned = Storyboard.parse(text, seconds: shotSeconds)
+        guard model.supportsStoryboard, !planned.isEmpty else {
+            prompt = text
+            return
+        }
+        shots = planned
+        storyboardMode = true
     }
 
     private var frameSlider: some View {
@@ -903,9 +1057,10 @@ struct VideoGenView: View {
     /// "about 50 min — estimated for M4 Max", under the Generate button.
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
+        if storyboardOn, shots.isEmpty { return nil }
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
-            frames: numFrames, steps: steps, fast: effectiveFast
+            shotFrames: storyboardOn ? shotFrames : [numFrames], steps: steps, fast: effectiveFast
         )
     }
 
@@ -924,7 +1079,8 @@ struct VideoGenView: View {
             if showMediaInputs {
                 keyframeRow
                 referencesSection
-                speechSection
+                // One clip cannot condition every shot of a storyboard.
+                if !storyboardOn { speechSection }
                 // Closes the block, the way the rule above Style LoRAs opens
                 // one: the sections inside are wells, and without it the
                 // last well runs straight into the clip-size fields.
@@ -1662,7 +1818,7 @@ struct VideoGenView: View {
 
             // Chained windows. Already wired end to end — this is the control
             // that never existed, which is why long clips were unreachable.
-            if model.supportsChainedWindows {
+            if model.supportsChainedWindows && !storyboardOn {
                 intSliderRow("Chained windows", value: $chainWindows, range: 1...6,
                              help: "Join several generations end to end, each starting from the last frame of the one before.")
                 // Through `deliveredFrames`: windows SHARE their seam frames,
@@ -1952,13 +2108,16 @@ struct VideoGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !customSizeValid || !payloadFits)
+                    .disabled(!canGenerate)
                 }
             }
             // A disabled button with no reason is worse than no button, and
             // this one guards a combination the controls no longer produce:
             // it is the backstop, not the message people normally see.
-            if !payloadFits {
+            if storyboardOn, !storyboardReady {
+                (shots.isEmpty ? Text("Add a shot, or let Enhance write them from your story.") : Text("Every shot needs a prompt."))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            } else if !storyboardOn, !payloadFits {
                 Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
                     .font(.app(.caption2)).foregroundStyle(.orange)
             }
@@ -2128,6 +2287,8 @@ struct VideoGenView: View {
         refsDroppedOnHydrate = [s.refImagePaths, s.refVideoPaths, s.refAudioPaths].joined()
             .contains { Self.existingFile($0) == nil }
         refImageSize = s.refImageSize
+        storyboardMode = s.storyboardMode
+        shots = s.storyboard
     }
 
     private static func existingFile(_ path: String?) -> URL? {
@@ -2183,6 +2344,8 @@ struct VideoGenView: View {
         s.refImageSize = refImageSize
         s.showMediaInputs = showMediaInputs
         s.showAdvanced = showAdvanced
+        s.storyboardMode = storyboardMode
+        s.storyboard = shots
         return s
     }
 
@@ -2321,12 +2484,23 @@ struct VideoGenView: View {
         // starting a second one, so both paths converge on one download.
         if turboFetchDecision == .fetch {
             downloads.startTurboLora(repoId: model.repo) {
-                service.generate(req, server: server)
+                run(req)
             }
             return
         }
 
-        service.generate(req, server: server)
+        run(req)
+    }
+
+    private var canGenerate: Bool {
+        guard (lanModel != nil || downloads.bundleReady(model.bundle)), customSizeValid else { return false }
+        return storyboardOn ? storyboardReady : !prompt.isBlank && payloadFits
+    }
+
+    /// A storyboard runs its shots; anything else is one request.
+    private func run(_ req: VideoGenRequest) {
+        guard storyboardOn else { return service.generate(req, server: server) }
+        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1) }, server: server)
     }
 
     /// Whether this pane's current selection needs the Turbo adapter fetched.

@@ -106,6 +106,9 @@ enum MediaSSE {
         case "frames":  return "Composing frames"
         case "diffuse": return "Composing"
         case "decode":  return "Rendering audio"
+        case "abc":      return "Writing the score"
+        case "semantic": return "Composing"
+        case "nar":      return "Rendering"
         default:        return stage
         }
     }

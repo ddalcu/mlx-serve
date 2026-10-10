@@ -20,7 +20,7 @@
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral 轮次 | -- |
 | **Laya**（类型化决策） | `laya` | `aac6fef/laya-multilingual-mlx`（mmBERT-base 编码器 + 决策头；`POST /v1/decisions`） | n/a | -- |
 | **Kev**（类型化决策） | `kev` | `aselea/Kev-4B-MLX-Serve-8bit`（Qwen3.5-4B + 指针头；`POST /v1/decisions`；由 `tests/convert_kev_weights.py` 生成） | n/a | -- |
-| **嵌入** | `bert`, `gemma3_text`, `qwen3` | bge、mxbai、EmbeddingGemma、Qwen3-Embedding（池化方式从检查点读取） | n/a | -- |
+| **嵌入** | `bert`, `gemma3_text`, `embedding_gemma2`, `qwen3` | bge、mxbai、EmbeddingGemma 1 和 2（2：768 维，`dimensions` 可低至 128，8192 个 token，文本、图片和视频）、Qwen3-Embedding（池化方式从检查点读取） | n/a | EmbeddingGemma 2：SigLIP（图片、视频） |
 | **其它一切以 GGUF 形式** | 通过内置 llama.cpp | HuggingFace 上任何 `.gguf` | 按模板 | -- |
 
 媒体模型位于同一个注册表里，分类方式也相同：FLUX.2、Krea-2 和 Mage-Flow（图像），Qwen3-TTS、Kokoro、ACE-Step 和 MiniMax Music 3（语音 + 音乐），LTX-Video 2.3 / 2.5 和 MiniMax-H3（视频），Hunyuan3D-2.1（3D）。聊天请求里点名其中之一，会收到一个 400，并指出应改用哪个端点。

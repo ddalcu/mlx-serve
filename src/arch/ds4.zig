@@ -16,6 +16,7 @@
 // straight through.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gguf_meta = @import("../gguf_meta.zig");
 const ffi = @import("../ds4_ffi.zig");
 const metal_sources = @import("ds4_metal_sources");
@@ -209,7 +210,7 @@ pub fn ensureMetalKernels(allocator: std.mem.Allocator) Error!void {
 }
 
 pub const OpenOptions = struct {
-    backend: ffi.Backend = .metal,
+    backend: ffi.Backend = if (builtin.os.tag == .macos) .metal else .cuda,
     n_threads: c_int = 0,
     warm_weights: bool = true,
     quality: bool = false,
@@ -237,6 +238,9 @@ pub const OpenOptions = struct {
     ssd_streaming_cache_experts: u32 = 0,
     ssd_streaming_cache_bytes: u64 = 0,
     ssd_streaming_preload_experts: u32 = 0,
+    /// Graph prefill chunk (`--prefill-chunk`); 0 = ds4's default. Its scratch
+    /// scales with it, so a small GPU needs a small chunk to stream experts.
+    prefill_chunk: u32 = 0,
 };
 
 /// Whether to actually pass `--dspark` to the engine: only when a support
@@ -277,7 +281,7 @@ pub const Ds4Engine = struct {
 
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*Ds4Engine {
         try refuseSplitGguf(allocator, model_path);
-        try ensureMetalKernels(allocator);
+        if (builtin.os.tag == .macos) try ensureMetalKernels(allocator);
 
         const path_z = allocator.dupeSentinel(u8, model_path, 0) catch return Error.OutOfMemory;
         errdefer allocator.free(path_z);
@@ -317,6 +321,7 @@ pub const Ds4Engine = struct {
             .ssd_streaming_cache_experts = opts.ssd_streaming_cache_experts,
             .ssd_streaming_cache_bytes = opts.ssd_streaming_cache_bytes,
             .ssd_streaming_preload_experts = opts.ssd_streaming_preload_experts,
+            .prefill_chunk = opts.prefill_chunk,
         };
 
         var raw: ?*ffi.Engine = null;
@@ -723,6 +728,7 @@ test "clampSessionCtx: idempotent (re-clamping a clamped value is a no-op except
 }
 
 test "kernel hash is stable across calls" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // Metal kernels only
     const a = computeKernelHash();
     const b = computeKernelHash();
     try std.testing.expectEqualSlices(u8, &a, &b);

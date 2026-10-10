@@ -18,6 +18,9 @@ final class MusicGenService: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
+    /// The ABC score the last YuE2 song was rendered from, for the pane's
+    /// "use last score" button; nil until a score-planning model finishes.
+    @Published private(set) var lastScore: String?
 
     private var task: Task<Void, Never>?
     private let api = APIClient()
@@ -37,18 +40,25 @@ final class MusicGenService: ObservableObject {
         // Sticky settings outlive a model switch: clamp the duration into THIS
         // model's server-valid range rather than earn a 400.
         let range = request.model.durationRange
-        let duration = Int(min(max(Double(request.durationSeconds), range.lowerBound), range.upperBound))
+        var duration = Int(min(max(Double(request.durationSeconds), range.lowerBound), range.upperBound))
         var body: [String: Any] = [
             "model": modelName,
             "prompt": request.prompt,
-            "duration_seconds": duration,
             "stream": true,
         ]
+        // YuE2's duration is a cap the model ends the song before. Auto sends none (the server's own
+        // ceiling applies); a set length gets grace so the last line can finish rather than be cut.
+        if request.model.supportsAutoLength {
+            duration = min(duration + Self.lengthGrace(duration), Int(range.upperBound))
+        }
+        if !(request.model.supportsAutoLength && request.autoLength) { body["duration_seconds"] = duration }
         // `instrumental` and lyrics are a named 400 on BOTH backends, so the
         // flag WINS here rather than letting the pair reach the server. On
         // Music 3 an omitted lyrics field is the only spelling of "no words"
         // that is accepted at all.
-        if request.instrumental {
+        // YuE2 has no wordless mode (a named 400), so a flag left over from
+        // another model's session yields to the lyrics.
+        if request.instrumental && request.model.supportsInstrumental {
             body["instrumental"] = true
         } else {
             let lyrics = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -103,6 +113,13 @@ final class MusicGenService: ObservableObject {
                 break
             }
         }
+        // The plan mode and any hand-written score are YuE2's; an edited score
+        // needs a plan that reads one, so `off` drops it.
+        if request.model.supportsScore {
+            body["cot"] = request.plan.rawValue
+            let abc = request.score.trimmingCharacters(in: .whitespacesAndNewlines)
+            if request.plan != .off, !abc.isEmpty { body["abc"] = abc }
+        }
         // -1 = fresh random seed, resolved HERE so the log can show it.
         body["seed"] = request.seed >= 0 ? request.seed : Int.random(in: 0..<1_000_000_000)
         return body
@@ -119,7 +136,13 @@ final class MusicGenService: ObservableObject {
         ]
         // A setting that changed the output but not the sidecar is a silent
         // setting — the .txt is what makes a track reproducible.
-        if request.instrumental { lines.append("instrumental: true") }
+        if request.instrumental && request.model.supportsInstrumental { lines.append("instrumental: true") }
+        if request.model.supportsScore {
+            lines.append("score: \(request.plan.rawValue)")
+            if request.plan != .off, !request.score.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                lines.append("score_source: edited")
+            }
+        }
         if request.model.supportsSteps, let steps = request.steps {
             let r = request.model.stepsRange
             lines.append("steps: \(min(max(steps, r.lowerBound), r.upperBound))")
@@ -151,7 +174,8 @@ final class MusicGenService: ObservableObject {
         var out = lines.joined(separator: "\n")
         out += "\n\n# Style prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let lyr = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-        out += "\n\n# Lyrics\n" + (request.instrumental || lyr.isEmpty ? "[Instrumental]" : lyr)
+        let wordless = request.instrumental && request.model.supportsInstrumental
+        out += "\n\n# Lyrics\n" + (wordless || lyr.isEmpty ? "[Instrumental]" : lyr)
         return out + "\n"
     }
 
@@ -183,6 +207,15 @@ final class MusicGenService: ObservableObject {
     /// `<track>.wav` → `<track>.txt` companion path.
     nonisolated static func sidecarPath(forWav wavPath: String) -> String {
         (wavPath as NSString).deletingPathExtension + ".txt"
+    }
+
+    /// Seconds a YuE2 length cap is stretched by: a few seconds past the asked length is fine, a lyric
+    /// cut mid-word is not.
+    nonisolated static func lengthGrace(_ seconds: Int) -> Int { max(10, seconds / 4) }
+
+    /// `<track>.wav` → `<track>.abc`: the score a planning model rendered from.
+    nonisolated static func scorePath(forWav wavPath: String) -> String {
+        (wavPath as NSString).deletingPathExtension + ".abc"
     }
 
     /// Generate through the ONE main server: ensure running (headless if
@@ -223,6 +256,7 @@ final class MusicGenService: ObservableObject {
         task?.cancel()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
+        lastScore = nil
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let keep = request.keepResident
@@ -242,6 +276,7 @@ final class MusicGenService: ObservableObject {
                 // SSE stages: encode (conditioning) → diffuse (8 turbo steps)
                 // → decode (VAE chunks); the `complete` event carries the WAV.
                 var wav: Data? = nil
+                var score: String? = nil
                 let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64, srcAudioB64: srcB64)
                 let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
                 for try await ev in api.streamGeneration(
@@ -256,6 +291,9 @@ final class MusicGenService: ObservableObject {
                         switch stage {
                         case "encode", "prefill": label = L10n.text("Encoding prompt…")
                         case "frames": label = "Composing (frame \(step)/\(total))…"
+                        case "abc": label = L10n.text("Writing the score…")
+                        case "semantic": label = L10n.format("Composing (%d s so far)…", step / 25)
+                        case "nar": label = "Rendering (step \(step)/\(total))…"
                         case "diffuse": label = "Composing (step \(step)/\(total))…"
                         case "decode": label = "Rendering audio (\(step)/\(total))…"
                         default: label = L10n.format("%@…", L10n.text(stage))
@@ -263,6 +301,7 @@ final class MusicGenService: ObservableObject {
                         phase = .running(step: step, total: total, message: label)
                     case "complete":
                         if let b64 = ev["data"] as? String { wav = await offMain { Data(base64Encoded: b64) } }
+                        score = ev["abc"] as? String
                     case "error":
                         await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Music generation failed.")
@@ -283,6 +322,11 @@ final class MusicGenService: ObservableObject {
                 let settings = Self.settingsText(request, resolvedSeed: resolvedSeed, modelName: modelId)
                 try? settings.write(to: URL(fileURLWithPath: Self.sidecarPath(forWav: outputPath)),
                                     atomically: true, encoding: .utf8)
+                if let score {
+                    try? score.write(to: URL(fileURLWithPath: Self.scorePath(forWav: outputPath)),
+                                     atomically: true, encoding: .utf8)
+                    lastScore = score
+                }
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
             } catch is CancellationError {
@@ -330,6 +374,7 @@ final class MusicGenService: ObservableObject {
         }
         do {
             var wav: Data? = nil
+            var score: String? = nil
             let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64)
             let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
             for try await ev in api.streamGeneration(
@@ -339,6 +384,7 @@ final class MusicGenService: ObservableObject {
                     report(step, total, MediaSSE.stageLabel(stage))
                 case .complete:
                     if let b64 = ev["data"] as? String { wav = await offMain { Data(base64Encoded: b64) } }
+                    score = ev["abc"] as? String
                 case .failed(let m):
                     throw MediaGenError.server(m)
                 case .ignored:
@@ -353,6 +399,10 @@ final class MusicGenService: ObservableObject {
             try? Self.settingsText(request, resolvedSeed: resolvedSeed, modelName: modelId)
                 .write(to: URL(fileURLWithPath: Self.sidecarPath(forWav: outputPath)),
                        atomically: true, encoding: .utf8)
+            if let score {
+                try? score.write(to: URL(fileURLWithPath: Self.scorePath(forWav: outputPath)),
+                                 atomically: true, encoding: .utf8)
+            }
             await releaseIfNeeded()
             return outputPath
         } catch {

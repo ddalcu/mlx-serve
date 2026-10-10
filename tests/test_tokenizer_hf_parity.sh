@@ -1,7 +1,8 @@
 #!/bin/bash
-# test_tokenizer_hf_parity.sh — /tokenize equals HF `tokenizers` on code, per tokenizer family.
+# test_tokenizer_hf_parity.sh — /tokenize equals HF `tokenizers` on code and whitespace runs, per tokenizer family.
 #
-# Bar: zero differing tokens over this repo's Zig, Swift and JS sources (agent traffic). A
+# Bar: zero differing tokens over this repo's Zig, Swift and JS sources (agent traffic) and the
+# texts of tests/fixtures/tokenizer_parity/qwen3_8.json (blank lines holding spaces, U+3000, NBSP). A
 # pre-token grammar or BPE option we read wrong (the plain Llama-3 regex served with Muse's cased
 # grammar; `ignore_merges`) puts every agent prompt off-distribution while nothing errors.
 # Not covered: non-Latin scripts and Unicode numerics (`²`, Devanagari marks), where our letter /
@@ -39,14 +40,16 @@ for pack in "${PACKS[@]}"; do
     HOME="$WORK" "$BIN" --model "$pack" --serve --host 127.0.0.1 --port "$PORT" > "$WORK/server.log" 2>&1 &
     SRV=$!
     for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | grep -q '"id"' && break; sleep 1; done
-    "$PY" - "$pack" "$PORT" src/server.zig src/chat.zig app/Sources/MLXServe/AppState.swift src/html/app.js <<'PY' || fail=1
+    "$PY" - "$pack" "$PORT" src/server.zig src/chat.zig app/Sources/MLXServe/AppState.swift src/html/index.html \
+        tests/fixtures/tokenizer_parity/qwen3_8.json <<'PY' || fail=1
 import difflib, json, sys, urllib.request
 from tokenizers import Tokenizer
 pack, port, files = sys.argv[1], sys.argv[2], sys.argv[3:]
 hf = Tokenizer.from_file(pack + "/tokenizer.json")
 diffs, total = [], 0
 for f in files:
-    text = open(f, errors="replace").read()[:40000]
+    text = open(f, errors="replace").read()
+    text = "\n".join(c["text"] for c in json.loads(text)) if f.endswith(".json") else text[:40000]
     req = urllib.request.Request(f"http://127.0.0.1:{port}/tokenize", json.dumps({"content": text, "add_special": False}).encode(),
                                  {"Content-Type": "application/json"})
     ours = json.load(urllib.request.urlopen(req, timeout=120))["tokens"]

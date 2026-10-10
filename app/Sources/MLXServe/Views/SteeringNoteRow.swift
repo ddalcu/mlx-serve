@@ -6,6 +6,7 @@ import AppKit
 /// composer.
 struct SteeringNoteRow: View {
     let note: String
+    var isPaused: Bool = false
     let onPause: () -> Void
 
     @State private var contentHeight: CGFloat = 0
@@ -44,8 +45,8 @@ struct SteeringNoteRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
                     Image(systemName: "clock.arrow.trianglehead.clockwise.rotate.90.path.dotted")
-                        .symbolEffect(.rotate.clockwise.byLayer, options: .repeat(.continuous))
-                    Text("About to send…")
+                        .symbolEffect(.rotate.clockwise.byLayer, options: .repeat(.continuous), isActive: !isPaused)
+                    Text(isPaused ? "Paused" : "About to send…")
                         .fontWeight(.bold)
                 }
                 .font(.app(.caption2))

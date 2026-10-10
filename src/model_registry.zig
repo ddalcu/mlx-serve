@@ -29,8 +29,8 @@ const token_mask_mod = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
@@ -1322,6 +1322,20 @@ pub const ModelRegistry = struct {
             out[n] = victim;
             n += 1;
         }
+    }
+
+    /// Registry resident-memory cap: the explicit value, else Metal's whole working-set limit
+    /// (the load preflight enforces it too, so a model that fits it must not be refused here).
+    pub fn residentMemCap(explicit: bool, val: u64, gpu_limit: u64) u64 {
+        return if (explicit) val else gpu_limit;
+    }
+
+    test "the auto resident-memory cap is the full GPU working-set limit" {
+        const gib: u64 = 1 << 30;
+        // A 190 GB model on a 223 GB limit loads; an explicit cap (or 0 = off) still wins.
+        try std.testing.expect(190 * gib <= residentMemCap(false, 0, 223 * gib));
+        try std.testing.expectEqual(@as(u64, 100 * gib), residentMemCap(true, 100 * gib, 223 * gib));
+        try std.testing.expectEqual(@as(u64, 0), residentMemCap(true, 0, 223 * gib));
     }
 
     /// Map a stored load-failure name back to the typed error `ensureLoaded`

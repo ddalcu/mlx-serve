@@ -29,7 +29,7 @@ if [ -f "$STAMP" ] && [ -x "$DEST/zig" ]; then
 fi
 
 case "$(uname -m)" in
-  arm64) ARCH="aarch64" ;;
+  arm64|aarch64) ARCH="aarch64" ;; # macOS says arm64, Linux aarch64
   x86_64) ARCH="x86_64" ;;
   *) echo "[fetch-zig] ERROR: unsupported arch $(uname -m)" >&2; exit 1 ;;
 esac

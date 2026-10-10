@@ -3,7 +3,10 @@ import AppKit
 
 @MainActor
 class DownloadManager: ObservableObject {
-    @Published var downloads: [String: DownloadState] = [:]
+    @Published var downloads: [String: DownloadState] = [:] {
+        // Any download event can change what is on disk.
+        didSet { readyCache.removeAll() }
+    }
     /// New files per checked pack, keyed by repo (`PackUpdateCheck`).
     @Published var packUpdates: [String: PackUpdate] = [:]
     /// Latest HF listing per checked repo (path -> size), read by the socket's gem catalog.
@@ -260,8 +263,9 @@ class DownloadManager: ObservableObject {
         // extension allowlist used to drop it, so app-downloaded packs failed
         // to load while `mlx-serve pull` (a denylist) got it. Torch/flax shadow
         // weights stay out on both sides — same rule as `cli.shouldDownload`,
-        // keep them in sync.
-        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin", "u32"]
+        // keep them in sync. `.tiktoken` is YuE2's tokenizer (rank file, no
+        // tokenizer.json): without it a downloaded pack never reaches ready.
+        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin", "u32", "tiktoken"]
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
@@ -357,6 +361,7 @@ class DownloadManager: ObservableObject {
         case "AudioVideo": return "connector.safetensors"
         case "minimax_h3": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
+        case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
         default: return nil
@@ -1257,8 +1262,18 @@ class DownloadManager: ObservableObject {
         bundle.components.allSatisfy { componentReady($0) }
     }
 
+    /// Panes ask this from their `body`, which re-runs whenever anything they observe publishes;
+    /// every answer is a walk of the model folders. Remembered for a moment, and dropped by any
+    /// download event (`downloads` changing) and on delete.
+    private var readyCache: [String: (ready: Bool, at: Date)] = [:]
+    private static let readyCacheSeconds: TimeInterval = 3
+
     func componentReady(_ comp: MediaComponent) -> Bool {
-        Self.componentReady(comp, roots: readRoots)
+        let key = comp.repo + "|" + comp.readyMarkers.joined(separator: ",")
+        if let hit = readyCache[key], Date().timeIntervalSince(hit.at) < Self.readyCacheSeconds { return hit.ready }
+        let ready = Self.componentReady(comp, roots: readRoots)
+        readyCache[key] = (ready, Date())
+        return ready
     }
 
     /// Multi-root form: ready in ANY owned root — a pack downloaded before the
@@ -2298,6 +2313,7 @@ class DownloadManager: ObservableObject {
     }
 
     func deleteModel(repoId: String) {
+        readyCache.removeAll()
         removeFromDisk(repoId: repoId)
     }
 
@@ -2312,6 +2328,7 @@ class DownloadManager: ObservableObject {
     /// because the DEFAULT must stay refusal: every other caller keeps the
     /// old behaviour by not passing it.
     func deleteModel(_ model: LocalModel, unlocked: Bool = false) {
+        readyCache.removeAll()
         // Only ~/.mlx-serve/models is ours to delete. LM Studio, the Hugging Face
         // hub cache, and custom-root models are owned by another tool or the user
         // (deleting an HF snapshot orphans shared blobs and dangles refs/main; the

@@ -246,6 +246,8 @@ extension AudioGenSettings {
 struct MusicGenSettings: Codable, Equatable {
     var modelId: String = MusicModelPreset.acestepXLTurbo8bit.id
     var durationSeconds: Int = 60
+    /// YuE2: let the model end the song (no cap). On by default: the cap cut songs mid-lyric.
+    var autoLength: Bool = true
     var vocalLanguage: String = "en"
     var keepResident: Bool = false
     // Everything below used to live in plain `@State`. The pane is UNMOUNTED
@@ -258,6 +260,9 @@ struct MusicGenSettings: Codable, Equatable {
     var seed: Int = -1
     var steps: Int? = nil
     var instrumental: Bool = false
+    /// YuE2's score plan and the hand-edited ABC (part of the draft).
+    var plan: MusicPlan = .full
+    var score: String = ""
     /// Advanced starts OPEN. Collapsed-by-default is why tempo, key, seed and
     /// steps read as missing features — they were one unlabeled chevron away.
     var showAdvanced: Bool = true
@@ -310,6 +315,7 @@ extension MusicGenSettings {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         if let v = try c.decodeIfPresent(String.self, forKey: .modelId) { modelId = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .durationSeconds) { durationSeconds = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .autoLength) { autoLength = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .vocalLanguage) { vocalLanguage = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         bpm = try c.decodeIfPresent(Int.self, forKey: .bpm)
@@ -318,6 +324,8 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
         steps = try c.decodeIfPresent(Int.self, forKey: .steps)
         if let v = try c.decodeIfPresent(Bool.self, forKey: .instrumental) { instrumental = v }
+        if let v = try c.decodeIfPresent(MusicPlan.self, forKey: .plan) { plan = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .score) { score = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lyrics) { lyrics = v }
@@ -434,6 +442,9 @@ struct VideoGenSettings: Codable, Equatable {
     var refImageSize: RefImageSizing = .match
     var showMediaInputs: Bool = true
     var showAdvanced: Bool = false
+    /// Storyboard mode: `prompt` is the story, the shots are what generates.
+    var storyboardMode: Bool = false
+    var storyboard: [StoryboardSegment] = []
 
     private static let storageKey = "videoGenSettings"
 
@@ -551,6 +562,8 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(RefImageSizing.self, forKey: .refImageSize) { refImageSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showMediaInputs) { showMediaInputs = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .storyboardMode) { storyboardMode = v }
+        if let v = try c.decodeIfPresent([StoryboardSegment].self, forKey: .storyboard) { storyboard = v }
     }
 }
 

@@ -12,6 +12,12 @@ const std = @import("std");
 const ffi = @import("../llama_ffi.zig");
 const log = @import("../log.zig");
 
+/// The llama shim's log sink: llama.cpp's warnings and errors stay visible, the rest
+/// (the loader's metadata dump, backend probing) is debug.
+export fn mlx_llama_log(warn: bool, text: [*:0]const u8) void {
+    if (warn) log.warn("{s}", .{std.mem.span(text)}) else log.debug("{s}", .{std.mem.span(text)});
+}
+
 pub const Error = error{
     EngineOpenFailed,
     SessionCreateFailed,

@@ -229,19 +229,19 @@ pub const VisionEncoder = struct {
 
         for (0..num_layers) |i| {
             layers[i] = .{
-                .input_layernorm = getVisionWeight(weights, &name_buf, i, "input_layernorm.weight"),
-                .post_attention_layernorm = getVisionWeight(weights, &name_buf, i, "post_attention_layernorm.weight"),
-                .pre_feedforward_layernorm = getVisionWeight(weights, &name_buf, i, "pre_feedforward_layernorm.weight"),
-                .post_feedforward_layernorm = getVisionWeight(weights, &name_buf, i, "post_feedforward_layernorm.weight"),
-                .q_proj = loadLinearWeight(weights, &name_buf, i, "self_attn.q_proj", clipped),
-                .k_proj = loadLinearWeight(weights, &name_buf, i, "self_attn.k_proj", clipped),
-                .v_proj = loadLinearWeight(weights, &name_buf, i, "self_attn.v_proj", clipped),
-                .out_proj = loadLinearWeight(weights, &name_buf, i, "self_attn.o_proj", clipped),
-                .q_norm = getVisionWeight(weights, &name_buf, i, "self_attn.q_norm.weight"),
-                .k_norm = getVisionWeight(weights, &name_buf, i, "self_attn.k_norm.weight"),
-                .gate_proj = loadLinearWeight(weights, &name_buf, i, "mlp.gate_proj", clipped),
-                .up_proj = loadLinearWeight(weights, &name_buf, i, "mlp.up_proj", clipped),
-                .down_proj = loadLinearWeight(weights, &name_buf, i, "mlp.down_proj", clipped),
+                .input_layernorm = try getVisionWeight(weights, &name_buf, i, "input_layernorm.weight"),
+                .post_attention_layernorm = try getVisionWeight(weights, &name_buf, i, "post_attention_layernorm.weight"),
+                .pre_feedforward_layernorm = try getVisionWeight(weights, &name_buf, i, "pre_feedforward_layernorm.weight"),
+                .post_feedforward_layernorm = try getVisionWeight(weights, &name_buf, i, "post_feedforward_layernorm.weight"),
+                .q_proj = try loadLinearWeight(weights, &name_buf, i, "self_attn.q_proj", clipped),
+                .k_proj = try loadLinearWeight(weights, &name_buf, i, "self_attn.k_proj", clipped),
+                .v_proj = try loadLinearWeight(weights, &name_buf, i, "self_attn.v_proj", clipped),
+                .out_proj = try loadLinearWeight(weights, &name_buf, i, "self_attn.o_proj", clipped),
+                .q_norm = try getVisionWeight(weights, &name_buf, i, "self_attn.q_norm.weight"),
+                .k_norm = try getVisionWeight(weights, &name_buf, i, "self_attn.k_norm.weight"),
+                .gate_proj = try loadLinearWeight(weights, &name_buf, i, "mlp.gate_proj", clipped),
+                .up_proj = try loadLinearWeight(weights, &name_buf, i, "mlp.up_proj", clipped),
+                .down_proj = try loadLinearWeight(weights, &name_buf, i, "mlp.down_proj", clipped),
             };
         }
 
@@ -512,7 +512,46 @@ pub const VisionEncoder = struct {
     /// lfm2 have no video path.
     pub fn forwardVideoPatches(self: *VisionEncoder, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         if (self.qwen) |*qv| return qv.forwardVideo(patches, grid_t, grid_h, grid_w);
+        if (self.config.isEmbeddingGemma2()) return self.forwardFrames(patches, grid_t, grid_h, grid_w);
         return error.NoVideoEncoder;
+    }
+
+    /// A video on EmbeddingGemma 2's tower is its frames, each encoded as an image of its own. `frames` is the
+    /// buffer the scheduler views as patch rows; its bytes are `grid_t` float32 CHW frames back to back, each
+    /// `grid_h x grid_w` patches. Returns every frame's soft tokens in order, [1, grid_t * n, hidden].
+    fn forwardFrames(self: *VisionEncoder, frames: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        const ps: c_int = @intCast(self.config.vision_patch_size);
+        const h: c_int = @as(c_int, @intCast(grid_h)) * ps;
+        const w: c_int = @as(c_int, @intCast(grid_w)) * ps;
+        const shape = [_]c_int{ @intCast(grid_t), 3, h, w };
+        var chw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(chw);
+        try mlx.check(mlx.mlx_reshape(&chw, frames, &shape, 4, self.s));
+
+        var parts = std.ArrayList(mlx.mlx_array).empty;
+        defer {
+            for (parts.items) |p| _ = mlx.mlx_array_free(p);
+            parts.deinit(self.allocator);
+        }
+        for (0..grid_t) |t| {
+            const start = [_]c_int{ @intCast(t), 0, 0, 0 };
+            const stop = [_]c_int{ @intCast(t + 1), 3, h, w };
+            const strides = [_]c_int{ 1, 1, 1, 1 };
+            var frame = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(frame);
+            try mlx.check(mlx.mlx_slice(&frame, chw, &start, 4, &stop, 4, &strides, 4, self.s));
+            const tokens = try self.forward(frame);
+            errdefer _ = mlx.mlx_array_free(tokens);
+            // One frame's activations at a time: the tower's graph is large and none of it is reused.
+            try mlx.check(mlx.mlx_array_eval(tokens));
+            try parts.append(self.allocator, tokens);
+        }
+        const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, self.s));
+        return out;
     }
 
     /// Apply a quantized (or dense) Linear y = x · Wᵀ (+ optional bias). `sc`
@@ -756,7 +795,9 @@ pub const VisionEncoder = struct {
         // 2c. Pad the patch sequence out to `max_patches` with zero embeddings so transformer
         //     blocks see the fixed shape they were trained on. Reference (vision.py:459-464).
         //     max_patches = default_output_length * pooling_kernel^2. For Gemma-4: 280 * 9 = 2520.
-        const max_patches: c_int = @intCast(cfg.vision_soft_tokens * kernel * kernel);
+        // Gemma 4 pads every image to its one token budget. EmbeddingGemma 2 sizes each image to a budget of its
+        // own, up to 1120 tokens, which can exceed `default_output_length`: its grid is the sequence.
+        const max_patches: c_int = if (cfg.isEmbeddingGemma2()) num_patches else @intCast(cfg.vision_soft_tokens * kernel * kernel);
         const num_padding: c_int = max_patches - num_patches;
         if (num_padding > 0) {
             const pad_shape = [_]c_int{ batch, num_padding, hidden };
@@ -1153,34 +1194,36 @@ pub const VisionEncoder = struct {
         defer _ = mlx.mlx_array_free(v_t);
         try mlx.check(mlx.mlx_transpose_axes(&v_t, v_normed, &perm, 4, self.s));
 
-        // Scaled dot-product attention (scale=1.0, no mask — bidirectional)
-        // Reference uses scale=1.0 because QK-norm already normalizes
-        const kt_perm = [_]c_int{ 0, 1, 3, 2 };
-        var k_tp = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_tp);
-        try mlx.check(mlx.mlx_transpose_axes(&k_tp, k_t, &kt_perm, 4, self.s));
-
-        var attn_weights = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn_weights);
-        try mlx.check(mlx.mlx_matmul(&attn_weights, q_t, k_tp, self.s));
-        // No scaling (scale=1.0); QK-norm replaces the usual 1/sqrt(d_k).
-
-        // Apply bidirectional attention mask (0 for valid-valid, -inf for padding pairs).
-        // Broadcasts along the head dim since mask is [1, 1, L, L].
-        if (mask) |m| {
-            var masked = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&masked, attn_weights, m, self.s));
-            _ = mlx.mlx_array_free(attn_weights);
-            attn_weights = masked;
-        }
-
-        var attn_probs = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn_probs);
-        try mlx.check(mlx.mlx_softmax_axis(&attn_probs, attn_weights, -1, false, self.s));
-
+        // Scaled dot-product attention (scale=1.0, bidirectional). Reference uses scale=1.0 because QK-norm
+        // already normalizes.
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
-        try mlx.check(mlx.mlx_matmul(&attn_out, attn_probs, v_t, self.s));
+        if (mask == null) {
+            // An unpadded grid (EmbeddingGemma 2) has nothing to mask, and the fused kernel never builds the
+            // [heads, L, L] score matrix: at the largest budget (10080 patches) that is 2.4 GB per layer in bf16.
+            const no_mask = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(no_mask);
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, 1.0, "", no_mask, .{ .ctx = null }, false, self.s));
+        } else {
+            const kt_perm = [_]c_int{ 0, 1, 3, 2 };
+            var k_tp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_tp);
+            try mlx.check(mlx.mlx_transpose_axes(&k_tp, k_t, &kt_perm, 4, self.s));
+
+            var attn_weights = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_weights);
+            try mlx.check(mlx.mlx_matmul(&attn_weights, q_t, k_tp, self.s));
+
+            // Padding keys carry -inf; the mask is [1, 1, 1, L] and broadcasts along heads and queries.
+            var masked = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(masked);
+            try mlx.check(mlx.mlx_add(&masked, attn_weights, mask.?, self.s));
+
+            var attn_probs = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_probs);
+            try mlx.check(mlx.mlx_softmax_axis(&attn_probs, masked, -1, false, self.s));
+            try mlx.check(mlx.mlx_matmul(&attn_out, attn_probs, v_t, self.s));
+        }
 
         // Transpose back: [B, heads, seq, head_dim] → [B, seq, heads*head_dim]
         const out_perm = [_]c_int{ 0, 2, 1, 3 };
@@ -1594,13 +1637,77 @@ pub const VisionEncoder = struct {
     }
 };
 
+// ── Soft-token-budget processor (EmbeddingGemma 2) ──
+
+pub const Resized = qwen_vision.Resized;
+
+/// `Gemma4ImageProcessor`'s resize target: the largest size with the image's aspect ratio whose patch grid
+/// fits `max_tokens` pooled soft tokens and whose sides are multiples of `merge * patch`. A source thinner than
+/// one multiple takes one multiple on its short side. Null for a degenerate request.
+pub fn budgetSize(height: u32, width: u32, patch: u32, merge: u32, max_tokens: u32) ?Resized {
+    if (height == 0 or width == 0 or patch == 0 or merge == 0 or max_tokens == 0) return null;
+    const side: u64 = @as(u64, merge) * patch;
+    const max_patches: u64 = @as(u64, max_tokens) * merge * merge;
+    const target_px: f64 = @floatFromInt(max_patches * patch * patch);
+    const factor = @sqrt(target_px / (@as(f64, @floatFromInt(height)) * @as(f64, @floatFromInt(width))));
+    const side_f: f64 = @floatFromInt(side);
+    var h: u64 = @as(u64, @intFromFloat(@floor(factor * @as(f64, @floatFromInt(height)) / side_f))) * side;
+    var w: u64 = @as(u64, @intFromFloat(@floor(factor * @as(f64, @floatFromInt(width)) / side_f))) * side;
+    if (h == 0 and w == 0) return null;
+    const max_side: u64 = (max_patches / (@as(u64, merge) * merge)) * side;
+    if (h == 0) {
+        h = side;
+        w = @min(@as(u64, width / height) * side, max_side);
+    } else if (w == 0) {
+        w = side;
+        h = @min(@as(u64, height / width) * side, max_side);
+    }
+    if (@as(f64, @floatFromInt(h * w)) > target_px) return null;
+    return .{ .h = @intCast(h), .w = @intCast(w) };
+}
+
+/// The i-th kept frame when a client sends `n` frames and the processor keeps `max`: `np.linspace(0, n-1, max,
+/// dtype=int)`, i.e. an even spread that always keeps the first and last frame.
+pub fn sampledFrame(i: usize, n: usize, max: usize) usize {
+    if (n <= max) return i;
+    if (max < 2) return 0;
+    return i * (n - 1) / (max - 1);
+}
+
+/// A resized image as the tower reads it: float32 CHW in [0, 1], as bytes.
+pub const UnitImage = struct { pixels: []u8, h: u32, w: u32 };
+
+/// Bicubic antialiased resize (Pillow's, which torchvision's uint8 kernel reproduces to within one level) of
+/// interleaved RGB8 to `[3, th, tw]` float32 in [0, 1]. Caller frees `pixels`.
+pub fn resizeToUnitChw(allocator: std.mem.Allocator, rgb: []const u8, sh: u32, sw: u32, th: u32, tw: u32) !UnitImage {
+    const resized: ?[]u8 = if (th == sh and tw == sw) null else try qwen_vision.resizeInterleavedPil(allocator, rgb, sh, sw, th, tw, 3, .bicubic);
+    defer if (resized) |r| allocator.free(r);
+    const src = resized orelse rgb;
+    const plane: usize = @as(usize, th) * tw;
+    if (src.len != plane * 3) return error.InvalidImageBuffer;
+    const bytes = try allocator.alloc(u8, plane * 3 * @sizeOf(f32));
+    const out = @as([*]f32, @ptrCast(@alignCast(bytes.ptr)))[0 .. plane * 3];
+    // The processor multiplies by the float32 of 1/255 rather than dividing.
+    const rescale: f32 = 1.0 / 255.0;
+    for (0..plane) |i| inline for (0..3) |c| {
+        out[c * plane + i] = @as(f32, @floatFromInt(src[i * 3 + c])) * rescale;
+    };
+    return .{ .pixels = bytes, .h = th, .w = tw };
+}
+
+/// `Gemma4ImageProcessor` on one decoded image: resize to the budget's target size and rescale.
+pub fn budgetPixels(allocator: std.mem.Allocator, rgb: []const u8, h: u32, w: u32, patch: u32, merge: u32, max_tokens: u32) !UnitImage {
+    const size = budgetSize(h, w, patch, merge, max_tokens) orelse return error.InvalidImageDimensions;
+    return resizeToUnitChw(allocator, rgb, h, w, size.h, size.w);
+}
+
 // ── Weight Loading Helpers ──
 
-fn getVisionWeight(weights: *const Weights, buf: *[256]u8, layer: usize, suffix: []const u8) mlx.mlx_array {
+fn getVisionWeight(weights: *const Weights, buf: *[256]u8, layer: usize, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "vision_tower.encoder.layers.{d}.{s}", .{ layer, suffix }) catch unreachable;
     return weights.get(name) orelse {
         log.err("MISSING VISION WEIGHT: {s}\n", .{name});
-        unreachable;
+        return error.MissingWeight;
     };
 }
 
@@ -1609,16 +1716,16 @@ fn getWeight(weights: *const Weights, buf: *[256]u8, name: []const u8) ?mlx.mlx_
     return weights.get(n);
 }
 
-fn loadLinearWeight(weights: *const Weights, buf: *[256]u8, layer: usize, prefix: []const u8, clipped: bool) LinearWeight {
-    const weight = getClippedWeight(weights, buf, layer, prefix, ".linear.weight");
+fn loadLinearWeight(weights: *const Weights, buf: *[256]u8, layer: usize, prefix: []const u8, clipped: bool) error{MissingWeight}!LinearWeight {
+    const weight = try getClippedWeight(weights, buf, layer, prefix, ".linear.weight");
     if (clipped) {
         return .{
             .weight = weight,
             .has_clip = true,
-            .input_min = getClippedWeight(weights, buf, layer, prefix, ".input_min"),
-            .input_max = getClippedWeight(weights, buf, layer, prefix, ".input_max"),
-            .output_min = getClippedWeight(weights, buf, layer, prefix, ".output_min"),
-            .output_max = getClippedWeight(weights, buf, layer, prefix, ".output_max"),
+            .input_min = try getClippedWeight(weights, buf, layer, prefix, ".input_min"),
+            .input_max = try getClippedWeight(weights, buf, layer, prefix, ".input_max"),
+            .output_min = try getClippedWeight(weights, buf, layer, prefix, ".output_min"),
+            .output_max = try getClippedWeight(weights, buf, layer, prefix, ".output_max"),
         };
     }
     return .{
@@ -1631,11 +1738,11 @@ fn loadLinearWeight(weights: *const Weights, buf: *[256]u8, layer: usize, prefix
     };
 }
 
-fn getClippedWeight(weights: *const Weights, buf: *[256]u8, layer: usize, prefix: []const u8, suffix: []const u8) mlx.mlx_array {
+fn getClippedWeight(weights: *const Weights, buf: *[256]u8, layer: usize, prefix: []const u8, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "vision_tower.encoder.layers.{d}.{s}{s}", .{ layer, prefix, suffix }) catch unreachable;
     return weights.get(name) orelse {
         log.err("MISSING VISION WEIGHT: {s}\n", .{name});
-        unreachable;
+        return error.MissingWeight;
     };
 }
 
@@ -1802,4 +1909,95 @@ test "EmbeddingCache keeps what the current request uses: a history past the cap
     defer _ = mlx.mlx_array_free(kept);
     try testing.expectEqual(@as(f32, 3), mlx.mlx_array_data_float32(kept).?[2]);
     try testing.expectEqual(@as(usize, cap), cache.bytes);
+}
+
+// Reference: `get_aspect_ratio_preserving_size` from transformers (patch 16, pooling kernel 3), rows of
+// { source h, source w, soft-token budget, target h, target w }.
+const SIZE_CASES = [_][5]u32{
+    .{ 5, 9, 70, 288, 528 },         .{ 16, 2000, 70, 48, 3360 },     .{ 2000, 16, 70, 3360, 48 },       .{ 48, 48, 70, 384, 384 },
+    .{ 47, 49, 70, 384, 384 },       .{ 1, 1, 70, 384, 384 },         .{ 300, 500, 70, 288, 480 },       .{ 200, 360, 70, 288, 528 },
+    .{ 1080, 1920, 70, 288, 528 },   .{ 3000, 4000, 70, 336, 432 },   .{ 50, 70, 70, 336, 432 },         .{ 16, 20000, 70, 48, 3360 },
+    .{ 20000, 16, 70, 3360, 48 },    .{ 2, 3, 70, 288, 480 },         .{ 5, 9, 140, 384, 720 },          .{ 16, 2000, 140, 48, 6336 },
+    .{ 47, 49, 140, 528, 576 },      .{ 300, 500, 140, 432, 720 },    .{ 200, 360, 140, 384, 720 },      .{ 3000, 4000, 140, 480, 624 },
+    .{ 5, 9, 280, 576, 1056 },       .{ 16, 2000, 280, 48, 8976 },    .{ 2000, 16, 280, 8976, 48 },      .{ 48, 48, 280, 768, 768 },
+    .{ 47, 49, 280, 768, 816 },      .{ 1, 1, 280, 768, 768 },        .{ 300, 500, 280, 576, 1008 },     .{ 200, 360, 280, 576, 1056 },
+    .{ 1080, 1920, 280, 576, 1056 }, .{ 3000, 4000, 280, 672, 912 },  .{ 16, 20000, 280, 48, 13440 },    .{ 20000, 16, 280, 13440, 48 },
+    .{ 2, 3, 280, 624, 960 },        .{ 5, 9, 560, 816, 1488 },       .{ 16, 2000, 560, 96, 12672 },     .{ 300, 500, 560, 864, 1440 },
+    .{ 3000, 4000, 560, 960, 1296 }, .{ 16, 20000, 560, 48, 26880 },  .{ 5, 9, 1120, 1152, 2112 },       .{ 16, 2000, 1120, 96, 17952 },
+    .{ 47, 49, 1120, 1536, 1632 },   .{ 300, 500, 1120, 1200, 2064 }, .{ 1080, 1920, 1120, 1200, 2112 }, .{ 16, 20000, 1120, 48, 53760 },
+};
+
+test "budgetSize: the largest aspect-preserving size that fits the soft-token budget, as the processor computes it" {
+    for (SIZE_CASES) |c| {
+        const got = budgetSize(c[0], c[1], 16, 3, c[2]) orelse {
+            std.debug.print("{d}x{d} @ {d}: refused\n", .{ c[0], c[1], c[2] });
+            return error.Refused;
+        };
+        testing.expect(got.h == c[3] and got.w == c[4]) catch |e| {
+            std.debug.print("{d}x{d} @ {d}: got {d}x{d}, want {d}x{d}\n", .{ c[0], c[1], c[2], got.h, got.w, c[3], c[4] });
+            return e;
+        };
+        // Whatever the shape, the grid pools evenly and fits the budget.
+        try testing.expect(got.h % 48 == 0 and got.w % 48 == 0);
+        try testing.expect((got.h / 16) * (got.w / 16) <= c[2] * 9);
+    }
+    try testing.expect(budgetSize(0, 10, 16, 3, 280) == null);
+    try testing.expect(budgetSize(10, 0, 16, 3, 280) == null);
+}
+
+test "sampledFrame: more frames than the processor keeps are cut to an even spread, first and last included" {
+    // np.linspace(0, n - 1, 32, dtype=int) for n = 33, 40, 100.
+    const want_33 = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32 };
+    const want_40 = [_]usize{ 0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 25, 26, 27, 28, 30, 31, 32, 33, 35, 36, 37, 39 };
+    const want_100 = [_]usize{ 0, 3, 6, 9, 12, 15, 19, 22, 25, 28, 31, 35, 38, 41, 44, 47, 51, 54, 57, 60, 63, 67, 70, 73, 76, 79, 83, 86, 89, 92, 95, 99 };
+    inline for (.{ .{ 33, want_33 }, .{ 40, want_40 }, .{ 100, want_100 } }) |c| {
+        for (c[1], 0..) |want, i| try testing.expectEqual(want, sampledFrame(i, c[0], 32));
+    }
+    // Within the cap every frame is kept, in order; a single kept frame is the first.
+    for (0..20) |i| try testing.expectEqual(i, sampledFrame(i, 20, 32));
+    try testing.expectEqual(@as(usize, 0), sampledFrame(0, 50, 1));
+}
+
+/// The closed-form source image of the fixture's resize cases.
+fn patternRgb(allocator: std.mem.Allocator, h: usize, w: usize) ![]u8 {
+    const out = try allocator.alloc(u8, h * w * 3);
+    for (0..h) |y| for (0..w) |x| for (0..3) |c| {
+        out[(y * w + x) * 3 + c] = @intCast((x * 7 + y * 13 + c * 61 + ((x * y) % 29) * 5) % 256);
+    };
+    return out;
+}
+
+test "resizeToUnitChw matches torchvision's bicubic antialias on the reference's own cases" {
+    const a = testing.allocator;
+    const Case = struct { src: [2]u32, dst: [2]u32, rgb: []const u8 };
+    const Expected = struct { media: struct { resize: []const Case } };
+    const parsed = try std.json.parseFromSlice(Expected, a, @embedFile("fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    for (parsed.value.media.resize, 0..) |c, case| {
+        const src = try patternRgb(a, c.src[0], c.src[1]);
+        defer a.free(src);
+        const img = try resizeToUnitChw(a, src, c.src[0], c.src[1], c.dst[0], c.dst[1]);
+        defer a.free(img.pixels);
+        try testing.expectEqual(c.dst[0], img.h);
+        try testing.expectEqual(c.dst[1], img.w);
+
+        const want = try a.alloc(u8, c.dst[0] * c.dst[1] * 3);
+        defer a.free(want);
+        try std.base64.standard.Decoder.decode(want, c.rgb);
+        const got: []const f32 = @as([*]const f32, @ptrCast(@alignCast(img.pixels.ptr)))[0..want.len];
+        const plane = @as(usize, c.dst[0]) * c.dst[1];
+        var off_by_one: usize = 0;
+        var worst: u32 = 0;
+        for (0..plane) |i| for (0..3) |ch| {
+            const level: i32 = @intFromFloat(@round(got[ch * plane + i] * 255.0));
+            const diff = @abs(level - @as(i32, want[i * 3 + ch]));
+            worst = @max(worst, diff);
+            off_by_one += @intFromBool(diff == 1);
+        };
+        // Torchvision's integer kernel and Pillow's differ in the last bit now and then, never more.
+        testing.expect(worst <= 1 and off_by_one * 20 <= plane * 3) catch |e| {
+            std.debug.print("case {d}: worst {d} levels, {d} of {d} values off by one\n", .{ case, worst, off_by_one, plane * 3 });
+            return e;
+        };
+    }
 }

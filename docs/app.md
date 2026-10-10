@@ -21,7 +21,7 @@ Menu-bar app that wraps the server with a full UI. [Download the latest release]
 - **Prompt-based skills** — drop `.md` files into `~/.mlx-serve/skills/` with YAML frontmatter to teach the agent custom capabilities triggered by keywords, or type `/` in the chat box to pick one and run it by name in any chat, agent mode or not.
 - **Engine-aware Settings window** (Cmd+,) — every server-launch flag and per-request default, with sections that show only the knobs relevant to the engine you've loaded (MLX vs GGUF vs ds4).
 - **Server management** — start/stop, live log buffer, restart-on-flag-change banner.
-- **Image / Video / Music / Speech / 3D generation** — FLUX.2, Krea-2, Mage-Flow, LTX-Video 2.3 / 2.5, MiniMax-H3, ACE-Step, MiniMax Music 3, Qwen3-TTS, Kokoro and Hunyuan3D, all native via the mlx-serve zig server.
+- **Image / Video / Music / Speech / 3D generation** — FLUX.2, Krea-2, Mage-Flow, LTX-Video 2.3 / 2.5, MiniMax-H3, ACE-Step, MiniMax Music 3, YuE2, Qwen3-TTS, Kokoro and Hunyuan3D, all native via the mlx-serve zig server.
 
 ## Image / Video / Music / Speech / 3D generation
 
@@ -50,12 +50,14 @@ And it goes well beyond text-to-X:
 | Image | FLUX.2-klein 4B 4-bit (mflux, ~5 GB pre-quantized) | FLUX.2-klein 9B (10 GB), Krea-2-Turbo, Mage-Flow Turbo / Edit 8-bit (8.5 / 9.1 GB) | 8 / 12 / 16 GB |
 | Video | LTX-Video 2.5 4-bit (36 GB, bundled text encoder) | LTX-Video 2.5 8-bit (59 GB, sharper + diffusion decoder), LTX-Video 2.3 Q4 (~50 GB), MiniMax-H3 (Hailuo 3.0) 4-bit / 8-bit, video **and** matching soundtrack in one pass | LTX 24 GB RAM; H3 26 GB (40 GB) or 44 GB (69 GB) |
 | Speech | Qwen3-TTS 1.7b (voice cloning) | Qwen3-TTS 0.6b, Kokoro-82M (54 voices, ~345 MB) | 8 GB RAM, ~3.5 GB first-run download |
-| Music | ACE-Step 1.5 XL Turbo 8-bit (fast, 8 steps) | MiniMax Music 3 8-bit (sings your lyrics, songs up to 6 min, strongest vocals) | ACE 8 GB RAM, ~6.2 GB download; Music 3 ~20 GB RAM, 13.6 GB download |
+| Music | ACE-Step 1.5 XL Turbo 8-bit (fast, 8 steps) | MiniMax Music 3 8-bit (sings your lyrics, songs up to 6 min, strongest vocals), YuE2 3B 8-bit (plans an editable score first; non-commercial license) | ACE 8 GB RAM, ~6.2 GB download; Music 3 ~20 GB RAM, 13.6 GB download; YuE2 ~10 GB RAM, 4.5 GB download |
 | 3D | Hunyuan3D-2.1 8-bit (shape + PBR texture) | — | 16 GB RAM |
 
 > The 41 GB LTX 2.3 snapshot ships **both** transformer variants (1-stage distilled + 2-stage dev, ~11 GB each) plus a 7.6 GB distillation LoRA, so you can switch between Fast/Good/Quality/Super offline without re-downloading.
 
 > LTX-Video 2.5 brings its own text encoder, so there is no separate 8 GB download on first use. The 8-bit pack keeps detail the 4-bit one loses and adds a **Diffusion decoder** toggle (the decoder Lightricks' own published clips use, `"decoder": "diffusion"` over the API) for sharper texture and edges. The default canvas and frame ladder are sized per Mac; two-stage tiers denoise at half the chosen size and upscale.
+
+> YuE2 plans a score (ABC notation) before it sings: the Music tab's **Score** box picks the plan (melody + chords, melody only, none) and takes your own or an edited score (**Use last score** fills it from the song you just made; every song's score is also saved as `.abc` beside the WAV). It requires lyrics, with capitalized tags like `[Verse]`, has no instrumental switch, and takes a comma-separated tag line as the style.
 
 > MiniMax Music 3 requires lyrics; structure tags like `[verse]` and `[chorus]` go on their own lines. ACE-Step's tempo, key, meter and language controls don't exist on it, so put those facts in the caption instead. The bundled **music3** skill writes the caption format the model was trained on when you ask the chat for a song.
 

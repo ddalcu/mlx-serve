@@ -1,0 +1,87 @@
+MLX's CUDA LRU caches (cuDNN conv plans, CUDA graphs, cuDNN SDPA) throw a
+"cache thrashing" error once misses pass 2x capacity, but the miss count
+never resets: a long-running server that sees many shapes over its life
+(Kokoro, whose conv shapes follow the audio length) then fails every new
+shape for good. Count CONSECUTIVE misses instead: any hit resets the count,
+so only a working set larger than the cache still throws. Upstream PR
+pending; drop this file and its step in build-mlx-linux.sh once
+lib/mlx-src includes it.
+
+diff --git a/docs/src/usage/environment_variables.rst b/docs/src/usage/environment_variables.rst
+index 3584f4c..4641411 100644
+--- a/docs/src/usage/environment_variables.rst
++++ b/docs/src/usage/environment_variables.rst
+@@ -177,8 +177,9 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
+ 
+ .. envvar:: MLX_ENABLE_CACHE_THRASHING_CHECK
+ 
+-   Detect repeated CUDA cache misses and raise an error suggesting a larger
+-   cache capacity. The default is ``1``.
++   Detect consecutive CUDA cache misses (more than twice the capacity with no
++   hit in between) and raise an error suggesting a larger cache capacity. The
++   default is ``1``.
+ 
+ MLX also uses ``CUDA_HOME`` or ``CUDA_PATH`` to locate CUDA headers for runtime
+ kernel compilation when they cannot be found in the Python environment.
+diff --git a/mlx/backend/cuda/lru_cache.h b/mlx/backend/cuda/lru_cache.h
+index d208315..cdf502e 100644
+--- a/mlx/backend/cuda/lru_cache.h
++++ b/mlx/backend/cuda/lru_cache.h
+@@ -76,6 +76,7 @@ class LRUCache {
+     auto it = map_.find(key);
+     if (it == map_.end())
+       return end();
++    cache_misses_ = 0;
+     vlist_.splice(vlist_.begin(), vlist_, it->second);
+     return it->second;
+   }
+@@ -84,6 +85,7 @@ class LRUCache {
+   std::pair<iterator, bool> emplace(const K& key, U&& value) {
+     auto it = map_.find(key);
+     if (it != map_.end()) {
++      cache_misses_ = 0;
+       vlist_.splice(vlist_.begin(), vlist_, it->second);
+       return {it->second, false};
+     }
+@@ -128,6 +130,8 @@ class LRUCache {
+   }
+ 
+   const char* env_name_{nullptr};
++  // Consecutive misses: any hit resets it, so only a working set larger than
++  // the capacity (every lookup missing) counts as thrashing.
+   size_t cache_misses_{0};
+ 
+   list_type vlist_;
+diff --git a/tests/cuda_tests.cpp b/tests/cuda_tests.cpp
+index aca39ca..d441dfb 100644
+--- a/tests/cuda_tests.cpp
++++ b/tests/cuda_tests.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2026 Apple Inc.
+ 
+ #include "doctest/doctest.h"
++#include "mlx/backend/cuda/lru_cache.h"
+ #include "mlx/mlx.h"
+ 
+ #ifdef _WIN32
+@@ -109,3 +110,20 @@ TEST_CASE("test clear cache trims CUDA pool") {
+       cudaSuccess);
+   CHECK_LT(final_reserved, allocated_reserved);
+ }
++
++TEST_CASE("test lru cache thrashing check counts consecutive misses") {
++  // Many distinct keys over time are not thrashing while lookups still hit.
++  LRUCache<int, int> cache("MLX_TEST_LRU_CACHE_SIZE", 2);
++  for (int i = 0; i < 100; ++i) {
++    cache.emplace(i, i);
++    CHECK(cache.find(i) != cache.end());
++  }
++
++  // A working set larger than the capacity misses on every lookup.
++  auto cycle = [&cache]() {
++    for (int i = 0; i < 100; ++i) {
++      cache[i % 3];
++    }
++  };
++  CHECK_THROWS(cycle());
++}

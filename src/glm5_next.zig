@@ -340,7 +340,7 @@ pub fn collapse(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array
 const HC_PRE_TPG: c_int = 1024;
 const HC_PRE_NT: c_int = 16;
 /// Rows one `hcPre` dispatch takes (a verify window): one counter word each.
-pub const HC_PRE_MAX_ROWS: c_int = 8;
+pub const HC_PRE_MAX_ROWS: c_int = 16;
 /// Threads per threadgroup the GPU grants this kernel: Metal caps it per compiled
 /// kernel by register use (M1/M2 below 1024), so the first eval probes and halves.
 var hc_pre_tpg: c_int = HC_PRE_TPG;
@@ -436,11 +436,11 @@ const HC_PRE_BODY =
     \\}
     \\if (tid == 0) msv_hc_gates1<ITERS>((threadgroup const float*)mix_n, base, scale[1], scale[2], EPS, post + row * HC, comb + row * HC * HC);
 ;
-const HC_DEFER_HVAL = "#define HVAL(k) msv_hc_hval<T, HC, D>((k), y, post_in, comb_in, h_in)\n";
+const HC_DEFER_HVAL = "#define HVAL(k) msv_hc_hval<T, HC, D>((k), y + row * D, post_in + row * HC, comb_in + row * HC * HC, h_in + row * HC * D)\n";
 const HC_PRE_SOURCE = "#define HVAL(k) float(x[row * K + (k)])\n#define STORE_H(k, v)\n#define TAIL4(k) float4(*(const device vec<T, 4>*)(x + row * K + (k)))\n" ++ HC_PRE_BODY;
 // The tail reads the stream the other threadgroups stored, two elements per 32-bit atomic.
-const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) h[k] = T(v)\n#define TAIL4(k) msv_hc_load4<T>(h, (k))\n" ++ HC_PRE_BODY;
-const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ "const int k = int(thread_position_in_grid.x);\nh[k] = T(HVAL(k));\n";
+const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) h[row * K + (k)] = T(v)\n#define TAIL4(k) msv_hc_load4<T>(h + row * K, (k))\n" ++ HC_PRE_BODY;
+const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ "const int k = int(thread_position_in_grid.x);\nconst uint row = thread_position_in_grid.y;\nh[row * HC * D + k] = T(HVAL(k));\n";
 var hc_pre_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var hc_pre_defer_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var hc_materialize_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -449,27 +449,28 @@ var hc_pre_counter: ?mlx.mlx_array = null;
 
 /// A sublayer's expand not applied yet: the stream is `expand(y, h)` under post/comb.
 pub const Deferred = struct {
-    /// [1, 1, D] the sublayer's output.
+    /// [1, R, D] the sublayer's output.
     y: mlx.mlx_array,
-    /// f32 [1, 1, HC] and [1, 1, HC, HC]: the sublayer's gates.
+    /// f32 [1, R, HC] and [1, R, HC, HC]: the sublayer's gates.
     post: mlx.mlx_array,
     comb: mlx.mlx_array,
-    /// [1, 1, HC, D] the sublayer's input stream.
+    /// [1, R, HC, D] the sublayer's input stream.
     h: mlx.mlx_array,
 
     pub fn deinit(self: *Deferred) void {
         inline for (.{ self.y, self.post, self.comb, self.h }) |a| _ = mlx.mlx_array_free(a);
     }
 
-    /// The [1, 1, HC, D] stream this stands for, as `expand` writes it.
+    /// The [1, R, HC, D] stream this stands for, as `expand` writes it.
     pub fn materialize(self: *const Deferred, s: mlx.mlx_stream) !mlx.mlx_array {
         const d = mlx.getShape(self.y)[2];
+        const rows = mlx.getShape(self.y)[1];
         const dt = mlx.mlx_array_dtype(self.y);
         const kern = try hcKernel(&hc_materialize_kernel, "glm5_hc_materialize", &.{ "y", "post_in", "comb_in", "h_in" }, &.{"h"}, HC_MATERIALIZE_SOURCE);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 1, HC, d }, 4, dt));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, HC * d, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, HC, d }, 4, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, HC * d, rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", HC));
@@ -488,12 +489,12 @@ pub const Deferred = struct {
 };
 
 pub const Pre = struct {
-    /// [1, 1, D] the sublayer's normed input.
+    /// [1, R, D] the sublayer's normed input.
     normed: mlx.mlx_array,
-    /// f32 [1, 1, HC] and [1, 1, HC, HC]
+    /// f32 [1, R, HC] and [1, R, HC, HC]
     post: mlx.mlx_array,
     comb: mlx.mlx_array,
-    /// [1, 1, HC, D] the stream rebuilt from a `Deferred`, else empty.
+    /// [1, R, HC, D] the stream rebuilt from a `Deferred`, else empty.
     h: mlx.mlx_array,
 
     pub fn deinit(self: *Pre) void {
@@ -511,12 +512,7 @@ pub const Pre = struct {
     }
 };
 
-/// Whether `hcPre` serves a one-token stream [1, 1, HC, d] of `dt` with this `fn`.
-pub fn hcOneServes(s: mlx.mlx_stream, sh: []const c_int, dt: mlx.mlx_dtype, fn_rows: mlx.mlx_array, norm_w: mlx.mlx_array) bool {
-    return sh.len == 4 and sh[0] * sh[1] == 1 and hcRowsServes(s, sh, dt, fn_rows, norm_w);
-}
-
-/// Whether `hcPre` serves a [1, R, HC, d] stream, R up to `HC_PRE_MAX_ROWS` (no deferral past one row).
+/// Whether `hcPre` serves a [1, R, HC, d] stream, R up to `HC_PRE_MAX_ROWS`.
 pub fn hcRowsServes(s: mlx.mlx_stream, sh: []const c_int, dt: mlx.mlx_dtype, fn_rows: mlx.mlx_array, norm_w: mlx.mlx_array) bool {
     return mlx.streamIsGpu(s) and sh.len == 4 and sh[0] == 1 and sh[1] >= 1 and sh[1] <= HC_PRE_MAX_ROWS and sh[2] == HC and @rem(sh[3], 4) == 0 and
         @divTrunc(sh[3], 4) <= HC_PRE_TPG and @rem(HC * sh[3], HC_PRE_NT) == 0 and (dt == .bfloat16 or dt == .float16) and
@@ -535,14 +531,14 @@ fn hcKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const
     return k;
 }
 
-/// The normed sublayer input and gates of one token, from its stream `x` [1, 1, HC, D] or
+/// The normed sublayer input and gates of R rows, from their stream `x` [1, R, HC, D] or
 /// from the previous sublayer's `Deferred` (then `Pre.h` is the stream). Callers check
-/// `hcOneServes` first.
+/// `hcRowsServes` first.
 pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, fn_rows: mlx.mlx_array, scale: mlx.mlx_array, base: mlx.mlx_array, norm_w: mlx.mlx_array, iters: u32, hc_eps: f32, norm_eps: f32, rms_eps: f32) !Pre {
     const d = mlx.getShape(norm_w)[0];
     const dt = mlx.mlx_array_dtype(norm_w);
     // Rows ride the grid's y: each has its own K-slices, counter word and gates.
-    const rows: c_int = if (x) |xa| mlx.getShape(xa)[1] else 1;
+    const rows: c_int = if (x) |xa| mlx.getShape(xa)[1] else mlx.getShape(deferred.?.y)[1];
     if (rows < 1 or rows > HC_PRE_MAX_ROWS) return error.Glm5HcShape;
     const kern = if (deferred != null)
         try hcKernel(&hc_pre_defer_kernel, "glm5_hc_pre_defer", &.{ "y", "post_in", "comb_in", "h_in", "fn", "scale", "base", "nw", "eps", "counter" }, &.{ "normed", "post", "comb", "parts", "h" }, HC_PRE_DEFER_SOURCE)
@@ -551,9 +547,9 @@ pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, f
     const counter = hc_pre_counter orelse blk: {
         var z = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(z);
-        // One word per row (HC_PRE_MAX_ROWS); 8 words also keep the input out of the
+        // One word per row; a counter of 8 or more words also keeps the input out of the
         // read-only constant address space.
-        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{8}, 1, .uint32, s));
+        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{HC_PRE_MAX_ROWS}, 1, .uint32, s));
         try mlx.check(mlx.mlx_array_eval(z));
         hc_pre_counter = z;
         break :blk z;
@@ -579,7 +575,7 @@ pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, f
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, HC }, 3, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, HC, HC }, 4, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows * HC_PRE_NT, MIX + 1 }, 2, .float32));
-        if (deferred != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 1, HC, d }, 4, dt));
+        if (deferred != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, HC, d }, 4, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, tpg * HC_PRE_NT, rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tpg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
@@ -2085,7 +2081,7 @@ fn moeLaunch(s: mlx.mlx_stream, k: mlx.mlx_fast_metal_kernel, inputs: []const ml
 /// shared one. `x` is one [.., hidden] row, `inds` uint32 [topk], `scores` [topk]; routed banks
 /// are [E, out, in]. Returns [hidden] in x's dtype, or null outside the shapes served.
 /// Rows one decode launch takes: a token or a verify window (the kernels index by token).
-pub const MOE_DECODE_MAX_ROWS: c_int = 8;
+pub const MOE_DECODE_MAX_ROWS: c_int = 16;
 
 pub fn moeDecode(s: mlx.mlx_stream, x: mlx.mlx_array, inds: mlx.mlx_array, scores: mlx.mlx_array, gate: QBank, up: QBank, down: QBank, sh_gate: QBank, sh_up: QBank, sh_down: QBank, limit: f32) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
@@ -2503,7 +2499,7 @@ test "glm5 one-token hcPre chain matches collapse, rms_norm and expand" {
     defer _ = mlx.mlx_array_free(base);
     const scale = mlx.mlx_array_new_data(&scv, &[_]c_int{3}, 1, .float32);
     defer _ = mlx.mlx_array_free(scale);
-    try testing.expect(hcOneServes(s, mlx.getShape(stream), .bfloat16, fn_rows, nw));
+    try testing.expect(hcRowsServes(s, mlx.getShape(stream), .bfloat16, fn_rows, nw));
 
     const near = struct {
         fn check(st: mlx.mlx_stream, a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, al: std.mem.Allocator) !void {
@@ -2562,6 +2558,74 @@ test "glm5 one-token hcPre chain matches collapse, rms_norm and expand" {
     defer _ = mlx.mlx_array_free(n1);
     try mlx.check(mlx.mlx_fast_rms_norm(&n1, c1.x, nw, 1e-5, s));
     try near.check(s, pre1.normed, n1, alloc);
+}
+
+test "glm5 hcPre over R rows equals R one-row dispatches, up to the widest verify window" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(33);
+    const rand = prng.random();
+    const d: c_int = 1024;
+    const wv = try alloc.alloc(f32, @intCast(HC * d * MIX));
+    defer alloc.free(wv);
+    for (wv) |*x| x.* = 0.02 * rand.floatNorm(f32);
+    var nv: [1024]f32 = undefined;
+    for (&nv) |*x| x.* = 1.0 + 0.1 * rand.floatNorm(f32);
+    var bv: [MIX]f32 = undefined;
+    for (&bv) |*x| x.* = 0.5 * rand.floatNorm(f32);
+    const scv = [3]f32{ 0.8, 1.1, 0.9 };
+    const bf = struct {
+        fn of(st: mlx.mlx_stream, v: []const f32, shape: []const c_int) !mlx.mlx_array {
+            const f = mlx.mlx_array_new_data(v.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&o, f, .bfloat16, st));
+            return o;
+        }
+    };
+    const nw = try bf.of(s, &nv, &.{d});
+    defer _ = mlx.mlx_array_free(nw);
+    const fn_rows = mlx.mlx_array_new_data(wv.ptr, &[_]c_int{ MIX, HC * d }, 2, .float32);
+    defer _ = mlx.mlx_array_free(fn_rows);
+    const base = mlx.mlx_array_new_data(&bv, &[_]c_int{MIX}, 1, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    const scale = mlx.mlx_array_new_data(&scv, &[_]c_int{3}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scale);
+
+    var rows: c_int = 2;
+    while (rows <= 16) : (rows += 1) {
+        const sv = try alloc.alloc(f32, @intCast(rows * HC * d));
+        defer alloc.free(sv);
+        for (sv) |*x| x.* = rand.floatNorm(f32);
+        const stream = try bf.of(s, sv, &.{ 1, rows, HC, d });
+        defer _ = mlx.mlx_array_free(stream);
+        try testing.expect(hcRowsServes(s, mlx.getShape(stream), .bfloat16, fn_rows, nw));
+        var all = try hcPre(s, stream, null, fn_rows, scale, base, nw, 20, 1e-6, 1e-5, 1e-5);
+        defer all.deinit();
+        const got = try readF32(all.normed, s, alloc);
+        defer alloc.free(got);
+        const got_post = try readF32(all.post, s, alloc);
+        defer alloc.free(got_post);
+        var r: c_int = 0;
+        while (r < rows) : (r += 1) {
+            var one = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(one);
+            try mlx.check(mlx.mlx_slice(&one, stream, &[_]c_int{ 0, r, 0, 0 }, 4, &[_]c_int{ 1, r + 1, HC, d }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+            var pre = try hcPre(s, one, null, fn_rows, scale, base, nw, 20, 1e-6, 1e-5, 1e-5);
+            defer pre.deinit();
+            const want = try readF32(pre.normed, s, alloc);
+            defer alloc.free(want);
+            const want_post = try readF32(pre.post, s, alloc);
+            defer alloc.free(want_post);
+            const off: usize = @intCast(r * d);
+            try testing.expectEqualSlices(f32, want, got[off .. off + @as(usize, @intCast(d))]);
+            const poff: usize = @intCast(r * HC);
+            try testing.expectEqualSlices(f32, want_post, got_post[poff .. poff + HC]);
+        }
+    }
 }
 
 test "glm5 head-folded latent attention matches sdpa with the keys broadcast to every head" {
@@ -2879,6 +2943,76 @@ test "glm5 a pool's completing row carries its pooled key, across a chunk bounda
             const want = if (pos % 4 == 3 and c >= D) pk[(pos / 4) * D + (c - D)] else r[pos * W + c];
             // The chain sums 4 bf16 products in bf16; the kernel in f32.
             try testing.expectApproxEqAbs(want, g[i * W + c], 0.03 + 0.02 * @abs(want));
+        }
+    }
+}
+
+test "glm5 a deferred expand over R rows rebuilds the materialized stream and feeds the next hcPre, bit for bit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(77);
+    const rand = prng.random();
+    const d: c_int = 1024;
+    const wv = try alloc.alloc(f32, @intCast(HC * d * MIX));
+    defer alloc.free(wv);
+    for (wv) |*x| x.* = 0.02 * rand.floatNorm(f32);
+    var nv: [1024]f32 = undefined;
+    for (&nv) |*x| x.* = 1.0 + 0.1 * rand.floatNorm(f32);
+    var bv: [MIX]f32 = undefined;
+    for (&bv) |*x| x.* = 0.5 * rand.floatNorm(f32);
+    const scv = [3]f32{ 0.8, 1.1, 0.9 };
+    const fn_rows = mlx.mlx_array_new_data(wv.ptr, &[_]c_int{ MIX, HC * d }, 2, .float32);
+    defer _ = mlx.mlx_array_free(fn_rows);
+    const base = mlx.mlx_array_new_data(&bv, &[_]c_int{MIX}, 1, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    const scale = mlx.mlx_array_new_data(&scv, &[_]c_int{3}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scale);
+    const bf = struct {
+        fn of(st: mlx.mlx_stream, r: std.Random, a: std.mem.Allocator, shape: []const c_int) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |x| n *= @intCast(x);
+            const buf = try a.alloc(f32, n);
+            defer a.free(buf);
+            for (buf) |*x| x.* = r.floatNorm(f32);
+            const f = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&o, f, .bfloat16, st));
+            return o;
+        }
+    };
+    const nw = try bf.of(s, rand, alloc, &.{d});
+    defer _ = mlx.mlx_array_free(nw);
+    for ([_]c_int{ 2, 5, HC_PRE_MAX_ROWS }) |rows| {
+        const stream = try bf.of(s, rand, alloc, &.{ 1, rows, HC, d });
+        defer _ = mlx.mlx_array_free(stream);
+        const y = try bf.of(s, rand, alloc, &.{ 1, rows, d });
+        defer _ = mlx.mlx_array_free(y);
+        try testing.expect(hcRowsServes(s, mlx.getShape(stream), .bfloat16, fn_rows, nw));
+        var pre0 = try hcPre(s, stream, null, fn_rows, scale, base, nw, 20, 1e-6, 1e-5, 1e-5);
+        defer pre0.deinit();
+        const c0: Collapsed = .{ .x = pre0.normed, .post = pre0.post, .comb = pre0.comb };
+        const want_h = try expand(s, y, stream, &c0);
+        defer _ = mlx.mlx_array_free(want_h);
+        var df = pre0.defer_(y, stream);
+        defer df.deinit();
+        const got_h = try df.materialize(s);
+        defer _ = mlx.mlx_array_free(got_h);
+        var want_pre = try hcPre(s, want_h, null, fn_rows, scale, base, nw, 20, 1e-6, 1e-5, 1e-5);
+        defer want_pre.deinit();
+        var got_pre = try hcPre(s, null, &df, fn_rows, scale, base, nw, 20, 1e-6, 1e-5, 1e-5);
+        defer got_pre.deinit();
+        const pairs = [_][2]mlx.mlx_array{ .{ got_h, want_h }, .{ got_pre.h, want_h }, .{ got_pre.normed, want_pre.normed }, .{ got_pre.post, want_pre.post }, .{ got_pre.comb, want_pre.comb } };
+        for (pairs, 0..) |pr, i| {
+            const a = try readF32(pr[0], s, alloc);
+            defer alloc.free(a);
+            const b = try readF32(pr[1], s, alloc);
+            defer alloc.free(b);
+            if (!std.mem.eql(f32, a, b)) std.debug.print("{d} rows: output {d} differs\n", .{ rows, i });
+            try testing.expectEqualSlices(f32, b, a);
         }
     }
 }

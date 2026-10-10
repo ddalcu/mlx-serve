@@ -29,11 +29,14 @@ struct DrafterGem: Equatable, Hashable, Identifiable {
     var needsDownload: Bool { kind != .mtp }
     /// Loads through the server's DFlash engine (a pack's `drafter/` does too).
     var isDflash: Bool { kind != .mtp && kind != .gemmaAssistant }
+    /// Terms shown where a download is offered: incoai's files are CC BY-NC-ND 4.0.
+    var licenseNote: String? { repo == DrafterGems.glmDFlash2Repo ? "non-commercial license" : nil }
 }
 
 enum DrafterGems {
     static let packFolder = "drafter"
     static let qwen38DFlash2Repo = "z-lab/Qwen3.8-27B-DFlash2"
+    static let glmDFlash2Repo = "incoai/GLM-5.3-Flash-DFlash2"
     static let museAssistantRepo = "meta-models/Muse-Glimmer-30B-assistant"
     /// LiquidAI's DSpark drafters, by the LFM2.5 base they draft for.
     static let lfmDSparkRepos = ["lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-DSpark", "lfm2.5-8b-a1b": "LiquidAI/LFM2.5-8B-A1B-DSpark"]
@@ -59,6 +62,8 @@ enum DrafterGems {
                 : DrafterGem(kind: .dflash2, repo: qwen38DFlash2Repo, subfolder: nil, sizeGB: 3.85))
         } else if packHasDrafter {
             out.append(DrafterGem(kind: .packDrafter, repo: repoId, subfolder: packFolder, sizeGB: packGB))
+        } else if base.contains("glm-5.3-flash") {
+            out.append(DrafterGem(kind: .dflash2, repo: glmDFlash2Repo, subfolder: nil, sizeGB: 2.34))
         } else if base.contains("muse-glimmer") {
             out.append(DrafterGem(kind: .museAssistant, repo: museAssistantRepo, subfolder: nil, sizeGB: 5.11))
         } else if let repo = lfmDSparkRepos.first(where: { base.hasPrefix($0.key) })?.value {
@@ -71,10 +76,10 @@ enum DrafterGems {
         return out
     }
 
-    /// The gem a fresh download fills its socket with. z-lab's 27B drafter is
-    /// offered but never auto-filled: our packs ship it only where it pays.
+    /// The gem a fresh download fills its socket with. The separate-repo DFlash2
+    /// drafters are offered but never auto-filled: they pay on code and edits, not everywhere.
     static func defaultGem(_ gems: [DrafterGem]) -> DrafterGem? {
-        gems.first { $0.needsDownload && $0.repo != qwen38DFlash2Repo }
+        gems.first { $0.needsDownload && $0.repo != qwen38DFlash2Repo && $0.repo != glmDFlash2Repo }
     }
 
     /// Whether `gem` fits beside a model of `modelGB` in this Mac's usable memory.

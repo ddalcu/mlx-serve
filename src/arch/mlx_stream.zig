@@ -146,6 +146,10 @@ pub fn blockSize(m: *const Model) u32 {
     return arch.draft_lane.blockSize(m.module);
 }
 
+pub fn laneName(m: *const Model) []const u8 {
+    return arch.draft_lane.laneName(m.module);
+}
+
 pub const SamplingParams = sdk.SamplingParams;
 
 /// Arms the draft lane for a request with nothing that shapes its logits (null: serial). The plugin samples a sampled

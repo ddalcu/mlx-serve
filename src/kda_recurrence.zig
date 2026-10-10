@@ -161,7 +161,61 @@ pub const DecodeOut = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, stat
 /// `proj` [1, T, W] is the row-joined input projection: q|k|v at 0, then the first gate stages
 /// and b at `off_ga`, `off_fa`, `off_b`. `f_b`/`g_b` are the second gate stages ([H*Dk, Dk]),
 /// `a_log` f32 [H], `dt_bias` f32 [H*Dk]. Null outside the shapes served.
+/// Rows one kernel launch takes: its threadgroup arrays hold TOK rows of the 32 KB budget.
+const STEP_ROWS: c_int = 8;
+/// Rows `decodeStep` serves: two launches, the second continuing from the first's conv window and state.
+pub const MAX_WINDOW: c_int = 2 * STEP_ROWS;
+
+/// `decodeRows` over up to `MAX_WINDOW` rows: a window past one launch's rows runs in passes of 8, each starting
+/// from the previous pass's conv window and state, so the rows see the recurrence one launch would give them.
 pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa: c_int, off_b: c_int, heads: c_int, conv_state: mlx.mlx_array, conv_w: mlx.mlx_array, a_log: mlx.mlx_array, dt_bias: mlx.mlx_array, state: mlx.mlx_array, norm_w: mlx.mlx_array, f_b: Low, g_b: Low, lower_bound: f32, norm_eps: f32, capture: bool) !?DecodeOut {
+    const ps = mlx.getShape(proj);
+    if (ps.len != 3 or ps[1] <= STEP_ROWS) return decodeRows(s, proj, off_ga, off_fa, off_b, heads, conv_state, conv_w, a_log, dt_bias, state, norm_w, f_b, g_b, lower_bound, norm_eps, capture);
+    if (ps[1] > MAX_WINDOW) return null;
+    var first_in = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(first_in);
+    try mlx.check(mlx.mlx_slice(&first_in, proj, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, STEP_ROWS, ps[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    var rest_in = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rest_in);
+    try mlx.check(mlx.mlx_slice(&rest_in, proj, &[_]c_int{ 0, STEP_ROWS, 0 }, 3, &[_]c_int{ 1, ps[1], ps[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    const a = (try decodeRows(s, first_in, off_ga, off_fa, off_b, heads, conv_state, conv_w, a_log, dt_bias, state, norm_w, f_b, g_b, lower_bound, norm_eps, capture)) orelse return null;
+    defer _ = mlx.mlx_array_free(a.conv_state);
+    defer _ = mlx.mlx_array_free(a.state);
+    defer _ = mlx.mlx_array_free(a.y);
+    defer if (a.state_seq.ctx != null) {
+        _ = mlx.mlx_array_free(a.state_seq);
+    };
+    const b = (try decodeRows(s, rest_in, off_ga, off_fa, off_b, heads, a.conv_state, conv_w, a_log, dt_bias, a.state, norm_w, f_b, g_b, lower_bound, norm_eps, capture)) orelse return null;
+    errdefer {
+        _ = mlx.mlx_array_free(b.conv_state);
+        _ = mlx.mlx_array_free(b.state);
+    }
+    defer _ = mlx.mlx_array_free(b.y);
+    defer if (b.state_seq.ctx != null) {
+        _ = mlx.mlx_array_free(b.state_seq);
+    };
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    var seq = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(seq);
+    {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, a.y);
+        _ = mlx.mlx_vector_array_append_value(vec, b.y);
+        try mlx.check(mlx.mlx_concatenate_axis(&y, vec, 1, s));
+    }
+    if (capture) {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, a.state_seq);
+        _ = mlx.mlx_vector_array_append_value(vec, b.state_seq);
+        try mlx.check(mlx.mlx_concatenate_axis(&seq, vec, 0, s));
+    }
+    return .{ .y = y, .conv_state = b.conv_state, .state = b.state, .state_seq = if (capture) seq else .{ .ctx = null } };
+}
+
+fn decodeRows(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa: c_int, off_b: c_int, heads: c_int, conv_state: mlx.mlx_array, conv_w: mlx.mlx_array, a_log: mlx.mlx_array, dt_bias: mlx.mlx_array, state: mlx.mlx_array, norm_w: mlx.mlx_array, f_b: Low, g_b: Low, lower_bound: f32, norm_eps: f32, capture: bool) !?DecodeOut {
     if (!mlx.streamIsGpu(s)) return null;
     const ps = mlx.getShape(proj);
     const dt = mlx.mlx_array_dtype(proj);
@@ -381,13 +435,12 @@ test "kda per-core recurrence follows the bounded-gate delta rule" {
     try testing.expect(max_s < 1e-4);
 }
 
-test "kda decode step over T rows equals T one-row steps, bit for bit, at the gate widths a verify window serves" {
+fn kdaRowsCase(rows: c_int) !void {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const s = mlx.gpuStream();
     const heads: c_int = 64;
     const qkv: c_int = heads * 128;
-    const rows: c_int = 4;
     const off_ga: c_int = 3 * qkv;
     const off_fa = off_ga + 128;
     const off_b = off_fa + 128;
@@ -461,7 +514,8 @@ test "kda decode step over T rows equals T one-row steps, bit for bit, at the ga
         const g_b: Low = .{ .w = gw, .s = gs_, .b = gbias, .bits = bits, .gs = 64 };
 
         // A threadgroup past the GPU's cap declines and leaves no latched error behind.
-        const launchable_at = &decode_launchable[0][@intCast(rows)][@intFromBool(bits == 8)];
+        const launchable_at = &decode_launchable[0][@intCast(@min(rows, STEP_ROWS))][@intFromBool(bits == 8)];
+        launchable_at.* = null; // an earlier case may have probed this width already
         {
             decode_threads = 2048;
             defer decode_threads = 1024;
@@ -515,4 +569,13 @@ test "kda decode step over T rows equals T one-row steps, bit for bit, at the ga
         try testing.expect(try mk.equal(multi.conv_state, conv, s));
         try testing.expect(try mk.equal(multi.state, st, s));
     }
+}
+
+test "kda decode step over T rows equals T one-row steps, bit for bit, at the gate widths a verify window serves" {
+    try kdaRowsCase(4);
+}
+
+test "kda decode step in two launches (9 and 16 rows) equals the one-row steps, bit for bit" {
+    try kdaRowsCase(9);
+    try kdaRowsCase(16);
 }

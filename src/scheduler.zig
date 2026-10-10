@@ -61,8 +61,8 @@ const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
@@ -304,6 +304,8 @@ pub const SubmitParams = struct {
     mrope_total: usize = 0,
     mrope_delta: i32 = 0,
     logprobs_n: u32 = 0,
+    /// `/v1/completions` echo: score every prompt token (cold prefill, no restore).
+    prompt_logprobs: bool = false,
     /// Wave 1.A: per-request override of the process-default KV-cache quant
     /// scheme. When non-null, this slot's KVCache is constructed with this
     /// config instead of `Scheduler.kv_quant_config`. Lets one server host a
@@ -416,8 +418,8 @@ pub var prefill_chunk_widen_ok: ?*const fn (
     u64,
 ) bool = null;
 
-/// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) void = null;
+/// Logs the numbers the estimator compared on a refusal and returns them, {needed, available} bytes.
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) [2]u64 = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
@@ -550,7 +552,7 @@ pub const Slot = struct {
     planner_price_transition: bool = false,
     planner_last_width: u8 = 255,
     planner_force_plain: bool = false,
-    dflash_company_ticks: u8 = 0,
+    company_ticks: u8 = 0,
     mtp_publish_ns: u64 = 0,
     mtp_publish_gap_ms: f32 = 0,
 
@@ -568,6 +570,9 @@ pub const Slot = struct {
     out_idx: usize,
     finished: bool,
     error_code: ?[]const u8,
+    /// {needed, available} bytes the inference thread compared when it refused this prefill, so the
+    /// client's `PrefillDoesNotFit` can quote them as the connection thread's refusal does.
+    refused_bill: ?[2]u64 = null,
     finish_reason: []const u8,
     /// Set ONLY by the degenerate-tail guard. The wire reason is "stop" so a
     /// client does not mistake the guard for output/context exhaustion; this
@@ -632,6 +637,10 @@ pub const Slot = struct {
     /// `nonStreamingViaScheduler` (or equivalent) at completion; if the
     /// caller doesn't consume, `Slot.deinit` frees the contents.
     logprobs_buf: std.ArrayList(generate_mod.LogprobResult),
+    /// Prompt-token logprobs for an echo request (`SubmitParams.prompt_logprobs`),
+    /// filled by prefill; taken by the conn thread like `logprobs_buf`.
+    prompt_logprobs: bool,
+    prompt_logprobs_buf: std.ArrayList(generate_mod.LogprobResult),
 
     /// Initialize but do NOT take ownership of caches — those are allocated
     /// inside `init` from the slot's allocator.
@@ -780,6 +789,9 @@ pub const Slot = struct {
             .generated_ids = null,
             .was_pad_only = true,
             .logprobs_buf = .empty,
+            .prompt_logprobs = params.prompt_logprobs,
+            .prompt_logprobs_buf = .empty,
+            .skip_prefix_cache = params.prompt_logprobs,
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the
@@ -845,8 +857,17 @@ pub const Slot = struct {
         // 0 so this is a no-op on the success path.
         for (self.logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
         self.logprobs_buf.deinit(self.allocator);
+        for (self.prompt_logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
+        self.prompt_logprobs_buf.deinit(self.allocator);
         self.out_buf.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// Inference thread: the echo sink, emptied first, since a retried prefill starts over.
+    fn freshPromptLogprobs(self: *Slot) *std.ArrayList(generate_mod.LogprobResult) {
+        for (self.prompt_logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
+        self.prompt_logprobs_buf.clearRetainingCapacity();
+        return &self.prompt_logprobs_buf;
     }
 
     /// Inference thread: record the reasoning→payload boundary so it is
@@ -1136,6 +1157,9 @@ pub const EmbedRequest = struct {
     model: *model_registry_mod.LoadedModel,
     /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
     token_seqs: []const []const u32,
+    /// The soft-token rows [1, n, hidden] of the ONE prompt's images and video, in prompt order. The request
+    /// owns them: the inference thread frees them when the forward is done.
+    vision_embeddings: ?mlx.mlx_array = null,
     /// Output: one pooled L2-normalized embedding per input on success.
     /// Rows + outer slice owned by `allocator`; caller frees.
     results: ?[][]f32 = null,
@@ -2357,16 +2381,7 @@ pub const Scheduler = struct {
         // re-enable check resumes the moment concurrency drops back to one.
         // Pinned by `a spec_disabled_runtime slot is batchable, and that is the
         // documented trade` below — flip either half deliberately, not by accident.
-        return gen.spec_disabled_runtime or specTickMode(
-            slot.enable_mtp,
-            gen.mtp != null,
-            slot.enable_drafter,
-            gen.drafter != null,
-            gen.dflash != null,
-            slot.enable_pld,
-            gen.pld_enabled,
-            gen.dspark_enabled,
-        ) == .regular;
+        return gen.spec_disabled_runtime or slotSpecMode(slot, gen) == .regular;
     }
 
     /// Does this slot owe a module-head release? One single-slot tick lands it.
@@ -2783,7 +2798,7 @@ const GgufRoute = struct {
 /// Both load construction sites (here and main.zig's startup load) stamp the
 /// per-model settings onto the config the bills and defaults read.
 /// The kwargs strings MOVE to the freshly loaded `chat_config` (same allocator).
-/// `mtp_flag` false (`--no-mtp`) stamps the head off so the memory bills skip it.
+/// `mtp_flag` false (`--no-mtp`) stamps the head off unless the model overrides it.
 pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *model_settings.Override, mtp_flag: bool) void {
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
@@ -3016,9 +3031,9 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (mtp_path) |p| log.info("[ds4] MTP draft head: {s}\n", .{p});
 
     const engine = try arch_ds4.Ds4Engine.open(sch.allocator, params.ds4_path, .{
-        .backend = .metal,
         .warm_weights = true,
         .ssd_streaming = params.ds4_ssd_streaming,
+        .prefill_chunk = generate_mod.explicitPrefillChunkU32(),
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
         .mtp_margin = DS4_MTP_MARGIN,
@@ -3206,6 +3221,16 @@ pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers
     return base + base / 10;
 }
 
+/// Where a media peak lives. Unified memory holds it in one pool. CUDA keeps file-loaded
+/// weights in managed memory backed by host RAM and the engine's working buffers on the GPU,
+/// so there the weights (capped by the peak: a staged pack never holds its whole sum) are
+/// RAM's and only the rest of the peak is the GPU's.
+pub fn mediaBill(peak: u64, weights_on_disk: u64, weights_page: bool) struct { ram: u64, gpu: u64 } {
+    if (!weights_page or weights_on_disk == 0) return .{ .ram = peak, .gpu = 0 };
+    const ram = @min(peak, weights_on_disk);
+    return .{ .ram = ram, .gpu = peak - ram };
+}
+
 /// What a media load COMMITS to the residency budget once ready. Same estimator
 /// the gate reserved against, so reserve and commit can only differ by the
 /// gate's headroom: committing the dir sum instead parked H3 in the budget at
@@ -3240,19 +3265,37 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         defer if (peeked) |p| sch.allocator.free(p);
         const backend_type = peeked orelse params.config.model_type;
         const peak = gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, backend_type);
-        const avail = availForLoad(peak);
+        const cuda = mlx.cudaAvailable();
+        const bill = mediaBill(peak, if (cuda) gen_mod.sumSafetensorsAt(sch.io, params.model_dir) else 0, cuda);
+        const avail = availForLoad(bill.ram);
         const gb = 1024.0 * 1024.0 * 1024.0;
         log.info("[preflight] media peak ~{d:.2} GB (staged residency), available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(peak)) / gb,
             @as(f64, @floatFromInt(avail)) / gb,
         });
-        if (memInsufficientForLoad(peak, avail)) {
+        if (memInsufficientForLoad(bill.ram, avail)) {
             log.err("Insufficient memory for this media model: needs ~{d:.1} GB free ({d:.1} GB for the model plus headroom for warmup buffers) but only {d:.1} GB is available. Unload the chat model or close other apps and retry; pass --skip-mem-preflight to override.\n", .{
-                @as(f64, @floatFromInt(loadRequirementBytes(peak))) / gb,
-                @as(f64, @floatFromInt(peak)) / gb,
+                @as(f64, @floatFromInt(loadRequirementBytes(bill.ram))) / gb,
+                @as(f64, @floatFromInt(bill.ram)) / gb,
                 @as(f64, @floatFromInt(avail)) / gb,
             });
             return error.InsufficientMemory;
+        }
+        if (bill.gpu > 0) {
+            var active: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active);
+            const gpu_free = mlx.maxRecommendedWorkingSet() -| active;
+            log.info("[preflight] media working set ~{d:.2} GB on the GPU, {d:.2} GB free\n", .{
+                @as(f64, @floatFromInt(bill.gpu)) / gb,
+                @as(f64, @floatFromInt(gpu_free)) / gb,
+            });
+            if (gpu_free > 0 and bill.gpu > gpu_free) {
+                log.err("Insufficient GPU memory for this media model: its working set needs ~{d:.1} GB but only {d:.1} GB of GPU memory is free. Unload other models and retry; pass --skip-mem-preflight to override.\n", .{
+                    @as(f64, @floatFromInt(bill.gpu)) / gb,
+                    @as(f64, @floatFromInt(gpu_free)) / gb,
+                });
+                return error.InsufficientMemory;
+            }
         }
     }
 
@@ -3698,10 +3741,17 @@ test "coldLoadVision honors the process-wide vision opt-out" {
 /// Memory a load of `need` bytes can use. A resident media cache is opportunistic, so a load that
 /// would be refused makes it let go first and the figure is read again.
 fn availForLoad(need: u64) u64 {
-    var avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+    var avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
     if (memInsufficientForLoad(need, avail) and gen_mod.releaseMediaResidency() > 0)
-        avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+        avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
     return avail;
+}
+
+/// The GPU ceiling on loaded weights. MLX's CUDA backend keeps file-loaded arrays in managed
+/// memory that pages to host RAM, so there RAM is the bound (and an allocation failure is a
+/// catchable error, not Metal's process-killing OOM); 0 = none.
+fn loadGpuLimit() u64 {
+    return if (mlx.cudaAvailable()) 0 else mlx.maxRecommendedWorkingSet();
 }
 
 fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
@@ -3724,22 +3774,9 @@ test "effectiveAvailableBytes prefers the per-process jetsam headroom when prese
 
 fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     if (weights_bytes == 0 or avail_bytes == 0) return false;
-    // Headroom over the weights for warmup compute buffers + a baseline KV cache.
-    // `avail_bytes` (status.getAvailableMemBytes) now excludes the resident anon
-    // set — an already-loaded model counts as used while file cache counts as free
-    // — so this margin can be generous without wrongly refusing a fresh load.
-    // CAVEAT: the KV cache scales with --ctx-size, which this guard doesn't see;
-    // a very large context can still exceed this margin (follow-up: plumb ctx +
-    // kv_quant to size KV precisely). Bypass with --skip-mem-preflight.
-    // The proportional term is CAPPED: headroom pays for warmup buffers and a
-    // baseline KV cache, and neither scales with a MoE's TOTAL weights (our
-    // 109.7 GB DeepSeek-V4 mirror activates 13B). Uncapped, weights/8 demanded
-    // 14.7 GB on that model — 124.4 GB total — which a 128 GB Mac cannot have,
-    // so the guard refused the flagship checkpoint on exactly the hardware its
-    // model card names, while --skip-mem-preflight booted it repeatedly and
-    // served 6.7K-token prefills with ~8.6 GB to spare. 6 GB keeps the original
-    // margin for every model under 48 GB (where it was tuned) and stays inside
-    // the measured envelope above it.
+    // Headroom over the weights for warmup buffers + a baseline KV cache (see
+    // `loadRequirementBytes`). `avail_bytes` (status.getAvailableMemBytes) is
+    // what the OS grants a new wiring, never total − used. --skip-mem-preflight bypasses.
     return avail_bytes < loadRequirementBytes(weights_bytes);
 }
 
@@ -3815,6 +3852,23 @@ pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     return weights_bytes + headroom;
 }
 
+test "media bill: CUDA checks the weights against RAM and only the working set against the GPU" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // Music3 8-bit: 13 GB of weights + its 6 GB generation buffer.
+    const peak = 13 * GB + gen_mod.MUSIC3_GEN_BUFFER_BYTES;
+    const cuda = mediaBill(peak, 13 * GB, true);
+    try std.testing.expectEqual(13 * GB, cuda.ram);
+    try std.testing.expectEqual(gen_mod.MUSIC3_GEN_BUFFER_BYTES, cuda.gpu);
+    // Unified memory holds both in one pool, as before.
+    const unified = mediaBill(peak, 13 * GB, false);
+    try std.testing.expectEqual(peak, unified.ram);
+    try std.testing.expectEqual(@as(u64, 0), unified.gpu);
+    // A staged pack peaks below its file sum: the peak bounds the RAM bill, nothing is left for the GPU.
+    const staged = mediaBill(15 * GB, 40 * GB, true);
+    try std.testing.expectEqual(15 * GB, staged.ram);
+    try std.testing.expectEqual(@as(u64, 0), staged.gpu);
+}
+
 test "a refusal quotes the number it actually compared" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -3849,7 +3903,7 @@ test "BOTH preflight refusals quote the number they compared, not the weights" {
     const src = @embedFile("scheduler.zig");
     // Each refusal formats the REQUIREMENT as its first figure, from the one
     // helper the comparison itself uses — never a second formula that can drift.
-    const media_arg = "loadRequirement" ++ "Bytes(peak))) / gb";
+    const media_arg = "loadRequirement" ++ "Bytes(bill.ram))) / gb";
     try testing.expect(std.mem.indexOf(u8, src, media_arg) != null);
     const text_arg = "loadRequirement" ++ "Bytes(weights_bytes))) / gb";
     try testing.expect(std.mem.indexOf(u8, src, text_arg) != null);
@@ -3924,13 +3978,16 @@ test "a sidecar bills its loaded width, and only an in-dir one is dropped to fit
 test "memInsufficientForLoad: headroom + unknown-query guards" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
-    // A 6.9 GB 4-bit model with ~10 GB genuinely available — file cache is
-    // excluded from the new anon-aware available figure (computeAvailableBytes),
-    // so this is what a 16 GB Mac actually reports pre-load. Needs ~8.8 GB
+    // A 6.9 GB 4-bit model with ~10 GB available (free + speculative + the file
+    // cache the OS will grant) — what a 16 GB Mac reports pre-load. Needs ~8.8 GB
     // (weights + weights/8 + 1 GB for warmup + baseline KV) → loads.
     try std.testing.expect(!memInsufficientForLoad(6900 * MB, 10 * GB));
     // Restart-into-pressure: 42 GB weights, only 44 GB free → needs ~46, refuse.
     try std.testing.expect(memInsufficientForLoad(42 * GB, 44 * GB));
+    // #45 end-to-end: a prior 7 GB model resident in the anon set leaves 3 GB of
+    // reclaimable classes — the guard must refuse the second 7 GB load, or warmup
+    // dies in an uncatchable Metal OOM instead of this 400.
+    try std.testing.expect(memInsufficientForLoad(7 * GB, 3 * GB));
     // Plenty of headroom → allow.
     try std.testing.expect(!memInsufficientForLoad(42 * GB, 86 * GB));
     // Exactly weights, no headroom → refuse.
@@ -4403,7 +4460,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 }
                 log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
             }
-            ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            // Rows past 16 are a prefill chunk unless `_KV` says a context stands behind them (verify widths up to 32).
+            const prefill_rows = rows > 16 and kv_pre == 0;
+            ctx.capture_ssm_seq = rows > 1 and rows <= 32 and !prefill_rows and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
             // MLX_SERVE_DECODE_FWD_UBENCH_TREE=1 at 16 rows: verify a fixed draft
             // tree (a 9-row trunk, siblings at depths 1-4, their children), as a round does.
             const tree_parents = [16]i32{ -1, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 9, 10, 11 };
@@ -4415,7 +4474,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // Prefill widths: every forward starts from an empty cache (else each
             // one attends over the previous ones' rows) and skips the lm_head,
             // which a real intermediate chunk never evaluates.
-            const prefill_rows = rows > 16 and kv_pre == 0;
             ctx.skip_lm_head = prefill_rows;
             log.info("[fwd-ubench] rows={d} capture={} prefill={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, prefill_rows });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
@@ -5293,7 +5351,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         _ = s.in_pass.fetchSub(1, .acq_rel);
     };
 
-    dflashYieldTick(active.items);
+    specYieldTick(active.items);
 
     // 4. Decode tick. Charge the full wall-clock tick time to each
     //    participating slot — for batched ticks this matches the per-slot
@@ -5496,7 +5554,12 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 /// the global xfm.cache before every sub-batch, and wakes the conn thread.
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     const xfm_ptr = req.model.transformer.?;
-    const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
+    // Held in a local: the request lives on the waiting thread's stack and is gone once `done` is observed.
+    const vision = req.vision_embeddings;
+    defer if (vision) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    const results = generate_mod.computeEmbeddingsBatchWith(req.allocator, xfm_ptr, req.token_seqs, vision) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
@@ -5696,10 +5759,17 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
             _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
         }
     }
+    var prev_mem_limit: usize = 0;
+    const gen_mem_limit = genMemoryLimit(mlx.cudaAvailable(), sch.gen_reserve_bytes);
+    if (gen_mem_limit) |lim| _ = mlx.mlx_set_memory_limit(&prev_mem_limit, lim);
     if (reqs.len == 1) req.run(req.ctx) else {
         var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;
         for (reqs, ctxs[0..reqs.len]) |r, *c| c.* = r.ctx;
         req.merge.?.run_many(ctxs[0..reqs.len]);
+    }
+    if (gen_mem_limit != null) {
+        var tmp: usize = 0;
+        _ = mlx.mlx_set_memory_limit(&tmp, prev_mem_limit);
     }
     if (small_ram) {
         var tmp: usize = 0;
@@ -5720,6 +5790,13 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
         r.done_cond.broadcast(sch.io);
         r.done_mu.unlock(sch.io);
     }
+}
+
+/// MLX memory limit for a media job, null = keep MLX's own. MLX only waits on
+/// in-flight work (whose graphs pin their inputs) once active memory passes this
+/// limit; CUDA's default is 95% of VRAM, so a diffusion step fills the card.
+fn genMemoryLimit(cuda: bool, est_peak: u64) ?usize {
+    return if (cuda) @intCast(est_peak) else null;
 }
 
 /// Clear MLX's allocator cache after a job holding `cached` bytes: always for
@@ -5885,6 +5962,8 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             }
         }
     }
+    // Plain DFlash rounds park their captures; they join the context before it is paired with the prefix.
+    gen_ptr.dflashSettle(slot.allocator, total_len) catch |err| log.warn("[hot-cache] dflash context settle failed: {s} — not committed\n", .{@errorName(err)});
     // A runtime fallback leaves the dormant assistant context at its last
     // speculative boundary while serial decode continues growing the trunk.
     // Only pair the assistant payload with this prefix when both end at the
@@ -6056,6 +6135,19 @@ pub const LoopStop = struct {
 pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
     const d = generate_mod.degenerateTail(generated_ids) orelse return null;
     return .{ .tier = d.tier, .trim_start = d.start };
+}
+
+const LoopAction = enum { cut, close_thought };
+
+/// A loop convicted INSIDE an open think block is recoverable once per request:
+/// commit the bound's early-stop line + closer and let the model answer. Anything
+/// else (answer-side loop, second loop, no room, no bound) keeps the ordinary cut.
+fn loopRecoveryAction(tb: ?*generate_mod.ThinkBound, ids: []const u32, completion_tokens: u32, max_tokens: u32) LoopAction {
+    const b = tb orelse return .cut;
+    b.observe(ids);
+    if (b.fired or !b.in_think) return .cut;
+    if (!generate_mod.forcedBoundaryCanContinue(completion_tokens, max_tokens, b.forced.len + 1)) return .cut;
+    return .close_thought;
 }
 
 var loop_trim_env: ?bool = null;
@@ -6740,25 +6832,33 @@ const InterleaveCtx = struct {
     chunk_sw: io_util.Stopwatch,
 };
 
-/// Ticks a DFlash slot must see company before it gives up speculation for the batch.
-const DFLASH_COMPANY_TICKS: u8 = 2;
+/// Ticks a speculating slot must see company before it gives up speculation for the batch.
+const COMPANY_YIELD_TICKS: u8 = 2;
 
 pub fn companyStreak(streak: u8, has_company: bool) u8 {
     return if (has_company) streak +| 1 else 0;
 }
 
-/// The first request of a burst was admitted alone, so it armed DFlash and ticks serial
-/// beside the group; once company is steady it yields.
-fn dflashYieldTick(active: []const *Slot) void {
+/// Spec modes that give way to the batched group once a slot has company: the DFlash
+/// family everywhere, PLD on CUDA, where a batched tick costs about one plain step.
+pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool) bool {
+    return mode == .dflash or mode == .dspark or (mode == .pld and cuda);
+}
+
+/// The first request of a burst was admitted alone, so it armed speculation and ticks
+/// serial beside the group; once company is steady it yields.
+fn specYieldTick(active: []const *Slot) void {
     for (active) |s| {
         const gen = if (s.legacy_gen) |*g| g else continue;
-        if (gen.dflash == null or gen.spec_disabled_runtime) continue;
+        if (gen.spec_disabled_runtime) continue;
+        const mode = slotSpecMode(s, gen);
+        if (!yieldsToCompany(mode, mlx.cudaAvailable())) continue;
         var company = false;
         for (active) |o| {
             if (o != s and o.model == s.model) company = true;
         }
-        s.dflash_company_ticks = companyStreak(s.dflash_company_ticks, company);
-        if (s.dflash_company_ticks >= DFLASH_COMPANY_TICKS) gen.dflashYieldToCompany();
+        s.company_ticks = companyStreak(s.company_ticks, company);
+        if (s.company_ticks >= COMPANY_YIELD_TICKS) gen.yieldSpecToCompany(@tagName(mode));
     }
 }
 
@@ -6787,6 +6887,16 @@ pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
 pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
     const text = flag orelse env orelse return 0;
     return parseDecodeShare(text);
+}
+
+/// An echo prefill ranks every row against the whole vocab: the top-k sort peaks at five
+/// [chunk, vocab] 4-byte arrays (1.25 GiB at 256 rows of Gemma's 262k vocab), beside the
+/// chunk's own bf16 logits (128 MiB).
+const PROMPT_LOGPROBS_CHUNK: u32 = 256;
+
+fn promptLogprobsWidthCap(echo: bool, cap: u32) u32 {
+    if (!echo) return cap;
+    return if (cap == 0) PROMPT_LOGPROBS_CHUNK else @min(cap, PROMPT_LOGPROBS_CHUNK);
 }
 
 /// The width a prefill started beside live decoders may run at, 0 = no cap. Decided when
@@ -7346,7 +7456,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (!report.admitted) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
                     if (prefill_admission_refused_log) |report_fn| {
-                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                        slot.refused_bill = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.
@@ -7418,12 +7528,13 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         sampling,
         slot.eos_token_ids,
         .{
-            .pld_enabled = use_pld or dsv4_spec_intent,
+            .pld_enabled = use_pld,
             .drafter_enabled = use_drafter,
             .drafter = if (use_drafter) slot.drafter else null,
             .drafter_block_size = slot.drafter_block_size,
             .dflash_enabled = use_dflash,
             .dflash = if (use_dflash) slot.dflash else null,
+            .dflash_policy = use_dflash and generate_mod.Generator.dflashPolicyFor(slot.model.config.?),
             // The dflash-resolved block rides the shared drafter_block_size.
             .dflash_block_size = slot.drafter_block_size,
             // Use the resolved thinking mode and normalize the M5/block-16
@@ -7433,7 +7544,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.enable_thinking,
                 slot.model.config.?.isMoe(),
             ),
-            .mtp_enabled = use_mtp,
+            .mtp_enabled = use_mtp or dsv4_spec_intent,
             .mtp_acceptance = slot.model.config.?.mtpAcceptance(generate_mod.mtp_acceptance_default),
             .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(slot.model.config.?.mtp_greedy_tail_override),
             .mtp = if (use_mtp) slot.mtp else null,
@@ -7458,7 +7569,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, sch.decodingCount()),
-            .decode_share_width_cap = decodeShareAdmissionCap(sch.liveDecodingCount(), prefillDecodeShare()),
+            .decode_share_width_cap = promptLogprobsWidthCap(slot.prompt_logprobs, decodeShareAdmissionCap(sch.liveDecodingCount(), prefillDecodeShare())),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -7480,7 +7591,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
             else
                 null,
-            .chunk_width_hook = if (prefill_chunk_adapt != null)
+            .chunk_width_hook = if (prefill_chunk_adapt != null and !slot.prompt_logprobs)
                 .{ .ctx = &width_ctx, .call = chunkWidthCb, .confirm = chunkWidenConfirmCb }
             else
                 null,
@@ -7490,6 +7601,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // prefill final-token forward runs — a post-init field write is
             // too late for the certified lm_head prune.
             .logprobs_n = slot.logprobs_n,
+            .prompt_logprobs = if (slot.prompt_logprobs) slot.freshPromptLogprobs() else null,
         },
     );
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
@@ -7740,7 +7852,7 @@ pub const SpecInitWiring = struct {
     use_pld: bool,
     /// The request's spec INTENT, forwarded to the Generator chokepoint for a
     /// module-owned arch that has its OWN draft mode (dsv4 → DSpark). Rides
-    /// `pld_enabled` alongside `use_pld`.
+    /// `mtp_enabled` alongside `use_mtp`.
     native_intent: bool,
 };
 
@@ -7865,6 +7977,20 @@ pub fn specTickMode(
     return .regular;
 }
 
+/// `specTickMode` for a slot and its generator.
+fn slotSpecMode(slot: *const Slot, gen: *const Generator) SpecTickMode {
+    return specTickMode(
+        slot.enable_mtp,
+        gen.mtp != null,
+        slot.enable_drafter,
+        gen.drafter != null,
+        gen.dflash != null,
+        slot.enable_pld,
+        gen.pld_enabled,
+        gen.dspark_enabled,
+    );
+}
+
 /// Drive one Generator step (regular / PLD / drafter) and push emitted
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
@@ -7943,6 +8069,13 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
                 // to the ordinary loop-stop cut.
                 .refused => {},
             }
+        }
+        if (loopRecoveryAction(gen.sampling.think_bound, gen.generated_ids.items, gen.completion_tokens, gen.max_tokens) == .close_thought) {
+            log.warn("[loop-recover] repetition loop inside the thought at {d} generated tokens; closing it\n", .{gen.generated_ids.items.len});
+            const tb = gen.sampling.think_bound.?;
+            tb.fired = true;
+            _ = try commitForcedTick(sch, slot, gen, tb.forced, .think_bound);
+            return true;
         }
         var stop = relative_stop;
         stop.trim_start += loop_guard_start;
@@ -10132,7 +10265,7 @@ test "the batched gate reads DISPATCH, not the armed spec flags" {
     const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
     const hbody = src[hs..he];
     try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime") != null);
-    try testing.expect(std.mem.indexOf(u8, hbody, "specTickMode(") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "slotSpecMode(") != null);
 
     // The dispatch answer itself: a live MTP slot never ticks regular, an
     // unarmed one always does.
@@ -11278,11 +11411,29 @@ test "companyStreak: only consecutive ticks with company count" {
     try testing.expectEqual(@as(u8, 0), companyStreak(1, false));
 }
 
+test "yieldsToCompany: the DFlash family everywhere, PLD only on CUDA" {
+    for ([_]SpecTickMode{ .dflash, .dspark }) |m| {
+        try testing.expect(yieldsToCompany(m, false));
+        try testing.expect(yieldsToCompany(m, true));
+    }
+    try testing.expect(yieldsToCompany(.pld, true));
+    try testing.expect(!yieldsToCompany(.pld, false));
+    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true));
+}
+
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {
     try testing.expectEqual(@as(u32, 8192), companyPrefillChunk(8192, 0));
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1));
     try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3));
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1));
+}
+
+test "promptLogprobsWidthCap: an echo prefill narrows to its cap, 0 (uncapped) included" {
+    try testing.expectEqual(@as(u32, 0), promptLogprobsWidthCap(false, 0));
+    try testing.expectEqual(@as(u32, 1024), promptLogprobsWidthCap(false, 1024));
+    try testing.expectEqual(PROMPT_LOGPROBS_CHUNK, promptLogprobsWidthCap(true, 0));
+    try testing.expectEqual(PROMPT_LOGPROBS_CHUNK, promptLogprobsWidthCap(true, 1024));
+    try testing.expectEqual(@as(u32, 128), promptLogprobsWidthCap(true, 128));
 }
 
 test "decode share: a live share caps the width only while someone decodes" {
@@ -11366,6 +11517,12 @@ test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chun
     try testing.expectEqual(@as(u32, 1), interleaveTicksFor(8000 * ms, 0));
 }
 
+test "a media job on CUDA throttles MLX at its estimated peak; Metal keeps MLX's limit" {
+    try testing.expectEqual(@as(?usize, 4 << 30), genMemoryLimit(true, 4 << 30));
+    try testing.expectEqual(@as(?usize, 0), genMemoryLimit(true, 0));
+    try testing.expectEqual(@as(?usize, null), genMemoryLimit(false, 4 << 30));
+}
+
 test "a media job always clears the allocator cache, a decision job only from 256 MiB" {
     try testing.expect(shouldClearCache(false, 0));
     try testing.expect(!shouldClearCache(true, (256 << 20) - 1));
@@ -11429,13 +11586,15 @@ test "takeMergeable: merges the contiguous run of same-model decision jobs withi
     try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
 }
 
-test "applyModelSettings: --no-mtp stamps the head off unless the model's own setting names it" {
+test "applyModelSettings: model MTP setting outranks the launch default" {
     var cc = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
     for ([_]struct { flag: bool, setting: ?bool, want: ?bool }{
         .{ .flag = false, .setting = null, .want = false },
         .{ .flag = false, .setting = true, .want = true },
+        .{ .flag = false, .setting = false, .want = false },
         .{ .flag = true, .setting = null, .want = null },
         .{ .flag = true, .setting = false, .want = false },
+        .{ .flag = true, .setting = true, .want = true },
     }) |c| {
         var cfg = ModelConfig{};
         var o = model_settings.Override{ .mtp = c.setting };
@@ -11453,4 +11612,32 @@ test "availForLoad: only a load that would be refused makes media residency let 
     try std.testing.expectEqual(@as(u64, 1000), held.bytes);
     _ = availForLoad(1 << 50); // can never fit: the cache is released before the refusal
     try std.testing.expectEqual(@as(u64, 0), held.bytes);
+}
+
+test "loop recovery: a loop inside an open think block closes the thought once" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, 31, CLOSE, 32 };
+    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6 });
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
+
+    try testing.expectEqual(LoopAction.close_thought, loopRecoveryAction(&tb, ids.items, 400, 4096));
+    // No room to close the thought: the ordinary cut.
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, ids.items, 4095, 4096));
+    // Once fired, a second loop is cut.
+    tb.fired = true;
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, ids.items, 400, 4096));
+}
+
+test "loop recovery: an answer-side loop and an unarmed request are still cut" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, CLOSE, 32 };
+    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
 }

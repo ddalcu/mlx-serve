@@ -124,33 +124,14 @@ pub fn getAppMemFootprintMb() u32 {
     return @intCast(info.phys_footprint / (1024 * 1024));
 }
 
-/// Bytes of physical memory available for new allocation without heavy
-/// Pure: bytes available for a new large allocation given the live page counts.
-///
-/// Subtracts the genuinely non-reclaimable set: `wired` (pinned), `compressor`
-/// (already-compressed app data), and `internal` (anonymous app pages — crucially
-/// INCLUDING a resident MLX model). File-backed cache (`external`) plus
-/// free/speculative/purgeable pages are NOT subtracted: macOS evicts them the
-/// instant a big allocation lands, so they don't block a load. That keeps a 12B
-/// (~7.7 GB) loading on a 16 GB Mac that shows only ~7.8 GB *instantaneous* free
-/// (the rest is reclaimable file cache). It also fixes the #45 OOM: a prior model
-/// still resident lives in the anonymous (`internal`) set, NOT necessarily in
-/// `wired` (verified live: a 5 GB resident model with only ~2.8 GB total wired) —
-/// so counting `internal` makes a second large load correctly fail the guard.
-/// `purgeable` anon pages (caches an app explicitly marked discardable — e.g.
-/// image/tile caches) are a SUBSET of `internal` that macOS drops the instant a
-/// big allocation lands, so they must NOT count as used; subtracting them back
-/// out of the internal set is the accuracy fix. Still slightly conservative
-/// (wired-anonymous pages can appear in both `wired` and `internal`), which is
-/// the safe direction for an OOM guard (`--skip-mem-preflight` overrides).
-/// Returns 0 when total is 0 or used ≥ total (a failed query must never block).
-fn computeAvailableBytes(total_mem: u64, wire_pages: u64, compressor_pages: u64, internal_pages: u64, purgeable_pages: u64, page: u64) u64 {
-    // Purgeable is reclaimable, so exclude it from the resident anon set. Saturate
-    // (never underflow) in case the counters momentarily disagree.
-    const resident_anon: u64 = internal_pages -| purgeable_pages;
-    const used: u64 = (wire_pages + compressor_pages + resident_anon) * page;
-    if (total_mem == 0 or used >= total_mem) return 0;
-    return total_mem - used;
+/// Bytes the OS will grant a new wiring: free (less speculative — free_count
+/// already contains them and `external` carries them back) plus file-backed,
+/// capped by the RAM outside wired + compressor. 0 on a failed query.
+fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
+    if (total_mem == 0) return 0;
+    const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages;
+    const outside: u64 = total_mem -| (wire_pages +| compressor_pages) *| page;
+    return @min(reclaimable *| page, outside);
 }
 
 extern "c" fn os_proc_available_memory() usize;
@@ -186,7 +167,7 @@ pub fn getAvailableMemBytes() u64 {
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
     if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
-    return computeAvailableBytes(total_mem, vm.wire_count, vm.compressor_page_count, vm.internal_page_count, vm.purgeable_count, page);
+    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.wire_count, vm.compressor_page_count, page);
 }
 
 /// One `/proc/meminfo` field in KiB ("MemTotal:", "MemAvailable:", …).
@@ -232,41 +213,34 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     return @intCast(n);
 }
 
-test "computeAvailableBytes counts the resident anon set, not file cache or purgeable" {
+test "computeAvailableBytes sums the reclaimable classes, capped by wired headroom" {
     const GB: u64 = 1024 * 1024 * 1024;
     const page: u64 = 16384;
     const ppg: u64 = GB / page; // pages per GB
 
-    // 16 GB Mac, light anon load: 3 GB wired, 1 GB compressed, 2 GB anonymous app
-    // pages, no purgeable; the remaining ~10 GB is free + reclaimable file cache,
-    // which must NOT count against availability. Available = 16 − (3+1+2) = 10 GB.
-    // (The old `active`-subtracting formula counted file cache and wrongly refused
-    // loads that fit; later dropping `active` entirely wrongly ignored resident
-    // models.)
-    try std.testing.expectEqual(@as(u64, 10 * GB), computeAvailableBytes(16 * GB, 3 * ppg, 1 * ppg, 2 * ppg, 0, page));
+    // free_count already contains speculative, and speculative pages are
+    // file-backed inside external — the sum carries them once.
+    try std.testing.expectEqual(@as(u64, 32 * GB), computeAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, 26 * ppg, 83 * ppg, ppg, page));
 
-    // #45 OOM guard: a prior 7 GB model is resident. It lives in the anonymous
-    // (`internal`) set — here 9 GB = 2 GB apps + 7 GB model — NOT in `wired`. So
-    // available = 16 − (3+1+9) = 3 GB, and a second 7 GB load is correctly refused.
-    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 3 * ppg, 1 * ppg, 9 * ppg, 0, page));
+    // The cap: wired + compressor bound the figure, however the wired pages
+    // are counted elsewhere.
+    try std.testing.expectEqual(@as(u64, 6 * GB), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 9 * ppg, ppg, page));
 
-    // Purgeable is reclaimable: 2 GB of the 9 GB internal set is a discardable
-    // cache, so it should NOT count as used. Available = 16 − (3+1+(9−2)) = 5 GB,
-    // up from the 3 GB the old formula reported — the accuracy fix.
-    try std.testing.expectEqual(@as(u64, 5 * GB), computeAvailableBytes(16 * GB, 3 * ppg, 1 * ppg, 9 * ppg, 2 * ppg, page));
+    // #45 OOM guard, in new units: a resident 7 GB model lives in the anonymous
+    // set, NOT in wired — it consumed the free/external pages (16 GB box: 9 GB
+    // anon + 3 wired + 1 comp), so only 3 GB of reclaimable classes remain.
+    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 3 * ppg, 1 * ppg, page));
 
-    // Purgeable never underflows the anon set even if the counters disagree.
-    try std.testing.expectEqual(@as(u64, 12 * GB), computeAvailableBytes(16 * GB, 3 * ppg, 1 * ppg, 1 * ppg, 5 * ppg, page));
-
-    // Degenerate guards: failed query (total 0) and used ≥ total → 0, never block.
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 0, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(8 * GB, 4 * ppg, 0, 5 * ppg, 0, page));
+    // Saturating: disagreeing counters never underflow; a failed query (total 0)
+    // or a box with no headroom (wired + compressor ≥ total) reports 0.
+    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, ppg, 5 * ppg, 4 * ppg, 0, 0, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 1, 1, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 16 * ppg, 0, page));
 }
 
 pub fn getSysMemPct() u32 {
     if (comptime !builtin.os.tag.isDarwin()) {
-        // (total - available) / total — available already excludes reclaimable
-        // page cache, so this matches the Mach wire+compressor+anon intent.
+        // (total - available) / total, from the kernel's MemAvailable.
         const total = linuxMemInfoKib("MemTotal:");
         if (total == 0) return 0;
         const avail = linuxMemInfoKib("MemAvailable:");

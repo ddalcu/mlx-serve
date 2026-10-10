@@ -116,9 +116,22 @@ case "$d" in ERR*) echo "FAIL: multi-reference edit -> $d"; exit 1;; esac
 grep -q "edit ref 2" "$LOG" || { echo "FAIL: second reference never reached the engine"; exit 1; }
 echo "PASS: multi-reference composition -> $d"
 
-# ── capabilities the app now HIDES must still be honest 400s on the wire ──
+# ── a WebP reference reaches the engine (stb_image reads no WebP) ──
+WEBP_B64="UklGRk4AAABXRUJQVlA4TEEAAAAvAkAAEC9AkG2zzGFe93e5B5m0Tek5/3pmrYoaEIAcFbz1L2kUtm2DlPY1nb6Ag/jqeuvW2wMISMiUPPJFRP8jFgA="
+d=$(post "{\"prompt\":\"put the colors from image 2 into image 1\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"ref_images\":[\"$WEBP_B64\"],\"steps\":4,\"seed\":5}")
+case "$d" in ERR*) echo "FAIL: WebP reference edit -> $d"; exit 1;; esac
+echo "PASS: WebP reference -> $d"
+
+# ── an undecodable reference is a named 400 before the model runs ──
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
-  -H 'Content-Type: application/json' -d "{\"prompt\":\"x\",\"image\":\"$SRC_B64\",\"strength\":0.5}")
+  -H 'Content-Type: application/json' -d @- <<<"{\"prompt\":\"x\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"ref_images\":[\"bm90IGFuIGltYWdl\"]}")
+[ "$code" = "400" ] || { echo "FAIL: undecodable reference returned $code (want 400)"; exit 1; }
+echo "PASS: undecodable reference -> 400"
+
+# ── capabilities the app now HIDES must still be honest 400s on the wire ──
+# Body on stdin: Linux caps ONE argv string at 128 KB and the image is bigger.
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
+  -H 'Content-Type: application/json' -d @- <<<"{\"prompt\":\"x\",\"image\":\"$SRC_B64\",\"strength\":0.5}")
 [ "$code" = "400" ] || { echo "FAIL: variation on a no-img2img backend returned $code (want 400)"; exit 1; }
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
   -H 'Content-Type: application/json' -d '{"prompt":"x","lora_path":"/tmp/nope.safetensors"}')
