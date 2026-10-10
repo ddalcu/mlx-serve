@@ -600,21 +600,23 @@ fn resolveOpencode2Bin(detected: ?OpenCodeVersion, legacy_installed: ?bool) ?[]c
     return null;
 }
 
-/// The login shell the agent runs under (a login shell = the user's real PATH):
-/// `$SHELL` when it speaks POSIX sh, as the script body does, else bash, else sh.
-/// macOS always has /bin/zsh; a Linux box may have only bash, or fish as `$SHELL`.
-pub fn loginShellFor(shell_env: ?[]const u8, has_bash: bool) [:0]const u8 {
+/// The login shell the agent runs under (a login shell = the user's real PATH): the
+/// user's own `$SHELL` binary when it speaks POSIX sh, as the script body does. Otherwise
+/// (fish, nushell) /bin/zsh on macOS, whose ~/.zprofile is where Homebrew's PATH lives,
+/// and bash, else sh, on Linux, which may have no zsh at all.
+pub fn loginShellFor(shell_env: ?[]const u8, macos: bool, has_bash: bool) []const u8 {
     if (shell_env) |sh| {
         const base = std.fs.path.basename(sh);
-        if (std.mem.eql(u8, base, "zsh")) return "zsh";
-        if (std.mem.eql(u8, base, "bash")) return "bash";
+        if (std.mem.eql(u8, base, "zsh") or std.mem.eql(u8, base, "bash")) return sh;
     }
+    if (macos) return "/bin/zsh";
     return if (has_bash) "bash" else "sh";
 }
 
-fn loginShell() [:0]const u8 {
+fn loginShell() []const u8 {
     const env: ?[]const u8 = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else null;
-    return loginShellFor(env, std.c.access("/bin/bash", std.c.X_OK) == 0 or std.c.access("/usr/bin/bash", std.c.X_OK) == 0);
+    const has_bash = std.c.access("/bin/bash", std.c.X_OK) == 0 or std.c.access("/usr/bin/bash", std.c.X_OK) == 0;
+    return loginShellFor(env, @import("builtin").os.tag == .macos, has_bash);
 }
 
 /// Run one command through the same login shell the real launch execs
@@ -2051,10 +2053,11 @@ test "zcode config escapes arbitrary model ids and declares server budgets and w
     try t.expect(std.mem.indexOf(u8, script, "zcode '--prompt' 'it'\\''s a prompt'") != null);
 }
 
-test "loginShellFor: the user's POSIX shell, else bash, else sh" {
-    try std.testing.expectEqualStrings("zsh", loginShellFor("/bin/zsh", true));
-    try std.testing.expectEqualStrings("bash", loginShellFor("/usr/bin/bash", false));
-    // fish and nushell cannot parse the POSIX script body.
-    try std.testing.expectEqualStrings("bash", loginShellFor("/usr/bin/fish", true));
-    try std.testing.expectEqualStrings("sh", loginShellFor(null, false));
+test "loginShellFor: the user's own POSIX shell binary, else zsh on macOS, else bash, else sh" {
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/bash", loginShellFor("/opt/homebrew/bin/bash", true, true));
+    try std.testing.expectEqualStrings("/bin/zsh", loginShellFor("/bin/zsh", false, false));
+    // fish and nushell cannot parse the POSIX script body: macOS keeps zsh (~/.zprofile's PATH).
+    try std.testing.expectEqualStrings("/bin/zsh", loginShellFor("/opt/homebrew/bin/fish", true, true));
+    try std.testing.expectEqualStrings("bash", loginShellFor("/usr/bin/fish", false, true));
+    try std.testing.expectEqualStrings("sh", loginShellFor(null, false, false));
 }
