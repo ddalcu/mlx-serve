@@ -4536,9 +4536,18 @@ pub fn indexOwners(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) ?Owner
     return out;
 }
 
+/// Sushi's EXL3 expert banks run on its Metal kernels only: without them (CUDA) the pack is
+/// refused by name before any weight loads.
+fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
+    if (config.exl3 == null or metal) return;
+    log.err("this Sushi pack's EXL3 experts run on Metal kernels only; this backend cannot serve it\n", .{});
+    return error.Exl3NeedsMetal;
+}
+
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
     if (config.dsv41_stream) return Weights.init(allocator); // mlx-stream loads its own
+    try admitExl3Backend(config, mlx.metalKernelsAvailable());
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
     if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
@@ -6300,6 +6309,15 @@ test "ModelConfig: mimo_v2 source release is refused with the converter's name" 
     );
     defer testing.allocator.free(src);
     try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, src));
+}
+
+test "admitExl3Backend: a Sushi EXL3 pack is refused by name where Metal kernels are missing" {
+    const eq = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14},";
+    const sushi = try parseConfigFromJson(testing.allocator, eq ++ glm5_next_pack_json[1..]);
+    const plain = try parseConfigFromJson(testing.allocator, glm5_next_pack_json);
+    try testing.expectError(error.Exl3NeedsMetal, admitExl3Backend(&sushi, false));
+    try admitExl3Backend(&sushi, true);
+    try admitExl3Backend(&plain, false);
 }
 
 test "ModelConfig: a Sushi pack's expert_quant selects EXL3 experts on mimo_v2 and glm5_next" {

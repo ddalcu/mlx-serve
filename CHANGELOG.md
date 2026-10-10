@@ -144,6 +144,7 @@ Estimated from the measured per-step cost:
 - On NVIDIA GPUs, MoE models such as LFM2-8B-A1B and Ling 3.0, and Prism's Bonsai 2 packs, answer instead of failing every request, and seeded sampling works on Nemotron-H and Qwen3.5 models.
 - On Linux, media models load when they fit: weights are counted against RAM and the working set against GPU memory, so MiniMax Music 3 runs on a 16 GB card without `--skip-mem-preflight`.
 - On Linux, a second server started on a port that is already in use now stops with "already in use"; it used to bind anyway and take half the first server's connections.
+- On NVIDIA GPUs, Sushi packs (EXL3 experts) are refused at load with a message saying why: their experts run on Metal kernels only.
 
 ---
 
