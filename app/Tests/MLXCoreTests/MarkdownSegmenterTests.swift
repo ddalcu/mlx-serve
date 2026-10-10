@@ -66,7 +66,16 @@ final class MarkdownSegmenterTests: XCTestCase {
         // prose that reflows into a code block a keystroke later.
         XCTAssertEqual(segs("intro\n```python\ndef f():"), [
             .prose("intro"),
-            .code(language: "python", code: "def f():"),
+            .code(language: "python", code: "def f():", closed: false),
+        ])
+    }
+
+    /// A block is still being written only until its closing fence arrives.
+    func testOnlyTheBlockWithoutItsClosingFenceIsOpen() {
+        XCTAssertEqual(segs("```\na\n```\nmid\n```js\nb"), [
+            .code(language: "", code: "a", closed: true),
+            .prose("mid"),
+            .code(language: "js", code: "b", closed: false),
         ])
     }
 
@@ -96,7 +105,7 @@ final class MarkdownSegmenterTests: XCTestCase {
             let joined = segs(src).map { seg -> String in
                 switch seg {
                 case .prose(let t): return t
-                case .code(_, let c): return c
+                case .code(_, let c, _): return c
                 }
             }.joined(separator: "\n")
             for line in src.components(separatedBy: "\n")

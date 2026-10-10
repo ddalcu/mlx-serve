@@ -172,6 +172,84 @@ enum CodeBlockText {
     }
 }
 
+/// Folding a long code block to its first lines. Code never wraps, so the
+/// count is exact and the fold ends on a line boundary.
+enum CodeBlockFold {
+
+    /// Lines kept while folded.
+    static let collapsedLines = 20
+
+    /// Lines a block must clear the limit by to earn a "Show more", as for a
+    /// long user turn: a control that reveals a line or two is a dead one.
+    static let foldMargin = 3
+
+    /// Lines end at `\n`, so CRLF counts too; scalars, not Characters, because
+    /// `\r\n` is one Character. Until the block is `finished`, the line being
+    /// written does not count: it may be the closing fence arriving.
+    static func lineCount(_ code: String, finished: Bool = true) -> Int {
+        let lines = code.unicodeScalars.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+        return finished ? lines : lines - 1
+    }
+
+    static func folds(_ code: String, finished: Bool = true) -> Bool {
+        lineCount(code, finished: finished) >= collapsedLines + foldMargin
+    }
+
+    /// What the block draws: its first lines while folded, all of it otherwise.
+    static func visible(_ code: String, finished: Bool = true, expanded: Bool) -> String {
+        guard !expanded, folds(code, finished: finished) else { return code }
+        let scalars = code.unicodeScalars
+        var newlines = 0
+        for i in scalars.indices where scalars[i] == "\n" {
+            newlines += 1
+            guard newlines == collapsedLines else { continue }
+            let crlf = i > scalars.startIndex && scalars[scalars.index(before: i)] == "\r"
+            return String(code[..<(crlf ? scalars.index(before: i) : i)])
+        }
+        return code
+    }
+
+    static func linesTotal(_ count: Int) -> String {
+        L10n.format("%lld lines total", Int64(count))
+    }
+}
+
+/// What a code block's status slot carries: Copy, or a spinner while the
+/// block is still being written, so half a block is not copied as if whole.
+enum CodeBlockStatus: Equatable {
+    case copy, streaming
+
+    /// A fence the model never closed is finished once the reply is.
+    static func of(closed: Bool, replyStreaming: Bool) -> CodeBlockStatus {
+        !closed && replyStreaming ? .streaming : .copy
+    }
+}
+
+/// What a transcript row hands its code blocks: the bracket around a change
+/// that shortens the row, so the reader keeps their place (`ChatScroll`'s
+/// `rowWillResize` / `rowDidResize`), and fold memory by block index that
+/// outlives a rebuild of the transcript (`FoldStore`). Always equal: a fresh
+/// one per row render must not re-render every block in the row.
+struct CodeBlockRow: Equatable {
+    let willResize: () -> Void
+    let didResize: () -> Void
+    let isExpanded: (Int) -> Bool
+    let setExpanded: (Int, Bool) -> Void
+
+    static func == (_: Self, _: Self) -> Bool { true }
+}
+
+private struct CodeBlockRowKey: EnvironmentKey {
+    static let defaultValue: CodeBlockRow? = nil
+}
+
+extension EnvironmentValues {
+    var codeBlockRow: CodeBlockRow? {
+        get { self[CodeBlockRowKey.self] }
+        set { self[CodeBlockRowKey.self] = newValue }
+    }
+}
+
 /// Layout constants for a code block.
 enum CodeBlockLayout {
     /// The code block's text, on the same ladder as everything else: the
@@ -183,7 +261,8 @@ enum CodeBlockLayout {
 }
 
 /// A fenced code block: language header with a copy button, and syntax-colored
-/// code that scrolls horizontally.
+/// code that scrolls horizontally. A long block folds to its first lines
+/// (`CodeBlockFold`) with a Show more / Show less footer.
 ///
 /// Rendered as its own view rather than as a run inside the message's text view.
 /// That costs cross-block drag-selection (each block is now its own selection
@@ -196,8 +275,13 @@ struct CodeBlockView: View {
     /// show what the model wrote when we don't recognize it.
     let language: String
     let code: String
+    var status: CodeBlockStatus = .copy
+    /// Its place among the reply's segments: the key of its fold memory.
+    var index = 0
 
     @State private var copied = false
+    @State private var expanded = false
+    @Environment(\.codeBlockRow) private var row
 
     private var resolved: SyntaxLanguage? { SyntaxLanguage(fence: language) }
 
@@ -213,6 +297,11 @@ struct CodeBlockView: View {
     }
 
     var body: some View {
+        let finished = status == .copy
+        let folds = CodeBlockFold.folds(code, finished: finished)
+        // Folded, the text view holds only the kept lines, so a long block
+        // still streaming past the fold lays nothing out.
+        let shown = CodeBlockFold.visible(code, finished: finished, expanded: expanded)
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider().opacity(0.5)
@@ -221,13 +310,21 @@ struct CodeBlockView: View {
                 // building a `Text` per line, so a 300-line block carried
                 // hundreds of nodes in SwiftUI's attribute graph and a streaming
                 // reply rebuilt every one of them per token.
-                CodeNSText(attributed: CodeBlockText.code(code, language: resolved), selectable: true,
-                           computed: CodeBlockText.measuredSize(of: code))
+                CodeNSText(attributed: CodeBlockText.code(shown, language: resolved), selectable: true,
+                           computed: CodeBlockText.measuredSize(of: shown))
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
             }
+            .overlay(alignment: .bottom) {
+                if folds && !expanded { foldFade }
+            }
+            if folds {
+                Divider().opacity(0.5)
+                foldToggle(lines: CodeBlockFold.lineCount(code, finished: finished))
+            }
         }
         .background(CodeTheme.background)
+        .onAppear { expanded = row?.isExpanded(index) ?? false }
         .clipShape(RoundedRectangle(cornerRadius: CodeBlockLayout.cornerRadius))
         .overlay(
             RoundedRectangle(cornerRadius: CodeBlockLayout.cornerRadius)
@@ -241,36 +338,110 @@ struct CodeBlockView: View {
                 .font(.app(.caption2, weight: .medium))
                 .foregroundStyle(.secondary)
             Spacer()
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(code, forType: .string)
-                copied = true
-                // The tick is the whole confirmation — a copy with no feedback
-                // reads as a dead button and gets clicked again.
-                Task {
-                    try? await Task.sleep(nanoseconds: 1_400_000_000)
-                    copied = false
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                        .font(.app(.caption2, weight: .medium))
-                    Text(L10n.text(copied ? "Copied" : "Copy"))
-                        .font(.app(.caption2, weight: .medium))
-                }
-                .foregroundStyle(copied ? Color.green : Color.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Copy this code block")
+            statusSlot(vertical: 3, trailing: 6)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(CodeTheme.header)
     }
 
+    /// Copy, or "Streaming" while the block is still written. The button stays
+    /// laid out underneath, so the header keeps its height when the block ends.
+    /// The insets are inside the button: they are its hit area.
+    private func statusSlot(vertical: CGFloat, trailing: CGFloat) -> some View {
+        copyButton(vertical: vertical, trailing: trailing)
+            .opacity(status == .copy ? 1 : 0)
+            .allowsHitTesting(status == .copy)
+            .accessibilityHidden(status != .copy)
+            .overlay(alignment: .trailing) {
+                if status == .streaming {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text(L10n.text("Streaming"))
+                            .font(.app(.caption2, weight: .medium))
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 6)
+                    .padding(.trailing, trailing)
+                    .fixedSize()
+                }
+            }
+    }
+
+    private func copyButton(vertical: CGFloat, trailing: CGFloat) -> some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(code, forType: .string)
+            copied = true
+            // The tick is the whole confirmation — a copy with no feedback
+            // reads as a dead button and gets clicked again.
+            Task {
+                try? await Task.sleep(nanoseconds: 1_400_000_000)
+                copied = false
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.app(.caption2, weight: .medium))
+                Text(L10n.text(copied ? "Copied" : "Copy"))
+                    .font(.app(.caption2, weight: .medium))
+            }
+            .foregroundStyle(copied ? Color.green : Color.secondary)
+            .padding(.leading, 6)
+            .padding(.trailing, trailing)
+            .padding(.vertical, vertical)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Copy this code block")
+    }
+
+    /// Fades the last kept lines into the block, so the fold reads as more
+    /// below rather than as the end. An overlay in the block's colour, not a
+    /// mask, for the same reason as a folded user turn.
+    private var foldFade: some View {
+        LinearGradient(colors: [CodeTheme.background.opacity(0), CodeTheme.background.opacity(0.85)],
+                       startPoint: .top, endPoint: .bottom)
+            .frame(height: 2 * (CodeBlockText.lineHeight + CodeBlockLayout.lineSpacing) + 10)
+            .allowsHitTesting(false)
+    }
+
+    /// The whole footer is the button, in the header's colours. Folded, it
+    /// says how long the block is, counting while it streams; unfolded, it
+    /// repeats the status slot at the right, so a long block can be copied (or
+    /// seen still streaming) from its end: an overlay, hit before the toggle.
+    private func foldToggle(lines: Int) -> some View {
+        Button(action: toggleFold) {
+            HStack(spacing: 4) {
+                Text(L10n.text(expanded ? "Show less" : "Show more"))
+                    .font(.app(.caption2, weight: .medium))
+                if !expanded {
+                    Text(verbatim: "·").font(.app(.caption2))
+                    Text(CodeBlockFold.linesTotal(lines)).font(.app(.caption2))
+                }
+            }
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .trailing) {
+            if expanded { statusSlot(vertical: 8, trailing: 16) }
+        }
+        .background(CodeTheme.header)
+    }
+
+    private func toggleFold() {
+        row?.setExpanded(index, !expanded)
+        guard expanded else { expanded = true; return }
+        // Folding shortens the row under the reader, so it is bracketed; the
+        // end is reported once the shorter layout has landed.
+        row?.willResize()
+        expanded = false
+        DispatchQueue.main.async { DispatchQueue.main.async { row?.didResize() } }
+    }
 }
 
 /// A code block's text, drawn by the text system rather than by a stack of
