@@ -18,6 +18,8 @@ const HEADER =
     \\}
 ;
 
+// Every kernel here computes the decay gate a + dt_bias -> g at the state's dtype (StT):
+// rounded to bf16, a gate near one is exactly 1.0 and that head never forgets.
 const K1_SOURCE =
     \\constexpr int NSG = NT / 32;
     \\constexpr int RB = DV / SPLIT;       // dv rows per threadgroup
@@ -73,10 +75,10 @@ const K1_SOURCE =
     \\  const T bv = b_in[hv];
     \\  T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\  gb[1] = float(bsig);
-    \\  const T apd = T(float(a_in[hv]) + float(dt_bias[hv]));
+    \\  const StT apd = StT(float(a_in[hv]) + float(dt_bias[hv]));
     \\  float sp = msv_log1p(metal::precise::exp(float(apd)));
     \\  float ea = metal::precise::exp(float(A_log[hv]));
-    \\  gb[0] = float(T(metal::precise::exp(-(ea * sp))));
+    \\  gb[0] = float(StT(metal::precise::exp(-(ea * sp))));
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\float kk[4], qq[4];
@@ -211,9 +213,9 @@ const K1S_HEAD =
     \\    const T bv = b_in[t * HV + hv];
     \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\    gb[t][1] = float(bsig);
-    \\    const T apd = T(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
+    \\    const StT apd = StT(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
     \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\    gb[t][0] = float(T(metal::precise::exp(-(ea * sp))));
+    \\    gb[t][0] = float(StT(metal::precise::exp(-(ea * sp))));
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -326,9 +328,9 @@ const K1P_SOURCE =
     \\    const T bv = b_in[t * ABS + BOFF + h];
     \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\    pg[(t * HV + h) * 2 + 1] = float(bsig);
-    \\    const T apd = T(float(a_in[t * ABS + AOFF + h]) + float(dt_bias[h]));
+    \\    const StT apd = StT(float(a_in[t * ABS + AOFF + h]) + float(dt_bias[h]));
     \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\    pg[(t * HV + h) * 2] = float(T(metal::precise::exp(-(ea * sp))));
+    \\    pg[(t * HV + h) * 2] = float(StT(metal::precise::exp(-(ea * sp))));
     \\  }
     \\}
 ;

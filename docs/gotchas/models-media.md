@@ -1915,6 +1915,25 @@ Two more came out of the first llmprobe run (all cells failing were ours):
 - Guard: `tests/test_hadamard_fidelity.sh` (server greedy logprobs vs a
   self-contained f32 reference, KL < 1e-5); red on the old engine.
 
+## Qwen3.8 Flash Next's GatedDeltaNet decayed in bf16 (2026-10-10)
+
+- Defect: qwen4_exp kept its GatedDeltaNet state in bf16 and rounded the
+  per-token decay g = exp(-exp(A_log)·softplus(a + dt_bias)) to bf16 in all
+  five gate producers. bf16's spacing below 1 is 2^-8, so a head meant to
+  forget slower than ~2e-3 per token got g = 1.0 exactly: at a = 0, 206 of
+  the shipped packs' 1728 heads never forgot and 469 forgot more than 10% off
+  rate, and the state re-rounded to bf16 every decoded token. The packs declare
+  `mamba_ssm_dtype: float32`; the HF reference and mlx-lm keep both in f32.
+- Fix: `ssmStateDtype` is f32 on qwen4_exp (set at parse, keyed on the arch:
+  HF ignores the key), and every producer computes the gate at the state's
+  dtype (K1/K1S/K1P `StT`, the packed prework's `GT`, the compiled chain). At
+  f32, serial decode, verify, tree, batched rows and a stock prefill dispatch
+  agree bit for bit. Checkpoints bill twice the state, f32 roots get their own
+  SSD namespace, and `MLX_SERVE_GDN_STATE_F32=0` restores bf16.
+- Guard: `qwen4_exp GDN: a slow-decay head forgets at its own rate on every
+  arm` (g^n of the bf16 A_log) and `... equal serial decode bit for bit`; red
+  on the old engine.
+
 ## Qwen-Image-2.1: an 18 GB VAE decode on a 5 GB engine
 
 Defect: the first 1024² generation on the 4-bit pack reported an 18 GB peak process footprint; the staged engine holds 5.5 GB and the 40-step denoise is flat at that. `mlx_get_peak_memory` read 4.9 GB throughout, so nothing MLX-side pointed at it.

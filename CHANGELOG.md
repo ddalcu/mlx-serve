@@ -1,5 +1,10 @@
 # Changelog
 
+## v26.10.3 — UNRELEASED - DEV
+
+### Fixes
+- **Qwen3.8 Flash Next remembers like its reference.** Its linear-attention state and decay gate now run in f32 instead of bf16, which kept slowly fading heads from ever fading, at twice that state's memory (`MLX_SERVE_GDN_STATE_F32=0` restores bf16).
+
 ## v26.10.2 — Songs, Films & Sound Effects - The Newest Frontier Models - Linux - Rock Solid Under Load
 
 ### Highlights
