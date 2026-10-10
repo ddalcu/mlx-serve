@@ -14,7 +14,7 @@
 
 - **The newest frontier models, at home.** DeepSeek-V4.1-Flash (even on a 128 GB Mac, streaming its experts from the SSD on @davidtai's mlx-stream), GLM-5.3-Flash, MiMo-V2.6-Flash and Kolibri-1 (thanks @albinekb) run locally with thinking and tool calls, and EmbeddingGemma 2 understands text, images and video for search.
 
-- **MLX-serve comes to Linux.** NVIDIA DGX Spark and cards from the RTX 20 to the 50 series run MLX models and media generation, and one script builds everything from a fresh checkout. Same exact MLX models that run on Mac + embedded DS4 and Llama.cpp 0.6.0 for GGUF.
+- **MLX-serve comes to Linux.** NVIDIA DGX Spark and cards from the RTX 20 to the 50 series run MLX models and media generation, and one script builds everything from a fresh checkout. Same exact MLX models that run on Mac + embedded DS4 and Llama.cpp 0.6.0 for GGUF. Every release now comes with ready-made Linux downloads for x64 and arm64.
 
 - **MLX Serve Web.** The built-in web page is now one place to chat, make images, audio and video, browse your library and watch the server live, and it opens with no model loaded. Its Code Launcher hands you one command that sets up Claude Code, pi, omp, OpenCode or Grok on another computer, pointed at this server. Thanks @alinselea.
 
@@ -36,6 +36,7 @@
 
 ### Also new
 
+- **A simpler app.** The server starts with the app, and Preload decides whether your model is ready right away. Settings put Server and Memory first, every setting explains itself in one plain sentence, and the tray's Web UI button opens the built-in web page.
 - **Korean.** The app speaks Korean (thanks @hemanpapa-coder), and Settings search finds settings by their translated names.
 - **Your defaults, everywhere.** Set temperature, penalties and reasoning budget once, for all models or per model, and lock them if you want them to win over the client (thanks @Cianidos).
 - **More launchers.** ZCode (thanks @beamivalice), fx and Grok join the app's Code menu and `mlx-serve launch`, and the console Monitor keeps 24 hours of history in your browser and names each agent (thanks @STRML).
