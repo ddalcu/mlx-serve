@@ -172,8 +172,7 @@ const opencode_reasoning =
 ;
 
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
-/// the user's own config, no file writes). Single-quoted in the script, so
-/// the JSON must stay single-quote-free.
+/// the user's own config, no file writes); the script shell-quotes it (`appendQuoted`).
 /// `pin_model` writes a top-level `"model"` — opencode 2's TUI has no
 /// `--model` flag, so the config is the only place to select one.
 /// `limit.output` is the room opencode keeps free before compacting (it
@@ -184,7 +183,11 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
-    if (pin_model) |m| try out.print(allocator, "\"model\": \"mlx/{s}\", ", .{m});
+    if (pin_model) |m| {
+        const v = try std.fmt.allocPrint(allocator, "mlx/{s}", .{m});
+        defer allocator.free(v);
+        try out.print(allocator, "\"model\": {f}, ", .{std.json.fmt(v, .{})});
+    }
     if (compaction) {
         var ctx: u64 = FALLBACK_BUDGET.context;
         for (entries) |e| {
@@ -201,10 +204,12 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
     , .{base_url});
     for (entries, 0..) |e, i| {
-        try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (mlx-serve)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}, {s}}}", .{
+        const name = try std.fmt.allocPrint(allocator, "{s} (mlx-serve)", .{e.id});
+        defer allocator.free(name);
+        try out.print(allocator, "{s}{f}: {{\"name\": {f},{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}, {s}}}", .{
             if (i == 0) "" else ", ",
-            e.id,
-            e.id,
+            std.json.fmt(e.id, .{}),
+            std.json.fmt(name, .{}),
             if (e.vision) " \"attachment\": true," else "",
             e.budget.context,
             compactionReserve(e.budget.context),
@@ -716,6 +721,10 @@ fn needsShellQuoting(arg: []const u8) bool {
 /// shell-significant bytes, so ordinary ids keep the exact script bytes.
 fn appendModelArg(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
     try out.append(allocator, ' ');
+    return appendModelValue(out, allocator, arg);
+}
+
+fn appendModelValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
     if (needsShellQuoting(arg)) return appendQuoted(out, allocator, arg);
     return out.appendSlice(allocator, arg);
 }
@@ -751,10 +760,14 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export ANTHROPIC_API_KEY=
                 \\export ANTHROPIC_AUTH_TOKEN=mlx-serve
                 \\export CLAUDE_CODE_ATTRIBUTION_HEADER=0
-                \\export ANTHROPIC_DEFAULT_OPUS_MODEL={s}
-                \\export ANTHROPIC_DEFAULT_SONNET_MODEL={s}
-                \\export ANTHROPIC_DEFAULT_HAIKU_MODEL={s}
-                \\export CLAUDE_CODE_SUBAGENT_MODEL={s}
+                \\
+            , .{base_url});
+            for ([_][]const u8{ "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL" }) |name| {
+                try out.print(allocator, "export {s}=", .{name});
+                try appendModelValue(&out, allocator, model);
+                try out.append(allocator, '\n');
+            }
+            try out.print(allocator,
                 \\export CLAUDE_CODE_MAX_OUTPUT_TOKENS={d}
                 \\export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
                 \\export API_TIMEOUT_MS=3600000
@@ -762,7 +775,7 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\
-            , .{ base_url, model, model, model, model, budget.output });
+            , .{budget.output});
             // A long prefill and a long think on a local model outlast Claude Code's stream watchdogs; a fallback
             // re-sends the whole prompt as a non-stream request, which then times out and retries.
             // Claude Code assumes 200k for a model outside its catalog; declare the advertised context verbatim.
@@ -792,10 +805,12 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             try appendModelArg(&out, allocator, omp_model);
         },
         .opencode => {
+            try out.appendSlice(allocator, "export OPENCODE_CONFIG_CONTENT=");
+            try appendQuoted(&out, allocator, opencode_launch.?.config);
             try out.print(allocator,
-                \\export OPENCODE_CONFIG_CONTENT='{s}'
+                \\
                 \\{s} --model
-            , .{ opencode_launch.?.config, opencode_launch.?.bin });
+            , .{opencode_launch.?.bin});
             const oc_model = try std.fmt.allocPrint(allocator, "mlx/{s}", .{model});
             defer allocator.free(oc_model);
             try appendModelArg(&out, allocator, oc_model);
@@ -803,12 +818,14 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
         .opencode2 => {
             // The binary is the version-detected resolution, not a fixed
             // name: Homebrew ships v2 as `opencode`, `opencode2` is legacy.
+            try out.appendSlice(allocator, "export OPENCODE_CONFIG_CONTENT=");
+            try appendQuoted(&out, allocator, opencode_launch.?.config);
             try out.print(allocator,
-                \\export OPENCODE_CONFIG_CONTENT='{s}'
+                \\
                 \\export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
                 \\if ! command -v {s} >/dev/null 2>&1; then echo "{s} is not installed"; exit 127; fi
                 \\{s} --standalone
-            , .{ opencode_launch.?.config, opencode_launch.?.bin, opencode_launch.?.bin, opencode_launch.?.bin });
+            , .{ opencode_launch.?.bin, opencode_launch.?.bin, opencode_launch.?.bin });
         },
         .codex => {
             // PATH first, then the CLI the desktop app bundles (codex's
@@ -1096,7 +1113,9 @@ pub fn installSkill(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
 }
 
 /// One file an agent reads, at `path` under $HOME.
-pub const ConfigFile = struct { path: []const u8, data: []const u8, private: bool = false };
+/// `merged`: the data merges onto the file's own contents, which a served script
+/// cannot read, so it writes the file only where there is none.
+pub const ConfigFile = struct { path: []const u8, data: []const u8, private: bool = false, merged: bool = false };
 
 /// What a merge keeps: the file's bytes, `{}` when it is missing or when
 /// there is no `io` (a script served to another machine keeps nothing).
@@ -1125,7 +1144,7 @@ fn configFiles(a: std.mem.Allocator, io: ?std.Io, kind: AgentKind, base_url: []c
         .pi => {
             try files.append(a, .{ .path = ".mlx-serve/pi/models.json", .data = try piModelsJson(a, base_url, entries) });
             const existing = try existingOrEmpty(a, io, ".mlx-serve/pi/settings.json");
-            try files.append(a, .{ .path = ".mlx-serve/pi/settings.json", .data = try mergePiSettingsJson(a, existing, budget.context) });
+            try files.append(a, .{ .path = ".mlx-serve/pi/settings.json", .data = try mergePiSettingsJson(a, existing, budget.context), .merged = true });
         },
         .omp => try files.append(a, .{ .path = ".mlx-serve/omp/models.yml", .data = try ompModelsYml(a, base_url, entries) }),
         .hermes => {
@@ -1136,7 +1155,7 @@ fn configFiles(a: std.mem.Allocator, io: ?std.Io, kind: AgentKind, base_url: []c
         .aider => try files.append(a, .{ .path = ".mlx-serve/aider/model-metadata.json", .data = try aiderMetadataJson(a, entries) }),
         .fx => {
             const existing = try existingOrEmpty(a, io, ".fx/settings.json");
-            try files.append(a, .{ .path = ".fx/settings.json", .data = try mergeFxSettingsJson(a, existing, base_url, entries), .private = true });
+            try files.append(a, .{ .path = ".fx/settings.json", .data = try mergeFxSettingsJson(a, existing, base_url, entries), .private = true, .merged = true });
         },
         .grok => try files.append(a, .{ .path = ".mlx-serve/grok/config.toml", .data = try grokConfigToml(a, base_url, model, entries) }),
     }
@@ -1204,7 +1223,7 @@ pub fn remoteScript(allocator: std.mem.Allocator, kind: AgentKind, base_url: []c
     if (agentSkillLink(kind)) |link| {
         try out.print(a, "mkdir -p \"$HOME/.mlx-serve/{s}\"\n[ -e \"$HOME/.mlx-serve/{s}\" ] || [ -L \"$HOME/.mlx-serve/{s}\" ] || ln -s \"$HOME/.mlx-serve/" ++ skill_dir ++ "\" \"$HOME/.mlx-serve/{s}\"\n", .{ std.fs.path.dirname(link).?, link, link, link });
     }
-    for (try configFiles(a, null, kind, base_url, model, budget, entries)) |f| try appendHeredoc(&out, a, f.path, f.data, false);
+    for (try configFiles(a, null, kind, base_url, model, budget, entries)) |f| try appendHeredoc(&out, a, f.path, f.data, f.merged);
 
     const oc: ?OpenCodeLaunch = if (kind == .opencode2) .{ .config = try opencodeJson(a, base_url, entries, model, true), .bin = "$OC_BIN" } else null;
     const run = try std.mem.concat(a, u8, &.{ if (kind == .opencode2) opencode2_bin_probe else "", try scriptFor(a, kind, base_url, model, budget, oc, &.{}) });
@@ -2111,7 +2130,8 @@ test "served launch script writes the agent's files, keeps an edited skill, and 
     try t.expect(std.mem.indexOf(u8, s, "ln -s \"$HOME/.mlx-serve/skills/mlx-serve\" \"$HOME/.mlx-serve/pi/skills/mlx-serve\"\n") != null);
     try t.expect(std.mem.indexOf(u8, s, "\ncat > \"$HOME/.mlx-serve/pi/models.json\" <<'MLX_SERVE_EOF'\n") != null);
     try t.expect(std.mem.indexOf(u8, s, "\"baseUrl\": \"http://h:1/v1\"") != null);
-    try t.expect(std.mem.indexOf(u8, s, "\ncat > \"$HOME/.mlx-serve/pi/settings.json\"") != null);
+    // The served script cannot read the settings it would merge into: an existing file is kept.
+    try t.expect(std.mem.indexOf(u8, s, "\n[ -e \"$HOME/.mlx-serve/pi/settings.json\" ] || cat > \"$HOME/.mlx-serve/pi/settings.json\"") != null);
     try t.expect(std.mem.indexOf(u8, s, "pi --provider mlx --model m1") != null);
     try t.expect(std.mem.endsWith(u8, s, "then exec \"$login\" -l -c \"$s\" </dev/tty; fi\nexec \"$login\" -l -c \"$s\"\n"));
 }
@@ -2126,6 +2146,27 @@ test "served opencode2 script resolves its binary in the login shell and pins th
     try t.expect(std.mem.indexOf(u8, s, "\"model\": \"mlx/m1\"") != null);
     try t.expect(std.mem.indexOf(u8, s, "cat > \"$HOME/.mlx-serve/opencode2/opencode/plugins/mlx-serve/tui.tsx\"") != null);
     try t.expect(std.mem.indexOf(u8, s, "\"metricsUrl\":\"http://h:1/metrics.json\"") != null);
+}
+
+test "a model id with shell or JSON bytes stays one value in the claude and opencode scripts" {
+    const id = "x'\"$(touch p)";
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = id, .budget = b, .vision = false, .loaded = true }};
+    const claude = try scriptFor(t.allocator, .claude, "http://h:1", id, b, null, &.{});
+    defer t.allocator.free(claude);
+    try t.expect(std.mem.indexOf(u8, claude, "export ANTHROPIC_DEFAULT_OPUS_MODEL='x'\\''\"$(touch p)'\n") != null);
+    try t.expect(std.mem.indexOf(u8, claude, "export CLAUDE_CODE_SUBAGENT_MODEL='x'\\''\"$(touch p)'\n") != null);
+
+    const json = try opencodeJson(t.allocator, "http://h:1", &entries, id, true);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("mlx/" ++ id, parsed.value.object.get("model").?.string);
+    try t.expect(parsed.value.object.get("provider").?.object.get("mlx").?.object.get("models").?.object.get(id) != null);
+
+    const oc = try scriptFor(t.allocator, .opencode2, "http://h:1", id, b, .{ .config = json, .bin = "opencode" }, &.{});
+    defer t.allocator.free(oc);
+    try t.expect(std.mem.indexOf(u8, oc, "\"model\": \"mlx/x'\\''\\\"$(touch p)\"") != null);
 }
 
 test "served launch script refuses a file that would end its heredoc" {

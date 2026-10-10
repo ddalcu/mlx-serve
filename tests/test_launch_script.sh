@@ -89,13 +89,16 @@ grep -q "\"baseUrl\": \"$BASE/v1\"" "$T/home/.mlx-serve/pi/models.json" 2>/dev/n
 if [ "$OK" = 1 ]; then run_test "pi launched with its models.json + skill" PASS
 else run_test "pi launched with its models.json + skill" FAIL "$OUT $(cat "$T/run.log")"; fi
 
-echo "[4] a rerun keeps an edited skill"
+echo "[4] a rerun keeps an edited skill and pi settings"
 echo edited > "$T/home/.mlx-serve/skills/mlx-serve/SKILL.md"
+echo '{"theme": "mine"}' > "$T/home/.mlx-serve/pi/settings.json"
 launch "agent=pi"
-if [ "$(cat "$T/home/.mlx-serve/skills/mlx-serve/SKILL.md")" = edited ] && grep -q 'args=--provider mlx --model org/chat-' "$T/home/agent.out"; then
-    run_test "edited skill kept, default model picked" PASS
+if [ "$(cat "$T/home/.mlx-serve/skills/mlx-serve/SKILL.md")" = edited ] \
+    && grep -q '"theme": "mine"' "$T/home/.mlx-serve/pi/settings.json" \
+    && grep -q 'args=--provider mlx --model org/chat-' "$T/home/agent.out"; then
+    run_test "edited skill and settings kept, default model picked" PASS
 else
-    run_test "edited skill kept, default model picked" FAIL "$(cat "$T/run.log")"
+    run_test "edited skill and settings kept, default model picked" FAIL "$(cat "$T/run.log")"
 fi
 
 echo "[5] opencode2: v2 binary resolved in the login shell"

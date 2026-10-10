@@ -143,8 +143,14 @@ final class AIRadio: ObservableObject {
 
     func stop() {
         guard isOn else { return }
+        end(status: "")
+    }
+
+    /// Every way a station ends, the user's Stop and giving up after failures alike:
+    /// the model it kept resident is handed back either way.
+    private func end(status: String) {
         isOn = false
-        status = ""
+        self.status = status
         progress = nil
         loop?.cancel()
         loop = nil
@@ -224,10 +230,7 @@ final class AIRadio: ObservableObject {
                 var why = L10n.text("Music generation failed.")
                 if case .failed(let message) = service.phase { why = message }
                 if failures >= Self.maxFailuresInARow {
-                    isOn = false
-                    player.onNaturalFinish = nil
-                    status = L10n.format("AI Radio stopped: %@", why)
-                    self.service = nil; self.server = nil
+                    end(status: L10n.format("AI Radio stopped: %@", why))
                     return
                 }
                 status = L10n.format("Retrying: %@", why)
