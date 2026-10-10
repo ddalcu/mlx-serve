@@ -3221,6 +3221,16 @@ pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers
     return base + base / 10;
 }
 
+/// Where a media peak lives. Unified memory holds it in one pool. CUDA keeps file-loaded
+/// weights in managed memory backed by host RAM and the engine's working buffers on the GPU,
+/// so there the weights (capped by the peak: a staged pack never holds its whole sum) are
+/// RAM's and only the rest of the peak is the GPU's.
+pub fn mediaBill(peak: u64, weights_on_disk: u64, weights_page: bool) struct { ram: u64, gpu: u64 } {
+    if (!weights_page or weights_on_disk == 0) return .{ .ram = peak, .gpu = 0 };
+    const ram = @min(peak, weights_on_disk);
+    return .{ .ram = ram, .gpu = peak - ram };
+}
+
 /// What a media load COMMITS to the residency budget once ready. Same estimator
 /// the gate reserved against, so reserve and commit can only differ by the
 /// gate's headroom: committing the dir sum instead parked H3 in the budget at
@@ -3255,19 +3265,37 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         defer if (peeked) |p| sch.allocator.free(p);
         const backend_type = peeked orelse params.config.model_type;
         const peak = gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, backend_type);
-        const avail = availForLoad(peak);
+        const cuda = mlx.cudaAvailable();
+        const bill = mediaBill(peak, if (cuda) gen_mod.sumSafetensorsAt(sch.io, params.model_dir) else 0, cuda);
+        const avail = availForLoad(bill.ram);
         const gb = 1024.0 * 1024.0 * 1024.0;
         log.info("[preflight] media peak ~{d:.2} GB (staged residency), available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(peak)) / gb,
             @as(f64, @floatFromInt(avail)) / gb,
         });
-        if (memInsufficientForLoad(peak, avail)) {
+        if (memInsufficientForLoad(bill.ram, avail)) {
             log.err("Insufficient memory for this media model: needs ~{d:.1} GB free ({d:.1} GB for the model plus headroom for warmup buffers) but only {d:.1} GB is available. Unload the chat model or close other apps and retry; pass --skip-mem-preflight to override.\n", .{
-                @as(f64, @floatFromInt(loadRequirementBytes(peak))) / gb,
-                @as(f64, @floatFromInt(peak)) / gb,
+                @as(f64, @floatFromInt(loadRequirementBytes(bill.ram))) / gb,
+                @as(f64, @floatFromInt(bill.ram)) / gb,
                 @as(f64, @floatFromInt(avail)) / gb,
             });
             return error.InsufficientMemory;
+        }
+        if (bill.gpu > 0) {
+            var active: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active);
+            const gpu_free = mlx.maxRecommendedWorkingSet() -| active;
+            log.info("[preflight] media working set ~{d:.2} GB on the GPU, {d:.2} GB free\n", .{
+                @as(f64, @floatFromInt(bill.gpu)) / gb,
+                @as(f64, @floatFromInt(gpu_free)) / gb,
+            });
+            if (gpu_free > 0 and bill.gpu > gpu_free) {
+                log.err("Insufficient GPU memory for this media model: its working set needs ~{d:.1} GB but only {d:.1} GB of GPU memory is free. Unload other models and retry; pass --skip-mem-preflight to override.\n", .{
+                    @as(f64, @floatFromInt(bill.gpu)) / gb,
+                    @as(f64, @floatFromInt(gpu_free)) / gb,
+                });
+                return error.InsufficientMemory;
+            }
         }
     }
 
@@ -3824,6 +3852,23 @@ pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     return weights_bytes + headroom;
 }
 
+test "media bill: CUDA checks the weights against RAM and only the working set against the GPU" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // Music3 8-bit: 13 GB of weights + its 6 GB generation buffer.
+    const peak = 13 * GB + gen_mod.MUSIC3_GEN_BUFFER_BYTES;
+    const cuda = mediaBill(peak, 13 * GB, true);
+    try std.testing.expectEqual(13 * GB, cuda.ram);
+    try std.testing.expectEqual(gen_mod.MUSIC3_GEN_BUFFER_BYTES, cuda.gpu);
+    // Unified memory holds both in one pool, as before.
+    const unified = mediaBill(peak, 13 * GB, false);
+    try std.testing.expectEqual(peak, unified.ram);
+    try std.testing.expectEqual(@as(u64, 0), unified.gpu);
+    // A staged pack peaks below its file sum: the peak bounds the RAM bill, nothing is left for the GPU.
+    const staged = mediaBill(15 * GB, 40 * GB, true);
+    try std.testing.expectEqual(15 * GB, staged.ram);
+    try std.testing.expectEqual(@as(u64, 0), staged.gpu);
+}
+
 test "a refusal quotes the number it actually compared" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -3858,7 +3903,7 @@ test "BOTH preflight refusals quote the number they compared, not the weights" {
     const src = @embedFile("scheduler.zig");
     // Each refusal formats the REQUIREMENT as its first figure, from the one
     // helper the comparison itself uses — never a second formula that can drift.
-    const media_arg = "loadRequirement" ++ "Bytes(peak))) / gb";
+    const media_arg = "loadRequirement" ++ "Bytes(bill.ram))) / gb";
     try testing.expect(std.mem.indexOf(u8, src, media_arg) != null);
     const text_arg = "loadRequirement" ++ "Bytes(weights_bytes))) / gb";
     try testing.expect(std.mem.indexOf(u8, src, text_arg) != null);

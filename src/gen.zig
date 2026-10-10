@@ -4998,7 +4998,7 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
 
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
 /// readable — 0 means "unknown", which every caller treats as "do not block".
-fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
+pub fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
     if (path.len == 0 or path[0] != '/') return 0; // openDirAbsolute UB class
     var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return 0;
     defer d.close(io);
