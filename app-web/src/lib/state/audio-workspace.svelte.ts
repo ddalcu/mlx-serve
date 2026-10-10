@@ -201,6 +201,11 @@ export class AudioWorkspace {
     this.busy = false;
     this.error = "";
     if (this.c.run) this.c.cancel();
+    this.leave();
+  }
+
+  /** The pane closed: the microphone and playback stop, a generation keeps running. */
+  leave() {
     this.stopRecording(true);
     this.stopPlayback();
   }

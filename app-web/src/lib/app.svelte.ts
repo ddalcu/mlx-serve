@@ -24,7 +24,7 @@ export const titles: Record<View, string> = {
   library: N("Library"),
 };
 
-export type SettingsCategory = "all" | "interface" | "servers" | "about";
+export type SettingsCategory = "all" | "interface" | "providers" | "about";
 
 /** Everything the panes share: storage, preferences, the selected server and where we are. */
 export class App {

@@ -42,7 +42,10 @@ const stb = @import("stb");
 /// The reference's recommended sampling: 40 steps, no guidance.
 pub const DEFAULT_STEPS: u32 = 40;
 
-pub fn resolveSteps(steps: u32) u32 {
+/// A checkpoint's own `sample_sigmas` grid (Turbo) decides the step count over
+/// the request's, as in diffusers' QwenImage21Pipeline.
+pub fn resolveSteps(grid: ?[]const f32, steps: u32) u32 {
+    if (grid) |g| return @intCast(g.len);
     return if (steps == 0) DEFAULT_STEPS else steps;
 }
 
@@ -362,6 +365,32 @@ pub fn computeSigmas(a: std.mem.Allocator, steps: u32, image_seq_len: u32) ![]f3
     const scale = (1.0 - shifted(emu, n, n - 1)) / (1.0 - terminal);
     for (0..steps) |i| out[i] = @floatCast(1.0 - (1.0 - shifted(emu, n, @floatFromInt(i))) / scale);
     out[steps] = 0;
+    return out;
+}
+
+/// Sigmas [steps+1] for one request: the checkpoint's grid verbatim plus the
+/// terminal 0 (its scheduler config is shift 1, no dynamic shifting), else
+/// the dynamic-shift schedule.
+pub fn scheduleSigmas(a: std.mem.Allocator, grid: ?[]const f32, steps: u32, image_seq_len: u32) ![]f32 {
+    const g = grid orelse return computeSigmas(a, steps, image_seq_len);
+    const out = try a.alloc(f32, g.len + 1);
+    @memcpy(out[0..g.len], g);
+    out[g.len] = 0;
+    return out;
+}
+
+/// `model_index.json` `sample_sigmas` (owned), or null when the file or key is absent.
+pub fn parseSampleSigmas(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !?[]f32 {
+    const path = try std.fmt.allocPrint(a, "{s}/model_index.json", .{model_dir});
+    defer a.free(path);
+    var parsed = readJson(io, a, path) catch |err| return if (err == error.QwenImageConfigMissing) null else err;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const v = parsed.value.object.get("sample_sigmas") orelse return null;
+    if (v != .array or v.array.items.len == 0) return error.QwenImageBadConfig;
+    const out = try a.alloc(f32, v.array.items.len);
+    errdefer a.free(out);
+    for (v.array.items, out) |e, *o| o.* = jsonF32(e) orelse return error.QwenImageBadConfig;
     return out;
 }
 
@@ -2049,6 +2078,8 @@ pub const Engine = struct {
     /// The pack's text_encoder/ carries the Qwen3-VL tower (edit capability),
     /// probed at load by `towerPresentIn`; the tower weights load on demand.
     has_tower: bool = false,
+    /// `model_index.json` `sample_sigmas` (Turbo's distilled grid), owned.
+    sample_sigmas: ?[]f32 = null,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, staged: bool) !*Engine {
         const dit_cfg = try DitConfig.parse(io, allocator, model_dir);
@@ -2069,6 +2100,8 @@ pub const Engine = struct {
         };
         errdefer allocator.free(self.model_dir);
         self.has_tower = towerPresentIn(io, allocator, self.model_dir);
+        self.sample_sigmas = try parseSampleSigmas(io, allocator, model_dir);
+        errdefer if (self.sample_sigmas) |g| allocator.free(g);
         self.vae_cfg = try VaeConfig.parse(io, allocator, model_dir);
         errdefer self.vae_cfg.deinit(allocator);
 
@@ -2087,9 +2120,10 @@ pub const Engine = struct {
         if (!staged) self.te = try TextEncoder.load(io, allocator, self.s, model_dir, COMPUTE);
         logMemory("load");
 
-        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s})\n", .{
+        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s}, {d} steps{s})\n", .{
             self.dit_cfg.layers, self.dit_cfg.hidden(), @tagName(self.dit.dtype),                         self.dit.fused_rope,
             self.vae_cfg.z_dim,  VAE_DOWNSAMPLE,        if (staged) "staged per request" else "resident",
+            self.stepsFor(0),    if (self.sample_sigmas != null) " from sample_sigmas" else "",
         });
         return self;
     }
@@ -2101,8 +2135,13 @@ pub const Engine = struct {
         self.dit.deinit();
         self.tok.deinit();
         self.vae_cfg.deinit(self.allocator);
+        if (self.sample_sigmas) |g| self.allocator.free(g);
         self.allocator.free(self.model_dir);
         self.allocator.destroy(self);
+    }
+
+    pub fn stepsFor(self: *const Engine, steps: u32) u32 {
+        return resolveSteps(self.sample_sigmas, steps);
     }
 
     /// Prompt → conditioning [1, n, context] (evaluated; caller frees).
@@ -2179,7 +2218,7 @@ pub const Engine = struct {
     /// Returns the image [1,3,H,W] f32 in [0,1] (owned; caller frees).
     pub fn generateImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: GenOpts, progress: ?sse.Progress) !A {
         const s = self.s;
-        const n_steps = resolveSteps(steps);
+        const n_steps = self.stepsFor(steps);
         const lat_h: usize = height / VAE_DOWNSAMPLE;
         const lat_w: usize = width / VAE_DOWNSAMPLE;
         const n_img: c_int = @intCast(lat_h * lat_w);
@@ -2200,7 +2239,7 @@ pub const Engine = struct {
         var neg_geo: ?Geometry = if (cond.neg) |n| try Geometry.init(allocator, self.dit_cfg, @intCast(mlx.getShape(n)[1]), lat_h, lat_w) else null;
         defer if (neg_geo) |*g| g.deinit();
 
-        const sigmas = try computeSigmas(allocator, n_steps, @intCast(n_img));
+        const sigmas = try scheduleSigmas(allocator, self.sample_sigmas, n_steps, @intCast(n_img));
         defer allocator.free(sigmas);
         const start: u32 = if (opts.init_image != null) @min(opts.start_step, n_steps - 1) else 0;
 
@@ -2309,7 +2348,7 @@ pub const Engine = struct {
         if (image_bytes.len == 0) return error.NoReferenceImages;
         const a = allocator;
         const s = self.s;
-        const n_steps = resolveSteps(steps);
+        const n_steps = self.stepsFor(steps);
         const lat_h: usize = out_h / VAE_DOWNSAMPLE;
         const lat_w: usize = out_w / VAE_DOWNSAMPLE;
         const target_tokens: usize = lat_h * lat_w;
@@ -2449,7 +2488,7 @@ pub const Engine = struct {
 
         // 5. The mu/shift input counts TARGET tokens only (the reference
         //    pipeline feeds the target latents' length, never the joint's).
-        const sigmas = try computeSigmas(a, n_steps, @intCast(target_tokens));
+        const sigmas = try scheduleSigmas(a, self.sample_sigmas, n_steps, @intCast(target_tokens));
         defer a.free(sigmas);
 
         // 6. Euler denoise: the packed stream is [refs (constant clean) |
@@ -2592,6 +2631,48 @@ test "QwenImage sigmas match the reference schedule" {
     const one = try computeSigmas(testing.allocator, 1, 640);
     defer testing.allocator.free(one);
     try testing.expectEqualSlices(f32, &.{ 1.0, 0.0 }, one);
+}
+
+const TURBO_SIGMAS = [_]f32{ 1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568 };
+
+test "QwenImage a checkpoint's sample_sigmas grid sets the steps and the schedule" {
+    try testing.expectEqual(@as(u32, 8), resolveSteps(&TURBO_SIGMAS, 0));
+    try testing.expectEqual(@as(u32, 8), resolveSteps(&TURBO_SIGMAS, 40));
+    try testing.expectEqual(DEFAULT_STEPS, resolveSteps(null, 0));
+    try testing.expectEqual(@as(u32, 12), resolveSteps(null, 12));
+
+    const got = try scheduleSigmas(testing.allocator, &TURBO_SIGMAS, 8, 4096);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(f32, &TURBO_SIGMAS ++ [_]f32{0.0}, got);
+    const dynamic = try scheduleSigmas(testing.allocator, null, 8, 640);
+    defer testing.allocator.free(dynamic);
+    const want = try computeSigmas(testing.allocator, 8, 640);
+    defer testing.allocator.free(want);
+    try testing.expectEqualSlices(f32, want, dynamic);
+}
+
+test "QwenImage parseSampleSigmas reads model_index.json" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+
+    // No model_index.json, or one without the key: the dynamic schedule.
+    try testing.expectEqual(@as(?[]f32, null), try parseSampleSigmas(io, a, root));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = "{\"_class_name\":\"QwenImage21Pipeline\"}" });
+    try testing.expectEqual(@as(?[]f32, null), try parseSampleSigmas(io, a, root));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = "{\"_class_name\":\"QwenImage21Pipeline\",\"sample_sigmas\":[1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568]}" });
+    const grid = (try parseSampleSigmas(io, a, root)).?;
+    defer a.free(grid);
+    try testing.expectEqualSlices(f32, &TURBO_SIGMAS, grid);
+
+    for ([_][]const u8{ "{\"sample_sigmas\":[]}", "{\"sample_sigmas\":[1.0,\"x\"]}", "{\"sample_sigmas\":0.5}" }) |bad| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = bad });
+        try testing.expectError(error.QwenImageBadConfig, parseSampleSigmas(io, a, root));
+    }
 }
 
 test "QwenImage convs strip only past the unfold budget" {

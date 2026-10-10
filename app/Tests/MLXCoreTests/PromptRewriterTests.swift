@@ -52,4 +52,34 @@ final class PromptRewriterTests: XCTestCase {
     func testCleanStripsFencesAndQuotes() {
         XCTAssertEqual(PromptRewriter.clean("```\n“A red fox.”\n```"), "A red fox.")
     }
+
+    // MARK: - First frame
+
+    private let png = Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3])
+
+    /// A clip with a first frame carries the picture and the rule that the prompt must describe it.
+    func testAFirstFrameRidesTheRequestWithItsRule() {
+        let clip = PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10, firstFrame: png)
+        let plan = PromptRewriter.storyboard(idea: "they dance", format: .h3Base, totalSeconds: 30,
+                                             shotSeconds: 5...10, firstFrame: png)
+        for r in [clip, plan] {
+            XCTAssertEqual(r.firstFrame, png)
+            XCTAssertTrue(r.user(seeingImage: true).contains("attached picture"))
+        }
+        XCTAssertTrue(plan.user(seeingImage: true).contains("Shot 1 opens on it"))
+        XCTAssertFalse(clip.user(seeingImage: true).contains("Shot 1"))
+    }
+
+    /// A model that cannot see the picture is never told about it.
+    func testTheRuleStaysOutWhenTheModelCannotSeeThePicture() {
+        let r = PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10, firstFrame: png)
+        XCTAssertFalse(r.user(seeingImage: false).contains("attached picture"))
+        XCTAssertEqual(r.user(seeingImage: false), PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10).user)
+    }
+
+    func testNoFirstFrameMeansNoPicture() {
+        let r = PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10)
+        XCTAssertNil(r.firstFrame)
+        XCTAssertEqual(r.user(seeingImage: true), r.user)
+    }
 }

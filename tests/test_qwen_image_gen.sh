@@ -19,7 +19,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 MODEL="${QWEN_IMAGE_MODEL:-$(ls -d /Users/Shared/mlx-serve/ddalcu/Qwen-Image-2.1-MLX-Serve-* ~/.mlx-serve/models/ddalcu/Qwen-Image-2.1-MLX-Serve-* 2>/dev/null | head -1)}"
-[ -n "$MODEL" ] && [ -f "$MODEL/config.json" ] || { echo "SKIP: no Qwen-Image-2.1 pack (set QWEN_IMAGE_MODEL)"; exit 0; }
+[ -n "$MODEL" ] && { [ -f "$MODEL/config.json" ] || [ -f "$MODEL/model_index.json" ]; } || { echo "SKIP: no Qwen-Image-2.1 pack (set QWEN_IMAGE_MODEL)"; exit 0; }
+# A pack with its own sampling grid (Turbo's `sample_sigmas`) runs that many steps whatever is requested.
+STEPS="$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('sample_sigmas') or [0]*6))" "$MODEL/model_index.json" 2>/dev/null || echo 6)"
 NOTOWER="${QWEN_IMAGE_NOTOWER_MODEL:-$HOME/claude-tmp/qwen21-edit/run1/pack-notower}"
 
 OUT="$(mktemp -d)"
@@ -77,6 +79,9 @@ m = [x for x in json.load(sys.stdin)['data'] if x['id'] == '$ID']
 assert m and m[0]['state'] == 'ready' and 'image' in m[0]['capabilities'], m" \
   && pass "load by path -> ready with the image capability" || fail "pack did not load as an image model"
 grep -q "\[image\] Qwen-Image-2.1 ready" "$LOG" && pass "qwen_image backend engaged" || fail "no backend ready line"
+if [ "$STEPS" != 6 ]; then
+  grep -q "$STEPS steps from sample_sigmas)" "$LOG" && pass "the pack's sample_sigmas grid sets $STEPS steps" || fail "sample_sigmas grid not engaged"
+fi
 
 # Loaded and unloaded rows must both report the pack's real model_type, never
 # the image modality's "flux2" marker (a client watching the list would see
@@ -156,7 +161,7 @@ done
 [ "$(gen "$OUT/e1.json" "\"prompt\":\"add a small red hat to the subject\",\"mode\":\"edit\",\"strength\":0.5,\"image\":\"$(cat "$OUT/src43.b64")\"")" = 200 ] \
   && [ "$(png_dims "$OUT/e1.json")" = "512x512" ] \
   && pass "instruction edit -> 512x512 PNG (valid strength accepted+ignored)" || fail "instruction edit"
-grep -q "\[qwen-image\] edit 512x512 refs=1 steps=6 guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
+grep -q "\[qwen-image\] edit 512x512 refs=1 steps=$STEPS guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
   && pass "edit engaged (one forward per step)" || fail "no edit engagement line"
 grep -q "\[image\] edit: reference .* bytes (byte-based backend)" "$LOG" \
   && pass "byte-based edit transport engaged" || fail "no byte-based edit reference line"
@@ -177,7 +182,7 @@ grep -q "edit: target 1024x1024 -> 1184x896 (last reference is 512x384, size mat
 [ "$(genq "$OUT/e3.json" "\"prompt\":\"compose the subject and the two references into one image\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src43.b64")\",\"ref_images\":[\"$(cat "$OUT/ref256.b64")\",\"$(cat "$OUT/refp.b64")\"]")" = 200 ] \
   && [ "$(png_dims "$OUT/e3.json")" = "896x1184" ] \
   && pass "multi-ref edit -> 896x1184 (LAST reference's aspect)" || fail "multi-ref edit"
-grep -q "\[qwen-image\] edit 896x1184 refs=3 steps=6 guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
+grep -q "\[qwen-image\] edit 896x1184 refs=3 steps=$STEPS guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
   && pass "multi-ref edit engaged (refs=3)" || fail "no multi-ref engagement line"
 grep -q "\[image\] edit ref 3: .* bytes (byte-based backend)" "$LOG" \
   && pass "second extra reference engaged (edit ref 3)" || fail "no edit ref 3 line"
@@ -207,7 +212,7 @@ code="$(curl -s -m 60 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content
   -o "$OUT/e10.json" -w '%{http_code}')"
 [ "$code" = 400 ] && grep -q "ref_resolution.*\[256,1024\]" "$OUT/e10.json" \
   && pass "ref_resolution 1536 -> 400 (named range)" || fail "ref_resolution out-of-range returned $code"
-grep -q "\[qwen-image\] edit 256x256 refs=5 steps=6 guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
+grep -q "\[qwen-image\] edit 256x256 refs=5 steps=$STEPS guidance=1.0 refres=1024 (one forward per step)" "$LOG" \
   && pass "5-ref edit engaged (refs=5)" || fail "no 5-ref engagement line"
 
 # ── the request-scope residency bill: a joint sequence past any working set
@@ -225,7 +230,7 @@ code="$(curl -s -m 60 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content
 [ "$(gen "$OUT/e5.json" "\"prompt\":\"add a small red hat to the subject\",\"mode\":\"edit\",\"guidance_scale\":2.5,\"negative_prompt\":\"blurry, low quality\",\"image\":\"$(cat "$OUT/src43.b64")\"")" = 200 ] \
   && [ "$(png_dims "$OUT/e5.json")" = "512x512" ] \
   && pass "guided edit -> PNG" || fail "guided edit"
-grep -q "\[qwen-image\] edit 512x512 refs=1 steps=6 guidance=2.5 refres=1024 (two forwards per step)" "$LOG" \
+grep -q "\[qwen-image\] edit 512x512 refs=1 steps=$STEPS guidance=2.5 refres=1024 (two forwards per step)" "$LOG" \
   && pass "edit CFG engaged (two forwards per step)" || fail "edit CFG did not engage"
 cmp -s "$OUT/e1.json" "$OUT/e5.json" && fail "edit guidance did not change the render" || pass "edit guidance changes the render"
 
@@ -252,8 +257,8 @@ code="$(curl -s -m 3600 -X POST "http://127.0.0.1:$PORT/v1/images/edits" \
   -F "size=256x256" -F "steps=6" -F "ref_resolution=512" -o "$OUT/mp.json" -w '%{http_code}')"
 [ "$code" = 200 ] && [ "$(png_dims "$OUT/mp.json")" = "256x256" ] \
   && pass "/v1/images/edits (multipart, 2 files) -> 256x256 PNG" || fail "multipart edit returned $code"
-grep -q "\[qwen-image\] edit 256x256 refs=2 steps=6 guidance=1.0 refres=512 (one forward per step)" "$LOG" \
-  && pass "multipart carried both files + the sampling knobs (refs=2 steps=6 refres=512)" || fail "multipart edit lost a reference or a knob"
+grep -q "\[qwen-image\] edit 256x256 refs=2 steps=$STEPS guidance=1.0 refres=512 (one forward per step)" "$LOG" \
+  && pass "multipart carried both files + the sampling knobs (refs=2 steps=$STEPS refres=512)" || fail "multipart edit lost a reference or a knob"
 
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && pass "server alive" || fail "server died"
 grep -q "\[mlx\]" "$LOG" && fail "MLX error in the log"

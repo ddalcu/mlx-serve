@@ -447,7 +447,13 @@ struct ImageGenView: View {
         if model.stepsAreFixed {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Quality").font(.app(.headline).weight(.semibold))
-                Text("Fixed at \(model.fixedSteps) steps — this model is distilled for a \(model.fixedSteps)-step schedule, so more steps cost time without adding detail.")
+                Group {
+                    if model.stepsSetByCheckpoint {
+                        Text("Fixed at \(model.fixedSteps) steps — this model runs its own \(model.fixedSteps)-step schedule.")
+                    } else {
+                        Text("Fixed at \(model.fixedSteps) steps — this model is distilled for a \(model.fixedSteps)-step schedule, so more steps cost time without adding detail.")
+                    }
+                }
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
@@ -704,9 +710,12 @@ struct ImageGenView: View {
             FoldingSectionHeader(title: "Advanced options", isExpanded: $showAdvanced)
             if showAdvanced {
                 // Steps stay overridable even where the schedule is fixed —
-                // it's the Advanced panel, and the hint says the cost.
-                intSliderRow("Steps", value: $steps, range: 1...50)
-                if model.stepsAreFixed {
+                // it's the Advanced panel, and the hint says the cost — except
+                // where the pack's own grid decides and the server ignores them.
+                if !model.stepsSetByCheckpoint {
+                    intSliderRow("Steps", value: $steps, range: 1...50)
+                }
+                if model.stepsAreFixed && !model.stepsSetByCheckpoint {
                     Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")
                         .font(.app(.caption2))
                         .foregroundStyle(.secondary)

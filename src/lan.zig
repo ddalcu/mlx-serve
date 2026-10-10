@@ -50,7 +50,7 @@ pub fn routeClass(method: []const u8, path: []const u8) RouteClass {
     const eql = std.mem.eql;
     if (eql(u8, method, "OPTIONS")) return .open; // CORS preflight
     if (eql(u8, method, "GET")) {
-        for ([_][]const u8{ "/health", "/v1/models", "/api/version" }) |p|
+        for ([_][]const u8{ "/health", "/v1/models", "/api/version", "/launch" }) |p|
             if (eql(u8, path, p)) return .open;
         return .denied;
     }
@@ -1087,6 +1087,7 @@ test "lan: routeClass allows exactly the shared inference surface" {
     try t.expectEqual(RouteClass.open, routeClass("GET", "/health"));
     try t.expectEqual(RouteClass.open, routeClass("GET", "/v1/models"));
     try t.expectEqual(RouteClass.open, routeClass("GET", "/api/version"));
+    try t.expectEqual(RouteClass.open, routeClass("GET", "/launch"));
     // Inference is model-gated on every surface, media included.
     for ([_][]const u8{
         "/v1/chat/completions",        "/v1/completions",

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Client } from "../src/lib/core/client";
 import type { Model } from "../src/lib/core/models";
-import { buildVideoRequest, frameOptions, h3Sizes, VideoController, videoDefaults, videoProfile, videoQuality, videoSize, type VideoInputs } from "../src/lib/state/video-state.svelte";
+import { buildVideoRequest, frameOptions, h3Sizes, sizeLabel, stepsAdvice, VideoController, videoDefaults, videoProfile, videoQuality, videoSize, type VideoInputs } from "../src/lib/state/video-state.svelte";
 import { MemoryLibrary } from "./support/memory-library";
 
 const model = (id: string, architecture: string): Model => ({ id, capabilities: ["video"], architecture, meta: {} });
@@ -95,7 +95,7 @@ describe("buildVideoRequest", () => {
   it("H3: chained windows, the slow recipe and Turbo are opt-ins", () => {
     const body = buildVideoRequest(h3, draft(h3, { ...small, windows: 2, best: true, turbo: true, steps: 8, frames: 39 }));
     expect(body).toMatchObject({ chain_windows: 2, fast: false, turbo: true });
-    expect(() => buildVideoRequest(h3, draft(h3, { ...small, turbo: true, steps: 30, frames: 39 }))).toThrow(/Steps must be 4–16/);
+    expect(() => buildVideoRequest(h3, draft(h3, { ...small, turbo: true, steps: 30, frames: 39 }))).toThrow(/Steps must be 4–8/);
     expect(body).not.toHaveProperty("pipeline");
     expect(buildVideoRequest(h3, draft(h3, { ...small, frames: 39 }))).not.toHaveProperty("chain_windows");
   });
@@ -135,6 +135,21 @@ describe("buildVideoRequest", () => {
 
   it("every size the picker offers is a size the model accepts", () => {
     for (const [width, height] of h3Sizes) expect(() => buildVideoRequest(h3, draft(h3, { width, height, frames: 22 }))).not.toThrow();
+  });
+});
+
+describe("the pane's guidance", () => {
+  it("size presets say which canvas is fastest and what the others cost", () => {
+    expect(sizeLabel(h3Sizes[1]!)).toBe("960 × 544 (16:9 widescreen) — fastest, best for long clips");
+    expect(sizeLabel(h3Sizes[0]!)).toBe("1344 × 768 (16:9 widescreen) — most detail, 2.9x slower");
+    expect(sizeLabel(videoProfile(ltx)!.sizes[1]!)).toBe("448 × 704 (portrait 9:14)");
+  });
+
+  it("H3 under 16 steps needs a few-step adapter unless Turbo is on", () => {
+    expect(stepsAdvice(h3, draft(h3, { steps: 8 }))).toMatch(/needs a distilled few-step adapter/);
+    expect(stepsAdvice(h3, draft(h3, { steps: 8, turbo: true }))).toBe("");
+    expect(stepsAdvice(h3, draft(h3, { steps: 16 }))).toBe("");
+    expect(stepsAdvice(ltx, draft(ltx, { steps: 4 }))).toBe("");
   });
 });
 
@@ -207,5 +222,44 @@ describe("VideoController", () => {
     release();
     await first;
     expect(c.phase).toBe("completed");
+  });
+
+  it("a storyboard runs its shots in order, each opening on the last frame of the one before, and joins them", async () => {
+    const sent: Record<string, unknown>[] = [],
+      added: [unknown, number][] = [];
+    const { c, library } = make(async (_c: never, r: never) => {
+      sent.push(r);
+      return { raw: { frames: sent.length }, elapsedMs: 10 };
+    }, async () => encoded);
+    c.lastFrame = async (r) => `LAST${(r as { frames: number }).frames}`;
+    c.openEncoder = async () => ({
+      add: async (r, skip) => void added.push([r, skip]),
+      finish: async () => ({ ...encoded, container: "mp4", heapBeforeBytes: null, peakHeapBytes: null, workingBufferBytes: 0 }),
+      close() {},
+    });
+    const base = { model: "m/h3", prompt: "story", steps: 30, seed: 5, first_frame_image: "MINE", last_frame_image: "END" } as never;
+    await c.generateStoryboard({} as Client, base, [{ prompt: "one", frames: 124 }, { prompt: "two", frames: 192 }, { prompt: "three", frames: 124 }], "http://s");
+    expect(sent.map((r) => [r.prompt, r.num_frames, r.seed, r.first_frame_image, r.last_frame_image])).toEqual([
+      ["one", 124, 5, "MINE", undefined],
+      ["two", 192, 7, "LAST1", undefined],
+      ["three", 124, 9, "LAST2", "END"],
+    ]);
+    expect(added.map(([, skip]) => skip)).toEqual([0, 1, 1]);
+    expect(c.phase).toBe("completed");
+    expect([...library.items.values()].map((i) => [i.model, i.prompt])).toEqual([["m/h3", "story"]]);
+  });
+
+  it("a failed shot says which one, and saves nothing", async () => {
+    let n = 0;
+    const { c, library } = make(async () => {
+      if (++n === 2) throw new Error("out of memory");
+      return { raw: { frames: 1 }, elapsedMs: 1 };
+    }, async () => encoded);
+    c.lastFrame = async () => "LAST";
+    c.openEncoder = async () => ({ add: async () => {}, finish: async () => { throw new Error("unreachable"); }, close() {} });
+    await c.generateStoryboard({} as Client, { model: "m", prompt: "s", steps: 4, seed: 1 } as never, [{ prompt: "a", frames: 5 }, { prompt: "b", frames: 5 }], "http://s");
+    expect(c.phase).toBe("failed");
+    expect(c.message).toBe("Shot 2 of 2: out of memory");
+    expect(library.items.size).toBe(0);
   });
 });

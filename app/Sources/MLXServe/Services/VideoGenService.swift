@@ -165,67 +165,8 @@ final class VideoGenService: ObservableObject {
                                             request: request, firstFrameB64: firstFrameB64,
                                             lastFrameB64: lastFrameB64,
                                             audioB64: audioB64, refs: refs)
-                // SSE: the server pushes `progress` events per denoise step, then a
-                // `complete` event with the frames. Drive a determinate bar from them.
-                var decoded: DecodedFrames? = nil
-                // Live ETA from the run's own cadence — the only estimate that
-                // knows what this machine is doing right now. A three-hour job
-                // with a bar and no number is indistinguishable from a hang.
-                var clock = H3StepClock()
-                // Floor + tail for the live number (H3 only; LTX keeps the
-                // plain lap mean — its laps are near-uniform and it has no
-                // pre-run model to floor against). `fast` is effectiveFast:
-                // turbo forces the server recipe off, never !bestQuality alone.
-                let pricing: (perStep: Double, tail: Double) =
-                    request.model.backend == .minimaxH3
-                    ? H3TimeEstimate.livePricing(model: request.model,
-                                                 width: request.width, height: request.height,
-                                                 frames: request.numFrames, steps: steps,
-                                                 fast: !request.bestQuality && !request.turbo)
-                    : (0, 0)
-                let startedAt = ProcessInfo.processInfo.systemUptime
-                for try await ev in api.streamGeneration(
-                    port: port, path: "/v1/video/generations", json: body) {
-                    switch ev["type"] as? String {
-                    case "progress":
-                        let step = ev["step"] as? Int ?? 0
-                        let total = ev["total"] as? Int ?? steps
-                        let stage = ev["stage"] as? String ?? L10n.text("Generating")
-                        clock.observe(step: step)
-                        var message = L10n.format("%@…", L10n.text(stage))
-                        if let eta = clock.eta(totalSteps: max(total, 1),
-                                               floorPerStep: pricing.perStep, tail: pricing.tail),
-                           eta > 0 {
-                            message += " \(H3TimeEstimate.duration(eta)) left"
-                        }
-                        if let data = MediaSSE.previewJPEG(ev), let img = NSImage(data: data) {
-                            setLivePreview(img, for: gen)
-                        }
-                        setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
-                    case "complete":
-                        decoded = await offMain { Self.decodeFrames(ev) }
-                    case "error":
-                        await releaseIfNeeded()
-                        setPhase(.failed(ev["message"] as? String ?? L10n.text("Generation failed.")), for: gen)
-                        return
-                    default:
-                        break
-                    }
-                }
-                try Task.checkCancellation()
+                let frames = try await streamWindow(request, body: body, port: port, gen: gen)
                 await releaseIfNeeded()
-                guard let frames = decoded else {
-                    setPhase(.failed(L10n.text("Server returned no video frames.")), for: gen)
-                    return
-                }
-                if Task.isCancelled { setPhase(.cancelled, for: gen); return }
-                // Calibrate this Mac against the anchor model, so the next
-                // estimate is measured rather than extrapolated. Recorded from
-                // the SAMPLING span only — the encode below is ours, not the
-                // model's, and the estimate does not include it.
-                H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
-                                      frames: request.numFrames, steps: steps, fast: !request.bestQuality,
-                                      measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
                 setPhase(.running(step: steps, total: steps, message: L10n.text("Encoding mp4…")), for: gen)
                 let outFps = frames.fps > 0 ? frames.fps : fps
                 let settings = Self.settingsText(
@@ -256,6 +197,166 @@ final class VideoGenService: ObservableObject {
                 }
                 await releaseIfNeeded()
                 setPhase(.failed(error.localizedDescription), for: gen)
+            }
+        }
+    }
+
+    /// One window: stream `/v1/video/generations`, drive the phase off its
+    /// `progress` events (`label` prefixes the stage, e.g. the shot number) and
+    /// return the decoded frames. A server `error` event throws its message.
+    private func streamWindow(_ request: VideoGenRequest, body: [String: Any], port: UInt16, gen: Int,
+                              label: String = "") async throws -> DecodedFrames {
+        let steps = request.steps
+        var decoded: DecodedFrames? = nil
+        // Live ETA from the run's own cadence — the only estimate that
+        // knows what this machine is doing right now. A three-hour job
+        // with a bar and no number is indistinguishable from a hang.
+        var clock = H3StepClock()
+        // Floor + tail for the live number (H3 only; LTX keeps the
+        // plain lap mean — its laps are near-uniform and it has no
+        // pre-run model to floor against). `fast` is effectiveFast:
+        // turbo forces the server recipe off, never !bestQuality alone.
+        let pricing: (perStep: Double, tail: Double) =
+            request.model.backend == .minimaxH3
+            ? H3TimeEstimate.livePricing(model: request.model,
+                                         width: request.width, height: request.height,
+                                         frames: request.numFrames, steps: steps,
+                                         fast: !request.bestQuality && !request.turbo)
+            : (0, 0)
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        for try await ev in api.streamGeneration(
+            port: port, path: "/v1/video/generations", json: body) {
+            switch ev["type"] as? String {
+            case "progress":
+                let step = ev["step"] as? Int ?? 0
+                let total = ev["total"] as? Int ?? steps
+                let stage = ev["stage"] as? String ?? L10n.text("Generating")
+                clock.observe(step: step)
+                var message = label + L10n.format("%@…", L10n.text(stage))
+                if let eta = clock.eta(totalSteps: max(total, 1),
+                                       floorPerStep: pricing.perStep, tail: pricing.tail),
+                   eta > 0 {
+                    message += " \(H3TimeEstimate.duration(eta)) left"
+                }
+                if let data = MediaSSE.previewJPEG(ev), let img = NSImage(data: data) {
+                    setLivePreview(img, for: gen)
+                }
+                setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
+            case "complete":
+                decoded = await offMain { Self.decodeFrames(ev) }
+            case "error":
+                throw MediaGenError.server(ev["message"] as? String ?? L10n.text("Generation failed."))
+            default:
+                break
+            }
+        }
+        try Task.checkCancellation()
+        guard let frames = decoded else {
+            throw MediaGenError.server(L10n.text("Server returned no video frames."))
+        }
+        // Calibrate this Mac against the anchor model, so the next
+        // estimate is measured rather than extrapolated. Recorded from
+        // the SAMPLING span only — the encode after this is ours, not the
+        // model's, and the estimate does not include it.
+        H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
+                              frames: request.numFrames, steps: steps, fast: !request.bestQuality,
+                              measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
+        return frames
+    }
+
+    /// A storyboard: one window per shot, each opening on the previous shot's
+    /// last frame (`Storyboard.shotRequest`), written to its own mp4 beside a
+    /// PNG of its last frame, then joined into one clip. The model loads once
+    /// for every shot; shots already written stay on disk if a later one fails.
+    func generateStoryboard(_ base: VideoGenRequest, shots: [(prompt: String, frames: Int)],
+                            server: ServerManager) {
+        guard !shots.isEmpty, shots.allSatisfy({ !$0.prompt.isBlank }) else {
+            phase = .failed(L10n.text("Every shot needs a prompt."))
+            return
+        }
+        guard base.lanModelId != nil || ServerManager.resolveModelDir(repo: base.model.repo) != nil else {
+            phase = .failed("Model \(base.model.repo) is not downloaded. Download it first.")
+            return
+        }
+
+        task?.cancel()
+        generationSeq += 1
+        let gen = generationSeq
+        livePreview = nil
+        startedAt = Date()
+        phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
+        log = []
+
+        let outputPath = Self.makeOutputPath(prompt: base.prompt.isBlank ? shots[0].prompt : base.prompt)
+        let shotsDir = URL(fileURLWithPath: (outputPath as NSString).deletingPathExtension + "-shots")
+        let keep = base.keepResident
+
+        task = Task {
+            var loadedId: String? = nil
+            func releaseIfNeeded() async {
+                if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
+            }
+            // The shot being worked on; nil once every shot is written.
+            var shotIndex: Int? = 0
+            do {
+                try FileManager.default.createDirectory(at: shotsDir, withIntermediateDirectories: true)
+                let (port, modelId, unloadId) = try await server.prepareGenModel(
+                    lanModelId: base.lanModelId, repo: base.model.repo)
+                loadedId = unloadId
+                var shotURLs: [URL] = []
+                var lastFrame: String? = nil
+                var fps = base.fps
+                var settings: [String] = []
+                for (i, shot) in shots.enumerated() {
+                    shotIndex = i
+                    let req = Storyboard.shotRequest(base: base, prompt: shot.prompt, frames: shot.frames,
+                                                     index: i, count: shots.count, previousLastFrame: lastFrame)
+                    let (first, last) = await Task.detached(priority: .userInitiated) {
+                        (req.firstFrameImagePath.flatMap(Self.imageFileToBase64),
+                         req.lastFrameImagePath.flatMap(Self.imageFileToBase64))
+                    }.value
+                    let body = Self.requestBody(model: modelId, prompt: req.prompt, request: req,
+                                                firstFrameB64: first, lastFrameB64: last)
+                    let label = L10n.format("Shot %lld of %lld · ", Int64(i + 1), Int64(shots.count))
+                    let frames = try await streamWindow(req, body: body, port: port, gen: gen, label: label)
+                    setPhase(.running(step: req.steps, total: req.steps, message: label + L10n.text("Encoding mp4…")), for: gen)
+                    let url = shotsDir.appendingPathComponent(String(format: "shot-%02d.mp4", i + 1))
+                    let png = shotsDir.appendingPathComponent(String(format: "shot-%02d-last.png", i + 1))
+                    fps = frames.fps > 0 ? frames.fps : base.fps
+                    let outFps = fps
+                    try await Task.detached(priority: .userInitiated) {
+                        try VideoGenService.writeMP4(
+                            rgb: frames.rgb, frames: frames.frames,
+                            width: frames.width, height: frames.height,
+                            fps: outFps, to: url,
+                            audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
+                            audioChannels: frames.audioChannels)
+                        guard let data = VideoGenService.lastFramePNG(frames) else {
+                            throw MediaGenError.server(L10n.text("Couldn't save the shot's last frame."))
+                        }
+                        try data.write(to: png)
+                    }.value
+                    shotURLs.append(url)
+                    lastFrame = png.path
+                    settings.append("--- shot \(i + 1) ---\n" + Self.settingsText(req, modelId: modelId))
+                }
+                shotIndex = nil
+                await releaseIfNeeded()
+                setPhase(.running(step: 1, total: 1, message: L10n.text("Joining shots…")), for: gen)
+                try await Self.stitchShots(shotURLs, fps: fps, to: URL(fileURLWithPath: outputPath))
+                try? Self.writeSettingsSidecar(settings.joined(separator: "\n"), forVideo: outputPath)
+                setPhase(.completed(path: outputPath), for: gen)
+                insertRecent(outputPath)
+            } catch {
+                if Task.isCancelled || Self.isCancellation(error) {
+                    setPhase(.cancelled, for: gen)
+                    return
+                }
+                await releaseIfNeeded()
+                let message = shotIndex.map {
+                    L10n.format("Shot %lld of %lld: %@", Int64($0 + 1), Int64(shots.count), error.localizedDescription)
+                } ?? error.localizedDescription
+                setPhase(.failed(message), for: gen)
             }
         }
     }
@@ -822,6 +923,52 @@ final class VideoGenService: ObservableObject {
             }
         }
         return out
+    }
+
+    /// The clip's final frame as a lossless PNG: the next shot's first frame.
+    nonisolated static func lastFramePNG(_ f: DecodedFrames) -> Data? {
+        let bytes = f.width * f.height * 3
+        guard f.frames > 0, bytes > 0, f.rgb.count >= f.frames * bytes,
+              let provider = CGDataProvider(data: f.rgb.subdata(in: (f.frames - 1) * bytes ..< f.frames * bytes) as CFData),
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let image = CGImage(width: f.width, height: f.height, bitsPerComponent: 8, bitsPerPixel: 24,
+                                  bytesPerRow: f.width * 3, space: space,
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { return nil }
+        return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    }
+
+    /// Join shot mp4s end to end. Every shot after the first OPENS on the frame
+    /// the one before it ended on, so that frame (and its slice of sound) is cut
+    /// from the joining shot — the server's own chain shares its seams the same way.
+    nonisolated static func stitchShots(_ shots: [URL], fps: Int, to out: URL) async throws {
+        let comp = AVMutableComposition()
+        guard let video = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
+        else { throw MuxError.writerInit }
+        var audio: AVMutableCompositionTrack? = nil
+        let seam = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
+        var cursor = CMTime.zero
+        for (i, url) in shots.enumerated() {
+            let asset = AVURLAsset(url: url)
+            guard let v = try await asset.loadTracks(withMediaType: .video).first else { throw MuxError.writerInit }
+            let vRange = try await v.load(.timeRange)
+            let start = i == 0 ? vRange.start : vRange.start + seam
+            let range = CMTimeRange(start: start, end: vRange.end)
+            try video.insertTimeRange(range, of: v, at: cursor)
+            if let a = try await asset.loadTracks(withMediaType: .audio).first {
+                let aRange = range.intersection(try await a.load(.timeRange))
+                if audio == nil {
+                    audio = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+                }
+                if !aRange.isEmpty { try audio?.insertTimeRange(aRange, of: a, at: cursor + (aRange.start - start)) }
+            }
+            cursor = cursor + range.duration
+        }
+        try? FileManager.default.removeItem(at: out)
+        guard let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHighestQuality)
+        else { throw MuxError.writerInit }
+        try await export.export(to: out, as: .mp4)
     }
 
     enum MuxError: Error { case writerInit, noPool, frameBuffer(Int), frameAppend(Int, String), finishFailed(String), audioBuffer }

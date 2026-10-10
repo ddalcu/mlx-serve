@@ -59,11 +59,11 @@ describe("Settings: search and categories", () => {
 
   it("shows every section, or only the chosen category", async () => {
     const ui = await settings();
-    expect(visible()).toEqual(["interface", "servers", "about"]);
-    await ui.click(button("Servers"));
-    expect(visible()).toEqual(["servers"]);
+    expect(visible()).toEqual(["interface", "providers", "about"]);
+    await ui.click(button("Providers"));
+    expect(visible()).toEqual(["providers"]);
     await ui.click(button("All Settings"));
-    expect(visible()).toEqual(["interface", "servers", "about"]);
+    expect(visible()).toEqual(["interface", "providers", "about"]);
   });
 
   it("filters sections by what they say, and admits when nothing matches", async () => {
@@ -134,7 +134,7 @@ describe("Settings: servers", () => {
     await form("Mac", "http://mac.local:1")();
     await ui.click("#edit-server");
     expect(ui.q<HTMLInputElement>("#server-name")!.value).toBe("Mac");
-    expect(text(ui.q("#server-form-title"))).toBe("Edit Server");
+    expect(text(ui.q("#server-form-title"))).toBe("Edit Provider");
     await ui.type("#server-name", "Studio");
     submit();
     expect(rows().filter((r) => r.includes("Studio")).length).toBe(1);
