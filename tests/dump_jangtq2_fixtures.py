@@ -103,7 +103,7 @@ def prefill_case(mod: TQSwitchGLU, x: mx.array, inds: mx.array, scores: mx.array
     mx.eval(order, inv, idx_s, xr, xs, h, hr, y, w, out)
     if not mx.array_equal(w, out).item():
         raise SystemExit("prefill decomposition differs from TQSwitchGLU.routed")
-    return {"x": x, "inds": inds, "scores": scores, "order": order.astype(mx.uint32), "inv": inv.astype(mx.uint32),
+    return {"x": x, "inds": inds, "scores": scores, "inv": inv.astype(mx.uint32),
             "idx_sorted": idx_s, "xr": xr, "xs": xs, "h": h, "hr": hr, "y": y, "out": out}
 
 

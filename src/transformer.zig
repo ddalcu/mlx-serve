@@ -32709,25 +32709,12 @@ pub const Transformer = struct {
         var flat_inds = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat_inds);
         try mlx.check(mlx.mlx_reshape(&flat_inds, inds, &flat_shape, 1, self.s));
-        var order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(order);
-        try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, self.s));
-        var inv_order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inv_order);
-        try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, self.s));
-        var sorted_inds = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sorted_inds);
-        try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, self.s));
-
-        const k_arr = mlx.mlx_array_new_int(k_count);
-        defer _ = mlx.mlx_array_free(k_arr);
-        var lhs_idx = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(lhs_idx);
-        try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
+        var routes = try sortRoutes(self.s, flat_inds, k_count);
+        defer routes.deinit();
 
         var x_gathered = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_gathered);
-        try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, self.s));
+        try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, routes.lhs, 0, self.s));
         const n1d_shape = [_]c_int{ total_inds, 1, d_dim };
         var x_rep = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_rep);
@@ -32735,14 +32722,14 @@ pub const Transformer = struct {
 
         var gate_out_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_out_3d);
-        try gatherExpertMm(&gate_out_3d, x_rep, gate_w, gate_s, gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+        try gatherExpertMm(&gate_out_3d, x_rep, gate_w, gate_s, gate_b, no_idx, routes.sorted, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
         var gate_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_out);
         try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
 
         var up_out_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up_out_3d);
-        try gatherExpertMm(&up_out_3d, x_rep, up_w, up_s, up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+        try gatherExpertMm(&up_out_3d, x_rep, up_w, up_s, up_b, no_idx, routes.sorted, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
         var up_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up_out);
         try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
@@ -32755,14 +32742,14 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
         var down_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_3d);
-        try gatherExpertMm(&down_3d, act_exp, down_w, down_s, down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
+        try gatherExpertMm(&down_3d, act_exp, down_w, down_s, down_b, no_idx, routes.sorted, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
         var down_squeezed = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_squeezed);
         try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s));
 
         var down_unsorted = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_unsorted);
-        try mlx.check(mlx.mlx_take_axis(&down_unsorted, down_squeezed, inv_order, 0, self.s));
+        try mlx.check(mlx.mlx_take_axis(&down_unsorted, down_squeezed, routes.inverse, 0, self.s));
         const hidden = mlx.getShape(down_unsorted)[1];
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
@@ -33728,22 +33715,12 @@ pub const Transformer = struct {
 
             const verify_route = self.verifyFeatureEnabled(.routing, skip_shared, B, S);
             const route_pack = if (verify_route) try verifyRoutePack(self.s, flat_inds, K) else try moePrefillRoutePack(self.s, flat_inds, K, @intCast(cfg.num_experts));
-            var inv_order = if (route_pack) |value| value.inverse else mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(inv_order);
-            var sorted_inds = if (route_pack) |value| value.sorted else mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sorted_inds);
-            var lhs_idx = if (route_pack) |value| value.lhs else mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(lhs_idx);
-            if (route_pack == null) {
-                var order = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(order);
-                try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, self.s));
-                try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, self.s));
-                try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, self.s));
-                const k_arr = mlx.mlx_array_new_int(K);
-                defer _ = mlx.mlx_array_free(k_arr);
-                try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
-            } else if (verify_route) {
+            var routes = route_pack orelse try sortRoutes(self.s, flat_inds, K);
+            defer routes.deinit();
+            const inv_order = routes.inverse;
+            const sorted_inds = routes.sorted;
+            const lhs_idx = routes.lhs;
+            if (route_pack != null and verify_route) {
                 mtp_verify_kernel_calls[2] +%= 1;
                 const Once = struct {
                     var logged = false;
@@ -33752,7 +33729,7 @@ pub const Transformer = struct {
                     Once.logged = true;
                     log.info("[mtp-verify] fused verifier route packing engaged\n", .{});
                 }
-            } else {
+            } else if (route_pack != null) {
                 const Once = struct {
                     var logged = false;
                 };
@@ -36263,31 +36240,19 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
             flat_inds = joined;
         }
         const rows_all: c_int = total_inds + pad;
-        var order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(order);
-        try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, s));
-        var inv_order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inv_order);
-        try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, s));
-        var sorted_inds = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sorted_inds);
-        try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, s));
-        const k_arr = mlx.mlx_array_new_int(k_count);
-        defer _ = mlx.mlx_array_free(k_arr);
-        var lhs_idx = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(lhs_idx);
-        try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, s));
+        var routes = try sortRoutes(s, flat_inds, k_count);
+        defer routes.deinit();
         if (pad > 0) {
             const last = mlx.mlx_array_new_int(t_count - 1);
             defer _ = mlx.mlx_array_free(last);
             var clamped = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_minimum(&clamped, lhs_idx, last, s));
-            _ = mlx.mlx_array_free(lhs_idx);
-            lhs_idx = clamped;
+            try mlx.check(mlx.mlx_minimum(&clamped, routes.lhs, last, s));
+            _ = mlx.mlx_array_free(routes.lhs);
+            routes.lhs = clamped;
         }
         var x_gathered = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_gathered);
-        try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, routes.lhs, 0, s));
         var x_rep = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_rep);
         try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &[_]c_int{ rows_all, 1, d_dim }, 3, s));
@@ -36295,22 +36260,22 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
         const fc1_qp = quantParamsOrDense(cfg, nm.fc1_w, nm.fc1_s, @intCast(d_dim));
         var h_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(h_3d);
-        try gatherExpertMm(&h_3d, x_rep, nm.fc1_w, nm.fc1_s, nm.fc1_b, no_idx, sorted_inds, fc1_qp.bits, fc1_qp.group_size, fc1_qp.mode, true, s);
+        try gatherExpertMm(&h_3d, x_rep, nm.fc1_w, nm.fc1_s, nm.fc1_b, no_idx, routes.sorted, fc1_qp.bits, fc1_qp.group_size, fc1_qp.mode, true, s);
         const act = try reluSquaredOp(h_3d, s);
         defer _ = mlx.mlx_array_free(act);
         const fc2_qp = quantParamsOrDense(cfg, nm.fc2_w, nm.fc2_s, lastDim(act));
         var y_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_3d);
-        try gatherExpertMm(&y_3d, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, no_idx, sorted_inds, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, true, s);
+        try gatherExpertMm(&y_3d, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, no_idx, routes.sorted, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, true, s);
         var y_unsorted = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_unsorted);
         if (pad > 0) {
             var head = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&head, inv_order, &[_]c_int{0}, 1, &[_]c_int{total_inds}, 1, &[_]c_int{1}, 1, s));
-            _ = mlx.mlx_array_free(inv_order);
-            inv_order = head;
+            try mlx.check(mlx.mlx_slice(&head, routes.inverse, &[_]c_int{0}, 1, &[_]c_int{total_inds}, 1, &[_]c_int{1}, 1, s));
+            _ = mlx.mlx_array_free(routes.inverse);
+            routes.inverse = head;
         }
-        try mlx.check(mlx.mlx_take_axis(&y_unsorted, y_3d, inv_order, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&y_unsorted, y_3d, routes.inverse, 0, s));
         try mlx.check(mlx.mlx_reshape(&y_tkh, y_unsorted, &[_]c_int{ t_count, k_count, d_dim }, 3, s));
     }
     return .{ .y_tkh = y_tkh, .scores = routing.norm_scores, .k_count = k_count };
@@ -44260,12 +44225,29 @@ const VerifyRoutePack = struct {
     inverse: mlx.mlx_array = .{},
     sorted: mlx.mlx_array = .{},
     lhs: mlx.mlx_array = .{},
-    fn deinit(self: *VerifyRoutePack) void {
+    pub fn deinit(self: *VerifyRoutePack) void {
         inline for (.{ "inverse", "sorted", "lhs" }) |name| {
             if (@field(self, name).ctx != null) _ = mlx.mlx_array_free(@field(self, name));
         }
     }
 };
+
+/// mlx-lm's `_gather_sort` over flat routed ids [N], `top_k` per token: `sorted` = ids[order] with
+/// order = argsort(ids), ties in routing order; `inverse` = argsort(order); `lhs` = order // top_k, the
+/// token row each sorted slot reads. The route-pack kernels below return the same values.
+pub fn sortRoutes(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !VerifyRoutePack {
+    var order = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order);
+    try mlx.check(mlx.mlx_argsort_axis(&order, ids, 0, s));
+    var result: VerifyRoutePack = .{ .inverse = mlx.mlx_array_new(), .sorted = mlx.mlx_array_new(), .lhs = mlx.mlx_array_new() };
+    errdefer result.deinit();
+    try mlx.check(mlx.mlx_argsort_axis(&result.inverse, order, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&result.sorted, ids, order, 0, s));
+    const k_arr = mlx.mlx_array_new_int(top_k);
+    defer _ = mlx.mlx_array_free(k_arr);
+    try mlx.check(mlx.mlx_floor_divide(&result.lhs, order, k_arr, s));
+    return result;
+}
 
 fn verifyRoutePack(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !?VerifyRoutePack {
     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or top_k != 10 or ids.ctx == null or mlx.mlx_array_dtype(ids) != .uint32) return null;
@@ -72870,21 +72852,11 @@ test "verify route packing preserves stable order and row indices" {
             try testing.expect((try verifyRoutePack(s, .{}, 10)) == null);
             var got = (try verifyRoutePack(s, input, 10)) orelse return error.RoutePackDeclined;
             defer got.deinit();
-            var order = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(order);
-            var inverse = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(inverse);
-            var sorted = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sorted);
-            var lhs = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(lhs);
-            try mlx.check(mlx.mlx_argsort_axis(&order, input, 0, s));
-            try mlx.check(mlx.mlx_argsort_axis(&inverse, order, 0, s));
-            try mlx.check(mlx.mlx_take_axis(&sorted, input, order, 0, s));
-            try mlx.check(mlx.mlx_floor_divide(&lhs, order, cachedScalarInt(10), s));
-            try testing.expect(try qsaArraysAllEqual(got.inverse, inverse, s));
-            try testing.expect(try qsaArraysAllEqual(got.sorted, sorted, s));
-            try testing.expect(try qsaArraysAllEqual(got.lhs, lhs, s));
+            var want = try sortRoutes(s, input, 10);
+            defer want.deinit();
+            try testing.expect(try qsaArraysAllEqual(got.inverse, want.inverse, s));
+            try testing.expect(try qsaArraysAllEqual(got.sorted, want.sorted, s));
+            try testing.expect(try qsaArraysAllEqual(got.lhs, want.lhs, s));
         }
     }
 }
@@ -72907,21 +72879,11 @@ test "prefill route packing equals the stable argsort, its inverse and the row i
         defer _ = mlx.mlx_array_free(input);
         var got = (try moePrefillRoutePack(s, input, 8, 256)) orelse return error.RoutePackDeclined;
         defer got.deinit();
-        var order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(order);
-        var inverse = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inverse);
-        var sorted = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sorted);
-        var lhs = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(lhs);
-        try mlx.check(mlx.mlx_argsort_axis(&order, input, 0, s));
-        try mlx.check(mlx.mlx_argsort_axis(&inverse, order, 0, s));
-        try mlx.check(mlx.mlx_take_axis(&sorted, input, order, 0, s));
-        try mlx.check(mlx.mlx_floor_divide(&lhs, order, cachedScalarInt(8), s));
-        try testing.expect(try qsaArraysAllEqual(got.inverse, inverse, s));
-        try testing.expect(try qsaArraysAllEqual(got.sorted, sorted, s));
-        try testing.expect(try qsaArraysAllEqual(got.lhs, lhs, s));
+        var want = try sortRoutes(s, input, 8);
+        defer want.deinit();
+        try testing.expect(try qsaArraysAllEqual(got.inverse, want.inverse, s));
+        try testing.expect(try qsaArraysAllEqual(got.sorted, want.sorted, s));
+        try testing.expect(try qsaArraysAllEqual(got.lhs, want.lhs, s));
     };
 }
 
@@ -75137,5 +75099,25 @@ test "jangh bundle: layer 0's MoE block through moeMLP against vMLX's SparseMoeB
         if (tokens <= jangtq2.DECODE_MAX_TOKENS) try testing.expect(same.max_steps <= 1);
         // Rounding, not wiring: a wrong bank, score or shared term is off by tenths, as the tie rows are.
         try testing.expect(same.relL2() < 1.0 / 64.0 and stepped.relL2() < 1.0 / 64.0);
+    }
+}
+
+test "sortRoutes: ids in expert order, ties in routing order, each slot's token row and the inverse permutation" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    // Three tokens' top-2 ids, each expert picked twice: every slot rests on the tie rule.
+    const ids = [_]u32{ 3, 1, 0, 3, 1, 0 };
+    const input = mlx.mlx_array_new_data(&ids, &.{6}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(input);
+    var got = try sortRoutes(s, input, 2);
+    defer got.deinit();
+    const want = [_][6]u32{ .{ 0, 0, 1, 1, 3, 3 }, .{ 1, 2, 0, 2, 0, 1 }, .{ 4, 2, 0, 5, 3, 1 } };
+    for ([_]mlx.mlx_array{ got.sorted, got.lhs, got.inverse }, &want) |arr, w| {
+        var u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(u);
+        try mlx.check(mlx.mlx_astype(&u, arr, .uint32, s));
+        try mlx.check(mlx.mlx_array_eval(u));
+        try testing.expectEqualSlices(c_int, &.{6}, mlx.getShape(u));
+        try testing.expectEqualSlices(u32, &w, (mlx.mlx_array_data_uint32(u) orelse return error.MlxArrayDataNull)[0..6]);
     }
 }

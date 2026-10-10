@@ -162,46 +162,20 @@ fn prefill(s: mlx.mlx_stream, x2: mlx.mlx_array, bank: Bank, idx: mlx.mlx_array,
         prefill_logged = true;
         log.info("[jangtq2] prefill engaged: {s} sorted GEMM E={d} D={d} I={d} bits={d}/{d} rotated={any} (> {d} tokens)\n", .{ @tagName(arm), g.e, g.d, g.i, g.bits_gu, g.bits_dn, bank.rotated, DECODE_MAX_TOKENS });
     }
-    const r = try sortRoutes(s, idx, g.k);
+    var r = try @import("transformer.zig").sortRoutes(s, idx, g.k);
     defer r.deinit();
     const xr = if (bank.rotated) try h32Rows(s, x2, xd) else try dup(x2);
     defer free(xr);
     var xs = mlx.mlx_array_new();
     defer free(xs);
-    try mlx.check(mlx.mlx_take_axis(&xs, xr, r.token, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&xs, xr, r.lhs, 0, s));
     const h = try gatherQmmSorted(s, xs, bank.gate, bank.up, r.sorted, g.bits_gu, limit, arm);
     defer free(h);
     const hr = if (bank.rotated) try h32Rows(s, h, xd) else try dup(h);
     defer free(hr);
     const y = try gatherQmmSorted(s, hr, bank.down, null, r.sorted, g.bits_dn, 0, arm);
     defer free(y);
-    return weightedUnsort(s, y, r.inv, wts, g.tokens, g.k);
-}
-
-/// The routed rows in expert order (switch.py _prefill): `order` = argsort(idx), `inv` its inverse,
-/// `sorted` = idx[order], `token` = order // k (the token row each sorted slot reads).
-const Routes = struct {
-    order: mlx.mlx_array,
-    inv: mlx.mlx_array,
-    sorted: mlx.mlx_array,
-    token: mlx.mlx_array,
-
-    fn deinit(self: Routes) void {
-        for ([_]mlx.mlx_array{ self.order, self.inv, self.sorted, self.token }) |a| free(a);
-    }
-};
-
-fn sortRoutes(s: mlx.mlx_stream, idx: mlx.mlx_array, k: c_int) !Routes {
-    var r: Routes = .{ .order = mlx.mlx_array_new(), .inv = mlx.mlx_array_new(), .sorted = mlx.mlx_array_new(), .token = mlx.mlx_array_new() };
-    errdefer r.deinit();
-    try mlx.check(mlx.mlx_argsort_axis(&r.order, idx, 0, s));
-    try mlx.check(mlx.mlx_argsort_axis(&r.inv, r.order, 0, s));
-    try mlx.check(mlx.mlx_take_axis(&r.sorted, idx, r.order, 0, s));
-    const k32: u32 = @intCast(k);
-    const kk = mlx.mlx_array_new_data(&k32, &[_]c_int{}, 0, .uint32);
-    defer free(kk);
-    try mlx.check(mlx.mlx_floor_divide(&r.token, r.order, kk, s));
-    return r;
+    return weightedUnsort(s, y, r.inverse, wts, g.tokens, g.k);
 }
 
 /// kernels.py h32_rows: blockwise normalized Hadamard-32 over the last axis of x [M, K], one launch,
@@ -1339,13 +1313,12 @@ fn fixtureCase(a: Allocator, dir: []const u8, case: std.json.ObjectMap, lb: Laye
             try t.expect("hr", try h32Rows(s, try c.get("h"), .float32), try c.get("hr"));
             try t.expect("out", try gatherQmvWeightedDown(s, try c.get("hr"), lb.bank.down, idx, wts, tokens, k, lb.bits_dn, xd), out);
         } else if (is(u8, kind, "prefill")) {
-            const r = try sortRoutes(s, idx, k);
+            var r = try @import("transformer.zig").sortRoutes(s, idx, k);
             defer r.deinit();
-            try t.expect("order", try dup(r.order), try c.get("order"));
-            try t.expect("inv", try dup(r.inv), try c.get("inv"));
+            try t.expect("inv", try dup(r.inverse), try c.get("inv"));
             try t.expect("idx_sorted", try dup(r.sorted), try c.get("idx_sorted"));
             try t.expect("xr", try h32Rows(s, x, xd), try c.get("xr"));
-            try t.expect("xs", try takeRows(s, try c.get("xr"), r.token), try c.get("xs"));
+            try t.expect("xs", try takeRows(s, try c.get("xr"), r.lhs), try c.get("xs"));
             const sorted = try c.get("idx_sorted");
             try t.expect("h", try gatherQmmSorted(s, try c.get("xs"), lb.bank.gate, lb.bank.up, sorted, lb.bits_gu, 0, arm), try c.get("h"));
             try t.expect("hr", try h32Rows(s, try c.get("h"), xd), try c.get("hr"));
