@@ -965,8 +965,8 @@ const ZH: Record<string, string> = {
   "Settings categories": "设置分类",
   "Several changes at once": "一次多处修改",
   "Sharpen (deblur)": "锐化（去模糊）",
-  "Shell script that configures a coding agent for this server and starts it (?agent=claude|pi|omp|opencode2|grok&model=<id>)":
-    "配置编码智能体连接此服务器并启动它的 Shell 脚本（?agent=claude|pi|omp|opencode2|grok&model=<id>）",
+  "Shell script that configures a coding agent for this server and starts it (?agent=claude|pi|omp|opencode2|grok&model=<id>&base=<url>)":
+    "配置编码智能体连接此服务器并启动它的 Shell 脚本（?agent=claude|pi|omp|opencode2|grok&model=<id>&base=<url>）",
   "Show live preview while generating (~1% slower)":
     "生成时显示实时预览（约慢 1%）",
   "Show more": "展开",

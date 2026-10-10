@@ -125,14 +125,14 @@ describe("Chat pane", () => {
     expect(text(ui.q(".message.user .message-text"))).toBe("question one");
   });
 
-  it("the Code Launcher gives a curl command for this server and the chat's model", async () => {
+  it("the Code Launcher gives a curl command for this server, the chat's model and the base the agent should use", async () => {
     ui = await mountApp({ api: mockApi() });
     await ui.click(".code-launcher summary");
     await ui.click(ui.qa(".code-launcher .discovery-menu button").find((b) => text(b) === "OpenCode 2")!);
     const model = ui.app.chat.c.active.model;
     expect(model).not.toBe("");
     expect(ui.q(".launch-dialog pre code")!.textContent).toBe(
-      `curl -fsSL '${ui.app.connection.active.url}/launch?agent=opencode2&model=${encodeURIComponent(model)}' | sh`,
+      `curl -fsSL '${ui.app.connection.active.url}/launch?agent=opencode2&model=${encodeURIComponent(model)}&base=${encodeURIComponent(ui.app.connection.active.url)}' | sh`,
     );
   });
 

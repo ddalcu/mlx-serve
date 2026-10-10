@@ -31,9 +31,10 @@ const launchAgents = [
   ["opencode2", "OpenCode 2"],
   ["grok", "Grok"],
 ] as const;
-/** Run on the agent's machine: the server writes the agent's config for itself and starts it. */
+/** Run on the agent's machine: the server writes the agent's config for itself and starts it.
+ *  `base` rides along so the agent targets the URL this page reached, path prefix and https included. */
 function launchCommand(base: string, agent: string, model?: string) {
-  const query = `agent=${encodeURIComponent(agent)}` + (model ? `&model=${encodeURIComponent(model)}` : "");
+  const query = `agent=${encodeURIComponent(agent)}` + (model ? `&model=${encodeURIComponent(model)}` : "") + `&base=${encodeURIComponent(base)}`;
   return `curl -fsSL ${shellQuote(`${base}/launch?${query}`)} | sh`;
 }
 
@@ -259,7 +260,7 @@ const apiReference = [
   {
     method: "GET",
     path: "/launch",
-    description: N("Shell script that configures a coding agent for this server and starts it (?agent=claude|pi|omp|opencode2|grok&model=<id>)"),
+    description: N("Shell script that configures a coding agent for this server and starts it (?agent=claude|pi|omp|opencode2|grok&model=<id>&base=<url>)"),
   },
   {
     method: "GET",

@@ -734,8 +734,8 @@ pub const ImageEngine = struct {
     /// Steps for a request: a checkpoint's own sampling grid, else the
     /// request's count, else the distilled backends' few-step default or an
     /// undistilled checkpoint's own recommendation.
-    pub fn resolveSteps(self: *const ImageEngine, requested: ?u64) u32 {
-        const steps: u32 = if (requested) |r| @intCast(r) else 0;
+    pub fn resolveSteps(self: *const ImageEngine, requested: ?u32) u32 {
+        const steps = requested orelse 0;
         return switch (self.backend) {
             .qwen_image => |q| q.stepsFor(steps),
             else => if (requested == null) 4 else steps,
@@ -2374,7 +2374,10 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    var steps: u32 = engine.resolveSteps(extractJsonInt(body, "steps"));
+    const req_steps = imageStepsRequest(extractJsonInt(body, "steps")) catch
+        return sendError(conn, 400, "'steps' must be in [0,100] (0 = the model's default)");
+    var steps: u32 = engine.resolveSteps(req_steps);
+    if (req_steps) |n| if (n != 0 and n != steps) log.info("[image] {d} steps requested, the checkpoint's own grid runs {d}\n", .{ n, steps });
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -5105,6 +5108,22 @@ fn parseSize(size: []const u8) ?struct { w: u32, h: u32 } {
     const h = std.fmt.parseInt(u32, size[xi + 1 ..], 10) catch return null;
     if (w == 0 or h == 0) return null;
     return .{ .w = w, .h = h };
+}
+
+/// A request's image `steps`, bounded like every other media endpoint's: a client
+/// integer never reaches a cast or a schedule allocation unchecked.
+fn imageStepsRequest(requested: ?u64) error{StepsOutOfRange}!?u32 {
+    const n = requested orelse return null;
+    if (n > 100) return error.StepsOutOfRange;
+    return @intCast(n);
+}
+
+test "imageStepsRequest: an omitted count stays omitted, 0..100 passes, anything above is refused" {
+    try std.testing.expectEqual(@as(?u32, null), try imageStepsRequest(null));
+    try std.testing.expectEqual(@as(?u32, 0), try imageStepsRequest(0));
+    try std.testing.expectEqual(@as(?u32, 100), try imageStepsRequest(100));
+    try std.testing.expectError(error.StepsOutOfRange, imageStepsRequest(101));
+    try std.testing.expectError(error.StepsOutOfRange, imageStepsRequest(5_000_000_000));
 }
 
 fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {

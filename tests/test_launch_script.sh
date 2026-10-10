@@ -76,6 +76,17 @@ else
     run_test "Host header becomes the base URL; the script parses" FAIL "$(echo "$S" | head -5)"
 fi
 
+echo "[2b] the console's base keeps its scheme and path prefix"
+S=$(curl -fsS "$BASE/launch?agent=pi&base=https%3A%2F%2Fmac.ts.net%2Fmlx-serve")
+if echo "$S" | grep -q '"baseUrl": "https://mac.ts.net/mlx-serve/v1"' && echo "$S" | sh -n; then
+    run_test "base=https://…/prefix becomes the agent's URL; the script parses" PASS
+else
+    run_test "base=https://…/prefix becomes the agent's URL; the script parses" FAIL "$(echo "$S" | head -5)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/launch?agent=pi&base=https%3A%2F%2Fh%2F%27%24(id)")
+if [ "$CODE" = 400 ]; then run_test "a quote-breaking base is a 400" PASS
+else run_test "a quote-breaking base is a 400" FAIL "got $CODE"; fi
+
 echo "[3] pi: configs written, skill linked, agent started"
 launch "agent=pi&model=org%2Fchat-b"
 OUT=$(cat "$T/home/agent.out" 2>/dev/null)
