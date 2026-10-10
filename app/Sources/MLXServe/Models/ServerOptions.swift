@@ -1046,7 +1046,7 @@ extension ServerOptions {
             needsRestart: true),
         "apiKey": .init(
             title: "API key",
-            explainer: "A password other devices must send, as a Bearer token, to use this server; this Mac never needs it.",
+            explainer: "A key other devices must send to use this server; this Mac never needs it.",
             needsRestart: true),
         "lanShareEnabled": .init(
             title: "Share my models on this network",

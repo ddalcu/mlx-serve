@@ -2143,7 +2143,7 @@
 "Save the server log to ~/.mlx-serve/logs so you can check it after a crash." = "서버 로그를 ~/.mlx-serve/logs에 저장해 충돌 후에 확인할 수 있게 합니다.";
 "How long one request may run, in seconds; 0 means no limit." = "요청 하나가 실행될 수 있는 시간(초)이며, 0은 제한이 없습니다.";
 "Show live speed and memory charts on the server's web page." = "서버 웹 페이지에 실시간 속도와 메모리 그래프를 보여 줍니다.";
-"A password other devices must send, as a Bearer token, to use this server; this Mac never needs it." = "다른 기기가 이 서버를 쓰려면 Bearer 토큰으로 보내야 하는 비밀번호이며, 이 Mac에는 필요 없습니다.";
+"A key other devices must send to use this server; this Mac never needs it." = "다른 기기가 이 서버를 쓰려면 보내야 하는 키이며, 이 Mac에는 필요 없습니다.";
 "Let other Macs on your network use the models you share." = "네트워크의 다른 Mac이 내가 공유한 모델을 쓰게 합니다.";
 "Share every model, or turn off to choose which ones." = "모든 모델을 공유하며, 끄면 공유할 모델을 고를 수 있습니다.";
 "The name other Macs see; leave blank to use this Mac's name." = "다른 Mac에 보이는 이름이며, 비워 두면 이 Mac의 이름을 씁니다.";

@@ -2143,7 +2143,7 @@
 "Save the server log to ~/.mlx-serve/logs so you can check it after a crash." = "把服务器日志保存到 ~/.mlx-serve/logs，便于崩溃后查看。";
 "How long one request may run, in seconds; 0 means no limit." = "单个请求可运行的时间（秒），0 表示不限制。";
 "Show live speed and memory charts on the server's web page." = "在服务器网页上显示实时速度和内存图表。";
-"A password other devices must send, as a Bearer token, to use this server; this Mac never needs it." = "其他设备使用此服务器时须以 Bearer 令牌发送的密码，这台 Mac 不需要。";
+"A key other devices must send to use this server; this Mac never needs it." = "其他设备使用此服务器时必须提供的密钥，这台 Mac 不需要。";
 "Let other Macs on your network use the models you share." = "允许网络上的其他 Mac 使用你共享的模型。";
 "Share every model, or turn off to choose which ones." = "共享所有模型；关闭后可选择要共享的模型。";
 "The name other Macs see; leave blank to use this Mac's name." = "其他 Mac 看到的名称，留空则使用这台 Mac 的名称。";

@@ -541,14 +541,8 @@ struct StatusMenuView: View {
     private var utilitiesSection: some View {
         TrayCard {
             if case .running = server.status {
-                // The Metrics button rides the header row — shown only when the
-                // server was launched with --metrics (opt-in; see
-                // ServerOptions.enableMetrics). The panel is hosted on the index
-                // page, so it opens root `/`.
-                EndpointsSection(
-                    baseURL: server.baseURL,
-                    showsMetricsButton: appState.serverOptions.enableMetrics
-                )
+                // The Web UI button rides the header row; the console at `/` works with or without metrics.
+                EndpointsSection(baseURL: server.baseURL)
                 TrayRowSeparator()
             }
 
@@ -950,10 +944,6 @@ struct StatusDot: View {
 
 struct EndpointsSection: View {
     let baseURL: String
-    /// Puts a "Web UI" button on the header row (the Browse-on-Download-
-    /// Models pattern). Callers gate it on `ServerOptions.enableMetrics` —
-    /// the panel only exists when the server got `--metrics`.
-    var showsMetricsButton: Bool = false
     @State private var copiedEndpoint: String?
     @State private var isExpanded = false
 
@@ -988,12 +978,10 @@ struct EndpointsSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             TrayDisclosureHeader(title: "Endpoints", isExpanded: $isExpanded) {
-                if showsMetricsButton {
-                    TrayAccessoryButton(title: "Web UI", icon: "safari",
-                                        help: "Open the web UI in your browser") {
-                        if let root = Self.rootURL(baseURL) {
-                            NSWorkspace.shared.open(root)
-                        }
+                TrayAccessoryButton(title: "Web UI", icon: "safari",
+                                    help: "Open the web UI in your browser") {
+                    if let root = Self.rootURL(baseURL) {
+                        NSWorkspace.shared.open(root)
                     }
                 }
             }
