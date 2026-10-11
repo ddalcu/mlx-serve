@@ -6,6 +6,8 @@ const ModelConfig = @import("../model.zig").ModelConfig;
 
 pub const built = false;
 
+pub fn setForeignBytes(_: u64) void {}
+
 pub const Model = struct {
     pub const DraftRound = struct {
         tokens: []u32,
