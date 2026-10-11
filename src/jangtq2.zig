@@ -49,9 +49,11 @@ const Geometry = struct { tokens: c_int, k: c_int, d: c_int, i: c_int, e: c_int,
 /// TQSwitchGLU.routed(x, inds, scores): the router-weighted sum of the routed experts, no shared
 /// expert. x [..., D] bf16/f16/f32, inds [..., k] any integer dtype (each < E), scores [..., k]
 /// f16/bf16/f32; returns [..., D] in x's dtype. `limit` > 0 clamps SwiGLU (gate above, up both ways).
-/// The k experts of a token are summed in the order `inds` lists them.
+/// The k experts of a token are summed in the order `inds` lists them. f32 x (QWEN4_STREAM_F32)
+/// prefills on the steel tiles even where NAX is available: the fused f32 NAX tile does not fit.
 pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, limit: f32) !mlx.mlx_array {
-    return moeOn(s, x, bank, inds, scores, limit, if (@import("transformer.zig").naxAvailable()) .nax else .steel);
+    const nax = @import("transformer.zig").naxAvailable() and mlx.mlx_array_dtype(x) != .float32;
+    return moeOn(s, x, bank, inds, scores, limit, if (nax) .nax else .steel);
 }
 
 /// `moe` with the prefill GEMM on `arm`.
@@ -1049,6 +1051,16 @@ test "jangtq2 moe matches the float64 format definition on synthetic banks, deco
                 if (!(err <= bar)) std.debug.print("[jangtq2] bits {d}/{d} rotated={any} limit={d} T={d} arm={t}: rel rms {e} > {e}\n", .{ c.gu, c.dn, c.rotated, c.limit, tokens, arm, err, bar });
                 try testing.expect(err <= bar);
             }
+            // f32 activations through the public entry: on an M5 the prefill must leave the NAX tile.
+            const x32 = try astype(x, .float32, s);
+            defer free(x32);
+            const y32 = try moe(s, x32, bank, inds, scores, c.limit);
+            defer free(y32);
+            try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(y32));
+            const err32 = relRms(try hostF32(a, y32, s), ref);
+            const bar32: f64 = if (gather) 6e-3 else 1.2e-2;
+            if (!(err32 <= bar32)) std.debug.print("[jangtq2] f32 x bits {d}/{d} T={d}: rel rms {e} > {e}\n", .{ c.gu, c.dn, tokens, err32, bar32 });
+            try testing.expect(err32 <= bar32);
         }
     }
 }
