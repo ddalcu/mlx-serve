@@ -1,14 +1,28 @@
 import SwiftUI
 
 struct GenerationDefaultsRows: View {
+    /// The spacing this stack's rows sit in, so the hairline each row draws
+    /// lands in the middle of its own gap — the card's 18 pt would put it
+    /// off centre here.
+    static let rowGap: CGFloat = 12
+
+    /// The gap one field row's hairline uses: the stack's own, and none on
+    /// the first row the filter leaves — the `Divider()` above already
+    /// opens the list.
+    static func separatorGap(field: GenerationField, visible: [GenerationField]) -> CGFloat? {
+        visible.first == field ? nil : rowGap
+    }
+
     @Binding var profile: GenerationDefaults
     var inheritance = "Inherit"
     var fields = GenerationField.allCases
     var allowsForce = true
     var inherited = GenerationDefaults()
 
+    @Environment(\.settingsSearchQuery) private var query
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Self.rowGap) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("All parameters").font(.app(.body))
@@ -24,7 +38,8 @@ struct GenerationDefaultsRows: View {
             }
             Divider()
             ForEach(fields) { field in
-                SearchableRow(searchText: [field.title, field.parameterName, field.help, inheritance, "Force", "Ignore client override"]) {
+                SearchableRow(searchText: searchText(field),
+                              separatorGap: Self.separatorGap(field: field, visible: visibleFields)) {
                     GenerationParameterRow(field: field, mode: profile.mode(field),
                         value: value(field), hasInheritedValue: inherited.rules[field.rawValue] != nil,
                         inheritance: inheritance, allowsForce: allowsForce,
@@ -33,6 +48,15 @@ struct GenerationDefaultsRows: View {
                 }
             }
         }
+    }
+
+    /// The rows the filter leaves, in stack order.
+    private var visibleFields: [GenerationField] {
+        fields.filter { SettingsSearch.matches(query: query, in: searchText($0)) }
+    }
+
+    private func searchText(_ field: GenerationField) -> [String] {
+        [field.title, field.parameterName, field.help, inheritance, "Force", "Ignore client override"]
     }
 
     private func value(_ field: GenerationField) -> GenerationDefaults.Value {

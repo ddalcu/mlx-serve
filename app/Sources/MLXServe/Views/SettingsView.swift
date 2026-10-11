@@ -268,7 +268,9 @@ private struct SettingsSearchQueryKey: EnvironmentKey {
 }
 
 extension EnvironmentValues {
-    fileprivate var settingsSearchQuery: String {
+    /// The active filter text. `fileprivate` to this file's rows plus the
+    /// stacks that draw their own lines under it.
+    var settingsSearchQuery: String {
         get { self[SettingsSearchQueryKey.self] }
         set { self[SettingsSearchQueryKey.self] = newValue }
     }
