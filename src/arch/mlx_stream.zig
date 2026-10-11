@@ -14,6 +14,11 @@ const arch = plugin.arch;
 
 pub const built = true;
 
+/// The bytes the host's other models hold in this process; the plugin's footprint bounds rise by it.
+pub fn setForeignBytes(n: u64) void {
+    sdk.memory.setForeignBytes(n);
+}
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     cfg: *arch.Config,
