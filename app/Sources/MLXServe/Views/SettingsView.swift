@@ -300,10 +300,12 @@ private struct SettingsVisibleRowCountKey: PreferenceKey {
 /// text the row renders, so what you read is what you can search for.
 struct SearchableRow<Content: View>: View {
     let searchText: [String]
-    /// Gap the row sits in, for the hairline drawn above it — nil draws no
-    /// line (a row in a sub-stack of its own, or one that draws its own).
+    /// Gap the row sits in, for the hairline drawn above it — the card's
+    /// own by default, so the next row someone adds has its line without
+    /// asking. A row inside a sub-stack of its own passes that stack's
+    /// spacing; one that draws its own line (or none at all) passes nil.
     /// Inside the filter, so a row the query hides takes its line with it.
-    var separatorGap: CGFloat? = nil
+    var separatorGap: CGFloat? = SettingsCardMetrics.gap
     @ViewBuilder var content: Content
 
     @Environment(\.settingsSearchQuery) private var query
@@ -419,7 +421,8 @@ private struct ResetDefaultsFooter: View {
 
     var body: some View {
         if !hidden {
-            SearchableRow(searchText: [label, helpText]) {
+            SearchableRow(searchText: [label, helpText],
+                          separatorGap: nil) {
                 HStack {
                     Spacer()
                     Button(role: .destructive) {
@@ -676,12 +679,19 @@ private struct SettingsSection<Content: View>: View {
             .environment(\.settingsSearchQuery, filter.childQuery)
             .padding(collapsed ? 0 : SettingsCardMetrics.inset)
             .background(collapsed ? Color.clear : Color(NSColor.controlBackgroundColor))
-            // The FIRST row's hairline lands in this inset — empty card
-            // ground, painted over, so a card never opens on a line. A
+            // The FIRST row's hairline lands inside this inset — empty card
+            // ground, painted over, so a card never opens on a line, and a
             // filtered card whose surviving row is not the first is covered
-            // the same way.
+            // the same way. Only the hairline's own 2 pt band is covered,
+            // though: the first row's chrome — a focused field's ring, a
+            // control's shadow — reaches into this inset too, and a
+            // full-inset cover would eat it.
             .overlay(alignment: .top) {
-                if !collapsed { Color(NSColor.controlBackgroundColor).frame(height: SettingsCardMetrics.inset) }
+                if !collapsed {
+                    Color(NSColor.controlBackgroundColor)
+                        .frame(height: 2)
+                        .offset(y: SettingsCardMetrics.inset - SettingsCardMetrics.gap / 2)
+                }
             }
             .clipShape(RoundedRectangle(cornerRadius: 10))
         }
@@ -788,8 +798,7 @@ private struct ModelFoldersSectionContent: View {
         let roots = ModelRoots()
         let configured = roots.configuredDownloadRoot
         let unavailable = roots.downloadRootIsUnavailable
-        SearchableRow(searchText: ["Default folder", "download", Self.defaultExplainer],
-                      separatorGap: SettingsCardMetrics.gap) {
+        SearchableRow(searchText: ["Default folder", "download", Self.defaultExplainer]) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(L10n.text("Default folder"))
@@ -867,8 +876,7 @@ private struct ModelFoldersSectionContent: View {
         }()
         let hasPath = !(downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
-        return SearchableRow(searchText: ["Custom folder", Self.explainer],
-                             separatorGap: SettingsCardMetrics.gap) {
+        return SearchableRow(searchText: ["Custom folder", Self.explainer]) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(L10n.text("Custom folder"))
@@ -972,7 +980,8 @@ private struct LanSharingSectionContent: View {
         }
         // The privacy disclosure — sharing means running other people's
         // prompts, and using a network model means the host reads yours.
-        SearchableRow(searchText: ["Privacy", Self.privacyNote]) {
+        SearchableRow(searchText: ["Privacy", Self.privacyNote],
+                      separatorGap: nil) {
             Text(L10n.text(Self.privacyNote))
                 .font(.app(.caption))
                 .foregroundStyle(.secondary)
@@ -1028,8 +1037,7 @@ private struct ProvidersSectionContent: View {
         // One searchable row: a section whose content publishes no row count
         // never collapses under the filter.
         SearchableRow(searchText: ["Providers", "OpenAI-compatible chat endpoints", "cloud API", "providers.json", "API key"]
-                      + formState.providerEntries.map(\.name),
-                      separatorGap: SettingsCardMetrics.gap) {
+                      + formState.providerEntries.map(\.name)) {
             providersBody
         }
     }
@@ -1586,7 +1594,7 @@ private struct ContextSizeRow: View {
         SearchableRow(searchText: [
             "Context size", ContextSizeDisplay.helpText,
             "Model max", "GPU-safe max", "In use",
-        ], separatorGap: SettingsCardMetrics.gap) {
+        ]) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
@@ -2388,8 +2396,7 @@ private struct WakePhraseSectionContent: View {
     private static let explainer = "What you say to call the assistant in hands-free mode."
 
     var body: some View {
-        SearchableRow(searchText: ["Wake phrase", "Hey Loki", Self.explainer],
-                      separatorGap: SettingsCardMetrics.gap) {
+        SearchableRow(searchText: ["Wake phrase", "Hey Loki", Self.explainer]) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(L10n.text("Wake phrase")).font(.app(.rowTitle).weight(.semibold))
                 TextField("Hey Loki", text: $appState.serverOptions.wakePhrase)
@@ -2437,29 +2444,25 @@ private struct VoiceCloneSectionContent: View {
     }
 
     var body: some View {
-        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"],
-                      separatorGap: SettingsCardMetrics.gap) {
+        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"]) {
             engineBody
         }
         // The clip control only makes sense for the backend that can USE it —
         // Kokoro has no cloning and asking it to clone is a named 400, so the
         // control is hidden rather than left dead (the image-preset rule).
         if appState.serverOptions.voiceEngine == .clone {
-            SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"],
-                          separatorGap: SettingsCardMetrics.gap) {
+            SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"]) {
                 clipBody
             }
         }
         if appState.serverOptions.voiceEngine == .kokoro {
             SearchableRow(searchText: ["Kokoro voice", "blend", "preview"]
-                          + AudioModelPreset.kokoroVoices,
-                      separatorGap: SettingsCardMetrics.gap) {
+                          + AudioModelPreset.kokoroVoices) {
                 kokoroBody
             }
         }
         if appState.serverOptions.voiceEngine == .system {
-            SearchableRow(searchText: ["System voice", "Apple voice"],
-                          separatorGap: SettingsCardMetrics.gap) {
+            SearchableRow(searchText: ["System voice", "Apple voice"]) {
                 systemVoiceBody
             }
         }
@@ -2802,8 +2805,7 @@ private struct MessagingSectionContent: View {
     var body: some View {
         // Live status pill (only meaningful once enabled).
         if telegram.enabled {
-            SearchableRow(searchText: ["Status", "Telegram bot bridge connection status"],
-                          separatorGap: SettingsCardMetrics.gap) {
+            SearchableRow(searchText: ["Status", "Telegram bot bridge connection status"]) {
                 HStack(spacing: 8) {
                     Text("Status")
                         .font(.app(.body))
@@ -2875,8 +2877,7 @@ private struct MessagingSectionContent: View {
         }
 
         // Allow-list / lock control.
-        SearchableRow(searchText: ["Locked to", "Reset lock", Self.lockExplainer],
-                      separatorGap: SettingsCardMetrics.gap) {
+        SearchableRow(searchText: ["Locked to", "Reset lock", Self.lockExplainer]) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text("Locked to")
@@ -2904,7 +2905,8 @@ private struct MessagingSectionContent: View {
 
         // Setup steps. The divider rides inside the searchable row so a
         // filtered view never leaves a dangling separator behind.
-        SearchableRow(searchText: ["Setup", "BotFather", "newbot", "token", "lock it to your chat"]) {
+        SearchableRow(searchText: ["Setup", "BotFather", "newbot", "token", "lock it to your chat"],
+                      separatorGap: nil) {
             VStack(alignment: .leading, spacing: 6) {
                 Divider()
                     .padding(.bottom, 6)
