@@ -20,6 +20,8 @@ enum InterfacePrefKey {
     /// "#RRGGBB" ground painted under the default terminal theme; "" = the
     /// theme's own.
     static let terminalBackground = "terminalBackground"
+    /// `AppLanguage` raw value; unset = follow the Mac.
+    static let language = "interfaceLanguage"
 }
 
 /// How wide a conversation reads: fixed points, so resizing the window spends
@@ -99,6 +101,39 @@ enum AppAppearanceMode: String, CaseIterable, Identifiable {
 
     static var current: AppAppearanceMode {
         AppAppearanceMode(rawValue: UserDefaults.standard.string(forKey: InterfacePrefKey.appearanceMode) ?? "") ?? .system
+    }
+}
+
+/// Interface language (Settings ▸ Interface ▸ Language). The default follows
+/// the Mac, and the app renders that as Simplified Chinese for BOTH Chinese
+/// spellings — it ships one Chinese catalog, so a zh-Hant reader gets the
+/// closest thing it has — and English for every other language.
+enum AppLanguage: String, CaseIterable, Identifiable {
+    case system, english = "en", simplifiedChinese = "zh-Hans"
+    var id: String { rawValue }
+    /// The English source doubles as the label for the two named languages:
+    /// each is shown in its own spelling, never translated.
+    var label: String {
+        switch self {
+        case .system: return "System Default"
+        case .english: return "English"
+        case .simplifiedChinese: return "简体中文"
+        }
+    }
+    /// `label` as the picker shows it — the autonyms verbatim, the rest
+    /// through the catalog.
+    var pickerLabel: String { self == .system ? L10n.text(label) : label }
+
+    /// The catalog to load. Both answers are ones the app ships: English is
+    /// the development region, so its keys are their own text.
+    func catalog(preferredLanguages: [String]) -> String {
+        switch self {
+        case .english: return AppLanguage.english.rawValue
+        case .simplifiedChinese: return AppLanguage.simplifiedChinese.rawValue
+        case .system: return (preferredLanguages.first ?? "").hasPrefix("zh")
+            ? AppLanguage.simplifiedChinese.rawValue
+            : AppLanguage.english.rawValue
+        }
     }
 }
 

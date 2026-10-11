@@ -2185,3 +2185,6 @@
 "News, benchmarks and plans, with questions and bug reports welcome." = "新闻、基准测试和计划，也欢迎提问和报告问题。";
 "Web UI" = "网页界面";
 "Open the web UI in your browser" = "在浏览器中打开网页界面";
+"Language" = "语言";
+"System Default" = "跟随系统设置";
+"\"System Default\" shows Simplified Chinese when the Mac's language is Chinese (either spelling), and English otherwise. The app relaunches to apply the change." = "「跟随系统设置」在 Mac 使用中文（简体或繁体）时显示简体中文，其余语言一律显示英文。更改后应用会重新启动。";
