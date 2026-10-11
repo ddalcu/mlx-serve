@@ -198,7 +198,8 @@ struct MusicGenView: View {
                             deck(width: width)
                             if showPlaylist {
                                 MlxAmpPlaylist(width: width, height: max(MlxAmpPlaylist.minHeight, height - MlxAmpPlayer.height),
-                                               paths: service.recent, current: clipPlayer.playingPath, locked: radio.isOn,
+                                               paths: service.recent, current: clipPlayer.playingPath,
+                                               locked: DeckKey.historyRow.isLocked(radioOn: radio.isOn),
                                                onPlay: { play($0) }, onStop: { stopPlayback() })
                             }
                         }
@@ -207,7 +208,7 @@ struct MusicGenView: View {
                     modernDeck
                     if showPlaylist {
                         ModernPlaylist(paths: service.recent, current: clipPlayer.playingPath, paused: clipPlayer.isPaused,
-                                       locked: radio.isOn,
+                                       locked: DeckKey.historyRow.isLocked(radioOn: radio.isOn),
                                        onPlay: { play($0) }, onStop: { stopPlayback() })
                             .frame(maxHeight: .infinity)
                     } else {

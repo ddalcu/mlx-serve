@@ -221,23 +221,23 @@ struct ModernAudioDeck: View {
 
     var body: some View {
         let info = status == nil ? AudioClipPlayer.info(path) : nil
-        let active = status == nil && player.playingPath == path
-        let playing = active && !player.isPaused
+        let deck = DeckActions(player: player, radio: radio, path: path, status: status,
+                               onRadioStart: onRadioStart, onRadioStop: onRadioStop)
         VStack(spacing: 10) {
             screen(info: info)
             seekRow(total: info?.seconds ?? 0)
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 12) {
                     volume.frame(maxWidth: .infinity, alignment: .leading)
-                    transport(active: active, playing: playing)
-                    actions.frame(maxWidth: .infinity, alignment: .trailing)
+                    transport(deck)
+                    actions(deck).frame(maxWidth: .infinity, alignment: .trailing)
                 }
                 VStack(spacing: 8) {
-                    transport(active: active, playing: playing)
-                    HStack(spacing: 6) { volume; Spacer(minLength: 0); actions }
+                    transport(deck)
+                    HStack(spacing: 6) { volume; Spacer(minLength: 0); actions(deck) }
                 }
             }
-            radioRow
+            radioRow(deck)
         }
         .font(.app(.body))
         .padding(12)
@@ -321,36 +321,36 @@ struct ModernAudioDeck: View {
         }
     }
 
-    private func transport(active: Bool, playing: Bool) -> some View {
+    private func transport(_ deck: DeckActions) -> some View {
         HStack(spacing: 14) {
-            key("backward.fill", L10n.text("Previous")) { player.advance(-1, from: path) }
-                .disabled(radio.isOn)
-            key(playing ? "pause.fill" : "play.fill", L10n.text(playing ? "Pause" : "Play"), large: true) {
-                if active { player.togglePause() } else if !path.isEmpty { player.play(path) }
-            }
-            key("stop.fill", L10n.text("Stop")) { if radio.isOn { onRadioStop() } else { player.stop() } }
-            key("forward.fill", L10n.text("Next")) { if radio.isOn { radio.skip() } else { player.advance(1, from: path) } }
+            key(.previous, deck, "backward.fill", L10n.text("Previous"))
+            key(.playPause, deck, deck.playing ? "pause.fill" : "play.fill", L10n.text(deck.playing ? "Pause" : "Play"), large: true)
+            key(.stop, deck, "stop.fill", L10n.text("Stop"))
+            key(.next, deck, "forward.fill", L10n.text("Next"))
         }
     }
 
     /// The quieter keys beside the transport, the way IINA dims its side icons.
-    private var actions: some View {
+    private func actions(_ deck: DeckActions) -> some View {
         HStack(spacing: 8) {
-            key("shuffle", L10n.text("Shuffle"), side: true, lit: player.shuffle) { player.shuffle.toggle() }
-                .disabled(radio.isOn)
-            key("repeat", L10n.text("Repeat"), help: L10n.text("Play the next track when one ends"),
-                side: true, lit: player.autoNext) { player.autoNext.toggle() }
-                .disabled(radio.isOn)
+            key(.shuffle, deck, "shuffle", L10n.text("Shuffle"), side: true, lit: player.shuffle)
+            key(.repeatAll, deck, "repeat", L10n.text("Repeat"), help: L10n.text("Play the next track when one ends"),
+                side: true, lit: player.autoNext)
             if case .failed = status, let onShowLog {
                 key("doc.text.magnifyingglass", L10n.text("Show log"), side: true, action: onShowLog)
             } else {
-                key("square.and.arrow.down", L10n.text("Export as M4A"), side: true) { if !path.isEmpty { AudioExport.exportAndReveal(path) } }
+                key(.export, deck, "square.and.arrow.down", L10n.text("Export as M4A"), side: true)
             }
-            key("folder", L10n.text("Reveal in Finder"), side: true) {
-                if !path.isEmpty { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
-            }
+            key(.reveal, deck, "folder", L10n.text("Reveal in Finder"), side: true)
             key("list.bullet", L10n.text("Playlist"), side: true, lit: showPlaylist) { showPlaylist.toggle() }
         }
+    }
+
+    /// A deck key: what it does and whether the radio locks it come from `DeckActions`.
+    private func key(_ deckKey: DeckKey, _ deck: DeckActions, _ symbol: String, _ title: String, help: String? = nil,
+                     large: Bool = false, side: Bool = false, lit: Bool = false) -> some View {
+        key(symbol, title, help: help, large: large, side: side, lit: lit) { deck.press(deckKey) }
+            .disabled(deck.isLocked(deckKey))
     }
 
     /// One glyph button: its title is what VoiceOver reads and, unless `help` says more, its tooltip.
@@ -372,10 +372,10 @@ struct ModernAudioDeck: View {
 
     // MARK: - AI Radio
 
-    private var radioRow: some View {
+    private func radioRow(_ deck: DeckActions) -> some View {
         HStack(spacing: 8) {
             Button {
-                if radio.isOn { onRadioStop() } else { onRadioStart() }
+                deck.press(.radio)
             } label: {
                 Label { Text(L10n.text("Radio")).font(.app(.callout)) } icon: { Image(systemName: "dot.radiowaves.left.and.right") }
                     .foregroundStyle(radio.isOn ? AnyShapeStyle(ModernSpectrum.violet) : AnyShapeStyle(.primary))
