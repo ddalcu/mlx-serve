@@ -18,8 +18,13 @@ const HEADER =
     \\}
 ;
 
-// Every kernel here computes the decay gate a + dt_bias -> g at the state's dtype (StT):
-// rounded to bf16, a gate near one is exactly 1.0 and that head never forgets.
+/// The dtype every kernel here (GT) rounds the decay gate a + dt_bias -> g to. Under bf16
+/// activations it is the state's: a bf16 gate near one is exactly 1.0 and that head never
+/// forgets. f16-activation (Hadamard) packs keep the f16 gate their fidelity guard measured.
+pub fn gateDtype(act: mlx.mlx_dtype, state: mlx.mlx_dtype) mlx.mlx_dtype {
+    return if (act == .bfloat16) state else act;
+}
+
 const K1_SOURCE =
     \\constexpr int NSG = NT / 32;
     \\constexpr int RB = DV / SPLIT;       // dv rows per threadgroup
@@ -75,10 +80,10 @@ const K1_SOURCE =
     \\  const T bv = b_in[hv];
     \\  T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\  gb[1] = float(bsig);
-    \\  const StT apd = StT(float(a_in[hv]) + float(dt_bias[hv]));
+    \\  const GT apd = GT(float(a_in[hv]) + float(dt_bias[hv]));
     \\  float sp = msv_log1p(metal::precise::exp(float(apd)));
     \\  float ea = metal::precise::exp(float(A_log[hv]));
-    \\  gb[0] = float(StT(metal::precise::exp(-(ea * sp))));
+    \\  gb[0] = float(GT(metal::precise::exp(-(ea * sp))));
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\float kk[4], qq[4];
@@ -213,9 +218,9 @@ const K1S_HEAD =
     \\    const T bv = b_in[t * HV + hv];
     \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\    gb[t][1] = float(bsig);
-    \\    const StT apd = StT(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
+    \\    const GT apd = GT(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
     \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\    gb[t][0] = float(StT(metal::precise::exp(-(ea * sp))));
+    \\    gb[t][0] = float(GT(metal::precise::exp(-(ea * sp))));
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -328,9 +333,9 @@ const K1P_SOURCE =
     \\    const T bv = b_in[t * ABS + BOFF + h];
     \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\    pg[(t * HV + h) * 2 + 1] = float(bsig);
-    \\    const StT apd = StT(float(a_in[t * ABS + AOFF + h]) + float(dt_bias[h]));
+    \\    const GT apd = GT(float(a_in[t * ABS + AOFF + h]) + float(dt_bias[h]));
     \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\    pg[(t * HV + h) * 2] = float(StT(metal::precise::exp(-(ea * sp))));
+    \\    pg[(t * HV + h) * 2] = float(GT(metal::precise::exp(-(ea * sp))));
     \\  }
     \\}
 ;
@@ -490,6 +495,7 @@ fn buildConfigs(g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c1, NT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "T", dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "StT", st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "GT", gateDtype(dt, st)));
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c1, kv[0], kv[1]));
     const c2 = mlx.mlx_fast_metal_kernel_config_new();
@@ -591,6 +597,7 @@ fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, seqNt(), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gateDtype(dt, st)));
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", seqNt() }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TL", t_len));
@@ -677,6 +684,7 @@ fn buildTreeConfigs(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dt
     for ([_]mlx.mlx_fast_metal_kernel_config{ pre, tree }) |cfg| {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gateDtype(dt, st)));
         inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "TL", t_len } }) |kv|
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     }
@@ -870,6 +878,7 @@ fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dty
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, foldNt(), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gateDtype(dt, st)));
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", foldNt() }, .{ "SPLIT", @as(c_int, 1) }, .{ "TL", t_len } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SWISH", @intFromBool(swish)));

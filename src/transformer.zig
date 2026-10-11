@@ -18365,7 +18365,7 @@ pub const Transformer = struct {
         _ = mlx.mlx_closure_free(raw_closure);
         if (rc == 0 and compiled.ctx != null) {
             self.compiled_gdn_gate = compiled;
-            log.info("GDN gate compiled (kernel fusion enabled); recurrent state + gate {s}\n", .{@tagName(self.ssmStateDtype())});
+            log.info("GDN gate compiled (kernel fusion enabled); recurrent state {s}, gate {s}\n", .{ @tagName(self.ssmStateDtype()), @tagName(gdn_decode.gateDtype(self.config.actDtype(), self.ssmStateDtype())) });
         }
     }
 
@@ -18381,7 +18381,7 @@ pub const Transformer = struct {
         if (mlx.mlx_vector_array_get(&dt_bias, input, 2) != 0) return -1;
         defer _ = mlx.mlx_array_free(dt_bias);
 
-        const g = gdnGateChain(A_log, a, dt_bias, self.ssmStateDtype(), self.s) catch return -1;
+        const g = gdnGateChain(A_log, a, dt_bias, gdnChainGateDtype(mlx.mlx_array_dtype(a), self.ssmStateDtype()), self.s) catch return -1;
         const out_arr = [_]mlx.mlx_array{g};
         res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
         _ = mlx.mlx_array_free(g);
@@ -18404,7 +18404,7 @@ pub const Transformer = struct {
                 return g;
             }
         }
-        return gdnGateChain(A_log, a, dt_bias, self.ssmStateDtype(), self.s);
+        return gdnGateChain(A_log, a, dt_bias, gdnChainGateDtype(mlx.mlx_array_dtype(a), self.ssmStateDtype()), self.s);
     }
 
     /// qwen4_exp: compile the four hyper-connection elementwise tails.
@@ -31328,7 +31328,7 @@ pub const Transformer = struct {
                 .seq = seq_len,
                 .batch = batch,
                 .gate = !kda_fused,
-                .g_dtype = self.ssmStateDtype(),
+                .g_dtype = gdn_decode.gateDtype(mlx.mlx_array_dtype(qkv), self.ssmStateDtype()),
             }) catch null) orelse break :blk;
             // Spec-capture rollback slices the conv INPUT; build the concat
             // the composed path would have stashed (lazy, one launch).
@@ -36884,6 +36884,12 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
 /// computed in float32 and returned at `g_dtype`, the recurrent state's. Mirrors
 /// mlx-lm's `compute_g` (which is `@mx.compile`d). Pure — serves as both the
 /// compiled-closure body and the uncompiled fallback. Returns owned array.
+/// The composed chain's gate dtype: an f32 state under bf16 activations takes an f32 gate;
+/// every other pack keeps the bf16 gate this chain has always returned.
+fn gdnChainGateDtype(act: mlx.mlx_dtype, state: mlx.mlx_dtype) mlx.mlx_dtype {
+    return if (act == .bfloat16) state else .bfloat16;
+}
+
 fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, g_dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     var A_log_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(A_log_f32);
@@ -65556,7 +65562,7 @@ fn gdnDecodeSeqParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
         .dk = dk,
         .dv = dv,
         .seq = t_len,
-        .g_dtype = st,
+        .g_dtype = gdn_decode.gateDtype(dt, st),
     })) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(pre.q);
     defer _ = mlx.mlx_array_free(pre.k);
@@ -65699,7 +65705,7 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
         .dk = dk,
         .dv = dv,
         .seq = 1,
-        .g_dtype = st,
+        .g_dtype = gdn_decode.gateDtype(dt, st),
     })) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(pre.q);
     defer _ = mlx.mlx_array_free(pre.k);
@@ -69109,9 +69115,18 @@ test "gdn gate: compiled closure vs graph chain vs prework kernel (bit-identity 
         try std.testing.expectEqual(g_dtype, mlx.mlx_array_dtype(g_compiled));
         const d = try attn256MaxDiff(g_compiled, g_chain, s);
         std.debug.print("[gate probe] {s}: compiled vs chain max |diff| = {e}\n", .{ @tagName(g_dtype), d });
-        // f32 shows the JIT's transcendentals are not the metallib's (an ulp); the kernels match the compiled closure.
-        try std.testing.expect(d <= if (g_dtype == .float32) std.math.floatEps(f32) else 0.0);
+        // f32: the JIT's transcendentals are not the metallib's, a few ulps apart depending on the GPU; the kernels match the compiled closure.
+        try std.testing.expect(d <= if (g_dtype == .float32) 4 * std.math.floatEps(f32) else 0.0);
     }
+}
+
+test "gdn gate dtype: an f32 state under bf16 activations takes an f32 gate; Hadamard packs keep theirs" {
+    try std.testing.expectEqual(mlx.mlx_dtype.float32, gdn_decode.gateDtype(.bfloat16, .float32));
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, gdn_decode.gateDtype(.bfloat16, .bfloat16));
+    try std.testing.expectEqual(mlx.mlx_dtype.float16, gdn_decode.gateDtype(.float16, .float32));
+    try std.testing.expectEqual(mlx.mlx_dtype.float32, gdnChainGateDtype(.bfloat16, .float32));
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, gdnChainGateDtype(.bfloat16, .bfloat16));
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, gdnChainGateDtype(.float16, .float32));
 }
 
 test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, PLE tokens) through capture and restore" {

@@ -1925,8 +1925,9 @@ Two more came out of the first llmprobe run (all cells failing were ours):
   rate, and the state re-rounded to bf16 every decoded token. The packs declare
   `mamba_ssm_dtype: float32`; the HF reference and mlx-lm keep both in f32.
 - Fix: `ssmStateDtype` is f32 on qwen4_exp (set at parse, keyed on the arch:
-  HF ignores the key), and every producer computes the gate at the state's
-  dtype (K1/K1S/K1P `StT`, the packed prework's `GT`, the compiled chain). At
+  HF ignores the key), and under bf16 activations every producer computes the
+  gate at the state's dtype (`gdn_decode.gateDtype`: K1/K1S/K1P and the packed
+  prework's `GT`; the compiled chain); f16 Hadamard packs keep their gate. At
   f32, serial decode, verify, tree, batched rows and a stock prefill dispatch
   agree bit for bit. Checkpoints bill twice the state, f32 roots get their own
   SSD namespace, and `MLX_SERVE_GDN_STATE_F32=0` restores bf16.
