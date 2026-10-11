@@ -2,10 +2,8 @@ import SwiftUI
 import AppKit
 
 // The Modern look of the generated-audio player (Settings ▸ Interface ▸ Audio
-// Player): the same player, AI Radio and actions as MLX-Amp, drawn with the
-// system's controls on the panes' grey card, over a dark screen whose spectrum
-// takes the app icon's night blue to violet. What moves (spectrum, seek bar,
-// radio strip) draws in a `LiveCanvas` on MLX-Amp's rates, never a SwiftUI timeline.
+// Player): MLX-Amp's player, AI Radio and actions with system controls. What
+// moves draws in a `LiveCanvas` at MLX-Amp's rates, never a SwiftUI timeline.
 
 /// What the Modern deck shows, as plain functions.
 enum ModernAudioPlayer {
@@ -61,9 +59,17 @@ enum ModernSpectrum {
     /// The deck's one accent: seek fill, lit toggles, the playing row.
     static let violet = Color(nsColor: violetNS)
 
-    /// Room the title takes at the top of the screen, and the floor under the bars.
+    /// Room the title takes at the top of the screen, and the space under the bars.
     static let titleBand: CGFloat = 46
-    static let floor: CGFloat = 12
+    static let bottomInset: CGFloat = 12
+
+    private static let space = CGColorSpace(name: CGColorSpace.sRGB)!
+    private static let glows = [glowBlue, glowViolet].map {
+        CGGradient(colorsSpace: space, colors: [$0.cgColor, $0.withAlphaComponent(0).cgColor] as CFArray, locations: [0, 1])!
+    }
+    private static let barFill = CGGradient(colorsSpace: space,
+                                            colors: [indigo.cgColor, violetNS.cgColor, orchid.cgColor, blush.cgColor] as CFArray,
+                                            locations: [0, 0.4, 0.8, 1])!
 
     /// Each band, with the midpoint of every neighbouring pair between: twice
     /// the bars from the same analysis, so a wide screen reads as one spectrum.
@@ -74,13 +80,10 @@ enum ModernSpectrum {
     }
 
     static func draw(_ cg: CGContext, size: CGSize, levels: [Float], peaks: [Float]) {
-        let space = CGColorSpace(name: CGColorSpace.sRGB)!
         cg.setFillColor(night.cgColor)
         cg.fill(CGRect(origin: .zero, size: size))
-        for (color, center) in [(glowBlue, CGPoint(x: size.width * 0.12, y: 0)),
-                                (glowViolet, CGPoint(x: size.width * 0.95, y: size.height))] {
-            let glow = CGGradient(colorsSpace: space, colors: [color.cgColor, color.withAlphaComponent(0).cgColor] as CFArray,
-                                  locations: [0, 1])!
+        let centers = [CGPoint(x: size.width * 0.12, y: 0), CGPoint(x: size.width * 0.95, y: size.height)]
+        for (glow, center) in zip(glows, centers) {
             cg.drawRadialGradient(glow, startCenter: center, startRadius: 0, endCenter: center,
                                   endRadius: max(size.width, size.height) * 0.75, options: [])
         }
@@ -88,7 +91,7 @@ enum ModernSpectrum {
         let values = bars(levels), caps = bars(peaks)
         guard !values.isEmpty else { return }
         let inset: CGFloat = 14
-        let base = size.height - floor
+        let base = size.height - bottomInset
         let tallest = max(8, base - titleBand)
         let slot = (size.width - 2 * inset) / CGFloat(values.count)
         let width = max(2, (slot * 0.62).rounded())
@@ -100,8 +103,8 @@ enum ModernSpectrum {
             path.addRoundedRect(in: CGRect(x: x, y: base - height, width: width, height: height),
                                 cornerWidth: radius, cornerHeight: radius)
         }
-        // A soft violet glow under the bars, then the bars in one gradient the
-        // full height of the screen, so a loud band reaches the orchid.
+        // A soft violet glow under the bars, then the bars in one gradient over
+        // the whole bar height, so only a loud band reaches the orchid.
         cg.saveGState()
         cg.setShadow(offset: .zero, blur: 10, color: violetNS.withAlphaComponent(0.6).cgColor)
         cg.addPath(path)
@@ -111,9 +114,7 @@ enum ModernSpectrum {
         cg.saveGState()
         cg.addPath(path)
         cg.clip()
-        let fill = CGGradient(colorsSpace: space, colors: [indigo.cgColor, violetNS.cgColor, orchid.cgColor, blush.cgColor] as CFArray,
-                              locations: [0, 0.4, 0.8, 1])!
-        cg.drawLinearGradient(fill, start: CGPoint(x: 0, y: base), end: CGPoint(x: 0, y: base - tallest),
+        cg.drawLinearGradient(barFill, start: CGPoint(x: 0, y: base), end: CGPoint(x: 0, y: base - tallest),
                               options: [.drawsAfterEndLocation])
         cg.restoreGState()
 
@@ -136,6 +137,12 @@ enum ModernLiveDrawing {
     /// Where the seek bar's track runs in a row `width` wide.
     static func track(width: CGFloat) -> ClosedRange<Double> {
         Double(labelWidth + labelGap)...Double(max(labelWidth + labelGap + 1, width - labelWidth - labelGap))
+    }
+
+    /// Where a click seeks: the track and the thumb's reach past its ends, not the clocks.
+    static func seekHitRect(size: CGSize) -> CGRect {
+        let range = track(width: size.width)
+        return CGRect(x: range.lowerBound - 6, y: 0, width: range.upperBound - range.lowerBound + 12, height: size.height)
     }
 
     /// `times` nil leaves the clocks out: while the pane generates, the bar is its progress.
@@ -227,7 +234,7 @@ struct ModernAudioDeck: View {
                 }
                 VStack(spacing: 8) {
                     transport(active: active, playing: playing)
-                    HStack { volume; Spacer(minLength: 8); actions }
+                    HStack(spacing: 6) { volume; Spacer(minLength: 0); actions }
                 }
             }
             radioRow
@@ -259,7 +266,7 @@ struct ModernAudioDeck: View {
                 }
             }
             .padding(.horizontal, 12).padding(.top, 10)
-            .help(path)
+            .help(status == nil ? path : title.text)
         }
         .frame(height: 132)
         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -285,7 +292,8 @@ struct ModernAudioDeck: View {
                               guard total > 0 else { return }
                               let range = ModernLiveDrawing.track(width: size.width)
                               player.seek(to: total * ModernAudioPlayer.seekFraction(x: Double(point.x), track: range))
-                          }) { cg, size in
+                          },
+                          pointerRegion: { ModernLiveDrawing.seekHitRect(size: $0) }) { cg, size in
             let now = moving()
             ModernLiveDrawing.seekRow(cg, size: size, times: status == nil ? (now ? player.elapsed : 0, total) : nil,
                                       fraction: now ? min(1, player.elapsed / total) : progress,
@@ -306,7 +314,7 @@ struct ModernAudioDeck: View {
                 .frame(width: 18)
             Slider(value: $player.volume, in: 0...1)
                 .controlSize(.mini)
-                .frame(minWidth: 40, idealWidth: 80, maxWidth: 80)
+                .frame(minWidth: 32, idealWidth: 80, maxWidth: 80)
                 .tint(ModernSpectrum.violet)
                 .help(L10n.text("Volume"))
                 .accessibilityLabel(Text(L10n.text("Volume")))
@@ -327,10 +335,11 @@ struct ModernAudioDeck: View {
 
     /// The quieter keys beside the transport, the way IINA dims its side icons.
     private var actions: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             key("shuffle", L10n.text("Shuffle"), side: true, lit: player.shuffle) { player.shuffle.toggle() }
                 .disabled(radio.isOn)
-            key("repeat", L10n.text("Repeat"), side: true, lit: player.autoNext) { player.autoNext.toggle() }
+            key("repeat", L10n.text("Repeat"), help: L10n.text("Play the next track when one ends"),
+                side: true, lit: player.autoNext) { player.autoNext.toggle() }
                 .disabled(radio.isOn)
             if case .failed = status, let onShowLog {
                 key("doc.text.magnifyingglass", L10n.text("Show log"), side: true, action: onShowLog)
@@ -344,9 +353,9 @@ struct ModernAudioDeck: View {
         }
     }
 
-    /// One glyph button: its title is its tooltip and what VoiceOver reads.
-    private func key(_ symbol: String, _ title: String, large: Bool = false, side: Bool = false, lit: Bool = false,
-                     action: @escaping () -> Void) -> some View {
+    /// One glyph button: its title is what VoiceOver reads and, unless `help` says more, its tooltip.
+    private func key(_ symbol: String, _ title: String, help: String? = nil, large: Bool = false, side: Bool = false,
+                     lit: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label { Text(verbatim: title) } icon: {
                 Image(systemName: symbol)
@@ -357,7 +366,8 @@ struct ModernAudioDeck: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(ModernKeyStyle(lit: lit))
-        .help(title)
+        .help(help ?? title)
+        .accessibilityAddTraits(lit ? .isSelected : [])
     }
 
     // MARK: - AI Radio
@@ -406,6 +416,7 @@ private struct ModernKeyStyle: ButtonStyle {
 struct ModernPlaylist: View {
     let paths: [String]
     let current: String?
+    var paused = false
     /// A running AI Radio owns playback: rows only offer export and reveal.
     var locked = false
     let onPlay: (String) -> Void
@@ -428,6 +439,11 @@ struct ModernPlaylist: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
     }
 
+    /// The same glyph on every row: what says a track is playing is that it MOVES.
+    static func moves(_ path: String, current: String?, paused: Bool) -> Bool {
+        current == path && !paused
+    }
+
     /// The row plays or stops; export and reveal sit beside it, never inside a
     /// tap gesture that would swallow their clicks.
     private func row(_ path: String, number: Int) -> some View {
@@ -435,11 +451,10 @@ struct ModernPlaylist: View {
         return HStack(spacing: 6) {
             Button { playing ? onStop() : onPlay(path) } label: {
                 HStack(spacing: 8) {
-                    // The same glyph throughout: what says it is playing is that it MOVES.
                     Image(systemName: "waveform")
                         .foregroundStyle(playing ? AnyShapeStyle(ModernSpectrum.violet) : AnyShapeStyle(.secondary))
                         .symbolEffect(.variableColor.iterative.dimInactiveLayers.nonReversing,
-                                      options: .repeat(.continuous), isActive: playing)
+                                      options: .repeat(.continuous), isActive: Self.moves(path, current: current, paused: paused))
                         .frame(width: 16)
                     Text(verbatim: "\(number).").foregroundStyle(.tertiary).monospacedDigit()
                     Text(verbatim: URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent)
@@ -448,6 +463,9 @@ struct ModernPlaylist: View {
                     Text(verbatim: AudioClipPlayer.info(path).map { AudioClipPlayer.clock($0.seconds) } ?? "")
                         .foregroundStyle(.secondary).monospacedDigit()
                 }
+                // The lit row is the button's to click, edges included.
+                .padding(.vertical, 3)
+                .padding(.leading, 6)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -467,8 +485,7 @@ struct ModernPlaylist: View {
             .help(L10n.text("Reveal in Finder"))
         }
         .font(.app(.caption))
-        .padding(.vertical, 3)
-        .padding(.horizontal, 6)
+        .padding(.trailing, 6)
         .background(RoundedRectangle(cornerRadius: 5).fill(playing ? ModernSpectrum.violet.opacity(0.15) : Color.clear))
     }
 }

@@ -173,6 +173,8 @@
 "Stereo" = "스테레오";
 "Stop AI Radio" = "AI 라디오 정지";
 "Volume" = "볼륨";
+"AI Radio is running. Settings are locked until you stop it." = "AI 라디오가 실행 중입니다. 정지할 때까지 설정이 잠깁니다.";
+"Play the next track when one ends" = "곡이 끝나면 다음 곡 재생";
 "Other" = "기타";
 "WAV, MP3, M4A or AAC. The clip drives the performance and becomes the video's soundtrack." = "WAV, MP3, M4A 또는 AAC. 클립이 연기를 이끌고 비디오의 사운드트랙이 됩니다.";
 "Updated to the latest defaults.\nYour previous versions were saved to:\n%@" = "최신 기본값으로 업데이트했습니다.\n이전 버전 저장 위치:\n%@";

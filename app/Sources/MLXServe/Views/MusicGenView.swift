@@ -41,7 +41,7 @@ struct MusicGenView: View {
     @State private var showPlaylist = true
     @State private var confirmStopRadio = false
     @AppStorage("aiRadio.theme") private var radioTheme = ""
-    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var playerStyle: AudioPlayerStyle = .mlxAmp
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var playerStyle = AudioPlayerStyle.defaultStyle
     @State private var showSaveStyle = false
     @State private var showSaveLyrics = false
     @State private var saveTitle = ""
@@ -206,7 +206,8 @@ struct MusicGenView: View {
                 case .modern:
                     modernDeck
                     if showPlaylist {
-                        ModernPlaylist(paths: service.recent, current: clipPlayer.playingPath, locked: radio.isOn,
+                        ModernPlaylist(paths: service.recent, current: clipPlayer.playingPath, paused: clipPlayer.isPaused,
+                                       locked: radio.isOn,
                                        onPlay: { play($0) }, onStop: { stopPlayback() })
                             .frame(maxHeight: .infinity)
                     } else {

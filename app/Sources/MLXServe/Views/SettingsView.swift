@@ -2229,7 +2229,7 @@ private struct InterfaceSectionContent: View {
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
     @AppStorage(InterfacePrefKey.terminalTheme) private var terminalThemeId = TerminalTheme.defaultId
     @AppStorage(InterfacePrefKey.terminalBackground) private var terminalBackgroundHex = ""
-    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var audioPlayerStyle: AudioPlayerStyle = .mlxAmp
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var audioPlayerStyle = AudioPlayerStyle.defaultStyle
 
     var body: some View {
         SettingsRow(title: "Appearance", explainer: "Follow the system, or always use light or dark.") {

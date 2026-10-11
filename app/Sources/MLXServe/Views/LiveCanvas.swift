@@ -1,19 +1,20 @@
 import SwiftUI
 import AppKit
 
-/// An AppKit view that draws itself and redraws on its own timer, so something
-/// moving (a spectrum, a clock, a seek bar) costs a draw of this one view and
-/// not a layout of the window. The timer runs only while `shouldRun` says
-/// something is moving and the window can be seen; `fps` is read each time it
-/// starts, so a slower machine state takes effect at once.
+/// An AppKit view that redraws on its own timer, so something moving costs a
+/// draw of this view, not a layout of the window. The timer runs only while
+/// `shouldRun` holds and the window can be seen, at `fps` read as it starts.
 final class LiveCanvasView: NSView {
     var render: @MainActor (CGContext, CGSize) -> Void = { _, _ in }
     var shouldRun: @MainActor () -> Bool = { false }
     var fps: @MainActor () -> Double = { 0 }
     /// A click or drag at this point, for a view that takes them (a seek bar).
     var onPointer: (@MainActor (CGPoint, CGSize) -> Void)?
+    /// Where a click may start (nil = anywhere); its drag then goes where it likes.
+    var pointerRegion: (@MainActor (CGSize) -> CGRect)?
 
     private var timer: Timer?
+    private var tracking = false
     private var observers: [NSObjectProtocol] = []
 
     override var isFlipped: Bool { true }
@@ -78,8 +79,17 @@ final class LiveCanvasView: NSView {
     }
 
     private func point(_ event: NSEvent) -> CGPoint { convert(event.locationInWindow, from: nil) }
-    override func mouseDown(with event: NSEvent) { onPointer?(point(event), bounds.size); needsDisplay = true }
-    override func mouseDragged(with event: NSEvent) { onPointer?(point(event), bounds.size); needsDisplay = true }
+    override func mouseDown(with event: NSEvent) {
+        let p = point(event)
+        tracking = pointerRegion.map { $0(bounds.size).contains(p) } ?? true
+        if tracking { onPointer?(p, bounds.size); needsDisplay = true }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard tracking else { return }
+        onPointer?(point(event), bounds.size)
+        needsDisplay = true
+    }
 }
 
 /// SwiftUI's door to `LiveCanvasView`, sized by its frame. SwiftUI hands it new
@@ -89,6 +99,7 @@ struct LiveCanvas: NSViewRepresentable {
     let shouldRun: @MainActor () -> Bool
     let fps: @MainActor () -> Double
     var onPointer: (@MainActor (CGPoint, CGSize) -> Void)?
+    var pointerRegion: (@MainActor (CGSize) -> CGRect)?
     let render: @MainActor (CGContext, CGSize) -> Void
 
     func makeNSView(context: Context) -> LiveCanvasView { configured(LiveCanvasView(frame: .zero)) }
@@ -103,6 +114,7 @@ struct LiveCanvas: NSViewRepresentable {
         view.shouldRun = shouldRun
         view.fps = fps
         view.onPointer = onPointer
+        view.pointerRegion = pointerRegion
         return view
     }
 }

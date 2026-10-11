@@ -37,9 +37,8 @@ enum AudioPlayerStyle: String, CaseIterable, Identifiable {
         }
     }
 
-    static func current(_ defaults: UserDefaults = .standard) -> AudioPlayerStyle {
-        AudioPlayerStyle(rawValue: defaults.string(forKey: InterfacePrefKey.audioPlayerStyle) ?? "") ?? .mlxAmp
-    }
+    /// The author's player stays the default; every view reading the setting starts here.
+    static let defaultStyle = AudioPlayerStyle.mlxAmp
 }
 
 /// How wide a conversation reads: fixed points, so resizing the window spends

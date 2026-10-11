@@ -241,6 +241,7 @@
 "Agent workspace folder" = "Agent 工作区文件夹";
 "Agents" = "智能体";
 "Agents…" = "智能体…";
+"AI Radio is running. Settings are locked until you stop it." = "AI 电台正在播放。停止之前设置保持锁定。";
 "AI Radio theme, e.g. mellow lo-fi for coding" = "AI 电台主题，例如：适合写代码的舒缓 lo-fi";
 "Alibaba's second-generation image model — strong prompt understanding and in-image text, in English and Chinese. Undistilled: 40 steps by default, so it is slower than the Turbo models. Open (Apache-2.0)." = "阿里巴巴的第二代图像模型 —— 提示词理解力强，擅长画面内文字，中英文皆可。未蒸馏：默认 40 步，因此比 Turbo 系列更慢。开源（Apache-2.0）。";
 "All Settings" = "所有设置";
@@ -1222,6 +1223,7 @@
 "Pinned llama.cpp release serving `.gguf` models. Ships inside the app download." = "锁定版本的 llama.cpp，用于对外提供 `.gguf` 模型服务。随应用下载一同提供。";
 "Plan (%lld steps)" = "计划（%lld 步）";
 "Play" = "播放";
+"Play the next track when one ends" = "一首播完后自动播放下一首";
 "Playlist" = "播放列表";
 "Pods, deployments, services — uses your local kubeconfig" = "Pod、部署、服务 —— 使用你本地的 kubeconfig";
 "Polish" = "波兰语";

@@ -467,7 +467,7 @@ struct MlxAmpSlider: View {
 /// A region of the skin drawn by a `LiveCanvasView`: pixels unsmoothed at the skin's scale, a
 /// pointer reported in skin pixels. Sized in skin pixels; between state changes only its own
 /// timer draws.
-struct MlxAmpLive: NSViewRepresentable {
+struct MlxAmpLive: View {
     let width: CGFloat
     let height: CGFloat
     let shouldRun: @MainActor () -> Bool
@@ -475,28 +475,15 @@ struct MlxAmpLive: NSViewRepresentable {
     var onDrag: (@MainActor (CGFloat) -> Void)?
     let draw: @MainActor (Px) -> Void
 
-    func makeNSView(context: Context) -> LiveCanvasView { configured(LiveCanvasView(frame: .zero)) }
-
-    func updateNSView(_ view: LiveCanvasView, context: Context) {
-        _ = configured(view)
-        view.reschedule()
-    }
-
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: LiveCanvasView, context: Context) -> CGSize? {
-        CGSize(width: width * MlxAmpStyle.scale, height: height * MlxAmpStyle.scale)
-    }
-
-    private func configured(_ view: LiveCanvasView) -> LiveCanvasView {
+    var body: some View {
         let draw = draw
-        view.render = { cg, _ in
+        LiveCanvas(shouldRun: shouldRun, fps: fps,
+                   onPointer: onDrag.map { drag in { point, _ in drag(point.x / MlxAmpStyle.scale) } }) { cg, _ in
             cg.setShouldAntialias(false)
             cg.scaleBy(x: MlxAmpStyle.scale, y: MlxAmpStyle.scale)
             draw(Px(cg: cg))
         }
-        view.shouldRun = shouldRun
-        view.fps = fps
-        view.onPointer = onDrag.map { drag in { point, _ in drag(point.x / MlxAmpStyle.scale) } }
-        return view
+        .frame(width: width * MlxAmpStyle.scale, height: height * MlxAmpStyle.scale)
     }
 }
 
