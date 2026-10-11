@@ -4211,6 +4211,61 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     try testing.expectError(error.DiskCacheNoCheckpoint, tier2.restoreIntoHybrid(&cache3, &dst2, 0, 200, s));
 }
 
+test "DiskTier: a qwen4_exp checkpoint keeps its f32 GatedDeltaNet state through SSD and restore, at the bill the config predicts" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const cfg = try model.parseConfigFromJson(testing.allocator, QWEN4_TINY_GDN);
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-q4", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 4);
+    defer cache.deinit();
+    try fillCache(&cache, s, 4, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Layers 0-2 hold the model's state, 1 + k/1024: exact in f32, rounded away in bf16.
+    var src: [4]SSMCacheEntry = undefined;
+    for (&src, 0..) |*e, i| {
+        e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = i < 3 };
+        if (i == 3) continue;
+        const conv = makeArange(s, &.{ 1, 3, 16 }, 100.0);
+        defer _ = mlx.mlx_array_free(conv);
+        try mlx.check(mlx.mlx_astype(&e.conv_state, conv, .bfloat16, s));
+        const raw = makeArange(s, &ssm_shape, 1024.0);
+        defer _ = mlx.mlx_array_free(raw);
+        const step = mlx.mlx_array_new_float(1.0 / 1024.0);
+        defer _ = mlx.mlx_array_free(step);
+        var scaled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scaled);
+        try mlx.check(mlx.mlx_multiply(&scaled, raw, step, s));
+        try mlx.check(mlx.mlx_astype(&e.ssm_state, scaled, cfg.ssmStateDtype(), s));
+    }
+    var dst: [4]SSMCacheEntry = undefined;
+    for (&dst) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    defer for ([_]*[4]SSMCacheEntry{ &src, &dst }) |set| for (set) |*e| {
+        _ = mlx.mlx_array_free(e.conv_state);
+        _ = mlx.mlx_array_free(e.ssm_state);
+    };
+    var cps = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s)};
+    defer cps[0].deinit(testing.allocator);
+    try testing.expectEqual(cfg.ssmCheckpointBytes(), transformer_mod.ssmCheckpointBytes(&cps[0]));
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-q4", 0, 128);
+    defer tier2.deinit();
+    var cache2 = try KVCache.init(testing.allocator, 4);
+    defer cache2.deinit();
+    try testing.expectEqual(@as(u32, 256), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 256, s));
+    for (dst[0..3]) |e| {
+        try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(e.ssm_state));
+        try testing.expectEqual(@as(f32, 1.0 + 5.0 / 1024.0), ssmArrVal(e.ssm_state, 5, s));
+    }
+}
+
 fn stAuxPooledBytes(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !struct { aux: u64, pooled: u64 } {
     const raw = readFileAlloc(allocator, io, path, 4 * 1024 * 1024) orelse return error.TestUnexpectedResult;
     defer allocator.free(raw);
@@ -5471,6 +5526,41 @@ test "modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root" {
     defer testing.allocator.free(fp_qwen);
     try testing.expect(!std.mem.eql(u8, old, fp_nemo));
     try testing.expectEqualStrings(old, fp_qwen);
+}
+
+/// A qwen4_exp pack with three GatedDeltaNet layers (Hv 2 over Dk = Dv = 4, conv 3 x 16) and one attention layer.
+const QWEN4_TINY_GDN =
+    \\{"model_type": "qwen4_exp", "text_config": {"hidden_size": 64, "num_hidden_layers": 4,
+    \\ "full_attention_interval": 4, "ple_layer_ids": [1], "linear_num_key_heads": 1,
+    \\ "linear_num_value_heads": 2, "linear_key_head_dim": 4, "linear_value_head_dim": 4,
+    \\ "mamba_ssm_dtype": "float32"}}
+;
+
+// Bar: a qwen4_exp root written while its GatedDeltaNet state was bf16 never restores into the f32
+// one, and MLX_SERVE_GDN_STATE_F32=0 keeps the historical root.
+test "modelFingerprint: a qwen4_exp f32 GatedDeltaNet state gets its own SSD root" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" });
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/m", .{base});
+    defer testing.allocator.free(dir);
+
+    const q4 = try model.parseConfigFromJson(testing.allocator, QWEN4_TINY_GDN);
+    const old = try modelFingerprint(testing.allocator, io, dir);
+    defer testing.allocator.free(old);
+    const fp = try modelFingerprintWithLayout(testing.allocator, io, dir, q4.cacheLayoutNamespace());
+    defer testing.allocator.free(fp);
+    try testing.expect(!std.mem.eql(u8, old, fp));
+    model.gdn_state_f32_override = false;
+    defer model.gdn_state_f32_override = null;
+    const q4_bf16 = try model.parseConfigFromJson(testing.allocator, QWEN4_TINY_GDN);
+    const fp_bf16 = try modelFingerprintWithLayout(testing.allocator, io, dir, q4_bf16.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_bf16);
+    try testing.expectEqualStrings(old, fp_bf16);
 }
 
 test "modelFingerprint: rolls with --config-overrides" {
