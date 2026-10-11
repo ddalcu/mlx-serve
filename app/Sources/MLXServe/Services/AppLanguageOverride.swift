@@ -16,7 +16,8 @@ import Foundation
 /// reader on a Korean Mac gets English from the first launch after updating,
 /// and a per-app language picked in System Settings is overridden. macOS's
 /// own per-app value lives in the same key of the same domain, so it is left
-/// to macOS to resolve.
+/// to macOS to resolve — and when it did move under us, the stamp goes, not
+/// the value.
 enum AppLanguageOverride {
     private static let preferredLanguagesKey = "AppleLanguages"
 
@@ -43,10 +44,15 @@ enum AppLanguageOverride {
         // System Settings' per-app language or a manual `defaults write`,
         // and deleting it loses the user's choice instead of following it.
         let applied = defaults.string(forKey: InterfacePrefKey.languageApplied)
+        guard let applied else { return }  // nothing this app ever wrote
         let current = (defaults.array(forKey: preferredLanguagesKey) as? [String])?.first
-        if let applied, current == applied {
+        if current == applied {
             defaults.removeObject(forKey: preferredLanguagesKey)
-            defaults.removeObject(forKey: InterfacePrefKey.languageApplied)
         }
+        // The value moved under us — System Settings changed it, or a manual
+        // `defaults write` did. Drop the stamp either way: a value that is
+        // not ours stays where its owner put it, and a later System Settings
+        // choice of the code we once stamped must not be mistaken for ours.
+        defaults.removeObject(forKey: InterfacePrefKey.languageApplied)
     }
 }

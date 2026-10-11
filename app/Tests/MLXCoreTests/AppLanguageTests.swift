@@ -119,7 +119,9 @@ final class AppLanguageTests: XCTestCase {
 
     /// The user picked a language here, then changed the app's language in
     /// System Settings: the override is no longer the one this app wrote, so
-    /// following the Mac leaves it alone.
+    /// following the Mac leaves it alone — and the mark goes with it, so a
+    /// later System Settings pick of the code this app once wrote is not
+    /// mistaken for ours and taken back.
     func testSystemDefaultLeavesAnOverrideChangedByTheSystem() {
         let (defaults, suite) = sandboxedDefaults()
         defer { removeSuite(suite) }
@@ -128,8 +130,34 @@ final class AppLanguageTests: XCTestCase {
 
         AppLanguageOverride.install(preference: nil,
                                     localizations: shippedLocalizations, defaults: defaults)
-        XCTAssertEqual(defaults.array(forKey: "AppleLanguages") as? [String], ["ko"])
-        XCTAssertEqual(defaults.string(forKey: InterfacePrefKey.languageApplied), "en")
+        defaults.synchronize()
+        let persisted = UserDefaults.standard.persistentDomain(forName: suite) ?? [:]
+        XCTAssertEqual(persisted["AppleLanguages"] as? [String], ["ko"])
+        XCTAssertNil(persisted[InterfacePrefKey.languageApplied])
+    }
+
+    /// The mark dropped above does its job: had it stayed, a launch after the
+    /// user later picked that same language in System Settings would read the
+    /// value as this app's own and delete it.
+    func testADroppedMarkLeavesALaterSystemPickOfThatCodeAlone() {
+        let (defaults, suite) = sandboxedDefaults()
+        defer { removeSuite(suite) }
+        // A launch that found the override changed under us: value kept, mark
+        // dropped.
+        defaults.set(["ko"], forKey: "AppleLanguages")
+        defaults.set("en", forKey: InterfacePrefKey.languageApplied)
+        AppLanguageOverride.install(preference: nil,
+                                    localizations: shippedLocalizations, defaults: defaults)
+        // The user now sets that same language (the one this app once wrote)
+        // in System Settings — the same key, the same domain.
+        defaults.set(["en"], forKey: "AppleLanguages")
+
+        AppLanguageOverride.install(preference: nil,
+                                    localizations: shippedLocalizations, defaults: defaults)
+        defaults.synchronize()
+        let persisted = UserDefaults.standard.persistentDomain(forName: suite) ?? [:]
+        XCTAssertEqual(persisted["AppleLanguages"] as? [String], ["en"])
+        XCTAssertNil(persisted[InterfacePrefKey.languageApplied])
     }
 
     // MARK: - What the picker shows
