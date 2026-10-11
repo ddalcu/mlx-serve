@@ -2229,6 +2229,7 @@ private struct InterfaceSectionContent: View {
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
     @AppStorage(InterfacePrefKey.terminalTheme) private var terminalThemeId = TerminalTheme.defaultId
     @AppStorage(InterfacePrefKey.terminalBackground) private var terminalBackgroundHex = ""
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var audioPlayerStyle: AudioPlayerStyle = .mlxAmp
 
     var body: some View {
         SettingsRow(title: "Appearance", explainer: "Follow the system, or always use light or dark.") {
@@ -2274,6 +2275,16 @@ private struct InterfaceSectionContent: View {
             Toggle("", isOn: $compactMode)
                 .labelsHidden()
                 .toggleStyle(.switch).font(.app(.body))
+        }
+        SettingsRow(title: "Audio Player",
+                    explainer: "How the Voice, Music and Sound tabs show the player and your history.") {
+            Picker("", selection: $audioPlayerStyle) {
+                ForEach(AudioPlayerStyle.allCases) { style in
+                    Text(verbatim: style.label).font(.app(.body)).tag(style)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 140).font(.app(.body))
         }
         SettingsRow(title: "Terminal Theme",
                     explainer: "Colors for new terminals; right-click a terminal to change just that one.") {

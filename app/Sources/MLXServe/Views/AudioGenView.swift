@@ -72,13 +72,21 @@ struct AudioHistoryShelf: View {
     let playingPath: String?
     let onPlay: (String) -> Void
     let onStop: () -> Void
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var style: AudioPlayerStyle = .mlxAmp
 
     var body: some View {
         Group {
             if !paths.isEmpty {
-                MlxAmpStretched { width, _ in
-                    MlxAmpPlaylist(width: width, height: MlxAmpPlaylist.minHeight, paths: paths, current: playingPath,
-                                   onPlay: onPlay, onStop: onStop)
+                Group {
+                    switch style {
+                    case .mlxAmp:
+                        MlxAmpStretched { width, _ in
+                            MlxAmpPlaylist(width: width, height: MlxAmpPlaylist.minHeight, paths: paths, current: playingPath,
+                                           onPlay: onPlay, onStop: onStop)
+                        }
+                    case .modern:
+                        ModernPlaylist(paths: paths, current: playingPath, onPlay: onPlay, onStop: onStop)
+                    }
                 }
                 .frame(height: MlxAmpPlaylist.minHeight * MlxAmpStyle.scale)
                 .onAppear { AudioClipPlayer.shared.queue = paths }

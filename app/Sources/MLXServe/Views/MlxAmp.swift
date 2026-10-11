@@ -464,83 +464,9 @@ struct MlxAmpSlider: View {
 
 // MARK: - Live (animated) drawing
 
-/// An AppKit view that draws a region of the skin and redraws itself on its own timer, so a
-/// moving spectrum or title costs a draw of that one view and not a layout of the window.
-/// The timer runs only while `shouldRun` says something is moving and the window is on screen.
-final class MlxAmpLiveView: NSView {
-    var draw: @MainActor (Px) -> Void = { _ in }
-    var shouldRun: @MainActor () -> Bool = { false }
-    var fps: @MainActor () -> Double = { 0 }
-    /// Pointer x in skin pixels, for a view that takes drags (the seek bar).
-    var onDrag: (@MainActor (CGFloat) -> Void)?
-
-    private var timer: Timer?
-    private var observers: [NSObjectProtocol] = []
-
-    override var isFlipped: Bool { true }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        layerContentsRedrawPolicy = .onSetNeedsDisplay
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    deinit {
-        timer?.invalidate()
-        observers.forEach(NotificationCenter.default.removeObserver)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard let cg = NSGraphicsContext.current?.cgContext else { return }
-        cg.setShouldAntialias(false)
-        cg.scaleBy(x: MlxAmpStyle.scale, y: MlxAmpStyle.scale)
-        draw(Px(cg: cg))
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        observers.forEach(NotificationCenter.default.removeObserver)
-        observers = []
-        let center = NotificationCenter.default
-        // A slower machine state, or a window that is hidden or covered, changes what is worth drawing.
-        for name in [Notification.Name.NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
-            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.reschedule() })
-        }
-        if let window {
-            observers.append(center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak self] _ in
-                self?.reschedule()
-            })
-        }
-        reschedule()
-    }
-
-    /// Redraw once, then run the timer only if something is moving and the window can be seen.
-    func reschedule() {
-        timer?.invalidate()
-        timer = nil
-        needsDisplay = true
-        guard let window, window.occlusionState.contains(.visible), shouldRun() else { return }
-        let rate = fps()
-        guard rate > 0 else { return }
-        let t = Timer(timeInterval: 1 / rate, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.needsDisplay = true
-            if !self.shouldRun() { self.reschedule() }
-        }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
-    }
-
-    private func skinX(_ event: NSEvent) -> CGFloat { convert(event.locationInWindow, from: nil).x / MlxAmpStyle.scale }
-    override func mouseDown(with event: NSEvent) { onDrag?(skinX(event)); needsDisplay = true }
-    override func mouseDragged(with event: NSEvent) { onDrag?(skinX(event)); needsDisplay = true }
-}
-
-/// SwiftUI's door to `MlxAmpLiveView`. SwiftUI hands it new closures when the player's state
-/// changes (a track starts, pauses, stops); between those, only the view's own timer draws.
+/// A region of the skin drawn by a `LiveCanvasView`: pixels unsmoothed at the skin's scale, a
+/// pointer reported in skin pixels. Sized in skin pixels; between state changes only its own
+/// timer draws.
 struct MlxAmpLive: NSViewRepresentable {
     let width: CGFloat
     let height: CGFloat
@@ -549,22 +475,27 @@ struct MlxAmpLive: NSViewRepresentable {
     var onDrag: (@MainActor (CGFloat) -> Void)?
     let draw: @MainActor (Px) -> Void
 
-    func makeNSView(context: Context) -> MlxAmpLiveView { configured(MlxAmpLiveView(frame: .zero)) }
+    func makeNSView(context: Context) -> LiveCanvasView { configured(LiveCanvasView(frame: .zero)) }
 
-    func updateNSView(_ view: MlxAmpLiveView, context: Context) {
+    func updateNSView(_ view: LiveCanvasView, context: Context) {
         _ = configured(view)
         view.reschedule()
     }
 
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: MlxAmpLiveView, context: Context) -> CGSize? {
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: LiveCanvasView, context: Context) -> CGSize? {
         CGSize(width: width * MlxAmpStyle.scale, height: height * MlxAmpStyle.scale)
     }
 
-    private func configured(_ view: MlxAmpLiveView) -> MlxAmpLiveView {
-        view.draw = draw
+    private func configured(_ view: LiveCanvasView) -> LiveCanvasView {
+        let draw = draw
+        view.render = { cg, _ in
+            cg.setShouldAntialias(false)
+            cg.scaleBy(x: MlxAmpStyle.scale, y: MlxAmpStyle.scale)
+            draw(Px(cg: cg))
+        }
         view.shouldRun = shouldRun
         view.fps = fps
-        view.onDrag = onDrag
+        view.onPointer = onDrag.map { drag in { point, _ in drag(point.x / MlxAmpStyle.scale) } }
         return view
     }
 }
