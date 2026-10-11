@@ -20,8 +20,11 @@ enum InterfacePrefKey {
     /// "#RRGGBB" ground painted under the default terminal theme; "" = the
     /// theme's own.
     static let terminalBackground = "terminalBackground"
-    /// `AppLanguage` raw value; unset = follow the Mac.
+    /// A `Bundle.main.localizations` code, or anything else = follow the Mac.
     static let language = "interfaceLanguage"
+    /// The last `AppleLanguages` override this app wrote — the companion that
+    /// tells "follow the Mac" which values in the app domain are ours.
+    static let languageApplied = "interfaceLanguageApplied"
 }
 
 /// How wide a conversation reads: fixed points, so resizing the window spends
@@ -104,35 +107,48 @@ enum AppAppearanceMode: String, CaseIterable, Identifiable {
     }
 }
 
-/// Interface language (Settings ▸ Interface ▸ Language). The default follows
-/// the Mac, and the app renders that as Simplified Chinese for BOTH Chinese
-/// spellings — it ships one Chinese catalog, so a zh-Hant reader gets the
-/// closest thing it has — and English for every other language.
-enum AppLanguage: String, CaseIterable, Identifiable {
-    case system, english = "en", simplifiedChinese = "zh-Hans"
-    var id: String { rawValue }
-    /// The English source doubles as the label for the two named languages:
-    /// each is shown in its own spelling, never translated.
-    var label: String {
-        switch self {
-        case .system: return "System Default"
-        case .english: return "English"
-        case .simplifiedChinese: return "简体中文"
-        }
-    }
-    /// `label` as the picker shows it — the autonyms verbatim, the rest
-    /// through the catalog.
-    var pickerLabel: String { self == .system ? L10n.text(label) : label }
+/// Settings ▸ Interface ▸ Language: follow the Mac, or one catalog the app
+/// ships. The named rows ARE the bundle's localizations, so a catalog added
+/// later is listed without a code change, and a code a build no longer ships
+/// reads as following the Mac rather than an unselected picker.
+struct AppLanguageChoice: Identifiable, Hashable {
+    /// nil = follow the Mac.
+    let code: String?
+    let label: String
+    var id: String { code ?? "" }
 
-    /// The catalog to load. Both answers are ones the app ships: English is
-    /// the development region, so its keys are their own text.
-    func catalog(preferredLanguages: [String]) -> String {
-        switch self {
-        case .english: return AppLanguage.english.rawValue
-        case .simplifiedChinese: return AppLanguage.simplifiedChinese.rawValue
-        case .system: return (preferredLanguages.first ?? "").hasPrefix("zh")
-            ? AppLanguage.simplifiedChinese.rawValue
-            : AppLanguage.english.rawValue
+    init(code: String?, label: String) {
+        self.code = code
+        self.label = label
+    }
+
+    /// The only row whose label is a word to translate; every other row is a
+    /// language's own spelling, shown verbatim in the language itself.
+    static let system = AppLanguageChoice(code: nil, label: L10n.text("System Default"))
+
+    /// "System Default" first, then every catalog the bundle ships, each in
+    /// its own spelling. `Base` is the storyboard shell, not a language.
+    static var all: [AppLanguageChoice] {
+        [system] + Bundle.main.localizations
+            .filter { $0 != "Base" }
+            .map { AppLanguageChoice(code: $0, label: Self.autonym($0)) }
+    }
+
+    private static func autonym(_ code: String) -> String {
+        // Each language named in its own spelling, the script spelled out:
+        // zh-Hans reads 简体中文, the way System Settings lists it. The locale
+        // and the value are the same identifier, so the answer is never a
+        // translation of the name into some other language.
+        NSLocale(localeIdentifier: code).displayName(forKey: .identifier, value: code) ?? code
+    }
+
+    /// The row a stored preference names. Anything the bundle does not ship
+    /// — an empty value, a code a previous build had — is the Mac's own.
+    init(raw: String, localizations: [String]) {
+        if localizations.contains(raw) {
+            self.init(code: raw, label: Self.autonym(raw))
+        } else {
+            self = AppLanguageChoice.system
         }
     }
 }

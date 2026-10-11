@@ -2185,3 +2185,6 @@
 "News, benchmarks and plans, with questions and bug reports welcome." = "소식, 벤치마크, 계획을 볼 수 있고 질문과 버그 신고도 환영합니다.";
 "Web UI" = "웹 UI";
 "Open the web UI in your browser" = "브라우저에서 웹 UI를 엽니다";
+"Language" = "언어";
+"System Default" = "시스템 기본값";
+"\"System Default\" follows the Mac. The app relaunches to apply the change." = "\"시스템 기본값\"은 이 Mac의 언어를 따릅니다. 변경 후 앱이 다시 시작됩니다.";

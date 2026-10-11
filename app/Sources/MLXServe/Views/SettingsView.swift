@@ -2222,7 +2222,7 @@ private struct EngineGroup<Content: View>: View {
 /// flag, so they're `@AppStorage`-backed instead of riding `ServerOptions`.
 private struct InterfaceSectionContent: View {
     @EnvironmentObject var appState: AppState
-    @AppStorage(InterfacePrefKey.language) private var languageRaw = AppLanguage.system.rawValue
+    @AppStorage(InterfacePrefKey.language) private var languageRaw = ""
     @AppStorage(InterfacePrefKey.appearanceMode) private var appearanceModeRaw = AppAppearanceMode.system.rawValue
     @AppStorage(InterfacePrefKey.accentColor) private var accentColorRaw = AppAccentColor.system.rawValue
     @AppStorage(InterfacePrefKey.textSize) private var textSizeRaw = ChatTextSize.medium.rawValue
@@ -2233,13 +2233,12 @@ private struct InterfaceSectionContent: View {
 
     var body: some View {
         SettingsRow(title: "Language",
-                    explainer: "\"System Default\" shows Simplified Chinese when the Mac's language is Chinese (either spelling), and English otherwise. The app relaunches to apply the change.") {
+                    explainer: "\"System Default\" follows the Mac. The app relaunches to apply the change.") {
             // A catalog is resolved once per process, so the change lands on
             // the next start — the app starts that one itself.
-            Picker("", selection: Binding(get: { languageRaw },
-                                          set: { languageRaw = $0; AppLanguageOverride.relaunch() })) {
-                ForEach(AppLanguage.allCases) { language in
-                    Text(verbatim: language.pickerLabel).tag(language.rawValue)
+            Picker("", selection: languageChoice) {
+                ForEach(AppLanguageChoice.all) { choice in
+                    Text(verbatim: choice.label).tag(choice)
                 }
             }
             .labelsHidden()
@@ -2319,6 +2318,19 @@ private struct InterfaceSectionContent: View {
 }
 
 extension InterfaceSectionContent {
+    /// The stored preference ↔ the row the picker shows. A preference naming
+    /// a catalog this build no longer ships reads as System Default, and
+    /// picking it again ("") means "follow the Mac" — install() then writes
+    /// no override, which is also what an untouched preference looks like.
+    fileprivate var languageChoice: Binding<AppLanguageChoice> {
+        Binding(
+            get: { AppLanguageChoice(raw: languageRaw, localizations: Bundle.main.localizations) },
+            set: { choice in
+                languageRaw = choice.code ?? ""
+                AppRelaunch.relaunch(at: Bundle.main.bundlePath)
+            })
+    }
+
     /// The color well ↔ the stored "#RRGGBB" (empty = the theme's ground).
     fileprivate var terminalBackground: Binding<Color> {
         Binding(

@@ -1,74 +1,159 @@
 import XCTest
 @testable import MLXCore
 
-/// Settings ▸ Interface ▸ Language: which catalog a choice loads.
+/// Settings ▸ Interface ▸ Language: which catalog a choice loads, what
+/// launch writes, and what the picker offers.
 final class AppLanguageTests: XCTestCase {
 
-    /// The override names two catalogs: Chinese ships a `.lproj`, and English
-    /// is the development region — a name with nothing behind it resolves to
-    /// whatever the Mac says, which is the language the row exists to change.
-    func testEveryCatalogTheOverrideCanNameIsShipped() {
-        let app = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // MLXCoreTests
-            .deletingLastPathComponent()   // Tests
-            .deletingLastPathComponent()   // app
-        let resources = app.appendingPathComponent("Sources/MLXServe/Resources")
-        XCTAssertTrue(FileManager.default.fileExists(
-            atPath: resources.appendingPathComponent("zh-Hans.lproj").path),
-            "no zh-Hans.lproj behind the Chinese choice")
+    private var appRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // MLXCoreTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // app
+    }
 
+    /// The catalogs the app ships — the same list `install()` reads from
+    /// `Bundle.main` at launch, pinned from the plist so this sees the real
+    /// bundle rather than the test host's.
+    private var shippedLocalizations: [String] {
         let plist = try! PropertyListSerialization.propertyList(
-            from: Data(contentsOf: app.appendingPathComponent("Info.plist")), format: nil) as? [String: Any]
-        XCTAssertEqual(plist?["CFBundleDevelopmentRegion"] as? String, "en",
-                       "English text comes from the development region")
+            from: Data(contentsOf: appRoot.appendingPathComponent("Info.plist")),
+            format: nil) as? [String: Any]
+        return plist?["CFBundleLocalizations"] as? [String] ?? []
     }
 
-    func testSystemDefaultReadsBothChineseSpellingsAsSimplified() {
-        for preference in ["zh-Hans", "zh-Hant", "zh-TW", "zh-CN", "zh"] {
-            XCTAssertEqual(AppLanguage.system.catalog(preferredLanguages: [preference]),
-                           "zh-Hans", preference)
+    // MARK: - Which catalog a choice loads
+
+    /// The picker is the bundle's own list: a catalog added later shows up
+    /// without a code change, and one a build drops is not offered. The
+    /// two-language enum this replaced shipped Korean and hid it.
+    func testThePickerOffersEveryCatalogTheBundleShips() {
+        let codes = shippedLocalizations
+        XCTAssertFalse(codes.contains("Base"), "Base is the storyboard shell, not a language")
+        XCTAssertTrue(codes.contains("ko"), "Korean ships ko.lproj beside zh-Hans.lproj")
+        for code in codes {
+            XCTAssertEqual(AppLanguageChoice(raw: code, localizations: codes).code, code,
+                           "\(code) ships but the picker drops it")
         }
-        // A second preference never outranks the first one.
-        XCTAssertEqual(AppLanguage.system.catalog(preferredLanguages: ["zh-HK", "en-US"]), "zh-Hans")
     }
 
-    func testSystemDefaultReadsEveryOtherLanguageAsEnglish() {
-        for preference in ["en", "en-GB", "ja-JP", "ko-KR", "fr-FR", "de-DE"] {
-            XCTAssertEqual(AppLanguage.system.catalog(preferredLanguages: [preference]),
-                           "en", preference)
+    /// Every offered code is loadable: English is the development region, so
+    /// its keys are their own text, and everything else ships an `.lproj`.
+    func testEveryOfferedCatalogResolves() throws {
+        let plist = try PropertyListSerialization.propertyList(
+            from: Data(contentsOf: appRoot.appendingPathComponent("Info.plist")),
+            format: nil) as? [String: Any]
+        let developmentRegion = try XCTUnwrap(plist?["CFBundleDevelopmentRegion"] as? String)
+        for code in shippedLocalizations {
+            let lproj = appRoot
+                .appendingPathComponent("Sources/MLXServe/Resources/\(code).lproj")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: lproj.path) || code == developmentRegion,
+                          "\(code) is offered with no catalog behind it")
         }
-        XCTAssertEqual(AppLanguage.system.catalog(preferredLanguages: []), "en")
     }
 
-    /// The named choices are not hints: English has to be loadable on a Mac
-    /// whose own language is Chinese, and Chinese on a Mac set to English.
-    func testANamedLanguageWinsOverTheMac() {
-        XCTAssertEqual(AppLanguage.english.catalog(preferredLanguages: ["zh-Hans"]), "en")
-        XCTAssertEqual(AppLanguage.simplifiedChinese.catalog(preferredLanguages: ["en-US"]), "zh-Hans")
+    /// Following the Mac resolves to no catalog of ours: macOS picks the
+    /// bundle the way it always has, so a Korean Mac keeps Korean.
+    func testSystemDefaultNamesNoCatalog() {
+        let codes = shippedLocalizations
+        XCTAssertNil(AppLanguageOverride.catalog(preference: nil, localizations: codes))
+        XCTAssertNil(AppLanguageOverride.catalog(preference: "", localizations: codes))
+        // Stored by the build this replaced, whose "system" was a value.
+        XCTAssertNil(AppLanguageOverride.catalog(preference: "system", localizations: codes))
+        // Left by a build with more languages than this one ships.
+        XCTAssertNil(AppLanguageOverride.catalog(preference: "ja", localizations: codes))
     }
 
-    /// Every choice names a catalog explicitly. English is one of them: on a
-    /// Mac set to Chinese the bundle would pick zh-Hans on its own, so
-    /// "English" has to load its (empty) catalog to mean anything.
-    func testEveryChoiceResolvesToAShippedCatalog() {
-        XCTAssertEqual(AppLanguageOverride.targetLanguage(preference: "zh-Hans", preferredLanguages: ["en-US"]),
-                       "zh-Hans")
-        XCTAssertEqual(AppLanguageOverride.targetLanguage(preference: "en", preferredLanguages: ["zh-Hant"]),
-                       "en")
-        XCTAssertEqual(AppLanguageOverride.targetLanguage(preference: nil, preferredLanguages: ["zh-TW"]),
-                       "zh-Hans")
-        XCTAssertEqual(AppLanguageOverride.targetLanguage(preference: nil, preferredLanguages: ["ja-JP"]),
-                       "en")
-        // A preference from a build that had more languages than this one.
-        XCTAssertEqual(AppLanguageOverride.targetLanguage(preference: "ko", preferredLanguages: ["ko-KR"]),
-                       "en")
+    /// A named catalog is written verbatim — one code, no region, no
+    /// fallback: English means English on a Chinese Mac, and 简体中文 means
+    /// 简体中文 on an English one.
+    func testANamedCatalogWritesExactlyItsCode() {
+        let codes = shippedLocalizations
+        for code in codes {
+            XCTAssertEqual(AppLanguageOverride.catalog(preference: code, localizations: codes), code, code)
+        }
     }
 
-    /// Each language is shown in its own spelling; only the "follow the Mac"
-    /// option is a word to translate.
+    // MARK: - What launch writes
+
+    /// A named catalog is written as that one code, and the companion records
+    /// it — the mark that lets "follow the Mac" take it back later.
+    func testANamedCatalogWritesItsCodeAndStampsTheCompanion() {
+        let (defaults, suite) = sandboxedDefaults()
+        defer { removeSuite(suite) }
+
+        AppLanguageOverride.install(preference: "zh-Hans",
+                                    localizations: shippedLocalizations, defaults: defaults)
+        XCTAssertEqual(defaults.array(forKey: "AppleLanguages") as? [String], ["zh-Hans"])
+        XCTAssertEqual(defaults.string(forKey: InterfacePrefKey.languageApplied), "zh-Hans")
+    }
+
+    /// Following the Mac takes back the override this app wrote, so macOS
+    /// resolves the bundle natively from the next launch on.
+    func testSystemDefaultTakesBackTheOverrideThisAppWrote() {
+        let (defaults, suite) = sandboxedDefaults()
+        defer { removeSuite(suite) }
+        defaults.set(["en"], forKey: "AppleLanguages")
+        defaults.set("en", forKey: InterfacePrefKey.languageApplied)
+
+        AppLanguageOverride.install(preference: nil,
+                                    localizations: shippedLocalizations, defaults: defaults)
+        defaults.synchronize()
+        let persisted = UserDefaults.standard.persistentDomain(forName: suite) ?? [:]
+        XCTAssertNil(persisted["AppleLanguages"], "the override this app wrote is still in place")
+        XCTAssertNil(persisted[InterfacePrefKey.languageApplied])
+    }
+
+    /// System Settings' per-app language writes the SAME key in the SAME
+    /// domain, so a value this app never wrote is not deleted — macOS
+    /// resolves it natively, and that is the Mac the row follows.
+    func testSystemDefaultLeavesAValueThisAppNeverWrote() {
+        let (defaults, suite) = sandboxedDefaults()
+        defer { removeSuite(suite) }
+        defaults.set(["ko"], forKey: "AppleLanguages")
+
+        AppLanguageOverride.install(preference: "",
+                                    localizations: shippedLocalizations, defaults: defaults)
+        XCTAssertEqual(defaults.array(forKey: "AppleLanguages") as? [String], ["ko"])
+    }
+
+    /// The user picked a language here, then changed the app's language in
+    /// System Settings: the override is no longer the one this app wrote, so
+    /// following the Mac leaves it alone.
+    func testSystemDefaultLeavesAnOverrideChangedByTheSystem() {
+        let (defaults, suite) = sandboxedDefaults()
+        defer { removeSuite(suite) }
+        defaults.set(["ko"], forKey: "AppleLanguages")
+        defaults.set("en", forKey: InterfacePrefKey.languageApplied)
+
+        AppLanguageOverride.install(preference: nil,
+                                    localizations: shippedLocalizations, defaults: defaults)
+        XCTAssertEqual(defaults.array(forKey: "AppleLanguages") as? [String], ["ko"])
+        XCTAssertEqual(defaults.string(forKey: InterfacePrefKey.languageApplied), "en")
+    }
+
+    // MARK: - What the picker shows
+
+    /// Each language is shown in its own spelling, the script spelled out the
+    /// way System Settings lists it; only "System Default" is translated.
     func testThePickerShowsAutonymsVerbatim() {
-        XCTAssertEqual(AppLanguage.english.pickerLabel, "English")
-        XCTAssertEqual(AppLanguage.simplifiedChinese.pickerLabel, "简体中文")
-        XCTAssertEqual(AppLanguage.system.pickerLabel, L10n.text("System Default"))
+        XCTAssertEqual(AppLanguageChoice(raw: "en", localizations: ["en"]).label, "English")
+        XCTAssertEqual(AppLanguageChoice(raw: "zh-Hans", localizations: ["zh-Hans"]).label, "简体中文")
+        XCTAssertEqual(AppLanguageChoice(raw: "ko", localizations: ["ko"]).label, "한국어")
+        XCTAssertEqual(AppLanguageChoice(raw: "ja", localizations: ["ja"]).label, "日本語")
+        // Not a row here: reads as following the Mac.
+        XCTAssertNil(AppLanguageChoice(raw: "ja", localizations: ["en"]).code)
+        XCTAssertEqual(AppLanguageChoice(raw: "", localizations: ["en"]).label, L10n.text("System Default"))
+    }
+
+    /// A suite per test: the launch path writes real keys, and none of them
+    /// may land in the suite `swift test` itself answers from.
+    private func sandboxedDefaults() -> (UserDefaults, String) {
+        let suite = "AppLanguageOverrideTests-\(UUID().uuidString)"
+        return (UserDefaults(suiteName: suite)!, suite)
+    }
+
+    private func removeSuite(_ suite: String) {
+        UserDefaults.standard.removePersistentDomain(forName: suite)
     }
 }
