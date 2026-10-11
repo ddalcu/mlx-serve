@@ -21,12 +21,14 @@ struct SegmentedOrMenu<P: View>: View {
     }
 }
 
-/// Reports its child's narrowest width as its ideal width.
-private struct MinimumWidthIsIdeal: Layout {
+/// Reports its child's narrowest width as its ideal width, and never more
+/// than the width it is offered: on macOS 27 a squeezed segmented control
+/// reports its natural width again after an unrelated update (issue #773).
+struct MinimumWidthIsIdeal: Layout {
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         guard let child = subviews.first else { return .zero }
-        let width = proposal.width ?? 0
-        return child.sizeThatFits(ProposedViewSize(width: width, height: proposal.height))
+        let size = child.sizeThatFits(ProposedViewSize(width: proposal.width ?? 0, height: proposal.height))
+        return CGSize(width: min(size.width, proposal.width ?? size.width), height: size.height)
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {

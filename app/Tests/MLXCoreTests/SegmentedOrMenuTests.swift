@@ -49,4 +49,12 @@ final class SegmentedOrMenuTests: XCTestCase {
         XCTAssertEqual(pickerWidth(offered: floor + 10), floor + 10, accuracy: 1)
         XCTAssertLessThan(pickerWidth(offered: floor - 10), floor - 10)
     }
+
+    // A segmented control that reports more width than it was offered must not widen the column.
+    @MainActor
+    func testTheSegmentsNeverReportMoreWidthThanTheyAreOffered() {
+        let rigid = MinimumWidthIsIdeal { Color.clear.frame(width: 500, height: 20) }
+        let width = NSHostingController(rootView: rigid).sizeThatFits(in: CGSize(width: 300, height: 400)).width
+        XCTAssertLessThanOrEqual(width, 300)
+    }
 }
