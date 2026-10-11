@@ -377,7 +377,7 @@ struct MusicGenView: View {
     /// stem. Both take their length from the clip, so Duration disappears.
     private var modeSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Picker("", selection: $task) {
+            SegmentedOrMenu(Picker("", selection: $task) {
                 // The Cover segment declares a missing tokenizer in its OWN
                 // label, so the reason is readable before the mode is even
                 // selected — the whole point of #269.
@@ -385,7 +385,7 @@ struct MusicGenView: View {
                     Text(L10n.text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready))).tag(t)
                 }
             }
-            .labelsHidden().pickerStyle(.segmented)
+            .labelsHidden())
             Text(L10n.text(
                  task == .cover
                  ? "Re-sings an existing track in the style you describe: melody and structure stay, the caption and lyrics decide the rest."

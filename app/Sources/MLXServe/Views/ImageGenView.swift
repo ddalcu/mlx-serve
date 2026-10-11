@@ -74,8 +74,6 @@ struct ImageGenView: View {
     /// True while a drag carrying a file is hovering the source-image section
     /// — drives that section's dashed-border highlight and the well's fill.
     @State private var isDropTargeted: Bool = false
-    /// Whether the Quality segments fit the column; a menu below that.
-    @State private var qualityFitsSegments: Bool = true
     /// A saved picture was gone on open and the rest renumbered, so the
     /// prompt's "image n" may now name another picture. Cleared by the first
     /// edit to either.
@@ -460,17 +458,14 @@ struct ImageGenView: View {
         } else {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Quality").font(.app(.rowTitle).weight(.semibold))
-                // Measured, not `ViewThatFits`: the menu variant is `fixedSize`
-                // and would never re-fit. Five segments degrade to a menu
-                // rather than shortening the tier names the Create panes share.
-                qualityPicker(segmented: qualityFitsSegments)
+                // Segments degrade to a menu rather than shortening the tier
+                // names the Create panes share.
+                SegmentedOrMenu(qualityPicker)
                 Text(L10n.text(qualityHint))
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .onGeometryChange(for: Bool.self) { $0.size.width >= Self.qualitySegmentsMinWidth }
-                action: { qualityFitsSegments = $0 }
         }
     }
 
@@ -487,10 +482,6 @@ struct ImageGenView: View {
         ImageQualityMatch.match(steps: steps, model: model, preferring: quality)
     }
 
-    /// The four tier names plus Custom at the segmented control's own
-    /// padding; the Video pane's value.
-    private static let qualitySegmentsMinWidth: CGFloat = 380
-
     /// Reads the DERIVED tier and writes by applying one.
     private var qualitySelection: Binding<QualitySelection> {
         Binding(
@@ -502,9 +493,8 @@ struct ImageGenView: View {
             })
     }
 
-    @ViewBuilder
-    private func qualityPicker(segmented: Bool) -> some View {
-        let picker = Picker("", selection: qualitySelection) {
+    private var qualityPicker: some View {
+        Picker("", selection: qualitySelection) {
             ForEach(QualityPreset.allCases) { q in
                 Text(L10n.text(q.label)).font(.app(.body)).tag(QualitySelection.preset(q))
             }
@@ -513,11 +503,6 @@ struct ImageGenView: View {
             }
         }
         .labelsHidden()
-        if segmented {
-            picker.pickerStyle(.segmented)
-        } else {
-            picker.pickerStyle(.menu).fixedSize()
-        }
     }
 
     /// The steps the request will carry, so Custom reads its own number.
