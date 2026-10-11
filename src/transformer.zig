@@ -22,6 +22,8 @@ const row_attn = @import("row_attn.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const sushi_pack = @import("sushi_pack.zig");
+const jangh = @import("jangh.zig");
+const jangtq2 = @import("jangtq2.zig");
 const qmv_nax2 = @import("qmv_nax2.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const qmm_int8 = @import("qmm_int8.zig");
@@ -9510,6 +9512,19 @@ test "checkQsaCompressRatio: a ratio the ring cannot hold is refused by name" {
     try checkQsaCompressRatio(@intCast(QSA_MAX_COMPRESS_RATIO));
 }
 
+/// An opened n-gram table against what the load expects of it: the payload the weights load billed, the
+/// hash's rows and width, and the hash constants a JANG pack records (`NgramTable.verifyHashBuffers`).
+fn checkQwen4Table(st: *const qwen4_mod.Qwen4State, config: *const ModelConfig) !void {
+    if (config.embedded_ple_payload_bytes) |bytes| {
+        if (st.table.embeddedPayloadBytes() != bytes) return error.EmbeddedNgramTableChanged;
+    }
+    if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
+        log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
+        return error.NgramTableMismatch;
+    }
+    try st.table.verifyHashBuffers(&st.hash);
+}
+
 /// The `pos % ratio` raw indexer rows ending at MTP-head row `pos`, copied while the ring
 /// still held them. The trunk restores at one of its checkpoint positions and the head is
 /// clamped to that same row; by commit time the head's ring is a whole generated tail past
@@ -15040,6 +15055,9 @@ pub const MoeMlpWeights = struct {
     router_global_scale: ?mlx.mlx_array = null,
     // One-expert views of the affine-4 banks the decode kernels bind (`moe_affine4.bindViews`).
     bank_views: ?moe_affine4.Views = null,
+    // JANGTQ2 codebook banks: switch_*_w hold `tq2_packed`, switch_*_s `tq2_scales`, switch_*_b
+    // nothing. Only their own kernels read them (`jangtq2Bank`); null = affine banks.
+    tq2: ?jangh.Layer = null,
 };
 
 const HybridMlpWeights = union(enum) {
@@ -17889,23 +17907,18 @@ pub const Transformer = struct {
             // The `0` is the PLE's ordinal among the config's injection points, not
             // `config.ple_layer_idx` (pinned by the oracle fixture with `ple_layer_ids=[2]`).
             try checkQsaCompressRatio(config.indexer_compress_ratio);
+            const source = try model_mod.qwen4NgramSource(&config);
             const st = try allocator.create(qwen4_mod.Qwen4State);
             errdefer allocator.destroy(st);
             st.* = .{
                 .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
-                .table = if (config.embedded_ple_payload_bytes != null)
-                    try qwen4_mod.NgramTable.openEmbedded(std.fs.path.dirname(config.ngram_table_path orelse return error.MissingNgramTable) orelse return error.MissingNgramTable, try model_mod.qwen4EmbeddedSpec(&config))
-                else
-                    try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
+                .table = switch (source) {
+                    .embedded => try qwen4_mod.NgramTable.openEmbedded(std.fs.path.dirname(config.ngram_table_path orelse return error.MissingNgramTable) orelse return error.MissingNgramTable, try model_mod.qwen4EmbeddedSpec(&config)),
+                    .external => try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
+                },
             };
             errdefer st.deinit();
-            if (config.embedded_ple_payload_bytes) |bytes| {
-                if (st.table.embeddedPayloadBytes() != bytes) return error.EmbeddedNgramTableChanged;
-            }
-            if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
-                log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
-                return error.NgramTableMismatch;
-            }
+            try checkQwen4Table(st, &config);
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
             st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
@@ -24640,6 +24653,8 @@ pub const Transformer = struct {
             return null;
         var mcfg = config;
         mcfg.weight_prefix = mtp_prefix;
+        // A JANGH bundle's MTP head keeps affine experts.
+        mcfg.jangtq2 = null;
         mcfg.num_hidden_layers = 1;
         mcfg.full_attention_interval = 1; // layer 0 is the full-attention layer
         mcfg.linear_attn_tail_from = 0;
@@ -32694,25 +32709,12 @@ pub const Transformer = struct {
         var flat_inds = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat_inds);
         try mlx.check(mlx.mlx_reshape(&flat_inds, inds, &flat_shape, 1, self.s));
-        var order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(order);
-        try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, self.s));
-        var inv_order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inv_order);
-        try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, self.s));
-        var sorted_inds = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sorted_inds);
-        try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, self.s));
-
-        const k_arr = mlx.mlx_array_new_int(k_count);
-        defer _ = mlx.mlx_array_free(k_arr);
-        var lhs_idx = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(lhs_idx);
-        try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
+        var routes = try sortRoutes(self.s, flat_inds, k_count);
+        defer routes.deinit();
 
         var x_gathered = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_gathered);
-        try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, self.s));
+        try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, routes.lhs, 0, self.s));
         const n1d_shape = [_]c_int{ total_inds, 1, d_dim };
         var x_rep = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_rep);
@@ -32720,14 +32722,14 @@ pub const Transformer = struct {
 
         var gate_out_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_out_3d);
-        try gatherExpertMm(&gate_out_3d, x_rep, gate_w, gate_s, gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+        try gatherExpertMm(&gate_out_3d, x_rep, gate_w, gate_s, gate_b, no_idx, routes.sorted, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
         var gate_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_out);
         try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
 
         var up_out_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up_out_3d);
-        try gatherExpertMm(&up_out_3d, x_rep, up_w, up_s, up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+        try gatherExpertMm(&up_out_3d, x_rep, up_w, up_s, up_b, no_idx, routes.sorted, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
         var up_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up_out);
         try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
@@ -32740,14 +32742,14 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
         var down_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_3d);
-        try gatherExpertMm(&down_3d, act_exp, down_w, down_s, down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
+        try gatherExpertMm(&down_3d, act_exp, down_w, down_s, down_b, no_idx, routes.sorted, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
         var down_squeezed = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_squeezed);
         try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s));
 
         var down_unsorted = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_unsorted);
-        try mlx.check(mlx.mlx_take_axis(&down_unsorted, down_squeezed, inv_order, 0, self.s));
+        try mlx.check(mlx.mlx_take_axis(&down_unsorted, down_squeezed, routes.inverse, 0, self.s));
         const hidden = mlx.getShape(down_unsorted)[1];
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
@@ -33475,13 +33477,6 @@ pub const Transformer = struct {
         // Decode MoE-internals profiler (MLX_SERVE_DECODE_PROFILE=1, S==1 only).
         const moe_prof = decodeProfileEnabled() and mlx.getShape(expert_x)[1] == 1;
         var mclk: ProfClock = if (moe_prof) ProfClock.init() else undefined;
-        // Per-expert-weight params: mixed-precision MoE checkpoints vary bits
-        // (and, with non-affine modes, group size + mode) per weight — resolve
-        // each individually. gate/up consume the hidden dim; down consumes the
-        // expert intermediate dim.
-        const gate_qp = self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x));
-        const up_qp = self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x));
-        const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
 
         const router_logits = if (router_override) |given| blk: {
             var owned = mlx.mlx_array_new();
@@ -33574,6 +33569,44 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(norm_scores);
             norm_scores = scaled_scores;
         }
+
+        // Codebook rows are not affine groups: only the jangtq2 kernels read these banks.
+        if (mw.tq2 != null) {
+            if (moe_prof) {
+                try mlx.check(mlx.mlx_array_eval(inds));
+                try mlx.check(mlx.mlx_array_eval(norm_scores));
+                decode_prof.moe_router_ns += mclk.lap();
+            }
+            const y = try jangtq2.moe(self.s, expert_x, jangtq2Bank(mw), inds, norm_scores, cfg.jangtq2.?.swiglu_limit);
+            if (moe_prof) {
+                try mlx.check(mlx.mlx_array_eval(y));
+                decode_prof.moe_experts_ns += mclk.lap();
+            }
+            if (skip_shared) return y;
+            if (mw.shared_ungated) return self.moeAddUngatedShared(y, expert_x, mw);
+            if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
+            defer _ = mlx.mlx_array_free(y);
+            // At one decode row the router folded the shared gate's logit and `shared_down` is built: reuse
+            // both, as the affine arms do.
+            const result = if (shared_down) |sd|
+                try self.moeSharedGateTail(y, routed.gate_logit, sd)
+            else
+                try self.moeAddGatedShared(y, expert_x, mw, null);
+            errdefer _ = mlx.mlx_array_free(result);
+            if (moe_prof) {
+                try mlx.check(mlx.mlx_array_eval(result));
+                decode_prof.moe_shared_ns += mclk.lap();
+            }
+            return result;
+        }
+
+        // Per-expert-weight params: mixed-precision MoE checkpoints vary bits
+        // (and, with non-affine modes, group size + mode) per weight — resolve
+        // each individually. gate/up consume the hidden dim; down consumes the
+        // expert intermediate dim.
+        const gate_qp = self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x));
+        const up_qp = self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x));
+        const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
 
         if (cfg.isGlm5() and cfg.exl3 == null and !skip_shared and mlx.mlx_array_size(expert_x) <= @as(usize, glm5.MOE_DECODE_MAX_ROWS) * cfg.hidden_size) {
             if (try self.glmMoeDecode(expert_x, inds, norm_scores, mw, gate_qp, up_qp, down_qp)) |y| return y;
@@ -33682,22 +33715,12 @@ pub const Transformer = struct {
 
             const verify_route = self.verifyFeatureEnabled(.routing, skip_shared, B, S);
             const route_pack = if (verify_route) try verifyRoutePack(self.s, flat_inds, K) else try moePrefillRoutePack(self.s, flat_inds, K, @intCast(cfg.num_experts));
-            var inv_order = if (route_pack) |value| value.inverse else mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(inv_order);
-            var sorted_inds = if (route_pack) |value| value.sorted else mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sorted_inds);
-            var lhs_idx = if (route_pack) |value| value.lhs else mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(lhs_idx);
-            if (route_pack == null) {
-                var order = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(order);
-                try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, self.s));
-                try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, self.s));
-                try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, self.s));
-                const k_arr = mlx.mlx_array_new_int(K);
-                defer _ = mlx.mlx_array_free(k_arr);
-                try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
-            } else if (verify_route) {
+            var routes = route_pack orelse try sortRoutes(self.s, flat_inds, K);
+            defer routes.deinit();
+            const inv_order = routes.inverse;
+            const sorted_inds = routes.sorted;
+            const lhs_idx = routes.lhs;
+            if (route_pack != null and verify_route) {
                 mtp_verify_kernel_calls[2] +%= 1;
                 const Once = struct {
                     var logged = false;
@@ -33706,7 +33729,7 @@ pub const Transformer = struct {
                     Once.logged = true;
                     log.info("[mtp-verify] fused verifier route packing engaged\n", .{});
                 }
-            } else {
+            } else if (route_pack != null) {
                 const Once = struct {
                     var logged = false;
                 };
@@ -35643,8 +35666,10 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             // `maybeTransposeForBf16` calls below pre-transpose bf16 weights from
             // `[out, in]` → `[in, out]` so `qmatmulBits` can dispatch to plain
             // `mlx_matmul`; they no-op on already-quantized AND on empty handles.
-            // An EXL3 pack (lib/sushi) binds trellis/suh/svh in the same slots.
-            const leaf: [3][]const u8 = if (config.exl3 != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
+            // An EXL3 pack (lib/sushi) binds trellis/suh/svh in the same slots, a JANGH bundle its
+            // codebook rows and row scales (no third leaf: the empty name matches no tensor).
+            const tq2: ?jangh.Layer = if (config.jangtq2) |spec| spec.layers[li] else null;
+            const leaf: [3][]const u8 = if (config.exl3 != null) .{ "trellis", "suh", "svh" } else if (tq2 != null) .{ "tq2_packed", "tq2_scales", "" } else .{ "weight", "scales", "biases" };
             var exbuf: [64]u8 = undefined;
             lw.mlp = .{ .moe = .{
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
@@ -35673,6 +35698,10 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 .shared_expert_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.biases") orelse mlx.mlx_array_new(),
             } };
             if (config.exl3) |spec| try checkExl3Bank(&lw.mlp.moe, config, spec);
+            if (tq2) |layer| {
+                lw.mlp.moe.tq2 = layer;
+                try checkJangtq2Bank(&lw.mlp.moe, config, layer);
+            }
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
@@ -36211,31 +36240,19 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
             flat_inds = joined;
         }
         const rows_all: c_int = total_inds + pad;
-        var order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(order);
-        try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, s));
-        var inv_order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inv_order);
-        try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, s));
-        var sorted_inds = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sorted_inds);
-        try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, s));
-        const k_arr = mlx.mlx_array_new_int(k_count);
-        defer _ = mlx.mlx_array_free(k_arr);
-        var lhs_idx = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(lhs_idx);
-        try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, s));
+        var routes = try sortRoutes(s, flat_inds, k_count);
+        defer routes.deinit();
         if (pad > 0) {
             const last = mlx.mlx_array_new_int(t_count - 1);
             defer _ = mlx.mlx_array_free(last);
             var clamped = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_minimum(&clamped, lhs_idx, last, s));
-            _ = mlx.mlx_array_free(lhs_idx);
-            lhs_idx = clamped;
+            try mlx.check(mlx.mlx_minimum(&clamped, routes.lhs, last, s));
+            _ = mlx.mlx_array_free(routes.lhs);
+            routes.lhs = clamped;
         }
         var x_gathered = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_gathered);
-        try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, routes.lhs, 0, s));
         var x_rep = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_rep);
         try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &[_]c_int{ rows_all, 1, d_dim }, 3, s));
@@ -36243,22 +36260,22 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
         const fc1_qp = quantParamsOrDense(cfg, nm.fc1_w, nm.fc1_s, @intCast(d_dim));
         var h_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(h_3d);
-        try gatherExpertMm(&h_3d, x_rep, nm.fc1_w, nm.fc1_s, nm.fc1_b, no_idx, sorted_inds, fc1_qp.bits, fc1_qp.group_size, fc1_qp.mode, true, s);
+        try gatherExpertMm(&h_3d, x_rep, nm.fc1_w, nm.fc1_s, nm.fc1_b, no_idx, routes.sorted, fc1_qp.bits, fc1_qp.group_size, fc1_qp.mode, true, s);
         const act = try reluSquaredOp(h_3d, s);
         defer _ = mlx.mlx_array_free(act);
         const fc2_qp = quantParamsOrDense(cfg, nm.fc2_w, nm.fc2_s, lastDim(act));
         var y_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_3d);
-        try gatherExpertMm(&y_3d, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, no_idx, sorted_inds, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, true, s);
+        try gatherExpertMm(&y_3d, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, no_idx, routes.sorted, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, true, s);
         var y_unsorted = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_unsorted);
         if (pad > 0) {
             var head = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&head, inv_order, &[_]c_int{0}, 1, &[_]c_int{total_inds}, 1, &[_]c_int{1}, 1, s));
-            _ = mlx.mlx_array_free(inv_order);
-            inv_order = head;
+            try mlx.check(mlx.mlx_slice(&head, routes.inverse, &[_]c_int{0}, 1, &[_]c_int{total_inds}, 1, &[_]c_int{1}, 1, s));
+            _ = mlx.mlx_array_free(routes.inverse);
+            routes.inverse = head;
         }
-        try mlx.check(mlx.mlx_take_axis(&y_unsorted, y_3d, inv_order, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&y_unsorted, y_3d, routes.inverse, 0, s));
         try mlx.check(mlx.mlx_reshape(&y_tkh, y_unsorted, &[_]c_int{ t_count, k_count, d_dim }, 3, s));
     }
     return .{ .y_tkh = y_tkh, .scores = routing.norm_scores, .k_count = k_count };
@@ -44208,12 +44225,29 @@ const VerifyRoutePack = struct {
     inverse: mlx.mlx_array = .{},
     sorted: mlx.mlx_array = .{},
     lhs: mlx.mlx_array = .{},
-    fn deinit(self: *VerifyRoutePack) void {
+    pub fn deinit(self: *VerifyRoutePack) void {
         inline for (.{ "inverse", "sorted", "lhs" }) |name| {
             if (@field(self, name).ctx != null) _ = mlx.mlx_array_free(@field(self, name));
         }
     }
 };
+
+/// mlx-lm's `_gather_sort` over flat routed ids [N], `top_k` per token: `sorted` = ids[order] with
+/// order = argsort(ids), ties in routing order; `inverse` = argsort(order); `lhs` = order // top_k, the
+/// token row each sorted slot reads. The route-pack kernels below return the same values.
+pub fn sortRoutes(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !VerifyRoutePack {
+    var order = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order);
+    try mlx.check(mlx.mlx_argsort_axis(&order, ids, 0, s));
+    var result: VerifyRoutePack = .{ .inverse = mlx.mlx_array_new(), .sorted = mlx.mlx_array_new(), .lhs = mlx.mlx_array_new() };
+    errdefer result.deinit();
+    try mlx.check(mlx.mlx_argsort_axis(&result.inverse, order, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&result.sorted, ids, order, 0, s));
+    const k_arr = mlx.mlx_array_new_int(top_k);
+    defer _ = mlx.mlx_array_free(k_arr);
+    try mlx.check(mlx.mlx_floor_divide(&result.lhs, order, k_arr, s));
+    return result;
+}
 
 fn verifyRoutePack(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !?VerifyRoutePack {
     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or top_k != 10 or ids.ctx == null or mlx.mlx_array_dtype(ids) != .uint32) return null;
@@ -45360,6 +45394,30 @@ fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, la
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
         return error.MissingWeight;
+    };
+}
+
+/// A JANGH layer's banks at the widths its config entries declare, with no third leaf.
+fn checkJangtq2Bank(mw: *const MoeMlpWeights, config: ModelConfig, layer: jangh.Layer) !void {
+    const h = config.hidden_size;
+    const inter = config.moe_intermediate_size;
+    const projs = [_]struct { w: mlx.mlx_array, sc: mlx.mlx_array, b: mlx.mlx_array, in: u32, out: u32, bits: u8 }{
+        .{ .w = mw.switch_gate_w, .sc = mw.switch_gate_s, .b = mw.switch_gate_b, .in = h, .out = inter, .bits = layer.gate_up_bits },
+        .{ .w = mw.switch_up_w, .sc = mw.switch_up_s, .b = mw.switch_up_b, .in = h, .out = inter, .bits = layer.gate_up_bits },
+        .{ .w = mw.switch_down_w, .sc = mw.switch_down_s, .b = mw.switch_down_b, .in = inter, .out = h, .bits = layer.down_bits },
+    };
+    for (projs) |p| {
+        if (p.b.ctx != null or !jangh.bankAdmitted(p.w, p.sc, config.num_experts, p.out, p.in, p.bits)) return error.Jangtq2BankGeometry;
+    }
+}
+
+/// A bound JANGTQ2 layer's banks in the kernels' contract.
+fn jangtq2Bank(mw: *const MoeMlpWeights) jangtq2.Bank {
+    return .{
+        .gate = .{ .packed_w = mw.switch_gate_w, .scales = mw.switch_gate_s },
+        .up = .{ .packed_w = mw.switch_up_w, .scales = mw.switch_up_s },
+        .down = .{ .packed_w = mw.switch_down_w, .scales = mw.switch_down_s },
+        .rotated = mw.tq2.?.rotated,
     };
 }
 
@@ -72794,21 +72852,11 @@ test "verify route packing preserves stable order and row indices" {
             try testing.expect((try verifyRoutePack(s, .{}, 10)) == null);
             var got = (try verifyRoutePack(s, input, 10)) orelse return error.RoutePackDeclined;
             defer got.deinit();
-            var order = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(order);
-            var inverse = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(inverse);
-            var sorted = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sorted);
-            var lhs = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(lhs);
-            try mlx.check(mlx.mlx_argsort_axis(&order, input, 0, s));
-            try mlx.check(mlx.mlx_argsort_axis(&inverse, order, 0, s));
-            try mlx.check(mlx.mlx_take_axis(&sorted, input, order, 0, s));
-            try mlx.check(mlx.mlx_floor_divide(&lhs, order, cachedScalarInt(10), s));
-            try testing.expect(try qsaArraysAllEqual(got.inverse, inverse, s));
-            try testing.expect(try qsaArraysAllEqual(got.sorted, sorted, s));
-            try testing.expect(try qsaArraysAllEqual(got.lhs, lhs, s));
+            var want = try sortRoutes(s, input, 10);
+            defer want.deinit();
+            try testing.expect(try qsaArraysAllEqual(got.inverse, want.inverse, s));
+            try testing.expect(try qsaArraysAllEqual(got.sorted, want.sorted, s));
+            try testing.expect(try qsaArraysAllEqual(got.lhs, want.lhs, s));
         }
     }
 }
@@ -72831,21 +72879,11 @@ test "prefill route packing equals the stable argsort, its inverse and the row i
         defer _ = mlx.mlx_array_free(input);
         var got = (try moePrefillRoutePack(s, input, 8, 256)) orelse return error.RoutePackDeclined;
         defer got.deinit();
-        var order = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(order);
-        var inverse = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inverse);
-        var sorted = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sorted);
-        var lhs = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(lhs);
-        try mlx.check(mlx.mlx_argsort_axis(&order, input, 0, s));
-        try mlx.check(mlx.mlx_argsort_axis(&inverse, order, 0, s));
-        try mlx.check(mlx.mlx_take_axis(&sorted, input, order, 0, s));
-        try mlx.check(mlx.mlx_floor_divide(&lhs, order, cachedScalarInt(8), s));
-        try testing.expect(try qsaArraysAllEqual(got.inverse, inverse, s));
-        try testing.expect(try qsaArraysAllEqual(got.sorted, sorted, s));
-        try testing.expect(try qsaArraysAllEqual(got.lhs, lhs, s));
+        var want = try sortRoutes(s, input, 8);
+        defer want.deinit();
+        try testing.expect(try qsaArraysAllEqual(got.inverse, want.inverse, s));
+        try testing.expect(try qsaArraysAllEqual(got.sorted, want.sorted, s));
+        try testing.expect(try qsaArraysAllEqual(got.lhs, want.lhs, s));
     };
 }
 
@@ -73318,6 +73356,26 @@ const PleArmFixture = struct {
         const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
         self.fx = try ple_gpu.writeFixture(4, hash.total_rows, 64, 32, 21);
         self.gpu = if (gate) |on| ple_gpu.load(&self.fx.table, on, 0) else try ple_gpu.wrap(&self.fx.table);
+        self.bind(hash);
+    }
+
+    /// The rig over a JANG-layout table (`qwen4_ple.writeJangFixture`: two heads, 5 rows, F16 scales and
+    /// biases) on the host gather.
+    fn initJang(self: *PleArmFixture) !void {
+        const qwen4_ple = @import("qwen4_ple.zig");
+        const hash = try qwen4_mod.NgramHash.init(1000, 3, 1, 2, 1, 1234, 0, 999);
+        var td = std.testing.tmpDir(.{});
+        errdefer td.cleanup();
+        try qwen4_ple.writeJangFixture(&td, .valid, .{ .multipliers = hash.multipliers[0..3], .vocab = hash.vocab[0..2], .offsets = hash.offsets[0..2] }, 7);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const table = try qwen4_mod.NgramTable.openEmbedded(path_buf[0..try td.dir.realPath(io, &path_buf)], qwen4_ple.JANG_FIXTURE_SPEC);
+        self.fx = .{ .td = td, .table = table };
+        self.gpu = null;
+        self.bind(hash);
+    }
+
+    fn bind(self: *PleArmFixture, hash: qwen4_mod.NgramHash) void {
         self.st = .{ .hash = hash, .table = self.fx.table, .gpu = self.gpu };
         self.xfm_bytes = @splat(0);
         self.cache_bytes = @splat(0);
@@ -73527,6 +73585,156 @@ test "qwen4 PLE gpu arm: without --ple-gpu the load wraps no table buffer and a 
     try testing.expect(on.gpu != null and on.st.table.gpu_owns_map);
 }
 
+/// The bf16 (RNE) bits of the rows `ids` hash to after the `history` tokens: what a PLE leaf uploads.
+fn plePackedRows(st: *const qwen4_mod.Qwen4State, history: []const u32, ids: []const u32) ![]u16 {
+    const a = testing.allocator;
+    const rows = try a.alloc(i64, ids.len * st.hash.n_heads);
+    defer a.free(rows);
+    st.hash.rowIds(history, ids, rows);
+    const dim: usize = st.table.dim;
+    const host = try a.alloc(f32, rows.len * dim);
+    defer a.free(host);
+    for (rows, 0..) |r, i| st.table.row(@intCast(r), host[i * dim ..][0..dim]);
+    const out = try a.alloc(u16, host.len);
+    for (host, out) |v, *o| o.* = qwen4_mod.bf16Rne(v);
+    return out;
+}
+
+fn expectPleLeaf(emb: mlx.mlx_array, want: []const u16) !void {
+    try mlx.check(mlx.mlx_array_eval(emb));
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(emb));
+    const bits = mlx.mlx_array_data_bfloat16(emb) orelse return error.MlxArrayDataNull;
+    try testing.expectEqualSlices(u16, want, bits[0..mlx.mlx_array_size(emb)]);
+}
+
+test "qwen4 PLE host gather: a JANG table's leaf, like every table's, is bf16 holding its rows' bits, eager, deferred, group and batched" {
+    for ([_]bool{ true, false }) |jang| {
+        var fx: PleArmFixture = undefined;
+        if (jang) try fx.initJang() else try fx.init(false);
+        defer fx.deinit();
+        const x = fx.xfm();
+        const st = x.qwen4.?;
+        const eos = st.hash.eos;
+        var prng = std.Random.DefaultPrng.init(83);
+        const r = prng.random();
+
+        // Serial: the eager leaf, and a deferred one `flushDeferredPle` fills, against a reference history.
+        var eager = pleArmEntry();
+        var deferred = pleArmEntry();
+        var history: [2]u32 = .{ eos, eos };
+        var buf: [18]u32 = undefined;
+        for ([_]usize{ 1, 9, 1, 16 }) |w| {
+            const ids = buf[2..][0..w];
+            for (ids) |*v| v.* = if (r.uintLessThan(u32, 6) == 0) eos else r.uintLessThan(u32, 1000);
+            const want = try plePackedRows(st, &history, ids);
+            defer testing.allocator.free(want);
+            const arr = pleArmIds(ids, 1);
+            defer _ = mlx.mlx_array_free(arr);
+            var ctx = fx.ctx();
+            const e = try x.pleEmbedding(&ctx, arr, &eager, 0, @intCast(w));
+            defer _ = mlx.mlx_array_free(e);
+            try expectPleLeaf(e, want);
+            ctx.ple_defer = true;
+            const d = try x.pleEmbedding(&ctx, arr, &deferred, 0, @intCast(w));
+            defer _ = mlx.mlx_array_free(d);
+            try testing.expect(ctx.ple_pending != null);
+            try x.flushDeferredPle(&ctx);
+            try expectPleLeaf(d, want);
+            buf[0..2].* = history;
+            history = buf[w..][0..2].*;
+            try testing.expectEqualSlices(u32, &history, eager.ple_prev[0..2]);
+            try expectPleHistoryEqual(&eager, &deferred);
+        }
+
+        // A verify group: each row's pending leaf, filled in one pass by `flushDeferredPleGroup`.
+        {
+            const fresh = [_]u32{ eos, eos };
+            const ids0 = [_]u32{ 5, eos, 17 };
+            const ids1 = [_]u32{ 400, 401 };
+            const rows = [_][]const u32{ &ids0, &ids1 };
+            var entries = [_]SSMCacheEntry{ pleArmEntry(), pleArmEntry() };
+            var ctxs = [_]ForwardCtx{ fx.ctx(), fx.ctx() };
+            var leaves: [2]mlx.mlx_array = undefined;
+            var built: usize = 0;
+            defer for (leaves[0..built]) |l| {
+                _ = mlx.mlx_array_free(l);
+            };
+            for (rows, &entries, &ctxs, 0..) |ids, *e, *c, i| {
+                c.ple_defer = true;
+                const arr = pleArmIds(ids, 1);
+                defer _ = mlx.mlx_array_free(arr);
+                leaves[i] = try x.pleEmbedding(c, arr, e, 0, @intCast(ids.len));
+                built += 1;
+            }
+            const group = [_]*ForwardCtx{ &ctxs[0], &ctxs[1] };
+            try x.flushDeferredPleGroup(&group);
+            for (rows, leaves, ctxs) |ids, l, c| {
+                try testing.expect(c.ple_pending == null);
+                const want = try plePackedRows(st, &fresh, ids);
+                defer testing.allocator.free(want);
+                try expectPleLeaf(l, want);
+            }
+        }
+
+        // Batched decode: one token per slot, each hashed against its own history, all in one leaf.
+        {
+            var slot_entries = [_][1]SSMCacheEntry{ .{pleArmEntry()}, .{pleArmEntry()} };
+            slot_entries[0][0].ple_prev = .{ 5, 6, 0, 0, 0, 0, 0, 0 };
+            slot_entries[1][0].ple_prev = .{ 7, eos, 0, 0, 0, 0, 0, 0 };
+            var slot_ctxs = [_]ForwardCtx{ fx.ctx(), fx.ctx() };
+            for (&slot_entries, &slot_ctxs) |*se, *sc| {
+                se[0].ple_prev_valid = true;
+                sc.ssm_entries = se;
+            }
+            const slots = [_]*ForwardCtx{ &slot_ctxs[0], &slot_ctxs[1] };
+            const next = [_]u32{ 11, 12 };
+            for ([_]bool{ false, true }) |defer_leaf| {
+                const w0 = try plePackedRows(st, slot_entries[0][0].ple_prev[0..2], next[0..1]);
+                defer testing.allocator.free(w0);
+                const w1 = try plePackedRows(st, slot_entries[1][0].ple_prev[0..2], next[1..2]);
+                defer testing.allocator.free(w1);
+                const want = try std.mem.concat(testing.allocator, u16, &.{ w0, w1 });
+                defer testing.allocator.free(want);
+                var bctx = fx.ctx();
+                bctx.batch_slots = &slots;
+                bctx.ple_defer = defer_leaf;
+                var merged = pleArmEntry();
+                const arr = pleArmIds(&next, 2);
+                defer _ = mlx.mlx_array_free(arr);
+                const leaf = try x.pleEmbedding(&bctx, arr, &merged, 0, 1);
+                defer _ = mlx.mlx_array_free(leaf);
+                try testing.expectEqual(defer_leaf, bctx.ple_pending != null);
+                if (defer_leaf) try x.flushDeferredPle(&bctx);
+                try expectPleLeaf(leaf, want);
+            }
+        }
+    }
+}
+
+test "checkQwen4Table: the billed payload, the hash's geometry and a JANG pack's recorded hash constants" {
+    var fx: PleArmFixture = undefined;
+    try fx.initJang();
+    defer fx.deinit();
+    const payload = fx.st.table.embeddedPayloadBytes();
+    var config: ModelConfig = .{ .model_type = "qwen4_exp", .ple_embed_dim = 64, .embedded_ple_payload_bytes = payload };
+    try checkQwen4Table(&fx.st, &config);
+    // Another seed hashes into the same geometry; only the pack's recorded constants tell the rows apart.
+    const reseeded: qwen4_mod.Qwen4State = .{ .hash = try qwen4_mod.NgramHash.init(1000, 3, 1, 2, 1, 4321, 0, 999), .table = fx.st.table };
+    try testing.expectError(error.EmbeddedPleHashMismatch, checkQwen4Table(&reseeded, &config));
+    config.embedded_ple_payload_bytes = payload + 1;
+    try testing.expectError(error.EmbeddedNgramTableChanged, checkQwen4Table(&fx.st, &config));
+    config.embedded_ple_payload_bytes = payload;
+    config.ple_embed_dim = 96;
+    try testing.expectError(error.NgramTableMismatch, checkQwen4Table(&fx.st, &config));
+
+    // ngram_table.bin records no constants, so the seed is not checked.
+    var bin: PleArmFixture = undefined;
+    try bin.init(false);
+    defer bin.deinit();
+    const bin_reseeded: qwen4_mod.Qwen4State = .{ .hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 4321, 0, 999), .table = bin.st.table };
+    try checkQwen4Table(&bin_reseeded, &.{ .model_type = "qwen4_exp", .ple_embed_dim = 64 * 16 });
+}
+
 /// A decode-width `forwardQwen4With` over dense synthetic weights with every block a stand-in: the graph is the
 /// embedding, one host-gathered PLE layer, the final mixer and the lm_head. Ladder strides start at the shipped
 /// defaults (serial off, batched `qwen4DecodeLadderStride(null)`).
@@ -73561,6 +73769,16 @@ const Qwen4LadderRig = struct {
 
     fn init(self: *Qwen4LadderRig) !void {
         try self.fx.init(null);
+        try self.build();
+    }
+
+    /// Over a JANG-layout table (F16 scales and biases).
+    fn initJang(self: *Qwen4LadderRig) !void {
+        try self.fx.initJang();
+        try self.build();
+    }
+
+    fn build(self: *Qwen4LadderRig) !void {
         self.n = 0;
         try self.fx.arm(false);
         const x = self.fx.xfm();
@@ -73777,6 +73995,32 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
             }
         }
     }
+}
+
+test "qwen4 PLE: a JANG pack's rows leave the residual stream bf16, prefill and batched decode" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
+    defer qwen4_standin_override = null;
+    var rig: Qwen4LadderRig = undefined;
+    try rig.initJang();
+    defer rig.deinit();
+    const alloc = testing.allocator;
+    var slots: [2]*Qwen4TestSlot = undefined;
+    var made: usize = 0;
+    defer for (slots[0..made]) |sl| sl.deinit(alloc);
+    for (&slots, [2][]const i32{ &.{ 5, 17, 42, 9 }, &.{ 11, 4, 19 } }) |*sl, prompt| {
+        sl.* = try Qwen4TestSlot.init(alloc, Qwen4LadderRig.LAYERS);
+        made += 1;
+        var stream = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(stream);
+        sl.*.ctx.capture_stream_all = &stream;
+        defer sl.*.ctx.capture_stream_all = null;
+        try rig.prefill(sl.*, prompt);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(stream));
+    }
+    const run = try qwen4BatchedPleForward(rig.fx.xfm(), &slots, &.{ 13, 6 }, 1, false, true, true);
+    defer _ = mlx.mlx_array_free(run.logits);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(run.logits));
 }
 
 test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2.py (MIMO_V2_MODEL, MIMO_V2_FIXTURE)" {
@@ -74539,4 +74783,364 @@ test "Metal-only kernels decline on a stream without them, so the MLX-op path ru
     const rotated = try rht.transform(a, signs, 1024, false, s);
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_array_eval(rotated));
+}
+
+// ── JANGH bundles (jangh.zig) ──
+
+test "jangh bank: a bound layer's switch slots reach the jangtq2 kernels as its gate, up and down" {
+    var arrs: [6]mlx.mlx_array = undefined;
+    for (&arrs, 0..) |*a, i| a.* = mlx.mlx_array_new_int(@intCast(i));
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for ([_]bool{ false, true }) |rotated| {
+        const mw = std.mem.zeroInit(MoeMlpWeights, .{
+            .switch_gate_w = arrs[0],
+            .switch_gate_s = arrs[1],
+            .switch_up_w = arrs[2],
+            .switch_up_s = arrs[3],
+            .switch_down_w = arrs[4],
+            .switch_down_s = arrs[5],
+            .tq2 = jangh.Layer{ .gate_up_bits = 4, .down_bits = 6, .rotated = rotated },
+        });
+        const bank = jangtq2Bank(&mw);
+        const got = [_]mlx.mlx_array{ bank.gate.packed_w, bank.gate.scales, bank.up.packed_w, bank.up.scales, bank.down.packed_w, bank.down.scales };
+        for (arrs, got) |want, g| try testing.expectEqual(want.ctx, g.ctx);
+        try testing.expectEqual(rotated, bank.rotated);
+    }
+}
+
+test "jangh bundle: layer 0, the PLE and the MTP head bind from the loaded map (QWEN4_JANGH_TEST_MODEL)" {
+    const raw = std.c.getenv("QWEN4_JANGH_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = std.mem.span(raw);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var config = try model_mod.parseConfig(io, allocator, path);
+    defer config.deinit(allocator);
+    const spec = config.jangtq2.?;
+    var weights = try model_mod.loadModelWeights(io, allocator, path, &config, false);
+    defer weights.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h: c_int = @intCast(config.hidden_size);
+    const inter: c_int = @intCast(config.moe_intermediate_size);
+    const streams: c_int = @intCast(config.hc_count * config.hidden_size);
+
+    // The MTP experts' split: each half is exactly its rows of the fused tensor as stored.
+    {
+        var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+        defer dir.close(io);
+        const index = try dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20));
+        const wm = (try std.json.parseFromSliceLeaky(std.json.Value, a, index, .{})).object.get("weight_map").?.object;
+        var fused_map = Weights.init(allocator);
+        defer fused_map.deinit();
+        const shard = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ path, wm.get("mtp.layers.0.mlp.experts.gate_up_proj.weight").?.string }, 0);
+        try model_mod.loadSafetensorsFile(allocator, &fused_map, shard, s, model_mod.loadOptsFor(&config, false));
+        for ([_][]const u8{ "weight", "scales", "biases" }) |leaf| {
+            const fused = fused_map.get(try std.fmt.allocPrint(a, "language_model.mtp.layers.0.mlp.experts.gate_up_proj.{s}", .{leaf})).?;
+            const sh = mlx.getShape(fused);
+            for ([_][]const u8{ "gate_proj", "up_proj" }, 0..) |proj, half| {
+                const r0: c_int = @as(c_int, @intCast(half)) * inter;
+                var view = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(view);
+                try mlx.check(mlx.mlx_slice(&view, fused, &.{ 0, r0, 0 }, 3, &.{ sh[0], r0 + inter, sh[2] }, 3, &.{ 1, 1, 1 }, 3, s));
+                const bound = weights.get(try std.fmt.allocPrint(a, "language_model.mtp.layers.0.mlp.switch_mlp.{s}.{s}", .{ proj, leaf })).?;
+                try testing.expect(try qsaArraysAllEqual(view, bound, s));
+            }
+        }
+    }
+
+    var name_buf: [256]u8 = undefined;
+    // Layer 0 through `initMoeLayers`: its banks bind as stored, with no third leaf and no affine views.
+    {
+        var one = config;
+        one.num_hidden_layers = 1;
+        one.ple_layer_idx = -1;
+        const ml = try initMoeLayers(allocator, one, &weights, &name_buf, s);
+        defer {
+            for (ml.owned_bf16) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(ml.owned_bf16);
+            for (ml.ssm_entries) |e| {
+                _ = mlx.mlx_array_free(e.conv_state);
+                _ = mlx.mlx_array_free(e.ssm_state);
+            }
+            allocator.free(ml.ssm_entries);
+            allocator.free(ml.moe_layers);
+        }
+        const mw = &ml.moe_layers[0].mlp.moe;
+        try testing.expectEqual(spec.layers[0], mw.tq2.?);
+        const leaves = [_]struct { w: mlx.mlx_array, sc: mlx.mlx_array, b: mlx.mlx_array, proj: []const u8 }{
+            .{ .w = mw.switch_gate_w, .sc = mw.switch_gate_s, .b = mw.switch_gate_b, .proj = "gate_proj" },
+            .{ .w = mw.switch_up_w, .sc = mw.switch_up_s, .b = mw.switch_up_b, .proj = "up_proj" },
+            .{ .w = mw.switch_down_w, .sc = mw.switch_down_s, .b = mw.switch_down_b, .proj = "down_proj" },
+        };
+        for (leaves) |l| {
+            try testing.expectEqual(weights.get(try std.fmt.allocPrint(a, "language_model.model.layers.0.mlp.switch_mlp.{s}.tq2_packed", .{l.proj})).?.ctx, l.w.ctx);
+            try testing.expectEqual(weights.get(try std.fmt.allocPrint(a, "language_model.model.layers.0.mlp.switch_mlp.{s}.tq2_scales", .{l.proj})).?.ctx, l.sc.ctx);
+            try testing.expect(l.b.ctx == null);
+        }
+        try testing.expect(mw.bank_views == null);
+        // The dense router and hyper-connections bind as transposed `[in, out]` plain-matmul operands.
+        try testing.expectEqualSlices(c_int, &.{ h, @intCast(config.num_experts) }, mlx.getShape(mw.router_w));
+        try testing.expect(mw.router_s.ctx == null);
+        const hc = ml.moe_layers[0].hc_attn.?;
+        try testing.expect(hc.down_s.ctx == null and hc.up_s.ctx == null);
+        try testing.expectEqualSlices(c_int, &.{ streams, @intCast(config.hc_lowrank) }, mlx.getShape(hc.down_w));
+    }
+
+    // A declared width the stored bank lacks, or narrowed row scales, refuse the bind (on the arena: an error leaks).
+    {
+        var wrong = config;
+        wrong.num_hidden_layers = 1;
+        wrong.ple_layer_idx = -1;
+        wrong.jangtq2.?.layers[0].down_bits = if (spec.layers[0].down_bits == 6) 4 else 6;
+        try testing.expectError(error.Jangtq2BankGeometry, initMoeLayers(a, wrong, &weights, &name_buf, s));
+        wrong.jangtq2.?.layers[0].down_bits = spec.layers[0].down_bits;
+        const scales_name = "language_model.model.layers.0.mlp.switch_mlp.up_proj.tq2_scales";
+        var kept = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kept);
+        try mlx.check(mlx.mlx_array_set(&kept, weights.get(scales_name).?));
+        var narrowed = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&narrowed, kept, .bfloat16, s));
+        weights.replace(scales_name, narrowed);
+        try testing.expectError(error.Jangtq2BankGeometry, initMoeLayers(a, wrong, &weights, &name_buf, s));
+        var restored = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&restored, kept));
+        weights.replace(scales_name, restored);
+    }
+
+    // The PLE's conv stored `[C, K]` binds as `[C, K, 1]`.
+    {
+        var owned: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (owned.items) |arr| _ = mlx.mlx_array_free(arr);
+            owned.deinit(allocator);
+        }
+        const ple = try loadPleWeights(&weights, &name_buf, config.weight_prefix, @intCast(config.ple_layer_idx), config.hc_count, config.hidden_size, &owned, allocator, s);
+        try testing.expectEqualSlices(c_int, &.{ streams, @intCast(config.ple_conv_kernel), 1 }, mlx.getShape(ple.conv_w));
+    }
+
+    // The MTP head binds its affine experts from the split, never as codebook banks.
+    {
+        var mtp = (try Transformer.loadQwen4Mtp(allocator, config, &weights, &name_buf, s)).?;
+        defer {
+            for (mtp.owned) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(mtp.owned);
+            mtp.cache.deinit();
+            _ = mlx.mlx_array_free(mtp.entry.conv_state);
+            _ = mlx.mlx_array_free(mtp.entry.ssm_state);
+            ssmFreeQsaState(&mtp.entry);
+            mtp.qsa_marks.deinit();
+        }
+        const mm = &mtp.layer.mlp.moe;
+        try testing.expect(mm.tq2 == null);
+        try testing.expectEqual(weights.get("language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight").?.ctx, mm.switch_gate_w.ctx);
+        try testing.expectEqual(weights.get("language_model.mtp.layers.0.mlp.switch_mlp.down_proj.biases").?.ctx, mm.switch_down_b.ctx);
+        const qp = computeQuantParams(&config, mm.switch_gate_w, mm.switch_gate_s, config.hidden_size);
+        try testing.expectEqual(QuantMode.affine, qp.mode);
+        try testing.expectEqual(@divExact(h * @as(c_int, @intCast(qp.bits)), 32), mlx.getShape(mm.switch_up_w)[2]);
+    }
+}
+
+/// One tensor of a reference file `tests/dump_jangh4_fixtures.py` writes, evaluated.
+fn janghFixtureTensor(map: mlx.mlx_map_string_to_array, name: [:0]const u8) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (mlx.mlx_map_string_to_array_get(&out, map, name.ptr) != 0) return error.FixtureTensorMissing;
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+/// `arr` as host f32 values (caller frees).
+fn janghHostF32(a: std.mem.Allocator, arr: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const d = mlx.mlx_array_data_float32(c) orelse return error.MlxArrayDataNull;
+    return a.dupe(f32, d[0..mlx.mlx_array_size(c)]);
+}
+
+/// Agreement of host values that are bf16: the most bf16 steps apart and the summed squares of a rel L2.
+const JanghDiff = struct {
+    n: usize = 0,
+    max_steps: u32 = 0,
+    num: f64 = 0,
+    den: f64 = 0,
+
+    fn add(d: *JanghDiff, got: []const f32, want: []const f32) !void {
+        for (got, want) |x, y| {
+            try testing.expect(std.math.isFinite(x));
+            d.n += 1;
+            d.max_steps = @max(d.max_steps, @abs(bf16Ordinal(x) - bf16Ordinal(y)));
+            d.num += (@as(f64, x) - y) * (@as(f64, x) - y);
+            d.den += @as(f64, y) * y;
+        }
+    }
+
+    /// A bf16 value's rank on the number line: neighbours differ by one, and both zeros are 0.
+    fn bf16Ordinal(v: f32) i32 {
+        const b: u16 = @truncate(@as(u32, @bitCast(v)) >> 16);
+        const mag: i32 = b & 0x7fff;
+        return if (b & 0x8000 != 0) -mag else mag;
+    }
+
+    fn relL2(d: JanghDiff) f64 {
+        return if (d.den == 0) 0 else @sqrt(d.num / d.den);
+    }
+};
+
+test "jangh bundle: layer 0's MoE block through moeMLP against vMLX's SparseMoeBlock (JANGH4_MOE_BLOCK_FIXTURE)" {
+    const raw = std.c.getenv("QWEN4_JANGH_TEST_MODEL") orelse return error.SkipZigTest;
+    const dir = std.c.getenv("JANGH4_MOE_BLOCK_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const manifest = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/manifest.json", .{std.mem.span(dir)}), a, .limited(1 << 20));
+    const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, manifest, .{})).object;
+    // The references' sorted-GEMM arm (NAX or steel) must be this GPU's.
+    if (root.get("nax").?.bool != naxAvailable()) return error.SkipZigTest;
+    const cases = root.get("cases").?.array.items;
+    try testing.expect(cases.len > 0);
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(raw));
+    defer config.deinit(allocator);
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(raw), &config, false);
+    defer weights.deinit();
+    var one = config;
+    one.num_hidden_layers = 1;
+    one.ple_layer_idx = -1;
+    var name_buf: [256]u8 = undefined;
+    const ml = try initMoeLayers(allocator, one, &weights, &name_buf, cpu);
+    defer {
+        for (ml.owned_bf16) |arr| _ = mlx.mlx_array_free(arr);
+        allocator.free(ml.owned_bf16);
+        for (ml.ssm_entries) |e| {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+        }
+        allocator.free(ml.ssm_entries);
+        allocator.free(ml.moe_layers);
+    }
+    const mw = &ml.moe_layers[0].mlp.moe;
+    try testing.expect(mw.tq2 != null and mw.shared_expert_gate_w != null);
+    // The MoE block's view of a Transformer: the trunk config on the GPU stream, every cache empty.
+    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
+    const xfm: *Transformer = @ptrCast(&xfm_bytes);
+    xfm.allocator = allocator;
+    xfm.s = mlx.gpuStream();
+    xfm.config = config;
+    const s = xfm.s;
+    const k: usize = config.num_experts_per_tok;
+    const ne: usize = config.num_experts;
+    const d: usize = config.hidden_size;
+
+    for (cases) |case| {
+        const file = case.object.get("file").?.string;
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ std.mem.span(dir), file }, 0);
+        var map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        var meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try mlx.check(mlx.mlx_load_safetensors(&map, &meta, path.ptr, cpu));
+        var t: [6]mlx.mlx_array = undefined;
+        var got_n: usize = 0;
+        defer for (t[0..got_n]) |arr| {
+            _ = mlx.mlx_array_free(arr);
+        };
+        for ([_][:0]const u8{ "x", "gates", "inds", "scores", "routed", "out" }, 0..) |name, i| {
+            t[i] = try janghFixtureTensor(map, name);
+            got_n += 1;
+        }
+        const x, const gates, const v_inds, const v_scores, const v_routed, const v_out = t;
+        const tokens: usize = @intCast(mlx.getShape(x)[1]);
+
+        // The bound banks through the jangtq2 kernels on vMLX's own routing: TQSwitchGLU.routed bit for bit.
+        const routed = try jangtq2.moe(s, x, jangtq2Bank(mw), v_inds, v_scores, config.jangtq2.?.swiglu_limit);
+        defer _ = mlx.mlx_array_free(routed);
+        try testing.expect(try qsaArraysAllEqual(routed, v_routed, s));
+
+        // Our router picks vMLX's experts except at a bf16 tie with its lowest pick; scores may sit bf16 steps apart.
+        const logits = try xfm.moeRouterLogits(x, mw);
+        defer _ = mlx.mlx_array_free(logits);
+        const r = try xfm.computeMoeRouting(logits, null);
+        defer {
+            _ = mlx.mlx_array_free(r.inds);
+            _ = mlx.mlx_array_free(r.norm_scores);
+            if (r.gate_logit.ctx != null) _ = mlx.mlx_array_free(r.gate_logit);
+        }
+        var m_inds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(m_inds);
+        try mlx.check(mlx.mlx_astype(&m_inds, r.inds, .uint32, s));
+        try mlx.check(mlx.mlx_array_eval(m_inds));
+        try mlx.check(mlx.mlx_array_eval(r.norm_scores));
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(r.norm_scores));
+        const mi = (mlx.mlx_array_data_uint32(m_inds) orelse return error.MlxArrayDataNull)[0 .. tokens * k];
+        const ms = (mlx.mlx_array_data_bfloat16(r.norm_scores) orelse return error.MlxArrayDataNull)[0 .. tokens * k];
+        const vi = (mlx.mlx_array_data_uint32(v_inds) orelse return error.MlxArrayDataNull)[0 .. tokens * k];
+        const vs = (mlx.mlx_array_data_bfloat16(v_scores) orelse return error.MlxArrayDataNull)[0 .. tokens * k];
+        const vg = (mlx.mlx_array_data_bfloat16(gates) orelse return error.MlxArrayDataNull)[0 .. tokens * ne];
+        const Row = enum { same, stepped, tie };
+        const rows = try a.alloc(Row, tokens);
+        for (rows, 0..) |*row, tk| {
+            const v_row = vi[tk * k ..][0..k];
+            var lowest: f32 = std.math.inf(f32);
+            for (v_row) |e| lowest = @min(lowest, @as(f32, @bitCast(@as(u32, vg[tk * ne + e]) << 16)));
+            row.* = .same;
+            for (mi[tk * k ..][0..k], 0..) |e, j| {
+                const at = std.mem.indexOfScalar(u32, v_row, e) orelse {
+                    try testing.expectEqual(lowest, @as(f32, @bitCast(@as(u32, vg[tk * ne + e]) << 16)));
+                    row.* = .tie;
+                    continue;
+                };
+                if (row.* == .same and ms[tk * k + j] != vs[tk * k + at]) row.* = .stepped;
+            }
+        }
+
+        // The whole block as the trunk calls it, row by row against vMLX's in our dtypes.
+        const y = try xfm.moeMLP(x, mw);
+        defer _ = mlx.mlx_array_free(y);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
+        const yh = try janghHostF32(a, y, s);
+        const vh = try janghHostF32(a, v_out, s);
+        var by: std.EnumArray(Row, JanghDiff) = .initFill(.{});
+        for (rows, 0..) |row, tk| try by.getPtr(row).add(yh[tk * d ..][0..d], vh[tk * d ..][0..d]);
+        const same = by.get(.same);
+        const stepped = by.get(.stepped);
+        std.debug.print("[jangh-moe-block] {s}: routed exact; rel L2 of same-routing rows ({d}) {e:.2}, stepped-score rows ({d}) {e:.2}, tie rows ({d}) {e:.2}\n", .{ file, same.n / d, same.relL2(), stepped.n / d, stepped.relL2(), by.get(.tie).n / d, by.get(.tie).relL2() });
+        // Same-routing rows: within one bf16 step at decode widths (prefill: vMLX's joined shared gate/up rounds apart).
+        if (tokens <= jangtq2.DECODE_MAX_TOKENS) try testing.expect(same.max_steps <= 1);
+        // Rounding, not wiring: a wrong bank, score or shared term is off by tenths, as the tie rows are.
+        try testing.expect(same.relL2() < 1.0 / 64.0 and stepped.relL2() < 1.0 / 64.0);
+    }
+}
+
+test "sortRoutes: ids in expert order, ties in routing order, each slot's token row and the inverse permutation" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    // Three tokens' top-2 ids, each expert picked twice: every slot rests on the tie rule.
+    const ids = [_]u32{ 3, 1, 0, 3, 1, 0 };
+    const input = mlx.mlx_array_new_data(&ids, &.{6}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(input);
+    var got = try sortRoutes(s, input, 2);
+    defer got.deinit();
+    const want = [_][6]u32{ .{ 0, 0, 1, 1, 3, 3 }, .{ 1, 2, 0, 2, 0, 1 }, .{ 4, 2, 0, 5, 3, 1 } };
+    for ([_]mlx.mlx_array{ got.sorted, got.lhs, got.inverse }, &want) |arr, w| {
+        var u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(u);
+        try mlx.check(mlx.mlx_astype(&u, arr, .uint32, s));
+        try mlx.check(mlx.mlx_array_eval(u));
+        try testing.expectEqualSlices(c_int, &.{6}, mlx.getShape(u));
+        try testing.expectEqualSlices(u32, &w, (mlx.mlx_array_data_uint32(u) orelse return error.MlxArrayDataNull)[0..6]);
+    }
 }

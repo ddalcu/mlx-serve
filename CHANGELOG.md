@@ -1,5 +1,10 @@
 # Changelog
 
+## v26.10.3 — UNRELEASED - DEV
+
+### New
+- **The JANGH4 bundle of Qwen3.8 Flash Next loads.** `JANGQ-AI/Qwen3.8-Flash-Next-JANGH4` runs with MTP: its 4- and 6-bit codebook experts on their own kernels and its n-gram table read from the model files. It runs in bf16 like the other Flash Next packs, where vMLX runs it in f16, and its vision tower is not served.
+
 ## v26.10.2 — Songs, Films & Sound Effects - The Newest Frontier Models - Linux - Rock Solid Under Load
 
 ### Highlights

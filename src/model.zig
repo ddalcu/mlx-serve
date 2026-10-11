@@ -9,6 +9,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const qwen4_ple = @import("qwen4_ple.zig");
+const jangh = @import("jangh.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
@@ -135,7 +136,12 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
     return null;
 }
 
-pub const Qwen4NormConvention = enum { delta, folded };
+pub const Qwen4NormConvention = enum {
+    delta,
+    folded,
+    /// JANG bundles: every layer norm stored folded, the MTP input norms (`pre_fc_norm_*`) zero-centred.
+    runtime_plus1_applied,
+};
 
 /// Llama 3.x `rope_type: "llama3"` (HF `_compute_llama3_parameters`).
 pub const Llama3Rope = struct {
@@ -327,6 +333,9 @@ pub const ModelConfig = struct {
     /// Routed experts in EXL3 (Sushi packs, `expert_quant` in config.json),
     /// served by lib/sushi; null = the pack's own affine banks.
     exl3: ?sushi_exl3.Spec = null,
+    /// Routed experts in the `jangtq2` codebook format (JANGH bundles: `jangtq` beside per-module
+    /// `quantization` entries); null = affine banks.
+    jangtq2: ?jangh.Spec = null,
     /// The TEXT config's own eos (its first entry): the n-gram hash's segment
     /// reset token, independent of the generation-time stop set.
     ngram_eos: u32 = 0,
@@ -1923,6 +1932,18 @@ fn validateQwen4Config(config: *const ModelConfig) !void {
     }
 }
 
+/// Where the n-gram table is read: indexed shards the embedded reader validated at parse
+/// (`embedded_ple_payload_bytes`, oMLX's layout or a JANG pack's `ple.ngram_embedding.shards.N`),
+/// or `ngram_table.bin`. A JANGH bundle ships its table only in its shards: an index listing none is refused.
+pub fn qwen4NgramSource(config: *const ModelConfig) !enum { embedded, external } {
+    if (config.embedded_ple_payload_bytes != null) return .embedded;
+    if (config.jangtq2 != null) {
+        log.err("[jangh] the bundle's index lists no n-gram table (`ple.ngram_embedding.shards.N`)\n", .{});
+        return error.JanghNgramTableMissing;
+    }
+    return .external;
+}
+
 pub fn qwen4EmbeddedSpec(config: *const ModelConfig) !qwen4_exp.EmbeddedSpec {
     const hash = try qwen4_exp.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, config.ngram_eos);
     if (config.ple_embed_dim == 0 or config.ple_embed_dim % hash.n_heads != 0) return error.InvalidQwen4PleGeometry;
@@ -2853,7 +2874,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.norm_has_offset = false;
         if (root.get("qwen4_norm_convention")) |v| {
             if (v != .string) return error.InvalidQwen4NormConvention;
-            config.qwen4_norm_convention = std.meta.stringToEnum(Qwen4NormConvention, v.string) orelse return error.InvalidQwen4NormConvention;
+            const marker = std.meta.stringToEnum(Qwen4NormConvention, v.string) orelse return error.InvalidQwen4NormConvention;
+            if (marker == .runtime_plus1_applied) return error.InvalidQwen4NormConvention;
+            config.qwen4_norm_convention = marker;
         }
         config.has_final_norm = false; // hyper_connection_mixer replaces model.norm
         config.scale_embeddings = false;
@@ -2914,6 +2937,16 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (jsonField(root, "expert_quant") != null) {
             config.exl3 = try sushi_exl3.parseExpertQuant(root);
             try sushi_exl3.admitTopK(config.num_experts_per_tok);
+        }
+        config.jangtq2 = try jangh.parseSpec(root, cfg_obj, config.num_hidden_layers);
+        if (config.jangtq2 != null) {
+            if (config.exl3 != null) return error.ConflictingRoutedExpertFormats;
+            if (config.qwen4_norm_convention != null) return error.ConflictingQwen4NormConvention;
+            try jangh.checkNormConvention(root);
+            config.qwen4_norm_convention = .runtime_plus1_applied;
+            // The bundle quantizes its Qwen3-VL tower; `qwen_vision.zig` runs dense towers only.
+            config.has_vision = false;
+            config.qwen_vision = false;
         }
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
@@ -4247,6 +4280,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.linear_num_value_heads % config.linear_num_key_heads != 0)
             return error.InvalidConfigField;
     }
+    // JANGTQ codebook banks are read on qwen4_exp only (`jangh.zig`).
+    if (config.jangtq2 == null and jangh.declared(root)) return error.Jangtq2UnsupportedFamily;
     return config;
 }
 
@@ -4514,7 +4549,13 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// `dsv41` also reads past the page cache (`nocache_reader`): its weights all load at init, and a pack near the
 /// RAM size would have them compressed under the file cache.
 /// `index_owners`: a tensor two shards carry loads from the shard the index names.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+/// `jangh`: a JANGH bundle, stored under the names our qwen4_exp loader reads (`jangh.runtimeName`).
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, jangh: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+
+/// How `loadModelWeights` reads `config`'s checkpoint.
+pub fn loadOptsFor(config: *const ModelConfig, load_vision: bool) LoadOpts {
+    return .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .jangh = config.jangtq2 != null };
+}
 
 pub const Owners = std.StringHashMapUnmanaged([]const u8);
 
@@ -4551,11 +4592,13 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
     if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
+    // Here, not at the table's open: Transformer.init opens it only after evaluating every weight.
+    if (config.isQwen4()) _ = try qwen4NgramSource(config);
     if (config.embedded_ple_payload_bytes != null) {
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, loadOptsFor(config, load_vision));
     errdefer weights.deinit();
     if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
@@ -4563,6 +4606,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         resolveWeightPrefix(config, &weights);
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
+        if (config.jangtq2 != null) try jangh.adapt(config, &weights, s);
         try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
     }
     if (config.exl3 != null) {
@@ -4811,7 +4855,6 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     opts: LoadOpts,
 ) !void {
-    const load_vision = opts.vision;
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
 
@@ -4839,12 +4882,15 @@ pub fn loadSafetensorsFile(
         const key_str = std.mem.span(key.?);
 
         const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
-        if (foreign or !shouldKeepWeightKey(key_str, load_vision) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
-            (opts.dsv41 and dsv41DropsKey(key_str)))
-        {
+        var name_buf: [256]u8 = undefined;
+        const kept: ?[]const u8 = if (foreign) null else loadedName(opts, key_str, &name_buf) catch |err| {
+            _ = mlx.mlx_array_free(value);
+            return err;
+        };
+        const name = kept orelse {
             _ = mlx.mlx_array_free(value);
             continue;
-        }
+        };
 
         // Read the shape BEFORE the cast frees `value` — a freed handle's
         // ndim is a use-after-free, not a zero.
@@ -4861,11 +4907,19 @@ pub fn loadSafetensorsFile(
             if (ndim == 1) narrowed_1d += 1;
         }
 
-        // oMLX's V4.1 packs nest the text model under `language_model.`: kept under the release's names.
-        const name = if (opts.dsv41 and std.mem.startsWith(u8, key_str, dsv41_text_prefix)) key_str[dsv41_text_prefix.len..] else key_str;
         const owned_key = try allocator.dupe(u8, name);
         try weights.map.put(owned_key, final_value);
     }
+}
+
+/// The name a checkpoint tensor is held under in the weight map (written into `buf` when it is
+/// not `key`), or null for a tensor this load skips.
+pub fn loadedName(opts: LoadOpts, key: []const u8, buf: []u8) !?[]const u8 {
+    if (!shouldKeepWeightKey(key, opts.vision) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key)) or
+        (opts.dsv41 and dsv41DropsKey(key))) return null;
+    if (opts.jangh) return jangh.runtimeName(buf, key);
+    // oMLX's V4.1 packs nest the text model under `language_model.`: kept under the release's names.
+    return if (opts.dsv41 and std.mem.startsWith(u8, key, dsv41_text_prefix)) key[dsv41_text_prefix.len..] else key;
 }
 
 pub const dsv41_text_prefix = "language_model.";
@@ -4938,7 +4992,12 @@ fn resolveAndFoldQwen4Norms(config: *ModelConfig, weights: *Weights, s: mlx.mlx_
     while (it.next()) |entry| {
         if (!qwen4NormNeedsFold(entry.key_ptr.*)) continue;
         const value = entry.value_ptr.*;
-        if (convention == .delta) {
+        const fold = switch (convention) {
+            .delta => true,
+            .folded => false,
+            .runtime_plus1_applied => qwen4MtpInputNorm(entry.key_ptr.*),
+        };
+        if (fold) {
             entry.value_ptr.* = try foldQwen4Norm(value, s);
         } else if (config.actDtype() != .float16 and narrowsLoadedF16(entry.key_ptr.*, mlx.mlx_array_ndim(value), mlx.mlx_array_dtype(value)) and narrow1dEnabled()) {
             var cast = mlx.mlx_array_new();
@@ -4957,6 +5016,11 @@ fn resolveAndFoldQwen4Norms(config: *ModelConfig, weights: *Weights, s: mlx.mlx_
     } else {
         log.info("[qwen4] using checkpoint-local {s} norm convention: {s}\n", .{ @tagName(convention), model_dir });
     }
+}
+
+/// The MTP head's input norms, which a JANG bundle keeps zero-centred.
+fn qwen4MtpInputNorm(key: []const u8) bool {
+    return std.mem.endsWith(u8, key, "pre_fc_norm_embedding.weight") or std.mem.endsWith(u8, key, "pre_fc_norm_hidden.weight");
 }
 
 pub fn qwen4NormNeedsFold(key: []const u8) bool {
@@ -5196,6 +5260,77 @@ test "Qwen4 folded f16 keeps generic narrowing after convention resolution" {
         try testing.expectEqual(Qwen4NormConvention.folded, config.qwen4_norm_convention.?);
         try testing.expectEqual(if (narrow1dEnabled()) mlx.mlx_dtype.bfloat16 else mlx.mlx_dtype.float16, mlx.mlx_array_dtype(weights.get(name).?));
     }
+}
+
+test "Qwen4 runtime_plus1_applied folds only the MTP input norms" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    const shape = [_]c_int{1};
+    const values = [_]f32{0.25};
+    const names = [_][]const u8{
+        "language_model.model.layers.0.attn_hyper_connection.hc_norm.weight",
+        "language_model.model.layers.3.self_attn.q_norm.weight",
+        "language_model.model.layers.3.self_attn.indexer.k_layernorm.weight",
+        "language_model.model.layers.1.ple.norm_conv.weight",
+        "language_model.mtp.hyper_connection_mixer.hc_norm.weight",
+        "language_model.mtp.pre_fc_norm_embedding.weight",
+        "language_model.mtp.pre_fc_norm_hidden.weight",
+    };
+    for (names) |name| try addQwen4NormTestArray(&weights, name, &values, &shape, .bfloat16, s);
+    var config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .runtime_plus1_applied };
+    try resolveAndFoldQwen4Norms(&config, &weights, s, "fixture");
+    for (names) |name| {
+        var f32_value = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32_value);
+        try mlx.check(mlx.mlx_astype(&f32_value, weights.get(name).?, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(f32_value));
+        const want: f32 = if (std.mem.indexOf(u8, name, "pre_fc_norm_") != null) 1.25 else 0.25;
+        try testing.expectEqual(want, mlx.mlx_array_data_float32(f32_value).?[0]);
+    }
+}
+
+test "parseConfigFromJson: runtime_plus1_applied comes from a JANG stamp, never a qwen4_norm_convention marker" {
+    const json =
+        \\{"model_type":"qwen4_exp","qwen4_norm_convention":"runtime_plus1_applied",
+        \\ "text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,"ple_layer_ids":[2],
+        \\ "num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"vocab_size":248320}}
+    ;
+    try testing.expectError(error.InvalidQwen4NormConvention, parseConfigFromJson(testing.allocator, json));
+}
+
+test "qwen4NgramSource: a JANGH bundle reads its in-shard table and is refused without one" {
+    var config = ModelConfig{ .model_type = "qwen4_exp" };
+    try testing.expectEqual(.external, try qwen4NgramSource(&config));
+    config.embedded_ple_payload_bytes = 120;
+    try testing.expectEqual(.embedded, try qwen4NgramSource(&config));
+    config.jangtq2 = .{};
+    try testing.expectEqual(.embedded, try qwen4NgramSource(&config));
+    config.embedded_ple_payload_bytes = null;
+    try testing.expectError(error.JanghNgramTableMissing, qwen4NgramSource(&config));
+}
+
+test "loadModelWeights: a JANGH bundle without its n-gram table is refused before any shard loads" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    var config = ModelConfig{ .model_type = "qwen4_exp", .jangtq2 = .{} };
+    try testing.expectError(error.JanghNgramTableMissing, loadModelWeights(testing.io, testing.allocator, dir, &config, false));
+}
+
+test "loadedName: a JANGH load renames and drops; every other load keeps the stored names" {
+    var buf: [256]u8 = undefined;
+    const tq2 = "model.layers.5.mlp.switch_mlp.down_proj.tq2_scales";
+    try testing.expectEqualStrings(tq2, (try loadedName(.{}, tq2, &buf)).?);
+    try testing.expectEqualStrings("language_model.model.layers.5.mlp.switch_mlp.down_proj.tq2_scales", (try loadedName(.{ .jangh = true }, tq2, &buf)).?);
+    try testing.expect(try loadedName(.{ .jangh = true, .vision = true }, "visual.merger.norm.weight", &buf) == null);
+    try testing.expectEqualStrings("model.layers.0.attn.wq.weight", (try loadedName(.{ .dsv41 = true }, "language_model.model.layers.0.attn.wq.weight", &buf)).?);
+    try testing.expect(try loadedName(.{}, "audio_tower.layers.0.weight", &buf) == null);
+    // Codebook row scales are no affine side tensor: they keep the f16 the kernels read.
+    try testing.expect(!narrowsLoadedF16(tq2, 2, .float16));
+    try testing.expect(narrowsLoadedF16("language_model.model.layers.0.self_attn.q_proj.scales", 2, .float16));
 }
 
 /// True if the safetensors weight `key` should be retained for the text
@@ -9305,6 +9440,27 @@ test "unmarked embedded qwen4 defers norm convention until weights load" {
     defer accepted.deinit(testing.allocator);
     try testing.expectEqual(Qwen4NormConvention.delta, accepted.qwen4_norm_convention.?);
     try testing.expectEqual(@as(?u64, 120), accepted.embedded_ple_payload_bytes);
+}
+
+test "parseConfig: a JANG pack's in-shard table sets the embedded payload" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try qwen4_ple.writeJangFixture(&td, .valid, .{ .multipliers = &.{ 7, -9, 11 }, .vocab = &.{ 2, 3 }, .offsets = &.{ 0, 2 } }, 5);
+    const json =
+        \\{"model_type":"qwen4_exp","hidden_size":64,"num_hidden_layers":2,
+        \\"num_attention_heads":1,"num_key_value_heads":1,"head_dim":64,
+        \\"vocab_size":1,"ple_layer_ids":[2],"ple_embed_dim":64,
+        \\"ngram_size":3,"heads_per_ngram":1,"ngram_vocab_size_base":2,
+        \\"make_ngram_vocab_size_divisible_by":1,"split_ngram_parts":3,
+        \\"indexer_n_heads":1,"indexer_head_dim":4,"indexer_budget":8,"indexer_compress_ratio":2}
+    ;
+    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try td.dir.realPath(io, &path);
+    var config = try parseConfig(io, testing.allocator, path[0..len]);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u64, 5 * (32 + 2 + 2)), config.embedded_ple_payload_bytes);
 }
 
 test "local oQ Qwen4 metadata defers convention until loaded weights" {

@@ -508,6 +508,21 @@ pub const NgramTable = struct {
         log.info("[qwen4] ngram table warm: done, {d:.1} GB in {d:.1} s (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{ asGb(total), secs });
     }
 
+    /// A JANG pack records the hash constants it was built with: rows hashed with any other constants are
+    /// other rows, so a difference refuses the table. No-op elsewhere.
+    pub fn verifyHashBuffers(self: *const NgramTable, h: *const NgramHash) !void {
+        const source = self.embedded orelse return;
+        if (source.layout != .jang) return;
+        const want = [_][]const i64{ h.multipliers[0..h.ngram_size], h.vocab[0..h.n_heads], h.offsets[0..h.n_heads] };
+        for (std.enums.values(embedded_ple.HashBuffer), want) |which, values| {
+            const raw = source.hashBuffer(which) orelse return error.EmbeddedPleHashMissing;
+            if (raw.len != values.len * 8) return error.EmbeddedPleHashMismatch;
+            for (values, 0..) |v, i| {
+                if (std.mem.readInt(i64, raw[i * 8 ..][0..8], .little) != v) return error.EmbeddedPleHashMismatch;
+            }
+        }
+    }
+
     /// Dequantize one row into `out[0..dim]` (mx.quantize packing: element i
     /// sits at bit offset i * bits of the little-endian u32 stream and may
     /// straddle a word boundary at 3/5/6 bits).
@@ -537,6 +552,7 @@ pub const NgramTable = struct {
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         // An embedded pack's global weight scale; 1.0 leaves every other table exact.
         const ws: f32 = if (self.embedded) |source| source.scale else 1.0;
+        const f16_scales = if (self.embedded) |source| source.layout.f16Scales() else false;
         var i: u32 = 0;
         while (i < self.dim) : (i += 1) {
             const off = i * self.bits;
@@ -546,8 +562,8 @@ pub const NgramTable = struct {
             if (shift + self.bits > 32) v |= @as(u64, std.mem.readInt(u32, words[w * 4 + 4 ..][0..4], .little)) << 32;
             const q: u32 = @truncate((v >> @intCast(shift)) & mask);
             const g = i / self.group_size;
-            const sc = bf16ToF32(std.mem.readInt(u16, scales[g * 2 ..][0..2], .little));
-            const bi = bf16ToF32(std.mem.readInt(u16, biases[g * 2 ..][0..2], .little));
+            const sc = scaleOrBias(scales, g, f16_scales);
+            const bi = scaleOrBias(biases, g, f16_scales);
             out[i] = (@as(f32, @floatFromInt(q)) * sc + bi) * ws;
         }
     }
@@ -829,6 +845,12 @@ pub fn bf16ToF32(u: u16) f32 {
     return @bitCast(@as(u32, u) << 16);
 }
 
+/// Group `g`'s scale or bias, as stored: F16 in a JANG pack, BF16 in every other table.
+fn scaleOrBias(bytes: []const u8, g: usize, f16_scales: bool) f32 {
+    const u = std.mem.readInt(u16, bytes[g * 2 ..][0..2], .little);
+    return if (f16_scales) @as(f16, @bitCast(u)) else bf16ToF32(u);
+}
+
 /// Round-to-nearest-even f32 -> bf16 bits, the PLE rows' upload format.
 pub fn bf16Rne(v: f32) u16 {
     const u: u32 = @bitCast(v);
@@ -1047,6 +1069,200 @@ test "embedded PLE rows and gathers match the merged table" {
         embedded.gather(&ids, &pooled, 0);
         try std.testing.expectEqualSlices(f32, &want, &pooled);
     }
+}
+
+fn jangTestTable(td: *std.testing.TmpDir, hash: embedded_ple.JangHash, seed: u64) !NgramTable {
+    try embedded_ple.writeJangFixture(td, .valid, hash, seed);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    return NgramTable.openEmbedded(path_buf[0..path_len], embedded_ple.JANG_FIXTURE_SPEC);
+}
+
+/// The constants of a 2-head hash (primes 2 and 3) that fits the 5-row JANG fixture.
+fn jangTestHash() !NgramHash {
+    return NgramHash.init(1000, 3, 1, 2, 1, 1234, 0, 999);
+}
+
+test "jangh4 ngram table: a row is its 8-bit codes times the F16 scale plus the F16 bias in f32, in every gather arm" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const h = try jangTestHash();
+    var table = try jangTestTable(&td, .{ .multipliers = h.multipliers[0..3], .vocab = h.vocab[0..2], .offsets = h.offsets[0..2] }, 9);
+    defer table.close();
+    const ids = [_]i64{ 4, 0, 1, 2, 3, 4, 1, 0 };
+    var want: [ids.len * 32]f32 = undefined;
+    for (ids, 0..) |id, i| {
+        const parts = table.embedded.?.rowParts(@intCast(id));
+        const s: f32 = @as(f16, @bitCast(std.mem.readInt(u16, parts.scales[0..2], .little)));
+        const b: f32 = @as(f16, @bitCast(std.mem.readInt(u16, parts.biases[0..2], .little)));
+        for (parts.weight, want[i * 32 ..][0..32]) |q, *w| w.* = @as(f32, @floatFromInt(q)) * s + b;
+        var one: [32]f32 = undefined;
+        table.row(@intCast(id), &one);
+        try testing.expectEqualSlices(f32, want[i * 32 ..][0..32], &one);
+    }
+    var serial: [ids.len * 32]f32 = undefined;
+    {
+        const pool = table.pool;
+        table.pool = null;
+        defer table.pool = pool;
+        table.gather(&ids, &serial, 0);
+    }
+    try testing.expectEqualSlices(f32, &want, &serial);
+    if (table.pool != null) {
+        var pooled: [ids.len * 32]f32 = undefined;
+        table.gather(&ids, &pooled, 0);
+        try testing.expectEqualSlices(f32, &want, &pooled);
+    }
+}
+
+test "jangh4 ngram table: the pack's hash constants must equal the runtime hash" {
+    const h = try jangTestHash();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    var table = try jangTestTable(&td, .{ .multipliers = h.multipliers[0..3], .vocab = h.vocab[0..2], .offsets = h.offsets[0..2] }, 1);
+    defer table.close();
+    try table.verifyHashBuffers(&h);
+    const mult = [_]i64{ h.multipliers[0], h.multipliers[1] + 2, h.multipliers[2] };
+    const three = [_]i64{ 2, 3, 5 };
+    for ([_]embedded_ple.JangHash{
+        .{ .multipliers = &mult, .vocab = h.vocab[0..2], .offsets = h.offsets[0..2] },
+        .{ .multipliers = h.multipliers[0..3], .vocab = &three, .offsets = h.offsets[0..2] },
+        .{ .multipliers = h.multipliers[0..3], .vocab = h.vocab[0..2], .offsets = h.vocab[0..2] },
+    }) |wrong| {
+        var wtd = std.testing.tmpDir(.{});
+        defer wtd.cleanup();
+        var t = try jangTestTable(&wtd, wrong, 1);
+        defer t.close();
+        try testing.expectError(error.EmbeddedPleHashMismatch, t.verifyHashBuffers(&h));
+    }
+}
+
+/// The vMLX PLE fixture `JANGH4_PLE_FIXTURE` names (tests/dump_jangh4_fixtures.py): its manifest and
+/// safetensors image, held in `aa`. Null when no fixture is configured.
+const PleFixture = struct {
+    manifest: std.json.ObjectMap,
+    header: std.json.ObjectMap,
+    data: []const u8,
+
+    fn open(aa: std.mem.Allocator) !?PleFixture {
+        const dir = std.mem.sliceTo(std.c.getenv("JANGH4_PLE_FIXTURE") orelse return null, 0);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var fdir = try std.Io.Dir.cwd().openDir(io, dir, .{});
+        defer fdir.close(io);
+        const manifest = (try std.json.parseFromSliceLeaky(std.json.Value, aa, try fdir.readFileAlloc(io, "ple_manifest.json", aa, .limited(1 << 20)), .{})).object;
+        const image = try fdir.readFileAlloc(io, manifest.get("fixture").?.string, aa, .limited(256 << 20));
+        const hlen: usize = @intCast(std.mem.readInt(u64, image[0..8], .little));
+        const header = (try std.json.parseFromSliceLeaky(std.json.Value, aa, image[8 .. 8 + hlen], .{})).object;
+        return .{ .manifest = manifest, .header = header, .data = image[8 + hlen ..] };
+    }
+
+    /// One 2-D tensor of the image: its bytes and dims.
+    fn tensor(self: *const PleFixture, name: []const u8, dtype: []const u8) !struct { bytes: []const u8, dims: [2]usize } {
+        const v = self.header.get(name) orelse return error.FixtureTensorMissing;
+        if (!std.mem.eql(u8, v.object.get("dtype").?.string, dtype)) return error.FixtureTensorDtype;
+        const shape = v.object.get("shape").?.array.items;
+        const offs = v.object.get("data_offsets").?.array.items;
+        if (shape.len != 2) return error.FixtureTensorShape;
+        return .{ .bytes = self.data[@intCast(offs[0].integer)..@intCast(offs[1].integer)], .dims = .{ @intCast(shape[0].integer), @intCast(shape[1].integer) } };
+    }
+};
+
+/// Elements of `host` whose upload bits (`bf16Rne`) differ from the bf16 bits in `want`.
+fn bf16Mismatches(host: []const f32, want: []const u8) usize {
+    var bad: usize = 0;
+    for (host, 0..) |v, i| bad += @intFromBool(bf16Rne(v) != std.mem.readInt(u16, want[i * 2 ..][0..2], .little));
+    return bad;
+}
+
+test "jangh4 ngram table: vMLX's PLE rows rounded once to bf16, bit for bit, read from the bundle's shards (JANGH4_PLE_FIXTURE)" {
+    const model_mod = @import("model.zig");
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const fx = (try PleFixture.open(arena.allocator())) orelse return error.SkipZigTest;
+    const manifest = fx.manifest;
+    const bundle = manifest.get("bundle").?.string;
+
+    // The load's path: config -> hash + spec -> the embedded source, hash constants checked.
+    var config = try model_mod.parseConfig(io, a, bundle);
+    defer config.deinit(a);
+    const h = try NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, config.ngram_eos);
+    var table = try NgramTable.openEmbedded(bundle, try model_mod.qwen4EmbeddedSpec(&config));
+    defer table.close();
+    try table.verifyHashBuffers(&h);
+    try testing.expectEqual(h.total_rows, table.rows);
+    try testing.expectEqual(config.ple_embed_dim, table.dim * h.n_heads);
+    try testing.expectEqual(config.embedded_ple_payload_bytes.?, table.embeddedPayloadBytes());
+    // vMLX's own geometry (FileBackedQuantizedNGramTable.per, shard count, total rows, head dim).
+    const source = table.embedded.?;
+    try testing.expectEqual(manifest.get("rows_per_shard").?.integer, @as(i64, @intCast(source.shards[0].rows)));
+    try testing.expectEqual(manifest.get("n_shards").?.integer, @as(i64, @intCast(source.shards.len)));
+    try testing.expectEqual(manifest.get("total_rows").?.integer, @as(i64, @intCast(table.rows)));
+    try testing.expectEqual(manifest.get("head_dim").?.integer, @as(i64, table.dim));
+    const dim: usize = table.dim;
+
+    // Every shard's first and last rows, the padding rows, random rows and repeats, through each read arm.
+    const probe = try fx.tensor("probe_rows", "I64");
+    const probe_vals = try fx.tensor("probe_vals", "BF16");
+    const n = probe.dims[1];
+    try testing.expectEqual([2]usize{ n, dim }, probe_vals.dims);
+    const rows = try a.alloc(i64, n);
+    defer a.free(rows);
+    for (rows, 0..) |*r, i| r.* = std.mem.readInt(i64, probe.bytes[i * 8 ..][0..8], .little);
+    const per = source.shards[0].rows;
+    for (0..source.shards.len) |s| for ([_]u64{ s * per, (s + 1) * per - 1 }) |edge| {
+        try testing.expect(std.mem.indexOfScalar(i64, rows, @intCast(edge)) != null);
+    };
+    const host = try a.alloc(f32, n * dim);
+    defer a.free(host);
+    for (rows, 0..) |r, i| table.row(@intCast(r), host[i * dim ..][0..dim]);
+    var bad = bf16Mismatches(host, probe_vals.bytes);
+    defer ple_prefill_prefetch_override = null;
+    for ([_]bool{ false, true }) |pooled| {
+        ple_prefill_prefetch_override = pooled;
+        @memset(host, std.math.nan(f32));
+        table.gather(rows, host, 0);
+        bad += bf16Mismatches(host, probe_vals.bytes);
+    }
+
+    // Token positions: the fixture's chunks replayed with the carried n-gram history, as a served request.
+    const tokens = try fx.tensor("tokens", "I32");
+    const chunks = try fx.tensor("chunks", "I32");
+    const row_ids = try fx.tensor("row_ids", "I64");
+    const emb = try fx.tensor("emb", "BF16");
+    const t_len = tokens.dims[1];
+    try testing.expectEqual([2]usize{ t_len, h.n_heads }, row_ids.dims);
+    try testing.expectEqual([2]usize{ t_len, dim * h.n_heads }, emb.dims);
+    var bad_ids: usize = 0;
+    for ([_]bool{ false, true }) |pooled| {
+        ple_prefill_prefetch_override = pooled;
+        var prev: [2]u32 = .{ h.eos, h.eos };
+        var pos: usize = 0;
+        for (0..chunks.dims[1]) |c| {
+            const len: usize = @intCast(std.mem.readInt(i32, chunks.bytes[c * 4 ..][0..4], .little));
+            const ids = try a.alloc(u32, len);
+            defer a.free(ids);
+            for (ids, 0..) |*id, i| id.* = @intCast(std.mem.readInt(i32, tokens.bytes[(pos + i) * 4 ..][0..4], .little));
+            const chunk_rows = try a.alloc(i64, len * h.n_heads);
+            defer a.free(chunk_rows);
+            h.rowIds(&prev, ids, chunk_rows);
+            for (chunk_rows, 0..) |r, i| bad_ids += @intFromBool(r != std.mem.readInt(i64, row_ids.bytes[(pos * h.n_heads + i) * 8 ..][0..8], .little));
+            const out = try a.alloc(f32, chunk_rows.len * dim);
+            defer a.free(out);
+            table.gather(chunk_rows, out, pos);
+            bad += bf16Mismatches(out, emb.bytes[pos * h.n_heads * dim * 2 ..][0 .. out.len * 2]);
+            const hist = try std.mem.concat(a, u32, &.{ &prev, ids });
+            defer a.free(hist);
+            prev = hist[hist.len - 2 ..][0..2].*;
+            pos += len;
+        }
+        try testing.expectEqual(t_len, pos);
+    }
+    std.debug.print("jangh4 ple fixture: {d} probe rows x 3 arms, {d} tokens x {d} heads in {d} chunks x 2 arms: {d} row-id and {d} bf16 element mismatches\n", .{ n, t_len, h.n_heads, chunks.dims[1], bad_ids, bad });
+    try testing.expectEqual(@as(usize, 0), bad_ids);
+    try testing.expectEqual(@as(usize, 0), bad);
 }
 
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and

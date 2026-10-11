@@ -57,6 +57,8 @@ pub const Table = struct {
     s_off: u64,
     b_off: u64,
     scale: f32 = 1.0,
+    /// F16 scales and biases (`qwen4_ple.Layout.f16Scales`); every other table's are BF16.
+    f16_scales: bool = false,
 
     pub fn release(self: Table) void {
         _ = mlx.mlx_array_free(self.arr);
@@ -104,7 +106,7 @@ fn wrapEmbedded(src: *const qwen4_ple.EmbeddedTable) !Table {
     owned = false;
     const wbytes = src.rows * @as(u64, src.wcols) * 4;
     const sbytes = src.rows * @as(u64, src.scols) * 2;
-    return .{ .arr = arr, .w_off = 0, .s_off = wbytes, .b_off = wbytes + sbytes, .scale = src.scale };
+    return .{ .arr = arr, .w_off = 0, .s_off = wbytes, .b_off = wbytes + sbytes, .scale = src.scale, .f16_scales = src.layout.f16Scales() };
 }
 
 /// `map` as one no-copy uint8 `[pages, 4096]` array (no dim past int32). The caller has
@@ -191,10 +193,11 @@ const P_MULT = 13;
 const P_VOCAB = P_MULT + qwen4.MAX_NGRAM_SIZE;
 const P_OFFSETS = P_VOCAB + qwen4.MAX_HEADS;
 const P_SCALE = P_OFFSETS + qwen4.MAX_HEADS;
-const P_LEN = P_SCALE + 1;
+const P_F16 = P_SCALE + 1;
+const P_LEN = P_F16 + 1;
 comptime {
     // ple_gather.metal reads these slots by literal.
-    std.debug.assert(P_VOCAB == 21 and P_OFFSETS == 53 and P_SCALE == 85);
+    std.debug.assert(P_VOCAB == 21 and P_OFFSETS == 53 and P_SCALE == 85 and P_F16 == 86);
 }
 
 /// bf16 `[S, n_heads * dim]` for the `S` ids of `ids` (any integer dtype, may be lazy),
@@ -211,6 +214,7 @@ pub fn embed(s: mlx.mlx_stream, tbl: Table, h: *const qwen4.NgramHash, t: *const
     @memcpy(p[P_VOCAB..P_OFFSETS], &h.vocab);
     @memcpy(p[P_OFFSETS..P_SCALE], &h.offsets);
     p[P_SCALE] = @as(u32, @bitCast(tbl.scale));
+    p[P_F16] = @intFromBool(tbl.f16_scales);
     const params = mlx.mlx_array_new_data(&p, &[_]c_int{P_LEN}, 1, .int64);
     defer _ = mlx.mlx_array_free(params);
     var prev_i: [qwen4.MAX_NGRAM_SIZE]i32 = undefined;
@@ -460,6 +464,36 @@ test "ple gpu: an embedded sharded table, weight scale included, embeds like the
         try testing.expectEqual(table.embedded.?.scale, tbl.scale);
         try expectArmsEqual(tbl, &h, &table, &[_]u32{ 3, 4 }, &ids);
     }
+}
+
+test "ple gpu: a jangh4 table's F16 scales and biases, subnormals included, embed bit-identical to the host gather" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    // Two heads of primes 2 and 3 over the 5-row fixture: every row is read.
+    const h = try qwen4.NgramHash.init(TEST_VOCAB, 3, 1, 2, 1, 1234, 0, TEST_EOS);
+    var prng = std.Random.DefaultPrng.init(13);
+    var ids: [256]u32 = undefined;
+    randIds(prng.random(), &ids);
+    var subnormals: usize = 0;
+    for (0..4) |seed| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try qwen4_ple.writeJangFixture(&td, .valid, .{ .multipliers = h.multipliers[0..3], .vocab = h.vocab[0..2], .offsets = h.offsets[0..2] }, seed);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var table = try qwen4.NgramTable.openEmbedded(path_buf[0..try td.dir.realPath(io, &path_buf)], qwen4_ple.JANG_FIXTURE_SPEC);
+        defer table.close();
+        for (0..table.rows) |r| {
+            const parts = table.embedded.?.rowParts(r);
+            for ([_][]const u8{ parts.scales, parts.biases }) |half| {
+                const bits = std.mem.readInt(u16, half[0..2], .little);
+                subnormals += @intFromBool((bits & 0x7C00) == 0 and (bits & 0x3FF) != 0);
+            }
+        }
+        const tbl = try wrapEmbedded(table.embedded.?);
+        defer tbl.release();
+        try expectArmsEqual(tbl, &h, &table, &[_]u32{ 3, 4 }, &ids);
+    }
+    try testing.expect(subnormals > 0);
 }
 
 test "ple gpu: a declined embedded table keeps the host gather" {
