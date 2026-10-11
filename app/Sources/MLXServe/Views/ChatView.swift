@@ -2799,6 +2799,7 @@ struct ChatDetailView: View {
                 // The empty toolbar band gives that effect nothing to frost, so
                 // unclipped rows would run under it to the window's top edge.
                 .clipped()
+                .contentShape(Rectangle())
                 // A chat opens at its newest line by LAYOUT, with the real
                 // heights in hand, not by a jump aimed at an estimate of them.
                 .defaultScrollAnchor(.bottom, for: .initialOffset)
