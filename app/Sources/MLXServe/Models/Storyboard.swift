@@ -6,6 +6,9 @@ struct StoryboardSegment: Codable, Equatable, Identifiable {
     var id = UUID()
     var prompt: String = ""
     var seconds: Int = 8
+    /// A picture this shot lands on and the next one opens on, in place of the
+    /// shot's own rendered last frame. Never the final shot's: that is the pane's.
+    var endFramePath: String? = nil
 }
 
 /// A long clip as a list of shots the APP chains: each shot is an ordinary
@@ -71,9 +74,10 @@ enum Storyboard {
 
     /// Shot `index` of `count`: the pane's settings with this shot's prompt and
     /// length, opening on the previous shot's last frame (shot 0 keeps the
-    /// user's first frame) and landing on the user's last frame only at the end.
+    /// user's first frame) and landing on `endFrame`, or on the user's last
+    /// frame at the end.
     static func shotRequest(base: VideoGenRequest, prompt: String, frames: Int, index: Int, count: Int,
-                            previousLastFrame: String?) -> VideoGenRequest {
+                            previousLastFrame: String?, endFrame: String? = nil) -> VideoGenRequest {
         var r = base
         r.prompt = prompt
         r.numFrames = frames
@@ -81,10 +85,57 @@ enum Storyboard {
         // The server's own chain offset: each window draws seed and seed+1.
         r.seed = base.seed &+ 2 * index
         if index > 0 { r.firstFrameImagePath = previousLastFrame }
-        if index < count - 1 { r.lastFrameImagePath = nil }
+        if index < count - 1 { r.lastFrameImagePath = endFrame }
         // One clip cannot condition every shot; each shot makes its own sound.
         r.audioPath = nil
         return r
+    }
+
+    /// Frames of the joined clip that fade toward the next shot: the last two
+    /// before every join, toward the first frame the next shot keeps (its own
+    /// opening frame is cut), by a third and two thirds. Keyed by frame index.
+    static func seamBlends(shotFrames: [Int]) -> [Int: (into: Int, weight: Double)] {
+        var blends: [Int: (into: Int, weight: Double)] = [:]
+        var start = 0
+        for (i, n) in shotFrames.enumerated() {
+            let kept = i == 0 ? n : n - 1
+            let next = start + kept
+            if i + 1 < shotFrames.count {
+                for (back, weight) in [(2, 1.0 / 3), (1, 2.0 / 3)] where kept >= back {
+                    blends[next - back] = (next, weight)
+                }
+            }
+            start = next
+        }
+        return blends
+    }
+
+    /// What the next shot opens on: the user's picture for this join while it
+    /// is on disk, else this shot's rendered last frame.
+    static func nextOpening(keyframe: String?, renderedLastFrame: String,
+                            exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> String {
+        keyframe.flatMap { exists($0) ? $0 : nil } ?? renderedLastFrame
+    }
+
+    /// Enhance's new shots with the pictures of the old ones, by position; the
+    /// final shot has none.
+    static func keepingEndFrames(_ planned: [StoryboardSegment], from old: [StoryboardSegment]) -> [StoryboardSegment] {
+        planned.enumerated().map { i, shot in
+            var shot = shot
+            shot.endFramePath = i < planned.count - 1 && i < old.count ? old[i].endFramePath : nil
+            return shot
+        }
+    }
+
+    /// Restored shots without the pictures that are no longer on disk.
+    static func withoutMissingEndFrames(_ shots: [StoryboardSegment],
+                                        exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) })
+        -> [StoryboardSegment] {
+        shots.map { shot in
+            var shot = shot
+            if let path = shot.endFramePath, !exists(path) { shot.endFramePath = nil }
+            return shot
+        }
     }
 }
 

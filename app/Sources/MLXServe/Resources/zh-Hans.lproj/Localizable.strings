@@ -879,6 +879,7 @@
 "Large" = "大";
 "Largest models" = "最大的模型";
 "Last frame" = "末帧";
+"Last frame (optional)..." = "末帧（可选）...";
 "Last model used" = "上次使用的模型";
 "Last request overflowed the context window." = "上一次请求超出了上下文窗口。";
 "Latest" = "最新";
@@ -1664,6 +1665,7 @@
 "The model invents a soundtrack from your prompt. Attach speech to make characters say exact words." = "模型会根据你的提示词自行创作配乐。附加语音可让角色说出指定台词。";
 "The model is loaded when the run starts." = "模型会在运行开始时加载。";
 "The newest LTX. Generates short video clips with sound from a text prompt, and optionally a starting image or audio track. Ships its own text encoder, so nothing extra downloads on first use." = "最新的 LTX。根据文字提示词（可选起始图片或音轨）生成带声音的短视频片段。自带文本编码器，首次使用无需额外下载。";
+"The picture this shot ends on and the next one starts from. Empty, the next shot starts from this shot's own last frame." = "此镜头结束、下一个镜头开始的画面。留空时，下一个镜头从此镜头实际生成的最后一帧开始。";
 "The reference recording was empty." = "参考录音是空的。";
 "The reference-conditioned MiniMax-H3: attach up to 9 images, 3 clips and 3 audio references and the generation follows them for character, style and scene continuity. Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1>. Same speed and soundtrack as the standard pack; every reference adds tokens to every sampling step, so more references means slower." = "参考条件化的 MiniMax-H3：最多可附加 9 张图片、3 段视频和 3 段音频参考，生成时会依据它们保持角色、风格与场景的连贯。在提示词中以 <Picture 1>、<Video 1>、<Audio 1> 引用它们。速度与音轨和标准权重包相同；每份参考都会给每个采样步增加 Token，因此参考越多越慢。";
 "The same Gemma mixture-of-experts model as above, stored with twice the numeric precision (8-bit instead of 4-bit). That means slightly more accurate, consistent answers, at roughly double the memory." = "与上文相同的 Gemma MoE 模型，但以两倍的数值精度存储（8-bit 而非 4-bit）。这意味着答案略更准确、更稳定，但内存大约翻倍。";

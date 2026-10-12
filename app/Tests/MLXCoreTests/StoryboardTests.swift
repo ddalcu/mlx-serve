@@ -19,6 +19,19 @@ final class StoryboardTests: XCTestCase {
     }
 
     /// Every join shares one frame: a shot opens on the frame the one before it ended on.
+    /// The last two frames before each join fade toward the next shot's first frame in the clip, by a third and two thirds.
+    func testTheLastTwoFramesBeforeAJoinBlendTowardTheNextShot() {
+        let blends = Storyboard.seamBlends(shotFrames: [10, 10, 10])
+        XCTAssertEqual(blends[8]?.into, 10)
+        XCTAssertEqual(blends[8]?.weight ?? 0, 1.0 / 3, accuracy: 1e-9)
+        XCTAssertEqual(blends[9]?.into, 10)
+        XCTAssertEqual(blends[9]?.weight ?? 0, 2.0 / 3, accuracy: 1e-9)
+        XCTAssertEqual(blends[17]?.into, 19)
+        XCTAssertEqual(blends[18]?.into, 19)
+        XCTAssertEqual(blends.count, 4)
+        XCTAssertTrue(Storyboard.seamBlends(shotFrames: [10]).isEmpty)
+    }
+
     func testDeliveredFramesShareOneSeamFramePerJoin() {
         XCTAssertEqual(Storyboard.deliveredFrames([192, 192, 192]), 574)
         XCTAssertEqual(Storyboard.deliveredFrames([124]), 124)
@@ -115,6 +128,59 @@ final class StoryboardTests: XCTestCase {
         XCTAssertNil(r.audioPath)
     }
 
+    /// A shot's own last frame lands that shot; the final shot keeps the pane's last frame.
+    func testAShotsOwnLastFrameLandsItAndTheFinalShotKeepsThePanes() {
+        let middle = Storyboard.shotRequest(base: base, prompt: "b", frames: 124, index: 1, count: 3,
+                                            previousLastFrame: "/k/0.png", endFrame: "/k/1.png")
+        XCTAssertEqual(middle.firstFrameImagePath, "/k/0.png")
+        XCTAssertEqual(middle.lastFrameImagePath, "/k/1.png")
+        let last = Storyboard.shotRequest(base: base, prompt: "c", frames: 124, index: 2, count: 3,
+                                          previousLastFrame: "/k/1.png", endFrame: "/k/2.png")
+        XCTAssertEqual(last.lastFrameImagePath, "/u/last.png")
+    }
+
+    /// The next shot opens on the user's picture when there is one on disk, else on the rendered last frame.
+    func testTheNextShotOpensOnTheUsersPictureWhenItIsThere() {
+        let there: (String) -> Bool = { $0 == "/k/1.png" }
+        XCTAssertEqual(Storyboard.nextOpening(keyframe: "/k/1.png", renderedLastFrame: "/s/1.png", exists: there), "/k/1.png")
+        XCTAssertEqual(Storyboard.nextOpening(keyframe: nil, renderedLastFrame: "/s/1.png", exists: there), "/s/1.png")
+        XCTAssertEqual(Storyboard.nextOpening(keyframe: "/gone.png", renderedLastFrame: "/s/1.png", exists: there), "/s/1.png")
+    }
+
+    /// Enhance rewrites the shots; the pictures stay where they were, and the final shot has none.
+    func testEnhanceKeepsTheShotsPicturesByPosition() {
+        let old = [StoryboardSegment(prompt: "a", endFramePath: "/k/0.png"),
+                   StoryboardSegment(prompt: "b", endFramePath: "/k/1.png"),
+                   StoryboardSegment(prompt: "c")]
+        let planned = [StoryboardSegment(prompt: "x"), StoryboardSegment(prompt: "y")]
+        let kept = Storyboard.keepingEndFrames(planned, from: old)
+        XCTAssertEqual(kept.map(\.prompt), ["x", "y"])
+        XCTAssertEqual(kept.map(\.endFramePath), ["/k/0.png", nil])
+    }
+
+    /// A shot's picture that is no longer on disk is dropped on restore.
+    func testAMissingShotPictureIsDroppedOnRestore() {
+        let shots = [StoryboardSegment(prompt: "a", endFramePath: "/k/0.png"),
+                     StoryboardSegment(prompt: "b", endFramePath: "/gone.png")]
+        let restored = Storyboard.withoutMissingEndFrames(shots) { $0 == "/k/0.png" }
+        XCTAssertEqual(restored.map(\.endFramePath), ["/k/0.png", nil])
+    }
+
+    /// A shot saved before shots had pictures still reads.
+    func testAShotSavedBeforePicturesStillDecodes() throws {
+        let json = #"{"id":"6C1F3E2A-8B1D-4E6F-9A0B-2C3D4E5F6A7B","prompt":"a fox","seconds":9}"#
+        let shot = try JSONDecoder().decode(StoryboardSegment.self, from: Data(json.utf8))
+        XCTAssertEqual(shot.prompt, "a fox")
+        XCTAssertNil(shot.endFramePath)
+    }
+
+    /// A shot's own last frame is sent as the request's last frame, so every pack that storyboards must take one.
+    func testEveryPackThatStoryboardsTakesALastFrame() {
+        for preset in VideoModelPreset.all where preset.supportsStoryboard {
+            XCTAssertTrue(preset.supportsLastFrame, preset.id)
+        }
+    }
+
     func testOnlyAPackWithAKeyframeRowCanStoryboard() {
         XCTAssertTrue(VideoModelPreset.minimaxH3.supportsStoryboard)
         XCTAssertTrue(VideoModelPreset.ltx23Q4.supportsStoryboard)
@@ -143,6 +209,58 @@ final class StoryboardTests: XCTestCase {
     }
 
     /// Three 10-frame shots join into 28 frames: each later shot drops the frame it opened on.
+    /// Joined frames, decoded, as the colour at each frame's centre.
+    private func centreColours(of url: URL) async throws -> [(r: Double, g: Double, b: Double)] {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let video = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: video, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        reader.add(output)
+        XCTAssertTrue(reader.startReading())
+        var colours: [(r: Double, g: Double, b: Double)] = []
+        while let s = output.copyNextSampleBuffer() {
+            guard let px = CMSampleBufferGetImageBuffer(s) else { continue }
+            CVPixelBufferLockBaseAddress(px, .readOnly)
+            let row = CVPixelBufferGetBytesPerRow(px)
+            let p = CVPixelBufferGetBaseAddress(px)!.assumingMemoryBound(to: UInt8.self)
+                + (CVPixelBufferGetHeight(px) / 2) * row + (CVPixelBufferGetWidth(px) / 2) * 4
+            colours.append((Double(p[2]), Double(p[1]), Double(p[0])))
+            CVPixelBufferUnlockBaseAddress(px, .readOnly)
+        }
+        return colours
+    }
+
+    /// Before each join the clip fades into the next shot over two frames; nothing is added or lost.
+    /// The shots carry sound, as generated ones do: it moves the video track onto the audio's timescale.
+    func testTheJoinedClipFadesIntoEachShotOverTwoFrames() async throws {
+        let (w, h, fps, n) = (64, 64, 24, 193)
+        let sr = 16000, ch = 2
+        let pcm = Data(count: (sr * n / fps) * ch * 2)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxserve-seam-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var shots: [URL] = []
+        for (i, c) in [(UInt8(200), UInt8(0), UInt8(0)), (0, 200, 0)].enumerated() {
+            let url = dir.appendingPathComponent("shot-\(i).mp4")
+            try VideoGenService.writeMP4(rgb: rgb(frames: Array(repeating: c, count: n), width: w, height: h),
+                                         frames: n, width: w, height: h, fps: fps, to: url,
+                                         audioPCM: pcm, audioSampleRate: sr, audioChannels: ch)
+            shots.append(url)
+        }
+        let out = dir.appendingPathComponent("joined.mp4")
+        try await VideoGenService.stitchShots(shots, fps: fps, to: out)
+        let colours = try await centreColours(of: out)
+        XCTAssertEqual(colours.count, 2 * n - 1)
+        // Red, then two frames mixing toward green, mostly red then mostly green, then the green shot itself.
+        let seam = n - 1
+        XCTAssertGreaterThan(colours[seam - 2].r, 150); XCTAssertLessThan(colours[seam - 2].g, 20)
+        XCTAssertGreaterThan(colours[seam - 1].g, 40); XCTAssertGreaterThan(colours[seam - 1].r, colours[seam - 1].g)
+        XCTAssertGreaterThan(colours[seam].r, 40); XCTAssertGreaterThan(colours[seam].g, colours[seam].r)
+        XCTAssertLessThan(colours[seam + 1].r, 20); XCTAssertGreaterThan(colours[seam + 1].g, 150)
+    }
+
     func testStitchedClipDropsOneSeamFramePerJoin() async throws {
         let (w, h, fps, n) = (64, 64, 24, 10)
         let sr = 16000, ch = 2

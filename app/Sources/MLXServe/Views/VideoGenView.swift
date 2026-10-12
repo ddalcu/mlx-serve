@@ -930,10 +930,20 @@ struct VideoGenView: View {
                        in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
                     .help("How long this shot runs. Longer shots mean fewer joins.")
             }
-            TextEditor(text: shot.prompt)
-                .font(.app(.body))
-                .frame(height: 90)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+            // `.center`: the well's drop outline adds 6pt round it, so centring
+            // lines its surface up with the editor.
+            HStack(alignment: .center, spacing: 2) {
+                TextEditor(text: shot.prompt)
+                    .font(.app(.body))
+                    .frame(height: 90)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+                // The final shot lands on the pane's Last frame.
+                if index < shots.count - 1 {
+                    let endFrame = Binding<URL?>(get: { shot.wrappedValue.endFramePath.map { URL(fileURLWithPath: $0) } },
+                                                 set: { shot.wrappedValue.endFramePath = $0?.path })
+                    ShotEndFrameWell(url: endFrame, height: 90) { chooseKeyframeImage(into: endFrame) }
+                }
+            }
         }
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
@@ -947,7 +957,7 @@ struct VideoGenView: View {
             prompt = text
             return
         }
-        shots = planned
+        shots = Storyboard.keepingEndFrames(planned, from: shots)
         storyboardMode = true
     }
 
@@ -2268,7 +2278,7 @@ struct VideoGenView: View {
             .contains { Self.existingFile($0) == nil }
         refImageSize = s.refImageSize
         storyboardMode = s.storyboardMode
-        shots = s.storyboard
+        shots = Storyboard.withoutMissingEndFrames(s.storyboard)
     }
 
     private static func existingFile(_ path: String?) -> URL? {
@@ -2480,7 +2490,8 @@ struct VideoGenView: View {
     /// A storyboard runs its shots; anything else is one request.
     private func run(_ req: VideoGenRequest) {
         guard storyboardOn else { return service.generate(req, server: server) }
-        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1) }, server: server)
+        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1, $0.endFramePath) },
+                                   server: server)
     }
 
     /// Whether this pane's current selection needs the Turbo adapter fetched.
