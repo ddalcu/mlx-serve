@@ -21,13 +21,19 @@ final class StoryboardTests: XCTestCase {
     /// The last two frames before each join fade toward the middle of the next shot's first frame in the
     /// clip, by a third and two thirds, read off the frames' own times whatever their spacing.
     func testTheLastTwoFramesBeforeAJoinBlendTowardTheNextShot() {
-        let blends = Storyboard.seamBlends(keptFrames: [[0, 0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.75]],
-                                           ends: [0.4, 0.7, 0.8])
+        // Typed up front: literals inferred inside XCTAssertEqual time out the type checker on CI.
+        let kept: [[Double]] = [[0, 0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.75]]
+        let ends: [Double] = [0.4, 0.7, 0.8]
+        let frames: [Range<Double>] = [0.2..<0.3, 0.3..<0.4, 0.5..<0.6, 0.6..<0.7]
+        let into: [Double] = [0.45, 0.45, 0.725, 0.725]
+        let weights: [Double] = [1.0 / 3, 2.0 / 3, 1.0 / 3, 2.0 / 3]
+        let blends = Storyboard.seamBlends(keptFrames: kept, ends: ends)
         XCTAssertEqual(blends.map(\.join), [0, 0, 1, 1])
-        XCTAssertEqual(blends.map(\.frame), [0.2..<0.3, 0.3..<0.4, 0.5..<0.6, 0.6..<0.7])
-        XCTAssertEqual(blends.map(\.into), [0.45, 0.45, 0.725, 0.725])
-        XCTAssertEqual(blends.map(\.weight), [1.0 / 3, 2.0 / 3, 1.0 / 3, 2.0 / 3])
-        XCTAssertTrue(Storyboard.seamBlends(keptFrames: [[0, 0.1]], ends: [0.2]).isEmpty)
+        XCTAssertEqual(blends.map(\.frame), frames)
+        XCTAssertEqual(blends.map(\.into), into)
+        XCTAssertEqual(blends.map(\.weight), weights)
+        let single: [[Double]] = [[0, 0.1]]
+        XCTAssertTrue(Storyboard.seamBlends(keptFrames: single, ends: [0.2]).isEmpty)
     }
 
     /// Every join shares one frame: a shot opens on the frame the one before it ended on.
