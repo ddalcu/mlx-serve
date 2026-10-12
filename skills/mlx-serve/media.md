@@ -70,7 +70,9 @@ Response: `{"created":0,"data":[{"b64_json":"<base64 PNG>"}]}`
 prefer the JSON `mode:"edit"` body above.
 
 Sprite and texture tips: ask for a plain or solid background and cut it out
-yourself unless the model supports `transparent`. Generate at the model's native
+(`node gen.mjs cutout`) unless the model supports `transparent`; `gen.mjs tile`
+and `gen.mjs maps` make a texture seamless and derive its normal, roughness and
+AO maps. Generate at the model's native
 size and downscale; for pixel art, downscale with nearest-neighbour.
 
 ## Speech (TTS): `POST /v1/audio/speech`

@@ -1477,6 +1477,18 @@ const DflashPol = struct {
     plain_watch: ?io_util.Stopwatch = null,
 };
 
+/// One pipelined step's recurrent state: the position it describes and a refcount snapshot per layer.
+const SsmLag = struct {
+    pos: usize = 0,
+    snaps: []SSMCacheEntrySnapshot = &.{},
+
+    fn deinit(self: *SsmLag, allocator: std.mem.Allocator) void {
+        for (self.snaps) |*s| ssmSnapshotDeinit(s);
+        allocator.free(self.snaps);
+        self.* = .{};
+    }
+};
+
 pub const Generator = struct {
     /// The verify forward's inputs for a draft tree of `parents` (row 0 the root,
     /// -1) at `depth`: the GDN tree table and each row's ancestor path.
@@ -1671,6 +1683,10 @@ pub const Generator = struct {
     /// Emitted tokens past the KV cache: the last one, when the budget ended on
     /// a token the previous verify already decided. Commits key on the rest.
     unforwarded_tail: u32 = 0,
+    /// A plain pipelined step forwards the stop token and one lookahead before it sees the stop,
+    /// and recurrent state cannot be rewound: the state at the last two such steps, shared by
+    /// refcount, so a finishing slot rolls back to what it commits (`rollbackSsmTo`).
+    ssm_lag: [2]SsmLag = .{ .{}, .{} },
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
@@ -3828,6 +3844,7 @@ pub const Generator = struct {
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
         self.xfm.discardDeferredPle(&self.ctx);
+        for (&self.ssm_lag) |*lag| lag.deinit(self.xfm.allocator);
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
@@ -12247,6 +12264,38 @@ pub const Generator = struct {
         t.reset();
     }
 
+    /// Keep the recurrent state this pipelined step starts from, dropping the oldest. Solo slots
+    /// only: a live batched group's states are copies, and qwen4_exp's aux buffers are written in place.
+    fn pushSsmLag(self: *Generator) void {
+        const entries = self.ctx.ssm_entries orelse return;
+        if (self.xfm.config.isQwen4()) return;
+        for (entries) |*e| if (e.group) |g| if (g.live) return;
+        var oldest = self.ssm_lag[0];
+        self.ssm_lag[0] = self.ssm_lag[1];
+        self.ssm_lag[1] = .{};
+        for (oldest.snaps) |*s| ssmSnapshotDeinit(s);
+        if (oldest.snaps.len != entries.len) {
+            self.xfm.allocator.free(oldest.snaps);
+            oldest.snaps = self.xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len) catch return;
+        }
+        for (entries, oldest.snaps) |*e, *s| s.* = ssmSnapshot(e);
+        oldest.pos = self.ctx.moe_seq_offset.*;
+        self.ssm_lag[1] = oldest;
+    }
+
+    /// Restore the recurrent state a pipelined step started from at `pos` (the committed length), so
+    /// the finishing slot's live state is exactly what it commits. False when no kept step is there.
+    pub fn rollbackSsmTo(self: *Generator, pos: usize) bool {
+        const entries = self.ctx.ssm_entries orelse return false;
+        for (&self.ssm_lag) |*lag| {
+            if (lag.snaps.len != entries.len or lag.pos != pos) continue;
+            for (entries, lag.snaps) |*e, *s| ssmRestore(e, s) catch return false;
+            self.ctx.moe_seq_offset.* = pos;
+            return true;
+        }
+        return false;
+    }
+
     /// Returns the next token ID, or null when generation is finished.
     ///
     /// Pipeline architecture (matches mlx-lm's generator pattern):
@@ -12299,6 +12348,7 @@ pub const Generator = struct {
             defer if (!adopted) {
                 _ = mlx.mlx_array_free(lazy_token);
             };
+            self.pushSsmLag();
             if (lazyForward(self.xfm, &self.ctx, lazy_token)) |next_logits| {
                 defer if (!adopted) {
                     _ = mlx.mlx_array_free(next_logits);

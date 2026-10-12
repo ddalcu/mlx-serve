@@ -1,7 +1,9 @@
 import { Library, type LibraryItem } from "../core/library";
 import { decodeBase64 } from "../core/media";
 import { t } from "../i18n/i18n";
-import { musicLyrics, musicStyles, music3Styles, soundPrompts } from "./audio-presets";
+import type { StorageAdapter } from "../core/servers";
+import { AmpPlayer } from "./amp-player.svelte";
+import { soundPrompts } from "./audio-presets";
 import { audioReference } from "./audio-reference";
 import {
   audioDefaults,
@@ -12,6 +14,9 @@ import {
   type AudioTab,
 } from "./audio-state.svelte";
 import type { Connection } from "./connection.svelte";
+import { lyricsExamples, styleExamples } from "./music-rewrite";
+import { AIRadio, type RadioTrack } from "./radio.svelte";
+import { SafeStorage } from "./storage.svelte";
 
 type Draft = ReturnType<typeof audioDefaults>;
 export type Clip = "reference" | "source";
@@ -53,13 +58,49 @@ export class AudioWorkspace {
   #recorder: MediaRecorder | null = null;
   #mic: MediaStream | null = null;
   #recordingTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The Music tab's deck: this server's saved music, played back. */
+  readonly player: AmpPlayer;
+  readonly radio: AIRadio;
+  readonly #storage: StorageAdapter;
+  #theme = $state("");
 
-  constructor(connection: Connection, library: Library, drafts: Pick<Library, "get" | "put">) {
+  constructor(connection: Connection, library: Library, drafts: Pick<Library, "get" | "put">, storage: StorageAdapter = new SafeStorage()) {
     this.#connection = connection;
     this.library = library;
     this.drafts = drafts;
     this.c = new AudioController(library);
     this.server = connection.active.url;
+    this.#storage = storage;
+    this.#theme = storage.getItem("aiRadio.theme") ?? "";
+    this.player = new AmpPlayer(library, storage);
+    const ws = this;
+    this.radio = new AIRadio({
+      get model() {
+        return ws.model;
+      },
+      get d() {
+        return ws.d;
+      },
+      get server() {
+        return ws.server;
+      },
+      c: this.c,
+      client: () => connection.client(),
+      chatModels: () => connection.models.filter((m) => m.capabilities.includes("chat")),
+      play: (track: RadioTrack) => void this.#playNew(track),
+      isPlaying: () => this.player.active,
+    });
+    // A track that ends while the radio is on is the radio's to follow.
+    this.player.onFinish = () => this.radio.skip();
+  }
+
+  /** The AI Radio theme typed into the deck, kept for the next visit. */
+  get radioTheme() {
+    return this.#theme;
+  }
+  set radioTheme(value: string) {
+    this.#theme = value;
+    this.#storage.setItem("aiRadio.theme", value);
   }
 
   get pane() {
@@ -94,7 +135,8 @@ export class AudioWorkspace {
   }
 
   examples(field: Field): { title: string; body: string }[] {
-    return this.tab === "sound" ? soundPrompts.map((body) => ({ title: body, body })) : field === "lyrics" ? musicLyrics : this.profile?.meta ? musicStyles : music3Styles;
+    const family = this.profile?.family ?? "acestep";
+    return this.tab === "sound" ? soundPrompts.map((body) => ({ title: body, body })) : field === "lyrics" ? lyricsExamples(family) : styleExamples(family);
   }
 
   async init() {
@@ -126,6 +168,7 @@ export class AudioWorkspace {
     }
     if (epoch !== this.#hydration) return;
     this.ready = true;
+    void this.player.refresh(this.server);
     this.#signature = this.signature();
     this.connectionChanged();
   }
@@ -195,22 +238,25 @@ export class AudioWorkspace {
     this.stopRecording(true);
   }
 
-  /** Everything in flight stops: generation, recording, playback. */
+  /** Everything in flight stops: generation, the radio, recording, playback. */
   stopActivity() {
     this.#epoch++;
+    this.radio.stop();
     this.busy = false;
     this.error = "";
     if (this.c.run) this.c.cancel();
     this.leave();
   }
 
-  /** The pane closed: the microphone and playback stop, a generation keeps running. */
+  /** The pane closed: the microphone, the radio and playback stop, a generation keeps running. */
   leave() {
     this.stopRecording(true);
+    this.radio.stop();
     this.stopPlayback();
   }
 
   stopPlayback() {
+    this.player.stop();
     document.querySelectorAll<HTMLAudioElement>(".audio-screen audio").forEach((a) => {
       a.pause();
       a.currentTime = 0;
@@ -312,9 +358,17 @@ export class AudioWorkspace {
       this.stopPlayback();
       this.flush();
       await this.c.generate(this.#connection.client(), request, this.server);
+      // A finished song takes over the deck; one already playing kept playing while it was made.
+      if (request.type === "music" && this.c.phase === "completed" && this.c.result) await this.#playNew(this.c.result);
     } catch (e) {
       this.error = e instanceof Error ? e.message : t("Generation failed.");
     }
+  }
+
+  /** A new track joins the playlist and plays. */
+  async #playNew(track: RadioTrack) {
+    await this.player.refresh(this.server);
+    await this.player.play({ ...track, model: "", createdAt: Date.now(), ...this.player.tracks.find((t) => t.id === track.id) });
   }
 
   /** Show a saved history item in the preview. */

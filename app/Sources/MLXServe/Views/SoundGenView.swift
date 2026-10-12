@@ -42,7 +42,7 @@ struct SoundGenView: View {
             VStack(spacing: 12) {
                 previewArea
                 AudioHistoryShelf(paths: service.recent,
-                                  playingPath: clipPlayer.playingPath,
+                                  playingPath: clipPlayer.playingPath, paused: clipPlayer.isPaused,
                                   onPlay: { clipPlayer.play($0) }, onStop: { clipPlayer.stop() })
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.soundRoot)])

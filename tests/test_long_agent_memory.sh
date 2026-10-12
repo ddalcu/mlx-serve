@@ -91,4 +91,6 @@ fi
 
 # Drive the whole test from python so we can keep one growing message list and
 # do clean SSE/JSON parsing without bash quoting nightmares.
-exec python3 "$(dirname "$0")/test_long_agent_memory.py" "$PORT"
+# Not exec: bash has to outlive python for its EXIT trap to stop the server.
+python3 "$(dirname "$0")/test_long_agent_memory.py" "$PORT"
+exit $?

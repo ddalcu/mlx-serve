@@ -47,7 +47,7 @@ export class App {
     this.library = library;
     this.chat = new ChatWorkspace({ connection: this.connection, storage: this.storage, library, openChat: () => this.go("chat") });
     this.image = new ImageWorkspace(this.connection, library, drafts("mlx-serve-studio-image-drafts"));
-    this.audio = new AudioWorkspace(this.connection, library, drafts("mlx-serve-studio-audio-drafts"));
+    this.audio = new AudioWorkspace(this.connection, library, drafts("mlx-serve-studio-audio-drafts"), this.storage);
     this.video = new VideoWorkspace(this.connection, library, drafts("mlx-serve-studio-video-drafts"));
     this.monitor = new MonitorWorkspace(this.connection);
     const query = matchMedia("(max-width: 700px)");

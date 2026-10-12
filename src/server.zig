@@ -19,6 +19,7 @@ const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_st
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
+const glm_vision = @import("glm_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -3767,7 +3768,7 @@ fn safeContextForBudget(
 ) u32 {
     if (per_tok == 0) return 1024;
     const max_seq: u64 = contextForBudget(working_set_limit, active_mem, hot_cache_reserve, per_tok);
-    if (max_seq == 0) return 1024;
+    if (max_seq < 1024) return 1024;
 
     var result: u32 = if (max_seq > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max_seq);
     // Cap at model's max position embeddings.
@@ -4174,6 +4175,12 @@ pub fn ssdFirstPrefixCacheMem(
     return @max(ctx_kv_bytes +| idle, 1);
 }
 
+/// The cache reserve the context sizer bills: at most half the room beside the weights and the
+/// prefill, so a small Mac's context is not starved for a cache the load-time clamp shrinks anyway.
+fn ctxCacheShare(cache_reserve: u64, ceiling: u64, active_mem: u64, transient_reserve: u64) u64 {
+    return @min(cache_reserve, (ceiling -| (active_mem +| transient_reserve)) / 2);
+}
+
 /// The context a load-time bill must use, before `pinAutoContext` has run: on an auto boot
 /// `getEffectiveContextLength` re-derives through `computeMemoryContext`, which reserves the
 /// very ask being resolved and answered a 1024-token placeholder. `cache_reserve` is
@@ -4195,7 +4202,7 @@ pub fn resolvedContextForLoad(
     return autoContextFrom(safeContextForBudget(
         ceiling,
         active_mem,
-        cache_reserve +| transient_reserve,
+        ctxCacheShare(cache_reserve, ceiling, active_mem, transient_reserve) +| transient_reserve,
         per_tok,
         0,
     ), ctx_cap);
@@ -4274,10 +4281,11 @@ const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
 /// ungated archs so their advertised `context_length` does not move.
-/// The ungated arm's ask. A sliding-ring entry cannot be trimmed below its ring (`ringFloor`), so
-/// a budget under one session caches nothing for it: it asks for one session at the working context.
+/// The ungated arm's ask. A sliding-ring entry cannot be trimmed below its ring (`ringFloor`) and a
+/// hybrid entry restores only at a checkpoint, so a budget under one session keeps a stale prefix of
+/// the longest conversations: those ask for one session at the working context.
 fn ungatedHotCacheAsk(config: *const model_mod.ModelConfig, requested: u64, explicit: bool, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    if (!config.slidingRing()) return requested;
+    if (!config.slidingRing() and !config.hasSsmLayers()) return requested;
     return defaultPrefixCacheAsk(requested, explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, chunk));
 }
 
@@ -4331,7 +4339,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         if (ask > 0 and clamped < ask) {
             log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ ask >> 20, clamped >> 20 });
         } else if (ask != requested) {
-            log.info("[hot-cache] budget {d} MB (one session at the working context: a sliding-ring entry is never trimmed)\n", .{clamped >> 20});
+            log.info("[hot-cache] budget {d} MB (one session at the working context: a sliding-ring or hybrid entry restores whole or at a checkpoint)\n", .{clamped >> 20});
         } else if (requested == 0) {
             log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
         }
@@ -4671,13 +4679,11 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
     try t.expectEqual(ctx_default, ctx_big_ask);
     try t.expect(ctx_default > 900_000); // a real context, not the floor
 
-    // The defect, both spellings: sizing against the granted budget...
+    // The defect's spellings (the granted budget, the raw ask) take at most half the room, never all of it.
     const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
-    try t.expect(vs_granted <= 1024);
-    // ...and against the raw ask, which saturates usable to zero.
+    try t.expect(vs_granted >= ctx_default / 3);
     const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
-    try t.expect(vs_raw_ask <= 1024);
-    try t.expect(ctx_default > vs_granted * 500);
+    try t.expect(vs_raw_ask >= ctx_default / 3);
 }
 
 test "the clamp bills the context that will be SERVED, not the placeholder" {
@@ -5364,15 +5370,17 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
 
+    // Real reachable ceiling, so auto-context shrinks under external memory pressure (#64).
+    const ceiling = currentGpuMemoryCeiling(config, active_mem);
+    const transient = prefillTransientReserve(config, kv_bits, chunk);
     return safeContextForBudget(
-        // Real reachable ceiling, so auto-context shrinks under external memory pressure (#64).
-        currentGpuMemoryCeiling(config, active_mem),
+        ceiling,
         active_mem,
         // The hot prefix cache fills to this cap over a session, and a prefill has to land on
         // top of whatever context we report. `CTX_SIZING_CACHE_RESERVE`, not the resolved
         // budget and not the ask: the ask starved the context, the resolved budget was a
         // one-step loop. Gated: off the gate this is the raw ask, so `/v1/models` is unchanged.
-        ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk),
+        ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient,
         per_tok,
         // 0 = do not clamp to the checkpoint's max here; the caller applies it after the margin.
         0,
@@ -6037,6 +6045,44 @@ pub const AdmissionBill = struct {
     }
 };
 
+/// Unloads idle resident models, least recently used first, until `fits` holds; false when
+/// nothing idle is left. An idle model is memory its next request reloads.
+pub fn fitAfterUnloadingIdle(ctx: anytype, fits: fn (@TypeOf(ctx)) bool, unloadOne: fn (@TypeOf(ctx)) bool) bool {
+    while (!fits(ctx)) if (!unloadOne(ctx)) return false;
+    return true;
+}
+
+test "a prompt that does not fit unloads idle models, oldest first, until it fits" {
+    const t = std.testing;
+    const Fake = struct {
+        needed: u64,
+        available: u64,
+        idle: []const u64, // resident bytes, least recently used first
+        unloaded: usize = 0,
+        fn fits(f: *@This()) bool {
+            return f.needed <= f.available;
+        }
+        fn unloadOne(f: *@This()) bool {
+            if (f.unloaded == f.idle.len) return false;
+            f.available += f.idle[f.unloaded];
+            f.unloaded += 1;
+            return true;
+        }
+    };
+    // Already fits: nothing is unloaded.
+    var a = Fake{ .needed = 5, .available = 9, .idle = &.{ 15, 3 } };
+    try t.expect(fitAfterUnloadingIdle(&a, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 0), a.unloaded);
+    // The live shape: GLM's prompt needs 10.5 GB beside 9.4 GB free and an idle 14.7 GB image model.
+    var b = Fake{ .needed = 10_558, .available = 9_466, .idle = &.{ 14_730, 8_000 } };
+    try t.expect(fitAfterUnloadingIdle(&b, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 1), b.unloaded);
+    // Nothing idle left to give back: still refused.
+    var c = Fake{ .needed = 50, .available = 9, .idle = &.{ 15, 3 } };
+    try t.expect(!fitAfterUnloadingIdle(&c, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 2), c.unloaded);
+}
+
 test "a refusal names the credit it COMPARED, never the residency it cannot take" {
     const t = std.testing;
     const mb: u64 = 1024 * 1024;
@@ -6548,9 +6594,36 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         });
         return true;
     }
-    if (needed > available) {
-        const needed_mb = needed / (1024 * 1024);
-        const avail_mb = available / (1024 * 1024);
+    if (needed > available) if (global_scheduler) |sch| {
+        const Rebill = struct {
+            sch: *scheduler_mod.Scheduler,
+            keep: []const u8,
+            bill: *AdmissionBill,
+            config: *const model_mod.ModelConfig,
+            prompt_ids: []const u32,
+            max_tokens: u32,
+            kv_override: ?transformer_mod.KVQuantConfig,
+            unchunked: bool,
+            enable_mtp: bool,
+            media_bytes: u64,
+            fn fits(r: *@This()) bool {
+                return r.bill.fits();
+            }
+            fn unloadOne(r: *@This()) bool {
+                const id = r.sch.idleModelToUnload(r.keep) orelse return false;
+                log.info("  prompt {d} tokens does not fit — unloading idle model {s} first\n", .{ r.prompt_ids.len, id });
+                r.sch.unloadModelIfIdle(id, 0) catch return false;
+                r.bill.* = prefillAdmissionBill(r.config, r.prompt_ids.len, r.max_tokens, r.kv_override, r.unchunked, r.prompt_ids, .{ .mtp_on = r.enable_mtp });
+                r.bill.needed += r.media_bytes;
+                return true;
+            }
+        };
+        var rebill = Rebill{ .sch = sch, .keep = lm.id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked = unchunked_prefill, .enable_mtp = enable_mtp, .media_bytes = media_bytes };
+        if (fitAfterUnloadingIdle(&rebill, Rebill.fits, Rebill.unloadOne)) return true;
+    };
+    if (bill.needed > bill.available) {
+        const needed_mb = bill.needed / (1024 * 1024);
+        const avail_mb = bill.available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
         // is evictable here by construction (the withheld case took the deferral arm).
@@ -14774,6 +14847,14 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
             .pixels_tolerance = config.lv_pixels_tolerance,
         };
     }
+    if (config.glm_vision) return .{
+        .mode = .glm,
+        .patch = config.qv_patch,
+        .tps = config.qv_temporal_patch,
+        .merge = config.qv_merge,
+        .min_tokens = config.glmv_min_image_tokens,
+        .max_tokens = config.glmv_max_image_tokens,
+    };
     if (config.isEmbeddingGemma2()) return .{
         .mode = .gemma_budget,
         .patch = config.vision_patch_size,
@@ -14841,6 +14922,23 @@ test "visionPreprocFromConfig threads each tower's processor bounds" {
     try std.testing.expectEqual(.gemma, visionPreprocFromConfig(&.{}).mode);
 }
 
+test "GLM-5.3-Flash images decode onto the processor's padded canvas" {
+    const glm = visionPreprocFromConfig(&.{ .glm_vision = true, .qv_patch = 14, .qv_temporal_patch = 2, .qv_merge = 2, .glmv_min_image_tokens = 16, .glmv_max_image_tokens = 8000 });
+    try std.testing.expectEqual(.glm, glm.mode);
+    try std.testing.expectEqual(@as(u32, 8000), glm.max_tokens);
+    const a = std.testing.allocator;
+    const jpeg = try @import("clef_http_test.zig").readFile(std.testing.io, "tests/fixtures/house.jpeg");
+    defer a.free(jpeg);
+    const img = decodeImageToPixels(a, jpeg, glm) orelse return error.BadImage;
+    defer a.free(img.pixels);
+    // 730x487 fits the budget: padded to 756x504, never resized (the reference's own numbers).
+    try std.testing.expectEqual(@as(u32, 756), img.width);
+    try std.testing.expectEqual(@as(u32, 504), img.height);
+    try std.testing.expectEqual(@as(u32, 36), img.grid_h);
+    try std.testing.expectEqual(@as(u32, 54), img.grid_w);
+    try std.testing.expectEqual(@as(usize, 36 * 54 * 3 * 2 * 14 * 14 * 4), img.pixels.len);
+}
+
 test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma format)" {
     // Live crash 2026-08-11: the app preprocesses images into Gemma's square
     // `x-mlx-pixels` buffer unless it recognises the arch, so Muse-Glimmer got
@@ -14854,7 +14952,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     try std.testing.expectEqual(@as(u32, 2), gemma.width);
     try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
 
-    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .gemma_budget } }) |vp| {
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .glm }, .{ .mode = .gemma_budget } }) |vp| {
         try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
     }
 }
@@ -15282,6 +15380,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
         const img = vision_mod.budgetPixels(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens) catch return null;
         log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW ({d} soft tokens)\n", .{ src_w, src_h, img.w, img.h, (img.h / vp.patch / vp.merge) * (img.w / vp.patch / vp.merge) });
         return .{ .pixels = img.pixels, .width = img.w, .height = img.h };
+    }
+
+    if (vp.mode == .glm) {
+        const pv = glm_vision.preprocess(allocator, src.rgb, src_h, src_w, vp.patch, vp.tps, vp.merge, vp.min_tokens, vp.max_tokens) catch return null;
+        log.info("  Decoded {d}x{d} image → glm grid {d}x{d} ({d} tokens, canvas {d}x{d})\n", .{ src_w, src_h, pv.grid_h, pv.grid_w, (pv.grid_h / vp.merge) * (pv.grid_w / vp.merge), pv.w, pv.h });
+        return .{ .pixels = pv.bytes, .width = pv.w, .height = pv.h, .grid_h = pv.grid_h, .grid_w = pv.grid_w };
     }
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
@@ -20887,6 +20991,24 @@ test "safeContextForBudget floors when memory is exhausted and caps at max_pos" 
     try testing.expectEqual(@as(u32, 4096), safeContextForBudget(256 * GB, 0, 0, per_tok, 4096));
     // Degenerate per_tok never divides by zero.
     try testing.expectEqual(@as(u32, 1024), safeContextForBudget(8 * GB, 0, 0, 0, 0));
+    // A budget that fits a few tokens gets the same floor as one that fits none.
+    try testing.expectEqual(@as(u32, 1024), safeContextForBudget(6 * GB + 100 * per_tok, 6 * GB, 0, per_tok, 0));
+}
+
+test "context sizer: the prompt-cache reserve never takes more than half the room beside the weights" {
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const per_tok: u64 = 28 * 1024;
+    const transient: u64 = 300 * MiB;
+    const reserve: u64 = 2048 * MiB;
+
+    // 16 GB Mac, 8 GB pack: 1.8 GB beside the weights. A full 2 GB reserve left the context 870 tokens.
+    const small = resolvedContextForLoad(0, 0, 10_200 * MiB, 8_100 * MiB, reserve, transient, per_tok, 262_144);
+    try t.expect(small >= 16_384);
+
+    // 128 GB Mac: the room dwarfs the reserve, which is billed in full as before.
+    const big = resolvedContextForLoad(0, 0, 100_000 * MiB, 60_000 * MiB, reserve, transient, per_tok, 0);
+    try t.expectEqual(autoContextFrom(safeContextForBudget(100_000 * MiB, 60_000 * MiB, reserve +| transient, per_tok, 0), 0), big);
 }
 
 test "kvBytesPerTokenAtBits: the KV bill follows the CONFIGURED quant width" {
@@ -23275,7 +23397,7 @@ test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill m
     try t.expect(!mlxMemoryGuardApplies(false, true));
 }
 
-test "ungatedHotCacheAsk: a sliding-ring arch asks for one whole session, every other arch keeps its ask" {
+test "ungatedHotCacheAsk: a sliding-ring or hybrid arch asks for one whole session, every other arch keeps its ask" {
     const t = std.testing;
     const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 4, .head_dim = 192, .v_head_dim = 128, .num_key_value_heads = 8, .num_global_key_value_heads = 4, .sliding_window = 128, .sliding_window_pattern = 4 };
     const session = oneSessionEntryBytes(&mimo, 16, 1_000_000, 8192);
@@ -23285,6 +23407,11 @@ test "ungatedHotCacheAsk: a sliding-ring arch asks for one whole session, every 
     try t.expectEqual(@as(u64, 1 << 30), ungatedHotCacheAsk(&mimo, 1 << 30, true, 16, 100_000, 8192));
     const llama: model_mod.ModelConfig = .{ .model_type = "llama" };
     try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, ungatedHotCacheAsk(&llama, PREFIX_CACHE_MEM_DEFAULT, false, 16, 100_000, 8192));
+    // A hybrid entry restores only at a checkpoint, so a budget under one session keeps a stale prefix.
+    const qwen: model_mod.ModelConfig = .{ .model_type = "qwen3_5", .num_hidden_layers = 64, .head_dim = 256, .num_attention_heads = 24, .num_key_value_heads = 4, .full_attention_interval = 4 };
+    const qwen_session = oneSessionEntryBytes(&qwen, 16, 262_144, 8192);
+    try t.expect(qwen_session > PREFIX_CACHE_MEM_DEFAULT);
+    try t.expectEqual(qwen_session, ungatedHotCacheAsk(&qwen, PREFIX_CACHE_MEM_DEFAULT, false, 16, 262_144, 8192));
 }
 
 test "slotFixedKvBytes: a MiMo slot bills its sliding rings once, at keep + one chunk of rows" {
@@ -23989,7 +24116,7 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
     // The sizer reserves the constant, not the ask or the resolved budget.
-    try t.expect(std.mem.indexOf(u8, src, "ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient") != null);
 }
 
 test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB" {

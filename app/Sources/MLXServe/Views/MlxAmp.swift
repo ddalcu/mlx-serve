@@ -464,84 +464,10 @@ struct MlxAmpSlider: View {
 
 // MARK: - Live (animated) drawing
 
-/// An AppKit view that draws a region of the skin and redraws itself on its own timer, so a
-/// moving spectrum or title costs a draw of that one view and not a layout of the window.
-/// The timer runs only while `shouldRun` says something is moving and the window is on screen.
-final class MlxAmpLiveView: NSView {
-    var draw: @MainActor (Px) -> Void = { _ in }
-    var shouldRun: @MainActor () -> Bool = { false }
-    var fps: @MainActor () -> Double = { 0 }
-    /// Pointer x in skin pixels, for a view that takes drags (the seek bar).
-    var onDrag: (@MainActor (CGFloat) -> Void)?
-
-    private var timer: Timer?
-    private var observers: [NSObjectProtocol] = []
-
-    override var isFlipped: Bool { true }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        layerContentsRedrawPolicy = .onSetNeedsDisplay
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    deinit {
-        timer?.invalidate()
-        observers.forEach(NotificationCenter.default.removeObserver)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard let cg = NSGraphicsContext.current?.cgContext else { return }
-        cg.setShouldAntialias(false)
-        cg.scaleBy(x: MlxAmpStyle.scale, y: MlxAmpStyle.scale)
-        draw(Px(cg: cg))
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        observers.forEach(NotificationCenter.default.removeObserver)
-        observers = []
-        let center = NotificationCenter.default
-        // A slower machine state, or a window that is hidden or covered, changes what is worth drawing.
-        for name in [Notification.Name.NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
-            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.reschedule() })
-        }
-        if let window {
-            observers.append(center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak self] _ in
-                self?.reschedule()
-            })
-        }
-        reschedule()
-    }
-
-    /// Redraw once, then run the timer only if something is moving and the window can be seen.
-    func reschedule() {
-        timer?.invalidate()
-        timer = nil
-        needsDisplay = true
-        guard let window, window.occlusionState.contains(.visible), shouldRun() else { return }
-        let rate = fps()
-        guard rate > 0 else { return }
-        let t = Timer(timeInterval: 1 / rate, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.needsDisplay = true
-            if !self.shouldRun() { self.reschedule() }
-        }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
-    }
-
-    private func skinX(_ event: NSEvent) -> CGFloat { convert(event.locationInWindow, from: nil).x / MlxAmpStyle.scale }
-    override func mouseDown(with event: NSEvent) { onDrag?(skinX(event)); needsDisplay = true }
-    override func mouseDragged(with event: NSEvent) { onDrag?(skinX(event)); needsDisplay = true }
-}
-
-/// SwiftUI's door to `MlxAmpLiveView`. SwiftUI hands it new closures when the player's state
-/// changes (a track starts, pauses, stops); between those, only the view's own timer draws.
-struct MlxAmpLive: NSViewRepresentable {
+/// A region of the skin drawn by a `LiveCanvasView`: pixels unsmoothed at the skin's scale, a
+/// pointer reported in skin pixels. Sized in skin pixels; between state changes only its own
+/// timer draws.
+struct MlxAmpLive: View {
     let width: CGFloat
     let height: CGFloat
     let shouldRun: @MainActor () -> Bool
@@ -549,23 +475,15 @@ struct MlxAmpLive: NSViewRepresentable {
     var onDrag: (@MainActor (CGFloat) -> Void)?
     let draw: @MainActor (Px) -> Void
 
-    func makeNSView(context: Context) -> MlxAmpLiveView { configured(MlxAmpLiveView(frame: .zero)) }
-
-    func updateNSView(_ view: MlxAmpLiveView, context: Context) {
-        _ = configured(view)
-        view.reschedule()
-    }
-
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: MlxAmpLiveView, context: Context) -> CGSize? {
-        CGSize(width: width * MlxAmpStyle.scale, height: height * MlxAmpStyle.scale)
-    }
-
-    private func configured(_ view: MlxAmpLiveView) -> MlxAmpLiveView {
-        view.draw = draw
-        view.shouldRun = shouldRun
-        view.fps = fps
-        view.onDrag = onDrag
-        return view
+    var body: some View {
+        let draw = draw
+        LiveCanvas(shouldRun: shouldRun, fps: fps,
+                   onPointer: onDrag.map { drag in { point, _ in drag(point.x / MlxAmpStyle.scale) } }) { cg, _ in
+            cg.setShouldAntialias(false)
+            cg.scaleBy(x: MlxAmpStyle.scale, y: MlxAmpStyle.scale)
+            draw(Px(cg: cg))
+        }
+        .frame(width: width * MlxAmpStyle.scale, height: height * MlxAmpStyle.scale)
     }
 }
 
@@ -677,8 +595,9 @@ struct MlxAmpPlayer: View {
 
     var body: some View {
         let info = status == nil ? AudioClipPlayer.info(path) : nil
-        let active = status == nil && player.playingPath == path
-        let playing = active && !player.isPaused
+        let deck = DeckActions(player: player, radio: radio, path: path, status: status,
+                               onRadioStart: onRadioStart, onRadioStop: onRadioStop)
+        let playing = deck.playing
         let total = info?.seconds ?? 0
         // The right-hand cluster starts a gap clear of the clock/spectrum screen.
         let rx: CGFloat = 115, rw = width - rx - 9
@@ -727,7 +646,7 @@ struct MlxAmpPlayer: View {
                 if case .failed = status, let onShowLog {
                     MlxAmpTextKey(text: "LOG", width: 24, height: 12, help: "Show log", action: onShowLog).px(width - 59, 58, 24, 12)
                 } else {
-                    MlxAmpTextKey(text: "M4A", width: 24, height: 12, help: "Export as M4A") { if !path.isEmpty { AudioExport.exportAndReveal(path) } }
+                    MlxAmpTextKey(text: "M4A", width: 24, height: 12, help: "Export as M4A") { deck.press(.export) }
                         .px(width - 59, 58, 24, 12)
                 }
 
@@ -745,25 +664,24 @@ struct MlxAmpPlayer: View {
                     .px(16, 72, seekWidth, 10)
 
                 // Transport.
-                MlxAmpGlyphKey(glyph: .prev, width: 23, height: 18, help: "Previous") { player.advance(-1, from: path) }
-                    .locked(radio.isOn).px(16, 88, 23, 18)
+                MlxAmpGlyphKey(glyph: .prev, width: 23, height: 18, help: "Previous") { deck.press(.previous) }
+                    .locked(deck.isLocked(.previous)).px(16, 88, 23, 18)
                 MlxAmpGlyphKey(glyph: playing ? .pause : .play, width: 23, height: 18, help: playing ? "Pause" : "Play") {
-                    if active { player.togglePause() } else if !path.isEmpty { player.play(path) }
+                    deck.press(.playPause)
                 }.px(39, 88, 23, 18)
-                MlxAmpGlyphKey(glyph: .stop, width: 23, height: 18, help: "Stop") { if radio.isOn { onRadioStop() } else { player.stop() } }.px(62, 88, 23, 18)
-                MlxAmpGlyphKey(glyph: .next, width: 22, height: 18, help: "Next") { if radio.isOn { radio.skip() } else { player.advance(1, from: path) } }.px(85, 88, 22, 18)
-                MlxAmpGlyphKey(glyph: .eject, width: 22, height: 16, help: "Reveal in Finder") {
-                    if !path.isEmpty { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
-                }.px(113, 89, 22, 16)
-                MlxAmpTextKey(text: "SHUFFLE", led: player.shuffle, width: 56, height: 15, help: "Shuffle") { player.shuffle.toggle() }
-                    .locked(radio.isOn).px(138, 89, 56, 15)
-                MlxAmpRepeatKey(lit: player.autoNext) { player.autoNext.toggle() }
-                    .locked(radio.isOn).px(194, 89, 28, 15)
+                MlxAmpGlyphKey(glyph: .stop, width: 23, height: 18, help: "Stop") { deck.press(.stop) }.px(62, 88, 23, 18)
+                MlxAmpGlyphKey(glyph: .next, width: 22, height: 18, help: "Next") { deck.press(.next) }.px(85, 88, 22, 18)
+                MlxAmpGlyphKey(glyph: .eject, width: 22, height: 16, help: "Reveal in Finder") { deck.press(.reveal) }
+                    .px(113, 89, 22, 16)
+                MlxAmpTextKey(text: "SHUFFLE", led: player.shuffle, width: 56, height: 15, help: "Shuffle") { deck.press(.shuffle) }
+                    .locked(deck.isLocked(.shuffle)).px(138, 89, 56, 15)
+                MlxAmpRepeatKey(lit: player.autoNext) { deck.press(.repeatAll) }
+                    .locked(deck.isLocked(.repeatAll)).px(194, 89, 28, 15)
 
                 // AI Radio: the key starts and stops the station; the screen takes its theme.
                 MlxAmpTextKey(text: "RADIO", led: radio.isOn, width: 46, height: 15,
                               help: radio.isOn ? "Stop AI Radio" : "Start AI Radio") {
-                    if radio.isOn { onRadioStop() } else { onRadioStart() }
+                    deck.press(.radio)
                 }.px(16, 111, 46, 15)
                 if radio.isOn {
                     // The strip is the progress bar: it redraws on its own timer, never through SwiftUI.

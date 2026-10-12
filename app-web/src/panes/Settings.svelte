@@ -21,6 +21,7 @@
     accent: [t("System"), t("Blue"), t("Purple"), t("Pink"), t("Red"), t("Orange"), t("Yellow"), t("Green"), t("Graphite")],
     textSize: [t("Small"), t("Default"), t("Large"), t("Extra Large")],
     column: [t("Narrow"), t("Medium"), t("Wide")],
+    audioPlayer: [t("Modern"), "MLX-Amp"],
   });
 
   let query = $state("");
@@ -97,7 +98,7 @@
   </div>
 {/snippet}
 
-{#snippet pick(field: "accent" | "textSize")}
+{#snippet pick(field: "accent" | "textSize" | "audioPlayer")}
   <select id={field} value={prefs[field]} onchange={(e) => prefs.set(field, e.currentTarget.value as never)}>
     {#each choices[field] as value, i}<option {value}>{labels[field][i]}</option>{/each}
   </select>
@@ -139,6 +140,8 @@
           <input id="compact" type="checkbox" role="switch" checked={prefs.compact} onchange={(e) => prefs.set("compact", e.currentTarget.checked)} />
         {/snippet}
         {@render setting("compact", t("Compact Mode"), t("Tighter spacing between messages — more of the conversation on screen."), compact)}
+        {#snippet audioPlayer()}{@render pick("audioPlayer")}{/snippet}
+        {@render setting("audioPlayer", t("Audio Player"), t("How the Voice, Music and Sound tabs show the player and your history."), audioPlayer)}
       </div>
 
       <div class="settings-section" data-section="providers">

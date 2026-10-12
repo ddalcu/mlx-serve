@@ -1,9 +1,11 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
+  import type { IconName } from "../lib/icons";
   import Icon from "./Icon.svelte";
 
   // A button that opens a native popover of choices. Items are buttons with a data-value; arrows, Home/End and typeahead move.
-  let { id, label, onchoose, disabled = false, children }: { id: string; label: string; onchoose: (value: string) => void; disabled?: boolean; children: Snippet } = $props();
+  // With `icon`, the trigger is that glyph alone and `label` is its name.
+  let { id, label, onchoose, disabled = false, icon, children }: { id: string; label: string; onchoose: (value: string) => void; disabled?: boolean; icon?: IconName; children: Snippet } = $props();
   let trigger: HTMLButtonElement;
   let popup: HTMLElement;
   let expanded = $state(false);
@@ -72,7 +74,9 @@
   <button
     type="button"
     {id}
-    class="chip"
+    class={icon ? "icon-button" : "chip"}
+    aria-label={icon ? label : undefined}
+    title={icon ? label : undefined}
     aria-haspopup="menu"
     aria-expanded={expanded}
     aria-controls="{id}-menu"
@@ -86,7 +90,7 @@
       }
     }}
   >
-    <span>{label}</span><Icon name="chevron-down" />
+    {#if icon}<Icon name={icon} />{:else}<span>{label}</span><Icon name="chevron-down" />{/if}
   </button>
   <span id="{id}-menu" class="image-menu-popup" popover="auto" role="menu" tabindex="-1" aria-labelledby={id} bind:this={popup} onbeforetoggle={(e) => e.newState === "closed" && (expanded = false)} onclick={pick} onkeydown={keys}>
     {@render children()}

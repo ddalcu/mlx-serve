@@ -3,9 +3,12 @@
   import type { ItemType, Library, LibraryItem } from "../../lib/core/library";
   import { download } from "../../lib/download";
   import { t } from "../../lib/i18n/i18n";
+  import type { Track, WavInfo } from "../../lib/state/amp-player.svelte";
+  import ModernHistory from "./ModernHistory.svelte";
 
-  // The clips saved for this server and tab, newest first.
-  let { library, server, type, onpick }: { library: Library; server: string; type: ItemType; onpick: (item: LibraryItem) => void } = $props();
+  // The clips saved for this server and tab, newest first; `modern` draws them in the Modern look.
+  type Props = { library: Library; server: string; type: ItemType; modern: boolean; info: (row: Track) => Promise<WavInfo | null>; onpick: (item: LibraryItem) => void };
+  let { library, server, type, modern, info, onpick }: Props = $props();
   const STEP = 60;
   let limit = $state(STEP);
   let rows = $state<Omit<LibraryItem, "blob">[]>([]);
@@ -31,6 +34,9 @@
 
 {#if failed}
   {t("Could not read audio saved in this browser.")}
+{:else if modern}
+  <ModernHistory id="audio-history" rows={rows.slice(0, limit)} {info} onplay={(r) => void open(r.id!, false)} ondownload={(r) => void open(r.id!, true)} />
+  {#if rows.length > limit}<button id="audio-more" type="button" onclick={() => (limit += STEP)}>{t("Show more")}</button>{/if}
 {:else}
   <h2>{t("History")}</h2>
   <div class="audio-history">

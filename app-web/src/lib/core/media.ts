@@ -4,7 +4,7 @@ import { parseEvent, readSSE } from "./sse";
 import type { RequestOptions } from "./client";
 export type MediaOptions = RequestOptions & { stream?: boolean; onProgress?: (event: Record<string, unknown>) => void; };
 
-export type MediaResult = { blob: Blob; elapsedMs: number; wireBytes: number; };
+export type MediaResult = { blob: Blob; elapsedMs: number; wireBytes: number; abc?: string; };
 
 function decodeBase64(value: unknown, maxBytes = 64 * 1024 * 1024): Uint8Array<ArrayBuffer> {
   if (typeof value !== "string" || value.length === 0)
@@ -169,6 +169,8 @@ async function audioRequest(client: Client, path: string, body: Record<string, u
     return {
       ...result,
       blob: wavBlob(decodeBase64(result.payload.data, maxWavBytes)),
+      // YuE2's `complete` event carries the score the song was rendered from.
+      ...(typeof result.payload.abc === "string" ? { abc: result.payload.abc } : {}),
     };
   }
   const bytes = await client.bytes(

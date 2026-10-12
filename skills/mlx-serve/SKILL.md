@@ -58,6 +58,9 @@ download one in the MLX Core app (Models). Do not invent an id.
 
 ## Rules for apps and games
 
+- Building a 3D game or scene? Read games.md first: movement, foliage and lighting rules,
+  and `gen.mjs` (next to this file, Node 18+), which generates and post-processes every
+  asset from one `assets.json` (`node gen.mjs help`).
 - Generate media AHEAD of time or in the background, never on the frame or
   input path. Cache results on disk keyed by model + prompt + seed + size, and
   ship the cache (or regenerate lazily) instead of calling on every run.

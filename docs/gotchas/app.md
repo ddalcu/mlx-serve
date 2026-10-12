@@ -865,6 +865,10 @@ Defect: the trash button on the last Providers row crashed the app (`Array._chec
 
 Defect: window moves and typing stuttered while photos or generated media were on screen. Cause: drop wells, reference tiles, previews and chat attachment bubbles built full-size `NSImage`s on the main thread, several straight from `body`, which re-runs on every streamed token and progress tick. Fix: `MediaImage` downsamples with ImageIO off the main thread and caches the result by path, mtime, size and display size; video frames and WAV payloads decode their base64 off the main actor too. Guard: `MediaImageTests`.
 
+## The AI Radio banner ran under the sidebar
+
+Defect: while AI Radio ran, the Music pane's grey "Settings are locked" bar reached past the column and showed under the sidebar. Cause: `.background(.regularMaterial)` takes a shape STYLE, and that overload fills the safe areas (`ignoresSafeAreaEdges: .all`); the floating sidebar covers the detail's leading safe area, so the material drew there. A `.background(view)` stays in bounds, which is why the panes' other cards never did it. Fix: `RadioLockBanner` is a card inside the column's margin, its material drawn `in:` a rounded rectangle, set above the settings with `safeAreaInset`; with the sidebar hidden it no longer touches the window's edge either. Guard: `RadioLockBannerTests` (renders the banner beside a leading safe area and reads the pixels there and in the margin).
+
 ### Composer note recovery must wait for the IME
 
 Recovering a steering note while the composer held marked text lost the note:

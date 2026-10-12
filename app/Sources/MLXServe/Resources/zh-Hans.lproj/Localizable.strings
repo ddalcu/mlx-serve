@@ -37,6 +37,7 @@
 "0 uses remaining context. Context and memory limits still apply." = "0 使用剩余上下文。上下文和内存限制仍然适用。";
 "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. Effort words map against this budget." = "API：reasoning_budget_tokens。-1 表示无限制；0 立即结束思考。推理强度词按此预算换算。";
 "Explicit client thinking or effort wins unless locked." = "未锁定时，以客户端明确指定的思考或努力级别为准。";
+"Export as M4A" = "导出为 M4A";
 "Mapped to the model's template vocabulary. Numeric thinking budget is a separate control." = "映射到模型模板的词汇。数值思考预算是独立控制项。";
 "Client values win unless Ignore client override is checked." = "未勾选“忽略客户端覆盖”时，以客户端值为准。";
 "This resets every section — Server, Speculative Decoding, Performance, Generation Defaults, Voice, Agent Sandbox and Messaging — not just the one you're looking at. Your Telegram bot token is kept, since only @BotFather can reissue it. Generation defaults apply to the next request; launch flags apply after Restart Now." = "这会重置所有区块 —— 服务器、投机解码、性能、生成默认值、语音、Agent 沙盒和消息 —— 而不只是当前区块。Telegram 机器人令牌会保留，因为只有 @BotFather 才能重新签发。生成默认值在下一次请求生效；启动参数在点击“立即重启”后生效。";
@@ -240,6 +241,8 @@
 "Agent workspace folder" = "Agent 工作区文件夹";
 "Agents" = "智能体";
 "Agents…" = "智能体…";
+"AI Radio is running. Settings are locked until you stop it." = "AI 电台正在播放。停止之前设置保持锁定。";
+"AI Radio theme, e.g. mellow lo-fi for coding" = "AI 电台主题，例如：适合写代码的舒缓 lo-fi";
 "Alibaba's second-generation image model — strong prompt understanding and in-image text, in English and Chinese. Undistilled: 40 steps by default, so it is slower than the Turbo models. Open (Apache-2.0)." = "阿里巴巴的第二代图像模型 —— 提示词理解力强，擅长画面内文字，中英文皆可。未蒸馏：默认 40 步，因此比 Turbo 系列更慢。开源（Apache-2.0）。";
 "All Settings" = "所有设置";
 "All machines" = "所有机器";
@@ -298,6 +301,7 @@
 "Audio file" = "音频文件";
 "Audio generation" = "音频生成";
 "Audio guidance" = "音频引导";
+"Audio Player" = "音频播放器";
 "Audio · %.1fs" = "音频 · %.1fs";
 "Authorization Header" = "Authorization 请求头";
 "Authorization was cancelled." = "授权已取消。";
@@ -1019,7 +1023,9 @@
 "Models" = "模型";
 "Models at %@" = "模型位于 %@";
 "Models, comma-separated — only these are exposed; empty = all the provider lists" = "模型，以逗号分隔 —— 只对外暴露这些模型；留空 = 提供商列出的全部模型";
+"Modern" = "现代";
 "Modern pop" = "现代流行";
+"Mono" = "单声道";
 "Mood / colour grade" = "氛围 / 调色";
 "More Models" = "更多模型";
 "More options" = "更多选项";
@@ -1217,6 +1223,12 @@
 "Pinned llama.cpp release serving `.gguf` models. Ships inside the app download." = "锁定版本的 llama.cpp，用于对外提供 `.gguf` 模型服务。随应用下载一同提供。";
 "Plan (%lld steps)" = "计划（%lld 步）";
 "Play" = "播放";
+"Play the next track when one ends" = "一首播完后自动播放下一首";
+"More" = "更多";
+"Today" = "今天";
+"Yesterday" = "昨天";
+"Earlier" = "更早";
+"Playlist" = "播放列表";
 "Pods, deployments, services — uses your local kubeconfig" = "Pod、部署、服务 —— 使用你本地的 kubeconfig";
 "Polish" = "波兰语";
 "Pop hook" = "流行洗脑段";
@@ -1239,6 +1251,7 @@
 "Preview reference" = "试听参考音频";
 "Preview source" = "预览来源";
 "Preview the clip" = "预览片段";
+"Previous" = "上一首";
 "Previous version of this reply" = "这条回复的上一个版本";
 "Privacy: prompts sent to a model you share are processed on — and visible to — this Mac. Prompts you send to a network model are visible to the Mac hosting it. Traffic stays on your local network, and everything here is off unless you turn it on." = "隐私：发送给你所共享模型的提示词会在这台 Mac 上处理，并对它可见。你发送给网络模型的提示词对托管该模型的 Mac 可见。流量始终停留在你的局域网内，这里的一切功能在你开启之前都是关闭的。";
 "Pro (black)" = "Pro（黑色）";
@@ -1274,6 +1287,7 @@
 "Qwen3-TTS 0.6B bf16 (full precision, ~2.5 GB)" = "Qwen3-TTS 0.6B bf16（全精度，约 2.5 GB）";
 "Qwen3-TTS 1.7B 8-bit (quality, ~3.1 GB)" = "Qwen3-TTS 1.7B 8-bit（高质量，约 3.1 GB）";
 "Qwen3-TTS 1.7B bf16 (max fidelity, ~4.5 GB)" = "Qwen3-TTS 1.7B bf16（最高保真，约 4.5 GB）";
+"Radio" = "电台";
 "RAM Est." = "内存估算";
 "Raw JSON" = "原始 JSON";
 "Re-pull Image" = "重新拉取镜像";
@@ -1330,6 +1344,7 @@
 "Rename…" = "重命名…";
 "Rendering audio" = "正在渲染音频";
 "Rendering video" = "正在渲染视频";
+"Repeat" = "循环播放";
 "Repeat penalty" = "重复惩罚";
 "Repetition penalty" = "重复惩罚";
 "Replace the background" = "替换背景";
@@ -1444,6 +1459,7 @@
 "Search the web" = "搜索网页";
 "Search the workspace" = "搜索工作区";
 "Seed" = "种子";
+"Seek" = "跳转";
 "Segmentation map" = "分割图";
 "Select Working Directory" = "选择工作目录";
 "Select a model" = "选择模型";
@@ -1496,6 +1512,7 @@
 "Showing %lld models" = "显示 %lld 个模型";
 "Shown to others as" = "对他人显示为";
 "Shrink the subject" = "缩小主体";
+"Shuffle" = "随机播放";
 "Simulate" = "模拟";
 "Size" = "大小";
 "Size on Disk" = "磁盘占用";
@@ -1539,6 +1556,7 @@
 "Start a chat with %@" = "与 %@ 开始聊天";
 "Start a fresh conversation with this agent — the old one stays in the chat list" = "与这个 Agent 开始新对话 —— 旧对话会保留在聊天列表中";
 "Start a new chat from this message" = "从这条消息开始新聊天";
+"Start AI Radio" = "开启 AI 电台";
 "Start from a type" = "从类型开始";
 "Start one from Recommended or Discover." = "从推荐或发现中选一个开始。";
 "Start the server and load the selected model." = "启动服务器并加载所选模型。";
@@ -1557,8 +1575,10 @@
 "Steps" = "步数";
 "Steps (%lld)" = "步数（%lld）";
 "Steps in the second, full-resolution pass. Auto uses the reference schedule (3)." = "第二轮全分辨率渲染的步数。自动使用参考调度（3）。";
+"Stereo" = "立体声";
 "Stop" = "停止";
 "Stop (%.1fs)" = "停止（%.1fs）";
+"Stop AI Radio" = "停止 AI 电台";
 "Stop Server" = "停止服务器";
 "Stop background process %@" = "停止后台进程 %@";
 "Stop dictation" = "停止口述";
@@ -1782,6 +1802,7 @@
 "Voice mode transcribes on-device — your audio never leaves this Mac — but on-device dictation isn't available for %@: it's either turned off or the language isn't installed. Turn on System Settings → Keyboard → Dictation (and add your language), then enable Voice again." = "语音模式在本机转写 —— 你的音频不会离开这台 Mac —— 但 %@ 无法使用本机听写：要么该功能已关闭，要么尚未安装对应语言。请打开 系统设置 → 键盘 → 听写（并添加你的语言），然后重新启用语音。";
 "Voices blend: type several separated by commas (af_bella,af_sky) to make a new one." = "音色混合：输入多个以逗号分隔的音色（af_bella,af_sky）即可创建一个新音色。";
 "Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline." = "音色、唇形同步与时间轴都跟随这段音频 —— 它会成为视频的配乐。在 2 阶段流水线上运行。";
+"Volume" = "音量";
 "WAV, MP3, M4A or AAC. The clip drives the performance and becomes the video's soundtrack." = "WAV、MP3、M4A 或 AAC。该片段驱动表演，并成为视频的配乐。";
 "Waiting for approval" = "等待批准";
 "Wake phrase" = "唤醒词";
@@ -2097,6 +2118,7 @@
 
 /* Settings help text */
 "How the server starts and where your models live; restart the server to apply changes." = "设置服务器的启动方式和模型位置，重启服务器后生效。";
+"How the Voice, Music and Sound tabs show the player and your history." = "语音、音乐和声音标签页中播放器与历史记录的显示方式。";
 "How much memory models and caches may use; restart the server to apply changes." = "设置模型和缓存可用的内存，重启服务器后生效。";
 "Share models with other Macs on your network and use theirs; restart the server to apply changes." = "与网络上的其他 Mac 共享模型并使用它们的模型，重启服务器后生效。";
 "Add other OpenAI-compatible services, and their models appear in the model picker." = "添加其他兼容 OpenAI 的服务，其模型会出现在模型选择器中。";
@@ -2183,6 +2205,7 @@
 "What's new in each version." = "每个版本的新内容。";
 "A star helps other people find mlx-serve." = "点个星标能帮助更多人发现 mlx-serve。";
 "News, benchmarks and plans, with questions and bug reports welcome." = "新闻、基准测试和计划，也欢迎提问和报告问题。";
+"Next" = "下一首";
 "Web UI" = "网页界面";
 "Open the web UI in your browser" = "在浏览器中打开网页界面";
 "Language" = "语言";

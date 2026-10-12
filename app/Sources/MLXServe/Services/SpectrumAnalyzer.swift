@@ -18,6 +18,8 @@ final class SpectrumAnalyzer: ObservableObject {
 
     private var samples: [Float] = []
     private var rate = 44_100.0
+    /// The clip's loudness outline, 0...1 per slice, for a waveform seek bar.
+    private(set) var envelope: [Float] = []
     private var levels = [Float](repeating: 0, count: bands)
     private var peaks = [Float](repeating: 0, count: bands)
     private let fft = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))!
@@ -35,9 +37,33 @@ final class SpectrumAnalyzer: ObservableObject {
         let read = await Task.detached { Self.readMono(path) }.value
         samples = read?.samples ?? []
         rate = read?.rate ?? 44_100
+        envelope = read?.envelope ?? []
     }
 
-    nonisolated private static func readMono(_ path: String) -> (samples: [Float], rate: Double)? {
+    nonisolated static let envelopeSlices = 1024
+
+    /// Loudness (RMS) per slice, scaled so the loudest is 1: a mastered track
+    /// peaks near full scale everywhere, so peaks would draw a flat bar code.
+    nonisolated static func envelope(_ samples: [Float], slices: Int = envelopeSlices) -> [Float] {
+        guard !samples.isEmpty, slices > 0 else { return [] }
+        let levels = (0..<slices).map { i -> Float in
+            let lo = i * samples.count / slices, hi = max(lo + 1, (i + 1) * samples.count / slices)
+            return hi <= samples.count ? vDSP.rootMeanSquare(samples[lo..<hi]) : 0
+        }
+        let top = levels.max() ?? 0
+        return top > 0 ? levels.map { $0 / top } : levels
+    }
+
+    /// `envelope` at `count` bars: each bar the loudest slice it covers.
+    nonisolated static func bars(_ envelope: [Float], count: Int) -> [Float] {
+        guard !envelope.isEmpty, count > 0 else { return [] }
+        return (0..<count).map { i in
+            let lo = i * envelope.count / count, hi = max(lo + 1, (i + 1) * envelope.count / count)
+            return envelope[lo..<min(hi, envelope.count)].max() ?? 0
+        }
+    }
+
+    nonisolated private static func readMono(_ path: String) -> (samples: [Float], rate: Double, envelope: [Float])? {
         guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)),
               let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
               (try? file.read(into: buffer)) != nil, let ch = buffer.floatChannelData else { return nil }
@@ -46,7 +72,7 @@ final class SpectrumAnalyzer: ObservableObject {
         if buffer.format.channelCount > 1 {
             mono = vDSP.multiply(0.5, vDSP.add(mono, Array(UnsafeBufferPointer(start: ch[1], count: frames))))
         }
-        return (mono, file.processingFormat.sampleRate)
+        return (mono, file.processingFormat.sampleRate, envelope(mono))
     }
 
     /// One animation frame: bars rise to the new level and fall at a fixed

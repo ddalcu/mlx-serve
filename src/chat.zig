@@ -46,15 +46,15 @@ pub const VisionPreproc = struct {
     /// `gemma_budget` (Gemma 4's own processor, as EmbeddingGemma 2 uses it: a CHW image of any
     /// aspect ratio sized to `max_tokens` soft tokens), or one of the patch-grid towers
     /// (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2, gemma_budget } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, glm, gemma_budget } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
     min_pixels: u32 = 0,
     max_pixels: u32 = 0,
-    /// muse/lfm2: the resize cap is on MERGED tokens, not pixels.
+    /// muse/lfm2/glm: the resize cap is on MERGED tokens, not pixels.
     max_tokens: u32 = 0,
-    /// lfm2: the budget has a FLOOR too — a small image is upscaled to it.
+    /// lfm2/glm: the budget has a FLOOR too — a small image is upscaled to it.
     min_tokens: u32 = 0,
     /// lfm2 tiling. A source past `max_tokens * pixels_tolerance` is split into
     /// a grid of `tile_size` tiles (plus a thumbnail) and encoded piece by

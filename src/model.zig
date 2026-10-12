@@ -659,6 +659,15 @@ pub const ModelConfig = struct {
     lv_pixels_tolerance: f32 = 2.0,
     lv_thumbnail_token_id: u32 = 0,
     lv_row_col_base_id: u32 = 0, // id of `<|img_row_1_col_1|>`; the block is row-major
+    // GLM-5.3-Flash vision (src/glm_vision.zig). Geometry rides the qv_* fields (same
+    // vision_config keys as Qwen's); these are the tower's own extras and the
+    // processor's token budget, in MERGED tokens.
+    glm_vision: bool = false,
+    glmv_proj_intermediate: u32 = 10240,
+    glmv_eps: f32 = 1e-5,
+    glmv_swiglu_limit: f32 = 10.0,
+    glmv_min_image_tokens: u32 = 16,
+    glmv_max_image_tokens: u32 = 8000,
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -905,6 +914,11 @@ pub const ModelConfig = struct {
     /// Rows a sliding layer keeps past its window on an arch that caches only the window
     /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
     pub const SLIDING_RING_SLACK: u32 = 2048;
+
+    /// Recurrent (SSM / conv) layers beside attention: a cached state restores only at a checkpoint.
+    pub fn hasSsmLayers(self: *const ModelConfig) bool {
+        return self.has_hybrid_layers or self.full_attention_interval > 0;
+    }
 
     /// Sliding layers cache a bounded ring of rows, as mlx-lm's `RotatingKVCache`, not every token.
     pub fn slidingRing(self: *const ModelConfig) bool {
@@ -1644,7 +1658,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // Qwen image sizing is processor metadata rather than an architecture
     // constant. Prefer processor_config.json and fill any missing field from
     // the older preprocessor_config.json layout.
-    if (config.qwen_vision or config.muse_vision) {
+    if (config.qwen_vision or config.muse_vision or config.glm_vision) {
         var vision_defaults = VisionProcessorDefaults{};
         const processor_files = [_][]const u8{
             "processor_config.json",
@@ -1666,6 +1680,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                         vision_defaults.max_pixels = parsed_defaults.max_pixels;
                     if (vision_defaults.max_image_tokens == null)
                         vision_defaults.max_image_tokens = parsed_defaults.max_image_tokens;
+                    if (vision_defaults.min_image_tokens == null)
+                        vision_defaults.min_image_tokens = parsed_defaults.min_image_tokens;
                 } else |_| {}
             } else |_| {}
         }
@@ -1678,6 +1694,15 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.qv_min_pixels = vision_defaults.min_pixels orelse 0;
         config.qv_max_pixels = vision_defaults.max_pixels orelse 0;
         config.mv_max_image_tokens = vision_defaults.max_image_tokens orelse MUSE_MAX_IMAGE_TOKENS;
+        if (config.glm_vision) {
+            const lo = vision_defaults.min_image_tokens orelse config.glmv_min_image_tokens;
+            const hi = vision_defaults.max_image_tokens orelse config.glmv_max_image_tokens;
+            // The processor raises on an inverted budget; keep its defaults instead.
+            if (lo <= hi) {
+                config.glmv_min_image_tokens = lo;
+                config.glmv_max_image_tokens = hi;
+            }
+        }
     }
 
     if (config.isEmbeddingGemma2()) {
@@ -1721,8 +1746,10 @@ pub const GenerationDefaults = struct {
 pub const VisionProcessorDefaults = struct {
     min_pixels: ?u32 = null,
     max_pixels: ?u32 = null,
-    /// Muse: the cap is on MERGED tokens, not pixels.
+    /// Muse and GLM: the cap is on MERGED tokens, not pixels.
     max_image_tokens: ?u32 = null,
+    /// GLM: the floor a small image is upscaled to.
+    min_image_tokens: ?u32 = null,
 };
 
 fn positiveJsonU32(value: ?std.json.Value) ?u32 {
@@ -1753,6 +1780,7 @@ pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessor
         .min_pixels = positiveJsonU32(processor.get("min_pixels")),
         .max_pixels = positiveJsonU32(processor.get("max_pixels")),
         .max_image_tokens = positiveJsonU32(processor.get("max_image_tokens")),
+        .min_image_tokens = positiveJsonU32(processor.get("min_image_tokens")),
     };
     if (processor.get("size")) |value| {
         if (value == .object) {
@@ -1960,40 +1988,44 @@ fn prismHadamardBlock(root: std.json.ObjectMap) !u32 {
     return block;
 }
 
+/// The Qwen-VL `vision_config` geometry keys into `qv_*`; GLM-5.3-Flash's tower names them the same.
+fn parseQvGeometry(config: *ModelConfig, vc: std.json.ObjectMap) !void {
+    if (jsonField(vc, "depth")) |v| {
+        if (v == .integer) config.qv_depth = try jsonU32(v);
+    }
+    if (jsonField(vc, "hidden_size")) |v| {
+        if (v == .integer) config.qv_hidden = try jsonU32(v);
+    }
+    if (jsonField(vc, "num_heads")) |v| {
+        if (v == .integer) config.qv_heads = try jsonU32(v);
+    }
+    if (jsonField(vc, "intermediate_size")) |v| {
+        if (v == .integer) config.qv_intermediate = try jsonU32(v);
+    }
+    if (jsonField(vc, "patch_size")) |v| {
+        if (v == .integer) config.qv_patch = try jsonU32(v);
+    }
+    if (jsonField(vc, "temporal_patch_size")) |v| {
+        if (v == .integer) config.qv_temporal_patch = try jsonU32(v);
+    }
+    if (jsonField(vc, "spatial_merge_size")) |v| {
+        if (v == .integer) config.qv_merge = try jsonU32(v);
+    }
+    if (jsonField(vc, "num_position_embeddings")) |v| {
+        if (v == .integer) config.qv_num_pos_emb = try jsonU32(v);
+    }
+    if (jsonField(vc, "out_hidden_size")) |v| {
+        if (v == .integer) config.qv_out_hidden = try jsonU32(v);
+    }
+    if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
+    if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
+}
+
 fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
     if (jsonField(root, "vision_config")) |vc_val| {
         if (vc_val == .object) {
-            const vc = vc_val.object;
             config.qwen_vision = true;
-            if (jsonField(vc, "depth")) |v| {
-                if (v == .integer) config.qv_depth = try jsonU32(v);
-            }
-            if (jsonField(vc, "hidden_size")) |v| {
-                if (v == .integer) config.qv_hidden = try jsonU32(v);
-            }
-            if (jsonField(vc, "num_heads")) |v| {
-                if (v == .integer) config.qv_heads = try jsonU32(v);
-            }
-            if (jsonField(vc, "intermediate_size")) |v| {
-                if (v == .integer) config.qv_intermediate = try jsonU32(v);
-            }
-            if (jsonField(vc, "patch_size")) |v| {
-                if (v == .integer) config.qv_patch = try jsonU32(v);
-            }
-            if (jsonField(vc, "temporal_patch_size")) |v| {
-                if (v == .integer) config.qv_temporal_patch = try jsonU32(v);
-            }
-            if (jsonField(vc, "spatial_merge_size")) |v| {
-                if (v == .integer) config.qv_merge = try jsonU32(v);
-            }
-            if (jsonField(vc, "num_position_embeddings")) |v| {
-                if (v == .integer) config.qv_num_pos_emb = try jsonU32(v);
-            }
-            if (jsonField(vc, "out_hidden_size")) |v| {
-                if (v == .integer) config.qv_out_hidden = try jsonU32(v);
-            }
-            if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
-            if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
+            try parseQvGeometry(config, vc_val.object);
         }
     }
     // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
@@ -3148,8 +3180,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.dsv4_hc_sinkhorn_iters = 20;
         if (jsonField(cfg_obj, "hc_sinkhorn_iters")) |v| config.dsv4_hc_sinkhorn_iters = try jsonU32(v);
         if (jsonField(cfg_obj, "hc_eps")) |v| config.dsv4_hc_eps = try jsonFloat(v);
-        // The GLM-5-Next vision tower is not wired.
-        config.has_vision = false;
+        // The tower (src/glm_vision.zig) splices at `<|image|>` with plain 1-D positions: the trunk is NoPE.
+        if (config.has_vision) {
+            const vc = jsonField(root, "vision_config").?.object;
+            config.glm_vision = true;
+            try parseQvGeometry(&config, vc);
+            if (jsonField(vc, "projection_intermediate_size")) |v| config.glmv_proj_intermediate = try jsonU32(v);
+            if (jsonField(vc, "rms_norm_eps")) |v| config.glmv_eps = try jsonFloat(v);
+            if (jsonField(vc, "swiglu_limit")) |v| config.glmv_swiglu_limit = try jsonFloat(v);
+            // The 2-D rotary splits a head into h and w halves of rotate_half pairs.
+            if (config.qv_heads == 0 or config.qv_hidden % config.qv_heads != 0 or config.qv_head_dim % 4 != 0 or
+                config.qv_patch == 0 or config.qv_merge == 0 or config.qv_temporal_patch == 0 or
+                config.qv_out_hidden != config.hidden_size) return error.InvalidConfigField;
+        }
         try parseSushiExperts(root, &config);
     } else if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "mimo_v2_flash")) {
         // Xiaomi MiMo-V2.6-Flash (309B-A15B) in the mlx-lm layout (tests/convert_mimo_v2.py,
@@ -6245,7 +6288,10 @@ const glm5_next_pack_json =
     \\    "linear_attn_config": {"num_heads": 64, "head_dim": 128, "gate_lower_bound": -5.0,
     \\                           "short_conv_kernel_size": 4, "full_attn_layers": [3, 7]}
     \\  },
-    \\  "vision_config": {"model_type": "glm5_next_vision", "depth": 24}
+    \\  "image_token_id": 154854, "image_start_token_id": 154830, "image_end_token_id": 154831,
+    \\  "vision_config": {"model_type": "glm5_next_vision", "depth": 24, "hidden_size": 1024, "num_heads": 16,
+    \\    "intermediate_size": 4096, "out_hidden_size": 4096, "patch_size": 14, "temporal_patch_size": 2,
+    \\    "spatial_merge_size": 2, "projection_intermediate_size": 10240, "rms_norm_eps": 1e-05, "swiglu_limit": 10.0}
     \\}
 ;
 
@@ -6283,7 +6329,21 @@ test "ModelConfig: glm5_next binds KDA, sparse latent attention, mHC and the cla
     try testing.expect(config.moe_sigmoid_router and config.moe_route_norm);
     // Per sparse-attention layer per token: the 512 latent plus the indexer's key and gate.
     try testing.expectEqual(@as(u64, 2 * (512 + 128 + 128) * 2), config.kvBytesPerToken());
-    try testing.expect(!config.has_vision);
+    // The pack ships its tower: a Qwen2-VL-shaped ViT whose rows splice at `<|image|>`, no M-RoPE.
+    try testing.expect(config.has_vision and config.glm_vision and !config.qwen_vision);
+    try testing.expectEqual(@as(u32, 154854), config.image_token_id);
+    try testing.expectEqual(@as(u32, 0), config.boi_token_id); // the template renders the image markers
+    try testing.expectEqual(@as(u32, 24), config.qv_depth);
+    try testing.expectEqual(@as(u32, 1024), config.qv_hidden);
+    try testing.expectEqual(@as(u32, 64), config.qv_head_dim);
+    try testing.expectEqual(@as(u32, 4096), config.qv_intermediate);
+    try testing.expectEqual(@as(u32, 4096), config.qv_out_hidden);
+    try testing.expectEqual(@as(u32, 14), config.qv_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_temporal_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_merge);
+    try testing.expectEqual(@as(u32, 10240), config.glmv_proj_intermediate);
+    try testing.expectEqual(@as(f32, 1e-5), config.glmv_eps);
+    try testing.expectEqual(@as(f32, 10.0), config.glmv_swiglu_limit);
     // The template opens `<think>` on every assistant turn.
     try testing.expect(config.defaultEnableThinking(false) and config.defaultEnableThinking(true));
     // The reference keeps the KDA state in f32.
@@ -7619,6 +7679,37 @@ test "parseConfig prefers processor_config and fills missing Qwen bounds from pr
     try testing.expect(config.qwen_vision);
     try testing.expectEqual(@as(u32, 65536), config.qv_min_pixels);
     try testing.expectEqual(@as(u32, 16777216), config.qv_max_pixels);
+}
+
+test "parseConfig reads GLM-5.3-Flash's image token budget from processor_config, else the processor's defaults" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = glm5_next_pack_json });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+
+    var defaults = try parseConfig(io, testing.allocator, path_buf[0..path_len]);
+    defer defaults.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 16), defaults.glmv_min_image_tokens);
+    try testing.expectEqual(@as(u32, 8000), defaults.glmv_max_image_tokens);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "processor_config.json",
+        .data = "{\"image_processor\":{\"min_image_tokens\":32,\"max_image_tokens\":4000},\"video_processor\":{\"max_image_tokens\":240000}}",
+    });
+    var read = try parseConfig(io, testing.allocator, path_buf[0..path_len]);
+    defer read.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 32), read.glmv_min_image_tokens);
+    try testing.expectEqual(@as(u32, 4000), read.glmv_max_image_tokens);
+}
+
+test "glm5_next without a vision_config serves text only" {
+    const text_only = try std.mem.replaceOwned(u8, testing.allocator, glm5_next_pack_json, "\"vision_config\"", "\"vision_config_dropped\"");
+    defer testing.allocator.free(text_only);
+    var config = try parseConfigFromJson(testing.allocator, text_only);
+    defer config.deinit(testing.allocator);
+    try testing.expect(!config.has_vision and !config.glm_vision);
 }
 
 test "ModelConfig prism_hadamard_qwen35 is qwen3_5 with the module Hadamard block" {

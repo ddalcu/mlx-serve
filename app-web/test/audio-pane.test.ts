@@ -1,15 +1,16 @@
 import { flushSync } from "svelte";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AudioWorkspace } from "../src/lib/state/audio-workspace.svelte";
-import { chatModel, mockApi, musicModel, soundModel, speechModel } from "./support/mock-api";
+import { chatModel, mockApi, musicModel, soundModel, speechModel, yue2Model } from "./support/mock-api";
 import { mountApp } from "./support/mount";
 
 let ui: Awaited<ReturnType<typeof mountApp>> | undefined;
+beforeEach(() => localStorage.clear());
 afterEach(() => ui?.unmount());
 const text = (el: Element | null | undefined) => el?.textContent?.replace(/\s+/g, " ").trim() ?? "";
 
-async function audioPane() {
-  const api = mockApi([speechModel, musicModel, soundModel, chatModel]);
+async function audioPane(models: object[] = [speechModel, musicModel, soundModel, chatModel]) {
+  const api = mockApi(models);
   ui = await mountApp({ hash: "#audio", api });
   await vi.waitFor(() => expect(ui!.app.audio.ready && ui!.app.audio.d.model !== "").toBe(true));
   flushSync();
@@ -29,6 +30,18 @@ describe("Audio pane", () => {
     expect(text(ui.q("#audio-validation"))).toBe("Enter text to be generated.");
     await ui.type("#audio-prompt", "Hello there");
     expect(generate().disabled).toBe(false);
+  });
+
+  it("lists saved voice clips by day in the Modern history, and a row brings one back", async () => {
+    const { ui } = await audioPane();
+    await ui.type("#audio-prompt", "Hello there. How are you?");
+    await ui.click(generate());
+    await vi.waitFor(() => expect(ui.q("#audio-result")).not.toBeNull());
+    await ui.click(ui.q<HTMLButtonElement>("#audio-gallery-toggle")!);
+    await vi.waitFor(() => expect(text(ui.q("#audio-gallery .modern-row"))).toContain("Hello there"));
+    expect(text(ui.q("#audio-gallery"))).toContain("Today");
+    await ui.click(ui.q<HTMLButtonElement>("#audio-gallery .modern-row button")!);
+    await vi.waitFor(() => expect(ui.q("#audio-result")).not.toBeNull());
   });
 
   it("speaks the text, offers the audio and saves it as speech", async () => {
@@ -62,9 +75,27 @@ describe("Audio pane", () => {
     await ui.type("input[name=seed]", "3");
     expect(generate().disabled).toBe(false);
     await ui.click(generate());
-    await vi.waitFor(() => expect(ui.q("#audio-result")).not.toBeNull());
-    expect(posts(api)[0]).toMatchObject({ path: "/v1/audio/music-generations", body: { model: "m/ace", prompt: "upbeat synthwave", duration_seconds: 60, seed: 3, response_format: "wav", stream: true } });
     await vi.waitFor(() => expect(saved().map((i) => i.type)).toEqual(["music"]));
+    expect(posts(api)[0]).toMatchObject({ path: "/v1/audio/music-generations", body: { model: "m/ace", prompt: "upbeat synthwave", duration_seconds: 60, seed: 3, response_format: "wav", stream: true } });
+    // The finished song goes on the Modern deck, titled from its prompt, and into today's history.
+    await vi.waitFor(() => expect(ui.app.audio.player.loaded?.prompt).toBe("upbeat synthwave"));
+    expect(ui.q("#audio-result")).toBeNull();
+    expect(text(ui.q("#modern-deck .modern-title"))).toBe("Upbeat synthwave");
+    expect(text(ui.q("#modern-deck .modern-detail"))).toContain("ace");
+    await vi.waitFor(() => expect(text(ui.q("#music-history"))).toContain("Today"));
+    expect(text(ui.q("#music-history .modern-row"))).toContain("Upbeat synthwave");
+    // The playlist key hides the history.
+    await ui.click(ui.q<HTMLButtonElement>("#modern-deck [aria-label=Playlist]")!);
+    expect(ui.q("#music-history")).toBeNull();
+  });
+
+  it("keeps the MLX-Amp look one setting away", async () => {
+    const { ui } = await audioPane();
+    ui.app.prefs.set("audioPlayer", "mlxAmp");
+    await tab("Music");
+    expect(ui.q("#modern-deck")).toBeNull();
+    expect(ui.q(".amp-playlist")).not.toBeNull();
+    expect(ui.q("#amp-radio")).not.toBeNull();
   });
 
   it("Sound Effects sends duration, steps and a seed to its own route", async () => {
@@ -102,5 +133,50 @@ describe("Audio pane", () => {
       expect(later.panes.voice.d.prompt).toBe("spoken words");
       expect(later.panes.music.d.prompt).toBe("a style");
     });
+  });
+
+  it("YuE2 offers a score and an auto length instead of Instrumental, tempo and key", async () => {
+    const { ui, api } = await audioPane([speechModel, yue2Model, chatModel]);
+    await tab("Music");
+    expect(ui.app.audio.d.model).toBe("m/yue2");
+    expect(ui.q("input[name=instrumental]")).toBeNull();
+    expect(ui.q("input[name=bpm]")).toBeNull();
+    expect(ui.q("input[name=duration]")).toBeNull();
+    expect(ui.q<HTMLInputElement>("input[name=autoLength]")!.checked).toBe(true);
+    await ui.type("#audio-prompt", "English, indie pop");
+    expect(text(ui.q("#audio-validation"))).toBe("This model requires lyrics.");
+    await ui.type("#audio-lyrics", "[Verse]\nla la");
+    await ui.click(generate());
+    await vi.waitFor(() => expect(saved().map((i) => i.type)).toEqual(["music"]));
+    expect(posts(api)[0]!.body).toMatchObject({ prompt: "English, indie pop", lyrics: "[Verse]\nla la", cot: "full", steps: 32 });
+    expect(posts(api)[0]!.body).not.toHaveProperty("duration_seconds");
+    // The score the song came from can be brought back to edit and render again.
+    await ui.click(ui.qa<HTMLButtonElement>("button").find((b) => text(b) === "Use last score")!);
+    expect(ui.q<HTMLTextAreaElement>("#audio-score")!.value).toBe("X:1\nK:C\nCDEF|");
+    await ui.click(ui.q<HTMLInputElement>("input[name=autoLength]")!);
+    expect(ui.q("input[name=duration]")).not.toBeNull();
+  });
+
+  it("AI Radio writes each track's prompt with the chat model, plays it, and locks the form until stopped", async () => {
+    const { ui, api } = await audioPane();
+    await tab("Music");
+    api.replies.push({ content: "dusty lo-fi, warm Rhodes, soft drums" });
+    await ui.type("#deck-radio-theme", "mellow lo-fi for coding");
+    await ui.click(ui.q<HTMLButtonElement>("#deck-radio")!);
+    expect(ui.app.audio.radio.on).toBe(true);
+    expect(ui.q<HTMLFieldSetElement>("#audio-fields")!.disabled).toBe(true);
+    await vi.waitFor(() => expect(posts(api)[0]?.body.prompt).toBe("dusty lo-fi, warm Rhodes, soft drums"));
+    const chat = api.requests.find((r) => r.path === "/v1/chat/completions")!;
+    expect(chat.body.messages[1].content).toContain("mellow lo-fi for coding");
+    expect(posts(api)[0]!.body).toMatchObject({ instrumental: true });
+    await vi.waitFor(() => expect(ui.app.audio.player.loaded?.prompt).toBe("dusty lo-fi, warm Rhodes, soft drums"));
+    // The deck's keys that pick a track lock while the radio plays; the strip says what it is doing.
+    expect(ui.q<HTMLButtonElement>("#modern-deck [aria-label=Shuffle]")!.disabled).toBe(true);
+    expect(ui.q("#deck-radio-strip")).not.toBeNull();
+    await ui.click(ui.q<HTMLButtonElement>("#deck-radio")!);
+    await ui.click(ui.q<HTMLButtonElement>("#audio-stop-radio")!);
+    expect(ui.app.audio.radio.on).toBe(false);
+    expect(ui.q<HTMLFieldSetElement>("#audio-fields")!.disabled).toBe(false);
+    expect(ui.app.audio.radioTheme).toBe("mellow lo-fi for coding");
   });
 });

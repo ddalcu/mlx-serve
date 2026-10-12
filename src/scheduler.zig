@@ -2312,6 +2312,15 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
     }
 
+    /// The least recently used resident model nobody is holding, other than `keep`; its id
+    /// outlives the unload (the entry stays registered as a stub).
+    pub fn idleModelToUnload(self: *Scheduler, keep: []const u8) ?[]const u8 {
+        self.registry.mutex.lockUncancelable(self.io);
+        defer self.registry.mutex.unlock(self.io);
+        const entry = self.registry.pickLruEvictable(keep) orelse return null;
+        return entry.id;
+    }
+
     /// Synchronously compute embeddings for `req.token_seqs` using the
     /// batched encoder forward pass on the inference thread. Same lifecycle
     /// as `encodeVision`: post + block + return results. Caller frees the
@@ -4905,8 +4914,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // are enabled (`enable_ssm_cps`, the same gate `shouldUse` applied).
         // Every failure mode is caught: persistence silently stays off, the
         // RAM cache is unaffected.
-        const has_ssm_layers = params.config.has_hybrid_layers or
-            params.config.full_attention_interval > 0;
+        const has_ssm_layers = params.config.hasSsmLayers();
         entry.prefix_cache.?.hybrid = has_ssm_layers;
         const disk_ok = !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
@@ -6010,7 +6018,9 @@ fn appendDecodeEndCheckpoint(
     const xfm = slot.model.transformer orelse return cps;
     const a = gen.ssm_checkpoint_alloc orelse return cps;
     const newest: ?usize = if (cps.len > 0) cps[cps.len - 1].pos else null;
-    if (!decodeEndCheckpointWanted(slot.full_prompt.len, total_len, slot.moe_seq_offset, newest, slot.media.len > 0)) {
+    // A plain pipelined step that met its stop already forwarded the stop token and a lookahead.
+    if (slot.moe_seq_offset > total_len) _ = gen.rollbackSsmTo(total_len);
+    if (!decodeEndCheckpointWanted(slot.full_prompt.len, total_len, slot.moe_seq_offset, newest)) {
         if (slot.moe_seq_offset != total_len) log.debug("[hot-cache] decode-end checkpoint skipped: live position {d}, committed {d}\n", .{ slot.moe_seq_offset, total_len });
         return cps;
     }
@@ -6027,10 +6037,10 @@ fn appendDecodeEndCheckpoint(
     return out;
 }
 
-/// PURE: the live state must describe exactly the committed tokens, past every prefill snapshot;
-/// media slots are excluded because M-RoPE positions are not token counts.
-fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usize, newest_cp: ?usize, has_media: bool) bool {
-    if (has_media or total_len <= prompt_len or live_pos != total_len) return false;
+/// PURE: the live state must describe exactly the committed tokens, past every prefill snapshot.
+/// `live_pos` counts tokens on media slots too: the M-RoPE shift is `mrope_delta`, kept apart.
+fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usize, newest_cp: ?usize) bool {
+    if (total_len <= prompt_len or live_pos != total_len) return false;
     if (newest_cp) |pos| return pos < total_len;
     return true;
 }
@@ -11220,13 +11230,12 @@ test "prefix-cache commit declines a pad-only generation, never a zero-token one
 
 test "decode-end checkpoint: taken only where the live state is the committed prefix" {
     // Bar: a turn that generated past its prompt-end snapshot gets one at its committed end, nothing else does.
-    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, 970, false));
-    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, null, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1000, 1000, 970, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1201, 970, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1199, 970, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 1200, false));
-    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 970, true));
+    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, 970));
+    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, null));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1000, 1000, 970));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1201, 970));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1199, 970));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 1200));
 }
 
 test "[short-gen] carries both token counts, the ids and what they decode to" {

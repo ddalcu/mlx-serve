@@ -8,9 +8,16 @@
   import { download } from "../lib/download";
   import { displayName, N, t } from "../lib/i18n/i18n";
   import type { IconName } from "../lib/icons";
-  import { commonTempos, kokoroVoices, keys, languages, musicLyrics, musicStyles, music3Styles, sectionTags, trackClasses, voiceLabel, voiceLanguages, voiceName } from "../lib/state/audio-presets";
+  import { commonTempos, kokoroVoices, keys, languages, trackClasses, voiceLabel, voiceLanguages, voiceName } from "../lib/state/audio-presets";
+  import { musicPlans } from "../lib/state/audio-state.svelte";
   import { tabs, type Field } from "../lib/state/audio-workspace.svelte";
+  import { rewriteRequest, tagsFor } from "../lib/state/music-rewrite";
+  import Dialog from "../components/Dialog.svelte";
   import AudioHistory from "./audio/AudioHistory.svelte";
+  import MlxAmp from "./audio/MlxAmp.svelte";
+  import ModernDeck from "./audio/ModernDeck.svelte";
+  import ModernHistory from "./audio/ModernHistory.svelte";
+  import { isLocked, saveTrack } from "../lib/state/deck";
   import SaveTemplateDialog from "./audio/SaveTemplateDialog.svelte";
 
   let { app }: { app: App } = $props();
@@ -23,6 +30,7 @@
   const voice = $derived(tab === "voice");
   const music = $derived(tab === "music");
   const source = $derived(!!p?.source && d.task !== "text2music");
+  const instrumental = $derived(!!p?.instrumental && d.instrumental);
   const busy = $derived(!!c.run);
   const labels = { voice: N("Voice"), music: N("Music"), sound: N("Sound Effects") };
   const glyphs: Record<string, IconName> = { voice: "audio-lines", music: "music", sound: "volume-2" };
@@ -83,7 +91,21 @@
       if (ws.d[field].trim()) saving = field;
     } else ws.chooseTemplate(field, value);
   }
-  const enhanceExamples = (field: Field) => (field === "lyrics" ? musicLyrics : p?.meta ? musicStyles : music3Styles);
+  const tags = $derived(tagsFor(p?.family ?? ""));
+  const radio = $derived(ws.radio);
+  let confirmStop = $state(false);
+  let showPlaylist = $state(true);
+  const modern = $derived(app.prefs.audioPlayer === "modern");
+  /** The deck shows the generation only while nothing plays; the radio has its own strip. */
+  const deckStatus = $derived(
+    radio.on ? null : !ws.player.active && c.phase === "running" ? { kind: "busy" as const, message: c.message, progress: c.total > 0 ? c.step / c.total : null } : c.phase === "failed" ? { kind: "failed" as const, message: c.message } : null,
+  );
+  const planLabels: Record<string, string> = { full: N("Melody + chords"), melody: N("Melody only"), off: N("No score") };
+  const planHints: Record<string, string> = {
+    full: N("The model writes a chord-annotated score first, then plays it. Best songs, and you can edit the score."),
+    melody: N("A melody-only score, without chords. The right choice for a cover: paste the original melody below."),
+    off: N("Straight to audio with no score. Fastest, and the least coherent."),
+  };
   const fileHandler = (key: "reference" | "source") => async (event: Event) => {
     const input = event.currentTarget as HTMLInputElement;
     if (input.files?.[0]) await ws.attach(input.files[0], key);
@@ -207,7 +229,8 @@
       }}
       oninput={() => (ws.error = "")}
     >
-      <fieldset id="audio-fields" disabled={!ws.ready || busy || ws.busy}>
+      {#if radio.on}<p class="field-note audio-radio-lock" role="status">{t("AI Radio is running. Settings are locked until you stop it.")}</p>{/if}
+      <fieldset id="audio-fields" disabled={!ws.ready || busy || ws.busy || radio.on}>
         <ModelChooser id="audio-model" models={ws.models} selected={d.model} status={connection.status} {detail} server={connection.serverName()} onchoose={(id) => ws.chooseModel(id)} />
         {#if p?.source}
           <div class="segmented" role="group" aria-label={t("Music mode")}>
@@ -245,7 +268,7 @@
             {#if !voice}{@render templates("prompt")}{/if}
           </div>
           <textarea id="audio-prompt" name="prompt" bind:value={ws.d.prompt} placeholder={voice ? t("Enter the text to speak…") : music ? t("Genre, mood, instruments…") : t("What makes it, the material, the space…")}></textarea>
-          {#if music}<p class="field-note">{t('Genre, mood, instruments — e.g. "upbeat synthwave with driving bass and dreamy pads".')}</p>{/if}
+          {#if music}<p class="field-note">{p?.family === "yue2" ? t('Comma-separated tags: language or genre, instruments, mood, lead vocal — e.g. "English, indie pop, bright acoustic guitar, soft drums, warm lead vocal".') : t('Genre, mood, instruments — e.g. "upbeat synthwave with driving bass and dreamy pads".')}</p>{/if}
         </section>
         {#if p?.voices}
           <section class="image-section">
@@ -273,37 +296,63 @@
           <section class="image-section">
             <div class="image-heading">
               <label for="audio-lyrics">{t("Lyrics")}</label>
-              <label class="check-label"><input name="instrumental" type="checkbox" role="switch" bind:checked={ws.d.instrumental} />{t("Instrumental")}</label>
-              {#if !d.instrumental}
+              {#if p.instrumental}<label class="check-label"><input name="instrumental" type="checkbox" role="switch" bind:checked={ws.d.instrumental} />{t("Instrumental")}</label>{/if}
+              {#if !instrumental}
                 <span class="lyrics-tools">
                   <button type="button" class="chip" onclick={() => (rewrite = "lyrics")}><Icon name="sparkles" />{t("Enhance…")}</button>
                   {@render templates("lyrics")}
                   <Menu id="audio-tags" label={t("Sections")} onchoose={(value) => (ws.d.lyrics += (ws.d.lyrics && !ws.d.lyrics.endsWith("\n") ? "\n" : "") + value + "\n")}>
-                    {#each sectionTags as tag}{@render entry(tag, tag)}{/each}
+                    {#each tags as tag}{@render entry(tag, tag)}{/each}
                   </Menu>
                 </span>
               {/if}
             </div>
-            {#if !d.instrumental}
-              <textarea id="audio-lyrics" name="lyrics" bind:value={ws.d.lyrics} placeholder="{p.family === 'minimax_music3' ? t('This model sings your lyrics. Section tags go on their own lines:') : t('Leave empty, or tick Instrumental, for a track with no vocals. Section tags:')} {sectionTags.join(' ')}"></textarea>
+            {#if !instrumental}
+              <textarea id="audio-lyrics" name="lyrics" bind:value={ws.d.lyrics} placeholder="{p.family !== 'acestep' ? t('This model sings your lyrics. Section tags go on their own lines:') : t('Leave empty, or tick Instrumental, for a track with no vocals. Section tags:')} {tags.join(' ')}"></textarea>
             {:else}
               <p class="field-note">{t("A wordless track. Lyrics are kept here for later, and omitted from this request.")}</p>
             {/if}
           </section>
         {/if}
+        {#if p?.score}
+          <section class="image-section">
+            <h2>{t("Score")}</h2>
+            <div class="segmented" role="group" aria-label={t("Score")}>
+              {#each musicPlans as plan}
+                <button type="button" aria-pressed={d.plan === plan} onclick={() => (ws.d.plan = plan)}>{t(planLabels[plan]!)}</button>
+              {/each}
+            </div>
+            <p class="field-note">{t(planHints[d.plan] ?? "")}</p>
+            {#if d.plan !== "off"}
+              <textarea id="audio-score" class="audio-score" name="score" bind:value={ws.d.score} placeholder={t("Leave empty and the model writes the score. Paste ABC notation to render your own.")}></textarea>
+              <div class="audio-score-tools">
+                <button type="button" disabled={!c.lastScore} title={t("Fills the box with the score the last song was rendered from, so you can change it and render again.")} onclick={() => (ws.d.score = c.lastScore)}>{t("Use last score")}</button>
+                <button type="button" disabled={!d.score} onclick={() => (ws.d.score = "")}>{t("Clear")}</button>
+              </div>
+            {/if}
+          </section>
+        {/if}
         {#if p?.reference}{@render clipWell("reference", voice ? t("Reference voice") : t("Reference audio (optional)"))}{/if}
         {#if p && !voice && !source}
-          {@render slider("duration", t("Duration"), p.duration[0]!, p.duration[1]!, music ? 5 : 0.5)}
-          {#if p.family === "minimax_music3"}<p class="field-note">{t("An upper bound — the model may end the song earlier.")}</p>{/if}
+          {#if p.autoLength}
+            <label class="check-label"><input name="autoLength" type="checkbox" bind:checked={ws.d.autoLength} />{t("Length: Auto")}</label>
+            {#if d.autoLength}<p class="field-note">{t("The model ends the song after the last lyric.")}</p>{/if}
+          {/if}
+          {#if !(p.autoLength && d.autoLength)}
+            {@render slider("duration", p.autoLength ? t("Limit") : t("Duration"), p.duration[0]!, p.duration[1]!, music ? 5 : 0.5)}
+            {#if p.autoLength}<p class="field-note">{t("A limit with a few seconds of grace — the model ends the song earlier when it can.")}</p>
+            {:else if music && p.family !== "acestep"}<p class="field-note">{t("An upper bound — the model may end the song earlier.")}</p>{/if}
+          {/if}
         {/if}
         {#if p && (p.speed || !voice)}
           <details id="audio-advanced" bind:open={ws.d.advanced}>
             <summary>{t("Advanced options")}</summary>
             <div class="image-advanced-body">
               {#if p.speed}{@render slider("speed", t("Speed (×)"), 0.5, 2, 0.05)}{/if}
-              {#if p.steps}{@render slider("steps", music ? t("Quality passes") : t("Steps"), music ? 4 : 1, music ? 100 : 50, 1)}{/if}
+              {#if p.steps}{@render slider("steps", music ? t("Quality passes") : t("Steps"), p.stepsRange[0]!, p.stepsRange[1]!, 1)}{/if}
               {#if music}
                 <div class="audio-knobs">
+                  {#if p.tempo}
                   <label class="audio-tempo">
                     <span>{t("Tempo (BPM)")}</span>
                     <input name="bpm" inputmode="numeric" placeholder={t("Auto")} bind:value={ws.d.bpm} />
@@ -312,6 +361,8 @@
                     </Menu>
                   </label>
                   {@render choice("keyscale", t("Key"), [["", t("Auto")], ...keys.map((k) => [k, k])])}
+                  {/if}
+                  {#if p.tempo && p.family === "minimax_music3"}<p class="field-note">{t("Tempo and key are written into the style prompt for this model — it has no separate fields for them.")}</p>{/if}
                   {#if p.meta}
                     {@render choice("language", t("Vocal language"), languages.map(([label, id]) => [id, label]))}
                     {@render choice("timesignature", t("Time signature"), [["", t("Auto")], ["4", "4/4"], ["3", "3/4"], ["2", "2/4"], ["6", "6/8"]])}
@@ -327,13 +378,36 @@
         {/if}
       </fieldset>
       <p id="audio-validation" class="field-note" role="status">{error}</p>
-      <button id="audio-generate" type="submit" class="generate" class:primary={!busy} disabled={!busy && (!!ws.validation || ws.busy || ws.recording)}>
-        {#if busy}{t("Cancel")}{:else}<Icon name={glyph} />{t("Generate")}{/if}
+      <button id="audio-generate" type="submit" class="generate" class:primary={!busy} disabled={radio.on || (!busy && (!!ws.validation || ws.busy || ws.recording))}>
+        {#if radio.on}<Icon name="music" />{t("AI Radio is on")}{:else if busy}{t("Cancel")}{:else}<Icon name={glyph} />{t("Generate")}{/if}
       </button>
+      {#if music && busy && !radio.on}
+        <p id="audio-progress" class="field-note" role="status">{c.message}{c.total > 0 ? ` ${Math.round(Math.min(1, c.step / c.total) * 100)}%` : ""}</p>
+      {/if}
       <p id="audio-storage" class="field-note" role="status">{ws.storageError}</p>
     </form>
 
     <div class="image-output">
+      {#if music}
+        {#if modern}
+          <ModernDeck player={ws.player} {radio} status={deckStatus} bind:theme={ws.radioTheme} bind:showPlaylist onradiostart={() => radio.start(ws.radioTheme)} onradiostop={() => (confirmStop = true)} />
+          {#if showPlaylist}
+            <ModernHistory
+              id="music-history"
+              rows={ws.player.tracks}
+              current={ws.player.active ? (ws.player.loaded?.id ?? null) : null}
+              paused={ws.player.paused}
+              locked={isLocked("historyRow", radio)}
+              info={(r) => ws.player.info(r)}
+              onplay={(r) => void ws.player.play(r)}
+              onstop={() => ws.player.stop()}
+              ondownload={(r) => void saveTrack(ws.player, r)}
+            />
+          {/if}
+        {:else}
+          <MlxAmp player={ws.player} {radio} status={deckStatus} bind:theme={ws.radioTheme} onradiostart={() => radio.start(ws.radioTheme)} onradiostop={() => (confirmStop = true)} />
+        {/if}
+      {:else}
       <div id="audio-preview" class="image-preview" class:playing>
         {#if c.phase === "completed" && c.result}
           {@const r = c.result}
@@ -376,8 +450,9 @@
       </div>
       <button id="audio-gallery-toggle" class="image-output-link" aria-expanded={gallery} onclick={() => (gallery = !gallery)}><Icon name="library" />{t("Audio saved in this browser")}</button>
       <section id="audio-gallery" class="audio-gallery" aria-label={t("Audio history")} hidden={!gallery}>
-        {#if gallery}<AudioHistory library={ws.library} server={ws.server} type={ws.type} onpick={(item) => ws.show(item)} />{/if}
+        {#if gallery}<AudioHistory library={ws.library} server={ws.server} type={ws.type} {modern} info={(r) => ws.player.info(r)} onpick={(item) => ws.show(item)} />{/if}
       </section>
+      {/if}
     </div>
   </div>
   {#if ws.clipUrl}
@@ -392,20 +467,14 @@
 
 {#if rewrite}
   {@const field = rewrite}
-  {@const context = field === "lyrics" ? d.prompt : d.instrumental ? "" : d.lyrics}
-  {@const shape =
-    field === "lyrics"
-      ? `Use section tags on their own lines: ${sectionTags.join(" ")}. Keep the user's theme and lines, tighten rhythm and rhyme.`
-      : p?.meta
-        ? "Write one paragraph of genre, mood, instruments and production. No tempo, key or time signature; those are separate controls."
-        : "Use the examples’ Global Metadata / Vocal Details / Arrangement format, including bpm, key and scale."}
+  {@const ask = rewriteRequest(field, d[field], p?.family ?? "acestep", field === "lyrics" ? d.prompt : instrumental ? "" : d.lyrics, instrumental, d.language)}
   <RewriteDialog
     {connection}
     title={t("Rewrite %@", [field === "prompt" ? t("style prompt") : t("lyrics")])}
     class="audio-rewrite"
     text={d[field]}
-    system={`You rewrite music ${field === "lyrics" ? "lyrics" : "style prompts"}. ${shape} Reply only with the rewritten text, no preamble or markdown.\nExamples:\n${enhanceExamples(field).map((e) => e.body).join("\n---\n")}`}
-    request={`Rewrite: ${d[field]}\n${d.instrumental ? "Instrumental, no vocals." : `Vocal language: ${d.language}.`}\nOther context: ${context}`}
+    system={ask.system}
+    request={ask.user}
     maxTokens={1024}
     textLabel={t("Rewritten text")}
     reviewed={t("Review the text, then Apply.")}
@@ -413,4 +482,25 @@
     onapply={(text) => (ws.d[field] = text)}
     onclose={() => (rewrite = "")}
   />
+{/if}
+
+{#if confirmStop}
+  <Dialog title={t("Stop AI Radio?")} base="library-dialog" bare onclose={() => (confirmStop = false)}>
+    {#snippet children(close)}
+      <h2>{t("Stop AI Radio?")}</h2>
+      <p>{t("The music stops and the track being composed is discarded.")}</p>
+      <div class="form-actions">
+        <button type="button" onclick={close}>{t("Keep Playing")}</button>
+        <button
+          type="button"
+          id="audio-stop-radio"
+          onclick={() => {
+            radio.stop();
+            ws.player.stop();
+            close();
+          }}>{t("Stop Radio")}</button
+        >
+      </div>
+    {/snippet}
+  </Dialog>
 {/if}

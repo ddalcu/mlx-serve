@@ -70,17 +70,27 @@ enum AudioSidecar {
 struct AudioHistoryShelf: View {
     let paths: [String]
     let playingPath: String?
+    var paused = false
     let onPlay: (String) -> Void
     let onStop: () -> Void
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var style = AudioPlayerStyle.defaultStyle
 
     var body: some View {
         Group {
             if !paths.isEmpty {
-                MlxAmpStretched { width, _ in
-                    MlxAmpPlaylist(width: width, height: MlxAmpPlaylist.minHeight, paths: paths, current: playingPath,
-                                   onPlay: onPlay, onStop: onStop)
+                Group {
+                    switch style {
+                    case .mlxAmp:
+                        MlxAmpStretched { width, _ in
+                            MlxAmpPlaylist(width: width, height: MlxAmpPlaylist.minHeight, paths: paths, current: playingPath,
+                                           onPlay: onPlay, onStop: onStop)
+                        }
+                        .frame(height: MlxAmpPlaylist.minHeight * MlxAmpStyle.scale)
+                    case .modern:
+                        ModernPlaylist(paths: paths, current: playingPath, paused: paused, onPlay: onPlay, onStop: onStop)
+                            .frame(height: 300)
+                    }
                 }
-                .frame(height: MlxAmpPlaylist.minHeight * MlxAmpStyle.scale)
                 .onAppear { AudioClipPlayer.shared.queue = paths }
                 .onChange(of: paths) { _, p in AudioClipPlayer.shared.queue = p }
             }
@@ -205,6 +215,7 @@ struct VoiceGenView: View {
                 AudioHistoryShelf(
                     paths: service.recent,
                     playingPath: clipPlayer.playingPath,
+                    paused: clipPlayer.isPaused,
                     onPlay: { play($0) },
                     onStop: { stopPlayback() }
                 )

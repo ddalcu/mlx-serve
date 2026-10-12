@@ -38,6 +38,10 @@
   --code-background: rgb(96% 96% 97%);
   --code-header: rgb(92% 92% 94%);
   --row-selected: color-mix(in srgb, var(--text-primary) 10%, transparent);
+  /* The MLX-Amp skin keeps its own colours in every appearance. */
+  --amp-lcd: #00e000;
+  --amp-white: #e8e8f4;
+  --amp-screen: #000;
   --row-hover: color-mix(in srgb, var(--text-primary) 5%, transparent);
   --chip-fill: color-mix(in srgb, var(--text-primary) 8%, transparent);
 }
@@ -3577,4 +3581,435 @@ body[data-workspace="chat"] .session-entry .nav-row.active {
 .video-shot textarea {
   width: 100%;
   min-height: 5.625rem;
+}
+
+/* MLX-Amp: a pixel-art skin on canvases, with a transparent real control over every key. */
+.amp {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+}
+.amp-window {
+  position: relative;
+}
+.amp-skin {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+}
+.amp-hit {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  opacity: 0;
+  cursor: pointer;
+}
+.amp-hit:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--amp-lcd);
+}
+.amp-hit:disabled {
+  cursor: default;
+}
+.amp-theme {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--amp-lcd);
+  caret-color: var(--amp-lcd);
+  font: bold 0.75rem ui-monospace, monospace;
+}
+.amp-theme::placeholder {
+  color: color-mix(in srgb, var(--amp-lcd) 30%, var(--amp-screen));
+}
+.amp-theme:focus {
+  outline: none;
+}
+.amp-playlist {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  scrollbar-color: #c4a95a var(--amp-screen);
+  color: var(--amp-lcd);
+  font-size: 0.75rem;
+}
+.amp-playlist li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 4px;
+}
+.amp-playlist li.current {
+  color: var(--amp-white);
+}
+.amp-playlist button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.amp-playlist li > button:first-child {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.amp-empty {
+  opacity: 0.6;
+}
+
+/* The Modern look of the audio player and history. */
+.modern-deck,
+.modern-history {
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text-primary) 7%, transparent);
+}
+.modern-main {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+}
+.modern-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+.modern-cover {
+  width: 5.75rem;
+  height: 5.75rem;
+  flex-shrink: 0;
+  border-radius: 9px;
+  box-shadow: 0 3px 6px rgb(0 0 0 / 0.25);
+}
+.modern-head {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.modern-head p {
+  margin: 0;
+}
+.modern-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font-size: 1.0625rem;
+  font-weight: 600;
+}
+.modern-detail,
+.modern-format {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+.modern-format {
+  color: var(--text-tertiary);
+  font-size: var(--annotation);
+}
+.modern-failed {
+  color: var(--status-error);
+}
+.modern-seek {
+  position: relative;
+}
+.modern-wave {
+  display: block;
+  width: 100%;
+  height: 30px;
+}
+.modern-seek-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 30px;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.modern-seek-input:disabled {
+  cursor: default;
+}
+.modern-seek:has(.modern-seek-input:focus-visible) .modern-wave {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.modern-clocks {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-secondary);
+  font-size: var(--annotation);
+  font-variant-numeric: tabular-nums;
+}
+.modern-progress {
+  position: relative;
+  height: 44px;
+}
+.modern-progress::before,
+.modern-progress > span {
+  content: "";
+  position: absolute;
+  top: 13px;
+  left: 0;
+  height: 4px;
+  border-radius: 2px;
+}
+.modern-progress::before {
+  right: 0;
+  background: var(--separator);
+}
+.modern-progress > span {
+  background: var(--accent);
+}
+.modern-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.modern-volume {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+.modern-volume input {
+  width: 90px;
+  min-width: 40px;
+}
+.modern-transport {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.modern-key {
+  display: grid;
+  place-items: center;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.modern-key:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+.modern-key.lit {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.modern-key:disabled {
+  color: color-mix(in srgb, var(--text-tertiary) 45%, transparent);
+}
+.modern-key.lit:disabled {
+  color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.modern-key.big {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--text-primary);
+  color: var(--surface-window);
+}
+.modern-key.big:disabled {
+  opacity: 0.4;
+}
+.modern-key.big .icon {
+  width: 20px;
+  height: 20px;
+}
+.modern-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--separator);
+}
+.modern-radio-icon {
+  display: grid;
+  color: var(--text-secondary);
+}
+.modern-radio-icon.on {
+  color: var(--accent);
+  animation: modern-pulse 1.4s ease-in-out infinite;
+}
+.modern-radio input {
+  flex: 1;
+  min-width: 0;
+}
+.modern-strip {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+}
+.modern-strip > span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.modern-strip p {
+  position: relative;
+  margin: 0;
+  padding: 0 8px;
+  overflow: hidden;
+  line-height: 22px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.modern-strip.sweep > span,
+.modern-progress.sweep > span {
+  width: 24px;
+  animation: modern-sweep 1.2s ease-in-out infinite alternate;
+}
+.modern-history {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 12px 6px 8px;
+}
+.modern-history h2 {
+  margin: 0 8px 4px;
+  font-size: var(--section-title);
+}
+.modern-history h2 span {
+  color: var(--text-secondary);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.modern-history h3 {
+  margin: 10px 8px 4px;
+  color: var(--text-secondary);
+  font-size: var(--annotation);
+  font-weight: 600;
+}
+.modern-history-list {
+  max-height: 24rem;
+  overflow: auto;
+}
+.modern-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 7px;
+}
+.modern-row:hover {
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+}
+.modern-row.playing {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.modern-row > button:first-child {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.modern-tile {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: 6px;
+  color: white;
+}
+.modern-tile > span {
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: rgb(0 0 0 / 0.3);
+}
+.modern-tile .moving {
+  animation: modern-pulse 1.2s ease-in-out infinite;
+}
+.modern-row-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.modern-row-text strong,
+.modern-row-text small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.modern-row-text strong {
+  font-weight: 400;
+}
+.modern-row.playing strong {
+  color: var(--accent);
+  font-weight: 600;
+}
+.modern-row-text small,
+.modern-length {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.modern-row-text small {
+  font-size: var(--annotation);
+}
+@keyframes modern-sweep {
+  from {
+    left: 0;
+  }
+  to {
+    left: calc(100% - 24px);
+  }
+}
+@keyframes modern-pulse {
+  50% {
+    opacity: 0.4;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .modern-radio-icon.on,
+  .modern-tile .moving,
+  .modern-strip.sweep > span,
+  .modern-progress.sweep > span {
+    animation: none;
+  }
+}
+.audio-score {
+  min-height: 7rem;
+  font-family: ui-monospace, monospace;
+  font-size: var(--annotation);
+}
+.audio-score-tools {
+  display: flex;
+  gap: 8px;
 }

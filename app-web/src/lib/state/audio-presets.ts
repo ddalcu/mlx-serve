@@ -80,6 +80,26 @@ const sectionTags = [
   "[solo]",
   "[outro]",
 ];
+/** The tags YuE2's model card writes its lyrics with, capitalized. */
+const yue2SectionTags = ["[Intro]", "[Verse]", "[Pre-Chorus]", "[Chorus]", "[Interlude]", "[Bridge]", "[Outro]"];
+/** YuE2 takes a comma-separated tag line: language or genre first, then instruments, mood and the lead vocal. */
+const yue2Styles = [
+  { title: N("City pop"), body: "City Pop, upbeat, danceable, groovy bass, electric guitar, synth, energetic, joyful, neon city night" },
+  { title: N("Jazz-funk"), body: "Jazz-funk, warm lead vocal, Rhodes piano, electric bass, tight drums" },
+  { title: N("Jazz ballad"), body: "Jazz, expressive lead vocal, piano, tenor saxophone, upright bass, brushed drums, no guitar, spacious modern harmony" },
+  { title: N("Indie pop"), body: "English, indie pop, bright acoustic guitar, soft drums, warm lead vocal" },
+];
+/** The model card's own demo lyrics, and a short English song in the same shape. */
+const yue2Lyrics = [
+  {
+    title: N("Short song (English)"),
+    body: "[Verse]\nSoft morning light is touching the window\nCoffee on the table and the radio low\nI hear your footsteps coming down the hall\nEvery little moment feels like it is all\n\n[Chorus]\nStay with the rhythm, let it carry us home\nWe are not alone, we are not alone\nSing it to the sky and it will sing right back\nStay with the rhythm, never look back\n\n[Outro]\nStay with the rhythm, let it carry us home",
+  },
+  {
+    title: N("今晚不眠 (Mandarin)"),
+    body: "[Intro]\n\n[Verse]\n路灯眨着眼睛 偷看谁的身影\n街道哼着小调 节奏多轻盈\n晚风染成霓虹 吹乱发际线\n脚步踩着鼓点 不需要终点\n\n[Pre-Chorus]\n旋转的唱片 划破了寂静\n气泡在上升 快乐在飞行\n把烦恼抛去 别再去在意\n这里的空气 充满了魔力\n\n[Chorus]\n今晚不眠 快乐无限\n城市在狂欢 我们在中间\n自由摇摆 光芒盛开\n跟着这节拍 把心打开\n\n今晚不眠 快乐无限\n城市在狂欢 我们在中间\n自由摇摆 光芒盛开\n跟着这节拍 把心打开\n\n[Interlude]\n\n[Bridge]\n像橘子汽水 充满了微醺的甜\n像流星划过 点亮了夜的天\n不需要理由 只要你感觉\n这一刻就是 永恒的瞬间\n\n[Chorus]\n今晚不眠 快乐无限\n城市在狂欢 我们在中间\n自由摇摆 光芒盛开\n跟着这节拍 把心打开\n\n[Outro]\n霓虹色的风 吹向那梦\n摇摆\n闪耀\nYeah",
+  },
+];
 const musicStyles = [
   {
     title: N("Synthwave"),
@@ -253,4 +273,4 @@ const commonTempos = [
   ["174", N("174 — drum & bass")],
 ];
 
-export { kokoroVoices, trackClasses, sectionTags, musicStyles, music3Styles, musicLyrics, languages, soundPrompts, keys, voiceLanguages, voiceName, voiceLabel, commonTempos };
+export { kokoroVoices, trackClasses, sectionTags, yue2SectionTags, musicStyles, music3Styles, yue2Styles, musicLyrics, yue2Lyrics, languages, soundPrompts, keys, voiceLanguages, voiceName, voiceLabel, commonTempos };

@@ -5670,3 +5670,10 @@ Defect: the first copy chain of 15 drafts killed the server with a SIGBUS in the
 Cause: `@min(p.len, MAX_DRAFTS)` with a comptime 15 has type `u4`, so `n + 2` overflowed at 15; ReleaseFast has no overflow check and the fall-through `unreachable` ran off the function.
 Fix: the result is typed (`const n: usize = @min(...)`) in `chooseRows` and `PositionStats.record`, and `chooseRows` ends in a real fallback.
 Guard: `chooseRows: a fifteen-draft chain is priced through its last row` and `PositionStats: the widest copied chain records without overflow`. A silent exit of a ReleaseFast server: read `~/Library/Logs/DiagnosticReports/*.ips` first.
+
+## One slow sample put a warm n-gram table on the slower pool (2026-10-11, #821)
+
+Defect: on some boots Flash Next prefilled ~20% slower (4.2k vs 5.2k tok/s on an M5 Ultra, 4.7bpw); 1 of 4 default boots picked the pooled PLE gather after the table warm.
+Cause: the warmed calibration timed ONE 128-row sample per arm, and the serial arm only touched pages while the pool did full preads; neither arm paid the dequant a prefill pays. A noisy sample or the lighter serial work left the pool a 20% "win" it loses at prefill width.
+Fix: both arms run the gather's own `gatherSerial` / `gatherPooled` (read + dequant), on fresh rows per trial, and the verdict is the median of `PLE_CALIBRATION_TRIALS` (5). A cold table still picks the pool (8-bit: 30 vs 2.5 ms).
+Guard: `ngram prefill calibration: one slow sample does not pick the arm`, the trial count in `ngram prefill gather: 4096 rows ...`; live, 6/6 boots SERIAL after vs 1/4 POOLED before.

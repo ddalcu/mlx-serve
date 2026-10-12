@@ -268,7 +268,9 @@ private struct SettingsSearchQueryKey: EnvironmentKey {
 }
 
 extension EnvironmentValues {
-    fileprivate var settingsSearchQuery: String {
+    /// The active filter text. `fileprivate` to this file's rows plus the
+    /// stacks that draw their own lines under it.
+    var settingsSearchQuery: String {
         get { self[SettingsSearchQueryKey.self] }
         set { self[SettingsSearchQueryKey.self] = newValue }
     }
@@ -300,14 +302,48 @@ private struct SettingsVisibleRowCountKey: PreferenceKey {
 /// text the row renders, so what you read is what you can search for.
 struct SearchableRow<Content: View>: View {
     let searchText: [String]
+    /// Gap the row sits in, for the hairline drawn above it — the card's
+    /// own by default, so the next row someone adds has its line without
+    /// asking. A row inside a sub-stack of its own passes that stack's
+    /// spacing; one that draws its own line (or none at all) passes nil.
+    /// Inside the filter, so a row the query hides takes its line with it.
+    var separatorGap: CGFloat? = SettingsCardMetrics.gap
     @ViewBuilder var content: Content
 
     @Environment(\.settingsSearchQuery) private var query
 
     var body: some View {
         if SettingsSearch.matches(query: query, in: searchText) {
-            content.preference(key: SettingsVisibleRowCountKey.self, value: 1)
+            separated.preference(key: SettingsVisibleRowCountKey.self, value: 1)
         }
+    }
+
+    @ViewBuilder
+    private var separated: some View {
+        if let separatorGap { content.settingsRowSeparator(gap: separatorGap) }
+        else { content }
+    }
+}
+
+/// The hairline between two rows of a settings card — the line macOS System
+/// Settings draws, so a dense card reads as a list rather than a pile. It is
+/// the row's BACKGROUND, never its layout: the row keeps the height it had,
+/// and the line lands in the middle of the gap above it.
+private struct SettingsRowSeparator: ViewModifier {
+    let gap: CGFloat
+
+    func body(content: Content) -> some View {
+        content.background(alignment: .top) {
+            Divider()
+                .offset(y: -gap / 2)
+        }
+    }
+}
+
+extension View {
+    /// See `SettingsRowSeparator`.
+    func settingsRowSeparator(gap: CGFloat) -> some View {
+        modifier(SettingsRowSeparator(gap: gap))
     }
 }
 
@@ -387,7 +423,8 @@ private struct ResetDefaultsFooter: View {
 
     var body: some View {
         if !hidden {
-            SearchableRow(searchText: [label, helpText]) {
+            SearchableRow(searchText: [label, helpText],
+                          separatorGap: nil) {
                 HStack {
                     Spacer()
                     Button(role: .destructive) {
@@ -580,6 +617,13 @@ private struct EngineAwareSections: View {
 
 // MARK: - Section frame
 
+/// Space between two rows of a settings card, and the card's own inset. The
+/// rows' hairlines are placed from these two numbers, so they move together.
+private enum SettingsCardMetrics {
+    static let gap: CGFloat = 18
+    static let inset: CGFloat = 16
+}
+
 private struct SettingsSection<Content: View>: View {
     /// Identity. The sidebar row and this header both read their text from it,
     /// so a section can never exist without a way to reach it (and its two
@@ -631,12 +675,26 @@ private struct SettingsSection<Content: View>: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            VStack(alignment: .leading, spacing: collapsed ? 0 : 18) {
+            VStack(alignment: .leading, spacing: collapsed ? 0 : SettingsCardMetrics.gap) {
                 content
             }
             .environment(\.settingsSearchQuery, filter.childQuery)
-            .padding(collapsed ? 0 : 16)
+            .padding(collapsed ? 0 : SettingsCardMetrics.inset)
             .background(collapsed ? Color.clear : Color(NSColor.controlBackgroundColor))
+            // The FIRST row's hairline lands inside this inset — empty card
+            // ground, painted over, so a card never opens on a line, and a
+            // filtered card whose surviving row is not the first is covered
+            // the same way. Only the hairline's own 2 pt band is covered,
+            // though: the first row's chrome — a focused field's ring, a
+            // control's shadow — reaches into this inset too, and a
+            // full-inset cover would eat it.
+            .overlay(alignment: .top) {
+                if !collapsed {
+                    Color(NSColor.controlBackgroundColor)
+                        .frame(height: 2)
+                        .offset(y: SettingsCardMetrics.inset - SettingsCardMetrics.gap / 2)
+                }
+            }
             .clipShape(RoundedRectangle(cornerRadius: 10))
         }
         .onPreferenceChange(SettingsVisibleRowCountKey.self) { visibleRows = $0 }
@@ -659,10 +717,14 @@ private struct SettingsRow<Control: View>: View {
     /// The setting's memory/disk cost; orange and bold while it is switched on.
     var cost: String? = nil
     var costActive: Bool = false
+    /// A row drawn inside a card's own sub-stack passes that stack's spacing
+    /// instead; nil leaves the line off (a row that draws its own).
+    var separatorGap: CGFloat? = SettingsCardMetrics.gap
     @ViewBuilder var control: Control
 
     var body: some View {
-        SearchableRow(searchText: [title, explainer] + [cost].compactMap { $0 }) {
+        SearchableRow(searchText: [title, explainer] + [cost].compactMap { $0 },
+                      separatorGap: separatorGap) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
@@ -920,7 +982,8 @@ private struct LanSharingSectionContent: View {
         }
         // The privacy disclosure — sharing means running other people's
         // prompts, and using a network model means the host reads yours.
-        SearchableRow(searchText: ["Privacy", Self.privacyNote]) {
+        SearchableRow(searchText: ["Privacy", Self.privacyNote],
+                      separatorGap: nil) {
             Text(L10n.text(Self.privacyNote))
                 .font(.app(.caption))
                 .foregroundStyle(.secondary)
@@ -2230,6 +2293,7 @@ private struct InterfaceSectionContent: View {
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
     @AppStorage(InterfacePrefKey.terminalTheme) private var terminalThemeId = TerminalTheme.defaultId
     @AppStorage(InterfacePrefKey.terminalBackground) private var terminalBackgroundHex = ""
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var audioPlayerStyle = AudioPlayerStyle.defaultStyle
 
     var body: some View {
         SettingsRow(title: "Language",
@@ -2287,6 +2351,16 @@ private struct InterfaceSectionContent: View {
             Toggle("", isOn: $compactMode)
                 .labelsHidden()
                 .toggleStyle(.switch).font(.app(.body))
+        }
+        SettingsRow(title: "Audio Player",
+                    explainer: "How the Voice, Music and Sound tabs show the player and your history.") {
+            Picker("", selection: $audioPlayerStyle) {
+                ForEach(AudioPlayerStyle.allCases) { style in
+                    Text(verbatim: style.label).font(.app(.body)).tag(style)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 140).font(.app(.body))
         }
         SettingsRow(title: "Terminal Theme",
                     explainer: "Colors for new terminals; right-click a terminal to change just that one.") {
@@ -2870,7 +2944,8 @@ private struct MessagingSectionContent: View {
 
         // Setup steps. The divider rides inside the searchable row so a
         // filtered view never leaves a dangling separator behind.
-        SearchableRow(searchText: ["Setup", "BotFather", "newbot", "token", "lock it to your chat"]) {
+        SearchableRow(searchText: ["Setup", "BotFather", "newbot", "token", "lock it to your chat"],
+                      separatorGap: nil) {
             VStack(alignment: .leading, spacing: 6) {
                 Divider()
                     .padding(.bottom, 6)

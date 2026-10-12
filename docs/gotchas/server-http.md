@@ -2645,3 +2645,30 @@ Fix: every non-multipart body (and every Responses WebSocket frame) is scanned o
 `[`/`{` outside strings (`jsonNestingDepth`) and refused past `MAX_JSON_DEPTH` (4096: above the
 3000-deep contract in `test_api_edges.sh`, far below the overflow).
 Guard: `jsonNestingDepth: brackets inside strings never count` (server.zig).
+
+## An idle media model got an agent turn refused (2026-10-11)
+
+Defect: a pi agent on GLM-5.3 (173 GB) generating its own assets got a 400 on a 36.7k-token turn
+("requires ~10558MB … only ~9466MB is available"), and pi ended the session. Krea (14.7 GB) sat
+idle beside it from the agent's image jobs a minute earlier.
+
+Cause: the connection thread's admission credited only the hot prefix cache as reclaimable. An idle
+resident model is memory too, but only a LOAD's eviction planner ever freed one.
+
+Fix: before refusing, `checkAttentionMemory` unloads idle resident models least recently used first
+(`Scheduler.idleModelToUnload` + `unloadModelIfIdle`, never the request's own model) and re-bills
+after each, via `fitAfterUnloadingIdle`.
+Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
+
+## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
+
+Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and
+gemma-3-12B to 45; v26.10.1 gave the 9B 10k. The prompt cache beside it kept 2 GB.
+
+Cause: the sizer billed the fixed 2 GB cache reserve before the context, and the honest available
+figure (#776, ~0.5 GB lower) took the last of the room. The 1024 floor applied only at exactly 0,
+so 53 tokens of room advertised 45.
+
+Fix: the reserve is at most half the room beside the weights and the prefill (`ctxCacheShare`, both
+sizer paths); the load-time clamp gives the cache the residual as before. Floor at < 1024.
+Guard: `context sizer: the prompt-cache reserve never takes more than half the room beside the weights`.

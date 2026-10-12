@@ -142,6 +142,23 @@ final class GenerationDefaultsRowsTests: XCTestCase {
         XCTAssertTrue(GenerationField.maxTokens.presets!.contains(16384))
     }
 
+    /// The stack lays its rows out at its own spacing, so the hairline a row
+    /// draws must land in the middle of THAT gap — and the first row the
+    /// filter leaves carries none: the `Divider()` above already opens the
+    /// list, and a second rule under it reads as a double line.
+    func testSeparatorGapFollowsTheStackAndSkipsTheFirstRowTheFilterLeaves() {
+        let fields = GenerationField.allCases
+        XCTAssertNil(GenerationDefaultsRows.separatorGap(field: fields[0], visible: fields))
+        XCTAssertEqual(GenerationDefaultsRows.separatorGap(field: fields[1], visible: fields),
+                       GenerationDefaultsRows.rowGap)
+        // A query that leaves a middle field on top of the list: that field
+        // is now the first one after the Divider, so it draws no line.
+        let filtered: [GenerationField] = [.topP, .topK]
+        XCTAssertNil(GenerationDefaultsRows.separatorGap(field: .topP, visible: filtered))
+        XCTAssertEqual(GenerationDefaultsRows.separatorGap(field: .topK, visible: filtered),
+                       GenerationDefaultsRows.rowGap)
+    }
+
     func testInheritedClientBodyDoesNotPinSamplingAndRemoteBodyKeepsExistingDefaults() throws {
         var local = APIClient.RequestDefaults()
         local.inheritGeneration = true

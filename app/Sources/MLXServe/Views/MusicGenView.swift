@@ -41,6 +41,7 @@ struct MusicGenView: View {
     @State private var showPlaylist = true
     @State private var confirmStopRadio = false
     @AppStorage("aiRadio.theme") private var radioTheme = ""
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var playerStyle = AudioPlayerStyle.defaultStyle
     @State private var showSaveStyle = false
     @State private var showSaveLyrics = false
     @State private var saveTitle = ""
@@ -183,25 +184,35 @@ struct MusicGenView: View {
             }
             .disabled(radio.isOn)
             .opacity(radio.isOn ? 0.45 : 1)
-            .overlay(alignment: .top) {
-                if radio.isOn {
-                    Label("AI Radio is running. Settings are locked until you stop it.", systemImage: "lock.fill")
-                        .font(.app(.caption)).padding(8).frame(maxWidth: .infinity)
-                        .background(.regularMaterial)
-                }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if radio.isOn { RadioLockBanner() }
             }
             .frame(minWidth: 340, idealWidth: 380)
 
             // One docked window: the deck on top, the playlist filling the rest.
             VStack(spacing: 12) {
-                MlxAmpStretched { width, height in
-                    VStack(spacing: 0) {
-                        deck(width: width)
-                        if showPlaylist {
-                            MlxAmpPlaylist(width: width, height: max(MlxAmpPlaylist.minHeight, height - MlxAmpPlayer.height),
-                                           paths: service.recent, current: clipPlayer.playingPath, locked: radio.isOn,
-                                           onPlay: { play($0) }, onStop: { stopPlayback() })
+                switch playerStyle {
+                case .mlxAmp:
+                    MlxAmpStretched { width, height in
+                        VStack(spacing: 0) {
+                            deck(width: width)
+                            if showPlaylist {
+                                MlxAmpPlaylist(width: width, height: max(MlxAmpPlaylist.minHeight, height - MlxAmpPlayer.height),
+                                               paths: service.recent, current: clipPlayer.playingPath,
+                                               locked: DeckKey.historyRow.isLocked(radioOn: radio.isOn),
+                                               onPlay: { play($0) }, onStop: { stopPlayback() })
+                            }
                         }
+                    }
+                case .modern:
+                    modernDeck
+                    if showPlaylist {
+                        ModernPlaylist(paths: service.recent, current: clipPlayer.playingPath, paused: clipPlayer.isPaused,
+                                       locked: DeckKey.historyRow.isLocked(radioOn: radio.isOn),
+                                       onPlay: { play($0) }, onStop: { stopPlayback() })
+                            .frame(maxHeight: .infinity)
+                    } else {
+                        Spacer(minLength: 0)
                     }
                 }
                 outputFolderLink
@@ -377,7 +388,7 @@ struct MusicGenView: View {
     /// stem. Both take their length from the clip, so Duration disappears.
     private var modeSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Picker("", selection: $task) {
+            SegmentedOrMenu(Picker("", selection: $task) {
                 // The Cover segment declares a missing tokenizer in its OWN
                 // label, so the reason is readable before the mode is even
                 // selected — the whole point of #269.
@@ -385,7 +396,7 @@ struct MusicGenView: View {
                     Text(L10n.text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready))).tag(t)
                 }
             }
-            .labelsHidden().pickerStyle(.segmented)
+            .labelsHidden())
             Text(L10n.text(
                  task == .cover
                  ? "Re-sings an existing track in the style you describe: melody and structure stay, the caption and lyrics decide the rest."
@@ -947,6 +958,20 @@ struct MusicGenView: View {
     /// The player shows whatever played last, generated or picked from History;
     /// while generating or after a failure its title line says so.
     private func deck(width: CGFloat) -> some View {
+        let (path, status) = deckState()
+        return MlxAmpPlayer(player: clipPlayer, radio: radio, width: width, path: path,
+                            showPlaylist: $showPlaylist, radioTheme: $radioTheme, onRadioStart: { startRadio() }, onRadioStop: { confirmStopRadio = true }, status: status, onShowLog: { showLogWindow() })
+    }
+
+    private var modernDeck: some View {
+        let (path, status) = deckState()
+        return ModernAudioDeck(player: clipPlayer, radio: radio, path: path, showPlaylist: $showPlaylist, radioTheme: $radioTheme,
+                               onRadioStart: { startRadio() }, onRadioStop: { confirmStopRadio = true },
+                               status: status, onShowLog: { showLogWindow() })
+    }
+
+    /// The track the deck holds and what its title says instead, for either look.
+    private func deckState() -> (path: String, status: MlxAmpPlayer.Status?) {
         var status: MlxAmpPlayer.Status?
         // The radio's progress lives in its own strip; the title keeps the track playing.
         if let p = MusicGenPlayback.deckProgress(phase: service.phase, radioOn: radio.isOn,
@@ -959,8 +984,7 @@ struct MusicGenView: View {
         // has something to start.
         let path = clipPlayer.loadedPath ?? service.recent.first ?? ""
         if path.isEmpty, status == nil, case .idle = service.phase { status = .busy(L10n.text("No music yet"), progress: nil) }
-        return MlxAmpPlayer(player: clipPlayer, radio: radio, width: width, path: path,
-                            showPlaylist: $showPlaylist, radioTheme: $radioTheme, onRadioStart: { startRadio() }, onRadioStop: { confirmStopRadio = true }, status: status, onShowLog: { showLogWindow() })
+        return (path, status)
     }
 
     private func showLogWindow() {
@@ -1232,5 +1256,16 @@ private struct GeneratingBar: View {
         }
         .frame(height: 28)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// Above the Music settings while AI Radio runs: a card inside the column's
+/// margin, so it reaches neither the floating sidebar nor the window's edge.
+struct RadioLockBanner: View {
+    var body: some View {
+        Label("AI Radio is running. Settings are locked until you stop it.", systemImage: "lock.fill")
+            .font(.app(.caption)).padding(8).frame(maxWidth: .infinity)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .padding([.horizontal, .top], 16)
     }
 }
