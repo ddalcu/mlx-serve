@@ -293,10 +293,12 @@ final class StoryboardTests: XCTestCase {
             let c = try await centreColours(of: out)
             XCTAssertEqual(c.count, 2 * n - 1, "\(fps) fps")
             let seam = n - 1
-            XCTAssertGreaterThan(c[seam - 2].r, 150, "\(fps) fps"); XCTAssertLessThan(c[seam - 2].g, 20, "\(fps) fps")
-            XCTAssertGreaterThan(c[seam - 1].g, 40, "\(fps) fps"); XCTAssertGreaterThan(c[seam - 1].r, c[seam - 1].g, "\(fps) fps")
-            XCTAssertGreaterThan(c[seam].r, 40, "\(fps) fps"); XCTAssertGreaterThan(c[seam].g, c[seam].r, "\(fps) fps")
-            XCTAssertLessThan(c[seam + 1].r, 20, "\(fps) fps"); XCTAssertGreaterThan(c[seam + 1].g, 150, "\(fps) fps")
+            // The join is re-encoded, and a software encoder (CI) smears some colour across a hard
+            // change into the frames either side; a blended frame carries over 100 of the other colour.
+            XCTAssertGreaterThan(c[seam - 2].r, 150, "\(fps) fps"); XCTAssertLessThan(c[seam - 2].g, 80, "\(fps) fps")
+            XCTAssertGreaterThan(c[seam - 1].g, 100, "\(fps) fps"); XCTAssertGreaterThan(c[seam - 1].r, c[seam - 1].g, "\(fps) fps")
+            XCTAssertGreaterThan(c[seam].r, 100, "\(fps) fps"); XCTAssertGreaterThan(c[seam].g, c[seam].r, "\(fps) fps")
+            XCTAssertLessThan(c[seam + 1].r, 80, "\(fps) fps"); XCTAssertGreaterThan(c[seam + 1].g, 150, "\(fps) fps")
             XCTAssertTrue(c[(seam - 1)...(seam + 1)].allSatisfy { $0.b < 30 }, "the cut opening frame leaked in at \(fps) fps")
         }
     }
