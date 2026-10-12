@@ -62,6 +62,7 @@ const supported_model_types = [_][]const u8{
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
     "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk, text/image/video embeddings)
+    "minicpmv4_7", // openbmb MiniCPM-V 4.7 (Qwen3.5 trunk; text served, vision pending)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -2149,6 +2150,7 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     // Sibling arches still recognized.
     try testing.expect(isSupportedModelType("qwen3_5_moe"));
     try testing.expect(isSupportedModelType("qwen3"));
+    try testing.expect(isSupportedModelType("minicpmv4_7"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
 }

@@ -257,7 +257,11 @@ class AppState: ObservableObject {
     lazy var imageGen = ImageGenService()
     lazy var videoGen = VideoGenService()
     lazy var audioGen = AudioGenService()
-    lazy var musicGen = MusicGenService()
+    lazy var musicGen: MusicGenService = {
+        let service = MusicGenService()
+        MusicTransport.shared.attach(service)
+        return service
+    }()
     lazy var soundGen = SoundGenService()
     lazy var model3dGen = Model3DGenService()
     /// The server always starts with the app; tests that build an AppState opt out.

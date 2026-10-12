@@ -41,6 +41,8 @@ struct DeckActions {
     let onRadioStart: () -> Void
     /// Asked first: stopping a station discards the track being composed.
     let onRadioStop: () -> Void
+    /// The list Previous/Next step through; nil = the player's own queue.
+    var queue: [String]? = nil
 
     var active: Bool { status == nil && player.playingPath == path }
     var playing: Bool { active && !player.isPaused }
@@ -53,10 +55,10 @@ struct DeckActions {
         case (.radio, _): if radio.isOn { onRadioStop() } else { onRadioStart() }
         case (.stop, .radio): onRadioStop()
         case (.next, .radio): radio.skip()
-        case (.previous, _): player.advance(-1, from: path)
+        case (.previous, _): player.advance(-1, from: path, in: queue)
         case (.playPause, _): if active { player.togglePause() } else if !path.isEmpty { player.play(path) }
         case (.stop, _): player.stop()
-        case (.next, _): player.advance(1, from: path)
+        case (.next, _): player.advance(1, from: path, in: queue)
         case (.shuffle, _): player.shuffle.toggle()
         case (.repeatAll, _): player.autoNext.toggle()
         case (.export, _): if !path.isEmpty { AudioExport.exportAndReveal(path) }

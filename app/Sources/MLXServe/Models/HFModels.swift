@@ -58,6 +58,7 @@ let supportedModelTypes: Set<String> = [
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
+    "minicpmv4_7", // openbmb MiniCPM-V 4.7 (Qwen3.5 trunk; text served, vision pending)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)

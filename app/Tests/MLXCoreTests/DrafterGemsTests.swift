@@ -37,9 +37,17 @@ final class DrafterGemsTests: XCTestCase {
                        [DrafterGem(kind: .dspark, repo: "LiquidAI/LFM2.5-2.6B-DSpark", subfolder: nil, sizeGB: 0.66)])
         XCTAssertEqual(DrafterGems.gems(forRepoId: "LiquidAI/LFM2.5-8B-A1B-MLX-8bit", packFiles: nil, localDrafter: false, mtpAvailable: false).first?.repo,
                        "LiquidAI/LFM2.5-8B-A1B-DSpark")
+        XCTAssertEqual(DrafterGems.gems(forRepoId: "openbmb/MiniCPM-V-4.7-35B-A3B-MLX-4bit", packFiles: nil, localDrafter: false, mtpAvailable: false),
+                       [DrafterGem(kind: .dspark, repo: "openbmb/MiniCPM-V-4.7-35B-A3B-DSpark", subfolder: nil, sizeGB: 0.74)])
+        XCTAssertEqual(DrafterGems.gems(forRepoId: "mlx-community/MiniCPM-V-4.7-1B-8bit", packFiles: nil, localDrafter: false, mtpAvailable: false).first?.repo,
+                       "openbmb/MiniCPM-V-4.7-1B-DSpark")
+        // MiniCPM's DSpark loses llmprobe's prose decode cell (1B 481 -> 208, 35B 171 -> 118 tok/s): offered, never auto-filled.
+        for repo in ["openbmb/MiniCPM-V-4.7-35B-A3B-MLX-4bit", "mlx-community/MiniCPM-V-4.7-1B-8bit"] {
+            XCTAssertNil(DrafterGems.defaultGem(DrafterGems.gems(forRepoId: repo, packFiles: nil, localDrafter: false, mtpAvailable: false)), repo)
+        }
         // The MoE Gemma regresses with a drafter; a drafter never pulls itself; GGUF has no drafter path.
         for repo in ["mlx-community/gemma-4-26b-a4b-it-4bit", GemmaVariant.E4B.drafterRepoId, DrafterGems.museAssistantRepo,
-                     "LiquidAI/LFM2.5-2.6B-DSpark", "mlx-community/LFM2.5-VL-1.6B-4bit",
+                     "LiquidAI/LFM2.5-2.6B-DSpark", "openbmb/MiniCPM-V-4.7-1B-DSpark", "mlx-community/LFM2.5-VL-1.6B-4bit",
                      DrafterGems.qwen38DFlash2Repo, DrafterGems.glmDFlash2Repo, "unsloth/Qwen3.8-27B-GGUF",
                      "mlx-community/gemma-3-12b-it-4bit"] {
             XCTAssertEqual(DrafterGems.gems(forRepoId: repo, packFiles: nil, localDrafter: false, mtpAvailable: false), [], repo)

@@ -52,8 +52,17 @@ final class AudioClipPlayer: NSObject, ObservableObject, NSSoundDelegate {
 
     private var sound: NSSound?
 
-    /// Seconds into the playing clip; 0 when stopped.
-    var elapsed: TimeInterval { sound?.currentTime ?? 0 }
+    /// Where the next `play` of `loadedPath` starts: a track restored from the last run.
+    private(set) var resumeAt: TimeInterval?
+
+    /// Seconds into the playing clip; the resume point, else 0, when stopped.
+    var elapsed: TimeInterval { sound?.currentTime ?? resumeAt ?? 0 }
+
+    /// Load `path` without playing it, so the next play starts `seconds` in.
+    func restore(_ path: String, at seconds: TimeInterval) {
+        loadedPath = path
+        resumeAt = seconds
+    }
 
     /// Jump within the loaded clip, starting it if it is stopped.
     func seek(to seconds: TimeInterval) {
@@ -87,10 +96,12 @@ final class AudioClipPlayer: NSObject, ObservableObject, NSSoundDelegate {
 
     /// Play `path` from the start, replacing whatever is playing.
     func play(_ path: String) {
+        let offset = path == loadedPath ? resumeAt : nil
         stop()
         guard let s = NSSound(contentsOfFile: path, byReference: true) else { return }
         s.delegate = self
         s.volume = Float(volume)
+        if let offset { s.currentTime = offset }
         sound = s
         playingPath = path
         loadedPath = path
@@ -103,6 +114,7 @@ final class AudioClipPlayer: NSObject, ObservableObject, NSSoundDelegate {
         sound = nil
         playingPath = nil
         isPaused = false
+        resumeAt = nil
     }
 
     func togglePause() {
@@ -113,7 +125,8 @@ final class AudioClipPlayer: NSObject, ObservableObject, NSSoundDelegate {
 
     /// Play the track `delta` rows from `from` (default: the loaded one) — a
     /// random other one when shuffling. Past either end it stops, unless `wrap`.
-    func advance(_ delta: Int, from path: String? = nil, wrap: Bool = false) {
+    func advance(_ delta: Int, from path: String? = nil, in list: [String]? = nil, wrap: Bool = false) {
+        let queue = list ?? queue
         guard let current = path ?? loadedPath, let i = queue.firstIndex(of: current) else { return }
         if shuffle, queue.count > 1 {
             play(queue.filter { $0 != current }.randomElement()!)

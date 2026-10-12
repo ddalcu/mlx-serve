@@ -1206,8 +1206,9 @@ fn fmtKey(buf: *[256]u8, prefix: []const u8, suffix: []const u8) []const u8 {
 
 /// Tower spellings we serve, most common first. Qwen3-VL checkpoints say
 /// `vision_tower.`; avlp12's Qwen3.8 "Alis" packs ship the same 333 tensors
-/// under `model.visual.` (pure rename, substructure identical).
-pub const VISION_PREFIXES = [_][]const u8{ "vision_tower.", "model.visual." };
+/// under `model.visual.` (pure rename, substructure identical), oMLX 0.7.1's
+/// GLM-5.3 oQ packs under `vision_model.`.
+pub const VISION_PREFIXES = [_][]const u8{ "vision_tower.", "model.visual.", "vision_model." };
 
 /// Stored axis order of `patch_embed.proj.weight`. mlx_lm's Conv3d writes
 /// channels LAST (`[out, kT, ps, ps, Cin]`); a straight torch export keeps
@@ -1251,12 +1252,26 @@ test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded"
         try put(&w, allocator, "vision_tower.patch_embed.proj.weight");
         try std.testing.expectEqualStrings("vision_tower.", resolveVisionPrefix(&w).?);
     }
+    // A MiniCPM-V SigLIP tower is not a Qwen3-VL tower: no prefix, vision off.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "vision_tower.embeddings.patch_embedding.weight");
+        try std.testing.expect(resolveVisionPrefix(&w) == null);
+    }
     // avlp12 Alis spelling (live: vision silently disabled, 0.92 GB dead weight).
     {
         var w = Weights.init(allocator);
         defer w.deinit();
         try put(&w, allocator, "model.visual.patch_embed.proj.weight");
         try std.testing.expectEqualStrings("model.visual.", resolveVisionPrefix(&w).?);
+    }
+    // oMLX 0.7.1 spelling (Jundot's GLM-5.3-Flash oQ packs).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "vision_model.patch_embed.proj.weight");
+        try std.testing.expectEqualStrings("vision_model.", resolveVisionPrefix(&w).?);
     }
     // No tower (text-only pack, or --no-vision dropped it) → vision disabled.
     {

@@ -250,6 +250,8 @@ pub const ModelConfig = struct {
     linear_key_head_dim: u32 = 128,
     linear_value_head_dim: u32 = 128,
     linear_conv_kernel_dim: u32 = 4,
+    /// Set at parse for qwen4_exp (`gdnStateF32Enabled`); read through `ssmStateDtype`.
+    ssm_state_f32: bool = false,
 
     // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
     // GatedDeltaNet recurrence:
@@ -1044,10 +1046,11 @@ pub const ModelConfig = struct {
         return if (self.hadamard_block > 0) .float16 else .bfloat16;
     }
 
-    /// GatedDeltaNet recurrent state dtype: f32 on Hadamard packs, as the
-    /// reference runtime keeps it; bf16 elsewhere.
+    /// GatedDeltaNet recurrent state dtype, which the decay gate is computed in too:
+    /// f32 where the reference runtime keeps it (Hadamard packs, GLM-5, qwen4_exp),
+    /// since a gate near one rounds to 1.0 in bf16 and that head stops forgetting.
     pub fn ssmStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
-        return if (self.hadamard_block > 0 or self.isGlm5()) .float32 else .bfloat16;
+        return if (self.hadamard_block > 0 or self.isGlm5() or self.ssm_state_f32) .float32 else .bfloat16;
     }
 
     /// Configured MTP depth (0 = auto). Hadamard packs run a grafted head that
@@ -1072,6 +1075,8 @@ pub const ModelConfig = struct {
         if (self.rope_llama3 != null) return "llama3-rope-v1";
         // A pool's completing indexer row stores the pool's key in its gate half.
         if (self.isGlm5()) return "glm5-pooled-keys-v1";
+        // A restored bf16 state would keep running bf16: every GDN kernel takes its state's dtype.
+        if (self.ssm_state_f32) return "gdn-f32-state-v1";
         return null;
     }
 
@@ -1920,6 +1925,20 @@ fn qwen4ConfigU32(cfg_obj: std.json.ObjectMap, key: []const u8) !?u32 {
     const v = try qwen4ConfigU64(cfg_obj, key) orelse return null;
     if (v > std.math.maxInt(u32)) return error.InvalidQwen4ConfigField;
     return @intCast(v);
+}
+
+pub var gdn_state_f32_override: ?bool = null; // test seam
+var gdn_state_f32_env: ?bool = null;
+
+/// qwen4_exp's GatedDeltaNet state and decay gate in f32, as its reference keeps them.
+/// MLX_SERVE_GDN_STATE_F32=0 restores bf16 (half the state memory, the old numerics).
+fn gdnStateF32Enabled() bool {
+    if (gdn_state_f32_override) |v| return v;
+    if (gdn_state_f32_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_GDN_STATE_F32");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    gdn_state_f32_env = on;
+    return on;
 }
 
 /// Range-check every qwen4_exp bound the forward indexes a fixed array with or divides by.
@@ -2859,7 +2878,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
         std.mem.eql(u8, model_type, "qwen3_5_text") or
-        std.mem.eql(u8, model_type, "prism_hadamard_qwen35"))
+        std.mem.eql(u8, model_type, "prism_hadamard_qwen35") or
+        // MiniCPM-V 4.7: a Qwen3.5 trunk in mlx-vlm's layout; its SigLIP tower
+        // resolves no Qwen3-VL prefix, so vision stays off.
+        std.mem.eql(u8, model_type, "minicpmv4_7"))
     {
         config.model_type = "qwen3_5_moe";
         if (std.mem.eql(u8, model_type, "prism_hadamard_qwen35")) config.hadamard_block = try prismHadamardBlock(root);
@@ -2895,6 +2917,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.has_sliding_window = false;
         config.attn_output_gate = true;
         config.kda_sigmoid_out_gate = true; // output_gate_type "sigmoid"
+        // Keyed on the arch: the HF reference ignores `mamba_ssm_dtype` and is f32 regardless.
+        config.ssm_state_f32 = gdnStateF32Enabled();
         config.rope_scaling_factor = 1.0;
         config.rope_local_base_freq = config.rope_theta;
         if (jsonField(cfg_obj, "query_pre_attn_scalar") == null) {
@@ -5254,6 +5278,7 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // wired in src/vision.zig (UnifiedEmbedder), so keep them under the same
     // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
+        std.mem.startsWith(u8, key, "vision_model.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
         std.mem.startsWith(u8, key, "vision_embedder.") or
         std.mem.startsWith(u8, key, "embed_audio.") or
@@ -5995,6 +6020,9 @@ test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nesti
     // --no-vision cannot drop it and we hold ~0.9 GB we never read.
     try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", false));
     try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", true));
+    // oMLX 0.7.1's GLM-5.3 oQ packs spell the tower `vision_model.`.
+    try testing.expect(!shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", true));
     // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
@@ -8181,6 +8209,22 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
 }
 
+test "parseConfigFromJson minicpmv4_7 (MiniCPM-V 4.7) serves its Qwen3.5 trunk" {
+    const json =
+        \\{
+        \\  "model_type": "minicpmv4_7",
+        \\  "text_config": {"model_type": "qwen3_5_moe_text", "hidden_size": 2048, "num_experts": 256},
+        \\  "vision_config": {"model_type": "minicpmv4_7_vision", "hidden_size": 1152, "patch_size": 14},
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expect(config.isMoe());
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+}
+
 test "a qwen3_5_moe trunk batches decode: its only per-slot state is the GDN pair" {
     // Bar: routed experts are row-generic (the sorted gather path takes B*S rows),
     // so a qwen3_5 MoE batches like the dense trunk; MoE trunks with other
@@ -9333,6 +9377,53 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
         try t.expect(!cfg.longCtxGated());
         try t.expect(!cfg.ssdFirstCapable());
     }
+}
+
+/// QWEN4_SHIPPED's GatedDeltaNet geometry: 36 linear layers of 48 value heads over Dk = Dv = 128.
+const QWEN4_GDN_FIELDS = ",\"linear_num_key_heads\":16,\"linear_num_value_heads\":48,\"linear_key_head_dim\":128," ++
+    "\"linear_value_head_dim\":128,\"linear_conv_kernel_dim\":4";
+
+test "qwen4_exp serves its GatedDeltaNet state in f32, declared or not; unmeasured families keep bf16" {
+    // The shipped packs declare it; the reference keeps f32 whether or not the key is there.
+    for ([_][]const u8{
+        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"mamba_ssm_dtype\":\"float32\""),
+        qwen4CaseJson(QWEN4_GOOD_FIELDS),
+    }) |json| try testing.expectEqual(mlx.mlx_dtype.float32, (try parseConfigFromJson(testing.allocator, json)).ssmStateDtype());
+    for ([_][]const u8{
+        \\{"model_type": "qwen3_5", "text_config": {"hidden_size": 1024, "mamba_ssm_dtype": "float32"}}
+        ,
+        \\{"model_type": "qwen3_5_moe", "text_config": {"hidden_size": 1024, "mamba_ssm_dtype": "float32"}}
+        ,
+        \\{"model_type": "qwen3_next", "hidden_size": 1024, "mamba_ssm_dtype": "float32"}
+        ,
+    }) |json| try testing.expectEqual(mlx.mlx_dtype.bfloat16, (try parseConfigFromJson(testing.allocator, json)).ssmStateDtype());
+}
+
+test "MLX_SERVE_GDN_STATE_F32=0 restores the bf16 GatedDeltaNet state on qwen4_exp only" {
+    gdn_state_f32_override = false;
+    defer gdn_state_f32_override = null;
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, (try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS))).ssmStateDtype());
+    const hadamard = try parseConfigFromJson(testing.allocator,
+        \\{"model_type": "prism_hadamard_qwen35", "text_config": {"hidden_size": 5120},
+        \\ "modules": [{"path": "lm_head", "block": 1024}]}
+    );
+    try testing.expectEqual(mlx.mlx_dtype.float32, hadamard.ssmStateDtype());
+    var glm = try parseConfigFromJson(testing.allocator, glm5_next_pack_json);
+    defer glm.deinit(testing.allocator);
+    try testing.expectEqual(mlx.mlx_dtype.float32, glm.ssmStateDtype());
+}
+
+test "a qwen4_exp checkpoint bills its f32 GatedDeltaNet state and gets its own cache layout" {
+    const c = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ QWEN4_GDN_FIELDS));
+    // 36 layers x (48 x 128 x 128 f32 state + 3 x 10240 bf16 conv rows).
+    try testing.expectEqual(@as(u64, 115_458_048), c.ssmCheckpointBytes());
+    try testing.expectEqualStrings("gdn-f32-state-v1", c.cacheLayoutNamespace() orelse "");
+    // The lever's bf16 arm bills and caches exactly as before.
+    gdn_state_f32_override = false;
+    defer gdn_state_f32_override = null;
+    const old = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ QWEN4_GDN_FIELDS));
+    try testing.expectEqual(@as(u64, 58_834_944), old.ssmCheckpointBytes());
+    try testing.expect(old.cacheLayoutNamespace() == null);
 }
 
 /// One qwen4_exp config document with `extra` fields spliced in.

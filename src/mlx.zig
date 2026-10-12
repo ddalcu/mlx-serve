@@ -838,6 +838,53 @@ pub fn applyWiredPolicy() WiredPolicyResult {
     }
 }
 
+/// Evaluates every array reachable through `value`'s fields (structs, optionals, fixed arrays),
+/// so weights a loader bound lazily are resident, and billed, before the first request.
+pub fn evalFields(value: anytype) !void {
+    const vec = mlx_vector_array_new();
+    defer _ = mlx_vector_array_free(vec);
+    appendFields(vec, value);
+    try check(mlx_eval(vec));
+}
+
+fn appendFields(vec: mlx_vector_array, value: anytype) void {
+    const T = @TypeOf(value);
+    if (T == mlx_array) {
+        if (value.ctx != null) _ = mlx_vector_array_append_value(vec, value);
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => |st| inline for (st.field_names) |name| appendFields(vec, @field(value, name)),
+        .optional => if (value) |v| appendFields(vec, v),
+        .array => for (value) |v| appendFields(vec, v),
+        else => {},
+    }
+}
+
+test "evalFields evaluates the arrays nested in structs, optionals and arrays" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const s = gpuStream();
+    const one = mlx_array_new_float(1.0);
+    defer _ = mlx_array_free(one);
+    var lazy: [4]mlx_array = undefined;
+    for (&lazy) |*a| {
+        a.* = mlx_array_new();
+        try check(mlx_add(a, one, one, s));
+    }
+    defer for (lazy) |a| {
+        _ = mlx_array_free(a);
+    };
+    const Inner = struct { w: mlx_array, none: mlx_array = .{ .ctx = null } };
+    const Outer = struct { inner: Inner, opt: ?mlx_array, rows: [2]mlx_array, n: u32 = 7 };
+    const v = Outer{ .inner = .{ .w = lazy[0] }, .opt = lazy[1], .rows = .{ lazy[2], lazy[3] } };
+    try evalFields(v);
+    for (lazy) |a| {
+        var ready = false;
+        _ = _mlx_array_is_available(&ready, a);
+        try std.testing.expect(ready);
+    }
+}
+
 test "cudaHomeDefault: export /opt/cuda only when nothing else names a toolkit" {
     try std.testing.expectEqualStrings("/opt/cuda", cudaHomeDefault(false, false, true).?);
     try std.testing.expect(cudaHomeDefault(true, false, true) == null);

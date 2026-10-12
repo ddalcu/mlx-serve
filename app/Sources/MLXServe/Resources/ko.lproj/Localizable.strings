@@ -2211,3 +2211,7 @@
 "Language" = "언어";
 "System Default" = "시스템 기본값";
 "\"System Default\" follows the Mac. The app relaunches to apply the change." = "\"시스템 기본값\"은 이 Mac의 언어를 따릅니다. 변경 후 앱이 다시 시작됩니다.";
+"Open the Music tab" = "음악 탭 열기";
+"Previous track" = "이전 곡";
+"Next track" = "다음 곡";
+"AI Radio picks the next track" = "AI 라디오가 다음 곡을 고릅니다";

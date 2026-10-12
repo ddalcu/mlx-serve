@@ -38,8 +38,13 @@ enum DrafterGems {
     static let qwen38DFlash2Repo = "z-lab/Qwen3.8-27B-DFlash2"
     static let glmDFlash2Repo = "incoai/GLM-5.3-Flash-DFlash2"
     static let museAssistantRepo = "meta-models/Muse-Glimmer-30B-assistant"
-    /// LiquidAI's DSpark drafters, by the LFM2.5 base they draft for.
-    static let lfmDSparkRepos = ["lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-DSpark", "lfm2.5-8b-a1b": "LiquidAI/LFM2.5-8B-A1B-DSpark"]
+    /// Separate-repo DSpark drafters, by the base-name prefix of the model they draft for.
+    static let dsparkRepos: [String: (repo: String, sizeGB: Double)] = [
+        "lfm2.5-2.6b": ("LiquidAI/LFM2.5-2.6B-DSpark", 0.66),
+        "lfm2.5-8b-a1b": ("LiquidAI/LFM2.5-8B-A1B-DSpark", 0.66),
+        "minicpm-v-4.7-35b-a3b": ("openbmb/MiniCPM-V-4.7-35B-A3B-DSpark", 0.74),
+        "minicpm-v-4.7-1b": ("openbmb/MiniCPM-V-4.7-1B-DSpark", 0.41),
+    ]
 
     /// The gems that fit `repoId`, the default first (after MTP).
     /// `packFiles`: the pack's HF listing (path → size) when fetched, nil when
@@ -66,8 +71,8 @@ enum DrafterGems {
             out.append(DrafterGem(kind: .dflash2, repo: glmDFlash2Repo, subfolder: nil, sizeGB: 2.34))
         } else if base.contains("muse-glimmer") {
             out.append(DrafterGem(kind: .museAssistant, repo: museAssistantRepo, subfolder: nil, sizeGB: 5.11))
-        } else if let repo = lfmDSparkRepos.first(where: { base.hasPrefix($0.key) })?.value {
-            out.append(DrafterGem(kind: .dspark, repo: repo, subfolder: nil, sizeGB: 0.66))
+        } else if let gem = dsparkRepos.first(where: { base.hasPrefix($0.key) })?.value {
+            out.append(DrafterGem(kind: .dspark, repo: gem.repo, subfolder: nil, sizeGB: gem.sizeGB))
         } else if base.contains("gemma-4") || base.contains("gemma4"),
                   let variant = DownloadManager.gemmaVariantFor(modelPath: base, isMoE: false), variant != .moe26B {
             // The MoE Gemma is left out: verify pays expert routing, the drafter regresses decode.
@@ -76,10 +81,15 @@ enum DrafterGems {
         return out
     }
 
-    /// The gem a fresh download fills its socket with. The separate-repo DFlash2
-    /// drafters are offered but never auto-filled: they pay on code and edits, not everywhere.
+    /// Drafters that pay on code and edits, not everywhere: offered, never auto-filled.
+    static let offeredOnlyRepos: Set<String> = [
+        qwen38DFlash2Repo, glmDFlash2Repo,
+        "openbmb/MiniCPM-V-4.7-35B-A3B-DSpark", "openbmb/MiniCPM-V-4.7-1B-DSpark",
+    ]
+
+    /// The gem a fresh download fills its socket with.
     static func defaultGem(_ gems: [DrafterGem]) -> DrafterGem? {
-        gems.first { $0.needsDownload && $0.repo != qwen38DFlash2Repo && $0.repo != glmDFlash2Repo }
+        gems.first { $0.needsDownload && !offeredOnlyRepos.contains($0.repo) }
     }
 
     /// Whether `gem` fits beside a model of `modelGB` in this Mac's usable memory.

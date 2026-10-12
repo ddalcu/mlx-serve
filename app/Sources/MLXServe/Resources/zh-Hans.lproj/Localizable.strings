@@ -2211,3 +2211,7 @@
 "Language" = "语言";
 "System Default" = "跟随系统设置";
 "\"System Default\" follows the Mac. The app relaunches to apply the change." = "「跟随系统设置」跟随这台 Mac 的语言。更改后应用会重新启动。";
+"Open the Music tab" = "打开音乐标签页";
+"Previous track" = "上一首";
+"Next track" = "下一首";
+"AI Radio picks the next track" = "AI 电台会挑选下一首";

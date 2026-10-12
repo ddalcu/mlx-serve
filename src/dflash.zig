@@ -287,7 +287,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     const head_dim: u32 = try jsonU32(root.get("head_dim") orelse return error.IncompleteDflashConfig);
     const intermediate: u32 = try jsonU32(root.get("intermediate_size") orelse return error.IncompleteDflashConfig);
     const eps: f32 = jsonFloat(root.get("rms_norm_eps") orelse return error.IncompleteDflashConfig);
-    const sliding: u32 = if (root.get("sliding_window")) |v| try jsonU32(v) else 0;
+    const sliding: u32 = if (root.get("sliding_window")) |v| (if (v == .null) 0 else try jsonU32(v)) else 0;
 
     // `rope_parameters.rope_theta` is the transformers-5 spelling (muse,
     // DFlash2); DSpark ships a flat root `rope_theta`. Reading only the
@@ -2693,6 +2693,15 @@ test "dflash: DSpark contract splits across root and dflash_config, and both hal
     try testing.expectEqual(@as(u32, 256), cfg.markov_rank);
     try testing.expect(cfg.isDspark());
     try testing.expect(!cfg.isDflash2());
+}
+
+test "dflash: an explicit null sliding_window keeps the no-window default (MiniCPM-V 4.7 DSpark)" {
+    const allocator = testing.allocator;
+    const nulled = try std.mem.replaceOwned(u8, allocator, DSPARK_LFM2_CONFIG_JSON, "\"markov_rank\": 256,", "\"markov_rank\": 256, \"sliding_window\": null,");
+    defer allocator.free(nulled);
+    var cfg = try parseConfigFromJson(allocator, nulled);
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 0), cfg.sliding_window);
 }
 
 test "dflash: a DSpark config with an unported markov head type is refused by name" {

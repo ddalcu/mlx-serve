@@ -145,6 +145,7 @@ struct StatusMenuView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    @ObservedObject private var music = MusicTransport.shared
     @State private var showDownloads = false
     /// Slot ids with an unload in flight (the eject button becomes a spinner —
     /// an unload can take seconds while the server drains a running request).
@@ -182,6 +183,8 @@ struct StatusMenuView: View {
             // them, which flattened the hierarchy into a stack of equals.
             VStack(alignment: .leading, spacing: TrayMetrics.sectionSpacing) {
                 serverSection
+
+                musicSection
 
                 if case .running = server.status {
                     residencySection
@@ -244,7 +247,11 @@ struct StatusMenuView: View {
 
     private var serverSection: some View {
         VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
-            TraySectionHeader(title: "Server")
+            HStack(spacing: 8) {
+                TraySectionHeader(title: "Server").fixedSize()
+                engineBadge
+                Spacer(minLength: 0)
+            }
             TrayCard {
                 if hasNoUsableModels {
                     VStack(alignment: .leading, spacing: 3) {
@@ -267,7 +274,6 @@ struct StatusMenuView: View {
                         .help("Model Settings for the selected model (context, KV cache, MTP)")
                     }
                     serverControls
-                    serverFooterRow
 
                     // Show error details
                     if case .error = server.status, !server.lastError.isEmpty {
@@ -428,24 +434,65 @@ struct StatusMenuView: View {
         }
     }
 
-    private var serverFooterRow: some View {
-        HStack {
-            Spacer()
-            // The engine the resident chat model runs on, as the SERVER
-            // reports it; before a load, the file-type guess for the
-            // selected model.
-            if let engine = server.residentChatModel?.engine {
-                EngineBadge(text: engine.label, tint: EngineBadge.tint(engine))
-                    .help("Engine the loaded model runs on")
-            } else if let engine = appState.localModels
-                .first(where: { $0.path == appState.selectedModelPath })?.engine
-            {
-                EngineBadge(text: engine.displayName, tint: .secondary)
-                    .help("Engine the selected model will run on")
+    /// The engine the resident chat model runs on, as the SERVER reports it;
+    /// before a load, the file-type guess for the selected model.
+    @ViewBuilder private var engineBadge: some View {
+        if let engine = server.residentChatModel?.engine {
+            EngineBadge(text: engine.label, tint: EngineBadge.tint(engine))
+                .help("Engine the loaded model runs on")
+        } else if let engine = appState.localModels
+            .first(where: { $0.path == appState.selectedModelPath })?.engine
+        {
+            EngineBadge(text: engine.displayName, tint: .secondary)
+                .help("Engine the selected model will run on")
+        }
+    }
+
+    // MARK: - Music
+
+    /// The Music tab's track while it plays, pauses or a station is on air.
+    @ViewBuilder private var musicSection: some View {
+        if let track = music.track {
+            VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
+                TraySectionHeader(title: track.radioOn ? "AI Radio" : "Now Playing")
+                TrayCard {
+                    HStack(spacing: 8) {
+                        Button {
+                            UserDefaults.standard.set(AudioGenView.Tab.music.rawValue, forKey: "audioGenTab")
+                            openAudioGen()
+                        } label: {
+                            Text(verbatim: track.title)
+                                .font(.app(.body))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open the Music tab")
+                        transportButton("backward.fill", .previous, track,
+                                        help: track.radioOn ? "AI Radio picks the next track" : "Previous track")
+                        transportButton(track.playing ? "pause.fill" : "play.fill", .playPause, track,
+                                        help: track.playing ? "Pause" : "Play")
+                        transportButton("forward.fill", .next, track, help: "Next track")
+                    }
+                }
             }
         }
-        .font(.app(.caption))
-        .foregroundStyle(.secondary)
+    }
+
+    /// A locked key stays drawn, dimmed, so its tooltip can say why.
+    private func transportButton(_ icon: String, _ key: DeckKey, _ track: MusicTransport.Track, help: String) -> some View {
+        let locked = key.isLocked(radioOn: track.radioOn)
+        return Button { music.press(key) } label: {
+            Image(systemName: icon)
+                .font(.app(.body))
+                .foregroundStyle(locked ? HierarchicalShapeStyle.tertiary : .primary)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text(help))
     }
 
     // MARK: - What's resident, and what it costs
