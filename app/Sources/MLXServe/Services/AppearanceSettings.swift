@@ -146,11 +146,22 @@ struct AppLanguageChoice: Identifiable, Hashable {
     static let system = AppLanguageChoice(code: nil, label: L10n.text("System Default"))
 
     /// "System Default" first, then every catalog the bundle ships, each in
-    /// its own spelling. `Base` is the storyboard shell, not a language.
+    /// its own spelling.
     static var all: [AppLanguageChoice] {
-        [system] + Bundle.main.localizations
-            .filter { $0 != "Base" }
-            .map { AppLanguageChoice(code: $0, label: Self.autonym($0)) }
+        rows(for: Bundle.main.localizations)
+    }
+
+    /// One row per catalog, in the bundle's own order. `Base` is the
+    /// storyboard shell, not a language, and the bundle lists a code twice
+    /// when it is both declared and shipped — `CFBundleLocalizations` names
+    /// `zh-Hans` and `ko` and an `.lproj` of each ships — so the first
+    /// sighting of a code wins and no language is drawn twice.
+    static func rows(for localizations: [String]) -> [AppLanguageChoice] {
+        var rows: [AppLanguageChoice] = [system]
+        for code in localizations where code != "Base" && !rows.contains(where: { $0.code == code }) {
+            rows.append(AppLanguageChoice(code: code, label: autonym(code)))
+        }
+        return rows
     }
 
     private static func autonym(_ code: String) -> String {

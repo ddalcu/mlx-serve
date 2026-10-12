@@ -174,6 +174,28 @@ final class AppLanguageTests: XCTestCase {
         XCTAssertEqual(AppLanguageChoice(raw: "", localizations: ["en"]).label, L10n.text("System Default"))
     }
 
+    /// One language, one row: the bundle answers with `CFBundleLocalizations`
+    /// followed by the `.lproj` directories it ships, so a code that is both
+    /// — every catalogue but English here — comes back twice, and the picker
+    /// drew 简体中文 and 한국어 twice each. English is the development region,
+    /// so it is declared with no `.lproj` of its own to repeat it.
+    func testThePickerDrawsOneRowPerLanguage() throws {
+        let lproj = try FileManager.default
+            .contentsOfDirectory(atPath: appRoot.appendingPathComponent("Sources/MLXServe/Resources").path)
+            .filter { $0.hasSuffix(".lproj") }
+            .map { ($0 as NSString).deletingPathExtension }
+            .sorted()
+        let asTheBundleListsThem = shippedLocalizations + lproj
+        XCTAssertLessThan(Set(asTheBundleListsThem).count, asTheBundleListsThem.count,
+                          "the bundle's own list repeats a code")
+
+        XCTAssertEqual(AppLanguageChoice.rows(for: asTheBundleListsThem).map(\.label),
+                       [L10n.text("System Default"), "English", "简体中文", "한국어"])
+        // Base is the storyboard shell, not a language.
+        XCTAssertEqual(AppLanguageChoice.rows(for: ["Base", "en", "Base"]).map(\.label),
+                       [L10n.text("System Default"), "English"])
+    }
+
     /// A suite per test: the launch path writes real keys, and none of them
     /// may land in the suite `swift test` itself answers from.
     private func sandboxedDefaults() -> (UserDefaults, String) {
