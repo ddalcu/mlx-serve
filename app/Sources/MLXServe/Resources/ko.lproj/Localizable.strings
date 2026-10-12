@@ -1475,6 +1475,7 @@
 "Last frame" = "마지막 프레임";
 "The picture this shot ends on and the next one starts from. Empty, the next shot starts from this shot's own last frame." = "이 샷이 끝나고 다음 샷이 시작되는 이미지입니다. 비워 두면 다음 샷은 이 샷의 실제 마지막 프레임에서 시작합니다.";
 "Last frame (optional)..." = "마지막 프레임 (선택 사항)...";
+"Couldn't read the picture %@." = "이미지 %@을(를) 읽지 못했습니다.";
 "CLI install isn't available in the App Store build (it can't symlink outside the sandbox). Download the CLI from GitHub, or use the direct-download build of the app." = "App Store 빌드에서는 CLI를 설치할 수 없습니다(샌드박스 밖으로 심볼릭 링크를 만들 수 없음). GitHub에서 CLI를 다운로드하거나 앱의 직접 다운로드 빌드를 사용하세요.";
 "Follow a clip's look and pacing (video reference)" = "클립의 룩과 템포 따르기(비디오 참조)";
 "Voice mode transcribes on-device — your audio never leaves this Mac — but on-device dictation isn't available for %@: it's either turned off or the language isn't installed. Turn on System Settings → Keyboard → Dictation (and add your language), then enable Voice again." = "음성 모드는 기기 내에서 받아쓰므로 오디오가 이 Mac을 벗어나지 않습니다. 하지만 %@의 기기 내 받아쓰기가 꺼져 있거나 언어가 설치되지 않아 사용할 수 없습니다. 시스템 설정 → 키보드 → 받아쓰기를 켜고 해당 언어를 추가한 뒤 음성 모드를 다시 켜세요.";

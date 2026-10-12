@@ -490,6 +490,7 @@
 "Couldn't read PDF" = "无法读取 PDF";
 "Couldn't read audio" = "无法读取音频";
 "Couldn't read video" = "无法读取视频";
+"Couldn't read the picture %@." = "无法读取图片 %@。";
 "Cover" = "翻唱";
 "Cover strength" = "翻唱强度";
 "Create" = "新建";

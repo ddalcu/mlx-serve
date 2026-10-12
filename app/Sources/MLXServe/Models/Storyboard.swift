@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 /// One shot of a storyboard: generated as its own window, opening on the last
 /// frame of the shot before it.
@@ -91,23 +92,44 @@ enum Storyboard {
         return r
     }
 
-    /// Frames of the joined clip that fade toward the next shot: the last two
-    /// before every join, toward the first frame the next shot keeps (its own
-    /// opening frame is cut), by a third and two thirds. Keyed by frame index.
-    static func seamBlends(shotFrames: [Int]) -> [Int: (into: Int, weight: Double)] {
-        var blends: [Int: (into: Int, weight: Double)] = [:]
-        var start = 0
-        for (i, n) in shotFrames.enumerated() {
-            let kept = i == 0 ? n : n - 1
-            let next = start + kept
-            if i + 1 < shotFrames.count {
-                for (back, weight) in [(2, 1.0 / 3), (1, 2.0 / 3)] where kept >= back {
-                    blends[next - back] = (next, weight)
-                }
+    /// One frame of the joined clip that fades toward the next shot.
+    struct SeamBlend: Equatable {
+        let join: Int
+        /// When the frame shows, in the joined clip's seconds.
+        let frame: Range<Double>
+        /// The middle of the next shot's first frame in the clip: the frame to fade into.
+        let into: Double
+        let weight: Double
+    }
+
+    /// The last two frames before every join fade toward the first frame the
+    /// next shot shows, by a third and two thirds. Read off the frames' own
+    /// times, so no frame or sample rate is assumed: `keptFrames[i]` holds when
+    /// each frame shot i keeps starts in the clip, `ends[i]` when the last ends.
+    static func seamBlends(keptFrames: [[Double]], ends: [Double]) -> [SeamBlend] {
+        var blends: [SeamBlend] = []
+        for i in keptFrames.indices.dropLast() where i < ends.count - 1 {
+            let frames = keptFrames[i], next = keptFrames[i + 1]
+            guard let opening = next.first else { continue }
+            let into = (opening + (next.count > 1 ? next[1] : ends[i + 1])) / 2
+            for (back, weight) in [(2, 1.0 / 3), (1, 2.0 / 3)] where frames.count >= back {
+                let k = frames.count - back
+                let end = k + 1 < frames.count ? frames[k + 1] : ends[i]
+                guard end > frames[k] else { continue }
+                blends.append(SeamBlend(join: i, frame: frames[k]..<end, into: into, weight: weight))
             }
-            start = next
         }
         return blends
+    }
+
+    /// Where a picture is drawn to cover a canvas: scaled to fill it, centred,
+    /// the overflow cropped, never stretched.
+    static func coverRect(source: CGSize, canvas: CGSize) -> CGRect {
+        guard source.width > 0, source.height > 0 else { return CGRect(origin: .zero, size: canvas) }
+        let scale = max(canvas.width / source.width, canvas.height / source.height)
+        let size = CGSize(width: source.width * scale, height: source.height * scale)
+        return CGRect(x: (canvas.width - size.width) / 2, y: (canvas.height - size.height) / 2,
+                      width: size.width, height: size.height)
     }
 
     /// What the next shot opens on: the user's picture for this join while it
@@ -117,14 +139,15 @@ enum Storyboard {
         keyframe.flatMap { exists($0) ? $0 : nil } ?? renderedLastFrame
     }
 
-    /// Enhance's new shots with the pictures of the old ones, by position; the
-    /// final shot has none.
-    static func keepingEndFrames(_ planned: [StoryboardSegment], from old: [StoryboardSegment]) -> [StoryboardSegment] {
-        planned.enumerated().map { i, shot in
-            var shot = shot
-            shot.endFramePath = i < planned.count - 1 && i < old.count ? old[i].endFramePath : nil
-            return shot
-        }
+    /// The shots with no picture on the final one: a picture left there (the
+    /// shot after it was removed) becomes the film's Last frame when that is empty,
+    /// and is dropped otherwise.
+    static func settlingFinalShot(_ shots: [StoryboardSegment], lastFrame: String?)
+        -> (shots: [StoryboardSegment], lastFrame: String?) {
+        guard let picture = shots.last?.endFramePath else { return (shots, lastFrame) }
+        var settled = shots
+        settled[settled.count - 1].endFramePath = nil
+        return (settled, lastFrame ?? picture)
     }
 
     /// Restored shots without the pictures that are no longer on disk.

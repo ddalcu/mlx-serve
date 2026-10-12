@@ -918,6 +918,7 @@ struct VideoGenView: View {
                     .foregroundStyle(.secondary)
                 Button {
                     shots.removeAll { $0.id == id }
+                    settleFinalShot()
                 } label: {
                     Image(systemName: "trash")
                 }
@@ -937,6 +938,8 @@ struct VideoGenView: View {
                     .font(.app(.body))
                     .frame(height: 90)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+                    // The well's room, so a card with no well is as tall as one with it.
+                    .padding(.vertical, 6)
                 // The final shot lands on the pane's Last frame.
                 if index < shots.count - 1 {
                     let endFrame = Binding<URL?>(get: { shot.wrappedValue.endFramePath.map { URL(fileURLWithPath: $0) } },
@@ -949,6 +952,14 @@ struct VideoGenView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
     }
 
+    /// A picture left on the final shot moves to the pane's Last frame when that
+    /// is empty, and is dropped otherwise (`Storyboard.settlingFinalShot`).
+    private func settleFinalShot() {
+        let settled = Storyboard.settlingFinalShot(shots, lastFrame: lastFrameImageURL?.path)
+        shots = settled.shots
+        lastFrameImageURL = settled.lastFrame.map { URL(fileURLWithPath: $0) }
+    }
+
     /// Enhance's text: a storyboard plan fills the shots (the story stays),
     /// anything else is the clip's prompt.
     private func applyEnhanced(_ text: String) {
@@ -957,7 +968,9 @@ struct VideoGenView: View {
             prompt = text
             return
         }
-        shots = Storyboard.keepingEndFrames(planned, from: shots)
+        // New shots, no join pictures: the planner never saw them, and a picture
+        // its shots do not describe would only fight them.
+        shots = planned
         storyboardMode = true
     }
 
@@ -2279,6 +2292,7 @@ struct VideoGenView: View {
         refImageSize = s.refImageSize
         storyboardMode = s.storyboardMode
         shots = Storyboard.withoutMissingEndFrames(s.storyboard)
+        settleFinalShot()
     }
 
     private static func existingFile(_ path: String?) -> URL? {

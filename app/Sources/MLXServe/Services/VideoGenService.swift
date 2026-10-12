@@ -5,6 +5,7 @@ import AVFoundation
 @preconcurrency import AVFAudio
 import CoreVideo
 import CoreImage.CIFilterBuiltins
+import ImageIO
 
 /// Runs LTX-Video 2.3 text-to-video via the native `mlx-serve` engine (no Python).
 ///
@@ -302,16 +303,35 @@ final class VideoGenService: ObservableObject {
             var shotIndex: Int? = 0
             do {
                 try FileManager.default.createDirectory(at: shotsDir, withIntermediateDirectories: true)
+                // Each join's picture, cropped to the canvas once, before any shot: the
+                // two shots meeting there read the same pixels (H3 crops a last frame
+                // and stretches a first), and one the server cannot read (HEIC, a file
+                // gone offline) stops the run now rather than shots later.
+                var endFrames = [String?](repeating: nil, count: shots.count)
+                let (canvasW, canvasH) = (base.width, base.height)
+                for i in shots.indices.dropLast() {
+                    guard let picture = shots[i].endFrame else { continue }
+                    shotIndex = i
+                    guard let data = await Task.detached(priority: .userInitiated, operation: {
+                        Self.canvasPNG(from: URL(fileURLWithPath: picture), width: canvasW, height: canvasH)
+                    }).value else {
+                        throw MediaGenError.server(L10n.format("Couldn't read the picture %@.",
+                                                               (picture as NSString).lastPathComponent))
+                    }
+                    let png = shotsDir.appendingPathComponent(String(format: "shot-%02d-end.png", i + 1))
+                    try data.write(to: png)
+                    endFrames[i] = png.path
+                }
+                shotIndex = 0
                 let (port, modelId, unloadId) = try await server.prepareGenModel(
                     lanModelId: base.lanModelId, repo: base.model.repo)
                 loadedId = unloadId
                 var shotURLs: [URL] = []
                 var lastFrame: String? = nil
-                var fps = base.fps
                 var settings: [String] = []
                 for (i, shot) in shots.enumerated() {
                     shotIndex = i
-                    let endFrame = i < shots.count - 1 ? shot.endFrame : nil
+                    let endFrame = endFrames[i]
                     let req = Storyboard.shotRequest(base: base, prompt: shot.prompt, frames: shot.frames,
                                                      index: i, count: shots.count, previousLastFrame: lastFrame,
                                                      endFrame: endFrame)
@@ -326,8 +346,7 @@ final class VideoGenService: ObservableObject {
                     setPhase(.running(step: req.steps, total: req.steps, message: label + L10n.text("Encoding mp4…")), for: gen)
                     let url = shotsDir.appendingPathComponent(String(format: "shot-%02d.mp4", i + 1))
                     let png = shotsDir.appendingPathComponent(String(format: "shot-%02d-last.png", i + 1))
-                    fps = frames.fps > 0 ? frames.fps : base.fps
-                    let outFps = fps
+                    let outFps = frames.fps > 0 ? frames.fps : base.fps
                     try await Task.detached(priority: .userInitiated) {
                         try VideoGenService.writeMP4(
                             rgb: frames.rgb, frames: frames.frames,
@@ -347,7 +366,7 @@ final class VideoGenService: ObservableObject {
                 shotIndex = nil
                 await releaseIfNeeded()
                 setPhase(.running(step: 1, total: 1, message: L10n.text("Joining shots…")), for: gen)
-                try await Self.stitchShots(shotURLs, fps: fps, to: URL(fileURLWithPath: outputPath))
+                try await Self.stitchShots(shotURLs, to: URL(fileURLWithPath: outputPath))
                 try? Self.writeSettingsSidecar(settings.joined(separator: "\n"), forVideo: outputPath)
                 setPhase(.completed(path: outputPath), for: gen)
                 insertRecent(outputPath)
@@ -943,24 +962,48 @@ final class VideoGenService: ObservableObject {
         return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
     }
 
+    /// A picture as a PNG of exactly `width` x `height`, upright and cropped to
+    /// cover it (`Storyboard.coverRect`); nil when the Mac cannot read it.
+    nonisolated static func canvasPNG(from url: URL, width: Int, height: Int) -> Data? {
+        guard width > 0, height > 0, let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let pw = props[kCGImagePropertyPixelWidth] as? Int, let ph = props[kCGImagePropertyPixelHeight] as? Int,
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: max(pw, ph)] as CFDictionary),
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+        else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: Storyboard.coverRect(source: CGSize(width: image.width, height: image.height),
+                                                 canvas: CGSize(width: width, height: height)))
+        guard let out = ctx.makeImage() else { return nil }
+        return NSBitmapImageRep(cgImage: out).representation(using: .png, properties: [:])
+    }
+
     /// Join shot mp4s end to end. Every shot after the first OPENS on the frame
     /// the one before it ended on, so that frame (and its slice of sound) is cut
     /// from the joining shot — the server's own chain shares its seams the same way.
     /// The last two frames before each join fade into the next shot (`Storyboard.seamBlends`).
-    nonisolated static func stitchShots(_ shots: [URL], fps: Int, to out: URL) async throws {
+    /// Frames are found by their own times, so no frame or sample rate is assumed.
+    nonisolated static func stitchShots(_ shots: [URL], to out: URL) async throws {
         let comp = AVMutableComposition()
         guard let video = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
         else { throw MuxError.writerInit }
         var audio: AVMutableCompositionTrack? = nil
-        let seam = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
         var cursor = CMTime.zero
-        var shotFrames: [Int] = []
+        var keptFrames: [[Double]] = []
+        var ends: [Double] = []
         for (i, url) in shots.enumerated() {
             let asset = AVURLAsset(url: url)
             guard let v = try await asset.loadTracks(withMediaType: .video).first else { throw MuxError.writerInit }
             let vRange = try await v.load(.timeRange)
-            shotFrames.append(Int((vRange.duration.seconds * Double(max(1, fps))).rounded()))
-            let start = i == 0 ? vRange.start : vRange.start + seam
+            let frames = try await frameTimes(of: asset, track: v)
+            let cut = i == 0 ? 0 : 1
+            guard frames.count > cut else { throw MuxError.writerInit }
+            let start = i == 0 ? vRange.start : frames[cut]
             let range = CMTimeRange(start: start, end: vRange.end)
             try video.insertTimeRange(range, of: v, at: cursor)
             if let a = try await asset.loadTracks(withMediaType: .audio).first {
@@ -970,16 +1013,38 @@ final class VideoGenService: ObservableObject {
                 }
                 if !aRange.isEmpty { try audio?.insertTimeRange(aRange, of: a, at: cursor + (aRange.start - start)) }
             }
+            keptFrames.append(frames[cut...].map { (cursor + ($0 - start)).seconds })
             cursor = cursor + range.duration
+            ends.append(cursor.seconds)
         }
         try? FileManager.default.removeItem(at: out)
         guard let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHighestQuality)
         else { throw MuxError.writerInit }
-        let blends = Storyboard.seamBlends(shotFrames: shotFrames)
+        let blends = Storyboard.seamBlends(keptFrames: keptFrames, ends: ends)
         if !blends.isEmpty {
-            export.videoComposition = try await seamComposition(comp, blends: blends, fps: fps)
+            export.videoComposition = try await seamComposition(comp, blends: blends)
         }
         try await export.export(to: out, as: .mp4)
+    }
+
+    /// When each frame of a video track starts on the track's timeline, in
+    /// presentation order, read off the samples themselves (nothing is decoded).
+    /// Samples carry MEDIA times, which the track's edit list shifts (by the
+    /// B-frame delay, for one); a sample outside every edit is not shown.
+    nonisolated private static func frameTimes(of asset: AVAsset, track: AVAssetTrack) async throws -> [CMTime] {
+        let edits = try await track.load(.segments).filter { !$0.isEmpty }.map(\.timeMapping)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        guard reader.startReading() else { throw MuxError.writerInit }
+        var times: [CMTime] = []
+        while let sample = output.copyNextSampleBuffer() {
+            let t = CMSampleBufferGetPresentationTimeStamp(sample)
+            guard t.isValid, CMSampleBufferGetNumSamples(sample) > 0,
+                  let edit = edits.first(where: { $0.source.containsTime(t) }) else { continue }
+            times.append(CMTimeMapTimeFromRangeToRange(t, fromRange: edit.source, toRange: edit.target))
+        }
+        return times.sorted()
     }
 
     /// The frames a join fades into, read back from the joined clip itself so
@@ -989,38 +1054,36 @@ final class VideoGenService: ObservableObject {
         init(_ images: [Int: CIImage]) { self.images = images }
     }
 
-    nonisolated private static func seamComposition(_ comp: AVComposition, blends: [Int: (into: Int, weight: Double)],
-                                                    fps: Int) async throws -> AVVideoComposition {
-        let timescale = CMTimeScale(max(1, fps))
+    nonisolated private static func seamComposition(_ comp: AVComposition,
+                                                    blends: [Storyboard.SeamBlend]) async throws -> AVVideoComposition {
         guard let track = try await comp.loadTracks(withMediaType: .video).first else { throw MuxError.writerInit }
         var images: [Int: CIImage] = [:]
-        for frame in Set(blends.values.map(\.into)) {
-            // Decoded the way the export decodes the frames it is mixed with (YUV
-            // with its colour tags), so both enter Core Image the same way. Read
-            // at the middle of the frame: a shot with sound puts its video on the
-            // audio's timescale, so a join lands a hair off the frame grid and the
-            // frame's own start can still show the shot before.
+        for blend in blends where images[blend.join] == nil {
+            // At the middle of the frame, which no join's rounding can move off it;
+            // decoded the way the export decodes the frames it is mixed with (YUV
+            // with its colour tags), so both enter Core Image the same way.
             let reader = try AVAssetReader(asset: comp)
-            reader.timeRange = CMTimeRange(start: CMTime(value: CMTimeValue(2 * frame + 1), timescale: 2 * timescale),
-                                           duration: CMTime(value: 1, timescale: 4 * timescale))
+            reader.timeRange = CMTimeRange(start: CMTime(seconds: blend.into, preferredTimescale: 1_000_000),
+                                           duration: CMTime(value: 1, timescale: 1_000_000))
             let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
             reader.add(output)
             guard reader.startReading(), let sample = output.copyNextSampleBuffer(),
                   let buffer = CMSampleBufferGetImageBuffer(sample) else { throw MuxError.writerInit }
-            images[frame] = CIImage(cvPixelBuffer: buffer)
+            images[blend.join] = CIImage(cvPixelBuffer: buffer)
             reader.cancelReading()
         }
         let targets = SeamTargets(images)
-        let composition = try await AVMutableVideoComposition.videoComposition(with: comp) { request in
-            let frame = Int((request.compositionTime.seconds * Double(timescale)).rounded())
-            guard let blend = blends[frame], let target = targets.images[blend.into] else {
-                return request.finish(with: request.sourceImage, context: nil)
+        // The composition keeps the shots' own frame timing; a frame is matched by
+        // the span it shows for, nudged past the start so rounding cannot miss it.
+        return try await AVVideoComposition(applyingFiltersTo: comp) { params in
+            let t = params.compositionTime.seconds + 1e-4
+            guard let blend = blends.first(where: { $0.frame.contains(t) }),
+                  let target = targets.images[blend.join] else {
+                return AVCIImageFilteringResult(resultImage: params.sourceImage)
             }
-            request.finish(with: dissolve(request.sourceImage, into: target, weight: blend.weight), context: nil)
+            return AVCIImageFilteringResult(resultImage: dissolve(params.sourceImage, into: target, weight: blend.weight))
         }
-        composition.frameDuration = CMTime(value: 1, timescale: timescale)
-        return composition
     }
 
     /// `weight` of the way from `a` to `b`.

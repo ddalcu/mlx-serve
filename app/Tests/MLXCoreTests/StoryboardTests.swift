@@ -18,20 +18,19 @@ final class StoryboardTests: XCTestCase {
         XCTAssertEqual(Storyboard.frames(seconds: 8, fps: 24, ladder: ltxLadder), 193)
     }
 
-    /// Every join shares one frame: a shot opens on the frame the one before it ended on.
-    /// The last two frames before each join fade toward the next shot's first frame in the clip, by a third and two thirds.
+    /// The last two frames before each join fade toward the middle of the next shot's first frame in the
+    /// clip, by a third and two thirds, read off the frames' own times whatever their spacing.
     func testTheLastTwoFramesBeforeAJoinBlendTowardTheNextShot() {
-        let blends = Storyboard.seamBlends(shotFrames: [10, 10, 10])
-        XCTAssertEqual(blends[8]?.into, 10)
-        XCTAssertEqual(blends[8]?.weight ?? 0, 1.0 / 3, accuracy: 1e-9)
-        XCTAssertEqual(blends[9]?.into, 10)
-        XCTAssertEqual(blends[9]?.weight ?? 0, 2.0 / 3, accuracy: 1e-9)
-        XCTAssertEqual(blends[17]?.into, 19)
-        XCTAssertEqual(blends[18]?.into, 19)
-        XCTAssertEqual(blends.count, 4)
-        XCTAssertTrue(Storyboard.seamBlends(shotFrames: [10]).isEmpty)
+        let blends = Storyboard.seamBlends(keptFrames: [[0, 0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.75]],
+                                           ends: [0.4, 0.7, 0.8])
+        XCTAssertEqual(blends.map(\.join), [0, 0, 1, 1])
+        XCTAssertEqual(blends.map(\.frame), [0.2..<0.3, 0.3..<0.4, 0.5..<0.6, 0.6..<0.7])
+        XCTAssertEqual(blends.map(\.into), [0.45, 0.45, 0.725, 0.725])
+        XCTAssertEqual(blends.map(\.weight), [1.0 / 3, 2.0 / 3, 1.0 / 3, 2.0 / 3])
+        XCTAssertTrue(Storyboard.seamBlends(keptFrames: [[0, 0.1]], ends: [0.2]).isEmpty)
     }
 
+    /// Every join shares one frame: a shot opens on the frame the one before it ended on.
     func testDeliveredFramesShareOneSeamFramePerJoin() {
         XCTAssertEqual(Storyboard.deliveredFrames([192, 192, 192]), 574)
         XCTAssertEqual(Storyboard.deliveredFrames([124]), 124)
@@ -76,6 +75,8 @@ final class StoryboardTests: XCTestCase {
         XCTAssertEqual(shots.map(\.seconds), [8, 15])
         XCTAssertEqual(shots[0].prompt, "integrated_multimodal_description:\nA red fox trots through snow.")
         XCTAssertEqual(shots[1].prompt, "The fox stops and looks back.")
+        // Enhance's shots replace the old ones whole: the planner never saw a join picture.
+        XCTAssertTrue(shots.allSatisfy { $0.endFramePath == nil })
     }
 
     func testAReplyWithNoShotHeadersYieldsNoShots() {
@@ -147,15 +148,43 @@ final class StoryboardTests: XCTestCase {
         XCTAssertEqual(Storyboard.nextOpening(keyframe: "/gone.png", renderedLastFrame: "/s/1.png", exists: there), "/s/1.png")
     }
 
-    /// Enhance rewrites the shots; the pictures stay where they were, and the final shot has none.
-    func testEnhanceKeepsTheShotsPicturesByPosition() {
-        let old = [StoryboardSegment(prompt: "a", endFramePath: "/k/0.png"),
-                   StoryboardSegment(prompt: "b", endFramePath: "/k/1.png"),
-                   StoryboardSegment(prompt: "c")]
-        let planned = [StoryboardSegment(prompt: "x"), StoryboardSegment(prompt: "y")]
-        let kept = Storyboard.keepingEndFrames(planned, from: old)
-        XCTAssertEqual(kept.map(\.prompt), ["x", "y"])
-        XCTAssertEqual(kept.map(\.endFramePath), ["/k/0.png", nil])
+    /// A picture left on the final shot becomes the film's Last frame when that is empty, and is dropped otherwise.
+    func testAPictureLeftOnTheFinalShotMovesToTheLastFrame() {
+        let shots = [StoryboardSegment(prompt: "a", endFramePath: "/k/0.png"),
+                     StoryboardSegment(prompt: "b", endFramePath: "/k/1.png")]
+        let moved = Storyboard.settlingFinalShot(shots, lastFrame: nil)
+        XCTAssertEqual(moved.shots.map(\.endFramePath), ["/k/0.png", nil])
+        XCTAssertEqual(moved.lastFrame, "/k/1.png")
+        let kept = Storyboard.settlingFinalShot(shots, lastFrame: "/u/last.png")
+        XCTAssertEqual(kept.shots.map(\.endFramePath), ["/k/0.png", nil])
+        XCTAssertEqual(kept.lastFrame, "/u/last.png")
+    }
+
+    /// A picture is cropped to the canvas, centred, without stretching.
+    func testAPictureCoversTheCanvasCentred() {
+        XCTAssertEqual(Storyboard.coverRect(source: CGSize(width: 400, height: 400), canvas: CGSize(width: 1536, height: 672)),
+                       CGRect(x: 0, y: -432, width: 1536, height: 1536))
+        XCTAssertEqual(Storyboard.coverRect(source: CGSize(width: 1920, height: 1080), canvas: CGSize(width: 1280, height: 704)),
+                       CGRect(x: 0, y: -8, width: 1280, height: 720))
+    }
+
+    /// Any picture the Mac reads becomes a PNG of the canvas's size; one it cannot read is nil.
+    func testAJoinPictureBecomesACanvasSizedPNG() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxserve-join-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tiff = dir.appendingPathComponent("join.tiff")
+        let source = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 120, pixelsHigh: 40, bitsPerSample: 8,
+                                      samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
+                                      colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        try XCTUnwrap(source.representation(using: .tiff, properties: [:])).write(to: tiff)
+        let png = try XCTUnwrap(VideoGenService.canvasPNG(from: tiff, width: 64, height: 48))
+        let rep = try XCTUnwrap(NSBitmapImageRep(data: png))
+        XCTAssertEqual([rep.pixelsWide, rep.pixelsHigh], [64, 48])
+        XCTAssertEqual(png.prefix(4), Data([0x89, 0x50, 0x4E, 0x47]))
+        let junk = dir.appendingPathComponent("junk.png")
+        try Data("not a picture".utf8).write(to: junk)
+        XCTAssertNil(VideoGenService.canvasPNG(from: junk, width: 64, height: 48))
     }
 
     /// A shot's picture that is no longer on disk is dropped on restore.
@@ -208,7 +237,6 @@ final class StoryboardTests: XCTestCase {
         XCTAssertEqual(Array(px.prefix(3)), [0, 0, 255])
     }
 
-    /// Three 10-frame shots join into 28 frames: each later shot drops the frame it opened on.
     /// Joined frames, decoded, as the colour at each frame's centre.
     private func centreColours(of url: URL) async throws -> [(r: Double, g: Double, b: Double)] {
         let asset = AVURLAsset(url: url)
@@ -232,35 +260,42 @@ final class StoryboardTests: XCTestCase {
         return colours
     }
 
-    /// Before each join the clip fades into the next shot over two frames; nothing is added or lost.
-    /// The shots carry sound, as generated ones do: it moves the video track onto the audio's timescale.
+    /// Before each join the clip fades into the next shot over two frames, toward the frame the clip shows
+    /// (the shot's own opening frame is cut); nothing is added or lost. The shots carry sound as generated
+    /// ones do, at two frame and sample rates: sound moves the video onto the audio's timescale.
     func testTheJoinedClipFadesIntoEachShotOverTwoFrames() async throws {
-        let (w, h, fps, n) = (64, 64, 24, 193)
-        let sr = 16000, ch = 2
-        let pcm = Data(count: (sr * n / fps) * ch * 2)
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxserve-seam-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        var shots: [URL] = []
-        for (i, c) in [(UInt8(200), UInt8(0), UInt8(0)), (0, 200, 0)].enumerated() {
-            let url = dir.appendingPathComponent("shot-\(i).mp4")
-            try VideoGenService.writeMP4(rgb: rgb(frames: Array(repeating: c, count: n), width: w, height: h),
-                                         frames: n, width: w, height: h, fps: fps, to: url,
-                                         audioPCM: pcm, audioSampleRate: sr, audioChannels: ch)
-            shots.append(url)
+        for (fps, sr) in [(24, 16000), (25, 32000)] {
+            let (w, h, n, ch) = (64, 64, 2 * fps, 2)
+            let pcm = Data(count: (sr * n / fps) * ch * 2)
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlxserve-seam-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let red: (UInt8, UInt8, UInt8) = (200, 0, 0), green: (UInt8, UInt8, UInt8) = (0, 200, 0)
+            var shots: [URL] = []
+            let opening: [(UInt8, UInt8, UInt8)] = [(0, 0, 200)]
+            let shotFrames: [[(UInt8, UInt8, UInt8)]] = [Array(repeating: red, count: n),
+                                                         opening + Array(repeating: green, count: n - 1)]
+            for (i, frames) in shotFrames.enumerated() {
+                let url = dir.appendingPathComponent("shot-\(i).mp4")
+                try VideoGenService.writeMP4(rgb: rgb(frames: frames, width: w, height: h),
+                                             frames: n, width: w, height: h, fps: fps, to: url,
+                                             audioPCM: pcm, audioSampleRate: sr, audioChannels: ch)
+                shots.append(url)
+            }
+            let out = dir.appendingPathComponent("joined.mp4")
+            try await VideoGenService.stitchShots(shots, to: out)
+            let c = try await centreColours(of: out)
+            XCTAssertEqual(c.count, 2 * n - 1, "\(fps) fps")
+            let seam = n - 1
+            XCTAssertGreaterThan(c[seam - 2].r, 150, "\(fps) fps"); XCTAssertLessThan(c[seam - 2].g, 20, "\(fps) fps")
+            XCTAssertGreaterThan(c[seam - 1].g, 40, "\(fps) fps"); XCTAssertGreaterThan(c[seam - 1].r, c[seam - 1].g, "\(fps) fps")
+            XCTAssertGreaterThan(c[seam].r, 40, "\(fps) fps"); XCTAssertGreaterThan(c[seam].g, c[seam].r, "\(fps) fps")
+            XCTAssertLessThan(c[seam + 1].r, 20, "\(fps) fps"); XCTAssertGreaterThan(c[seam + 1].g, 150, "\(fps) fps")
+            XCTAssertTrue(c[(seam - 1)...(seam + 1)].allSatisfy { $0.b < 30 }, "the cut opening frame leaked in at \(fps) fps")
         }
-        let out = dir.appendingPathComponent("joined.mp4")
-        try await VideoGenService.stitchShots(shots, fps: fps, to: out)
-        let colours = try await centreColours(of: out)
-        XCTAssertEqual(colours.count, 2 * n - 1)
-        // Red, then two frames mixing toward green, mostly red then mostly green, then the green shot itself.
-        let seam = n - 1
-        XCTAssertGreaterThan(colours[seam - 2].r, 150); XCTAssertLessThan(colours[seam - 2].g, 20)
-        XCTAssertGreaterThan(colours[seam - 1].g, 40); XCTAssertGreaterThan(colours[seam - 1].r, colours[seam - 1].g)
-        XCTAssertGreaterThan(colours[seam].r, 40); XCTAssertGreaterThan(colours[seam].g, colours[seam].r)
-        XCTAssertLessThan(colours[seam + 1].r, 20); XCTAssertGreaterThan(colours[seam + 1].g, 150)
     }
 
+    /// Three 10-frame shots join into 28 frames: each later shot drops the frame it opened on.
     func testStitchedClipDropsOneSeamFramePerJoin() async throws {
         let (w, h, fps, n) = (64, 64, 24, 10)
         let sr = 16000, ch = 2
@@ -277,7 +312,7 @@ final class StoryboardTests: XCTestCase {
             shots.append(url)
         }
         let out = dir.appendingPathComponent("joined.mp4")
-        try await VideoGenService.stitchShots(shots, fps: fps, to: out)
+        try await VideoGenService.stitchShots(shots, to: out)
 
         let asset = AVURLAsset(url: out)
         let videos = try await asset.loadTracks(withMediaType: .video)
