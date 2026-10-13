@@ -304,6 +304,7 @@ struct VideoGenView: View {
                         .foregroundStyle(.secondary.opacity(0.6))
                         .padding(.horizontal, 5)
                         .padding(.vertical, 8)
+                        .clearOfEditorScroller()
                         .allowsHitTesting(false)
                 }
             }

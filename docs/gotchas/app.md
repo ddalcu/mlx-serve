@@ -880,3 +880,6 @@ Restore after SwiftUI observes the end of composition and the committed
 binding is available. Window removal preserves the store; deleting a session
 prunes both stores, even without a running turn.
 Guards: `SteeringNotesTests`, `ComposerMarkedTextTests`.
+
+## A placeholder over a `TextEditor` ran under its scroller (2026-10-13)
+With "Show scroll bars: Always" (or a mouse attached), the Video prompt's placeholder ran under the editor's scroll bar: "Click" sat on the track. A legacy scroller takes 17 pt from the column the editor's text wraps in; the placeholder is a `Text` laid over the editor at full width. Fix: `.clearOfEditorScroller()` pads it by `EditorScrollerInset.trailing(for: NSScroller.preferredScrollerStyle)` and follows the style-change notification; every laid-over text uses it (Video prompt, Music lyrics and score, New Task goal, the Enhance sheet's thought). Guard: `EditorScrollerInsetTests`.
