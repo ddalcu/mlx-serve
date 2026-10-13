@@ -324,24 +324,14 @@ const PREFILL =
     \\
 ;
 
-/// MLX's steel NAX headers in include order, their own includes and
-/// include guards dropped: they sit inline in one `metal_kernel` header.
+/// MLX's steel NAX header with everything it includes, inline in one
+/// `metal_kernel` header.
 fn prefillHeader() ![:0]const u8 {
     if (prefill_header) |h| return h;
-    const a = std.heap.c_allocator;
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(a);
-    try out.appendSlice(a, "#include <metal_stdlib>\n#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n");
-    for ([_][]const u8{ steel.defines, steel.type_traits, steel.integral_constant, steel.nax }) |src| {
-        var lines = std.mem.splitScalar(u8, src, '\n');
-        while (lines.next()) |line| {
-            if (std.mem.startsWith(u8, line, "#include \"mlx/") or std.mem.startsWith(u8, line, "#pragma once")) continue;
-            try out.appendSlice(a, line);
-            try out.append(a, '\n');
-        }
-    }
-    try out.appendSlice(a, "using namespace metal;\nusing namespace mlx::steel;\n");
-    const h = try out.toOwnedSliceSentinel(a, 0);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const parts = [_][]const u8{ try steel.inlined(arena.allocator(), &.{"steel/gemm/nax.h"}), "using namespace metal;\nusing namespace mlx::steel;\n" };
+    const h = try std.mem.concatWithSentinel(std.heap.c_allocator, u8, &parts, 0);
     prefill_header = h;
     return h;
 }

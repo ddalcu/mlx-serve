@@ -13,3 +13,7 @@ static inline ulong ple_word(const device uint8_t* b, ulong o, int n) {
   for (int k = 0; k < n; k++) v |= ulong(b[o + k]) << (8 * k);
   return v;
 }
+// A scale or bias as stored: F16 in a JANG pack, BF16 in every other table (NgramTable.dequantRow).
+static inline float ple_scale_or_bias(ushort u, bool f16) {
+  return f16 ? float(as_type<half>(u)) : as_type<float>(uint(u) << 16);
+}

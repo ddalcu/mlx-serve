@@ -34,10 +34,10 @@ if (bits == 16) {
   const ulong v = ple_word(table, word, off % 32 + ulong(bits) > 32 ? 8 : 4);
   const uint q = uint(v >> (off % 32)) & ((1u << uint(bits)) - 1u);
   const ulong g = row * ulong(params[9]) + ulong(i / params[7]);
-  const float scale = as_type<float>(uint(ple_u16(table, ulong(params[11]) + g * 2)) << 16);
-  const float bias = as_type<float>(uint(ple_u16(table, ulong(params[12]) + g * 2)) << 16);
-  // q < 2^8 times an 8-bit-mantissa scale is exact, so FMA contraction cannot move a bit.
-  // The global weight scale applies after, as in NgramTable.dequantRow.
+  const float scale = ple_scale_or_bias(ple_u16(table, ulong(params[11]) + g * 2), params[86] != 0);
+  const float bias = ple_scale_or_bias(ple_u16(table, ulong(params[12]) + g * 2), params[86] != 0);
+  // q < 2^8 times a scale of at most 11 significant bits (F16) is exact, so FMA contraction cannot move
+  // a bit. The global weight scale applies after, as in NgramTable.dequantRow.
   const float ws = as_type<float>(uint(params[85]));
   const uint u = as_type<uint>((float(q) * scale + bias) * ws);
   q16 = ushort((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
