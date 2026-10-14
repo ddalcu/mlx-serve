@@ -10,3 +10,4 @@ Unmodified public `config.json` files. Hashes identify the captured bytes; the l
 | `mistral.json` | [gabor-hosu/e5-mistral-7b-instruct-bnb-4bit](https://huggingface.co/gabor-hosu/e5-mistral-7b-instruct-bnb-4bit/blob/main/config.json) | `844bced582346efc907fc3cbd7d0480d4093e07218c5cab968ca31cff1dbd94f` |
 | `nemotron-h.json` | [RedHatAI/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-FP8](https://huggingface.co/RedHatAI/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-FP8/blob/main/config.json) | `ed0f49f2c751308234e2bb2f815c614b5257714a357fac60615727d3d136043d` |
 | `laguna.json` | [poolside/Laguna-XS.2](https://huggingface.co/poolside/Laguna-XS.2/blob/main/config.json) | `ea98d58d56f27126ffaf70df77cac7de1c09af448c09a2734cecf5854fc6d86b` |
+| `minicpmv4_7.json` | [openbmb/MiniCPM-V-4.7-35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B/blob/main/config.json) | `3a47edeb5fdd3e0c7b95fee2b8a3d7dfcd3c193ca6c185ef54142134c53e0097` |

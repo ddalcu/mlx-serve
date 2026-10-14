@@ -206,7 +206,7 @@ Samuel Reed (the Monitoring panel, #701) and Pan Patryk (mount-prefix resolution
 presets, prompts, translations and layout are ported from Studio's modules.
 
 --------------------------------------------------------------------------------
-Sushi n-gram gather calibration and MTP depth bounds
+Sushi n-gram gather calibration, MTP depth bounds and the e4m3 GEMV
 https://github.com/beamivalice/sushi
 Copyright (c) 2026 Theinruj Toranavikrai
 Copyright (c) 2026 David Dalcu
@@ -217,6 +217,8 @@ Sushi commit feb9ed7d92149e7ebc46a34595e19d440a929a0a.
 The CLI depth-range helpers in `src/mtp_depth_bounds.zig`, planner clamping
 and associated regression tests in `src/generate.zig` and `src/scheduler.zig`
 are adapted from Sushi commit 09e6d4792e6178b864b809299d53dbd05cd054cd.
+The e4m3 GEMV in `src/sushi_pack.zig` is adapted from `src/fp8_block.zig` of
+Sushi v1.2.3 (commit 2c602b9e).
 
 --------------------------------------------------------------------------------
 mlx-stream

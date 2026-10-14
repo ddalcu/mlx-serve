@@ -143,6 +143,9 @@ enum SettingsReset {
                 f("voiceEngine") { $0.voiceEngine = $1.voiceEngine },
                 f("kokoroVoice") { $0.kokoroVoice = $1.kokoroVoice },
                 f("wakePhrase") { $0.wakePhrase = $1.wakePhrase },
+                f("transcriptNotesModel") { $0.transcriptNotesModel = $1.transcriptNotesModel },
+                f("transcriptAutoStopMinutes") { $0.transcriptAutoStopMinutes = $1.transcriptAutoStopMinutes },
+                f("transcriptAutoStartCamera") { $0.transcriptAutoStartCamera = $1.transcriptAutoStartCamera },
             ]
 
         case .sandbox:

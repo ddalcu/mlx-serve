@@ -2922,22 +2922,10 @@ struct ChatDetailView: View {
                     RoundedRectangle(cornerRadius: 18)
                         .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
                 )
-                // "/" skill menu — FLOATS over the transcript rather than
-                // sitting in the bar: as a sibling it grew the composer and
-                // shoved the conversation up on every keystroke. An overlay
-                // past the clip, its own bottom guide pinned to the
-                // container's top, so it needs no height to position itself.
-                // Not an NSPopover — that takes first responder, and the menu
-                // has to stay open while you keep typing.
-                .overlay(alignment: .topLeading) {
-                    if !slashMatches.isEmpty {
-                        SlashSkillMenu(matches: slashMatches,
-                                       selection: min(slashSelection, max(0, slashMatches.count - 1)),
-                                       onPick: { pickSlashSkill($0) })
-                            .alignmentGuide(.top) { $0[.bottom] + 8 }
-                            .shadow(color: .black.opacity(0.28), radius: 14, y: 4)
-                    }
-                }
+                // "/" skill menu, past the clip so it can hang above the container.
+                .slashSkillMenu(matches: slashMatches,
+                                selection: min(slashSelection, max(0, slashMatches.count - 1)),
+                                onPick: { pickSlashSkill($0) })
                 // Hover cards for the row's bare glyphs. Drawn HERE, past the
                 // clip: an overlay on the control itself is cut off at the
                 // container's rounded edge and lands over the text field.
@@ -4696,8 +4684,13 @@ struct MessageBubble: View {
                                 .foregroundStyle(.secondary)
                         }
                         if message.role == .assistant {
-                            MarkdownText(message.content.isEmpty && message.isStreaming ? " " : message.content)
+                            MarkdownText(message.content.isEmpty && message.isStreaming ? " " : message.content,
+                                         streaming: message.isStreaming)
                                 .textSelection(.enabled)
+                                .environment(\.codeBlockRow, CodeBlockRow(
+                                    resize: { resize(animated: false, $0) },
+                                    isExpanded: { [foldStore, id = message.id] in foldStore?.isExpanded(id, block: $0) ?? false },
+                                    setExpanded: { [foldStore, id = message.id] in foldStore?.set(id, block: $0, expanded: $1) }))
                         } else {
                             // The user's own turn is plain text (no markdown
                             // render), so it needs the transcript size stated —
@@ -5698,8 +5691,12 @@ struct MarkdownText: View {
         "tool_call", "tool_response",
     ]
 
-    init(_ source: String) {
+    /// The reply is still coming, so a block with an open fence is being written.
+    let streaming: Bool
+
+    init(_ source: String, streaming: Bool = false) {
         self.source = source
+        self.streaming = streaming
     }
 
     private var latexTheme: LaTeXTheme {
@@ -5714,7 +5711,7 @@ struct MarkdownText: View {
         // lists, and tables. See `MarkdownSegmenter` for why the split is at
         // fences, not at blocks.
         VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { _, segment in
+            ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { index, segment in
                 switch segment {
                 case .prose(let text):
                     ForEach(Array(Self.latexBlocks(in: text).enumerated()), id: \.offset) { _, block in
@@ -5727,8 +5724,9 @@ struct MarkdownText: View {
                             DisplayLaTeXView(latex: latex, raw: raw, theme: latexTheme)
                         }
                     }
-                case .code(let language, let code):
-                    CodeBlockView(language: language, code: code)
+                case .code(let language, let code, let closed):
+                    CodeBlockView(language: language, code: code,
+                                  status: .of(closed: closed, replyStreaming: streaming), index: index)
                 }
             }
         }

@@ -129,6 +129,7 @@ struct NewTaskSheet: View {
                         // standing in for.
                         .padding(.horizontal, 8 + 5)
                         .padding(.vertical, 8)
+                        .clearOfEditorScroller()
                         .allowsHitTesting(false)
                 }
             }

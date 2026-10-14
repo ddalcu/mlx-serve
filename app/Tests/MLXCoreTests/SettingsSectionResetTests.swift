@@ -51,6 +51,7 @@ final class SettingsSectionResetTests: XCTestCase {
         o.sandbox.enabled = true; o.toolsOnlyWhenAsked = true
         o.voiceClonePath = "/tmp/clip.wav"; o.voiceCloneEnabled = false
         o.voiceCloneLabel = "My clip"; o.wakePhrase = "hey robot"
+        o.transcriptNotesModel = ServerOptions.notesOff; o.transcriptAutoStopMinutes = 60; o.transcriptAutoStartCamera = true
         return o
     }
 
@@ -107,6 +108,9 @@ final class SettingsSectionResetTests: XCTestCase {
         // Voice fields went back to default…
         XCTAssertEqual(after.wakePhrase, ServerOptions().wakePhrase)
         XCTAssertEqual(after.voiceClonePath, "")
+        XCTAssertEqual(after.transcriptNotesModel, "")
+        XCTAssertEqual(after.transcriptAutoStopMinutes, 10)
+        XCTAssertFalse(after.transcriptAutoStartCamera)
         // …and nothing else moved.
         XCTAssertEqual(after.host, "127.0.0.1")
         XCTAssertEqual(after.kvQuant, .int4)
@@ -159,7 +163,7 @@ final class SettingsSectionResetTests: XCTestCase {
         XCTAssertFalse(voice.localizedCaseInsensitiveContains("every section"))
 
         XCTAssertEqual(SettingsReset.buttonLabel(.all), "Reset All Settings")
-        XCTAssertEqual(SettingsReset.buttonLabel(.category(.voice)), "Reset Voice")
+        XCTAssertEqual(SettingsReset.buttonLabel(.category(.voice)), "Reset Voice & Transcribe")
         XCTAssertTrue(SettingsReset.confirmTitle(.category(.server)).contains("Server"))
     }
 }

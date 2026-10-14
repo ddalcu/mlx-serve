@@ -13,7 +13,7 @@ set -u
 
 PORT=${1:-8133}
 BASE="http://127.0.0.1:$PORT"
-BIN=./zig-out/bin/mlx-serve
+BIN=${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}
 PASS=0
 FAIL=0
 TOTAL=0
@@ -35,7 +35,7 @@ exec /bin/sh -c "$1"
 EOF
 cat > "$T/bin/pi" <<'EOF'
 #!/bin/sh
-echo "dir=$PI_CODING_AGENT_DIR url=$MLX_SERVE_URL args=$*" > "$HOME/agent.out"
+echo "dir=$PI_CODING_AGENT_DIR url=$MLX_SERVE_URL tty=$(tty) args=$*" > "$HOME/agent.out"
 EOF
 cat > "$T/bin/opencode" <<'EOF'
 #!/bin/sh
@@ -121,6 +121,25 @@ if echo "$OUT" | grep -q 'xdg=.*/.mlx-serve/opencode2 args=--standalone' \
     run_test "opencode 2.x started standalone with cli.json + plugin" PASS
 else
     run_test "opencode 2.x started standalone with cli.json + plugin" FAIL "$OUT $(cat "$T/run.log")"
+fi
+
+echo "[6] piped to sh on a terminal, the agent gets the terminal itself as stdin"
+# Agents built on Bun (Claude Code, oh-my-pi, OpenCode) and Grok cannot watch a reopened /dev/tty on macOS.
+if command -v expect >/dev/null 2>&1; then
+    rm -f "$T/home/agent.out"
+    HOME="$T/home" PATH="$T/bin:$PATH" expect -c "
+        set timeout 30
+        spawn sh -c {curl -fsSL '$BASE/launch?agent=pi' | sh}
+        expect eof
+    " >"$T/run.log" 2>&1
+    OUT=$(cat "$T/home/agent.out" 2>/dev/null)
+    if echo "$OUT" | grep -q 'tty=/dev/' && ! echo "$OUT" | grep -q 'tty=/dev/tty '; then
+        run_test "pi's stdin is the terminal device, not a reopened /dev/tty" PASS
+    else
+        run_test "pi's stdin is the terminal device, not a reopened /dev/tty" FAIL "$OUT $(cat "$T/run.log")"
+    fi
+else
+    echo "  SKIP: no expect"
 fi
 
 echo ""

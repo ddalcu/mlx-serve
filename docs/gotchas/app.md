@@ -800,6 +800,9 @@ The tile's hover bubble carries the whole picture, and every preview came out a 
 ## `onGeometryChange` fires when its value changes, so return the answer (2026-09-20)
 Three observers returned raw rects and widths, so a window drag wrote pane state on every frame and rebuilt the whole pane with it — the resize dragged. Returning a Bool at a threshold, an Int, or a rect quantised to 8pt fires only when the answer changes. And never measure the thing whose size depends on the answer: a `fixedSize` menu never re-fits once the segmented picker has shrunk, and a grid chunked from its own container's width goes into one long row and stays there (the row widens the form, the form measures as room for the row). Rows are decided inside the layout pass, or by the container: `LazyVGrid` with `adaptive(minimum:maximum:)` at ONE value packs fixed cells leading. A `ViewThatFits` over a segmented `Picker` never picks the fallback either, because the picker accepts any width and squeezes.
 
+## A segmented control's floor is the smallest it has ever reported (2026-10-13)
+On macOS 27 the Video pane's Quality picker turned into a menu and back while the form scrolled (reported on [mlx-serve#810](https://github.com/ddalcu/mlx-serve/pull/810)). Cause: asked for its narrowest width, the five-segment control answered 350.5 pt most times and its natural 530 pt sometimes, and `ViewThatFits` asks again on each update; a column between the two flips. Fix: `SegmentFloors` keeps the smallest floor per natural width (the label set), so a later natural-width answer cannot move the choice. Guard: `SegmentedOrMenuTests.testTheChoiceHoldsWhenTheControlMisreportsItsFloor`.
+
 ## A padded stack that will not compress is centred by the ScrollView (2026-09-20)
 A child that refuses to compress makes the padded form wider than its column, and `ScrollView` centres content it cannot fit, so the overflow hangs off the leading edge. The fix is a full-width, leading-aligned frame with the padding INSIDE it; with the frame inside the padding the frame takes the column and the padding adds 32pt on top, which moves the form by less but still moves it. All three relaid panes carry the frame now.
 
@@ -880,3 +883,6 @@ Restore after SwiftUI observes the end of composition and the committed
 binding is available. Window removal preserves the store; deleting a session
 prunes both stores, even without a running turn.
 Guards: `SteeringNotesTests`, `ComposerMarkedTextTests`.
+
+## A placeholder over a `TextEditor` ran under its scroller (2026-10-13)
+With "Show scroll bars: Always" (or a mouse attached), the Video prompt's placeholder ran under the editor's scroll bar: "Click" sat on the track. A legacy scroller takes 17 pt from the column the editor's text wraps in; the placeholder is a `Text` laid over the editor at full width. Fix: `.clearOfEditorScroller()` pads it by `EditorScrollerInset.trailing(for: NSScroller.preferredScrollerStyle)` and follows the style-change notification; every laid-over text uses it (Video prompt, Music lyrics and score, New Task goal, the Enhance sheet's thought). Guard: `EditorScrollerInsetTests`.

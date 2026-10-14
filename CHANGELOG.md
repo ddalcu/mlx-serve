@@ -1,5 +1,18 @@
 # Changelog
 
+## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
+
+- **Speech to text.** `POST /v1/audio/transcriptions` turns WAV recordings into text in 30 languages with Qwen3-ASR, through the OpenAI SDK's own transcription call, with word and sentence times and SRT/WebVTT subtitles in 11 of them from Qwen3-ForcedAligner, and who said what (`diarized_json`, up to eight speakers) from NVIDIA's Nemotron 3 Diarization; the app downloads both alongside.
+- **Transcripts from the tray.** Switch on Transcript in the menu bar to record your microphone, and optionally what your Mac plays; switch it off and the transcript opens as Markdown with notes your chat model writes on top (summary, decisions, action items), each speaker named and your own voice marked You on a call; it can start when a call turns on your camera, stops by itself after a silence, and survives a quit.
+- **MiniCPM-V 4.7 sees.** OpenBMB's MiniCPM-V 4.7 reads images, from screenshots to pages of small print: large pictures are cut into crops so fine text stays legible, and a pack without the vision tower still answers text.
+- **Agents make films.** The mlx-serve skill walks a coding agent from a brief to a finished music video, trailer or release film: it writes and sings the song, times every word and beat, renders the shots on your Mac and cuts them to the music. Storyboards in the app join more smoothly too: a shot can end on a picture you choose, and every join fades.
+- **Sushi packs draft.** MiMo-V2.6-Flash Sushi packs draft with their own MTP heads and read their FP8 attention weights in place, about 105 tokens per second instead of 32 on an M5 Ultra, and GLM-5.3-Flash Sushi packs use the DFlash2 drafter they ship with, 94 instead of 66 on code.
+- **Coding agents in one line.** `curl -fsSL https://mlxserve.com/agent.sh | sh` sets up pi, Claude Code, oh-my-pi, OpenCode or Grok against your server, and agents started from the web console's Code Launcher no longer quit on launch.
+- **Use a Mac that shares with a key.** When another Mac shares its models behind an API key, it shows up in Settings > LAN Sharing as needing a key; enter it there and its models appear in your pickers. Headless: `~/.mlx-serve/lan-keys.json`.
+- **Fixes.** DeepSeek-V4-Flash GGUFs open again with default settings, a picture sent as a plain image URL string reaches the model instead of being silently dropped, a damaged LAN key file can no longer stall peer discovery, and LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 downloads are no longer marked unsupported in the app.
+
+---
+
 ## v26.10.2 — Songs, Films & Sound Effects - The Newest Frontier Models - Linux - Rock Solid Under Load
 
 ### Highlights

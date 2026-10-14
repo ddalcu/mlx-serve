@@ -1238,7 +1238,7 @@ fn matchWhitespaceRun(text: []const u8, start: usize) ?usize {
 
 /// `\s` in HF `tokenizers`' regex engine (Oniguruma) is Unicode White_Space:
 /// the full-width U+3000 and NBSP U+00A0 are whitespace, not punctuation.
-fn isWhitespaceCp(cp: u21) bool {
+pub fn isWhitespaceCp(cp: u21) bool {
     return switch (cp) {
         0x09...0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
         else => false,
@@ -1285,7 +1285,7 @@ fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
     return CpInfo{ .cp = cp, .len = end - pos };
 }
 
-fn isLetter(cp: u21) bool {
+pub fn isLetter(cp: u21) bool {
     // The script ranges below are whole blocks; their digits are \p{N}, not letters.
     if (cp >= 0x80 and isDigit(cp)) return false;
     // ASCII letters
@@ -1342,7 +1342,7 @@ const NUMBER_RANGES = [_][2]u21{
 };
 
 /// `\p{N}`: every script's digits, superscripts, fractions and numerals, not just ASCII.
-fn isDigit(cp: u21) bool {
+pub fn isDigit(cp: u21) bool {
     if (cp < 0x80) return cp >= '0' and cp <= '9';
     var lo: usize = 0;
     var hi: usize = NUMBER_RANGES.len;
@@ -1423,8 +1423,43 @@ pub fn loadTokenizerSlow(io: std.Io, allocator: std.mem.Allocator, model_dir: []
         try appendJsonEscapedTok(allocator, &buf, line);
         try buf.append(allocator, '"');
     }
-    try buf.appendSlice(allocator, "]}}");
+    try buf.appendSlice(allocator, "]},\"added_tokens\":");
+    try appendAddedTokens(io, allocator, &buf, model_dir);
+    try buf.append(allocator, '}');
     return parseTokenizerContent(io, allocator, buf.items);
+}
+
+/// The slow format's added tokens (chat markers, `<think>`, Qwen3-ASR's `<asr_text>`) live in
+/// tokenizer_config.json's `added_tokens_decoder`, keyed by id; `[]` when it has none.
+fn appendAddedTokens(io: std.Io, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), model_dir: []const u8) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
+    defer allocator.free(path);
+    const bytes = readFileAllocTok(io, allocator, path) catch |e| switch (e) {
+        error.FileNotFound => return buf.appendSlice(allocator, "[]"),
+        else => return e,
+    };
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    try buf.append(allocator, '[');
+    const decoder = if (parsed.value == .object) parsed.value.object.get("added_tokens_decoder") else null;
+    if (decoder) |d| if (d == .object) {
+        var it = d.object.iterator();
+        var first = true;
+        while (it.next()) |e| {
+            const id = std.fmt.parseInt(u32, e.key_ptr.*, 10) catch continue;
+            if (e.value_ptr.* != .object) continue;
+            const content = e.value_ptr.object.get("content") orelse continue;
+            if (content != .string) continue;
+            const special = if (e.value_ptr.object.get("special")) |v| v == .bool and v.bool else false;
+            if (!first) try buf.append(allocator, ',');
+            first = false;
+            try buf.print(allocator, "{{\"id\":{d},\"special\":{},\"content\":\"", .{ id, special });
+            try appendJsonEscapedTok(allocator, buf, content.string);
+            try buf.appendSlice(allocator, "\"}");
+        }
+    };
+    try buf.append(allocator, ']');
 }
 
 /// Load an OpenAI tiktoken rank file (`<base64 bytes> <rank>` per line, ranks
@@ -3165,4 +3200,28 @@ test "tiktoken rank file encodes through the merges it implies" {
         try testing.expectEqualSlices(u32, c.want, ids);
     }
     try testing.expectError(error.BadTiktoken, tiktokenToTokenizerJson(a, "YQ== 1\n"));
+}
+
+test "loadTokenizerSlow: tokenizer_config.json's added tokens encode whole and decode" {
+    // Qwen3-ASR ships vocab.json + merges.txt; its chat markers and `<asr_text>` live only in
+    // tokenizer_config.json's `added_tokens_decoder`.
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "vocab.json", .data = "{\"a\":0,\"b\":1,\"ab\":2}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "merges.txt", .data = "#version: 0.2\na b\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data =
+        \\{"added_tokens_decoder": {"5": {"content": "<|im_end|>", "special": true},
+        \\  "6": {"content": "<asr_text>", "special": false}}}
+    });
+    var pbuf: [512]u8 = undefined;
+    const plen = try tmp.dir.realPath(io, &pbuf);
+    var tok = try loadTokenizerSlow(io, testing.allocator, pbuf[0..plen]);
+    defer tok.deinit();
+    const ids = try tok.encode(testing.allocator, "ab<asr_text>a<|im_end|>");
+    defer testing.allocator.free(ids);
+    try testing.expectEqualSlices(u32, &.{ 2, 6, 0, 5 }, ids);
+    const text = try tok.decode(testing.allocator, &.{ 2, 6, 0 }, false);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("ab<asr_text>a", text);
 }

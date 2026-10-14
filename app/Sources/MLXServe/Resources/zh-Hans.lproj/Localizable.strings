@@ -92,6 +92,7 @@
 "%lld bytes" = "%lld 字节";
 "%lld discarded" = "%lld 个被丢弃";
 "%lld frames · ~%.1fs" = "%lld 帧 · ~%.1fs";
+"%lld lines total" = "共 %lld 行";
 "%lld model on disk" = "%lld 个模型在磁盘上";
 "%lld model%@" = "%lld 个模型";
 "%lld models" = "%lld 个模型";
@@ -202,6 +203,7 @@
 "A well-rounded Qwen model — good at chatting, coding help, and following instructions, while staying quick to respond. A solid alternative to Gemma if you want to compare styles." = "一款均衡的 Qwen 模型 —— 擅长聊天、编码辅助和指令遵循，同时保持快速响应。如果你想比较不同风格，它是 Gemma 之外可靠的选择。";
 "API" = "API 接口";
 "API key" = "API 密钥";
+"Needs key" = "需要密钥";
 "About MLX-Serve" = "关于 MLX-Serve";
 "About mlx-serve" = "关于 mlx-serve";
 "About to send…" = "即将发送…";
@@ -490,6 +492,7 @@
 "Couldn't read PDF" = "无法读取 PDF";
 "Couldn't read audio" = "无法读取音频";
 "Couldn't read video" = "无法读取视频";
+"Couldn't read the picture %@." = "无法读取图片 %@。";
 "Cover" = "翻唱";
 "Cover strength" = "翻唱强度";
 "Create" = "新建";
@@ -879,6 +882,7 @@
 "Large" = "大";
 "Largest models" = "最大的模型";
 "Last frame" = "末帧";
+"Last frame (optional)..." = "末帧（可选）...";
 "Last model used" = "上次使用的模型";
 "Last request overflowed the context window." = "上一次请求超出了上下文窗口。";
 "Latest" = "最新";
@@ -1593,6 +1597,7 @@
 "Stopped after %lld rung%@; the drift check was skipped." = "在完成 %lld 个档位后停止；已跳过漂移检查。";
 "Stopped — the model started repeating itself and the server cut the reply. Try rephrasing, or ask for a smaller piece of the task." = "已停止 —— 模型开始重复自己，服务器截断了回复。试试换个说法，或者让它只做任务中更小的一块。";
 "Stopping after the current request…" = "将在当前请求完成后停止…";
+"Streaming" = "正在生成";
 "Strong" = "强";
 "Strong at coding and multi-step agent work like using tools." = "擅长编码，以及使用工具这类多步 Agent 工作。";
 "Style LoRAs" = "风格 LoRA";
@@ -1664,6 +1669,7 @@
 "The model invents a soundtrack from your prompt. Attach speech to make characters say exact words." = "模型会根据你的提示词自行创作配乐。附加语音可让角色说出指定台词。";
 "The model is loaded when the run starts." = "模型会在运行开始时加载。";
 "The newest LTX. Generates short video clips with sound from a text prompt, and optionally a starting image or audio track. Ships its own text encoder, so nothing extra downloads on first use." = "最新的 LTX。根据文字提示词（可选起始图片或音轨）生成带声音的短视频片段。自带文本编码器，首次使用无需额外下载。";
+"The picture this shot ends on and the next one starts from. Empty, the next shot starts from this shot's own last frame." = "此镜头结束、下一个镜头开始的画面。留空时，下一个镜头从此镜头实际生成的最后一帧开始。";
 "The reference recording was empty." = "参考录音是空的。";
 "The reference-conditioned MiniMax-H3: attach up to 9 images, 3 clips and 3 audio references and the generation follows them for character, style and scene continuity. Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1>. Same speed and soundtrack as the standard pack; every reference adds tokens to every sampling step, so more references means slower." = "参考条件化的 MiniMax-H3：最多可附加 9 张图片、3 段视频和 3 段音频参考，生成时会依据它们保持角色、风格与场景的连贯。在提示词中以 <Picture 1>、<Video 1>、<Audio 1> 引用它们。速度与音轨和标准权重包相同；每份参考都会给每个采样步增加 Token，因此参考越多越慢。";
 "The same Gemma mixture-of-experts model as above, stored with twice the numeric precision (8-bit instead of 4-bit). That means slightly more accurate, consistent answers, at roughly double the memory." = "与上文相同的 Gemma MoE 模型，但以两倍的数值精度存储（8-bit 而非 4-bit）。这意味着答案略更准确、更稳定，但内存大约翻倍。";
@@ -2124,7 +2130,6 @@
 "Add other OpenAI-compatible services, and their models appear in the model picker." = "添加其他兼容 OpenAI 的服务，其模型会出现在模型选择器中。";
 "Defaults for every request, such as temperature, used from the next message on." = "所有请求的默认设置（如 temperature），从下一条消息起生效。";
 "How the app looks and how you open the Quick Launcher." = "应用的外观以及打开快速启动器的方式。";
-"Your wake phrase for hands-free mode and an optional voice clip it answers in." = "选择免提模式的唤醒词，以及用于回答的声音片段。";
 "Chat with your local model from your phone through a Telegram bot." = "通过 Telegram 机器人在手机上与本地模型聊天。";
 "Install new versions from GitHub while keeping your chats, models and settings." = "从 GitHub 安装新版本，聊天、模型和设置都会保留。";
 "mlx-serve is free and open source, made by one person, and questions and bug reports are welcome." = "mlx-serve 由一人开发，免费开源，欢迎提问和报告问题。";
@@ -2215,3 +2220,28 @@
 "Previous track" = "上一首";
 "Next track" = "下一首";
 "AI Radio picks the next track" = "AI 电台会挑选下一首";
+"Transcript" = "转写";
+"Record, then open as Markdown" = "录音，关闭后以 Markdown 打开";
+"Recording since %@" = "%@ 起录音中";
+"Transcribing…" = "正在转写…";
+"Nothing was heard" = "没有听到任何内容";
+"Needs speech models" = "需要语音模型";
+"Downloading speech models…" = "正在下载语音模型…";
+"Open the transcripts folder" = "打开转写文件夹";
+"Also record desktop audio" = "同时录制桌面音频";
+"Voice & Transcribe" = "语音与转写";
+"Your wake phrase and voice for hands-free mode, and how meeting transcripts start, stop and get their notes." = "免提模式的唤醒词和语音，以及会议转写如何开始、停止和生成纪要。";
+"Meeting notes" = "会议纪要";
+"The model that writes a title, summary, decisions and action items above each transcript." = "为每份转写在开头写下标题、摘要、决定和待办事项的模型。";
+"Chat model in use" = "当前聊天模型";
+"Stop after silence" = "静音后停止";
+"Ends a recording when nothing has been heard for this long, then transcribes it." = "在这么长时间没有听到声音时结束录音并转写。";
+"Never" = "从不";
+"%d minutes" = "%d 分钟";
+"Start when the camera turns on" = "摄像头打开时开始";
+"Starts a transcript when an app such as Zoom, Teams or FaceTime turns on your camera." = "当 Zoom、Teams 或 FaceTime 等应用打开摄像头时开始转写。";
+"Stopped after %d minutes of silence" = "静音 %d 分钟后已停止";
+"Saved without notes: %@" = "已保存，但没有纪要：%@";
+"Reset Voice & Transcribe" = "重置语音与转写";
+"Speaker %@" = "说话人 %@";
+"You" = "你";

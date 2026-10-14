@@ -32,8 +32,10 @@ const io_util = @import("io_util.zig");
 const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
+const diarization_mod = @import("nemotron_diarization.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
@@ -261,6 +263,7 @@ pub const LoadedModel = struct {
     video_engine: ?*gen_mod.VideoEngine = null,
     mesh_engine: ?*gen_mod.MeshEngine = null,
     decision_engine: ?*gen_mod.DecisionEngine = null,
+    diarization_engine: ?*diarization_mod.Engine = null,
     /// Model-wide serialization gate for media generation. A gen runs to completion on the inference thread
     /// (the sole mlx caller), so gen-vs-gen is already serial; this flag makes
     /// the in-flight state visible (set around the gen job).
@@ -403,6 +406,10 @@ pub const LoadedModel = struct {
         if (self.decision_engine) |e| {
             e.deinit();
             self.decision_engine = null;
+        }
+        if (self.diarization_engine) |e| {
+            e.deinit();
+            self.diarization_engine = null;
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
@@ -583,6 +590,10 @@ pub const LoadedModel = struct {
         if (self.decision_engine) |e| {
             e.deinit();
             self.decision_engine = null;
+        }
+        if (self.diarization_engine) |e| {
+            e.deinit();
+            self.diarization_engine = null;
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
@@ -1133,13 +1144,23 @@ pub const ModelRegistry = struct {
         return n;
     }
 
-    /// Entries mid-load other than `exclude_id`. Caller holds `mutex`.
-    fn countLoadingLocked(self: *const ModelRegistry, exclude_id: []const u8) u32 {
+    /// A transcription's aligner and diarizer take no slot under
+    /// `max_resident_models`: they serve no request of their own. Their memory
+    /// is billed like any model's.
+    fn takesSlot(entry: *const LoadedModel) bool {
+        return !model_discovery.isTranscriptionCompanion(entry.arch_hint);
+    }
+
+    /// Resident and loading entries that take a slot, `exclude_id` aside.
+    /// Caller holds `mutex`.
+    fn countSlotsLocked(self: *const ModelRegistry, exclude_id: []const u8) u32 {
         var n: u32 = 0;
         var it = self.entries.valueIterator();
         while (@constCast(&it).next()) |entry_ptr| {
             const entry = entry_ptr.*;
-            if (entry.state == .loading and !std.mem.eql(u8, entry.id, exclude_id)) n += 1;
+            const held = entry.state == .ready or entry.state == .evicting or
+                (entry.state == .loading and !std.mem.eql(u8, entry.id, exclude_id));
+            if (held and takesSlot(entry)) n += 1;
         }
         return n;
     }
@@ -1153,6 +1174,21 @@ pub const ModelRegistry = struct {
         } else {
             self.current_resident_bytes = 0;
         }
+        mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
+    }
+
+    /// What every ready model except a streaming pack holds: the plugin bills only its own bytes, and its
+    /// footprint reads are the whole process's. Caller holds `mutex`.
+    pub fn streamForeignBytesLocked(self: *ModelRegistry) u64 {
+        var sum: u64 = 0;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready) continue;
+            if (entry.config) |c| if (c.dsv41_stream) continue;
+            sum +|= entry.bytes_resident;
+        }
+        return sum;
     }
 
     /// Release a borrowed pointer obtained from `ensureLoaded`. Decrements
@@ -1190,7 +1226,7 @@ pub const ModelRegistry = struct {
     /// excluding `exclude_id` (typically the entry the caller is about to
     /// load — never evict ourselves). Returns null if no evictable entry
     /// exists. Caller holds `mutex`.
-    pub fn pickLruEvictable(self: *ModelRegistry, exclude_id: []const u8) ?*LoadedModel {
+    pub fn pickLruEvictable(self: *ModelRegistry, exclude_id: []const u8, slot_only: bool) ?*LoadedModel {
         var best: ?*LoadedModel = null;
         var best_used: i64 = std.math.maxInt(i64);
         var it = self.entries.valueIterator();
@@ -1199,6 +1235,7 @@ pub const ModelRegistry = struct {
             if (entry.state != .ready) continue;
             if (entry.refcount.load(.acquire) != 0) continue;
             if (std.mem.eql(u8, entry.id, exclude_id)) continue;
+            if (slot_only and !takesSlot(entry)) continue;
             if (entry.last_used_ns < best_used) {
                 best_used = entry.last_used_ns;
                 best = entry;
@@ -1256,6 +1293,7 @@ pub const ModelRegistry = struct {
         // tick, undoing an explicit /v1/load-model the moment it finished.
         entry.last_used_ms.store(io_util.nowMsMonotonic(self.io), .release);
         self.current_resident_bytes += bytes_resident;
+        mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
         // Headless default promotion: a server started without --model has no
         // default, so requests addressing the "mlx-serve" alias (the app's
         // chat/avatar surfaces, Claude Code) 503 with no_model even after the
@@ -1276,10 +1314,10 @@ pub const ModelRegistry = struct {
 
     /// Can this READY entry serve chat/completions? Media models (image/
     /// audio/video/mesh — identified by model_type, so no engine pointers
-    /// are needed) and embedding encoders cannot.
+    /// are needed), embedding encoders and audio-tower trunks cannot.
     fn chatCapable(entry: *const LoadedModel) bool {
         const cfg = entry.config orelse return false;
-        if (cfg.is_encoder_only) return false;
+        if (cfg.is_encoder_only or cfg.qwen_audio != null) return false;
         if (model_discovery.isMediaModelType(cfg.model_type)) return false;
         return true;
     }
@@ -1328,18 +1366,21 @@ pub const ModelRegistry = struct {
     pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, live_bytes: u64) ?usize {
         var n: usize = 0;
         var freed: u64 = 0;
+        var freed_slots: u32 = 0;
+        const loading_slot: u32 = if (self.entries.get(exclude_id)) |e| @intFromBool(takesSlot(e)) else 1;
         while (true) {
             // Resident-after-plan = current minus what these victims free, plus
             // every in-flight reservation (including this load's own estimate).
             const projected_mem = (@max(self.current_resident_bytes, live_bytes) -| freed) + self.reserved_bytes;
-            // Count: .ready+.evicting now and every other load in flight, minus the
+            // Slots: .ready+.evicting now and every other load in flight, minus the
             // victims we'll drop, plus this load (currently `.loading`, becomes resident).
-            const projected_count = self.countLoadedLocked() + self.countLoadingLocked(exclude_id) - @as(u32, @intCast(n)) + 1;
+            const projected_count = self.countSlotsLocked(exclude_id) - freed_slots + loading_slot;
             const mem_ok = self.max_resident_mem == 0 or projected_mem <= self.max_resident_mem;
             const count_ok = projected_count <= self.max_resident_models;
             if (mem_ok and count_ok) return n;
 
-            const victim = self.pickLruEvictable(exclude_id) orelse {
+            // Over the model cap alone, only a model that takes a slot frees one.
+            const victim = self.pickLruEvictable(exclude_id, mem_ok) orelse {
                 // Can't satisfy the caps — roll back every marking we made.
                 for (out[0..n]) |v| self.unmarkEvictingLocked(v);
                 return null;
@@ -1350,6 +1391,7 @@ pub const ModelRegistry = struct {
             }
             self.markEvictingLocked(victim); // now `.evicting` → pickLru won't repick
             freed += victim.bytes_resident;
+            freed_slots += @intFromBool(takesSlot(victim));
             out[n] = victim;
             n += 1;
         }
@@ -1780,6 +1822,22 @@ test "ModelRegistry: pickIdleEvictable skips non-ready and takes the oldest firs
     try testing.expect(reg.pickIdleEvictable(901_000, 900_000).? == old_entry);
 }
 
+test "ModelRegistry: the streaming pack's foreign bytes are every other ready model's" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    var cfg = ModelConfig{};
+    cfg.dsv41_stream = true;
+    const stream = try makeReadyStub(reg, "deepseek", 180_000_000_000);
+    stream.config = &cfg;
+    defer stream.config = null; // borrowed: the registry frees the configs it owns
+    _ = try makeReadyStub(reg, "krea", 14_730_000_000);
+    _ = try reg.registerStub("yue2", "yue2", 4_000_000_000); // discovered, never loaded
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try testing.expectEqual(@as(u64, 14_730_000_000), reg.streamForeignBytesLocked());
+}
+
 test "ModelRegistry: ensureLoaded fails on unloaded stub" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
@@ -1918,7 +1976,7 @@ test "ModelRegistry: pickLruEvictable orders by last_used_ns, ignores refcounted
     {
         reg.mutex.lockUncancelable(reg.io);
         defer reg.mutex.unlock(reg.io);
-        const lru = reg.pickLruEvictable("").?;
+        const lru = reg.pickLruEvictable("", false).?;
         try testing.expectEqualStrings("a", lru.id);
     }
 
@@ -1927,7 +1985,7 @@ test "ModelRegistry: pickLruEvictable orders by last_used_ns, ignores refcounted
     {
         reg.mutex.lockUncancelable(reg.io);
         defer reg.mutex.unlock(reg.io);
-        const lru = reg.pickLruEvictable("").?;
+        const lru = reg.pickLruEvictable("", false).?;
         try testing.expectEqualStrings("b", lru.id);
     }
     reg.release(held);
@@ -1936,7 +1994,7 @@ test "ModelRegistry: pickLruEvictable orders by last_used_ns, ignores refcounted
     {
         reg.mutex.lockUncancelable(reg.io);
         defer reg.mutex.unlock(reg.io);
-        const lru = reg.pickLruEvictable("a").?;
+        const lru = reg.pickLruEvictable("a", false).?;
         try testing.expectEqualStrings("b", lru.id);
     }
 }
@@ -2151,6 +2209,31 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0));
 }
 
+test "planEvictions: a transcription's aligner and diarizer take no model slot" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const aligner = try reg.registerStubWithArch("aligner", "aligner", 10, "qwen3_forced_aligner"); // the oldest
+    const chat = try makeReadyStub(reg, "chat", 10);
+    _ = try makeReadyStub(reg, "asr", 10);
+    const diarizer = try reg.registerStubWithArch("diarizer", "diarizer", 10, "nemotron_diarization");
+    const image = try reg.registerStub("image", "image", 10);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    reg.markReadyLocked(aligner, 10);
+    try testing.expect(reg.tryBeginLoadLocked(diarizer));
+    reg.reserveLoadLocked(diarizer, 10);
+    var buf: [16]*LoadedModel = undefined;
+    // chat and asr fill the two slots; the companions sit beside them.
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, &buf, 0));
+    reg.markReadyLocked(diarizer, 10);
+    // A third model that takes a slot evicts the oldest that holds one, never a companion.
+    try testing.expect(reg.tryBeginLoadLocked(image));
+    reg.reserveLoadLocked(image, 10);
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, &buf, 0));
+    try testing.expectEqual(chat, buf[0]);
+}
+
 test "planEvictions: another model still loading counts against the model cap" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
@@ -2211,6 +2294,17 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     reg.mutex.unlock(reg.io);
     try testing.expectEqualStrings("", reg.default_id);
 
+    // Nor a qwen3 trunk behind an audio tower (Qwen3-ASR, its forced aligner).
+    const asr = try reg.registerStub("asr", "/m/asr", 64);
+    var asr_cfg = model_mod.ModelConfig{};
+    asr_cfg.model_type = "qwen3";
+    asr_cfg.qwen_audio = .{};
+    asr.config = &asr_cfg;
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(asr, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("", reg.default_id);
+
     // The first chat-capable load IS promoted...
     const chat = try reg.registerStub("gemma", "/m/gemma", 64);
     var chat_cfg = model_mod.ModelConfig{};
@@ -2247,6 +2341,7 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     // registry deinit tries to free entry-owned configs.
     mesh.config = null;
     bge.config = null;
+    asr.config = null;
     chat.config = null;
     chat2.config = null;
 }

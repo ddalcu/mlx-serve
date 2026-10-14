@@ -18,16 +18,16 @@
 
 ## Decode tok/s by release — Apple M5 Ultra 80c 256 GB
 
-| Model | 26.10.2 |
-|---|---|
-| Gemma 4 E4B 4b | 196 pld |
-| Gemma 4 26B-A4B 4b | 187 pld |
-| Qwen3.6 35B-A3B 4b (MTP) | 416 mtp |
-| Qwen3.8 27B 4b (ddalcu) | 242 dflash |
-| Qwen3.8 27B iQ-MLX 3.8bpw | 134 mtp |
-| Qwen3.8 Flash-Next iQ-MLX 4.7bpw | 169 mtp |
-| MiMo-V2.6-Flash MXFP4-Q8 | 94 mtp |
-| GLM-5.3-Flash oQ4-MTP | 82 mtp |
+| Model | 26.10.2 | 26.10.3 |
+|---|---|---|
+| Gemma 4 E4B 4b | 196 pld | 198 pld |
+| Gemma 4 26B-A4B 4b | 187 pld | 187 pld |
+| Qwen3.6 35B-A3B 4b (MTP) | 416 mtp | 414 mtp |
+| Qwen3.8 27B 4b (ddalcu) | 242 dflash | 250 dflash |
+| Qwen3.8 27B iQ-MLX 3.8bpw | 134 mtp | · |
+| Qwen3.8 Flash-Next iQ-MLX 4.7bpw | 169 mtp | 155 mtp |
+| MiMo-V2.6-Flash MXFP4-Q8 | 94 mtp | · |
+| GLM-5.3-Flash oQ4-MTP | 82 mtp | · |
 
 ## Decode tok/s by release — x86 Linux, RTX 5060 Ti 16 GB (CUDA 13), i5-12600K, 31 GB RAM
 

@@ -57,6 +57,10 @@ pub const Info = struct {
 // qwen4exp file ds4 cannot load goes there instead.
 const ds4_only_archs = [_][]const u8{ "deepseek41", "qwen4exp", "glm-dsa", "glm5-next" };
 
+// Archs whose NextN layers ds4 drafts from inside the checkpoint; DeepSeek-V4 declares
+// `nextn_predict_layers` but takes its head from a separate GGUF, and ds4 refuses to open it with one armed.
+const ds4_embedded_mtp_archs = [_][]const u8{ "glm-dsa", "glm5-next", "qwen4exp" };
+
 // GGML types ds4 accepts for Qwen tensors: F32 F16 Q4_0 Q8_0 Q2_K Q4_K Q5_K Q6_K IQ2_XXS BF16 MXFP4.
 const ds4_qwen_tensor_types = [_]u32{ 0, 1, 2, 8, 10, 12, 13, 14, 16, 30, 39 };
 const GGML_TYPE_BF16: u32 = 30;
@@ -154,6 +158,9 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     if (info.architecture) |a| {
         if (std.mem.eql(u8, a, "qwen4exp")) info.ds4_unloadable = try scanDs4Unloadable(r, tensor_count);
     }
+    if (info.embedded_mtp) info.embedded_mtp = for (ds4_embedded_mtp_archs) |d| {
+        if (info.architecture != null and std.mem.eql(u8, info.architecture.?, d)) break true;
+    } else false;
     return info;
 }
 
@@ -415,6 +422,16 @@ test "embedded MTP is read from <arch>.nextn_predict_layers" {
     var b = try parseBytes(testing.allocator, zero);
     defer b.deinit(testing.allocator);
     try testing.expect(!b.embedded_mtp);
+
+    // DeepSeek-V4 declares its NextN layer but ships the head as a separate GGUF.
+    const dsv4 = try buildHeader(testing.allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "deepseek4" } },
+        .{ .key = "deepseek4.nextn_predict_layers", .value = .{ .u32_v = 1 } },
+    });
+    defer testing.allocator.free(dsv4);
+    var c = try parseBytes(testing.allocator, dsv4);
+    defer c.deinit(testing.allocator);
+    try testing.expect(!c.embedded_mtp);
 }
 
 test "preferredEngine: ds4-only archs → ds4 without the lora key" {

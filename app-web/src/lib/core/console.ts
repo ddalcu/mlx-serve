@@ -187,6 +187,11 @@ const apiReference = [
   },
   {
     method: "POST",
+    path: "/v1/audio/transcriptions",
+    description: N("Qwen3-ASR speech to text \u00b7 WAV in, OpenAI form"),
+  },
+  {
+    method: "POST",
     path: "/v1/audio/music-generations",
     description: N("ACE-Step text-to-music \u00b7 48 kHz stereo WAV"),
   },

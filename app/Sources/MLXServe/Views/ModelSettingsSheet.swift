@@ -45,6 +45,8 @@ struct ModelSettingsSheet: View {
     @State private var socket: DrafterSocket = .automatic
     @State private var initialSocket: DrafterSocket = .automatic
     @State private var modelGB: Double = 0
+    /// The pack's own drafter folder, read once (`DrafterGems.packDrafterFolder`).
+    @State private var packDrafter: String?
 
     private var live: ModelInfo? {
         server.allModels.first { request.path.hasSuffix("/" + $0.name) || $0.name == request.path }
@@ -92,8 +94,7 @@ struct ModelSettingsSheet: View {
     }
 
     private var bindsDflash: Bool {
-        socket.bindsDflash(localDrafter: FileManager.default.fileExists(
-            atPath: (request.path as NSString).appendingPathComponent(DrafterGems.packFolder + "/config.json")))
+        socket.bindsDflash(localDrafter: packDrafter != nil)
     }
 
     private var repoId: String {
@@ -201,8 +202,8 @@ struct ModelSettingsSheet: View {
                 }
                 if !isGguf {
                     Section("Speculation") {
-                        SpeculationSocketRow(socket: $socket, repoId: repoId,
-                                             modelDir: request.path, modelGB: modelGB, mtpAvailable: rows.mtp)
+                        SpeculationSocketRow(socket: $socket, repoId: repoId, modelDir: request.path,
+                                             packDrafter: packDrafter, modelGB: modelGB, mtpAvailable: rows.mtp)
                         if let specLine {
                             Text(specLine).font(.app(.caption)).foregroundStyle(.secondary)
                         }
@@ -327,7 +328,8 @@ struct ModelSettingsSheet: View {
             override = settingsFile.override(for: request.path) ?? ModelOverride()
             initialOverride = override
             inheritedGeneration = (try? GenerationDefaultsFile.load()) ?? .init()
-            let gems = SpeculationSocketRow.gems(repoId: repoId, modelDir: request.path, mtpAvailable: rows.mtp,
+            packDrafter = DrafterGems.packDrafterFolder(modelDir: request.path)
+            let gems = SpeculationSocketRow.gems(repoId: repoId, packDrafter: packDrafter, mtpAvailable: rows.mtp,
                                                  listing: downloads.packListings[repoId])
             socket = DrafterSocket.read(override, gems: gems) { downloads.gemPath($0, modelDir: request.path) }
             initialSocket = socket
@@ -386,17 +388,18 @@ struct SpeculationSocketRow: View {
     @EnvironmentObject var downloads: DownloadManager
     let repoId: String
     let modelDir: String
+    let packDrafter: String?
     let modelGB: Double
     let mtpAvailable: Bool
     @State private var removing: DrafterGem?
 
     private var gems: [DrafterGem] {
-        Self.gems(repoId: repoId, modelDir: modelDir, mtpAvailable: mtpAvailable, listing: downloads.packListings[repoId])
+        Self.gems(repoId: repoId, packDrafter: packDrafter, mtpAvailable: mtpAvailable, listing: downloads.packListings[repoId])
     }
 
-    static func gems(repoId: String, modelDir: String, mtpAvailable: Bool, listing: [String: Int64]?) -> [DrafterGem] {
-        let local = FileManager.default.fileExists(atPath: (modelDir as NSString).appendingPathComponent(DrafterGems.packFolder + "/config.json"))
-        return DrafterGems.gems(forRepoId: repoId, packFiles: listing, localDrafter: local, mtpAvailable: mtpAvailable)
+    static func gems(repoId: String, packDrafter: String?, mtpAvailable: Bool, listing: [String: Int64]?) -> [DrafterGem] {
+        DrafterGems.gems(forRepoId: repoId, packFiles: listing, localDrafter: packDrafter != nil,
+                         packDrafterFolder: packDrafter ?? DrafterGems.packFolder, mtpAvailable: mtpAvailable)
     }
 
     private var fetching: DrafterGem? { gems.first { downloads.isFetchingGem($0) } }

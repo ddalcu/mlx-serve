@@ -47,6 +47,8 @@
 	<string>Copyright 2026 David Dalcu. All rights reserved.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>MLX-Serve uses your local network only when LAN Sharing is enabled in Settings: to advertise the models you chose to share and to discover models other Macs share, over Bonjour. Nothing leaves your network.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Needed only when a transcript also records desktop audio: what your Mac plays, like the other side of a call. The audio stays on your Mac.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Needed for Voice mode and recording audio prompts. macOS also asks for this when the app plays audio; playback never records.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

@@ -103,6 +103,8 @@ struct RefTile: View {
     let promptMarker: String
     let kind: RefTileKind
     let container: CGRect
+    /// The caption under the tile; off where the slot names itself.
+    var showsMarker = true
     let insert: (String) -> Void
     let remove: () -> Void
 
@@ -147,10 +149,12 @@ struct RefTile: View {
                 .buttonStyle(.plain)
                 .padding(3)
             }
-            Text(promptMarker)
-                .font(.app(.caption2).monospacedDigit())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            if showsMarker {
+                Text(promptMarker)
+                    .font(.app(.caption2).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .frame(width: RefTiles.side)
         .hoverReveal(placement: .pointerClamped(width: bubbleWidth, container: container)) {

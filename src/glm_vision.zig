@@ -136,7 +136,7 @@ pub fn preprocess(allocator: std.mem.Allocator, rgb: []const u8, src_h: u32, src
 }
 
 /// A linear: dense `w [out, in]`, or quantized with its params solved from geometry.
-const Lin = struct {
+pub const Lin = struct {
     w: mlx.mlx_array,
     scales: mlx.mlx_array = .{ .ctx = null },
     biases: mlx.mlx_array = .{ .ctx = null },
@@ -364,7 +364,7 @@ pub const GlmVision = struct {
     }
 
     fn merger(self: *GlmVision, x_in: mlx.mlx_array) !mlx.mlx_array {
-        var x = try self.linear(x_in, self.m_proj);
+        var x = try linear(x_in, self.m_proj, self.s);
         defer _ = mlx.mlx_array_free(x);
         {
             var t = mlx.mlx_array_new();
@@ -377,21 +377,21 @@ pub const GlmVision = struct {
 
     /// `down(silu(min(gate, limit)) * clip(up, ±limit))`.
     fn swiglu(self: *GlmVision, x: mlx.mlx_array, gate: Lin, up: Lin, down: Lin) !mlx.mlx_array {
-        const g = try self.linear(x, gate);
+        const g = try linear(x, gate, self.s);
         defer _ = mlx.mlx_array_free(g);
-        const u = try self.linear(x, up);
+        const u = try linear(x, up, self.s);
         defer _ = mlx.mlx_array_free(u);
         const act = (try transformer.fusedClampedSwiGLU(self.s, g, u, self.limit)) orelse
             try transformer.clampedSwiGLU(self.s, g, u, self.limit);
         defer _ = mlx.mlx_array_free(act);
-        return self.linear(act, down);
+        return linear(act, down, self.s);
     }
 
     /// Full bidirectional attention over one image's patches.
     fn attention(self: *GlmVision, x: mlx.mlx_array, b: *const Block, cos: mlx.mlx_array, sin: mlx.mlx_array, n: c_int) !mlx.mlx_array {
         const heads: c_int = @intCast(self.heads);
         const hd: c_int = @intCast(self.head_dim);
-        const qkv = try self.linear(x, b.qkv);
+        const qkv = try linear(x, b.qkv, self.s);
         defer _ = mlx.mlx_array_free(qkv);
         var r = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(r);
@@ -429,7 +429,7 @@ pub const GlmVision = struct {
         var flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat);
         try mlx.check(mlx.mlx_reshape(&flat, t, &[_]c_int{ n, @intCast(self.hidden) }, 2, self.s));
-        return self.linear(flat, b.proj);
+        return linear(flat, b.proj, self.s);
     }
 
     fn rmsNorm(self: *GlmVision, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -439,27 +439,28 @@ pub const GlmVision = struct {
     }
 
     fn dense(self: *GlmVision, x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array) !mlx.mlx_array {
-        return self.linear(x, .{ .w = w, .bias = bias });
-    }
-
-    fn linear(self: *GlmVision, x: mlx.mlx_array, l: Lin) !mlx.mlx_array {
-        var out = mlx.mlx_array_new();
-        if (l.qp) |qp| {
-            try mlx.check(mlx.mlx_quantized_matmul(&out, x, l.w, l.scales, l.biases, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), self.s));
-        } else {
-            var wt = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(wt);
-            try mlx.check(mlx.mlx_transpose(&wt, l.w, self.s));
-            try mlx.check(mlx.mlx_matmul(&out, x, wt, self.s));
-        }
-        if (l.bias.ctx != null) {
-            var biased = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&biased, out, l.bias, self.s));
-            replace(&out, biased);
-        }
-        return out;
+        return linear(x, .{ .w = w, .bias = bias }, self.s);
     }
 };
+
+/// A dense or quantized `x @ w.T`, plus the bias when the linear has one.
+pub fn linear(x: mlx.mlx_array, l: Lin, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    if (l.qp) |qp| {
+        try mlx.check(mlx.mlx_quantized_matmul(&out, x, l.w, l.scales, l.biases, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), s));
+    } else {
+        var wt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt);
+        try mlx.check(mlx.mlx_transpose(&wt, l.w, s));
+        try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
+    }
+    if (l.bias.ctx != null) {
+        var biased = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&biased, out, l.bias, s));
+        replace(&out, biased);
+    }
+    return out;
+}
 
 /// `x*cos + rotate_half(x)*sin` in f32, back in `x`'s dtype. `x` is `[N, heads, hd]`, tables `[N, 1, hd]`.
 fn rope2d(x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -494,7 +495,7 @@ fn rope2d(x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, s: mlx.mlx_s
 }
 
 /// Exact `gelu`: `x * (1 + erf(x / sqrt(2))) / 2`.
-fn geluErf(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn geluErf(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const dt = mlx.mlx_array_dtype(x);
     const inv_sqrt2 = try transformer.scalarOf(0.7071067811865476, dt, s);
     defer _ = mlx.mlx_array_free(inv_sqrt2);
@@ -513,12 +514,12 @@ fn geluErf(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return out;
 }
 
-fn replace(dst: *mlx.mlx_array, next: mlx.mlx_array) void {
+pub fn replace(dst: *mlx.mlx_array, next: mlx.mlx_array) void {
     _ = mlx.mlx_array_free(dst.*);
     dst.* = next;
 }
 
-fn appendLin(allocator: std.mem.Allocator, list: *std.ArrayList(mlx.mlx_array), l: Lin) !void {
+pub fn appendLin(allocator: std.mem.Allocator, list: *std.ArrayList(mlx.mlx_array), l: Lin) !void {
     for ([_]mlx.mlx_array{ l.w, l.scales, l.biases, l.bias }) |a| {
         if (a.ctx != null) try list.append(allocator, a);
     }
@@ -684,7 +685,7 @@ test "glm vision: tower and merger match the reference" {
     }
 }
 
-fn cosineSim(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+pub fn cosineSim(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     const dot = try sumProd(a_arr, b_arr, s);
     const na = try sumProd(a_arr, a_arr, s);
     const nb = try sumProd(b_arr, b_arr, s);
@@ -692,7 +693,7 @@ fn cosineSim(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, s: mlx.mlx_stream) !f32
     return dot / (@sqrt(na) * @sqrt(nb));
 }
 
-fn rmsRatio(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+pub fn rmsRatio(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     const na = try sumProd(a_arr, a_arr, s);
     const nb = try sumProd(b_arr, b_arr, s);
     if (!std.math.isFinite(na) or nb <= 0) return std.math.nan(f32);

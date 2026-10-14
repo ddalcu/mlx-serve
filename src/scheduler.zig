@@ -40,6 +40,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
+const diarization_mod = @import("nemotron_diarization.zig");
 const gen_sse = @import("gen_sse.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
@@ -2317,7 +2318,7 @@ pub const Scheduler = struct {
     pub fn idleModelToUnload(self: *Scheduler, keep: []const u8) ?[]const u8 {
         self.registry.mutex.lockUncancelable(self.io);
         defer self.registry.mutex.unlock(self.io);
-        const entry = self.registry.pickLruEvictable(keep) orelse return null;
+        const entry = self.registry.pickLruEvictable(keep, false) orelse return null;
         return entry.id;
     }
 
@@ -2886,7 +2887,7 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
 
     const tok = try allocator.create(Tokenizer);
     errdefer allocator.destroy(tok);
-    tok.* = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
+    tok.* = try tokenizer_mod.loadTokenizerAny(io, allocator, model_dir);
     errdefer tok.deinit();
 
     const cc = try allocator.create(ChatConfig);
@@ -3328,6 +3329,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         .video => entry.video_engine = try gen_mod.VideoEngine.load(sch.io, sch.allocator, params.model_dir),
         .mesh => entry.mesh_engine = try gen_mod.MeshEngine.load(sch.io, sch.allocator, params.model_dir),
         .decision => entry.decision_engine = try gen_mod.DecisionEngine.load(sch.io, sch.allocator, params.model_dir),
+        .diarization => entry.diarization_engine = try diarization_mod.Engine.load(sch.io, sch.allocator, params.model_dir),
     }
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).
@@ -5657,6 +5659,7 @@ fn encodeVisionItem(req: *VisionEncodeRequest, vision_enc: anytype, item: Vision
             return vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w);
         },
         .audio => |clip| {
+            if (vision_enc.qwen_audio) |*qa| return qa.forward(clip);
             const cfg = req.model.config orelse return error.NoConfig;
             const spt: usize = if (cfg.audio_samples_per_token > 0) cfg.audio_samples_per_token else 640;
             const n_frames = (clip.len / 4 + spt - 1) / spt;
@@ -5941,7 +5944,7 @@ fn runGenJobs(reqs: []*GenRequest) void {
 /// in-flight work (whose graphs pin their inputs) once active memory passes this
 /// limit; CUDA's default is 95% of VRAM, so a diffusion step fills the card.
 fn genMemoryLimit(cuda: bool, est_peak: u64) ?usize {
-    return if (cuda) @intCast(est_peak) else null;
+    return if (cuda and est_peak > 0) @intCast(est_peak) else null;
 }
 
 /// Clear MLX's allocator cache after a job holding `cached` bytes: always for
@@ -8733,7 +8736,7 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
         try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
             std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
     }
-    try testing.expectEqual(@as(usize, 4), calls);
+    try testing.expectEqual(@as(usize, 5), calls);
 }
 
 /// Per-slot follow-up to a batched forward: `record` moves the id ledger, `publish` samples and streams.
@@ -11665,7 +11668,8 @@ test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chun
 
 test "a media job on CUDA throttles MLX at its estimated peak; Metal keeps MLX's limit" {
     try testing.expectEqual(@as(?usize, 4 << 30), genMemoryLimit(true, 4 << 30));
-    try testing.expectEqual(@as(?usize, 0), genMemoryLimit(true, 0));
+    // No estimate (the forced aligner's pass) keeps MLX's limit: 0 would throttle every allocation.
+    try testing.expectEqual(@as(?usize, null), genMemoryLimit(true, 0));
     try testing.expectEqual(@as(?usize, null), genMemoryLimit(false, 4 << 30));
 }
 

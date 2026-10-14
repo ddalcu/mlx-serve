@@ -86,6 +86,7 @@ struct PromptRewriteSheet: View {
                             .font(.app(.caption)).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                             .padding(8)
+                            .clearOfEditorScroller()
                             .clipped()
                             .allowsHitTesting(false)
                     }

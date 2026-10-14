@@ -1,17 +1,25 @@
 #!/usr/bin/env node
-// gen.mjs: generate game assets on a local mlx-serve and post-process them.
+// gen.mjs: generate game and film assets on a local mlx-serve and post-process them.
 // Node 18+, no dependencies. `node gen.mjs help` for usage.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { deflateSync, inflateSync } from "node:zlib";
 
-const BASE = (process.env.MLX_SERVE_URL || "http://127.0.0.1:11234").replace(/\/+$/, "");
+export const BASE = (process.env.MLX_SERVE_URL || "http://127.0.0.1:11234").replace(/\/+$/, "");
 
 const HELP = `gen.mjs: mlx-serve asset generator and post-processor (server: ${BASE}, env MLX_SERVE_URL)
 
 Generate (picks the model by capability from /v1/models; --model <id> overrides):
   node gen.mjs image "<prompt>" -o roof.png [--size 1024x1024] [--seed 7] [--tile] [--maps] [--cutout]
+  node gen.mjs image "<prompt>" -o dawn.png --source room.png [--source-strength 0.6]
+                                    -> a variation of room.png: same composition, what the prompt changes
+  node gen.mjs video "<prompt>" -o clip.mp4 [--first-frame shot.png] [--last-frame end.png]
+                     [--size 1312x736] [--frames 124] [--steps 4] [--turbo] [--seed 42]
+                                    -> an mp4 with the model's own sound (needs ffmpeg, or set FFMPEG);
+                                       124 frames = 5 s at 24 fps; sizes are multiples of 32
   node gen.mjs speech "<text>" -o line.wav [--voice af_heart]
   node gen.mjs music "<prompt>" -o theme.wav [--lyrics lyrics.txt] [--duration 90]
   node gen.mjs sound "<prompt>" -o door.wav [--duration 2]
@@ -35,8 +43,10 @@ batch file:
     {"type": "speech", "id": "narration", "input": "..."},
     {"type": "music", "id": "theme", "prompt": "...", "lyrics": "[verse]\\n..."},
     {"type": "sound", "id": "door", "prompt": "...", "duration_seconds": 2},
-    {"type": "3d", "id": "stone_lantern", "prompt": "a granite Japanese stone lantern", "height_m": 1.6, "max_tris": 8000}]}
-  Jobs run one at a time. Other job fields go to the endpoint as is (steps, voice, lyrics, ...).
+    {"type": "3d", "id": "stone_lantern", "prompt": "a granite Japanese stone lantern", "height_m": 1.6, "max_tris": 8000},
+    {"type": "image", "id": "room_dawn", "prompt": "the same room at dawn", "source": "room.png", "source_strength": 0.6},
+    {"type": "video", "id": "storm", "prompt": "...", "first_frame": "storm.png", "width": 1312, "height": 736, "num_frames": 124, "turbo": true}]}
+  Paths in jobs (source, first_frame, image_file) are relative to where gen.mjs runs. Jobs run one at a time. Other job fields go to the endpoint as is (steps, voice, lyrics, ...).
   Writes <out>/<id>.png|wav|glb plus <out>/manifest.json; a job whose spec and model did not
   change is skipped (--force regenerates). Media models are unloaded at the end (--keep-loaded).`;
 
@@ -48,6 +58,7 @@ const ENDPOINT = {
   music: "/v1/audio/music-generations",
   sound: "/v1/audio/sound-generations",
   "3d": "/v1/3d/generations",
+  video: "/v1/video/generations",
 };
 const has = (m, c) => (m.capabilities || []).includes(c);
 const WANTS = {
@@ -56,10 +67,13 @@ const WANTS = {
   music: (m) => has(m, "music"),
   sound: (m) => has(m, "sound"),
   "3d": (m) => has(m, "3d"),
+  video: (m) => has(m, "video"),
 };
+// Several models qualify: a clip is cut in from a still, which is MiniMax-H3's first-frame pack (REF2VA takes no frame).
+const PREFER = { video: /fl2va/i };
 
 let modelList = null;
-async function listModels() {
+export async function listModels() {
   if (modelList) return modelList;
   const res = await fetch(BASE + "/v1/models").catch((e) => {
     throw new Error(`mlx-serve is not reachable at ${BASE} (${e.cause?.code || e.message}); start it or set MLX_SERVE_URL`);
@@ -68,17 +82,17 @@ async function listModels() {
   return (modelList = (await res.json()).data || []);
 }
 
-/** A local model that is already loaded wins, then a local one, then a LAN peer's. */
-async function pickModel(kind, explicit) {
+/** A local model that is already loaded wins, then a local one, then a LAN peer's; `prefer` (a RegExp on the id) first. */
+export async function pickModel(kind, explicit, prefer = PREFER[kind]) {
   if (explicit) return explicit;
   const rank = (m) => (m.state === "ready" ? 0 : m.state === "remote" ? 2 : 1);
   const found = (await listModels()).filter(WANTS[kind]).sort((a, b) => rank(a) - rank(b));
   if (!found.length) throw new Error(`no model with the ${kind} capability: download one in the MLX Core app (Models)`);
-  return found[0].id;
+  return ((prefer && found.find((m) => prefer.test(m.id))) || found[0]).id;
 }
 
 /** POST a streamed media job; returns the SSE `complete` event. */
-async function generate(kind, body) {
+export async function generate(kind, body) {
   const res = await fetch(BASE + ENDPOINT[kind], {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -118,6 +132,108 @@ async function generate(kind, body) {
   }
 }
 
+/** A video job's `complete` event is one JSON line with hundreds of MB of base64 RGB in `data`: stream that
+ * field to a raw file instead of holding it as a string, then mux frames + audio into an mp4 with ffmpeg. */
+async function generateVideo(body, file) {
+  const res = await fetch(BASE + ENDPOINT.video, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...body, stream: true }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = text;
+    try { msg = JSON.parse(text).error?.message ?? text; } catch {}
+    throw new Error(`video: HTTP ${res.status}: ${msg}`);
+  }
+  const rgb = file + ".rgb", pcm = file + ".pcm";
+  const fd = openSync(rgb, "w");
+  const reader = res.body.getReader();
+  const t0 = Date.now();
+  let buf = Buffer.alloc(0), head = null, tail = null, carry = "", inData = false, ev = null; // tail: Buffer[] after "data"
+  const event = (block) => {
+    const data = block.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("");
+    if (!data || data === "[DONE]") return;
+    const e = JSON.parse(data);
+    if (e.type === "progress") {
+      const step = e.total ? `${e.step}/${e.total}` : `${e.step ?? ""}`;
+      process.stderr.write(`\r  video ${e.stage ?? ""} ${step}  ${((Date.now() - t0) / 1000).toFixed(0)}s   `);
+    } else if (e.type === "error") throw new Error(`video: ${e.message}`);
+    else if (e.type === "complete") ev = e;
+  };
+  const writeB64 = (s) => {
+    s = carry + s.replace(/\\/g, "");
+    const n = s.length - (s.length % 4);
+    if (n) writeSync(fd, Buffer.from(s.slice(0, n), "base64"));
+    carry = s.slice(n);
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      if (inData) {
+        const q = chunk.indexOf(0x22);
+        if (q < 0) { writeB64(chunk.toString("latin1")); continue; }
+        writeB64(chunk.subarray(0, q).toString("latin1"));
+        inData = false;
+        tail = [chunk.subarray(q + 1)];
+        continue;
+      }
+      if (tail) { tail.push(chunk); continue; }
+      buf = Buffer.concat([buf, chunk]);
+      for (;;) {
+        const i = buf.indexOf("\n\n");
+        if (i >= 0) { event(buf.subarray(0, i).toString("utf8").replace(/\r/g, "")); buf = buf.subarray(i + 2); continue; }
+        // a block this big is the result: stream its "data" string straight to disk
+        const m = buf.length > (1 << 20) ? /"data"\s*:\s*"/.exec(buf.toString("latin1")) : null;
+        if (m) {
+          head = buf.subarray(0, m.index).toString("utf8");
+          const rest = buf.subarray(m.index + m[0].length);
+          buf = Buffer.alloc(0);
+          const q = rest.indexOf(0x22);
+          if (q < 0) { inData = true; writeB64(rest.toString("latin1")); }
+          else { writeB64(rest.subarray(0, q).toString("latin1")); tail = [rest.subarray(q + 1)]; }
+        }
+        break;
+      }
+    }
+  } catch (e) {
+    rmSync(rgb, { force: true });
+    throw e;
+  } finally {
+    closeSync(fd);
+  }
+  if (head !== null) {
+    const json = head.slice(head.indexOf("{")) + '"data":""' + Buffer.concat(tail || []).toString("utf8").split("\n\n")[0];
+    ev = JSON.parse(json);
+  } else if (ev?.data) {
+    writeFileSync(rgb, Buffer.from(ev.data, "base64"));
+  }
+  process.stderr.write("\n");
+  if (!ev) { rmSync(rgb, { force: true }); throw new Error("video: stream ended without a result"); }
+  const args = ["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", `${ev.width}x${ev.height}`, "-r", String(ev.fps || 24), "-i", rgb];
+  if (ev.audio_data) {
+    writeFileSync(pcm, Buffer.from(ev.audio_data, "base64"));
+    args.push("-f", "s16le", "-ar", String(ev.audio_sample_rate), "-ac", String(ev.audio_channels || 2), "-i", pcm);
+  }
+  args.push("-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p");
+  if (ev.audio_data) args.push("-c:a", "aac", "-b:a", "256k");
+  const ff = runFfmpeg(process.env.FFMPEG || "ffmpeg", [...args, file]);
+  if (ff.error || ff.status !== 0) {
+    throw new Error(`video: ffmpeg could not mux ${rgb} (${ff.error?.message || ff.stderr.trim()}); install ffmpeg or set FFMPEG`);
+  }
+  rmSync(rgb, { force: true });
+  rmSync(pcm, { force: true });
+  console.error(`  ${ev.frames} frames ${ev.width}x${ev.height} at ${ev.fps} fps${ev.audio_data ? " with sound" : ""}`);
+}
+
+/** Run an ffmpeg; a bundled one (Remotion's) finds its libraries next to itself. */
+export function runFfmpeg(bin, args) {
+  const env = bin.includes("/") ? { ...process.env, DYLD_LIBRARY_PATH: dirname(bin), LD_LIBRARY_PATH: dirname(bin) } : process.env;
+  return spawnSync(bin, args, { encoding: "utf8", env, maxBuffer: 1 << 26 });
+}
+
 /** The file bytes inside a `complete` event: images carry `data[0].b64_json`, the rest `data`. */
 function payload(kind, ev) {
   const b64 = kind === "image" ? ev.data?.[0]?.b64_json : ev.data;
@@ -125,7 +241,7 @@ function payload(kind, ev) {
   return Buffer.from(b64, "base64");
 }
 
-async function unload(model) {
+export async function unload(model) {
   await fetch(BASE + "/v1/unload-model", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -137,16 +253,17 @@ async function unload(model) {
 
 // Job fields that steer this script; everything else is forwarded to the endpoint.
 const LOCAL = new Set(["type", "id", "file", "model", "tile", "maps", "cutout", "trim", "holes", "tolerance", "band",
-  "strength", "roughness", "height_m", "size_m", "max_tris", "image_file", "ref_prompt"]);
+  "strength", "roughness", "height_m", "size_m", "max_tris", "image_file", "ref_prompt",
+  "source", "source_strength", "source_mode", "first_frame", "last_frame"]);
 
 const REF_SUFFIX = ", a single object, centered, whole object in frame, three-quarter view, plain white background, soft even studio light";
 
 async function runJob(job, out, used) {
   const kind = job.type;
-  if (!ENDPOINT[kind]) throw new Error(`job ${job.id}: unknown type "${kind}" (image, speech, music, sound, 3d)`);
+  if (!ENDPOINT[kind]) throw new Error(`job ${job.id}: unknown type "${kind}" (image, speech, music, sound, 3d, video)`);
   const model = await pickModel(kind, job.model);
   used.add(model);
-  const ext = { image: ".png", speech: ".wav", music: ".wav", sound: ".wav", "3d": ".glb" }[kind];
+  const ext = { image: ".png", speech: ".wav", music: ".wav", sound: ".wav", "3d": ".glb", video: ".mp4" }[kind];
   const file = job.file || join(out, job.id + ext);
   mkdirSync(dirname(file), { recursive: true });
   const body = { model };
@@ -171,6 +288,22 @@ async function runJob(job, out, used) {
     if (job.height_m || job.size_m || job.max_tris) glb = fixGlb(glb, { height: job.height_m, size: job.size_m, maxTris: job.max_tris });
     writeFileSync(file, glb);
     return { model, files };
+  }
+
+  if (kind === "video") {
+    // the server's defaults are tiny test sizes; a film wants 16:9 and about five seconds (MiniMax-H3's 17k+5 ladder)
+    body.width ??= 1312;
+    body.height ??= 736;
+    body.num_frames ??= 124;
+    if (job.first_frame) body.first_frame_image = readFileSync(job.first_frame).toString("base64");
+    if (job.last_frame) body.last_frame_image = readFileSync(job.last_frame).toString("base64");
+    await generateVideo(body, file);
+    return { model, files };
+  }
+  if (kind === "image" && job.source) {
+    body.image = readFileSync(job.source).toString("base64");
+    body.mode = job.source_mode || "variation";
+    if (body.mode === "variation") body.strength = job.source_strength ?? 0.6;
   }
 
   const bytes = payload(kind, await generate(kind, body));
@@ -271,7 +404,8 @@ function decodePng(buf) {
   return { w, h, data };
 }
 
-function encodePng({ w, h, data }) {
+/** RGBA 8-bit pixels -> PNG bytes. */
+export function encodePng({ w, h, data }) {
   const raw = Buffer.alloc((w * 4 + 1) * h);
   for (let y = 0; y < h; y++) raw.set(data.subarray(y * w * 4, (y + 1) * w * 4), y * (w * 4 + 1) + 1);
   const chunk = (type, d) => {
@@ -604,7 +738,7 @@ function fixGlb(buf, { height, size, maxTris } = {}) {
 
 // ---------- CLI ----------
 
-const BOOL = new Set(["tile", "maps", "cutout", "trim", "holes", "force", "keep-loaded"]);
+const BOOL = new Set(["tile", "maps", "cutout", "trim", "holes", "force", "keep-loaded", "turbo"]);
 function parseArgs(argv) {
   const pos = [], opt = {};
   for (let i = 0; i < argv.length; i++) {
@@ -630,12 +764,23 @@ async function main() {
       return;
     case "batch":
       return runBatch(need("a batch JSON file"), { force: !!opt.force, keepLoaded: !!opt["keep-loaded"] });
+    case "video": {
+      const [width, height] = opt.size ? opt.size.split("x").map(Number) : [];
+      const job = { type: "video", id: basename(opt.out || "video", ".mp4"), file: opt.out || "video.mp4", model: opt.model, prompt: need("a prompt"),
+        first_frame: opt["first-frame"], last_frame: opt["last-frame"], width, height, num_frames: num(opt.frames),
+        steps: num(opt.steps), turbo: opt.turbo, seed: num(opt.seed) };
+      for (const k of Object.keys(job)) if (job[k] === undefined) delete job[k];
+      const r = await runJob(job, ".", new Set());
+      console.log(r.files.main);
+      return;
+    }
     case "image": case "speech": case "music": case "sound": case "3d": {
       const job = { type: cmd, id: basename(opt.out || cmd, extname(opt.out || "")), file: opt.out, model: opt.model, seed: num(opt.seed) };
       if (cmd === "3d" && existsSync(need("a prompt or image")) && /\.(png|jpe?g|webp)$/i.test(pos[0])) job.image_file = pos[0];
       else if (cmd === "speech") job.input = need("the text");
       else job.prompt = need("a prompt");
       if (opt.size && cmd === "image") job.size = opt.size;
+      if (opt.source && cmd === "image") Object.assign(job, { source: opt.source, source_strength: num(opt["source-strength"]) });
       if (opt.voice) job.voice = opt.voice;
       if (opt.duration) job.duration_seconds = num(opt.duration);
       if (opt.lyrics) job.lyrics = existsSync(opt.lyrics) ? readFileSync(opt.lyrics, "utf8") : opt.lyrics;
@@ -665,4 +810,7 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error(`error: ${e.message}`); process.exitCode = 1; });
+// run as a CLI, also through a symlinked skill folder (Node resolves the module's own path)
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => { console.error(`error: ${e.message}`); process.exitCode = 1; });
+}

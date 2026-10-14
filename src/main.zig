@@ -1051,9 +1051,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
-    // MTP verify rounds cost more than they save without the Metal verify
-    // kernels: plain decode is faster on CUDA unless `--mtp` asks for it.
-    if (!mtp_forced and mlx.cudaAvailable()) enable_mtp = false;
+    if (!server_mod.mtpAllowedByDefault(mtp_forced)) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
@@ -1372,7 +1370,7 @@ pub fn main(init: std.process.Init) !void {
     log.info("Loading tokenizer...\n", .{});
     const tok = try allocator.create(tokenizer_mod.Tokenizer);
     var tok_owned_by_registry = false;
-    tok.* = tokenizer_mod.loadTokenizer(io, allocator, model_dir) catch |err| {
+    tok.* = tokenizer_mod.loadTokenizerAny(io, allocator, model_dir) catch |err| {
         // Raw memory only — nothing initialized to deinit. The cleanup defer
         // below must NOT be registered yet: deinit on the undefined pointee
         // was a live SIGSEGV on a partially-downloaded model dir (the

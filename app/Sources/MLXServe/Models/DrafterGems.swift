@@ -48,9 +48,9 @@ enum DrafterGems {
 
     /// The gems that fit `repoId`, the default first (after MTP).
     /// `packFiles`: the pack's HF listing (path → size) when fetched, nil when
-    /// unknown. `localDrafter`: `<model_dir>/drafter` is already on disk.
+    /// unknown. `localDrafter`: the pack's own drafter is on disk, in `packDrafterFolder`.
     static func gems(forRepoId repoId: String, packFiles: [String: Int64]?,
-                     localDrafter: Bool, mtpAvailable: Bool) -> [DrafterGem] {
+                     localDrafter: Bool, packDrafterFolder: String = packFolder, mtpAvailable: Bool) -> [DrafterGem] {
         var out: [DrafterGem] = []
         if mtpAvailable { out.append(DrafterGem(kind: .mtp, repo: "", subfolder: nil, sizeGB: 0)) }
         let base = (repoId as NSString).lastPathComponent.lowercased()
@@ -63,10 +63,10 @@ enum DrafterGems {
 
         if base.contains("qwen3.8-27b") {
             out.append(packHasDrafter
-                ? DrafterGem(kind: .dflash2, repo: repoId, subfolder: packFolder, sizeGB: packGB > 0 ? packGB : 3.85)
+                ? DrafterGem(kind: .dflash2, repo: repoId, subfolder: packDrafterFolder, sizeGB: packGB > 0 ? packGB : 3.85)
                 : DrafterGem(kind: .dflash2, repo: qwen38DFlash2Repo, subfolder: nil, sizeGB: 3.85))
         } else if packHasDrafter {
-            out.append(DrafterGem(kind: .packDrafter, repo: repoId, subfolder: packFolder, sizeGB: packGB))
+            out.append(DrafterGem(kind: .packDrafter, repo: repoId, subfolder: packDrafterFolder, sizeGB: packGB))
         } else if base.contains("glm-5.3-flash") {
             out.append(DrafterGem(kind: .dflash2, repo: glmDFlash2Repo, subfolder: nil, sizeGB: 2.34))
         } else if base.contains("muse-glimmer") {
@@ -153,13 +153,37 @@ extension DrafterGems {
                       config: (String) -> [String: Any]? = readConfig) -> SocketBadge {
         let drafterDir: String? = switch o.drafter {
         case "off": nil
-        case nil, "auto": (modelDir as NSString).appendingPathComponent(packFolder)
+        case nil, "auto": packDrafterFolder(modelDir: modelDir, config: config).map { (modelDir as NSString).appendingPathComponent($0) }
         case let path?: path
         }
         let drafter = drafterDir.flatMap(config).flatMap(stone(drafterConfig:))
         if let drafter, drafter != .ruby { return SocketBadge(stone: drafter, skull: false) }
         guard hasMtpHead, o.mtp ?? options.enableMTP else { return SocketBadge(stone: drafter, skull: false) }
         return SocketBadge(stone: .emerald, skull: o.mtpAcceptance == .typical || o.mtpAcceptance == .tokenv3)
+    }
+
+    /// The pack's own drafter folder, found as the server finds it (`dflash.resolveInDirDrafter`):
+    /// `drafter/`, else the one subfolder holding a DFlash drafter the server serves (Sushi's GLM
+    /// ships `GLM-5.3-Flash-DFlash2/`). Two candidates is a guess: nil. Standalone sushi's derived
+    /// copy (`sushi-runtime-cache.json`) is that engine's cache, never a candidate.
+    static func packDrafterFolder(modelDir: String, config: (String) -> [String: Any]? = readConfig) -> String? {
+        func dir(_ name: String) -> String { (modelDir as NSString).appendingPathComponent(name) }
+        if config(dir(packFolder)) != nil { return packFolder }
+        let served = ((try? FileManager.default.contentsOfDirectory(atPath: modelDir)) ?? []).filter { name in
+            guard let root = config(dir(name)), let s = stone(drafterConfig: root), s != .ruby,
+                  !FileManager.default.fileExists(atPath: dir(name) + "/sushi-runtime-cache.json") else { return false }
+            return servable(drafterConfig: root)
+        }
+        return served.count == 1 ? served[0] : nil
+    }
+
+    /// What `dflash.parseConfigFromJson` refuses by name: partial rotary, a value scale, attention sinks.
+    static func servable(drafterConfig root: [String: Any]) -> Bool {
+        let nested = root["dflash_config"] as? [String: Any] ?? [:]
+        func get(_ k: String) -> Any? { nested[k] ?? root[k] }
+        if let p = get("partial_rotary_factor") as? Double, p != 1 { return false }
+        if get("add_swa_attention_sink_bias") as? Bool == true || get("attention_sink_bias") as? Bool == true { return false }
+        return get("attention_value_scale") == nil
     }
 
     static func readConfig(_ dir: String) -> [String: Any]? {

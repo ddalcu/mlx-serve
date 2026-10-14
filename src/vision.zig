@@ -6,6 +6,8 @@ const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const glm_vision = @import("glm_vision.zig");
+const minicpm_vision = @import("minicpm_vision.zig");
+const qwen_audio = @import("qwen_audio.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -200,6 +202,9 @@ pub const VisionEncoder = struct {
     muse: ?muse_vision.MuseVision = null,
     lfm2: ?lfm2_vision.Lfm2Vision = null,
     glm: ?glm_vision.GlmVision = null,
+    minicpm: ?minicpm_vision.MiniCpmVision = null,
+    /// Qwen3-ASR: an audio-only tower; every image/video entry point refuses.
+    qwen_audio: ?qwen_audio.QwenAudio = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
@@ -207,6 +212,15 @@ pub const VisionEncoder = struct {
         if (config.muse_vision) return initMuse(allocator, config, weights);
         if (config.lfm2_vision) return initLfm2(allocator, config, weights);
         if (config.glm_vision) return initGlm(allocator, config, weights);
+        if (config.minicpm_vision) return initMiniCpm(allocator, config, weights);
+        if (config.qwen_audio) |qa_cfg| {
+            var enc = patchGridShell(allocator, config);
+            enc.qwen_audio = qwen_audio.QwenAudio.init(allocator, qa_cfg, weights) catch |e| {
+                enc.deinit();
+                return e;
+            };
+            return enc;
+        }
         const s = mlx.mlx_default_gpu_stream_new();
 
         var name_buf: [256]u8 = undefined;
@@ -333,6 +347,8 @@ pub const VisionEncoder = struct {
         if (self.muse) |*m| m.deinit();
         if (self.lfm2) |*l| l.deinit();
         if (self.glm) |*g| g.deinit();
+        if (self.minicpm) |*m| m.deinit();
+        if (self.qwen_audio) |*q| q.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -342,6 +358,11 @@ pub const VisionEncoder = struct {
     /// reported by /v1/models so the app only offers the mic on audio models.
     pub fn supportsAudio(self: *const VisionEncoder) bool {
         return if (self.unified) |u| u.ea_w != null else false;
+    }
+
+    /// False for an audio-only tower (Qwen3-ASR).
+    pub fn supportsImages(self: *const VisionEncoder) bool {
+        return self.qwen_audio == null;
     }
 
     // ── Gemma 4 12B unified (encoder-free) ──
@@ -467,6 +488,13 @@ pub const VisionEncoder = struct {
         return enc;
     }
 
+    fn initMiniCpm(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const mv = try minicpm_vision.MiniCpmVision.init(allocator, config, weights);
+        var enc = patchGridShell(allocator, config);
+        enc.minicpm = mv;
+        return enc;
+    }
+
     fn initGlm(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         const gv = try glm_vision.GlmVision.init(allocator, config, weights);
         var enc = patchGridShell(allocator, config);
@@ -482,6 +510,7 @@ pub const VisionEncoder = struct {
         if (self.qwen) |*qv| return qv.forward(patches, grid_h, grid_w);
         if (self.lfm2) |*lv| return lv.forward(patches, grid_h, grid_w);
         if (self.glm) |*gv| return gv.forward(patches, grid_h, grid_w);
+        if (self.minicpm) |*mv| return mv.forward(patches, grid_h, grid_w);
         return error.NoPatchGridEncoder;
     }
 
@@ -716,6 +745,7 @@ pub const VisionEncoder = struct {
         // (Gemma-shaped) buffer reaching here is a client/preprocessing
         // mismatch, not something to dereference. Backstop for the parse-level
         // refusal in `parseImageUrlContent`.
+        if (self.qwen_audio != null) return error.NoImageEncoder;
         if (self.qwen != null or self.muse != null or self.lfm2 != null) return error.PixelsMissingPatchGrid;
         const cfg = &self.config;
         const ps: c_int = @intCast(cfg.vision_patch_size);

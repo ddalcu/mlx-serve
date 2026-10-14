@@ -26,7 +26,7 @@ enum AgentSkills {
     static func files() -> [(name: String, content: String)] {
         guard let src = sourceDir(),
               let names = try? FileManager.default.contentsOfDirectory(atPath: src.path) else { return [] }
-        return names.filter { $0.hasSuffix(".md") || $0.hasSuffix(".mjs") }.sorted().compactMap { n in
+        return names.filter { $0.hasSuffix(".md") || $0.hasSuffix(".mjs") || $0.hasSuffix(".tsx") }.sorted().compactMap { n in
             (try? String(contentsOf: src.appendingPathComponent(n), encoding: .utf8)).map { (n, $0) }
         }
     }

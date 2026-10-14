@@ -19799,18 +19799,16 @@ pub const Transformer = struct {
     pub fn spliceVisionRows(h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32, video_token_id: u32, row_offset: usize, s: mlx.mlx_stream) !mlx.mlx_array {
         const h_shape = mlx.getShape(h);
 
-        // mask = (token_ids == image_token_id) [| (token_ids == audio_token_id)].
-        // Every modality splices through this one channel: the embedding tensor
-        // concatenates each item's rows in prompt order, so a single
-        // sequence-order scatter lands each row in its slot.
-        const img_id_arr = mlx.mlx_array_new_int(@intCast(image_token_id));
-        defer _ = mlx.mlx_array_free(img_id_arr);
+        // mask = token_ids is any placeholder id. Every modality splices through
+        // this one channel: the embedding tensor concatenates each item's rows
+        // in prompt order, so a single sequence-order scatter lands each row in
+        // its slot. An id of 0 is unset (an audio-only model has no image
+        // token), never token 0.
         var mask_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_2d);
-        try mlx.check(mlx.mlx_equal(&mask_2d, token_ids, img_id_arr, s));
-        // Qwen video pads (`video_token_id`) and Gemma audio pads ride the same
-        // row stream: the encoder output is concatenated in prompt order.
-        for ([_]u32{ audio_token_id, video_token_id }) |extra_id| {
+        const ids_shape = mlx.getShape(token_ids);
+        try mlx.check(mlx.mlx_zeros(&mask_2d, ids_shape.ptr, ids_shape.len, .bool_, s));
+        for ([_]u32{ image_token_id, audio_token_id, video_token_id }) |extra_id| {
             if (extra_id == 0) continue;
             const extra_arr = mlx.mlx_array_new_int(@intCast(extra_id));
             defer _ = mlx.mlx_array_free(extra_arr);
@@ -19917,7 +19915,7 @@ pub const Transformer = struct {
         // Only during prefill (seq_len > 1)
         if (h_shape[1] <= 1) return h;
         const ve = ctx.vision_embeddings orelse return h;
-        if (cfg.image_token_id == 0) return h;
+        if (cfg.image_token_id == 0 and cfg.audio_token_id == 0 and cfg.video_token_id == 0) return h;
 
         // Vision embeddings come out of the MultimodalEmbedder already in text-hidden space;
         // mlx-vlm does NOT re-scale them by sqrt(hidden) the way text embeddings are scaled
@@ -20636,7 +20634,8 @@ pub const Transformer = struct {
     /// Verify rows can form a draft tree: every per-row piece of this forward
     /// follows a row's ancestors (row-exact kernels, the GDN fold).
     pub fn specTreeSupported(self: *const Transformer) bool {
-        return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnDecodeRecurEnabled();
+        // The tree verify's GDN kernels are Metal-only; elsewhere a tree round fails, so draft chains.
+        return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnDecodeRecurEnabled() and mlx.metalKernelsAvailable();
     }
 
     /// The quantized head's first `rows` vocab rows only (a draft vocabulary).
@@ -21873,7 +21872,7 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_set(target_all, final_normed);
         }
 
-        if (self.embedding_mode) return final_normed;
+        if (self.embedding_mode or ctx.skip_lm_head) return final_normed;
         var logits = try self.lmHeadProject(final_normed, ctx.argmax_only);
         _ = mlx.mlx_array_free(final_normed);
 
@@ -65156,6 +65155,15 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     try std.testing.expect(!mlx.errorPending());
 }
 
+test "specTreeSupported follows the backend that runs the tree kernels" {
+    var xfm: Transformer = undefined;
+    xfm.config = .{ .model_type = "qwen3_5", .row_exact_covered = true, .dflash_bound = true };
+    xfm.moe_layers = &.{};
+    xfm.rht = null;
+    try std.testing.expect(xfm.config.rowExactDecode());
+    try std.testing.expectEqual(gdnDecodeRecurEnabled() and mlx.metalKernelsAvailable(), xfm.specTreeSupported());
+}
+
 test "gdn_decode.recurTree: every node of a draft tree equals a chain over its own path" {
     // A tree of 1 or 2 nodes has fewer rows than the conv window it commits.
     for ([_]usize{ 1, 2, 8 }) |nodes| {
@@ -66631,6 +66639,30 @@ test "spliceVisionRows: audio placeholders share the row stream in prompt order"
     try std.testing.expectEqual(@as(f32, 50), ptr[0]); // image row 0
     try std.testing.expectEqual(@as(f32, 0), ptr[4]); // text untouched
     try std.testing.expectEqual(@as(f32, 51), ptr[8]); // audio row 1
+}
+
+test "spliceVisionRows: an unset placeholder id (0) never claims token 0" {
+    // An audio-only model has no image token: token 0 (Qwen's "!") stays text.
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const hidden: c_int = 4;
+    const ids = [_]i32{ 0, 88, 7 };
+    var h_data: [12]f32 = @splat(0);
+    var ve_data: [4]f32 = @splat(50);
+    const ve = mlx.mlx_array_new_data(&ve_data, &[_]c_int{ 1, 1, hidden }, 3, .float32);
+    defer _ = mlx.mlx_array_free(ve);
+    const h = mlx.mlx_array_new_data(&h_data, &[_]c_int{ 1, 3, hidden }, 3, .float32);
+    const tid = mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, 3 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(tid);
+    const spliced = try Transformer.spliceVisionRows(h, tid, ve, 0, 88, 0, 0, s);
+    defer _ = mlx.mlx_array_free(spliced);
+    var f32arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32arr);
+    try mlx.check(mlx.mlx_astype(&f32arr, spliced, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32arr));
+    const ptr = mlx.mlx_array_data_float32(f32arr).?;
+    try std.testing.expectEqual(@as(f32, 0), ptr[0]); // token 0 untouched
+    try std.testing.expectEqual(@as(f32, 50), ptr[4]); // audio row
 }
 
 test "ane channel-split GPU complement: axis-0 slice VIEW of a packed weight through qmm vs its materialized copy" {

@@ -139,11 +139,19 @@ class APIClient {
     /// callers prefer this over `fetchModels(port:)` so the picker UI can
     /// show loaded/unloaded badges per model.
     func fetchAllModels(port: UInt16) async throws -> [ModelInfo] {
-        let url = serverURL(port: port, path: "/v1/models")
-        let (data, _) = try await session.data(from: url)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let dataArr = json["data"] as? [[String: Any]] else { return [] }
-        return dataArr.map { Self.parseModelInfo($0) }
+        try await fetchModelList(port: port).models
+    }
+
+    /// `/v1/models` whole: the rows plus the LAN peers that refused us for want of a key.
+    func fetchModelList(port: UInt16) async throws -> (models: [ModelInfo], lanNeedsKey: [String]) {
+        let (data, _) = try await session.data(from: serverURL(port: port, path: "/v1/models"))
+        return Self.parseModelsBody(data)
+    }
+
+    static func parseModelsBody(_ data: Data) -> (models: [ModelInfo], lanNeedsKey: [String]) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let dataArr = json["data"] as? [[String: Any]] else { return ([], []) }
+        return (dataArr.map { parseModelInfo($0) }, json["lan_needs_key"] as? [String] ?? [])
     }
 
     // Internal (not private) so unit tests can exercise the capability/meta

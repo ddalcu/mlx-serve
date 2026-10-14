@@ -661,7 +661,7 @@ final class HFModelQuantGateTests: XCTestCase {
     }
 
     func testMiniCPMV47IsSupportedArchitecture() {
-        // MiniCPM-V 4.7 (model_type minicpmv4_7) serves its Qwen3.5 trunk, text only.
+        // MiniCPM-V 4.7 (model_type minicpmv4_7): a Qwen3.5 trunk behind a SigLIP2 tower.
         let m = mlx(id: "mlx-community/MiniCPM-V-4.7-35B-A3B-4bit",
                     tags: ["mlx", "safetensors", "minicpmv4_7", "image-text-to-text",
                            "minicpm-v", "multimodal", "moe", "conversational", "4-bit"])

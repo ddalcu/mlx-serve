@@ -1357,7 +1357,7 @@ pub fn visionPrefillUnchunked(has_vision: bool) bool {
 pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32, video_token_id: u32) usize {
     var n: usize = 0;
     for (ids) |id| {
-        if (id == @as(i32, @intCast(image_token_id)) or
+        if ((image_token_id > 0 and id == @as(i32, @intCast(image_token_id))) or
             (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id))) or
             (video_token_id > 0 and id == @as(i32, @intCast(video_token_id)))) n += 1;
     }
@@ -21148,6 +21148,8 @@ test "countSpliceRows counts image, audio and video placeholders, extras only wh
     try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88, 0));
     try testing.expectEqual(@as(usize, 4), countSpliceRows(&ids, 99, 88, 77));
     try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88, 77));
+    // An audio-only model declares no image token: token 0 is text.
+    try testing.expectEqual(@as(usize, 1), countSpliceRows(&[_]i32{ 0, 88, 0 }, 0, 88, 0));
 }
 
 test "vision prefill chunks by default and the splice offset feeds every prefill forward" {

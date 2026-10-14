@@ -87,6 +87,45 @@ final class DrafterGemsTests: XCTestCase {
         }
     }
 
+    func testAPacksOneServableDrafterSubfolderStandsInForDrafter() throws {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("pack-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        func write(_ sub: String, _ json: [String: Any]) throws {
+            let d = (dir as NSString).appendingPathComponent(sub)
+            try FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: json).write(to: URL(fileURLWithPath: d + "/config.json"))
+        }
+        let dflash2: [String: Any] = ["dflash_config": ["block_size": 8, "mask_token_id": 1, "target_layer_ids": [1], "selector_rank": 256]]
+        var mimo = dflash2; mimo["partial_rotary_factor"] = 0.5
+
+        // Not drafters, and a drafter whose attention the server refuses, are passed over.
+        try write("assets", ["model_type": "siglip"])
+        try write("dflash", mimo)
+        XCTAssertNil(DrafterGems.packDrafterFolder(modelDir: dir))
+
+        // Sushi's GLM ships its DFlash2 as `GLM-5.3-Flash-DFlash2/`: the socket offers it as the pack's own.
+        try write("GLM-5.3-Flash-DFlash2", dflash2)
+        XCTAssertEqual(DrafterGems.packDrafterFolder(modelDir: dir), "GLM-5.3-Flash-DFlash2")
+        let gems = DrafterGems.gems(forRepoId: "beamster/GLM-5.3-Flash-Sushi-2bpw", packFiles: nil, localDrafter: true,
+                                    packDrafterFolder: "GLM-5.3-Flash-DFlash2", mtpAvailable: false)
+        XCTAssertEqual(gems.map(\.kind), [.packDrafter])
+        XCTAssertEqual(gems.first?.subfolder, "GLM-5.3-Flash-DFlash2")
+        var o = ModelOverride()
+        DrafterSocket.gem(gems[0]).write(into: &o)
+        XCTAssertEqual(o.drafter, "auto", "the server finds the pack's folder itself")
+
+        // Standalone sushi's derived copy beside it is that engine's cache, not a second candidate.
+        try write("dflash2", dflash2)
+        try Data("{}".utf8).write(to: URL(fileURLWithPath: dir + "/dflash2/sushi-runtime-cache.json"))
+        XCTAssertEqual(DrafterGems.packDrafterFolder(modelDir: dir), "GLM-5.3-Flash-DFlash2")
+
+        // Two candidates is a guess; `drafter/` stays the pack's own name and wins.
+        try write("Other-DFlash2", dflash2)
+        XCTAssertNil(DrafterGems.packDrafterFolder(modelDir: dir))
+        try write(DrafterGems.packFolder, dflash2)
+        XCTAssertEqual(DrafterGems.packDrafterFolder(modelDir: dir), DrafterGems.packFolder)
+    }
+
     func testTheMenuNamesTheLicenseWhereItAsksForADownload() {
         let glm = DrafterGem(kind: .dflash2, repo: DrafterGems.glmDFlash2Repo, subfolder: nil, sizeGB: 2.34)
         let zlab = DrafterGem(kind: .dflash2, repo: DrafterGems.qwen38DFlash2Repo, subfolder: nil, sizeGB: 3.85)

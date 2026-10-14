@@ -132,10 +132,11 @@ pub fn cudaAvailable() bool {
     return cuda_cache.?;
 }
 
-/// Metal, or mlx-omarchy's Vulkan backend (which translates MSL), runs
-/// `mlx_fast_metal_kernel`; the CUDA backend runs MLX ops only.
+/// Only Metal runs `mlx_fast_metal_kernel`; CUDA and Vulkan run MLX ops only.
+/// mlx-omarchy's Vulkan backend translates a subset of MSL and refuses the
+/// rest at EVAL, which fails the request instead of declining the kernel.
 pub fn metalKernelsAvailable() bool {
-    return !cudaAvailable();
+    return comptime builtin.os.tag.isDarwin();
 }
 pub extern "c" fn mlx_cuda_is_available(res: *bool) c_int;
 
@@ -381,6 +382,7 @@ pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_arra
 // `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
 pub const mlx_fft_norm = c_int;
 pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
+pub extern "c" fn mlx_as_strided(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, strides: [*]const i64, strides_num: usize, offset: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
 // Real-output inverse transform — the iSTFT head of Kokoro's iSTFTNet generator
 // (`src/kokoro.zig`). `n` is the OUTPUT length in samples, so the caller states
@@ -836,6 +838,10 @@ pub fn applyWiredPolicy() WiredPolicyResult {
             return .{ .mode = mode, .target = target };
         },
     }
+}
+
+test "custom Metal kernels run on the Metal backend only" {
+    try std.testing.expectEqual(builtin.os.tag.isDarwin(), metalKernelsAvailable());
 }
 
 /// Evaluates every array reachable through `value`'s fields (structs, optionals, fixed arrays),

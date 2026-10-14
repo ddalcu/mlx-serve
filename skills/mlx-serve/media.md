@@ -127,6 +127,35 @@ Response: raw `audio/wav` bytes (44.1 kHz stereo) or SSE. About a second per
 clip, so a game can generate variations up front (several seeds of one prompt)
 and pick at random at play time.
 
+## Speech to text: `POST /v1/audio/transcriptions`
+
+Qwen3-ASR, in OpenAI's multipart form (the OpenAI SDK's transcription call works):
+what is said in a WAV (any rate, mono or stereo, any length: a long one is cut into pieces), in 30 languages.
+
+| field | notes |
+|---|---|
+| `file` | required: the WAV |
+| `model` | a model with the `transcription` capability |
+| `language` | ISO code or name; omit it and the model detects it |
+| `prompt` | names and terms the transcript should spell your way |
+| `response_format` | `json` (default, `{"text"}`), `text`, `verbose_json`, `srt`, `vtt`, `diarized_json` |
+| `timestamp_granularities[]` | `word` adds `words` to `verbose_json`; segments are always there |
+
+Times come from the forced aligner, a model with the `alignment` capability (the
+app downloads `mlx-community/Qwen3-ForcedAligner-0.6B-8bit` with the ASR):
+`verbose_json` segments end at sentences and pauses, each word has `start`/`end`
+seconds, and `srt`/`vtt` are those segments as subtitles. It times Chinese,
+Cantonese, English, German, Spanish, French, Italian, Portuguese, Russian, Korean
+and Japanese (a Chinese or Japanese word is one character); speech in another
+language is one segment. Without the aligner, `verbose_json` is one segment for
+the whole clip and `srt`/`vtt` answer 400.
+
+`diarized_json` says who said what: `{"task","duration","text","segments":[{"type",
+"id","start","end","text","speaker"}]}`, the speakers `"A"`, `"B"`, … in the order
+they first speak (up to eight), a segment closing where the speaker changes. It
+needs the diarizer, a model with the `diarization` capability (the app downloads
+`mlx-community/Nemotron-3-Diarization-8bit` with the ASR); without it, a 400.
+
 ## Video: `POST /v1/video/generations`
 
 | field | notes |
