@@ -20634,7 +20634,8 @@ pub const Transformer = struct {
     /// Verify rows can form a draft tree: every per-row piece of this forward
     /// follows a row's ancestors (row-exact kernels, the GDN fold).
     pub fn specTreeSupported(self: *const Transformer) bool {
-        return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnDecodeRecurEnabled();
+        // The tree verify's GDN kernels are Metal-only; elsewhere a tree round fails, so draft chains.
+        return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnDecodeRecurEnabled() and mlx.metalKernelsAvailable();
     }
 
     /// The quantized head's first `rows` vocab rows only (a draft vocabulary).
@@ -65152,6 +65153,15 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, good, false, cpu)) == null);
     try std.testing.expect((try gdn_decode.recurSeq(g, t_len, good, cpu)) == null);
     try std.testing.expect(!mlx.errorPending());
+}
+
+test "specTreeSupported follows the backend that runs the tree kernels" {
+    var xfm: Transformer = undefined;
+    xfm.config = .{ .model_type = "qwen3_5", .row_exact_covered = true, .dflash_bound = true };
+    xfm.moe_layers = &.{};
+    xfm.rht = null;
+    try std.testing.expect(xfm.config.rowExactDecode());
+    try std.testing.expectEqual(gdnDecodeRecurEnabled() and mlx.metalKernelsAvailable(), xfm.specTreeSupported());
 }
 
 test "gdn_decode.recurTree: every node of a draft tree equals a chain over its own path" {
