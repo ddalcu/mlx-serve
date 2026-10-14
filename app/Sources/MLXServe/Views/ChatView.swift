@@ -2922,22 +2922,10 @@ struct ChatDetailView: View {
                     RoundedRectangle(cornerRadius: 18)
                         .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
                 )
-                // "/" skill menu — FLOATS over the transcript rather than
-                // sitting in the bar: as a sibling it grew the composer and
-                // shoved the conversation up on every keystroke. An overlay
-                // past the clip, its own bottom guide pinned to the
-                // container's top, so it needs no height to position itself.
-                // Not an NSPopover — that takes first responder, and the menu
-                // has to stay open while you keep typing.
-                .overlay(alignment: .topLeading) {
-                    if !slashMatches.isEmpty {
-                        SlashSkillMenu(matches: slashMatches,
-                                       selection: min(slashSelection, max(0, slashMatches.count - 1)),
-                                       onPick: { pickSlashSkill($0) })
-                            .alignmentGuide(.top) { $0[.bottom] + 8 }
-                            .shadow(color: .black.opacity(0.28), radius: 14, y: 4)
-                    }
-                }
+                // "/" skill menu, past the clip so it can hang above the container.
+                .slashSkillMenu(matches: slashMatches,
+                                selection: min(slashSelection, max(0, slashMatches.count - 1)),
+                                onPick: { pickSlashSkill($0) })
                 // Hover cards for the row's bare glyphs. Drawn HERE, past the
                 // clip: an overlay on the control itself is cut off at the
                 // container's rounded edge and lands over the text field.

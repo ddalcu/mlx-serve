@@ -1103,7 +1103,7 @@ struct LocalModel: Identifiable, Hashable {
     /// no longer flags them "Unsupported".
     var isChatPickable: Bool {
         guard defect == nil, !isDownloading else { return false }
-        return kind == .base && isSupportedArchitecture && modelType != "bert" && modelType != "embedding_gemma2" && !isMediaModelType(modelType)
+        return kind == .base && isSupportedArchitecture && modelType != "bert" && modelType != "embedding_gemma2" && modelType != "qwen3_asr" && modelType != "qwen3_forced_aligner" && !isMediaModelType(modelType)
     }
 
     /// Likely tool/function-calling support (name heuristic, shared with the

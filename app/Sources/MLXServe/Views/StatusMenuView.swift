@@ -624,6 +624,10 @@ struct StatusMenuView: View {
             // Spotlight-style ⌃Space prompt panel, summonable from any app
             // while MLX Core runs in the tray.
             QuickLauncherTrayRow()
+
+            TrayRowSeparator()
+
+            TranscriptTrayRow()
         }
     }
 

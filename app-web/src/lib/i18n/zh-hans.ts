@@ -865,6 +865,7 @@ const ZH: Record<string, string> = {
   Quality: "质量",
   "Quality passes": "质量步数",
   "Quick start": "快速开始",
+  "Qwen3-ASR speech to text · WAV in, OpenAI form": "Qwen3-ASR 语音转文字 · 输入 WAV，OpenAI 表单",
   "Qwen3-TTS (zero-shot voice cloning) or Kokoro (54 blendable voices) · WAV":
     "Qwen3-TTS（零样本语音克隆）或 Kokoro（54 种可混合音色）· WAV",
   Random: "随机",

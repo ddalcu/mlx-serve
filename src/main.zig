@@ -1372,7 +1372,7 @@ pub fn main(init: std.process.Init) !void {
     log.info("Loading tokenizer...\n", .{});
     const tok = try allocator.create(tokenizer_mod.Tokenizer);
     var tok_owned_by_registry = false;
-    tok.* = tokenizer_mod.loadTokenizer(io, allocator, model_dir) catch |err| {
+    tok.* = tokenizer_mod.loadTokenizerAny(io, allocator, model_dir) catch |err| {
         // Raw memory only — nothing initialized to deinit. The cleanup defer
         // below must NOT be registered yet: deinit on the undefined pointee
         // was a live SIGSEGV on a partially-downloaded model dir (the

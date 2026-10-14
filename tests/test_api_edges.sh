@@ -184,6 +184,12 @@ expect_status 400 "chat: undecodable image_url refused"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[$IMG_HTTP]}],\"max_tokens\":5}"
 expect_status 400 "chat: remote image URL refused by name"
 [[ "$(echo "$BODY" | J 'd["error"]["message"]')" == *"remote URLs are not fetched"* ]] && ok "chat: refusal names the cause" || bad "chat: refusal names the cause" "$(echo "$BODY" | head -c 160)"
+# the bare-string image_url is read as the URL, and a part with no URL is refused, never dropped
+req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":"http://127.0.0.1:1/x.png"}]}],"max_tokens":5}'
+expect_status 400 "chat: a bare-string image_url is read as the URL"
+[[ "$(echo "$BODY" | J 'd["error"]["message"]')" == *"remote URLs are not fetched"* ]] && ok "chat: bare-string refusal names the cause" || bad "chat: bare-string refusal names the cause" "$(echo "$BODY" | head -c 160)"
+req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"href":"x"}}]}],"max_tokens":5}'
+expect_status 400 "chat: an image_url part without a url is refused"
 req POST /v1/messages '{"model":"m","max_tokens":5,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}'
 expect_status 400 "messages: undecodable image block refused"
 req POST /v1/responses '{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"http://127.0.0.1:1/x.png"}]}],"max_output_tokens":5}'

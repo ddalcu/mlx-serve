@@ -44,7 +44,7 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; shift; for l in "$@"; do echo "        $
 [ -x ./zig-out/bin/mlx-serve ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
 LOG=$(mktemp /tmp/hot_switch.XXXXXX)
-pkill -f "bin/mlx-serve" 2>/dev/null; sleep 1
+pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
 ./zig-out/bin/mlx-serve serve --port "$PORT" --host 127.0.0.1 --model-dir "$ROOT" \
     --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
@@ -70,7 +70,8 @@ def ok(m):
     meta = m.get('meta') or {}
     # Local packs only: a provider or LAN row is someone else's server.
     local = 'provider' not in m and m.get('state') != 'remote'
-    return local and 'chat' in caps and (meta.get('bytes_on_disk') or m.get('bytes_on_disk') or 0) < 12e9
+    # An embedder on a decoder arch advertises chat too, and only babbles.
+    return local and 'chat' in caps and 'embeddings' not in caps and (meta.get('bytes_on_disk') or m.get('bytes_on_disk') or 0) < 12e9
 picked = [m['id'] for m in sorted(d, key=lambda m: m.get('bytes_on_disk') or 0) if ok(m)]
 print('\n'.join(picked[:3]))
 " 2>/dev/null)

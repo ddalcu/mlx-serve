@@ -381,6 +381,7 @@ pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_arra
 // `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
 pub const mlx_fft_norm = c_int;
 pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
+pub extern "c" fn mlx_as_strided(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, strides: [*]const i64, strides_num: usize, offset: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
 // Real-output inverse transform — the iSTFT head of Kokoro's iSTFTNet generator
 // (`src/kokoro.zig`). `n` is the OUTPUT length in samples, so the caller states

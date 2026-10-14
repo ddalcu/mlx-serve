@@ -55,7 +55,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .engines:           return "Engines"
         case .requestDefaults:   return "Generation Defaults"
         case .interface:         return "Interface"
-        case .voice:             return "Voice"
+        case .voice:             return "Voice & Transcribe"
         case .sandbox:           return "Agent Sandbox"
         case .messaging:         return "Messaging — Telegram bot"
         case .updates:           return "Updates"

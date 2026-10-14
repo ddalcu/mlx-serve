@@ -22,7 +22,12 @@ const transformer_mod = @import("transformer.zig");
 const tok_mod = @import("tokenizer.zig");
 const wav_mod = @import("wav.zig");
 const sse = @import("gen_sse.zig");
-const Scope = @import("mlx_scope.zig").Scope;
+const scope_mod = @import("mlx_scope.zig");
+const Scope = scope_mod.Scope;
+const Linear = scope_mod.Linear;
+const getW = scope_mod.getW;
+const linear = scope_mod.linear;
+const evalAll = scope_mod.evalAll;
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
@@ -366,25 +371,6 @@ fn argmax(scores: []const f32, phase: Phase) u32 {
 // Weights
 // ════════════════════════════════════════════════════════════════════════
 
-/// A projection resolved once at load: affine-quantized (width solved from the packed
-/// geometry, never a literal) or dense, with an optional bias. Handles are borrowed from `Weights`.
-const Linear = struct {
-    w: A,
-    scales: ?A = null,
-    biases: A = .{ .ctx = null },
-    bias: ?A = null,
-    bits: u32 = 0,
-    group_size: u32 = 0,
-
-    fn forward(self: *const Linear, sc: *Scope, x: A) !A {
-        const y = if (self.scales) |sca|
-            try sc.qmm(x, self.w, sca, self.biases, self.group_size, self.bits)
-        else
-            try sc.matmul(x, try sc.transpose(self.w, &.{ 1, 0 }));
-        return if (self.bias) |b| sc.add(y, b) else y;
-    }
-};
-
 /// One of a layer's two weight sets.
 const Path = struct {
     ln: A,
@@ -405,33 +391,6 @@ const Layer = struct { ar: Path, nar: Path };
 /// A layer's K/V for the NAR queries to attend over (owned handles).
 const ArKv = struct { k: A, v: A };
 
-fn getW(w: *const Weights, comptime fmt: []const u8, args: anytype) !A {
-    var buf: [160]u8 = undefined;
-    const key = try std.fmt.bufPrint(&buf, fmt, args);
-    return w.get(key) orelse {
-        log.err("[yue2] MISSING WEIGHT: {s}\n", .{key});
-        return error.MissingWeight;
-    };
-}
-
-fn linear(w: *const Weights, comptime fmt: []const u8, args: anytype, in_dim: u32) !Linear {
-    var buf: [160]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&buf, fmt, args);
-    var l = Linear{ .w = try getW(w, "{s}.weight", .{prefix}) };
-    if (w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.scales", .{prefix}))) |sca| {
-        l.scales = sca;
-        l.biases = try getW(w, "{s}.biases", .{prefix});
-        const qp = transformer_mod.affineParamsFromGeometry(l.w, sca, in_dim) orelse {
-            log.err("[yue2] unsolvable quant geometry for {s}\n", .{prefix});
-            return error.BadQuantGeometry;
-        };
-        l.bits = qp.bits;
-        l.group_size = qp.group_size;
-    }
-    l.bias = w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.bias", .{prefix}));
-    return l;
-}
-
 fn resolvePath(w: *const Weights, li: usize, comptime ln: []const u8, comptime attn: []const u8, comptime mlp_ln: []const u8, comptime mlp: []const u8, hidden: u32, q_out: u32, ffn_in: u32) !Path {
     const p = "model.layers.{d}.";
     return .{
@@ -447,15 +406,6 @@ fn resolvePath(w: *const Weights, li: usize, comptime ln: []const u8, comptime a
         .up = try linear(w, p ++ mlp ++ ".up_proj", .{li}, hidden),
         .down = try linear(w, p ++ mlp ++ ".down_proj", .{li}, ffn_in),
     };
-}
-
-/// Evaluate every array once so no weight stays a lazy file read.
-fn evalAll(w: *const Weights) !void {
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    var it = w.map.valueIterator();
-    while (it.next()) |v| _ = mlx.mlx_vector_array_append_value(vec, v.*);
-    try mlx.check(mlx.mlx_eval(vec));
 }
 
 // ════════════════════════════════════════════════════════════════════════

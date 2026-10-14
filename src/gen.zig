@@ -65,6 +65,9 @@ pub const Modality = enum {
     /// Typed decisions (`/v1/decisions`, Laya or Kev): scorers, not generators,
     /// but they ride the media plumbing (engine slot, inference-thread job).
     decision,
+    /// Speaker diarization (Nemotron 3 Diarization): no route of its own, the
+    /// speakers of a `diarized_json` transcription.
+    diarization,
 
     pub fn capability(self: Modality) []const u8 {
         return switch (self) {
@@ -73,6 +76,7 @@ pub const Modality = enum {
             .video => "video",
             .mesh => "3d",
             .decision => "decisions",
+            .diarization => "diarization",
         };
     }
 
@@ -86,6 +90,7 @@ pub const Modality = enum {
             .video => "AudioVideo",
             .mesh => "hunyuan3d_2_1",
             .decision => "laya",
+            .diarization => "nemotron_diarization",
         };
     }
 };
@@ -109,7 +114,7 @@ pub const media_model_types = [_][]const u8{
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
     "laya",      "kev",        "clef",           "d1",
-    "stable_audio3", "yue2",
+    "stable_audio3", "yue2",      "nemotron_diarization",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -127,6 +132,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
+    if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     return null;
 }
 
@@ -5976,7 +5982,7 @@ test "ImageEngine FLUX generatePng produces a PNG (characterization)" {
 }
 
 test "Modality.modelType round-trips through modalityFromType" {
-    for ([_]Modality{ .image, .audio, .video, .mesh, .decision }) |m| {
+    for ([_]Modality{ .image, .audio, .video, .mesh, .decision, .diarization }) |m| {
         try testing.expectEqual(m, modalityFromType(m.modelType()).?);
     }
 }

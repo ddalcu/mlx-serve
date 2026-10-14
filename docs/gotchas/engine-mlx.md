@@ -5677,3 +5677,10 @@ Defect: on some boots Flash Next prefilled ~20% slower (4.2k vs 5.2k tok/s on an
 Cause: the warmed calibration timed ONE 128-row sample per arm, and the serial arm only touched pages while the pool did full preads; neither arm paid the dequant a prefill pays. A noisy sample or the lighter serial work left the pool a 20% "win" it loses at prefill width.
 Fix: both arms run the gather's own `gatherSerial` / `gatherPooled` (read + dequant), on fresh rows per trial, and the verdict is the median of `PLE_CALIBRATION_TRIALS` (5). A cold table still picks the pool (8-bit: 30 vs 2.5 ms).
 Guard: `ngram prefill calibration: one slow sample does not pick the arm`, the trial count in `ngram prefill gather: 4096 rows ...`; live, 6/6 boots SERIAL after vs 1/4 POOLED before.
+
+## The standard forward handed back logits under `skip_lm_head` (2026-10-13)
+
+Defect: the forced aligner's head ran on the trunk's logits (`[..., 5000]` into a `[5000, 1024]` matmul), an MLX shape error on the first aligned request.
+Cause: `ForwardCtx.skip_lm_head` promises the post-final-norm hidden, and the moe, hybrid and module paths honor it, but `forwardStandardWith` only checked `embedding_mode`; the LTX text encoder had been paying a full-vocab head it then discarded.
+Fix: the standard path returns `final_normed` under either flag.
+Guard: `standard forward: skip_lm_head hands back the hidden the head reads, never logits` (dflash.zig, the tiny llama trunk).

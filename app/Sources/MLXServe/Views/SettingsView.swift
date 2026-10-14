@@ -163,10 +163,11 @@ struct SettingsView: View {
 
         SettingsSection(
             category: .voice,
-            subtitle: "Your wake phrase for hands-free mode and an optional voice clip it answers in."
+            subtitle: "Your wake phrase and voice for hands-free mode, and how meeting transcripts start, stop and get their notes."
         ) {
             WakePhraseSectionContent()
             VoiceCloneSectionContent()
+            TranscribeSectionContent()
         }
 
         SettingsSection(
@@ -935,6 +936,7 @@ private struct ModelFoldersSectionContent: View {
 private struct LanSharingSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @State private var peerKeys: [String: String] = [:]
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
@@ -979,6 +981,13 @@ private struct LanSharingSectionContent: View {
                     .labelsHidden()
                     .toggleStyle(.switch).font(.app(.body))
             }
+            .task {
+                peerKeys = LanPeerKeys.load()
+                await server.refreshModels()
+            }
+        }
+        if appState.serverOptions.lanDiscoverEnabled {
+            LanPeerKeyRows(keys: $peerKeys)
         }
         // The privacy disclosure — sharing means running other people's
         // prompts, and using a network model means the host reads yours.
@@ -1021,6 +1030,62 @@ private struct LanSharingSectionContent: View {
         }
         .padding(.leading, 8)
         .padding(.vertical, 2)
+    }
+}
+
+/// A key field per LAN peer that runs with --api-key. Saving writes
+/// lan-keys.json, which the server picks up on its own.
+private struct LanPeerKeyRows: View {
+    @EnvironmentObject var server: ServerManager
+    @Binding var keys: [String: String]
+    @State private var saveError: String?
+
+    var body: some View {
+        let names = LanPeerKeys.rows(needingKey: server.lanPeersNeedingKey, saved: keys)
+        if !names.isEmpty {
+            SearchableRow(searchText: ["API key", "LAN peer"] + names) {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(names, id: \.self) { name in
+                        HStack(spacing: 8) {
+                            Text(verbatim: name).font(.app(.body))
+                            if server.lanPeersNeedingKey.contains(name) {
+                                Text(L10n.text("Needs key")).font(.app(.caption)).foregroundStyle(.orange)
+                            }
+                            Spacer()
+                            SecureField("api key", text: Binding(
+                                get: { keys[name] ?? "" },
+                                set: { keys[name] = $0 }
+                            ), prompt: Text(L10n.text("API key")))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 200)
+                            .onSubmit(save)
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Button { save() } label: { Text("Save").font(.app(.body)) }
+                    }
+                    if let saveError {
+                        Text(verbatim: saveError).font(.app(.caption)).foregroundStyle(.red)
+                    }
+                }
+            }
+        }
+    }
+
+    private func save() {
+        do {
+            try LanPeerKeys.save(keys)
+            saveError = nil
+        } catch {
+            saveError = error.localizedDescription
+            return
+        }
+        Task {
+            // The server retries the peer within a second of the file changing.
+            try? await Task.sleep(for: .seconds(3))
+            await server.refreshModels()
+        }
     }
 }
 
@@ -2418,6 +2483,54 @@ private struct WakePhraseSectionContent: View {
                 Text(L10n.text(Self.explainer))
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+// MARK: - Transcribe section
+
+/// The tray Transcript's settings: which model writes the meeting notes, when a
+/// recording stops by itself and when one starts by itself. App-side like the
+/// voice fields, so never a restart.
+private struct TranscribeSectionContent: View {
+    @EnvironmentObject var appState: AppState
+
+    private var pickable: [LocalModel] { appState.localModels.filter(\.isChatPickable) }
+
+    /// A chosen model that is gone shows as the fallback it gets: the chat model in use.
+    private var notesModel: Binding<String> {
+        Binding(get: {
+            let v = appState.serverOptions.transcriptNotesModel
+            return v == ServerOptions.notesOff || pickable.contains(where: { $0.path == v }) ? v : ""
+        }, set: { appState.serverOptions.transcriptNotesModel = $0 })
+    }
+
+    var body: some View {
+        SettingsRow(title: "Meeting notes", explainer: "The model that writes a title, summary, decisions and action items above each transcript.") {
+            Picker("", selection: notesModel) {
+                Text(L10n.text("Chat model in use")).font(.app(.body)).tag("")
+                Text(L10n.text("Off")).font(.app(.body)).tag(ServerOptions.notesOff)
+                ForEach(pickable) { model in
+                    Text(model.displayLabel).font(.app(.body)).tag(model.path)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 220).font(.app(.body))
+        }
+        SettingsRow(title: "Stop after silence", explainer: "Ends a recording when nothing has been heard for this long, then transcribes it.") {
+            Picker("", selection: $appState.serverOptions.transcriptAutoStopMinutes) {
+                Text(L10n.text("Never")).font(.app(.body)).tag(0)
+                ForEach([5, 10, 15, 30, 60], id: \.self) { minutes in
+                    Text(L10n.format("%d minutes", minutes)).font(.app(.body)).tag(minutes)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 140).font(.app(.body))
+        }
+        SettingsRow(title: "Start when the camera turns on", explainer: "Starts a transcript when an app such as Zoom, Teams or FaceTime turns on your camera.") {
+            Toggle("", isOn: $appState.serverOptions.transcriptAutoStartCamera)
+                .labelsHidden()
+                .toggleStyle(.switch).font(.app(.body))
         }
     }
 }

@@ -317,6 +317,16 @@ struct ServerOptions: Codable, Equatable {
     /// voice fields — never a server-launch flag.
     var wakePhrase: String = WakeWord.defaultPhrase
 
+    // MARK: Transcribe (app-level, like the voice fields: never a launch flag)
+    /// The chat model that writes a tray transcript's notes: a model path, ""
+    /// for the chat model in use, or `notesOff`.
+    var transcriptNotesModel: String = ""
+    static let notesOff = "off"
+    /// Minutes of silence after which a tray recording stops itself; 0 never.
+    var transcriptAutoStopMinutes: Int = 10
+    /// Start a tray recording when an app turns the camera on.
+    var transcriptAutoStartCamera: Bool = false
+
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
         var id: String { rawValue }
@@ -940,6 +950,9 @@ extension ServerOptions {
         }
         if let v = try c.decodeIfPresent(String.self, forKey: .kokoroVoice) { kokoroVoice = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .transcriptNotesModel) { transcriptNotesModel = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .transcriptAutoStopMinutes) { transcriptAutoStopMinutes = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .transcriptAutoStartCamera) { transcriptAutoStartCamera = v }
     }
 }
 

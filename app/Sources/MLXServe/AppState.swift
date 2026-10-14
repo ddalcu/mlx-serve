@@ -652,6 +652,10 @@ class AppState: ObservableObject {
         // And the quick launcher's global ⌃Space hotkey.
         if quickLauncherEnabled { quickLauncher.setEnabled(true) }
 
+        // The tray transcript starts with the camera, stops after a silence and
+        // picks up a recording left behind, without the tray open.
+        TrayTranscript.shared.attach(self)
+
         // The app-level agent's voice, applied once at launch (didSet doesn't
         // fire for the init assignment above). Everything else it owns is
         // resolved per turn.

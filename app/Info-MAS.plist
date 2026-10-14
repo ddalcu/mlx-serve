@@ -49,6 +49,8 @@
 	<array>
 		<string>_mlxserve._tcp</string>
 	</array>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Needed only when a transcript also records desktop audio: what your Mac plays, like the other side of a call. The audio stays on your Mac.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Needed for Voice mode and recording audio prompts. macOS also asks for this when the app plays audio; playback never records.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

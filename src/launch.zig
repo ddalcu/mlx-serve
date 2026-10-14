@@ -1229,9 +1229,12 @@ pub fn remoteScript(allocator: std.mem.Allocator, kind: AgentKind, base_url: []c
     const run = try std.mem.concat(a, u8, &.{ if (kind == .opencode2) opencode2_bin_probe else "", try scriptFor(a, kind, base_url, model, budget, oc, &.{}) });
     try out.appendSlice(a, "login=$(command -v zsh || command -v bash || echo sh)\ns=");
     try appendQuoted(&out, a, run);
+    // The agent's stdin is the terminal the output goes to, /dev/tty only as a last resort: agents
+    // built on Bun (Claude Code, oh-my-pi, OpenCode) and Grok cannot watch a reopened /dev/tty on macOS.
+    // The redirect rides the exec, because sh is still reading this script from stdin.
     try out.appendSlice(a,
         \\
-        \\if [ ! -t 0 ] && (: </dev/tty) 2>/dev/null; then exec "$login" -l -c "$s" </dev/tty; fi
+        \\if [ ! -t 0 ]; then if [ -t 2 ]; then exec "$login" -l -c "$s" 0<&2; elif [ -t 1 ]; then exec "$login" -l -c "$s" 0<&1; elif (: </dev/tty) 2>/dev/null; then exec "$login" -l -c "$s" </dev/tty; fi; fi
         \\exec "$login" -l -c "$s"
         \\
     );
@@ -2133,7 +2136,7 @@ test "served launch script writes the agent's files, keeps an edited skill, and 
     // The served script cannot read the settings it would merge into: an existing file is kept.
     try t.expect(std.mem.indexOf(u8, s, "\n[ -e \"$HOME/.mlx-serve/pi/settings.json\" ] || cat > \"$HOME/.mlx-serve/pi/settings.json\"") != null);
     try t.expect(std.mem.indexOf(u8, s, "pi --provider mlx --model m1") != null);
-    try t.expect(std.mem.endsWith(u8, s, "then exec \"$login\" -l -c \"$s\" </dev/tty; fi\nexec \"$login\" -l -c \"$s\"\n"));
+    try t.expect(std.mem.endsWith(u8, s, "then exec \"$login\" -l -c \"$s\" 0<&2; elif [ -t 1 ]; then exec \"$login\" -l -c \"$s\" 0<&1; elif (: </dev/tty) 2>/dev/null; then exec \"$login\" -l -c \"$s\" </dev/tty; fi; fi\nexec \"$login\" -l -c \"$s\"\n"));
 }
 
 test "served opencode2 script resolves its binary in the login shell and pins the model" {

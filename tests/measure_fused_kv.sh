@@ -35,7 +35,7 @@ CONFIGS=(
 if [[ ! -x "$BINARY" ]]; then
     echo "[fatal] binary missing: $BINARY"; exit 1
 fi
-pkill -f 'mlx-serve --serve' >/dev/null 2>&1 || true
+pkill -f "mlx-serve.*--port $PORT" >/dev/null 2>&1 || true
 sleep 1
 
 echo "# Fused KV-attention measurement — $(date '+%Y-%m-%d %H:%M')" > "$RESULTS"
@@ -94,7 +94,7 @@ run_cell() {
     sleep 2
 }
 
-trap 'pkill -f "mlx-serve --serve" 2>/dev/null || true' EXIT
+trap 'pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true' EXIT
 
 for m in "${MODELS[@]}"; do
     IFS='|' read -r name display path <<< "$m"

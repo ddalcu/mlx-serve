@@ -189,7 +189,8 @@ grep -q "\[image\] edit ref 3: .* bytes (byte-based backend)" "$LOG" \
 
 # ── the cap: image + 10 dummy refs (11 total) -> 400 by name BEFORE any
 # denoise (qwen's cap is 10 total — the other editors' is 4)
-code="$(gen "$OUT/e4.json" "\"prompt\":\"x\",\"mode\":\"edit\",\"image\":\"QQ==\",\"ref_images\":[\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\"]")"
+R="\"$(cat "$OUT/ref256.b64")\""
+code="$(gen "$OUT/e4.json" "\"prompt\":\"x\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src43.b64")\",\"ref_images\":[$R,$R,$R,$R,$R,$R,$R,$R,$R,$R]")"
 [ "$code" = 400 ] && grep -q "too many reference images" "$OUT/e4.json" && grep -q "at most 9" "$OUT/e4.json" \
   && pass "image + 10 ref_images -> 400 (cap: 10 total)" || fail "over-cap edit returned $code"
 
@@ -217,12 +218,17 @@ grep -q "\[qwen-image\] edit 256x256 refs=5 steps=$STEPS guidance=1.0 refres=102
 
 # ── the request-scope residency bill: a joint sequence past any working set
 #    refuses BY NAME (the #496 regime: high ref counts used to hang the first
-#    denoise step with no error). 10 refs + a 2048x2048 target bills >100 GB.
+#    denoise step with no error). 10 refs + a 2048x2048 target bills >100 GB,
+#    which a 192 GB+ Mac holds, so there it is a real job, not a refusal.
+if [ "$(sysctl -n hw.memsize)" -ge $((192 * 1024 * 1024 * 1024)) ]; then
+  echo "SKIP: over-budget edit: the >100 GB bill fits this Mac's working set"
+else
 code="$(curl -s -m 60 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$ID\",\"size\":\"2048x2048\",\"steps\":6,\"seed\":3,\"prompt\":\"compose\",\"mode\":\"edit\",\"image\":\"QQ==\",\"ref_images\":[\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\",\"QQ==\"]}" \
+  -d "{\"model\":\"$ID\",\"size\":\"2048x2048\",\"steps\":6,\"seed\":3,\"prompt\":\"compose\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src43.b64")\",\"ref_images\":[$R,$R,$R,$R,$R,$R,$R,$R,$R]}" \
   -o "$OUT/e11.json" -w '%{http_code}')"
 [ "$code" = 400 ] && grep -q "working set" "$OUT/e11.json" \
   && pass "over-budget edit -> 400 named (bill vs headroom)" || fail "over-budget edit returned $code"
+fi
 
 # ── edit CFG: guidance 2.5 + negative prompt runs TWO forwards per step and
 # changes the render (same seed/steps/source/prompt as the happy path — only
