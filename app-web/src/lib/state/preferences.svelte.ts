@@ -6,6 +6,7 @@ export const choices = {
   accent: ["system", "blue", "purple", "pink", "red", "orange", "yellow", "green", "graphite"],
   textSize: ["small", "medium", "large", "xlarge"],
   column: ["narrow", "medium", "wide"],
+  audioPlayer: ["modern", "mlxAmp"],
 } as const;
 
 export type Preferences = {
@@ -14,6 +15,8 @@ export type Preferences = {
   textSize: (typeof choices.textSize)[number];
   column: (typeof choices.column)[number];
   compact: boolean;
+  /** How the Voice, Music and Sound tabs show the player and the history. */
+  audioPlayer: (typeof choices.audioPlayer)[number];
 };
 
 const KEY = "studio.interface";
@@ -25,7 +28,7 @@ export function readPreferences(storage: StorageAdapter): Preferences {
   } catch {
     /* defaults */
   }
-  const pick = <K extends "theme" | "accent" | "textSize" | "column">(key: K, fallback: Preferences[K]): Preferences[K] =>
+  const pick = <K extends "theme" | "accent" | "textSize" | "column" | "audioPlayer">(key: K, fallback: Preferences[K]): Preferences[K] =>
     (choices[key] as readonly unknown[]).includes(value[key]) ? (value[key] as Preferences[K]) : fallback;
   return {
     theme: pick("theme", "system"),
@@ -33,6 +36,7 @@ export function readPreferences(storage: StorageAdapter): Preferences {
     textSize: pick("textSize", "medium"),
     column: pick("column", "wide"),
     compact: value.compact === true,
+    audioPlayer: pick("audioPlayer", "modern"),
   };
 }
 
@@ -43,6 +47,7 @@ export class InterfacePreferences implements Preferences {
   textSize = $state<Preferences["textSize"]>("medium");
   column = $state<Preferences["column"]>("wide");
   compact = $state(false);
+  audioPlayer = $state<Preferences["audioPlayer"]>("modern");
   systemDark = $state(false);
   resolvedTheme = $derived(this.theme === "system" ? (this.systemDark ? "dark" : "light") : this.theme);
   #storage: StorageAdapter;
@@ -59,7 +64,7 @@ export class InterfacePreferences implements Preferences {
 
   set<K extends keyof Preferences>(key: K, value: Preferences[K]) {
     (this as Preferences)[key] = value;
-    const { theme, accent, textSize, column, compact } = this;
-    this.#storage.setItem(KEY, JSON.stringify({ theme, accent, textSize, column, compact }));
+    const { theme, accent, textSize, column, compact, audioPlayer } = this;
+    this.#storage.setItem(KEY, JSON.stringify({ theme, accent, textSize, column, compact, audioPlayer }));
   }
 }

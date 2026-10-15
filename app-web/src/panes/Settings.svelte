@@ -13,7 +13,7 @@
   const categories: [SettingsCategory, string, IconName][] = [
     ["all", N("All Settings"), "settings"],
     ["interface", N("Interface"), "palette"],
-    ["servers", N("Servers"), "server"],
+    ["providers", N("Providers"), "server"],
     ["about", N("About"), "info"],
   ];
   const labels = $derived({
@@ -21,6 +21,7 @@
     accent: [t("System"), t("Blue"), t("Purple"), t("Pink"), t("Red"), t("Orange"), t("Yellow"), t("Green"), t("Graphite")],
     textSize: [t("Small"), t("Default"), t("Large"), t("Extra Large")],
     column: [t("Narrow"), t("Medium"), t("Wide")],
+    audioPlayer: [t("Modern"), "MLX-Amp"],
   });
 
   let query = $state("");
@@ -97,7 +98,7 @@
   </div>
 {/snippet}
 
-{#snippet pick(field: "accent" | "textSize")}
+{#snippet pick(field: "accent" | "textSize" | "audioPlayer")}
   <select id={field} value={prefs[field]} onchange={(e) => prefs.set(field, e.currentTarget.value as never)}>
     {#each choices[field] as value, i}<option {value}>{labels[field][i]}</option>{/each}
   </select>
@@ -139,10 +140,12 @@
           <input id="compact" type="checkbox" role="switch" checked={prefs.compact} onchange={(e) => prefs.set("compact", e.currentTarget.checked)} />
         {/snippet}
         {@render setting("compact", t("Compact Mode"), t("Tighter spacing between messages — more of the conversation on screen."), compact)}
+        {#snippet audioPlayer()}{@render pick("audioPlayer")}{/snippet}
+        {@render setting("audioPlayer", t("Audio Player"), t("How the Voice, Music and Sound tabs show the player and your history."), audioPlayer)}
       </div>
 
-      <div class="settings-section" data-section="servers">
-        <h1>{t("Servers")}</h1>
+      <div class="settings-section" data-section="providers">
+        <h1>{t("Providers")}</h1>
         <p class="section-description">{t("Connect to an mlx-serve server. This page’s server is used by default.")}</p>
         <div id="server-list">
           {#each connection.servers as s (s.id)}
@@ -173,19 +176,19 @@
         </div>
         <div class="server-actions">
           <button id="refresh-server" onclick={() => void connection.refresh()}><Icon name="refresh-cw" />{t("Check connection")}</button>
-          <button id="edit-server" onclick={edit}>{t("Edit selected server")}</button>
+          <button id="edit-server" onclick={edit}>{t("Edit selected provider")}</button>
         </div>
         <p id="server-status" class="connection-detail" class:error-message={connection.status === "error"} role="status">{connection.message}</p>
         <form id="server-form" onsubmit={save}>
-          <h2 id="server-form-title">{editing ? t("Edit Server") : t("Add Server")}</h2>
-          <label>{t("Name")} <input id="server-name" autocomplete="off" bind:value={name} placeholder={t("My server")} /></label>
-          <label>{t("Server URL")} <input id="server-url" type="url" required bind:value={url} placeholder="http://server:11234" autocomplete="url" /></label>
+          <h2 id="server-form-title">{editing ? t("Edit Provider") : t("Add Provider")}</h2>
+          <label>{t("Name")} <input id="server-name" autocomplete="off" bind:value={name} placeholder={t("My provider")} /></label>
+          <label>{t("URL")} <input id="server-url" type="url" required bind:value={url} placeholder="http://server:11234" autocomplete="url" /></label>
           <label>{t("API key")} <input id="server-key" type="password" autocomplete="off" spellcheck="false" bind:value={key} placeholder={t("Optional")} /></label>
           <label class="check-label"><input type="checkbox" id="remember-key" bind:checked={remember} />{t("Remember key on this device")}</label>
           <p class="field-note">{t("Keys last for this session by default. Browser storage is not a keyring.")}</p>
           <p id="form-error" role="alert">{error}</p>
           <div class="form-actions">
-            <button type="submit" class="primary" id="save-server">{editing ? t("Save") : t("Add Server")}</button>
+            <button type="submit" class="primary" id="save-server">{editing ? t("Save") : t("Add Provider")}</button>
             <button type="button" id="cancel-edit" hidden={!editing} onclick={reset}>{t("Cancel")}</button>
           </div>
         </form>

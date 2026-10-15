@@ -169,11 +169,8 @@ enum SystemMetrics {
     }()
 
     /// Bytes available for a NEW large allocation (a model load), using the
-    /// SAME formula as the server's pre-flight (`status.zig` `computeAvailableBytes`):
-    /// total minus the non-reclaimable resident set — wired + compressed +
-    /// anonymous, less reclaimable purgeable. This matches the "Available RAM"
-    /// the tray shows from a running server, so the meter reads the same with or
-    /// without one (the tray prefers the live server value when present).
+    /// SAME formula as the server's pre-flight (`status.zig` `computeAvailableBytes`),
+    /// so the meter reads the same with or without a running server.
     static func availableForModelBytes() -> UInt64 {
         var totalMem: UInt64 = 0
         var len = MemoryLayout<UInt64>.size
@@ -193,26 +190,30 @@ enum SystemMetrics {
 
         return computeAvailableForModel(
             totalBytes: totalMem,
+            freePages: UInt64(stats.free_count),
+            speculativePages: UInt64(stats.speculative_count),
+            externalPages: UInt64(stats.external_page_count),
             wirePages: UInt64(stats.wire_count),
             compressorPages: UInt64(stats.compressor_page_count),
-            internalPages: UInt64(stats.internal_page_count),
-            purgeablePages: UInt64(stats.purgeable_count),
             pageSize: UInt64(pageSize)
         )
     }
 
     /// Pure counterpart of `availableForModelBytes` — the exact arithmetic of
-    /// `status.zig`'s `computeAvailableBytes`, so it's unit-tested without the
-    /// live Mach call. Purgeable is reclaimable, so it's excluded from the
-    /// resident anon set (saturating, never underflowing). Returns 0 on a bad
-    /// query or when used ≥ total.
-    static func computeAvailableForModel(totalBytes: UInt64, wirePages: UInt64,
-                                         compressorPages: UInt64, internalPages: UInt64,
-                                         purgeablePages: UInt64, pageSize: UInt64) -> UInt64 {
-        let residentAnon = internalPages >= purgeablePages ? internalPages - purgeablePages : 0
-        let usedBytes = (wirePages + compressorPages + residentAnon) &* pageSize
-        if totalBytes == 0 || usedBytes >= totalBytes { return 0 }
-        return totalBytes - usedBytes
+    /// `status.zig`'s `computeAvailableBytes` (saturating, capped by the RAM
+    /// outside wired + compressed). Returns 0 on a failed query.
+    static func computeAvailableForModel(totalBytes: UInt64, freePages: UInt64,
+                                         speculativePages: UInt64, externalPages: UInt64,
+                                         wirePages: UInt64, compressorPages: UInt64,
+                                         pageSize: UInt64) -> UInt64 {
+        if totalBytes == 0 { return 0 }
+        let freeClean = freePages >= speculativePages ? freePages - speculativePages : 0
+        let (reclaimPages, rpOv) = freeClean.addingReportingOverflow(externalPages)
+        let (reclaimBytes, rbOv) = reclaimPages.multipliedReportingOverflow(by: pageSize)
+        let (nonGrantPages, npOv) = wirePages.addingReportingOverflow(compressorPages)
+        let (nonGrantBytes, nbOv) = nonGrantPages.multipliedReportingOverflow(by: pageSize)
+        let outside = (npOv || nbOv || nonGrantBytes >= totalBytes) ? 0 : totalBytes - nonGrantBytes
+        return min(rpOv || rbOv ? UInt64.max : reclaimBytes, outside)
     }
 
     // MARK: - Process identity (was: /bin/ps -o comm=)

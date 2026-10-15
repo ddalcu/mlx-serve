@@ -1,6 +1,7 @@
 import { t, N } from "../i18n/i18n";
 import { generateVideo } from "../core/video";
-import { encodeVideo } from "../core/encode-video";
+import { encodeVideo, lastFramePng, openShotEncoder } from "../core/encode-video";
+import { shotRequest, type Shot } from "../core/storyboard";
 import type { Model } from "../core/models";
 import type { VideoRequest } from "../core/video";
 import type { LibraryInput } from "../core/library";
@@ -13,28 +14,32 @@ const qualities = [
   N("Quality"),
   N("Super Quality"),
 ];
-const ltxSizes = [
-  [704, 448],
-  [448, 704],
-  [768, 512],
-  [512, 768],
-  [1024, 576],
-  [576, 1024],
-  [1600, 896],
-  [896, 1600],
-  [1920, 1088],
-  [1088, 1920],
+/** Width, height, shape and what the canvas costs: the app's own picker rows (MediaGen.swift). */
+type SizeRow = [number, number, string, string?];
+const ltxSizes: SizeRow[] = [
+  [704, 448, N("landscape 14:9"), N("fastest")],
+  [448, 704, N("portrait 9:14")],
+  [768, 512, N("landscape 3:2")],
+  [512, 768, N("portrait 2:3")],
+  [1024, 576, N("landscape 16:9")],
+  [576, 1024, N("portrait 9:16")],
+  [1600, 896, N("landscape 16:9"), N("recommended")],
+  [896, 1600, N("portrait 9:16")],
+  [1920, 1088, N("landscape 16:9"), N("LTX's own canvas, slowest")],
+  [1088, 1920, N("portrait 9:16"), N("slowest")],
 ];
-const h3Sizes = [
-  [1344, 768],
-  [960, 544],
-  [768, 768],
-  [1024, 768],
-  [768, 1024],
-  [544, 960],
-  [768, 1344],
-  [1536, 672],
+// Speeds relative to 960x544: the DiT attends over one packed sequence, so cost grows faster than pixels.
+const h3Sizes: SizeRow[] = [
+  [1344, 768, N("16:9 widescreen"), N("most detail, 2.9x slower")],
+  [960, 544, N("16:9 widescreen"), N("fastest, best for long clips")],
+  [768, 768, N("square"), N("1.2x slower")],
+  [1024, 768, N("4:3 landscape"), N("1.8x slower")],
+  [768, 1024, N("3:4 portrait"), N("1.8x slower")],
+  [544, 960, N("9:16 portrait"), N("fastest, best for long clips")],
+  [768, 1344, N("9:16 portrait"), N("2.9x slower")],
+  [1536, 672, N("21:9 cinematic"), N("2.9x slower")],
 ];
+const sizeLabel = ([w, h, shape, note]: SizeRow) => `${w} × ${h} (${t(shape)})` + (note ? ` — ${t(note)}` : "");
 function videoProfile(model: Model | undefined) {
   if (!model?.capabilities.includes("video")) return;
   const h3 = model.architecture === "minimax_h3",
@@ -52,6 +57,8 @@ function videoProfile(model: Model | undefined) {
     decoder: model.id === "ddalcu/LTX-2.5-MLX-Serve-8bit",
     sizes: h3 ? h3Sizes : ltxSizes,
     minFrames: h3 ? 5 : 9,
+    /** MiniMax's stated 4-second minimum (the lowest rung at or above it); the frame advice and a storyboard shot's floor. */
+    statedFrames: h3 ? 107 : 0,
     maxFrames: h3 ? 362 : 193,
     frameStep: h3 ? 17 : 8,
   };
@@ -92,6 +99,8 @@ function videoDefaults(model?: Model | undefined) {
     media: true,
     speech: "",
     promptHeight: 110,
+    storyboard: false,
+    shots: [] as Shot[],
   };
 }
 type VideoDraft = ReturnType<typeof videoDefaults>;
@@ -115,6 +124,17 @@ function videoSize(m: Model | undefined, d: VideoDraft, inputs: VideoInputs = {}
     width: Math.round(d.width / grid) * grid,
     height: Math.round(d.height / grid) * grid,
   };
+}
+/** Turbo turns the fast recipe off, so past the distillation's trained 4–8 a Turbo step costs a full one. */
+function maxSteps(m: Model | undefined, d: VideoDraft) {
+  const p = videoProfile(m);
+  return p?.turbo && d.turbo ? 8 : 50;
+}
+/** Advice under Steps: H3 below 16 steps needs a few-step adapter, which Turbo is. */
+function stepsAdvice(m: Model | undefined, d: VideoDraft) {
+  return videoProfile(m)?.h3 && d.steps < 16 && !d.turbo
+    ? t("Under 16 steps this model needs a distilled few-step adapter, like the Turbo LoRA. Without one the picture is rough and the soundtrack usually comes out garbled.")
+    : "";
 }
 function frameOptions(m: Model | undefined, d: VideoDraft, inputs: VideoInputs = {}) {
   const p = videoProfile(m);
@@ -163,7 +183,7 @@ function buildVideoRequest(m: Model | undefined, d: VideoDraft, inputs: VideoInp
       ),
     );
   const seed = range(d.seed, 0, Number.MAX_SAFE_INTEGER, t("Seed")),
-    steps = range(d.steps, 4, p.turbo && d.turbo ? 16 : 50, t("Steps"));
+    steps = range(d.steps, 4, maxSteps(m, d), t("Steps"));
   if (!Number.isSafeInteger(seed) || !Number.isInteger(steps))
     throw Error(t("Seed and steps must be whole numbers."));
   const body = {
@@ -242,6 +262,8 @@ class VideoController extends MediaRun<LibraryInput & { id?: string; elapsedMs: 
   preview = $state<Record<string, unknown> | null>(null);
   request: typeof generateVideo;
   encode: typeof encodeVideo;
+  openEncoder = openShotEncoder;
+  lastFrame = lastFramePng;
 
   constructor(library: Pick<Library, "add">, generate: typeof generateVideo = generateVideo, encode: typeof encodeVideo = encodeVideo) {
     super(library);
@@ -287,6 +309,60 @@ class VideoController extends MediaRun<LibraryInput & { id?: string; elapsedMs: 
       this.end(run);
     }
   }
+
+  /**
+   * A storyboard: each shot is its own request opening on the last frame of the shot before, encoded onto
+   * one timeline as it arrives, so only one shot's raw frames are held at a time.
+   */
+  async generateStoryboard(client: Client, base: VideoRequest, shots: { prompt: string; frames: number }[], server: string) {
+    const run = this.begin(Number(base.steps) || 0);
+    this.preview = null;
+    let encoder: Awaited<ReturnType<typeof openShotEncoder>> | undefined,
+      previous: string | undefined,
+      elapsedMs = 0,
+      shot = 0;
+    try {
+      for (; shot < shots.length; shot++) {
+        const prefix = t("Shot %@ of %@ · ", [shot + 1, shots.length]);
+        this.started = Date.now();
+        this.message = prefix + t("Loading model…");
+        const request = shotRequest(base, shots[shot]!.prompt, shots[shot]!.frames, shot, shots.length, previous);
+        const generated = await this.request(client, request, {
+          signal: run.signal,
+          onProgress: this.progress(run, (e) => {
+            if (typeof e.preview === "string") this.preview = e;
+          }, prefix),
+        });
+        if (this.run !== run) return;
+        this.preview = null;
+        elapsedMs += generated.elapsedMs;
+        if (shot < shots.length - 1) previous = await this.lastFrame(generated.raw);
+        encoder ??= await this.openEncoder(generated.raw, { signal: run.signal });
+        await encoder.add(generated.raw, shot ? 1 : 0);
+        if (this.run !== run) return;
+      }
+      this.phase = "encoding";
+      this.message = t("Joining shots…");
+      const encoded = await encoder!.finish();
+      if (this.run !== run || run.signal.aborted) return;
+      await this.complete({
+        type: "video",
+        model: String(base.model),
+        prompt: base.prompt,
+        server,
+        blob: encoded.blob,
+        createdAt: Date.now(),
+        elapsedMs: elapsedMs + encoded.encodeMs,
+        codec: encoded.codec,
+      });
+    } catch (e) {
+      encoder?.close();
+      const reason = e instanceof Error ? e.message : t("Generation failed.");
+      this.fail(run, shot < shots.length ? Error(t("Shot %@ of %@: %@", [shot + 1, shots.length, reason])) : e);
+    } finally {
+      this.end(run);
+    }
+  }
 }
 
-export { qualities, ltxSizes, h3Sizes, videoProfile, videoQuality, videoDefaults, videoSize, frameOptions, buildVideoRequest, VideoController };
+export { qualities, ltxSizes, h3Sizes, sizeLabel, maxSteps, stepsAdvice, videoProfile, videoQuality, videoDefaults, videoSize, frameOptions, buildVideoRequest, VideoController };

@@ -26,6 +26,17 @@ final class AgentSkillsTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root + "/claude/plugin/.claude-plugin/plugin.json"))
     }
 
+    // The app ships exactly the files `mlx-serve launch` embeds (skills/agent_skills.zig), scripts included.
+    func testShipsTheSameFilesAsTheZigLauncher() throws {
+        let zig = try String(contentsOf: URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("skills/agent_skills.zig"), encoding: .utf8)
+        let embedded = zig.components(separatedBy: ".name = \"").dropFirst()
+            .compactMap { $0.split(separator: "\"").first.map(String.init) }.sorted()
+        XCTAssertTrue(embedded.contains("gen.mjs"), "\(embedded)")
+        XCTAssertEqual(AgentSkills.files().map(\.name), embedded)
+    }
+
     func testCodexGetsNoSkillLinkAndNoDedicatedDir() throws {
         XCTAssertNil(AgentSkills.linkPath(agentId: "codex"))
         let root = try tempDir()

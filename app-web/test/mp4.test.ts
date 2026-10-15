@@ -180,6 +180,19 @@ describe("muxMp4", () => {
     expect(() => muxMp4(video(), { ...aac(0) })).toThrow(/unsupported/i);
   });
 
+  it("unwraps a description WebKit hands over as a whole ES_Descriptor, keeping only its AudioSpecificConfig", async () => {
+    // Safari's AudioEncoder (AAC-LC, 48 kHz, stereo), captured verbatim: wrapping it again made an undecodable track.
+    const webkit = Uint8Array.from("038080802200000004808080144014001800000000000000000005808080021190068080800102".match(/../g)!, (h) => parseInt(h, 16));
+    const { bytes } = await mux(video(), { ...aac(), description: webkit });
+    const stsd = find(bytes, all(bytes, find(bytes, undefined, "moov"), "trak")[1]!, "mdia", "minf", "stbl", "stsd");
+    const entry = boxes(bytes, stsd.body + 8, stsd.end)[0]!;
+    const esds = boxes(bytes, entry.body + 28, entry.end)[0]!;
+    const payload = bytes.slice(esds.body + 4, esds.end);
+    const at = payload.findIndex((b, i) => b === 0x05 && payload[i + 1] === 2);
+    expect([...payload.subarray(at + 2, at + 4)]).toEqual([0x11, 0x90]);
+    expect(payload.filter((b) => b === 0x03).length).toBe(1);
+  });
+
   it("interleaves video and audio samples by timestamp in mdat", async () => {
     const { bytes } = await mux(video(), aac());
     const moov = find(bytes, undefined, "moov"), mdat = find(bytes, undefined, "mdat");

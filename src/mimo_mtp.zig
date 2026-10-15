@@ -291,7 +291,7 @@ pub const Head = struct {
     /// The heads present in `weights` (`model.mtp.layers.{0..}`), in the sliding
     /// layers' geometry. Null when the pack carries none.
     pub fn load(allocator: std.mem.Allocator, s: mlx.mlx_stream, config: *const ModelConfig, weights: *const Weights) !?Head {
-        const swa = slidingLayer(config) orelse return error.MimoMtpNeedsSlidingGeometry;
+        const swa = config.firstSlidingLayer() orelse return error.MimoMtpNeedsSlidingGeometry;
         var head = Head{
             .s = s,
             .heads = 0,
@@ -319,13 +319,6 @@ pub const Head = struct {
             return null;
         }
         return head;
-    }
-
-    fn slidingLayer(config: *const ModelConfig) ?u32 {
-        for (0..config.num_hidden_layers) |i| {
-            if (!config.isGlobalLayer(@intCast(i))) return @intCast(i);
-        }
-        return null;
     }
 
     fn get(self: *Head, weights: *const Weights, comptime fmt: []const u8, k: usize, required: bool) !mlx.mlx_array {

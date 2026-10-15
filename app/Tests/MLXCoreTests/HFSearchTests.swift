@@ -660,6 +660,20 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertTrue(supportedModelTypes.contains("laguna"))
     }
 
+    func testMiniCPMV47IsSupportedArchitecture() {
+        // MiniCPM-V 4.7 (model_type minicpmv4_7): a Qwen3.5 trunk behind a SigLIP2 tower.
+        let m = mlx(id: "mlx-community/MiniCPM-V-4.7-35B-A3B-4bit",
+                    tags: ["mlx", "safetensors", "minicpmv4_7", "image-text-to-text",
+                           "minicpm-v", "multimodal", "moe", "conversational", "4-bit"])
+        XCTAssertTrue(m.isSupportedArchitecture)
+        XCTAssertNil(m.incompatibleReason)
+        XCTAssertTrue(supportedModelTypes.contains("minicpmv4_7"))
+        // Only 4.7 is served; earlier MiniCPM-V generations are a different trunk.
+        let older = mlx(id: "mlx-community/MiniCPM-V-4.6-4bit",
+                        tags: ["mlx", "safetensors", "minicpmv4_6", "image-text-to-text"])
+        XCTAssertFalse(older.isSupportedArchitecture)
+    }
+
     func testMuseGlimmerIsSupportedArchitecture() {
         // meta-models Muse-Glimmer-30B (config.json model_type=muse_glimmer) is
         // served by the MLX engine — same class as hy_v3/laguna: the model_type

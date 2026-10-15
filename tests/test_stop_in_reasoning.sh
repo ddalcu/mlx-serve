@@ -16,7 +16,7 @@ BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 [[ -d "$MODEL" ]] || { echo "SKIP: model dir not found: $MODEL"; exit 0; }
 [[ -x "$BINARY" ]] || { echo "SKIP: $BINARY missing"; exit 0; }
 
-WORK=$(mktemp -d "$HOME/claude-tmp/stop-reasoning.XXXXXX")
+WORK=$(mktemp -d "$HOME/claude-tmp/stop-reasoning.XXXXXX" 2>/dev/null || mktemp -d)
 mkdir -p "$WORK/home"
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 0.5
 HOME="$WORK/home" "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" \

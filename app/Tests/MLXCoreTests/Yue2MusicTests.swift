@@ -57,7 +57,7 @@ final class Yue2MusicTests: XCTestCase {
                        "a leftover instrumental flag yields to the lyrics instead of dropping them")
         XCTAssertEqual(body["prompt"] as? String, "English, pop")
         XCTAssertEqual(body["steps"] as? Int, 16)
-        XCTAssertEqual(body["duration_seconds"] as? Int, 90)
+        XCTAssertEqual(body["duration_seconds"] as? Int, 90 + MusicGenService.lengthGrace(90), "a set length is a soft cap")
         XCTAssertEqual(body["seed"] as? Int, 7)
         XCTAssertEqual(body["stream"] as? Bool, true)
     }
@@ -70,7 +70,57 @@ final class Yue2MusicTests: XCTestCase {
         let low = MusicGenService.requestBody(
             MusicGenRequest(model: yue2, prompt: "p", lyrics: "l", durationSeconds: 1, steps: 0), modelName: "m")
         XCTAssertEqual(low["steps"] as? Int, 1)
-        XCTAssertEqual(low["duration_seconds"] as? Int, 5)
+        XCTAssertEqual(low["duration_seconds"] as? Int, 5 + MusicGenService.lengthGrace(5))
+    }
+
+    // MARK: - Length: the model ends the song, the cap only backs it up
+
+    func testAutoLengthSendsNoCapSoTheModelEndsTheSongItself() {
+        var req = MusicGenRequest(model: yue2, prompt: "p", lyrics: "[Verse]\nla", durationSeconds: 60)
+        req.autoLength = true
+        XCTAssertNil(MusicGenService.requestBody(req, modelName: "m")["duration_seconds"],
+                     "an omitted field is the server's own 360 s ceiling; the cap used to cut songs mid-lyric")
+    }
+
+    func testASetLengthGetsGraceSoTheLastLineCanFinish() {
+        func sent(_ seconds: Int) -> Int? {
+            MusicGenService.requestBody(MusicGenRequest(model: yue2, prompt: "p", lyrics: "l", durationSeconds: seconds),
+                                        modelName: "m")["duration_seconds"] as? Int
+        }
+        XCTAssertEqual(sent(60), 75)
+        XCTAssertEqual(sent(20), 30, "never less than 10 s of grace")
+        XCTAssertEqual(sent(300), 360, "and never past the server's ceiling")
+        XCTAssertEqual(MusicGenService.lengthGrace(120), 30)
+    }
+
+    func testOtherModelsKeepTheirExactDuration() {
+        var ace = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "p", durationSeconds: 60)
+        ace.autoLength = true
+        XCTAssertEqual(MusicGenService.requestBody(ace, modelName: "m")["duration_seconds"] as? Int, 60,
+                       "ACE-Step makes exactly the length asked; only YuE2 ends on its own")
+        XCTAssertTrue(yue2.supportsAutoLength)
+        XCTAssertFalse(MusicModelPreset.acestepXLTurbo8bit.supportsAutoLength)
+        XCTAssertFalse(MusicModelPreset.miniMaxMusic3_8bit.supportsAutoLength)
+    }
+
+    func testAutoLengthIsStickyAndOnForSettingsThatNeverWroteIt() throws {
+        XCTAssertTrue(MusicGenSettings().autoLength)
+        var s = MusicGenSettings()
+        s.autoLength = false
+        let back = try JSONDecoder().decode(MusicGenSettings.self, from: try JSONEncoder().encode(s))
+        XCTAssertFalse(back.autoLength)
+        var obj = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(MusicGenSettings())) as! [String: Any]
+        obj.removeValue(forKey: "autoLength")
+        let old = try JSONDecoder().decode(MusicGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertTrue(old.autoLength)
+    }
+
+    func testTheRadioLetsYuE2EndEachSongAndSizesTheLyrics() {
+        let station = AIRadio.stationRequest(from: MusicGenRequest(model: yue2, prompt: "", durationSeconds: 300))
+        XCTAssertTrue(station.autoLength)
+        XCTAssertFalse(AIRadio.stationRequest(from: MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "")).autoLength)
+        let r = MusicPromptRewriter.radioLyricsRequest(theme: "t", style: "s", nudge: "n", recent: [], family: .yue2, fallbackLanguage: "en")
+        XCTAssertTrue(r.user.contains("16"), "a song that ends by itself should be asked for a bounded number of lines")
     }
 
     func testPlanRidesWithTheScoreOnlyWhereThePlanReadsOne() {

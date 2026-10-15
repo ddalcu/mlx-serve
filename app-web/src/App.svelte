@@ -99,6 +99,11 @@
     };
   });
 
+  // A reload or close ends a media generation for good: the browser asks first.
+  function beforeunload(event: BeforeUnloadEvent) {
+    if (app.image.c.run || app.audio.c.run || app.video.c.run) event.preventDefault();
+  }
+
   function keydown(event: KeyboardEvent) {
     if (!app.phone) return;
     if (event.key === "Escape" && !document.querySelector("dialog[open]")) closeSidebar();
@@ -117,6 +122,7 @@
 </script>
 
 <svelte:document onkeydown={keydown} />
+<svelte:window onbeforeunload={beforeunload} />
 
 <a
   class="skip-link"

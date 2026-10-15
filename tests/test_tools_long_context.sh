@@ -35,7 +35,7 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; shift; for l in "$@"; do echo "        $
 
 RUNGS="${LONGCTX_RUNGS:-16000,32000,64000}"
 LOG=$(mktemp /tmp/tools_longctx.XXXXXX)
-pkill -f "bin/mlx-serve" 2>/dev/null; sleep 1
+pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
 ./zig-out/bin/mlx-serve --model "$MODEL" --serve --port "$PORT" --ctx-size 131072 \
     --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!

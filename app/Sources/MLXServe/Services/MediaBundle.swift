@@ -586,7 +586,7 @@ extension ImageModelPreset {
             return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .mageFlowTurbo, .mageFlowEditTurbo:
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
-        case .qwenImage21:
+        case .qwenImage21, .qwenImage21Turbo:
             return .qwenImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .flux2Klein9B, .flux2Klein9BBase:
             // The MLX conversions of klein 9B — distilled and base alike —

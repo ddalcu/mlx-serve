@@ -110,7 +110,7 @@ PY
 )
 E=$(chat "$EDIT" || true)
 check "[9] edit answered" "$E" "dequant_fp8"
-LOOKUP=$(grep -oE "lookup=[0-9]+" "$LOG" | tail -1 | cut -d= -f2)
+LOOKUP=$(grep -oE "lookup=[0-9]+" "$LOG" | tail -1 | cut -d= -f2 || true)
 [ "${LOOKUP:-0}" -gt 0 ] && { echo "PASS [9] lookup drafts engaged ($LOOKUP)"; pass=$((pass+1)); } || { echo "FAIL [9] no lookup rounds"; fail=$((fail+1)); }
 
 check "[8] MTP heads loaded" "$(cat "$LOG")" "MiMo MTP heads ready (3 heads"

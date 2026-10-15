@@ -206,7 +206,8 @@ extension TerminalSessionListTests {
         m.rename(b, to: "backend")
         m.setTheme(a, themeId: "dracula")
 
-        var r = try JSONDecoder().decode(TerminalSessionList.self, from: JSONEncoder().encode(m))
+        let stored = try JSONDecoder().decode([TerminalSessionList.Session].self, from: JSONEncoder().encode(m.sessions))
+        var r = TerminalSessionList(restoring: stored)
         XCTAssertEqual(r.sessions.map(\.id), [a, b, c])
         XCTAssertEqual(r.sessions.map(\.displayName), ["pi", "backend", "Claude Code"])
         XCTAssertEqual(r.session(c)?.kind, .host)
@@ -218,5 +219,40 @@ extension TerminalSessionListTests {
         XCTAssertEqual(r.session(a)?.phase, .preparing, "opening a restored row starts it in place")
         let d = r.addPreparing(label: "pi", agentId: "pi", workspace: "/d")
         XCTAssertEqual(r.displayName(d), "pi 3", "numbering carries over")
+    }
+}
+
+extension TerminalSessionListTests {
+    /// The counter is not stored: the names on the rows are the record of what was used.
+    func testNumberingIsReadBackFromTheNamesOnTheRows() {
+        var m = TerminalSessionList()
+        _ = m.addPreparing(label: "pi", agentId: "pi", workspace: "/a")
+        let b = m.addPreparing(label: "pi", agentId: "pi", workspace: "/b")
+        let c = m.addPreparing(label: "pi", agentId: "pi", workspace: "/c")
+        _ = m.addPreparing(label: "pi 2", agentId: nil, workspace: "/d", kind: .host)
+        m.rename(b, to: "backend")
+        m.close(c)
+
+        let hermes = TerminalSessionList.Session(id: UUID(), label: "hermes", autoName: "hermes 5", agentId: "hermes",
+                                                 workspace: "/h", createdAt: Date(), phase: .suspended)
+        var r = TerminalSessionList(restoring: m.sessions + [hermes])
+        let e = r.addPreparing(label: "pi", agentId: "pi", workspace: "/e")
+        let f = r.addPreparing(label: "pi 2", agentId: nil, workspace: "/f")
+        let g = r.addPreparing(label: "hermes", agentId: "hermes", workspace: "/g")
+        XCTAssertEqual(r.displayName(e), "pi 3", "a renamed row still holds its number; a closed one gives its number back")
+        XCTAssertEqual(r.displayName(f), "pi 2 2", "a label is counted by its own names only")
+        XCTAssertEqual(r.displayName(g), "hermes 6", "the number on the row, not a count of rows")
+    }
+
+    func testARowCarriesItsPlaceInTheSidebar() {
+        var m = TerminalSessionList()
+        let a = m.addPreparing(label: "pi", agentId: "pi", workspace: "/a")
+        let b = m.addPreparing(label: "pi", agentId: "pi", workspace: "/b")
+        let group = UUID()
+        m.setPlacements([a: .init(group: group, position: 2), UUID(): .init(group: nil, position: 0)])
+        XCTAssertEqual(m.session(a)?.groupId, group)
+        XCTAssertEqual(m.session(a)?.position, 2)
+        XCTAssertNil(m.session(b)?.groupId)
+        XCTAssertNil(m.session(b)?.position)
     }
 }

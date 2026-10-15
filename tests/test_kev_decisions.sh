@@ -192,6 +192,6 @@ EOF
 echo "  median $LAT ms"
 
 check "no MLX error in the server log" "$(grep -c '\[mlx\]' "$LOG")" "0"
-check "Kev engine logged ready" "$(grep -c 'Kev engine ready' "$LOG")" "1"
+check "Kev engine logged ready" "$(grep -c '\[decision\] kev engine ready' "$LOG")" "1"
 echo "=== $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

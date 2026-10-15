@@ -26,36 +26,71 @@ enum AgentComposer {
     static func complete(userText: String, systemPrompt: String,
                          appState: AppState, maxTokens: Int = 512) async throws -> String {
         var reply = ""
-        for try await delta in try await stream(userText: userText, systemPrompt: systemPrompt,
-                                                appState: appState, maxTokens: maxTokens) {
-            reply += delta
+        for try await event in events(userText: userText, systemPrompt: systemPrompt,
+                                      appState: appState, maxTokens: maxTokens) {
+            if case .content(let delta) = event { reply += delta }
         }
         return reply
     }
 
-    /// Same request, content deltas as they arrive.
-    static func stream(userText: String, systemPrompt: String,
-                       appState: AppState, maxTokens: Int = 512) async throws -> AsyncThrowingStream<String, Error> {
-        guard appState.server.status == .running else { throw ComposerError.noModel }
-        await appState.server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
+    /// What a request goes through, as it happens: a slow load or a long think
+    /// is normal, and a sheet that shows nothing meanwhile reads as a hang.
+    enum Event: Equatable {
+        /// The chat model is being hot-loaded first (its name).
+        case loading(String)
+        /// The request is with the server: reading the prompt, or a cold load there.
+        case sent
+        case reasoning(String)
+        case content(String)
+        /// The reply was cut at its token budget.
+        case truncated
+    }
 
-        let messages: [[String: Any]] = [
-            ["role": "system", "content": systemPrompt],
-            ["role": "user", "content": userText],
-        ]
-        let stream = APIClient().streamChat(
-            port: appState.server.port,
-            messages: messages,
-            maxTokens: maxTokens,
-            temperature: 0.7,
-            defaults: APIClient.RequestDefaults.from(appState.serverOptions),
-            modelId: appState.server.chatRequestModelId(selectedPath: appState.selectedModelPath))
+    /// Whether the model that will answer can see a picture: the resident
+    /// chat model's live capabilities, else the picked model's config.
+    static func seesImages(appState: AppState) -> Bool {
+        appState.server.chatModelInfo?.supportsVision
+            ?? appState.localModels.first { $0.path == appState.selectedModelPath }?.hasVision
+            ?? false
+    }
 
-        return AsyncThrowingStream { continuation in
+    /// Same request, every stage as it arrives. `image` rides the user turn.
+    static func events(userText: String, systemPrompt: String, image: Data? = nil, appState: AppState,
+                       maxTokens: Int = 512) -> AsyncThrowingStream<Event, Error> {
+        AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    let server = appState.server
+                    guard server.status == .running else { throw ComposerError.noModel }
+                    let path = appState.selectedModelPath
+                    if server.chatLoadNeeded(selectedModelPath: path) {
+                        continuation.yield(.loading((path as NSString).lastPathComponent))
+                    }
+                    await server.ensureDefaultChatModel(selectedModelPath: path)
+                    continuation.yield(.sent)
+                    let user: Any = image.map {
+                        MultimodalContent.build(text: userText, images: [ChatImage(data: $0)],
+                                                serverPreprocess: MultimodalContent.wantsServerPreprocess(
+                                                    architecture: server.chatModelInfo?.architecture ?? ""))
+                    } ?? userText
+                    let messages: [[String: Any]] = [
+                        ["role": "system", "content": systemPrompt],
+                        ["role": "user", "content": user],
+                    ]
+                    let stream = APIClient().streamChat(
+                        port: server.port,
+                        messages: messages,
+                        maxTokens: maxTokens,
+                        temperature: 0.7,
+                        defaults: APIClient.RequestDefaults.from(appState.serverOptions),
+                        modelId: server.chatRequestModelId(selectedPath: path))
                     for try await event in stream {
-                        if case .content(let delta) = event { continuation.yield(delta) }
+                        switch event {
+                        case .content(let delta): continuation.yield(.content(delta))
+                        case .reasoning(let delta): continuation.yield(.reasoning(delta))
+                        case .truncated: continuation.yield(.truncated)
+                        default: break
+                        }
                     }
                     continuation.finish()
                 } catch {

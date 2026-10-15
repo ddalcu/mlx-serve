@@ -5,7 +5,9 @@
   import type { App } from "../lib/app.svelte";
   import { displayName, t } from "../lib/i18n/i18n";
   import { canThink } from "../lib/state/chat-state.svelte";
+  import { launchAgents } from "../lib/core/console";
   import ContextDialog from "./chat/ContextDialog.svelte";
+  import LaunchDialog from "./chat/LaunchDialog.svelte";
   import ModelPalette from "./chat/ModelPalette.svelte";
   import SettingsDialog from "./chat/SettingsDialog.svelte";
   import VoiceDialog from "./chat/VoiceDialog.svelte";
@@ -39,6 +41,8 @@
 
   let dialog = $state<"" | "settings" | "palette" | "context" | "voice">("");
   let modelMenu = $state(false);
+  let launcherMenu = $state(false);
+  let launching = $state<(typeof launchAgents)[number]>();
   let transcript = $state<HTMLElement>();
   let input = $state<HTMLTextAreaElement>();
   let files = $state<HTMLInputElement>();
@@ -141,6 +145,19 @@
           </div>
         </details>
         <button class="chip" onclick={() => app.go("models")}><Icon name="search" />{t("Browse Models")}</button>
+        <details class="code-launcher" bind:open={launcherMenu}>
+          <summary class="chip"><Icon name="terminal" />{t("Code Launcher")} <Icon name="chevron-down" /></summary>
+          <div class="discovery-menu">
+            {#each launchAgents as agent (agent[0])}
+              <button
+                onclick={() => {
+                  launcherMenu = false;
+                  launching = agent;
+                }}>{agent[1]}</button
+              >
+            {/each}
+          </div>
+        </details>
       </div>
     </div>
     <div class="jump-latest-row"><button id="jump-latest" hidden={follow} onclick={toBottom}>{t("Jump to the latest message ↓")}</button></div>
@@ -175,7 +192,7 @@
           onclick={() => {
             session.settings.thinking = !session.settings.thinking;
             void chat.c.save();
-          }}><Icon name="lightbulb" /></button
+          }}><Icon name="brain" /></button
         >
         <button
           class="icon-button"
@@ -221,6 +238,7 @@
         <button class="context-button" id="chat-context" aria-label={t("Context window")} title={t("Context window")} hidden={!model?.contextLength} onclick={() => (dialog = "context")}
           >{typeof used === "number" && model?.contextLength ? ((used / model.contextLength) * 100).toFixed(1) + "%" : ""}</button
         >
+        <span class="composer-spacer"></span>
         <button
           class="icon-button"
           id="chat-voice"
@@ -236,7 +254,7 @@
             }
           }}><Icon name="audio-lines" /></button
         >
-        <button class="icon-button" id="chat-settings" aria-label={t("Chat settings")} title={t("Chat settings")} disabled={busy || chat.voicing} onclick={() => (dialog = "settings")}><Icon name="settings" /></button>
+        <button class="icon-button" id="chat-settings" hidden aria-label={t("Chat settings")} title={t("Chat settings")} disabled={busy || chat.voicing} onclick={() => (dialog = "settings")}><Icon name="settings" /></button>
         <button class="send-button" id="chat-send" aria-label={chat.voicing ? t("Stop voice chat") : busy ? t("Stop generation") : t("Send message")} disabled={!enabled} onclick={sendOrStop}>
           {#if busy || chat.voicing}<Icon name="stop" filled />{:else}<Icon name="arrow-up" />{/if}
         </button>
@@ -252,3 +270,4 @@
 {#if dialog === "palette"}<ModelPalette onclose={() => (dialog = "")} />{/if}
 {#if dialog === "context"}<ContextDialog onclose={() => (dialog = "")} />{/if}
 {#if dialog === "voice"}<VoiceDialog onclose={() => (dialog = "")} />{/if}
+{#if launching}<LaunchDialog agent={launching[0]} label={launching[1]} onclose={() => (launching = undefined)} />{/if}

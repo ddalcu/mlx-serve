@@ -24,7 +24,7 @@ export const titles: Record<View, string> = {
   library: N("Library"),
 };
 
-export type SettingsCategory = "all" | "interface" | "servers" | "about";
+export type SettingsCategory = "all" | "interface" | "providers" | "about";
 
 /** Everything the panes share: storage, preferences, the selected server and where we are. */
 export class App {
@@ -47,7 +47,7 @@ export class App {
     this.library = library;
     this.chat = new ChatWorkspace({ connection: this.connection, storage: this.storage, library, openChat: () => this.go("chat") });
     this.image = new ImageWorkspace(this.connection, library, drafts("mlx-serve-studio-image-drafts"));
-    this.audio = new AudioWorkspace(this.connection, library, drafts("mlx-serve-studio-audio-drafts"));
+    this.audio = new AudioWorkspace(this.connection, library, drafts("mlx-serve-studio-audio-drafts"), this.storage);
     this.video = new VideoWorkspace(this.connection, library, drafts("mlx-serve-studio-video-drafts"));
     this.monitor = new MonitorWorkspace(this.connection);
     const query = matchMedia("(max-width: 700px)");

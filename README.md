@@ -15,7 +15,7 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-**[mlxserve.com](https://mlxserve.com/)** · [Download MLX-Serve.app](https://github.com/ddalcu/mlx-serve/releases/latest) · [Docs](#docs) · [Changelog](CHANGELOG.md)
+**[mlxserve.com](https://mlxserve.com/)** · [Download MLX-Serve.app](https://github.com/ddalcu/mlx-serve/releases/latest) · [Docs](#docs) · [Changelog](CHANGELOG.md) · **[MLX-Serve official chat (our Discord)](https://x.com/i/chat/group_join/g2108335256541741397/K38XS6aGRh)**
 
 mlx-serve is a native Zig server that runs **any LLM on Apple Silicon** — MLX-format models *and* every GGUF on HuggingFace (Qwen, Llama, Mistral, Gemma, DeepSeek V4 Flash, thousands more). It exposes **OpenAI-compatible** *and* **Anthropic-compatible** HTTP APIs out of the box, so the same `http://localhost:11234` works with Claude Code, the OpenAI SDK, Continue, Cursor, Open WebUI, and anything else that speaks one of those wires. Beyond text, the same server generates **images, video, music, speech (with voice cloning), and 3D models** — all natively on MLX. Ships with **MLX Core**, a macOS menu-bar app with chat, agent mode, MCP tool calling, and model management.
 
@@ -37,6 +37,18 @@ brew trust ddalcu/mlx-serve
 brew install --cask mlx-serve  # the app (recommended)
 brew install mlx-serve         # CLI + server only, no GUI
 ```
+
+To upgrade, name the package (the app also updates itself from its menu):
+
+```bash
+brew update
+brew upgrade --cask mlx-serve  # the app
+brew upgrade mlx-serve         # the CLI
+```
+
+### Linux (NVIDIA)
+
+Every release attaches `mlx-serve-linux-x64-cuda13.tar.gz` (RTX 20–50 series) and `mlx-serve-linux-arm64-cuda13.tar.gz` (GH200, Jetson Thor, DGX Spark). They need an NVIDIA driver ≥ 580, the CUDA 13 toolkit, cuDNN 9, OpenBLAS/LAPACKE, libwebp and the Avahi dns_sd compat library. Unpack into an empty folder (the tarball has no top-level directory) and run `zig-out/bin/mlx-serve`; it finds its libraries next to itself.
 
 ### Prefer the terminal?
 
@@ -144,7 +156,7 @@ The full feature list is in [docs/app.md](docs/app.md).
 
 ## Supported models
 
-Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next, Meta's Muse-Glimmer-30B, inclusionAI Ling 3.0, DeepSeek V4 Flash (284B), Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna, Llama 3.x, Mistral, Nemotron-H, LFM2/2.5 (including the VL vision builds), plus embedding models (BERT, EmbeddingGemma, Qwen3-Embedding) and Laya typed-decision models (`POST /v1/decisions`). Anything else runs as GGUF through the embedded llama.cpp, auto-routed by format. The full table with `model_type`s, chat formats and vision support is in [docs/models.md](docs/models.md).
+Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next, Meta's Muse-Glimmer-30B, OpenBMB MiniCPM-V 4.7, inclusionAI Ling 3.0, DeepSeek V4 Flash (284B), Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna, Llama 3.x, Mistral, Nemotron-H, LFM2/2.5 (including the VL vision builds), plus embedding models (BERT, EmbeddingGemma, Qwen3-Embedding) and Laya typed-decision models (`POST /v1/decisions`). Anything else runs as GGUF through the embedded llama.cpp, auto-routed by format. The full table with `model_type`s, chat formats and vision support is in [docs/models.md](docs/models.md).
 
 ## Performance
 

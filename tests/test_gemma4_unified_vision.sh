@@ -35,7 +35,7 @@ assert_contains() { if grep -qi "$2" <<< "$3"; then ok "$1"; else bad "$1" "miss
 
 # Build a distinctive test image: a red ellipse on the left/center, a blue
 # rectangle on the right, on a light-gray background. Requires Pillow.
-IMG="$(mktemp -t g4shapes).png"
+IMG="$(mktemp -t g4shapes.XXXXXX).png"
 "$PY" - "$IMG" <<'PY' 2>/dev/null
 import sys
 try:

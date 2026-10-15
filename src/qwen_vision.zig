@@ -807,70 +807,15 @@ pub const QwenVision = struct {
         return out;
     }
 
-    /// Build per-token vision-RoPE cos/sin tables [N, 1, head_dim] (bf16) for a
-    /// single image, in merge-block token order. VisionRotaryEmbedding(head_dim/2):
-    /// 16 freqs; each token gets [h_emb(16) ‖ w_emb(16)], tiled ×2 over head_dim.
+    /// Per-token vision-RoPE cos/sin tables [N, 1, head_dim] (bf16), see `fillVisionRope`.
     fn buildVisionRope(self: *QwenVision, grid_h: u32, grid_w: u32) !struct { cos: mlx.mlx_array, sin: mlx.mlx_array } {
-        const hd: usize = self.head_dim;
-        const half = hd / 2; // 32
-        const nfreq = half / 2; // 16
-        const merge = self.merge;
-        const mh = grid_h / merge;
-        const mw = grid_w / merge;
-        const n: usize = grid_h * grid_w;
-
-        var inv_freq = try self.allocator.alloc(f64, nfreq);
-        defer self.allocator.free(inv_freq);
-        for (0..nfreq) |k| {
-            const exp = -@as(f64, @floatFromInt(2 * k)) / @as(f64, @floatFromInt(half));
-            inv_freq[k] = std.math.pow(f64, self.rope_theta, exp);
-        }
-
-        var cos_buf = try self.allocator.alloc(f32, n * hd);
-        defer self.allocator.free(cos_buf);
-        var sin_buf = try self.allocator.alloc(f32, n * hd);
-        defer self.allocator.free(sin_buf);
-
-        var token: usize = 0;
-        var bh: usize = 0;
-        while (bh < mh) : (bh += 1) {
-            var bw: usize = 0;
-            while (bw < mw) : (bw += 1) {
-                var ir: usize = 0;
-                while (ir < merge) : (ir += 1) {
-                    var ic: usize = 0;
-                    while (ic < merge) : (ic += 1) {
-                        const row: f64 = @floatFromInt(bh * merge + ir);
-                        const col: f64 = @floatFromInt(bw * merge + ic);
-                        const o = token * hd;
-                        for (0..nfreq) |k| {
-                            const ah = row * inv_freq[k];
-                            const aw = col * inv_freq[k];
-                            // emb = [h(16), w(16)] then tile ×2 over head_dim.
-                            cos_buf[o + k] = @floatCast(@cos(ah));
-                            cos_buf[o + nfreq + k] = @floatCast(@cos(aw));
-                            cos_buf[o + half + k] = @floatCast(@cos(ah));
-                            cos_buf[o + half + nfreq + k] = @floatCast(@cos(aw));
-                            sin_buf[o + k] = @floatCast(@sin(ah));
-                            sin_buf[o + nfreq + k] = @floatCast(@sin(aw));
-                            sin_buf[o + half + k] = @floatCast(@sin(ah));
-                            sin_buf[o + half + nfreq + k] = @floatCast(@sin(aw));
-                        }
-                        token += 1;
-                    }
-                }
-            }
-        }
-
-        const shape = [_]c_int{ @intCast(n), 1, @intCast(hd) };
-        const cos_f = mlx.mlx_array_new_data(cos_buf.ptr, &shape, 3, .float32);
-        defer _ = mlx.mlx_array_free(cos_f);
-        const sin_f = mlx.mlx_array_new_data(sin_buf.ptr, &shape, 3, .float32);
-        defer _ = mlx.mlx_array_free(sin_f);
+        const t = try visionRopeTables(self.allocator, grid_h, grid_w, self.merge, self.head_dim, self.rope_theta);
+        defer _ = mlx.mlx_array_free(t.cos);
+        defer _ = mlx.mlx_array_free(t.sin);
         var cos = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&cos, cos_f, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&cos, t.cos, .bfloat16, self.s));
         var sin = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&sin, sin_f, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&sin, t.sin, .bfloat16, self.s));
         return .{ .cos = cos, .sin = sin };
     }
 
@@ -1201,6 +1146,51 @@ pub const QwenVision = struct {
     }
 };
 
+/// 2-D vision RoPE angles for one image in merge-block token order: `head_dim/4`
+/// frequencies (VisionRotaryEmbedding(head_dim/2)), each token's row
+/// `[h(f) | w(f) | h(f) | w(f)]` for the rotate_half pairing. `cos`/`sin` are
+/// `[gh*gw * head_dim]`.
+pub fn fillVisionRope(cos: []f32, sin: []f32, grid_h: u32, grid_w: u32, merge: u32, head_dim: u32, theta: f64) void {
+    const hd: usize = head_dim;
+    const half = hd / 2;
+    const nfreq = half / 2;
+    std.debug.assert(cos.len == @as(usize, grid_h) * grid_w * hd and sin.len == cos.len and nfreq <= 64);
+    var inv_freq: [64]f64 = undefined;
+    for (0..nfreq) |k| inv_freq[k] = std.math.pow(f64, theta, -@as(f64, @floatFromInt(2 * k)) / @as(f64, @floatFromInt(half)));
+    var token: usize = 0;
+    for (0..grid_h / merge) |bh| for (0..grid_w / merge) |bw| for (0..merge) |ir| for (0..merge) |ic| {
+        const row: f64 = @floatFromInt(bh * merge + ir);
+        const col: f64 = @floatFromInt(bw * merge + ic);
+        const o = token * hd;
+        for (0..nfreq) |k| {
+            const ah = row * inv_freq[k];
+            const aw = col * inv_freq[k];
+            inline for (.{ 0, half }) |base| {
+                cos[o + base + k] = @floatCast(@cos(ah));
+                cos[o + base + nfreq + k] = @floatCast(@cos(aw));
+                sin[o + base + k] = @floatCast(@sin(ah));
+                sin[o + base + nfreq + k] = @floatCast(@sin(aw));
+            }
+        }
+        token += 1;
+    };
+}
+
+/// `fillVisionRope` as f32 `[N, 1, head_dim]` arrays.
+pub fn visionRopeTables(allocator: std.mem.Allocator, grid_h: u32, grid_w: u32, merge: u32, head_dim: u32, theta: f64) !struct { cos: mlx.mlx_array, sin: mlx.mlx_array } {
+    const n: usize = @as(usize, grid_h) * grid_w;
+    const cos_buf = try allocator.alloc(f32, n * head_dim);
+    defer allocator.free(cos_buf);
+    const sin_buf = try allocator.alloc(f32, n * head_dim);
+    defer allocator.free(sin_buf);
+    fillVisionRope(cos_buf, sin_buf, grid_h, grid_w, merge, head_dim, theta);
+    const shape = [_]c_int{ @intCast(n), 1, @intCast(head_dim) };
+    return .{
+        .cos = mlx.mlx_array_new_data(cos_buf.ptr, &shape, 3, .float32),
+        .sin = mlx.mlx_array_new_data(sin_buf.ptr, &shape, 3, .float32),
+    };
+}
+
 fn getWeightLocal(weights: *const Weights, buf: *[256]u8, name: []const u8) ?mlx.mlx_array {
     _ = buf;
     return weights.get(name);
@@ -1216,8 +1206,9 @@ fn fmtKey(buf: *[256]u8, prefix: []const u8, suffix: []const u8) []const u8 {
 
 /// Tower spellings we serve, most common first. Qwen3-VL checkpoints say
 /// `vision_tower.`; avlp12's Qwen3.8 "Alis" packs ship the same 333 tensors
-/// under `model.visual.` (pure rename, substructure identical).
-pub const VISION_PREFIXES = [_][]const u8{ "vision_tower.", "model.visual." };
+/// under `model.visual.` (pure rename, substructure identical), oMLX 0.7.1's
+/// GLM-5.3 oQ packs under `vision_model.`.
+pub const VISION_PREFIXES = [_][]const u8{ "vision_tower.", "model.visual.", "vision_model." };
 
 /// Stored axis order of `patch_embed.proj.weight`. mlx_lm's Conv3d writes
 /// channels LAST (`[out, kT, ps, ps, Cin]`); a straight torch export keeps
@@ -1261,12 +1252,26 @@ test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded"
         try put(&w, allocator, "vision_tower.patch_embed.proj.weight");
         try std.testing.expectEqualStrings("vision_tower.", resolveVisionPrefix(&w).?);
     }
+    // A MiniCPM-V SigLIP tower is not a Qwen3-VL tower: no prefix, vision off.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "vision_tower.embeddings.patch_embedding.weight");
+        try std.testing.expect(resolveVisionPrefix(&w) == null);
+    }
     // avlp12 Alis spelling (live: vision silently disabled, 0.92 GB dead weight).
     {
         var w = Weights.init(allocator);
         defer w.deinit();
         try put(&w, allocator, "model.visual.patch_embed.proj.weight");
         try std.testing.expectEqualStrings("model.visual.", resolveVisionPrefix(&w).?);
+    }
+    // oMLX 0.7.1 spelling (Jundot's GLM-5.3-Flash oQ packs).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "vision_model.patch_embed.proj.weight");
+        try std.testing.expectEqualStrings("vision_model.", resolveVisionPrefix(&w).?);
     }
     // No tower (text-only pack, or --no-vision dropped it) → vision disabled.
     {
@@ -1502,6 +1507,18 @@ test "qwen buildPixelValuesVideo reads REAL per-frame data, not one frame duplic
         11,   1011, // token3 row1col1
     };
     try std.testing.expectEqualSlices(f32, &expect, pv);
+}
+
+test "fillVisionRope: merge-block token order, [h | w | h | w] angles per row" {
+    // grid 2x4, merge 2, head_dim 8: two frequencies (1 and theta^-1/2); token 5 is
+    // block (0,1)'s second patch, row 0 col 3.
+    var cos: [8 * 8]f32 = undefined;
+    var sin: [8 * 8]f32 = undefined;
+    fillVisionRope(&cos, &sin, 2, 4, 2, 8, 10000.0);
+    const want = [_]f32{ 0, 0, @sin(@as(f32, 3.0)), @sin(@as(f32, 0.03)), 0, 0, @sin(@as(f32, 3.0)), @sin(@as(f32, 0.03)) };
+    for (want, sin[5 * 8 ..][0..8]) |w, got| try std.testing.expectApproxEqAbs(w, got, 1e-6);
+    try std.testing.expectApproxEqAbs(@cos(@as(f32, 1.0)), cos[2 * 8 + 0], 1e-6); // token 2: row 1 col 0
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cos[2 * 8 + 2], 1e-6);
 }
 
 test "qwen image token count" {

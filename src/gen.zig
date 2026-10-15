@@ -50,6 +50,7 @@ const server_mod = @import("server.zig");
 const multipart = @import("multipart.zig");
 const discovery = @import("model_discovery.zig");
 const stb = @import("stb");
+const webp = @import("webp");
 
 const Conn = server_mod.Conn;
 
@@ -64,6 +65,9 @@ pub const Modality = enum {
     /// Typed decisions (`/v1/decisions`, Laya or Kev): scorers, not generators,
     /// but they ride the media plumbing (engine slot, inference-thread job).
     decision,
+    /// Speaker diarization (Nemotron 3 Diarization): no route of its own, the
+    /// speakers of a `diarized_json` transcription.
+    diarization,
 
     pub fn capability(self: Modality) []const u8 {
         return switch (self) {
@@ -72,6 +76,7 @@ pub const Modality = enum {
             .video => "video",
             .mesh => "3d",
             .decision => "decisions",
+            .diarization => "diarization",
         };
     }
 
@@ -85,6 +90,7 @@ pub const Modality = enum {
             .video => "AudioVideo",
             .mesh => "hunyuan3d_2_1",
             .decision => "laya",
+            .diarization => "nemotron_diarization",
         };
     }
 };
@@ -108,7 +114,7 @@ pub const media_model_types = [_][]const u8{
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
     "laya",      "kev",        "clef",           "d1",
-    "stable_audio3", "yue2",
+    "stable_audio3", "yue2",      "nemotron_diarization",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -126,6 +132,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
+    if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     return null;
 }
 
@@ -730,10 +737,15 @@ pub const ImageEngine = struct {
         return self.backend == .flux or self.backend == .qwen_image;
     }
 
-    /// Steps for a request that names none: the distilled backends' few-step
-    /// default, or an undistilled checkpoint's own recommendation.
-    pub fn defaultSteps(self: *const ImageEngine) u32 {
-        return if (self.backend == .qwen_image) qwen_image.DEFAULT_STEPS else 4;
+    /// Steps for a request: a checkpoint's own sampling grid, else the
+    /// request's count, else the distilled backends' few-step default or an
+    /// undistilled checkpoint's own recommendation.
+    /// 0 = the backend's default, the same as an omitted count.
+    pub fn resolveSteps(self: *const ImageEngine, steps: u32) u32 {
+        return switch (self.backend) {
+            .qwen_image => |q| q.stepsFor(steps),
+            else => if (steps == 0) 4 else steps,
+        };
     }
 
     /// Reconcile the engine's attached LoRA stack with the request: an empty
@@ -1165,7 +1177,7 @@ fn sendDecisionError(conn: *Conn, engine: *DecisionEngine, err: anyerror) !void 
     };
     if (named) |msg| return sendError(conn, 400, msg);
     log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
-    return sendError(conn, 500, "decision forward failed");
+    return sendError(conn, jobFailureStatus(err), "decision forward failed");
 }
 
 /// One queued `/v1/decisions` request.
@@ -2368,7 +2380,10 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    var steps: u32 = @intCast(extractJsonInt(body, "steps") orelse engine.defaultSteps());
+    const req_steps = stepsRequest(extractJsonInt(body, "steps"), 0, 0, 100) catch
+        return sendError(conn, 400, "'steps' must be in [0,100] (0 = the model's default)");
+    var steps: u32 = engine.resolveSteps(req_steps);
+    if (req_steps != 0 and req_steps != steps) log.info("[image] {d} steps requested, the checkpoint's own grid runs {d}\n", .{ req_steps, steps });
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -2412,13 +2427,15 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             if (!(sv > 0.0 and sv <= 1.0)) return sendError(conn, 400, "'strength' must be in (0,1]");
             strength = @floatCast(sv);
         }
-        const img_bytes = base64DecodeAlloc(allocator, raw_img) catch
+        const img_bytes = imageB64Alloc(allocator, raw_img) catch
             return sendError(conn, 400, "invalid base64 in 'image'");
         defer allocator.free(img_bytes);
         if (edit_mode and engine.editUsesRawBytes()) {
             // Byte-based edit backend: keep the source bytes; the engine does
             // its own preprocessing (MageFlow's target-size VAE resize + VLM
             // resize, Qwen's tower/VAE encode — raw bytes, so alpha survives).
+            if (imageNativeSize(img_bytes) == null)
+                return sendError(conn, 400, "could not decode 'image' (PNG/JPEG/WebP supported)");
             edit_byte_bufs[0] = try allocator.dupe(u8, img_bytes);
             edit_byte_n = 1;
             if (engine.backend == .qwen_image) {
@@ -2492,7 +2509,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 
     // Extra in-context references (edit mode only): each keeps its own aspect
     // ratio like the primary and rides at its own t offset in the DiT.
-    if (std.mem.indexOf(u8, body, "\"ref_images\"") != null) {
+    if (jsonFieldSet(body, "ref_images")) {
         if (!edit_mode) return sendError(conn, 400, "'ref_images' requires mode:\"edit\"");
         var it = iterJsonStringArray(body, "ref_images") orelse
             return sendError(conn, 400, "invalid 'ref_images' (must be a JSON array of base64 strings)");
@@ -2503,10 +2520,12 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
                     "too many reference images ('ref_images' takes at most 9 beside 'image')"
                 else
                     "too many reference images ('ref_images' takes at most 3 beside 'image')");
-            const ref_bytes = base64DecodeAlloc(allocator, raw_ref) catch
+            const ref_bytes = imageB64Alloc(allocator, raw_ref) catch
                 return sendError(conn, 400, "invalid base64 in 'ref_images'");
             defer allocator.free(ref_bytes);
             if (engine.editUsesRawBytes()) {
+                if (imageNativeSize(ref_bytes) == null)
+                    return sendError(conn, 400, "could not decode a 'ref_images' entry (PNG/JPEG/WebP supported)");
                 edit_byte_bufs[edit_byte_n] = try allocator.dupe(u8, ref_bytes);
                 edit_byte_n += 1;
                 // Qwen output aspect follows the LAST condition image.
@@ -2547,7 +2566,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
     var wbuf: [16]f32 = undefined;
     var cond_weights: ?[]const f32 = null;
-    if (std.mem.indexOf(u8, body, "\"cond_weights\"") != null) {
+    if (jsonFieldSet(body, "cond_weights")) {
         const wl = extractCondWeights(body, &wbuf) orelse
             return sendError(conn, 400, "invalid 'cond_weights' (numbers, comma/space separated, or a JSON array)");
         if (wl.len != engine.condWeightCount()) {
@@ -2688,7 +2707,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             sse.sendError(conn, "generation failed");
             return;
         }
-        return sendError(conn, 500, "generation failed");
+        return sendError(conn, jobFailureStatus(err), "generation failed");
     };
     defer _ = mlx.mlx_array_free(img);
 
@@ -2737,7 +2756,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         defer allocator.free(samples);
         const was_cached = synth.warmSpeaker(samples) catch |err| {
             log.err("[audio] warm_only failed: {}\n", .{err});
-            return sendError(conn, 500, "speaker embedding failed");
+            return sendError(conn, jobFailureStatus(err), "speaker embedding failed");
         };
         log.info("[audio] warm_only: speaker embedding {s}\n", .{if (was_cached) "already cached" else "cached"});
         return sendBytesJson(conn, allocator, if (was_cached)
@@ -2794,12 +2813,15 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             sse.sendError(conn, "synthesis failed");
             return;
         }
-        return sendError(conn, 500, "synthesis failed");
+        return sendError(conn, jobFailureStatus(err), "synthesis failed");
     };
     defer allocator.free(wav);
     log.info("[audio] -> {d} WAV bytes\n", .{wav.len});
     return sendWav(allocator, conn, wav, want_stream);
 }
+
+/// OpenAI's `input` limit for `/v1/audio/speech`; longer text is spoken window by window up to it.
+const KOKORO_MAX_INPUT = 4096;
 
 /// `POST /v1/audio/speech` on a Kokoro checkpoint.
 ///
@@ -2818,6 +2840,7 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     const text = try jsonUnescape(allocator, input);
     defer allocator.free(text);
     if (text.len == 0) return sendError(conn, 400, "empty 'input'");
+    if ((std.unicode.utf8CountCodepoints(text) catch text.len) > KOKORO_MAX_INPUT) return sendError(conn, 400, "'input' is longer than 4096 characters");
 
     if (extractJsonString(body, "ref_audio")) |raw| {
         if (raw.len > 0) return sendError(conn, 400, "this model does not support voice cloning; use 'voice' to pick or blend a built-in voice");
@@ -2844,7 +2867,7 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     const speed: f32 = @floatCast(extractJsonFloat(body, "speed") orelse 1.0);
     if (!(speed > 0.0) or speed > 5.0) return sendError(conn, 400, "'speed' must be in (0, 5]");
 
-    const seed: u64 = if (extractJsonFloat(body, "seed")) |v| @intFromFloat(@max(0, v)) else 0;
+    const seed: u64 = extractJsonInt(body, "seed") orelse 0;
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[kokoro] {d} chars voice={s} speed={d:.2} stream={}\n", .{ text.len, voice, speed, want_stream });
@@ -2852,11 +2875,12 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
 
     const out = engine.synthesizeWav(text, voice, speed, seed) catch |err| {
         log.err("[kokoro] synthesis failed: {}\n", .{err});
+        const msg = if (err == error.EmptyKokoroInput) "'input' has no speakable text" else "synthesis failed";
         if (want_stream) {
-            sse.sendError(conn, "synthesis failed");
+            sse.sendError(conn, msg);
             return;
         }
-        return sendError(conn, 500, "synthesis failed");
+        return sendError(conn, if (err == error.EmptyKokoroInput) 400 else 500, msg);
     };
     defer allocator.free(out);
     log.info("[kokoro] -> {d} WAV bytes\n", .{out.len});
@@ -2989,7 +3013,7 @@ pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             sse.sendError(conn, "sound generation failed");
             return;
         }
-        return sendError(conn, 500, "sound generation failed");
+        return sendError(conn, jobFailureStatus(err), "sound generation failed");
     };
     defer allocator.free(wav);
     log.info("[sa3] -> {d} WAV bytes\n", .{wav.len});
@@ -3050,7 +3074,7 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
         if (b < 30 or b > 300) return sendError(conn, 400, "'bpm' must be in [30,300]");
         bpm = @intCast(b);
     }
-    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
+    const duration: u32 = extractJsonU32(body, "duration_seconds") orelse 60;
     if (duration < acestep.MIN_DURATION_S or duration > acestep.MAX_DURATION_S)
         return sendError(conn, 400, "'duration_seconds' must be in [10,600]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
@@ -3173,7 +3197,7 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
             sse.sendError(conn, "music generation failed");
             return;
         }
-        return sendError(conn, 500, "music generation failed");
+        return sendError(conn, jobFailureStatus(err), "music generation failed");
     };
     defer allocator.free(wav);
     log.info("[music] -> {d} WAV bytes\n", .{wav.len});
@@ -3258,11 +3282,11 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     defer allocator.free(caption);
     const caption_grew = caption.len != prompt.len;
 
-    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
+    const duration: u32 = extractJsonU32(body, "duration_seconds") orelse 60;
     if (duration < music3.MIN_DURATION_S or duration > music3.MAX_DURATION_S)
         return sendError(conn, 400, "'duration_seconds' must be in [1,360]");
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse music3.DEFAULT_STEPS);
-    if (steps < 4 or steps > 100) return sendError(conn, 400, "'steps' must be in [4,100]");
+    const steps = stepsRequest(extractJsonInt(body, "steps"), music3.DEFAULT_STEPS, 4, 100) catch
+        return sendError(conn, 400, "'steps' must be in [4,100]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
 
     // Pre-validate the prompt budget BEFORE any SSE bytes go out, so the cap
@@ -3299,7 +3323,7 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
             sse.sendError(conn, "music generation failed");
             return;
         }
-        return sendError(conn, 500, "music generation failed");
+        return sendError(conn, jobFailureStatus(err), "music generation failed");
     };
     defer allocator.free(wav);
     log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
@@ -3341,10 +3365,10 @@ fn handleYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engin
         if (std.mem.trim(u8, abc.?, " \t\r\n").len == 0) return sendError(conn, 400, "empty 'abc'");
         if (cot == .off) return sendError(conn, 400, "'abc' needs 'cot' melody or full — cot off renders without a score");
     }
-    const seconds: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse yue2.MAX_SECONDS);
+    const seconds: u32 = extractJsonU32(body, "duration_seconds") orelse yue2.MAX_SECONDS;
     if (seconds < yue2.MIN_SECONDS or seconds > yue2.MAX_SECONDS) return sendError(conn, 400, "'duration_seconds' must be in [5,360]");
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse yue2.DEFAULT_STEPS);
-    if (steps < 1 or steps > yue2.MAX_STEPS) return sendError(conn, 400, "'steps' must be in [1,100]");
+    const steps = stepsRequest(extractJsonInt(body, "steps"), yue2.DEFAULT_STEPS, 1, yue2.MAX_STEPS) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
     var cfg_scale: ?f32 = null;
     if (extractJsonFloat(body, "cfg_scale")) |g| {
         if (!(g >= 0 and g <= yue2.MAX_CFG)) return sendError(conn, 400, "'cfg_scale' must be in [0,20]");
@@ -3380,7 +3404,7 @@ fn handleYue2(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engin
             sse.sendError(conn, "music generation failed");
             return;
         }
-        return sendError(conn, 500, "music generation failed");
+        return sendError(conn, jobFailureStatus(err), "music generation failed");
     };
     defer allocator.free(song.wav);
     defer if (song.abc) |t| allocator.free(t);
@@ -3655,7 +3679,7 @@ fn parseH3Refs(
             const bytes = jsonB64Alloc(allocator, b64) catch
                 return std.fmt.bufPrint(err_buf, "'ref_images'[{d}] is not valid base64", .{pend.images.items.len}) catch
                     "a 'ref_images' entry is not valid base64";
-            try pend.images.append(allocator, bytes);
+            try pend.images.append(allocator, try webpAsPng(allocator, bytes));
         }
         if (it.bad) return "'ref_images' must be an array of base64 PNG/JPEG strings";
     }
@@ -3676,7 +3700,7 @@ fn parseH3Refs(
                 const bytes = jsonB64Alloc(allocator, b64) catch
                     return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].frames[{d}] is not valid base64", .{ vi, frames.items.len }) catch
                         "a 'ref_videos' frame is not valid base64";
-                try frames.append(allocator, bytes);
+                try frames.append(allocator, try webpAsPng(allocator, bytes));
             }
             if (fit.bad)
                 return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].frames must be an array of base64 PNG/JPEG strings", .{vi}) catch
@@ -3886,11 +3910,12 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     if (turbo and !engine.hasTurboLora(io, allocator))
         return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
-    const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
-    const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse (if (turbo) @as(u64, 4) else 30));
+    const width: u32 = extractJsonU32(body, "width") orelse 256;
+    const height: u32 = extractJsonU32(body, "height") orelse 256;
+    const steps = stepsRequest(extractJsonInt(body, "steps"), if (turbo) 4 else 30, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
     const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
-    const requested_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 56);
+    const requested_frames: u32 = extractJsonU32(body, "num_frames") orelse 56;
 
     if (width % 32 != 0 or height % 32 != 0)
         return sendError(conn, 400, "width and height must be multiples of 32");
@@ -3902,7 +3927,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // path. `num_frames` is PER WINDOW; the response reports the delivered
     // (joined) count. Needs the FL2VA pack — a reference has no keyframe row
     // to chain through — so the REF2VA partition is refused by name.
-    const chain_windows: u32 = @intCast(extractJsonInt(body, "chain_windows") orelse 1);
+    const chain_windows: u32 = extractJsonU32(body, "chain_windows") orelse 1;
     if (chain_windows < 1 or chain_windows > 6)
         return sendError(conn, 400, "chain_windows must be 1-6");
     if (chain_windows > 1 and engine.supports_refs)
@@ -3939,7 +3964,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             const b64 = try jsonUnescape(allocator, raw_img);
             defer allocator.free(b64);
             if (b64.len > 0) {
-                const img_bytes = base64DecodeAlloc(allocator, b64) catch
+                const img_bytes = imageB64Alloc(allocator, b64) catch
                     return sendError(conn, 400, "keyframe image is not valid base64");
                 defer allocator.free(img_bytes);
                 const decodeAt = struct {
@@ -3982,9 +4007,9 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         for (refs.items) |*m| m.deinit();
         refs.deinit(allocator);
     }
-    const has_ref_fields = std.mem.indexOf(u8, body, "\"ref_images\"") != null or
-        std.mem.indexOf(u8, body, "\"ref_videos\"") != null or
-        std.mem.indexOf(u8, body, "\"ref_audios\"") != null;
+    const has_ref_fields = jsonFieldSet(body, "ref_images") or
+        jsonFieldSet(body, "ref_videos") or
+        jsonFieldSet(body, "ref_audios");
     if (has_ref_fields and !engine.supports_refs)
         return sendError(conn, 400, "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
     if (has_ref_fields) {
@@ -4097,7 +4122,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         // Mid-stream the headers are already out, so an error must be an SSE
         // event, not a status line the client will never parse.
         if (want_stream) return sse.sendError(conn, "MiniMax-H3 generation failed");
-        return sendError(conn, 500, "MiniMax-H3 generation failed");
+        return sendError(conn, jobFailureStatus(e), "MiniMax-H3 generation failed");
     };
     defer res.deinit();
 
@@ -4110,9 +4135,9 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     defer allocator.free(prompt);
     if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
 
-    const num_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 9);
-    const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
-    const width: u32 = @intCast(extractJsonInt(body, "width") orelse 384);
+    const num_frames: u32 = extractJsonU32(body, "num_frames") orelse 9;
+    const height: u32 = extractJsonU32(body, "height") orelse 256;
+    const width: u32 = extractJsonU32(body, "width") orelse 384;
     if (videoRgbTransportReason(num_frames, width, height)) |reason|
         return sendError(conn, 400, reason);
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
@@ -4123,8 +4148,10 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     const cfg_audio: ?f32 = if (extractJsonFloat(body, "cfg_audio_scale")) |v| @floatCast(v) else null;
     const stg: ?f32 = if (extractJsonFloat(body, "stg_scale")) |v| @floatCast(v) else null;
     const guiders = videoGuiderDefaults(pipeline, cfg_video, cfg_audio, stg);
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse guiders.stage1_steps_default);
-    const stage2_steps: u32 = @intCast(extractJsonInt(body, "stage2_steps") orelse 0);
+    const steps = stepsRequest(extractJsonInt(body, "steps"), guiders.stage1_steps_default, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
+    const stage2_steps = stepsRequest(extractJsonInt(body, "stage2_steps"), 0, 0, 100) catch
+        return sendError(conn, 400, "'stage2_steps' must be in [0,100] (0 = the pipeline's default)");
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     const preview_req = sse.parsePreview(body);
@@ -4211,7 +4238,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
                 if (err == error.AudioTooShort)
                     return sendError(conn, 400, "audio: clip too short (needs at least ~50 ms)");
                 log.err("[video] audio conditioning encode failed: {}\n", .{err});
-                return sendError(conn, 500, "audio: conditioning encode failed");
+                return sendError(conn, jobFailureStatus(err), "audio: conditioning encode failed");
             };
             log.info("[video] audio-to-video: {d} tokens (budget {d}) from {d} Hz {d}ch clip\n", .{ mlx.getShape(audio_cond.?)[1], max_tokens, dec.sample_rate, dec.channels });
         }
@@ -4240,7 +4267,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
             defer allocator.free(b64);
             if (b64.len > 0) {
-                if (base64DecodeAlloc(allocator, b64)) |img_bytes| {
+                if (imageB64Alloc(allocator, b64)) |img_bytes| {
                     defer allocator.free(img_bytes);
                     const enc_h = (height / 32) * 32;
                     const enc_w = (width / 32) * 32;
@@ -4281,7 +4308,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         defer allocator.free(b64);
         if (b64.len > 0) {
             const ve = if (engine.vae_encoder) |*e| e else return sendError(conn, 400, "last frame conditioning needs vae_encoder.safetensors — download it into the model dir");
-            const img_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "last_frame_image: invalid base64");
+            const img_bytes = imageB64Alloc(allocator, b64) catch return sendError(conn, 400, "last_frame_image: invalid base64");
             defer allocator.free(img_bytes);
             if (num_frames < 9) return sendError(conn, 400, "last_frame_image needs at least 9 frames (one latent frame cannot hold an anchor and still generate)");
             const enc_h = (height / 32) * 32;
@@ -4357,7 +4384,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             conn.writeAll("data: {\"type\":\"error\",\"message\":\"generation failed\"}\n\n") catch {};
             return;
         }
-        return sendError(conn, 500, "generation failed");
+        return sendError(conn, jobFailureStatus(err), "generation failed");
     };
     defer frames.deinit(allocator);
     log.info("[video] -> {d}f {d}x{d} ({d} rgb bytes)\n", .{ frames.frames, frames.height, frames.width, frames.rgb.len });
@@ -4463,15 +4490,16 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
     const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
     defer allocator.free(b64);
     if (b64.len == 0) return sendError(conn, 400, "empty 'image'");
-    const img_bytes = base64DecodeAlloc(allocator, b64) catch
+    const img_bytes = imageB64Alloc(allocator, b64) catch
         return sendError(conn, 400, "invalid base64 in 'image'");
     defer allocator.free(img_bytes);
     const img = decodeImageRgba(allocator, img_bytes) orelse
         return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
     defer allocator.free(img.pix);
 
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
-    const res: u32 = @intCast(extractJsonInt(body, "octree_resolution") orelse 256);
+    const steps = stepsRequest(extractJsonInt(body, "steps"), 30, 1, 100) catch
+        return sendError(conn, 400, "'steps' must be in [1,100]");
+    const res: u32 = extractJsonU32(body, "octree_resolution") orelse 256;
     if (res < 64 or res > 512) return sendError(conn, 400, "'octree_resolution' must be in [64,512]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
     var guidance: f32 = 5.0;
@@ -4514,7 +4542,7 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
             sse.sendError(conn, "generation failed");
             return;
         }
-        return sendError(conn, 500, "generation failed");
+        return sendError(conn, jobFailureStatus(err), "generation failed");
     };
     defer allocator.free(glb_bytes);
     log.info("[mesh] -> {d} GLB bytes\n", .{glb_bytes.len});
@@ -4755,7 +4783,7 @@ const QwenImageEditPlan = struct { steps: u32, prefix_cache: bool };
 
 /// Prefer cached edits, but preserve requests that fit only without the cache.
 fn planQwenImageEdit(steps: u32, cache_enabled: bool, base_bill: u64, prefix_bill: u64, headroom: u64) !QwenImageEditPlan {
-    const resolved_steps = qwen_image.resolveSteps(steps);
+    const resolved_steps = qwen_image.resolveSteps(null, steps);
     if (base_bill -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES > headroom)
         return error.QwenImageEditMemoryBudget;
     return .{
@@ -4981,7 +5009,7 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
 
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
 /// readable — 0 means "unknown", which every caller treats as "do not block".
-fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
+pub fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
     if (path.len == 0 or path[0] != '/') return 0; // openDirAbsolute UB class
     var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return 0;
     defer d.close(io);
@@ -5067,6 +5095,13 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     try conn.writeAll(body);
 }
 
+/// A media or decision job that ran out of memory hit the machine's capacity, not a server fault: 503, like chat.
+fn jobFailureStatus(err: anyerror) u16 {
+    if (err == error.OutOfMemory) return 503;
+    const latched = mlx.peekErrorName() orelse return 500;
+    return if (std.mem.eql(u8, latched, "OutOfMemory")) 503 else 500;
+}
+
 // ── Minimal JSON parsing helpers (top-level keys only) ──
 
 fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
@@ -5097,6 +5132,39 @@ fn parseSize(size: []const u8) ?struct { w: u32, h: u32 } {
     return .{ .w = w, .h = h };
 }
 
+/// A request's step count: `default` when omitted, else held to [lo, hi] BEFORE any
+/// cast, so a client integer never reaches a narrowing cast or a schedule unchecked.
+fn stepsRequest(requested: ?u64, default: u32, lo: u32, hi: u32) error{StepsOutOfRange}!u32 {
+    const n = requested orelse return default;
+    if (n < lo or n > hi) return error.StepsOutOfRange;
+    return @intCast(n);
+}
+
+test "stepsRequest: omitted takes the default, the range is checked before the cast" {
+    try std.testing.expectEqual(@as(u32, 30), try stepsRequest(null, 30, 1, 100));
+    try std.testing.expectEqual(@as(u32, 1), try stepsRequest(1, 30, 1, 100));
+    try std.testing.expectEqual(@as(u32, 100), try stepsRequest(100, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(0, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(101, 30, 1, 100));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(5_000_000_000, 30, 1, 100));
+}
+
+/// `key` is in the body with a value other than `null` (clients send null for an unset field).
+fn jsonFieldSet(body: []const u8, key: []const u8) bool {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return false;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return false;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) i += 1;
+    return !std.mem.startsWith(u8, body[i..], "null");
+}
+
+test "jsonFieldSet: a null value is an unset field" {
+    try std.testing.expect(jsonFieldSet("{\"ref_images\":[\"a\"]}", "ref_images"));
+    try std.testing.expect(!jsonFieldSet("{\"ref_images\": null}", "ref_images"));
+    try std.testing.expect(!jsonFieldSet("{\"prompt\":\"x\"}", "ref_images"));
+}
+
 fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
     var key_pat_buf: [64]u8 = undefined;
     const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
@@ -5107,6 +5175,13 @@ fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
     while (i < body.len and (std.ascii.isDigit(body[i]))) i += 1;
     if (i == start) return null;
     return std.fmt.parseInt(u64, body[start..i], 10) catch null;
+}
+
+/// `extractJsonInt` saturated to u32: a value past the range reaches the caller's bound check
+/// as the largest u32 (a named 400) instead of an out-of-range cast.
+fn extractJsonU32(body: []const u8, key: []const u8) ?u32 {
+    const v = extractJsonInt(body, key) orelse return null;
+    return std.math.cast(u32, v) orelse std.math.maxInt(u32);
 }
 
 /// Parse a JSON number (int or float) for `key`. Accepts a leading sign, digits,
@@ -5210,7 +5285,7 @@ fn parseLoraFields(
     var n: usize = 0;
     errdefer for (path_bufs[0..n]) |p| allocator.free(p);
 
-    if (std.mem.indexOf(u8, body, "\"lora_paths\"") != null) {
+    if (jsonFieldSet(body, "lora_paths")) {
         var it = iterJsonStringArray(body, "lora_paths") orelse return error.BadLoraPathsJson;
         while (it.next()) |raw| {
             if (n >= lora_mod.MAX_LORAS) return error.TooManyLoraPaths;
@@ -5225,7 +5300,7 @@ fn parseLoraFields(
     if (n == 0) return 0;
     if (!local) return error.LoraPathsLocalOnly;
 
-    if (std.mem.indexOf(u8, body, "\"lora_scales\"") != null) {
+    if (jsonFieldSet(body, "lora_scales")) {
         var sbuf: [lora_mod.MAX_LORAS]f32 = undefined;
         const sl = extractLoraScales(body, &sbuf) orelse return error.BadLoraScalesJson;
         const m = @min(sl.len, n);
@@ -5372,6 +5447,24 @@ fn base64DecodeAlloc(allocator: std.mem.Allocator, b64: []const u8) ![]u8 {
     errdefer allocator.free(out);
     try dec.decode(out, b64);
     return out;
+}
+
+/// Base64-decode an image for the media backends, which all read through
+/// stb_image: a WebP comes back re-encoded as a lossless PNG (alpha kept),
+/// anything else exactly as sent.
+fn imageB64Alloc(allocator: std.mem.Allocator, b64: []const u8) ![]u8 {
+    return webpAsPng(allocator, try base64DecodeAlloc(allocator, b64));
+}
+
+/// Takes ownership of `bytes`.
+fn webpAsPng(allocator: std.mem.Allocator, bytes: []u8) ![]u8 {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    const rgba = webp.WebPDecodeRGBA(bytes.ptr, bytes.len, &w, &h) orelse return bytes;
+    defer webp.WebPFree(rgba);
+    defer allocator.free(bytes);
+    const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    return png_mod.encodeRgba(allocator, rgba[0..n], @intCast(w), @intCast(h));
 }
 
 /// Decode a 16-bit PCM mono WAV → f32 samples in [-1, 1]. Scans the RIFF
@@ -5889,7 +5982,7 @@ test "ImageEngine FLUX generatePng produces a PNG (characterization)" {
 }
 
 test "Modality.modelType round-trips through modalityFromType" {
-    for ([_]Modality{ .image, .audio, .video, .mesh, .decision }) |m| {
+    for ([_]Modality{ .image, .audio, .video, .mesh, .decision, .diarization }) |m| {
         try testing.expectEqual(m, modalityFromType(m.modelType()).?);
     }
 }
@@ -5919,6 +6012,12 @@ test "extractJsonFloat parses cfg scales (int + float + sign)" {
     try testing.expectEqual(@as(?f64, 3.5), extractJsonFloat("{\"cfg_scale\":3.5,\"x\":1}", "cfg_scale"));
     try testing.expectEqual(@as(?f64, 7), extractJsonFloat("{\"cfg_audio_scale\": 7}", "cfg_audio_scale"));
     try testing.expectEqual(@as(?f64, null), extractJsonFloat("{\"prompt\":\"hi\"}", "cfg_scale"));
+}
+
+test "extractJsonU32 saturates a value past u32 so the caller's bound check refuses it" {
+    try testing.expectEqual(@as(?u32, 256), extractJsonU32("{\"width\": 256}", "width"));
+    try testing.expectEqual(@as(?u32, std.math.maxInt(u32)), extractJsonU32("{\"width\": 99999999999}", "width"));
+    try testing.expectEqual(@as(?u32, null), extractJsonU32("{\"width\": -5}", "width"));
 }
 
 test "extractJsonInt parses seed/steps" {
@@ -6875,4 +6974,53 @@ test "h3 residency: the margin scales with RAM and never drops below 10 GiB" {
     const gb: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(10 * gb, h3ResidentMargin(64 * gb));
     try std.testing.expectEqual(16 * gb, h3ResidentMargin(256 * gb));
+}
+
+test "a base64 WebP reference reaches the media backends as a PNG with the same pixels" {
+    const a = std.testing.allocator;
+    // cwebp -lossless -exact of a 3x2 RGBA PNG (one pixel fully transparent).
+    const webp_bytes = [_]u8{
+        0x52, 0x49, 0x46, 0x46, 0x4e, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+        0x56, 0x50, 0x38, 0x4c, 0x41, 0x00, 0x00, 0x00, 0x2f, 0x02, 0x40, 0x00,
+        0x10, 0x2f, 0x40, 0x90, 0x6d, 0xb3, 0xcc, 0x61, 0x5e, 0xf7, 0x77, 0xb9,
+        0x07, 0x99, 0xb4, 0x4d, 0xe9, 0x39, 0xff, 0x7a, 0x66, 0xad, 0x8a, 0x1a,
+        0x10, 0x80, 0x1c, 0x15, 0xbc, 0xf5, 0x2f, 0x69, 0x14, 0xb6, 0x6d, 0x83,
+        0x94, 0xf6, 0x35, 0x9d, 0xbe, 0x80, 0x83, 0xf8, 0xea, 0x7a, 0xeb, 0xd6,
+        0xdb, 0x03, 0x08, 0x48, 0xc8, 0x94, 0x3c, 0xf2, 0x45, 0x44, 0xff, 0x23,
+        0x16, 0x00,
+    };
+    const want = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 10, 20, 30, 255, 200, 100, 50, 255, 1, 2, 3, 4 };
+    var b64: [std.base64.standard.Encoder.calcSize(webp_bytes.len)]u8 = undefined;
+    const out = try imageB64Alloc(a, std.base64.standard.Encoder.encode(&b64, &webp_bytes));
+    defer a.free(out);
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const px = stb.stbi_load_from_memory(out.ptr, @intCast(out.len), &w, &h, &ch, 4) orelse return error.TestUnexpectedResult;
+    defer stb.stbi_image_free(px);
+    try std.testing.expectEqual(@as(c_int, 3), w);
+    try std.testing.expectEqual(@as(c_int, 2), h);
+    try std.testing.expectEqualSlices(u8, &want, px[0..want.len]);
+
+    // Anything stb already reads passes through byte for byte.
+    const png_bytes = try png_mod.encodeRgba(a, &want, 3, 2);
+    defer a.free(png_bytes);
+    var b64_png: [256]u8 = undefined;
+    const same = try imageB64Alloc(a, std.base64.standard.Encoder.encode(&b64_png, png_bytes));
+    defer a.free(same);
+    try std.testing.expectEqualSlices(u8, png_bytes, same);
+}
+
+test "jobFailureStatus: a memory failure is a 503, any other failure a 500" {
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale); // an earlier test's latch would shadow this one's
+    try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.OutOfMemory));
+    try std.testing.expectEqual(@as(u16, 500), jobFailureStatus(error.MlxError));
+    var buf: [256]u8 = undefined;
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.MlxError));
+    _ = mlx.takeError(&buf);
+    mlx.latchErrorForTest("[gather] index out of range");
+    try std.testing.expectEqual(@as(u16, 500), jobFailureStatus(error.MlxError));
+    _ = mlx.takeError(&buf);
 }

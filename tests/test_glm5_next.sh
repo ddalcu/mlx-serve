@@ -10,6 +10,9 @@
 #       low effort thinks less       [7] streaming carries no think/tool markup
 #   [3] parallel tool calls             [8] the pack's MTP head loads and drafts
 #                                       [9] concurrent requests share one batched forward
+#   [11] images: the tower loads, house.jpeg lands on the reference's 36x54 grid (486 tokens) and all of
+#        them reach the prompt, the street signs' names are read (pixel-only content), /v1/messages takes an
+#        image block, and a repeated image turn reuses the prefix
 #   [10] with GLM5_DRAFTER=<incoai/GLM-5.3-Flash-DFlash2> (second boot): the DFlash2 round policy engages on
 #        predictable text, stays armed on novel text (plain rounds, never the sticky serial fallback), and
 #        leaves the answer, the stream, a tool call and concurrent requests unchanged
@@ -148,6 +151,42 @@ check "[9] 45-count stream correct under batching" "$CONC" "count45=True"
 check "[9] 60-count stream correct under batching" "$CONC" "count60=True"
 check "[9] needle recovered under batching" "$CONC" "needle=741952"
 check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] glm batched decode engaged"
+
+# [11] Images. The grid and token accounting come from the log: a run of pads that missed the
+# splice still answers plausibly, so the signs' names (only the pixels carry them) are the bar.
+FIX="$(dirname "$0")/fixtures"
+img_chat() { # img_chat <file> <mime> <prompt> <max_tokens>
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import base64, json, sys
+f, mime, prompt, mt = sys.argv[1:]
+url = "data:%s;base64,%s" % (mime, base64.b64encode(open(f, "rb").read()).decode())
+print(json.dumps({"max_tokens": int(mt), "temperature": 0, "enable_thinking": False, "messages": [{"role": "user", "content": [
+    {"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": url}}]}]}))
+PY
+}
+content() { python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'; }
+check "[11] tower loads" "$(cat "$LOG")" "Vision encoder: GLM-5.3-Flash ViT"
+check "[11] vision advertised" "$M" '"vision"'
+HOUSE_REQ=$(img_chat "$FIX/house.jpeg" image/jpeg "What is the main subject of this image? One word." 40)
+H1=$(chat "$HOUSE_REQ")
+echo "$H1" | content | grep -qiE "house|home|building|cottage" && { echo "PASS [11] house named"; pass=$((pass+1)); } || { echo "FAIL [11] house not named: $(echo "$H1" | head -c 300)"; fail=$((fail+1)); }
+check "[11] reference geometry" "$(cat "$LOG")" "glm grid 36x54 (486 tokens, canvas 756x504)"
+check "[11] every soft token reaches the prompt" "$(cat "$LOG")" "486 image + 0 video"
+SIGNS=$(chat "$(img_chat "$FIX/street-name-signs.jpg" image/jpeg "Read the street names on the signs. Answer with just the names." 60)" | content)
+echo "$SIGNS" | grep -qiE "grey fox|waterfall" && { echo "PASS [11] sign text read ($SIGNS)"; pass=$((pass+1)); } || { echo "FAIL [11] sign text not read: $SIGNS"; fail=$((fail+1)); }
+ROBOT=$(python3 - "$FIX/robot.png" <<'PY' | curl -s -m 600 "$BASE/v1/messages" -H 'Content-Type: application/json' --data-binary @-
+import base64, json, sys
+d = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
+print(json.dumps({"model": "glm", "max_tokens": 40, "thinking": {"type": "disabled"}, "messages": [{"role": "user", "content": [
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": d}},
+    {"type": "text", "text": "What is in this image? One word."}]}]}))
+PY
+)
+echo "$ROBOT" | grep -qiE "robot|android|cyborg|humanoid|machine" && { echo "PASS [11] /v1/messages image block"; pass=$((pass+1)); } || { echo "FAIL [11] /v1/messages: $(echo "$ROBOT" | head -c 300)"; fail=$((fail+1)); }
+H2=$(chat "$HOUSE_REQ")
+HC=$(echo "$H2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"]["prompt_tokens_details"]["cached_tokens"])')
+[ "$HC" -gt 0 ] && { echo "PASS [11] image prefix reused ($HC cached tokens)"; pass=$((pass+1)); } || { echo "FAIL [11] image prefix not reused ($HC cached)"; fail=$((fail+1)); }
+echo "$H2" | content | grep -qiE "house|home|building|cottage" && { echo "PASS [11] warm answer still names the house"; pass=$((pass+1)); } || { echo "FAIL [11] warm answer: $(echo "$H2" | head -c 300)"; fail=$((fail+1)); }
 
 check_absent "[log] no MLX error" "$(cat "$LOG")" "[mlx]"
 

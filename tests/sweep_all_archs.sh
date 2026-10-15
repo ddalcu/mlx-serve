@@ -61,7 +61,7 @@ if [[ ! -x "$BINARY" ]]; then
 fi
 
 # Make sure nothing else is occupying our port.
-pkill -f 'mlx-serve --serve' >/dev/null 2>&1 || true
+pkill -f "mlx-serve.*--port $PORT" >/dev/null 2>&1 || true
 sleep 1
 
 echo "# Architecture sweep — $(date '+%Y-%m-%d %H:%M')" > "$RESULTS"
@@ -278,12 +278,12 @@ PY
     return 0
 }
 
-trap 'pkill -f "mlx-serve --serve" 2>/dev/null || true' EXIT
+trap 'pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true' EXIT
 
 for entry in "${MODELS[@]}"; do
     IFS='|' read -r name display path type <<< "$entry"
     run_one "$name" "$display" "$path" "$type" || true
-    pkill -f "mlx-serve --serve" 2>/dev/null || true
+    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
     sleep 3
 done
 

@@ -69,15 +69,20 @@ async function support(raw: RawVideo): Promise<"aac" | "opus" | "silent" | null>
     return null;
   }
 }
-async function mp4(raw: RawVideo, signal: AbortSignal, audioCodec: "aac" | "opus" | "silent"): Promise<Blob> {
+/** An MP4 encoder that takes clips one after another on one timeline: a storyboard's shots arrive one at a time. */
+function mp4Writer(shape: RawVideo, signal: AbortSignal, audioCodec: "aac" | "opus" | "silent") {
   const video: EncodedSample[] = [],
     audio: EncodedSample[] = [];
   let description: Uint8Array | undefined,
     audioDescription: Uint8Array | undefined,
-    failure: Error | undefined;
+    failure: Error | undefined,
+    frameIndex = 0,
+    audioFrames = 0;
   const onError = (e: DOMException) => {
     failure = e;
   };
+  const copyDescription = (d: AllowSharedBufferSource) =>
+    new Uint8Array(ArrayBuffer.isView(d) ? d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength) : d.slice(0));
   const ve = new VideoEncoder({
     output: (c, m) => {
       const data = new Uint8Array(c.byteLength);
@@ -85,74 +90,18 @@ async function mp4(raw: RawVideo, signal: AbortSignal, audioCodec: "aac" | "opus
       video.push({
         data,
         timestamp: c.timestamp,
-        duration: c.duration ?? Math.round(1e6 / raw.fps),
+        duration: c.duration ?? Math.round(1e6 / shape.fps),
         key: c.type === "key",
       });
-      if (m?.decoderConfig?.description) {
-        const d = m.decoderConfig.description;
-        description = new Uint8Array(
-          ArrayBuffer.isView(d)
-            ? d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength)
-            : d.slice(0),
-        );
-      }
+      if (m?.decoderConfig?.description) description = copyDescription(m.decoderConfig.description);
     },
     error: onError,
   });
-  let ae: AudioEncoder | undefined;
-  const cancel = () => {
-    if (ve.state !== "closed") ve.close();
-    if (ae && ae.state !== "closed") ae.close();
-  };
-  signal.addEventListener("abort", cancel, { once: true });
-  const check = () => {
-    throwIfAborted(signal);
-    if (failure) throw failure;
-  };
-  try {
-    check();
-    ve.configure({
-      codec: "avc1.42001f",
-      width: raw.width,
-      height: raw.height,
-      bitrate: 1_000_000,
-      framerate: raw.fps,
-      avc: { format: "avc" },
-      latencyMode: "realtime",
-    });
-    const pixels = new Uint8ClampedArray(raw.width * raw.height * 4);
-    for (let i = 0; i < raw.frames; i++) {
-      check();
-      rgba(raw, i, pixels);
-      const frame = new VideoFrame(pixels, {
-        format: "RGBA",
-        codedWidth: raw.width,
-        codedHeight: raw.height,
-        timestamp: Math.round((i * 1e6) / raw.fps),
-        duration: Math.round(1e6 / raw.fps),
-      });
-      try {
-        ve.encode(frame, { keyFrame: i % Math.max(1, raw.fps * 2) === 0 });
-      } finally {
-        frame.close();
-      }
-      if (ve.encodeQueueSize >= 4) await ve.flush();
-    }
-    await ve.flush();
-    check();
-    if (raw.audio) {
-      const a = raw.audio,
-        pcm = pcmFloats(raw);
-      ae = new AudioEncoder({
+  const a = shape.audio;
+  const ae = a
+    ? new AudioEncoder({
         output: (c, m) => {
-          if (m?.decoderConfig?.description) {
-            const d = m.decoderConfig.description;
-            audioDescription = new Uint8Array(
-              ArrayBuffer.isView(d)
-                ? d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength)
-                : d.slice(0),
-            );
-          }
+          if (m?.decoderConfig?.description) audioDescription = copyDescription(m.decoderConfig.description);
           const data = new Uint8Array(c.byteLength);
           c.copyTo(data);
           audio.push({
@@ -163,15 +112,63 @@ async function mp4(raw: RawVideo, signal: AbortSignal, audioCodec: "aac" | "opus
           });
         },
         error: onError,
-      });
-      ae.configure({
-        codec: audioCodec === "opus" ? "opus" : "mp4a.40.2",
-        sampleRate: a.sampleRate,
-        numberOfChannels: a.channels,
-        bitrate: 128_000,
-      });
-      const count = pcm.length / a.channels;
-      for (let offset = 0; offset < count; offset += 1024) {
+      })
+    : undefined;
+  const close = () => {
+    signal.removeEventListener("abort", close);
+    if (ve.state !== "closed") ve.close();
+    if (ae && ae.state !== "closed") ae.close();
+  };
+  signal.addEventListener("abort", close, { once: true });
+  const check = () => {
+    throwIfAborted(signal);
+    if (failure) throw failure;
+  };
+  check();
+  ve.configure({
+    codec: "avc1.42001f",
+    width: shape.width,
+    height: shape.height,
+    bitrate: 1_000_000,
+    framerate: shape.fps,
+    avc: { format: "avc" },
+    latencyMode: "realtime",
+  });
+  if (a && ae)
+    ae.configure({
+      codec: audioCodec === "opus" ? "opus" : "mp4a.40.2",
+      sampleRate: a.sampleRate,
+      numberOfChannels: a.channels,
+      bitrate: 128_000,
+    });
+  const pixels = new Uint8ClampedArray(shape.width * shape.height * 4);
+  return {
+    /** Append `raw` after what is already encoded, dropping its first `skip` frames (and their sound). */
+    async add(raw: RawVideo, skip: number) {
+      if (raw.width !== shape.width || raw.height !== shape.height || raw.fps !== shape.fps || !raw.audio !== !a)
+        throw new StudioError("protocol", t("Every shot must share one canvas, frame rate and soundtrack."));
+      for (let i = skip; i < raw.frames; i++, frameIndex++) {
+        check();
+        rgba(raw, i, pixels);
+        const frame = new VideoFrame(pixels, {
+          format: "RGBA",
+          codedWidth: raw.width,
+          codedHeight: raw.height,
+          timestamp: Math.round((frameIndex * 1e6) / raw.fps),
+          duration: Math.round(1e6 / raw.fps),
+        });
+        try {
+          ve.encode(frame, { keyFrame: frameIndex % Math.max(1, raw.fps * 2) === 0 });
+        } finally {
+          frame.close();
+        }
+        if (ve.encodeQueueSize >= 4) await ve.flush();
+      }
+      if (!raw.audio || !a || !ae) return;
+      const pcm = pcmFloats(raw),
+        count = pcm.length / a.channels,
+        from = Math.min(count, Math.round((skip * a.sampleRate) / raw.fps));
+      for (let offset = from; offset < count; offset += 1024) {
         check();
         const frames = Math.min(1024, count - offset);
         const sample = new AudioData({
@@ -179,11 +176,8 @@ async function mp4(raw: RawVideo, signal: AbortSignal, audioCodec: "aac" | "opus
           sampleRate: a.sampleRate,
           numberOfChannels: a.channels,
           numberOfFrames: frames,
-          timestamp: Math.round((offset * 1e6) / a.sampleRate),
-          data: pcm.subarray(
-            offset * a.channels,
-            (offset + frames) * a.channels,
-          ),
+          timestamp: Math.round(((audioFrames + offset - from) * 1e6) / a.sampleRate),
+          data: pcm.subarray(offset * a.channels, (offset + frames) * a.channels),
         });
         try {
           ae.encode(sample);
@@ -192,41 +186,51 @@ async function mp4(raw: RawVideo, signal: AbortSignal, audioCodec: "aac" | "opus
         }
         if (ae.encodeQueueSize >= 8) await delay(0, signal);
       }
-      await ae.flush();
+      audioFrames += count - from;
+    },
+    async finish(): Promise<Blob> {
+      await ve.flush();
+      if (ae) await ae.flush();
       check();
-    }
-    if (!description)
-      throw new StudioError(
-        "protocol",
-        t("H.264 encoder returned no decoder configuration."),
+      if (!description)
+        throw new StudioError(
+          "protocol",
+          t("H.264 encoder returned no decoder configuration."),
+        );
+      return muxMp4(
+        {
+          width: shape.width,
+          height: shape.height,
+          fps: shape.fps,
+          description,
+          chunks: video,
+        },
+        a
+          ? {
+              sampleRate: audioCodec === "opus" ? 48000 : a.sampleRate,
+              channels: a.channels,
+              chunks: audio,
+              codec: audioCodec === "opus" ? "opus" : "aac",
+              description: audioDescription,
+              durationSeconds: audioFrames / a.sampleRate,
+            }
+          : undefined,
       );
-    return muxMp4(
-      {
-        width: raw.width,
-        height: raw.height,
-        fps: raw.fps,
-        description,
-        chunks: video,
-      },
-      raw.audio
-        ? {
-            sampleRate: audioCodec === "opus" ? 48000 : raw.audio.sampleRate,
-            channels: raw.audio.channels,
-            chunks: audio,
-            codec: audioCodec === "opus" ? "opus" : "aac",
-            description: audioDescription,
-            durationSeconds:
-              raw.audio.pcm.byteLength /
-              (2 * raw.audio.channels * raw.audio.sampleRate),
-          }
-        : undefined,
-    );
+    },
+    close,
+  };
+}
+async function mp4(raw: RawVideo, signal: AbortSignal, audioCodec: "aac" | "opus" | "silent"): Promise<Blob> {
+  let writer: ReturnType<typeof mp4Writer> | undefined;
+  try {
+    writer = mp4Writer(raw, signal, audioCodec);
+    await writer.add(raw, 0);
+    return await writer.finish();
   } catch (e) {
     throwIfAborted(signal);
     throw e;
   } finally {
-    signal.removeEventListener("abort", cancel);
-    cancel();
+    writer?.close();
   }
 }
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -393,10 +397,7 @@ async function encodeVideo(raw: RawVideo, options: EncodeOptions = {}): Promise<
       blob,
       encodeMs: performance.now() - start,
       container: useMp4 ? "mp4" : "webm",
-      codec: useMp4
-        ? "H.264" +
-          (raw.audio ? (selected === "opus" ? " + Opus" : " + AAC") : "")
-        : `browser WebM (VP8/VP9${raw.audio ? " + Opus" : ""})`,
+      codec: useMp4 ? h264Label(raw, selected) : `browser WebM (VP8/VP9${raw.audio ? " + Opus" : ""})`,
       heapBeforeBytes: before,
       peakHeapBytes: peak,
       workingBufferBytes:
@@ -412,4 +413,62 @@ async function encodeVideo(raw: RawVideo, options: EncodeOptions = {}): Promise<
   }
 }
 
-export { encodeVideo };
+const h264Label = (raw: RawVideo, audio: "aac" | "opus" | "silent") =>
+  "H.264" + (raw.audio ? (audio === "opus" ? " + Opus" : " + AAC") : "");
+
+export type ShotEncoder = { add(raw: RawVideo, skip: number): Promise<void>; finish(): Promise<EncodeResult>; close(): void };
+
+/**
+ * A storyboard's encoder: shots are appended as they arrive, each dropping the frame it shares with the
+ * shot before, so only one shot's raw frames are ever held. Needs WebCodecs: the WebM fallback records in
+ * real time from one buffer.
+ */
+async function openShotEncoder(first: RawVideo, options: EncodeOptions = {}): Promise<ShotEncoder> {
+  const signal = options.signal ?? new AbortController().signal;
+  const selected = await support(first);
+  if (!selected)
+    throw new StudioError("unsupported", t("Storyboards need this browser's H.264 encoder (WebCodecs). Try Chrome, Edge or Safari."));
+  const writer = mp4Writer(first, signal, selected);
+  let encodeMs = 0;
+  return {
+    async add(raw, skip) {
+      const start = performance.now();
+      await writer.add(raw, skip);
+      encodeMs += performance.now() - start;
+    },
+    async finish() {
+      const start = performance.now(),
+        blob = await writer.finish();
+      encodeMs += performance.now() - start;
+      writer.close();
+      return { blob, encodeMs, container: "mp4", codec: h264Label(first, selected), heapBeforeBytes: null, peakHeapBytes: null, workingBufferBytes: blob.size };
+    },
+    close: writer.close,
+  };
+}
+
+/** The clip's last frame as a lossless PNG (base64): the next shot opens on it. */
+async function lastFramePng(raw: RawVideo): Promise<string> {
+  const pixels = new Uint8ClampedArray(raw.width * raw.height * 4);
+  rgba(raw, raw.frames - 1, pixels);
+  const image = new ImageData(pixels, raw.width, raw.height);
+  let blob: Blob | null;
+  if (typeof OffscreenCanvas !== "undefined") {
+    const canvas = new OffscreenCanvas(raw.width, raw.height);
+    canvas.getContext("2d")!.putImageData(image, 0, 0);
+    blob = await canvas.convertToBlob({ type: "image/png" });
+  } else {
+    const canvas = document.createElement("canvas");
+    canvas.width = raw.width;
+    canvas.height = raw.height;
+    canvas.getContext("2d")!.putImageData(image, 0, 0);
+    blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+  }
+  if (!blob) throw new StudioError("unsupported", t("Couldn't save the shot's last frame."));
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+export { encodeVideo, openShotEncoder, lastFramePng };

@@ -2198,17 +2198,85 @@ pub const Engine = struct {
         defer a.free(phonemes);
         log.debug("[kokoro] \"{s}\" → {s}\n", .{ text, phonemes });
 
-        const samples = try self.model.synthesize(phonemes, voice, speed, seed);
-        defer a.free(samples);
-        return wav.encodePcm16Mono(a, samples, self.model.cfg.sample_rate);
+        // One forward reads at most the BERT context (two ids are boundary zeros), so longer
+        // input is spoken window by window, as the reference pipeline does.
+        var samples: std.ArrayList(f32) = .empty;
+        defer samples.deinit(a);
+        var rest = phonemes;
+        while (rest.len > 0) {
+            const cut = phonemeWindow(rest, self.model.cfg.bert_max_pos - 2);
+            const piece: ?[]f32 = if (!hasSpeakable(rest[0..cut])) null else self.model.synthesize(rest[0..cut], voice, speed, seed) catch |err| switch (err) {
+                error.EmptyKokoroInput => null, // a window of marks and spaces only
+                else => return err,
+            };
+            rest = rest[cut..];
+            if (piece) |p| {
+                defer a.free(p);
+                try samples.appendSlice(a, p);
+            }
+        }
+        if (samples.items.len == 0) return error.EmptyKokoroInput;
+        return wav.encodePcm16Mono(a, samples.items, self.model.cfg.sample_rate);
     }
 };
+
+/// Byte length of the longest prefix of `phonemes` within `max_cps` codepoints, cut after its
+/// last sentence mark, else clause mark, else space; a hard cut only when it has none.
+pub fn phonemeWindow(phonemes: []const u8, max_cps: usize) usize {
+    var i: usize = 0;
+    var cps: usize = 0;
+    var sentence: usize = 0;
+    var clause: usize = 0;
+    var space: usize = 0;
+    while (i < phonemes.len and cps < max_cps) : (cps += 1) {
+        const end = @min(i + (std.unicode.utf8ByteSequenceLength(phonemes[i]) catch 1), phonemes.len);
+        switch (phonemes[i]) {
+            '.', '!', '?' => sentence = end,
+            ',', ';', ':' => clause = end,
+            ' ' => space = end,
+            else => {},
+        }
+        i = end;
+    }
+    if (i == phonemes.len) return i;
+    return if (sentence > 0) sentence else if (clause > 0) clause else if (space > 0) space else i;
+}
 
 // ════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+
+/// Whether `phonemes` holds a sound: the vocab encodes marks too, and a run of them alone
+/// synthesizes silence.
+fn hasSpeakable(phonemes: []const u8) bool {
+    const view = std.unicode.Utf8View.init(phonemes) catch return true;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| switch (cp) {
+        ' ', '.', ',', '!', '?', ';', ':', '"', '(', ')', '—', '…', '«', '»', '“', '”', '¡', '¿' => {},
+        else => return true,
+    };
+    return false;
+}
+
+test "kokoro: hasSpeakable is false for marks and spaces alone" {
+    try testing.expect(hasSpeakable("hˈɛloʊ."));
+    try testing.expect(hasSpeakable("ə"));
+    try testing.expect(!hasSpeakable("!!! ... ???"));
+    try testing.expect(!hasSpeakable("— … «» “” ¡¿ ;:,"));
+    try testing.expect(!hasSpeakable(""));
+}
+
+test "kokoro: phonemeWindow cuts long input at the last sentence, clause or word mark that fits" {
+    try testing.expectEqual(@as(usize, 6), phonemeWindow("hˈɛ.", 10)); // fits whole
+    try testing.expectEqual(@as(usize, 3), phonemeWindow("ab. cd, ef gh", 4)); // after "."
+    try testing.expectEqual(@as(usize, 6), phonemeWindow("ab cd, ef gh", 8)); // after ","
+    try testing.expectEqual(@as(usize, 6), phonemeWindow("ab cd ef gh", 7)); // after the space
+    try testing.expectEqual(@as(usize, 4), phonemeWindow("abcdefgh", 4)); // no mark: hard cut
+    // Counted in codepoints, never cut inside one: "ə" is two bytes.
+    try testing.expectEqual(@as(usize, 6), phonemeWindow("əəəəə", 3));
+}
 
 test "kokoro: config defaults survive an empty object and samplesPerFrame is 300" {
     const cfg = try parseConfig(testing.allocator, "{}");

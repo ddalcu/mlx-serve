@@ -104,6 +104,7 @@ fn configFor(n: c_int, k: c_int, dt: mlx.mlx_dtype) !mlx.mlx_fast_metal_kernel_c
 /// `x @ w.T` for one activation row, or null when the call is outside the
 /// kernel (caller keeps stock qmm).
 pub fn qmv(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
     const nk = eligible(x, w, sc, bi, bits, group_size) orelse return null;
     return try launch(try kernel(), &.{ x, w, sc, bi }, x, nk[0], nk[1], s);
 }
@@ -468,7 +469,7 @@ pub fn qmmMmaAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.m
 /// or null (caller keeps stock qmm). `legacy_ok` = a Hadamard pack, the only
 /// packs the pre-plan kernels were measured on.
 pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, bneg: bool, legacy_ok: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (bits != 2 or group_size != 128 or !enabled()) return null;
+    if (bits != 2 or group_size != 128 or !enabled() or !mlx.streamIsGpu(s)) return null;
     const xs = mlx.getShape(x);
     if (xs.len == 0) return null;
     var m: c_int = 1;

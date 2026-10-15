@@ -54,10 +54,7 @@
     ws.signature();
     untrack(() => ws.touch());
   });
-  $effect(() => () => {
-    ws.flush();
-    if (ws.c.run) ws.c.cancel();
-  });
+  $effect(() => () => ws.flush());
   // The finished picture is shown from an object URL that lives as long as that result.
   $effect(() => {
     const blob = c.phase === "completed" ? c.result?.blob : undefined;

@@ -17,6 +17,10 @@ import {
   type VideoInputs,
 } from "./video-state.svelte";
 import { videoReference } from "./video-reference";
+import type { VideoRequest } from "../core/video";
+import { newId } from "../core/id";
+import { storyboardRewrite, videoRewrite, type RewriteRequest } from "../core/rewrite";
+import { deliveredFrames, lengthLabel, LONGEST_PLANNED_STORY, parseStoryboard, plannedRange, secondsRange, shotFrames, type SecondsRange } from "../core/storyboard";
 
 export type MediaKey = "first" | "last" | "audio" | "images" | "videos" | "audios";
 const LISTS = ["images", "videos", "audios"] as const;
@@ -84,11 +88,102 @@ export class VideoWorkspace {
     return !!this.c.run || this.busy;
   }
 
+  /** Storyboard mode, on a model whose shots can open on a first frame (REF2VA has no first-frame anchor). */
+  get storyboardOn() {
+    return this.d.storyboard && !!this.profile && !this.profile.references;
+  }
+  /** The rungs a shot can use: this canvas's ladder, one window, within one response's raw-frame budget. */
+  get shotLadder() {
+    return frameOptions(this.model, { ...this.d, windows: 1 }, { ...this.inputs, audio: undefined });
+  }
+  get shotRange(): SecondsRange {
+    return secondsRange(this.shotLadder, 24, this.profile?.statedFrames ?? 0);
+  }
+  get shotFrames() {
+    const [lo, hi] = this.shotRange;
+    return this.d.shots.map((s) => shotFrames(Math.min(hi, Math.max(lo, s.seconds)), 24, this.shotLadder));
+  }
+  get storyboardSeconds() {
+    return Math.round(deliveredFrames(this.shotFrames) / 24);
+  }
+  /** One line under Quality: the pipeline, the steps and the length the request will run. */
+  get qualityNote() {
+    const p = this.profile;
+    if (!p) return "";
+    const mode = p.audio && this.inputs.audio && this.d.mode === "one_stage" && !this.storyboardOn
+        ? t("2-stage (audio-to-video)")
+        : { one_stage: t("1-stage"), two_stage: t("2-stage"), two_stage_hq: t("2-stage HQ") }[this.d.mode] ?? this.d.mode,
+      turbo = p.turbo && this.d.turbo ? t(" (Turbo)") : "";
+    return this.storyboardOn
+      ? t("%@, %@ steps%@, %@ shots · %@", [mode, this.d.steps, turbo, this.d.shots.length, lengthLabel(this.storyboardSeconds)])
+      : t("%@, %@ steps%@, %@ frames (~%@ s)", [mode, this.d.steps, turbo, this.d.frames, (this.d.frames / 24).toFixed(1)]);
+  }
+
+  /** A storyboard's base request: the pane's settings with the first shot's length and no soundtrack. */
+  #storyboardBase(): VideoRequest {
+    if (!this.d.shots.length) throw Error(t("Add a shot."));
+    if (this.d.shots.some((s) => !s.prompt.trim())) throw Error(t("Every shot needs a prompt."));
+    const d = { ...this.d, prompt: this.d.prompt.trim() || this.d.shots[0]!.prompt, frames: this.shotFrames[0]!, windows: 1 };
+    return buildVideoRequest(this.model, d, { ...this.inputs, audio: undefined });
+  }
+
+  addShot() {
+    this.d.shots.push({ id: newId(), prompt: "", seconds: plannedRange(this.shotRange)[1] });
+  }
+  removeShot(id: string) {
+    this.d.shots = this.d.shots.filter((s) => s.id !== id);
+  }
+
+  /** Past one shot, or with the storyboard already on, Enhance plans shots. */
+  plansStoryboard(seconds: number) {
+    return !!this.profile && !this.profile.references && (this.storyboardOn || seconds > this.shotRange[1]);
+  }
+  /** Enhance's length slider: a storyboard-capable model runs to two minutes, anything else to its longest clip. */
+  get enhanceLength() {
+    const p = this.profile;
+    if (!p || p.references) {
+      const max = Math.max(1, Math.floor((this.frames.at(-1) ?? this.d.frames) / 24));
+      return { initial: Math.min(max, Math.max(1, Math.round(this.d.frames / 24))), min: 1, max };
+    }
+    const initial = this.storyboardOn ? (this.d.shots.length ? this.storyboardSeconds : 60) : Math.round(this.d.frames / 24);
+    return { initial: Math.min(LONGEST_PLANNED_STORY, Math.max(1, initial)), min: 1, max: LONGEST_PLANNED_STORY };
+  }
+  /** What Enhance asks the chat model for at `seconds`; the first frame rides along for a model that can see it. */
+  rewriteRequest(seconds: number): RewriteRequest {
+    const p = this.profile,
+      format = p?.h3 ? (p.references ? "h3Reference" : "h3Base") : "ltx",
+      first = this.inputs.first?.base64;
+    return this.plansStoryboard(seconds)
+      ? storyboardRewrite(this.d.prompt, format, seconds, plannedRange(this.shotRange), first)
+      : videoRewrite(this.d.prompt, format, seconds, first);
+  }
+  /** A planned storyboard fills the shots and turns the mode on; anything else replaces the prompt. */
+  applyRewrite(text: string, seconds: number) {
+    const shots = parseStoryboard(text, this.shotRange);
+    if (shots.length) {
+      this.d.shots = shots;
+      this.d.storyboard = true;
+      return;
+    }
+    this.d.prompt = text;
+    if (!this.plansStoryboard(seconds)) this.d.frames = this.frames.find((f) => f >= seconds * 24) ?? this.frames.at(-1) ?? this.d.frames;
+  }
+  /** Why `text` written at `seconds` cannot be applied, or "". */
+  rewriteError(text: string, seconds: number) {
+    return this.plansStoryboard(seconds) && !parseStoryboard(text, this.shotRange).length ? t("No shots found. Each shot starts with a line like === SHOT 1 | 8s ===.") : "";
+  }
+  /** A line under Enhance's length slider when that length plans a storyboard. */
+  enhanceNote(seconds: number) {
+    const longest = plannedRange(this.shotRange)[1];
+    return this.plansStoryboard(seconds) ? t("Enhance writes a storyboard: about %@ shots of up to %@ s each.", [Math.ceil(seconds / longest), longest]) : "";
+  }
+
   /** The reason Generate is unavailable, and the pipeline's size rounding hint. */
   get validation() {
     let error = this.error;
     try {
-      buildVideoRequest(this.model, this.d, this.inputs);
+      if (this.storyboardOn) this.#storyboardBase();
+      else buildVideoRequest(this.model, this.d, this.inputs);
     } catch (e) {
       error ||= e instanceof Error ? e.message : t("Invalid settings.");
     }
@@ -114,6 +209,8 @@ export class VideoWorkspace {
         if (epoch !== this.#hydration) return;
         const d = videoDefaults();
         for (const key of Object.keys(d) as (keyof typeof d)[]) if (typeof value.d?.[key] === typeof d[key]) Object.assign(d, { [key]: value.d[key] });
+        // A stored draft is untrusted: keep only well-formed shots.
+        d.shots = (Array.isArray(d.shots) ? d.shots : []).filter((s) => typeof s?.prompt === "string" && Number.isFinite(s?.seconds)).map((s) => ({ id: typeof s.id === "string" ? s.id : newId(), prompt: s.prompt, seconds: s.seconds }));
         this.d = d;
         this.inputs = value.inputs || {};
       }
@@ -180,7 +277,7 @@ export class VideoWorkspace {
   chooseModel(id: string) {
     const model = this.models.find((m) => m.id === id);
     this.stopActivity();
-    this.d = { ...videoDefaults(model), prompt: this.d.prompt };
+    this.d = { ...videoDefaults(model), prompt: this.d.prompt, storyboard: this.d.storyboard, shots: this.d.shots };
     if (!videoProfile(model)?.audio) delete this.inputs.audio;
     this.clamp();
   }
@@ -197,7 +294,7 @@ export class VideoWorkspace {
       if (input?.width && input.height) {
         const ratio = input.width / input.height;
         const size = [...(this.profile?.sizes || [])].sort((a, b) => Math.abs(a[0]! / a[1]! - ratio) - Math.abs(b[0]! / b[1]! - ratio))[0];
-        if (size) [this.d.width, this.d.height] = size as [number, number];
+        if (size) [this.d.width, this.d.height] = [size[0], size[1]];
       }
     } else [this.d.width, this.d.height] = value.split("x").map(Number) as [number, number];
     this.clamp();
@@ -356,6 +453,13 @@ export class VideoWorkspace {
   async generate() {
     this.error = "";
     try {
+      if (this.storyboardOn) {
+        const base = this.#storyboardBase(),
+          frames = this.shotFrames;
+        this.flush();
+        await this.c.generateStoryboard(this.#connection.client(), base, this.d.shots.map((s, i) => ({ prompt: s.prompt, frames: frames[i]! })), this.server);
+        return;
+      }
       const request = buildVideoRequest(this.model, this.d, this.inputs);
       this.flush();
       await this.c.generate(this.#connection.client(), request, this.server);

@@ -29,18 +29,17 @@ enum SettingsReset {
     /// sections with nothing of their own to reset.
     static func fields(for category: SettingsCategory) -> [SettingsFieldReset] {
         switch category {
-        // Model Folders' two paths live in `ModelRoots` (UserDefaults), not in
-        // ServerOptions, and each row carries its own Clear/Reset button beside
-        // the path it clears; Updates holds no settings, and About is links
-        // only. None offers a section Reset button (`isResettable`), rather
+        // Updates holds no settings, and About is links only. None offers a section Reset button (`isResettable`), rather
         // than a button that does nothing. Interface is the same shape:
         // `@AppStorage`-backed display prefs, not a `ServerOptions` field —
         // each of its rows (appearance/accent/text size/compact/shortcut)
         // carries its own control default or Reset (the shortcut row's).
         // Providers live in providers.json, edited row by row in their own pane.
-        case .modelFolders, .updates, .about, .interface, .providers:
+        case .updates, .about, .interface, .providers:
             return []
 
+        // The model folder rows inside Server live in `ModelRoots` (UserDefaults), not in
+        // ServerOptions: each carries its own Clear/Reset, so Server's Reset never touches them.
         case .server:
             return [
                 f("host") { $0.host = $1.host },
@@ -144,6 +143,9 @@ enum SettingsReset {
                 f("voiceEngine") { $0.voiceEngine = $1.voiceEngine },
                 f("kokoroVoice") { $0.kokoroVoice = $1.kokoroVoice },
                 f("wakePhrase") { $0.wakePhrase = $1.wakePhrase },
+                f("transcriptNotesModel") { $0.transcriptNotesModel = $1.transcriptNotesModel },
+                f("transcriptAutoStopMinutes") { $0.transcriptAutoStopMinutes = $1.transcriptAutoStopMinutes },
+                f("transcriptAutoStartCamera") { $0.transcriptAutoStartCamera = $1.transcriptAutoStartCamera },
             ]
 
         case .sandbox:

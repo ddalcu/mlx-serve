@@ -20,6 +20,25 @@ enum InterfacePrefKey {
     /// "#RRGGBB" ground painted under the default terminal theme; "" = the
     /// theme's own.
     static let terminalBackground = "terminalBackground"
+    /// How the Voice, Music and Sound tabs draw the player (`AudioPlayerStyle`).
+    static let audioPlayerStyle = "audioPlayerStyle"
+}
+
+/// The look of the player and the history in the Voice, Music and Sound tabs.
+/// Both run the same player and AI Radio; only the drawing differs.
+enum AudioPlayerStyle: String, CaseIterable, Identifiable {
+    case modern, mlxAmp
+    var id: String { rawValue }
+    /// What the setting's menu shows. MLX-Amp is a name and stays as written.
+    var label: String {
+        switch self {
+        case .mlxAmp: return "MLX-Amp"
+        case .modern: return L10n.text("Modern")
+        }
+    }
+
+    /// Every view reading the setting starts here.
+    static let defaultStyle = AudioPlayerStyle.modern
 }
 
 /// How wide a conversation reads: fixed points, so resizing the window spends

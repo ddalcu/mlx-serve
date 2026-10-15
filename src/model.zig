@@ -7,6 +7,7 @@ const sushi_exl3 = @import("sushi_exl3");
 const sushi_pack = @import("sushi_pack.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const transcription = @import("transcription.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const qwen4_ple = @import("qwen4_ple.zig");
 const kv_quant_mod = @import("kv_quant.zig");
@@ -145,6 +146,30 @@ pub const Llama3Rope = struct {
     original_max_position_embeddings: f32 = 8192.0,
 };
 
+/// `thinker_config.audio_config` of a Qwen3-ASR pack (mlx-audio's `AudioEncoderConfig`).
+pub const QwenAudioConfig = struct {
+    d_model: u32 = 1024,
+    layers: u32 = 24,
+    heads: u32 = 16,
+    ffn: u32 = 4096,
+    mel_bins: u32 = 128,
+    downsample: u32 = 480,
+    /// Half a conv chunk in mel frames.
+    n_window: u32 = 50,
+    /// Attention window in mel frames.
+    n_window_infer: u32 = 800,
+    output_dim: u32 = 2048,
+};
+
+/// Qwen3-ForcedAligner: the trunk's head classifies each `<timestamp>` row
+/// into steps of `step_ms` (src/forced_align.zig).
+pub const ForcedAlignerConfig = struct {
+    timestamp_token_id: u32 = 151705,
+    step_ms: f32 = 80,
+    /// `support_languages`, as `transcription.languageBit`s.
+    languages: u32 = 0,
+};
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
@@ -250,6 +275,8 @@ pub const ModelConfig = struct {
     linear_key_head_dim: u32 = 128,
     linear_value_head_dim: u32 = 128,
     linear_conv_kernel_dim: u32 = 4,
+    /// Set at parse for qwen4_exp (`gdnStateF32Enabled`); read through `ssmStateDtype`.
+    ssm_state_f32: bool = false,
 
     // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
     // GatedDeltaNet recurrence:
@@ -611,6 +638,10 @@ pub const ModelConfig = struct {
     eoa_token_id: u32 = 0, // end of audio
     audio_embed_dim: u32 = 0, // unified: raw samples per token (640)
     audio_samples_per_token: u32 = 640, // 40ms @ 16kHz
+    /// Qwen3-ASR's audio tower (src/qwen_audio.zig); the trunk is a plain qwen3.
+    qwen_audio: ?QwenAudioConfig = null,
+    /// Set on Qwen3-ForcedAligner, the ASR shape with a timestamp head.
+    forced_aligner: ?ForcedAlignerConfig = null,
 
     // Qwen3.5/3.6 vision (Qwen3-VL ViT). Distinct from the Gemma SigLIP fields
     // above: Qwen ships a fused-qkv ViT with a patch merger, and the text trunk
@@ -659,6 +690,31 @@ pub const ModelConfig = struct {
     lv_pixels_tolerance: f32 = 2.0,
     lv_thumbnail_token_id: u32 = 0,
     lv_row_col_base_id: u32 = 0, // id of `<|img_row_1_col_1|>`; the block is row-major
+    // GLM-5.3-Flash vision (src/glm_vision.zig). Geometry rides the qv_* fields (same
+    // vision_config keys as Qwen's); these are the tower's own extras and the
+    // processor's token budget, in MERGED tokens.
+    glm_vision: bool = false,
+    glmv_proj_intermediate: u32 = 10240,
+    glmv_eps: f32 = 1e-5,
+    glmv_swiglu_limit: f32 = 10.0,
+    glmv_min_image_tokens: u32 = 16,
+    glmv_max_image_tokens: u32 = 8000,
+    // MiniCPM-V 4.7 vision (src/minicpm_vision.zig): the SigLIP2 geometry rides the vision_*
+    // fields; these are its window merger, slicing and placeholder tokens. The token ids
+    // that are not in config.json come from the tokenizer (`populateMiniCpmImageTokens`).
+    minicpm_vision: bool = false,
+    mcv_insert_layer: u32 = 6,
+    mcv_downsample_4x: bool = false,
+    mcv_max_slice_nums: u32 = 9,
+    mcv_eps: f32 = 1e-6,
+    mcv_image_start_id: u32 = 0,
+    mcv_image_end_id: u32 = 0,
+    mcv_slice_start_id: u32 = 0,
+    mcv_slice_end_id: u32 = 0,
+    mcv_newline_id: u32 = 0,
+    mcv_image_id_start: u32 = 0,
+    mcv_image_id_end: u32 = 0,
+    mcv_digit_ids: [10]u32 = @splat(0),
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -754,6 +810,11 @@ pub const ModelConfig = struct {
             widest = @max(widest, cols);
         }
         return @min(seq, window + widest + 1);
+    }
+
+    pub fn firstSlidingLayer(self: ModelConfig) ?u32 {
+        for (0..self.num_hidden_layers) |i| if (!self.isGlobalLayer(@intCast(i))) return @intCast(i);
+        return null;
     }
 
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
@@ -906,6 +967,11 @@ pub const ModelConfig = struct {
     /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
     pub const SLIDING_RING_SLACK: u32 = 2048;
 
+    /// Recurrent (SSM / conv) layers beside attention: a cached state restores only at a checkpoint.
+    pub fn hasSsmLayers(self: *const ModelConfig) bool {
+        return self.has_hybrid_layers or self.full_attention_interval > 0;
+    }
+
     /// Sliding layers cache a bounded ring of rows, as mlx-lm's `RotatingKVCache`, not every token.
     pub fn slidingRing(self: *const ModelConfig) bool {
         return self.isMimo();
@@ -1030,10 +1096,11 @@ pub const ModelConfig = struct {
         return if (self.hadamard_block > 0) .float16 else .bfloat16;
     }
 
-    /// GatedDeltaNet recurrent state dtype: f32 on Hadamard packs, as the
-    /// reference runtime keeps it; bf16 elsewhere.
+    /// GatedDeltaNet recurrent state dtype, which the decay gate is computed in too:
+    /// f32 where the reference runtime keeps it (Hadamard packs, GLM-5, qwen4_exp),
+    /// since a gate near one rounds to 1.0 in bf16 and that head stops forgetting.
     pub fn ssmStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
-        return if (self.hadamard_block > 0 or self.isGlm5()) .float32 else .bfloat16;
+        return if (self.hadamard_block > 0 or self.isGlm5() or self.ssm_state_f32) .float32 else .bfloat16;
     }
 
     /// Configured MTP depth (0 = auto). Hadamard packs run a grafted head that
@@ -1058,6 +1125,8 @@ pub const ModelConfig = struct {
         if (self.rope_llama3 != null) return "llama3-rope-v1";
         // A pool's completing indexer row stores the pool's key in its gate half.
         if (self.isGlm5()) return "glm5-pooled-keys-v1";
+        // A restored bf16 state would keep running bf16: every GDN kernel takes its state's dtype.
+        if (self.ssm_state_f32) return "gdn-f32-state-v1";
         return null;
     }
 
@@ -1523,6 +1592,19 @@ pub const ModelConfig = struct {
             }
         }
         self.populateLfm2ImageTokens(tok);
+        self.populateMiniCpmImageTokens(tok);
+    }
+
+    /// MiniCPM-V's `<image_id>N</image_id>` tags and the digits of N are tokenizer-only ids.
+    /// A missing one leaves 0, which the run builder reads as "no image-id tag".
+    pub fn populateMiniCpmImageTokens(self: *ModelConfig, tok: *const tokenizer_mod.Tokenizer) void {
+        if (!self.minicpm_vision) return;
+        if (tok.special_tokens.get("</image_id>")) |id| self.mcv_image_id_end = id;
+        if (tok.special_tokens.get("<image_id>")) |id| self.mcv_image_id_start = id;
+        // Digits are single tokens in a byte-level BPE vocab (the pre-tokenizer splits every \p{N}).
+        for (&self.mcv_digit_ids, 0..) |*slot, digit| {
+            if (tok.vocab.get(&[_]u8{@intCast('0' + digit)})) |id| slot.* = id else self.mcv_image_id_start = 0;
+        }
     }
 
     /// LFM2-VL wraps its image-token run in `<|image_start|>`/`<|image_end|>`,
@@ -1644,7 +1726,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // Qwen image sizing is processor metadata rather than an architecture
     // constant. Prefer processor_config.json and fill any missing field from
     // the older preprocessor_config.json layout.
-    if (config.qwen_vision or config.muse_vision) {
+    if (config.qwen_vision or config.muse_vision or config.glm_vision) {
         var vision_defaults = VisionProcessorDefaults{};
         const processor_files = [_][]const u8{
             "processor_config.json",
@@ -1666,6 +1748,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                         vision_defaults.max_pixels = parsed_defaults.max_pixels;
                     if (vision_defaults.max_image_tokens == null)
                         vision_defaults.max_image_tokens = parsed_defaults.max_image_tokens;
+                    if (vision_defaults.min_image_tokens == null)
+                        vision_defaults.min_image_tokens = parsed_defaults.min_image_tokens;
                 } else |_| {}
             } else |_| {}
         }
@@ -1678,6 +1762,29 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.qv_min_pixels = vision_defaults.min_pixels orelse 0;
         config.qv_max_pixels = vision_defaults.max_pixels orelse 0;
         config.mv_max_image_tokens = vision_defaults.max_image_tokens orelse MUSE_MAX_IMAGE_TOKENS;
+        if (config.glm_vision) {
+            const lo = vision_defaults.min_image_tokens orelse config.glmv_min_image_tokens;
+            const hi = vision_defaults.max_image_tokens orelse config.glmv_max_image_tokens;
+            // The processor raises on an inverted budget; keep its defaults instead.
+            if (lo <= hi) {
+                config.glmv_min_image_tokens = lo;
+                config.glmv_max_image_tokens = hi;
+            }
+        }
+    }
+
+    if (config.minicpm_vision) {
+        const path = try std.fmt.allocPrint(allocator, "{s}/preprocessor_config.json", .{model_dir});
+        defer allocator.free(path);
+        if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
+            defer file.close(io);
+            var buf: [4096]u8 = undefined;
+            var reader = file.reader(io, &buf);
+            if (reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |json| {
+                defer allocator.free(json);
+                config.mcv_max_slice_nums = parseMaxSliceNumsFromJson(json) orelse config.mcv_max_slice_nums;
+            } else |_| {}
+        } else |_| {}
     }
 
     if (config.isEmbeddingGemma2()) {
@@ -1721,8 +1828,10 @@ pub const GenerationDefaults = struct {
 pub const VisionProcessorDefaults = struct {
     min_pixels: ?u32 = null,
     max_pixels: ?u32 = null,
-    /// Muse: the cap is on MERGED tokens, not pixels.
+    /// Muse and GLM: the cap is on MERGED tokens, not pixels.
     max_image_tokens: ?u32 = null,
+    /// GLM: the floor a small image is upscaled to.
+    min_image_tokens: ?u32 = null,
 };
 
 fn positiveJsonU32(value: ?std.json.Value) ?u32 {
@@ -1753,6 +1862,7 @@ pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessor
         .min_pixels = positiveJsonU32(processor.get("min_pixels")),
         .max_pixels = positiveJsonU32(processor.get("max_pixels")),
         .max_image_tokens = positiveJsonU32(processor.get("max_image_tokens")),
+        .min_image_tokens = positiveJsonU32(processor.get("min_image_tokens")),
     };
     if (processor.get("size")) |value| {
         if (value == .object) {
@@ -1894,6 +2004,20 @@ fn qwen4ConfigU32(cfg_obj: std.json.ObjectMap, key: []const u8) !?u32 {
     return @intCast(v);
 }
 
+pub var gdn_state_f32_override: ?bool = null; // test seam
+var gdn_state_f32_env: ?bool = null;
+
+/// qwen4_exp's GatedDeltaNet state and decay gate in f32, as its reference keeps them.
+/// MLX_SERVE_GDN_STATE_F32=0 restores bf16 (half the state memory, the old numerics).
+fn gdnStateF32Enabled() bool {
+    if (gdn_state_f32_override) |v| return v;
+    if (gdn_state_f32_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_GDN_STATE_F32");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    gdn_state_f32_env = on;
+    return on;
+}
+
 /// Range-check every qwen4_exp bound the forward indexes a fixed array with or divides by.
 /// Names travel to the client as "Model load failed: <name>".
 fn validateQwen4Config(config: *const ModelConfig) !void {
@@ -1960,40 +2084,44 @@ fn prismHadamardBlock(root: std.json.ObjectMap) !u32 {
     return block;
 }
 
+/// The Qwen-VL `vision_config` geometry keys into `qv_*`; GLM-5.3-Flash's tower names them the same.
+fn parseQvGeometry(config: *ModelConfig, vc: std.json.ObjectMap) !void {
+    if (jsonField(vc, "depth")) |v| {
+        if (v == .integer) config.qv_depth = try jsonU32(v);
+    }
+    if (jsonField(vc, "hidden_size")) |v| {
+        if (v == .integer) config.qv_hidden = try jsonU32(v);
+    }
+    if (jsonField(vc, "num_heads")) |v| {
+        if (v == .integer) config.qv_heads = try jsonU32(v);
+    }
+    if (jsonField(vc, "intermediate_size")) |v| {
+        if (v == .integer) config.qv_intermediate = try jsonU32(v);
+    }
+    if (jsonField(vc, "patch_size")) |v| {
+        if (v == .integer) config.qv_patch = try jsonU32(v);
+    }
+    if (jsonField(vc, "temporal_patch_size")) |v| {
+        if (v == .integer) config.qv_temporal_patch = try jsonU32(v);
+    }
+    if (jsonField(vc, "spatial_merge_size")) |v| {
+        if (v == .integer) config.qv_merge = try jsonU32(v);
+    }
+    if (jsonField(vc, "num_position_embeddings")) |v| {
+        if (v == .integer) config.qv_num_pos_emb = try jsonU32(v);
+    }
+    if (jsonField(vc, "out_hidden_size")) |v| {
+        if (v == .integer) config.qv_out_hidden = try jsonU32(v);
+    }
+    if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
+    if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
+}
+
 fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
     if (jsonField(root, "vision_config")) |vc_val| {
         if (vc_val == .object) {
-            const vc = vc_val.object;
             config.qwen_vision = true;
-            if (jsonField(vc, "depth")) |v| {
-                if (v == .integer) config.qv_depth = try jsonU32(v);
-            }
-            if (jsonField(vc, "hidden_size")) |v| {
-                if (v == .integer) config.qv_hidden = try jsonU32(v);
-            }
-            if (jsonField(vc, "num_heads")) |v| {
-                if (v == .integer) config.qv_heads = try jsonU32(v);
-            }
-            if (jsonField(vc, "intermediate_size")) |v| {
-                if (v == .integer) config.qv_intermediate = try jsonU32(v);
-            }
-            if (jsonField(vc, "patch_size")) |v| {
-                if (v == .integer) config.qv_patch = try jsonU32(v);
-            }
-            if (jsonField(vc, "temporal_patch_size")) |v| {
-                if (v == .integer) config.qv_temporal_patch = try jsonU32(v);
-            }
-            if (jsonField(vc, "spatial_merge_size")) |v| {
-                if (v == .integer) config.qv_merge = try jsonU32(v);
-            }
-            if (jsonField(vc, "num_position_embeddings")) |v| {
-                if (v == .integer) config.qv_num_pos_emb = try jsonU32(v);
-            }
-            if (jsonField(vc, "out_hidden_size")) |v| {
-                if (v == .integer) config.qv_out_hidden = try jsonU32(v);
-            }
-            if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
-            if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
+            try parseQvGeometry(config, vc_val.object);
         }
     }
     // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
@@ -2023,6 +2151,53 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
     if (jsonField(root, "vision_end_token_id")) |v| {
         if (v == .integer) config.vision_end_token_id = try jsonU32(v);
     }
+}
+
+/// MiniCPM-V 4.7's tower options (`src/minicpm_vision.zig`). The generic `vision_config` block has
+/// already read the SigLIP2 geometry; this adds the window merger, the downsample mode and the
+/// token ids config.json carries. One round of 2x2 merging in each merger is the only shape served.
+fn parseMiniCpmVision(config: *ModelConfig, root: std.json.ObjectMap) !void {
+    const vc_val = jsonField(root, "vision_config") orelse return;
+    if (vc_val != .object) return;
+    const vc = vc_val.object;
+    config.minicpm_vision = true;
+    // Video frames are not served: no `<|video_pad|>` placeholder, no "video" modality.
+    config.video_token_id = 0;
+    if (jsonField(root, "insert_layer_id")) |v| config.mcv_insert_layer = try jsonU32(v);
+    if (jsonField(vc, "layer_norm_eps")) |v| config.mcv_eps = try jsonFloat(v);
+    if (config.mcv_insert_layer >= config.vision_num_layers) return error.InvalidConfigField;
+    if (jsonField(root, "downsample_mode")) |v| {
+        const mode = try jsonValue(.string, v);
+        if (std.mem.eql(u8, mode, "4x")) {
+            config.mcv_downsample_4x = true;
+        } else if (!std.mem.eql(u8, mode, "16x")) return error.InvalidConfigField;
+    }
+    if (jsonField(root, "merger_times")) |v| {
+        if (try jsonU32(v) != 1) return error.InvalidConfigField;
+    }
+    for ([_]std.json.ObjectMap{ root, vc }, [_][]const u8{ "merge_kernel_size", "window_kernel_size" }) |obj, key| {
+        const v = jsonField(obj, key) orelse continue;
+        const kernel = try jsonValue(.array, v);
+        if (kernel.items.len != 2 or try jsonU32(kernel.items[0]) != 2 or try jsonU32(kernel.items[1]) != 2) return error.InvalidConfigField;
+    }
+    const ids = .{
+        .{ "image_start_id", &config.mcv_image_start_id },
+        .{ "image_end_id", &config.mcv_image_end_id },
+        .{ "slice_start_id", &config.mcv_slice_start_id },
+        .{ "slice_end_id", &config.mcv_slice_end_id },
+        .{ "newline_id", &config.mcv_newline_id },
+    };
+    inline for (ids) |entry| {
+        if (jsonField(root, entry[0])) |v| entry[1].* = try jsonU32(v);
+    }
+}
+
+/// `max_slice_nums` of the checkpoint's `preprocessor_config.json` (null when absent or 0).
+pub fn parseMaxSliceNumsFromJson(content: []const u8) ?u32 {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    return positiveJsonU32(parsed.value.object.get("max_slice_nums"));
 }
 
 /// Flat HF `rope_parameters` carrying `rope_type: "yarn"` — the YaRN context
@@ -2208,7 +2383,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged orelse content, .{});
     defer parsed.deinit();
 
-    const root = try jsonValue(.object, parsed.value);
+    const outer = try jsonValue(.object, parsed.value);
+    const root = qwenAsrThinker(outer) orelse outer;
     var config = ModelConfig{};
 
     // Detect model_type from top-level (always present)
@@ -2387,7 +2563,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     }
 
     // Parse quantization from top level
-    if (jsonField(root, "quantization")) |q_val| {
+    if (jsonField(outer, "quantization")) |q_val| {
         const q = try jsonValue(.object, q_val);
         if (jsonField(q, "bits")) |v| config.quant_bits = try jsonU32(v);
         if (jsonField(q, "group_size")) |v| config.quant_group_size = try jsonU32(v);
@@ -2827,7 +3003,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
         std.mem.eql(u8, model_type, "qwen3_5_text") or
-        std.mem.eql(u8, model_type, "prism_hadamard_qwen35"))
+        std.mem.eql(u8, model_type, "prism_hadamard_qwen35") or
+        // MiniCPM-V 4.7: a Qwen3.5 trunk behind a SigLIP2 tower (src/minicpm_vision.zig).
+        std.mem.eql(u8, model_type, "minicpmv4_7"))
     {
         config.model_type = "qwen3_5_moe";
         if (std.mem.eql(u8, model_type, "prism_hadamard_qwen35")) config.hadamard_block = try prismHadamardBlock(root);
@@ -2845,6 +3023,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         try parseQwenVisionFields(&config, root, cfg_obj);
+        if (std.mem.eql(u8, model_type, "minicpmv4_7")) {
+            // Its vision_config is a SigLIP2 tower, not Qwen3-VL's.
+            config.qwen_vision = false;
+            try parseMiniCpmVision(&config, root);
+        }
     } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
         std.mem.eql(u8, model_type, "qwen4_exp_text"))
     {
@@ -2863,6 +3046,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.has_sliding_window = false;
         config.attn_output_gate = true;
         config.kda_sigmoid_out_gate = true; // output_gate_type "sigmoid"
+        // Keyed on the arch: the HF reference ignores `mamba_ssm_dtype` and is f32 regardless.
+        config.ssm_state_f32 = gdnStateF32Enabled();
         config.rope_scaling_factor = 1.0;
         config.rope_local_base_freq = config.rope_theta;
         if (jsonField(cfg_obj, "query_pre_attn_scalar") == null) {
@@ -3148,8 +3333,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.dsv4_hc_sinkhorn_iters = 20;
         if (jsonField(cfg_obj, "hc_sinkhorn_iters")) |v| config.dsv4_hc_sinkhorn_iters = try jsonU32(v);
         if (jsonField(cfg_obj, "hc_eps")) |v| config.dsv4_hc_eps = try jsonFloat(v);
-        // The GLM-5-Next vision tower is not wired.
-        config.has_vision = false;
+        // The tower (src/glm_vision.zig) splices at `<|image|>` with plain 1-D positions: the trunk is NoPE.
+        if (config.has_vision) {
+            const vc = jsonField(root, "vision_config").?.object;
+            config.glm_vision = true;
+            try parseQvGeometry(&config, vc);
+            if (jsonField(vc, "projection_intermediate_size")) |v| config.glmv_proj_intermediate = try jsonU32(v);
+            if (jsonField(vc, "rms_norm_eps")) |v| config.glmv_eps = try jsonFloat(v);
+            if (jsonField(vc, "swiglu_limit")) |v| config.glmv_swiglu_limit = try jsonFloat(v);
+            // The 2-D rotary splits a head into h and w halves of rotate_half pairs.
+            if (config.qv_heads == 0 or config.qv_hidden % config.qv_heads != 0 or config.qv_head_dim % 4 != 0 or
+                config.qv_patch == 0 or config.qv_merge == 0 or config.qv_temporal_patch == 0 or
+                config.qv_out_hidden != config.hidden_size) return error.InvalidConfigField;
+        }
         try parseSushiExperts(root, &config);
     } else if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "mimo_v2_flash")) {
         // Xiaomi MiMo-V2.6-Flash (309B-A15B) in the mlx-lm layout (tests/convert_mimo_v2.py,
@@ -4178,6 +4374,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // Llama-family defaults (qwen3, llama, mistral, etc.)
         if (std.mem.eql(u8, model_type, "qwen3")) {
             config.model_type = "qwen3";
+        } else if (std.mem.eql(u8, model_type, "qwen3_asr") or std.mem.eql(u8, model_type, "qwen3_forced_aligner")) {
+            config.model_type = "qwen3";
+            config.qwen_audio = try parseQwenAudioConfig(root);
+            config.has_vision = true;
+            if (std.mem.eql(u8, model_type, "qwen3_forced_aligner")) config.forced_aligner = try parseForcedAligner(outer);
         } else if (std.mem.eql(u8, model_type, "qwen2")) {
             // Qwen2.5 family: dense Llama-style attention, NO QK-norm (left
             // false below), additive qkv-projection biases applied in the
@@ -4234,7 +4435,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
 
-        if (std.mem.eql(u8, model_type, "qwen3")) {
+        if (std.mem.eql(u8, config.model_type, "qwen3")) {
             config.has_qk_norm = true;
         }
     }
@@ -4347,6 +4548,42 @@ fn parseDsv41Fields(cfg_obj: std.json.ObjectMap, config: *ModelConfig) !void {
     for (config.dsv4_dspark_target_layers[0..config.dsv4_n_dspark_target_layers]) |l| {
         if (l >= n_layers) return refuse("DSpark target layer {d} of {d}", .{ l, n_layers });
     }
+}
+
+fn parseQwenAudioConfig(root: std.json.ObjectMap) !QwenAudioConfig {
+    var qa = QwenAudioConfig{};
+    const ac = jsonField(root, "audio_config") orelse return qa;
+    const o = try jsonValue(.object, ac);
+    inline for (.{
+        .{ "d_model", "d_model" },             .{ "encoder_layers", "layers" },     .{ "encoder_attention_heads", "heads" },
+        .{ "encoder_ffn_dim", "ffn" },         .{ "num_mel_bins", "mel_bins" },     .{ "downsample_hidden_size", "downsample" },
+        .{ "n_window", "n_window" },           .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
+    }) |kv| {
+        if (jsonField(o, kv[0])) |v| @field(qa, kv[1]) = try jsonU32(v);
+    }
+    if (qa.heads == 0 or qa.d_model % qa.heads != 0 or qa.n_window == 0 or qa.n_window_infer < 2 * qa.n_window or qa.downsample == 0)
+        return error.InvalidConfigField;
+    return qa;
+}
+
+/// The aligner's timestamp fields sit at the pack's root, beside `thinker_config`.
+fn parseForcedAligner(outer: std.json.ObjectMap) !ForcedAlignerConfig {
+    var fa = ForcedAlignerConfig{};
+    if (jsonField(outer, "timestamp_token_id")) |v| fa.timestamp_token_id = try jsonU32(v);
+    if (jsonField(outer, "timestamp_segment_time")) |v| fa.step_ms = try jsonFloat(v);
+    if (jsonField(outer, "support_languages")) |v| {
+        for ((try jsonValue(.array, v)).items) |l| fa.languages |= transcription.languageBit(try jsonValue(.string, l));
+    }
+    if (fa.step_ms <= 0) return error.InvalidConfigField;
+    return fa;
+}
+
+/// Qwen3-ASR nests the whole model under `thinker_config`; the pack's quantization stays outside it.
+fn qwenAsrThinker(outer: std.json.ObjectMap) ?std.json.ObjectMap {
+    const mt = jsonField(outer, "model_type") orelse return null;
+    if (mt != .string or !std.mem.eql(u8, mt.string, "qwen3_asr")) return null;
+    const t = jsonField(outer, "thinker_config") orelse return null;
+    return if (t == .object) t.object else null;
 }
 
 fn jsonValue(comptime tag: std.meta.Tag(std.json.Value), v: std.json.Value) !@TypeOf(@field(@as(std.json.Value, undefined), @tagName(tag))) {
@@ -4514,7 +4751,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// `dsv41` also reads past the page cache (`nocache_reader`): its weights all load at init, and a pack near the
 /// RAM size would have them compressed under the file cache.
 /// `index_owners`: a tensor two shards carry loads from the shard the index names.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+pub const LoadOpts = struct { vision: bool = false, audio_tower: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
 
 pub const Owners = std.StringHashMapUnmanaged([]const u8);
 
@@ -4536,9 +4773,18 @@ pub fn indexOwners(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) ?Owner
     return out;
 }
 
+/// Sushi's EXL3 expert banks run on its Metal kernels only: without them (CUDA) the pack is
+/// refused by name before any weight loads.
+fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
+    if (config.exl3 == null or metal) return;
+    log.err("this Sushi pack's EXL3 experts run on Metal kernels only; this backend cannot serve it\n", .{});
+    return error.Exl3NeedsMetal;
+}
+
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
     if (config.dsv41_stream) return Weights.init(allocator); // mlx-stream loads its own
+    try admitExl3Backend(config, mlx.metalKernelsAvailable());
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
     if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
@@ -4546,7 +4792,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null });
     errdefer weights.deinit();
     if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
@@ -4802,7 +5048,6 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     opts: LoadOpts,
 ) !void {
-    const load_vision = opts.vision;
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
 
@@ -4830,7 +5075,7 @@ pub fn loadSafetensorsFile(
         const key_str = std.mem.span(key.?);
 
         const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
-        if (foreign or !shouldKeepWeightKey(key_str, load_vision) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
+        if (foreign or !keepsTensor(key_str, opts) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
             (opts.dsv41 and dsv41DropsKey(key_str)))
         {
             _ = mlx.mlx_array_free(value);
@@ -5189,6 +5434,12 @@ test "Qwen4 folded f16 keeps generic narrowing after convention resolution" {
     }
 }
 
+/// `shouldKeepWeightKey`, plus Qwen3-ASR's `audio_tower.*` under the same media gate.
+fn keepsTensor(key: []const u8, opts: LoadOpts) bool {
+    if (opts.audio_tower and opts.vision and std.mem.startsWith(u8, key, "audio_tower.")) return true;
+    return shouldKeepWeightKey(key, opts.vision);
+}
+
 /// True if the safetensors weight `key` should be retained for the text
 /// forward pass. Audio is always dropped; vision is dropped unless
 /// `load_vision` is set. MTP-style head tensors (`*.mtp.*`) on Qwen3.5/3.6
@@ -5202,7 +5453,10 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // wired in src/vision.zig (UnifiedEmbedder), so keep them under the same
     // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
+        std.mem.startsWith(u8, key, "vision_model.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
+        std.mem.startsWith(u8, key, "merger.") or
+        std.mem.startsWith(u8, key, "vit_merger.") or
         std.mem.startsWith(u8, key, "vision_embedder.") or
         std.mem.startsWith(u8, key, "embed_audio.") or
         std.mem.startsWith(u8, key, "multi_modal_projector.") or
@@ -5926,6 +6180,14 @@ test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
 }
 
+test "shouldKeepWeightKey gates MiniCPM-V's tower and both mergers on load_vision" {
+    for ([_][]const u8{ "vision_tower.encoder.layers.0.mlp.fc1.weight", "vit_merger.linear_1.weight", "merger.mlp.0.linear_1.weight" }) |key| {
+        try testing.expect(!shouldKeepWeightKey(key, false));
+        try testing.expect(shouldKeepWeightKey(key, true));
+    }
+    try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.mlp.gate.weight", false));
+}
+
 test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nestings" {
     // Ours nests the tower under `model.`; mlx-community re-nests it bare.
     // Both spellings ride the same gate --no-vision flips.
@@ -5943,6 +6205,9 @@ test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nesti
     // --no-vision cannot drop it and we hold ~0.9 GB we never read.
     try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", false));
     try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", true));
+    // oMLX 0.7.1's GLM-5.3 oQ packs spell the tower `vision_model.`.
+    try testing.expect(!shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", true));
     // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
@@ -6236,7 +6501,10 @@ const glm5_next_pack_json =
     \\    "linear_attn_config": {"num_heads": 64, "head_dim": 128, "gate_lower_bound": -5.0,
     \\                           "short_conv_kernel_size": 4, "full_attn_layers": [3, 7]}
     \\  },
-    \\  "vision_config": {"model_type": "glm5_next_vision", "depth": 24}
+    \\  "image_token_id": 154854, "image_start_token_id": 154830, "image_end_token_id": 154831,
+    \\  "vision_config": {"model_type": "glm5_next_vision", "depth": 24, "hidden_size": 1024, "num_heads": 16,
+    \\    "intermediate_size": 4096, "out_hidden_size": 4096, "patch_size": 14, "temporal_patch_size": 2,
+    \\    "spatial_merge_size": 2, "projection_intermediate_size": 10240, "rms_norm_eps": 1e-05, "swiglu_limit": 10.0}
     \\}
 ;
 
@@ -6274,7 +6542,21 @@ test "ModelConfig: glm5_next binds KDA, sparse latent attention, mHC and the cla
     try testing.expect(config.moe_sigmoid_router and config.moe_route_norm);
     // Per sparse-attention layer per token: the 512 latent plus the indexer's key and gate.
     try testing.expectEqual(@as(u64, 2 * (512 + 128 + 128) * 2), config.kvBytesPerToken());
-    try testing.expect(!config.has_vision);
+    // The pack ships its tower: a Qwen2-VL-shaped ViT whose rows splice at `<|image|>`, no M-RoPE.
+    try testing.expect(config.has_vision and config.glm_vision and !config.qwen_vision);
+    try testing.expectEqual(@as(u32, 154854), config.image_token_id);
+    try testing.expectEqual(@as(u32, 0), config.boi_token_id); // the template renders the image markers
+    try testing.expectEqual(@as(u32, 24), config.qv_depth);
+    try testing.expectEqual(@as(u32, 1024), config.qv_hidden);
+    try testing.expectEqual(@as(u32, 64), config.qv_head_dim);
+    try testing.expectEqual(@as(u32, 4096), config.qv_intermediate);
+    try testing.expectEqual(@as(u32, 4096), config.qv_out_hidden);
+    try testing.expectEqual(@as(u32, 14), config.qv_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_temporal_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_merge);
+    try testing.expectEqual(@as(u32, 10240), config.glmv_proj_intermediate);
+    try testing.expectEqual(@as(f32, 1e-5), config.glmv_eps);
+    try testing.expectEqual(@as(f32, 10.0), config.glmv_swiglu_limit);
     // The template opens `<think>` on every assistant turn.
     try testing.expect(config.defaultEnableThinking(false) and config.defaultEnableThinking(true));
     // The reference keeps the KDA state in f32.
@@ -6300,6 +6582,15 @@ test "ModelConfig: mimo_v2 source release is refused with the converter's name" 
     );
     defer testing.allocator.free(src);
     try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, src));
+}
+
+test "admitExl3Backend: a Sushi EXL3 pack is refused by name where Metal kernels are missing" {
+    const eq = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14},";
+    const sushi = try parseConfigFromJson(testing.allocator, eq ++ glm5_next_pack_json[1..]);
+    const plain = try parseConfigFromJson(testing.allocator, glm5_next_pack_json);
+    try testing.expectError(error.Exl3NeedsMetal, admitExl3Backend(&sushi, false));
+    try admitExl3Backend(&sushi, true);
+    try admitExl3Backend(&plain, false);
 }
 
 test "ModelConfig: a Sushi pack's expert_quant selects EXL3 experts on mimo_v2 and glm5_next" {
@@ -7603,6 +7894,37 @@ test "parseConfig prefers processor_config and fills missing Qwen bounds from pr
     try testing.expectEqual(@as(u32, 16777216), config.qv_max_pixels);
 }
 
+test "parseConfig reads GLM-5.3-Flash's image token budget from processor_config, else the processor's defaults" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = glm5_next_pack_json });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+
+    var defaults = try parseConfig(io, testing.allocator, path_buf[0..path_len]);
+    defer defaults.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 16), defaults.glmv_min_image_tokens);
+    try testing.expectEqual(@as(u32, 8000), defaults.glmv_max_image_tokens);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "processor_config.json",
+        .data = "{\"image_processor\":{\"min_image_tokens\":32,\"max_image_tokens\":4000},\"video_processor\":{\"max_image_tokens\":240000}}",
+    });
+    var read = try parseConfig(io, testing.allocator, path_buf[0..path_len]);
+    defer read.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 32), read.glmv_min_image_tokens);
+    try testing.expectEqual(@as(u32, 4000), read.glmv_max_image_tokens);
+}
+
+test "glm5_next without a vision_config serves text only" {
+    const text_only = try std.mem.replaceOwned(u8, testing.allocator, glm5_next_pack_json, "\"vision_config\"", "\"vision_config_dropped\"");
+    defer testing.allocator.free(text_only);
+    var config = try parseConfigFromJson(testing.allocator, text_only);
+    defer config.deinit(testing.allocator);
+    try testing.expect(!config.has_vision and !config.glm_vision);
+}
+
 test "ModelConfig prism_hadamard_qwen35 is qwen3_5 with the module Hadamard block" {
     const json =
         \\{
@@ -7811,6 +8133,99 @@ test "ModelConfig parses gemma4_unified vision + audio multimodal fields" {
     try testing.expectEqual(@as(u32, 258882), config.eoi_token_id);
     try testing.expectEqual(@as(u32, 256000), config.boa_token_id);
     try testing.expectEqual(@as(u32, 258883), config.eoa_token_id);
+}
+
+test "ModelConfig parses Qwen3-ASR: a qwen3 trunk and an audio tower under thinker_config" {
+    // mlx-community/Qwen3-ASR-0.6B-8bit, abridged: the whole model nests under
+    // `thinker_config`, the pack's quantization stays at the root.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_asr",
+        \\  "quantization": {"group_size": 64, "bits": 8, "mode": "affine"},
+        \\  "thinker_config": {
+        \\    "model_type": "qwen3_asr",
+        \\    "audio_token_id": 151676,
+        \\    "audio_start_token_id": 151669,
+        \\    "audio_end_token_id": 151670,
+        \\    "audio_config": {"d_model": 896, "encoder_layers": 18, "encoder_attention_heads": 14,
+        \\      "encoder_ffn_dim": 3584, "num_mel_bins": 128, "downsample_hidden_size": 480, "n_window": 50,
+        \\      "n_window_infer": 800, "output_dim": 1024, "max_source_positions": 1500},
+        \\    "text_config": {"model_type": "qwen3", "hidden_size": 1024, "intermediate_size": 3072,
+        \\      "num_hidden_layers": 28, "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+        \\      "rms_norm_eps": 1e-06, "rope_theta": 1000000, "tie_word_embeddings": true, "vocab_size": 151936,
+        \\      "rope_scaling": {"interleaved": true, "mrope_interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default"}}
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expect(config.has_qk_norm);
+    try testing.expect(config.tie_word_embeddings);
+    try testing.expectEqual(@as(u32, 1024), config.hidden_size);
+    try testing.expectEqual(@as(u32, 28), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expectEqual(@as(f32, 1.0), config.rope_scaling_factor);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+    try testing.expectEqual(@as(u32, 151676), config.audio_token_id);
+    // The template renders the start/end markers itself, like Qwen's vision wrap.
+    try testing.expectEqual(@as(u32, 0), config.boa_token_id);
+    try testing.expect(config.has_vision); // the tower loads under the media gate
+    const qa = config.qwen_audio.?;
+    try testing.expectEqual(@as(u32, 896), qa.d_model);
+    try testing.expectEqual(@as(u32, 18), qa.layers);
+    try testing.expectEqual(@as(u32, 14), qa.heads);
+    try testing.expectEqual(@as(u32, 3584), qa.ffn);
+    try testing.expectEqual(@as(u32, 128), qa.mel_bins);
+    try testing.expectEqual(@as(u32, 480), qa.downsample);
+    try testing.expectEqual(@as(u32, 50), qa.n_window);
+    try testing.expectEqual(@as(u32, 800), qa.n_window_infer);
+    try testing.expectEqual(@as(u32, 1024), qa.output_dim);
+    try testing.expect(config.forced_aligner == null);
+}
+
+test "ModelConfig parses Qwen3-ForcedAligner: the ASR shape plus its timestamp head" {
+    // mlx-community/Qwen3-ForcedAligner-0.6B-8bit, abridged: a `qwen3_forced_aligner`
+    // thinker in a `qwen3_asr` pack, the timestamp fields at the root.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_asr",
+        \\  "quantization": {"group_size": 64, "bits": 8, "mode": "affine"},
+        \\  "support_languages": ["Chinese", "Cantonese", "English", "German", "Spanish", "French", "Italian", "Portuguese", "Russian", "Korean", "Japanese"],
+        \\  "timestamp_segment_time": 80,
+        \\  "timestamp_token_id": 151705,
+        \\  "thinker_config": {
+        \\    "model_type": "qwen3_forced_aligner",
+        \\    "audio_token_id": 151676,
+        \\    "classify_num": 5000,
+        \\    "audio_config": {"d_model": 1024, "encoder_layers": 24, "encoder_attention_heads": 16,
+        \\      "encoder_ffn_dim": 4096, "num_mel_bins": 128, "downsample_hidden_size": 480, "n_window": 50,
+        \\      "n_window_infer": 800, "output_dim": 1024},
+        \\    "text_config": {"model_type": "qwen3", "hidden_size": 1024, "intermediate_size": 3072,
+        \\      "num_hidden_layers": 28, "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+        \\      "max_position_embeddings": 8192, "rms_norm_eps": 1e-06, "rope_theta": 1000000,
+        \\      "tie_word_embeddings": false, "vocab_size": 152064}
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3", config.model_type);
+    try testing.expect(!config.tie_word_embeddings and config.has_vision);
+    try testing.expectEqual(@as(u32, 8192), config.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 24), config.qwen_audio.?.layers);
+    const fa = config.forced_aligner.?;
+    try testing.expectEqual(@as(u32, 151705), fa.timestamp_token_id);
+    try testing.expectEqual(@as(f32, 80), fa.step_ms);
+    for ([_][]const u8{ "English", "Chinese", "Korean", "Japanese", "Cantonese" }) |l| try testing.expect(fa.languages & transcription.languageBit(l) != 0);
+    try testing.expect(fa.languages & transcription.languageBit("Arabic") == 0);
+}
+
+test "a Qwen3-ASR load keeps its audio tower; every other audio tower stays dropped" {
+    const asr: LoadOpts = .{ .vision = true, .audio_tower = true };
+    try testing.expect(keepsTensor("audio_tower.layers.0.fc1.weight", asr));
+    try testing.expect(keepsTensor("model.layers.0.mlp.up_proj.weight", asr));
+    try testing.expect(!keepsTensor("audio_tower.layers.0.fc1.weight", .{ .vision = true }));
+    try testing.expect(!keepsTensor("audio_tower.layers.0.fc1.weight", .{ .vision = false, .audio_tower = true }));
 }
 
 test "parseConfigFromJson mistral honors explicit head_dim (≠ hidden/heads), flat prefix, quant" {
@@ -8070,6 +8485,22 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
+}
+
+test "parseConfigFromJson minicpmv4_7 (MiniCPM-V 4.7) serves its Qwen3.5 trunk" {
+    const json =
+        \\{
+        \\  "model_type": "minicpmv4_7",
+        \\  "text_config": {"model_type": "qwen3_5_moe_text", "hidden_size": 2048, "num_experts": 256},
+        \\  "vision_config": {"model_type": "minicpmv4_7_vision", "hidden_size": 1152, "patch_size": 14},
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expect(config.isMoe());
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
 }
 
 test "a qwen3_5_moe trunk batches decode: its only per-slot state is the GDN pair" {
@@ -9226,6 +9657,53 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
     }
 }
 
+/// QWEN4_SHIPPED's GatedDeltaNet geometry: 36 linear layers of 48 value heads over Dk = Dv = 128.
+const QWEN4_GDN_FIELDS = ",\"linear_num_key_heads\":16,\"linear_num_value_heads\":48,\"linear_key_head_dim\":128," ++
+    "\"linear_value_head_dim\":128,\"linear_conv_kernel_dim\":4";
+
+test "qwen4_exp serves its GatedDeltaNet state in f32, declared or not; unmeasured families keep bf16" {
+    // The shipped packs declare it; the reference keeps f32 whether or not the key is there.
+    for ([_][]const u8{
+        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"mamba_ssm_dtype\":\"float32\""),
+        qwen4CaseJson(QWEN4_GOOD_FIELDS),
+    }) |json| try testing.expectEqual(mlx.mlx_dtype.float32, (try parseConfigFromJson(testing.allocator, json)).ssmStateDtype());
+    for ([_][]const u8{
+        \\{"model_type": "qwen3_5", "text_config": {"hidden_size": 1024, "mamba_ssm_dtype": "float32"}}
+        ,
+        \\{"model_type": "qwen3_5_moe", "text_config": {"hidden_size": 1024, "mamba_ssm_dtype": "float32"}}
+        ,
+        \\{"model_type": "qwen3_next", "hidden_size": 1024, "mamba_ssm_dtype": "float32"}
+        ,
+    }) |json| try testing.expectEqual(mlx.mlx_dtype.bfloat16, (try parseConfigFromJson(testing.allocator, json)).ssmStateDtype());
+}
+
+test "MLX_SERVE_GDN_STATE_F32=0 restores the bf16 GatedDeltaNet state on qwen4_exp only" {
+    gdn_state_f32_override = false;
+    defer gdn_state_f32_override = null;
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, (try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS))).ssmStateDtype());
+    const hadamard = try parseConfigFromJson(testing.allocator,
+        \\{"model_type": "prism_hadamard_qwen35", "text_config": {"hidden_size": 5120},
+        \\ "modules": [{"path": "lm_head", "block": 1024}]}
+    );
+    try testing.expectEqual(mlx.mlx_dtype.float32, hadamard.ssmStateDtype());
+    var glm = try parseConfigFromJson(testing.allocator, glm5_next_pack_json);
+    defer glm.deinit(testing.allocator);
+    try testing.expectEqual(mlx.mlx_dtype.float32, glm.ssmStateDtype());
+}
+
+test "a qwen4_exp checkpoint bills its f32 GatedDeltaNet state and gets its own cache layout" {
+    const c = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ QWEN4_GDN_FIELDS));
+    // 36 layers x (48 x 128 x 128 f32 state + 3 x 10240 bf16 conv rows).
+    try testing.expectEqual(@as(u64, 115_458_048), c.ssmCheckpointBytes());
+    try testing.expectEqualStrings("gdn-f32-state-v1", c.cacheLayoutNamespace() orelse "");
+    // The lever's bf16 arm bills and caches exactly as before.
+    gdn_state_f32_override = false;
+    defer gdn_state_f32_override = null;
+    const old = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ QWEN4_GDN_FIELDS));
+    try testing.expectEqual(@as(u64, 58_834_944), old.ssmCheckpointBytes());
+    try testing.expect(old.cacheLayoutNamespace() == null);
+}
+
 /// One qwen4_exp config document with `extra` fields spliced in.
 fn qwen4CaseJson(comptime extra: []const u8) []const u8 {
     return "{\"model_type\":\"qwen4_exp\",\"hidden_size\":2560,\"num_hidden_layers\":48," ++
@@ -9593,4 +10071,79 @@ test "parseConfigFromJson accepts real checkpoint configs" {
         }
     }
     try testing.expect(!failed);
+}
+
+test "minicpmv4_7: the checkpoint's real config binds the Qwen3.5-MoE trunk" {
+    var config = try parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/minicpmv4_7.json"));
+    defer config.deinit(testing.allocator);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 40), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 2048), config.hidden_size);
+    try testing.expectEqual(@as(u32, 248144), config.vocab_size);
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 512), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 4), config.full_attention_interval);
+    try testing.expectEqual(@as(u32, 256), config.head_dim);
+    try testing.expectEqual(@as(f32, 1e7), config.rope_theta);
+    try testing.expectEqual(@as(f32, 0.25), config.partial_rotary_factor);
+    try testing.expect(config.attn_output_gate and config.has_qk_norm and !config.tie_word_embeddings);
+    try testing.expect(config.mrope_interleaved);
+    try testing.expectEqualSlices(u32, &.{ 11, 11, 10 }, &config.mrope_section);
+    try testing.expect(config.isLinearLayer(2) and !config.isLinearLayer(3) and !config.isLinearLayer(39));
+    // The SigLIP2 tower is its own arch, not Qwen3-VL's.
+    try testing.expect(config.has_vision and config.minicpm_vision and !config.qwen_vision);
+    try testing.expectEqual(@as(u32, 27), config.vision_num_layers);
+    try testing.expectEqual(@as(u32, 1152), config.vision_hidden_size);
+    try testing.expectEqual(@as(u32, 16), config.vision_num_heads);
+    try testing.expectEqual(@as(u32, 4304), config.vision_intermediate_size);
+    try testing.expectEqual(@as(u32, 14), config.vision_patch_size);
+    try testing.expectEqual(@as(u32, 6), config.mcv_insert_layer);
+    try testing.expect(!config.mcv_downsample_4x);
+    try testing.expectEqual(@as(u32, 248056), config.image_token_id);
+    try testing.expectEqual(@as(u32, 0), config.video_token_id);
+    try testing.expectEqual(@as(u32, 248078), config.mcv_image_start_id);
+    try testing.expectEqual(@as(u32, 248079), config.mcv_image_end_id);
+    try testing.expectEqual(@as(u32, 248088), config.mcv_slice_start_id);
+    try testing.expectEqual(@as(u32, 248089), config.mcv_slice_end_id);
+    try testing.expectEqual(@as(u32, 198), config.mcv_newline_id);
+}
+
+test "minicpmv4_7 downsample_mode 4x skips the window merger, an unknown mode is refused" {
+    const four = try std.mem.replaceOwned(u8, testing.allocator, @embedFile("fixtures/model-configs/minicpmv4_7.json"), "\"16x\"", "\"4x\"");
+    defer testing.allocator.free(four);
+    var config = try parseConfigFromJson(testing.allocator, four);
+    defer config.deinit(testing.allocator);
+    try testing.expect(config.mcv_downsample_4x);
+
+    const odd = try std.mem.replaceOwned(u8, testing.allocator, @embedFile("fixtures/model-configs/minicpmv4_7.json"), "\"16x\"", "\"8x\"");
+    defer testing.allocator.free(odd);
+    try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, odd));
+}
+
+test "minicpmv4_7 image slice budget comes from preprocessor_config" {
+    try testing.expectEqual(@as(?u32, 9), parseMaxSliceNumsFromJson("{\"max_slice_nums\": 9, \"mrope_mode\": \"canvas\"}"));
+    try testing.expectEqual(@as(?u32, null), parseMaxSliceNumsFromJson("{\"max_slice_nums\": 0}"));
+    try testing.expectEqual(@as(?u32, null), parseMaxSliceNumsFromJson("{}"));
+}
+
+test "minicpmv4_7 resolves its tokenizer-only image tokens by string" {
+    var tok: tokenizer_mod.Tokenizer = undefined;
+    tok.vocab = std.StringHashMap(u32).init(testing.allocator);
+    defer tok.vocab.deinit();
+    tok.special_tokens = std.StringHashMap(u32).init(testing.allocator);
+    defer tok.special_tokens.deinit();
+    const digits = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+    for (digits, 0..) |d, i| try tok.vocab.put(d, @intCast(15 + i));
+    try tok.special_tokens.put("<image_id>", 248090);
+    try tok.special_tokens.put("</image_id>", 248091);
+
+    var config = try parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/minicpmv4_7.json"));
+    defer config.deinit(testing.allocator);
+    config.populateMiniCpmImageTokens(&tok);
+    try testing.expectEqual(@as(u32, 248090), config.mcv_image_id_start);
+    try testing.expectEqual(@as(u32, 248091), config.mcv_image_id_end);
+    try testing.expectEqual(@as(u32, 15), config.mcv_digit_ids[0]);
+    try testing.expectEqual(@as(u32, 24), config.mcv_digit_ids[9]);
 }

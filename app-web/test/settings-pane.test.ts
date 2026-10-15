@@ -22,15 +22,17 @@ function choose(select: HTMLSelectElement, value: string) {
 const button = (label: string) => ui!.qa<HTMLButtonElement>("button").find((b) => text(b) === label)!;
 
 describe("Settings: interface", () => {
-  it("appearance, accent, text size, column and compact mode apply at once and are remembered", async () => {
+  it("appearance, accent, text size, column, compact mode and the audio player apply at once and are remembered", async () => {
     const ui = await settings();
     await ui.click(button("Dark"));
     choose(ui.q<HTMLSelectElement>("#accent")!, "purple");
     choose(ui.q<HTMLSelectElement>("#textSize")!, "large");
     await ui.click(button("Narrow"));
     await ui.click("#compact");
+    expect(ui.q<HTMLSelectElement>("#audioPlayer")!.value).toBe("modern");
+    choose(ui.q<HTMLSelectElement>("#audioPlayer")!, "mlxAmp");
     expect([html().dataset.theme, html().dataset.accent, html().dataset.textSize, html().dataset.column, html().dataset.compact]).toEqual(["dark", "purple", "large", "narrow", "true"]);
-    expect(stored("studio.interface")).toEqual({ theme: "dark", accent: "purple", textSize: "large", column: "narrow", compact: true });
+    expect(stored("studio.interface")).toEqual({ theme: "dark", accent: "purple", textSize: "large", column: "narrow", compact: true, audioPlayer: "mlxAmp" });
     expect(ui.qa(".segmented")[0]!.querySelector("[aria-pressed=true]")?.textContent).toBe("Dark");
   });
 
@@ -59,11 +61,11 @@ describe("Settings: search and categories", () => {
 
   it("shows every section, or only the chosen category", async () => {
     const ui = await settings();
-    expect(visible()).toEqual(["interface", "servers", "about"]);
-    await ui.click(button("Servers"));
-    expect(visible()).toEqual(["servers"]);
+    expect(visible()).toEqual(["interface", "providers", "about"]);
+    await ui.click(button("Providers"));
+    expect(visible()).toEqual(["providers"]);
     await ui.click(button("All Settings"));
-    expect(visible()).toEqual(["interface", "servers", "about"]);
+    expect(visible()).toEqual(["interface", "providers", "about"]);
   });
 
   it("filters sections by what they say, and admits when nothing matches", async () => {
@@ -134,7 +136,7 @@ describe("Settings: servers", () => {
     await form("Mac", "http://mac.local:1")();
     await ui.click("#edit-server");
     expect(ui.q<HTMLInputElement>("#server-name")!.value).toBe("Mac");
-    expect(text(ui.q("#server-form-title"))).toBe("Edit Server");
+    expect(text(ui.q("#server-form-title"))).toBe("Edit Provider");
     await ui.type("#server-name", "Studio");
     submit();
     expect(rows().filter((r) => r.includes("Studio")).length).toBe(1);

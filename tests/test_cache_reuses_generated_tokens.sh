@@ -71,7 +71,8 @@ if ! curl -sf "$BASE/health" > /dev/null 2>&1; then
 fi
 
 # All driving + parsing in python so we get clean JSON + log handling.
-exec python3 - "$LOG" "$BASE" <<'PY'
+# Not exec: bash has to outlive python for its EXIT trap to stop the server.
+python3 - "$LOG" "$BASE" <<'PY'
 import json, re, sys, time, urllib.request
 
 LOG = sys.argv[1]
@@ -194,3 +195,4 @@ print(f"  Passed: {GREEN}{passes}{NC}  Failed: {RED}{fails}{NC}")
 print(f"{CYAN}═══════════════════════════════════════════{NC}")
 sys.exit(0 if fails == 0 else 1)
 PY
+exit $?

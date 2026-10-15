@@ -3,7 +3,10 @@ import AppKit
 
 @MainActor
 class DownloadManager: ObservableObject {
-    @Published var downloads: [String: DownloadState] = [:]
+    @Published var downloads: [String: DownloadState] = [:] {
+        // Any download event can change what is on disk.
+        didSet { readyCache.removeAll() }
+    }
     /// New files per checked pack, keyed by repo (`PackUpdateCheck`).
     @Published var packUpdates: [String: PackUpdate] = [:]
     /// Latest HF listing per checked repo (path -> size), read by the socket's gem catalog.
@@ -392,6 +395,7 @@ class DownloadManager: ObservableObject {
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
         if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
+        if qwen3AsrThinker(dir) == "qwen3_forced_aligner" { return "qwen3_forced_aligner" }
         return nil
     }
 
@@ -930,6 +934,7 @@ class DownloadManager: ObservableObject {
             await self?.download(repoId: repoId)
             self?.finalizeIfCancelled(repoId: repoId)
             await self?.autoFillSocket(for: repoId)
+            await self?.fetchCompanions(for: repoId)
             self?.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
@@ -1059,6 +1064,33 @@ class DownloadManager: ObservableObject {
         DrafterSocket.gem(gem).write(into: &o, gemPath: path)
         file.set(o, for: modelDir)
         try? file.save()
+    }
+
+    // MARK: - Qwen3-ASR's companions
+
+    /// The model the server times transcripts with (verbose_json, srt, vtt).
+    nonisolated static let alignerRepo = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+    /// The model it labels their speakers with (diarized_json).
+    nonisolated static let diarizerRepo = "mlx-community/Nemotron-3-Diarization-8bit"
+
+    /// The thinker's model_type in a Qwen3-ASR pack: `qwen3_asr`, or `qwen3_forced_aligner` for its
+    /// aligner, whose root says `qwen3_asr` too. Nil for any other model.
+    nonisolated static func qwen3AsrThinker(_ dir: String) -> String? {
+        guard let data = FileManager.default.contents(atPath: (dir as NSString).appendingPathComponent("config.json")),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              cfg["model_type"] as? String == "qwen3_asr" else { return nil }
+        return (cfg["thinker_config"] as? [String: Any])?["model_type"] as? String
+    }
+
+    /// A fresh Qwen3-ASR download brings the aligner and the diarizer beside
+    /// it, into the same root the server discovers them in. Failures stay
+    /// silent: the user asked for the ASR, which serves without them.
+    private func fetchCompanions(for repoId: String) async {
+        guard !Task.isCancelled, downloads[repoId]?.status == .completed,
+              let dir = existingModelDir(for: repoId), Self.qwen3AsrThinker(dir) == "qwen3_asr" else { return }
+        for repo in [Self.alignerRepo, Self.diarizerRepo] where existingModelDir(for: repo) == nil {
+            await download(repoId: repo, alertOnFailure: false)
+        }
     }
 
     // MARK: - Turbo LoRA (on demand)
@@ -1259,8 +1291,18 @@ class DownloadManager: ObservableObject {
         bundle.components.allSatisfy { componentReady($0) }
     }
 
+    /// Panes ask this from their `body`, which re-runs whenever anything they observe publishes;
+    /// every answer is a walk of the model folders. Remembered for a moment, and dropped by any
+    /// download event (`downloads` changing) and on delete.
+    private var readyCache: [String: (ready: Bool, at: Date)] = [:]
+    private static let readyCacheSeconds: TimeInterval = 3
+
     func componentReady(_ comp: MediaComponent) -> Bool {
-        Self.componentReady(comp, roots: readRoots)
+        let key = comp.repo + "|" + comp.readyMarkers.joined(separator: ",")
+        if let hit = readyCache[key], Date().timeIntervalSince(hit.at) < Self.readyCacheSeconds { return hit.ready }
+        let ready = Self.componentReady(comp, roots: readRoots)
+        readyCache[key] = (ready, Date())
+        return ready
     }
 
     /// Multi-root form: ready in ANY owned root — a pack downloaded before the
@@ -2300,6 +2342,7 @@ class DownloadManager: ObservableObject {
     }
 
     func deleteModel(repoId: String) {
+        readyCache.removeAll()
         removeFromDisk(repoId: repoId)
     }
 
@@ -2314,6 +2357,7 @@ class DownloadManager: ObservableObject {
     /// because the DEFAULT must stay refusal: every other caller keeps the
     /// old behaviour by not passing it.
     func deleteModel(_ model: LocalModel, unlocked: Bool = false) {
+        readyCache.removeAll()
         // Only ~/.mlx-serve/models is ours to delete. LM Studio, the Hugging Face
         // hub cache, and custom-root models are owned by another tool or the user
         // (deleting an HF snapshot orphans shared blobs and dangles refs/main; the

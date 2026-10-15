@@ -136,7 +136,7 @@ bin_stamp() { stat -f "%Sm" -t "%Y-%m-%dT%H:%M" "$1" 2>/dev/null; }
 # The kill list and the wait list must name the SAME port, or every stop burns
 # the full timeout (11 min/run when this was last broken).
 stop_engine() {
-    pkill -f "mlx-serve --serve" 2>/dev/null
+    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
     for _ in $(seq 1 40); do
         lsof -ti tcp:"$PORT" >/dev/null 2>&1 || return 0
         sleep 1

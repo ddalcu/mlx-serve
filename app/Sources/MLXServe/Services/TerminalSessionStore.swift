@@ -23,12 +23,11 @@ final class TerminalSessionStore: ObservableObject {
         }
     }
 
-    private static let defaultsKey = "terminalSessions"
+    /// nil when `mlx-serve.db` could not be opened: rows then last this run only.
+    private let store: SidebarStore?
 
     @Published private(set) var sessions: TerminalSessionList {
-        didSet {
-            UserDefaults.standard.set(try? JSONEncoder().encode(sessions), forKey: Self.defaultsKey)
-        }
+        didSet { store?.saveTerminals(sessions.sessions) }
     }
     private var runtimes: [UUID: Runtime] = [:]
     /// An exited session's terminal, kept so its output stays readable until the row closes.
@@ -38,11 +37,11 @@ final class TerminalSessionStore: ObservableObject {
     private let sandbox = AgentSandbox.shared
     private var observers: [AnyCancellable] = []
 
-    init(server: ServerManager, options: @escaping () -> ServerOptions) {
+    init(server: ServerManager, options: @escaping () -> ServerOptions, store: SidebarStore?) {
         self.server = server
         self.options = options
-        sessions = UserDefaults.standard.data(forKey: Self.defaultsKey)
-            .flatMap { try? JSONDecoder().decode(TerminalSessionList.self, from: $0) } ?? TerminalSessionList()
+        self.store = store
+        sessions = TerminalSessionList(restoring: store?.loadTerminals() ?? [])
         // Settings workspace pick under live sessions: the guest was already
         // torn down — restart every living session in the new guest.
         observers.append(NotificationCenter.default
@@ -58,6 +57,8 @@ final class TerminalSessionStore: ObservableObject {
     }
 
     func rename(_ id: UUID, to name: String) { sessions.rename(id, to: name) }
+
+    func setPlacements(_ placements: [UUID: SidebarChatRows.Placement]) { sessions.setPlacements(placements) }
 
     /// "Move Tab to New Window" / the window closing again.
     func setInOwnWindow(_ id: UUID, _ flag: Bool) {

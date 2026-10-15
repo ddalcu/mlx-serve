@@ -69,6 +69,82 @@ final class SteeringNotesTests: XCTestCase {
         XCTAssertNil(notes.note(for: s))
     }
 
+    func testPausedNoteWaitsForCompositionToCommitOrCancelAndRestoresOnce() {
+        for draft in ["日本", ""] {
+            var notes = SteeringNotes()
+            let session = UUID()
+            notes.append("英語で答えて", for: session)
+            notes.pause(for: session)
+
+            XCTAssertNil(notes.take(for: session), "Pause removes the agent's sending ownership")
+            XCTAssertNil(notes.restore(for: session, into: "", hasMarkedText: true))
+            XCTAssertNil(notes.restore(for: session, into: "にほん", hasMarkedText: true))
+            XCTAssertEqual(notes.restoringNote(for: session), "英語で答えて")
+            XCTAssertEqual(notes.composerNote(for: session), "英語で答えて")
+
+            let expected = draft.isEmpty ? "英語で答えて" : "英語で答えて\n\n日本"
+            XCTAssertEqual(notes.restore(for: session, into: draft, hasMarkedText: false), expected)
+            XCTAssertNil(notes.restoringNote(for: session))
+            XCTAssertNil(notes.composerNote(for: session))
+            XCTAssertNil(notes.restore(for: session, into: expected, hasMarkedText: false))
+        }
+    }
+
+    func testRepeatedPausesPreserveOrderAndKeepNewSendingNotesSeparate() {
+        var notes = SteeringNotes()
+        let session = UUID()
+        notes.append("first", for: session)
+        notes.pause(for: session)
+        notes.pause(for: session)
+        notes.append("second", for: session)
+        notes.pause(for: session)
+        notes.append("third", for: session)
+
+        XCTAssertEqual(notes.restoringNote(for: session), "first\n\nsecond")
+        XCTAssertEqual(notes.composerNote(for: session), "first\n\nsecond\n\nthird")
+        XCTAssertEqual(notes.take(for: session), "third")
+        XCTAssertEqual(notes.restoringNote(for: session), "first\n\nsecond")
+        XCTAssertEqual(notes.restore(for: session, into: "draft", hasMarkedText: false),
+                       "first\n\nsecond\n\ndraft")
+    }
+
+    func testSessionSwitchDoesNotConsumeAnotherSessionsRestoringNote() {
+        var notes = SteeringNotes()
+        let a = UUID(), b = UUID()
+        notes.append("A paused", for: a)
+        notes.pause(for: a)
+        notes.append("B sending", for: b)
+
+        XCTAssertNil(notes.restore(for: b, into: "B draft", hasMarkedText: false))
+        XCTAssertEqual(notes.composerNote(for: b), "B sending")
+        XCTAssertEqual(notes.restoringNote(for: a), "A paused")
+        XCTAssertEqual(notes.restore(for: a, into: "A draft", hasMarkedText: false),
+                       "A paused\n\nA draft")
+        XCTAssertEqual(notes.take(for: b), "B sending")
+    }
+
+    func testRetainDropsBothNoteKindsWithoutAnActiveTurn() {
+        var notes = SteeringNotes()
+        let retained = UUID(), deleted = UUID()
+        for session in [retained, deleted] {
+            notes.append("paused", for: session)
+            notes.pause(for: session)
+            notes.append("sending", for: session)
+        }
+
+        notes.retain(only: [retained])
+        XCTAssertNil(notes.note(for: deleted))
+        XCTAssertNil(notes.restoringNote(for: deleted))
+        XCTAssertNil(notes.composerNote(for: deleted))
+        XCTAssertNil(notes.restore(for: deleted, into: "draft", hasMarkedText: false))
+        XCTAssertEqual(notes.note(for: retained), "sending")
+        XCTAssertEqual(notes.restoringNote(for: retained), "paused")
+
+        notes.retain(only: [])
+        XCTAssertNil(notes.take(for: retained))
+        XCTAssertNil(notes.restoringNote(for: retained))
+    }
+
     // MARK: - Composer Return while generating
 
     func testBareReturnWhileGeneratingQueuesANoteWhereTheFieldCanSteer() {

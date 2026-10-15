@@ -6,6 +6,8 @@ const ModelConfig = @import("../model.zig").ModelConfig;
 
 pub const built = false;
 
+pub fn setForeignBytes(_: u64) void {}
+
 pub const Model = struct {
     pub const DraftRound = struct {
         tokens: []u32,
@@ -43,6 +45,9 @@ pub fn position(_: *const Model) u64 {
 }
 pub fn blockSize(_: *const Model) u32 {
     return 0;
+}
+pub fn laneName(_: *const Model) []const u8 {
+    return "serial";
 }
 pub const SamplingParams = struct { temperature: f32 = 1.0, top_p: f32 = 1.0, top_k: u32 = 0, min_p: ?f32 = null, seed: u64 = 0 };
 pub fn arm(_: *Model, _: ?SamplingParams) bool {

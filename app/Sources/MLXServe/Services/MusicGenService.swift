@@ -40,13 +40,18 @@ final class MusicGenService: ObservableObject {
         // Sticky settings outlive a model switch: clamp the duration into THIS
         // model's server-valid range rather than earn a 400.
         let range = request.model.durationRange
-        let duration = Int(min(max(Double(request.durationSeconds), range.lowerBound), range.upperBound))
+        var duration = Int(min(max(Double(request.durationSeconds), range.lowerBound), range.upperBound))
         var body: [String: Any] = [
             "model": modelName,
             "prompt": request.prompt,
-            "duration_seconds": duration,
             "stream": true,
         ]
+        // YuE2's duration is a cap the model ends the song before. Auto sends none (the server's own
+        // ceiling applies); a set length gets grace so the last line can finish rather than be cut.
+        if request.model.supportsAutoLength {
+            duration = min(duration + Self.lengthGrace(duration), Int(range.upperBound))
+        }
+        if !(request.model.supportsAutoLength && request.autoLength) { body["duration_seconds"] = duration }
         // `instrumental` and lyrics are a named 400 on BOTH backends, so the
         // flag WINS here rather than letting the pair reach the server. On
         // Music 3 an omitted lyrics field is the only spelling of "no words"
@@ -203,6 +208,10 @@ final class MusicGenService: ObservableObject {
     nonisolated static func sidecarPath(forWav wavPath: String) -> String {
         (wavPath as NSString).deletingPathExtension + ".txt"
     }
+
+    /// Seconds a YuE2 length cap is stretched by: a few seconds past the asked length is fine, a lyric
+    /// cut mid-word is not.
+    nonisolated static func lengthGrace(_ seconds: Int) -> Int { max(10, seconds / 4) }
 
     /// `<track>.wav` → `<track>.abc`: the score a planning model rendered from.
     nonisolated static func scorePath(forWav wavPath: String) -> String {

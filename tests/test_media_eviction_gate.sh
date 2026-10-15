@@ -41,7 +41,7 @@ JSON
 
 MODEL_ID="fake/MiniMax-H3-Gate"
 rc=0
-# Arms [1], [3] and [4] need the 17.3 GB staged peak to clear the server's
+# Arms [1], [3] and [4] need the 14.7 GB staged peak to clear the server's
 # real-RAM preflight too; below a 48 GB Mac it refuses first (503), correctly.
 RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 FITS=1; [ "$RAM_GB" -ge 48 ] || FITS=0
@@ -105,11 +105,12 @@ else
 fi
 # The number it names must be the BIGGEST STAGE, not the sum and not a stage
 # plus another stage. For this pack: TE 14.72, DiT 17.41 x 0.65 (precomputeAdaln
-# frees the 13B modulation weights) = 11.32, VAEs 5.41 — and the two stages that
-# GENERATE carry a 6 GiB transient allowance the TE stage does not. So
-# max(14.72, 11.32 + 6, 5.41 + 6) = 17.32, against a 37.55 dir sum.
+# frees the 13B modulation weights) = 11.32, VAEs 5.41 — and the stages that
+# GENERATE carry the 1 GiB request base (the canvas itself is billed per request,
+# `h3ActivationBytes`). So max(14.72, 11.32 + 1, 5.41 + 1) = 14.72, against a
+# 37.55 dir sum.
 EST=$(sed -E -n 's/.*needs ~([0-9.]+) GB.*/\1/p' "$LOG2" | head -1)
-if [ -n "$EST" ] && python3 -c "import sys; sys.exit(0 if 16.0 < float('$EST') < 19.0 else 1)"; then
+if [ -n "$EST" ] && python3 -c "import sys; sys.exit(0 if 14.0 < float('$EST') < 16.0 else 1)"; then
   echo "PASS: the gate billed the biggest stage (~$EST GB, not the ~37.6 sum)"
 else
   echo "FAIL: gate estimate '$EST' GB is not the staged peak"; rc=1

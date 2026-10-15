@@ -31,6 +31,7 @@ export const imageModel = { id: "m/flux", capabilities: ["image"], loaded: false
 export const kreaModel = { id: "m/krea", capabilities: ["image"], loaded: false, meta: { architecture: "krea" } };
 export const speechModel = { id: "m/kokoro", capabilities: ["audio"], loaded: false, meta: { architecture: "kokoro" } };
 export const musicModel = { id: "m/ace", capabilities: ["audio", "music"], loaded: false, meta: { architecture: "acestep" } };
+export const yue2Model = { id: "m/yue2", capabilities: ["audio", "music"], loaded: false, meta: { architecture: "yue2" } };
 export const soundModel = { id: "m/sat", capabilities: ["audio"], loaded: false, meta: { architecture: "stable_audio3" } };
 export const videoModel = { id: "m/ltx", capabilities: ["video"], loaded: false, meta: { architecture: "AudioVideo" } };
 export const otherModel = { id: "m/other", capabilities: ["chat"], loaded: false, context_length: 4096, meta: {} };
@@ -69,7 +70,8 @@ export function mockApi(models: object[] = [chatModel, otherModel]) {
       if (failure) return json({ error: { message: failure.error } }, failure.status);
       if (path === "/v1/images/generations") return sse([...progress(2), { type: "complete", data: [{ b64_json: PNG_1X1 }] }]);
       if (body?.stream === false) return new Response(WAV_BYTES, { status: 200, headers: { "content-type": "audio/wav" } });
-      return sse([...progress(2), { type: "complete", data: WAV_BASE64 }]);
+      // YuE2 (`cot`) reports the score it rendered from.
+      return sse([...progress(2), { type: "complete", data: WAV_BASE64, ...(body?.cot ? { abc: "X:1\nK:C\nCDEF|" } : {}) }]);
     }
     if (path === "/v1/chat/completions") {
       const reply = replies.shift() ?? { content: "ok" };

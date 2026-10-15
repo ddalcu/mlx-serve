@@ -59,8 +59,8 @@ COPY = {
 
 
 README = """---
-license: apache-2.0
-base_model: Qwen/Qwen-Image-2.1
+{license}
+base_model: {base}
 base_model_relation: quantized
 library_name: mlx-serve
 tags:
@@ -68,68 +68,169 @@ tags:
   - mlx-serve
   - quantized
   - text-to-image
+  - image-to-image
 pipeline_tag: text-to-image
 ---
 
-# Qwen-Image-2.1 MLX-Serve {bits}-bit
+# {title}
 
-{bits}-bit pack of [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) for
-[mlx-serve](https://github.com/ddalcu/mlx-serve): {size_gb:.1f} GB, for {target} Macs.
-
-> **Not released yet.** These packs load only on the mlx-serve branch
-> [`feat/qwen-image-2.1`](https://github.com/ddalcu/mlx-serve/pull/477). No released
-> mlx-serve or MLX Core build can run them. This notice goes away when the PR ships.
+{bits}-bit pack of [{base}](https://huggingface.co/{base}) for
+[mlx-serve](https://mlxserve.com/): {size_gb:.1f} GB, for {target} Macs.{pitch}
 
 ![sample]({sample})
+
+## Run it
+
+Download **[MLX-Serve.app](https://github.com/ddalcu/mlx-serve/releases/latest)**,
+open the Image tab, and pick **{menu_name}** from the model menu.
+It downloads with a progress bar and generates in the same window. No terminal,
+nothing to configure.
+
+Prefer Homebrew? It is a third-party tap, so tap it first:
+
+```bash
+brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
+brew trust ddalcu/mlx-serve
+brew install --cask mlx-serve
+```
+
+Driving it from code instead? The app runs the server on `http://localhost:11234`:
+
+```sh
+curl localhost:11234/v1/images/generations -H 'Content-Type: application/json' \\
+  -d '{{"model":"{repo}","prompt":"a red fox in fresh snow","size":"1024x1024"}}'
+```
+
+{usage}
+
+## Measured ({machine})
+
+{measured}
+
+## mlx-serve
+
+A native Zig server for Apple Silicon. No Python, no cloud, no Electron. One
+9 MB binary.
+
+- **One server, every modality.** Chat, images, video, music, speech with voice
+  cloning, and 3D, all running natively on MLX.
+- **Points at what you already use.** OpenAI- *and* Anthropic-compatible APIs on
+  `http://localhost:11234`, so Claude Code, the OpenAI SDK, Continue, Cursor and
+  Open WebUI just work.
+- **Any LLM, not just these.** Every MLX model and every GGUF on Hugging Face,
+  with speculative decoding built in.
+- **MLX-Serve.app included.** Signed macOS menu-bar app: chat, agent mode with
+  MCP tools, model downloads, and every generator above, no terminal needed.
+
+[mlxserve.com](https://mlxserve.com/) · [GitHub](https://github.com/ddalcu/mlx-serve)
+
+If it is useful to you, a star on
+[GitHub](https://github.com/ddalcu/mlx-serve) genuinely helps.
 
 ## What is in it
 
 The checkpoint's own diffusers layout and key names, with the DiT block linears and the
-text-encoder layer linears affine-quantized to {bits}-bit (group 64), plus the Qwen3-VL
-vision tower kept with its 2D linears quantized the same way (patch embed and position
-table stay dense), so the pack also carries instruction-edit capability. Kept dense: the VAE (f32), `embed_tokens`, norms, and the DiT's small or
-shared linears. Dropped: `lm_head` (text-to-image only) and the VAE's per-frame
-`time_conv`s. Built by `tests/convert_qwen_image21_weights.py --preset {preset}`.
+text-encoder layer linears affine-quantized to {bits}-bit (group 64). Kept dense: the VAE
+(f32), `embed_tokens`, norms, and the DiT's small or shared linears. Kept: the Qwen3-VL
+vision tower, for instruction editing. Dropped: `lm_head` and the VAE's per-frame `time_conv`s.
+Built by `tests/convert_qwen_image21_weights.py --preset {preset}` in the mlx-serve repo.
 
-## Measured (M1 Pro, 32 GB)
+{license_text}
+"""
 
-| Pack | Size | Steps | Wall clock incl. load | Peak memory |
+NOTICE = """Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.
+
+Modified by mlx-serve (https://github.com/ddalcu/mlx-serve): the transformer/ and text_encoder/
+weights are re-quantized to {bits}-bit affine (group 64) by tests/convert_qwen_image21_weights.py,
+and lm_head and the VAE's time_conv weights are dropped. Every other file is copied unchanged.
+"""
+
+BASE_MEASURED = """| Pack | Size | Steps | Wall clock incl. load | Peak memory |
 |---|---|---|---|---|
 | 8-bit | 1024x1024 | 40 | 985 s (~23 s/step) | 12.95 GB |
 | 4-bit | 1024x1024 | 3 | 87 s | 9.55 GB |
 | 4-bit | 512x512 | 20 | 118 s | - |
 
 On a Mac the full set would crowd, mlx-serve loads the text encoder per request and frees
-it before the denoise, so the resident set is the DiT and VAE.
+it before the denoise, so the resident set is the DiT and VAE."""
 
-## Run it (from the branch)
+TURBO_MEASURED = """| Pack | 1024x1024 text-to-image | Instruction edit, 1 reference | Peak memory |
+|---|---|---|---|
+| bf16 (`Qwen/Qwen-Image-2.1-Turbo`) | 7.2 s | 11.2 s | 31.4 GB |
+| 8-bit | 7.8 s | 12.5 s | 19.3 GB |
+| 4-bit | 8.8 s | 11.9 s | 12.8 GB |
 
-```sh
-git clone -b feat/qwen-image-2.1 https://github.com/ddalcu/mlx-serve && cd mlx-serve
-./scripts/fetch-zig.sh && ./scripts/build-mlx.sh && .zig-toolchain/zig build -Doptimize=ReleaseFast
-./zig-out/bin/mlx-serve pull {repo}
-./zig-out/bin/mlx-serve serve
-curl localhost:11234/v1/images/generations -H 'Content-Type: application/json' \\
-  -d '{{"model":"{repo}","prompt":"a red fox in fresh snow","size":"1024x1024"}}'
-```
+Per request with the model loaded, 8 steps; peak is MLX's own across the request with
+everything resident. Quantizing saves memory, not time, on a Mac this size. On a Mac the
+full set would crowd, mlx-serve loads the text encoder per request and frees it before the
+denoise, so the resident set is the DiT and VAE."""
 
-40 steps when `steps` is omitted. `guidance_scale` above 1 with a `negative_prompt` runs
-real CFG (two forwards per step). `image` + `strength` does image-to-image.
-
-Apache-2.0, same as the base model.
-"""
+VARIANTS = {
+    False: dict(
+        license="license: apache-2.0",
+        base="Qwen/Qwen-Image-2.1",
+        title="Qwen-Image-2.1 MLX-Serve {bits}-bit",
+        menu_name="Qwen-Image 2.1 {bits}-bit",
+        repo="ddalcu/Qwen-Image-2.1-MLX-Serve-{bits}bit",
+        sample="https://raw.githubusercontent.com/ddalcu/mlx-serve/main/website/screenshots/{base_sample}",
+        machine="M1 Pro, 32 GB",
+        measured=BASE_MEASURED,
+        usage="40 steps when `steps` is omitted. `guidance_scale` above 1 with a `negative_prompt` runs\n"
+              "real CFG (two forwards per step). `image` + `strength` does image-to-image. `\"mode\":\"edit\"`\n"
+              "with an `image` (plus up to 9 `ref_images`) edits it from the prompt.",
+        license_text="Apache-2.0, same as the base model.",
+    ),
+    True: dict(
+        license="license: other\nlicense_name: qwen-research\nlicense_link: LICENSE",
+        base="Qwen/Qwen-Image-2.1-Turbo",
+        title="Qwen-Image-2.1-Turbo MLX-Serve {bits}-bit",
+        menu_name="Qwen-Image 2.1 Turbo {bits}-bit",
+        repo="ddalcu/Qwen-Image-2.1-Turbo-MLX-Serve-{bits}bit",
+        sample="https://huggingface.co/ddalcu/Qwen-Image-2.1-Turbo-MLX-Serve-{bits}bit/resolve/main/sample.jpg",
+        machine="M5 Ultra, 256 GB",
+        measured=TURBO_MEASURED,
+        usage="8 steps, always: the pack's own sampling schedule (`sample_sigmas` in `model_index.json`)\n"
+              "decides, and a requested `steps` is ignored, as in diffusers. Needs mlx-serve 26.10.2 or\n"
+              "newer; an older build runs the base model's 40-step schedule on it. Guidance is 1 by\n"
+              "default; `guidance_scale` above 1 with a `negative_prompt` runs real CFG (two forwards per\n"
+              "step). `image` + `strength` does image-to-image, and `\"mode\":\"edit\"` with an `image` (plus\n"
+              "up to 9 `ref_images`) edits it from the prompt.",
+        license_text="Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou\n"
+                     "Tongyi Laboratory Technology Co., Ltd. All Rights Reserved. **Non-commercial use only**:\n"
+                     "see [LICENSE](LICENSE) and [NOTICE](NOTICE). The original model and weights are by the Qwen team.",
+    ),
+}
 
 CARDS = {
-    "32gb": dict(bits=8, target="32 GB", repo="ddalcu/Qwen-Image-2.1-MLX-Serve-8bit",
-                 sample="https://raw.githubusercontent.com/ddalcu/mlx-serve/feat/qwen-image-2.1/website/screenshots/qwen-image-2.1-8bit-1024.jpg"),
-    "16gb": dict(bits=4, target="16 GB", repo="ddalcu/Qwen-Image-2.1-MLX-Serve-4bit",
-                 sample="https://raw.githubusercontent.com/ddalcu/mlx-serve/feat/qwen-image-2.1/website/screenshots/qwen-image-2.1-4bit-512.jpg"),
+    "32gb": dict(bits=8, target="32 GB", base_sample="qwen-image-2.1-8bit-1024.jpg",
+                 pitch={False: "", True: " The same text rendering as bf16 at the same seed."}),
+    "16gb": dict(bits=4, target="16 GB", base_sample="qwen-image-2.1-4bit-512.jpg",
+                 pitch={False: "", True: " Small print can lose a glyph at 4-bit (a `€` came out wrong in\n"
+                                          "our test); the 8-bit pack keeps it."}),
 }
 
 
+def is_turbo(out):
+    """A pack carrying its own sampling grid is the Turbo checkpoint."""
+    with open(os.path.join(out, "model_index.json")) as f:
+        return "sample_sigmas" in json.load(f)
+
+
+def render_card(preset, size_gb, turbo):
+    card, variant = CARDS[preset], VARIANTS[turbo]
+    fields = {k: v.format(bits=card["bits"], base_sample=card["base_sample"]) if isinstance(v, str) else v
+              for k, v in variant.items()}
+    return README.format(preset=preset, size_gb=size_gb, bits=card["bits"], target=card["target"],
+                         pitch=card["pitch"][turbo], **fields)
+
+
 def write_card(out, preset, size_gb):
+    turbo = is_turbo(out)
     with open(os.path.join(out, "README.md"), "w") as f:
-        f.write(README.format(preset=preset, size_gb=size_gb, **CARDS[preset]))
+        f.write(render_card(preset, size_gb, turbo))
+    if turbo:
+        with open(os.path.join(out, "NOTICE"), "w") as f:
+            f.write(NOTICE.format(bits=CARDS[preset]["bits"]))
 
 
 def should_drop(component, name):
@@ -229,8 +330,14 @@ def self_test():
     assert not q("text_encoder", "model.visual.blocks.0.norm1.weight", (1152,), 4)
     assert should_drop("vae", "decoder.up_blocks.0.upsampler.time_conv.weight")
     assert not should_drop("vae", "decoder.up_blocks.0.upsampler.resample.1.weight")
-    for preset in CARDS:
-        assert "Not released yet" in README.format(preset=preset, size_gb=1.0, **CARDS[preset])
+    for turbo in (False, True):
+        for preset in PRESETS:
+            card = render_card(preset, 1.0, turbo)
+            assert "mlxserve.com" in card and "base_model_relation: quantized" in card
+            assert ("license_name: qwen-research" in card) == turbo
+            assert ("license: apache-2.0" in card) != turbo
+            assert ("Qwen-Image-2.1-Turbo" in card) == turbo
+    assert "Qwen RESEARCH LICENSE AGREEMENT" in NOTICE
     print("ok")
 
 

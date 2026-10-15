@@ -100,8 +100,9 @@ check "cancelled, failed, rejected unchanged" \
 
 echo ""
 echo "── 2. stream dropped mid-decode ──"
-curl -sN --max-time 2 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"Write a very long story about a lighthouse keeper."}],"max_tokens":600,"stream":true}' \
+# Cut at 1 s: the 1024 window caps the reply near 1000 tokens, which a fast chip finishes in 2.
+curl -sN --max-time 1 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"Write a very long story about a lighthouse keeper."}],"max_tokens":900,"stream":true}' \
     >/dev/null 2>&1
 wait_for 2 $((C1 + 1))
 read -r S2 C2 F2 R2 <<< "$(settled)"

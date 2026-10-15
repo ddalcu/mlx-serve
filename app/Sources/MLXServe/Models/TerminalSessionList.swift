@@ -8,7 +8,7 @@ import Foundation
 /// them all). The model owns ordering, phases and stable display names. Which
 /// row is SHOWING is `ChatWorkspace.terminal(id)`; the processes live in
 /// `TerminalSessionStore`.
-struct TerminalSessionList: Equatable, Codable {
+struct TerminalSessionList: Equatable, Decodable {
 
     struct Session: Identifiable, Equatable, Codable {
         /// Where the process runs: ssh into the guest VM, or a host CLI
@@ -43,6 +43,9 @@ struct TerminalSessionList: Equatable, Codable {
         var isInOwnWindow = false
         /// Launches continue the agent's last conversation (a restored row).
         var resumes = false
+        /// Its sidebar group (nil = the root) and dragged position (`SidebarChatRows.Placement`).
+        var groupId: UUID? = nil
+        var position: Int? = nil
 
         var isActive: Bool {
             switch phase {
@@ -51,8 +54,10 @@ struct TerminalSessionList: Equatable, Codable {
             }
         }
 
-        private enum CodingKeys: String, CodingKey {
+        /// What is stored (`SidebarStore.terminalColumns`); the rest is this run's.
+        enum CodingKeys: String, CodingKey, CaseIterable {
             case id, label, autoName, customName, agentId, workspace, createdAt, kind, themeId
+            case groupId, position
         }
 
         init(id: UUID, label: String, autoName: String, agentId: String?, workspace: String,
@@ -73,15 +78,29 @@ struct TerminalSessionList: Equatable, Codable {
             createdAt = try c.decode(Date.self, forKey: .createdAt)
             kind = try c.decode(Kind.self, forKey: .kind)
             themeId = try c.decodeIfPresent(String.self, forKey: .themeId)
+            groupId = try c.decodeIfPresent(UUID.self, forKey: .groupId)
+            position = try c.decodeIfPresent(Int.self, forKey: .position)
             phase = .suspended
             resumes = true
         }
     }
 
     private(set) var sessions: [Session] = []
-    /// Per-label session ordinals. Monotonic — a closed "pi" never frees its
-    /// number, so "pi 2" can't silently become "pi" mid-session.
+    /// Per-label session ordinals. While the app runs a closed "pi" never frees
+    /// its number, so "pi 2" can't silently become "pi" mid-session.
     private var ordinals: [String: Int] = [:]
+
+    init() {}
+
+    /// Stored rows after a relaunch. The ordinals are read back from their
+    /// auto names, so a number a closed row held may be used again.
+    init(restoring sessions: [Session]) {
+        self.sessions = sessions
+        for s in sessions {
+            guard let n = s.autoName == s.label ? 1 : Int(s.autoName.dropFirst(s.label.count + 1)) else { continue }
+            ordinals[s.label] = max(ordinals[s.label] ?? 0, n)
+        }
+    }
 
     func session(_ id: UUID) -> Session? { sessions.first { $0.id == id } }
 
@@ -108,6 +127,14 @@ struct TerminalSessionList: Equatable, Codable {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         sessions[i].customName = trimmed.isEmpty ? nil : trimmed
+    }
+
+    mutating func setPlacements(_ placements: [UUID: SidebarChatRows.Placement]) {
+        for i in sessions.indices {
+            guard let p = placements[sessions[i].id] else { continue }
+            sessions[i].groupId = p.group
+            sessions[i].position = p.position
+        }
     }
 
     mutating func setInOwnWindow(_ id: UUID, _ flag: Bool) {

@@ -5,6 +5,9 @@ const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
+const glm_vision = @import("glm_vision.zig");
+const minicpm_vision = @import("minicpm_vision.zig");
+const qwen_audio = @import("qwen_audio.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -198,12 +201,26 @@ pub const VisionEncoder = struct {
     qwen: ?qwen_vision.QwenVision = null,
     muse: ?muse_vision.MuseVision = null,
     lfm2: ?lfm2_vision.Lfm2Vision = null,
+    glm: ?glm_vision.GlmVision = null,
+    minicpm: ?minicpm_vision.MiniCpmVision = null,
+    /// Qwen3-ASR: an audio-only tower; every image/video entry point refuses.
+    qwen_audio: ?qwen_audio.QwenAudio = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
         if (config.qwen_vision) return initQwen(allocator, config, weights);
         if (config.muse_vision) return initMuse(allocator, config, weights);
         if (config.lfm2_vision) return initLfm2(allocator, config, weights);
+        if (config.glm_vision) return initGlm(allocator, config, weights);
+        if (config.minicpm_vision) return initMiniCpm(allocator, config, weights);
+        if (config.qwen_audio) |qa_cfg| {
+            var enc = patchGridShell(allocator, config);
+            enc.qwen_audio = qwen_audio.QwenAudio.init(allocator, qa_cfg, weights) catch |e| {
+                enc.deinit();
+                return e;
+            };
+            return enc;
+        }
         const s = mlx.mlx_default_gpu_stream_new();
 
         var name_buf: [256]u8 = undefined;
@@ -329,6 +346,9 @@ pub const VisionEncoder = struct {
         if (self.qwen) |*q| q.deinit();
         if (self.muse) |*m| m.deinit();
         if (self.lfm2) |*l| l.deinit();
+        if (self.glm) |*g| g.deinit();
+        if (self.minicpm) |*m| m.deinit();
+        if (self.qwen_audio) |*q| q.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -338,6 +358,11 @@ pub const VisionEncoder = struct {
     /// reported by /v1/models so the app only offers the mic on audio models.
     pub fn supportsAudio(self: *const VisionEncoder) bool {
         return if (self.unified) |u| u.ea_w != null else false;
+    }
+
+    /// False for an audio-only tower (Qwen3-ASR).
+    pub fn supportsImages(self: *const VisionEncoder) bool {
+        return self.qwen_audio == null;
     }
 
     // ── Gemma 4 12B unified (encoder-free) ──
@@ -415,85 +440,66 @@ pub const VisionEncoder = struct {
         };
     }
 
-    /// Build a VisionEncoder wrapping the Qwen3-VL ViT. SigLIP fields are
-    /// sentinels; `qwen` drives `forwardQwen`. The ViT owns its own GPU stream.
-    fn initQwen(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+    /// A VisionEncoder whose SigLIP fields are sentinels: a patch-grid tower set on it
+    /// drives `forwardPatches`, and each tower owns its own GPU stream.
+    fn patchGridShell(allocator: std.mem.Allocator, config: ModelConfig) VisionEncoder {
         const s = mlx.mlx_default_gpu_stream_new();
+        return .{
+            .config = config,
+            .s = s,
+            .allocator = allocator,
+            .patch_proj_w = mlx.mlx_array_new(),
+            .position_embedding = mlx.mlx_array_new(),
+            .layers = &.{},
+            .proj_w = mlx.mlx_array_new(),
+            .proj_s = mlx.mlx_array_new(),
+            .proj_b = mlx.mlx_array_new(),
+            .proj_quant_bits = 4,
+            .proj_quant_group_size = config.quant_group_size,
+            .std_scale = null,
+            .std_bias = null,
+            .rms_eps = 1e-6,
+            .half = bf16Scalar(0.5, s),
+            .one = bf16Scalar(1.0, s),
+        };
+    }
+
+    fn initQwen(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         const qv = try qwen_vision.QwenVision.init(allocator, config, weights);
         log.info("Vision encoder: Qwen3-VL ViT (depth={d}, hidden={d}, heads={d}, merge={d}, out_hidden={d})\n", .{
             config.qv_depth, config.qv_hidden, config.qv_heads, config.qv_merge, config.qv_out_hidden,
         });
-        return .{
-            .config = config,
-            .s = s,
-            .allocator = allocator,
-            .patch_proj_w = mlx.mlx_array_new(),
-            .position_embedding = mlx.mlx_array_new(),
-            .layers = &.{},
-            .proj_w = mlx.mlx_array_new(),
-            .proj_s = mlx.mlx_array_new(),
-            .proj_b = mlx.mlx_array_new(),
-            .proj_quant_bits = 4,
-            .proj_quant_group_size = config.quant_group_size,
-            .std_scale = null,
-            .std_bias = null,
-            .rms_eps = 1e-6,
-            .half = bf16Scalar(0.5, s),
-            .one = bf16Scalar(1.0, s),
-            .qwen = qv,
-        };
+        var enc = patchGridShell(allocator, config);
+        enc.qwen = qv;
+        return enc;
     }
 
-    /// Build a VisionEncoder wrapping the Muse-Glimmer ViT. Same sentinel shape
-    /// as `initQwen`; `muse` drives `forwardPatches`.
     fn initMuse(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
-        const s = mlx.mlx_default_gpu_stream_new();
         const mv = try muse_vision.MuseVision.init(allocator, config, weights);
-        return .{
-            .config = config,
-            .s = s,
-            .allocator = allocator,
-            .patch_proj_w = mlx.mlx_array_new(),
-            .position_embedding = mlx.mlx_array_new(),
-            .layers = &.{},
-            .proj_w = mlx.mlx_array_new(),
-            .proj_s = mlx.mlx_array_new(),
-            .proj_b = mlx.mlx_array_new(),
-            .proj_quant_bits = 4,
-            .proj_quant_group_size = config.quant_group_size,
-            .std_scale = null,
-            .std_bias = null,
-            .rms_eps = 1e-6,
-            .half = bf16Scalar(0.5, s),
-            .one = bf16Scalar(1.0, s),
-            .muse = mv,
-        };
+        var enc = patchGridShell(allocator, config);
+        enc.muse = mv;
+        return enc;
     }
 
-    /// Build a VisionEncoder wrapping the LFM2-VL SigLIP2-NaFlex tower. Same
-    /// sentinel shape as `initQwen`; `lfm2` drives `forwardPatches`.
     fn initLfm2(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
-        const s = mlx.mlx_default_gpu_stream_new();
         const lv = try lfm2_vision.Lfm2Vision.init(allocator, config, weights);
-        return .{
-            .config = config,
-            .s = s,
-            .allocator = allocator,
-            .patch_proj_w = mlx.mlx_array_new(),
-            .position_embedding = mlx.mlx_array_new(),
-            .layers = &.{},
-            .proj_w = mlx.mlx_array_new(),
-            .proj_s = mlx.mlx_array_new(),
-            .proj_b = mlx.mlx_array_new(),
-            .proj_quant_bits = 4,
-            .proj_quant_group_size = config.quant_group_size,
-            .std_scale = null,
-            .std_bias = null,
-            .rms_eps = 1e-6,
-            .half = bf16Scalar(0.5, s),
-            .one = bf16Scalar(1.0, s),
-            .lfm2 = lv,
-        };
+        var enc = patchGridShell(allocator, config);
+        enc.lfm2 = lv;
+        return enc;
+    }
+
+    fn initMiniCpm(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const mv = try minicpm_vision.MiniCpmVision.init(allocator, config, weights);
+        var enc = patchGridShell(allocator, config);
+        enc.minicpm = mv;
+        return enc;
+    }
+
+    fn initGlm(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const gv = try glm_vision.GlmVision.init(allocator, config, weights);
+        var enc = patchGridShell(allocator, config);
+        enc.glm = gv;
+        return enc;
     }
 
     /// Encode one image on a patch-grid tower: `patches` is the processor's
@@ -503,6 +509,8 @@ pub const VisionEncoder = struct {
         if (self.muse) |*mv| return mv.forward(patches, grid_h, grid_w);
         if (self.qwen) |*qv| return qv.forward(patches, grid_h, grid_w);
         if (self.lfm2) |*lv| return lv.forward(patches, grid_h, grid_w);
+        if (self.glm) |*gv| return gv.forward(patches, grid_h, grid_w);
+        if (self.minicpm) |*mv| return mv.forward(patches, grid_h, grid_w);
         return error.NoPatchGridEncoder;
     }
 
@@ -737,6 +745,7 @@ pub const VisionEncoder = struct {
         // (Gemma-shaped) buffer reaching here is a client/preprocessing
         // mismatch, not something to dereference. Backstop for the parse-level
         // refusal in `parseImageUrlContent`.
+        if (self.qwen_audio != null) return error.NoImageEncoder;
         if (self.qwen != null or self.muse != null or self.lfm2 != null) return error.PixelsMissingPatchGrid;
         const cfg = &self.config;
         const ps: c_int = @intCast(cfg.vision_patch_size);

@@ -10,10 +10,11 @@ const memory = (initial: Record<string, string> = {}) => {
 
 describe("preferences", () => {
   it("fall back to defaults for anything stored that is not a known choice", () => {
-    expect(readPreferences(memory())).toEqual({ theme: "system", accent: "system", textSize: "medium", column: "wide", compact: false });
-    expect(readPreferences(memory({ "studio.interface": '{"theme":"dark","accent":"nope","textSize":"large","column":7,"compact":"yes"}' }))).toEqual({
-      theme: "dark", accent: "system", textSize: "large", column: "wide", compact: false,
+    expect(readPreferences(memory())).toEqual({ theme: "system", accent: "system", textSize: "medium", column: "wide", compact: false, audioPlayer: "modern" });
+    expect(readPreferences(memory({ "studio.interface": '{"theme":"dark","accent":"nope","textSize":"large","column":7,"compact":"yes","audioPlayer":"cassette"}' }))).toEqual({
+      theme: "dark", accent: "system", textSize: "large", column: "wide", compact: false, audioPlayer: "modern",
     });
+    expect(readPreferences(memory({ "studio.interface": '{"audioPlayer":"mlxAmp"}' })).audioPlayer).toBe("mlxAmp");
     expect(readPreferences(memory({ "studio.interface": "[" })).theme).toBe("system");
   });
 
@@ -22,7 +23,7 @@ describe("preferences", () => {
     const prefs = new InterfacePreferences(storage);
     prefs.set("accent", "green");
     prefs.set("compact", true);
-    expect(JSON.parse(storage.saved.get("studio.interface")!)).toEqual({ theme: "system", accent: "green", textSize: "medium", column: "wide", compact: true });
+    expect(JSON.parse(storage.saved.get("studio.interface")!)).toEqual({ theme: "system", accent: "green", textSize: "medium", column: "wide", compact: true, audioPlayer: "modern" });
     expect(new InterfacePreferences(storage).accent).toBe("green");
   });
 

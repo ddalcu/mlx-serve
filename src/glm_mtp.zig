@@ -43,6 +43,9 @@ pub const Head = struct {
         const base = mtpBase(&base_buf, config.weight_prefix);
         var name_buf: [256]u8 = undefined;
         if (weights.get(std.fmt.bufPrint(&name_buf, "{s}.eh_proj.weight", .{base}) catch unreachable) == null) return null;
+        // The caller serves on without the head, so a failure here must not leave its latch behind.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         var owned: std.ArrayList(mlx.mlx_array) = .empty;
         errdefer {
             for (owned.items) |a| _ = mlx.mlx_array_free(a);
@@ -65,6 +68,8 @@ pub const Head = struct {
         };
         try transformer_mod.maybeTransposeForBf16(&head.eh_proj.w, head.eh_proj.s, &owned, allocator, s);
         head.owned = owned;
+        // Resident at load, so the load gate and admission see the expert banks.
+        try mlx.evalFields(head);
         return head;
     }
 

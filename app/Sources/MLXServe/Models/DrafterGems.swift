@@ -38,14 +38,19 @@ enum DrafterGems {
     static let qwen38DFlash2Repo = "z-lab/Qwen3.8-27B-DFlash2"
     static let glmDFlash2Repo = "incoai/GLM-5.3-Flash-DFlash2"
     static let museAssistantRepo = "meta-models/Muse-Glimmer-30B-assistant"
-    /// LiquidAI's DSpark drafters, by the LFM2.5 base they draft for.
-    static let lfmDSparkRepos = ["lfm2.5-2.6b": "LiquidAI/LFM2.5-2.6B-DSpark", "lfm2.5-8b-a1b": "LiquidAI/LFM2.5-8B-A1B-DSpark"]
+    /// Separate-repo DSpark drafters, by the base-name prefix of the model they draft for.
+    static let dsparkRepos: [String: (repo: String, sizeGB: Double)] = [
+        "lfm2.5-2.6b": ("LiquidAI/LFM2.5-2.6B-DSpark", 0.66),
+        "lfm2.5-8b-a1b": ("LiquidAI/LFM2.5-8B-A1B-DSpark", 0.66),
+        "minicpm-v-4.7-35b-a3b": ("openbmb/MiniCPM-V-4.7-35B-A3B-DSpark", 0.74),
+        "minicpm-v-4.7-1b": ("openbmb/MiniCPM-V-4.7-1B-DSpark", 0.41),
+    ]
 
     /// The gems that fit `repoId`, the default first (after MTP).
     /// `packFiles`: the pack's HF listing (path → size) when fetched, nil when
-    /// unknown. `localDrafter`: `<model_dir>/drafter` is already on disk.
+    /// unknown. `localDrafter`: the pack's own drafter is on disk, in `packDrafterFolder`.
     static func gems(forRepoId repoId: String, packFiles: [String: Int64]?,
-                     localDrafter: Bool, mtpAvailable: Bool) -> [DrafterGem] {
+                     localDrafter: Bool, packDrafterFolder: String = packFolder, mtpAvailable: Bool) -> [DrafterGem] {
         var out: [DrafterGem] = []
         if mtpAvailable { out.append(DrafterGem(kind: .mtp, repo: "", subfolder: nil, sizeGB: 0)) }
         let base = (repoId as NSString).lastPathComponent.lowercased()
@@ -58,16 +63,16 @@ enum DrafterGems {
 
         if base.contains("qwen3.8-27b") {
             out.append(packHasDrafter
-                ? DrafterGem(kind: .dflash2, repo: repoId, subfolder: packFolder, sizeGB: packGB > 0 ? packGB : 3.85)
+                ? DrafterGem(kind: .dflash2, repo: repoId, subfolder: packDrafterFolder, sizeGB: packGB > 0 ? packGB : 3.85)
                 : DrafterGem(kind: .dflash2, repo: qwen38DFlash2Repo, subfolder: nil, sizeGB: 3.85))
         } else if packHasDrafter {
-            out.append(DrafterGem(kind: .packDrafter, repo: repoId, subfolder: packFolder, sizeGB: packGB))
+            out.append(DrafterGem(kind: .packDrafter, repo: repoId, subfolder: packDrafterFolder, sizeGB: packGB))
         } else if base.contains("glm-5.3-flash") {
             out.append(DrafterGem(kind: .dflash2, repo: glmDFlash2Repo, subfolder: nil, sizeGB: 2.34))
         } else if base.contains("muse-glimmer") {
             out.append(DrafterGem(kind: .museAssistant, repo: museAssistantRepo, subfolder: nil, sizeGB: 5.11))
-        } else if let repo = lfmDSparkRepos.first(where: { base.hasPrefix($0.key) })?.value {
-            out.append(DrafterGem(kind: .dspark, repo: repo, subfolder: nil, sizeGB: 0.66))
+        } else if let gem = dsparkRepos.first(where: { base.hasPrefix($0.key) })?.value {
+            out.append(DrafterGem(kind: .dspark, repo: gem.repo, subfolder: nil, sizeGB: gem.sizeGB))
         } else if base.contains("gemma-4") || base.contains("gemma4"),
                   let variant = DownloadManager.gemmaVariantFor(modelPath: base, isMoE: false), variant != .moe26B {
             // The MoE Gemma is left out: verify pays expert routing, the drafter regresses decode.
@@ -76,10 +81,15 @@ enum DrafterGems {
         return out
     }
 
-    /// The gem a fresh download fills its socket with. The separate-repo DFlash2
-    /// drafters are offered but never auto-filled: they pay on code and edits, not everywhere.
+    /// Drafters that pay on code and edits, not everywhere: offered, never auto-filled.
+    static let offeredOnlyRepos: Set<String> = [
+        qwen38DFlash2Repo, glmDFlash2Repo,
+        "openbmb/MiniCPM-V-4.7-35B-A3B-DSpark", "openbmb/MiniCPM-V-4.7-1B-DSpark",
+    ]
+
+    /// The gem a fresh download fills its socket with.
     static func defaultGem(_ gems: [DrafterGem]) -> DrafterGem? {
-        gems.first { $0.needsDownload && $0.repo != qwen38DFlash2Repo && $0.repo != glmDFlash2Repo }
+        gems.first { $0.needsDownload && !offeredOnlyRepos.contains($0.repo) }
     }
 
     /// Whether `gem` fits beside a model of `modelGB` in this Mac's usable memory.
@@ -143,13 +153,37 @@ extension DrafterGems {
                       config: (String) -> [String: Any]? = readConfig) -> SocketBadge {
         let drafterDir: String? = switch o.drafter {
         case "off": nil
-        case nil, "auto": (modelDir as NSString).appendingPathComponent(packFolder)
+        case nil, "auto": packDrafterFolder(modelDir: modelDir, config: config).map { (modelDir as NSString).appendingPathComponent($0) }
         case let path?: path
         }
         let drafter = drafterDir.flatMap(config).flatMap(stone(drafterConfig:))
         if let drafter, drafter != .ruby { return SocketBadge(stone: drafter, skull: false) }
         guard hasMtpHead, o.mtp ?? options.enableMTP else { return SocketBadge(stone: drafter, skull: false) }
         return SocketBadge(stone: .emerald, skull: o.mtpAcceptance == .typical || o.mtpAcceptance == .tokenv3)
+    }
+
+    /// The pack's own drafter folder, found as the server finds it (`dflash.resolveInDirDrafter`):
+    /// `drafter/`, else the one subfolder holding a DFlash drafter the server serves (Sushi's GLM
+    /// ships `GLM-5.3-Flash-DFlash2/`). Two candidates is a guess: nil. Standalone sushi's derived
+    /// copy (`sushi-runtime-cache.json`) is that engine's cache, never a candidate.
+    static func packDrafterFolder(modelDir: String, config: (String) -> [String: Any]? = readConfig) -> String? {
+        func dir(_ name: String) -> String { (modelDir as NSString).appendingPathComponent(name) }
+        if config(dir(packFolder)) != nil { return packFolder }
+        let served = ((try? FileManager.default.contentsOfDirectory(atPath: modelDir)) ?? []).filter { name in
+            guard let root = config(dir(name)), let s = stone(drafterConfig: root), s != .ruby,
+                  !FileManager.default.fileExists(atPath: dir(name) + "/sushi-runtime-cache.json") else { return false }
+            return servable(drafterConfig: root)
+        }
+        return served.count == 1 ? served[0] : nil
+    }
+
+    /// What `dflash.parseConfigFromJson` refuses by name: partial rotary, a value scale, attention sinks.
+    static func servable(drafterConfig root: [String: Any]) -> Bool {
+        let nested = root["dflash_config"] as? [String: Any] ?? [:]
+        func get(_ k: String) -> Any? { nested[k] ?? root[k] }
+        if let p = get("partial_rotary_factor") as? Double, p != 1 { return false }
+        if get("add_swa_attention_sink_bias") as? Bool == true || get("attention_sink_bias") as? Bool == true { return false }
+        return get("attention_value_scale") == nil
     }
 
     static func readConfig(_ dir: String) -> [String: Any]? {

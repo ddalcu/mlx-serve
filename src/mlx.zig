@@ -132,10 +132,11 @@ pub fn cudaAvailable() bool {
     return cuda_cache.?;
 }
 
-/// Metal, or mlx-omarchy's Vulkan backend (which translates MSL), runs
-/// `mlx_fast_metal_kernel`; the CUDA backend runs MLX ops only.
+/// Only Metal runs `mlx_fast_metal_kernel`; CUDA and Vulkan run MLX ops only.
+/// mlx-omarchy's Vulkan backend translates a subset of MSL and refuses the
+/// rest at EVAL, which fails the request instead of declining the kernel.
 pub fn metalKernelsAvailable() bool {
-    return !cudaAvailable();
+    return comptime builtin.os.tag.isDarwin();
 }
 pub extern "c" fn mlx_cuda_is_available(res: *bool) c_int;
 
@@ -381,6 +382,7 @@ pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_arra
 // `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
 pub const mlx_fft_norm = c_int;
 pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
+pub extern "c" fn mlx_as_strided(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, strides: [*]const i64, strides_num: usize, offset: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
 // Real-output inverse transform — the iSTFT head of Kokoro's iSTFTNet generator
 // (`src/kokoro.zig`). `n` is the OUTPUT length in samples, so the caller states
@@ -838,6 +840,57 @@ pub fn applyWiredPolicy() WiredPolicyResult {
     }
 }
 
+test "custom Metal kernels run on the Metal backend only" {
+    try std.testing.expectEqual(builtin.os.tag.isDarwin(), metalKernelsAvailable());
+}
+
+/// Evaluates every array reachable through `value`'s fields (structs, optionals, fixed arrays),
+/// so weights a loader bound lazily are resident, and billed, before the first request.
+pub fn evalFields(value: anytype) !void {
+    const vec = mlx_vector_array_new();
+    defer _ = mlx_vector_array_free(vec);
+    appendFields(vec, value);
+    try check(mlx_eval(vec));
+}
+
+fn appendFields(vec: mlx_vector_array, value: anytype) void {
+    const T = @TypeOf(value);
+    if (T == mlx_array) {
+        if (value.ctx != null) _ = mlx_vector_array_append_value(vec, value);
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => |st| inline for (st.field_names) |name| appendFields(vec, @field(value, name)),
+        .optional => if (value) |v| appendFields(vec, v),
+        .array => for (value) |v| appendFields(vec, v),
+        else => {},
+    }
+}
+
+test "evalFields evaluates the arrays nested in structs, optionals and arrays" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const s = gpuStream();
+    const one = mlx_array_new_float(1.0);
+    defer _ = mlx_array_free(one);
+    var lazy: [4]mlx_array = undefined;
+    for (&lazy) |*a| {
+        a.* = mlx_array_new();
+        try check(mlx_add(a, one, one, s));
+    }
+    defer for (lazy) |a| {
+        _ = mlx_array_free(a);
+    };
+    const Inner = struct { w: mlx_array, none: mlx_array = .{ .ctx = null } };
+    const Outer = struct { inner: Inner, opt: ?mlx_array, rows: [2]mlx_array, n: u32 = 7 };
+    const v = Outer{ .inner = .{ .w = lazy[0] }, .opt = lazy[1], .rows = .{ lazy[2], lazy[3] } };
+    try evalFields(v);
+    for (lazy) |a| {
+        var ready = false;
+        _ = _mlx_array_is_available(&ready, a);
+        try std.testing.expect(ready);
+    }
+}
+
 test "cudaHomeDefault: export /opt/cuda only when nothing else names a toolkit" {
     try std.testing.expectEqualStrings("/opt/cuda", cudaHomeDefault(false, false, true).?);
     try std.testing.expect(cudaHomeDefault(true, false, true) == null);
@@ -1066,6 +1119,8 @@ test "an MLX memory failure is classified as a memory error, an argument error i
 
 test "the latch turns an mlx-c error into a Zig error instead of exiting, once" {
     const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = takeError(&stale); // an earlier test's latch would shadow this one's
     try t.expect(!errorPending());
     try checkError();
 

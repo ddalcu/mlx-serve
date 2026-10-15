@@ -379,7 +379,10 @@ pub const LlamaSeq = struct {
         if (common < self.resident.items.len) {
             // 1 = the tail could not be rolled back (recurrent state) and the
             // whole sequence was cleared: nothing is resident any more.
-            if (ffi.mlx_llama_seq_trim(self.ctx.handle, self.id, @intCast(common)) == 1) common = 0;
+            if (ffi.mlx_llama_seq_trim(self.ctx.handle, self.id, @intCast(common)) == 1) {
+                log.info("[llama] recurrent state cannot roll back to {d}; cold prefill\n", .{common});
+                common = 0;
+            }
             self.resident.shrinkRetainingCapacity(common);
         }
 

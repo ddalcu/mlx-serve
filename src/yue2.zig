@@ -22,7 +22,12 @@ const transformer_mod = @import("transformer.zig");
 const tok_mod = @import("tokenizer.zig");
 const wav_mod = @import("wav.zig");
 const sse = @import("gen_sse.zig");
-const Scope = @import("mlx_scope.zig").Scope;
+const scope_mod = @import("mlx_scope.zig");
+const Scope = scope_mod.Scope;
+const Linear = scope_mod.Linear;
+const getW = scope_mod.getW;
+const linear = scope_mod.linear;
+const evalAll = scope_mod.evalAll;
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
@@ -47,6 +52,9 @@ const CODEC_OFFSET: u32 = 151853;
 const CODEC_SIZE: u32 = 32768;
 const VOCAB: u32 = 184704;
 const LATENT_DIM: c_int = 64;
+/// VAE decode tile core, in latent frames. Each block holds full-rate f32 activations sized by
+/// the tile; the halo covers the decoder's receptive field, so the core size never moves the audio.
+const DECODE_CORE_FRAMES: usize = 256;
 const ABC_MAX_TOKENS: u32 = 4096;
 
 pub const Cot = enum {
@@ -363,25 +371,6 @@ fn argmax(scores: []const f32, phase: Phase) u32 {
 // Weights
 // ════════════════════════════════════════════════════════════════════════
 
-/// A projection resolved once at load: affine-quantized (width solved from the packed
-/// geometry, never a literal) or dense, with an optional bias. Handles are borrowed from `Weights`.
-const Linear = struct {
-    w: A,
-    scales: ?A = null,
-    biases: A = .{ .ctx = null },
-    bias: ?A = null,
-    bits: u32 = 0,
-    group_size: u32 = 0,
-
-    fn forward(self: *const Linear, sc: *Scope, x: A) !A {
-        const y = if (self.scales) |sca|
-            try sc.qmm(x, self.w, sca, self.biases, self.group_size, self.bits)
-        else
-            try sc.matmul(x, try sc.transpose(self.w, &.{ 1, 0 }));
-        return if (self.bias) |b| sc.add(y, b) else y;
-    }
-};
-
 /// One of a layer's two weight sets.
 const Path = struct {
     ln: A,
@@ -402,33 +391,6 @@ const Layer = struct { ar: Path, nar: Path };
 /// A layer's K/V for the NAR queries to attend over (owned handles).
 const ArKv = struct { k: A, v: A };
 
-fn getW(w: *const Weights, comptime fmt: []const u8, args: anytype) !A {
-    var buf: [160]u8 = undefined;
-    const key = try std.fmt.bufPrint(&buf, fmt, args);
-    return w.get(key) orelse {
-        log.err("[yue2] MISSING WEIGHT: {s}\n", .{key});
-        return error.MissingWeight;
-    };
-}
-
-fn linear(w: *const Weights, comptime fmt: []const u8, args: anytype, in_dim: u32) !Linear {
-    var buf: [160]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&buf, fmt, args);
-    var l = Linear{ .w = try getW(w, "{s}.weight", .{prefix}) };
-    if (w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.scales", .{prefix}))) |sca| {
-        l.scales = sca;
-        l.biases = try getW(w, "{s}.biases", .{prefix});
-        const qp = transformer_mod.affineParamsFromGeometry(l.w, sca, in_dim) orelse {
-            log.err("[yue2] unsolvable quant geometry for {s}\n", .{prefix});
-            return error.BadQuantGeometry;
-        };
-        l.bits = qp.bits;
-        l.group_size = qp.group_size;
-    }
-    l.bias = w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.bias", .{prefix}));
-    return l;
-}
-
 fn resolvePath(w: *const Weights, li: usize, comptime ln: []const u8, comptime attn: []const u8, comptime mlp_ln: []const u8, comptime mlp: []const u8, hidden: u32, q_out: u32, ffn_in: u32) !Path {
     const p = "model.layers.{d}.";
     return .{
@@ -444,15 +406,6 @@ fn resolvePath(w: *const Weights, li: usize, comptime ln: []const u8, comptime a
         .up = try linear(w, p ++ mlp ++ ".up_proj", .{li}, hidden),
         .down = try linear(w, p ++ mlp ++ ".down_proj", .{li}, ffn_in),
     };
-}
-
-/// Evaluate every array once so no weight stays a lazy file read.
-fn evalAll(w: *const Weights) !void {
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    var it = w.map.valueIterator();
-    while (it.next()) |v| _ = mlx.mlx_vector_array_append_value(vec, v.*);
-    try mlx.check(mlx.mlx_eval(vec));
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -911,8 +864,17 @@ pub const Engine = struct {
         return sc.keep(t.out(try t.add(x, try self.conv(&t, a2, "layers.{d}.layers.{d}.layers.3", .{ block, unit }, 0, 1))));
     }
 
-    /// Latents [1,L,64] f32 → audio [1,decodedLen(L),2] f32. One scope and one eval per
-    /// stage keep the transient at a single stage's activations.
+    /// Evaluates `next`, frees `prev` and hands the freed buffers back.
+    fn advance(prev: A, next: A) !A {
+        errdefer _ = mlx.mlx_array_free(next);
+        try mlx.check(mlx.mlx_array_eval(next));
+        _ = mlx.mlx_array_free(prev);
+        _ = mlx.mlx_clear_cache();
+        return next;
+    }
+
+    /// Latents [1,L,64] f32 → audio [1,decodedLen(L),2] f32. One eval per block keeps the
+    /// transient at a single block's activations.
     fn decodeWindow(self: *const Engine, a: std.mem.Allocator, z: A) !A {
         const d = self.vae_parsed.value.decoder_config;
         var sc0 = Scope.init(a, self.s);
@@ -921,28 +883,32 @@ pub const Engine = struct {
         defer _ = mlx.mlx_array_free(h);
         const n = d.strides.len;
         for (0..n) |bi| {
-            var sc = Scope.init(a, self.s);
-            defer sc.deinit();
             const stride = d.strides[n - 1 - bi];
             const li = bi + 1;
-            var y = try self.snake(&sc, h, "layers.{d}.layers.0", .{li});
-            const up = try sc.convT1d(y, try self.vaeW("layers.{d}.layers.1.weight", .{li}), stride, @divTrunc(stride + 1, 2));
-            y = try sc.add(up, try self.vaeW("layers.{d}.layers.1.bias", .{li}));
-            y = try self.resUnit(&sc, y, li, 2, 1);
-            y = try self.resUnit(&sc, y, li, 3, 3);
-            y = try self.resUnit(&sc, y, li, 4, 9);
-            const next = sc.out(y);
-            try mlx.check(mlx.mlx_array_eval(next));
-            _ = mlx.mlx_array_free(h);
-            h = next;
+            {
+                var sc = Scope.init(a, self.s);
+                defer sc.deinit();
+                const y = try self.snake(&sc, h, "layers.{d}.layers.0", .{li});
+                const up = try sc.convT1d(y, try self.vaeW("layers.{d}.layers.1.weight", .{li}), stride, @divTrunc(stride + 1, 2));
+                h = try advance(h, sc.out(try sc.add(up, try self.vaeW("layers.{d}.layers.1.bias", .{li}))));
+            }
+            inline for (.{ .{ 2, 1 }, .{ 3, 3 }, .{ 4, 9 } }) |u| {
+                var sc = Scope.init(a, self.s);
+                defer sc.deinit();
+                h = try advance(h, sc.out(try self.resUnit(&sc, h, li, u[0], u[1])));
+            }
         }
         const a1 = try self.snake(&sc0, h, "layers.{d}", .{n + 1});
         return sc0.out(try self.conv(&sc0, a1, "layers.{d}", .{n + 2}, 3, 1));
     }
 
+    fn decodeCore(self: *const Engine) usize {
+        return @min(self.vae_parsed.value.decode_core_frames, DECODE_CORE_FRAMES);
+    }
+
     /// Latents [frames,64] → interleaved stereo f32 (owned): cores decoded with a halo of context
     /// on each side, then cropped exactly, so tiles join without a crossfade.
-    fn decodeLatents(self: *const Engine, a: std.mem.Allocator, latents: A, progress: ?sse.Progress) ![]f32 {
+    fn decodeLatents(self: *const Engine, a: std.mem.Allocator, latents: A, core: usize, progress: ?sse.Progress) ![]f32 {
         const d = self.vae_parsed.value.decoder_config;
         const vf = self.vae_parsed.value;
         const frames: usize = @intCast(mlx.getShape(latents)[0]);
@@ -950,7 +916,6 @@ pub const Engine = struct {
         const total = decodedLen(d.strides, frames);
         const out = try a.alloc(f32, total * 2);
         errdefer a.free(out);
-        const core: usize = vf.decode_core_frames;
         const n_tiles = (frames + core - 1) / core;
         var tile: usize = 0;
         var start: usize = 0;
@@ -960,6 +925,7 @@ pub const Engine = struct {
                 p.emit("decode", @intCast(tile), @intCast(n_tiles));
             }
             tile += 1;
+            defer _ = mlx.mlx_clear_cache();
             const end = @min(frames, start + core);
             const left = start -| vf.decode_halo_frames;
             const right = @min(frames, end + vf.decode_halo_frames);
@@ -1042,7 +1008,7 @@ pub const Engine = struct {
         defer _ = mlx.mlx_array_free(latents);
         _ = mlx.mlx_clear_cache();
 
-        const pcm = try self.decodeLatents(allocator, latents, progress);
+        const pcm = try self.decodeLatents(allocator, latents, self.decodeCore(), progress);
         defer allocator.free(pcm);
         const wav = try wav_mod.encodePcm16(allocator, pcm, SAMPLE_RATE, 2);
         return .{ .wav = wav, .abc = abc_text };
@@ -1456,7 +1422,7 @@ test "yue2 VAE: two tiles of random latents decode like the reference" {
     var sc = Scope.init(a, e.s);
     defer sc.deinit();
     const z = try sc.fromF32(lat_f, &.{ @intCast(lat_f.len / @as(usize, LATENT_DIM)), LATENT_DIM });
-    const pcm = try e.decodeLatents(a, z, null);
+    const pcm = try e.decodeLatents(a, z, e.decodeCore(), null);
     defer a.free(pcm);
     try testing.expectEqual(ref.len, pcm.len);
     var dot: f64 = 0;
@@ -1475,4 +1441,60 @@ test "yue2 VAE: two tiles of random latents decode like the reference" {
     // `MLX_ENABLE_TF32=0` makes the same decode match to cos 1.000000.
     try testing.expect(cos > 0.9999);
     try testing.expectApproxEqRel(@as(f64, 1), @sqrt(na / nb), 0.01);
+}
+
+test "yue2 VAE: a 44 s decode stays under 2 GiB of transient and hands its buffers back" {
+    const a = testing.allocator;
+    const e = try testEngine();
+    defer e.deinit();
+    const frames = 1100;
+    const lat = try a.alloc(f32, frames * LATENT_DIM);
+    defer a.free(lat);
+    var prng = std.Random.DefaultPrng.init(7);
+    for (lat) |*v| v.* = prng.random().floatNorm(f32);
+    var sc = Scope.init(a, e.s);
+    defer sc.deinit();
+    const z = try sc.fromF32(lat, &.{ frames, LATENT_DIM });
+    try mlx.check(mlx.mlx_array_eval(z));
+    _ = mlx.mlx_clear_cache();
+    _ = mlx.mlx_reset_peak_memory();
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    const pcm = try e.decodeLatents(a, z, e.decodeCore(), null);
+    defer a.free(pcm);
+    var peak: usize = 0;
+    var cached: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    _ = mlx.mlx_get_cache_memory(&cached);
+    std.debug.print("[yue2-test] vae decode: transient {d} MB, cache after {d} MB\n", .{ (peak - before) >> 20, cached >> 20 });
+    try testing.expect(peak - before < 2 << 30);
+    try testing.expect(cached < 256 << 20);
+}
+
+test "yue2 VAE: the decode tile size never changes the audio" {
+    const a = testing.allocator;
+    const e = try testEngine();
+    defer e.deinit();
+    const frames = 1100;
+    const lat = try a.alloc(f32, frames * LATENT_DIM);
+    defer a.free(lat);
+    var prng = std.Random.DefaultPrng.init(11);
+    for (lat) |*v| v.* = prng.random().floatNorm(f32);
+    var sc = Scope.init(a, e.s);
+    defer sc.deinit();
+    const z = try sc.fromF32(lat, &.{ frames, LATENT_DIM });
+    const pack = try e.decodeLatents(a, z, e.vae_parsed.value.decode_core_frames, null);
+    defer a.free(pack);
+    const ours = try e.decodeLatents(a, z, e.decodeCore(), null);
+    defer a.free(ours);
+    try testing.expect(e.decodeCore() < e.vae_parsed.value.decode_core_frames);
+    try testing.expectEqual(pack.len, ours.len);
+    var worst: f32 = 0;
+    var peak: f32 = 0;
+    for (pack, ours) |p, o| {
+        worst = @max(worst, @abs(p - o));
+        peak = @max(peak, @abs(p));
+    }
+    std.debug.print("[yue2-test] vae tile size: max |diff| {e} of peak {d:.3}\n", .{ worst, peak });
+    try testing.expect(worst <= peak * 1e-4);
 }

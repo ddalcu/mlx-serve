@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Model } from "../src/lib/core/models";
-import { audioDefaults, audioProfile, buildAudioRequest } from "../src/lib/state/audio-state.svelte";
+import { AudioController, audioDefaults, audioProfile, buildAudioRequest, lengthGrace, musicStageLabel } from "../src/lib/state/audio-state.svelte";
 
 const model = (id: string, architecture: string, ...capabilities: string[]): Model => ({ id, capabilities: (capabilities.length ? capabilities : ["audio"]) as Model["capabilities"], architecture, meta: {} });
 const kokoro = model("org/kokoro", "kokoro");
@@ -8,6 +8,7 @@ const qwenTts = model("org/qwen3-tts", "qwen3_tts");
 const ace = model("org/ace-step", "acestep", "audio", "music");
 const music3 = model("org/minimax-music3", "minimax_music3", "audio", "music");
 const sound = model("org/stable-audio", "stable_audio3");
+const yue2 = model("org/yue2", "yue2", "audio", "music");
 const draft = (m: Model, patch: Record<string, unknown> = {}) => ({ ...audioDefaults(m), prompt: "hello there", seed: "5", ...patch });
 const clip = { base64: "AAAA", name: "ref.wav" };
 
@@ -18,6 +19,8 @@ describe("audioProfile", () => {
     expect(audioProfile(ace)).toMatchObject({ tab: "music", source: true, meta: true, steps: false, duration: [10, 600] });
     expect(audioProfile(music3)).toMatchObject({ tab: "music", source: false, meta: false, steps: true, duration: [5, 360] });
     expect(audioProfile(sound)).toMatchObject({ tab: "sound", steps: true, duration: [0.5, 120] });
+    expect(audioProfile(yue2)).toMatchObject({ tab: "music", source: false, meta: false, steps: true, stepsRange: [1, 100], instrumental: false, tempo: false, score: true, autoLength: true, duration: [5, 360] });
+    expect(audioProfile(music3)).toMatchObject({ stepsRange: [4, 100], score: false, autoLength: false });
   });
 
   it("offers nothing for unknown architectures or non-audio models", () => {
@@ -106,7 +109,63 @@ describe("buildAudioRequest: music", () => {
     expect(() => buildAudioRequest(ace, draft(ace, { task: "remix" }), { source: clip })).toThrow("Choose a music mode.");
   });
 
+  it("YuE2 needs lyrics and sends no field its server refuses", () => {
+    expect(() => buildAudioRequest(yue2, draft(yue2, { instrumental: true }), {})).toThrow("This model requires lyrics.");
+    const { body } = buildAudioRequest(yue2, draft(yue2, { lyrics, instrumental: true, bpm: "120", keyscale: "C major" }), {});
+    expect(body).toMatchObject({ lyrics, steps: 32, cot: "full" });
+    for (const field of ["instrumental", "bpm", "keyscale"]) expect(body).not.toHaveProperty(field);
+  });
+
+  it("YuE2 ends its own song: Auto sends no cap, a set limit gets grace", () => {
+    expect(buildAudioRequest(yue2, draft(yue2, { lyrics }), {}).body).not.toHaveProperty("duration_seconds");
+    const capped = (duration: number) => buildAudioRequest(yue2, draft(yue2, { lyrics, autoLength: false, duration }), {}).body.duration_seconds;
+    expect(capped(60)).toBe(75);
+    expect(capped(20)).toBe(30);
+    expect(capped(300)).toBe(360);
+    expect(lengthGrace(120)).toBe(30);
+    expect(buildAudioRequest(music3, draft(music3, { lyrics, autoLength: true }), {}).body.duration_seconds).toBe(60);
+  });
+
+  it("YuE2's plan rides with the score only where the plan reads one", () => {
+    const body = (plan: string, score: string, m = yue2) => buildAudioRequest(m, draft(m, { lyrics, plan, score }), {}).body;
+    expect(body("full", "  X:1\nK:C\n  ")).toMatchObject({ cot: "full", abc: "X:1\nK:C" });
+    expect(body("melody", "X:1").cot).toBe("melody");
+    expect(body("full", "  \n")).not.toHaveProperty("abc");
+    expect(body("off", "X:1")).toMatchObject({ cot: "off" });
+    expect(body("off", "X:1")).not.toHaveProperty("abc");
+    expect(body("full", "X:1", music3)).not.toHaveProperty("cot");
+    expect(body("full", "X:1", music3)).not.toHaveProperty("abc");
+  });
+
+  it("YuE2 takes 1–100 steps", () => {
+    expect(buildAudioRequest(yue2, draft(yue2, { lyrics, steps: 1 }), {}).body.steps).toBe(1);
+    expect(() => buildAudioRequest(yue2, draft(yue2, { lyrics, steps: 101 }), {})).toThrow(/Steps must be 1–100/);
+    expect(() => buildAudioRequest(music3, draft(music3, { lyrics, steps: 2 }), {})).toThrow(/Steps must be 4–100/);
+  });
+
+  it("names YuE2's stages", () => {
+    expect(musicStageLabel({ stage: "abc", step: 3, total: 0 })).toBe("Writing the score…");
+    expect(musicStageLabel({ stage: "semantic", step: 250, total: 0 })).toBe("Composing (10 s so far)…");
+    expect(musicStageLabel({ stage: "nar", step: 2, total: 32 })).toBe("Rendering (step 2/32)…");
+    expect(musicStageLabel({ stage: "diffuse", step: 1, total: 8 })).toBeUndefined();
+  });
+
   it("a model without source support ignores the source", () => {
     expect(buildAudioRequest(music3, draft(music3, { lyrics, task: "cover" }), { source: clip }).body).not.toHaveProperty("src_audio");
+  });
+});
+
+describe("AudioController", () => {
+  it("keeps the score a YuE2 song was rendered from and names its stages", async () => {
+    let stage = "";
+    const request = vi.fn(async (_c: unknown, _p: string, _b: unknown, o: { onProgress?: (e: Record<string, unknown>) => void }) => {
+      o.onProgress?.({ stage: "abc", step: 1, total: 0 });
+      stage = controller.message;
+      return { blob: new Blob(["x"]), elapsedMs: 1, wireBytes: 1, abc: "X:1\nK:C" };
+    });
+    const controller = new AudioController({ add: async () => "id" }, request as never);
+    await controller.generate({} as never, buildAudioRequest(yue2, draft(yue2, { lyrics: "[Verse]\nla" }), {}), "s");
+    expect(stage).toBe("Writing the score…");
+    expect(controller.lastScore).toBe("X:1\nK:C");
   });
 });

@@ -47,17 +47,19 @@ ARCHES=(
     "lfm2_vl|yes|mlx-community/LFM2.5-VL-1.6B-4bit"
     "llama|no|mlx-community/Llama-3.2-3B-Instruct-4bit"
     "mistral|no|mlx-community/Mistral-7B-Instruct-v0.3-4bit"
-    "nemotron_h|yes|mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4|Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit"
-    "muse_glimmer|yes|ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit"
+    "nemotron_h|yes|mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4|Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit|mlx-community/NVIDIA-Nemotron-3-Nano-4B-4bit"
+    "muse_glimmer|yes|ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit|ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit"
     "spark2_5|yes|abenzerps/Spark-X2.5-4B-MLX-8bit|abenzerps/Spark-X2.5-4B-MLX-4bit"
     "k2_horizon|yes|mlx-community/K2-Horizon-7B-oQ6e"
     "laguna|yes|poolside/Laguna-XS-2.1-NVFP4-mlx"
     "gguf_llama|yes|unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf|gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf|unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ2_XXS.gguf|unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-IQ4_NL.gguf"
-    "qwen4_exp|yes|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-3.3bpw"
+    "qwen4_exp|yes|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-3.3bpw|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw"
     "qwen4_exp_sushi|yes|beamster/Qwen3.8-Flash-Next-Sushi-2bpw"
     "bailing_hybrid|yes|rapid-mlx/Ling-3.0-tiny-MLX-4bit"
     "mimo_v2|yes|ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8"
-    "glm5_next|yes|TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP"
+    "mimo_v2_sushi|yes|beamster/MiMo-V2.6-Flash-Sushi-2.3bpw"
+    "glm5_next|yes|ddalcu/GLM-5.3-Flash-MLX-Serve-iQ-MLX-5.1bpw"
+    "glm5_next_sushi|yes|beamster/GLM-5.3-Flash-Sushi-2bpw"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,kv4,kv8,mtp,nospec,drafter,drafter_kv8}"
 # A DFlash drafter per arch when the pack carries none in drafter/.
@@ -134,7 +136,7 @@ run_checks() { # $1 thinking yes/no, $2 has_spec yes/no
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"temperature\":0}")
     rc=$(echo "$r" | J 'd["usage"]["prompt_tokens_details"]["cached_tokens"]')
     # llama.cpp cannot roll recurrent state back one token, so a hybrid GGUF re-prefills an identical prompt.
-    if [[ "$model" == *.gguf ]] && grep -q 'llama_memory_recurrent' "$OUT/$CELL.server.log"; then
+    if [[ "$model" == *.gguf ]] && grep -q 'recurrent state cannot roll back' "$OUT/$CELL.server.log"; then
         skip "prefix cache: repeat reports cached_tokens>0" "recurrent GGUF re-prefills a full match"
     else
     check "prefix cache: repeat reports cached_tokens>0" "$([[ "${rc:-0}" -gt 0 ]] && echo 0 || echo 1)" "cached=$rc"; fi
@@ -207,7 +209,9 @@ print(json.dumps({"model": "m", "messages": [{"role": "user", "content": p}], "m
         local nm args; nm=$(echo "$r" | J 'd["choices"][0]["message"]["tool_calls"][0]["function"]["name"]')
         args=$(echo "$r" | J 'json.loads(d["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]).get("city","")')
         check "tools: call names declared tool with city" "$([[ "$nm" == get_weather && -n "$args" ]] && echo 0 || echo 1)" "$nm($args)"
-        check "tools: finish_reason tool_calls" "$([[ "$(echo "$r" | J 'd["choices"][0]["finish_reason"]')" == tool_calls ]] && echo 0 || echo 1)"
+        # A call that ran into max_tokens reports "length": the cap is the honest reason it stopped.
+        local fr ct; fr=$(echo "$r" | J 'd["choices"][0]["finish_reason"]'); ct=$(echo "$r" | J 'd["usage"]["completion_tokens"]')
+        check "tools: finish_reason tool_calls (length at the cap)" "$([[ "$fr" == tool_calls || ( "$fr" == length && "${ct:-0}" -ge 300 ) ]] && echo 0 || echo 1)" "$fr after $ct tokens"
     else
         c=$(echo "$r" | J 'd["choices"][0]["message"]["content"] or ""')
         check "tools: answered without call (200, no markup leak)" "$([[ -n "$c" ]] && ! echo "$c" | grep -Eq '<tool_call>|<function=' && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"

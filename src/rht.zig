@@ -100,7 +100,7 @@ fn transformKernel(x: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, inverse
 /// Input side: `H(signs * x)`; inverse: `signs * H(x)`. Computed in f32 like
 /// the reference, returned in x's dtype. Caller owns the result.
 pub fn transform(x: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, inverse: bool, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (kernelBlock(block)) {
+    if (kernelBlock(block) and mlx.streamIsGpu(s)) {
         const sh = mlx.getShape(x);
         var total: c_int = 1;
         for (sh) |d| total *= d;
@@ -232,7 +232,7 @@ pub const NORM_ROTATE_MAX_ROWS: c_int = 16;
 /// Null when the shape is outside the kernel (caller keeps the composed ops).
 /// `b` null = no residual add; `want_normed` also returns the unrotated norm.
 pub fn normRotate(a: mlx.mlx_array, b: ?mlx.mlx_array, w: mlx.mlx_array, eps: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, want_normed: bool, s: mlx.mlx_stream) !?NormRotate {
-    if (block != 1024 or eps.ctx == null) return null;
+    if (block != 1024 or eps.ctx == null or !mlx.streamIsGpu(s)) return null;
     const sh = mlx.getShape(a);
     if (sh.len == 0 or sh.len > 4) return null;
     const hidden = sh[sh.len - 1];

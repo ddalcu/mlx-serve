@@ -19,6 +19,14 @@
       connection.residentBytes === null ? "unavailable" : (connection.residentBytes / 1024 ** 3).toFixed(2) + " GiB",
     ]),
   );
+  /** The server's host and port, as this page reaches it. */
+  const address = $derived.by(() => {
+    try {
+      return new URL(connection.active.url).host;
+    } catch {
+      return connection.active.url;
+    }
+  });
   const main: [View, string, IconName][] = [
     ["models", N("Models"), "layers"],
     ["monitoring", N("Monitoring"), "activity"],
@@ -54,7 +62,7 @@
     title="{connection.active.url} — {connection.message}"
     aria-label={t("Server connection: %@, %@", [connection.serverName(), connection.message])}
     onclick={() => {
-      app.settingsCategory = "servers";
+      app.settingsCategory = "providers";
       go("settings");
     }}
   >
@@ -62,5 +70,5 @@
     <span id="server-label">{connection.serverName()}</span>
   </button>
   <p class="sidebar-note" id="server-info">{info}</p>
-  <p class="sidebar-note">{t("Saved in this browser")}</p>
+  <p class="sidebar-note" id="server-address">{address}</p>
 </aside>

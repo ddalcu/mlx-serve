@@ -162,6 +162,7 @@ enum FluxVariant: String, Hashable, Codable {
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
     case qwenImage21      // Qwen-Image-2.1 block-causal DiT — served by the qwen_image backend; undistilled (40 steps, optional real CFG)
+    case qwenImage21Turbo // Qwen-Image-2.1-Turbo — same backend; its pack's 8-sigma grid sets the steps server-side
 }
 
 struct ImageQualitySettings: Hashable {
@@ -516,6 +517,47 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Qwen-Image 2.1 quantized to 4-bit for smaller Macs — the same 40-step model at about half the memory, with some loss of fine detail. Open (Apache-2.0)."
     )
 
+    /// The checkpoint's own 8-step sampling grid (`sample_sigmas`) decides
+    /// every tier: the server runs it whatever `steps` says.
+    private static let qwenImageTurboQuality: [QualityPreset: ImageQualitySettings] = [
+        .fast:         .init(steps: 8),
+        .good:         .init(steps: 8),
+        .quality:      .init(steps: 8),
+        .superQuality: .init(steps: 8),
+    ]
+
+    /// Qwen-Image-2.1-Turbo, same `--preset 32gb` recipe as the base pack.
+    static let qwenImage21Turbo_8bit = ImageModelPreset(
+        id: "ddalcu/qwen-image-2.1-turbo-8bit",
+        name: "Qwen-Image 2.1 Turbo 8-bit (~18 GB)",
+        variant: .qwenImage21Turbo,
+        configName: "qwen_image21",
+        repo: "ddalcu/Qwen-Image-2.1-Turbo-MLX-Serve-8bit",
+        approxDownloadGB: 18,
+        approxRAMGB: 22,
+        resolutions: qwenImageResolutions,
+        defaultResolution: qwenImageResolutions[0],
+        qualityProfiles: qwenImageTurboQuality,
+        defaultQuality: .good,
+        description: "Qwen-Image 2.1 distilled to 8 steps — the same strong prompt understanding and in-image text, in English and Chinese, in 8 steps instead of 40. Qwen Research License (non-commercial)."
+    )
+
+    /// The 4-bit Turbo pack (`--preset 16gb`) for 16 GB Macs.
+    static let qwenImage21Turbo_4bit = ImageModelPreset(
+        id: "ddalcu/qwen-image-2.1-turbo-4bit",
+        name: "Qwen-Image 2.1 Turbo 4-bit (~11 GB)",
+        variant: .qwenImage21Turbo,
+        configName: "qwen_image21",
+        repo: "ddalcu/Qwen-Image-2.1-Turbo-MLX-Serve-4bit",
+        approxDownloadGB: 11,
+        approxRAMGB: 13,
+        resolutions: qwenImageResolutions,
+        defaultResolution: qwenImageResolutions[0],
+        qualityProfiles: qwenImageTurboQuality,
+        defaultQuality: .good,
+        description: "Qwen-Image 2.1 Turbo quantized to 4-bit for smaller Macs — 8 steps at about half the memory, with some loss of fine detail. Qwen Research License (non-commercial)."
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
@@ -524,8 +566,10 @@ struct ImageModelPreset: Identifiable, Hashable {
         .flux2Klein9B_Q4,                              // 10
         .flux2Klein9BBase_Q4,                          // 10
         .qwenImage21_4bit,                             // 10
+        .qwenImage21Turbo_4bit,                        // 11
         .krea2Turbo,                                   // 15
         .qwenImage21_8bit,                             // 18
+        .qwenImage21Turbo_8bit,                        // 18
     ]
 }
 
@@ -1484,6 +1528,9 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// field there, so exposing it would be a control that visibly does
     /// nothing. `fixedSteps` stays the per-checkpoint default either way.
     var supportsSteps: Bool { family != .acestep }
+    /// YuE2 ends its own song (an end token after the last lyric); its duration is only a cap, so
+    /// the pane can leave the cap off. ACE-Step and Music 3 make exactly the length asked.
+    var supportsAutoLength: Bool { family == .yue2 }
     var stepsRange: ClosedRange<Int> { family == .yue2 ? 1...100 : 4...100 }
     /// YuE2's score: the plan mode and the ABC text that replaces the model's
     /// own. Gates the controls AND the `cot`/`abc` fields.
@@ -2155,7 +2202,7 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21: return 0
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo: return 0
         default: return 3
         }
     }
@@ -2167,7 +2214,7 @@ extension ImageModelPreset {
         switch variant {
         // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
         // with a ×16 VAE downsample and shares the same clamp server-side.
-        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21:
+        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
             return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
         // widest preset edge.
@@ -2213,7 +2260,7 @@ extension ImageModelPreset {
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
     var supportsLoRA: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo: return false
         default: return true
         }
     }
@@ -2223,10 +2270,14 @@ extension ImageModelPreset {
     /// 8 steps costs 2× and 12 costs 4× for a DIFFERENT image, not a better one.
     var stepsAreFixed: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return true
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21Turbo: return true
         default: return false
         }
     }
+
+    /// The pack's own sampling grid sets the step count server-side, so a
+    /// `steps` field would be a control that does nothing.
+    var stepsSetByCheckpoint: Bool { variant == .qwenImage21Turbo }
 
     /// The fixed step count for a distilled preset (its `.good` profile).
     var fixedSteps: Int { settings(.good).steps }
@@ -2437,6 +2488,9 @@ struct MusicGenRequest {
     var timesignature: String = ""
     /// Track length in seconds (server-valid 10–600).
     var durationSeconds: Int = 60
+    /// YuE2: send no cap, so the model ends the song after the last lyric instead of being cut at
+    /// `durationSeconds`. Ignored by models that make exactly the length asked.
+    var autoLength: Bool = false
     /// -1 = fresh random seed per generation.
     var seed: Int = -1
     /// Flow-match refinement passes; nil = the server's own default. Only sent

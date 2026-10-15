@@ -25,11 +25,11 @@ pub fn adapt(config: *const ModelConfig, weights: *Weights, s: mlx.mlx_stream) !
     }
 }
 
-/// Tensors this engine never reads (vision and audio towers, the MTP block). The load is lazy, so
-/// they are never evaluated: they cost no resident bytes.
+/// Tensors this engine never reads (vision and audio towers, GLM's EXL3 MTP layer past the trunk).
+/// The load is lazy, so they are never evaluated: they cost no resident bytes.
 fn isUnserved(config: *const ModelConfig, key: []const u8) bool {
     const prefixes: []const []const u8 = if (config.isMimo())
-        &.{ "visual.", "audio_encoder.", "speech_embeddings.", "model.mtp." }
+        &.{ "visual.", "audio_encoder.", "speech_embeddings." }
     else
         &.{"model.visual."};
     return hasAnyPrefix(key, prefixes) or pastTrunk(key, config.num_hidden_layers);
@@ -357,24 +357,39 @@ fn dequantFp8Trunk(config: *const ModelConfig, weights: *Weights, s: mlx.mlx_str
         const li: u32 = @intCast(i);
         const base = try std.fmt.bufPrint(&buf, "{s}.layers.{d}", .{ config.weight_prefix, li });
         try splitFusedQkv(config, weights, base, li, s);
-        if (li < config.first_k_dense_replace) for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
-            var k1: [200]u8 = undefined;
-            var k2: [200]u8 = undefined;
-            const wk = try std.fmt.bufPrint(&k1, "{s}.mlp.{s}.weight", .{ base, proj });
-            const sk = try std.fmt.bufPrint(&k2, "{s}.mlp.{s}.weight_scale_inv", .{ base, proj });
-            const codes = takeKey(weights, wk) orelse continue;
-            defer _ = mlx.mlx_array_free(codes);
-            const scales = takeKey(weights, sk) orelse return error.MissingFp8Scale;
-            defer _ = mlx.mlx_array_free(scales);
-            const rows: u32 = @intCast(mlx.getShape(codes)[0]);
-            const dense = try dequantSlabs(codes, scales, 1, rows, s);
-            defer _ = mlx.mlx_array_free(dense);
-            var flat = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(flat);
-            try mlx.check(mlx.mlx_reshape(&flat, dense, &[_]c_int{ @intCast(rows), mlx.getShape(codes)[1] }, 2, s));
-            try mlx.check(mlx.mlx_array_eval(flat));
-            try putOwned(weights, wk, flat);
-        };
+        if (li < config.first_k_dense_replace) try decodeDenseMlp(weights, base, s);
+    }
+    // The MTP heads are stored the same way and attend in a sliding layer's geometry.
+    const swa = config.firstSlidingLayer() orelse return;
+    var k: u32 = 0;
+    while (true) : (k += 1) {
+        const base = try std.fmt.bufPrint(&buf, "model.mtp.layers.{d}", .{k});
+        var probe: [200]u8 = undefined;
+        if (weights.get(try std.fmt.bufPrint(&probe, "{s}.eh_proj.weight", .{base})) == null) break;
+        try splitFusedQkv(config, weights, base, swa, s);
+        try decodeDenseMlp(weights, base, s);
+    }
+}
+
+/// A dense e4m3 MLP decoded to bf16 once; the loader reads it as a plain projection.
+fn decodeDenseMlp(weights: *Weights, base: []const u8, s: mlx.mlx_stream) !void {
+    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
+        var k1: [200]u8 = undefined;
+        var k2: [200]u8 = undefined;
+        const wk = try std.fmt.bufPrint(&k1, "{s}.mlp.{s}.weight", .{ base, proj });
+        const sk = try std.fmt.bufPrint(&k2, "{s}.mlp.{s}.weight_scale_inv", .{ base, proj });
+        const codes = takeKey(weights, wk) orelse continue;
+        defer _ = mlx.mlx_array_free(codes);
+        const scales = takeKey(weights, sk) orelse return error.MissingFp8Scale;
+        defer _ = mlx.mlx_array_free(scales);
+        const rows: u32 = @intCast(mlx.getShape(codes)[0]);
+        const dense = try dequantSlabs(codes, scales, 1, rows, s);
+        defer _ = mlx.mlx_array_free(dense);
+        var flat = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, dense, &[_]c_int{ @intCast(rows), mlx.getShape(codes)[1] }, 2, s));
+        try mlx.check(mlx.mlx_array_eval(flat));
+        try putOwned(weights, wk, flat);
     }
 }
 
@@ -467,9 +482,11 @@ fn dequantRows(w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_
     return dense;
 }
 
-/// `x @ W^T` for a row-scaled e4m3 weight, decoded to bf16 one projection at a time so the
-/// resident bytes stay the stored ones.
+/// `x @ W^T` for a row-scaled e4m3 weight. Decode and verify widths read the stored codes in
+/// place (`gemv`); wider inputs decode to bf16 one projection at a time, so the resident bytes
+/// stay the stored ones either way.
 pub fn fp8Linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (try gemv(x, w, sc, s)) |y| return y;
     const dense = try dequantRows(w, sc, s);
     defer _ = mlx.mlx_array_free(dense);
     var wt = mlx.mlx_array_new();
@@ -478,6 +495,135 @@ pub fn fp8Linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.m
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
+    return out;
+}
+
+// e4m3 GEMV ported from sushi's fp8_block.zig (beamivalice/sushi, MIT): each simdgroup owns NR
+// weight rows for all M input rows, lanes stride a row in 16-byte chunks, products sum in f32.
+// The e4m3 decode is bit-exact: the code's low 7 bits as a half, times 256.
+const GEMV_HEADER =
+    \\static inline float4 msv_e4m3_decode4(uint w) {
+    \\    uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
+    \\    uint hs = w >> 8;
+    \\    uint hi = ((hs & 0x007F007Fu) << 7) | ((hs & 0x00800080u) << 8);
+    \\    half2 h02 = as_type<half2>(lo) * half2((half)256.0f);
+    \\    half2 h13 = as_type<half2>(hi) * half2((half)256.0f);
+    \\    return float4(float(h02.x), float(h13.x), float(h02.y), float(h13.y));
+    \\}
+;
+const GEMV_SOURCE =
+    \\constexpr uint KC = uint(K) / 16u;
+    \\constexpr uint KB = uint(K) / 128u;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint row0 = (threadgroup_position_in_grid.x * uint(SGS) + simdgroup_index_in_threadgroup) * uint(NR);
+    \\const device uint4* wp[NR];
+    \\uint srow[NR];
+    \\float acc[M][NR];
+    \\#pragma clang loop unroll(full)
+    \\for (int r = 0; r < NR; ++r) {
+    \\  uint o = metal::min(row0 + uint(r), uint(N) - 1u);
+    \\  srow[r] = o * KB;
+    \\  wp[r] = (const device uint4*)(w + (size_t)o * (size_t)K);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int m = 0; m < M; ++m) acc[m][r] = 0.0f;
+    \\}
+    \\for (uint c = lane; c < KC; c += 32u) {
+    \\  uint4 wr[NR];
+    \\  float sc[NR];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int r = 0; r < NR; ++r) {
+    \\    wr[r] = wp[r][c];
+    \\    sc[r] = scales[srow[r] + (c >> 3)];
+    \\  }
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 4; ++i) {
+    \\    float4 wv[NR];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int r = 0; r < NR; ++r) wv[r] = msv_e4m3_decode4(wr[r][i]) * sc[r];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int m = 0; m < M; ++m) {
+    \\      float4 xv = float4(*((const device vec<T, 4>*)(x + (size_t)m * (size_t)K + c * 16u + uint(i) * 4u)));
+    \\      #pragma clang loop unroll(full)
+    \\      for (int r = 0; r < NR; ++r) acc[m][r] += dot(xv, wv[r]);
+    \\    }
+    \\  }
+    \\}
+    \\#pragma clang loop unroll(full)
+    \\for (int m = 0; m < M; ++m) {
+    \\  #pragma clang loop unroll(full)
+    \\  for (int r = 0; r < NR; ++r) {
+    \\    float total = simd_sum(acc[m][r]);
+    \\    uint o = row0 + uint(r);
+    \\    if (lane == 0u && o < uint(N)) y[(size_t)m * uint(N) + o] = T(total);
+    \\  }
+    \\}
+;
+const GEMV_MAX_ROWS = 8;
+const GemvKey = struct { m: c_int, n: c_int, k: c_int, dt: mlx.mlx_dtype };
+var gemv_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var gemv_keys: [64]GemvKey = undefined;
+var gemv_cfgs: [64]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var gemv_next: usize = 0;
+
+fn gemvConfig(key: GemvKey) !mlx.mlx_fast_metal_kernel_config {
+    for (gemv_cfgs, 0..) |c, i| if (c != null and std.meta.eql(gemv_keys[i], key)) return c.?;
+    // Past four rows two weight rows per simdgroup share each x read.
+    const nr: c_int = if (key.m <= 4) 1 else 2;
+    const sgs: c_int = if (key.m <= 4) 2 else 8;
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ key.m, key.n }, 2, key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * sgs * @divTrunc(key.n + nr * sgs - 1, nr * sgs), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32 * sgs, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", key.dt));
+    inline for (.{ .{ "M", key.m }, .{ "N", key.n }, .{ "K", key.k }, .{ "NR", nr }, .{ "SGS", sgs } }) |t|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t[0], t[1]));
+    const slot = gemv_next % gemv_cfgs.len;
+    if (gemv_cfgs[slot]) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old);
+    gemv_keys[slot] = key;
+    gemv_cfgs[slot] = c;
+    gemv_next += 1;
+    return c;
+}
+
+/// `x @ W^T` over the stored codes for up to `GEMV_MAX_ROWS` input rows on the GPU; null otherwise.
+fn gemv(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    const wsh = mlx.getShape(w);
+    const dt = mlx.mlx_array_dtype(x);
+    if (!mlx.streamIsGpu(s) or xsh.len == 0 or wsh.len != 2 or xsh[xsh.len - 1] != wsh[1] or @rem(wsh[1], FP8_BLOCK) != 0) return null;
+    if (dt != .bfloat16 and dt != .float16 and dt != .float32) return null;
+    var m: c_int = 1;
+    for (xsh[0 .. xsh.len - 1]) |d| m *= d;
+    if (m < 1 or m > GEMV_MAX_ROWS) return null;
+    if (gemv_kernel == null) {
+        const ins = [_][*:0]const u8{ "x", "w", "scales" };
+        const outs = [_][*:0]const u8{"y"};
+        const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_fp8_gemv", in_vec, out_vec, GEMV_SOURCE, GEMV_HEADER, true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        gemv_kernel = k;
+        log.info("[fp8] e4m3 GEMV engaged (up to {d} rows)\n", .{GEMV_MAX_ROWS});
+    }
+    const cfg = try gemvConfig(.{ .m = m, .n = wsh[0], .k = wsh[1], .dt = dt });
+    const in_vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ x, w, sc }, 3);
+    defer _ = mlx.mlx_vector_array_free(in_vec);
+    var out_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(out_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&out_vec, gemv_kernel.?, in_vec, cfg, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_vector_array_get(&flat, out_vec, 0));
+    var lead: [8]c_int = undefined;
+    if (xsh.len > lead.len) return null;
+    @memcpy(lead[0..xsh.len], xsh);
+    lead[xsh.len - 1] = wsh[0];
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, flat, &lead, xsh.len, s));
     return out;
 }
 
@@ -568,37 +714,39 @@ test "sushi pack: a QKV part keeps its e4m3 rows and decodes as the slab dequant
 
     const got = try dequantRows(part, row_scales, s);
     defer _ = mlx.mlx_array_free(got);
-    // The projection itself: x @ W^T over the decoded rows (GPU, as served).
+    // The projection itself: x @ W^T over the decoded rows (GPU, as served), at both GEMV shapes.
     const gs = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(gs);
-    var xs: [2 * k]f32 = undefined;
-    for (&xs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
-    const x32 = mlx.mlx_array_new_data(&xs, &[_]c_int{ 1, 2, k }, 3, .float32);
-    defer _ = mlx.mlx_array_free(x32);
-    var xb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xb);
-    try mlx.check(mlx.mlx_astype(&xb, x32, .bfloat16, gs));
-    const y = try fp8Linear(xb, part, row_scales, gs);
-    defer _ = mlx.mlx_array_free(y);
-    var yf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(yf);
-    try mlx.check(mlx.mlx_astype(&yf, y, .float32, gs));
-    try mlx.check(mlx.mlx_array_eval(yf));
     var dense_f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dense_f);
     try mlx.check(mlx.mlx_astype(&dense_f, got, .float32, s));
     try mlx.check(mlx.mlx_array_eval(dense_f));
     const dv = mlx.mlx_array_data_float32(dense_f).?;
-    const yv = mlx.mlx_array_data_float32(yf).?;
-    for (0..2) |row| for (0..tp * 30) |r| {
-        var acc: f64 = 0;
-        var mag: f64 = 0;
-        for (0..k) |c| {
-            acc += @as(f64, xs[row * k + c]) * dv[r * k + c];
-            mag += @abs(@as(f64, xs[row * k + c]) * dv[r * k + c]);
-        }
-        try testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), yv[row * tp * 30 + r], @as(f32, @floatCast(0.02 * mag + 1e-3)));
-    };
+    var xs: [5 * k]f32 = undefined;
+    for (&xs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
+    for ([_]c_int{ 2, 5 }) |rows| {
+        const x32 = mlx.mlx_array_new_data(&xs, &[_]c_int{ 1, rows, k }, 3, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        var xb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xb);
+        try mlx.check(mlx.mlx_astype(&xb, x32, .bfloat16, gs));
+        const y = try fp8Linear(xb, part, row_scales, gs);
+        defer _ = mlx.mlx_array_free(y);
+        var yf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(yf);
+        try mlx.check(mlx.mlx_astype(&yf, y, .float32, gs));
+        try mlx.check(mlx.mlx_array_eval(yf));
+        const yv = mlx.mlx_array_data_float32(yf).?;
+        for (0..@intCast(rows)) |row| for (0..tp * 30) |r| {
+            var acc: f64 = 0;
+            var mag: f64 = 0;
+            for (0..k) |c| {
+                acc += @as(f64, xs[row * k + c]) * dv[r * k + c];
+                mag += @abs(@as(f64, xs[row * k + c]) * dv[r * k + c]);
+            }
+            try testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), yv[row * tp * 30 + r], @as(f32, @floatCast(0.02 * mag + 1e-3)));
+        };
+    }
 
     var want_slab = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(want_slab);
@@ -624,7 +772,7 @@ test "sushi pack: a QKV part keeps its e4m3 rows and decodes as the slab dequant
     };
 }
 
-test "sushi pack: the resident bill holds QKV as stored, the dense MLP decoded, and nothing unserved" {
+test "sushi pack: the resident bill holds QKV as stored, the dense MLP decoded, the MTP heads, and nothing unserved" {
     const header =
         \\{"__metadata__":{"format":"pt"},
         \\"model.layers.0.self_attn.qkv_proj.weight":{"dtype":"F8_E4M3","shape":[1,1],"data_offsets":[0,1000]},
@@ -636,8 +784,43 @@ test "sushi pack: the resident bill holds QKV as stored, the dense MLP decoded, 
         \\"visual.blocks.0.attn.proj.weight":{"dtype":"BF16","shape":[1,1],"data_offsets":[2900,3900]}}
     ;
     var config: ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 48 };
-    // qkv 1000 + its scales 100 x 128 + gate 200 held twice + trellis 500.
-    try testing.expectEqual(@as(u64, 1000 + 100 * 128 + 400 + 500), try headerResidentBytes(testing.allocator, header, &config, "a.safetensors", null));
+    // qkv 1000 + its scales 100 x 128 + gate 200 held twice + trellis 500 + the MTP head's 1000.
+    try testing.expectEqual(@as(u64, 1000 + 100 * 128 + 400 + 500 + 1000), try headerResidentBytes(testing.allocator, header, &config, "a.safetensors", null));
+}
+
+test "sushi pack: the MiMo MTP heads get the trunk's split QKV and decoded MLP" {
+    const s = cpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    // Layer 0 slides (pattern 2): its geometry is the heads'. q 32 + k 32 + v 32 rows over 4 ranks.
+    var config: ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 2, .num_attention_heads = 4, .num_key_value_heads = 4, .head_dim = 8, .has_sliding_window = true, .sliding_window_pattern = 2, .weight_prefix = "model" };
+    var w = Weights.init(testing.allocator);
+    defer w.deinit();
+    var codes: [128 * 128]u8 = undefined;
+    for (&codes, 0..) |*c, i| c.* = @intCast((i * 13 + 3) % 0x70);
+    const ones = [_]f32{ 0.5, 0.5, 0.5, 0.5 };
+    try putNew(&w, "model.mtp.layers.0.eh_proj.weight", mlx.mlx_array_new_float(1));
+    try putNew(&w, "model.mtp.layers.0.self_attn.qkv_proj.weight", mlx.mlx_array_new_data(&codes, &[_]c_int{ 96, 128 }, 2, .uint8));
+    try putNew(&w, "model.mtp.layers.0.self_attn.qkv_proj.weight_scale_inv", mlx.mlx_array_new_data(&ones, &[_]c_int{ 4, 1 }, 2, .float32));
+    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
+        var k1: [96]u8 = undefined;
+        var k2: [96]u8 = undefined;
+        try putNew(&w, try std.fmt.bufPrint(&k1, "model.mtp.layers.0.mlp.{s}.weight", .{proj}), mlx.mlx_array_new_data(&codes, &[_]c_int{ 128, 128 }, 2, .uint8));
+        try putNew(&w, try std.fmt.bufPrint(&k2, "model.mtp.layers.0.mlp.{s}.weight_scale_inv", .{proj}), mlx.mlx_array_new_data(&ones, &[_]c_int{ 1, 1 }, 2, .float32));
+    }
+    try dequantFp8Trunk(&config, &w, s);
+
+    try testing.expect(w.get("model.mtp.layers.0.self_attn.qkv_proj.weight") == null);
+    for ([_][]const u8{ "q_proj", "k_proj", "v_proj" }) |proj| {
+        var k1: [96]u8 = undefined;
+        const part = w.get(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.self_attn.{s}.weight", .{proj})).?;
+        try testing.expectEqualSlices(c_int, &.{ 32, 128 }, mlx.getShape(part));
+        try testing.expect(w.get(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.self_attn.{s}.scales", .{proj})) != null);
+    }
+    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
+        var k1: [96]u8 = undefined;
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(w.get(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.mlp.{s}.weight", .{proj})).?));
+        try testing.expect(w.get(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.mlp.{s}.weight_scale_inv", .{proj})) == null);
+    }
 }
 
 test "sushi pack: the GLM bill holds the joined KDA projections and the dense kv_b halves" {

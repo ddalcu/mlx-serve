@@ -1085,6 +1085,28 @@ final class MediaGenServiceTests: XCTestCase {
         }
     }
 
+    /// Turbo ships its own 8-sigma grid and the server runs it whatever `steps`
+    /// says, so the pane must offer no step count at all.
+    func testQwenImageTurboPresetsRunTheCheckpointsOwnSchedule() {
+        for p in [ImageModelPreset.qwenImage21Turbo_8bit, .qwenImage21Turbo_4bit] {
+            XCTAssertTrue(p.stepsAreFixed, "\(p.id): distilled 8-step grid")
+            XCTAssertTrue(p.stepsSetByCheckpoint, "\(p.id): the server ignores steps")
+            XCTAssertEqual(p.fixedSteps, 8)
+            for q in QualityPreset.allCases { XCTAssertEqual(p.settings(q).steps, 8) }
+            XCTAssertTrue(p.supportsImg2Img)
+            XCTAssertFalse(p.supportsLoRA)
+            XCTAssertEqual(p.condWeightCount, 0)
+            XCTAssertEqual(p.resolutionGrid.alignment, 16)
+            XCTAssertEqual(p.configName, "qwen_image21")
+            XCTAssertTrue(p.repo.hasPrefix("ddalcu/Qwen-Image-2.1-Turbo-"))
+            XCTAssertTrue(ImageModelPreset.all.contains(p))
+            XCTAssertTrue(p.bundle.components[0].readyMarkers.contains("processor"))
+        }
+        for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit, .mageFlowTurbo] {
+            XCTAssertFalse(p.stepsSetByCheckpoint, "\(p.id): steps reach the server")
+        }
+    }
+
     /// The 8-bit mirrors are the SAME architecture at half the download, so they
     /// reuse their bf16 sibling's variant — quantization is a property of the
     /// checkpoint, not of what the model can do. If they ever diverge on a

@@ -1,74 +1,119 @@
 MLX's CUDA quantized matmul has two kernels for a few rows of x: qmv, which
 streams the whole weight matrix once per row, and the tiled qmm_sm80, which
-reads it once but dequantizes into a tensor-core GEMM. On a GPU with little
-compute per byte of memory bandwidth (GB10, sm_121) the tiled kernel costs
-over twice a single row at any width, so a speculative-verify forward of 2..8
-rows is slower than decoding its tokens one at a time.
+reads it once but dequantizes into a tensor-core GEMM. On GB10 (sm_121) the
+tiled kernel is the expensive one, so a speculative verify or a small batched
+decode is faster as one weight read dotted with each row.
 
-This adds a rows variant of qmv: each warp dequantizes its row of w once and
-takes its dot product with every row of x, in float32. Two or three rows cost
-about what one does; each further row adds scalar compute only.
-
-Off by default: MLX_CUDA_QMV_MAX_ROWS=<1..8> sets how many rows of one batch
-take it (2D weights, no gather).
+This adds that rows kernel. It is the default for up to 6 rows on GB10 and
+stays off on every other chip, where the tiled kernel wins from 2 rows up.
+MLX_CUDA_QMV_MAX_ROWS=<1..8> overrides either choice.
 
 Drop this file and its step in build-mlx-linux.sh once lib/mlx-src includes
 it.
 
 diff --git a/docs/src/usage/environment_variables.rst b/docs/src/usage/environment_variables.rst
-index 4641411d9..2660de4f6 100644
+index 4641411d9..c2012d530 100644
 --- a/docs/src/usage/environment_variables.rst
 +++ b/docs/src/usage/environment_variables.rst
-@@ -175,6 +175,12 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
+@@ -175,6 +175,13 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
     Set the CUDA backward scaled dot-product attention cache capacity. The
     default is ``64``.
  
 +.. envvar:: MLX_CUDA_QMV_MAX_ROWS
 +
 +   Rows of one batch (``1`` to ``8``) that a CUDA quantized matmul runs through
-+   the mat-vec kernel, which past one row reads the weights once for all of
-+   them. The default is ``1``.
++   the mat-vec kernel, reading the weights once for all of them. A speculative
++   verify and a batched decode both arrive as those rows. Unset, a GB10
++   (compute capability 12.1) uses ``6`` and every other GPU uses ``1``.
 +
  .. envvar:: MLX_ENABLE_CACHE_THRASHING_CHECK
  
     Detect consecutive CUDA cache misses (more than twice the capacity with no
 diff --git a/mlx/backend/cuda/quantized/qmm/qmm.h b/mlx/backend/cuda/quantized/qmm/qmm.h
-index 6991baad1..77921b5be 100644
+index 6991baad1..61f1945c6 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmm.h
 +++ b/mlx/backend/cuda/quantized/qmm/qmm.h
-@@ -118,6 +118,10 @@ bool supports_qmv(
+@@ -5,6 +5,8 @@
+ #include "mlx/backend/cuda/device.h"
+ #include "mlx/primitives.h"
+ 
++#include <algorithm>
++#include <cstdlib>
+ #include <optional>
+ 
+ namespace mlx::core {
+@@ -118,6 +120,21 @@ bool supports_qmv(
      QuantizationMode mode,
      cu::Device& device);
  
-+// Rows of one batch that qmv serves with a single read of the weights
-+// (MLX_CUDA_QMV_MAX_ROWS, 1 to 8, default 1).
-+int qmv_max_rows();
++// Rows that share one weight read. A set MLX_CUDA_QMV_MAX_ROWS wins,
++// clamped to 1..8. Unset: 6 on GB10 (sm_121), 1 on every other chip.
++inline int qmv_rows_cap(int major, int minor, const char* env) {
++  if (env != nullptr && env[0] != '\0') {
++    return std::clamp(std::atoi(env), 1, 8);
++  }
++  if (major == 12 && minor == 1) {
++    return 6;
++  }
++  return 1;
++}
++
++// Parsed once until MLX_CUDA_QMV_MAX_ROWS or the device changes.
++int qmv_max_rows(const cu::Device& device);
 +
  void qmv(
      const array& x,
      const array& w,
 diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
-index 63c847844..0423afd37 100644
+index 63c847844..68718579f 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmv.cu
 +++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
-@@ -8,8 +8,16 @@
+@@ -8,8 +8,44 @@
  #include <cooperative_groups.h>
  #include <cooperative_groups/reduce.h>
  
-+#include <algorithm>
 +#include <cstdlib>
++#include <cstring>
 +
  namespace mlx::core {
  
-+int qmv_max_rows() {
-+  const char* v = std::getenv("MLX_CUDA_QMV_MAX_ROWS");
-+  return v ? std::clamp(std::atoi(v), 1, 8) : 1;
++int qmv_max_rows(const cu::Device& device) {
++  // The parse is cached. A test can still bracket one case: a changed
++  // variable is picked up, and an empty one falls back to the device.
++  static int cached_cap = -1;
++  static int cached_major = -1;
++  static int cached_minor = -1;
++  static bool cached_set = false;
++  static char cached_env[8] = {};
++
++  const char* env = std::getenv("MLX_CUDA_QMV_MAX_ROWS");
++  bool set = env != nullptr && env[0] != '\0';
++  int major = device.compute_capability_major();
++  int minor = device.compute_capability_minor();
++  if (cached_cap >= 0 && cached_major == major && cached_minor == minor &&
++      cached_set == set &&
++      (!set || std::strncmp(cached_env, env, sizeof(cached_env)) == 0)) {
++    return cached_cap;
++  }
++  cached_major = major;
++  cached_minor = minor;
++  cached_set = set;
++  cached_env[0] = '\0';
++  if (set) {
++    size_t i = 0;
++    for (; i + 1 < sizeof(cached_env) && env[i] != '\0'; ++i) {
++      cached_env[i] = env[i];
++    }
++    cached_env[i] = '\0';
++  }
++  cached_cap = qmv_rows_cap(major, minor, set ? cached_env : nullptr);
++  return cached_cap;
 +}
 +
  namespace cu {
  
  namespace cg = cooperative_groups;
-@@ -208,6 +216,105 @@ __global__ void qmv_kernel(
+@@ -208,6 +244,105 @@ __global__ void qmv_kernel(
        x, w, scales, biases, global_scale, out, row, w_batch, n, k);
  }
  
@@ -174,11 +219,19 @@ index 63c847844..0423afd37 100644
  template <
      int rows_per_block,
      int elems_per_thread,
-@@ -283,6 +390,51 @@ void qmv(
+@@ -272,6 +407,7 @@ void qmv(
+     int k,
+     int l,
+     bool broadcast_w,
++    int max_rows,
+     F&& launch_kernel) {
+   constexpr int rows_per_block = 8;
+   constexpr int elems_per_thread =
+@@ -283,6 +419,51 @@ void qmv(
    void* args[] = {
        &x, &w, &scales, &biases, &global_scale, &out, &n, &k, &broadcast_w};
  
-+  if (m >= 2 && m <= qmv_max_rows() && l == 1 && !global_scale) {
++  if (m >= 2 && m <= max_rows && l == 1 && !global_scale) {
 +    dim3 row_blocks{uint32_t(cuda::ceil_div(n, rows_per_block)), 1, 1};
 +    void* row_args[] = {&x, &w, &scales, &biases, &out, &n, &k};
 +    dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
@@ -226,24 +279,41 @@ index 63c847844..0423afd37 100644
    dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
      auto* kernel = &qmv_kernel<
          rows_per_block,
+@@ -466,6 +647,7 @@ void qmv(
+               k,
+               l,
+               broadcast_w,
++              qmv_max_rows(encoder.device()),
+               [&](auto* kernel, dim3 num_blocks, dim3 block_dims, void** args) {
+                 encoder.add_kernel_node_raw(
+                     kernel, num_blocks, block_dims, {}, 0, args);
 diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
-index 68012cbf3..2ad9fd017 100644
+index 68012cbf3..c3747144b 100644
 --- a/mlx/backend/cuda/quantized/quantized.cpp
 +++ b/mlx/backend/cuda/quantized/quantized.cpp
-@@ -119,7 +119,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -119,7 +119,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
    }
  
    if (can_use_qmm_sm80) {
 -    if (can_use_qmv && (M * B == 1)) {
-+    if (can_use_qmv && (M * B == 1 || (B == 1 && M <= qmv_max_rows()))) {
++    if (can_use_qmv &&
++        (M * B == 1 || (B == 1 && M <= qmv_max_rows(encoder.device())))) {
        call_qmv();
      } else {
        call_qmm_sm80();
 diff --git a/tests/cuda_tests.cpp b/tests/cuda_tests.cpp
-index fee796ee1..9f9d86c25 100644
+index fee796ee1..31f6a26ae 100644
 --- a/tests/cuda_tests.cpp
 +++ b/tests/cuda_tests.cpp
-@@ -11,6 +11,7 @@
+@@ -2,6 +2,7 @@
+ 
+ #include "doctest/doctest.h"
+ #include "mlx/backend/cuda/lru_cache.h"
++#include "mlx/backend/cuda/quantized/qmm/qmm.h"
+ #include "mlx/mlx.h"
+ 
+ #ifdef _WIN32
+@@ -11,6 +12,7 @@
  #include <cuda_runtime.h>
  
  #include <cstdint>
@@ -251,22 +321,36 @@ index fee796ee1..9f9d86c25 100644
  #include <limits>
  
  using namespace mlx::core;
-@@ -195,3 +196,26 @@ TEST_CASE("test quantized matmul over a few rows") {
+@@ -195,3 +197,40 @@ TEST_CASE("test quantized matmul over a few rows") {
      }
    }
  }
 +
++TEST_CASE("test qmv rows cap") {
++  // GB10 (sm_121) shares one weight read across 6 rows. Other chips keep
++  // the tiled kernel. A set variable overrides either default.
++  CHECK(qmv_rows_cap(12, 1, nullptr) == 6);
++  CHECK(qmv_rows_cap(12, 1, "") == 6);
++  CHECK(qmv_rows_cap(12, 0, nullptr) == 1);
++  CHECK(qmv_rows_cap(8, 9, nullptr) == 1);
++  CHECK(qmv_rows_cap(12, 0, "6") == 6);
++  CHECK(qmv_rows_cap(12, 1, "1") == 1);
++  CHECK(qmv_rows_cap(12, 1, "9") == 8);
++  CHECK(qmv_rows_cap(12, 1, "0") == 1);
++}
++
 +#ifndef _WIN32
 +TEST_CASE("test quantized matmul rows kernel") {
-+  // MLX_CUDA_QMV_MAX_ROWS sends 2..8 rows through the mat-vec rows kernel;
-+  // each row must match a dequantized reference, a ragged K too.
++  // Cap 8 sends 2..8 rows through the mat-vec rows kernel, including a
++  // ragged K. A wider matmul stays on the tiled kernel. Each row matches
++  // a dequantized reference.
 +  setenv("MLX_CUDA_QMV_MAX_ROWS", "8", 1);
 +  for (int bits : {4, 8}) {
 +    for (int k : {512, 1088}) {
 +      auto w = random::normal({384, k}, bfloat16);
 +      auto q = quantize(w, 64, bits);
 +      auto w_dq = astype(dequantize(q[0], q[1], q[2], 64, bits), float32);
-+      for (int m : {2, 3, 5, 8}) {
++      for (int m : {2, 3, 5, 6, 8, 16}) {
 +        auto x = random::normal({m, k}, bfloat16);
 +        auto out = quantized_matmul(x, q[0], q[1], q[2], true, 64, bits);
 +        auto expected = matmul(astype(x, float32), transpose(w_dq));

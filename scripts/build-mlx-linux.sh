@@ -119,7 +119,7 @@ if [[ "$MLX_BACKEND" == cuda ]]; then
   else
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmm-read-weights-once.patch"
   fi
-  echo "== patch mlx: CUDA mat-vec rows kernel (MLX_CUDA_QMV_MAX_ROWS)"
+  echo "== patch mlx: CUDA mat-vec rows kernel (GB10 default, MLX_CUDA_QMV_MAX_ROWS)"
   if grep -q 'qmv_rows_kernel' "$MLX_SOURCE/mlx/backend/cuda/quantized/qmm/qmv.cu"; then
     echo "   qmv rows: already applied"
   else

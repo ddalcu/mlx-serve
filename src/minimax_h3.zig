@@ -77,9 +77,8 @@ pub const PATCH_W: u32 = 2;
 
 /// Snap UP to the model's 17k+5 grid. 40 -> 56, 200 -> 209, 363 -> 379.
 pub fn alignFrameCount(n: u32) u32 {
-    var v = n;
-    while (v % 17 != 5) v += 1;
-    return v;
+    // Saturates near the u32 limit, where no ladder rung exists; the transport cap refuses it.
+    return n +| (22 - n % 17) % 17;
 }
 
 /// Snap DOWN to the same ladder, with the model's 5-frame floor. A ref2va
@@ -103,7 +102,8 @@ pub const TemporalShape = struct { frame_count: u32, latent_t: u32, audio_t: u32
 
 /// Aligned frame count + its latent-frame and audio-latent counts.
 pub fn temporalShape(length: u32) TemporalShape {
-    const frame_count = alignFrameCount(@max(5, length));
+    // 2^24 frames is past what the transport cap admits at any canvas, and keeps audio_t in range.
+    const frame_count = alignFrameCount(std.math.clamp(length, 5, 1 << 24));
     const fc: f64 = @floatFromInt(frame_count);
     // audio_t = round(frame_count / 24 * 40) = round(frame_count * 5 / 3). The
     // reference uses Python's banker's rounding, but frame_count*5/3 can only
@@ -917,13 +917,22 @@ fn concat(arrs: []const mlx.mlx_array, axis: c_int, s: S) !mlx.mlx_array {
     try mlx.check(mlx.mlx_concatenate_axis(&o, vec, axis, s));
     return o;
 }
+/// Equal views along `axis`, taken with `mlx_slice`: MLX 0.32.3's split view records its element
+/// COUNT as its data size, so elementwise kernels pick 32-bit indexing and read out of bounds once
+/// `row * stride` passes 2^31 (fc1's [S, 28672] past S = 74,898: a NaN latent, a black clip).
 fn splitEqual(x: mlx.mlx_array, n: usize, axis: c_int, out: []mlx.mlx_array, s: S) !void {
-    var vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    try mlx.check(mlx.mlx_split(&vec, x, @intCast(n), axis, s));
+    const shp = mlx.getShape(x);
+    const ax: usize = @intCast(axis);
+    const part = @divExact(shp[ax], @as(c_int, @intCast(n)));
+    var start: [8]c_int = @splat(0);
+    var stop: [8]c_int = undefined;
+    var step: [8]c_int = @splat(1);
+    @memcpy(stop[0..shp.len], shp);
     for (0..n) |i| {
+        start[ax] = @as(c_int, @intCast(i)) * part;
+        stop[ax] = start[ax] + part;
         var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(&o, vec, i));
+        try mlx.check(mlx.mlx_slice(&o, x, &start, shp.len, &stop, shp.len, &step, shp.len, s));
         out[i] = o;
     }
 }
@@ -4664,7 +4673,7 @@ fn generateOne(
 /// Unique frames a chained clip delivers: each seam drops the duplicate frame
 /// (window N+1's frame 0 reproduces its conditioning keyframe).
 pub fn chainDeliveredFrames(windows: u32, window_frames: u32) u32 {
-    return windows * window_frames - (windows - 1);
+    return windows *| window_frames -| (windows - 1);
 }
 
 /// One video frame of audio — the cross-fade width at each seam.
@@ -6301,6 +6310,60 @@ fn sumAll(x: mlx.mlx_array, s: S) !f32 {
     return v;
 }
 
+test "minimax h3: splitEqual returns the n column blocks in order" {
+    const s = mlx.gpuStream();
+    var buf: [12]f32 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @floatFromInt(i);
+    const x = mlx.mlx_array_new_data(&buf, &[_]c_int{ 2, 6 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(x);
+    var parts: [3]mlx.mlx_array = undefined;
+    try splitEqual(x, 3, 1, &parts, s);
+    defer for (parts) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    for (parts, 0..) |p, k| {
+        const c = try contig(p, s);
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_array_eval(c));
+        const got = (mlx.mlx_array_data_float32(c) orelse return error.NoData)[0..4];
+        const b: f32 = @floatFromInt(2 * k);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ b, b + 1, b + 6, b + 7 }, got);
+    }
+}
+
+test "minimax h3 live: the SwiGLU fallback reads every row of a [S, 28672] fc1 output past 2^31" {
+    // 6.5 GB of GPU memory. Rows from 74,898 on read out of bounds when the split view picks
+    // 32-bit indexing (a black clip).
+    _ = std.c.getenv("MINIMAX_H3_SPLIT_OVERFLOW") orelse return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const rows: c_int = 75_157;
+    const f: c_int = 14_336;
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &[_]c_int{ rows, 2 * f }, 2, mlx.mlx_dtype.bfloat16, s));
+    var halves: [2]mlx.mlx_array = undefined;
+    try splitEqual(x, 2, 1, &halves, s);
+    defer for (halves) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    const act = try siluA(halves[1], s);
+    defer _ = mlx.mlx_array_free(act);
+    const tail = try sliceRows(act, 74_898, rows, s);
+    defer _ = mlx.mlx_array_free(tail);
+    var ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ rows - 74_898, f }, 2, mlx.mlx_dtype.bfloat16, s));
+    const want = try siluA(ones, s);
+    defer _ = mlx.mlx_array_free(want);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, tail, want, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try std.testing.expect(same);
+}
+
 test "minimax h3: DiT block matches the reference transcription" {
     // Hermetic: a 1.8 MB toy-geometry fixture with synthetic weights, from
     // tests/dump_minimax_h3_fixtures.py. See that file's header for exactly
@@ -6926,6 +6989,15 @@ test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-orde
     const fine_exact = audioStepFactor(true, 0.5, 0.49, sv, sa);
     const fine_first = audioStepFactor(false, 0.5, 0.49, sv, sa);
     try testing.expect(@abs(fine_exact - fine_first) < @abs(fine_first) * 0.02);
+}
+
+test "minimax h3: a frame count near the u32 limit reaches the transport cap instead of overflowing" {
+    const max = std.math.maxInt(u32);
+    try testing.expectEqual(@as(u32, 22), alignFrameCount(18));
+    try testing.expectEqual(@as(u32, 22), alignFrameCount(22));
+    try testing.expectEqual(@as(u32, max), alignFrameCount(max - 3));
+    try testing.expect(chainDeliveredFrames(6, max) > 1 << 24);
+    try testing.expect(temporalShape(max).frame_count >= 1 << 24);
 }
 
 test "minimax h3: chain math — delivered frames, overlap width, cross-fade seam" {

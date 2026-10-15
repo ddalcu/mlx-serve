@@ -70,7 +70,9 @@ Response: `{"created":0,"data":[{"b64_json":"<base64 PNG>"}]}`
 prefer the JSON `mode:"edit"` body above.
 
 Sprite and texture tips: ask for a plain or solid background and cut it out
-yourself unless the model supports `transparent`. Generate at the model's native
+(`node gen.mjs cutout`) unless the model supports `transparent`; `gen.mjs tile`
+and `gen.mjs maps` make a texture seamless and derive its normal, roughness and
+AO maps. Generate at the model's native
 size and downscale; for pixel art, downscale with nearest-neighbour.
 
 ## Speech (TTS): `POST /v1/audio/speech`
@@ -93,14 +95,19 @@ fast enough for on-demand lines; still cache every line you can.
 |---|---|
 | `prompt` | required: genre, mood, instruments, tempo feel |
 | `lyrics` | section-tagged lines (`[verse]`, `[chorus]`, `[bridge]` on their own line) |
-| `instrumental` | `true` = no vocals; do not also send `lyrics` |
-| `duration_seconds` | ACE-Step 10-600 (default 60); MiniMax Music 3 1-360 |
+| `instrumental` | `true` = no vocals; do not also send `lyrics` (not YuE2) |
+| `duration_seconds` | ACE-Step 10-600 (default 60); MiniMax Music 3 1-360; YuE2 5-360, an upper bound (the song ends itself) |
 | `seed` | reproducible track |
 | `bpm`, `keyscale`, `timesignature`, `vocal_language` | ACE-Step only |
 | `task`, `src_audio`, `ref_audio` | ACE-Step only: `cover` / `complete` a base64 WAV, or match a reference's timbre |
 
 MiniMax Music 3 needs `lyrics` unless `instrumental` is true, and rejects the
-ACE-Step-only fields by name. Response: raw `audio/wav` bytes or SSE.
+ACE-Step-only fields by name. YuE2 always needs `lyrics` (`[verse]`-style tags on
+their own lines; for a calm, mostly instrumental feel keep them short and soft) and
+refuses `instrumental` and the ACE-Step fields by name; its own fields are `cot`
+(`full` default, `melody` or `off`: whether it writes a melody score first), `abc`
+(your own or an edited score), `steps` 1-100 (default 32) and `cfg_scale` 0-20. Its
+streaming `complete` event also returns the score as `abc`. Response: raw `audio/wav` bytes or SSE.
 For game loops, generate a track then crossfade the tail yourself; the model does
 not guarantee a seamless loop point.
 
@@ -119,6 +126,35 @@ door, an engine, impacts, UI blips).
 Response: raw `audio/wav` bytes (44.1 kHz stereo) or SSE. About a second per
 clip, so a game can generate variations up front (several seeds of one prompt)
 and pick at random at play time.
+
+## Speech to text: `POST /v1/audio/transcriptions`
+
+Qwen3-ASR, in OpenAI's multipart form (the OpenAI SDK's transcription call works):
+what is said in a WAV (any rate, mono or stereo, any length: a long one is cut into pieces), in 30 languages.
+
+| field | notes |
+|---|---|
+| `file` | required: the WAV |
+| `model` | a model with the `transcription` capability |
+| `language` | ISO code or name; omit it and the model detects it |
+| `prompt` | names and terms the transcript should spell your way |
+| `response_format` | `json` (default, `{"text"}`), `text`, `verbose_json`, `srt`, `vtt`, `diarized_json` |
+| `timestamp_granularities[]` | `word` adds `words` to `verbose_json`; segments are always there |
+
+Times come from the forced aligner, a model with the `alignment` capability (the
+app downloads `mlx-community/Qwen3-ForcedAligner-0.6B-8bit` with the ASR):
+`verbose_json` segments end at sentences and pauses, each word has `start`/`end`
+seconds, and `srt`/`vtt` are those segments as subtitles. It times Chinese,
+Cantonese, English, German, Spanish, French, Italian, Portuguese, Russian, Korean
+and Japanese (a Chinese or Japanese word is one character); speech in another
+language is one segment. Without the aligner, `verbose_json` is one segment for
+the whole clip and `srt`/`vtt` answer 400.
+
+`diarized_json` says who said what: `{"task","duration","text","segments":[{"type",
+"id","start","end","text","speaker"}]}`, the speakers `"A"`, `"B"`, … in the order
+they first speak (up to eight), a segment closing where the speaker changes. It
+needs the diarizer, a model with the `diarization` capability (the app downloads
+`mlx-community/Nemotron-3-Diarization-8bit` with the ASR); without it, a 400.
 
 ## Video: `POST /v1/video/generations`
 

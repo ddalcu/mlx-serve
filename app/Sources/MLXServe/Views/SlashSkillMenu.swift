@@ -39,3 +39,22 @@ struct SlashSkillMenu: View {
         )
     }
 }
+
+extension View {
+    /// The "/" menu hung 8pt above this view (the composer), over the transcript: inside the bar it grew the
+    /// composer on every keystroke, and an NSPopover would take the keyboard from the field. An alignment
+    /// guide does not reach the overlay through the `if`, so the menu sits at the bottom of a zero-height box.
+    func slashSkillMenu(matches: [SkillSummary], selection: Int, onPick: @escaping (SkillSummary) -> Void) -> some View {
+        overlay(alignment: .top) {
+            VStack(spacing: 0) {
+                if !matches.isEmpty {
+                    SlashSkillMenu(matches: matches, selection: selection, onPick: onPick)
+                        .shadow(color: .black.opacity(0.28), radius: 14, y: 4)
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.bottom, 8)
+            .frame(height: 0, alignment: .bottom)
+        }
+    }
+}

@@ -36,6 +36,7 @@ SETTLE="${SETTLE:-20}"
 BINARY="${BINARY:-$ROOT/zig-out/bin/mlx-serve}"
 LLMPROBE="${LLMPROBE:-npx -y llmprobe@latest}"
 PORT=11250
+RAN=()
 
 usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
@@ -71,6 +72,7 @@ TARGETS=(
     "qwen38-27b|ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
     "qwen38-27b-iq|ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw"
     "qwen38-flash-next|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+    "qwen38-flash-next-iq|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw"
     "mimo-v26-flash|ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8"
     "glm53-flash|TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP"
 )
@@ -89,6 +91,7 @@ probe() { # logical host model_id
     local depth=(--bench-only)
     [[ "$FULL" -eq 1 ]] && depth+=(--full)
     echo "── $1 ($2, $3) ──"
+    RAN+=("$1")
     # shellcheck disable=SC2086
     $LLMPROBE "$2" -m "$3" "${depth[@]}" --save "$OUT/$1.json" \
         || echo "  llmprobe failed for $1" >&2
@@ -153,11 +156,14 @@ fi
 
 # ── The only artifact: rows to paste into benchmarks.md ──
 echo
-python3 - "$OUT" <<'PY'
+python3 - "$OUT" ${RAN[@]+"${RAN[@]}"} <<'PY'
 import json, re, sys
 from pathlib import Path
 
-for path in sorted(Path(sys.argv[1]).glob("*.json")):
+# Only this run's rows: an earlier run's reports in the same tag dir are stale.
+for path in sorted(Path(sys.argv[1]) / f"{name}.json" for name in sys.argv[2:]):
+    if not path.exists():
+        continue
     bench = (json.loads(path.read_text()) or {}).get("bench") or {}
     decode = (bench.get("decodeTokPerSec") or {}).get("median")
     prefill = (bench.get("prefillTokPerSec") or {}).get("median")

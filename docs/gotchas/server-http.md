@@ -45,6 +45,10 @@ Guard: `media renders one template placeholder per item` (chat.zig, real Qwen3.8
 the `expandMediaPlaceholders` tests (server.zig), `media spans bound the reusable prefix`
 (prefix_cache.zig), `EmbeddingCache serves a hit and evicts` (vision.zig), `tests/test_multi_image_history.sh`.
 
+### A bare-string `image_url` vanished from the prompt (2026-10-13)
+
+`{"type":"image_url","image_url":"data:..."}` (the shape some clients send, and the Responses API's own) answered 200 while the model described a picture it never saw: the chat parser `continue`d past any part whose `image_url` was not an object, and so did every malformed one (`{"href":...}`, a non-string `url`). `imageUrlOfPart` reads the object and the string form, and any other shape is the named decode 400, on chat and embeddings. Guard: its unit test + `tests/test_api_edges.sh` (red on 26.10.2: 200).
+
 ### A `seed` that only the synchronous sampler read (seeded replies flipped between identical requests)
 
 `integration_test.sh`'s "same seed produces same first token" went red on the v26.8.11 release run: `Ephemeral` vs `**Ephemeral**` with identical top-2 logprobs (gap 0.75 nats, not a tie). The lazy decode sampler (`sampleTokenLazy`, every serial/batched/spec site) passed a null key to `mlx_random_categorical`, i.e. MLX's global RNG; only the synchronous `sampleToken` (the `logprobs` path) built a key from `seed`, and it built the SAME key every step, so a seeded reply was a single coin flip replayed. The test had passed for months on an 82/18 draw. Fix: `seedKey(sampling)` mixes `seed` with a per-draw index (`SamplingParams.draw`); `Generator.sampleLazy` is the one lazy sampler a slot calls and advances the index; init paths hand the Generator `draw = 1` after drawing t1. Bar: seeded replay identical at temp 1.0 across cold and prefix-cache-hit requests; no seed still varies.
@@ -101,8 +105,12 @@ Live SIGSEGV 2026-07-06 (`mlx-serve run <flux dir>`): a chat request whose resol
 ### A split GGUF on the ds4 engine killed the process with nothing in the log (#586)
 A 4-shard `qwen4exp` pack routed to ds4 by arch. ds4 reads one file; shard 1 of a split carries the metadata and no tensors, so `required_tensor` printed `ds4: required tensor is missing: token_embd.weight` to stderr and called `exit(1)`: the log ended after kernel staging. Fix: `gguf_meta` reads `split.count` (writers put it after every key, so the header walk no longer stops early) and `preferredEngine` sends any split file to llama.cpp, which loads the siblings itself; `Ds4Engine.open` refuses a split by name before ds4 sees it (`--engine ds4`). Guard: `preferredEngine: a split GGUF goes to llama.cpp, whatever its arch`.
 
+### A DeepSeek-V4 GGUF refused to open with default flags (2026-10-13)
+
+From 26.9.x every antirez DeepSeek-V4-Flash GGUF failed to load unless the user passed `--no-mtp` or `--ssd-streaming`: `ds4: --mtp requires a model with embedded MTP weights`, `EngineOpenFailed`. `gguf_meta` armed ds4's in-checkpoint MTP for any arch that declares `nextn_predict_layers`, and DeepSeek-V4 declares it while shipping its head as a separate GGUF (`--mtp-model`); ds4 drafts in-checkpoint only for glm-dsa, glm5-next and qwen4exp. Fix: `ds4_embedded_mtp_archs` gates `embedded_mtp`. Guard: the `embedded MTP is read from <arch>.nextn_predict_layers` test (deepseek4 case) + `tests/test_ds4_serve.sh` on a DeepSeek-V4 GGUF.
+
 ### Auto-context budget + the misleading libllama OOM backtrace
-A runtime Metal OOM during MLX generation (`[METAL] Command buffer execution failed: Insufficient Memory`) prints a backtrace whose top frames are `libllama.dylib` (`ggml_print_backtrace` / `ggml_uncaught_exception`) — even for a pure-MLX model. That's a RED HERRING: libllama installs a global `std::set_terminate` handler at load (for GGUF support), so it prints the trace, but the throw is from `libmlx` (`mlx::core::gpu::check_error`). Don't chase a GGUF/llama bug — it's MLX exceeding the GPU working set. The auto-context budget (`computeMaxSafeContext` → `safeContextForBudget`, server.zig) must therefore: (1) ceiling = `max_recommended_working_set_size` (`getGpuWorkingSetLimit`), NOT `hw.memsize × 0.75` (`getMetalBufferLimit`) — the latter over-estimates the real limit on small-RAM Macs (16 GB: 12 GB vs ~11.9 GB recommended); (2) reserve the FULL hot prefix cache budget (`prefix_cache_mem_bytes`, default 2 GB) up front — it fills over an agentic session, so an auto-ctx computed against an empty cache (24k on a 16 GB Mac) later collides with the filled cache + a large cold MoE prefill and crashes. `checkAttentionMemory` (the per-request prefill guard) shares the same `getGpuWorkingSetLimit` ceiling. When the budget tightens, an oversized prompt hits the graceful `400 "Prompt exceeds maximum context length"` gate (all four HTTP paths) instead of the process-killing Metal allocator. **(3) — the ceiling must also see EXTERNAL memory pressure (#64, 2026-07):** `getGpuWorkingSetLimit()` is a STATIC device max (128 GB Mac → 115 GB) that assumes the whole GPU working set is MLX's to claim; it is blind to memory held by OTHER processes (the field crash: a Claude Code session running a docker-compose stack — firecrawl/rabbitmq/postgres/playwright — held tens of GB, so the guard budgeted 115 GB, admitted a 90 K-token MoE prefill, and Metal OOM'd). Both guards now budget against `currentGpuMemoryCeiling(active) = min(getGpuWorkingSetLimit(), mlx_active + mlx_cache_memory + getAvailableMemBytes())` — capping the static max by what's PHYSICALLY reachable now (MLX's own footprint + free system RAM via `status.getAvailableMemBytes`, which counts wired+compressed+internal-anon, so docker's pages tighten it). Idle machines see `mlx_active + cache + free ≈ static max` → no auto-ctx regression (verified: 128 GB Mac ctx 169516 idle → 55787 under a 55 GB hog, oversized prompt then 400s, server stays alive). The OOM is NOT catchable — the throw is async on a Metal completion-handler GCD thread (`addCompletedHandler`) via `std::terminate`, so PREVENTION (a tighter guard) is the only lever, not a try/catch. Pure-helper unit tests in server.zig (`physicalMemoryCeiling …`, `safeContextForBudget …`). NOTE: the per-token working-set term still under-models a batched MoE prefill spike — if OOMs persist on ≤16 GB, fall back to `--ctx-size <N>` + `--prefix-cache-mem 512MB`.
+A runtime Metal OOM during MLX generation (`[METAL] Command buffer execution failed: Insufficient Memory`) prints a backtrace whose top frames are `libllama.dylib` (`ggml_print_backtrace` / `ggml_uncaught_exception`) — even for a pure-MLX model. That's a RED HERRING: libllama installs a global `std::set_terminate` handler at load (for GGUF support), so it prints the trace, but the throw is from `libmlx` (`mlx::core::gpu::check_error`). Don't chase a GGUF/llama bug — it's MLX exceeding the GPU working set. The auto-context budget (`computeMaxSafeContext` → `safeContextForBudget`, server.zig) must therefore: (1) ceiling = `max_recommended_working_set_size` (`getGpuWorkingSetLimit`), NOT `hw.memsize × 0.75` (`getMetalBufferLimit`) — the latter over-estimates the real limit on small-RAM Macs (16 GB: 12 GB vs ~11.9 GB recommended); (2) reserve the FULL hot prefix cache budget (`prefix_cache_mem_bytes`, default 2 GB) up front — it fills over an agentic session, so an auto-ctx computed against an empty cache (24k on a 16 GB Mac) later collides with the filled cache + a large cold MoE prefill and crashes. `checkAttentionMemory` (the per-request prefill guard) shares the same `getGpuWorkingSetLimit` ceiling. When the budget tightens, an oversized prompt hits the graceful `400 "Prompt exceeds maximum context length"` gate (all four HTTP paths) instead of the process-killing Metal allocator. **(3) — the ceiling must also see EXTERNAL memory pressure (#64, 2026-07):** `getGpuWorkingSetLimit()` is a STATIC device max (128 GB Mac → 115 GB) that assumes the whole GPU working set is MLX's to claim; it is blind to memory held by OTHER processes (the field crash: a Claude Code session running a docker-compose stack — firecrawl/rabbitmq/postgres/playwright — held tens of GB, so the guard budgeted 115 GB, admitted a 90 K-token MoE prefill, and Metal OOM'd). Both guards now budget against `currentGpuMemoryCeiling(active) = min(getGpuWorkingSetLimit(), mlx_active + mlx_cache_memory + getAvailableMemBytes())` — capping the static max by what's PHYSICALLY reachable now (MLX's own footprint + free system RAM via `status.getAvailableMemBytes` — the OS-grantable classes (free less speculative, plus file-backed) capped by the RAM outside wired + compressor — so a hog's pages collapse the reclaimable sum and tighten it). Idle machines see `mlx_active + cache + free ≈ static max` → no auto-ctx regression (verified: 128 GB Mac ctx 169516 idle → 55787 under a 55 GB hog, oversized prompt then 400s, server stays alive). The OOM is NOT catchable — the throw is async on a Metal completion-handler GCD thread (`addCompletedHandler`) via `std::terminate`, so PREVENTION (a tighter guard) is the only lever, not a try/catch. Pure-helper unit tests in server.zig (`physicalMemoryCeiling …`, `safeContextForBudget …`). NOTE: the per-token working-set term still under-models a batched MoE prefill spike — if OOMs persist on ≤16 GB, fall back to `--ctx-size <N>` + `--prefix-cache-mem 512MB`.
 
 ### Request timeout is a STALL timeout, and a truncated generation must keep finish_reason "length" through tool-call parse
 Two coupled rules from one live failure (2026-07-03, Qwen3.6-27B agent writing a website): the model one-shot ~33KB `writeFile` calls (~8-10K tokens ≈ 5 min at 30 tok/s); the old wall-clock `--timeout` (default 300s, measured from request start) guillotined every round that ran a few seconds long, mid-tool-call; `parseToolCalls`' truncation salvage then recovered a name + path-only/`{}` call; and the tool-parse sites OVERRODE the generator's `finish_reason="length"` with `"tool_calls"` — so the app saw a "complete" call with no content, told the model IT forgot `content`, and the model re-emitted the same doomed mega-call. Three of six writeFile rounds (≈15 min of GPU) were silently discarded. Diagnosis signature: failed agent rounds whose `completion_tokens / tok_s ≈ the timeout` exactly, while raw speed looks nominal; app-side `tool-calls.log` shows `EMIT rawArgs={}`/path-only after a full-length generation. Rules: (1) `--timeout` counts seconds WITHOUT a new token (`generate.StallClock` — progress detected from `generated_ids.len` at the check site, so every decode path resets it without instrumentation); a request that keeps producing never times out. (2) Every site that sets a tool-call finish reason goes through `server.toolCallFinishReason(pre_parse)` — "length" survives the parse (all four surfaces), so clients' truncation recovery (the app's chunk-and-retry nudge; APIClient emits accumulated calls on "length" too) actually fires. (3) `AgentPrompt.outputBudgetGuidance` is a SCARCITY warning and is emitted ONLY when the effective budget is tight (< `outputBudgetGuidanceThreshold`, 12288 — a one-shot file write measured live runs 8–10.7K tokens); roomy machines get NO section at all, because an honest "~419430 tokens per response" on a 1M-ctx machine reads as an invitation to one-shot mega-calls and OVERRIDES the writeFile description's ~200-line chunking convention (two prompt layers in conflict → the specific number wins). Guards: `toolCallFinishReason` + `StallClock` unit tests, `testOutputBudgetGuidanceOnlyAppearsWhenBudgetIsTight`. Harvest aid: `MLX_SERVE_RAW_DUMP_FILE=<abs path>` (with `--log-level debug`) writes the FULL pre-parse text of streamed tools requests — the inline debug dump caps at 4KB.
@@ -2536,3 +2544,142 @@ the staged plan by name, quoting the need and the free memory. The per-model gat
 only the smallest request's base, and on CUDA the request's DiT is billed to RAM (managed
 memory pages to the host), its activations to the GPU (`h3CanvasBill`). Guards: `h3 request
 rows`, `h3 request bill`, `h3 residency is priced on the request's activations`, `h3CanvasBill`.
+
+## A loop-stop inside the thought ended the agent's turn (2026-10-09)
+
+Defect: Qwen3.8-Flash-Next sometimes fell into `?!?!?!` while thinking. The `exact_cycle` guard cut
+the request 138-807 tokens in with `finish_reason "stop"`, so omp saw a finished turn with no tool
+call and the agent stopped after garbage.
+
+Cause: the loop guard treated a loop in reasoning like a loop in the answer. The turn had produced
+no answer, and the cut was its end.
+
+Fix: when the convicted loop sits in an open think block and the request has not recovered yet,
+`loopRecoveryAction` commits the bound's early-stop line and closer (`commitForcedTick`, shared
+with the reasoning budget) and decoding continues. Requests without a budget now arm the bound at
+an unreachable limit (`thinkBoundBudget`). A second loop, an answer-side loop, or no room before
+`max_tokens` keeps the ordinary cut.
+Guard: `loop recovery:` tests in `scheduler.zig`, `thinkBoundBudget` test in `server.zig`.
+
+
+## Bytes past `Content-Length` corrupted the heap (2026-10-10)
+
+Defect: a body longer than its declared `Content-Length` (or a `Content-Length` near 2^64) made
+the server answer the wrong body, then crash minutes later on an unrelated request (a WebSocket
+frame was the first victim in the chaos run). ReleaseFast logs nothing.
+
+Cause: the head was read in 16 KB gulps and copied whole into a buffer sized `head + Content-Length`;
+any extra bytes in the gulp overran it, and `head + Content-Length` wrapped for a near-2^64 length.
+
+Fix: `readRequest` keeps only the declared bytes and adds saturating, so a wrapping length meets the
+413 cap. A `/v1/completions` prompt that encodes to no tokens was the second crash of that run:
+`Scheduler.submit` refuses an empty prompt by name for every surface.
+Guard: `readRequest: bytes past Content-Length are dropped, a wrapping Content-Length is a 413`
+(server.zig), `a streaming fault answers with the SAME mapped error` (`EmptyPrompt`).
+
+## A refused load failed the NEXT request (2026-10-10)
+
+Defect: after `/v1/load-model` on a pack with a corrupt `.safetensors`, or an image request whose
+`lora_paths` named a file that is not safetensors (`/etc/passwd`), the request itself got its error,
+and the next unrelated chat or vision request answered 500 "generation failed".
+
+Cause: MLX's error handler latches every failure; the load's catch and `lora.loadFile` returned the
+error without dropping the latch, so the next prefill's `checkError` found it.
+
+Fix: both sites drop the latch they raised (`dropLatchedErrorUnless(had_error)`), the rule every
+swallowed MLX failure already follows. Guard: `loadFile: a file that is not safetensors fails without
+leaving an MLX error for the next request` (lora.zig).
+
+A media or decision job had the same leak: its handler answered the failure (a 500 even for a Metal
+OOM) and left the latch for the next chat. `runGenJobs` drops what the job raised, and the handlers
+answer a memory failure 503 (`jobFailureStatus`). Guards: `runGenJobs: a latch the job raised is
+dropped…` (scheduler.zig), `jobFailureStatus…` (gen.zig).
+
+## Model churn: six models under a cap of three, and nameless "Model load failed" (2026-10-10)
+
+Defect: 16 clients spread over seven small models (cap 3) left six models resident, and a few
+requests a minute answered 500 "Model load failed" with no error name and nothing in the log.
+
+Cause: the eviction planner counted `.ready` models only, so concurrent cold loads each saw room
+for themselves. And a model that finished loading had refcount 0 until its requester woke and took
+the registry lock: in that gap another load's planner evicted it (or an explicit unload claimed it),
+and the requester read a non-ready entry as a failed load.
+
+Fix: the planner counts other `.loading` entries (`countLoadingLocked`); `ensureLoaded` takes the
+requester's reference when it claims the load (`pinned`, dropped on every error), and an explicit
+unload that wins the race is the 503 "not currently loaded". The refusal log names both caps.
+Guard: `planEvictions: another model still loading counts against the model cap` (model_registry.zig).
+
+## A Stop click mid-flush crashed the server (2026-10-10)
+
+Defect: eight agent clients on Qwen3.8 Flash Next (tools, thinking, random mid-stream disconnects)
+crashed the server within ten minutes: `POINTER_BEING_FREED_WAS_NOT_ALLOCATED` in
+`handleStreamingGeneration`. Small models ran 20-minute storms clean: the window needs several held
+tokens flushing at once while the client hangs up.
+
+Cause: the tools path buffers token texts in `token_texts`; the `.flush_text` arm freed each one with
+a per-iteration `defer` while sending it. A failed send (`WriteFailed`) returned from the handler with
+the list not cleared, and the handler's own defer freed every item again. `/v1/messages` had the same
+arm.
+
+Fix: both arms free and clear the whole list in one arm-scoped defer; the loop body only sends.
+Guard: live only — eight concurrent tool-using streams with random disconnects on Flash Next, 20
+minutes clean (it crashed in ten before the fix).
+
+## A load right after an unload was refused for memory it was about to get (2026-10-10)
+
+Defect: unload GLM-5.3 (174 GB), load it again at once: 503 "only 66 GB is available". A few
+seconds later the same load passed. Under model churn this refused a thousand loads in 15 minutes.
+
+Cause: the unload frees the weights and clears MLX's cache, but the OS unwires 150 GB of pages over
+one to two seconds after that (`vm_stat` wired: 151 GB at the 200, 36 GB a second later, 5 GB after
+two). The preflight read the OS figure once, mid-release. Waiting on the GPU stream does not help:
+the pages are already out of MLX's hands.
+
+Fix: `availForLoad` hands a too-low reading to `settledAvail`, which re-reads every 100 ms while the
+figure still climbs by more than 64 MB, up to 5 s; five flat readings keep the refusal.
+Guard: `settledAvail: a refused reading waits while freed memory still reaches the OS` (scheduler.zig).
+
+## A deeply nested tool schema overflowed a connection thread's stack (2026-10-10)
+
+Defect: a chat request whose tool `parameters` nested an object 50,000 levels deep killed the
+server (SIGBUS in a stack guard page). 10,000 levels answered, in 9 s.
+
+Cause: `std.json` parses with an explicit stack, but re-serializing the tool definitions for the
+template (`chat.fillOptionalToolDefKeys` → `Stringify`) recurses once per level, as do the schema
+walkers behind it, on a thread stack.
+
+Fix: every non-multipart body (and every Responses WebSocket frame) is scanned once for its deepest
+`[`/`{` outside strings (`jsonNestingDepth`) and refused past `MAX_JSON_DEPTH` (4096: above the
+3000-deep contract in `test_api_edges.sh`, far below the overflow).
+Guard: `jsonNestingDepth: brackets inside strings never count` (server.zig).
+
+## An idle media model got an agent turn refused (2026-10-11)
+
+Defect: a pi agent on GLM-5.3 (173 GB) generating its own assets got a 400 on a 36.7k-token turn
+("requires ~10558MB … only ~9466MB is available"), and pi ended the session. Krea (14.7 GB) sat
+idle beside it from the agent's image jobs a minute earlier.
+
+Cause: the connection thread's admission credited only the hot prefix cache as reclaimable. An idle
+resident model is memory too, but only a LOAD's eviction planner ever freed one.
+
+Fix: before refusing, `checkAttentionMemory` unloads idle resident models least recently used first
+(`Scheduler.idleModelToUnload` + `unloadModelIfIdle`, never the request's own model) and re-bills
+after each, via `fitAfterUnloadingIdle`.
+Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
+
+## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
+
+Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and
+gemma-3-12B to 45; v26.10.1 gave the 9B 10k. The prompt cache beside it kept 2 GB.
+
+Cause: the sizer billed the fixed 2 GB cache reserve before the context, and the honest available
+figure (#776, ~0.5 GB lower) took the last of the room. The 1024 floor applied only at exactly 0,
+so 53 tokens of room advertised 45.
+
+Fix: the reserve is at most half the room beside the weights and the prefill (`ctxCacheShare`, both
+sizer paths); the load-time clamp gives the cache the residual as before. Floor at < 1024.
+Guard: `context sizer: the prompt-cache reserve never takes more than half the room beside the weights`.
+
+### An agent started from a piped script got `/dev/tty`, which Bun agents and Grok cannot watch on macOS
+The served `/launch` script (the console's Code Launcher, `curl … | sh`) arrives on stdin, so its tail reopened `/dev/tty` for the agent. pi worked (Node; libuv falls back to `select()` for that device); Claude Code, oh-my-pi and OpenCode (Bun) died on `EINVAL: invalid argument, kqueue`, Grok exited at once, and omp's unanswered terminal queries landed in the user's shell as `1;2c1;2c…`. `/dev/tty` is its own device node, not the terminal it reaches (`tty` reads `/dev/tty`, not `/dev/ttys002`), and macOS kqueue refuses it. Fix: the agent's stdin is a dup of whichever of stderr/stdout is the terminal, `/dev/tty` only when neither is (`launch.remoteScript`), and the redirect rides the agent's `exec`: the served script is still being read from stdin, so a bare `exec 0<&2` made `sh` wait on the terminal for the rest of it; `website/agent.sh` writes the setup script to `~/.mlx-serve/launch-<agent>.sh` and execs it with the terminal as stdin, which also covers servers older than the fix. Guards: a fake agent records `tty` under `expect` (`tests/test_launch_script.sh` [6], `tests/test_website_agent_install.sh` [3]).

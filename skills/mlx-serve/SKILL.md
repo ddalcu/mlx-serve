@@ -1,6 +1,6 @@
 ---
 name: mlx-serve
-description: Hook an app, game or script up to the local mlx-serve server for LLM chat, embeddings, image, speech, music, sound effect, video and 3D generation, and Laya/Kev/Clef typed decisions. Use when code should call mlx-serve.
+description: Hook an app, game or script up to the local mlx-serve server for LLM chat, embeddings, image, speech, music, sound effect, video and 3D generation, and Laya/Kev/Clef typed decisions, or make a whole film or music video on this Mac. Use when code should call mlx-serve or the user wants a video, song, pictures or game assets made locally.
 ---
 
 # mlx-serve
@@ -37,6 +37,7 @@ Each row has `id` (like `org/name`), `capabilities`, `state` (`ready`,
 | `audio` without `music` or `sound` | `POST /v1/audio/speech` (TTS) | media.md |
 | `music` | `POST /v1/audio/music-generations` | media.md |
 | `sound` | `POST /v1/audio/sound-generations` (sound effects) | media.md |
+| `transcription` | `POST /v1/audio/transcriptions` (speech to text, word times, subtitles) | media.md |
 | `video` | `POST /v1/video/generations` | media.md |
 | `3d` | `POST /v1/3d/generations` | media.md |
 | `decisions` | `POST /v1/decisions`, `POST /v1/systemone` | decisions.md |
@@ -56,8 +57,17 @@ download one in the MLX Core app (Models). Do not invent an id.
 - Generation runs on one inference thread: a 3-minute video render stalls chat
   replies for 3 minutes. Decisions and embeddings are milliseconds.
 
+## Films and music videos
+
+Making a video (music video, trailer, release or story film)? Read film.md first: a YuE2 song is the
+spine, `gen.mjs` makes the pictures, clips and sound effects, and `film.mjs` (Node 18+) times every cut
+to the sung words and renders it.
+
 ## Rules for apps and games
 
+- Building a 3D game or scene? Read games.md first: movement, foliage and lighting rules,
+  and `gen.mjs` (next to this file, Node 18+), which generates and post-processes every
+  asset from one `assets.json` (`node gen.mjs help`).
 - Generate media AHEAD of time or in the background, never on the frame or
   input path. Cache results on disk keyed by model + prompt + seed + size, and
   ship the cache (or regenerate lazily) instead of calling on every run.

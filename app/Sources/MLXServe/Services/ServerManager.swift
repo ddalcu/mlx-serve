@@ -10,6 +10,8 @@ class ServerManager: ObservableObject {
     /// loop. UI uses this for the "Loaded Models" section and the model
     /// picker. First entry mirrors `modelInfo` (server sorts default first).
     @Published var allModels: [ModelInfo] = []
+    /// LAN peers running with --api-key that we hold no working key for.
+    @Published var lanPeersNeedingKey: [String] = []
     /// Chat target when the user picked a LAN model in the tray: the remote
     /// routing id (`<model>@<peer>`). nil = the local server's default model.
     /// Persisted so the choice survives relaunch; cleared by picking a local
@@ -152,6 +154,12 @@ class ServerManager: ObservableObject {
         running && launchedModelPath.isEmpty && !chatResident && !selectedModelPath.isEmpty
     }
 
+    /// Whether `ensureDefaultChatModel` would load the selected model first.
+    func chatLoadNeeded(selectedModelPath: String) -> Bool {
+        Self.shouldEnsureChatDefault(running: status == .running, launchedModelPath: currentModelPath,
+                                     chatResident: residentChatModel != nil, selectedModelPath: selectedModelPath)
+    }
+
     /// Called by chat surfaces (chat window / quick launcher via
     /// ChatTurnEngine, the avatar) before a turn: when the running server was
     /// started headless for media generation, hot-load the user's selected
@@ -160,10 +168,7 @@ class ServerManager: ObservableObject {
     /// default, so the alias-addressed request that follows resolves).
     /// Failures are left to the request itself to surface.
     func ensureDefaultChatModel(selectedModelPath: String) async {
-        guard Self.shouldEnsureChatDefault(running: status == .running,
-                                           launchedModelPath: currentModelPath,
-                                           chatResident: residentChatModel != nil,
-                                           selectedModelPath: selectedModelPath) else { return }
+        guard chatLoadNeeded(selectedModelPath: selectedModelPath) else { return }
         if (try? await loadModel(id: selectedModelPath)) != nil {
             // Recorded here, not in `loadModel`: this hot-load passes no `setDefault`.
             StartupModelChoice.recordLoaded(path: selectedModelPath)
@@ -315,6 +320,7 @@ class ServerManager: ObservableObject {
         // model that was resident before the stop instead of the one just
         // picked, and Start looked like it might launch either one.
         allModels = []
+        lanPeersNeedingKey = []
         memoryInfo = nil
         specCost = nil
         batching = nil
@@ -645,8 +651,9 @@ class ServerManager: ObservableObject {
     }
 
     func refreshModels() async {
-        if let all = try? await api.fetchAllModels(port: port) {
+        if let (all, needsKey) = try? await api.fetchModelList(port: port) {
             allModels = all
+            lanPeersNeedingKey = needsKey
             // Headless servers sort no default first, so the head row can be an unloaded stub.
             modelInfo = all.first { $0.loaded && $0.lanPeer == nil }
         }

@@ -179,7 +179,7 @@ final class SettingsSearchTests: XCTestCase {
         }
         XCTAssertTrue(SettingsSearch.matches(query: "port", in: hay("port")))
         XCTAssertTrue(SettingsSearch.matches(query: "api key", in: hay("apiKey")))
-        XCTAssertTrue(SettingsSearch.matches(query: "bearer", in: hay("apiKey")), "explainer text must be searchable")
-        XCTAssertFalse(SettingsSearch.matches(query: "bearer", in: hay("port")))
+        XCTAssertTrue(SettingsSearch.matches(query: "devices", in: hay("apiKey")), "explainer text must be searchable")
+        XCTAssertFalse(SettingsSearch.matches(query: "devices", in: hay("port")))
     }
 }

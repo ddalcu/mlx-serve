@@ -118,9 +118,22 @@ decode_cancel_section() {
     # early.
     local body
     body="$(body_chat "$SYSTEM_PROMPT" true 2000)"
-    curl -sN --max-time 3 -o /tmp/test_cancel_partial.sse \
-        -X POST "$BASE/v1/chat/completions" \
-        -H 'Content-Type: application/json' -d "$body" 2>/dev/null
+    # Hang up after a few content deltas: a timed kill misses on a GPU that finishes the
+    # answer inside the window. rc 28 = cut mid-decode, 0 = the stream ended on its own.
+    python3 -I - "$BASE" "$body" > /tmp/test_cancel_partial.sse <<'PY'
+import sys, urllib.request
+req = urllib.request.Request(sys.argv[1] + "/v1/chat/completions", data=sys.argv[2].encode(), headers={"Content-Type": "application/json"})
+n = 0
+with urllib.request.urlopen(req, timeout=120) as r:
+    for line in r:
+        sys.stdout.write(line.decode(errors="replace"))
+        if b'"content":"' in line:
+            n += 1
+            if n >= 5:
+                sys.exit(28)
+        if line.startswith(b"data: [DONE]"):
+            sys.exit(0)
+PY
     local curl_rc=$?
     # 28 = timeout kill (what we want); 18/56/55 also fine (partial/close).
     if [ "$curl_rc" -eq 0 ]; then

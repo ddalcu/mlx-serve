@@ -9,14 +9,14 @@ struct BenchmarkChartPoint: Identifiable {
     var id: String { "\(series)-\(targetTokens)" }
 }
 
-/// Decode + speculation ceiling per rung. Log2 x axis, because the rungs are
+/// Decode + best-case ("Max", the speculation ceiling) per rung. Log2 x axis, because the rungs are
 /// powers of two and a linear axis puts three of four points in the first
 /// eighth of the width.
 struct BenchmarkLadderChart: View {
     let points: [BenchmarkChartPoint]
 
     static let decodeSeries = "Decode"
-    static let ceilingSeries = "Ceiling"
+    static let ceilingSeries = "Max"
 
     static func points(decode: [(Int, Double)], ceiling: [(Int, Double)]) -> [BenchmarkChartPoint] {
         decode.filter { $0.1 > 0 }.map { BenchmarkChartPoint(targetTokens: $0.0, series: decodeSeries, value: $0.1) }
@@ -50,7 +50,7 @@ private struct BenchmarkRateChart: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 14) {
                 legend(showsCeiling ? "Decode" : "Prefill", color: color)
-                if showsCeiling { legend("Ceiling", color: .secondary, dashed: true) }
+                if showsCeiling { legend("Max", color: .secondary, dashed: true) }
                 Spacer()
                 Text("tok/s").font(.app(.caption)).foregroundStyle(.secondary)
             }
@@ -129,9 +129,17 @@ private var rungDomain: ClosedRange<Double> {
 struct BenchmarkHighlights: View {
     let rows: [BenchmarkRungTable.Row]
 
-    private var peakDecode: BenchmarkRungTable.Row? {
+    /// The realistic peak: the coding answer's decode rate.
+    static func peakDecode(_ rows: [BenchmarkRungTable.Row]) -> BenchmarkRungTable.Row? {
         rows.filter { $0.decodeTps > 0 }.max { $0.decodeTps < $1.decodeTps }
     }
+    /// The best case: the count-to-200 run, where speculation accepts nearly every draft. Its peak
+    /// is often at a different rung than the peak decode, so it names its own.
+    static func maxDecode(_ rows: [BenchmarkRungTable.Row]) -> BenchmarkRungTable.Row? {
+        rows.filter { $0.ceilingDecodeTps > 0 }.max { $0.ceilingDecodeTps < $1.ceilingDecodeTps }
+    }
+
+    private var peakDecode: BenchmarkRungTable.Row? { Self.peakDecode(rows) }
     private var peakPrefill: BenchmarkRungTable.Row? {
         rows.filter { $0.prefillTps > 0 }.max { $0.prefillTps < $1.prefillTps }
     }
@@ -142,7 +150,8 @@ struct BenchmarkHighlights: View {
     var body: some View {
         HStack(spacing: 16) {
             metric("Peak decode", icon: "waveform.path", color: .accentColor,
-                   value: peakDecode?.decodeTps, decimals: 1, unit: "tok/s", row: peakDecode)
+                   value: peakDecode?.decodeTps, decimals: 1, unit: "tok/s", row: peakDecode,
+                   beside: Self.maxDecode(rows))
             metric("Peak prefill", icon: "bolt", color: .orange,
                    value: peakPrefill?.prefillTps, decimals: 0, unit: "tok/s", row: peakPrefill)
             metric("Fastest first token", icon: "stopwatch", color: .primary,
@@ -151,24 +160,43 @@ struct BenchmarkHighlights: View {
     }
 
     private func metric(_ title: String, icon: String, color: Color, value: Double?,
-                        decimals: Int, unit: String, row: BenchmarkRungTable.Row?) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label(L10n.text(title), systemImage: icon)
-                .font(.app(.callout, weight: .medium)).foregroundStyle(.secondary)
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text(BenchmarkFormat.rate(value ?? 0, decimals: decimals))
-                    .font(.app(.largeTitle, weight: .semibold)).monospacedDigit()
-                    .foregroundStyle(color)
-                Text(unit).font(.app(.callout)).foregroundStyle(.secondary)
+                        decimals: Int, unit: String, row: BenchmarkRungTable.Row?,
+                        beside: BenchmarkRungTable.Row? = nil) -> some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(L10n.text(title), systemImage: icon)
+                    .font(.app(.callout, weight: .medium)).foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(BenchmarkFormat.rate(value ?? 0, decimals: decimals))
+                        .font(.app(.largeTitle, weight: .semibold)).monospacedDigit()
+                        .foregroundStyle(color)
+                    Text(unit).font(.app(.callout)).foregroundStyle(.secondary)
+                }
+                Group {
+                    if let row {
+                        Text(L10n.format("At %@ context", BenchmarkSuite.title(forTarget: row.targetTokens)))
+                    } else {
+                        Text("No measurements")
+                    }
+                }
+                .font(.app(.caption)).foregroundStyle(.secondary)
             }
-            Group {
-                if let row {
-                    Text(L10n.format("At %@ context", BenchmarkSuite.title(forTarget: row.targetTokens)))
-                } else {
-                    Text("No measurements")
+            // The best case, quieter, with the context it was reached at.
+            if let beside {
+                Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Max decode")
+                        .font(.app(.callout, weight: .medium)).foregroundStyle(.secondary)
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Text(BenchmarkFormat.rate(beside.ceilingDecodeTps, decimals: decimals))
+                            .font(.app(.title2, weight: .semibold)).monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Text(unit).font(.app(.callout)).foregroundStyle(.tertiary)
+                    }
+                    Text(L10n.format("At %@ context", BenchmarkSuite.title(forTarget: beside.targetTokens)))
+                        .font(.app(.caption)).foregroundStyle(.tertiary)
                 }
             }
-            .font(.app(.caption)).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
@@ -222,7 +250,7 @@ struct BenchmarkRungTable: View {
                 if showsPrompt { header("Prompt", unit: "tokens") }
                 header("Prefill", unit: "tok/s")
                 header("Decode", unit: "tok/s")
-                header("Ceiling", unit: "tok/s")
+                header("Max", unit: "tok/s")
                 header("First token", unit: "ms")
                 if showsSamples { header("Samples", unit: "sessions") }
                 else { header("Context", unit: "check") }

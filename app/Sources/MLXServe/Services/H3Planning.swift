@@ -347,15 +347,25 @@ enum H3TimeEstimate {
     static func describeBest(model: VideoModelPreset, width: Int, height: Int, frames: Int,
                              steps: Int, fast: Bool,
                              history: H3RunHistory = .load()) -> String {
-        let anchorSeconds = seconds(model: model, width: width, height: height, frames: frames,
-                                    steps: steps, fast: fast, hardware: .anchor)
+        describeBest(model: model, width: width, height: height, shotFrames: [frames],
+                     steps: steps, fast: fast, history: history)
+    }
+
+    /// A storyboard is one run per shot, so its time is their sum.
+    static func describeBest(model: VideoModelPreset, width: Int, height: Int, shotFrames: [Int],
+                             steps: Int, fast: Bool,
+                             history: H3RunHistory = .load()) -> String {
+        func total(_ hardware: H3Hardware) -> Double {
+            shotFrames.reduce(0) {
+                $0 + seconds(model: model, width: width, height: height, frames: $1,
+                             steps: steps, fast: fast, hardware: hardware)
+            }
+        }
         if history.speedFactor != nil {
-            return describe(seconds: history.apply(toAnchorSeconds: anchorSeconds),
+            return describe(seconds: history.apply(toAnchorSeconds: total(.anchor)),
                             source: .ownHistory(runs: history.runs))
         }
-        return describe(seconds: seconds(model: model, width: width, height: height, frames: frames,
-                                         steps: steps, fast: fast),
-                        source: .hardwareModel(.current))
+        return describe(seconds: total(.current), source: .hardwareModel(.current))
     }
 
     static func describe(seconds: Double, source: H3EstimateSource) -> String {

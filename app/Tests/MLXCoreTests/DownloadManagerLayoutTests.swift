@@ -318,6 +318,17 @@ final class DownloadManagerLayoutTests: XCTestCase {
         }
     }
 
+    func testLfm2MoeAndKolibriAreChatPickable() {
+        // LFM2.5-8B-A1B / 24B-A2B ship "lfm2_moe", Kolibri-1 "kolibri1"; the server serves both.
+        for mt in ["lfm2_moe", "kolibri1"] {
+            let m = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/tmp/\(mt)",
+                sizeFormatted: "1 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(m.isChatPickable, "\"\(mt)\" must be in supportedModelTypes")
+        }
+    }
+
     func testMediaModelTypesAreSupportedArchitectures() {
         // Native media-gen checkpoints (3D shape+paint, image, video, TTS,
         // music) are real, loadable models — just not chat models. They must

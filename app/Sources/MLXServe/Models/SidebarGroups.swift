@@ -1,30 +1,60 @@
 import Foundation
 
 /// User-made sidebar groups: named, collapsible folders over chats, agent
-/// threads and terminals. A row sits in at most one group; deleting a group
-/// only ungroups its rows. Persisted by `AppState.sidebarGroups`.
-struct SidebarGroups: Codable, Equatable {
+/// threads and terminals. A group sits in a parent group (nil = the root) at a
+/// position among its siblings; each row names its own group. Stored in
+/// `sidebar_groups` (`SidebarStore`).
+struct SidebarGroups: Equatable {
 
-    struct Group: Identifiable, Codable, Equatable {
+    struct Group: Identifiable, Equatable {
         let id: UUID
         var name: String
+        var parentId: UUID? = nil
+        var position: Int
         var collapsed = false
     }
 
-    private(set) var groups: [Group] = []
-    /// Row id -> group id.
-    private var membership: [UUID: UUID] = [:]
+    private(set) var groups: [Group]
 
-    func group(of row: UUID) -> UUID? { membership[row] }
+    init(_ groups: [Group] = []) {
+        self.groups = groups
+    }
 
-    /// nil when the name is blank.
+    /// The parent the group shows under. A link that names a missing group or
+    /// closes a cycle is cut, so every group shows somewhere.
+    func parent(of id: UUID) -> UUID? {
+        guard let group = groups.first(where: { $0.id == id }), let parentId = group.parentId else { return nil }
+        var seen = Set<UUID>()
+        var current: UUID? = parentId
+        while let step = current, seen.insert(step).inserted {
+            guard let node = groups.first(where: { $0.id == step }) else { return step == parentId ? nil : parentId }
+            if step == id { return nil }
+            current = node.parentId
+        }
+        return parentId
+    }
+
+    /// In sidebar order: by position, a tie keeping the stored order.
+    func children(of parent: UUID?) -> [Group] {
+        groups.filter { self.parent(of: $0.id) == parent }.sorted { $0.position < $1.position }
+    }
+
+    /// Every group, each followed by its subtree.
+    var ordered: [Group] {
+        func subtree(_ parent: UUID?) -> [Group] {
+            children(of: parent).flatMap { [$0] + subtree($0.id) }
+        }
+        return subtree(nil)
+    }
+
+    /// Last among its siblings; nil when the name is blank.
     @discardableResult
-    mutating func create(_ name: String, with rows: some Sequence<UUID>) -> UUID? {
+    mutating func create(_ name: String, in parent: UUID? = nil) -> UUID? {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return nil }
-        let group = Group(id: UUID(), name: name)
+        let position = (children(of: parent).map(\.position).max() ?? -1) + 1
+        let group = Group(id: UUID(), name: name, parentId: parent, position: position)
         groups.append(group)
-        assign(rows, to: group.id)
         return group.id
     }
 
@@ -34,19 +64,18 @@ struct SidebarGroups: Codable, Equatable {
         groups[i].name = name
     }
 
+    /// Its subgroups take its place among its siblings. Its rows are the
+    /// caller's (`SidebarChatRows.dissolving`).
     mutating func delete(_ id: UUID) {
+        guard groups.contains(where: { $0.id == id }) else { return }
+        let parent = parent(of: id)
+        let order = children(of: parent).flatMap { $0.id == id ? children(of: id) : [$0] }.map(\.id)
         groups.removeAll { $0.id == id }
-        membership = membership.filter { $0.value != id }
-    }
-
-    /// nil takes the rows out of whatever group they are in.
-    mutating func assign(_ rows: some Sequence<UUID>, to group: UUID?) {
-        for row in rows { membership[row] = group }
-    }
-
-    /// A row dropped onto another takes that row's group (none included).
-    mutating func join(_ row: UUID, groupOf target: UUID) {
-        membership[row] = membership[target]
+        for (position, child) in order.enumerated() {
+            guard let i = groups.firstIndex(where: { $0.id == child }) else { continue }
+            groups[i].parentId = parent
+            groups[i].position = position
+        }
     }
 
     mutating func toggleCollapsed(_ id: UUID) {
@@ -54,24 +83,20 @@ struct SidebarGroups: Codable, Equatable {
         groups[i].collapsed.toggle()
     }
 
-    /// Drop memberships of rows that no longer exist (terminals end at quit).
-    mutating func retain(only live: Set<UUID>) {
-        membership = membership.filter { live.contains($0.key) }
-    }
-
-    /// Groups in creation order (empty ones too), each with its rows in the
-    /// order given; the rest stay where they were.
+    /// Groups in sidebar order (empty ones too), each with its rows in the
+    /// order given; rows naming no known group stay where they were.
     func partition(_ rows: [SidebarChatRows.Row])
         -> (groups: [(group: Group, rows: [SidebarChatRows.Row])], ungrouped: [SidebarChatRows.Row]) {
+        let known = Set(groups.map(\.id))
         var byGroup: [UUID: [SidebarChatRows.Row]] = [:]
         var ungrouped: [SidebarChatRows.Row] = []
         for row in rows {
-            if let g = membership[row.id], groups.contains(where: { $0.id == g }) {
+            if let g = row.groupId, known.contains(g) {
                 byGroup[g, default: []].append(row)
             } else {
                 ungrouped.append(row)
             }
         }
-        return (groups.map { ($0, byGroup[$0.id] ?? []) }, ungrouped)
+        return (ordered.map { ($0, byGroup[$0.id] ?? []) }, ungrouped)
     }
 }

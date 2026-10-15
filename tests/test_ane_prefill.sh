@@ -133,6 +133,11 @@ if grep -q "\[ane\] unavailable" "$ON_LOG"; then
     rm -f "$ON_LOG"
     exit 0
 fi
+if grep -q "\[ane\] --ane-prefill disabled: NAX-class" "$ON_LOG"; then
+    echo -e "${YELLOW}SKIP${NC} the server declines ANE prefill on a NAX GPU (MLX_SERVE_ANE_FORCE=1 runs it anyway)."
+    rm -f "$ON_LOG"
+    exit 0
+fi
 if ! grep -q "\[ane\] prefill offload ready" "$ON_LOG"; then
     echo -e "${RED}FAIL${NC} no '[ane] prefill offload ready' line — the build silently died:"
     grep "\[ane\]" "$ON_LOG" | head -5

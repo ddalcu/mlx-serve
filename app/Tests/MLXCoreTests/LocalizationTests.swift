@@ -460,7 +460,7 @@ final class LocalizationTests: XCTestCase {
 
         // Headers are uppercased AFTER the lookup, so the key is the source
         // spelling; `TTFT` and `n` are notation and stay Latin.
-        let headers = ["Rung", "Prompt", "Prefill", "Decode", "Ceiling", "TTFT", "Ctx", "n"]
+        let headers = ["Rung", "Prompt", "Prefill", "Decode", "Max", "Max decode", "TTFT", "Ctx", "n"]
 
         // One dictionary per chip branch, including the ds4 / llama.cpp
         // engines and the two drafter spellings.

@@ -59,6 +59,8 @@ enum ChatFork {
         fork.useMCP = source.useMCP
         fork.agentId = source.agentId
         fork.disabledTools = source.disabledTools
+        // Beside its source in the sidebar, on top like any new row.
+        fork.groupId = source.groupId
         return fork
     }
 }
