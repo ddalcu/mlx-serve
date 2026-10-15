@@ -3004,6 +3004,7 @@ test "quantizationJson: a declared width is N-bit, an undeclared one is null" {
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
 /// header is read at load time.
 fn modelEngineName(has_ds4: bool, has_llama: bool, mlx_gguf_served: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+    if (std.mem.eql(u8, arch_hint, "coreai")) return "coreai";
     if (has_ds4) return "ds4";
     if (has_llama) return "llama";
     if (mlx_gguf_served) return "mlx-gguf";
@@ -5718,8 +5719,8 @@ fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
 /// MLX qwen35 engine one model-switch earlier (live 2026-07-15, pi + ds4). Skip
 /// the memory guard whenever an embedded engine will serve; the context-length
 /// guard still bounds the prompt against ds4's own session ctx.
-fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
-    return !(uses_ds4 or uses_llama);
+fn mlxMemoryGuardApplies(engine_backed: bool) bool {
+    return !engine_backed;
 }
 
 /// Estimate peak GPU memory for prefill and reject if it would exceed the Metal
@@ -5977,6 +5978,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
             .message = PROMPT_LOGPROBS_UNAVAILABLE_MSG,
+        },
+        // A Core AI model samples the raw logits: refused, not silently ignored.
+        error.NeuralEngineUnsupported => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "This model runs on the Neural Engine, which serves plain sampling only: structured output (response_format, grammars), logprobs, repetition or presence penalties and forced tool calls are not available. Use a GPU model for those.",
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -6629,7 +6638,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool, enable_mtp: bool, media_bytes: u64) !bool {
     const prompt_len: usize = prompt_ids.len;
-    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
+    if (!mlxMemoryGuardApplies(lm.engineBacked())) return true;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
     var bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
@@ -7006,8 +7015,7 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
         .has_video_engine = lm.video_engine != null,
         .has_mesh_engine = lm.mesh_engine != null,
         .has_decision_engine = lm.decision_engine != null,
-        .has_text_lm = lm.state != .ready or lm.transformer != null or
-            lm.ds4_engine != null or lm.llama_engine != null,
+        .has_text_lm = lm.state != .ready or lm.transformer != null or lm.engineBacked(),
     };
 }
 
@@ -7063,7 +7071,7 @@ fn renderModelEntry(
         const has_chat = readyHasChat(
             config.is_encoder_only,
             chat_config.chat_template.len,
-            entry.ds4_engine != null or entry.llama_engine != null,
+            entry.engineBacked(),
         );
         const has_vision = if (entry.vision_encoder) |ve| ve.supportsImages() else false;
         const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
@@ -8217,7 +8225,7 @@ fn renderPropsBody(
 fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
     // llama.cpp batches its own sequences (`runLlamaDecodeTick`).
     if (entry.llama_ctx) |c| return if (c.seqs.len > 1) .ok else .embedded_engine;
-    if (entry.ds4_engine != null or entry.llama_engine != null) return .embedded_engine;
+    if (entry.engineBacked()) return .embedded_engine;
     const cfg = entry.config orelse return .arch;
     return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
 }
@@ -8265,7 +8273,7 @@ const PropsSettings = struct {
     prefill_decode_share: f32 = 0,
 };
 
-const PropsEngine = enum { mlx, llama, ds4 };
+const PropsEngine = enum { mlx, llama, ds4, coreai };
 
 /// ds4 and llama.cpp bypass generate.zig: MLX decode levers, PLD and the MLX drafters never run there.
 fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bool) PropsSettings {
@@ -8285,9 +8293,11 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
 }
 
 fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
-    const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else .mlx;
+    const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else if (lm.coreai != null) .coreai else .mlx;
     const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else if (lm.llama_ctx) |c| c.mtpDrafts() > 0 else false;
-    return embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
+    var out = embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
+    if (lm.coreai) |w| out.kv_quant = @tagName(w.engines[0].man.kv_format);
+    return out;
 }
 
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
@@ -10233,7 +10243,7 @@ fn handleCompletions(
 
     const prompt_logprobs = echoRequested(root) and logprobs_n > 0;
     if (prompt_logprobs) if (promptLogprobsRejectReason(.{
-        .engine_backed = lm.ds4_engine != null or lm.llama_engine != null,
+        .engine_backed = lm.engineBacked(),
         .diffusion = config.isDiffusion(),
         .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
     })) |reason| {
@@ -22727,6 +22737,12 @@ test "embeddedEngineSettings: an engine-backed model reports only the levers its
     try testing.expect(!llama.decode_attn_quant and !llama.pld.enable and !llama.mtp_default_on);
     try testing.expectEqual(@as(f32, 0), llama.prefill_decode_share);
 
+    // Core AI: none of the MLX levers either (its KV format comes from the bundle, in `propsSettingsFor`).
+    const ane = embeddedEngineSettings(base, .coreai, false);
+    try testing.expectEqualStrings("coreai", ane.engine);
+    try testing.expect(!ane.decode_attn_quant and !ane.pld.enable and !ane.mtp_loaded);
+    try testing.expectEqual(@as(usize, 0), ane.prefill_chunk);
+
     try testing.expect(embeddedEngineSettings(base, .mlx, false).decode_attn_quant);
     try testing.expectEqual(@as(f32, 0.5), embeddedEngineSettings(base, .mlx, false).prefill_decode_share);
 }
@@ -23933,18 +23949,13 @@ test "readyHasChat: embedded-engine GGUF without a chat template still advertise
     try t.expect(!readyHasChat(false, 0, false));
 }
 
-test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill memory guard" {
+test "mlxMemoryGuardApplies: engine-backed models (ds4/llama/Core AI) skip the MLX-prefill memory guard" {
     const t = std.testing;
-    // MLX model — no embedded engine — the guard applies (real per-token working set).
-    try t.expect(mlxMemoryGuardApplies(false, false));
-    // ds4 (DeepSeek-V4-Flash): its stub config advertises 56 heads / 61 layers,
-    // so the guard would project ~25 GB for an 8.6K-token prompt and 400-reject
-    // a request ds4 serves fine (live 2026-07-15: the SAME prompt had succeeded
-    // on the MLX qwen35 engine one model-switch earlier). ds4 owns its KV
-    // outside MLX, so the guard is skipped.
-    try t.expect(!mlxMemoryGuardApplies(true, false));
-    // llama.cpp GGUF engine: same reasoning — no MLX prefill path.
-    try t.expect(!mlxMemoryGuardApplies(false, true));
+    // MLX model — the guard applies (real per-token working set).
+    try t.expect(mlxMemoryGuardApplies(false));
+    // ds4's stub config advertises 56 heads / 61 layers, so the guard would project ~25 GB for an
+    // 8.6K-token prompt and 400-reject a request ds4 serves fine; no engine-backed model prefills in MLX.
+    try t.expect(!mlxMemoryGuardApplies(true));
 }
 
 test "ungatedHotCacheAsk: a sliding-ring or hybrid arch asks for one whole session, every other arch keeps its ask" {
@@ -25136,6 +25147,12 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         try t.expectEqualStrings("invalid_request_error", w.openai_type);
     }
     {
+        // What a Core AI model cannot honor is the request's shape, not a fault.
+        const w = mapGenerationError(error.NeuralEngineUnsupported, &buf);
+        try t.expectEqual(@as(u32, 400), w.code);
+        try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    }
+    {
         // Anything else keeps its name in the message, at a mapped status.
         const w = mapGenerationError(error.WriteFailed, &buf);
         try t.expectEqual(@as(u32, 500), w.code);
@@ -25226,6 +25243,7 @@ test "modelEngineName: native dsv4 reports mlx, embedded engines report themselv
     // Loaded entries: the attached engine pointer decides.
     try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, "/m/DeepSeek-V4-Flash.gguf", ""));
     try testing.expectEqualStrings("llama", modelEngineName(false, true, false, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("coreai", modelEngineName(false, false, false, "/m/Qwen3.8-27B-M5-ANE", "coreai"));
     // A GGUF on the MLX path (lib/mlx-serve-gguf) is its own engine: the app
     // reads "gguf" as llama.cpp.
     try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, true, "/m/qwen.gguf", ""));

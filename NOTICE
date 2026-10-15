@@ -253,6 +253,18 @@ mlx-serve addition modeled on the same project's `h3_ane_linear.m` blob
 layout and int8 constexpr-dequantize idioms.
 
 --------------------------------------------------------------------------------
+ANEMLL Forge
+https://github.com/Anemll/anemll-forge
+Copyright (c) 2026 ANEMLL contributors
+Licensed under the MIT License.
+
+Vendored into `lib/coreai/CoreAIBridge.swift` (from `coreai/swift_bridge/`, commit 6c572a8): the C ABI
+over the Core AI Swift runtime (model / function / IOSurface buffer / binding / run). `src/arch/coreai.zig`
+is an mlx-serve port of Forge's host runtime for its Core AI builds (`scripts/qwen38_coreai_model.py`,
+`scripts/qwen38_kv_cache.py`): the per-call positions and masks, the DeltaNet state ping-pong, and the
+V8 key/value cache writes. The ANE packages themselves are built with Forge and are not part of mlx-serve.
+
+--------------------------------------------------------------------------------
 SwaTex
 https://github.com/PhraseHQ/SwaTex
 Copyright (c) 2026 Phrase (https://phrase.so) and SwaTex contributors

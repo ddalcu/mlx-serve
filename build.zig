@@ -237,6 +237,7 @@ pub fn build(b: *std.Build) void {
     exe.headerpad_max_install_names = true;
 
     b.installArtifact(exe);
+    addCoreAiBridge(b, macos_sdk_frameworks);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -788,6 +789,22 @@ fn addDs4LinuxLib(b: *std.Build, module: *std.Build.Module) void {
     module.addLibraryPath(b.path("lib/ds4-linux"));
     module.linkSystemLibrary("ds4", .{ .use_pkg_config = .no });
     module.addCSourceFile(.{ .file = b.path("src/ds4_layout_check.c"), .flags = &.{"-std=c99"} });
+}
+
+/// libcoreai_bridge.dylib (lib/coreai, Swift) beside the binary in zig-out/lib: Core AI ships with the
+/// macOS 27 SDK, so the dylib is built only when the SDK has the framework and mlx-serve dlopens it.
+fn addCoreAiBridge(b: *std.Build, frameworks: ?[]const u8) void {
+    const fw = frameworks orelse return;
+    std.Io.Dir.cwd().access(b.graph.io, b.fmt("{s}/CoreAI.framework", .{fw}), .{}) catch return;
+    const swiftc = b.addSystemCommand(&.{
+        "xcrun",    "swiftc",                "-O",            "-swift-version",                "5",
+        "-target",  "arm64-apple-macos27.0", "-emit-library", "-module-name",                  "CoreAIBridge",
+        "-Xlinker", "-install_name",         "-Xlinker",      "@rpath/libcoreai_bridge.dylib",
+    });
+    swiftc.addFileArg(b.path("lib/coreai/CoreAIBridge.swift"));
+    swiftc.addArg("-o");
+    const dylib = swiftc.addOutputFileArg("libcoreai_bridge.dylib");
+    b.getInstallStep().dependOn(&b.addInstallLibFile(dylib, "libcoreai_bridge.dylib").step);
 }
 
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and

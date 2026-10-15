@@ -15,6 +15,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const gguf_meta = @import("gguf_meta.zig");
+const arch_coreai = @import("arch/coreai.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("dflash.zig");
@@ -659,7 +660,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
     if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
-    if (std.mem.eql(u8, model_type, "gguf")) return .chat;
+    if (std.mem.eql(u8, model_type, "gguf") or std.mem.eql(u8, model_type, "coreai")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
 }
@@ -669,7 +670,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
 /// null when the dir is not model-shaped at all.
 pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) ?ModelKind {
     if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return null;
-    if (isGgufModelPath(io, abs_path)) return .chat;
+    if (isGgufModelPath(io, abs_path) or arch_coreai.isBundle(io, abs_path)) return .chat;
     const trimmed = trimTrailingSlash(abs_path);
     const base = std.fs.path.basename(trimmed);
     const parent = std.fs.path.dirname(trimmed) orelse return null;
@@ -1026,6 +1027,14 @@ fn tryAddModel(
             bytes_ok = true;
             break :blk try allocator.dupe(u8, "gguf");
         }
+        // A Forge ANE bundle (`coreai/` + `model/`): no root config.json, served by Core AI.
+        if (arch_coreai.isBundleDir(io, sub)) {
+            if (arch_coreai.bundleBytes(io, sub)) |b| {
+                bytes = b;
+                bytes_ok = true;
+            }
+            break :blk try allocator.dupe(u8, "coreai");
+        }
 
         // No root config.json is not automatically "not a model": a MageFlow
         // diffusers repo keeps every config in a component subdir and carries
@@ -1201,6 +1210,13 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
                 .bytes_on_disk = scan.pick_bytes,
             };
         }
+    }
+
+    coreai: {
+        var sub = dir.openDir(io, base, .{}) catch break :coreai;
+        defer sub.close(io);
+        if (!arch_coreai.isBundleDir(io, sub)) break :coreai;
+        return .{ .model_type = try allocator.dupe(u8, "coreai"), .bytes_on_disk = arch_coreai.bundleBytes(io, sub) };
     }
 
     const model_type: []const u8 = switch (peekConfig(io, allocator, dir, base)) {

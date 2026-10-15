@@ -31,6 +31,7 @@ const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
 const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_coreai = @import("arch/coreai.zig");
 const gen_mod = @import("gen.zig");
 const diarization_mod = @import("nemotron_diarization.zig");
 const generate_mod = @import("generate.zig");
@@ -247,6 +248,9 @@ pub const LoadedModel = struct {
     /// `LlamaEngine` / `llama_ctx`. Mutually exclusive with the safetensors
     /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
     llama_engine: ?*arch_llama.LlamaEngine = null,
+    /// A Forge ANE bundle served through Core AI on its own thread (`arch/coreai.zig`): like the
+    /// embedded engines, the MLX fields stay null; the tokenizer and chat template are MLX-serve's.
+    coreai: ?*arch_coreai.Worker = null,
     /// Whether lib/mlx-serve-gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
@@ -354,11 +358,23 @@ pub const LoadedModel = struct {
     }
 
     /// Requests that may hold an engine session at once: one per llama
-    /// sequence, one for ds4; null for every other engine (no claim).
+    /// sequence, one for ds4 and Core AI; null for every other engine (no claim).
     pub fn sessionCapacity(self: *const LoadedModel) ?u32 {
         if (self.llama_ctx) |ctx| return @intCast(ctx.seqs.len);
+        if (self.coreai) |w| return @intCast(w.engines.len);
         if (self.ds4_engine != null) return 1;
         return null;
+    }
+
+    /// Served by an engine that is not MLX (no Transformer, no MLX memory).
+    pub fn engineBacked(self: *const LoadedModel) bool {
+        return self.ds4_engine != null or self.llama_engine != null or self.coreai != null;
+    }
+
+    fn closeCoreAi(self: *LoadedModel) void {
+        const w = self.coreai orelse return;
+        w.close();
+        self.coreai = null;
     }
 
     /// Free all owned state. Safe to call regardless of `state` — null
@@ -386,6 +402,7 @@ pub const LoadedModel = struct {
             engine.close();
             self.llama_engine = null;
         }
+        self.closeCoreAi();
         if (self.image_engine) |e| {
             e.deinit();
             self.image_engine = null;
@@ -570,6 +587,7 @@ pub const LoadedModel = struct {
             engine.close();
             self.llama_engine = null;
         }
+        self.closeCoreAi();
         if (self.image_engine) |e| {
             e.deinit();
             self.image_engine = null;

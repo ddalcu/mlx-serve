@@ -64,6 +64,7 @@ const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_coreai = @import("arch/coreai.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
@@ -154,6 +155,8 @@ pub const LoadParams = struct {
     /// perf-plan-aug-17 P5). Opt-in, lossy by design; every refusal is a
     /// named `[ane]` line and the model serves GPU-only.
     ane_prefill: bool = false,
+    /// Engines on one load of each Core AI bundle (`--ane-slots`): that many requests run at once.
+    ane_slots: u32 = 1,
     /// The server's prefill-chunk pin (`server.pinPrefillChunk`), passed as a
     /// pointer because the scheduler deliberately has no server.zig import.
     /// The ANE build compiles fixed-shape tiles against THIS width — resolving
@@ -659,7 +662,7 @@ pub const Slot = struct {
         // allocations — the engine owns its own KV cache, vision is not
         // supported, and the forward path bypasses `ForwardCtx`. Build
         // sentinel-empty fields so `Slot.deinit` is well-defined on both paths.
-        const is_embedded = params.model.ds4_engine != null or params.model.llama_engine != null;
+        const is_embedded = params.model.engineBacked();
 
         // Per-slot KVCache, honoring the process-level kv-quant setting. For
         // embedded slots the engine owns its own cache — we initialize a
@@ -1225,6 +1228,7 @@ pub const LoadRequest = struct {
     mtp_depth: u32 = 0,
     /// `--ane-prefill` survives cold loads (the flag-eater class).
     ane_prefill: bool = false,
+    ane_slots: u32 = 1,
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
     ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
 
@@ -1415,6 +1419,7 @@ pub const Scheduler = struct {
     ds4_ssd_streaming: bool,
     /// `--ane-prefill`, retained for cold loads (same class as `mtp_enabled`).
     ane_prefill: bool,
+    ane_slots: u32,
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32,
     ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64,
     /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
@@ -1481,6 +1486,8 @@ pub const Scheduler = struct {
     queue_cond: std.Io.Condition,
     pending: std.ArrayList(*Slot),
     decoding: std.ArrayList(*Slot),
+    /// Slots a Core AI worker runs (`runCoreAiSlot`), off the inference thread.
+    offloaded: std.ArrayList(*Slot) = .empty,
     /// Phase A4: pending vision-encode requests. The inference thread drains
     /// these in the gap before/after each prefill+decode tick. Posting
     /// broadcasts on `queue_cond` to wake an idle inference thread.
@@ -1617,6 +1624,7 @@ pub const Scheduler = struct {
             .ds4_dspark = params.ds4_dspark,
             .ds4_ssd_streaming = params.ds4_ssd_streaming,
             .ane_prefill = params.ane_prefill,
+            .ane_slots = params.ane_slots,
             .ane_chunk_resolver = params.ane_chunk_resolver,
             .ane_headroom_resolver = params.ane_headroom_resolver,
             .no_drafter = params.no_drafter,
@@ -1702,6 +1710,7 @@ pub const Scheduler = struct {
         self.pending.deinit(self.allocator);
         for (self.decoding.items) |slot| slot.deinit();
         self.decoding.deinit(self.allocator);
+        self.offloaded.deinit(self.allocator);
         for (self.cleanup_queue.items) |slot| slot.deinit();
         self.cleanup_queue.deinit(self.allocator);
         // Vision/embed queues should be empty (encodeVision/computeEmbedding
@@ -1807,10 +1816,11 @@ pub const Scheduler = struct {
         return self.decoding.items.len;
     }
 
+    /// Another request this one could batch with is live. Core AI slots run on the ANE, never in a group.
     pub fn hasCompany(self: *Scheduler) bool {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
-        return self.in_flight > 0;
+        return self.in_flight > self.offloaded.items.len;
     }
 
     /// Submit a new request. Builds a Slot, queues it, returns the handle.
@@ -1827,6 +1837,7 @@ pub const Scheduler = struct {
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        if (params.model.coreai != null and !coreAiServes(params.sampling, params.logprobs_n, params.prompt_logprobs)) return error.NeuralEngineUnsupported;
         // Every decode path reads the prompt's last token; `""` on a BOS-less vocab encodes to none.
         if (params.prompt_ids.len == 0) return error.EmptyPrompt;
         const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
@@ -1854,6 +1865,23 @@ pub const Scheduler = struct {
             slot.holds_session = true;
         }
 
+        if (params.model.coreai) |w| {
+            // The worker holds `in_pass` until it lets the slot go; `complete` waits that out.
+            _ = slot.in_pass.fetchAdd(1, .acq_rel);
+            self.offloaded.append(self.allocator, slot) catch |err| {
+                _ = slot.in_pass.fetchSub(1, .release);
+                if (slot.holds_session) self.releaseSessionLocked(slot);
+                return err;
+            };
+            w.post(slot) catch |err| {
+                _ = self.offloaded.pop();
+                _ = slot.in_pass.fetchSub(1, .release);
+                if (slot.holds_session) self.releaseSessionLocked(slot);
+                return err;
+            };
+            self.in_flight += 1;
+            return slot;
+        }
         self.pending.append(self.allocator, slot) catch |err| {
             // Release the session claim before bubbling the error — the caller
             // never gets the slot, so `complete` won't run for it.
@@ -1912,6 +1940,10 @@ pub const Scheduler = struct {
                 break;
             }
         }
+        for (self.offloaded.items, 0..) |s, j| if (s == slot) {
+            _ = self.offloaded.swapRemove(j);
+            break;
+        };
 
         // Release the session claim (if this slot held it) so the next queued
         // request can claim it AND reuse the KV prefix it now holds. Done before
@@ -1953,6 +1985,7 @@ pub const Scheduler = struct {
         defer self.queue_mu.unlock(self.io);
         for (self.pending.items) |slot| slot.cancel();
         for (self.decoding.items) |slot| slot.cancel();
+        for (self.offloaded.items) |slot| slot.cancel();
     }
 
     /// The media residency bill for an entry, or 0 when it is not a media
@@ -2165,6 +2198,7 @@ pub const Scheduler = struct {
             .ds4_dspark = self.ds4_dspark,
             .ds4_ssd_streaming = self.ds4_ssd_streaming,
             .ane_prefill = self.ane_prefill,
+            .ane_slots = self.ane_slots,
             .ane_chunk_resolver = self.ane_chunk_resolver,
             .ane_headroom_resolver = self.ane_headroom_resolver,
             .evict_entries = victims_buf[0..n_victims],
@@ -2855,6 +2889,12 @@ const CpuState = struct {
 /// call deinit on uninitialized memory. `ModelConfig.deinit` frees the config's
 /// one owned field; `allocator.destroy` alone would leak it.
 fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, gguf_ctx_size: u32) !CpuState {
+    // A Core AI bundle keeps its config, tokenizer and template in `model/`; the engine opens the rest.
+    if (arch_coreai.isBundle(io, model_dir)) {
+        const text_dir = try std.fs.path.join(allocator, &.{ model_dir, "model" });
+        defer allocator.free(text_dir);
+        return preloadTextCpuState(allocator, io, text_dir);
+    }
     // GGUF first — mirrors `--model` routing in main.zig, where isGgufPath
     // is checked before any config.json read ("GGUF files bypass the MLX
     // dispatch entirely"). The embedded engine owns the real tokenizer +
@@ -2880,7 +2920,10 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     if (gen_mod.incompleteMediaDir(io, allocator, model_dir)) {
         return error.IncompleteMediaPack;
     }
+    return preloadTextCpuState(allocator, io, model_dir);
+}
 
+fn preloadTextCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !CpuState {
     const config = try allocator.create(ModelConfig);
     errdefer allocator.destroy(config);
     config.* = try model_mod.parseConfig(io, allocator, model_dir);
@@ -3209,6 +3252,137 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
+}
+
+/// Core AI bundle: open the engine (a bundle's first load on this Mac compiles every package for
+/// the Neural Engine, minutes; cached after) and start its worker. Installs the CPU state like the
+/// llama arm, but the inference thread's current model stays: the ANE model runs beside it.
+fn doLoadCoreAiOnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    log.info("[coreai] opening {s}\n", .{params.model_dir});
+    // The hot prefix cache's switches: its entry cap counts checkpoints here, each a full DeltaNet state.
+    const limits: ?arch_coreai.CacheLimits = if (params.prefix_cache_capacity > 0 and params.prefix_cache_ram_enabled and params.ssm_checkpoint_stride > 0)
+        .{ .max_bytes = params.prefix_cache_mem_bytes, .max_states = params.prefix_cache_capacity, .stride = params.ssm_checkpoint_stride }
+    else
+        null;
+    const worker = try arch_coreai.openPool(sch.allocator, sch.io, params.model_dir, params.ane_slots, limits, sch, runCoreAiSlot);
+    errdefer worker.close();
+    params.config.max_position_embeddings = worker.engines[0].maxPositions();
+    const entry = params.entry;
+    entry.coreai = worker;
+    entry.releaseRetainedCpuState();
+    entry.config = params.config;
+    entry.tokenizer = params.tok;
+    entry.chat_config = params.chat_config;
+    entry.weights = null;
+    entry.transformer = null;
+    entry.vision_encoder = null;
+    entry.drafter = null;
+    entry.dflash = null;
+    entry.drafter_block_size = 0;
+    entry.drafter_path = "";
+    entry.prefix_cache = null;
+    if (params.tokenize_cache_entries > 0) {
+        entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(sch.allocator, params.tokenize_cache_entries);
+    }
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.markReadyLocked(entry, (entry.bytes_on_disk orelse 0) + worker.stateBytes());
+    sch.registry.mutex.unlock(sch.io);
+}
+
+/// One request on a Core AI worker thread: sync the engine to the prompt, then sample, publish and
+/// feed one token at a time. Never calls MLX, so it ends the slot itself instead of `finishSlot`.
+fn runCoreAiSlot(ctx: *anyopaque, engine: *arch_coreai.Engine, job: *anyopaque) void {
+    const sch: *Scheduler = @ptrCast(@alignCast(ctx));
+    const slot: *Slot = @ptrCast(@alignCast(job));
+    defer _ = slot.in_pass.fetchSub(1, .release);
+    runCoreAiRequest(sch, slot, engine) catch |err| {
+        if (err == error.Cancelled) return endCoreAiSlot(sch, slot, "cancelled");
+        log.err("[coreai] request failed: {s}\n", .{@errorName(err)});
+        recordSlotEnd(sch.metrics, slot, .failed);
+        slot.markError(@errorName(err));
+        return;
+    };
+    // After the terminator: the next turn of this conversation starts from here.
+    engine.checkpoint();
+}
+
+fn runCoreAiRequest(sch: *Scheduler, slot: *Slot, engine: *arch_coreai.Engine) !void {
+    if (slot.cancelled.load(.acquire)) return error.Cancelled;
+    var prefill_sw = io_util.Stopwatch.init(sch.io);
+    const synced = try engine.sync(slot.full_prompt, &slot.cancelled);
+    slot.prompt_tokens = @intCast(slot.full_prompt.len);
+    slot.cached_tokens = @intCast(synced.cached);
+    slot.prefill_ns = prefill_sw.read();
+    slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+    slot.state = .decoding;
+    const seed = slot.sampling.seed orelse blk: {
+        var r: u64 = undefined;
+        sch.io.random(std.mem.asBytes(&r));
+        break :blk r;
+    };
+    var prng = std.Random.DefaultPrng.init(seed);
+    const sampling: arch_coreai.Sampling = .{
+        .temperature = slot.sampling.temperature,
+        .top_k = slot.sampling.top_k,
+        .top_p = slot.sampling.top_p,
+        .min_p = slot.sampling.min_p orelse 0,
+    };
+    var decode_sw = io_util.Stopwatch.init(sch.io);
+    var tok = engine.draw(synced.logits, sampling, prng.random());
+    var emitted = false;
+    // DFlash2: each cycle commits `tok` plus the accepted drafts and yields the drafts and the next token.
+    if (engine.drafter != null) {
+        const drafts: usize = engine.man.T - 1;
+        var cycles: usize = 0;
+        var accepted: usize = 0;
+        defer if (cycles > 0) log.info("[coreai] spec: {d} cycles, {d}% of drafts accepted\n", .{ cycles, 100 * accepted / (drafts * cycles) });
+        if (coreAiEmit(slot, tok)) |reason| return endCoreAiSlot(sch, slot, reason);
+        emitted = true;
+        while (true) {
+            const c = engine.cycle(tok, sampling, prng.random(), slot.eos_token_ids) catch |err| switch (err) {
+                error.ContextFull => break, // the last positions take one token per call
+                else => return err,
+            };
+            cycles += 1;
+            accepted += c.accepted;
+            slot.decode_ns = decode_sw.read();
+            for (c.tokens[0..c.n]) |t| if (coreAiEmit(slot, t)) |reason| return endCoreAiSlot(sch, slot, reason);
+            tok = c.tokens[c.n - 1];
+        }
+    }
+    while (true) {
+        if (!emitted) if (coreAiEmit(slot, tok)) |reason| return endCoreAiSlot(sch, slot, reason);
+        emitted = false;
+        const logits = engine.step(tok) catch |err| switch (err) {
+            error.ContextFull => return endCoreAiSlot(sch, slot, "length"),
+            else => return err,
+        };
+        slot.decode_ns = decode_sw.read();
+        tok = engine.draw(logits, sampling, prng.random());
+    }
+}
+
+/// Whether a Core AI model honors the request: its engine samples the raw logits, so a grammar,
+/// penalties, logprobs or a forced tool call would be ignored. A thinking budget is not enforced.
+pub fn coreAiServes(sampling: SamplingParams, logprobs_n: u32, prompt_logprobs: bool) bool {
+    return !sampling.shapesLogits() and sampling.tool_force == null and logprobs_n == 0 and !prompt_logprobs;
+}
+
+/// Publish one generated token; the finish reason when the slot ends here.
+fn coreAiEmit(slot: *Slot, tok: u32) ?[]const u8 {
+    if (generate_mod.isEosId(tok, slot.eos_token_ids)) return "stop";
+    slot.pushToken(tok);
+    if (tok != 0) slot.was_pad_only = false;
+    slot.completion_tokens += 1;
+    if (slot.completion_tokens >= slot.max_tokens) return "length";
+    if (slot.cancelled.load(.acquire)) return "cancelled";
+    return null;
+}
+
+/// Metrics first: once the terminator is out, the connection thread may complete the slot.
+fn endCoreAiSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, null));
+    publishSlotTerminator(slot, reason, null);
 }
 
 /// The post-load residency bill the eviction gate reserves, in bytes.
@@ -3707,7 +3881,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "llama",                     "ds4_mtp",                   "ds4_dspark",
         "ds4_ssd_streaming",         "no_drafter",                "draft_block_size",
         "draft_block_size_explicit", "ane_prefill",               "ane_chunk_resolver",
-        "ane_headroom_resolver",     "prefix_cache_mem_resolver",
+        "ane_headroom_resolver",     "prefix_cache_mem_resolver", "ane_slots",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -4165,6 +4339,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const Ty = @TypeOf(params);
     const TyInfo = @typeInfo(Ty);
     const Inner = if (TyInfo == .pointer) TyInfo.pointer.child else Ty;
+    if (arch_coreai.isBundle(sch.io, params.model_dir)) return doLoadCoreAiOnInferenceThread(sch, params);
     if (@hasField(Inner, "ds4_path") and params.ds4_path.len > 0) {
         try doLoadDs4OnInferenceThread(sch, params);
         return;
@@ -11814,4 +11989,30 @@ test "loop recovery: an answer-side loop and an unarmed request are still cut" {
     const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
+}
+
+test "company: a Core AI slot runs on the ANE and never batches, so it does not count" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.offloaded = .empty;
+    defer sch.offloaded.deinit(testing.allocator);
+    var ane: Slot = undefined;
+    try sch.offloaded.append(testing.allocator, &ane);
+    sch.in_flight = 1;
+    try testing.expect(!sch.hasCompany());
+    sch.in_flight = 2;
+    try testing.expect(sch.hasCompany());
+}
+
+test "coreAiServes: plain sampling only; a grammar, a penalty, logprobs or a forced tool call is refused" {
+    try testing.expect(coreAiServes(.{ .temperature = 0.7, .top_p = 0.9, .top_k = 20 }, 0, false));
+    try testing.expect(!coreAiServes(.{ .repeat_penalty = 1.1 }, 0, false));
+    try testing.expect(!coreAiServes(.{ .presence_penalty = 0.5 }, 0, false));
+    try testing.expect(!coreAiServes(.{ .constraint = @ptrFromInt(8) }, 0, false));
+    try testing.expect(!coreAiServes(.{ .tool_force = @ptrFromInt(8) }, 0, false));
+    try testing.expect(!coreAiServes(.{}, 5, false));
+    try testing.expect(!coreAiServes(.{}, 0, true));
+    // A thinking budget is not enforced, but the answer is still the model's own.
+    try testing.expect(coreAiServes(.{ .think_bound = @ptrFromInt(8) }, 0, false));
 }

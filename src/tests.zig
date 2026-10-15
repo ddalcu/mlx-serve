@@ -114,6 +114,10 @@ test {
     _ = @import("qwen_image_edit.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");
+    _ = @import("arch/coreai.zig");
+    _ = @import("arch/coreai_dflash.zig");
+    _ = @import("arch/coreai_prefix.zig");
+    _ = @import("coreai_ffi.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_diffvae.zig");
     _ = @import("ltx_diffvae_kernel.zig");

@@ -79,6 +79,8 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
+// `--ane-slots`: requests each Core AI bundle runs at once, file-level for the same reason.
+var ane_slots: u32 = 1;
 // `--ane-image/--ane-video/--ane-audio` + `--ane-split`: the media DiTs' MLP
 // offload, published as ONE value (`ane.media_offload`) after the parse.
 var ane_media: ane_mod.MediaOffload = .{};
@@ -202,6 +204,11 @@ fn printUsage(io: std.Io) void {
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
         \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
+        \\  --ane-slots <n>     Requests each Core AI (Neural Engine) bundle runs
+        \\                        at once (default: 1). Slots share the weights;
+        \\                        each adds its own KV and state (~0.75 GB for a
+        \\                        27B at 8K). Two ANE clusters on an Ultra: 2
+        \\                        slots double the throughput, more queue less.
         \\  --ane-image         Run a share of each image DiT block's MLP on the
         \\  --ane-video           Neural Engine beside the GPU (Krea / MiniMax-H3 /
         \\  --ane-audio           ACE-Step; int8/fp16, lossy; off by default). The
@@ -789,6 +796,9 @@ pub fn main(init: std.process.Init) !void {
             // are named [ane] log lines at load; MLX_SERVE_ANE_SPLIT tunes
             // the row share.
             ane_prefill = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-slots") and i + 1 < args.len) {
+            i += 1;
+            ane_slots = @max(std.fmt.parseInt(u32, args[i], 10) catch 1, 1);
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {
@@ -1490,6 +1500,7 @@ pub fn main(init: std.process.Init) !void {
             .mtp_head_kv_quant = mtp_head_kv_quant,
             .mtp_depth = depth_bounds.active.max,
             .ane_prefill = ane_prefill,
+            .ane_slots = ane_slots,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
             .ane_headroom_resolver = server_mod.aneGateHeadroom,
             .load_vision = load_vision,
@@ -1915,6 +1926,7 @@ fn runGenServe(
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
+        .ane_slots = ane_slots,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
         .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
@@ -2062,6 +2074,7 @@ fn runHeadlessServe(
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
+        .ane_slots = ane_slots,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
         .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
