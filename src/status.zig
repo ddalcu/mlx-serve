@@ -154,6 +154,23 @@ pub fn getTotalMemBytes() u64 {
     return total_mem;
 }
 
+/// Free RAM the plan never touches. MLX wires what it allocates, so planning down to the last
+/// free page leaves the OS nothing to reclaim: a 16 GB Mac died on wired memory (15.4 GB wired,
+/// 14 MB free) with every request admitted.
+pub fn osReserveBytes(total_ram: u64) u64 {
+    if (os_reserve_override) |v| return v;
+    return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
+}
+
+/// `--os-reserve-gib N` in bytes; 0 turns the reserve off. Null = the automatic eighth.
+pub var os_reserve_override: ?u64 = null;
+
+pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
+    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
+    if (n > 64) return error.InvalidOsReserve;
+    return @as(u64, n) << 30;
+}
+
 pub fn getAvailableMemBytes() u64 {
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
     var total_mem: u64 = 0;
@@ -211,6 +228,18 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     const n = std.c.read(fd, buf.ptr, buf.len);
     if (n <= 0) return null;
     return @intCast(n);
+}
+
+test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB" {
+    const gb: u64 = 1 << 30;
+    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb));
+    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb));
+    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb));
+    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb));
+    os_reserve_override = try parseOsReserveGib("0");
+    defer os_reserve_override = null;
+    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb));
+    try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
 }
 
 test "computeAvailableBytes sums the reclaimable classes, capped by wired headroom" {

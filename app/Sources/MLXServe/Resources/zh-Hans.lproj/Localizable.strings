@@ -179,6 +179,11 @@
 "8-bit (≈2× smaller KV)" = "8-bit（KV 缩小 ≈2×）";
 "832 × 1216 (portrait 2:3)" = "832 × 1216（竖版 2:3）";
 "832 × 1248 (portrait 2:3)" = "832 × 1248（竖版 2:3）";
+"2048 × 2048 (square, finest text)" = "2048 × 2048（方形，文字最清晰）";
+"1360 × 2048 (portrait 2:3, finest text)" = "1360 × 2048（竖版 2:3，文字最清晰）";
+"2048 × 1360 (landscape 3:2, finest text)" = "2048 × 1360（横版 3:2，文字最清晰）";
+"2048 × 1152 (landscape 16:9, finest text)" = "2048 × 1152（横版 16:9，文字最清晰）";
+"1152 × 2048 (portrait 9:16, finest text)" = "1152 × 2048（竖版 9:16，文字最清晰）";
 "85 — hip-hop" = "85 —— 嘻哈";
 "896 × 1152 (portrait 3:4)" = "896 × 1152（竖版 3:4）";
 "896 × 1600 (portrait 9:16)" = "896 × 1600（竖版 9:16）";
@@ -1631,6 +1636,13 @@
 "Terminal Theme" = "终端主题";
 "Text Size" = "文字大小";
 "Text on a sign" = "招牌上的文字";
+"Infographics" = "信息图";
+"Key stats" = "关键数据";
+"Step-by-step process" = "分步流程";
+"Comparison slide" = "对比幻灯片";
+"Bar chart" = "柱状图";
+"Event poster" = "活动海报";
+"Café menu" = "咖啡馆菜单";
 "Text to be generated" = "待生成的文本";
 "Text to music" = "文生音乐";
 "Text to speak" = "朗读文本";

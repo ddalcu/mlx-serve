@@ -30,8 +30,8 @@ struct LoadProgressBar: View {
     }
 }
 
-/// The chat model loading (above the composer, in the tray). Its own observing view, so a poll
-/// redraws this row and not the view around it.
+/// The chat model loading (above the composer, in the tray), else whatever the server is loading.
+/// Its own observing view, so a poll redraws this row and not the view around it.
 struct ModelLoadProgressRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -41,12 +41,16 @@ struct ModelLoadProgressRow: View {
             LoadProgressLine(name: ModelDisplayName.pretty(URL(fileURLWithPath: path).lastPathComponent),
                              progress: LoadProgress.lookup(server.loadProgress, path: path))
                 .padding(.horizontal, 6)
+        } else {
+            // A load this app did not ask for: the server's startup load, another client's.
+            LoadingModelsRow()
+                .padding(.horizontal, 6)
         }
     }
 }
 
-/// Every model this app is loading (`ServerManager.loadProgress`), for the Create panes; nothing
-/// when none is.
+/// Every model the server is loading, whichever client asked (`ServerManager.loadProgress`);
+/// nothing when none is.
 struct LoadingModelsRow: View {
     @EnvironmentObject var server: ServerManager
 

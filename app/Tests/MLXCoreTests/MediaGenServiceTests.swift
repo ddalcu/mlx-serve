@@ -1227,8 +1227,53 @@ final class MediaGenServiceTests: XCTestCase {
             "Extract the main foreground subject from the image and isolate it on a clean pure white background. Preserve its shape, identity, texture, and fine boundary details.")
     }
 
+    /// Qwen-Image lays out dense text (verified live on both packs), so its
+    /// text-to-image menu adds infographic layouts; the other models were never
+    /// verified on dense text and do not get them.
+    func testQwenImageOffersInfographicTemplates() {
+        for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit, .qwenImage21Turbo_8bit, .qwenImage21Turbo_4bit] {
+            XCTAssertTrue(p.rendersDenseText, "\(p.id)")
+            XCTAssertEqual(p.promptExamples(editing: false),
+                           ImagePromptExamples.textToImage + [ImagePromptExamples.infographics], "\(p.id)")
+        }
+        for p in [ImageModelPreset.flux2Klein4B_Q4, .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo] {
+            XCTAssertFalse(p.rendersDenseText, "\(p.id)")
+        }
+    }
+
+    /// The format Qwen's own prompt enhancer writes, which Enhance teaches from
+    /// these bodies: every string quoted, nothing left for the model to invent.
+    func testEveryInfographicTemplateQuotesItsTextAndClosesTheLayout() {
+        for e in ImagePromptExamples.infographics.examples {
+            let quotes = e.body.filter { $0 == "\"" }.count
+            XCTAssertGreaterThanOrEqual(quotes, 6, "\(e.title): at least three quoted strings")
+            XCTAssertEqual(quotes % 2, 0, "\(e.title): unbalanced quote")
+            XCTAssertTrue(e.body.contains("There is no other text in the image."), e.title)
+        }
+    }
+
+    /// Qwen's card recommends about 4 MP and the server caps a side at 2048, so
+    /// the 1 MP shapes come again at that cap. The default stays 1 MP: a 2048
+    /// run takes several times as long.
+    func testQwenImageOffersTwoKSizesOnItsGrid() {
+        for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit, .qwenImage21Turbo_8bit, .qwenImage21Turbo_4bit] {
+            let sizes = p.resolutions.map { [$0.width, $0.height] }
+            for want in [[2048, 2048], [1360, 2048], [2048, 1360], [1152, 2048], [2048, 1152]] {
+                XCTAssertTrue(sizes.contains(want), "\(p.id): \(want)")
+            }
+            for r in p.resolutions {
+                let verdict = p.resolutionGrid.resolve(width: r.width, height: r.height)
+                XCTAssertTrue(verdict.isValid, "\(p.id): \(r.label)")
+                XCTAssertEqual(verdict.size?.width, r.width, "\(p.id): \(r.label)")
+                XCTAssertEqual(verdict.size?.height, r.height, "\(p.id): \(r.label)")
+            }
+            XCTAssertEqual(p.defaultResolution.width * p.defaultResolution.height, 1024 * 1024, "\(p.id)")
+        }
+    }
+
     func testEveryExampleGroupIsUsableInAMenu() {
-        for lib in [ImagePromptExamples.textToImage, ImagePromptExamples.mageFlowEdit, ImagePromptExamples.genericEdit] {
+        for lib in [ImagePromptExamples.textToImage, ImagePromptExamples.mageFlowEdit, ImagePromptExamples.genericEdit,
+                    [ImagePromptExamples.infographics]] {
             var seenGroups = Set<String>()
             for g in lib {
                 XCTAssertFalse(g.examples.isEmpty, "\(g.name): an empty submenu is a dead end")

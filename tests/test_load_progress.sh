@@ -2,7 +2,9 @@
 # `GET /v1/load-progress` (`src/load_progress.zig`): a headless server answers an empty list; a
 # GPU load shows `reading_weights` (bytes) and a Neural Engine load `ane_programs` (programs), each
 # with a total and progress that moves, and the list is empty once the model is ready. `/props`
-# `registry_generation` moves with the load, so a client knows to re-read `/v1/models`.
+# `registry_generation` moves with the load, so a client knows to re-read `/v1/models`. A POST
+# naming a model loads nothing; a `--model` boot answers `/health` (503 `loading`) and the progress
+# while its startup load runs.
 #
 # Scratch HOME (the Neural Engine opt-in goes in its model-settings.json); the ANE compile cache
 # stays the real one. SKIPs without the packs; the ANE half without the private framework.
@@ -81,6 +83,8 @@ check "[1] {\"loading\":[]} (got $R)" "$([ "$R" = '{"loading":[]}' ] && echo 1 |
 generation() { curl -s "http://127.0.0.1:$PORT/props" | python3 -c "import sys, json; print(json.load(sys.stdin).get('registry_generation', -1))"; }
 G0="$(generation)"
 check "[1] /props registry_generation (got $G0)" "$([ "${G0:--1}" -ge 0 ] && echo 1 || echo 0)"
+R="$(curl -s -X POST "http://127.0.0.1:$PORT/v1/load-progress" -H 'Content-Type: application/json' -d "{\"model\":\"$GPU_MODEL\"}")"
+check "[1] a POST naming a model loads nothing (got $R)" "$([ "$R" = '{"loading":[]}' ] && [ "$(generation)" = "$G0" ] && echo 1 || echo 0)"
 
 echo "[2] a GPU load reads weights ($GPU_MODEL)"
 watch "$GPU_MODEL" "$FAKE_HOME/gpu.jsonl"
@@ -108,6 +112,26 @@ if [ -n "$ANE_MODEL" ] && [ -d /System/Library/PrivateFrameworks/AppleNeuralEngi
 else
     echo "  SKIP [3]: no Neural Engine pack or framework"
 fi
+
+echo "[4] a --model boot answers while its model loads ($GPU_MODEL)"
+: >"$LOG"
+: >"$FAKE_HOME/boot.txt"
+HOME="$FAKE_HOME" "$BIN" --serve --model "$GPU_MODEL" --host 127.0.0.1 --port "$PORT" --log-level info --log-file off >"$LOG" 2>&1 &
+SRV=$!
+CODE=""
+for _ in $(seq 1 2400); do
+    CODE="$(curl -s -o "$FAKE_HOME/h.json" -w '%{http_code}' "http://127.0.0.1:$PORT/health")"
+    [ "$CODE" = "200" ] && break
+    if [ "$CODE" = "503" ]; then
+        { cat "$FAKE_HOME/h.json"; echo; curl -s "http://127.0.0.1:$PORT/v1/load-progress"; echo; } >>"$FAKE_HOME/boot.txt"
+    fi
+    kill -0 "$SRV" 2>/dev/null || break
+    sleep 0.05
+done
+check "[4] /health is 503 loading during the startup load" "$(grep -q '"status":"loading"' "$FAKE_HOME/boot.txt" && echo 1 || echo 0)"
+check "[4] /v1/load-progress names the loading model" "$(grep -q '"phase":"' "$FAKE_HOME/boot.txt" && echo 1 || echo 0)"
+check "[4] healthy once loaded (got $CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+stop
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ]

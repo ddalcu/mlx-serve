@@ -1854,6 +1854,73 @@ fn listenExclusiveLinux(addr: std.Io.net.IpAddress) !std.Io.net.Server {
 /// `cfg` carries all process-wide defaults (context size, timeouts, PLD
 /// defaults, reasoning budget). It's copied into the module-level
 /// `server_config` before the listen loop starts.
+/// Dotted-decimal IPv4 (`0.0.0.0` and anything unparsable read as zeros).
+fn parseIp4(host: []const u8) [4]u8 {
+    var out: [4]u8 = .{ 0, 0, 0, 0 };
+    if (std.mem.eql(u8, host, "0.0.0.0")) return out;
+    var parts = std.mem.splitScalar(u8, host, '.');
+    var idx: usize = 0;
+    while (parts.next()) |part| {
+        if (idx >= 4) break;
+        out[idx] = std.fmt.parseInt(u8, part, 10) catch 0;
+        idx += 1;
+    }
+    return out;
+}
+
+/// Answers on the bound socket while the startup load runs, before the accept loop takes it:
+/// `/health` is 503 `loading` (clients keep waiting), a loopback client reads `/v1/load-progress`,
+/// anything else is 503. One connection at a time; nothing here touches the scheduler.
+const StartupResponder = struct {
+    server: *std.Io.net.Server,
+    registry: *ModelRegistry,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *StartupResponder) void {
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
+    }
+
+    fn stop(self: *StartupResponder) void {
+        self.done.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    fn run(self: *StartupResponder) void {
+        var fds = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        while (!self.done.load(.acquire)) {
+            const ready = std.posix.poll(&fds, 100) catch continue;
+            // Once done, a waiting connection is the accept loop's.
+            if (ready == 0 or self.done.load(.acquire)) continue;
+            const accepted = self.server.accept(self.io) catch continue;
+            var conn: Conn = undefined;
+            Conn.init(&conn, accepted, self.io);
+            defer conn.close();
+            self.answer(&conn) catch {};
+        }
+    }
+
+    fn answer(self: *StartupResponder, conn: *Conn) !void {
+        const raw = (try readRequest(self.allocator, conn)) orelse return;
+        defer self.allocator.free(raw.buf);
+        const line_end = std.mem.indexOf(u8, raw.buf[0..raw.len], "\r\n") orelse return;
+        var words = std.mem.splitScalar(u8, raw.buf[0..line_end], ' ');
+        _ = words.next();
+        const raw_path = words.next() orelse return;
+        const path = if (std.mem.indexOfScalar(u8, raw_path, '?')) |q| raw_path[0..q] else raw_path;
+        if (std.mem.eql(u8, path, "/health")) return sendResponse(conn, "503 Service Unavailable", "application/json", "{\"status\":\"loading\"}");
+        if (std.mem.eql(u8, path, "/v1/load-progress") and peerIsLoopback(conn)) {
+            const body = try loadProgressBody(self.allocator, self.io, self.registry);
+            defer self.allocator.free(body);
+            return sendResponse(conn, "200 OK", "application/json", body);
+        }
+        return sendErrorResponse(self.allocator, conn, "503 Service Unavailable", "loading", "The model is still loading", 503);
+    }
+};
+
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1877,6 +1944,18 @@ pub fn serve(
     //    Transformer/vision/drafter load, JIT compile, and warmup before
     //    `Scheduler.init` returns. From this point on, mlx ops are bound
     //    to the inference thread's GPU stream.
+    // Bound before the startup load, which can take minutes (a first Neural Engine compile):
+    // until it ends, `StartupResponder` answers in place of the accept loop below.
+    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = parseIp4(host), .port = port } };
+    var server = listenExclusive(io, ip_addr) catch |err| {
+        if (err == error.AddressInUse) log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
+        return err;
+    };
+    defer server.deinit(io);
+    var startup: StartupResponder = .{ .server = &server, .registry = load_params.registry, .allocator = allocator, .io = io };
+    if (!load_params.no_initial_load) startup.start();
+    defer startup.stop();
+
     var scheduler = try scheduler_mod.Scheduler.init(
         allocator,
         io,
@@ -1884,6 +1963,7 @@ pub fn serve(
         max_concurrent,
     );
     defer scheduler.deinit();
+    startup.stop();
     global_scheduler = scheduler;
     defer global_scheduler = null;
     // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
@@ -2010,25 +2090,6 @@ pub fn serve(
     std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
 
-    // Parse host address
-    var ip4_bytes: [4]u8 = .{ 0, 0, 0, 0 };
-    if (!std.mem.eql(u8, host, "0.0.0.0")) {
-        // Parse dotted-decimal IP
-        var parts = std.mem.splitScalar(u8, host, '.');
-        var idx: usize = 0;
-        while (parts.next()) |part| {
-            if (idx >= 4) break;
-            ip4_bytes[idx] = std.fmt.parseInt(u8, part, 10) catch 0;
-            idx += 1;
-        }
-    }
-
-    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = ip4_bytes, .port = port } };
-    var server = listenExclusive(io, ip_addr) catch |err| {
-        if (err == error.AddressInUse) log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
-        return err;
-    };
-    defer server.deinit(io);
 
     // ── LAN sharing/discovery (src/lan.zig): started HERE — the one chokepoint
     //    every serve path (model/headless/gen/ds4/llama) flows through — so the
@@ -2575,7 +2636,8 @@ fn handleConnection(
         try handleLoadModelStrict(allocator, stream, request_body);
         return;
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/load-progress")) {
+    // Any method: a status route never reaches `ensureLoaded`, whatever its body names.
+    if (std.mem.eql(u8, path, "/v1/load-progress")) {
         const body = renderLoadProgressBody(allocator, stream.io) catch |err| switch (err) {
             error.RegistryNotReady => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503),
             else => return err,
@@ -3686,23 +3748,6 @@ pub fn applyGpuCeilingEnv() void {
 
 /// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
 /// admission bill all read it, so the wired-limit floor cannot reach some of them and not others.
-/// Free RAM the plan never touches. MLX wires what it allocates, so planning down to the last
-/// free page leaves the OS nothing to reclaim: a 16 GB Mac died on wired memory (15.4 GB wired,
-/// 14 MB free) with every request admitted.
-pub fn osReserveBytes(total_ram: u64) u64 {
-    if (os_reserve_override) |v| return v;
-    return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
-}
-
-/// `--os-reserve-gib N` in bytes; 0 turns the reserve off. Null = the automatic eighth.
-pub var os_reserve_override: ?u64 = null;
-
-pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
-    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
-    if (n > 64) return error.InvalidOsReserve;
-    return @as(u64, n) << 30;
-}
-
 fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
@@ -3716,7 +3761,7 @@ fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u6
     return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        (metrics.getAvailableMemBytes() -| osReserveBytes(metrics.getTotalMemBytes())) +| ane_bytes,
+        (metrics.getAvailableMemBytes() -| metrics.osReserveBytes(metrics.getTotalMemBytes())) +| ane_bytes,
         wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }
@@ -7496,12 +7541,13 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
     if (body.len > 0) try stream.writeAll(body);
 }
 
-/// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
-/// new dirs, clearing failed loads (`ModelRegistry.rescan`). Answers `{"added":N}`.
 /// `GET /v1/load-progress`: every model mid-load and what its load is doing (`load_progress.zig`).
 /// Cheap enough to poll while a load runs: it reads no configs.
 fn renderLoadProgressBody(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    const registry = global_registry orelse return error.RegistryNotReady;
+    return loadProgressBody(allocator, io, global_registry orelse return error.RegistryNotReady);
+}
+
+fn loadProgressBody(allocator: std.mem.Allocator, io: std.Io, registry: *ModelRegistry) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     const now = io_util.nowMsMonotonic(io);
@@ -7531,6 +7577,8 @@ fn renderLoadProgressBody(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
+/// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
+/// new dirs, clearing failed loads (`ModelRegistry.rescan`). Answers `{"added":N}`.
 fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
     const registry = global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
@@ -8520,7 +8568,8 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-/// `ModelRegistry.generation`: moves whenever `/v1/models` would read differently.
+/// `ModelRegistry.generation`: moves with every model added and every load state change (not with
+/// provider or LAN rows).
 fn registryGeneration() u64 {
     const reg = global_registry orelse return 0;
     return reg.generation.load(.monotonic);
@@ -20918,6 +20967,46 @@ test "Conn.close does not wait for the peer after a Content-Length response" {
     try expectCloseWaitsForPeer(false);
 }
 
+/// `request` through `StartupResponder.answer` over a socketpair from `peer`; the reply's bytes.
+fn startupReply(r: *StartupResponder, request: []const u8, peer: std.Io.net.IpAddress, out: []u8) ![]const u8 {
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = peer } }, testing.io);
+    defer conn.close();
+    try testing.expectEqual(@as(isize, @intCast(request.len)), std.c.send(sv[1], request.ptr, request.len, 0));
+    _ = std.c.shutdown(sv[1], 1);
+    try r.answer(&conn);
+    try conn.flush();
+    const got = std.c.recv(sv[1], out.ptr, out.len, std.c.MSG.DONTWAIT);
+    return out[0..@intCast(@max(got, 0))];
+}
+
+test "startup: /health is 503 loading, a loopback client reads the load, the rest is 503" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStub("m", "/models/m", 10);
+    reg.mutex.lockUncancelable(testing.io);
+    try testing.expect(reg.tryBeginLoadLocked(stub));
+    reg.mutex.unlock(testing.io);
+    var r: StartupResponder = .{ .server = undefined, .registry = reg, .allocator = testing.allocator, .io = testing.io };
+    const local: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    const lan: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 5 }, .port = 0 } };
+    var buf: [4096]u8 = undefined;
+
+    var reply = try startupReply(&r, "GET /health HTTP/1.1\r\n\r\n", local, &buf);
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 503"));
+    try testing.expect(std.mem.endsWith(u8, reply, "{\"status\":\"loading\"}"));
+    reply = try startupReply(&r, "GET /v1/load-progress HTTP/1.1\r\n\r\n", local, &buf);
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, reply, "\"path\":\"/models/m\",\"progress\":{\"phase\":\"starting\"") != null);
+    reply = try startupReply(&r, "GET /v1/load-progress HTTP/1.1\r\n\r\n", lan, &buf);
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 503"));
+    reply = try startupReply(&r, "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", local, &buf);
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 503"));
+}
+
 test "listenExclusive: a second server cannot bind a port that is already listening" {
     var first = try listenExclusive(testing.io, .{ .ip4 = std.Io.net.Ip4Address.loopback(0) });
     defer first.deinit(testing.io);
@@ -21269,9 +21358,9 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     defer server_config.max_context_size = original;
     server_config.max_context_size = 0;
     // The OS reserve alone eats a 7 GB CI runner's free RAM; it is not what is on trial.
-    const orig_reserve = os_reserve_override;
-    defer os_reserve_override = orig_reserve;
-    os_reserve_override = 0;
+    const orig_reserve = metrics.os_reserve_override;
+    defer metrics.os_reserve_override = orig_reserve;
+    metrics.os_reserve_override = 0;
 
     // A tiny model whose `max_position_embeddings` is far below anything memory
     // could constrain: it must get its FULL declared context, un-margined.
@@ -24730,17 +24819,6 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient") != null);
 }
 
-test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB" {
-    const gb: u64 = 1 << 30;
-    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb));
-    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb));
-    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb));
-    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb));
-    os_reserve_override = try parseOsReserveGib("0");
-    defer os_reserve_override = null;
-    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb));
-    try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
-}
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // Fatal-class drift: the bill is linear in the chunk, so a guard that

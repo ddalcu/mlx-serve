@@ -74,6 +74,17 @@ that mlx-serve does not use. Those notices are omitted here as permitted by
 Apache-2.0 section 4(d).
 
 --------------------------------------------------------------------------------
+Qwen-Image
+https://github.com/QwenLM/Qwen-Image
+Copyright Alibaba Qwen team
+Licensed under the Apache License, Version 2.0.
+
+The image Enhance rules for text in a picture (`textLayoutShape` in
+app/Sources/MLXServe/Services/PromptRewriter.swift) are condensed from the
+text-image instructions of `polish_prompt_en` in
+src/examples/tools/prompt_utils_2512.py.
+
+--------------------------------------------------------------------------------
 laya-mlx
 https://github.com/mizorewww/laya-mlx
 Copyright laya-mlx contributors

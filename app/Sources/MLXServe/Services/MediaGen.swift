@@ -463,9 +463,10 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)."
     )
 
-    /// Qwen-Image-2.1 is undistilled and ~1 MP-trained: a step costs the same
-    /// at any shape, so the menu stays at the sizes a 40-step run finishes in
-    /// reasonable time on a laptop.
+    /// Qwen-Image-2.1's card recommends about 4 MP; the server caps a side at
+    /// 2048, so the 1 MP shapes come again at that cap, where small text gets
+    /// the pixels it needs. 1 MP stays the default: a 2048 run costs several
+    /// times as long.
     private static let qwenImageResolutions: [ResolutionOption] = [
         .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
         .init(width: 768,  height: 768,  label: "768 × 768 (square, fast)"),
@@ -474,6 +475,11 @@ struct ImageModelPreset: Identifiable, Hashable {
         .init(width: 1248, height: 832,  label: "1248 × 832 (landscape 3:2)"),
         .init(width: 1344, height: 768,  label: "1344 × 768 (landscape 16:9)"),
         .init(width: 768,  height: 1344, label: "768 × 1344 (portrait 9:16)"),
+        .init(width: 2048, height: 2048, label: "2048 × 2048 (square, finest text)"),
+        .init(width: 1360, height: 2048, label: "1360 × 2048 (portrait 2:3, finest text)"),
+        .init(width: 2048, height: 1360, label: "2048 × 1360 (landscape 3:2, finest text)"),
+        .init(width: 2048, height: 1152, label: "2048 × 1152 (landscape 16:9, finest text)"),
+        .init(width: 1152, height: 2048, label: "1152 × 2048 (portrait 9:16, finest text)"),
     ]
 
     private static let qwenImageQuality: [QualityPreset: ImageQualitySettings] = [
@@ -2282,12 +2288,19 @@ extension ImageModelPreset {
     /// The fixed step count for a distilled preset (its `.good` profile).
     var fixedSteps: Int { settings(.good).steps }
 
+    /// Lays out whole pages of text (infographics, slides, posters), verified
+    /// live: the Infographics templates and Enhance's layout rules follow it.
+    var rendersDenseText: Bool { variant == .qwenImage21 || variant == .qwenImage21Turbo }
+
     /// Starter prompts for the Examples menu, for the mode the pane is in.
     /// An instruction-tuned editor's repertoire IS its prompt vocabulary — the
     /// only way to discover that it can produce a depth map or de-rain a photo
     /// is to be shown the sentence that does it.
     func promptExamples(editing: Bool) -> [ImagePromptExampleGroup] {
-        guard editing && supportsReferenceEdit else { return ImagePromptExamples.textToImage }
+        guard editing && supportsReferenceEdit else {
+            return rendersDenseText ? ImagePromptExamples.textToImage + [ImagePromptExamples.infographics]
+                                    : ImagePromptExamples.textToImage
+        }
         switch variant {
         case .mageFlowEditTurbo: return ImagePromptExamples.mageFlowEdit
         default: return ImagePromptExamples.genericEdit

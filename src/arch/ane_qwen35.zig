@@ -320,9 +320,8 @@ pub fn smallModel(A: Arch) bool {
     return modelBytes(A) < 1 << 30;
 }
 
-/// A lane program's ceilings, measured on the M5 Ultra: the compiler refuses a program whose
-/// functions have more than ~256 inputs plus outputs in total (244 compiled, 274 did not, with no
-/// reason given), and a full-width 4-layer 27B chunk (1.5 GB) is the largest program measured to compile.
+/// A lane program's ceilings: the compiler refuses, with no reason given, a program whose functions
+/// have more than ~256 inputs plus outputs in total; MAX_PROGRAM_BYTES is the largest known to compile.
 pub const MAX_IO: u32 = 244;
 pub const MAX_PROGRAM_BYTES: u64 = 1600 << 20;
 
@@ -844,8 +843,8 @@ fn gdnCorePrefill(g: *Builder, A: Arch, prm: GdnParams, pj: GdnProj, st: [3]Var,
                 return gb.reshape(try gb.slice(t, &.{ 0, blk, 0, 0 }, &.{ nv, blk + 1, rows, d }), &.{ nv, rows, d });
             }
         };
-        // wk @ S and qd @ S as ONE matmul: two matmuls on the same state compile only about half the
-        // time ("Couldn't do topological sort", M5 Ultra).
+        // wk @ S and qd @ S as ONE matmul: two matmuls on the same state often fail to compile
+        // ("Couldn't do topological sort").
         const ws = try g.matmul(try g.concat(&.{ try Sl.of(g, wk, A.nv, b, C, A.dk), try Sl.of(g, qd, A.nv, b, C, A.dk) }, 1), s, false, false);
         const vn = try g.sub(try Sl.of(g, u, A.nv, b, C, A.dv), try g.sliceAxis(ws, 1, 0, C));
         outs[bi] = try g.add(try g.sliceAxis(ws, 1, C, 2 * C), try g.matmul(try Sl.of(g, intra, A.nv, b, C, C), vn, false, false));
@@ -1058,7 +1057,7 @@ pub fn attCoreName(buf: []u8, ctx: u32, h: u32) ![:0]const u8 {
 
 /// Vocabulary parts of the head program over `hidden` inputs: each part's logits are one output.
 /// A part stays at or under 96 MiB of weights: the compiler cannot always split a larger kernel into
-/// its 128 MB sections (a 27B lane's 159 MB parts failed now and then).
+/// its 128 MB sections.
 pub fn headParts(vocab: u32, hidden: u32) u32 {
     const rows: u32 = @intCast(@min(32768, (96 << 20) / hidden));
     return (vocab + rows - 1) / rows;

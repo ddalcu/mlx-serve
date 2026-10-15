@@ -20,6 +20,8 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const ane_lm = @import("arch/ane_lm.zig");
+const status = @import("status.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const ds4_arch = if (build_options.embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
@@ -210,7 +212,7 @@ fn printUsage(io: std.Io) void {
         \\                        instead of the GPU (a model's "ane" setting in
         \\                        model-settings.json wins). The first load on a
         \\                        Mac builds and compiles its ANE programs (cached).
-        \\  --ane-slots <n>     Requests each Neural Engine model runs at once
+        \\  --ane-slots <n>     Requests each Neural Engine model runs at once, 1..4
         \\                        (default: 1). Slots share the weights; each adds
         \\                        its own KV and state (2 slots: ~1.75x the
         \\                        decode throughput on an M5 Ultra).
@@ -805,7 +807,10 @@ pub fn main(init: std.process.Init) !void {
             ane_serve = true;
         } else if (std.mem.eql(u8, args[i], "--ane-slots") and i + 1 < args.len) {
             i += 1;
-            ane_slots = @max(std.fmt.parseInt(u32, args[i], 10) catch 1, 1);
+            ane_slots = ane_lm.parseSlots(args[i]) catch {
+                log.err("--ane-slots: expected an integer 1..{d}, got '{s}'\n", .{ ane_lm.max_slots, args[i] });
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {
@@ -942,7 +947,7 @@ pub fn main(init: std.process.Init) !void {
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
+            status.os_reserve_override = status.parseOsReserveGib(args[i]) catch {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };

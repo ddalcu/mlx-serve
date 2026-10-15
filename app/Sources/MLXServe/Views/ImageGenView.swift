@@ -157,7 +157,7 @@ struct ImageGenView: View {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
         .sheet(isPresented: $showEnhance) {
-            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing)) }, onApply: { prompt = $0 })
+            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing), denseText: model.rendersDenseText) }, onApply: { prompt = $0 })
                 .environmentObject(appState)
         }
     }

@@ -134,6 +134,7 @@ pub const Surface = struct {
     bytes: usize,
 
     pub fn create(bytes: usize) Error!Surface {
+        if (comptime !builtin.os.tag.isDarwin()) return error.AneUnavailable;
         const s = msv_ane_bridge_surface(bytes) orelse return error.OutOfMemory;
         const base: [*]u8 = @ptrCast(IOSurfaceGetBaseAddress(s) orelse return error.OutOfMemory);
         const n = IOSurfaceGetAllocSize(s);
@@ -142,7 +143,7 @@ pub const Surface = struct {
     }
 
     pub fn release(self: Surface) void {
-        CFRelease(self.ref);
+        if (comptime builtin.os.tag.isDarwin()) CFRelease(self.ref);
     }
 };
 

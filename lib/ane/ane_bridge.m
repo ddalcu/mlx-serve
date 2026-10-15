@@ -336,16 +336,15 @@ static bool bridge_has_symbol_api(id in_memory_model) {
 }
 
 /* Whether a failed compile is one of the compiler's nondeterministic internal errors ("Couldn't do
- * topological sort", "Attention branch must have ..."): the same program compiles on a later try
- * (measured on the M5 Ultra: a third to a half of the attempts of some DeltaNet graphs). */
+ * topological sort", "Attention branch must have ..."): the same program compiles on a later try. */
 static bool bridge_retryable(NSError *failure) {
     NSString *text = failure.description;
     return text && [text rangeOfString:@"Compiler internal error"].location != NSNotFound;
 }
 
 #define BRIDGE_COMPILE_TRIES 10
-/* A bare failure ("ANECCompile() FAILED", a load with no error) also came and went with several
- * builds in flight (measured: the same 27B lane program failed, then compiled and loaded alone). */
+/* A bare failure ("ANECCompile() FAILED", a load with no error) can pass on a retry when several
+ * builds are in flight. */
 #define BRIDGE_BARE_TRIES 3
 
 /* Load `model`, again after a pause when the runtime refuses. */

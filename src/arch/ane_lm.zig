@@ -25,7 +25,7 @@ const io_util = @import("../io_util.zig");
 
 pub const P = q35.P;
 const TP = q35.TP;
-const Arch = q35.Arch;
+pub const Arch = q35.Arch;
 const EntryKind = q35.EntryKind;
 
 pub const Error = error{
@@ -37,6 +37,20 @@ pub const Error = error{
     Cancelled,
     OutOfMemory,
 };
+
+/// Bytes a load of `arch` holds: its int8 weights (the gate's and the preflight's bill).
+pub fn weightBytes(arch: Arch) u64 {
+    return q35.modelBytes(arch);
+}
+
+/// The most engines one load holds: `Model.open` pins each slot's programs per lane (`hb`).
+pub const max_slots: u32 = 4;
+
+/// `--ane-slots`: 1..`max_slots`.
+pub fn parseSlots(raw: []const u8) error{InvalidSlots}!u32 {
+    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidSlots;
+    return if (n >= 1 and n <= max_slots) n else error.InvalidSlots;
+}
 
 pub const Options = struct {
     /// Engines on one load (`--ane-slots`): each its own instance of every program.
@@ -50,6 +64,9 @@ pub const Options = struct {
     taps: []const u32 = &.{},
     /// Counts the programs as they are built (the server's load progress).
     progress: ?*load_progress.Progress = null,
+    /// `Model.suppress_ids` / `defined_vocab`.
+    suppress_ids: []const u32 = &.{},
+    defined_vocab: u32 = 0,
 };
 
 /// The architecture of a dense qwen3_5 (`ModelConfig` spells every variant `qwen3_5_moe`) or Qwen3
@@ -176,6 +193,14 @@ pub fn argmax(logits: []const f16) u32 {
 }
 
 pub const Cand = struct { logit: f32, id: u32 };
+
+/// Rule out `ids` and every row from `defined_vocab` on (0 = none) before anything samples `row`.
+pub fn suppress(row: []f16, ids: []const u32, defined_vocab: u32) void {
+    for (ids) |id| if (id < row.len) {
+        row[id] = -std.math.inf(f16);
+    };
+    if (defined_vocab > 0 and defined_vocab < row.len) @memset(row[defined_vocab..], -std.math.inf(f16));
+}
 
 /// Temperature / top-k / top-p / min-p sampling; temperature <= 0 is argmax. `scratch` holds vocab entries.
 pub fn sample(logits: []const f16, s: Sampling, rng: std.Random, scratch: []Cand) u32 {
@@ -324,6 +349,10 @@ pub const Model = struct {
     mask_emb: []f32 = &.{},
     /// Bytes of compiled weights the ANE holds (one copy for every slot).
     weight_bytes: u64,
+    /// Ids never sampled (reserved specials) and the first padding row past the tokenizer's last
+    /// id (0 = none): `generate.installSuppressMask`'s rule, applied to every logits row.
+    suppress_ids: []const u32,
+    defined_vocab: u32,
     test_taps: []const u32 = &.{},
 
     /// Build (or restore from the compile cache) every program of the pack at `dir`, loaded `opts.slots` times.
@@ -339,6 +368,8 @@ pub const Model = struct {
         self.arch = arch;
         self.instances = @max(opts.slots, 1);
         self.weight_bytes = 0;
+        self.suppress_ids = try a.dupe(u32, opts.suppress_ids);
+        self.defined_vocab = opts.defined_vocab;
         self.dcfg = null;
         self.dprog = null;
         self.dpack = null;
@@ -1607,6 +1638,7 @@ pub const Engine = struct {
                 }
                 o += n;
             }
+            for (0..P) |row| suppress(self.rows[row * V ..][0..V], self.model.suppress_ids, self.model.defined_vocab);
             self.rows_ready = true;
         }
         return self.rows[r * V ..][0..V];
@@ -2021,13 +2053,7 @@ pub const CacheLimits = struct { max_bytes: u64, max_states: u32, stride: u32 };
 pub fn openPool(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, arch: Arch, opts: Options, limits: ?CacheLimits, ctx: *anyopaque, runFn: *const fn (*anyopaque, *Engine, *anyopaque) void) !*Worker {
     const model = try Model.open(allocator, io, dir, arch, opts);
     errdefer model.deinit();
-    const engines = try allocator.alloc(*Engine, model.instances);
-    var opened: usize = 0;
-    errdefer {
-        var i = opened;
-        while (i > 0) : (i -= 1) engines[i - 1].deinit();
-        allocator.free(engines);
-    }
+    // Before the engines: an engine's deinit still reads the cache it follows.
     const cache: ?*prefix.Cache = if (limits) |l| blk: {
         const c = try allocator.create(prefix.Cache);
         c.* = .init(allocator, if (l.max_bytes == 0) std.math.maxInt(u64) else l.max_bytes, l.max_states);
@@ -2037,6 +2063,13 @@ pub fn openPool(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, arch:
         c.deinit();
         allocator.destroy(c);
     };
+    const engines = try allocator.alloc(*Engine, model.instances);
+    var opened: usize = 0;
+    errdefer {
+        var i = opened;
+        while (i > 0) : (i -= 1) engines[i - 1].deinit();
+        allocator.free(engines);
+    }
     for (engines, 0..) |*e, i| {
         e.* = try Engine.open(model, io, @intCast(i));
         opened += 1;
@@ -2202,6 +2235,21 @@ test "lanes: two Neural Engines split a layer only for a model big enough to gai
     var odd = q27;
     odd.nkv = 1;
     try testing.expectEqual(@as(u32, 1), lanesFor(odd, 2));
+}
+
+test "--ane-slots takes 1 to max_slots" {
+    try std.testing.expectEqual(@as(u32, 1), try parseSlots("1"));
+    try std.testing.expectEqual(max_slots, try parseSlots("4"));
+    for ([_][]const u8{ "0", "5", "17", "-1", "x", "" }) |bad| try std.testing.expectError(error.InvalidSlots, parseSlots(bad));
+}
+
+test "suppress: reserved ids and padding rows are never drawn" {
+    var row = [_]f16{ 1, 9, 2, 8, 7 };
+    suppress(&row, &.{ 1, 40 }, 3);
+    try std.testing.expectEqual(@as(u32, 2), argmax(&row));
+    var scratch: [5]Cand = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..32) |_| try std.testing.expect(sample(&row, .{ .temperature = 2 }, prng.random(), &scratch) != 1);
 }
 
 test "padding rows repeat the last real position" {

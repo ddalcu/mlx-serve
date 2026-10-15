@@ -68,6 +68,14 @@ final class LoadReadyNotificationTests: XCTestCase {
     }
 }
 
+final class LoadProgressPollingTests: XCTestCase {
+    /// Every load shows, any client's: a slow look while idle, fast while anything loads.
+    func testPollsFastWhileLoadingAndSlowlyOtherwise() {
+        XCTAssertEqual(ServerManager.loadProgressInterval(loading: true), .milliseconds(400))
+        XCTAssertEqual(ServerManager.loadProgressInterval(loading: false), .seconds(2))
+    }
+}
+
 final class ModelListRefreshTests: XCTestCase {
     /// The tray re-reads `/v1/models` while open only when the server says it would read
     /// differently (`/props` `registry_generation`); the first reading only records it.

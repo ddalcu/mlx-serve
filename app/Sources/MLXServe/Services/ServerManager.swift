@@ -10,7 +10,7 @@ class ServerManager: ObservableObject {
     /// loop. UI uses this for the "Loaded Models" section and the model
     /// picker. First entry mirrors `modelInfo` (server sorts default first).
     @Published var allModels: [ModelInfo] = []
-    /// Each model mid-load, by path, while a load this app asked for runs (`loadModel`).
+    /// Each model mid-load, by path, whichever client asked for it, while the server process is up.
     @Published private(set) var loadProgress: [String: LoadProgress] = [:]
     private var loadsInFlight = 0
     /// `/props` `registry_generation` as last read (`modelListMoved`).
@@ -271,6 +271,7 @@ class ServerManager: ObservableObject {
             try proc.run()
             process = proc
             startHealthPolling()
+            startLoadProgressPolling()
         } catch {
             status = .error(error.localizedDescription)
             lastError = error.localizedDescription
@@ -297,6 +298,7 @@ class ServerManager: ObservableObject {
     func stop() {
         pollSource?.cancel()
         pollSource = nil
+        stopLoadProgressPolling()
         healthTask?.cancel()
         healthTask = nil
         healthTimer?.invalidate()
@@ -393,6 +395,7 @@ class ServerManager: ObservableObject {
     private func handleTermination(exitCode: Int32) {
         pollSource?.cancel()
         pollSource = nil
+        stopLoadProgressPolling()
         healthTask?.cancel()
         healthTask = nil
         healthTimer?.invalidate()
@@ -721,24 +724,40 @@ class ServerManager: ObservableObject {
         return info
     }
 
-    /// Poll `/v1/load-progress` while any load is in flight; clear it when the last one ends.
+    /// A load this app asks for reads progress from its first moment, not the next slow poll.
     private func watchLoads(_ delta: Int) {
         loadsInFlight += delta
-        if loadsInFlight > 0, loadProgressPoll == nil {
-            loadProgressPoll = Task { [weak self] in
-                while !Task.isCancelled {
-                    guard let self else { return }
-                    if let p = try? await self.api.loadProgress(port: self.port), !Task.isCancelled {
-                        self.loadProgress = p
-                    }
-                    try? await Task.sleep(for: .milliseconds(400))
+        if delta > 0, loadsInFlight == 1, process != nil { startLoadProgressPolling() }
+    }
+
+    /// How often `/v1/load-progress` is read: often while anything loads, else a slow look for a
+    /// load another client starts. It reads no configs, so the slow look costs next to nothing.
+    nonisolated static func loadProgressInterval(loading: Bool) -> Duration {
+        loading ? .milliseconds(400) : .seconds(2)
+    }
+
+    /// From launch (the startup load answers too) until the process stops.
+    private func startLoadProgressPolling() {
+        loadProgressPoll?.cancel()
+        loadProgressPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let p = try? await self.api.loadProgress(port: self.port), !Task.isCancelled {
+                    let ended = !self.loadProgress.isEmpty && p.isEmpty
+                    self.loadProgress = p
+                    // Another client's load ended: the model list moved.
+                    if ended, self.loadsInFlight == 0, self.status == .running { await self.refreshModels() }
                 }
+                let loading = !self.loadProgress.isEmpty || self.loadsInFlight > 0
+                try? await Task.sleep(for: Self.loadProgressInterval(loading: loading))
             }
-        } else if loadsInFlight == 0 {
-            loadProgressPoll?.cancel()
-            loadProgressPoll = nil
-            loadProgress = [:]
         }
+    }
+
+    private func stopLoadProgressPolling() {
+        loadProgressPoll?.cancel()
+        loadProgressPoll = nil
+        loadProgress = [:]
     }
 
     /// Free a model's resident GPU state (registry keeps the stub). Used by the

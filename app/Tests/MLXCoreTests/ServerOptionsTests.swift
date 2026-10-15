@@ -1048,11 +1048,6 @@ extension ServerOptionsTests {
         XCTAssertNil(empty.decodeAttnQuantChoice)
     }
 
-    /// The registry's residency cap was reachable only from a hand-launched
-    /// server: the app emitted no `--max-resident-mem` and has no extra-args
-    /// passthrough, so every GUI launch ran the auto cap (80% of the wired
-    /// limit) and a model the auto cap refuses was unloadable at any setting.
-    /// `--skip-mem-preflight` does not help — the registry gate runs first.
     func testAneSlotsAreEmittedOnlyAboveOne() {
         var opts = ServerOptions()
         XCTAssertFalse(opts.toCLIArgs().contains("--ane-slots"))
@@ -1060,6 +1055,11 @@ extension ServerOptionsTests {
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--ane-slots", value: "2"))
     }
 
+    /// The registry's residency cap was reachable only from a hand-launched
+    /// server: the app emitted no `--max-resident-mem` and has no extra-args
+    /// passthrough, so every GUI launch ran the auto cap (80% of the wired
+    /// limit) and a model the auto cap refuses was unloadable at any setting.
+    /// `--skip-mem-preflight` does not help — the registry gate runs first.
     func testMaxResidentMemIsEmittedWhenSetAndOmittedOtherwise() {
         var opts = ServerOptions()
         XCTAssertEqual(opts.maxResidentMemGB, 0)  // 0 = Auto (the server's own cap)

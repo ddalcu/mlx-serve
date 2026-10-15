@@ -90,11 +90,11 @@ struct ModelSettingsSheet: View {
         request.path.hasSuffix(".gguf") || appState.localModels.first { $0.path == request.path }?.quantFile != nil
     }
 
-    /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
     private var offersNeuralEngine: Bool {
         ModelSettingsApply.offersNeuralEngine(modelType: appState.localModels.first { $0.path == request.path }?.modelType)
     }
 
+    /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
     private var hasInt8PrefillRoute: Bool {
         appState.localModels.first { $0.path == request.path }?.modelType == "prism_hadamard_qwen35"
     }

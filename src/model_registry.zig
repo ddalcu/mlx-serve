@@ -1103,18 +1103,18 @@ pub const ModelRegistry = struct {
         }
     }
 
-    /// Phase D: claim the right to perform a cold load for `entry`. Caller
-    /// MUST already hold `mutex`. Transitions `.unloaded` → `.loading` and
-    /// broadcasts so any other ensureLoaded callers join the wait. Returns
-    /// false if the entry isn't in `.unloaded` state (someone else is
-    /// already loading it, or it's already ready/error). On false, the
-    /// caller should re-check state and wait or fast-path.
     /// An entry's state changed: wake the waiters and move the generation.
     fn stateChanged(self: *ModelRegistry) void {
         _ = self.generation.fetchAdd(1, .monotonic);
         self.state_cond.broadcast(self.io);
     }
 
+    /// Phase D: claim the right to perform a cold load for `entry`. Caller
+    /// MUST already hold `mutex`. Transitions `.unloaded` → `.loading` and
+    /// broadcasts so any other ensureLoaded callers join the wait. Returns
+    /// false if the entry isn't in `.unloaded` state (someone else is
+    /// already loading it, or it's already ready/error). On false, the
+    /// caller should re-check state and wait or fast-path.
     pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
         if (entry.state != .unloaded) return false;
         entry.state = .loading;
@@ -1383,9 +1383,7 @@ pub const ModelRegistry = struct {
     /// too small) — in which case any victims marked here are rolled back so
     /// the registry is left untouched. Caller holds `mutex` and must drain each
     /// returned victim's refcount, then hand them to the load request to free.
-    /// `ram_room` is the RAM the OS still grants (null = unknown): idle models also go until
-    /// the loads in flight fit in it, but a load the caps admit is never refused on it.
-    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, live_bytes: u64, ram_room: ?u64) ?usize {
+    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, live_bytes: u64) ?usize {
         var n: usize = 0;
         var freed: u64 = 0;
         var freed_slots: u32 = 0;
@@ -1399,22 +1397,58 @@ pub const ModelRegistry = struct {
             const projected_count = self.countSlotsLocked(exclude_id) - freed_slots + loading_slot;
             const mem_ok = self.max_resident_mem == 0 or projected_mem <= self.max_resident_mem;
             const count_ok = projected_count <= self.max_resident_models;
-            const ram_ok = if (ram_room) |room| self.reserved_bytes <= room +| freed else true;
-            if (mem_ok and count_ok and ram_ok) return n;
+            if (mem_ok and count_ok) return n;
 
             // Over the model cap alone, only a model that takes a slot frees one.
-            const victim = (if (n < out.len) self.pickLruEvictable(exclude_id, mem_ok and ram_ok) else null) orelse {
-                if (mem_ok and count_ok) return n;
+            const victim = self.pickLruEvictable(exclude_id, mem_ok) orelse {
                 // Can't satisfy the caps — roll back every marking we made.
                 for (out[0..n]) |v| self.unmarkEvictingLocked(v);
                 return null;
             };
+            if (n >= out.len) {
+                for (out[0..n]) |v| self.unmarkEvictingLocked(v);
+                return null;
+            }
             self.markEvictingLocked(victim); // now `.evicting` → pickLru won't repick
             freed += victim.bytes_resident;
             freed_slots += @intFromBool(takesSlot(victim));
             out[n] = victim;
             n += 1;
         }
+    }
+
+    /// Idle models a load needing `need` bytes of RAM unloads with `room` free, oldest first: as few
+    /// as make it fit, none when it already fits or when even all of them cannot. Marks each
+    /// `.evicting` into `out`. Engines serving mmapped files (ds4, llama.cpp) are skipped: their
+    /// pages already count as free. Caller holds `mutex`.
+    pub fn planRamEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, room: u64, need: u64) usize {
+        if (need <= room) return 0;
+        var idle: [16]*LoadedModel = undefined;
+        var n_idle: usize = 0;
+        var reachable = room;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const e = entry_ptr.*;
+            if (e.state != .ready or e.refcount.load(.acquire) != 0 or std.mem.eql(u8, e.id, exclude_id)) continue;
+            if (e.ds4_engine != null or e.llama_engine != null or n_idle == idle.len) continue;
+            idle[n_idle] = e;
+            n_idle += 1;
+            reachable +|= e.bytes_resident;
+        }
+        if (reachable < need) return 0;
+        std.sort.pdq(*LoadedModel, idle[0..n_idle], {}, struct {
+            fn older(_: void, a: *LoadedModel, b: *LoadedModel) bool {
+                return a.last_used_ns < b.last_used_ns;
+            }
+        }.older);
+        var free = room;
+        var n: usize = 0;
+        while (free < need and n < out.len) : (n += 1) {
+            self.markEvictingLocked(idle[n]);
+            out[n] = idle[n];
+            free +|= idle[n].bytes_resident;
+        }
+        return n;
     }
 
     /// Registry resident-memory cap: the explicit value, else Metal's whole working-set limit
@@ -2155,7 +2189,7 @@ test "planEvictions: evicts one LRU victim to fit the memory budget" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(c.id, &buf, 0, null).?;
+    const n = reg.planEvictionsLocked(c.id, &buf, 0).?;
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a", buf[0].id); // LRU victim
     try testing.expectEqual(LoadState.evicting, buf[0].state);
@@ -2172,9 +2206,9 @@ test "planEvictions: live memory above the billed weights forces an eviction" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0, null));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0));
     // KV, caches and a wired table put 95 bytes live: 95 + 10 > 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 95, null));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 95));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2190,7 +2224,7 @@ test "planEvictions: multi-victim — evicts as many as needed to fit" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(d.id, &buf, 0, null).?;
+    const n = reg.planEvictionsLocked(d.id, &buf, 0).?;
     try testing.expectEqual(@as(usize, 2), n); // a and b (the two oldest)
 }
 
@@ -2204,7 +2238,7 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     const b = try beginLoad(reg, "b", 80); // 80 + 80 = 160 > 100 → must evict a
     reg.mutex.lockUncancelable(io);
     var buf: [16]*LoadedModel = undefined;
-    const plan = reg.planEvictionsLocked(b.id, &buf, 0, null);
+    const plan = reg.planEvictionsLocked(b.id, &buf, 0);
     try testing.expectEqual(@as(?usize, null), plan); // can't evict the pinned victim
     try testing.expectEqual(LoadState.ready, a.state); // rolled back, not left .evicting
     // Scheduler then rolls back the load → releases the reservation.
@@ -2214,39 +2248,40 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     a.refcount.store(0, .release);
 }
 
-test "planEvictions: an idle model makes room in physical RAM the caps leave open" {
+test "RAM: idle models unload oldest first, as few as fit the load" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 1000, null);
     defer reg.deinit();
     _ = try makeReadyStub(reg, "a", 70); // oldest
     _ = try makeReadyStub(reg, "b", 10);
-    const c = try beginLoad(reg, "c", 140); // 80 + 140 is far under the 1000 cap
+    const c = try beginLoad(reg, "c", 140); // far under the 1000 cap
 
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0, null)); // RAM unknown
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0, 140)); // fits beside both
-    // 80 left in RAM: the oldest idle model goes, and 80 + 70 holds the load.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0, 80));
+    try testing.expectEqual(@as(usize, 0), reg.planRamEvictionsLocked(c.id, &buf, 140, 140));
+    try testing.expectEqual(@as(usize, 1), reg.planRamEvictionsLocked(c.id, &buf, 80, 140));
     try testing.expectEqualStrings("a", buf[0].id);
+    try testing.expectEqual(LoadState.evicting, buf[0].state);
     try testing.expectEqual(LoadState.ready, reg.entries.get("b").?.state);
 }
 
-test "planEvictions: RAM frees what is idle but never refuses a load the caps admit" {
+test "RAM: nothing unloads when even every idle model cannot fit the load, and busy ones never" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 1000, null);
     defer reg.deinit();
     const a = try makeReadyStub(reg, "a", 40); // oldest, but serving a request
     _ = a.refcount.fetchAdd(1, .acq_rel);
     defer a.refcount.store(0, .release);
-    _ = try makeReadyStub(reg, "b", 10);
+    const b = try makeReadyStub(reg, "b", 10);
     const c = try beginLoad(reg, "c", 100);
 
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0, 20));
+    try testing.expectEqual(@as(usize, 0), reg.planRamEvictionsLocked(c.id, &buf, 20, 100));
+    try testing.expectEqual(LoadState.ready, b.state);
+    try testing.expectEqual(@as(usize, 1), reg.planRamEvictionsLocked(c.id, &buf, 20, 25));
     try testing.expectEqualStrings("b", buf[0].id);
     try testing.expectEqual(LoadState.ready, a.state);
 }
@@ -2267,7 +2302,7 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0, null));
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0));
 }
 
 test "planEvictions: a transcription's aligner and diarizer take no model slot" {
@@ -2286,12 +2321,12 @@ test "planEvictions: a transcription's aligner and diarizer take no model slot" 
     reg.reserveLoadLocked(diarizer, 10);
     var buf: [16]*LoadedModel = undefined;
     // chat and asr fill the two slots; the companions sit beside them.
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, &buf, 0, null));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, &buf, 0));
     reg.markReadyLocked(diarizer, 10);
     // A third model that takes a slot evicts the oldest that holds one, never a companion.
     try testing.expect(reg.tryBeginLoadLocked(image));
     reg.reserveLoadLocked(image, 10);
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, &buf, 0, null));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, &buf, 0));
     try testing.expectEqual(chat, buf[0]);
 }
 
@@ -2306,7 +2341,7 @@ test "planEvictions: another model still loading counts against the model cap" {
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // a + b + c would be three models under a cap of two: `a` has to go.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0, null));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
