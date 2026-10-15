@@ -132,10 +132,11 @@ pub fn cudaAvailable() bool {
     return cuda_cache.?;
 }
 
-/// Metal, or mlx-omarchy's Vulkan backend (which translates MSL), runs
-/// `mlx_fast_metal_kernel`; the CUDA backend runs MLX ops only.
+/// Only Metal runs `mlx_fast_metal_kernel`; CUDA and Vulkan run MLX ops only.
+/// mlx-omarchy's Vulkan backend translates a subset of MSL and refuses the
+/// rest at EVAL, which fails the request instead of declining the kernel.
 pub fn metalKernelsAvailable() bool {
-    return !cudaAvailable();
+    return comptime builtin.os.tag.isDarwin();
 }
 pub extern "c" fn mlx_cuda_is_available(res: *bool) c_int;
 
@@ -837,6 +838,10 @@ pub fn applyWiredPolicy() WiredPolicyResult {
             return .{ .mode = mode, .target = target };
         },
     }
+}
+
+test "custom Metal kernels run on the Metal backend only" {
+    try std.testing.expectEqual(builtin.os.tag.isDarwin(), metalKernelsAvailable());
 }
 
 /// Evaluates every array reachable through `value`'s fields (structs, optionals, arrays, slices),

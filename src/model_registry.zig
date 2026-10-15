@@ -37,6 +37,7 @@ const gen_mod = @import("gen.zig");
 const diarization_mod = @import("nemotron_diarization.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
@@ -1210,6 +1211,21 @@ pub const ModelRegistry = struct {
         } else {
             self.current_resident_bytes = 0;
         }
+        mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
+    }
+
+    /// What every ready model except a streaming pack holds: the plugin bills only its own bytes, and its
+    /// footprint reads are the whole process's. Caller holds `mutex`.
+    pub fn streamForeignBytesLocked(self: *ModelRegistry) u64 {
+        var sum: u64 = 0;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready) continue;
+            if (entry.config) |c| if (c.dsv41_stream) continue;
+            sum +|= entry.bytes_resident;
+        }
+        return sum;
     }
 
     /// Release a borrowed pointer obtained from `ensureLoaded`. Decrements
@@ -1314,6 +1330,7 @@ pub const ModelRegistry = struct {
         // tick, undoing an explicit /v1/load-model the moment it finished.
         entry.last_used_ms.store(io_util.nowMsMonotonic(self.io), .release);
         self.current_resident_bytes += bytes_resident;
+        mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
         // Headless default promotion: a server started without --model has no
         // default, so requests addressing the "mlx-serve" alias (the app's
         // chat/avatar surfaces, Claude Code) 503 with no_model even after the
@@ -1894,6 +1911,22 @@ test "ModelRegistry: pickIdleEvictable skips non-ready and takes the oldest firs
     try testing.expect(reg.pickIdleEvictable(1_000_000, 900_000).? == old_entry);
     // Only the older one is past it.
     try testing.expect(reg.pickIdleEvictable(901_000, 900_000).? == old_entry);
+}
+
+test "ModelRegistry: the streaming pack's foreign bytes are every other ready model's" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    var cfg = ModelConfig{};
+    cfg.dsv41_stream = true;
+    const stream = try makeReadyStub(reg, "deepseek", 180_000_000_000);
+    stream.config = &cfg;
+    defer stream.config = null; // borrowed: the registry frees the configs it owns
+    _ = try makeReadyStub(reg, "krea", 14_730_000_000);
+    _ = try reg.registerStub("yue2", "yue2", 4_000_000_000); // discovered, never loaded
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try testing.expectEqual(@as(u64, 14_730_000_000), reg.streamForeignBytesLocked());
 }
 
 test "ModelRegistry: ensureLoaded fails on unloaded stub" {

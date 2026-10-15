@@ -1073,9 +1073,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
-    // MTP verify rounds cost more than they save without the Metal verify
-    // kernels: plain decode is faster on CUDA unless `--mtp` asks for it.
-    if (!mtp_forced and mlx.cudaAvailable()) enable_mtp = false;
+    if (!server_mod.mtpAllowedByDefault(mtp_forced)) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
