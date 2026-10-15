@@ -286,11 +286,12 @@ struct MLXCoreApp: App {
 
                 // Pull in the latest built-in prompt and skills when ours have moved
                 // ahead of the on-disk copies. Backs up the user's edits first.
+                // Always enabled: this scene observes nothing, so a disabled
+                // check would go stale; the flow says when nothing is outdated.
                 Button {
                     AgentPrompt.runSystemPromptUpdateFlow()
                 } label: { Text("Update System Prompt and Skills to Latest…")
                     .font(.app(.body)) }
-                .disabled(!AgentPrompt.isPromptOrSkillsOutdated())
 
                 Button {
                     let path = NSString(string: "~/.mlx-serve/memory.md").expandingTildeInPath

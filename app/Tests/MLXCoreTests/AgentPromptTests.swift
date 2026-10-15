@@ -92,7 +92,7 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertTrue(p.contains("readProcessOutput"), "prompt should mention readProcessOutput")
     }
 
-    // "Update System Prompt" menu item: enabled only when the on-disk prompt is a
+    // "Update System Prompt" replaces the prompt only when the on-disk one is a
     // real prompt that differs from the latest default.
     func testIsPromptOutdated() {
         // Missing / empty / legacy stub all resolve to the default → not outdated.
