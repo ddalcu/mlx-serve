@@ -486,6 +486,7 @@
 "Copy Model ID" = "复制模型 ID";
 "Copy Path" = "复制路径";
 "Copy model name" = "复制模型名称";
+"Engine serving this model" = "运行此模型的引擎";
 "Copy the entire log to the clipboard" = "将整个日志复制到剪贴板";
 "Copy the ssh command — opens another session into the same guest" = "复制 ssh 命令 —— 会在同一个客户机中再打开一个会话";
 "Copy this code block" = "复制此代码块";

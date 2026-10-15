@@ -73,6 +73,8 @@ void msv_ane_cache_variant(const char *group, char *out, int out_len);
 /* Apply the cache's caps now (as every cold store does): other variants of
  * the current group first, then the oldest entries outside the current set. */
 void msv_ane_cache_prune(void);
+/* After a build: drop the current group's entries it did not restore or store. */
+void msv_ane_cache_sweep(void);
 
 /* ── programs (the ANE LM engine) ──
  * One MIL program of several functions ("procedures") over one weight blob, loaded as `instances`

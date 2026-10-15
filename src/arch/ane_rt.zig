@@ -214,6 +214,11 @@ pub fn cacheLineage(group: [:0]const u8, variant: [:0]const u8) void {
     if (comptime builtin.os.tag.isDarwin()) msv_ane_cache_lineage(group.ptr, variant.ptr);
 }
 
+/// After a build under the current lineage: its group's entries it did not restore or store go.
+pub fn cacheSweep() void {
+    if (comptime builtin.os.tag.isDarwin()) msv_ane_cache_sweep();
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -249,6 +254,7 @@ test "tensor layout: MIL axes map onto (batch, plane, row, width) from the right
 
 extern fn msv_ane_cache_lineage(group: [*:0]const u8, variant: [*:0]const u8) void;
 extern fn msv_ane_cache_prune() void;
+extern fn msv_ane_cache_sweep() void;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
@@ -269,6 +275,33 @@ fn testEntry(root: []const u8, name: []const u8, gb: i64, mtime: i64, lineage: [
     }
     var tv = [2]std.c.timeval{ .{ .sec = mtime, .usec = 0 }, .{ .sec = mtime, .usec = 0 } };
     _ = std.c.utimes(dir, &tv);
+}
+
+test "cache sweep: after a build, its group's entries it did not touch go; other groups stay" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    var rb: [128]u8 = undefined;
+    const root = try std.fmt.bufPrintSentinel(&rb, "/tmp/msv-ane-sweep-{d}", .{std.c.getpid()}, 0);
+    var eb: [160]u8 = undefined;
+    _ = std.c.mkdir(root, 0o755);
+    _ = std.c.mkdir(try std.fmt.bufPrintSentinel(&eb, "{s}/entries", .{root}, 0), 0o755);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
+    _ = setenv("MLX_SERVE_ANE_CACHE_DIR", root, 1);
+    defer {
+        _ = unsetenv("MLX_SERVE_ANE_CACHE_DIR");
+        msv_ane_cache_lineage("", "");
+    }
+    msv_ane_cache_lineage("lm:a", "v1");
+    // Touched after the lineage was named, as a restore or a store touches it.
+    try testEntry(root, "used", 0, 4_000_000_000, "lm:a\nv1\n");
+    try testEntry(root, "dead", 0, 1_000, "lm:a\nv1\n");
+    try testEntry(root, "other", 0, 1_000, "lm:b\nv1\n");
+    try testEntry(root, "untagged", 0, 1_000, "");
+    msv_ane_cache_sweep();
+    for ([_][]const u8{ "used", "dead", "other", "untagged" }, [_]bool{ true, false, true, true }) |name, kept| {
+        var pb: [256]u8 = undefined;
+        const p = try std.fmt.bufPrintSentinel(&pb, "{s}/entries/{s}/compiled.ok", .{ root, name }, 0);
+        try testing.expectEqual(kept, std.c.access(p, 0) == 0);
+    }
 }
 
 test "cache prune: never the set being built; its group's other variants first, then the oldest" {

@@ -598,6 +598,17 @@ struct ModelInfo {
         return nil
     }
 
+    /// The engine serving it, for the tray's badge.
+    var engineBadge: String {
+        if engineName == "ane" { return "ANE" }
+        switch engine {
+        case .mlx: return "MLX"
+        case .llama: return "GGUF"
+        case .dsv4: return "DS4"
+        case .mlxGguf: return "MLX GGUF"
+        }
+    }
+
     /// "KV4" / "KV8" while this model stores a quantized KV cache.
     var kvBadge: String? {
         kvQuant == "4" || kvQuant == "8" ? "KV\(kvQuant)" : nil

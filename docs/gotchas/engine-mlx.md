@@ -5684,3 +5684,10 @@ Defect: the forced aligner's head ran on the trunk's logits (`[..., 5000]` into 
 Cause: `ForwardCtx.skip_lm_head` promises the post-final-norm hidden, and the moe, hybrid and module paths honor it, but `forwardStandardWith` only checked `embedding_mode`; the LTX text encoder had been paying a full-vocab head it then discarded.
 Fix: the standard path returns `final_normed` under either flag.
 Guard: `standard forward: skip_lm_head hands back the hidden the head reads, never logits` (dflash.zig, the tiny llama trunk).
+
+## A rebuild recompiled every cached Neural Engine program (2026-10-15)
+
+Defect: after a new build, a cached Qwen3.8-27B recompiled for minutes on the Neural Engine instead of restoring in seconds.
+Cause: the LM engine's cache variant hashed `round_cost.engineBuildId()`, and a dev build hashes its executable (a release, its git sha). The bridge's cold-compile prune deletes the model's entries tagged with another variant, so the first miss after a rebuild deleted every entry not yet restored, and the rest recompiled.
+Fix: the variant names only the configuration (lanes, contexts, drafter taps). Entries are keyed by program, so a rebuild restores what it still emits, and `rt.cacheSweep` drops the model's entries a finished build did not touch (an older engine's). Builds take turns (`build_mu`): the lineage is process-wide.
+Guard: `cache sweep: after a build, its group's entries it did not touch go; other groups stay` (ane_rt.zig).

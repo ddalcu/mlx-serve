@@ -152,10 +152,14 @@ static bool bridge_cache_restore(NSString *identifier, NSString *directory) {
 
 static char lineage_group[128];
 static char lineage_variant[32];
+/* When the current lineage was named: every entry its build restores or
+ * stores is touched after it (`msv_ane_cache_sweep`). */
+static NSTimeInterval lineage_since;
 
 void msv_ane_cache_lineage(const char *group, const char *variant) {
     snprintf(lineage_group, sizeof lineage_group, "%s", group ? group : "");
     snprintf(lineage_variant, sizeof lineage_variant, "%s", variant ? variant : "");
+    lineage_since = [NSDate date].timeIntervalSince1970;
 }
 
 /* Tag an entry with the current lineage (no-op when untagged). A build that
@@ -257,6 +261,23 @@ static void bridge_cache_prune(void) {
 }
 
 void msv_ane_cache_prune(void) { bridge_cache_prune(); }
+
+/* A build of the current group is done: the group's entries it did not touch
+ * (an older engine's, whose programs it no longer emits) go. Whole seconds:
+ * filesystem times may be truncated. */
+void msv_ane_cache_sweep(void) {
+    if (!lineage_group[0]) return;
+    NSString *root = [bridge_cache_root() stringByAppendingPathComponent:@"entries"];
+    NSFileManager *files = [NSFileManager defaultManager];
+    for (NSString *name in [files contentsOfDirectoryAtPath:root error:nil]) {
+        NSString *path = [root stringByAppendingPathComponent:name];
+        NSArray<NSString *> *lineage = bridge_entry_lineage(path);
+        if (!lineage || ![lineage[0] isEqualToString:@(lineage_group)]) continue;
+        NSDate *date = [[files attributesOfItemAtPath:path error:nil] fileModificationDate];
+        if (!date || date.timeIntervalSince1970 < floor(lineage_since))
+            [files removeItemAtPath:path error:nil];
+    }
+}
 
 /* Only the compiled artifacts are kept: `data` embeds the constants, so the
  * weights copy and the MIL text are dead weight in an entry. */

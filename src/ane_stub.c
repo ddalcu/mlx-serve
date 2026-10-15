@@ -26,6 +26,7 @@ void msv_ane_cache_variant(const char *group, char *out, int out_len) {
     (void)out_len;
 }
 void msv_ane_cache_prune(void) {}
+void msv_ane_cache_sweep(void) {}
 
 // lib/ane/ane_bridge.h's LM engine programs (src/arch/ane_rt.zig).
 typedef struct msv_ane_program msv_ane_program;

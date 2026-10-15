@@ -1491,6 +1491,7 @@
 "Browse Models…" = "모델 찾아보기…";
 "Open Terminal" = "터미널 열기";
 "Copy model name" = "모델 이름 복사";
+"Engine serving this model" = "이 모델을 실행하는 엔진";
 "Images" = "이미지";
 "MiniMax-H3 (Hailuo 3.0) 8-bit — video + native audio" = "MiniMax-H3(Hailuo 3.0) 8비트 — 비디오 + 네이티브 오디오";
 "A run measures the server exactly as configured. These are recorded with every result." = "현재 설정 그대로 서버를 측정합니다. 이 설정은 모든 결과와 함께 기록됩니다.";

@@ -19,7 +19,6 @@ const prefix = @import("ane_prefix.zig");
 const ane = @import("../ane.zig");
 const mil = @import("ane_mil.zig");
 const dflash = @import("ane_dflash.zig");
-const round_cost = @import("../round_cost.zig");
 const load_progress = @import("../load_progress.zig");
 const io_util = @import("../io_util.zig");
 
@@ -100,15 +99,18 @@ pub fn archOf(cfg: anytype) Error!Arch {
     return a;
 }
 
+/// Serializes `Model.open`'s program builds (`rt.cacheLineage` is one per process).
+var build_mu: std.Io.Mutex = .init;
+
 /// The compile-cache group of the model at `dir`.
 fn cacheGroup(buf: []u8, dir: []const u8) [:0]const u8 {
     return std.fmt.bufPrintSentinel(buf, "lm:{x:0>16}", .{std.hash.Wyhash.hash(0, dir)}, 0) catch unreachable;
 }
 
-/// The compile-cache variant of a configuration: what decides the programs' text, and the engine build.
+/// The compile-cache variant of a configuration: what decides the programs' text. Not the engine
+/// build: entries are keyed by the program itself, and a rebuild that still emits them restores them.
 fn cacheVariant(buf: []u8, lanes: u32, ctxs: []const u32, taps: []const u32) [:0]const u8 {
     var h = std.hash.Wyhash.init(lanes);
-    h.update(round_cost.engineBuildId());
     h.update(std.mem.sliceAsBytes(ctxs));
     h.update(std.mem.sliceAsBytes(taps));
     return std.fmt.bufPrintSentinel(buf, "{x:0>16}", .{h.final()}, 0) catch unreachable;
@@ -391,7 +393,10 @@ pub const Model = struct {
         };
         errdefer if (self.dpack) |d| d.close();
 
-        // This build's cache entries: one set per model and configuration (`rt.cacheLineage`).
+        // This build's cache entries: one set per model and configuration (`rt.cacheLineage`). One
+        // build at a time: the cache's lineage is process-wide.
+        build_mu.lockUncancelable(io);
+        defer build_mu.unlock(io);
         var gb: [32]u8 = undefined;
         var vb: [32]u8 = undefined;
         rt.cacheLineage(cacheGroup(&gb, dir), cacheVariant(&vb, self.lanes, self.ctxs, self.taps()));
@@ -441,6 +446,8 @@ pub const Model = struct {
         for (self.ctxs, self.att_core) |c, *procs| for (procs, 1..) |*pi, i| {
             pi.* = self.cores.function(q35.attCoreName(&nb, c, @intCast(c * i / q35.ATT_SLICES)) catch unreachable) catch return error.LoadFailed;
         };
+        // Entries of this model the build did not use are an older engine's.
+        rt.cacheSweep();
         const dt = @divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms);
         log.info("[ane] ready: {d} chunks x {d} lane(s) + head, {d} slot(s), contexts {any}, {d} MB of weights, in {d} ms ({d} at once)\n", .{ self.chunks, self.lanes, self.instances, self.ctxs, self.weight_bytes >> 20, dt, lanes });
         return self;
