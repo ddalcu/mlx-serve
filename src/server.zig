@@ -2706,9 +2706,11 @@ fn handleConnection(
     // so every consumer below (proxy, peek, ensureLoaded) sees the real id.
     var model_id_buf: [512]u8 = undefined;
     var query_model_buf: [512]u8 = undefined;
+    // The proxies splice over the value as written, so they also get the raw slice.
+    const body_model = parseModelFromRequest(request_body, request_content_type);
     var requested_model_id = lan_mod.unescapeJsonSlashes(
         &model_id_buf,
-        parseModelFromRequest(request_body, request_content_type) orelse queryModel(&query_model_buf, raw_path) orelse "",
+        body_model orelse queryModel(&query_model_buf, raw_path) orelse "",
     );
     // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
     //    its host byte-for-byte, model field rewritten to the bare id.
@@ -2724,13 +2726,13 @@ fn handleConnection(
     if (g_providers) |prov| if (lan_mod.splitRemoteId(requested_model_id)) |rid| if (prov.isProvider(rid.peer) and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
-        try handleProviderProxy(allocator, stream, prov, path, request_body, requested_model_id);
+        try handleProviderProxy(allocator, stream, prov, path, request_body, body_model, requested_model_id);
         return;
     };
     if (g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
-        try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, requested_model_id);
+        try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, body_model, requested_model_id);
         return;
     }
     switch (resolveRequestModelId(registry, &g_model_aliases, requested_model_id, path)) {
@@ -13601,23 +13603,18 @@ const LAN_PEER_WAIT_MS: i64 = 15_000;
 ///     (client disconnect abandons the wait), then 404.
 /// 502 when the peer resolves but stops accepting. Never a silent fallback
 /// to the local default model.
-fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, full_id: []const u8) !void {
-    // Swift/PHP clients escape '/' as '\/', so the raw body slice can read
-    // `ddalcu\/gemma…@peer` while the peer table stores the canonical id
-    // (live 404 "no longer shares this model" from the app). Look up with
-    // the CANONICAL form — and splice the canonical bare id into the
-    // forwarded body too, or the peer's own scanner would miss it and
-    // silently serve its default model.
-    var canon_buf: [512]u8 = undefined;
-    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
-    const rid = lan_mod.splitRemoteId(canon).?;
+/// `full_id` is canonical (`\/` collapsed) and `raw_model` the body's value as written: Swift/PHP
+/// clients send `ddalcu\/gemma…@peer`, the peer table stores `ddalcu/gemma…`, and the canonical
+/// bare id replaces the raw bytes, or the peer's own scanner would miss it and serve its default.
+fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, raw_model: ?[]const u8, full_id: []const u8) !void {
+    const rid = lan_mod.splitRemoteId(full_id).?;
     if (!l.discover) {
         try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "This id names a LAN peer's model, but LAN discovery is off on this server — start it with --lan-discover (app: Settings > LAN Sharing > Use models shared by other Macs)", 404);
         return;
     }
     const deadline = nowMsMonotonic(stream.io) + LAN_PEER_WAIT_MS;
     const remote: lan_mod.Remote = remote: while (true) {
-        switch (l.lookupRemote(canon)) {
+        switch (l.lookupRemote(full_id)) {
             .found => |r| break :remote r,
             .model_unlisted => {
                 try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "The LAN peer no longer shares this model", 404);
@@ -13635,7 +13632,7 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
             },
         }
     };
-    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, rid.bare);
+    const rewritten = try proxiedBody(allocator, body, raw_model, rid.bare);
     defer allocator.free(rewritten);
     const key = l.peerKey(allocator, rid.peer);
     defer if (key) |k| allocator.free(k);
@@ -13648,19 +13645,24 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
 /// Proxy `<bare>@<provider>` to the provider's /v1/chat/completions. Only that
 /// surface exists upstream, so every other model-gated route is a named 400
 /// rather than a request the provider would reject in its own words.
-fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, full_id: []const u8) !void {
+/// `body` to forward with its model value replaced by `bare`: `raw` is that value as the client
+/// wrote it (a slice of `body`); a model named in the query string leaves the body as is.
+fn proxiedBody(allocator: std.mem.Allocator, body: []const u8, raw: ?[]const u8, bare: []const u8) ![]u8 {
+    const r = raw orelse return allocator.dupe(u8, body);
+    return lan_mod.rewriteModelValue(allocator, body, r, bare);
+}
+
+fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, raw_model: ?[]const u8, full_id: []const u8) !void {
     if (!std.mem.eql(u8, path, "/v1/chat/completions")) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Provider models are served on /v1/chat/completions only", 400);
         return;
     }
-    var canon_buf: [512]u8 = undefined;
-    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
-    var up = prov.lookup(allocator, canon) orelse {
+    var up = prov.lookup(allocator, full_id) orelse {
         try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No such provider", 404);
         return;
     };
     defer up.deinit(allocator);
-    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, up.bare);
+    const rewritten = try proxiedBody(allocator, body, raw_model, up.bare);
     defer allocator.free(rewritten);
     log.info("[providers] proxy \"{s}\" -> {s}/chat/completions\n", .{ up.bare, up.url });
     providers_mod.proxyChat(allocator, stream.io, up, rewritten, stream) catch {
