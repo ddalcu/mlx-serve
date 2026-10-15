@@ -8,6 +8,7 @@ const lfm2_vision = @import("lfm2_vision.zig");
 const glm_vision = @import("glm_vision.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const qwen_audio = @import("qwen_audio.zig");
+const radio_vision = @import("radio_vision.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -205,8 +206,11 @@ pub const VisionEncoder = struct {
     minicpm: ?minicpm_vision.MiniCpmVision = null,
     /// Qwen3-ASR: an audio-only tower; every image/video entry point refuses.
     qwen_audio: ?qwen_audio.QwenAudio = null,
+    /// Nemotron 3.5 Bolt: RADIO ViT + mlp1 projector. CHW in, not a patch grid.
+    radio: ?radio_vision.RadioVision = null,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        if (config.radio_vision) return initRadio(allocator, config, weights);
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
         if (config.qwen_vision) return initQwen(allocator, config, weights);
         if (config.muse_vision) return initMuse(allocator, config, weights);
@@ -349,6 +353,7 @@ pub const VisionEncoder = struct {
         if (self.glm) |*g| g.deinit();
         if (self.minicpm) |*m| m.deinit();
         if (self.qwen_audio) |*q| q.deinit();
+        if (self.radio) |*r| r.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -499,6 +504,13 @@ pub const VisionEncoder = struct {
         const gv = try glm_vision.GlmVision.init(allocator, config, weights);
         var enc = patchGridShell(allocator, config);
         enc.glm = gv;
+        return enc;
+    }
+
+    fn initRadio(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const rv = try radio_vision.RadioVision.init(allocator, config, weights);
+        var enc = patchGridShell(allocator, config);
+        enc.radio = rv;
         return enc;
     }
 
@@ -740,6 +752,7 @@ pub const VisionEncoder = struct {
     /// N_out is the number of valid pooled tokens (e.g. 25 for 224x224 with kernel=3).
     /// The caller must cycle these to fill the expected image_seq_length (280) token positions.
     pub fn forward(self: *VisionEncoder, pixels: mlx.mlx_array) !mlx.mlx_array {
+        if (self.radio) |*rv| return rv.forward(pixels);
         if (self.unified) |u| return self.forwardUnified(&u, pixels);
         // A patch-grid tower's SigLIP fields are null sentinels, so a gridless
         // (Gemma-shaped) buffer reaching here is a client/preprocessing

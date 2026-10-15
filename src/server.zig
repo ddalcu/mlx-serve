@@ -20,6 +20,7 @@ const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const glm_vision = @import("glm_vision.zig");
+const radio_vision = @import("radio_vision.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const minicpm_canvas = @import("minicpm_canvas.zig");
 const mrope_mod = @import("mrope.zig");
@@ -5687,8 +5688,11 @@ fn prefillStreamBytesPerTokenOn(config: *const model_mod.ModelConfig, nax: bool)
     }
     if (config.isMoe()) {
         const top_k: u64 = @max(@as(u64, config.num_experts_per_tok), 1);
+        // Puzzle experts contract in the latent width. The router and the
+        // shared expert stay on hidden_size and are not this replica.
+        const expert_in: u64 = if (config.moe_latent_size > 0) config.moe_latent_size else config.hidden_size;
         per_tok += MOE_PREFILL_COEXIST * top_k * 2 *
-            (@as(u64, config.hidden_size) + config.moe_intermediate_size) * 2;
+            (expert_in + config.moe_intermediate_size) * 2;
     }
     return per_tok;
 }
@@ -14998,7 +15002,7 @@ fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: 
         }
         return;
     }
-    const wrap = !config.qwen_vision;
+    const wrap = !config.qwen_vision and !config.radio_vision;
     const open: u32, const pad: u32, const close: u32 = switch (item) {
         .image => |pieces| blk: {
             if (config.lfm2_vision) return appendLfm2ImageRun(allocator, ids, pieces, config);
@@ -15341,6 +15345,7 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.radio_vision) return .{ .mode = .radio, .patch = radio_vision.PATCH, .merge = radio_vision.DOWNSAMPLE };
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -15918,6 +15923,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
+
+    if (vp.mode == .radio) {
+        const img = radio_vision.prepareImage(allocator, src.rgb, src_h, src_w) catch return null;
+        log.info("  Decoded {d}x{d} image → RADIO {d}x{d} float32 CHW ({d} tokens, PIL bicubic)\n", .{ src_w, src_h, img.w, img.h, img.tokens });
+        return .{ .pixels = img.pixels, .width = img.w, .height = img.h };
+    }
 
     if (vp.mode == .gemma_budget) {
         const img = vision_mod.budgetPixels(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens) catch return null;

@@ -39,7 +39,13 @@ const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
+const lilicorr_mod = @import("lilicorr.zig");
 const DflashModel = dflash_mod.DflashModel;
+
+fn embedTrunk(ctx: *const anyopaque, ids: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const xfm: *const transformer_mod.Transformer = @ptrCast(@alignCast(ctx));
+    return xfm.rawEmbedding(ids);
+}
 const gdn_decode = @import("gdn_decode.zig");
 const KVCache = transformer_mod.KVCache;
 
@@ -2861,7 +2867,7 @@ pub const Generator = struct {
         var dfl_cl: transformer_mod.CaptureLayers = undefined;
         if (dflash_active) {
             dfl_out_buf = try allocator.alloc(mlx.mlx_array, options.dflash.?.config.target_layer_ids.len);
-            dfl_cl = .{ .ids = options.dflash.?.config.target_layer_ids, .out = dfl_out_buf };
+            dfl_cl = .{ .ids = options.dflash.?.config.captureIds(), .out = dfl_out_buf };
         }
 
         // Start of the final (logits) forward's token span. Without SSM
@@ -5453,7 +5459,12 @@ pub const Generator = struct {
         // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
         // ALL rows starting at the anchor — so DSpark needs only m noise rows
         // for the same m drafts and the same verify width.
-        const noise_rows: u32 = if (model.config.anchor_row_drafts) m_draft else m_draft + 1;
+        const noise_rows: u32 = if (model.lilicorr != null)
+            model.config.block_size
+        else if (model.config.anchor_row_drafts)
+            m_draft
+        else
+            m_draft + 1;
         const noise_ids = try allocator.alloc(i32, noise_rows);
         defer allocator.free(noise_ids);
         noise_ids[0] = @intCast(t1);
@@ -5474,6 +5485,50 @@ pub const Generator = struct {
         }
         const draft_logits_all = try model.draftLogits(xfm, blk_hidden);
         defer _ = mlx.mlx_array_free(draft_logits_all);
+
+        if (model.lilicorr) |*hd| {
+            if (dctx.anchor.ctx == null) return error.LilicorrAnchorMissing;
+            const slots: u32 = model.config.block_size - 1;
+            if (m > slots) m = slots;
+            var slot_logits = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(slot_logits);
+            const vocab = mlx.getShape(draft_logits_all)[2];
+            const start = [_]c_int{ 0, 1, 0 };
+            const stop = [_]c_int{ 1, 1 + @as(c_int, @intCast(slots)), vocab };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&slot_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
+            const ids = try hd.draft(allocator, .{ .ctx = xfm, .call = embedTrunk }, dctx.anchor, blk_hidden, slot_logits, m);
+            defer allocator.free(ids);
+            const ids_i32 = try allocator.alloc(i32, m);
+            defer allocator.free(ids_i32);
+            for (ids, ids_i32) |v, *dst| dst.* = @intCast(v);
+            const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
+            const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(host_arr);
+            var lili_ids = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(lili_ids);
+            try mlx.check(mlx.mlx_array_set(&lili_ids, host_arr));
+            if (tracing) {
+                try mlx.check(mlx.mlx_array_eval(lili_ids));
+                self.dflash_trace.add(.head, ph.read());
+                ph.reset();
+            }
+            return try self.dflashVerify(allocator, .{
+                .t1 = t1,
+                .m = m,
+                .m_draft = m_draft,
+                .anchor_pos = anchor_pos,
+                .kv_step_snap = kv_step_snap,
+                .serial = serial,
+                .stochastic = stochastic,
+                .tracing = tracing,
+                .ph = &ph,
+                .watch = dflash_kv_watch,
+                .draft_ids = lili_ids,
+                .sel_path = null,
+                .draft_q = .{ .ctx = null },
+            });
+        }
 
         // Slice the m draft rows: DFlash drops the anchor row (1..bs-1),
         // DSpark reads every row (0..m) — the anchor row IS draft 0.
@@ -5709,7 +5764,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         // Per-position SSM capture on a GDN trunk so partial accept can roll
@@ -6051,7 +6106,7 @@ pub const Generator = struct {
             allocator.free(caps);
         }
         for (caps) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = caps };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = false; // one row never rolls back
         const forward = xfm.forwardWith(&self.ctx, t1_arr);
@@ -6121,7 +6176,7 @@ pub const Generator = struct {
             allocator.free(caps);
         }
         for (caps) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = caps };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         self.ctx.capture_ssm_seq = false; // one row never rolls back
@@ -6369,7 +6424,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         self.ctx.tree = &spec_tree;

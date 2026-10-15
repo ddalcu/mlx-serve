@@ -45,6 +45,8 @@ const supported_model_types = [_][]const u8{
     "llama",     "mistral",
     "lfm2", "lfm2_vl", "lfm2_moe", // any other "lfm2*" passes by prefix, as model.zig parses it
     "nemotron_h",
+    "nemotron_h_puzzle", // Nemotron 3.5 Bolt language tower (latent heterogeneous MoE)
+    "nemotron_h_omni", // Bolt omni wrapper; language config is llm_config
     "bert",
     "deepseek_v4",
     "deepseek_v41", // DeepSeek-V4.1-Flash (src/deepseek_v41.zig; the EXL3 repack on mlx-stream)

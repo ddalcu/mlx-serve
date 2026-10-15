@@ -46,7 +46,7 @@ pub const VisionPreproc = struct {
     /// `gemma_budget` (Gemma 4's own processor, as EmbeddingGemma 2 uses it: a CHW image of any
     /// aspect ratio sized to `max_tokens` soft tokens), or one of the patch-grid towers
     /// (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,

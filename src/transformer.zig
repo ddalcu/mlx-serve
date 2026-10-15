@@ -15119,20 +15119,28 @@ pub const SimpleMlpWeights = struct {
     down_b: mlx.mlx_array,
 };
 
-/// Nemotron-H MoE block (mlx-lm `NemotronHMoE` without the latent projection).
+/// Nemotron-H MoE block (mlx-lm `NemotronHMoE`).
+/// Puzzle trunks set the latent pair: experts run in `moe_latent_size`, and
+/// the router plus the shared expert stay on the full hidden width.
 pub const NemotronMoeWeights = struct {
     router_w: mlx.mlx_array, // mixer.gate.weight — dense, pre-transposed [hidden, E]
     router_s: mlx.mlx_array,
     router_b: mlx.mlx_array,
     expert_bias: mlx.mlx_array, // e_score_correction_bias f32 [E], selection only
-    fc1_w: mlx.mlx_array, // switch_mlp.fc1 [E, inter, hidden]
+    fc1_w: mlx.mlx_array, // switch_mlp.fc1 [E, inter, expert_in]
     fc1_s: mlx.mlx_array,
     fc1_b: mlx.mlx_array,
-    fc2_w: mlx.mlx_array, // switch_mlp.fc2 [E, hidden, inter]
+    fc2_w: mlx.mlx_array, // switch_mlp.fc2 [E, expert_in, inter]
     fc2_s: mlx.mlx_array,
     fc2_b: mlx.mlx_array,
     shared: ?SimpleMlpWeights = null, // shared_experts (ReLU^2, ungated, always added)
     router_rows: mlx.mlx_array = .{ .ctx = null }, // mixer.gate.weight as stored [E, hidden], for `rowqmv.router`
+    fc1_latent_w: mlx.mlx_array = .{ .ctx = null }, // [latent, hidden] after the dense transpose
+    fc1_latent_s: mlx.mlx_array = .{ .ctx = null },
+    fc1_latent_b: mlx.mlx_array = .{ .ctx = null },
+    fc2_latent_w: mlx.mlx_array = .{ .ctx = null }, // [hidden, latent] after the dense transpose
+    fc2_latent_s: mlx.mlx_array = .{ .ctx = null },
+    fc2_latent_b: mlx.mlx_array = .{ .ctx = null },
 };
 
 const HybridOp = union(enum) {
@@ -27564,7 +27572,8 @@ pub const Transformer = struct {
             const fuse_here = fuse_add_norm and next_norm_w != null and !has_mlp;
 
             var fused_out: ?add_norm.Out = null;
-            if (fuse_here and lw.op == .nemotron_moe and batch * seq_len <= add_norm_max_rows) {
+            // The fused combine has no latent projection. Puzzle layers take nemotronMoe.
+            if (fuse_here and lw.op == .nemotron_moe and lw.op.nemotron_moe.fc1_latent_w.ctx == null and batch * seq_len <= add_norm_max_rows) {
                 const parts = try nemotronMoeExperts(normed, &lw.op.nemotron_moe, cfg, moeStreamPadPays(&lw.op.nemotron_moe), self.s);
                 defer parts.deinit();
                 const shared = try nemotronSharedExpert(normed, &lw.op.nemotron_moe, cfg, self.s);
@@ -27573,7 +27582,7 @@ pub const Transformer = struct {
                 };
                 fused_out = try add_norm.moeCombineAddNorm(h, parts.y_tkh, parts.scores, shared, next_norm_w.?, eps_arr, self.s);
                 if (fused_out == null) {
-                    const op_out = try nemotronMoeCombine(normed, &parts, &lw.op.nemotron_moe, cfg, self.s);
+                    const op_out = try nemotronMoeCombine(normed, &parts, &lw.op.nemotron_moe, cfg, self.s, true);
                     defer _ = mlx.mlx_array_free(op_out);
                     var h_new = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_add(&h_new, h, op_out, self.s));
@@ -35894,6 +35903,13 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
             .moe => {
                 if (!is_nemotron) return error.UnsupportedHybridBlock;
                 const has_shared = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.shared_experts.up_proj.weight") != null;
+                const lat1 = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.fc1_latent_proj.weight");
+                const lat2 = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.fc2_latent_proj.weight");
+                if (config.moe_latent_size > 0 and (lat1 == null or lat2 == null)) {
+                    log.err("MISSING WEIGHT: layer {d} latent proj (moe_latent_size={d})\n", .{ li, config.moe_latent_size });
+                    return error.MissingWeight;
+                }
+                if ((lat1 == null) != (lat2 == null)) return error.MissingWeight;
                 lw.op = .{ .nemotron_moe = .{
                     .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.gate.weight"),
                     .router_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.gate.scales"),
@@ -35905,6 +35921,12 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                     .fc2_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.switch_mlp.fc2.weight"),
                     .fc2_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.switch_mlp.fc2.scales"),
                     .fc2_b = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.switch_mlp.fc2.biases"),
+                    .fc1_latent_w = lat1 orelse mlx.mlx_array_new(),
+                    .fc1_latent_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.fc1_latent_proj.scales"),
+                    .fc1_latent_b = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.fc1_latent_proj.biases"),
+                    .fc2_latent_w = lat2 orelse mlx.mlx_array_new(),
+                    .fc2_latent_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.fc2_latent_proj.scales"),
+                    .fc2_latent_b = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.fc2_latent_proj.biases"),
                     .shared = if (has_shared) .{
                         .up_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.shared_experts.up_proj.weight"),
                         .up_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.shared_experts.up_proj.scales"),
@@ -36019,6 +36041,8 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                 try maybeTransposeForBf16(&nm.router_w, nm.router_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&nm.fc1_w, nm.fc1_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&nm.fc2_w, nm.fc2_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&nm.fc1_latent_w, nm.fc1_latent_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&nm.fc2_latent_w, nm.fc2_latent_s, &owned_bf16, allocator, s);
                 if (nm.shared) |*sm| {
                     try maybeTransposeForBf16(&sm.up_w, sm.up_s, &owned_bf16, allocator, s);
                     try maybeTransposeForBf16(&sm.down_w, sm.down_s, &owned_bf16, allocator, s);
@@ -36167,6 +36191,12 @@ const NemotronMoeParts = struct {
 
 /// `stream_pad`: pad a short sorted window up to the expert-streaming kernel (`moeStreamPadRows`).
 fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, stream_pad: bool, s: mlx.mlx_stream) !NemotronMoeParts {
+    return nemotronMoeExpertsRouted(x, x, nm, cfg, stream_pad, s);
+}
+
+/// Experts consume `x`. The router reads `route_x` (the full hidden state when
+/// `x` has already been projected into the latent).
+fn nemotronMoeExpertsRouted(x: mlx.mlx_array, route_x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, stream_pad: bool, s: mlx.mlx_stream) !NemotronMoeParts {
     const x_shape = mlx.getShape(x);
     const batch = x_shape[0];
     const seq = x_shape[1];
@@ -36180,8 +36210,21 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
     defer _ = mlx.mlx_array_free(x_flat);
     try mlx.check(mlx.mlx_reshape(&x_flat, x, &[_]c_int{ t_count, d_dim }, 2, s));
 
-    const row_logits = if (cfg.rowExactDecode() and nm.router_rows.ctx != null) try rowqmv.router(x_flat, nm.router_rows, s) else null;
-    const logits = row_logits orelse try projectWithConfig(cfg, x_flat, nm.router_w, nm.router_s, nm.router_b, s);
+    var route_flat = x_flat;
+    var route_owned = false;
+    if (route_x.ctx != x.ctx) {
+        const route_dim = mlx.getShape(route_x)[2];
+        var rf = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&rf, route_x, &[_]c_int{ t_count, route_dim }, 2, s));
+        route_flat = rf;
+        route_owned = true;
+    }
+    defer if (route_owned) {
+        _ = mlx.mlx_array_free(route_flat);
+    };
+
+    const row_logits = if (cfg.rowExactDecode() and nm.router_rows.ctx != null) try rowqmv.router(route_flat, nm.router_rows, s) else null;
+    const logits = row_logits orelse try projectWithConfig(cfg, route_flat, nm.router_w, nm.router_s, nm.router_b, s);
     defer _ = mlx.mlx_array_free(logits);
     const routing = try groupLimitedRouting(logits, nm.expert_bias, k_count, @intCast(cfg.moe_n_group), @intCast(cfg.moe_topk_group), cfg.moe_route_norm, cfg.router_scaling_factor, s);
     errdefer _ = mlx.mlx_array_free(routing.norm_scores);
@@ -36280,10 +36323,62 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
 /// reads, `nemotronMoeDecodeExperts`; else the sorted gather_qmm path), the
 /// f32 routing weights applied before the K-sum, then the shared expert
 /// added. x [B, S, hidden] → [B, S, hidden]; caller owns.
+var nemotron_latent_logged = false;
+
 pub fn nemotronMoe(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (nm.fc1_latent_w.ctx != null) {
+        if (!nemotron_latent_logged) {
+            nemotron_latent_logged = true;
+            log.info("[moe] nemotron latent projection engaged: latent={d}\n", .{cfg.moe_latent_size});
+        }
+        return nemotronMoeLatent(x, nm, cfg, s);
+    }
     const parts = try nemotronMoeExperts(x, nm, cfg, moeStreamPadPays(nm), s);
     defer parts.deinit();
-    return nemotronMoeCombine(x, &parts, nm, cfg, s);
+    return nemotronMoeCombine(x, &parts, nm, cfg, s, true);
+}
+
+/// Puzzle MoE: route on the full hidden state, run experts in the latent,
+/// project back, then add the shared expert on the original residual.
+fn nemotronMoeLatent(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream) !mlx.mlx_array {
+    const x_shape = mlx.getShape(x);
+    const batch = x_shape[0];
+    const seq = x_shape[1];
+    const hidden = x_shape[2];
+    const t_count: c_int = batch * seq;
+
+    var x_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_flat);
+    try mlx.check(mlx.mlx_reshape(&x_flat, x, &[_]c_int{ t_count, hidden }, 2, s));
+    const lat = try projectWithConfig(cfg, x_flat, nm.fc1_latent_w, nm.fc1_latent_s, nm.fc1_latent_b, s);
+    defer _ = mlx.mlx_array_free(lat);
+    const lat_dim = mlx.getShape(lat)[1];
+    var x_lat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_lat);
+    try mlx.check(mlx.mlx_reshape(&x_lat, lat, &[_]c_int{ batch, seq, lat_dim }, 3, s));
+
+    const parts = try nemotronMoeExpertsRouted(x_lat, x, nm, cfg, moeStreamPadPays(nm), s);
+    defer parts.deinit();
+    const y_lat = try nemotronMoeCombine(x_lat, &parts, nm, cfg, s, false);
+    defer _ = mlx.mlx_array_free(y_lat);
+    var y_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_flat);
+    try mlx.check(mlx.mlx_reshape(&y_flat, y_lat, &[_]c_int{ t_count, lat_dim }, 2, s));
+    const y_h = try projectWithConfig(cfg, y_flat, nm.fc2_latent_w, nm.fc2_latent_s, nm.fc2_latent_b, s);
+    defer _ = mlx.mlx_array_free(y_h);
+
+    var combined = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(combined);
+    if (try nemotronSharedExpert(x, nm, cfg, s)) |shared| {
+        defer _ = mlx.mlx_array_free(shared);
+        try mlx.check(mlx.mlx_add(&combined, y_h, shared, s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&combined, y_h));
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, combined, &[_]c_int{ batch, seq, hidden }, 3, s));
+    return out;
 }
 
 /// The shared expert (ReLU^2, ungated) over x [B, S, hidden] → [B*S, hidden];
@@ -36306,7 +36401,7 @@ fn nemotronSharedExpert(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *c
 
 /// Reference: (y * scores[..., None]).sum(-2).astype(y.dtype) with f32
 /// scores (product and sum in f32), plus the shared expert.
-fn nemotronMoeCombine(x: mlx.mlx_array, parts: *const NemotronMoeParts, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream) !mlx.mlx_array {
+fn nemotronMoeCombine(x: mlx.mlx_array, parts: *const NemotronMoeParts, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream, with_shared: bool) !mlx.mlx_array {
     const x_shape = mlx.getShape(x);
     const batch = x_shape[0];
     const seq = x_shape[1];
@@ -36327,9 +36422,13 @@ fn nemotronMoeCombine(x: mlx.mlx_array, parts: *const NemotronMoeParts, nm: *con
 
     var combined = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(combined);
-    if (try nemotronSharedExpert(x, nm, cfg, s)) |shared| {
-        defer _ = mlx.mlx_array_free(shared);
-        try mlx.check(mlx.mlx_add(&combined, routed, shared, s));
+    if (with_shared) {
+        if (try nemotronSharedExpert(x, nm, cfg, s)) |shared| {
+            defer _ = mlx.mlx_array_free(shared);
+            try mlx.check(mlx.mlx_add(&combined, routed, shared, s));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&combined, routed));
+        }
     } else {
         try mlx.check(mlx.mlx_array_set(&combined, routed));
     }
@@ -48275,7 +48374,7 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
         try t.expectEqual(@as(c_int, 4 * E - T * K), moeStreamPadRows(T * K, E));
         const parts = try nemotronMoeExperts(x, &nm, &cfg, true, s);
         defer parts.deinit();
-        const got_pad = try nemotronMoeCombine(x, &parts, &nm, &cfg, s);
+        const got_pad = try nemotronMoeCombine(x, &parts, &nm, &cfg, s, true);
         defer _ = mlx.mlx_array_free(got_pad);
         try mlx.check(mlx.mlx_array_eval(got_pad));
         const gpad = mlx.mlx_array_data_float32(got_pad) orelse return error.MlxArrayDataNull;

@@ -38,6 +38,7 @@ const mtp_mod = @import("mtp.zig");
 const simd_qmm = @import("simd_qmm.zig");
 const lane_qmm = @import("lane_qmm.zig");
 const ane_mod = @import("ane.zig");
+const lilicorr_mod = @import("lilicorr.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -98,9 +99,27 @@ pub const DflashConfig = struct {
     /// v1/v2 sidecar so far is neox (half-split); DSpark's is not, and the
     /// wrong half rotates silently.
     rope_traditional: bool = false,
+    /// Bolt LiLiCorr head. Capture ids are the declared targets minus one:
+    /// this engine stores a layer's output, and the head was trained on its input.
+    lilicorr: bool = false,
+    candidate_topk: u32 = 0,
+    lilicorr_hidden: u32 = 0,
+    lilicorr_layers: u32 = 0,
+    lilicorr_heads: u32 = 0,
+    factor_dim: u32 = 0,
+    vector_eps: f32 = 0.0001,
+    logit_scale: f32 = 8,
+    has_attn_sinks: bool = false,
+    /// Owned when `lilicorr` (same length as `target_layer_ids`). Empty otherwise.
+    capture_ids: []u32 = &.{},
 
     pub fn isDflash2(self: *const DflashConfig) bool {
         return self.selector_rank > 0 or self.conv_kernel_size > 0;
+    }
+
+    pub fn captureIds(self: *const DflashConfig) []const u32 {
+        if (self.capture_ids.len != 0) return self.capture_ids;
+        return self.target_layer_ids;
     }
 
     pub fn isDspark(self: *const DflashConfig) bool {
@@ -110,6 +129,7 @@ pub const DflashConfig = struct {
     pub fn deinit(self: *DflashConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.layer_types);
         allocator.free(self.target_layer_ids);
+        if (self.capture_ids.len != 0) allocator.free(self.capture_ids);
     }
 };
 
@@ -252,6 +272,37 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
 
     const contract = dflashContractObject(root) orelse return error.NotDflashConfig;
 
+    // Bolt's LiLiCorr head reuses the DFlash trunk, then drafts with the
+    // correlation module loaded beside it. Argmax of the trunk logits is not
+    // that head.
+    var lilicorr = false;
+    if (contract.get("projector_type")) |pt| if (pt == .string and std.mem.eql(u8, pt.string, "lilicorr")) {
+        lilicorr = true;
+    };
+    if (root.get("architectures")) |archs| if (archs == .array) {
+        for (archs.array.items) |a| {
+            if (a == .string and std.mem.indexOf(u8, a.string, "LiLiCorr") != null) lilicorr = true;
+        }
+    };
+    var candidate_topk: u32 = 0;
+    var lilicorr_hidden: u32 = 0;
+    var lilicorr_layers: u32 = 0;
+    var lilicorr_heads: u32 = 0;
+    var factor_dim: u32 = 0;
+    var vector_eps: f32 = 0.0001;
+    var logit_scale: f32 = 8;
+    if (lilicorr) {
+        candidate_topk = try contractFirstU32(contract, &.{ "lilicorr_candidate_topk", "candidate_topk" });
+        lilicorr_hidden = try lilicorrHiddenSize(contract);
+        lilicorr_layers = try contractFirstU32(contract, &.{ "lilicorr_num_layers", "num_layers", "layers" });
+        lilicorr_heads = try contractFirstU32(contract, &.{ "lilicorr_num_heads", "num_heads", "heads" });
+        factor_dim = try contractFirstU32(contract, &.{ "lilicorr_factor_dim", "factor_dim", "factor" });
+        vector_eps = try contractFirstFloat(contract, &.{ "lilicorr_vector_eps", "vector_eps" });
+        logit_scale = try contractFirstFloat(contract, &.{ "lilicorr_logit_scale", "logit_scale" });
+        if (candidate_topk < 2 or lilicorr_hidden == 0 or lilicorr_layers == 0 or lilicorr_heads == 0 or factor_dim == 0) return error.InvalidDflashConfigValue;
+        if (lilicorr_hidden % lilicorr_heads != 0) return error.InvalidDflashConfigValue;
+    }
+
     // DSpark export markers. `markov_rank` is the load-bearing one (the head
     // IS DSpark); the architecture string and `projector_type` cover exports
     // that ship the row convention without one.
@@ -308,6 +359,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         // against it; a non-ascending list is a converter bug worth naming.
         if (i > 0 and target_layer_ids[i] <= target_layer_ids[i - 1]) return error.InvalidDflashTargetLayers;
     }
+    var capture_ids: []u32 = &.{};
+    errdefer if (capture_ids.len != 0) allocator.free(capture_ids);
+    if (lilicorr) {
+        capture_ids = try allocator.alloc(u32, target_layer_ids.len);
+        for (target_layer_ids, capture_ids) |id, *slot| {
+            if (id == 0) return error.InvalidDflashTargetLayers;
+            slot.* = id - 1;
+        }
+    }
 
     const hidden_size: u32 = try jsonU32(root.get("hidden_size") orelse return error.IncompleteDflashConfig);
     if (conv_group_size > 0 and hidden_size % conv_group_size != 0) return error.InvalidDflashConfigValue;
@@ -342,13 +402,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         if (!std.mem.eql(u8, kind, "vanilla")) return error.UnsupportedMarkovHeadType;
     }
 
-    // MiMo's drafter rotates part of each head, scales values and adds attention sinks. The block
-    // forward has none of those arms, and its wrong drafts would outrank the target's own MTP heads.
+    // MiMo's drafter rotates part of each head and scales values. Learned per-head
+    // sinks (`attention_sink_bias`) are loaded into SDPA. The SWA-sink flag is a
+    // different module and stays refused.
     const partial: f32 = if (contract.get("partial_rotary_factor")) |v| jsonFloat(v) else 1.0;
-    const sinks = for ([_][]const u8{ "add_swa_attention_sink_bias", "attention_sink_bias" }) |k| {
-        if (contract.get(k)) |v| if (v == .bool and v.bool) break true;
-    } else false;
-    if (partial != 1.0 or sinks or contract.get("attention_value_scale") != null) return error.UnsupportedDflashAttention;
+    var has_attn_sinks = false;
+    if (contract.get("attention_sink_bias")) |v| {
+        if (v == .bool and v.bool) has_attn_sinks = true;
+    }
+    var swa_sinks = false;
+    if (contract.get("add_swa_attention_sink_bias")) |v| {
+        if (v == .bool and v.bool) swa_sinks = true;
+    }
+    if (partial != 1.0 or swa_sinks or contract.get("attention_value_scale") != null) return error.UnsupportedDflashAttention;
 
     const lt_val = root.get("layer_types") orelse return error.IncompleteDflashConfig;
     if (lt_val != .array or lt_val.array.items.len != num_layers) return error.LayerTypesLengthMismatch;
@@ -383,6 +449,16 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .markov_rank = markov_rank,
         .rope_traditional = rope_traditional,
         .anchor_row_drafts = anchor_row_drafts,
+        .lilicorr = lilicorr,
+        .candidate_topk = candidate_topk,
+        .lilicorr_hidden = lilicorr_hidden,
+        .lilicorr_layers = lilicorr_layers,
+        .lilicorr_heads = lilicorr_heads,
+        .factor_dim = factor_dim,
+        .vector_eps = vector_eps,
+        .logit_scale = logit_scale,
+        .has_attn_sinks = has_attn_sinks,
+        .capture_ids = capture_ids,
     };
 }
 
@@ -399,6 +475,29 @@ fn jsonFloat(v: std.json.Value) f32 {
         .integer => |i| @floatFromInt(i),
         else => 0.0,
     };
+}
+
+fn contractFirstU32(contract: Contract, keys: []const []const u8) !u32 {
+    for (keys) |k| if (contract.get(k)) |v| return jsonU32(v);
+    return error.IncompleteDflashConfig;
+}
+
+fn contractFirstFloat(contract: Contract, keys: []const []const u8) !f32 {
+    for (keys) |k| if (contract.get(k)) |v| {
+        if (v != .float and v != .integer) return error.InvalidDflashConfigValue;
+        return jsonFloat(v);
+    };
+    return error.IncompleteDflashConfig;
+}
+
+/// Head width. Nested `hidden_size` only — the root value is the trunk width.
+fn lilicorrHiddenSize(contract: Contract) !u32 {
+    if (contract.get("lilicorr_hidden_size")) |v| return jsonU32(v);
+    if (contract.nested) |n| {
+        if (n.get("hidden_size")) |v| return jsonU32(v);
+        if (n.get("hidden")) |v| return jsonU32(v);
+    }
+    return error.IncompleteDflashConfig;
 }
 
 /// Every `target_layer_ids` entry must name an existing trunk layer — the
@@ -719,10 +818,13 @@ pub const DflashLayer = struct {
     // DFlash2 only — null on a v1 assistant.
     attention_conv: ?DynConv = null,
     mlp_conv: ?DynConv = null,
+    /// Learned per-query-head softmax sink. Null when the config has no sinks.
+    attn_sink: mlx.mlx_array = .{ .ctx = null },
 
     fn deinit(self: *DflashLayer) void {
         if (self.attention_conv) |*c| c.deinit();
         if (self.mlp_conv) |*c| c.deinit();
+        if (self.attn_sink.ctx != null) _ = mlx.mlx_array_free(self.attn_sink);
         _ = mlx.mlx_array_free(self.input_norm);
         _ = mlx.mlx_array_free(self.post_attn_norm);
         _ = mlx.mlx_array_free(self.q_norm);
@@ -746,6 +848,7 @@ pub const DflashLayer = struct {
         }
         if (self.attention_conv) |*c| c.appendEval(vec);
         if (self.mlp_conv) |*c| c.appendEval(vec);
+        if (self.attn_sink.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, self.attn_sink);
     }
 };
 
@@ -774,11 +877,15 @@ pub const DflashModel = struct {
     /// DSpark Markov head — null unless the config declares `markov_rank`.
     markov: ?MarkovHead = null,
 
+    /// Bolt correlation head. Null on a stock DFlash assistant.
+    lilicorr: ?lilicorr_mod.Head = null,
+
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
         lane_qmm.release(@intFromPtr(self));
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
+        if (self.lilicorr) |*hd| hd.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
@@ -839,6 +946,14 @@ pub const DflashModel = struct {
             });
             return err;
         };
+        if (self.config.lilicorr) {
+            validateTargetLayers(self.config.captureIds(), target.config.num_hidden_layers) catch |err| {
+                log.err("[dflash] lilicorr capture ids {any} out of range for {d}-layer target\n", .{
+                    self.config.captureIds(), target.config.num_hidden_layers,
+                });
+                return err;
+            };
+        }
         if (self.selector) |*sel| {
             // Candidate ids come from the TRUNK head's logits and gather
             // codebook rows — a trunk vocab wider than the tables reads OOB.
@@ -1208,6 +1323,16 @@ pub fn loadDflashQuant(
             layers[li].attention_conv = try loadDynConv(&weights, li, "attention_conv", hidden, bits, s);
             layers[li].mlp_conv = try loadDynConv(&weights, li, "mlp_conv", hidden, bits, s);
         }
+        if (cfg.has_attn_sinks) {
+            const sink = try ownWeight(&weights, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.attention_sink_bias", .{li}));
+            const sh = mlx.getShape(sink);
+            if (sh.len != 1 or sh[0] != @as(c_int, @intCast(cfg.num_attention_heads))) {
+                _ = mlx.mlx_array_free(sink);
+                log.err("[dflash] attention_sink_bias layer {d} is {any}, expected [{d}]\n", .{ li, sh, cfg.num_attention_heads });
+                return error.InvalidDflashConfigValue;
+            }
+            layers[li].attn_sink = sink;
+        }
     }
 
     var selector: ?Selector = null;
@@ -1239,6 +1364,23 @@ pub fn loadDflashQuant(
         }
     }
 
+    var head: ?lilicorr_mod.Head = null;
+    errdefer if (head) |*hd| hd.deinit();
+    if (cfg.lilicorr) {
+        head = try lilicorr_mod.load(allocator, &weights, s, .{
+            .top_k = cfg.candidate_topk,
+            .hidden = cfg.lilicorr_hidden,
+            .trunk = cfg.hidden_size,
+            .heads = cfg.lilicorr_heads,
+            .slots = cfg.block_size - 1,
+            .layers = cfg.lilicorr_layers,
+            .factor = cfg.factor_dim,
+            .vector_eps = cfg.vector_eps,
+            .logit_scale = cfg.logit_scale,
+            .rms_eps = cfg.rms_norm_eps,
+        });
+    }
+
     // Force-eval all weights so serve time never faults a lazy transpose or
     // an un-materialized load-time quantization.
     {
@@ -1250,6 +1392,7 @@ pub fn loadDflashQuant(
         for (layers) |*lw| lw.appendEval(eval_vec);
         if (selector) |*sel| sel.appendEval(eval_vec);
         if (markov) |*mh| mh.appendEval(eval_vec);
+        if (head) |*hd| hd.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
     // Hand the bf16 sources the load-time quantization freed back to the OS
@@ -1287,6 +1430,7 @@ pub fn loadDflashQuant(
         .layers = layers,
         .selector = selector,
         .markov = markov,
+        .lilicorr = head,
     };
 }
 
@@ -1326,6 +1470,9 @@ pub const DflashCtx = struct {
     /// late-starting context is self-consistent (sliding-window semantics,
     /// same rule as the MTP history).
     base_pos: usize,
+    /// Last encoded context row. LiLiCorr scores slot 0 against this feature,
+    /// which is the token before the next draft anchor.
+    anchor: mlx.mlx_array = .{ .ctx = null },
 
     pub fn init(allocator: std.mem.Allocator, model: *const DflashModel, base_pos: usize) !DflashCtx {
         return .{
@@ -1336,6 +1483,7 @@ pub const DflashCtx = struct {
 
     pub fn deinit(self: *DflashCtx) void {
         self.cache.deinit();
+        if (self.anchor.ctx != null) _ = mlx.mlx_array_free(self.anchor);
     }
 
     /// Absolute trunk position one past the last cached context token.
@@ -1351,6 +1499,7 @@ pub const DflashCtx = struct {
             _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
             _ = mlx.mlx_vector_array_append_value(vec, entry.values);
         }
+        if (self.anchor.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, self.anchor);
     }
 };
 
@@ -2357,6 +2506,21 @@ pub fn appendContext(
 
     const enc = try encodeContext(model, captures);
     defer _ = mlx.mlx_array_free(enc);
+    if (model.lilicorr != null) {
+        const esh = mlx.getShape(enc);
+        if (esh.len != 3 or esh[1] < 1) return error.InvalidLilicorrDraft;
+        var last = mlx.mlx_array_new();
+        errdefer {
+            if (last.ctx != null) _ = mlx.mlx_array_free(last);
+        }
+        const start = [_]c_int{ 0, esh[1] - 1, 0 };
+        const stop = [_]c_int{ esh[0], esh[1], esh[2] };
+        const step = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&last, enc, &start, 3, &stop, 3, &step, 3, s));
+        if (ctx.anchor.ctx != null) _ = mlx.mlx_array_free(ctx.anchor);
+        ctx.anchor = last;
+        last = .{ .ctx = null };
+    }
 
     for (model.layers, 0..) |*lw, li| {
         const k = try projectHeads(enc, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, first_pos, true, cfg.rope_traditional, s);
@@ -2509,9 +2673,9 @@ pub fn forwardBlock(
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (mask) |m| {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "array", m, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "array", m, lw.attn_sink, false, s));
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "", none_mask, lw.attn_sink, false, s));
         }
 
         var attn_t = mlx.mlx_array_new();
@@ -2629,6 +2793,31 @@ const GEMMA_ASSISTANT_CONFIG_JSON =
     \\  }
     \\}
 ;
+
+test "dflash: a LiLiCorr contract parses and shifts capture ids to layer outputs" {
+    const json =
+        \\{"architectures":["LiLiCorrDraftModel"],"model_type":"qwen3",
+        \\ "hidden_size":4096,"num_hidden_layers":2,"num_attention_heads":32,"num_key_value_heads":2,
+        \\ "head_dim":128,"intermediate_size":12288,"rms_norm_eps":1e-6,"sliding_window":1024,
+        \\ "layer_types":["sliding_attention","sliding_attention"],"block_size":8,
+        \\ "attention_sink_bias":true,
+        \\ "dflash_config":{"mask_token_id":990,"target_layer_ids":[1,18],"projector_type":"lilicorr",
+        \\  "candidate_topk":8,"hidden":1024,"layers":2,"heads":8,"factor":1024,
+        \\  "vector_eps":0.0001,"logit_scale":8.0,"conv_kernel_size":2,"conv_group_size":16,
+        \\  "attention_sink_bias":true}}
+    ;
+    const allocator = testing.allocator;
+    var cfg = try parseConfigFromJson(allocator, json);
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.lilicorr);
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 17 }, cfg.captureIds());
+    try testing.expectEqual(@as(u32, 8), cfg.candidate_topk);
+    try testing.expectEqual(@as(u32, 1024), cfg.lilicorr_hidden);
+    try testing.expectEqual(@as(u32, 2), cfg.lilicorr_layers);
+    try testing.expectEqual(@as(u32, 8), cfg.lilicorr_heads);
+    try testing.expect(cfg.has_attn_sinks);
+    try testing.expect(cfg.isDflash2());
+}
 
 test "dflash: muse assistant config parses with the full DFlash contract" {
     const allocator = testing.allocator;

@@ -246,6 +246,9 @@ pub const ModelConfig = struct {
     num_experts: u32 = 0,
     num_experts_per_tok: u32 = 0,
     moe_intermediate_size: u32 = 0,
+    /// Nemotron-H Puzzle: routed experts run in this width, not `hidden_size`.
+    /// 0 means the uniform trunk (no fc1/fc2_latent_proj).
+    moe_latent_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
     // DeepSeek-V3-style sigmoid routing (hy_v3): scores = sigmoid(logits) in
     // f32; top-k SELECTED on scores + expert_bias but WEIGHTED by the unbiased
@@ -648,6 +651,10 @@ pub const ModelConfig = struct {
     // uses INTERLEAVED M-RoPE (image tokens get 2D grid positions). Populated in
     // the qwen3_5 arm below. Encoder: src/qwen_vision.zig; M-RoPE: src/mrope.zig.
     qwen_vision: bool = false,
+    /// Nemotron 3.5 Bolt RADIO tower. Set only when the checkpoint actually
+    /// ships `vision_model.radio_model.*` and `mlp1.*`. A bare vision_config
+    /// must not arm this: the generic vision path would load SigLIP instead.
+    radio_vision: bool = false,
     qv_depth: u32 = 0, // ViT transformer blocks
     qv_hidden: u32 = 0, // ViT hidden size
     qv_heads: u32 = 0, // ViT attention heads
@@ -1593,6 +1600,9 @@ pub const ModelConfig = struct {
         }
         self.populateLfm2ImageTokens(tok);
         self.populateMiniCpmImageTokens(tok);
+        if (self.radio_vision and self.image_token_id == 0) {
+            if (tok.special_tokens.get("<image>")) |id| self.image_token_id = id;
+        }
     }
 
     /// MiniCPM-V's `<image_id>N</image_id>` tags and the digits of N are tokenizer-only ids.
@@ -2388,10 +2398,22 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     var config = ModelConfig{};
 
     // Detect model_type from top-level (always present)
-    const model_type = if (jsonField(root, "model_type")) |v| try jsonValue(.string, v) else "gemma3";
+    var model_type: []const u8 = if (jsonField(root, "model_type")) |v| try jsonValue(.string, v) else "gemma3";
 
-    // Determine which object to read config from: text_config (nested) or root (flat)
-    const cfg_obj = if (jsonField(root, "text_config")) |tc_val| try jsonValue(.object, tc_val) else root;
+    // Determine which object to read config from: text_config (nested) or root (flat).
+    // Nemotron omni wraps the language tower in llm_config; the outer object has
+    // no hidden size or layer list.
+    var cfg_obj: std.json.ObjectMap = if (jsonField(root, "text_config")) |tc_val| try jsonValue(.object, tc_val) else root;
+    if (std.mem.eql(u8, model_type, "nemotron_h_omni")) {
+        if (jsonField(root, "llm_config")) |lc| {
+            if (lc == .object) {
+                cfg_obj = lc.object;
+                if (jsonField(lc.object, "model_type")) |mt| {
+                    if (mt == .string) model_type = mt.string;
+                }
+            }
+        }
+    }
 
     // Parse common fields
     if (jsonField(cfg_obj, "vocab_size")) |v| config.vocab_size = try jsonU32(v);
@@ -4220,9 +4242,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 config.has_vision = false;
             }
         }
-    } else if (std.mem.eql(u8, model_type, "nemotron_h")) {
+    } else if (std.mem.eql(u8, model_type, "nemotron_h") or std.mem.eql(u8, model_type, "nemotron_h_puzzle")) {
+        // Puzzle is the heterogeneous latent-MoE trunk. The runtime still
+        // keys every kernel and weight prefix on "nemotron_h".
         config.model_type = "nemotron_h";
         config.weight_prefix = "backbone";
+        // The omni wrapper's vision_config is a RADIO tower. The generic
+        // vision block above would arm SigLIP. Vision turns on only when the
+        // serving config sets radio_vision, which loads src/radio_vision.zig.
+        if (jsonField(root, "radio_vision")) |v| {
+            if (v == .bool) config.radio_vision = v.bool;
+        }
+        config.has_vision = config.radio_vision;
         config.hidden_act = .silu;
         config.mamba_mlp_act = .relu_sq;
         config.norm_has_offset = false;
@@ -4238,6 +4269,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // NoPE: the reference attention never rotates q/k, whatever
         // rope_theta the config carries. Covers the MTP head's layer too.
         config.layer_no_rope = @splat(true);
+        // Bolt's llm_config omits num_hidden_layers; the block list is the depth.
+        if (jsonField(cfg_obj, "num_hidden_layers") == null) {
+            const listed: usize = if (jsonField(cfg_obj, "layers_block_type")) |v|
+                (if (v == .array) v.array.items.len else 0)
+            else if (jsonField(cfg_obj, "block_configs")) |v|
+                (if (v == .array) v.array.items.len else 0)
+            else if (jsonField(cfg_obj, "hybrid_override_pattern")) |v|
+                (if (v == .string) v.string.len else 0)
+            else
+                0;
+            if (listed > config.layer_block_types.len) return error.UnsupportedLayerGeometry;
+            if (listed > 0) config.num_hidden_layers = @intCast(listed);
+        }
         if (jsonField(cfg_obj, "rms_norm_eps")) |v| {
             config.rms_norm_eps = try jsonFloat(v);
         } else if (jsonField(cfg_obj, "layer_norm_epsilon")) |v| {
@@ -4276,7 +4320,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 const items = v.array.items;
                 if (items.len >= 2) {
                     config.time_step_min = try jsonFloat(items[0]);
-                    config.time_step_max = try jsonFloat(items[1]);
+                    // HF writes +inf as {"__float__": "Infinity"}, which is not a JSON number.
+                    config.time_step_max = switch (items[1]) {
+                        .object, .string => std.math.inf(f32),
+                        else => try jsonFloat(items[1]),
+                    };
                 }
             }
         }
@@ -4337,7 +4385,29 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
         if (jsonField(cfg_obj, "routed_scaling_factor")) |v| config.router_scaling_factor = try jsonFloat(v);
         if (jsonField(cfg_obj, "moe_latent_size")) |v| {
-            if (v == .integer) return error.UnsupportedNemotronLatentMoe;
+            if (v == .integer) config.moe_latent_size = try jsonU32(v);
+        }
+        // Per-layer expert banks. The forward reads each tensor's own shape;
+        // these scalars are the maxima, for memory billing.
+        if (jsonField(cfg_obj, "block_configs")) |v| {
+            if (v == .array) {
+                var max_experts: u32 = 0;
+                var max_inter: u32 = 0;
+                for (v.array.items) |item| {
+                    if (item != .object) continue;
+                    if (jsonField(item.object, "n_routed_experts")) |e| {
+                        if (e == .integer) max_experts = @max(max_experts, try jsonU32(e));
+                    }
+                    if (jsonField(item.object, "moe_intermediate_size")) |e| {
+                        if (e == .integer) max_inter = @max(max_inter, try jsonU32(e));
+                    }
+                    if (jsonField(item.object, "num_experts_per_tok")) |e| {
+                        if (e == .integer) config.num_experts_per_tok = try jsonU32(e);
+                    }
+                }
+                if (max_experts > 0) config.num_experts = max_experts;
+                if (max_inter > 0) config.moe_intermediate_size = max_inter;
+            }
         }
         if (config.num_eos_tokens == 0) {
             if (jsonField(cfg_obj, "eos_token_id")) |v| {
@@ -5454,6 +5524,7 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
         std.mem.startsWith(u8, key, "vision_model.") or
+        std.mem.startsWith(u8, key, "mlp1.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
         std.mem.startsWith(u8, key, "merger.") or
         std.mem.startsWith(u8, key, "vit_merger.") or
@@ -6208,6 +6279,8 @@ test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nesti
     // oMLX 0.7.1's GLM-5.3 oQ packs spell the tower `vision_model.`.
     try testing.expect(!shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", false));
     try testing.expect(shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", true));
+    try testing.expect(!shouldKeepWeightKey("mlp1.1.weight", false));
+    try testing.expect(shouldKeepWeightKey("mlp1.1.weight", true));
     // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
@@ -9130,7 +9203,7 @@ test "nemotron_h: attention is NoPE in every trunk layer and the MTP head" {
     for (0..cfg.num_hidden_layers + 1) |i| try testing.expect(cfg.layerSkipsRope(@intCast(i)));
 }
 
-test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
+test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
     // Nemotron-3.5-Lightning-30B-A3B's shipped values.
     const json =
         \\{
@@ -9157,8 +9230,6 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
     try testing.expect(cfg.isMoe());
     try testing.expect(cfg.has_hybrid_layers);
 
-    // The latent variant projects into a smaller expert space
-    // (fc1/fc2_latent_proj) that the hybrid MoE op does not carry.
     const latent =
         \\{
         \\  "model_type": "nemotron_h",
@@ -9168,7 +9239,68 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
         \\  "n_routed_experts": 512, "num_experts_per_tok": 22, "moe_latent_size": 1024
         \\}
     ;
-    try testing.expectError(error.UnsupportedNemotronLatentMoe, parseConfigFromJson(testing.allocator, latent));
+    const lat = try parseConfigFromJson(testing.allocator, latent);
+    try testing.expectEqual(@as(u32, 1024), lat.moe_latent_size);
+    try testing.expectEqual(@as(u32, 512), lat.num_experts);
+    try testing.expect(std.mem.eql(u8, lat.model_type, "nemotron_h"));
+
+    // Bolt ships as an omni wrapper around a puzzle tower. Expert counts differ
+    // per layer; the top-level num_experts (512) is not the bank width.
+    const omni =
+        \\{
+        \\  "model_type": "nemotron_h_omni",
+        \\  "vision_config": {"model_type": "radio", "hidden_size": 1280},
+        \\  "llm_config": {
+        \\    "model_type": "nemotron_h_puzzle",
+        \\    "hidden_size": 4096,
+        \\    "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\    "vocab_size": 131072, "max_position_embeddings": 262144,
+        \\    "layers_block_type": ["mamba", "moe", "attention"],
+        \\    "block_configs": [
+        \\      {"block_type": "mamba"},
+        \\      {"block_type": "moe", "moe_intermediate_size": 1536, "n_routed_experts": 240, "num_experts_per_tok": 9},
+        \\      {"block_type": "attention"}
+        \\    ],
+        \\    "moe_latent_size": 1024,
+        \\    "moe_shared_expert_intermediate_size": 5376,
+        \\    "routed_scaling_factor": 5.0,
+        \\    "norm_topk_prob": true,
+        \\    "num_experts": 512,
+        \\    "time_step_limit": [0.0, {"__float__": "Infinity"}]
+        \\  }
+        \\}
+    ;
+    const bolt = try parseConfigFromJson(testing.allocator, omni);
+    try testing.expect(std.mem.eql(u8, bolt.model_type, "nemotron_h"));
+    try testing.expectEqual(@as(u32, 3), bolt.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 4096), bolt.hidden_size);
+    try testing.expectEqual(@as(u32, 262144), bolt.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 240), bolt.num_experts);
+    try testing.expectEqual(@as(u32, 9), bolt.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1536), bolt.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 1024), bolt.moe_latent_size);
+    try testing.expectEqual(@as(u32, 5376), bolt.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(f32, 5.0), bolt.router_scaling_factor);
+    try testing.expect(std.math.isInf(bolt.time_step_max));
+    try testing.expectEqual(LayerBlockType.mamba2, bolt.layer_block_types[0]);
+    try testing.expectEqual(LayerBlockType.moe, bolt.layer_block_types[1]);
+    try testing.expectEqual(LayerBlockType.attention, bolt.layer_block_types[2]);
+    try testing.expectEqualStrings("backbone", bolt.weight_prefix);
+    try testing.expect(!bolt.has_vision);
+    try testing.expect(!bolt.radio_vision);
+
+    const flagged =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 4096, "num_hidden_layers": 2,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "layers_block_type": ["mamba", "moe"],
+        \\  "radio_vision": true, "image_token_id": 18
+        \\}
+    ;
+    const radio = try parseConfigFromJson(testing.allocator, flagged);
+    try testing.expect(radio.radio_vision and radio.has_vision);
+    try testing.expectEqual(@as(u32, 18), radio.image_token_id);
 }
 
 test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {
