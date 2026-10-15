@@ -17,7 +17,9 @@ enum MarkdownSegmenter {
 
     enum Segment: Equatable {
         case prose(String)
-        case code(language: String, code: String)
+        /// `closed` is false until the closing fence arrives: a block a
+        /// streaming reply is still writing.
+        case code(language: String, code: String, closed: Bool = true)
     }
 
     /// Fences are matched exactly as `MarkdownText.parseBlocks` matches them —
@@ -52,8 +54,9 @@ enum MarkdownSegmenter {
                     body.append(lines[i])
                     i += 1
                 }
-                if i < lines.count { i += 1 }
-                out.append(.code(language: language, code: body.joined(separator: "\n")))
+                let closed = i < lines.count
+                if closed { i += 1 }
+                out.append(.code(language: language, code: body.joined(separator: "\n"), closed: closed))
                 continue
             }
 

@@ -908,12 +908,31 @@ fn threadMain(l: *Lan) void {
     }
 }
 
+const FileStat = struct { mtime_ns: i64, regular: bool };
+
+/// `path` relative to the cwd, or the open `fd` itself when `path` is empty.
+/// `std.c.Stat` is Darwin-only in Zig 0.17, so Linux reads `statx`.
+fn statFile(fd: std.c.fd_t, path: [*:0]const u8) ?FileStat {
+    if (comptime @import("builtin").os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        const flags: u32 = if (path[0] == 0) linux.AT.EMPTY_PATH else 0;
+        if (linux.errno(linux.statx(fd, path, flags, .{ .TYPE = true, .MTIME = true }, &sx)) != .SUCCESS) return null;
+        return .{ .mtime_ns = sx.mtime.sec * 1_000_000_000 + sx.mtime.nsec, .regular = linux.S.ISREG(sx.mode) };
+    }
+    var st: std.c.Stat = undefined;
+    if ((if (path[0] == 0) std.c.fstat(fd, &st) else std.c.stat(path, &st)) != 0) return null;
+    const m = st.mtime();
+    return .{
+        .mtime_ns = @as(i64, @intCast(m.sec)) * 1_000_000_000 + @as(i64, @intCast(m.nsec)),
+        .regular = st.mode & std.c.S.IFMT == std.c.S.IFREG,
+    };
+}
+
 /// mtime in ns, 0 when the file is absent.
 fn fileStamp(path: [*:0]const u8) i64 {
-    var st: std.c.Stat = undefined;
-    if (std.c.stat(path, &st) != 0) return 0;
-    const m = st.mtime();
-    return @as(i64, @intCast(m.sec)) * 1_000_000_000 + @as(i64, @intCast(m.nsec));
+    const st = statFile(std.c.AT.FDCWD, path) orelse return 0;
+    return st.mtime_ns;
 }
 
 /// Regular files only, opened non-blocking: a FIFO at the path would park the
@@ -922,8 +941,8 @@ fn readSmallFile(alloc: std.mem.Allocator, path: [*:0]const u8) ?[]u8 {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0 or st.mode & std.c.S.IFMT != std.c.S.IFREG) return null;
+    const st = statFile(fd, "") orelse return null;
+    if (!st.regular) return null;
     var buf: std.ArrayList(u8) = .empty;
     var chunk: [4096]u8 = undefined;
     while (buf.items.len < 64 * 1024) {
@@ -1386,6 +1405,18 @@ test "lan: a keys path that is not a regular file reads as absent without blocki
     defer _ = std.c.unlink(path);
     try t.expect(readSmallFile(t.allocator, path) == null);
     try t.expect(readSmallFile(t.allocator, "/tmp") == null);
+}
+
+test "lan: fileStamp is a file's mtime, and 0 when it is absent" {
+    var buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "/tmp/mlx-serve-lan-stamp-{d}", .{std.c.getpid()}, 0);
+    _ = std.c.unlink(path);
+    try t.expectEqual(@as(i64, 0), fileStamp(path));
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o600));
+    try t.expect(fd >= 0);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+    try t.expect(fileStamp(path) > 0);
 }
 
 test "lan: a peer that answered 401 is listed as needing a key" {

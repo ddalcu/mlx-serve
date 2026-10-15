@@ -5671,6 +5671,13 @@ Cause: `@min(p.len, MAX_DRAFTS)` with a comptime 15 has type `u4`, so `n + 2` ov
 Fix: the result is typed (`const n: usize = @min(...)`) in `chooseRows` and `PositionStats.record`, and `chooseRows` ends in a real fallback.
 Guard: `chooseRows: a fifteen-draft chain is priced through its last row` and `PositionStats: the widest copied chain records without overflow`. A silent exit of a ReleaseFast server: read `~/Library/Logs/DiagnosticReports/*.ips` first.
 
+## A Vulkan backend's MSL translator refused our kernels at eval (2026-10-10)
+
+Defect: Qwen3.5-0.8B on the mlx-omarchy Vulkan backend (RTX 5060 Ti) failed every request with a 500 (`MlxFailure` in prefill).
+Cause: `metalKernelsAvailable` was true on every non-CUDA backend, so our MSL kernels went to omarchy's MSL-subset translator, which refuses what it cannot translate only when the graph evaluates: no decline probe sees it, and the latched error fails the request.
+Fix: `metalKernelsAvailable` is true on Metal only; Vulkan runs MLX ops, like CUDA (Qwen3-1.7B decoded 3% faster without the translated kernels). MTP's off-by-default gate keys on the same predicate (`mtpAllowedByDefault`): it was CUDA-only, and a 9B Qwen3.5 decoded at a third of plain speed with MTP on Vulkan.
+Guard: `custom Metal kernels run on the Metal backend only` and `MTP is off by default where the Metal verify kernels cannot run` (both red on a non-CUDA Linux build).
+
 ## One slow sample put a warm n-gram table on the slower pool (2026-10-11, #821)
 
 Defect: on some boots Flash Next prefilled ~20% slower (4.2k vs 5.2k tok/s on an M5 Ultra, 4.7bpw); 1 of 4 default boots picked the pooled PLE gather after the table warm.
