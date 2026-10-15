@@ -91,5 +91,6 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--no-warmup-eager` | 关闭 | 跳过启动时的立即预热（用于基准测试 / 最小占用部署） |
 | `--skip-mem-preflight` | 关闭 | 加载时跳过空闲内存预检（上面的上限先检查，并且仍然适用） |
 | `--no-tool-autocorrect` | 关闭 | 关闭对模型输出的工具参数所做的 schema 驱动修复 |
+| `--late-effort-hint` | 关闭 | Qwen3.8 27B / Flash Next：把推理强度（reasoning effort）提示放在对话之后而不是模板规定的开头，切换强度时保留提示缓存。会改变模板定义的提示。`model-settings.json` 中模型的 `late_effort_hint` 优先 |
 | `--log-level` | `info` | 日志级别（error、warn、info、debug） |
 | `--log-file PATH` | `~/.mlx-serve/logs/` | 服务器日志的落盘位置 |

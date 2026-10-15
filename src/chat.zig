@@ -163,6 +163,9 @@ pub const ChatConfig = struct {
     /// `templateRendersToolTurn` for this template, probed ONCE at load (a probe render
     /// per request is a second parse of a multi-KB template); null = unknown, probe.
     renders_tool_turn: ?bool = null,
+    /// Opt-in (`--late-effort-hint`, `late_effort_hint` in `model-settings.json`): see
+    /// `lateEffortHint`.
+    late_effort_hint: bool = false,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
@@ -705,7 +708,8 @@ pub fn renderChatTemplate(
         .empty_string
     else
         .null_literal;
-    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
+    const late_hint = lateEffortHint(chat_config, enable_thinking, effort);
+    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, if (late_hint != null) "medium" else effort);
     defer allocator.free(extra_json);
     if (hasExtraSystemMessages(effective_messages)) {
         if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
@@ -719,7 +723,12 @@ pub fn renderChatTemplate(
 
     if (try renderJinja(allocator, effective_messages, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
         defer allocator.free(rendered);
-        const collapsed = try collapseDoubledThinkTags(allocator, rendered);
+        const collapsed = blk: {
+            const whole = try collapseDoubledThinkTags(allocator, rendered);
+            const hint = late_hint orelse break :blk whole;
+            defer allocator.free(whole);
+            break :blk try insertLateEffortHint(allocator, whole, hint);
+        };
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
         // tail, never beside it — both append the same channel commit, and
@@ -1356,6 +1365,47 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     if (std.mem.eql(u8, e, "medium")) return "medium";
     if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
     return "xhigh";
+}
+
+const qwen38_27b_template = @embedFile("fixtures/qwen38_27b_chat_template.jinja");
+const qwen_assistant_open = "<|im_start|>assistant\n<think>\n";
+
+/// The 27B template's effort sentences as system blocks of their own.
+const late_effort_hints = [_]struct { word: []const u8, block: []const u8 }{
+    .{ .word = "low", .block = "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n" },
+    .{ .word = "xhigh", .block = "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n" },
+};
+
+/// The process default for `ChatConfig.late_effort_hint` (`--late-effort-hint`).
+pub var late_effort_hint_default: bool = false;
+
+/// Opt-in: Qwen3.8's effort sentence, rendered as the last system block before the assistant
+/// turn instead of at the head of the prompt where the template puts it, so a conversation
+/// tokenizes (and caches) the same at every effort. Byte-pinned to the template it was measured
+/// on (Flash Next, 27B); null where the effort renders no sentence.
+fn lateEffortHint(config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ?[]const u8 {
+    if (!config.late_effort_hint or !enable_thinking or !std.mem.eql(u8, config.chat_template, qwen38_27b_template)) return null;
+    const word = qwen38EffortFor(effort, true);
+    for (late_effort_hints) |h| if (std.mem.eql(u8, h.word, word)) return h.block;
+    return null;
+}
+
+fn insertLateEffortHint(allocator: std.mem.Allocator, rendered: []const u8, hint: []const u8) ![]const u8 {
+    const at = if (std.mem.endsWith(u8, rendered, qwen_assistant_open)) rendered.len - qwen_assistant_open.len else rendered.len;
+    return std.mem.concat(allocator, u8, &.{ rendered[0..at], hint, rendered[at..] });
+}
+
+/// The token where a late effort hint begins in `prompt`, 0 when it has none.
+pub fn lateEffortHintStart(allocator: std.mem.Allocator, tok: *const Tokenizer, config: *const ChatConfig, prompt: []const u32) !usize {
+    if (!config.late_effort_hint or !std.mem.eql(u8, config.chat_template, qwen38_27b_template)) return 0;
+    for (late_effort_hints) |h| {
+        const text = try std.mem.concat(allocator, u8, &.{ h.block, qwen_assistant_open });
+        defer allocator.free(text);
+        const tail = try tok.encode(allocator, text);
+        defer allocator.free(tail);
+        if (tail.len > 0 and std.mem.endsWith(u32, prompt, tail)) return prompt.len - tail.len;
+    }
+    return 0;
 }
 
 /// K2-Horizon reads `reasoning_effort` as high|medium|low (default high) and
@@ -10453,6 +10503,106 @@ test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" 
         try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
         try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
         try testing.expect(!promptTailOpensThink(rendered));
+    }
+}
+
+test "late effort hint: off keeps the template's head placement; on renders the sentence last, after the same conversation" {
+    const a = testing.allocator;
+    var config = ChatConfig{ .chat_template = qwen38_27b_template, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "It is noon.", .reasoning_content = "Read the clock." },
+        .{ .role = "user", .content = "And in Tokyo?" },
+    };
+    // Off, the default: the template's own render byte for byte, the sentence at the head, and
+    // no hint for the prefill to snapshot at.
+    for ([_]?[]const u8{ null, "low", "medium", "high" }) |effort| {
+        const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, effort, false);
+        defer a.free(rendered);
+        const extra = try serializeExtraContext(a, &config, true, effort);
+        defer a.free(extra);
+        const native = (try renderJinja(a, &messages, &config, null, extra, .null_literal)).?;
+        defer a.free(native);
+        try testing.expectEqualStrings(native, rendered);
+    }
+    {
+        const rendered = try renderChatTemplate(a, &messages, &config, tools_json, null, true, "low", false);
+        defer a.free(rendered);
+        try testing.expect(std.mem.startsWith(u8, rendered, "<|im_start|>system\nReasoning effort is set to low."));
+        var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+        defer tok.deinit();
+        try testing.expectEqual(@as(usize, 0), try lateEffortHintStart(a, &tok, &config, &.{ 1, 2, 3 }));
+    }
+
+    config.late_effort_hint = true;
+    const cases = [_]struct { effort: ?[]const u8, block: []const u8 }{
+        .{ .effort = null, .block = late_effort_hints[0].block },
+        .{ .effort = "low", .block = late_effort_hints[0].block },
+        .{ .effort = "high", .block = late_effort_hints[1].block },
+        .{ .effort = "xhigh", .block = late_effort_hints[1].block },
+        .{ .effort = "medium", .block = "" },
+    };
+    for ([_]?[]const u8{ null, tools_json }) |tools| {
+        const medium = try renderChatTemplate(a, &messages, &config, tools, null, true, "medium", false);
+        defer a.free(medium);
+        const conversation = medium[0 .. medium.len - qwen_assistant_open.len];
+        for (cases) |c| {
+            const rendered = try renderChatTemplate(a, &messages, &config, tools, null, true, c.effort, false);
+            defer a.free(rendered);
+            try testing.expect(std.mem.startsWith(u8, rendered, conversation));
+            try testing.expectEqualStrings(c.block, rendered[conversation.len .. rendered.len - qwen_assistant_open.len]);
+            try testing.expect(std.mem.endsWith(u8, rendered, qwen_assistant_open));
+        }
+        // The previous turn's prompt, its hint dropped, leads the next turn's at another effort.
+        const first = try renderChatTemplate(a, messages[0..2], &config, tools, null, true, "low", false);
+        defer a.free(first);
+        const next = try renderChatTemplate(a, &messages, &config, tools, null, true, "high", false);
+        defer a.free(next);
+        try testing.expect(std.mem.startsWith(u8, next, first[0 .. first.len - late_effort_hints[0].block.len - qwen_assistant_open.len]));
+    }
+    // Each block is the template's own: what it renders at the head of a conversation with no
+    // system message.
+    for (late_effort_hints) |h| {
+        const extra = try serializeExtraContext(a, &config, true, h.word);
+        defer a.free(extra);
+        const head = (try renderJinja(a, messages[1..2], &config, null, extra, .null_literal)).?;
+        defer a.free(head);
+        try testing.expect(std.mem.startsWith(u8, head, h.block));
+    }
+    // Thinking off and other templates keep the template's own placement.
+    try testing.expect(lateEffortHint(&config, false, "low") == null);
+    config.chat_template = @embedFile("fixtures/qwen38_chat_template.jinja");
+    try testing.expect(lateEffortHint(&config, true, "low") == null);
+}
+
+test "late effort hint: real Qwen3.8 pack, on, tokenizes the conversation identically before the hint" {
+    const dir = std.c.getenv("QWEN38_EFFORT_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try loadChatConfig(io, a, std.mem.span(dir));
+    defer config.deinit();
+    config.late_effort_hint = true;
+    var tok = try tokenizer_mod.loadTokenizer(io, a, std.mem.span(dir));
+    defer tok.deinit();
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "It is noon.", .reasoning_content = "Read the clock." },
+        .{ .role = "user", .content = "And in Tokyo?" },
+    };
+    const medium = try formatChat(a, &tok, &messages, &config, null, null, true, "medium", false);
+    defer a.free(medium);
+    try testing.expectEqual(@as(usize, 0), try lateEffortHintStart(a, &tok, &config, medium));
+    for ([_][]const u8{ "low", "high" }) |effort| {
+        const ids = try formatChat(a, &tok, &messages, &config, null, null, true, effort, false);
+        defer a.free(ids);
+        const start = try lateEffortHintStart(a, &tok, &config, ids);
+        try testing.expect(start > 0);
+        try testing.expectEqualSlices(u32, medium[0..start], ids[0..start]);
+        try testing.expectEqualSlices(u32, medium[start..], ids[ids.len - (medium.len - start) ..]);
     }
 }
 

@@ -1281,6 +1281,15 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     return SSM_SNAPSHOT_BACKOFF;
 }
 
+/// Where the chunk loop ends a chunk and snapshots for the absolute position `snapshot_at`,
+/// relative to this prefill's first token. 0 = none: the position is already restored, or sits
+/// at or past `loop_end`, where the always-on snapshot is the nearest one before it.
+pub fn ssmSnapshotStop(want_ssm_cp: bool, snapshot_at: usize, offset: usize, loop_end: usize) usize {
+    if (!want_ssm_cp or snapshot_at <= offset) return 0;
+    const rel = snapshot_at - offset;
+    return if (rel < loop_end) rel else 0;
+}
+
 /// Effective SSM-checkpoint stride for a model, given the base (configured)
 /// stride: checkpointing never sub-divides the prefill chunk, on ANY arch.
 ///
@@ -2442,6 +2451,9 @@ pub const Generator = struct {
         /// absolute positions usable by future warm-path lookups against
         /// the full prompt.
         ssm_checkpoint_pos_offset: usize = 0,
+        /// Absolute position of one more snapshot (0 = none): where a late effort hint begins
+        /// (`chat.lateEffortHintStart`), so the next request at any effort resumes there.
+        ssm_snapshot_at: usize = 0,
         /// Placeholder rows inside a restored prefix (prefix-cache hit on an
         /// image prompt): the vision splice starts here, not at row 0.
         vision_rows_before: usize = 0,
@@ -2888,6 +2900,7 @@ pub const Generator = struct {
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
+            const snapshot_stop = ssmSnapshotStop(want_state_cp, options.ssm_snapshot_at, ssm_cp_offset, loop_end);
             // Vision prompts chunk like text (issue #197) — the splice offset
             // below keeps the row scatter chunk-exact. Kill switch restores
             // the whole-prompt forward.
@@ -2984,7 +2997,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                const end = nextChunkEnd(pos, if (pos < snapshot_stop) snapshot_stop else loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -3131,7 +3144,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
+                if (want_ssm_cp and ssm_cp_stride > 0 and (abs_end_for_cp2 % ssm_cp_stride == 0 or end == snapshot_stop)) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -3245,7 +3258,9 @@ pub const Generator = struct {
                 // to be a stride multiple).
                 const already_have = ssm_checkpoints.items.len > 0 and
                     ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos == final_abs;
-                if (!already_have) {
+                // A late effort hint's start replaces this snapshot: one inside the hint serves
+                // only a retry at the same effort, which the hint's start serves too.
+                if (!already_have and snapshot_stop == 0) {
                     // SSM state is already materialized — the chunked loop
                     // evaluated it at every chunk boundary. The final chunk
                     // may have been a stride-aligned one (already evaluated)
@@ -17164,6 +17179,24 @@ test "ssmSnapshotBackoff: engages only under checkpointing and past the backoff 
     // (seq >= 32 turns it into a "prefill" costing ~450ms of eval bubbles):
     // tail = backoff + 1 <= 31.
     try testing.expect(SSM_SNAPSHOT_BACKOFF + 1 < 32);
+}
+
+test "ssmSnapshotStop: the chunk loop ends a chunk where the late effort hint begins" {
+    // A 6014-token prompt whose 35-token hint tail begins at 5979; the always-on snapshot
+    // (6013 - 30) falls inside the hint, out of reach of a request at another effort.
+    const loop_end: usize = 6013 - SSM_SNAPSHOT_BACKOFF;
+    const stop = ssmSnapshotStop(true, 5979, 0, loop_end);
+    try testing.expectEqual(@as(usize, 5979), stop);
+    try testing.expectEqual(stop, nextChunkEnd(4096, stop, 4096, true, 4096, 0, false));
+    try testing.expectEqual(loop_end, nextChunkEnd(4096, loop_end, 4096, true, 4096, 0, false));
+    // Warm: restored at the hint start nothing is left to snapshot; restored earlier, the stop
+    // is relative to the restored position.
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotStop(true, 5979, 5979, 34 - SSM_SNAPSHOT_BACKOFF));
+    try testing.expectEqual(@as(usize, 26), ssmSnapshotStop(true, 5979, 5953, 60 - SSM_SNAPSHOT_BACKOFF));
+    // Past the loop (inside the final forward), no hint, or no checkpointing: none.
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotStop(true, 5990, 0, loop_end));
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotStop(true, 0, 0, loop_end));
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotStop(false, 5979, 0, loop_end));
 }
 
 test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill chunk (dense AND MoE)" {

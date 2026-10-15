@@ -17,6 +17,9 @@ pub const Override = struct {
     mtp_greedy_tail: ?bool = null,
     /// LOSSY int8-activation prefill for 2-bit Prism packs (`qmm_int8`).
     int8_prefill: ?bool = null,
+    /// Qwen3.8 27B / Flash Next: the effort sentence after the conversation, not at the
+    /// template's head (`chat.lateEffortHint`). Null = the `--late-effort-hint` default.
+    late_effort_hint: ?bool = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
@@ -26,7 +29,7 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.late_effort_hint == null and o.chat_template_kwargs == null and o.drafter == null;
     }
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
@@ -157,6 +160,10 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     };
     if (obj.get("int8_prefill")) |m| switch (m) {
         .bool => |b| o.int8_prefill = b,
+        else => {},
+    };
+    if (obj.get("late_effort_hint")) |m| switch (m) {
+        .bool => |b| o.late_effort_hint = b,
         else => {},
     };
     if (obj.get("mtp_greedy_tail")) |g| switch (g) {
@@ -323,7 +330,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
             o.drafter = null;
         };
     };
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} late_effort={s} drafter={s} kwargs={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -331,6 +338,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
         if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
         if (o.int8_prefill) |b| (if (b) "on" else "off") else "default",
+        if (o.late_effort_hint) |b| (if (b) "on" else "off") else "default",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
     });
@@ -430,6 +438,16 @@ test "model_settings: int8_prefill is a boolean, anything else is unset" {
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").int8_prefill);
     try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: late_effort_hint is a boolean, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"late_effort_hint": true}, "/m/b": {"late_effort_hint": "on"}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").late_effort_hint);
+    try std.testing.expect(s.lookup(t, "/m/b").isEmpty());
 }
 
 test "model_settings: bad values ignored, bad JSON = empty" {

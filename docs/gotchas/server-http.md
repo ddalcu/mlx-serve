@@ -2683,3 +2683,22 @@ Guard: `context sizer: the prompt-cache reserve never takes more than half the r
 
 ### An agent started from a piped script got `/dev/tty`, which Bun agents and Grok cannot watch on macOS
 The served `/launch` script (the console's Code Launcher, `curl … | sh`) arrives on stdin, so its tail reopened `/dev/tty` for the agent. pi worked (Node; libuv falls back to `select()` for that device); Claude Code, oh-my-pi and OpenCode (Bun) died on `EINVAL: invalid argument, kqueue`, Grok exited at once, and omp's unanswered terminal queries landed in the user's shell as `1;2c1;2c…`. `/dev/tty` is its own device node, not the terminal it reaches (`tty` reads `/dev/tty`, not `/dev/ttys002`), and macOS kqueue refuses it. Fix: the agent's stdin is a dup of whichever of stderr/stdout is the terminal, `/dev/tty` only when neither is (`launch.remoteScript`), and the redirect rides the agent's `exec`: the served script is still being read from stdin, so a bare `exec 0<&2` made `sh` wait on the terminal for the rest of it; `website/agent.sh` writes the setup script to `~/.mlx-serve/launch-<agent>.sh` and execs it with the terminal as stdin, which also covers servers older than the fix. Guards: a fake agent records `tty` under `expect` (`tests/test_launch_script.sh` [6], `tests/test_website_agent_install.sh` [3]).
+
+## Changing the reasoning effort re-prefilled the whole conversation (2026-10-14)
+
+Defect: on Qwen3.8-Flash-Next an effort change between two turns of the same conversation reused
+nothing from the prompt cache: a 24k-token conversation re-prefilled for about 60 s each time.
+
+Cause: the template renders the effort sentence (xhigh, low; medium has none) at the head of the
+first system block, so the effort word changed the prompt's first tokens.
+
+Fix, opt-in because it changes the prompt the template defines (`--late-effort-hint`, or
+`late_effort_hint` per model in `model-settings.json`): on the byte-pinned 27B / Flash Next
+template the render passes `medium` (no sentence) and inserts the sentence as its own system block
+right before the assistant turn (`lateEffortHint`). The prefill ends a chunk where that block
+begins and snapshots there instead of 30 tokens before the prompt's end (`lateEffortHintStart` ->
+`ssm_snapshot_at`), so a hybrid resumes exactly at the conversation's end. Cost: a client that
+replays the model's reasoning no longer resumes after the previous reply at low or xhigh, because
+that reply was generated after a hint the next prompt does not repeat.
+Guard: `late effort hint:` tests (chat.zig), `ssmSnapshotStop` (generate.zig),
+`tests/test_effort_hint_cache.sh`.

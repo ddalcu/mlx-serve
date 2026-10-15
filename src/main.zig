@@ -420,6 +420,12 @@ fn printUsage(io: std.Io) void {
         \\                        declared types (e.g. Python `False` -> JSON
         \\                        `false`). Args then pass through as the model
         \\                        emitted them (still valid JSON). Default: on.
+        \\  --late-effort-hint  Qwen3.8 27B / Flash Next: render the reasoning-
+        \\                        effort sentence after the conversation instead
+        \\                        of at the head where the template puts it, so
+        \\                        an effort change keeps the prompt cache. Off by
+        \\                        default; a model's `late_effort_hint` in
+        \\                        model-settings.json overrides it.
         \\  --api-key <token>   Require this key on every request (OpenAI/
         \\                        Anthropic/Ollama APIs + index page + metrics).
         \\                        Accepts Authorization: Bearer, x-api-key, HTTP
@@ -720,6 +726,8 @@ pub fn main(init: std.process.Init) !void {
             enable_pld = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
             server_mod.g_tool_autocorrect = false;
+        } else if (std.mem.eql(u8, args[i], "--late-effort-hint")) {
+            chat_mod.late_effort_hint_default = true;
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {
             enable_pld = false;
         } else if (std.mem.eql(u8, args[i], "--pld-draft-len") and i + 1 < args.len) {

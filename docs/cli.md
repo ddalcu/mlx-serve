@@ -95,5 +95,6 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--no-warmup-eager` | off | Skip the eager warmup at boot (benchmarking / minimal-footprint deployments) |
 | `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies) |
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
+| `--late-effort-hint` | off | Qwen3.8 27B / Flash Next: render the reasoning-effort sentence after the conversation instead of at the head, so changing the effort keeps the prompt cache. Changes the prompt the template defines. A model's `late_effort_hint` in `model-settings.json` outranks it |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 | `--log-file PATH` | `~/.mlx-serve/logs/` | Where the server log goes |
