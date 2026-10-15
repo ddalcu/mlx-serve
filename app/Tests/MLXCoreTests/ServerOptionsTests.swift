@@ -51,6 +51,7 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.requestTimeout, 300)         // main.zig timeout
         XCTAssertEqual(d.noVision, false)             // main.zig no_vision
         XCTAssertEqual(d.maxConcurrent, 1)            // server.zig max_concurrent
+        XCTAssertEqual(d.aneSlots, 1)                 // main.zig ane_slots
         XCTAssertEqual(d.kvQuant, .off)               // server.zig kv-quant
         XCTAssertEqual(d.prefixCacheMem, "")          // server.zig prefix_cache_mem_bytes (auto)
         XCTAssertEqual(d.tokenizeCacheEntries, 4)     // server.zig tokenize_cache_entries
@@ -517,6 +518,7 @@ extension ServerOptionsTests {
         o.pldDraftLen = 7
         o.pldKeyLen = 4
         o.maxConcurrent = 4
+        o.aneSlots = 3
         o.kvQuant = .int8
         o.hotPrefixCacheEnabled = false
         o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it
@@ -1051,6 +1053,13 @@ extension ServerOptionsTests {
     /// passthrough, so every GUI launch ran the auto cap (80% of the wired
     /// limit) and a model the auto cap refuses was unloadable at any setting.
     /// `--skip-mem-preflight` does not help — the registry gate runs first.
+    func testAneSlotsAreEmittedOnlyAboveOne() {
+        var opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs().contains("--ane-slots"))
+        opts.aneSlots = 2
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--ane-slots", value: "2"))
+    }
+
     func testMaxResidentMemIsEmittedWhenSetAndOmittedOtherwise() {
         var opts = ServerOptions()
         XCTAssertEqual(opts.maxResidentMemGB, 0)  // 0 = Auto (the server's own cap)

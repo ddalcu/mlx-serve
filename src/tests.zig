@@ -69,6 +69,7 @@ test {
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
+    _ = @import("load_progress.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("dflash_policy.zig");
@@ -114,10 +115,13 @@ test {
     _ = @import("qwen_image_edit.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");
-    _ = @import("arch/coreai.zig");
-    _ = @import("arch/coreai_dflash.zig");
-    _ = @import("arch/coreai_prefix.zig");
-    _ = @import("coreai_ffi.zig");
+    _ = @import("arch/ane_dflash.zig");
+    _ = @import("arch/ane_lm.zig");
+    _ = @import("arch/ane_mil.zig");
+    _ = @import("arch/ane_pack.zig");
+    _ = @import("arch/ane_prefix.zig");
+    _ = @import("arch/ane_qwen35.zig");
+    _ = @import("arch/ane_rt.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_diffvae.zig");
     _ = @import("ltx_diffvae_kernel.zig");

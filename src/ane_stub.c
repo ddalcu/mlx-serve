@@ -25,6 +25,7 @@ void msv_ane_cache_variant(const char *group, char *out, int out_len) {
     (void)out;
     (void)out_len;
 }
+void msv_ane_cache_prune(void) {}
 
 MsvAnePlane *msv_ane_plane_create(size_t bytes) {
     (void)bytes;

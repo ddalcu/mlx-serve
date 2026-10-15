@@ -51,7 +51,9 @@ download one in the MLX Core app (Models). Do not invent an id.
 - Any request names its model with `"model": "<id>"`. An unloaded model loads on
   the first request, which can take seconds to minutes.
   `POST /v1/load-model {"model": "<id>"}` pre-warms one;
-  `POST /v1/unload-model {"model": "<id>"}` frees it.
+  `POST /v1/unload-model {"model": "<id>"}` frees it. While a load runs,
+  `GET /v1/load-progress` lists each loading model's `phase`, `done`/`total`
+  and `eta_s`.
 - All models share one GPU memory budget. A 503 `out_of_memory` means unload
   something first (typically the media model when you are done with it).
 - Generation runs on one inference thread: a 3-minute video render stalls chat

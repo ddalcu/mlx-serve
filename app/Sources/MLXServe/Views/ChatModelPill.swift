@@ -171,7 +171,11 @@ struct ChatModelPill: View {
                             .frame(width: 8, height: 8)
                     }
                 }
-                if let active = activeDownload {
+                if pill.isLoading, let path = appState.loadingModelPath {
+                    LoadProgressBar(progress: LoadProgress.lookup(server.loadProgress, path: path))
+                        .frame(height: 3)
+                        .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth)
+                } else if let active = activeDownload {
                     // Deliberately wordless: a hairline that fills. The figures
                     // live in the browser; here it only has to say "something is
                     // arriving, that's why it can't answer yet".
@@ -199,7 +203,8 @@ struct ChatModelPill: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help(pill.isLoading
-              ? L10n.format("Loading %@…", ModelDisplayName.pretty(pill.name))
+              ? L10n.format("Loading %@ · %@", ModelDisplayName.pretty(pill.name),
+                            appState.loadingModelPath.flatMap { LoadProgress.lookup(server.loadProgress, path: $0) }?.label ?? L10n.text("Starting"))
               : L10n.text("Chat model. Click to switch — models on this Mac and any shared by other Macs on your network."))
     }
 

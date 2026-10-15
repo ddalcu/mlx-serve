@@ -389,17 +389,20 @@ struct StatusMenuView: View {
                 loadModelAtStart: appState.loadModelAtStart,
                 selectedModelPath: appState.selectedModelPath),
             isLoadingModel: appState.loadingModelPath != nil)
-        return HStack(spacing: 6) {
-            serverPrimaryButton(control)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                serverPrimaryButton(control)
 
-            Button {
-                openServerLog()
-            } label: {
-                Image(systemName: "macwindow.on.rectangle")
+                Button {
+                    openServerLog()
+                } label: {
+                    Image(systemName: "macwindow.on.rectangle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .help("Open Server Log in a separate window (easier copy/paste)")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.regular)
-            .help("Open Server Log in a separate window (easier copy/paste)")
+            ModelLoadProgressRow()
         }
     }
 

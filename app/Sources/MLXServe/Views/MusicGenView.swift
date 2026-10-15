@@ -176,6 +176,7 @@ struct MusicGenView: View {
                     advancedSection.padding(.top, 8)
                     // Generate stands apart from the settings it acts on.
                     actionRow.padding(.top, 14)
+                    LoadingModelsRow()
                 }
                 // Full-width, leading-aligned frame OUTSIDE the padding — see
                 // AudioGenView.

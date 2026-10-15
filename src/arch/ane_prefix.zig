@@ -1,4 +1,4 @@
-//! Prefix cache for the Core AI engine: checkpoints of the model state along token sequences.
+//! Prefix cache for the ANE LM engine: checkpoints of the model state along token sequences.
 //!
 //! The KV cache can be cut back to any position, the DeltaNet states cannot, so a sequence is a
 //! chain of nodes. Each node holds its tokens since its parent, those tokens' KV rows, and the full

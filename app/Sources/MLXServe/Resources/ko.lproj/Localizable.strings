@@ -2240,3 +2240,15 @@
 "Reset Voice & Transcribe" = "음성 및 받아쓰기 재설정";
 "Speaker %@" = "화자 %@";
 "You" = "나";
+"Starting" = "시작하는 중";
+"Warming up" = "준비하는 중";
+"Reading weights · %@ of %@ GB" = "가중치 읽는 중 · %@ / %@ GB";
+"Compiling for the Neural Engine · %d of %d" = "Neural Engine용으로 컴파일하는 중 · %d / %d";
+"Loading from the Neural Engine cache · %d of %d" = "Neural Engine 캐시에서 불러오는 중 · %d / %d";
+"about %d s left" = "약 %d초 남음";
+"about %d min left" = "약 %d분 남음";
+"Neural Engine requests at once" = "Neural Engine 동시 요청 수";
+"How many requests a model on the Neural Engine answers together; they share its speed, and each adds its own memory." = "Neural Engine의 모델이 함께 답하는 요청 수입니다. 요청들이 속도를 나눠 쓰며, 요청마다 메모리를 따로 사용합니다.";
+"Loading %@ · %@" = "%1$@ 로드 중 · %2$@";
+"%@ is ready" = "%@ 준비 완료";
+"The model finished loading." = "모델 로드를 마쳤습니다.";

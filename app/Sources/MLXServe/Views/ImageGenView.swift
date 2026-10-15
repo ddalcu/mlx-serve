@@ -934,6 +934,7 @@ struct ImageGenView: View {
                     ContentUnavailableView("No generation yet", systemImage: "photo", description: Text("Enter a prompt and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
+                        LoadingModelsRow()
                         ProgressView(value: Double(step), total: max(1, Double(total)))
                             .progressViewStyle(.linear)
                             .frame(width: 240)

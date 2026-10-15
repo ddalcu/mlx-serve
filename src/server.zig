@@ -828,6 +828,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/images/edits",
     "/v1/images/generations",
     "/v1/load-model",
+    "/v1/load-progress",
     "/v1/messages",
     "/v1/models",
     "/v1/models/rescan",
@@ -1305,7 +1306,8 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
 /// tracked. `forced` is allocated; the caller frees it after generation.
 fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, forced_tool: ?chat_mod.ForcedTool) ?generate_mod.ToolForce {
     const ft = forced_tool orelse return null;
-    if (lm.transformer == null) return null;
+    // Armed on the Neural Engine too, so `aneServes` refuses the request by name.
+    if (lm.transformer == null and lm.ane == null) return null;
     const cc = lm.chat_config orelse return null;
     const text = (chat_mod.forcedToolOpener(allocator, cc.chat_template, ft) catch return null) orelse return null;
     defer allocator.free(text);
@@ -2573,6 +2575,15 @@ fn handleConnection(
         try handleLoadModelStrict(allocator, stream, request_body);
         return;
     }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/load-progress")) {
+        const body = renderLoadProgressBody(allocator, stream.io) catch |err| switch (err) {
+            error.RegistryNotReady => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503),
+            else => return err,
+        };
+        defer allocator.free(body);
+        try sendResponse(stream, "200 OK", "application/json", body);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/unload-model")) {
         // Free a model's resident GPU state (the app's load→generate→unload
         // default). The stub stays registered so it can reload. Idempotent.
@@ -3003,8 +3014,8 @@ test "quantizationJson: a declared width is N-bit, an undeclared one is null" {
 /// on the embedded ds4 engine report the SAME model_type. "gguf" = an
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
 /// header is read at load time.
-fn modelEngineName(has_ds4: bool, has_llama: bool, mlx_gguf_served: bool, path: []const u8, arch_hint: []const u8) []const u8 {
-    if (std.mem.eql(u8, arch_hint, "coreai")) return "coreai";
+fn modelEngineName(has_ds4: bool, has_llama: bool, has_ane: bool, mlx_gguf_served: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+    if (has_ane) return "ane";
     if (has_ds4) return "ds4";
     if (has_llama) return "llama";
     if (mlx_gguf_served) return "mlx-gguf";
@@ -5979,7 +5990,7 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .anthropic_type = "invalid_request_error",
             .message = PROMPT_LOGPROBS_UNAVAILABLE_MSG,
         },
-        // A Core AI model samples the raw logits: refused, not silently ignored.
+        // A Neural Engine model samples the raw logits: refused, not silently ignored.
         error.NeuralEngineUnsupported => .{
             .status_line = "400 Bad Request",
             .code = 400,
@@ -6889,7 +6900,7 @@ fn mediaRejectReason(messages: []const chat_mod.Message, continue_final: bool) ?
         const m = messages[i];
         if (std.mem.eql(u8, m.role, "assistant")) break;
         if (!std.mem.eql(u8, m.role, "user")) continue;
-        if (m.images != null or m.videos != null) return "This model is serving without its vision tower (--no-vision or no vision weights); image/video content is not supported";
+        if (m.images != null or m.videos != null) return "This model is serving without its vision tower (--no-vision, no vision weights, or on the Neural Engine); image/video content is not supported";
         if (m.audio != null) return "This model is serving without its audio embedder; input_audio content is not supported";
     }
     return null;
@@ -7110,7 +7121,7 @@ fn renderModelEntry(
         // config's modality marker ("flux2" for every image backend).
         const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
-        const drafter_loaded = entry.drafter != null or entry.dflash != null;
+        const drafter_loaded = entry.hasDrafter();
         const mtp_loaded = entry.mtp != null or if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
@@ -7160,7 +7171,7 @@ fn renderModelEntry(
             caps.items,
             mods.items,
             arch_label,
-            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.path, entry.arch_hint),
+            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.ane != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -7291,7 +7302,7 @@ fn renderModelEntry(
     // MLX GGUF engine would claim the file, else "gguf" (undetermined
     // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
     const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
-        modelEngineName(false, false, mlxGgufClaims(io, entry), entry.path, entry.arch_hint),
+        modelEngineName(false, false, false, mlxGgufClaims(io, entry), entry.path, entry.arch_hint),
     });
     defer allocator.free(engine_part);
 
@@ -7487,6 +7498,39 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
 
 /// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
 /// new dirs, clearing failed loads (`ModelRegistry.rescan`). Answers `{"added":N}`.
+/// `GET /v1/load-progress`: every model mid-load and what its load is doing (`load_progress.zig`).
+/// Cheap enough to poll while a load runs: it reads no configs.
+fn renderLoadProgressBody(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    const registry = global_registry orelse return error.RegistryNotReady;
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const now = io_util.nowMsMonotonic(io);
+    const footprint = metrics.getAppMemFootprintMb();
+    try buf.appendSlice(allocator, "{\"loading\":[");
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    var it = registry.entries.valueIterator();
+    var first = true;
+    while (it.next()) |e| {
+        const entry = e.*;
+        if (entry.state != .loading) continue;
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.appendSlice(allocator, "{\"id\":");
+        try chat_mod.appendJsonString(allocator, &buf, entry.id);
+        try buf.appendSlice(allocator, ",\"path\":");
+        try chat_mod.appendJsonString(allocator, &buf, entry.path);
+        try buf.appendSlice(allocator, ",\"progress\":");
+        var jb: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&jb);
+        try entry.load_progress.snapshot(now, footprint).writeJson(&w);
+        try buf.appendSlice(allocator, w.buffered());
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "]}");
+    return buf.toOwnedSlice(allocator);
+}
+
 fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
     const registry = global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
@@ -7620,7 +7664,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
-    const drafter_loaded = lm.drafter != null or lm.dflash != null;
+    const drafter_loaded = lm.hasDrafter();
     const drafter_path_json = if (drafter_loaded)
         try jsonEscape(allocator, lm.drafter_path)
     else
@@ -8273,7 +8317,7 @@ const PropsSettings = struct {
     prefill_decode_share: f32 = 0,
 };
 
-const PropsEngine = enum { mlx, llama, ds4, coreai };
+const PropsEngine = enum { mlx, llama, ds4, ane };
 
 /// ds4 and llama.cpp bypass generate.zig: MLX decode levers, PLD and the MLX drafters never run there.
 fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bool) PropsSettings {
@@ -8293,10 +8337,10 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
 }
 
 fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
-    const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else if (lm.coreai != null) .coreai else .mlx;
+    const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else if (lm.ane != null) .ane else .mlx;
     const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else if (lm.llama_ctx) |c| c.mtpDrafts() > 0 else false;
     var out = embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
-    if (lm.coreai) |w| out.kv_quant = @tagName(w.engines[0].man.kv_format);
+    if (lm.ane != null) out.kv_quant = "off";
     return out;
 }
 
@@ -8464,7 +8508,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"registry_generation\":{d}", .{ ane_json, ngram_json, batching_json, settings_json, registryGeneration() });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -8474,6 +8518,12 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, residentWeightsBytes(stream.io), kv_cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// `ModelRegistry.generation`: moves whenever `/v1/models` would read differently.
+fn registryGeneration() u64 {
+    const reg = global_registry orelse return 0;
+    return reg.generation.load(.monotonic);
 }
 
 /// The registry's residency bill: the weights of every ready model, media ones included.
@@ -8495,8 +8545,8 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
-    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}},"registry_generation":{d}}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, registryGeneration() });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -22737,9 +22787,9 @@ test "embeddedEngineSettings: an engine-backed model reports only the levers its
     try testing.expect(!llama.decode_attn_quant and !llama.pld.enable and !llama.mtp_default_on);
     try testing.expectEqual(@as(f32, 0), llama.prefill_decode_share);
 
-    // Core AI: none of the MLX levers either (its KV format comes from the bundle, in `propsSettingsFor`).
-    const ane = embeddedEngineSettings(base, .coreai, false);
-    try testing.expectEqualStrings("coreai", ane.engine);
+    // The Neural Engine: none of the MLX levers either.
+    const ane = embeddedEngineSettings(base, .ane, false);
+    try testing.expectEqualStrings("ane", ane.engine);
     try testing.expect(!ane.decode_attn_quant and !ane.pld.enable and !ane.mtp_loaded);
     try testing.expectEqual(@as(usize, 0), ane.prefill_chunk);
 
@@ -23949,7 +23999,7 @@ test "readyHasChat: embedded-engine GGUF without a chat template still advertise
     try t.expect(!readyHasChat(false, 0, false));
 }
 
-test "mlxMemoryGuardApplies: engine-backed models (ds4/llama/Core AI) skip the MLX-prefill memory guard" {
+test "mlxMemoryGuardApplies: engine-backed models (ds4/llama/ANE) skip the MLX-prefill memory guard" {
     const t = std.testing;
     // MLX model — the guard applies (real per-token working set).
     try t.expect(mlxMemoryGuardApplies(false));
@@ -25147,7 +25197,7 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         try t.expectEqualStrings("invalid_request_error", w.openai_type);
     }
     {
-        // What a Core AI model cannot honor is the request's shape, not a fault.
+        // What a Neural Engine model cannot honor is the request's shape, not a fault.
         const w = mapGenerationError(error.NeuralEngineUnsupported, &buf);
         try t.expectEqual(@as(u32, 400), w.code);
         try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
@@ -25241,19 +25291,19 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
 
 test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
     // Loaded entries: the attached engine pointer decides.
-    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, "/m/DeepSeek-V4-Flash.gguf", ""));
-    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, "/m/qwen.gguf", ""));
-    try testing.expectEqualStrings("coreai", modelEngineName(false, false, false, "/m/Qwen3.8-27B-M5-ANE", "coreai"));
+    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, false, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, false, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("ane", modelEngineName(false, false, true, false, "/m/Qwen3.8-27B-MLX-Serve-4bit", "qwen3_5"));
     // A GGUF on the MLX path (lib/mlx-serve-gguf) is its own engine: the app
     // reads "gguf" as llama.cpp.
-    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, true, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, false, true, "/m/qwen.gguf", ""));
     // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
     // distinguish it from the ds4 GGUF — meta.engine must.
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
     // Unloaded GGUF stubs: engine undetermined until the header is read.
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/x.gguf", ""));
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/dir", "gguf"));
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/gemma-4-12b", "gemma4"));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, "/m/gemma-4-12b", "gemma4"));
 }
 
 test "formatCompletionsLogprobs: an echoed prompt's first token carries null, the rest shift by one" {

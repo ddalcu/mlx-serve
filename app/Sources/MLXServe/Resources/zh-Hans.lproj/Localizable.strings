@@ -2240,3 +2240,15 @@
 "Reset Voice & Transcribe" = "重置语音与转写";
 "Speaker %@" = "说话人 %@";
 "You" = "你";
+"Starting" = "正在启动";
+"Warming up" = "正在预热";
+"Reading weights · %@ of %@ GB" = "正在读取权重 · %@ / %@ GB";
+"Compiling for the Neural Engine · %d of %d" = "正在为神经引擎编译 · %d / %d";
+"Loading from the Neural Engine cache · %d of %d" = "正在从神经引擎缓存加载 · %d / %d";
+"about %d s left" = "约剩 %d 秒";
+"about %d min left" = "约剩 %d 分钟";
+"Neural Engine requests at once" = "神经引擎同时处理的请求数";
+"How many requests a model on the Neural Engine answers together; they share its speed, and each adds its own memory." = "神经引擎上的模型可同时回答的请求数；这些请求分享其速度，并各自占用一份内存。";
+"Loading %@ · %@" = "正在加载 %@ · %@";
+"%@ is ready" = "%@ 已就绪";
+"The model finished loading." = "模型已加载完成。";

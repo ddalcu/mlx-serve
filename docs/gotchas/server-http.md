@@ -22,6 +22,12 @@ Third, the feature did not survive contact with its own clients. `GET /props` fe
 
 Guards: `tests/test_idle_evict.sh` (evicts when idle, reloads under all three concurrent readers, RSS flat across cycles that all end with nothing resident, and still resident with the flag off), `testing.allocator` on the reload-frees test, and behavioural tests on each `.loading` predicate. The locking itself is comment-pinned — a source scan is the obvious guard and this repo bans them.
 
+### Two models under the registry cap still killed the server (2026-10-15)
+
+The registry's resident cap defaults to Metal's working-set limit (230 GB on a 256 GB M5 Ultra), and the planner evicted only past it. With Flash Next 4.7bpw (70 GB) loaded and idle, a load of the 8-bit pack (128 GB) evicted nothing, 198 GB being under the cap, while two other mlx-serve processes held 59 GB. macOS ran out of memory: jetsam killed idle daemons, then the server. No crash report, and the log just stops (SIGKILL loses its buffered tail). The app ran with `--skip-mem-preflight`, and the preflight only ever refused anyway.
+
+Fix: `planEvictionsLocked` takes `ram_room` (`scheduler.loadRamRoom`: what the OS grants, less `osReserveBytes`) and unloads IDLE models, oldest first, until the loads in flight fit in it. RAM never refuses a load the caps admit. `[registry] <id> needs ~X GB beside Y GB of free RAM: unloading N model(s)` names it. The tell for this class: `log show` lines with `OS_REASON_JETSAM` / `JETSAM_REASON_MEMORY_IDLE_EXIT` in the seconds before the server's `proc_exit`. Guard: the two `planEvictions:` RAM tests in `model_registry.zig`.
+
 ### Only the latest turn's images reached the model (2026-09-23)
 
 Defect: pi reading page1..3 of a spec mid-task saw page3 only. Flash invented a 5-digit SKU

@@ -10,6 +10,12 @@ class ServerManager: ObservableObject {
     /// loop. UI uses this for the "Loaded Models" section and the model
     /// picker. First entry mirrors `modelInfo` (server sorts default first).
     @Published var allModels: [ModelInfo] = []
+    /// Each model mid-load, by path, while a load this app asked for runs (`loadModel`).
+    @Published private(set) var loadProgress: [String: LoadProgress] = [:]
+    private var loadsInFlight = 0
+    /// `/props` `registry_generation` as last read (`modelListMoved`).
+    private var seenRegistryGeneration: UInt64?
+    private var loadProgressPoll: Task<Void, Never>?
     /// LAN peers running with --api-key that we hold no working key for.
     @Published var lanPeersNeedingKey: [String] = []
     /// Chat target when the user picked a LAN model in the tray: the remote
@@ -632,6 +638,9 @@ class ServerManager: ObservableObject {
             memoryInfo = memory
             specCost = props.specCost
             batching = props.batching
+            let moved = Self.modelListMoved(seen: seenRegistryGeneration, reported: props.registryGeneration)
+            seenRegistryGeneration = props.registryGeneration ?? seenRegistryGeneration
+            if moved { await refreshModels() }
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {
@@ -640,14 +649,16 @@ class ServerManager: ObservableObject {
             }
             throughput = snap
         }
-        // Intentionally do NOT poll /v1/models here. The registry snapshot is
-        // already populated once on `transitionToRunning` and again after every
-        // explicit `loadModel(id:)` the app makes — those are the only events
-        // that can change the loaded/unloaded badges from within this app.
-        // Hot-load / eviction triggered by a different client (curl, another
-        // app) won't be reflected until the next user-initiated load or a
-        // restart; that's an acceptable trade for not hitting /v1/models
-        // every 3 s for the lifetime of the session.
+        // `/v1/models` reads every model's config, so it is re-read only when
+        // `registry_generation` says a load, unload or eviction (from any
+        // client) has changed it.
+    }
+
+    /// Whether the registry changed since the last `/props`: the first reading only records it
+    /// (opening the tray re-reads the list anyway).
+    nonisolated static func modelListMoved(seen: UInt64?, reported: UInt64?) -> Bool {
+        guard let seen, let reported else { return false }
+        return seen != reported
     }
 
     func refreshModels() async {
@@ -691,7 +702,13 @@ class ServerManager: ObservableObject {
     /// the refreshed list sorts the new model first (`modelInfo` follows) and
     /// aliased requests route to it — the parts a restart used to provide.
     func loadModel(id: String, setDefault: Bool = false) async throws -> ModelInfo {
+        watchLoads(1)
+        defer { watchLoads(-1) }
+        let started = Date()
         let info = try await api.loadModel(port: port, id: id, setDefault: setDefault)
+        if LoadProgress.notifiesReady(after: Date().timeIntervalSince(started), appActive: NSApp.isActive) {
+            TaskNotifier.shared.notifyModelReady(name: ModelDisplayName.pretty(info.name))
+        }
         // A switch moves what the process is serving without restarting it;
         // keep `currentModelPath` honest for the readers that gate on it
         // (TaskScheduler's pinned-model check, TestServer's status).
@@ -702,6 +719,26 @@ class ServerManager: ObservableObject {
         }
         await refreshModels()
         return info
+    }
+
+    /// Poll `/v1/load-progress` while any load is in flight; clear it when the last one ends.
+    private func watchLoads(_ delta: Int) {
+        loadsInFlight += delta
+        if loadsInFlight > 0, loadProgressPoll == nil {
+            loadProgressPoll = Task { [weak self] in
+                while !Task.isCancelled {
+                    guard let self else { return }
+                    if let p = try? await self.api.loadProgress(port: self.port), !Task.isCancelled {
+                        self.loadProgress = p
+                    }
+                    try? await Task.sleep(for: .milliseconds(400))
+                }
+            }
+        } else if loadsInFlight == 0 {
+            loadProgressPoll?.cancel()
+            loadProgressPoll = nil
+            loadProgress = [:]
+        }
     }
 
     /// Free a model's resident GPU state (registry keeps the stub). Used by the

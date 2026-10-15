@@ -258,11 +258,14 @@ https://github.com/Anemll/anemll-forge
 Copyright (c) 2026 ANEMLL contributors
 Licensed under the MIT License.
 
-Vendored into `lib/coreai/CoreAIBridge.swift` (from `coreai/swift_bridge/`, commit 6c572a8): the C ABI
-over the Core AI Swift runtime (model / function / IOSurface buffer / binding / run). `src/arch/coreai.zig`
-is an mlx-serve port of Forge's host runtime for its Core AI builds (`scripts/qwen38_coreai_model.py`,
-`scripts/qwen38_kv_cache.py`): the per-call positions and masks, the DeltaNet state ping-pong, and the
-V8 key/value cache writes. The ANE packages themselves are built with Forge and are not part of mlx-serve.
+Ported (commit 6c572a8), not vendored: `src/arch/ane_qwen35.zig` and `src/arch/ane_dflash.zig` emit, as
+MIL text from MLX packs, the Neural Engine graphs of Forge's builders (`coreai/qwen38_coreai_build.py`,
+`scripts/qwen38_ane_chunk.py`, `scripts/dflash2_gdn_lazy.py`, `coreai/dflash2_coreai_build.py`): the
+lazy-commit Gated DeltaNet and its UT-transform form, the attention over host-owned KV, the fp16 numerics
+(scale-free RMSNorm, tanh SiLU, overflow-safe softplus, q / v range scales, the drafter's residual scale)
+and the DFlash2 drafter's draft / context entries. `src/arch/ane_lm.zig` is an mlx-serve port of Forge's
+host runtime (`scripts/qwen38_coreai_model.py`, `scripts/qwen38_kv_cache.py`): the per-call positions and
+masks, the DeltaNet state ping-pong, the KV commits, the speculative cycle and the selector walk.
 
 --------------------------------------------------------------------------------
 SwaTex

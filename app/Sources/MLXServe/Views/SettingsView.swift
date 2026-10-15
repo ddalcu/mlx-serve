@@ -2206,6 +2206,14 @@ private struct NeuralEngineSectionContent: View {
                 Toggle("", isOn: opts.aneAudio).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }
         }
+        if let m = meta["aneSlots"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneSlots)) {
+                Stepper(value: opts.aneSlots, in: 1...4) {
+                    Text("\(appState.serverOptions.aneSlots)")
+                        .font(.app(.body).monospacedDigit())
+                }
+            }
+        }
     }
 }
 
