@@ -292,15 +292,16 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     var vector_eps: f32 = 0.0001;
     var logit_scale: f32 = 8;
     if (lilicorr) {
-        candidate_topk = try contractFirstU32(contract, &.{ "lilicorr_candidate_topk", "candidate_topk" });
-        lilicorr_hidden = try lilicorrHiddenSize(contract);
-        lilicorr_layers = try contractFirstU32(contract, &.{ "lilicorr_num_layers", "num_layers", "layers" });
-        lilicorr_heads = try contractFirstU32(contract, &.{ "lilicorr_num_heads", "num_heads", "heads" });
-        factor_dim = try contractFirstU32(contract, &.{ "lilicorr_factor_dim", "factor_dim", "factor" });
-        vector_eps = try contractFirstFloat(contract, &.{ "lilicorr_vector_eps", "vector_eps" });
-        logit_scale = try contractFirstFloat(contract, &.{ "lilicorr_logit_scale", "logit_scale" });
-        if (candidate_topk < 2 or lilicorr_hidden == 0 or lilicorr_layers == 0 or lilicorr_heads == 0 or factor_dim == 0) return error.InvalidDflashConfigValue;
-        if (lilicorr_hidden % lilicorr_heads != 0) return error.InvalidDflashConfigValue;
+        candidate_topk = try jsonU32(contract.get("lilicorr_candidate_topk") orelse return error.IncompleteDflashConfig);
+        lilicorr_hidden = try jsonU32(contract.get("lilicorr_hidden_size") orelse return error.IncompleteDflashConfig);
+        lilicorr_layers = try jsonU32(contract.get("lilicorr_num_layers") orelse return error.IncompleteDflashConfig);
+        lilicorr_heads = try jsonU32(contract.get("lilicorr_num_heads") orelse return error.IncompleteDflashConfig);
+        factor_dim = try jsonU32(contract.get("lilicorr_factor_dim") orelse return error.IncompleteDflashConfig);
+        vector_eps = try contractFloat(contract, "lilicorr_vector_eps");
+        logit_scale = try contractFloat(contract, "lilicorr_logit_scale");
+        if (candidate_topk == 0 or lilicorr_hidden == 0 or lilicorr_layers == 0 or lilicorr_heads == 0 or factor_dim == 0) return error.InvalidDflashConfigValue;
+        if (candidate_topk > 64 or lilicorr_hidden % lilicorr_heads != 0) return error.InvalidDflashConfigValue;
+        if (!std.math.isFinite(vector_eps) or vector_eps <= 0 or vector_eps >= 0.5 or !std.math.isFinite(logit_scale) or logit_scale <= 0) return error.InvalidDflashConfigValue;
     }
 
     // DSpark export markers. `markov_rank` is the load-bearing one (the head
@@ -477,27 +478,10 @@ fn jsonFloat(v: std.json.Value) f32 {
     };
 }
 
-fn contractFirstU32(contract: Contract, keys: []const []const u8) !u32 {
-    for (keys) |k| if (contract.get(k)) |v| return jsonU32(v);
-    return error.IncompleteDflashConfig;
-}
-
-fn contractFirstFloat(contract: Contract, keys: []const []const u8) !f32 {
-    for (keys) |k| if (contract.get(k)) |v| {
-        if (v != .float and v != .integer) return error.InvalidDflashConfigValue;
-        return jsonFloat(v);
-    };
-    return error.IncompleteDflashConfig;
-}
-
-/// Head width. Nested `hidden_size` only — the root value is the trunk width.
-fn lilicorrHiddenSize(contract: Contract) !u32 {
-    if (contract.get("lilicorr_hidden_size")) |v| return jsonU32(v);
-    if (contract.nested) |n| {
-        if (n.get("hidden_size")) |v| return jsonU32(v);
-        if (n.get("hidden")) |v| return jsonU32(v);
-    }
-    return error.IncompleteDflashConfig;
+fn contractFloat(contract: Contract, key: []const u8) !f32 {
+    const v = contract.get(key) orelse return error.IncompleteDflashConfig;
+    if (v != .float and v != .integer) return error.InvalidDflashConfigValue;
+    return jsonFloat(v);
 }
 
 /// Every `target_layer_ids` entry must name an existing trunk layer — the
@@ -1910,7 +1894,6 @@ fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !m
 
 // ── DFlash2 path selector (forward + host trace) ──
 
-
 pub const SelectedPath = struct {
     ids: []u32, // [m] chosen draft token ids
     chosen_idx: []u32, // [m] index of the choice within its candidate row
@@ -2246,7 +2229,6 @@ pub fn lattice(
         lat.e = try allocator.dupe(f32, e_data[0 .. (m - 1) * k * k]);
     }
     return lat;
-
 }
 
 /// A best-first draft tree over the lattice: node values are path sums of
@@ -2795,28 +2777,39 @@ const GEMMA_ASSISTANT_CONFIG_JSON =
 ;
 
 test "dflash: a LiLiCorr contract parses and shifts capture ids to layer outputs" {
-    const json =
-        \\{"architectures":["LiLiCorrDraftModel"],"model_type":"qwen3",
-        \\ "hidden_size":4096,"num_hidden_layers":2,"num_attention_heads":32,"num_key_value_heads":2,
-        \\ "head_dim":128,"intermediate_size":12288,"rms_norm_eps":1e-6,"sliding_window":1024,
-        \\ "layer_types":["sliding_attention","sliding_attention"],"block_size":8,
-        \\ "attention_sink_bias":true,
-        \\ "dflash_config":{"mask_token_id":990,"target_layer_ids":[1,18],"projector_type":"lilicorr",
-        \\  "candidate_topk":8,"hidden":1024,"layers":2,"heads":8,"factor":1024,
-        \\  "vector_eps":0.0001,"logit_scale":8.0,"conv_kernel_size":2,"conv_group_size":16,
-        \\  "attention_sink_bias":true}}
-    ;
+    const json = @embedFile("fixtures/lilicorr_config.json");
     const allocator = testing.allocator;
     var cfg = try parseConfigFromJson(allocator, json);
     defer cfg.deinit(allocator);
     try testing.expect(cfg.lilicorr);
-    try testing.expectEqualSlices(u32, &[_]u32{ 0, 17 }, cfg.captureIds());
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 17, 34, 50, 67, 84 }, cfg.captureIds());
     try testing.expectEqual(@as(u32, 8), cfg.candidate_topk);
     try testing.expectEqual(@as(u32, 1024), cfg.lilicorr_hidden);
     try testing.expectEqual(@as(u32, 2), cfg.lilicorr_layers);
     try testing.expectEqual(@as(u32, 8), cfg.lilicorr_heads);
+    try testing.expectEqual(@as(u32, 1024), cfg.factor_dim);
+    try testing.expectApproxEqAbs(@as(f32, 0.0001), cfg.vector_eps, 1e-9);
+    try testing.expectEqual(@as(f32, 8), cfg.logit_scale);
     try testing.expect(cfg.has_attn_sinks);
     try testing.expect(cfg.isDflash2());
+}
+
+test "dflash: LiLiCorr rejects undeclared head-key aliases" {
+    const json = @embedFile("fixtures/lilicorr_config.json");
+    const allocator = testing.allocator;
+    for ([_][2][]const u8{
+        .{ "lilicorr_candidate_topk", "candidate_topk" },
+        .{ "lilicorr_hidden_size", "hidden" },
+        .{ "lilicorr_num_layers", "layers" },
+        .{ "lilicorr_num_heads", "heads" },
+        .{ "lilicorr_factor_dim", "factor" },
+        .{ "lilicorr_vector_eps", "vector_eps" },
+        .{ "lilicorr_logit_scale", "logit_scale" },
+    }) |keys| {
+        const guessed = try std.mem.replaceOwned(u8, allocator, json, keys[0], keys[1]);
+        defer allocator.free(guessed);
+        try testing.expectError(error.IncompleteDflashConfig, parseConfigFromJson(allocator, guessed));
+    }
 }
 
 test "dflash: muse assistant config parses with the full DFlash contract" {

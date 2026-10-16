@@ -7051,6 +7051,12 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses");
 }
 
+fn loadedSupportsVideo(entry: *const LoadedModel, config: *const model_mod.ModelConfig) bool {
+    const ve = entry.vision_encoder orelse return false;
+    if (ve.radio) |radio| return radio.video_w.ctx != null;
+    return ve.supportsImages() and config.video_token_id != 0;
+}
+
 /// pulls full capabilities/dimensions off the resident config/chat_config;
 /// for non-ready entries renders a lightweight stub with state +
 /// bytes_on_disk only. Returns an allocator-owned string; caller frees.
@@ -7105,7 +7111,7 @@ fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
-        if (has_vision and (config.video_token_id != 0 or config.radio_vision)) try mods.appendSlice(allocator, ",\"video\"");
+        if (loadedSupportsVideo(entry, config)) try mods.appendSlice(allocator, ",\"video\"");
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
@@ -13987,24 +13993,60 @@ test "every continuation surface consults continuationRejectReason before render
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
-test "every input_modalities gate that advertises image beside a video-capable model also advertises video" {
-    // Video piggybacks the SAME "does this model take image input?" signal —
-    // Qwen3-VL-family checkpoints declare `video_token_id` alongside
-    // `vision_config`/`vision_encoder` — so a future edit to either the READY
-    // (live config) or STUB (unloaded, config.json-only) input_modalities
-    // builder that touches the image gate but forgets video would silently
-    // under-report every video-capable model to the app forever (the attach
-    // menu's video option reads exactly this field). Two independent checks:
-    // the two sites read DIFFERENT underlying signals (config.video_token_id
-    // vs StubMeta.has_video) and must each carry their own gate.
-    const src = @embedFile("server.zig");
-
-    const ready_anchor = "if (has_vision) try mods.appendSlice(allocator, ";
-    const ready_at = std.mem.indexOf(u8, src, ready_anchor) orelse return error.ReadyImageGateMissing;
-    const ready_window = src[ready_at .. ready_at + 260];
-    try std.testing.expect(std.mem.indexOf(u8, ready_window, "video_token_id") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, src, "sm.found and sm.has_vision and sm.has_video") != null);
+test "input_modalities renders resident video weights and native unloaded capabilities" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const native = "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\",\"num_attention_heads\":16},\"llm_config\":{\"model_type\":\"nemotron_h_puzzle\"}}";
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = native });
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("video", path, 0);
+    defer {
+        entry.config = null;
+        entry.chat_config = null;
+        entry.vision_encoder = null;
+        entry.state = .unloaded;
+    }
+    var qwen_config = model_mod.ModelConfig{ .qwen_vision = true, .video_token_id = 7 };
+    var radio_config = try model_mod.parseConfigFromJson(a, native);
+    defer radio_config.deinit(a);
+    var chat_config = chat_mod.ChatConfig{
+        .chat_template = "template", .bos_token = null, .eos_token = null,
+        .add_bos_token = false, .allocator = a,
+    };
+    var encoder = std.mem.zeroInit(vision_mod.VisionEncoder, .{ .allocator = a, .config = qwen_config });
+    var radio = std.mem.zeroInit(radio_vision.RadioVision, .{ .allocator = a });
+    const video_weight = mlx.mlx_array_new_float(1);
+    defer _ = mlx.mlx_array_free(video_weight);
+    entry.config = &qwen_config;
+    entry.chat_config = &chat_config;
+    entry.vision_encoder = &encoder;
+    entry.state = .ready;
+    const expect_modalities = struct {
+        fn check(alloc: std.mem.Allocator, runtime_io: std.Io, model: *LoadedModel, want: []const []const u8) !void {
+            const json = try renderModelEntry(alloc, runtime_io, model);
+            defer alloc.free(json);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            const modalities = parsed.value.object.get("input_modalities").?.array.items;
+            try testing.expectEqual(want.len, modalities.len);
+            for (want, modalities) |expected, actual| try testing.expectEqualStrings(expected, actual.string);
+        }
+    }.check;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
+    entry.config = &radio_config;
+    encoder.config = radio_config;
+    radio.video_w = video_weight;
+    encoder.radio = radio;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
+    encoder.radio.?.video_w = .{ .ctx = null };
+    try expect_modalities(a, io, entry, &.{ "text", "image" });
+    entry.state = .unloaded;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
 }
 
 test "routeExists answers endpoint existence without consulting the model" {
@@ -14918,8 +14960,7 @@ fn collectMediaItems(allocator: std.mem.Allocator, messages: []const chat_mod.Me
 
 const MediaTokens = struct {
     config: *const model_mod.ModelConfig,
-    /// `<img>`. RADIO rewrites the template's `<video>` to this before tokenize,
-    /// so one sentinel stands for the clip. It must not be the image token.
+    /// `<img>`, emitted for each RADIO video part. Distinct from the image token.
     video_sentinel: u32 = 0,
     /// `</img>`, closing each tubelet's kept `<image>` run.
     img_end: u32 = 0,
@@ -15381,9 +15422,10 @@ fn radioMediaTokens(lm: *LoadedModel, config: *const model_mod.ModelConfig) Medi
 /// `prepareMultimodalPrompt` for items a caller already put in placeholder order.
 fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
     if (items.len == 0) return .{};
-    const mt = radioMediaTokens(lm, config);
     var videos: usize = 0;
     for (items) |it| videos += @intFromBool(it == .video);
+    if (videos > 0 and !loadedSupportsVideo(lm, config)) return error.VideoUnsupported;
+    const mt = radioMediaTokens(lm, config);
     if (config.radio_vision and videos > 0 and (mt.video_sentinel == 0 or mt.img_end == 0 or mt.video_sentinel == config.image_token_id)) {
         log.warn("  media: RADIO video needs distinct <img> and </img> special tokens\n", .{});
         return error.MediaPlaceholderMismatch;
@@ -15438,6 +15480,7 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config
 
 /// The error response for a failed `prepareMultimodalPrompt`.
 fn multimodalFailure(err: anyerror) struct { status: []const u8, code: u16, kind: []const u8, message: []const u8 } {
+    if (err == error.VideoUnsupported) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "video input is not supported by this model's loaded vision tower" };
     if (err == error.MediaPlaceholderMismatch) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = MEDIA_PLACEHOLDER_REJECT };
     return .{ .status = "500 Internal Server Error", .code = 500, .kind = "server_error", .message = "media encoding failed" };
 }
@@ -22450,6 +22493,50 @@ const ByteTokenizer = struct {
         return out;
     }
 };
+
+test "RADIO video availability follows loaded embedder weights" {
+    var radio: radio_vision.RadioVision = undefined;
+    radio.video_w = .{ .ctx = null };
+    var encoder: vision_mod.VisionEncoder = undefined;
+    encoder.radio = radio;
+    encoder.qwen_audio = null;
+    var entry: LoadedModel = undefined;
+    entry.vision_encoder = &encoder;
+    var config = model_mod.ModelConfig{ .radio_vision = true };
+    try testing.expect(encoder.supportsImages());
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+    encoder.radio.?.video_w.ctx = @ptrCast(&radio);
+    try testing.expect(loadedSupportsVideo(&entry, &config));
+    encoder.radio = null;
+    config.radio_vision = false;
+    config.video_token_id = 7;
+    try testing.expect(loadedSupportsVideo(&entry, &config));
+    config.video_token_id = 0;
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+    entry.vision_encoder = null;
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+}
+
+test "RADIO video availability rejects a forced clip before encoding with a named 400" {
+    const a = testing.allocator;
+    var radio: radio_vision.RadioVision = undefined;
+    radio.video_w = .{ .ctx = null };
+    var encoder: vision_mod.VisionEncoder = undefined;
+    encoder.radio = radio;
+    encoder.qwen_audio = null;
+    var entry: LoadedModel = undefined;
+    entry.vision_encoder = &encoder;
+    entry.tokenizer = null;
+    const config = model_mod.ModelConfig{ .radio_vision = true, .image_token_id = 18 };
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 64, .grid_w = 64 };
+    const items = [_]MediaItem{.{ .video = &clip }};
+    var ids = try a.dupe(u32, &.{19});
+    defer a.free(ids);
+    try testing.expectError(error.VideoUnsupported, prepareMultimodalItems(a, &entry, &config, &items, &ids));
+    const failure = multimodalFailure(error.VideoUnsupported);
+    try testing.expectEqual(@as(u16, 400), failure.code);
+    try testing.expect(std.mem.indexOf(u8, failure.message, "video") != null);
+}
 
 test "radio prompt: a video sentinel expands into labeled tubelets and the keep mask" {
     const a = testing.allocator;

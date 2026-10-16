@@ -5651,7 +5651,7 @@ fn applyRadioVideoEvs(req: *VisionEncodeRequest, vision_enc: *VisionEncoder, com
     for (req.items) |item| videos += @intFromBool(item == .video);
     if (videos == 0) return;
 
-    const rate: f32 = if (req.model.config) |c| c.video_pruning_rate else radio_vision.VIDEO_PRUNING_RATE;
+    const rate: f64 = if (req.model.config) |c| c.video_pruning_rate else model_mod.RADIO_VIDEO_PRUNING_RATE_DEFAULT;
     const keeps = try req.allocator.alloc(?[]bool, req.items.len);
     errdefer req.allocator.free(keeps);
     @memset(keeps, null);

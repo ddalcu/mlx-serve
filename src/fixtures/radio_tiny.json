@@ -1,0 +1,32 @@
+{
+  "source": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16",
+  "dtype": "float32",
+  "clip_sha256": "12013b61f613da3a84fc16a16d4527ad5b582a2bf77351014daaa931c3b92c61",
+  "files_sha256": {
+    "configuration_radio.py": "b0f1ea1d8136272635bc8d6eeba0564542a4e48474ae98b2d8ed74b0fc5d20ce",
+    "modeling_radio.py": "ceec4c1ecd2a2649a79e74b16a2ea4af60e6cd11fbecebbd681c33fb1fccb943",
+    "modeling_nemotron_h_omni.py": "5a1f40fea6a8fb0361c9da6510ed3de51c303046b82954258e92884cf9882fbf",
+    "image_processing_nemotron_h_omni.py": "0344e8432097e0718672d6529c68fd6095c36bea176500f131d203d1c7d497e0"
+  },
+  "versions": {
+    "torch": "2.10.0",
+    "transformers": "5.8.1",
+    "numpy": "2.5.4",
+    "safetensors": "0.8.0",
+    "PIL": "12.3.0"
+  },
+  "geometry": {
+    "hidden_size": 8,
+    "heads": 2,
+    "layers": 2,
+    "patch": 16,
+    "temporal_patch": 2,
+    "image_grid": [
+      2,
+      4
+    ],
+    "real_video_frames": 5,
+    "projector_hidden": 16,
+    "output_hidden": 6
+  }
+}

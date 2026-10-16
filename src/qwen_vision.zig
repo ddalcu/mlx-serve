@@ -260,6 +260,54 @@ pub fn resampleWeightMatrix(
     }
 }
 
+/// Torch's antialiased bicubic resize keeps both passes in float32, including
+/// overshoot outside [0,255]. RADIO normalizes this result without a u8 boundary.
+pub fn resizeRgbBicubicFloatChw(
+    allocator: std.mem.Allocator,
+    dst: []f32,
+    rgb: []const u8,
+    source_h: u32,
+    source_w: u32,
+    target_h: u32,
+    target_w: u32,
+) !void {
+    if (source_h == 0 or source_w == 0 or target_h == 0 or target_w == 0) return error.InvalidImageDimensions;
+    const plane: usize = @as(usize, target_h) * target_w;
+    if (rgb.len != @as(usize, source_h) * source_w * 3 or dst.len != plane * 3) return error.InvalidImageBuffer;
+    const intermediate = try allocator.alloc(f32, @as(usize, source_h) * target_w * 3);
+    defer allocator.free(intermediate);
+    const horizontal = AxisGeometry.init(source_w, target_w, .bicubic);
+    const vertical = AxisGeometry.init(source_h, target_h, .bicubic);
+    const taps = try allocator.alloc(f64, @max(horizontal.kernelSize(), vertical.kernelSize()));
+    defer allocator.free(taps);
+    for (0..target_w) |x| {
+        const win = try horizontal.window(x, source_w);
+        try horizontal.taps(taps[0..win.count], win.start, win.center, .bicubic);
+        for (0..source_h) |y| {
+            inline for (0..3) |c| {
+                var sum: f32 = 0;
+                for (taps[0..win.count], 0..) |weight, k| {
+                    sum += @as(f32, @floatFromInt(rgb[(y * source_w + win.start + k) * 3 + c])) * @as(f32, @floatCast(weight));
+                }
+                intermediate[(y * target_w + x) * 3 + c] = sum;
+            }
+        }
+    }
+    for (0..target_h) |y| {
+        const win = try vertical.window(y, source_h);
+        try vertical.taps(taps[0..win.count], win.start, win.center, .bicubic);
+        for (0..target_w) |x| {
+            inline for (0..3) |c| {
+                var sum: f32 = 0;
+                for (taps[0..win.count], 0..) |weight, k| {
+                    sum += intermediate[((win.start + k) * target_w + x) * 3 + c] * @as(f32, @floatCast(weight));
+                }
+                dst[c * plane + y * target_w + x] = sum;
+            }
+        }
+    }
+}
+
 fn clipFixedResample(value: i64) u8 {
     const rounded = @divFloor(value, @as(i64, 1) << RESAMPLE_PRECISION_BITS);
     return @intCast(std.math.clamp(rounded, 0, 255));

@@ -26,6 +26,9 @@ pub const MAX_VISION_LAYERS = 64;
 /// `MuseGlimmerImageProcessor.max_image_tokens` — MERGED tokens, not pixels.
 pub const MUSE_MAX_IMAGE_TOKENS = 4096;
 
+/// Default fraction of RADIO video tokens removed by EVS.
+pub const RADIO_VIDEO_PRUNING_RATE_DEFAULT: f64 = 0.7;
+
 pub const QuantMode = enum {
     affine,
     nvfp4,
@@ -651,13 +654,12 @@ pub const ModelConfig = struct {
     // uses INTERLEAVED M-RoPE (image tokens get 2D grid positions). Populated in
     // the qwen3_5 arm below. Encoder: src/qwen_vision.zig; M-RoPE: src/mrope.zig.
     qwen_vision: bool = false,
-    /// Nemotron 3.5 Bolt RADIO tower. Set only when the checkpoint actually
-    /// ships `vision_model.radio_model.*` and `mlp1.*`. A bare vision_config
-    /// must not arm this: the generic vision path would load SigLIP instead.
+    /// Nemotron RADIO tower, selected by `vision_config.model_type`.
     radio_vision: bool = false,
+    radio_num_heads: u32 = 0,
     /// RADIO video EVS drop fraction. 0 keeps every tubelet token. The Bolt
     /// checkpoint uses 0.7; other models leave this at 0.
-    video_pruning_rate: f32 = 0,
+    video_pruning_rate: f64 = 0,
     qv_depth: u32 = 0, // ViT transformer blocks
     qv_hidden: u32 = 0, // ViT hidden size
     qv_heads: u32 = 0, // ViT attention heads
@@ -4250,24 +4252,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // keys every kernel and weight prefix on "nemotron_h".
         config.model_type = "nemotron_h";
         config.weight_prefix = "backbone";
-        // The omni wrapper's vision_config is a RADIO tower. The generic
-        // vision block above would arm SigLIP. Vision turns on only when the
-        // serving config sets radio_vision, which loads src/radio_vision.zig.
-        if (jsonField(root, "radio_vision")) |v| {
-            if (v == .bool) config.radio_vision = v.bool;
-        }
+        config.radio_vision = model_discovery.hasRadioVision(root);
         config.has_vision = config.radio_vision;
         if (config.radio_vision) {
-            // Same default as radio_vision.VIDEO_PRUNING_RATE. model.zig cannot
-            // import that module: the tower already imports ModelConfig.
-            config.video_pruning_rate = 0.7;
+            const vc = jsonField(root, "vision_config").?.object;
+            if (jsonField(vc, "num_attention_heads")) |v| config.radio_num_heads = try jsonU32(v);
+            config.video_pruning_rate = RADIO_VIDEO_PRUNING_RATE_DEFAULT;
             if (jsonField(root, "video_pruning_rate")) |v| {
-                config.video_pruning_rate = try jsonFloat(v);
-            } else if (jsonField(root, "vision_config")) |vc| {
-                if (vc == .object) {
-                    if (vc.object.get("video_pruning_rate")) |v| config.video_pruning_rate = try jsonFloat(v);
-                }
+                config.video_pruning_rate = try jsonFloat64(v);
+            } else if (jsonField(vc, "video_pruning_rate")) |v| {
+                config.video_pruning_rate = try jsonFloat64(v);
             }
+            if (config.video_pruning_rate < 0 or config.video_pruning_rate > 1) return error.InvalidConfigField;
         }
         config.hidden_act = .silu;
         config.mamba_mlp_act = .relu_sq;
@@ -4331,17 +4327,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // config.json may have time_step_min/time_step_max fields but Python ignores them
         // for SSM clipping — only time_step_limit (a 2-element array) is used.
         if (jsonField(cfg_obj, "time_step_limit")) |v| {
-            if (v == .array) {
-                const items = v.array.items;
-                if (items.len >= 2) {
-                    config.time_step_min = try jsonFloat(items[0]);
-                    // HF writes +inf as {"__float__": "Infinity"}, which is not a JSON number.
-                    config.time_step_max = switch (items[1]) {
-                        .object, .string => std.math.inf(f32),
-                        else => try jsonFloat(items[1]),
-                    };
-                }
-            }
+            if (v != .array or v.array.items.len != 2) return error.InvalidConfigField;
+            const items = v.array.items;
+            config.time_step_min = try jsonSsmBound(items[0], false);
+            config.time_step_max = try jsonSsmBound(items[1], true);
+            if (config.time_step_min < 0 or config.time_step_max < config.time_step_min) return error.InvalidConfigField;
         }
         if (jsonField(cfg_obj, "chunk_size")) |v| config.mamba_chunk_size = switch (v) {
             .integer => |i| std.math.cast(u32, i) orelse return error.InvalidConfigField,
@@ -4698,6 +4688,32 @@ fn parseLlama3Rope(cfg_obj: std.json.ObjectMap) !?Llama3Rope {
     if (jsonField(rs.object, "original_max_position_embeddings")) |v| r.original_max_position_embeddings = try jsonFloat(v);
     if (r.factor <= 0 or r.high_freq_factor <= r.low_freq_factor) return error.InvalidConfigField;
     return r;
+}
+
+fn jsonSsmBound(v: std.json.Value, allow_infinity: bool) !f32 {
+    switch (v) {
+        .integer, .float => return jsonFloat(v),
+        .string => |name| if (allow_infinity and std.mem.eql(u8, name, "Infinity")) return std.math.inf(f32),
+        .object => |obj| {
+            if (allow_infinity and obj.count() == 1) {
+                if (obj.get("__float__")) |value| {
+                    if (value == .string and std.mem.eql(u8, value.string, "Infinity")) return std.math.inf(f32);
+                }
+            }
+        },
+        else => {},
+    }
+    return error.InvalidConfigField;
+}
+
+fn jsonFloat64(v: std.json.Value) !f64 {
+    const value: f64 = switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => return error.InvalidConfigField,
+    };
+    if (!std.math.isFinite(value)) return error.InvalidConfigField;
+    return value;
 }
 
 fn jsonFloat(v: std.json.Value) !f32 {
@@ -9264,7 +9280,7 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
     const omni =
         \\{
         \\  "model_type": "nemotron_h_omni",
-        \\  "vision_config": {"model_type": "radio", "hidden_size": 1280},
+        \\  "vision_config": {"model_type": "radio", "hidden_size": 1280, "num_attention_heads": 16},
         \\  "llm_config": {
         \\    "model_type": "nemotron_h_puzzle",
         \\    "hidden_size": 4096,
@@ -9301,9 +9317,9 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
     try testing.expectEqual(LayerBlockType.moe, bolt.layer_block_types[1]);
     try testing.expectEqual(LayerBlockType.attention, bolt.layer_block_types[2]);
     try testing.expectEqualStrings("backbone", bolt.weight_prefix);
-    try testing.expect(!bolt.has_vision);
-    try testing.expect(!bolt.radio_vision);
-    try testing.expectEqual(@as(f32, 0), bolt.video_pruning_rate);
+    try testing.expect(bolt.has_vision and bolt.radio_vision);
+    try testing.expectEqual(@as(u32, 16), bolt.radio_num_heads);
+    try testing.expectEqual(@as(f64, 0.7), bolt.video_pruning_rate);
 
     const flagged =
         \\{
@@ -9315,18 +9331,43 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
         \\}
     ;
     const radio = try parseConfigFromJson(testing.allocator, flagged);
-    try testing.expect(radio.radio_vision and radio.has_vision);
+    try testing.expect(!radio.radio_vision and !radio.has_vision);
     try testing.expectEqual(@as(u32, 18), radio.image_token_id);
-    try testing.expectEqual(@as(f32, 0.7), radio.video_pruning_rate);
+    try testing.expectEqual(@as(f64, 0), radio.video_pruning_rate);
 
     const rated =
         \\{"model_type":"nemotron_h","hidden_size":4096,"num_hidden_layers":2,
         \\"num_attention_heads":32,"num_key_value_heads":2,"head_dim":128,
         \\"vocab_size":131072,"layers_block_type":["mamba","moe"],
-        \\"radio_vision":true,"video_pruning_rate":0.5}
+        \\"vision_config":{"model_type":"radio","num_attention_heads":8,"video_pruning_rate":0.5}}
     ;
     const custom = try parseConfigFromJson(testing.allocator, rated);
-    try testing.expectEqual(@as(f32, 0.5), custom.video_pruning_rate);
+    try testing.expectEqual(@as(f64, 0.5), custom.video_pruning_rate);
+    try testing.expectEqual(@as(u32, 8), custom.radio_num_heads);
+}
+
+test "nemotron_h: RADIO pruning preserves checkpoint decimal precision" {
+    inline for (.{ "0.1", "0.3" }) |rate| {
+        const root_rate = try parseConfigFromJson(testing.allocator, "{\"model_type\":\"nemotron_h\",\"vision_config\":{\"model_type\":\"radio\"},\"video_pruning_rate\":" ++ rate ++ "}");
+        const nested_rate = try parseConfigFromJson(testing.allocator, "{\"model_type\":\"nemotron_h\",\"vision_config\":{\"model_type\":\"radio\",\"video_pruning_rate\":" ++ rate ++ "}}");
+        const expected = try std.fmt.parseFloat(f64, rate);
+        try testing.expectEqual(expected, @as(f64, root_rate.video_pruning_rate));
+        try testing.expectEqual(expected, @as(f64, nested_rate.video_pruning_rate));
+    }
+}
+
+test "nemotron_h: time_step_limit accepts only numeric bounds and positive infinity" {
+    const prefix = "{\"model_type\":\"nemotron_h\",\"time_step_limit\":[0,";
+    inline for (.{ "{\"__float__\":\"Infinity\"}", "\"Infinity\"" }) |bound| {
+        const cfg = try parseConfigFromJson(testing.allocator, prefix ++ bound ++ "]}");
+        try testing.expectEqual(std.math.inf(f32), cfg.time_step_max);
+    }
+    const finite = try parseConfigFromJson(testing.allocator, prefix ++ "0.125]}");
+    try testing.expectEqual(@as(f32, 0.125), finite.time_step_max);
+    inline for (.{ "{\"__float__\":\"-Infinity\"}", "{\"__float__\":\"NaN\"}", "{\"other\":\"Infinity\"}", "\"NaN\"", "\"-Infinity\"", "{}", "null", "true" }) |bound| {
+        try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, prefix ++ bound ++ "]}"));
+    }
+    try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, "{\"model_type\":\"nemotron_h\",\"time_step_limit\":[0.5,0.25]}"));
 }
 
 test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {

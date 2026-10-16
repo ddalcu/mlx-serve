@@ -2,6 +2,12 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### RADIO configuration and numerics must follow the checkpoint
+
+A private `radio_vision` switch left native omni conversions text-only despite `vision_config.model_type: "radio"`. Loader and discovery now share the native metadata predicate; discovery reads `llm_config` and infers omitted depth from its block list. Loaded video capability also requires an actual video embedder. Fixed heads and duplicated EVS defaults were replaced with checkpoint geometry and one model default. Float64 pruning rates avoid dropping an extra token at 0.1 or 0.3. Strict SSM bound parsing rejects malformed infinity sentinels. Guards: native RADIO/config unit tests, the format corpus, and loaded-video capability tests.
+
+The official image processor uses float32 antialiased bicubic resize; PIL's intermediate uint8 rounding/clamping changed normalized pixels. CPE also interpolates in float32 with clamped boundaries. LiLiCorr uses a clamped L2 norm rather than adding epsilon under the square root, and typed scalars preserve bf16 activations. Executed NVIDIA fp32 fixtures pin these operations and the complete RADIO/LiLiCorr forwards; cosine checks include RMS ratio so scale errors cannot pass.
+
 ### Metaspace `prepend_scheme: "first"` read as "always" (Mistral v0.3)
 The laya port added HF `Metaspace` support and treated every scheme except `never` as `always`, so Mistral's SentencePiece tokenizer got a ▁ after every special token (`[INST]Use` -> `▁Use`; HF gives `Use`). HF's `first` only prepends to text at original offset 0, and `always` does it per segment after added-token extraction.
 - Found by the smoke matrix: every Mistral cell's prompt grew 11 tokens. Part of that was CORRECT: 26.9.5 dropped every `\n` on byte-fallback tokenizers (no `<0x0A>`), which the same port fixed.

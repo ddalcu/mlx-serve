@@ -27582,7 +27582,7 @@ pub const Transformer = struct {
                 };
                 fused_out = try add_norm.moeCombineAddNorm(h, parts.y_tkh, parts.scores, shared, next_norm_w.?, eps_arr, self.s);
                 if (fused_out == null) {
-                    const op_out = try nemotronMoeCombine(normed, &parts, &lw.op.nemotron_moe, cfg, self.s, true);
+                    const op_out = try nemotronMoeCombine(normed, &parts, &lw.op.nemotron_moe, cfg, self.s, normed);
                     defer _ = mlx.mlx_array_free(op_out);
                     var h_new = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_add(&h_new, h, op_out, self.s));
@@ -36076,7 +36076,7 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
     };
 }
 
-fn reluSquaredOp(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn reluSquaredOp(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const zero = bf16Scalar(0.0, s);
     defer _ = mlx.mlx_array_free(zero);
     var relu = mlx.mlx_array_new();
@@ -36210,18 +36210,9 @@ fn nemotronMoeExpertsRouted(x: mlx.mlx_array, route_x: mlx.mlx_array, nm: *const
     defer _ = mlx.mlx_array_free(x_flat);
     try mlx.check(mlx.mlx_reshape(&x_flat, x, &[_]c_int{ t_count, d_dim }, 2, s));
 
-    var route_flat = x_flat;
-    var route_owned = false;
-    if (route_x.ctx != x.ctx) {
-        const route_dim = mlx.getShape(route_x)[2];
-        var rf = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&rf, route_x, &[_]c_int{ t_count, route_dim }, 2, s));
-        route_flat = rf;
-        route_owned = true;
-    }
-    defer if (route_owned) {
-        _ = mlx.mlx_array_free(route_flat);
-    };
+    var route_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(route_flat);
+    try mlx.check(mlx.mlx_reshape(&route_flat, route_x, &[_]c_int{ t_count, mlx.getShape(route_x)[2] }, 2, s));
 
     const row_logits = if (cfg.rowExactDecode() and nm.router_rows.ctx != null) try rowqmv.router(route_flat, nm.router_rows, s) else null;
     const logits = row_logits orelse try projectWithConfig(cfg, route_flat, nm.router_w, nm.router_s, nm.router_b, s);
@@ -36335,7 +36326,7 @@ pub fn nemotronMoe(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const 
     }
     const parts = try nemotronMoeExperts(x, nm, cfg, moeStreamPadPays(nm), s);
     defer parts.deinit();
-    return nemotronMoeCombine(x, &parts, nm, cfg, s, true);
+    return nemotronMoeCombine(x, &parts, nm, cfg, s, x);
 }
 
 /// Puzzle MoE: route on the full hidden state, run experts in the latent,
@@ -36359,26 +36350,7 @@ fn nemotronMoeLatent(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *cons
 
     const parts = try nemotronMoeExpertsRouted(x_lat, x, nm, cfg, moeStreamPadPays(nm), s);
     defer parts.deinit();
-    const y_lat = try nemotronMoeCombine(x_lat, &parts, nm, cfg, s, false);
-    defer _ = mlx.mlx_array_free(y_lat);
-    var y_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(y_flat);
-    try mlx.check(mlx.mlx_reshape(&y_flat, y_lat, &[_]c_int{ t_count, lat_dim }, 2, s));
-    const y_h = try projectWithConfig(cfg, y_flat, nm.fc2_latent_w, nm.fc2_latent_s, nm.fc2_latent_b, s);
-    defer _ = mlx.mlx_array_free(y_h);
-
-    var combined = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(combined);
-    if (try nemotronSharedExpert(x, nm, cfg, s)) |shared| {
-        defer _ = mlx.mlx_array_free(shared);
-        try mlx.check(mlx.mlx_add(&combined, y_h, shared, s));
-    } else {
-        try mlx.check(mlx.mlx_array_set(&combined, y_h));
-    }
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_reshape(&out, combined, &[_]c_int{ batch, seq, hidden }, 3, s));
-    return out;
+    return nemotronMoeCombine(x_lat, &parts, nm, cfg, s, x);
 }
 
 /// The shared expert (ReLU^2, ungated) over x [B, S, hidden] → [B*S, hidden];
@@ -36401,11 +36373,10 @@ fn nemotronSharedExpert(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *c
 
 /// Reference: (y * scores[..., None]).sum(-2).astype(y.dtype) with f32
 /// scores (product and sum in f32), plus the shared expert.
-fn nemotronMoeCombine(x: mlx.mlx_array, parts: *const NemotronMoeParts, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream, with_shared: bool) !mlx.mlx_array {
+fn nemotronMoeCombine(x: mlx.mlx_array, parts: *const NemotronMoeParts, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream, shared_x: ?mlx.mlx_array) !mlx.mlx_array {
     const x_shape = mlx.getShape(x);
     const batch = x_shape[0];
     const seq = x_shape[1];
-    const d_dim = x_shape[2];
 
     var sc_exp = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc_exp);
@@ -36419,22 +36390,24 @@ fn nemotronMoeCombine(x: mlx.mlx_array, parts: *const NemotronMoeParts, nm: *con
     var routed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(routed);
     try mlx.check(mlx.mlx_astype(&routed, summed, mlx.mlx_array_dtype(parts.y_tkh), s));
+    if (nm.fc2_latent_w.ctx != null) {
+        const projected = try projectWithConfig(cfg, routed, nm.fc2_latent_w, nm.fc2_latent_s, nm.fc2_latent_b, s);
+        _ = mlx.mlx_array_free(routed);
+        routed = projected;
+    }
 
     var combined = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(combined);
-    if (with_shared) {
-        if (try nemotronSharedExpert(x, nm, cfg, s)) |shared| {
-            defer _ = mlx.mlx_array_free(shared);
-            try mlx.check(mlx.mlx_add(&combined, routed, shared, s));
-        } else {
-            try mlx.check(mlx.mlx_array_set(&combined, routed));
-        }
+    const shared = if (shared_x) |input| try nemotronSharedExpert(input, nm, cfg, s) else null;
+    if (shared) |value| {
+        defer _ = mlx.mlx_array_free(value);
+        try mlx.check(mlx.mlx_add(&combined, routed, value, s));
     } else {
         try mlx.check(mlx.mlx_array_set(&combined, routed));
     }
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_reshape(&out, combined, &[_]c_int{ batch, seq, d_dim }, 3, s));
+    try mlx.check(mlx.mlx_reshape(&out, combined, &[_]c_int{ batch, seq, mlx.getShape(routed)[1] }, 3, s));
     return out;
 }
 
@@ -48171,13 +48144,14 @@ test "conv1dWithCache compact conv_state is bit-identical across two chunks" {
 // `NemotronHMoE` — sigmoid router, top-k SELECTED on scores + bias but
 // WEIGHTED by the unbiased scores, renormalized, x routed_scaling_factor,
 // ReLU^2 experts, plus the ungated shared expert.
-test "nemotronMoe matches a host reference of NemotronHMoE" {
+fn testNemotronMoeHostReference(comptime latent: bool) !void {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const allocator = t.allocator;
     const s = mlx.gpuStream();
     const T: usize = 6;
-    const D: usize = 64;
+    const D: usize = 128;
+    const L: usize = if (latent) 64 else D;
     const I: usize = 64;
     const SI: usize = 128;
     const E: usize = 8;
@@ -48216,20 +48190,28 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
         }
     };
 
-    const w1 = try allocator.alloc(f32, E * I * D);
+    const w1 = try allocator.alloc(f32, E * I * L);
     defer allocator.free(w1);
-    const w2 = try allocator.alloc(f32, E * D * I);
+    const w2 = try allocator.alloc(f32, E * L * I);
     defer allocator.free(w2);
     const su = try allocator.alloc(f32, SI * D);
     defer allocator.free(su);
     const sd = try allocator.alloc(f32, D * SI);
     defer allocator.free(sd);
-    const fc1 = try Q.make(allocator, rnd, &.{ @intCast(E), @intCast(I), @intCast(D) }, s, w1);
-    const fc2 = try Q.make(allocator, rnd, &.{ @intCast(E), @intCast(D), @intCast(I) }, s, w2);
+    const fc1 = try Q.make(allocator, rnd, &.{ @intCast(E), @intCast(I), @intCast(L) }, s, w1);
+    const fc2 = try Q.make(allocator, rnd, &.{ @intCast(E), @intCast(L), @intCast(I) }, s, w2);
     const up = try Q.make(allocator, rnd, &.{ @intCast(SI), @intCast(D) }, s, su);
     const down = try Q.make(allocator, rnd, &.{ @intCast(D), @intCast(SI) }, s, sd);
     defer for ([_][3]mlx.mlx_array{ fc1, fc2, up, down }) |tr| {
         for (tr) |a| _ = mlx.mlx_array_free(a);
+    };
+
+    var lat1_host: [L * D]f32 = @splat(0);
+    var lat2_host: [D * L]f32 = @splat(0);
+    const lat1 = try Q.make(allocator, rnd, &.{ @intCast(L), @intCast(D) }, s, &lat1_host);
+    const lat2 = try Q.make(allocator, rnd, &.{ @intCast(D), @intCast(L) }, s, &lat2_host);
+    defer for ([_][3]mlx.mlx_array{ lat1, lat2 }) |tr| {
+        for (tr) |array| _ = mlx.mlx_array_free(array);
     };
 
     var router: [E * D]f32 = @splat(0);
@@ -48262,9 +48244,16 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
         .fc2_w = fc2[0],
         .fc2_s = fc2[1],
         .fc2_b = fc2[2],
+        .fc1_latent_w = if (latent) lat1[0] else .{ .ctx = null },
+        .fc1_latent_s = if (latent) lat1[1] else .{ .ctx = null },
+        .fc1_latent_b = if (latent) lat1[2] else .{ .ctx = null },
+        .fc2_latent_w = if (latent) lat2[0] else .{ .ctx = null },
+        .fc2_latent_s = if (latent) lat2[1] else .{ .ctx = null },
+        .fc2_latent_b = if (latent) lat2[2] else .{ .ctx = null },
         .shared = .{ .up_w = up[0], .up_s = up[1], .up_b = up[2], .down_w = down[0], .down_s = down[1], .down_b = down[2] },
     };
     var cfg = ModelConfig{};
+    cfg.moe_latent_size = if (latent) L else 0;
     cfg.quant_bits = 4;
     cfg.quant_group_size = 64;
     cfg.num_experts = E;
@@ -48310,21 +48299,33 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
         }
         var wsum: f32 = 0;
         for (chosen) |e| wsum += sig[e];
-        var out: [D]f32 = @splat(0);
+        var expert_x: [L]f32 = @splat(0);
+        if (latent) {
+            for (0..L) |l| for (0..D) |d| {
+                expert_x[l] += xt[d] * lat1_host[l * D + d];
+            };
+        } else @memcpy(&expert_x, xt);
+        var expert_out: [L]f32 = @splat(0);
         for (chosen) |e| {
             const wt = sig[e] / wsum * scale;
             var h: [I]f32 = undefined;
             for (0..I) |i| {
                 var a: f32 = 0;
-                for (0..D) |d| a += xt[d] * w1[(e * I + i) * D + d];
+                for (0..L) |d| a += expert_x[d] * w1[(e * I + i) * L + d];
                 h[i] = relu2(a);
             }
-            for (0..D) |d| {
+            for (0..L) |d| {
                 var a: f32 = 0;
-                for (0..I) |i| a += h[i] * w2[(e * D + d) * I + i];
-                out[d] += wt * a;
+                for (0..I) |i| a += h[i] * w2[(e * L + d) * I + i];
+                expert_out[d] += wt * a;
             }
         }
+        var out: [D]f32 = @splat(0);
+        if (latent) {
+            for (0..D) |d| for (0..L) |l| {
+                out[d] += expert_out[l] * lat2_host[d * L + l];
+            };
+        } else @memcpy(&out, &expert_out);
         var hs: [SI]f32 = undefined;
         for (0..SI) |i| {
             var a: f32 = 0;
@@ -48368,20 +48369,27 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
         for (0..T * D) |i| max_err_sorted = @max(max_err_sorted, @abs(gp[i] - gs_p[i]));
         try t.expect(max_err_sorted < 2e-3 * max_ref);
 
-        // Padded up to 4 rows per expert for the streaming kernel; the pad rows are dropped.
-        try t.expectEqual(@as(c_int, 0), moeStreamPadRows(2 * E - 1, E));
-        try t.expectEqual(@as(c_int, 0), moeStreamPadRows(4 * E, E));
-        try t.expectEqual(@as(c_int, 4 * E - T * K), moeStreamPadRows(T * K, E));
-        const parts = try nemotronMoeExperts(x, &nm, &cfg, true, s);
-        defer parts.deinit();
-        const got_pad = try nemotronMoeCombine(x, &parts, &nm, &cfg, s, true);
-        defer _ = mlx.mlx_array_free(got_pad);
-        try mlx.check(mlx.mlx_array_eval(got_pad));
-        const gpad = mlx.mlx_array_data_float32(got_pad) orelse return error.MlxArrayDataNull;
-        var max_err_pad: f32 = 0;
-        for (0..T * D) |i| max_err_pad = @max(max_err_pad, @abs(gp[i] - gpad[i]));
-        try t.expect(max_err_pad < 2e-3 * max_ref);
+        if (!latent) {
+            // Padded up to 4 rows per expert for the streaming kernel; the pad rows are dropped.
+            try t.expectEqual(@as(c_int, 0), moeStreamPadRows(2 * E - 1, E));
+            try t.expectEqual(@as(c_int, 0), moeStreamPadRows(4 * E, E));
+            try t.expectEqual(@as(c_int, 4 * E - T * K), moeStreamPadRows(T * K, E));
+            const parts = try nemotronMoeExperts(x, &nm, &cfg, true, s);
+            defer parts.deinit();
+            const got_pad = try nemotronMoeCombine(x, &parts, &nm, &cfg, s, x);
+            defer _ = mlx.mlx_array_free(got_pad);
+            try mlx.check(mlx.mlx_array_eval(got_pad));
+            const gpad = mlx.mlx_array_data_float32(got_pad) orelse return error.MlxArrayDataNull;
+            var max_err_pad: f32 = 0;
+            for (0..T * D) |i| max_err_pad = @max(max_err_pad, @abs(gp[i] - gpad[i]));
+            try t.expect(max_err_pad < 2e-3 * max_ref);
+        }
     }
+}
+
+test "nemotronMoe matches a host reference of NemotronHMoE" {
+    try testNemotronMoeHostReference(false);
+    try testNemotronMoeHostReference(true);
 }
 
 // Bar: the fused residual add + next norm is BIT-EQUAL to add -> fast rms_norm,
@@ -65197,8 +65205,8 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
     var arrs: [14]mlx.mlx_array = undefined;
     const shapes = [_][]const c_int{
-        &.{ 1, t_len, c_dim }, &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 },
-        &.{ c_dim, 4, 1 },     &.{hv},                   &.{hv},              &.{128},             &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
+        &.{ 1, t_len, c_dim },     &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim },            &.{ 1, hv, 128, 128 },
+        &.{ c_dim, 4, 1 },         &.{hv},                   &.{hv},             &.{128},            &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
         &.{ 1, t_len + 1, c_dim }, &.{ 1, 3, c_dim + 1 },
     };
     for (&arrs, shapes) |*a, sh| a.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
@@ -74530,35 +74538,35 @@ test "glm5_next verify windows of 2..16 rows track the same rows decoded one at 
     };
     // A short tail chunk of a prefix-cache restore is a prefill, not a verify: both modes ride the same rows.
     for ([_]bool{ true, false }) |mode_verify| {
-    var w: usize = 2;
-    while (w <= 16) : (w += 1) {
-        const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
-        // The window in one forward.
-        try xfm.resetCache();
-        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
-        const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
-        defer _ = mlx.mlx_array_free(got_arr);
-        const got = try qwen4ReadF32(allocator, got_arr, s);
-        defer allocator.free(got);
-        // The same rows one at a time.
-        try xfm.resetCache();
-        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
-        var worst: f64 = 1.0;
-        var misses: usize = 0;
-        for (0..w) |r| {
-            const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
-            defer _ = mlx.mlx_array_free(one);
-            const want = try qwen4ReadF32(allocator, one, s);
-            defer allocator.free(want);
-            const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
-            worst = @min(worst, cmp.min_cos);
-            misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+        var w: usize = 2;
+        while (w <= 16) : (w += 1) {
+            const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
+            // The window in one forward.
+            try xfm.resetCache();
+            _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+            const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
+            defer _ = mlx.mlx_array_free(got_arr);
+            const got = try qwen4ReadF32(allocator, got_arr, s);
+            defer allocator.free(got);
+            // The same rows one at a time.
+            try xfm.resetCache();
+            _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+            var worst: f64 = 1.0;
+            var misses: usize = 0;
+            for (0..w) |r| {
+                const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
+                defer _ = mlx.mlx_array_free(one);
+                const want = try qwen4ReadF32(allocator, one, s);
+                defer allocator.free(want);
+                const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+                worst = @min(worst, cmp.min_cos);
+                misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+            }
+            std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
+            // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
+            // rows before the wide windows existed): a broken row path lands far below this.
+            try testing.expect(worst > 0.94);
         }
-        std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
-        // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
-        // rows before the wide windows existed): a broken row path lands far below this.
-        try testing.expect(worst > 0.94);
-    }
     }
 }
 
@@ -74761,12 +74769,12 @@ fn glmProfNow() i128 {
 fn glmProfLap(a: mlx.mlx_array, kind: GlmProfKind, t0: i128) i128 {
     _ = mlx.mlx_array_eval(a);
     const now = glmProfNow();
-    glm_prof_ns[@intFromEnum(kind)] += @intCast(now - t0);
+    glm_prof_ns[@backingInt(kind)] += @intCast(now - t0);
     return now;
 }
 
 fn glmProfMs(kind: GlmProfKind) f64 {
-    return @as(f64, @floatFromInt(glm_prof_ns[@intFromEnum(kind)])) / 1.0e6;
+    return @as(f64, @floatFromInt(glm_prof_ns[@backingInt(kind)])) / 1.0e6;
 }
 
 /// MiMo's attention reads its LOSSY decode-attn-quant copies at decode width and on a

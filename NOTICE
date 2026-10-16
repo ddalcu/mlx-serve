@@ -14,6 +14,18 @@ Apache License, Version 2.0
 ================================================================================
 
 --------------------------------------------------------------------------------
+NVIDIA Nemotron / RADIO and Model Optimizer LiLiCorr
+https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16
+https://github.com/NVIDIA/Model-Optimizer
+Copyright (c) 2026 NVIDIA CORPORATION. All rights reserved.
+Licensed under the Apache License, Version 2.0.
+
+The RADIO tower/processor in src/radio_vision.zig and the LiLiCorr head in
+src/lilicorr.zig follow NVIDIA's reference implementations. The fixture
+generators in tests/dump_radio_* and tests/dump_lilicorr_fixtures.py execute
+those references to validate the native engine.
+
+--------------------------------------------------------------------------------
 Cloudflare Clef and mlx-community Clef MLX
 https://huggingface.co/Cloudflare/clef
 https://huggingface.co/mlx-community/clef-flash-4bit

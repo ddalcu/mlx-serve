@@ -5422,7 +5422,10 @@ pub const Generator = struct {
         // drawn with the verify row's key, rows kept only while they match.
         const serial = self.sampling.keyed and self.sampling.temperature > 0.01 and self.sampling.seed != null;
         const stochastic = self.sampling.temperature > 0.01 and !serial;
-        if (m_draft == 0) return try self.dflashPlainRound(allocator, t1, serial, stochastic);
+        // Prefix snapshots keep assistant K/V without the LiLiCorr anchor.
+        // A plain round supplies a fresh committed row for the next draft.
+        if (m_draft == 0 or (model.lilicorr != null and dctx.anchor.ctx == null))
+            return try self.dflashPlainRound(allocator, t1, serial, stochastic);
         if (self.dflash_pol != null) if (try self.dflashCopyRound(allocator, t1, anchor_pos, kv_step_snap, serial, stochastic, tracing, &ph, dflash_kv_watch)) |res| return res;
         // DFlash2 path selector: when the sidecar ships one, drafts come from
         // the pairwise-scored path trace instead of per-position argmax /
@@ -5487,7 +5490,6 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(draft_logits_all);
 
         if (model.lilicorr) |*hd| {
-            if (dctx.anchor.ctx == null) return error.LilicorrAnchorMissing;
             const slots: u32 = model.config.block_size - 1;
             if (m > slots) m = slots;
             var slot_logits = mlx.mlx_array_new();
@@ -20104,7 +20106,6 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
     }
 }
 
-
 test "nextDraw: each stochastic DSpark round takes a fresh draw of the request's seed" {
     var gen: Generator = undefined;
     gen.sampling = .{ .temperature = 0.6, .seed = 7, .draw = 5 };
@@ -20580,6 +20581,60 @@ test "logprobs publish through the one-token delay, never straight from sampleTo
         }
     }
     try testing.expect(seen >= 1);
+}
+
+test "lilicorr missing restored anchor takes a plain round and recovers it" {
+    if (mlx.noGpuBackend()) return;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var trunk_tmp = testing.tmpDir(.{});
+    defer trunk_tmp.cleanup();
+    var asst_tmp = testing.tmpDir(.{});
+    defer asst_tmp.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_len = try trunk_tmp.dir.realPath(io, &trunk_buf);
+    const trunk_path = trunk_buf[0..trunk_len];
+    var asst_buf: [512]u8 = undefined;
+    const asst_len = try asst_tmp.dir.realPath(io, &asst_buf);
+    const asst_path = asst_buf[0..asst_len];
+    try dflash_mod.TinyFix.writeTrunk(io, trunk_tmp.dir, trunk_path, s);
+    try dflash_mod.TinyFix.writeAssistant(io, asst_tmp.dir, asst_path, s);
+    var cfg = try model_mod.parseConfig(io, a, trunk_path);
+    var weights = try model_mod.loadWeights(io, a, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&cfg, &weights);
+    var xfm = try Transformer.init(io, a, cfg, &weights);
+    defer xfm.deinit();
+    var dm = try dflash_mod.loadDflash(io, a, s, asst_path);
+    defer dm.deinit();
+    try dm.bind(&xfm);
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5 };
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 8, .{ .temperature = 0 }, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_min_accepted_per_round = 0,
+    });
+    defer gen.deinit(a);
+    // A restored context has its K/V but no LiLiCorr anchor row.
+    try asst_tmp.dir.writeFile(io, .{ .sub_path = "fixture.safetensors", .data = @embedFile("fixtures/lilicorr_fp32.safetensors") });
+    const path = try std.fmt.allocPrint(a, "{s}/fixture.safetensors", .{asst_path});
+    defer a.free(path);
+    var fx = try model_mod.loadWeightsSingleFile(a, path);
+    defer fx.deinit();
+    dm.lilicorr = try lilicorr_mod.load(a, &fx, s, .{ .top_k = 3, .hidden = 8, .trunk = 12, .heads = 2, .slots = 3, .layers = 2, .factor = 6, .vector_eps = 0.0001, .logit_scale = 8, .rms_eps = 1e-6 });
+    try testing.expect(gen.dflash_ctx.?.anchor.ctx == null);
+    const pending = gen.next_token_id;
+    const step = (try gen.nextDflash(a)).?;
+    defer a.free(step.tokens);
+    try testing.expectEqualSlices(u32, &[_]u32{pending}, step.tokens);
+    try testing.expectEqual(@as(u32, 0), step.accepted_tokens);
+    try testing.expectEqual(@as(u32, 1), gen.dflash_plain);
+    try testing.expect(!gen.spec_disabled_runtime);
+    try gen.dflashFlushPending(a);
+    try testing.expect(gen.dflash_ctx.?.anchor.ctx != null);
+    try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
 }
 
 test "dflash: nextDflash greedy equals serial decode, invariants exact each round" {

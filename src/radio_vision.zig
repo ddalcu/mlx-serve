@@ -15,6 +15,7 @@ const model_mod = @import("model.zig");
 const Weights = model_mod.Weights;
 const qwen_vision = @import("qwen_vision.zig");
 const glm_vision = @import("glm_vision.zig");
+const transformer = @import("transformer.zig");
 const log = @import("log.zig");
 
 const ModelConfig = model_mod.ModelConfig;
@@ -30,9 +31,6 @@ pub const DOWNSAMPLE: u32 = 2;
 pub const TEMPORAL: u32 = 2;
 /// Patch budget for a video frame (`video_target_num_patches`), pre-shuffle.
 pub const VIDEO_TARGET_PATCHES: u32 = 1024;
-/// Default EVS drop fraction. The Bolt checkpoint sets this to 0.7.
-pub const VIDEO_PRUNING_RATE: f32 = 0.7;
-const HEADS: u32 = 16;
 const LN_EPS: f32 = 1e-6;
 const PROJECTOR_EPS: f32 = 1e-5;
 
@@ -196,10 +194,11 @@ pub fn videoGroupSegment(buf: []u8, group: u32, frames: u32) []const u8 {
 
 /// How many language tokens EVS keeps. `int(groups * spatial * (1-q))`, and
 /// never fewer than one tubelet. `q <= 0` keeps the whole clip.
-pub fn evsKeepCount(groups: u32, spatial: u32, q: f32) u32 {
+pub fn evsKeepCount(groups: u32, spatial: u32, q: f64) u32 {
     const all = groups * spatial;
     if (!(q > 0) or groups == 0 or spatial == 0) return all;
-    const prod = @as(f64, @floatFromInt(groups)) * @as(f64, @floatFromInt(spatial)) * (1.0 - @as(f64, q));
+    if (q >= 1) return spatial;
+    const prod = @as(f64, @floatFromInt(groups)) * @as(f64, @floatFromInt(spatial)) * (1.0 - q);
     const evs: u32 = @intFromFloat(@trunc(prod));
     return @max(spatial, evs);
 }
@@ -237,8 +236,7 @@ fn cosine(a: []const f32, b: []const f32) f32 {
         na += xf * xf;
         nb += yf * yf;
     }
-    const denom = @sqrt(na) * @sqrt(nb);
-    if (!(denom > 0)) return 0;
+    const denom = @max(@sqrt(na), 1e-8) * @max(@sqrt(nb), 1e-8);
     return @floatCast(dot / denom);
 }
 
@@ -265,34 +263,25 @@ pub const Prepared = struct {
     tokens: u32,
 };
 
-fn writeClipChw(chw: []f32, hwc: []const u8, th: u32, tw: u32) void {
+fn resizeClipChw(a: std.mem.Allocator, chw: []f32, rgb: []const u8, sh: u32, sw: u32, th: u32, tw: u32) !void {
+    try qwen_vision.resizeRgbBicubicFloatChw(a, chw, rgb, sh, sw, th, tw);
     const plane: usize = @as(usize, th) * tw;
-    for (0..th) |y| {
-        for (0..tw) |x| {
-            const src = (y * tw + x) * 3;
-            const dst = y * tw + x;
-            inline for (0..3) |c| {
-                const unit = @as(f32, @floatFromInt(hwc[src + c])) / 255.0;
-                chw[c * plane + dst] = (unit - MEAN[c]) / STD[c];
-            }
-        }
-    }
+    for (chw, 0..) |*value, i| value.* = (value.* / 255 - MEAN[i / plane]) / STD[i / plane];
 }
 
-/// PIL bicubic resize (the tower's reference is antialiased torch bicubic) then CLIP norm.
+/// Antialiased float32 bicubic resize, then CLIP normalization.
 /// Returned bytes are float32 CHW `[3, H, W]`. `tokens` is the language-token count after shuffle.
 pub fn prepareImage(allocator: std.mem.Allocator, rgb: []const u8, src_h: u32, src_w: u32) !Prepared {
     const grid = targetPatches(src_h, src_w, ENGINE_MAX_PATCHES);
     const tw = grid.w * PATCH;
     const th = grid.h * PATCH;
-    const resized = try qwen_vision.resizeInterleavedPil(allocator, rgb, src_h, src_w, th, tw, 3, .bicubic);
-    defer allocator.free(resized);
     const plane: usize = @as(usize, th) * tw;
     // Keep the allocation align-1 so callers can free the []u8 pixels. The
     // write needs an f32 view, and a byte slice does not carry that alignment.
     const buf = try allocator.alloc(u8, plane * 3 * @sizeOf(f32));
+    errdefer allocator.free(buf);
     const aligned: []align(@alignOf(f32)) u8 = @alignCast(buf);
-    writeClipChw(std.mem.bytesAsSlice(f32, aligned), resized, th, tw);
+    try resizeClipChw(allocator, std.mem.bytesAsSlice(f32, aligned), rgb, src_h, src_w, th, tw);
     return .{
         .pixels = buf,
         .h = th,
@@ -323,10 +312,8 @@ pub fn prepareVideo(allocator: std.mem.Allocator, rgbs: []const []const u8, hs: 
     const buf = try allocator.alloc(u8, rgbs.len * frame_bytes);
     errdefer allocator.free(buf);
     for (rgbs, hs, ws, 0..) |rgb, h, w, i| {
-        const resized = try qwen_vision.resizeInterleavedPil(allocator, rgb, h, w, th, tw, 3, .bicubic);
-        defer allocator.free(resized);
         const bytes: []align(@alignOf(f32)) u8 = @alignCast(buf[i * frame_bytes ..][0..frame_bytes]);
-        writeClipChw(std.mem.bytesAsSlice(f32, bytes), resized, th, tw);
+        try resizeClipChw(allocator, std.mem.bytesAsSlice(f32, bytes), rgb, h, w, th, tw);
     }
     const geom = videoGeometry(@intCast(rgbs.len), th, tw) orelse return error.InvalidVisionInput;
     return .{
@@ -358,24 +345,20 @@ const Axis = struct {
     lo: []i32,
     hi: []i32,
     frac: []f64,
-    lo_valid: []bool,
-    hi_valid: []bool,
 
     fn deinit(self: *Axis, a: std.mem.Allocator) void {
         a.free(self.lo);
         a.free(self.hi);
         a.free(self.frac);
-        a.free(self.lo_valid);
-        a.free(self.hi_valid);
     }
 };
 
 fn bilinearAxis(a: std.mem.Allocator, len: u32, side: u32) !Axis {
     const lo = try a.alloc(i32, len);
+    errdefer a.free(lo);
     const hi = try a.alloc(i32, len);
+    errdefer a.free(hi);
     const frac = try a.alloc(f64, len);
-    const lo_valid = try a.alloc(bool, len);
-    const hi_valid = try a.alloc(bool, len);
     const last: i32 = @intCast(side - 1);
     const scale = @as(f64, @floatFromInt(side)) / @as(f64, @floatFromInt(len));
     for (0..len) |i| {
@@ -383,12 +366,10 @@ fn bilinearAxis(a: std.mem.Allocator, len: u32, side: u32) !Axis {
         const fl = @floor(g);
         const fi: i32 = @intFromFloat(fl);
         frac[i] = g - fl;
-        lo_valid[i] = fi >= 0 and fi <= last;
-        hi_valid[i] = fi + 1 >= 0 and fi + 1 <= last;
         lo[i] = std.math.clamp(fi, 0, last);
         hi[i] = std.math.clamp(fi + 1, 0, last);
     }
-    return .{ .lo = lo, .hi = hi, .frac = frac, .lo_valid = lo_valid, .hi_valid = hi_valid };
+    return .{ .lo = lo, .hi = hi, .frac = frac };
 }
 
 fn must(weights: *const Weights, buf: *[320]u8, comptime fmt: []const u8, args: anytype) !mlx.mlx_array {
@@ -423,14 +404,6 @@ fn loadVideoEmbedder(weights: *const Weights, hidden: u32) mlx.mlx_array {
     return w;
 }
 
-fn scalar(val: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
-    const f = mlx.mlx_array_new_float(val);
-    defer _ = mlx.mlx_array_free(f);
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, f, dt, s));
-    return out;
-}
-
 pub const RadioVision = struct {
     s: mlx.mlx_stream,
     allocator: std.mem.Allocator,
@@ -452,7 +425,7 @@ pub const RadioVision = struct {
     proj_fc1: mlx.mlx_array,
     proj_fc2: mlx.mlx_array,
 
-    pub fn init(allocator: std.mem.Allocator, _: ModelConfig, weights: *const Weights) !RadioVision {
+    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !RadioVision {
         const s = mlx.gpuStream();
         errdefer _ = mlx.mlx_stream_free(s);
         var buf: [320]u8 = undefined;
@@ -469,7 +442,8 @@ pub const RadioVision = struct {
         const qshape = mlx.getShape(qkv0);
         if (qshape.len != 2 or qshape[0] <= 0 or qshape[1] <= 0) return error.InvalidVisionWeights;
         const hidden: u32 = @intCast(qshape[1]);
-        if (@as(u32, @intCast(qshape[0])) != hidden * 3 or hidden % HEADS != 0) return error.InvalidVisionWeights;
+        const heads = config.radio_num_heads;
+        if (heads == 0 or @as(u32, @intCast(qshape[0])) != hidden * 3 or hidden % heads != 0) return error.InvalidVisionWeights;
 
         var blocks = try allocator.alloc(Block, depth);
         errdefer allocator.free(blocks);
@@ -492,6 +466,7 @@ pub const RadioVision = struct {
 
         const pos_raw = try must(weights, &buf, "vision_model.radio_model.model.patch_generator.pos_embed", .{});
         const ps = mlx.getShape(pos_raw);
+        if (!((ps.len == 2 and ps[1] == hidden) or (ps.len == 3 and ps[0] == 1 and ps[2] == hidden))) return error.InvalidVisionWeights;
         var pos_table = pos_raw;
         var pos_owned = false;
         if (ps.len == 3 and ps[0] == 1) {
@@ -511,20 +486,20 @@ pub const RadioVision = struct {
 
         const cls = try must(weights, &buf, "vision_model.radio_model.model.patch_generator.cls_token.token", .{});
         const cls_shape = mlx.getShape(cls);
-        if (cls_shape.len != 2) return error.InvalidVisionWeights;
+        if (cls_shape.len != 2 or cls_shape[0] <= 0 or cls_shape[1] != hidden) return error.InvalidVisionWeights;
         const fc2 = try must(weights, &buf, "mlp1.3.weight", .{});
         const fc2_shape = mlx.getShape(fc2);
         if (fc2_shape.len != 2) return error.InvalidVisionWeights;
 
         log.info("Vision encoder: RADIO (depth={d}, hidden={d}, heads={d}, prefix={d}, pos={d}, out={d}, patch cap={d})\n", .{
-            depth, hidden, HEADS, cls_shape[0], side, fc2_shape[0], ENGINE_MAX_PATCHES,
+            depth, hidden, heads, cls_shape[0], side, fc2_shape[0], ENGINE_MAX_PATCHES,
         });
         return .{
             .s = s,
             .allocator = allocator,
             .hidden = hidden,
-            .heads = HEADS,
-            .head_dim = hidden / HEADS,
+            .heads = heads,
+            .head_dim = hidden / heads,
             .prefix = @intCast(cls_shape[0]),
             .pos_side = side,
             .out_hidden = @intCast(fc2_shape[0]),
@@ -555,7 +530,7 @@ pub const RadioVision = struct {
         const width: u32 = @intCast(shape[3]);
         const rows, const cols = try patchGrid(height, width);
         var x = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&x, pixels, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&x, pixels, mlx.mlx_array_dtype(self.patch_w), self.s));
         defer _ = mlx.mlx_array_free(x);
         return self.forwardBody(x, rows, cols, 3, self.patch_w);
     }
@@ -582,7 +557,7 @@ pub const RadioVision = struct {
             const tube = try self.packTubelet(frames, @intCast(g), n, height, width);
             defer _ = mlx.mlx_array_free(tube);
             var x = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&x, tube, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_astype(&x, tube, mlx.mlx_array_dtype(self.video_w), self.s));
             const tokens = self.forwardBody(x, rows, cols, TEMPORAL * 3, self.video_w) catch |err| {
                 _ = mlx.mlx_array_free(x);
                 return err;
@@ -611,7 +586,7 @@ pub const RadioVision = struct {
     /// EVS keep-mask for the rows `[row_off, row_off + groups*spatial)` of
     /// `emb` (`[1, rows, hidden]`). The mask is the full pre-prune length.
     /// `rate <= 0` keeps every row and does not read the tensor.
-    pub fn videoKeepMask(self: *RadioVision, allocator: std.mem.Allocator, emb: mlx.mlx_array, row_off: usize, groups: u32, spatial: u32, rate: f32) ![]bool {
+    pub fn videoKeepMask(self: *RadioVision, allocator: std.mem.Allocator, emb: mlx.mlx_array, row_off: usize, groups: u32, spatial: u32, rate: f64) ![]bool {
         const full: usize = @as(usize, groups) * spatial;
         if (!(rate > 0)) {
             const mask = try allocator.alloc(bool, full);
@@ -764,16 +739,16 @@ pub const RadioVision = struct {
         defer wa.deinit(a);
 
         const n: usize = @as(usize, rows) * cols;
+        const indices = try a.alloc(i32, n * 4);
+        defer a.free(indices);
+        const weights = try a.alloc(f32, n * 4);
+        defer a.free(weights);
         var idx: [4][]i32 = undefined;
         var wgt: [4][]f32 = undefined;
         inline for (0..4) |c| {
-            idx[c] = try a.alloc(i32, n);
-            wgt[c] = try a.alloc(f32, n);
+            idx[c] = indices[c * n ..][0..n];
+            wgt[c] = weights[c * n ..][0..n];
         }
-        defer inline for (0..4) |c| {
-            a.free(idx[c]);
-            a.free(wgt[c]);
-        };
 
         const side_i: i32 = @intCast(side);
         for (0..rows) |r| {
@@ -785,28 +760,28 @@ pub const RadioVision = struct {
                 idx[1][t] = ha.lo[r] * side_i + wa.hi[c];
                 idx[2][t] = ha.hi[r] * side_i + wa.lo[c];
                 idx[3][t] = ha.hi[r] * side_i + wa.hi[c];
-                wgt[0][t] = if (ha.lo_valid[r] and wa.lo_valid[c]) @floatCast((1 - dh) * (1 - dw)) else 0;
-                wgt[1][t] = if (ha.lo_valid[r] and wa.hi_valid[c]) @floatCast((1 - dh) * dw) else 0;
-                wgt[2][t] = if (ha.hi_valid[r] and wa.lo_valid[c]) @floatCast(dh * (1 - dw)) else 0;
-                wgt[3][t] = if (ha.hi_valid[r] and wa.hi_valid[c]) @floatCast(dh * dw) else 0;
+                wgt[0][t] = @floatCast((1 - dh) * (1 - dw));
+                wgt[1][t] = @floatCast((1 - dh) * dw);
+                wgt[2][t] = @floatCast(dh * (1 - dw));
+                wgt[3][t] = @floatCast(dh * dw);
             }
         }
 
         const wshape = [_]c_int{ @intCast(n), 1 };
+        var table = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(table);
+        try mlx.check(mlx.mlx_astype(&table, self.pos_table, .float32, self.s));
         var acc: mlx.mlx_array = undefined;
         inline for (0..4) |c| {
             const ix = hostI32(idx[c]);
             defer _ = mlx.mlx_array_free(ix);
             var gathered = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gathered);
-            try mlx.check(mlx.mlx_take_axis(&gathered, self.pos_table, ix, 0, self.s));
+            try mlx.check(mlx.mlx_take_axis(&gathered, table, ix, 0, self.s));
             const wf = mlx.mlx_array_new_data(wgt[c].ptr, &wshape, 2, .float32);
             defer _ = mlx.mlx_array_free(wf);
-            var wbf = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(wbf);
-            try mlx.check(mlx.mlx_astype(&wbf, wf, .bfloat16, self.s));
             var weighted = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&weighted, gathered, wbf, self.s));
+            try mlx.check(mlx.mlx_multiply(&weighted, gathered, wf, self.s));
             if (c == 0) {
                 acc = weighted;
             } else {
@@ -817,10 +792,13 @@ pub const RadioVision = struct {
                 acc = sum;
             }
         }
+        defer _ = mlx.mlx_array_free(acc);
+        var cast = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cast);
+        try mlx.check(mlx.mlx_astype(&cast, acc, mlx.mlx_array_dtype(self.patch_w), self.s));
         var out = mlx.mlx_array_new();
         const oshape = [_]c_int{ 1, @intCast(n), @intCast(self.hidden) };
-        try mlx.check(mlx.mlx_reshape(&out, acc, &oshape, 3, self.s));
-        _ = mlx.mlx_array_free(acc);
+        try mlx.check(mlx.mlx_reshape(&out, cast, &oshape, 3, self.s));
         return out;
     }
 
@@ -891,7 +869,7 @@ pub const RadioVision = struct {
         try mlx.check(mlx.mlx_fast_rms_norm(&normed, x, self.proj_norm, PROJECTOR_EPS, self.s));
         const up = try self.dense(normed, self.proj_fc1, .{ .ctx = null });
         defer _ = mlx.mlx_array_free(up);
-        const act = try reluSquared(up, self.s);
+        const act = try transformer.reluSquaredOp(up, self.s);
         defer _ = mlx.mlx_array_free(act);
         return self.dense(act, self.proj_fc2, .{ .ctx = null });
     }
@@ -907,20 +885,242 @@ pub const RadioVision = struct {
     }
 };
 
-fn reluSquared(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const zero = try scalar(0.0, mlx.mlx_array_dtype(x), s);
-    defer _ = mlx.mlx_array_free(zero);
-    var relu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(relu);
-    try mlx.check(mlx.mlx_maximum(&relu, x, zero, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_square(&out, relu, s));
-    return out;
-}
-
 fn hostI32(v: []const i32) mlx.mlx_array {
     const shape = [_]c_int{@intCast(v.len)};
     return mlx.mlx_array_new_data(v.ptr, &shape, 1, .int32);
+}
+
+const RadioFixture = struct {
+    tmp: std.testing.TmpDir,
+    weights: Weights,
+
+    fn open() !RadioFixture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "radio.safetensors", .data = @embedFile("fixtures/radio_tiny.safetensors") });
+        var buf: [1024]u8 = undefined;
+        const dir = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+        return .{ .tmp = tmp, .weights = try model_mod.loadWeightsWithVision(std.testing.io, std.testing.allocator, dir) };
+    }
+
+    fn deinit(self: *RadioFixture) void {
+        self.weights.deinit();
+        self.tmp.cleanup();
+    }
+
+    fn tensor(self: *const RadioFixture, name: []const u8) !mlx.mlx_array {
+        return self.weights.get(name) orelse error.MissingFixtureTensor;
+    }
+};
+
+fn expectReferenceTensor(got: mlx.mlx_array, want: mlx.mlx_array, s: mlx.mlx_stream, tolerance: f32) !void {
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    var fp32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fp32);
+    try mlx.check(mlx.mlx_astype(&fp32, got, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(fp32));
+    try mlx.check(mlx.mlx_array_eval(want));
+    const n = mlx.mlx_array_size(want);
+    const actual = mlx.mlx_array_data_float32(fp32).?[0..n];
+    const expected = mlx.mlx_array_data_float32(want).?[0..n];
+    var worst: f32 = 0;
+    for (actual, expected) |x, y| {
+        try std.testing.expect(std.math.isFinite(x));
+        worst = @max(worst, @abs(x - y));
+    }
+    std.debug.print("[radio-reference] max|diff|={e}\n", .{worst});
+    try std.testing.expect(worst < tolerance);
+}
+
+test "radio reference: full image/video forward and EVS on a decoded clip" {
+    var fx = try RadioFixture.open();
+    defer fx.deinit();
+    var rv = try RadioVision.init(std.testing.allocator, .{ .radio_num_heads = 2 }, &fx.weights);
+    defer rv.deinit();
+    _ = mlx.mlx_stream_free(rv.s);
+    rv.s = mlx.mlx_default_cpu_stream_new();
+    try std.testing.expectEqual(@as(u32, 2), rv.heads);
+    const image = try rv.forward(try fx.tensor("image_pixels"));
+    defer _ = mlx.mlx_array_free(image);
+    try expectReferenceTensor(image, try fx.tensor("image_features"), rv.s, 2e-5);
+    const video = try rv.forwardVideo(try fx.tensor("video_pixels"));
+    defer _ = mlx.mlx_array_free(video);
+    try expectReferenceTensor(video, try fx.tensor("video_features"), rv.s, 2e-5);
+    const mask = try rv.videoKeepMask(std.testing.allocator, video, 0, 3, 2, 0.3);
+    defer std.testing.allocator.free(mask);
+    const expected = try fx.tensor("video_mask");
+    try mlx.check(mlx.mlx_array_eval(expected));
+    try std.testing.expectEqualSlices(bool, mlx.mlx_array_data_bool(expected).?[0..mask.len], mask);
+}
+
+test "radio reference: bf16 image/video serving preserves reference direction and magnitude" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var fx = try RadioFixture.open();
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    var it = fx.weights.map.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, name, "vision_model.") and !std.mem.startsWith(u8, name, "mlp1.")) continue;
+        var cast = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&cast, entry.value_ptr.*, .bfloat16, s));
+        _ = mlx.mlx_array_free(entry.value_ptr.*);
+        entry.value_ptr.* = cast;
+    }
+    var rv = try RadioVision.init(std.testing.allocator, .{ .radio_num_heads = 2 }, &fx.weights);
+    defer rv.deinit();
+    for ([_]bool{ false, true }) |video| {
+        const got = if (video) try rv.forwardVideo(try fx.tensor("video_pixels")) else try rv.forward(try fx.tensor("image_pixels"));
+        defer _ = mlx.mlx_array_free(got);
+        const want = try fx.tensor(if (video) "video_features" else "image_features");
+        const c = try glm_vision.cosineSim(got, want, rv.s);
+        const r = try glm_vision.rmsRatio(got, want, rv.s);
+        std.debug.print("[radio-reference] bf16 video={any} cosine={d:.7} rms_ratio={d:.6}\n", .{ video, c, r });
+        try std.testing.expect(c > 0.9999 and r > 0.98 and r < 1.02);
+    }
+}
+
+test "radio reference: cropped position interpolation clamps boundaries and keeps fp32 precision" {
+    var fx = try RadioFixture.open();
+    defer fx.deinit();
+    var rv = try RadioVision.init(std.testing.allocator, .{ .radio_num_heads = 2 }, &fx.weights);
+    defer rv.deinit();
+    const pos = try rv.posEmbed(2, 4);
+    defer _ = mlx.mlx_array_free(pos);
+    try expectReferenceTensor(pos, try fx.tensor("image_positions"), rv.s, 1e-7);
+}
+
+test "radio reference: float bicubic preprocessing matches torch antialias without a uint8 boundary" {
+    var fx = try RadioFixture.open();
+    defer fx.deinit();
+    const rgb = try fx.tensor("resize_rgb");
+    try mlx.check(mlx.mlx_array_eval(rgb));
+    const input = mlx.mlx_array_data_uint8(rgb).?[0 .. 8 * 9 * 3];
+    for ([_]struct { name: []const u8, h: u32, w: u32 }{
+        .{ .name = "resize_down", .h = 3, .w = 4 },
+        .{ .name = "resize_up", .h = 11, .w = 13 },
+    }) |case| {
+        const n: usize = @as(usize, case.h) * case.w;
+        const actual = try std.testing.allocator.alloc(f32, n * 3);
+        defer std.testing.allocator.free(actual);
+        try resizeClipChw(std.testing.allocator, actual, input, 8, 9, case.h, case.w);
+        const ref = try fx.tensor(case.name);
+        try mlx.check(mlx.mlx_array_eval(ref));
+        const expected = mlx.mlx_array_data_float32(ref).?[0..actual.len];
+        var worst: f32 = 0;
+        for (actual, expected, 0..) |x, y, i| {
+            const want = (y / 255 - MEAN[i / n]) / STD[i / n];
+            worst = @max(worst, @abs(x - want));
+        }
+        std.debug.print("[radio-reference] {s} normalized pixels max|diff|={e}\n", .{ case.name, worst });
+        try std.testing.expect(worst < 4e-6);
+    }
+}
+
+test "radio reference: EVS keeps the reference token count for custom pruning rates" {
+    try std.testing.expectEqual(@as(u32, 18), evsKeepCount(5, 4, 0.1));
+    try std.testing.expectEqual(@as(u32, 14), evsKeepCount(5, 4, 0.3));
+    try std.testing.expectEqual(@as(u32, 6), evsKeepCount(5, 4, 0.7));
+    var fx = try RadioFixture.open();
+    defer fx.deinit();
+    var rv = try RadioVision.init(std.testing.allocator, .{ .radio_num_heads = 2 }, &fx.weights);
+    defer rv.deinit();
+    for ([_]struct { name: []const u8, rate: f64 }{
+        .{ .name = "evs_mask_10", .rate = 0.1 },
+        .{ .name = "evs_mask_30", .rate = 0.3 },
+        .{ .name = "evs_mask_70", .rate = 0.7 },
+    }) |case| {
+        const mask = try rv.videoKeepMask(std.testing.allocator, try fx.tensor("evs_features"), 0, 5, 4, case.rate);
+        defer std.testing.allocator.free(mask);
+        const expected = try fx.tensor(case.name);
+        try mlx.check(mlx.mlx_array_eval(expected));
+        try std.testing.expectEqualSlices(bool, mlx.mlx_array_data_bool(expected).?[0..mask.len], mask);
+    }
+}
+
+test "radio EVS cosine clamps each norm to the reference epsilon" {
+    const embeddings = [_]f32{ 1e-10, 0, 1e-10, 0 };
+    var scores: [2]f32 = undefined;
+    videoDissimilarity(&embeddings, 2, 1, 2, &scores);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9999), scores[1], 1e-6);
+}
+
+test "radio full checkpoint: image/video embeddings and EVS match the official fp32 oracle" {
+    const model_raw = std.c.getenv("RADIO_VISION_MODEL") orelse return error.SkipZigTest;
+    const fixture_raw = std.c.getenv("RADIO_VISION_FIXTURE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const model_dir = std.mem.span(model_raw);
+    var source = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+    defer source.close(io);
+    const json = try source.readFileAlloc(io, "config.hf.json", a, .limited(1024 * 1024));
+    defer a.free(json);
+    var config = try model_mod.parseConfigFromJson(a, json);
+    defer config.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [1024]u8 = undefined;
+    const tower_dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    for (0..3) |i| {
+        const name = try std.fmt.allocPrint(a, "vision-{d:0>5}.safetensors", .{i});
+        defer a.free(name);
+        const from = try std.fmt.allocPrint(a, "{s}/{s}", .{ model_dir, name });
+        defer a.free(from);
+        const to = try std.fmt.allocPrint(a, "{s}/{s}", .{ tower_dir, name });
+        defer a.free(to);
+        try std.Io.Dir.symLinkAbsolute(io, from, to, .{});
+    }
+    var weights = try model_mod.loadWeightsWithVision(io, a, tower_dir);
+    defer weights.deinit();
+    var fx = try model_mod.loadWeightsSingleFile(a, std.mem.span(fixture_raw));
+    defer fx.deinit();
+    var rv = try RadioVision.init(a, config, &weights);
+    defer rv.deinit();
+    const rgb_arr = fx.get("video_rgb").?;
+    try mlx.check(mlx.mlx_array_eval(rgb_arr));
+    const rgb_shape = mlx.getShape(rgb_arr);
+    const n: usize = @intCast(rgb_shape[0]);
+    const height: u32 = @intCast(rgb_shape[1]);
+    const width: u32 = @intCast(rgb_shape[2]);
+    const frame_bytes: usize = @as(usize, height) * width * 3;
+    const raw_rgb = mlx.mlx_array_data_uint8(rgb_arr).?[0 .. frame_bytes * n];
+    var rgbs: [5][]const u8 = undefined;
+    const hs: [5]u32 = @splat(height);
+    const ws: [5]u32 = @splat(width);
+    try std.testing.expectEqual(rgbs.len, n);
+    for (&rgbs, 0..) |*rgb, i| rgb.* = raw_rgb[i * frame_bytes ..][0..frame_bytes];
+    const image_px = try prepareImage(a, rgbs[0], height, width);
+    defer a.free(image_px.pixels);
+    const video_px = try prepareVideo(a, &rgbs, &hs, &ws);
+    defer a.free(video_px.pixels);
+    for ([_]bool{ false, true }) |video| {
+        const bytes = if (video) video_px.pixels else image_px.pixels;
+        const expected = fx.get(if (video) "video_pixels" else "image_pixels").?;
+        const shape = mlx.getShape(expected);
+        const pixels = mlx.mlx_array_new_data(bytes.ptr, shape.ptr, @intCast(shape.len), .float32);
+        defer _ = mlx.mlx_array_free(pixels);
+        try expectReferenceTensor(pixels, expected, rv.s, 2e-5);
+    }
+    for ([_]bool{ false, true }) |video| {
+        const pixels = fx.get(if (video) "video_pixels" else "image_pixels").?;
+        const got = if (video) try rv.forwardVideo(pixels) else try rv.forward(pixels);
+        defer _ = mlx.mlx_array_free(got);
+        const want = fx.get(if (video) "video_features" else "image_features").?;
+        const c = try glm_vision.cosineSim(got, want, rv.s);
+        const r = try glm_vision.rmsRatio(got, want, rv.s);
+        std.debug.print("[radio-full] video={any} tokens={d} cosine={d:.7} rms_ratio={d:.6}\n", .{ video, mlx.getShape(got)[1], c, r });
+        try std.testing.expect(c > 0.99 and r > 0.97 and r < 1.03);
+        if (video) {
+            const shape = mlx.getShape(pixels);
+            const geom = videoGeometry(@intCast(shape[0]), @intCast(shape[2]), @intCast(shape[3])).?;
+            const mask = try rv.videoKeepMask(a, want, 0, geom.groups, geom.spatial, 0.3);
+            defer a.free(mask);
+            const expected = fx.get("video_mask").?;
+            try mlx.check(mlx.mlx_array_eval(expected));
+            try std.testing.expectEqualSlices(bool, mlx.mlx_array_data_bool(expected).?[0..mask.len], mask);
+        }
+    }
 }
 
 test "radio targetPatches matches the processor on a 512 square" {
