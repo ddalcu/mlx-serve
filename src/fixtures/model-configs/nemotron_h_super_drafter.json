@@ -1,0 +1,92 @@
+{
+  "architectures": [
+    "LiLiCorrDraftModel"
+  ],
+  "model_type": "qwen3",
+  "block_size": 8,
+  "dflash_config": {
+    "mask_token_id": 990,
+    "target_layer_ids": [
+      1,
+      22,
+      43,
+      64,
+      85
+    ],
+    "causal": false,
+    "projector_type": "lilicorr",
+    "lilicorr_enabled": true,
+    "lilicorr_candidate_topk": 8,
+    "lilicorr_hidden_size": 1024,
+    "lilicorr_num_layers": 2,
+    "lilicorr_num_heads": 8,
+    "lilicorr_mlp_ratio": 2.0,
+    "lilicorr_factor_dim": 1024,
+    "lilicorr_vector_eps": 0.0001,
+    "lilicorr_logit_scale": 8.0,
+    "conv_kernel_size": 2,
+    "conv_group_size": 16,
+    "use_swa": true,
+    "swa_window_size": 8192
+  },
+  "hidden_size": 4096,
+  "num_hidden_layers": 5,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 12288,
+  "hidden_act": "silu",
+  "rms_norm_eps": 1e-05,
+  "vocab_size": 131072,
+  "max_position_embeddings": 1048576,
+  "initializer_range": 0.02,
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "rope_theta": 1000000.0,
+  "rope_scaling": null,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "num_target_layers": 88,
+  "layer_types": [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention"
+  ],
+  "sliding_window": 8192,
+  "use_sliding_window": true,
+  "max_window_layers": 0,
+  "has_own_lm_head": true,
+  "draft_vocab_size": 131072,
+  "quantization_config": {
+    "quant_algo": "W4A16_NVFP4",
+    "kv_cache_quant_algo": null,
+    "group_size": 16,
+    "exclude_modules": [
+      "*attention_conv*",
+      "*mlp_conv*",
+      "*self_attn*",
+      "*norm",
+      "*lilicorr.anchor_out_head",
+      "*lilicorr.factor_input_proj",
+      "*lilicorr.feature_mlp*",
+      "*lilicorr.in_head",
+      "*lilicorr.out_head",
+      "*qkv_proj"
+    ],
+    "quant_method": "modelopt_fp4",
+    "ignore": [
+      "*attention_conv*",
+      "*mlp_conv*",
+      "*self_attn*",
+      "*norm",
+      "*lilicorr.anchor_out_head",
+      "*lilicorr.factor_input_proj",
+      "*lilicorr.feature_mlp*",
+      "*lilicorr.in_head",
+      "*lilicorr.out_head",
+      "*qkv_proj"
+    ]
+  }
+}

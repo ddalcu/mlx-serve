@@ -43,7 +43,7 @@ class Server:
             sock.bind(('127.0.0.1', 0))
             self.port = sock.getsockname()[1]
         self.base = f'http://127.0.0.1:{self.port}'
-        drafter_flags = ['--drafter', str(args.drafter)] if args.drafter else ['--no-drafter']
+        drafter_flags = ([] if args.drafter_auto else ['--drafter', str(args.drafter)]) if args.drafter else ['--no-drafter']
         self.command = [str(args.binary), '--model', str(args.model), *drafter_flags,
                         '--serve', '--host', '127.0.0.1', '--port', str(self.port),
                         '--ctx-size', '32768', '--max-tokens', '256', '--reasoning-budget', '0',
@@ -68,6 +68,10 @@ class Server:
             loaded = [m for m in self.request('/v1/models')['data'] if m.get('loaded')]
             assert len(loaded) == 1, loaded
             self.model = loaded[0]
+            if args.drafter:
+                config = json.loads((args.drafter / 'config.json').read_text())
+                if config.get('has_own_lm_head'):
+                    assert '[dflash] trained own lm_head loaded:' in self.log.read_text(), 'trained draft output head was not loaded'
         except BaseException:
             self.close()
             raise
@@ -83,12 +87,15 @@ class Server:
 
     def chat(self, content, drafter=False, tokens=192):
         start = time.monotonic()
-        reply = self.request('/v1/chat/completions', {
+        body = {
             'model': self.model['id'], 'messages': [{'role': 'user', 'content': content}],
             'temperature': 0, 'top_k': 1, 'seed': 42, 'max_tokens': tokens, 'stream': False,
-            'enable_drafter': drafter, 'enable_pld': False, 'enable_mtp': False,
+            'enable_pld': False, 'enable_mtp': False,
             'chat_template_kwargs': {'enable_thinking': False},
-        })
+        }
+        if drafter is not None:
+            body['enable_drafter'] = drafter
+        reply = self.request('/v1/chat/completions', body)
         return {'wall_seconds': time.monotonic() - start, 'response': reply}
 
     def close(self):
@@ -111,30 +118,41 @@ def spec_stats(log):
     return [{k: float(v) for k, v in re.findall(r'\b(attempts|accepts|avg_per_round)=([0-9.]+)', row)} for row in rows]
 
 
-def vision_checks(server):
+def vision_checks(server, drafter=False):
     assert {'image', 'video'} <= set(server.model['input_modalities']), server.model
-    results = {'text': server.chat('What is 17 + 25? Reply with just the integer.', tokens=16)}
+    results = {'text': server.chat('What is 17 + 25? Reply with just the integer.', tokens=16, drafter=drafter)}
     assert re.search(r'\b42\b', text_of(results['text'])), results['text']
-    results['literal_html'] = server.chat('Explain how an HTML <video> element works in one sentence.')
+    results['literal_html'] = server.chat('Explain how an HTML <video> element works in one sentence.', drafter=drafter)
     assert text_of(results['literal_html']).strip()
+    image_offset = server.log.stat().st_size
     results['image'] = server.chat([
         {'type': 'text', 'text': 'Name the main subject of this image in one sentence.'},
         {'type': 'image_url', 'image_url': {'url': image_uri(REPO / 'tests/fixtures/robot.png')}},
-    ])
+    ], drafter=drafter)
     assert 'robot' in text_of(results['image']).lower(), results['image']
+    if drafter:
+        stats = spec_stats(server.log.read_bytes()[image_offset:].decode('utf-8'))
+        assert sum(s['attempts'] for s in stats) > 0, 'image drafting did not engage'
+        results['image']['spec_stats'] = stats
     red, blue = color_uri((255, 0, 0)), color_uri((0, 0, 255))
     for count in (128, 256):
         offset = server.log.stat().st_size
+        prompt = 'The HTML <video> tag is mentioned here as text. Name the first and final colors in the attached clip, in order.'
+        prompt += ' Then explain the color change across the clip in three sentences.' if drafter else ' Answer with just the two colors.'
         result = server.chat([
-            {'type': 'text', 'text': 'The HTML <video> tag is mentioned here as text. Name the first and final colors in the attached clip, in order. Answer with just the two colors.'},
+            {'type': 'text', 'text': prompt},
             {'type': 'video_url', 'video_url': {'frames': [red] * (count - 32) + [blue] * 32}},
-        ])
+        ], drafter=drafter)
         logs = server.log.read_bytes()[offset:].decode('utf-8')
         assert f'Decoded {count} frames → RADIO video' in logs, logs
         assert f'RADIO video EVS: {count} frames' in logs, logs
         answer = text_of(result).lower()
         assert 'red' in answer and 'blue' in answer and answer.index('red') < answer.index('blue'), result
         assert result['response']['usage']['prompt_tokens'] > 1000
+        if drafter:
+            stats = spec_stats(logs)
+            assert sum(s['attempts'] for s in stats) > 0, f'{count}-frame video drafting did not engage'
+            result['spec_stats'] = stats
         result['video_log'] = [line for line in logs.splitlines() if 'RADIO' in line or 'Multimodal:' in line]
         results[f'video_{count}'] = result
         print(f'PASS: {count} supplied frames reach temporal video; late color recognized', flush=True)
@@ -150,6 +168,27 @@ PROMPTS = {
 
 
 def drafter_measurements(server, reps):
+    defaults = {}
+    prompt = 'Explain how binary search finds an item in a sorted list.'
+    offset = server.log.stat().st_size
+    defaults['chat'] = server.chat(prompt, drafter=None, tokens=96)
+    logs = server.log.read_bytes()[offset:].decode('utf-8')
+    stats = spec_stats(logs)
+    assert sum(s['attempts'] for s in stats) > 0, 'chat drafting did not engage by default'
+    assert sum(s['accepts'] for s in stats) > 0, 'chat default drafting accepted no tokens'
+    defaults['chat']['spec_stats'] = stats
+    offset = server.log.stat().st_size
+    defaults['messages'] = server.request('/v1/messages', {
+        'model': server.model['id'], 'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0, 'top_k': 1, 'seed': 42, 'max_tokens': 96, 'stream': False,
+        'thinking': {'type': 'disabled'}, 'enable_pld': False, 'enable_mtp': False,
+    })
+    logs = server.log.read_bytes()[offset:].decode('utf-8')
+    stats = spec_stats(logs)
+    assert sum(s['attempts'] for s in stats) > 0, 'Anthropic-compatible drafting did not engage by default'
+    assert sum(s['accepts'] for s in stats) > 0, 'Anthropic-compatible drafting accepted no tokens'
+    defaults['messages']['spec_stats'] = stats
+    print('PASS: chat and Anthropic-compatible requests draft by default and accept tokens', flush=True)
     for enabled in (False, True):
         server.chat('List five practical uses of a dictionary in Python.', drafter=enabled, tokens=64)
     rows = []
@@ -184,7 +223,7 @@ def drafter_measurements(server, reps):
                         'on_median_tok_s': statistics.median(r['decode_tok_s'] for r in on),
                         'drafts_accepted_per_round': accepts / attempts,
                         'attempts': attempts, 'accepts': accepts})
-    return {'rows': rows, 'summary': summary}
+    return {'defaults': defaults, 'rows': rows, 'summary': summary}
 
 
 def restore_check(server):
@@ -209,6 +248,7 @@ def main():
     parser.add_argument('--reps', type=int, default=3)
     args = parser.parse_args()
     args.model, args.binary, args.output = args.model.resolve(), args.binary.resolve(), args.output.resolve()
+    args.drafter_auto = args.drafter is None
     if args.drafter is not None:
         args.drafter = args.drafter.resolve()
     elif (args.model / 'drafter' / 'config.json').is_file():
@@ -225,7 +265,7 @@ def main():
         results['models'] = server.model
         results['props'] = server.request('/props')
         if args.checks in ('vision', 'all'):
-            results['vision'] = vision_checks(server)
+            results['vision'] = vision_checks(server, drafter=args.checks == 'all' and args.drafter is not None)
         if args.checks in ('drafter', 'bench', 'all'):
             results['drafter'] = drafter_measurements(server, 1 if args.checks == 'drafter' else args.reps)
         if args.checks == 'restore':

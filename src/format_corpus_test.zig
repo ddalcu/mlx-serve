@@ -2856,3 +2856,22 @@ test "format corpus: constrained JSON marker strings are data on every protocol"
         try testing.expectEqualStrings(json, output.items);
     }
 }
+
+test "format corpus: native LiLiCorr configs preserve borrowed and own output heads" {
+    const dflash = @import("dflash.zig");
+    const cases = [_]struct { source: []const u8, own_head: bool, captures: []const u32 }{
+        .{ .source = @embedFile("fixtures/lilicorr_config.json"), .own_head = false, .captures = &.{ 0, 17, 34, 50, 67, 84 } },
+        .{ .source = @embedFile("fixtures/model-configs/nemotron_h_super_drafter.json"), .own_head = true, .captures = &.{ 0, 21, 42, 63, 84 } },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.source, .{});
+        defer parsed.deinit();
+        try testing.expect(dflash.isDflashConfigJson(parsed.value.object));
+        var config = try dflash.parseConfigFromJson(testing.allocator, case.source);
+        defer config.deinit(testing.allocator);
+        try testing.expect(config.lilicorr);
+        try testing.expectEqual(case.own_head, config.has_own_lm_head);
+        if (case.own_head) try testing.expectEqual(@as(u32, 131072), config.draft_vocab_size);
+        try testing.expectEqualSlices(u32, case.captures, config.captureIds());
+    }
+}

@@ -11777,6 +11777,31 @@ pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) 
     return has_hybrid_layers and !dflash_loaded;
 }
 
+fn anthropicEnableDrafter(explicit: ?std.json.Value, gemma_loaded: bool, dflash_loaded: bool, is_moe: bool, has_hybrid_layers: bool) bool {
+    const enabled = if (explicit) |v| v == .bool and v.bool else (gemma_loaded and !is_moe) or dflash_loaded;
+    if (!enabled or (!gemma_loaded and !dflash_loaded)) return false;
+    return !archBlocksAssistantSidecar(has_hybrid_layers, dflash_loaded);
+}
+
+test "Anthropic drafter admission: DFlash defaults on for dense and hybrid MoE targets" {
+    for ([_]bool{ false, true }) |is_moe| {
+        for ([_]bool{ false, true }) |hybrid| {
+            try testing.expect(anthropicEnableDrafter(null, false, true, is_moe, hybrid));
+            try testing.expect(anthropicEnableDrafter(.{ .bool = true }, false, true, is_moe, hybrid));
+            try testing.expect(!anthropicEnableDrafter(.{ .bool = false }, false, true, is_moe, hybrid));
+            try testing.expect(!anthropicEnableDrafter(.{ .string = "true" }, false, true, is_moe, hybrid));
+            try testing.expect(!anthropicEnableDrafter(null, false, false, is_moe, hybrid));
+            try testing.expect(!anthropicEnableDrafter(.{ .bool = true }, false, false, is_moe, hybrid));
+            try testing.expectEqual(!is_moe and !hybrid, anthropicEnableDrafter(null, true, false, is_moe, hybrid));
+            try testing.expectEqual(!hybrid, anthropicEnableDrafter(.{ .bool = true }, true, false, is_moe, hybrid));
+            try testing.expect(!anthropicEnableDrafter(.{ .bool = false }, true, false, is_moe, hybrid));
+            const enabled = anthropicEnableDrafter(null, false, true, is_moe, hybrid);
+            try testing.expect(requestSpecModes(false, enabled, false, false, true, false, false, 0, false).use_drafter);
+            try testing.expectEqual(StreamMode.drafter, pickStreamMode(false, enabled, false, false, true, false, false, 0, false));
+        }
+    }
+}
+
 pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
 
 fn requestHasCompany() bool {
@@ -17143,13 +17168,7 @@ fn handleAnthropicMessages(
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
-    if (enable_drafter and lm.drafter == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
+    var enable_drafter = anthropicEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)

@@ -8,7 +8,7 @@
 //! (`block_size` + `mask_token_id` + `target_layer_ids`), never on the
 //! `model_type` string.
 //!
-//! Protocol per round (assistant borrows the trunk's embed table + lm_head):
+//! Protocol per round (assistant borrows the trunk's embed table):
 //!   1. Context delta = trunk hiddens at the OUTPUT of layers
 //!      `target_layer_ids` for the tokens the trunk just accepted,
 //!      concatenated on features → `encoder.fc` → RMS norm → per-layer K/V
@@ -18,8 +18,8 @@
 //!   3. Assistant forward: Q from the block only; K/V = cached context +
 //!      fresh block K/V. Block attends bidirectionally among itself,
 //!      sliding-windowed/full to context.
-//!   4. Draft logits = trunk `lm_head(hidden)[:, 1:]` — the anchor position
-//!      is DROPPED → block_size-1 drafts.
+//!   4. Draft logits use the declared own head or the trunk
+//!      `lm_head(hidden)[:, 1:]` — drop the anchor → block_size-1 drafts.
 //!   5. Trunk verify over `[t1, drafts...]` (standard spec verify invariant);
 //!      the verify forward doubles as the next round's context producer.
 //!   6. Block K/V are NEVER cached (reference evicts them via
@@ -77,7 +77,7 @@ pub const DflashConfig = struct {
     conv_kernel_size: u32 = 0,
     conv_group_size: u32 = 0,
     /// Reference `compute_logits`: `logits * output_multiplier`, then
-    /// `tanh(l/cap)*cap`. The trunk head we borrow is the BARE Linear — an
+    /// `tanh(l/cap)*cap`. The selected head is the BARE Linear — an
     /// argmax draft is invariant to these (monotone), but the selector SUMS
     /// unary logits with codebook edges, so the muse sidecar's declared
     /// scale is load-bearing there. 0 cap / 1.0 multiplier = no transform.
@@ -110,6 +110,9 @@ pub const DflashConfig = struct {
     vector_eps: f32 = 0.0001,
     logit_scale: f32 = 8,
     has_attn_sinks: bool = false,
+    /// A trained sidecar head uses the target's token ids without remapping.
+    has_own_lm_head: bool = false,
+    draft_vocab_size: u32 = 0,
     /// Owned when `lilicorr` (same length as `target_layer_ids`). Empty otherwise.
     capture_ids: []u32 = &.{},
 
@@ -271,6 +274,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     const root = parsed.value.object;
 
     const contract = dflashContractObject(root) orelse return error.NotDflashConfig;
+    const has_own_lm_head = if (root.get("has_own_lm_head")) |v| switch (v) {
+        .bool => v.bool,
+        .null => false,
+        else => return error.InvalidDflashConfigValue,
+    } else false;
+    const draft_vocab_size: u32 = if (has_own_lm_head)
+        try jsonU32(root.get("draft_vocab_size") orelse return error.IncompleteDflashConfig)
+    else
+        0;
+    if (has_own_lm_head) {
+        if (draft_vocab_size == 0 or draft_vocab_size > std.math.maxInt(c_int)) return error.InvalidDflashConfigValue;
+        if (root.get("vocab_size")) |v| if (v != .null and try jsonU32(v) != draft_vocab_size) return error.InvalidDflashConfigValue;
+    }
 
     // Bolt's LiLiCorr head reuses the DFlash trunk, then drafts with the
     // correlation module loaded beside it. Argmax of the trunk logits is not
@@ -459,6 +475,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
         .vector_eps = vector_eps,
         .logit_scale = logit_scale,
         .has_attn_sinks = has_attn_sinks,
+        .has_own_lm_head = has_own_lm_head,
+        .draft_vocab_size = draft_vocab_size,
         .capture_ids = capture_ids,
     };
 }
@@ -844,10 +862,12 @@ pub const DflashModel = struct {
     fc: DflashLinear, // encoder.fc [n_targets*hidden → hidden]
     enc_norm: mlx.mlx_array, // encoder.output_norm_enc [hidden]
     final_norm: mlx.mlx_array, // norm [hidden]
+    /// Trained by the sidecar; only draft logits use this projection.
+    own_lm_head: ?DflashLinear = null,
     layers: []DflashLayer,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
-    /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 3, 0 disables).
+    /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 0 disables).
     /// Only the block's draft argmax projects through it — VERIFICATION is a
     /// trunk forward and never touches it, so the emitted distribution is
     /// untouched; drafts just read ~⅓ of the bytes of a full-vocab head.
@@ -870,6 +890,7 @@ pub const DflashModel = struct {
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
         if (self.lilicorr) |*hd| hd.deinit();
+        if (self.own_lm_head) |*head| head.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
@@ -903,14 +924,13 @@ pub const DflashModel = struct {
         }
         if (self.selector) |*sel| bytes += try Tile.one(owner, &sel.hidden_projection, s);
         if (self.markov) |*mh| bytes += try Tile.one(owner, &mh.w2, s);
+        if (self.own_lm_head) |*head| bytes += try Tile.one(owner, head, s);
         return bytes;
     }
 
     /// Validate compatibility with the target trunk. The assistant borrows
-    /// the trunk's embedding table and lm_head, so hidden size and token-id
-    /// space must line up; the capture seam lives in the STANDARD forward
-    /// path only (v1), so module-owned / MoE / hybrid trunks are refused by
-    /// name at load rather than silently drafting from empty captures.
+    /// the trunk's embedding table, so hidden size and token ids must agree.
+    /// An own head cannot remap a smaller draft vocabulary into the target's.
     pub fn bind(self: *DflashModel, target: *Transformer) !void {
         if (self.config.hidden_size != target.config.hidden_size) {
             log.err("[dflash] hidden_size mismatch: assistant={d}, target={d}\n", .{
@@ -922,6 +942,10 @@ pub const DflashModel = struct {
             log.err("[dflash] mask_token_id {d} outside target vocab {d}\n", .{
                 self.config.mask_token_id, target.config.vocab_size,
             });
+            return error.DflashTargetMismatch;
+        }
+        if (self.own_lm_head != null and self.config.draft_vocab_size != target.config.vocab_size) {
+            log.err("[dflash] own head vocab {d} differs from target vocab {d}\n", .{ self.config.draft_vocab_size, target.config.vocab_size });
             return error.DflashTargetMismatch;
         }
         validateTargetLayers(self.config.target_layer_ids, target.config.num_hidden_layers) catch |err| {
@@ -990,6 +1014,7 @@ pub const DflashModel = struct {
     /// from the trunk global); a dense bf16 head is quantized outright. Never
     /// built when it would not shrink the read.
     fn buildDraftHead(self: *DflashModel, target: *Transformer, bits: u32) !void {
+        if (self.own_lm_head != null) return;
         if (bits == 0) {
             log.info("[dflash] draft lm_head: trunk head (no requantization)\n", .{});
             return;
@@ -1038,15 +1063,17 @@ pub const DflashModel = struct {
         log.info("[dflash] draft-only lm_head requantized to {d}-bit/gs{d}\n", .{ bits, group });
     }
 
-    /// Draft logits for the block hidden: the low-bit draft head when one was
-    /// built, else the trunk's own head. Both are the bare Linear; when the
+    /// Draft logits use the trained own head, otherwise the optional low-bit
+    /// copy or trunk head. These are bare Linears; when the
     /// sidecar DECLARES a softcap / output_multiplier (muse DFlash2) they are
     /// applied here — argmax drafts are invariant (monotone), but the
     /// selector sums these logits with codebook edges and the sampled arm
     /// softmaxes them, neither of which survives a scale change.
     pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
         var out: mlx.mlx_array = undefined;
-        if (self.draft_head) |*dh| {
+        if (self.own_lm_head) |*head| {
+            out = try head.apply(x, self.s);
+        } else if (self.draft_head) |*dh| {
             out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_quantized_matmul(
@@ -1206,6 +1233,23 @@ fn loadLinear(
     return .{ .w = transposed, .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
 }
 
+fn loadOwnHead(weights: *Weights, cfg: *const DflashConfig, bits: u32, s: mlx.mlx_stream) !DflashLinear {
+    const raw = weights.get("lm_head.weight") orelse return error.MissingWeight;
+    const shape = mlx.getShape(raw);
+    if (shape.len != 2 or shape[0] != cfg.draft_vocab_size or shape[1] <= 0) return error.InvalidDflashHeadWeights;
+    if (weights.get("lm_head.scales")) |scales| {
+        const bias = weights.get("lm_head.biases") orelse return error.InvalidDflashHeadWeights;
+        const scale_shape = mlx.getShape(scales);
+        if (mlx.mlx_array_dtype(raw) != .uint32 or !transformer_mod.floatDtypeTable(mlx.mlx_array_dtype(scales)) or
+            !transformer_mod.floatDtypeTable(mlx.mlx_array_dtype(bias))) return error.InvalidDflashHeadWeights;
+        if (scale_shape.len != 2 or scale_shape[0] != shape[0] or !std.mem.eql(c_int, scale_shape, mlx.getShape(bias))) return error.InvalidDflashHeadWeights;
+        if (transformer_mod.affineParamsFromGeometry(raw, scales, cfg.hidden_size) == null) return error.InvalidDflashHeadWeights;
+    } else if (shape[1] != cfg.hidden_size or !transformer_mod.floatDtypeTable(mlx.mlx_array_dtype(raw))) {
+        return error.InvalidDflashHeadWeights;
+    }
+    return loadLinear(weights, "lm_head", cfg.hidden_size, bits, s);
+}
+
 /// Affine-quantize a dense `[out, in]` weight in place of a transpose — the
 /// packed layout is exactly what `mlx_quantized_matmul(transpose=true)` reads.
 fn quantizeDense(raw: mlx.mlx_array, bits: u32, group: u32, s: mlx.mlx_stream) !DflashLinear {
@@ -1261,6 +1305,10 @@ pub fn loadDflashQuant(
 
     var weights = try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
+
+    var own_lm_head: ?DflashLinear = null;
+    errdefer if (own_lm_head) |*head| head.deinit();
+    if (cfg.has_own_lm_head) own_lm_head = try loadOwnHead(&weights, &cfg, bits, s);
 
     const hidden = cfg.hidden_size;
     const q_out = cfg.num_attention_heads * cfg.head_dim;
@@ -1377,6 +1425,7 @@ pub fn loadDflashQuant(
         if (selector) |*sel| sel.appendEval(eval_vec);
         if (markov) |*mh| mh.appendEval(eval_vec);
         if (head) |*hd| hd.appendEval(eval_vec);
+        if (own_lm_head) |*lm_head| lm_head.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
     // Hand the bf16 sources the load-time quantization freed back to the OS
@@ -1392,6 +1441,8 @@ pub fn loadDflashQuant(
             cfg.num_hidden_layers, cfg.hidden_size, cfg.block_size, cfg.target_layer_ids,
         });
     }
+
+    if (own_lm_head != null) log.info("[dflash] trained own lm_head loaded: vocab={d}\n", .{cfg.draft_vocab_size});
 
     if (cfg.isDflash2()) {
         log.info("[dflash] dflash2: selector rank={d} top_k={d}, dyn-convs ksize={d} group={d}\n", .{
@@ -1411,6 +1462,7 @@ pub fn loadDflashQuant(
         .fc = fc,
         .enc_norm = enc_norm,
         .final_norm = final_norm,
+        .own_lm_head = own_lm_head,
         .layers = layers,
         .selector = selector,
         .markov = markov,
@@ -3539,6 +3591,172 @@ pub const TinyFix = struct {
         return bf;
     }
 };
+
+const OwnHeadFix = struct {
+    const seed = 777;
+    fn write(io: std.Io, dir: std.Io.Dir, path: []const u8, s: mlx.mlx_stream, rows: usize, cols: usize, prepacked: bool) !void {
+        try TinyFix.writeAssistant(io, dir, path, s);
+        const cfg = try std.fmt.allocPrint(testing.allocator, "{s},\"has_own_lm_head\":true,\"draft_vocab_size\":128}}", .{TinyFix.ASSISTANT_CONFIG[0 .. TinyFix.ASSISTANT_CONFIG.len - 1]});
+        defer testing.allocator.free(cfg);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
+        if (rows == 0) return;
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        if (prepacked) {
+            const dense = try TinyFix.bf16Arr(rows, cols, seed, s);
+            defer _ = mlx.mlx_array_free(dense);
+            var lin = try quantizeDense(dense, 4, 64, s);
+            defer lin.deinit();
+            try TinyFix.put(map, "lm_head.weight", lin.w);
+            try TinyFix.put(map, "lm_head.scales", lin.scales);
+            try TinyFix.put(map, "lm_head.biases", lin.biases);
+        } else try TinyFix.putW(map, "lm_head.weight", rows, cols, seed, s);
+        const file = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/head.safetensors", .{path}, 0);
+        defer testing.allocator.free(file);
+        try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
+    }
+};
+
+test "dflash own head: official Super config and malformed declarations" {
+    const alloc = testing.allocator;
+    var super = try parseConfigFromJson(alloc, @embedFile("fixtures/model-configs/nemotron_h_super_drafter.json"));
+    defer super.deinit(alloc);
+    try testing.expect(super.has_own_lm_head);
+    try testing.expectEqual(@as(u32, 131072), super.draft_vocab_size);
+    try testing.expectEqual(@as(u32, 8), super.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 8192), super.sliding_window);
+    try testing.expectEqual(@as(u32, 2), super.conv_kernel_size);
+    try testing.expectEqualSlices(u32, &.{ 0, 21, 42, 63, 84 }, super.captureIds());
+    var borrow = try parseConfigFromJson(alloc, TinyFix.ASSISTANT_CONFIG);
+    defer borrow.deinit(alloc);
+    try testing.expect(!borrow.has_own_lm_head);
+    const begin = TinyFix.ASSISTANT_CONFIG[0 .. TinyFix.ASSISTANT_CONFIG.len - 1];
+    inline for (.{ "\"true\"", "1", "{}" }) |flag| {
+        const raw = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":{s}}}", .{ begin, flag });
+        defer alloc.free(raw);
+        try testing.expectError(error.InvalidDflashConfigValue, parseConfigFromJson(alloc, raw));
+    }
+    inline for (.{ "0", "-1", "1.5", "\"128\"" }) |width| {
+        const raw = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":true,\"draft_vocab_size\":{s}}}", .{ begin, width });
+        defer alloc.free(raw);
+        try testing.expectError(error.InvalidDflashConfigValue, parseConfigFromJson(alloc, raw));
+    }
+    inline for (.{ "false", "null" }) |flag| {
+        const raw = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":{s}}}", .{ begin, flag });
+        defer alloc.free(raw);
+        var optional = try parseConfigFromJson(alloc, raw);
+        defer optional.deinit(alloc);
+        try testing.expect(!optional.has_own_lm_head);
+    }
+    const remapped = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":true,\"draft_vocab_size\":128,\"vocab_size\":256}}", .{begin});
+    defer alloc.free(remapped);
+    try testing.expectError(error.InvalidDflashConfigValue, parseConfigFromJson(alloc, remapped));
+    const missing = try std.fmt.allocPrint(alloc, "{s},\"has_own_lm_head\":true}}", .{begin});
+    defer alloc.free(missing);
+    try testing.expectError(error.IncompleteDflashConfig, parseConfigFromJson(alloc, missing));
+}
+
+test "dflash own head: declared weights and geometry are mandatory" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    for ([_][2]usize{ .{ 0, 0 }, .{ 127, 64 }, .{ 128, 32 } }) |shape| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+        try OwnHeadFix.write(io, tmp.dir, dir, s, shape[0], shape[1], false);
+        if (loadDflashQuant(io, testing.allocator, s, dir, 0)) |unexpected| {
+            var model = unexpected;
+            model.deinit();
+            return error.ExpectedHeadWeightError;
+        } else |err| try testing.expectEqual(if (shape[0] == 0) error.MissingWeight else error.InvalidDflashHeadWeights, err);
+    }
+}
+
+test "dflash own head: dense and affine projections preserve trained logits and target verification" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    var trunk = testing.tmpDir(.{});
+    defer trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try trunk.dir.realPath(io, &trunk_buf)];
+    try TinyFix.writeTrunk(io, trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    const ids = mlx.mlx_array_new_data(&[_]i32{ 2, 3, 7 }, &[_]c_int{ 1, 3 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    const before = try xfm.forward(ids);
+    defer _ = mlx.mlx_array_free(before);
+    const before_values = try TinyFix.readF32(before, allocator, s);
+    defer allocator.free(before_values);
+    const x = try TinyFix.capArr(TinyFix.BLOCK, 800, s);
+    defer _ = mlx.mlx_array_free(x);
+    const trunk_logits = try xfm.lmHeadForDraft(x);
+    defer _ = mlx.mlx_array_free(trunk_logits);
+    const trunk_values = try TinyFix.readF32(trunk_logits, allocator, s);
+    defer allocator.free(trunk_values);
+    for ([_]u32{ 0, 8, 4 }) |bits| {
+        var asst = testing.tmpDir(.{});
+        defer asst.cleanup();
+        var asst_buf: [512]u8 = undefined;
+        const path = asst_buf[0..try asst.dir.realPath(io, &asst_buf)];
+        try OwnHeadFix.write(io, asst.dir, path, s, TinyFix.VOCAB, TinyFix.HIDDEN, bits == 4);
+        var model = try loadDflashQuant(io, allocator, s, path, if (bits == 8) 8 else 0);
+        defer model.deinit();
+        try testing.expect(model.own_lm_head != null);
+        try testing.expectEqual(bits, model.own_lm_head.?.bits);
+        try model.bindWithDraftBits(&xfm, 3);
+        try testing.expect(model.draft_head == null);
+        xfm.config.vocab_size += 1;
+        try testing.expectError(error.DflashTargetMismatch, model.bind(&xfm));
+        xfm.config.vocab_size -= 1;
+        const dense = try TinyFix.bf16Arr(TinyFix.VOCAB, TinyFix.HIDDEN, OwnHeadFix.seed, s);
+        defer _ = mlx.mlx_array_free(dense);
+        var ref_weights = if (bits > 0) try quantizeDense(dense, bits, 64, s) else DflashLinear{
+            .w = mlx.mlx_array_new(),
+            .scales = mlx.mlx_array_new(),
+            .biases = mlx.mlx_array_new(),
+        };
+        defer ref_weights.deinit();
+        var expected = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(expected);
+        if (bits > 0) {
+            try mlx.check(mlx.mlx_quantized_matmul(&expected, x, ref_weights.w, ref_weights.scales, ref_weights.biases, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", s));
+        } else {
+            try mlx.check(mlx.mlx_transpose_axes(&ref_weights.w, dense, &[_]c_int{ 1, 0 }, 2, s));
+            try mlx.check(mlx.mlx_matmul(&expected, x, ref_weights.w, s));
+        }
+        const expected_values = try TinyFix.readF32(expected, allocator, s);
+        defer allocator.free(expected_values);
+        for ([_]bool{ false, true }) |tile| {
+            if (tile) _ = try model.tileLaneWeights(.bfloat16, s);
+            const got = try model.draftLogits(&xfm, x);
+            defer _ = mlx.mlx_array_free(got);
+            const values = try TinyFix.readF32(got, allocator, s);
+            defer allocator.free(values);
+            const parity = try paritySlices(expected_values, values);
+            try testing.expect(parity.cos > 0.9999 and @abs(parity.rms_ratio - 1) < 0.01);
+            var difference: f32 = 0;
+            for (values, trunk_values) |a, b| difference = @max(difference, @abs(a - b));
+            try testing.expect(difference > 0.1);
+        }
+        try xfm.resetCache();
+        const after = try xfm.forward(ids);
+        defer _ = mlx.mlx_array_free(after);
+        const after_values = try TinyFix.readF32(after, allocator, s);
+        defer allocator.free(after_values);
+        try testing.expectEqualSlices(f32, before_values, after_values);
+    }
+}
 
 test "dflash: loadDflash keeps a dense bf16 assistant dense + pre-transposed when quantization is off" {
     const allocator = testing.allocator;

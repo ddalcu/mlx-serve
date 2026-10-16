@@ -742,16 +742,14 @@ pub const Slot = struct {
             .has_tools = params.has_tools,
             .enable_thinking = params.enable_thinking,
             .enable_pld = params.enable_pld,
-            // Qwen's external drafter does not yet carry M-RoPE positions.
-            // Muse DFlash is different: it consumes captures from the same
-            // vision-conditioned trunk forward and Muse has no M-RoPE table,
-            // so image requests may keep that sidecar armed.
+            // Muse and Nemotron RADIO DFlash consume vision-conditioned
+            // trunk captures; Qwen's external drafter lacks M-RoPE positions.
             .enable_drafter = assistantSidecarEnabledForRequest(
                 params.enable_drafter,
                 params.vision_embeddings != null,
                 params.mrope_pos != null,
                 params.dflash != null,
-                config.muse_vision,
+                config,
             ),
             .drafter = params.drafter,
             .dflash = params.dflash,
@@ -8163,33 +8161,57 @@ pub fn specInitWiring(
 
 /// Resolve the request-level switch shared by the classic external drafter
 /// and DFlash. Vision stays guarded by default: placeholder ids alone do not
-/// tell an external sidecar how to position image tokens. Muse DFlash is the
-/// measured exception because it drafts from captures produced by Muse's own
-/// vision-conditioned trunk and Muse does not use Qwen's M-RoPE table.
+/// tell an external sidecar how to position image tokens. Muse and Nemotron
+/// RADIO DFlash consume the vision-conditioned trunk's captures without
+/// Qwen's M-RoPE table.
 pub fn assistantSidecarEnabledForRequest(
     requested: bool,
     has_vision: bool,
     has_mrope: bool,
     has_dflash: bool,
-    is_muse_vision: bool,
+    config: *const ModelConfig,
 ) bool {
     if (!requested) return false;
     if (!has_vision) return true;
-    return has_dflash and is_muse_vision and !has_mrope;
+    const native_captures = config.muse_vision or
+        (config.radio_vision and std.mem.eql(u8, config.model_type, "nemotron_h"));
+    return has_dflash and native_captures and !has_mrope;
 }
 
 test "assistant sidecar vision gate admits Muse DFlash without weakening Qwen M-RoPE" {
+    const generic = ModelConfig{};
+    const muse = ModelConfig{ .muse_vision = true };
     // Text requests keep the existing shared sidecar behavior.
-    try testing.expect(assistantSidecarEnabledForRequest(true, false, false, false, false));
+    try testing.expect(assistantSidecarEnabledForRequest(true, false, false, false, &generic));
     // A request opt-out always wins.
-    try testing.expect(!assistantSidecarEnabledForRequest(false, true, false, true, true));
+    try testing.expect(!assistantSidecarEnabledForRequest(false, true, false, true, &muse));
     // Image requests remain guarded for classic external drafters.
-    try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, false, false));
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, false, &generic));
     // Muse DFlash consumes vision-conditioned trunk captures and may engage.
-    try testing.expect(assistantSidecarEnabledForRequest(true, true, false, true, true));
+    try testing.expect(assistantSidecarEnabledForRequest(true, true, false, true, &muse));
     // Qwen's explicit M-RoPE table is never admitted through this exception.
-    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, true));
-    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, false));
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, &muse));
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, &generic));
+}
+
+test "assistant sidecar vision gate admits Nemotron RADIO captures for image and video" {
+    for ([_]ModelConfig{
+        .{ .model_type = "nemotron_h", .radio_vision = true },
+        .{ .model_type = "nemotron_h", .radio_vision = true, .has_hybrid_layers = true, .num_experts = 512 },
+    }) |config| {
+        try testing.expect(assistantSidecarEnabledForRequest(true, true, false, true, &config));
+        try testing.expect(assistantSidecarEnabledForRequest(true, false, false, true, &config));
+        try testing.expect(!assistantSidecarEnabledForRequest(false, true, false, true, &config));
+        try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, &config));
+        try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, false, &config));
+    }
+    for ([_]ModelConfig{
+        .{ .model_type = "nemotron_h" },
+        .{ .model_type = "qwen3_5", .radio_vision = true },
+        .{ .model_type = "gemma4" },
+    }) |config| {
+        try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, true, &config));
+    }
 }
 
 /// Which spec mode a decode tick drives for a slot.
