@@ -318,12 +318,39 @@ final class MediaGenServiceTests: XCTestCase {
             XCTAssertGreaterThan(p.stagedPeakUnstreamedGB, p.stagedPeakGB)
         }
         // Measured on the 8-bit pack with "stream_weights": false: a 25.96 GiB text-encoder stage
-        // and a 30.96 GiB denoise peak at 1120x640 x 124 with the fast recipe.
+        // and a 30.96 GiB denoise peak at 1120x640 x 124 with the fast recipe and the 8-bit cache.
         let h3 = VideoModelPreset.minimaxH3
         XCTAssertGreaterThanOrEqual(h3.stagedPeakUnstreamedGB, 25.96)
-        let bill = Double(H3Plan.peakBytes(model: h3, width: 1120, height: 640, frames: 124, fast: true, streamWeights: false)) / gib
+        let bill = Double(H3Plan.peakBytes(model: h3, width: 1120, height: 640, frames: 124, fast: true, streamWeights: false,
+                                           cache8bit: true)) / gib
         XCTAssertGreaterThanOrEqual(bill, 30.96)
         XCTAssertLessThan(bill, 30.96 + 5)
+    }
+
+    /// The 8-bit cache is opt-in and rides only a request that runs the fast recipe; the memory
+    /// check is skipped only when the user answered a refusal with "Start anyway".
+    func testRequestBodySendsTheCacheAndMemoryOverrideOnlyWhenAsked() {
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        func body() -> [String: Any] { VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil) }
+        XCTAssertNil(body()["attn_cache_8bit"])
+        XCTAssertNil(body()["ignore_memory_check"])
+        req.attnCache8bit = true
+        XCTAssertEqual(body()["attn_cache_8bit"] as? Bool, true)
+        req.bestQuality = true // no fast recipe, no cache to store
+        XCTAssertNil(body()["attn_cache_8bit"])
+        req.ignoreMemoryCheck = true
+        XCTAssertEqual(body()["ignore_memory_check"] as? Bool, true)
+    }
+
+    /// The server's memory refusal is typed, so the pane can offer "Start anyway" for it and for nothing else.
+    func testOnlyTheServersMemoryRefusalOffersStartAnyway() {
+        let refusal = #"{"error":{"message":"1120x640 x 124 frames needs ~45.0 GB but 40.1 GB is available","type":"insufficient_memory"}}"#
+        let err = APIError.streamStartError(code: 400, body: Data(refusal.utf8))
+        XCTAssertTrue(VideoGenService.isMemoryRefusal(err))
+        XCTAssertEqual(err.errorDescription, "1120x640 x 124 frames needs ~45.0 GB but 40.1 GB is available")
+        let other = APIError.streamStartError(code: 400, body: Data(#"{"error":{"message":"width must be a multiple of 32"}}"#.utf8))
+        XCTAssertFalse(VideoGenService.isMemoryRefusal(other))
     }
 
     func testStreamStartFailureSurfacesTheServersOwnMessage() {

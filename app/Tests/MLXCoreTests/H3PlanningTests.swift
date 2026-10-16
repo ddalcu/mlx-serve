@@ -49,19 +49,20 @@ final class H3PlanningTests: XCTestCase {
 
     /// The fast recipe caches one `[S, hidden]` per block for the whole run, and at long frame
     /// counts that cache — not the weights — is what runs a Mac out of memory. Measured on the
-    /// 8-bit pack at 1344x768 with a bf16 cache: ~20 GB at 124 frames, ~34 GB at 209. The server
-    /// stores it 8-bit (group 64, bf16 scale + bias): 5712 of those 10752 bytes per row and block.
-    func testPabCacheIsTheMeasuredBf16FootprintAtTheStoredWidth() {
+    /// 8-bit pack at 1344x768 with the bf16 cache: ~20 GB at 124 frames, ~34 GB at 209. Asked
+    /// for 8-bit (group 64, bf16 scale + bias) it is 5712 of those 10752 bytes per row and block.
+    func testPabCacheIsTheMeasuredBf16FootprintAndShrinksWhen8Bit() {
         // Decimal GB, because that is the unit those two figures were written
         // down in. Everything that compares against a MACHINE's memory uses
         // GiB (`RAMChecker.totalGB` is `physicalMemory / 1024^3`), and mixing
         // the two silently is a 7% error at this scale.
         let gb = 1_000_000_000.0
-        let stored = 5712.0 / 10752.0
-        let at124 = Double(H3Plan.pabCacheBytes(rows: H3Plan.rows(width: 1344, height: 768, frames: 124, promptTokens: 250))) / gb
+        let rows124 = H3Plan.rows(width: 1344, height: 768, frames: 124, promptTokens: 250)
+        let at124 = Double(H3Plan.pabCacheBytes(rows: rows124)) / gb
         let at209 = Double(H3Plan.pabCacheBytes(rows: H3Plan.rows(width: 1344, height: 768, frames: 209, promptTokens: 250))) / gb
-        XCTAssertEqual(at124, 20.4 * stored, accuracy: 0.3, "measured ~20 GB bf16 at 768p/124f")
-        XCTAssertEqual(at209, 34.1 * stored, accuracy: 0.3, "measured ~34 GB bf16 at 768p/209f")
+        XCTAssertEqual(at124, 20.4, accuracy: 0.5, "measured ~20 GB bf16 at 768p/124f")
+        XCTAssertEqual(at209, 34.1, accuracy: 0.5, "measured ~34 GB bf16 at 768p/209f")
+        XCTAssertEqual(Double(H3Plan.pabCacheBytes(rows: rows124, cache8bit: true)) / gb, 20.4 * 5712 / 10752, accuracy: 0.3)
         // It is LINEAR in rows — the square term is time, not memory (SDPA is
         // fused, so the [S, S] score matrix is never materialized; at 362
         // frames it would be 1.3 PB).
@@ -89,7 +90,8 @@ final class H3PlanningTests: XCTestCase {
 
     func testSamplingBillCoversTheMeasuredStepPeak() {
         let gib = 1024.0 * 1024.0 * 1024.0
-        let peak = Double(H3Plan.peakBytes(model: h3q4, width: 1120, height: 640, frames: 192, fast: true)) / gib
+        let peak = Double(H3Plan.peakBytes(model: h3q4, width: 1120, height: 640, frames: 192, fast: true,
+                                           cache8bit: true)) / gib
         XCTAssertGreaterThanOrEqual(peak, 15.77)
         XCTAssertLessThan(peak, 15.77 + 5.0)
     }
@@ -120,9 +122,9 @@ final class H3PlanningTests: XCTestCase {
         let slow = H3Plan.peakBytes(model: h3, width: long.w, height: long.h, frames: long.f, fast: false)
         XCTAssertLessThan(slow, fast)
         let gib = 1024.0 * 1024.0 * 1024.0
-        XCTAssertEqual(Double(fast) / gib, 48.2, accuracy: 4.0)
+        XCTAssertEqual(Double(fast) / gib, 73.9, accuracy: 4.0)
         // Without the cache the same run holds the streamed DiT, the request base
-        // and its rows, so the trade is ~48 GiB for ~19, paid for in roughly 4x
+        // and its rows, so the trade is ~74 GiB for ~19, paid for in roughly 4x
         // the runtime.
         XCTAssertEqual(Double(slow) / gib, 19.2, accuracy: 1.0)
     }
@@ -135,8 +137,12 @@ final class H3PlanningTests: XCTestCase {
         // 362 frames at 960x544 is the run we actually did, on an M5 Max.
         XCTAssertLessThan(longForm, 64.0, "the measured 362-frame run must read as fitting")
         let budget = { (ram: Int) in Double(H3Plan.budgetBytes(availableGB: ram)) / gib }
-        XCTAssertGreaterThan(wide, budget(48), "1344x768 at 362 frames does not fit a 48 GB Mac")
-        XCTAssertLessThan(wide, budget(64), "...but with the DiT streaming it is a 64 GB job")
+        XCTAssertGreaterThan(wide, budget(64), "1344x768 at 362 frames with the bf16 cache does not fit a 64 GB Mac")
+        XCTAssertLessThan(wide, budget(96), "...but with the DiT streaming it is a 96 GB job")
+        let wide8 = Double(H3Plan.peakBytes(model: h3, width: 1344, height: 768, frames: 362, fast: true,
+                                            cache8bit: true)) / gib
+        XCTAssertGreaterThan(wide8, budget(48), "with the 8-bit cache it still does not fit a 48 GB Mac")
+        XCTAssertLessThan(wide8, budget(64), "...but it is a 64 GB job")
 
         // The 4-bit pack is the low-RAM option and must bill lower everywhere.
         for f in [124, 209, 362] {

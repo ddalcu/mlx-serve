@@ -102,6 +102,8 @@ struct VideoGenView: View {
     @State private var turbo: Bool = false
     /// H3 streams its weights from disk (server default); off holds them in memory.
     @State private var streamWeights: Bool = true
+    /// H3's fast-recipe attention cache stored 8-bit (less memory, slightly lossy).
+    @State private var attnCache8bit: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -864,7 +866,7 @@ struct VideoGenView: View {
         let opts = model.frameOptions(width: effectiveSize.width, height: effectiveSize.height)
         let cap = RAMChecker.safeFrameCap(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                           available: RAMChecker.totalGB, fast: effectiveFast,
-                                          streamWeights: streamWeights)
+                                          streamWeights: streamWeights, cache8bit: attnCache8bit)
         let fits = opts.filter { $0 <= cap }
         return fits.isEmpty ? Array(opts.prefix(1)) : fits
     }
@@ -1033,7 +1035,8 @@ struct VideoGenView: View {
             height: effectiveSize.height,
             available: total,
             fast: effectiveFast,
-            streamWeights: streamWeights
+            streamWeights: streamWeights,
+            cache8bit: attnCache8bit
         )
         guard model.backend == .minimaxH3 else {
             guard numFrames > cap else { return nil }
@@ -1045,20 +1048,27 @@ struct VideoGenView: View {
         // no warning at all at exactly 124 frames.
         guard !H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
                            frames: numFrames, fast: effectiveFast, turbo: turboEngaged, streamWeights: streamWeights,
-                           availableGB: total) else { return nil }
+                           cache8bit: attnCache8bit, availableGB: total) else { return nil }
         let gib = 1024.0 * 1024.0 * 1024.0
         let need = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                            frames: numFrames, fast: effectiveFast, turbo: turboEngaged,
-                                           streamWeights: streamWeights)) / gib
+                                           streamWeights: streamWeights, cache8bit: attnCache8bit)) / gib
         var out = String(format: "Needs about %.0f GB at this size and length; your Mac has %d GB. ", need, total)
         let floorFits = H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                     frames: cap, fast: effectiveFast, turbo: turboEngaged, streamWeights: streamWeights,
-                                    availableGB: total)
+                                    cache8bit: attnCache8bit, availableGB: total)
         out += floorFits && cap < numFrames ? "About \(cap) frames fits here" : "Try a smaller resolution"
         if !streamWeights {
             let streamed = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                                   frames: numFrames, fast: effectiveFast, turbo: turboEngaged)) / gib
+                                                   frames: numFrames, fast: effectiveFast, turbo: turboEngaged,
+                                                   cache8bit: attnCache8bit)) / gib
             out += String(format: ", or turn on Stream weights from disk (%.0f GB)", streamed)
+        } else if effectiveFast, !attnCache8bit {
+            let q8 = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                             frames: numFrames, fast: true, cache8bit: true)) / gib
+            if q8 < need - 2 {
+                out += String(format: ", or turn on the 8-bit attention cache (%.0f GB)", q8)
+            }
         } else if effectiveFast {
             let slow = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                                frames: numFrames, fast: false)) / gib
@@ -1076,7 +1086,7 @@ struct VideoGenView: View {
         let frames = storyboardOn ? shotFrames : [numFrames]
         let peak = H3Plan.describePeak(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                        shotFrames: frames, fast: effectiveFast, turbo: turboEngaged,
-                                       streamWeights: streamWeights)
+                                       streamWeights: streamWeights, cache8bit: attnCache8bit)
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
             shotFrames: frames, steps: steps, fast: effectiveFast, streamWeights: streamWeights, alongside: peak
@@ -1910,6 +1920,12 @@ struct VideoGenView: View {
                     .font(.app(.caption))
                     .help("On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run.")
             }
+            if model.supportsFastRecipe {
+                Toggle("8-bit attention cache (less memory, slightly lossy)", isOn: $attnCache8bit)
+                    .font(.app(.caption))
+                    .help("Off (default): the fast recipe keeps its attention cache in bf16. On: the cache is stored 8-bit, about half its memory, which matters most on long clips. The video comes out slightly different from the bf16 cache's. Max quality and Turbo keep no cache, so this does nothing there.")
+                    .disabled(!effectiveFast)
+            }
             Toggle("Show live preview while generating (~1% slower)", isOn: $livePreview)
                 .font(.app(.caption))
                 .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It is not free — every step solves for the clean latent and copies the previewed frame to the CPU.")
@@ -2207,6 +2223,11 @@ struct VideoGenView: View {
                     } description: {
                         Text(msg)
                     } actions: {
+                        if service.refusedForMemory {
+                            Button { tryGenerate(ignoreMemoryCheck: true) } label: { Text("Start anyway")
+                                .font(.app(.body)) }
+                                .help("The free-memory reading undercounts what macOS can release on demand (cached files, idle apps), so a run it refuses can still fit. If it does run out of memory, the whole server stops, and any chat or agent on it with it.")
+                        }
                         Button { showLogWindow() } label: { Text("Show log")
                             .font(.app(.body)) }
                     }
@@ -2280,6 +2301,7 @@ struct VideoGenView: View {
         // preset's floor, and clamping first would bounce a saved 8 up to 16.
         turbo = s.turbo && model.supportsTurbo
         streamWeights = s.streamWeights
+        attnCache8bit = s.attnCache8bit
         // Clamp into the slider ranges — a value persisted by the old wider
         // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
         steps = min(effectiveStepsRange.upperBound, max(effectiveStepsRange.lowerBound, s.steps))
@@ -2376,6 +2398,7 @@ struct VideoGenView: View {
         s.diffusionDecoder = diffusionDecoder
         s.turbo = turbo
         s.streamWeights = streamWeights
+        s.attnCache8bit = attnCache8bit
         s.promptHeight = PromptEditorHeight.clamp(promptHeight)
         s.loras = loras
         s.prompt = prompt
@@ -2470,7 +2493,7 @@ struct VideoGenView: View {
     /// total. macOS's "available" reading is misleading on unified memory
     /// (idle apps get paged out under pressure) — using it as a hard gate
     /// blocked legitimate runs, so we let the user override.
-    private func tryGenerate() {
+    private func tryGenerate(ignoreMemoryCheck: Bool = false) {
         let req = VideoGenRequest(
             model: model,
             prompt: prompt,
@@ -2500,6 +2523,8 @@ struct VideoGenView: View {
             // preset switches, like the reference files below).
             turbo: turboEngaged,
             streamWeights: streamWeights,
+            attnCache8bit: attnCache8bit,
+            ignoreMemoryCheck: ignoreMemoryCheck,
             // Gated here too: the stepper's value survives a preset switch,
             // and only the fl2va partition has a keyframe row to chain.
             chainWindows: model.supportsChainedWindows ? chainWindows : 1,

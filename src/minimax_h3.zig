@@ -2179,12 +2179,6 @@ pub const AttnBroadcast = struct {
         };
     }
 
-    /// `MINIMAX_H3_ATTN_BCAST_Q8=0` keeps the cache bf16 (lossless, ~1.9x the bytes).
-    pub fn q8FromEnv() bool {
-        const raw = envStr("MINIMAX_H3_ATTN_BCAST_Q8") orelse return true;
-        return !std.mem.eql(u8, raw, "0");
-    }
-
     /// Bytes the cache holds per sequence row across `n_blocks` blocks (scales and biases bf16).
     pub fn rowBytes(hidden: u64, n_blocks: u64, q8: bool) u64 {
         const per_block = if (q8 and hidden % GROUP == 0) hidden + hidden / GROUP * 4 else hidden * 2;
@@ -3789,6 +3783,9 @@ pub const GenRequest = struct {
     /// (request `stream_weights`, default on): ~20 GB less for the 8-bit pack, each pass slower
     /// by what the disk takes to read them. A resident set never streams.
     stream_weights: bool = true,
+    /// Store the fast recipe's attention cache 8-bit (request `attn_cache_8bit`, default off):
+    /// about half its bytes, LOSSY, so a render differs slightly from the bf16 cache's.
+    attn_cache_8bit: bool = false,
     /// Style LoRAs stacked on the DiT: absolute `.safetensors` paths and their
     /// strengths (parallel arrays; a missing scale is 1.0 at the caller). They
     /// sum with each other and with Turbo, never merge — order is irrelevant
@@ -4663,7 +4660,7 @@ fn generateOne(
         const speed = req.speed;
         log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.turbo });
         const bcast_k: u32 = speed.bcast_k;
-        var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len, AttnBroadcast.q8FromEnv()) else null;
+        var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len, req.attn_cache_8bit) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
         var bcast_reused: u32 = 0;
         const mem_cap = DenoiseMemCap.begin();

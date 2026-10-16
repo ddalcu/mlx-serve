@@ -44,13 +44,13 @@ enum H3Plan {
     }
 
     /// The fast recipe's attention-broadcast cache: one `[S, hidden]` per block,
-    /// held for the whole run, stored 8-bit with a bf16 scale and bias per 64
-    /// (`AttnBroadcast.rowBytes`). At long frame counts THIS is what runs a Mac
-    /// out of memory, not the weights — 31 GB at 1344x768 x 362 frames.
+    /// held for the whole run, bf16, or 8-bit with a bf16 scale and bias per 64
+    /// when the request asks (`attn_cache_8bit`, `AttnBroadcast.rowBytes`). At long
+    /// frame counts THIS is what runs a Mac out of memory, not the weights.
     /// Linear in rows: the [S, S] score matrix is never materialized (SDPA is
     /// fused), which is the only reason a 108k-row sequence is possible at all.
-    static func pabCacheBytes(rows: Int) -> UInt64 {
-        UInt64(rows) * UInt64(hiddenSize + hiddenSize / 64 * 4) * UInt64(blocks)
+    static func pabCacheBytes(rows: Int, cache8bit: Bool = false) -> UInt64 {
+        UInt64(rows) * UInt64(cache8bit ? hiddenSize + hiddenSize / 64 * 4 : hiddenSize * 2) * UInt64(blocks)
     }
 
     /// What a denoise step holds above the DiT: a base plus per-row transients.
@@ -83,7 +83,8 @@ enum H3Plan {
     /// staged LOAD peak (the preset's `stagedPeakGB`) is the floor.
     static func peakBytes(model: VideoModelPreset, width: Int, height: Int,
                           frames: Int, fast: Bool, turbo: Bool = false,
-                          streamWeights: Bool = true, promptTokens: Int = 250) -> UInt64 {
+                          streamWeights: Bool = true, cache8bit: Bool = false,
+                          promptTokens: Int = 250) -> UInt64 {
         let gb: UInt64 = 1024 * 1024 * 1024
         let held = !streamWeights && model.supportsWeightStreaming
         let declaredStaged = held ? model.stagedPeakUnstreamedGB : model.stagedPeakGB
@@ -95,7 +96,7 @@ enum H3Plan {
         // fast=false and the broadcast cache never bills; the LoRA itself
         // rides beside the DiT.
         let sampling = UInt64((held ? model.ditResidentUnstreamedGB : model.ditResidentGB) * Double(gb))
-            + (fast ? pabCacheBytes(rows: r) : 0)
+            + (fast ? pabCacheBytes(rows: r, cache8bit: cache8bit) : 0)
             + (turbo ? turboLoraBytes : 0)
             + requestBaseBytes + UInt64(r) * activationBytesPerRow
         return max(loadPeak, sampling, vaeStageBytes(width: width, height: height, frames: frames))
@@ -103,9 +104,10 @@ enum H3Plan {
 
     /// "12 GB peak memory usage": the plan `fits` checks, for the longest shot of a run.
     static func describePeak(model: VideoModelPreset, width: Int, height: Int, shotFrames: [Int],
-                             fast: Bool, turbo: Bool = false, streamWeights: Bool = true) -> String {
+                             fast: Bool, turbo: Bool = false, streamWeights: Bool = true,
+                             cache8bit: Bool = false) -> String {
         let peak = peakBytes(model: model, width: width, height: height, frames: shotFrames.max() ?? 0,
-                             fast: fast, turbo: turbo, streamWeights: streamWeights)
+                             fast: fast, turbo: turbo, streamWeights: streamWeights, cache8bit: cache8bit)
         return L10n.format("%.0f GB peak memory usage", Double(peak) / (1024 * 1024 * 1024))
     }
 
@@ -126,9 +128,9 @@ enum H3Plan {
     /// see no warning at exactly 124 frames.
     static func fits(model: VideoModelPreset, width: Int, height: Int,
                      frames: Int, fast: Bool, turbo: Bool = false, streamWeights: Bool = true,
-                     availableGB: Int) -> Bool {
+                     cache8bit: Bool = false, availableGB: Int) -> Bool {
         peakBytes(model: model, width: width, height: height, frames: frames, fast: fast, turbo: turbo,
-                  streamWeights: streamWeights)
+                  streamWeights: streamWeights, cache8bit: cache8bit)
             <= budgetBytes(availableGB: availableGB)
     }
 
@@ -136,12 +138,13 @@ enum H3Plan {
     /// frame ladder. Never returns less than the ladder floor — ask `fits`
     /// whether that floor is itself reachable.
     static func frameCap(model: VideoModelPreset, width: Int, height: Int,
-                         availableGB: Int, fast: Bool = true, streamWeights: Bool = true) -> Int {
+                         availableGB: Int, fast: Bool = true, streamWeights: Bool = true,
+                         cache8bit: Bool = false) -> Int {
         let budget = budgetBytes(availableGB: availableGB)
         var best = model.frameOptions.first ?? 124
         for n in model.frameOptions {
             if peakBytes(model: model, width: width, height: height, frames: n, fast: fast,
-                         streamWeights: streamWeights) <= budget { best = n }
+                         streamWeights: streamWeights, cache8bit: cache8bit) <= budget { best = n }
         }
         return best
     }

@@ -2741,3 +2741,9 @@ Cause: the denoise loop polled `Progress.boundary` only between steps, and one s
 Fix: `Model.forward` takes the progress probe and, when given one, evaluates the residual stream after each block and returns `error.Cancelled` when the client left. Same bits, no measurable cost (median step 33.6 s vs 33.8 s at 640x352 x 97f streamed); a disconnect now lands in about a second. The first early return also hit a latent double free: the input pieces were freed after the concat but stayed under their `errdefer`.
 Guard: `minimax h3: a cancel lands between DiT blocks, and polling it leaves the forward unchanged`.
 
+## The H3 memory refusal blocked runs that fit
+
+Defect: with the weights streaming, the H3 refusal (#764) still turned away canvases that ran fine; the app's only way past it was to edit the request by hand.
+Cause: "available" is macOS's free-memory reading, and it undercounts what the OS hands back on demand: the file cache (which streaming fills with the very weights it reads), compressed pages and idle apps' memory. A Mac with 40 GB "available" can often give an H3 run 45. Turning the refusal into a warning was the wrong fix: a Metal OOM mid-step is uncatchable and stops the whole server, every chat and agent on it with it, so one request cannot decide that for everyone by default.
+Fix: the refusal stays, priced with the streamed bill (`h3Shortfall`), as a typed 400 (`"type": "insufficient_memory"`). A request with `ignore_memory_check` runs past it with an SSE `warning`; the app offers that as "Start anyway" on the refusal card, so it is an explicit choice made after reading why.
+Guard: `h3 shortfall names the stage that does not fit ...`, app `testOnlyTheServersMemoryRefusalOffersStartAnyway`, `testRequestBodySendsTheCacheAndMemoryOverrideOnlyWhenAsked`.

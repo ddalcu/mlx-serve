@@ -3925,6 +3925,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // non-turbo default.
     const turbo = sse.bodyWantsTrue(body, "turbo");
     const stream_weights = h3StreamWeights(body);
+    const attn_cache_8bit = sse.bodyWantsTrue(body, "attn_cache_8bit");
+    const ignore_memory_check = sse.bodyWantsTrue(body, "ignore_memory_check");
     if (turbo and !engine.hasTurboLora(io, allocator))
         return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
@@ -4052,15 +4054,17 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     var sctx = videoStreamCtx(conn, allocator, body, want_stream);
     const prog: ?sse.Progress = sctx.progress();
     // The load gate bills the model, not the request: the request's own activations price the
-    // resident plan, and when that does not fit, the staged DiT stage is checked here. Past the
-    // available memory the run still starts, with a warning: the Metal OOM mid-step is uncatchable.
+    // resident plan, and when that does not fit, each stage is checked here, before any loads: the
+    // Metal OOM mid-step is uncatchable and takes the whole server down. Only a request that
+    // acknowledges that (`ignore_memory_check`) runs past the bill, with a warning.
     const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo, minimax_h3.envStr("MINIMAX_H3_STEP_CACHE"), minimax_h3.envStr("MINIMAX_H3_ATTN_BCAST"));
     const cfg = minimax_h3.Config{};
-    const bcast_row: u64 = if (speed.bcast_k > 0) minimax_h3.AttnBroadcast.rowBytes(cfg.hidden_size, cfg.num_layers, minimax_h3.AttnBroadcast.q8FromEnv()) else 0;
+    const bcast_row: u64 = if (speed.bcast_k > 0) minimax_h3.AttnBroadcast.rowBytes(cfg.hidden_size, cfg.num_layers, attn_cache_8bit) else 0;
     const rows = h3RequestRows(width, height, shape.frame_count, @intCast(n_kf));
     const activations = h3ActivationBytes(rows, bcast_row);
     const plan = h3ResidentFor(engine, io, allocator, activations);
-    var warn_buf: [512]u8 = undefined;
+    var reason_buf: [384]u8 = undefined;
+    var msg_buf: [640]u8 = undefined;
     var memory_warning: ?[]const u8 = null;
     if (plan == null) {
         const dit = h3DitResidentBytes(packFileBytes(io, allocator, engine.model_dir, "transformer.safetensors"), minimax_h3.adalnPrecomputeOn(), minimax_h3.ditStreamOn(stream_weights)) +
@@ -4072,37 +4076,31 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         const vae = h3VaeStageBytes(packFileBytes(io, allocator, engine.model_dir, "video_vae.safetensors"), width, height, shape.frame_count, held);
         const te = h3TeResidentBytes(packFileBytes(io, allocator, engine.model_dir, "text_encoder.safetensors"), stream_weights);
         const gb = 1024.0 * 1024.0 * 1024.0;
-        if (dit > 0 and bill.avail > 0 and te > bill.need and te > vae and te > bill.avail) {
-            memory_warning = std.fmt.bufPrint(&warn_buf, "holding the text encoder needs ~{d:.1} GB but {d:.1} GB is available: generating anyway, it may run out of memory (\"stream_weights\": true streams it from disk)", .{
-                @as(f64, @floatFromInt(te)) / gb,
-                @as(f64, @floatFromInt(bill.avail)) / gb,
-            }) catch "the text encoder does not fit in available memory: generating anyway, it may run out of memory";
-            log.warn("[video] minimax-h3 {s}\n", .{memory_warning.?});
-        } else if (dit > 0 and bill.avail > 0 and vae > bill.need and vae > bill.avail) {
-            memory_warning = std.fmt.bufPrint(&warn_buf, "{d}x{d} x {d} frames needs ~{d:.1} GB to decode the video but {d:.1} GB is available: generating anyway, it may run out of memory (a smaller canvas or fewer frames fits)", .{
-                width,
-                height,
-                shape.frame_count,
-                @as(f64, @floatFromInt(vae)) / gb,
-                @as(f64, @floatFromInt(bill.avail)) / gb,
-            }) catch "the canvas does not fit in available memory: generating anyway, it may run out of memory";
-            log.warn("[video] minimax-h3 {s}\n", .{memory_warning.?});
-        } else if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
-            const with_cache = bcast_row > 0;
-            memory_warning = std.fmt.bufPrint(&warn_buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: generating anyway, it may run out of memory (a smaller canvas or fewer frames fits{s}{s})", .{
-                width,
-                height,
-                shape.frame_count,
-                @as(f64, @floatFromInt(bill.need)) / gb,
-                @as(f64, @floatFromInt(dit)) / gb,
-                if (mlx.cudaAvailable()) " paged to RAM" else "",
-                @as(f64, @floatFromInt(activations)) / gb,
-                rows,
-                if (with_cache) " with the fast recipe's attention cache" else "",
-                @as(f64, @floatFromInt(bill.avail)) / gb,
-                if (with_cache) ", as does \"turbo\", which keeps no attention cache" else "",
-                if (stream_weights) "" else "; \"stream_weights\": true streams the DiT from disk",
-            }) catch "the canvas does not fit in available memory: generating anyway, it may run out of memory";
+        const avail_gb = @as(f64, @floatFromInt(bill.avail)) / gb;
+        const with_cache = bcast_row > 0;
+        const short: ?H3Shortfall = if (dit > 0) h3Shortfall(te, vae, bill.need, bill.avail) else null;
+        if (short) |stage| {
+            const reason = switch (stage) {
+                .text_encoder => std.fmt.bufPrint(&reason_buf, "holding the text encoder needs ~{d:.1} GB but {d:.1} GB is available", .{ @as(f64, @floatFromInt(te)) / gb, avail_gb }),
+                .vae => std.fmt.bufPrint(&reason_buf, "{d}x{d} x {d} frames needs ~{d:.1} GB to decode the video but {d:.1} GB is available", .{ width, height, shape.frame_count, @as(f64, @floatFromInt(vae)) / gb, avail_gb }),
+                .denoise => std.fmt.bufPrint(&reason_buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available", .{
+                    width,                                           height, shape.frame_count,
+                    @as(f64, @floatFromInt(bill.need)) / gb,         @as(f64, @floatFromInt(dit)) / gb,
+                    if (mlx.cudaAvailable()) " paged to RAM" else "", @as(f64, @floatFromInt(activations)) / gb,
+                    rows,                                            if (with_cache) " with the fast recipe's attention cache" else "",
+                    avail_gb,
+                }),
+            } catch "the request does not fit in available memory";
+            if (!ignore_memory_check) {
+                const fix = switch (stage) {
+                    .text_encoder => "\"stream_weights\": true streams it from disk",
+                    .vae => "use a smaller canvas or fewer frames",
+                    .denoise => if (!stream_weights) "use a smaller canvas or fewer frames, or \"stream_weights\": true" else if (with_cache) "use a smaller canvas or fewer frames, or \"turbo\", which keeps no attention cache" else "use a smaller canvas or fewer frames",
+                };
+                const msg = std.fmt.bufPrint(&msg_buf, "{s}: {s}. \"ignore_memory_check\": true runs it anyway; running out of memory stops the whole server", .{ reason, fix }) catch reason;
+                return sendErrorType(conn, 400, "insufficient_memory", msg);
+            }
+            memory_warning = std.fmt.bufPrint(&msg_buf, "{s}: running anyway (\"ignore_memory_check\"), it may run out of memory", .{reason}) catch reason;
             log.warn("[video] minimax-h3 {s}\n", .{memory_warning.?});
         }
     }
@@ -4133,6 +4131,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .speed = speed,
         .turbo = turbo,
         .stream_weights = stream_weights,
+        .attn_cache_8bit = attn_cache_8bit,
         .lora_paths = lora_paths[0..lora_n],
         .lora_scales = lora_scales[0..lora_n],
         .chain_windows = chain_windows,
@@ -5002,6 +5001,17 @@ pub fn h3AvailBytes(host_avail: u64, gpu_limit: u64, gpu_active: u64) u64 {
 /// What a staged DiT run is checked against: the bytes it needs and the bytes that hold them.
 /// CUDA keeps file-loaded weights in managed memory that pages to host RAM, so there the DiT is
 /// billed to RAM and only the activations to the GPU.
+/// The H3 stage a request's bill says will not fit in `avail`, or null (also when `avail` is unknown).
+pub const H3Shortfall = enum { text_encoder, vae, denoise };
+
+pub fn h3Shortfall(te: u64, vae: u64, need: u64, avail: u64) ?H3Shortfall {
+    if (avail == 0) return null;
+    if (te > need and te > vae and te > avail) return .text_encoder;
+    if (vae > need and vae > avail) return .vae;
+    if (need > avail) return .denoise;
+    return null;
+}
+
 pub fn h3CanvasBill(dit: u64, activations: u64, host_avail: u64, gpu_limit: u64, gpu_active: u64, weights_page: bool) struct { need: u64, avail: u64 } {
     if (!weights_page) return .{ .need = dit + activations, .avail = h3AvailBytes(host_avail, gpu_limit, gpu_active) };
     if (dit > host_avail) return .{ .need = dit, .avail = host_avail };
@@ -5168,6 +5178,11 @@ fn sendBytes(conn: *Conn, allocator: std.mem.Allocator, content_type: []const u8
 }
 
 fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
+    return sendErrorType(conn, code, null, msg);
+}
+
+/// `err_type` names a refusal a client can act on (`insufficient_memory`: resend with `ignore_memory_check`).
+fn sendErrorType(conn: *Conn, code: u16, err_type: ?[]const u8, msg: []const u8) !void {
     // A refusal that logs nothing is invisible the moment a client drops the
     // body (live 2026-08-06: the app's stream path showed a bare "HTTP 400"
     // while the log showed a clean load→unload and nothing else).
@@ -5175,10 +5190,13 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     // Escape at the SINK: several of these messages quote a field value
     // (`mode:"edit"`), which went onto the wire as raw quotes inside a JSON
     // string — an unparseable body. See `sse.jsonEscapeMessage`.
-    var esc_buf: [512]u8 = undefined;
+    var esc_buf: [768]u8 = undefined;
     const esc = sse.jsonEscapeMessage(&esc_buf, msg);
-    var body_buf: [640]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, "{{\"error\":{{\"message\":\"{s}\"}}}}", .{esc}) catch return;
+    var body_buf: [896]u8 = undefined;
+    const body = if (err_type) |ty|
+        std.fmt.bufPrint(&body_buf, "{{\"error\":{{\"message\":\"{s}\",\"type\":\"{s}\"}}}}", .{ esc, ty }) catch return
+    else
+        std.fmt.bufPrint(&body_buf, "{{\"error\":{{\"message\":\"{s}\"}}}}", .{esc}) catch return;
     var hdr: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{ code, body.len }) catch return;
     try conn.writeAllNoFlush(head);
@@ -6909,6 +6927,17 @@ test "h3 request bill covers every measured step peak without over-billing it, a
     // 1536x672 with two keyframes and a bf16 cache died with 32.58 GB available (4-bit pack).
     const dit = h3DitResidentBytes(18_698_813_290, true, false);
     try std.testing.expect(dit + h3ActivationBytes(h3RequestRows(1536, 672, 124, 2), bf16) > 33 * (1 << 30));
+}
+
+test "h3 shortfall names the stage that does not fit, and nothing when it all fits or memory is unknown" {
+    const GB: u64 = 1 << 30;
+    // Held text encoder bigger than the denoise and the decode, past what is free.
+    try std.testing.expectEqual(@as(?H3Shortfall, .text_encoder), h3Shortfall(28 * GB, 7 * GB, 20 * GB, 24 * GB));
+    // A long canvas whose decode outgrows the denoise.
+    try std.testing.expectEqual(@as(?H3Shortfall, .vae), h3Shortfall(4 * GB, 30 * GB, 20 * GB, 24 * GB));
+    try std.testing.expectEqual(@as(?H3Shortfall, .denoise), h3Shortfall(4 * GB, 7 * GB, 30 * GB, 24 * GB));
+    try std.testing.expectEqual(@as(?H3Shortfall, null), h3Shortfall(4 * GB, 7 * GB, 20 * GB, 24 * GB));
+    try std.testing.expectEqual(@as(?H3Shortfall, null), h3Shortfall(40 * GB, 40 * GB, 40 * GB, 0));
 }
 
 test "h3 residency is priced on the request's activations, so a warm set yields to a big canvas (#764)" {
