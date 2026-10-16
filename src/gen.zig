@@ -4657,7 +4657,7 @@ pub fn freeStubCpuState(allocator: std.mem.Allocator, s: *StubCpuState) void {
 /// transformer/, vae/, text_encoder/; LTX keeps them top-level). Returns 0 on
 /// any read failure (treated as "unknown" → the registry skips the byte cap).
 pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
-    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     return sumSafetensorsIn(io, dir);
@@ -5010,7 +5010,7 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
 /// readable — 0 means "unknown", which every caller treats as "do not block".
 pub fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
-    if (path.len == 0 or path[0] != '/') return 0; // openDirAbsolute UB class
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return 0; // openDirAbsolute UB class
     var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return 0;
     defer d.close(io);
     return sumSafetensorsIn(io, d);
@@ -5034,7 +5034,7 @@ fn ltxTextEncoderBytes(io: std.Io) u64 {
 }
 
 pub fn estimatePeakResidentBytes(io: std.Io, model_dir: []const u8, model_type: []const u8) u64 {
-    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     const in_dir = estimatePeakResidentBytesInDir(io, dir, model_type, model_dir);
