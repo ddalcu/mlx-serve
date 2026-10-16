@@ -224,14 +224,13 @@ final class VideoGenService: ObservableObject {
         var clock = H3StepClock()
         // Floor + tail for the live number (H3 only; LTX keeps the
         // plain lap mean — its laps are near-uniform and it has no
-        // pre-run model to floor against). `fast` is effectiveFast:
-        // turbo forces the server recipe off, never !bestQuality alone.
+        // pre-run model to floor against).
         let pricing: (perStep: Double, tail: Double) =
             request.model.backend == .minimaxH3
             ? H3TimeEstimate.livePricing(model: request.model,
                                          width: request.width, height: request.height,
                                          frames: request.numFrames, steps: steps,
-                                         fast: !request.bestQuality && !request.turbo,
+                                         fast: request.fastRecipe,
                                          streamWeights: request.streamWeights)
             : (0, 0)
         let samplingShare = request.model.backend == .minimaxH3
@@ -292,7 +291,7 @@ final class VideoGenService: ObservableObject {
     static func recordRun(_ request: VideoGenRequest, steps: Int, measuredSeconds: Double,
                           defaults: UserDefaults = .standard) {
         H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
-                              frames: request.numFrames, steps: steps, fast: !request.bestQuality,
+                              frames: request.numFrames, steps: steps, fast: request.fastRecipe,
                               streamWeights: request.streamWeights, measuredSeconds: measuredSeconds,
                               defaults: defaults)
     }
@@ -727,7 +726,7 @@ final class VideoGenService: ObservableObject {
             lines.append("stg_scale: \(String(format: "%.2f", request.stgScale))")
         }
         if request.model.supportsFastRecipe {
-            lines.append("fast_recipe: \(!request.bestQuality && !request.turbo)")
+            lines.append("fast_recipe: \(request.fastRecipe)")
         }
         if request.model.supportsDiffusionDecoder {
             lines.append("decoder: \(request.diffusionDecoder ? "diffusion" : "convolution")")
