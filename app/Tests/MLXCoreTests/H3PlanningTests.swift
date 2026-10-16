@@ -47,25 +47,67 @@ final class H3PlanningTests: XCTestCase {
 
     // MARK: - Memory (CALIBRATION — these are measured numbers)
 
-    /// The fast recipe caches one `[S, hidden]` bf16 per block for the whole
-    /// run, and at long frame counts that cache — not the weights — is what
-    /// runs a Mac out of memory. Measured on the 8-bit pack at 1344x768:
-    /// ~20 GB at 124 frames, ~34 GB at 209.
-    func testPabCacheReproducesTheMeasuredFootprints() {
+    /// The fast recipe caches one `[S, hidden]` per block for the whole run, and at long frame
+    /// counts that cache — not the weights — is what runs a Mac out of memory. Measured on the
+    /// 8-bit pack at 1344x768 with a bf16 cache: ~20 GB at 124 frames, ~34 GB at 209. The server
+    /// stores it 8-bit (group 64, bf16 scale + bias): 5712 of those 10752 bytes per row and block.
+    func testPabCacheIsTheMeasuredBf16FootprintAtTheStoredWidth() {
         // Decimal GB, because that is the unit those two figures were written
         // down in. Everything that compares against a MACHINE's memory uses
         // GiB (`RAMChecker.totalGB` is `physicalMemory / 1024^3`), and mixing
         // the two silently is a 7% error at this scale.
         let gb = 1_000_000_000.0
+        let stored = 5712.0 / 10752.0
         let at124 = Double(H3Plan.pabCacheBytes(rows: H3Plan.rows(width: 1344, height: 768, frames: 124, promptTokens: 250))) / gb
         let at209 = Double(H3Plan.pabCacheBytes(rows: H3Plan.rows(width: 1344, height: 768, frames: 209, promptTokens: 250))) / gb
-        XCTAssertEqual(at124, 20.4, accuracy: 0.5, "measured ~20 GB at 768p/124f")
-        XCTAssertEqual(at209, 34.1, accuracy: 0.5, "measured ~34 GB at 768p/209f")
+        XCTAssertEqual(at124, 20.4 * stored, accuracy: 0.3, "measured ~20 GB bf16 at 768p/124f")
+        XCTAssertEqual(at209, 34.1 * stored, accuracy: 0.3, "measured ~34 GB bf16 at 768p/209f")
         // It is LINEAR in rows — the square term is time, not memory (SDPA is
         // fused, so the [S, S] score matrix is never materialized; at 362
         // frames it would be 1.3 PB).
         let a = H3Plan.pabCacheBytes(rows: 10_000)
         XCTAssertEqual(H3Plan.pabCacheBytes(rows: 20_000), a * 2)
+    }
+
+    /// The bill covers a measured step: with the DiT's blocks streaming, 1120x640 x 192 frames under
+    /// the fast recipe peaked at 15.77 GiB (process footprint, 8-bit pack). The 4-bit preset's text
+    /// encoder floor sits below that, so the sampling bill is what answers.
+    /// The memory figure in the time estimate quotes the plan for the longest shot, which covers
+    /// the measured streamed peak (11.9 GiB, 8-bit, 1120x640 x 124, fast recipe).
+    func testRamEstimateQuotesThePlanForTheLongestShot() {
+        let gib = 1024.0 * 1024.0 * 1024.0
+        let streamed = Double(H3Plan.peakBytes(model: h3, width: 1120, height: 640, frames: 124, fast: true)) / gib
+        XCTAssertGreaterThanOrEqual(streamed, 11.9)
+        XCTAssertEqual(H3Plan.describePeak(model: h3, width: 1120, height: 640, shotFrames: [49, 124], fast: true),
+                       String(format: "%.0f GB peak memory usage", streamed))
+        let held = Double(H3Plan.peakBytes(model: h3, width: 1120, height: 640, frames: 124, fast: true,
+                                           streamWeights: false)) / gib
+        XCTAssertEqual(H3Plan.describePeak(model: h3, width: 1120, height: 640, shotFrames: [124], fast: true,
+                                           streamWeights: false),
+                       String(format: "%.0f GB peak memory usage", held))
+    }
+
+    func testSamplingBillCoversTheMeasuredStepPeak() {
+        let gib = 1024.0 * 1024.0 * 1024.0
+        let peak = Double(H3Plan.peakBytes(model: h3q4, width: 1120, height: 640, frames: 192, fast: true)) / gib
+        XCTAssertGreaterThanOrEqual(peak, 15.77)
+        XCTAssertLessThan(peak, 15.77 + 5.0)
+    }
+
+    /// The VAE stage is billed per canvas, mirroring the server's `h3VaeStageBytes`: measured
+    /// process peaks of the capped video decode (8-bit pack), 5.71 GiB at 512x288 x 56 to
+    /// 10.42 at 1120x640 x 192.
+    func testVaeStageCoversTheMeasuredDecodePeaks() {
+        let gib = 1024.0 * 1024.0 * 1024.0
+        for c in [(512, 288, 56, 5.71), (1120, 640, 56, 7.05), (512, 288, 192, 6.52),
+                  (768, 448, 124, 6.93), (1120, 640, 192, 10.42)] {
+            let bill = Double(H3Plan.vaeStageBytes(width: c.0, height: c.1, frames: c.2)) / gib
+            XCTAssertGreaterThanOrEqual(bill, c.3)
+            XCTAssertLessThan(bill, c.3 + 1.0)
+        }
+        // Without the fast recipe's cache, decoding 1120x640 x 192 holds more than sampling it.
+        XCTAssertEqual(H3Plan.peakBytes(model: h3, width: 1120, height: 640, frames: 192, fast: false),
+                       H3Plan.vaeStageBytes(width: 1120, height: 640, frames: 192))
     }
 
     /// Turning the fast recipe OFF removes the cache entirely (`bcast_k = 1`
@@ -78,11 +120,11 @@ final class H3PlanningTests: XCTestCase {
         let slow = H3Plan.peakBytes(model: h3, width: long.w, height: long.h, frames: long.f, fast: false)
         XCTAssertLessThan(slow, fast)
         let gib = 1024.0 * 1024.0 * 1024.0
-        XCTAssertEqual(Double(fast) / gib, 85.0, accuracy: 4.0)
-        // Without the cache the same run bottoms out at the staged LOAD peak —
-        // the weights still have to get in — so the trade is ~85 GiB for ~38,
-        // paid for in roughly 4x the runtime.
-        XCTAssertEqual(Double(slow) / gib, h3.stagedPeakGB, accuracy: 1.0)
+        XCTAssertEqual(Double(fast) / gib, 48.2, accuracy: 4.0)
+        // Without the cache the same run holds the streamed DiT, the request base
+        // and its rows, so the trade is ~48 GiB for ~19, paid for in roughly 4x
+        // the runtime.
+        XCTAssertEqual(Double(slow) / gib, 19.2, accuracy: 1.0)
     }
 
     /// The three answers that decide what the pane may offer on a given Mac.
@@ -92,8 +134,9 @@ final class H3PlanningTests: XCTestCase {
         let longForm = Double(H3Plan.peakBytes(model: h3, width: 960, height: 544, frames: 362, fast: true)) / gib
         // 362 frames at 960x544 is the run we actually did, on an M5 Max.
         XCTAssertLessThan(longForm, 64.0, "the measured 362-frame run must read as fitting")
-        XCTAssertGreaterThan(wide, 64.0, "1344x768 at 362 frames is a 128 GB job")
-        XCTAssertLessThan(wide, 102.0, "...but it IS a 128 GB job, not an impossible one")
+        let budget = { (ram: Int) in Double(H3Plan.budgetBytes(availableGB: ram)) / gib }
+        XCTAssertGreaterThan(wide, budget(48), "1344x768 at 362 frames does not fit a 48 GB Mac")
+        XCTAssertLessThan(wide, budget(64), "...but with the DiT streaming it is a 64 GB job")
 
         // The 4-bit pack is the low-RAM option and must bill lower everywhere.
         for f in [124, 209, 362] {
@@ -103,16 +146,17 @@ final class H3PlanningTests: XCTestCase {
     }
 
     /// A load that never samples still needs its staged weight peak, so the
-    /// floor of the estimate is the pack's measured `max(TE, DiT) + VAEs` —
+    /// floor of the estimate is the pack's biggest staged stage —
     /// not `approxRAMGB`, which is that number rounded up for a coarser gate.
     func testPeakNeverFallsBelowTheStagedLoadPeak() {
         let tiny = H3Plan.peakBytes(model: h3, width: 768, height: 768, frames: 124, fast: true)
         XCTAssertGreaterThanOrEqual(Double(tiny) / (1024 * 1024 * 1024), h3.stagedPeakGB - 0.01)
         // The declared staged peak has to be the pack's real arithmetic: the
-        // 8-bit files are TE 26.28 + DiT 32.83 + VAEs 4.85 + 0.56 GiB, and the
-        // encoder is freed before the DiT loads.
-        XCTAssertEqual(h3.stagedPeakGB, max(26.28, 32.83) + 4.85 + 0.56, accuracy: 0.05)
-        XCTAssertEqual(h3q4.stagedPeakGB, max(14.72, 17.41) + 4.85 + 0.56, accuracy: 0.05)
+        // text encoder and the DiT both stream (the server bills the encoder
+        // at 4 GiB), so the biggest stage is the video decoder (4.85) plus the
+        // VAE stage's 0.78 GiB base; the audio VAE loads after it is freed.
+        XCTAssertEqual(h3.stagedPeakGB, max(4.0, 4.85 + 0.78), accuracy: 0.05)
+        XCTAssertEqual(h3q4.stagedPeakGB, max(4.0, 4.85 + 0.78), accuracy: 0.05)
     }
 
     // MARK: - The frame cap the pane offers
@@ -126,12 +170,12 @@ final class H3PlanningTests: XCTestCase {
         // A 128 GB Mac gets the whole ladder at both canvases.
         XCTAssertEqual(RAMChecker.safeFrameCap(model: h3, width: 960, height: 544, available: 128), 362)
         XCTAssertEqual(RAMChecker.safeFrameCap(model: h3, width: 1344, height: 768, available: 128), 362)
-        // A 64 GB Mac does not — and the widescreen canvas runs out first,
+        // A 48 GB Mac does not — and the widescreen canvas runs out first,
         // which is the whole reason 960x544 is offered as the long-form one.
-        let at64wide = RAMChecker.safeFrameCap(model: h3, width: 1344, height: 768, available: 64)
-        let at64long = RAMChecker.safeFrameCap(model: h3, width: 960, height: 544, available: 64)
-        XCTAssertLessThan(at64wide, 362)
-        XCTAssertGreaterThan(at64long, at64wide)
+        let at48wide = RAMChecker.safeFrameCap(model: h3, width: 1344, height: 768, available: 48)
+        let at48long = RAMChecker.safeFrameCap(model: h3, width: 960, height: 544, available: 48)
+        XCTAssertLessThan(at48wide, 362)
+        XCTAssertGreaterThan(at48long, at48wide)
         // A 48 GB Mac can still do real work on the 4-bit pack — the answer
         // must be a usable clip length, not a number below the model's floor.
         let cap48 = RAMChecker.safeFrameCap(model: h3q4, width: 960, height: 544, available: 48)
@@ -148,26 +192,26 @@ final class H3PlanningTests: XCTestCase {
                                     RAMChecker.safeFrameCap(model: h3, width: 1344, height: 768, available: 64))
     }
 
-    /// `frameCap` has a FLOOR, so its answer is ambiguous at the bottom: 124
-    /// means both "124 frames fits" and "nothing fits". A 24 GB Mac cannot load
-    /// the 8-bit pack at all, and the pane read that as "124 frames is fine".
+    /// `frameCap` has a FLOOR, so its answer is ambiguous at the bottom: the
+    /// floor means both "the shortest clip fits" and "nothing fits". 6 GB cannot
+    /// hold even the video decoder, and the pane must not read the cap as "it fits".
     func testFitsAnswersTheQuestionTheCapCannotAtTheFloor() {
         let floor = h3.frameOptions.first!
-        XCTAssertEqual(RAMChecker.safeFrameCap(model: h3, width: 960, height: 544, available: 24), floor)
-        XCTAssertFalse(H3Plan.fits(model: h3, width: 960, height: 544, frames: floor, fast: true, availableGB: 24))
+        XCTAssertEqual(RAMChecker.safeFrameCap(model: h3, width: 960, height: 544, available: 6), floor)
+        XCTAssertFalse(H3Plan.fits(model: h3, width: 960, height: 544, frames: floor, fast: true, availableGB: 6))
         // ...while the same floor on a machine that can hold it does fit.
         XCTAssertTrue(H3Plan.fits(model: h3, width: 960, height: 544, frames: floor, fast: true, availableGB: 64))
     }
 
     /// The 4-bit pack is sold as the 32 GB option, so the model must not round
-    /// it out of reach: `approxRAMGB` is a rounded-up 26 where the pack's real
-    /// staged peak is 22.8, and the difference is exactly one 32 GB Mac.
+    /// it out of reach: the frame model reads the staged peak, never the
+    /// rounded-up `approxRAMGB`.
     func testFourBitPackFitsTheMacIttIsSoldFor() {
         XCTAssertGreaterThan(h3q4.stagedPeakGB, 0, "the measured staged peak must be declared")
         XCTAssertLessThan(h3q4.stagedPeakGB, Double(h3q4.approxRAMGB), "approxRAMGB is the rounded-up one")
         XCTAssertTrue(H3Plan.fits(model: h3q4, width: 960, height: 544, frames: 124, fast: true, availableGB: 32))
-        // The 8-bit pack genuinely does not fit there, and must still say so.
-        XCTAssertFalse(H3Plan.fits(model: h3, width: 960, height: 544, frames: 124, fast: true, availableGB: 32))
+        // With the encoder and the DiT both streaming, the 8-bit pack fits there too.
+        XCTAssertTrue(H3Plan.fits(model: h3, width: 960, height: 544, frames: 124, fast: true, availableGB: 32))
     }
 
     /// LTX keeps its own formula, byte for byte — the H3 model is not a general
@@ -229,15 +273,40 @@ final class H3PlanningTests: XCTestCase {
     func testTimeEstimateReproducesTheMeasuredRuns() {
         let m4max = H3Hardware(gpuCores: 40, label: "M4 Max")
         // 1344x768, 124 frames, 30 steps, fast recipe on: measured 49 minutes.
-        let a = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 124, steps: 30, fast: true, hardware: m4max)
+        let a = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 124, steps: 30, fast: true, streamWeights: false, hardware: m4max)
         XCTAssertEqual(a / 60.0, 49.0, accuracy: 10.0)
         // Same canvas, 209 frames: measured 1 h 57 m.
-        let b = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 209, steps: 30, fast: true, hardware: m4max)
+        let b = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 209, steps: 30, fast: true, streamWeights: false, hardware: m4max)
         XCTAssertEqual(b / 60.0, 117.0, accuracy: 25.0)
         // Fast recipe off at the capstone geometry: measured 2 h 19 m.
-        let c = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 124, steps: 30, fast: false, hardware: m4max)
+        let c = H3TimeEstimate.seconds(model: h3, width: 1344, height: 768, frames: 124, steps: 30, fast: false, streamWeights: false, hardware: m4max)
         XCTAssertEqual(c / 60.0, 139.0, accuracy: 30.0)
         XCTAssertGreaterThan(c, a, "the fast recipe must never be estimated slower")
+    }
+
+    /// Streaming the weights from disk costs its measured share of every denoise step (a 1495 s
+    /// streamed denoise against 1416 s resident) and nothing on the fixed stages or the decode.
+    func testStreamingTheWeightsCostsItsMeasuredTimeOnTheStepsOnly() {
+        let held = H3TimeEstimate.livePricing(model: h3, width: 1120, height: 640, frames: 124, steps: 30,
+                                              fast: true, streamWeights: false, history: H3RunHistory(records: []))
+        let streamed = H3TimeEstimate.livePricing(model: h3, width: 1120, height: 640, frames: 124, steps: 30,
+                                                  fast: true, history: H3RunHistory(records: []))
+        XCTAssertEqual(streamed.perStep / held.perStep, 1495.4 / 1415.6, accuracy: 0.002)
+        XCTAssertEqual(streamed.tail, held.tail, accuracy: 0.001)
+    }
+
+    /// A streamed run is recorded against a streamed prediction, so history never prices the
+    /// stream twice: a run exactly as long as predicted calibrates to 1.0 either way.
+    func testHistoryRecordsARunAgainstItsOwnStreamingSetting() throws {
+        for stream in [true, false] {
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: "H3StreamHistory-\(stream)"))
+            defaults.removePersistentDomain(forName: "H3StreamHistory-\(stream)")
+            let predicted = H3TimeEstimate.seconds(model: h3, width: 960, height: 544, frames: 124, steps: 30,
+                                                   fast: true, streamWeights: stream, hardware: .anchor)
+            H3RunHistory.remember(model: h3, width: 960, height: 544, frames: 124, steps: 30, fast: true,
+                                  streamWeights: stream, measuredSeconds: predicted, defaults: defaults)
+            XCTAssertEqual(H3RunHistory.load(defaults: defaults).speedFactor!, 1.0, accuracy: 0.0001)
+        }
     }
 
     /// Cost is super-linear in rows: at a matched 124 frames, 1344x768 measured
@@ -430,6 +499,10 @@ final class H3PlanningTests: XCTestCase {
         // Measured-on-this-Mac must say so — it is a different kind of claim.
         let measured = H3TimeEstimate.describe(seconds: 600, source: .ownHistory(runs: 3))
         XCTAssertTrue(measured.lowercased().contains("your"), measured)
+        // The memory figure sits beside the time, before where the numbers came from.
+        XCTAssertEqual(H3TimeEstimate.describe(seconds: 1500, source: .ownHistory(runs: 3),
+                                               alongside: "12 GB peak memory usage"),
+                       "about 25 min and 12 GB peak memory usage — based on your last 3 runs")
     }
 
     /// Live ETA from step cadence. Step 0 carries graph build + Metal JIT and

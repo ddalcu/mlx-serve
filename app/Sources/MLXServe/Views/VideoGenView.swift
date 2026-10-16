@@ -100,6 +100,8 @@ struct VideoGenView: View {
     @State private var livePreview: Bool = false
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, recipe off.
     @State private var turbo: Bool = false
+    /// H3 streams its weights from disk (server default); off holds them in memory.
+    @State private var streamWeights: Bool = true
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -861,7 +863,8 @@ struct VideoGenView: View {
     private var shotLadder: [Int] {
         let opts = model.frameOptions(width: effectiveSize.width, height: effectiveSize.height)
         let cap = RAMChecker.safeFrameCap(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                          available: RAMChecker.totalGB, fast: effectiveFast)
+                                          available: RAMChecker.totalGB, fast: effectiveFast,
+                                          streamWeights: streamWeights)
         let fits = opts.filter { $0 <= cap }
         return fits.isEmpty ? Array(opts.prefix(1)) : fits
     }
@@ -1029,7 +1032,8 @@ struct VideoGenView: View {
             width: effectiveSize.width,
             height: effectiveSize.height,
             available: total,
-            fast: effectiveFast
+            fast: effectiveFast,
+            streamWeights: streamWeights
         )
         guard model.backend == .minimaxH3 else {
             guard numFrames > cap else { return nil }
@@ -1040,15 +1044,22 @@ struct VideoGenView: View {
         // fits" and "nothing fits", and a Mac too small to load the pack saw
         // no warning at all at exactly 124 frames.
         guard !H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged, availableGB: total) else { return nil }
+                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged, streamWeights: streamWeights,
+                           availableGB: total) else { return nil }
         let gib = 1024.0 * 1024.0 * 1024.0
         let need = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged)) / gib
+                                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged,
+                                           streamWeights: streamWeights)) / gib
         var out = String(format: "Needs about %.0f GB at this size and length; your Mac has %d GB. ", need, total)
         let floorFits = H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                    frames: cap, fast: effectiveFast, turbo: turboEngaged, availableGB: total)
+                                    frames: cap, fast: effectiveFast, turbo: turboEngaged, streamWeights: streamWeights,
+                                    availableGB: total)
         out += floorFits && cap < numFrames ? "About \(cap) frames fits here" : "Try a smaller resolution"
-        if effectiveFast {
+        if !streamWeights {
+            let streamed = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                                   frames: numFrames, fast: effectiveFast, turbo: turboEngaged)) / gib
+            out += String(format: ", or turn on Stream weights from disk (%.0f GB)", streamed)
+        } else if effectiveFast {
             let slow = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                                frames: numFrames, fast: false)) / gib
             if slow < need - 2 {
@@ -1062,9 +1073,13 @@ struct VideoGenView: View {
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         if storyboardOn, shots.isEmpty { return nil }
+        let frames = storyboardOn ? shotFrames : [numFrames]
+        let peak = H3Plan.describePeak(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                       shotFrames: frames, fast: effectiveFast, turbo: turboEngaged,
+                                       streamWeights: streamWeights)
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
-            shotFrames: storyboardOn ? shotFrames : [numFrames], steps: steps, fast: effectiveFast
+            shotFrames: frames, steps: steps, fast: effectiveFast, streamWeights: streamWeights, alongside: peak
         )
     }
 
@@ -1890,6 +1905,11 @@ struct VideoGenView: View {
                     // toggle that could not change anything is a dead control.
                     .disabled(turboEngaged)
             }
+            if model.supportsWeightStreaming {
+                Toggle("Stream weights from disk (less memory)", isOn: $streamWeights)
+                    .font(.app(.caption))
+                    .help("On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run.")
+            }
             Toggle("Show live preview while generating (~1% slower)", isOn: $livePreview)
                 .font(.app(.caption))
                 .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It is not free — every step solves for the clean latent and copies the previewed frame to the CPU.")
@@ -2129,7 +2149,7 @@ struct VideoGenView: View {
                 Text(L10n.text(est))
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
-                    .help("Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU.")
+                    .help("Time is estimated from measured runs and this Mac's GPU, and varies with what else is using the GPU. Peak memory usage is the most memory this size and length are planned to need.")
             }
         }
     }
@@ -2170,6 +2190,12 @@ struct VideoGenView: View {
                             Text(service.startedAt, style: .timer).monospacedDigit()
                         }
                         .font(.app(.footnote)).foregroundStyle(.secondary)
+                        if let warning = service.memoryWarning {
+                            Label { Text(verbatim: warning) } icon: { Image(systemName: "exclamationmark.triangle") }
+                                .font(.app(.footnote)).foregroundStyle(.orange)
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: 420)
+                        }
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -2253,6 +2279,7 @@ struct VideoGenView: View {
         // Turbo restores BEFORE the steps clamp: its range reaches below the
         // preset's floor, and clamping first would bounce a saved 8 up to 16.
         turbo = s.turbo && model.supportsTurbo
+        streamWeights = s.streamWeights
         // Clamp into the slider ranges — a value persisted by the old wider
         // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
         steps = min(effectiveStepsRange.upperBound, max(effectiveStepsRange.lowerBound, s.steps))
@@ -2348,6 +2375,7 @@ struct VideoGenView: View {
         s.bestQuality = bestQuality
         s.diffusionDecoder = diffusionDecoder
         s.turbo = turbo
+        s.streamWeights = streamWeights
         s.promptHeight = PromptEditorHeight.clamp(promptHeight)
         s.loras = loras
         s.prompt = prompt
@@ -2471,6 +2499,7 @@ struct VideoGenView: View {
             // Belt-and-braces with the requestBody gate (turbo state survives
             // preset switches, like the reference files below).
             turbo: turboEngaged,
+            streamWeights: streamWeights,
             // Gated here too: the stepper's value survives a preset switch,
             // and only the fl2va partition has a keyframe row to chain.
             chainWindows: model.supportsChainedWindows ? chainWindows : 1,

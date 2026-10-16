@@ -529,7 +529,8 @@
 "Cancel" = "취소";
 "Enable MCP & Send" = "MCP 활성화 및 보내기";
 "Enable MCP first?" = "먼저 MCP를 활성화할까요?";
-"Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU." = "측정된 실행과 이 Mac의 GPU를 기준으로 추정한 값입니다. 실제 시간은 GPU를 사용하는 다른 작업에 따라 달라집니다.";
+"Time is estimated from measured runs and this Mac's GPU, and varies with what else is using the GPU. Peak memory usage is the most memory this size and length are planned to need." = "시간은 측정된 실행과 이 Mac의 GPU를 기준으로 추정하며, GPU를 사용하는 다른 작업에 따라 달라집니다. 최대 메모리 사용량은 이 크기와 길이에 필요할 것으로 계산된 최대 메모리입니다.";
+"%.0f GB peak memory usage" = "최대 메모리 사용량 %.0f GB";
 "Enhance…" = "개선…";
 "Generate spoken audio" = "음성 오디오 생성";
 "Needs more memory than this Mac has" = "이 Mac보다 더 많은 메모리가 필요함";
@@ -2262,3 +2263,5 @@
 "Window %lld of %lld · step %lld of %lld" = "윈도우 %lld/%lld · 스텝 %lld/%lld";
 "%.1f s per step" = "스텝당 %.1f초";
 "%.1f min per step" = "스텝당 %.1f분";
+"Stream weights from disk (less memory)" = "디스크에서 가중치 스트리밍(메모리 절약)";
+"On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run." = "켜짐(기본값): 텍스트 인코더와 비디오 모델을 실행하면서 디스크에서 레이어 단위로 읽어, 최대 RAM 사용량이 약 60% 줄고 속도는 약 5% 느려집니다. 빠른 SSD 사용을 적극 권장합니다. 꺼짐: 실행하는 동안 둘 다 메모리에 유지합니다.";

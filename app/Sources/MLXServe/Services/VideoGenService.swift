@@ -34,6 +34,8 @@ final class VideoGenService: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var livePreview: NSImage? = nil
+    /// The server's `warning` event for the current run (a canvas past the memory it sees free).
+    @Published private(set) var memoryWarning: String? = nil
     /// Percent, step, pace and workload of the current run; nil until its first progress event.
     @Published private(set) var readout: VideoRunReadout? = nil
     /// When the current run started; read only while `phase` is `.running`.
@@ -99,6 +101,7 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
+        memoryWarning = nil
         readout = nil
         startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
@@ -228,7 +231,8 @@ final class VideoGenService: ObservableObject {
             ? H3TimeEstimate.livePricing(model: request.model,
                                          width: request.width, height: request.height,
                                          frames: request.numFrames, steps: steps,
-                                         fast: !request.bestQuality && !request.turbo)
+                                         fast: !request.bestQuality && !request.turbo,
+                                         streamWeights: request.streamWeights)
             : (0, 0)
         let samplingShare = request.model.backend == .minimaxH3
             ? VideoRunReadout.samplingShare(perStep: pricing.perStep, steps: steps, tail: pricing.tail)
@@ -262,6 +266,8 @@ final class VideoGenService: ObservableObject {
                         secondsPerStep: clock.secondsPerStep)
                 }
                 setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
+            case "warning":
+                if gen == generationSeq { memoryWarning = ev["message"] as? String }
             case "complete":
                 decoded = await offMain { Self.decodeFrames(ev) }
             case "error":
@@ -280,6 +286,7 @@ final class VideoGenService: ObservableObject {
         // model's, and the estimate does not include it.
         H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
                               frames: request.numFrames, steps: steps, fast: !request.bestQuality,
+                              streamWeights: request.streamWeights,
                               measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
         return frames
     }
@@ -304,6 +311,7 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
+        memoryWarning = nil
         readout = nil
         startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
@@ -610,6 +618,7 @@ final class VideoGenService: ObservableObject {
         // and emitted only when engaged — the server's defaults are the
         // absent-field behavior.
         if request.model.supportsTurbo, request.turbo { body["turbo"] = true }
+        if request.model.supportsWeightStreaming, !request.streamWeights { body["stream_weights"] = false }
         if request.model.supportsChainedWindows, request.chainWindows > 1 {
             body["chain_windows"] = request.chainWindows
         }
@@ -719,6 +728,9 @@ final class VideoGenService: ObservableObject {
         }
         if request.model.supportsTurbo {
             lines.append("turbo: \(request.turbo)")
+        }
+        if request.model.supportsWeightStreaming {
+            lines.append("stream_weights: \(request.streamWeights)")
         }
         if request.model.supportsChainedWindows {
             lines.append("chain_windows: \(max(request.chainWindows, 1))")

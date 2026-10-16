@@ -679,7 +679,8 @@
 "Error: createTask needs a non-empty \"goal\" — the full instruction the task should carry out (it has no memory of this conversation)." = "错误：createTask 需要一个非空的 \"goal\" —— 任务要执行的完整指令（它对本次对话没有任何记忆）。";
 "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}" = "错误：cwd 需要一个 path 参数。示例：{\"path\": \"myproject\"}";
 "Error: no document folder is attached to this chat. Ask the user to attach one via the paperclip menu (Attach Folder for Q&A)." = "错误：此聊天没有附带文档文件夹。请让用户通过回形针菜单（为问答附加文件夹）附加一个。";
-"Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU." = "依据实测运行结果和这台 Mac 的 GPU 估算。实际耗时取决于 GPU 上还有哪些负载。";
+"Time is estimated from measured runs and this Mac's GPU, and varies with what else is using the GPU. Peak memory usage is the most memory this size and length are planned to need." = "耗时依据实测运行结果和这台 Mac 的 GPU 估算，并随 GPU 上的其他负载而变化。峰值内存占用是按此尺寸和长度预计需要的最大内存。";
+"%.0f GB peak memory usage" = "峰值内存占用 %.0f GB";
 "Every coding run was served from the KV cache, so nothing was actually measured. Restarting the server clears it." = "每次编码测试都来自 KV 缓存，所以实际上什么也没测到。重启服务器即可清除缓存。";
 "Every quant is downloaded" = "所有量化版本都已下载";
 "Every quantization is downloaded" = "所有量化版本均已下载";
@@ -2274,3 +2275,5 @@
 "Window %lld of %lld · step %lld of %lld" = "窗口 %lld/%lld · 第 %lld/%lld 步";
 "%.1f s per step" = "每步 %.1f 秒";
 "%.1f min per step" = "每步 %.1f 分钟";
+"Stream weights from disk (less memory)" = "从磁盘流式读取权重（省内存）";
+"On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run." = "开启（默认）：文本编码器和视频模型在运行时逐层从磁盘读取，峰值内存占用减少约 60%，速度慢约 5%。强烈建议使用快速 SSD。关闭：两者在整个运行期间都保留在内存中。";
