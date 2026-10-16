@@ -2846,7 +2846,6 @@ pub const Model = struct {
         s: S,
     ) !Output {
         const a = self.allocator;
-        _ = cancel;
         const cfg = self.cfg;
 
         // Embed the two latent streams through their fp32 patch projections.
@@ -2886,6 +2885,7 @@ pub const Model = struct {
         }
         var h = try concat(pieces, 0, s);
         for (pieces) |p| _ = mlx.mlx_array_free(p);
+        built = 0;
         errdefer _ = mlx.mlx_array_free(h);
 
         // t_emb is only needed when modulation still runs from weights; with
@@ -2979,6 +2979,12 @@ pub const Model = struct {
             defer _ = mlx.mlx_array_free(mo);
             pend = PendingGate.init(mo, mods[5]);
             if (stream_w) |*w| try b.reloadTrunk(w, a, @intCast(bi), cfg, self.dtype, s);
+            // A step is one graph that runs for minutes at large sizes: run it block by block
+            // so a client that left stops the GPU here, not at the end of the step.
+            if (cancel) |p| {
+                try mlx.check(mlx.mlx_array_eval(h));
+                if (p.cancelled()) return error.Cancelled;
+            }
         }
         try applyPending(&h, &pend, plan.runs, a, s);
         defer _ = mlx.mlx_array_free(h);
