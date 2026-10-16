@@ -3085,11 +3085,16 @@ test "quantizationJson: a declared width is N-bit, an undeclared one is null" {
 /// `architecture`: a NATIVE deepseek_v4 safetensors dir and a DeepSeek GGUF
 /// on the embedded ds4 engine report the SAME model_type. "gguf" = an
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
-/// header is read at load time.
-fn modelEngineName(has_ds4: bool, has_llama: bool, has_ane: bool, mlx_gguf_served: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+/// header is read at load time. A loaded model's `config` names the MLX path's own engines: the
+/// mlx-stream DeepSeek-V4.1 repack and a Sushi pack's EXL3 experts.
+fn modelEngineName(has_ds4: bool, has_llama: bool, has_ane: bool, mlx_gguf_served: bool, config: ?*const model_mod.ModelConfig, path: []const u8, arch_hint: []const u8) []const u8 {
     if (has_ane) return "ane";
     if (has_ds4) return "ds4";
     if (has_llama) return "llama";
+    if (config) |c| {
+        if (c.dsv41_stream) return "mlx-stream";
+        if (c.exl3 != null) return "sushi";
+    }
     if (mlx_gguf_served) return "mlx-gguf";
     if (std.mem.endsWith(u8, path, ".gguf") or std.mem.eql(u8, arch_hint, "gguf")) return "gguf";
     return "mlx";
@@ -7226,7 +7231,7 @@ fn renderModelEntry(
             caps.items,
             mods.items,
             arch_label,
-            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.ane != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.path, entry.arch_hint),
+            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.ane != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.config, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -7357,7 +7362,7 @@ fn renderModelEntry(
     // MLX GGUF engine would claim the file, else "gguf" (undetermined
     // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
     const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
-        modelEngineName(false, false, false, mlxGgufClaims(io, entry), entry.path, entry.arch_hint),
+        modelEngineName(false, false, false, mlxGgufClaims(io, entry), null, entry.path, entry.arch_hint),
     });
     defer allocator.free(engine_part);
 
@@ -9535,6 +9540,13 @@ fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
 }
 
+/// The request's `enable_pld`, else the launch default; never on a Neural Engine model, whose
+/// engine drafts on its own.
+fn requestPld(root: std.json.ObjectMap, lm: *const LoadedModel) bool {
+    if (lm.ane != null) return false;
+    return if (root.get("enable_pld")) |v| v == .bool and v.bool else server_config.default_enable_pld;
+}
+
 fn handleChatCompletions(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -9981,10 +9993,7 @@ fn handleChatCompletions(
     // that came from the default — explicit user overrides are honored even
     // on novel content.
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
+    var enable_pld: bool = requestPld(root, lm);
     // Tools do NOT disable PLD: tool-pattern detection operates on emitted
     // text and is agnostic to how many tokens a decode step yields, and
     // agent traffic (tool results echoed into edits) is PLD's best workload.
@@ -10427,10 +10436,7 @@ fn handleCompletions(
     // (tests/test_completions_spec.sh). Embedded engines (ds4/llama) ignore
     // these flags at dispatch.
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
+    var enable_pld: bool = requestPld(root, lm);
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
@@ -17040,10 +17046,7 @@ fn handleAnthropicMessages(
     // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
     // runtime acceptance gate handle the rest).
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
+    var enable_pld: bool = requestPld(root, lm);
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
@@ -19178,10 +19181,7 @@ fn handleResponsesInner(
     // chat-completions auto-disable logic exactly so the same prompt picks
     // the same path on /v1/chat/completions and /v1/responses.
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld_resp: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
+    var enable_pld_resp: bool = requestPld(root, lm);
 
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
@@ -20991,6 +20991,16 @@ fn startupReply(r: *StartupResponder, request: []const u8, peer: std.Io.net.IpAd
     try conn.flush();
     const got = std.c.recv(sv[1], out.ptr, out.len, std.c.MSG.DONTWAIT);
     return out[0..@intCast(@max(got, 0))];
+}
+
+test "PLD: the request's flag, else the default; never on a Neural Engine model" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"enable_pld\":true}", .{});
+    defer parsed.deinit();
+    var lm: LoadedModel = undefined;
+    lm.ane = null;
+    try testing.expect(requestPld(parsed.value.object, &lm));
+    lm.ane = @ptrFromInt(0x1000);
+    try testing.expect(!requestPld(parsed.value.object, &lm));
 }
 
 test "startup: /health is 503 loading, a loopback client reads the load, the rest is 503" {
@@ -25384,19 +25394,26 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
 
 test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
     // Loaded entries: the attached engine pointer decides.
-    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, false, "/m/DeepSeek-V4-Flash.gguf", ""));
-    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, false, "/m/qwen.gguf", ""));
-    try testing.expectEqualStrings("ane", modelEngineName(false, false, true, false, "/m/Qwen3.8-27B-MLX-Serve-4bit", "qwen3_5"));
+    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, false, null, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, false, null, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("ane", modelEngineName(false, false, true, false, null, "/m/Qwen3.8-27B-MLX-Serve-4bit", "qwen3_5"));
     // A GGUF on the MLX path (lib/mlx-serve-gguf) is its own engine: the app
     // reads "gguf" as llama.cpp.
-    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, false, true, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, false, true, null, "/m/qwen.gguf", ""));
+    // The MLX path's own engines, from a loaded model's config.
+    var stream: model_mod.ModelConfig = .{ .dsv41_stream = true };
+    try testing.expectEqualStrings("mlx-stream", modelEngineName(false, false, false, false, &stream, "/m/DeepSeek-V4.1-Flash-MLX", "deepseek_v41"));
+    var sushi: model_mod.ModelConfig = .{};
+    sushi.exl3 = @as(@typeInfo(@TypeOf(sushi.exl3)).optional.child, undefined);
+    try testing.expectEqualStrings("sushi", modelEngineName(false, false, false, false, &sushi, "/m/GLM-5.3-Flash-Sushi", "glm5_next"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, &(model_mod.ModelConfig{}), "/m/gemma-4-12b", "gemma4"));
     // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
     // distinguish it from the ds4 GGUF — meta.engine must.
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, null, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
     // Unloaded GGUF stubs: engine undetermined until the header is read.
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, "/m/x.gguf", ""));
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, "/m/dir", "gguf"));
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, "/m/gemma-4-12b", "gemma4"));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, null, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, null, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, null, "/m/gemma-4-12b", "gemma4"));
 }
 
 test "formatCompletionsLogprobs: an echoed prompt's first token carries null, the rest shift by one" {

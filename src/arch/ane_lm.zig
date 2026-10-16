@@ -37,9 +37,13 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Bytes a load of `arch` holds: its int8 weights (the gate's and the preflight's bill).
-pub fn weightBytes(arch: Arch) u64 {
-    return q35.modelBytes(arch);
+/// Bytes a load of `arch` with `slots` engines holds at its top context: the int8 weights and each
+/// slot's fp16 KV (the gate's and the preflight's bill; the KV grows to it rung by rung).
+pub fn loadBytes(arch: Arch, slots: u32) u64 {
+    var attn: u64 = 0;
+    for (0..arch.layers) |l| attn += @intFromBool(!arch.isLinear(@intCast(l)));
+    const top_ctx: u64 = std.mem.max(u32, (Options{}).ctxs);
+    return q35.modelBytes(arch) + @as(u64, @max(slots, 1)) * attn * 2 * arch.nkv * arch.hd * 2 * top_ctx;
 }
 
 /// The most engines one load holds: `Model.open` pins each slot's programs per lane (`hb`).
@@ -225,8 +229,7 @@ pub fn drawFrom(cands: []const Cand, rng: std.Random) u32 {
 /// `logit`; null for greedy. Plain and speculative decoding draw from exactly this.
 pub fn dist(logits: []const f16, s: Sampling, scratch: []Cand) ?[]Cand {
     if (s.temperature <= 0) return null;
-    const k: usize = if (s.top_k == 0) logits.len else @min(s.top_k, logits.len);
-    var cands = topK(logits, k, scratch);
+    var cands = if (s.top_k == 0) nearTop(logits, 28 * s.temperature, scratch) else topK(logits, @min(s.top_k, logits.len), scratch);
     const inv_t = 1.0 / s.temperature;
     const top = cands[0].logit;
     var total: f32 = 0;
@@ -276,15 +279,28 @@ pub fn verifyDraft(row: []const f16, dk: u32, s: Sampling, rng: std.Random, scra
 }
 
 /// The k largest logits, descending.
+fn candDesc(_: void, a: Cand, b: Cand) bool {
+    return a.logit > b.logit;
+}
+
+/// Every logit within `margin` of the largest, descending. At `margin` = 28 x temperature a token
+/// left out is e^-28 as likely as the top one: no top-k, without sorting the whole vocabulary.
+fn nearTop(logits: []const f16, margin: f32, scratch: []Cand) []Cand {
+    var top: f32 = -std.math.inf(f32);
+    for (logits) |v| top = @max(top, @as(f32, v));
+    var n: usize = 0;
+    for (logits, 0..) |v, i| if (@as(f32, v) >= top - margin) {
+        scratch[n] = .{ .logit = v, .id = @intCast(i) };
+        n += 1;
+    };
+    std.sort.pdq(Cand, scratch[0..n], {}, candDesc);
+    return scratch[0..n];
+}
+
 pub fn topK(logits: []const f16, k: usize, scratch: []Cand) []Cand {
-    const desc = struct {
-        fn f(_: void, a: Cand, b: Cand) bool {
-            return a.logit > b.logit;
-        }
-    }.f;
     if (k == logits.len) {
         for (logits, scratch[0..logits.len], 0..) |v, *c, i| c.* = .{ .logit = v, .id = @intCast(i) };
-        std.sort.pdq(Cand, scratch[0..logits.len], {}, desc);
+        std.sort.pdq(Cand, scratch[0..logits.len], {}, candDesc);
         return scratch[0..logits.len];
     }
     // Insertion into a sorted window of k: cheap for the small k sampling uses.
@@ -430,6 +446,12 @@ pub const Model = struct {
             if (build.done[nunits + self.lanes]) self.cores.deinit();
             if (self.dcfg != null and build.done[nunits + self.lanes + 1]) self.dprog.?.deinit();
             return err;
+        }
+        errdefer {
+            for (self.units) |u| u.prog.deinit();
+            for (self.heads[0..self.lanes]) |h| h.deinit();
+            self.cores.deinit();
+            if (self.dprog) |d| d.deinit();
         }
         for (0..self.chunks) |ci| {
             const info = self.units[ci * self.lanes].info;
@@ -2227,6 +2249,13 @@ test "arch: qwen3_5 and qwen3 dense packs; experts and Hadamard packs are refuse
     try testing.expectError(error.UnsupportedArch, archOf(Cfg{ .model_type = "qwen3", .full_attention_interval = 0, .linear_num_value_heads = 0, .embedding = true }));
 }
 
+test "load bill: the int8 weights and every slot's KV at the top context" {
+    const q27: Arch = .{ .hidden = 5120, .ffn = 17408, .layers = 64, .vocab = 248320, .nk = 16, .nv = 48, .dk = 128, .dv = 128, .nh = 24, .nkv = 4, .hd = 256, .rot = 64, .rope_theta = 1e7, .eps = 1e-6, .full_interval = 4, .tie = false };
+    // 16 attention layers x K and V x 4 heads x 256 x fp16, over 64K positions: 4 GiB a slot.
+    try testing.expectEqual(@as(u64, 4) << 30, loadBytes(q27, 2) - loadBytes(q27, 1));
+    try testing.expectEqual(q35.modelBytes(q27) + (@as(u64, 4) << 30), loadBytes(q27, 1));
+}
+
 test "lanes: two Neural Engines split a layer only for a model big enough to gain from it" {
     const q27: Arch = .{ .hidden = 5120, .ffn = 17408, .layers = 64, .vocab = 248320, .nk = 16, .nv = 48, .dk = 128, .dv = 128, .nh = 24, .nkv = 4, .hd = 256, .rot = 64, .rope_theta = 1e7, .eps = 1e-6, .full_interval = 4, .tie = false };
     var small = q27;
@@ -2248,6 +2277,15 @@ test "--ane-slots takes 1 to max_slots" {
     try std.testing.expectEqual(@as(u32, 1), try parseSlots("1"));
     try std.testing.expectEqual(max_slots, try parseSlots("4"));
     for ([_][]const u8{ "0", "5", "17", "-1", "x", "" }) |bad| try std.testing.expectError(error.InvalidSlots, parseSlots(bad));
+}
+
+test "sampling: without a top-k, only tokens near the top are candidates" {
+    const logits = [_]f16{ 3, 10, 9, -40 };
+    var scratch: [4]Cand = undefined;
+    const wide = dist(&logits, .{ .temperature = 1 }, &scratch).?;
+    try std.testing.expectEqual(@as(usize, 3), wide.len);
+    try std.testing.expectEqual(@as(u32, 1), wide[0].id);
+    try std.testing.expectEqual(@as(usize, 2), dist(&logits, .{ .temperature = 0.1 }, &scratch).?.len);
 }
 
 test "suppress: reserved ids and padding rows are never drawn" {

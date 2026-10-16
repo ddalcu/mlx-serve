@@ -271,7 +271,8 @@ pub fn int8Rows(lin: Linear, r0: usize, r1: usize, codes: []i8, scales: []align(
         lin.row(r, scratch);
         var amax: f32 = 0;
         for (scratch) |v| amax = @max(amax, @abs(v));
-        const s16: f16 = @floatCast(@max(amax / 127.0, 1e-8));
+        // Floored in f16 itself: a zero row's scale must not round to 0 (and its codes to 0 * inf).
+        const s16: f16 = @max(@as(f16, @floatCast(amax / 127.0)), std.math.floatTrueMin(f16));
         scales[r] = s16;
         const inv = 1.0 / @as(f32, s16);
         const dst = codes[r * lin.in ..][0..lin.in];
@@ -461,4 +462,23 @@ test "convert: every row of every job, whatever the jobs' row counts" {
     var scratch: [in]f32 = undefined;
     int8Rows(lin, 0, 40, &want, &want_s, &scratch);
     try testing.expectEqualSlices(i8, &want, &got);
+    try testing.expectEqualSlices(f16, &want_s, &got_s);
+}
+
+test "int8 rows: a row of zeros gets a positive scale and zero codes" {
+    const in = 64;
+    var codes: [2 * in]u32 = @splat(3);
+    var words: [2 * in * 4 / 32]u32 = undefined;
+    var scales: [2 * 2]u16 = undefined;
+    var biases: [2 * 2]u16 = undefined;
+    const lin = testAffine(4, 2, in, 32, &codes, &words, &scales, &biases);
+    // Row 0 dequantizes to zeros.
+    @memset(scales[0..2], 0);
+    @memset(biases[0..2], 0);
+    var q: [2 * in]i8 = undefined;
+    var s: [2]f16 = undefined;
+    var scratch: [in]f32 = undefined;
+    int8Rows(lin, 0, 2, &q, &s, &scratch);
+    try testing.expect(s[0] > 0 and std.math.isFinite(s[0]));
+    for (q[0..in]) |c| try testing.expectEqual(@as(i8, 0), c);
 }

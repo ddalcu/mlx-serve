@@ -2099,9 +2099,9 @@ pub const Scheduler = struct {
         else
             null;
         const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
-        // A Neural Engine load holds int8 copies of the pack's 4- to 8-bit weights.
+        // A Neural Engine load holds int8 copies of the pack's 4- to 8-bit weights, and its KV.
         const ane_bytes: ?u64 = if (mlx_text and aneWanted(owned.config, self.ane))
-            (if (arch_ane.archOf(owned.config)) |a| arch_ane.weightBytes(a) else |_| null)
+            (if (arch_ane.archOf(owned.config)) |a| arch_ane.loadBytes(a, self.ane_slots) else |_| null)
         else
             null;
         const gate_model_bytes: ?u64 = if (ane_bytes) |b| @max(b, resident_model_bytes orelse 0) else resident_model_bytes;
@@ -3293,7 +3293,7 @@ fn aneAdmit(sch: *Scheduler, params: anytype) ?arch_ane.Arch {
         return null;
     };
     // Its own preflight: the int8 copies outweigh a 4-bit pack's shards, and the GPU arm checks those.
-    const need = arch_ane.weightBytes(arch);
+    const need = arch_ane.loadBytes(arch, params.ane_slots);
     makeRoomInRam(sch, params.entry.id, need);
     if (!skip_mem_preflight) {
         const avail = availForLoad(sch.io, need);
@@ -3340,7 +3340,9 @@ fn aneBuild(sch: *Scheduler, params: anytype, arch: arch_ane.Arch) !bool {
     };
     errdefer worker.close();
     const drafter_path: []const u8 = if (drafter != null and worker.engines[0].drafter != null) try sch.allocator.dupe(u8, drafter.?) else "";
-    const max_pos = worker.engines[0].model.maxPositions();
+    // The engine's top rung, or less where the pack was trained to less.
+    const trained = params.config.max_position_embeddings;
+    const max_pos = if (trained > 0) @min(trained, worker.engines[0].model.maxPositions()) else worker.engines[0].model.maxPositions();
     params.config.max_position_embeddings = max_pos;
     // What the engine holds is the context it advertises, whatever `--ctx-size` asks.
     params.config.ctx_override = if (params.config.ctx_override > 0) @min(params.config.ctx_override, max_pos) else max_pos;
@@ -5451,6 +5453,10 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     } else {
         // Startup load runs before the wait loop can acquire.
         sleep_inhibit.setActive(true);
+        // `.loading` while it runs, so the startup responder's `/v1/load-progress` lists it.
+        sch.registry.mutex.lockUncancelable(sch.io);
+        _ = sch.registry.tryBeginLoadLocked(params.entry);
+        sch.registry.mutex.unlock(sch.io);
         if (doLoadOnInferenceThread(sch, params)) |_| {
             log.info("Model ready (loaded on inference thread).\n", .{});
             signalStarted(sch);

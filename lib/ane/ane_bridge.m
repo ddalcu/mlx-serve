@@ -760,6 +760,39 @@ static NSArray *program_indices(msv_ane_program *p, uint32_t proc, int output) {
                                              : @"ANEFModelInputSymbolIndexArray"];
 }
 
+/* Staging directories are named by program content, so two live programs of one text (a
+ * weight-free program on two packs of one shape) share one, and aned reads it while serving: only
+ * the last program to go removes it. */
+static NSMutableDictionary<NSString *, NSNumber *> *bridge_staging_users(void) {
+    static NSMutableDictionary *users;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ users = [NSMutableDictionary dictionary]; });
+    return users;
+}
+
+static void bridge_staging_retain(const char *directory) {
+    NSMutableDictionary *users = bridge_staging_users();
+    @synchronized(users) {
+        NSString *key = @(directory);
+        users[key] = @([users[key] intValue] + 1);
+    }
+}
+
+/* Whether this was the directory's last user. */
+static bool bridge_staging_release(const char *directory) {
+    NSMutableDictionary *users = bridge_staging_users();
+    @synchronized(users) {
+        NSString *key = @(directory);
+        int left = [users[key] intValue] - 1;
+        if (left > 0) {
+            users[key] = @(left);
+            return false;
+        }
+        [users removeObjectForKey:key];
+        return true;
+    }
+}
+
 msv_ane_program *msv_ane_program_create(const char *name, const char *mil,
                                         void *weights_owned, size_t weight_bytes,
                                         uint32_t instances, const uint32_t *ane_hints,
@@ -797,6 +830,7 @@ msv_ane_program *msv_ane_program_create(const char *name, const char *mil,
                                          &p->cache_hit, error, error_size))
                     goto fail;
                 p->staging_directory = strdup(directory.UTF8String);
+                bridge_staging_retain(p->staging_directory);
             } else {
                 /* Same identifier, same staging directory: the second load maps the compiled
                  * program the first one made (one weight copy, its own queue). */
@@ -830,7 +864,8 @@ msv_ane_program *msv_ane_program_create(const char *name, const char *mil,
             ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(m, @selector(unloadWithQoS:error:), 21, &failure);
         }
         if (p->staging_directory) {
-            [[NSFileManager defaultManager] removeItemAtPath:@(p->staging_directory) error:nil];
+            if (bridge_staging_release(p->staging_directory))
+                [[NSFileManager defaultManager] removeItemAtPath:@(p->staging_directory) error:nil];
             free(p->staging_directory);
         }
         free(p);
@@ -857,9 +892,11 @@ void msv_ane_program_free(msv_ane_program *p) {
             (void)o;
         }
         if (p->staging_directory) {
-            [[NSFileManager defaultManager] removeItemAtPath:@(p->staging_directory) error:nil];
-            if (!msv_ane_cache_enabled())
-                bridge_cache_evict(strrchr(p->staging_directory, '/') + 1);
+            if (bridge_staging_release(p->staging_directory)) {
+                [[NSFileManager defaultManager] removeItemAtPath:@(p->staging_directory) error:nil];
+                if (!msv_ane_cache_enabled())
+                    bridge_cache_evict(strrchr(p->staging_directory, '/') + 1);
+            }
             free(p->staging_directory);
         }
     }

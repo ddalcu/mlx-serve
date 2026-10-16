@@ -137,6 +137,8 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertEqual(badge("llama"), "GGUF")
         XCTAssertEqual(badge("ds4"), "DS4")
         XCTAssertEqual(badge("mlx-gguf"), "MLX GGUF")
+        XCTAssertEqual(badge("sushi"), "Sushi")
+        XCTAssertEqual(badge("mlx-stream"), "Stream")
         XCTAssertEqual(badge(nil), "MLX") // a server that predates the field
     }
 

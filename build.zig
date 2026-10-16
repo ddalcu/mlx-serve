@@ -310,6 +310,9 @@ pub fn build(b: *std.Build) void {
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
+    // that the run's cache key does not see: it reruns every time.
+    if (test_filter != null) run_unit_tests.has_side_effects = true;
     if (qwen_preprocess_fixture) |fixture| {
         run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
         run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
@@ -508,7 +511,10 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    // Rerun every time when filtered, as on macOS (env-gated tests).
+    if (test_filter != null) run_unit_tests.has_side_effects = true;
+    test_step.dependOn(&run_unit_tests.step);
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/

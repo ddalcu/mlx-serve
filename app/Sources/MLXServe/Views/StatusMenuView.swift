@@ -249,7 +249,6 @@ struct StatusMenuView: View {
         VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
             HStack(spacing: 8) {
                 TraySectionHeader(title: "Server").fixedSize()
-                engineBadge
                 Spacer(minLength: 0)
             }
             TrayCard {
@@ -439,18 +438,6 @@ struct StatusMenuView: View {
 
     /// The engine the resident chat model runs on, as the SERVER reports it;
     /// before a load, the file-type guess for the selected model.
-    @ViewBuilder private var engineBadge: some View {
-        if let engine = server.residentChatModel?.engine {
-            EngineBadge(text: engine.label, tint: EngineBadge.tint(engine))
-                .help("Engine the loaded model runs on")
-        } else if let engine = appState.localModels
-            .first(where: { $0.path == appState.selectedModelPath })?.engine
-        {
-            EngineBadge(text: engine.displayName, tint: .secondary)
-                .help("Engine the selected model will run on")
-        }
-    }
-
     // MARK: - Music
 
     /// The Music tab's track while it plays, pauses or a station is on air.
@@ -1408,26 +1395,3 @@ struct TerminalLogTextView: NSViewRepresentable {
     }
 }
 
-/// The engine name as a tinted capsule, so it reads at a glance.
-struct EngineBadge: View {
-    let text: String
-    let tint: Color
-
-    var body: some View {
-        Text(text)
-            .font(.app(.caption).weight(.semibold))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(tint.opacity(0.15), in: Capsule())
-    }
-
-    static func tint(_ engine: ServerEngine) -> Color {
-        switch engine {
-        case .mlx:     return .accentColor
-        case .mlxGguf: return .teal
-        case .llama:   return .orange
-        case .dsv4:    return .purple
-        }
-    }
-}
