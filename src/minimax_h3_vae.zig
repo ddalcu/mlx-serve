@@ -370,11 +370,21 @@ const DecBlockW = struct {
     w2: mlx.mlx_array,
     w2_b: mlx.mlx_array,
 
+    fn arrays(self: *const DecBlockW) [12]mlx.mlx_array {
+        return .{ self.norm1, self.norm2, self.scale1, self.scale2, self.qkv_w, self.qkv_b, self.out_w, self.out_b, self.w1, self.w1_b, self.w2, self.w2_b };
+    }
+
     fn deinit(self: *DecBlockW) void {
-        inline for (.{ self.norm1, self.norm2, self.scale1, self.scale2, self.qkv_w, self.qkv_b, self.out_w, self.out_b, self.w1, self.w1_b, self.w2, self.w2_b }) |f|
-            _ = mlx.mlx_array_free(f);
+        for (self.arrays()) |f| _ = mlx.mlx_array_free(f);
     }
 };
+
+fn evalArrays(xs: []const mlx.mlx_array) !void {
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (xs) |x| _ = mlx.mlx_vector_array_append_value(vec, x);
+    try mlx.check(mlx.mlx_eval(vec));
+}
 
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
@@ -452,6 +462,39 @@ pub const Decoder = struct {
             };
         }
         return self;
+    }
+
+    /// The decoder holds converted (bf16, transposed) copies of the f16 file: the map is dropped
+    /// BEFORE the first eval, so each original is freed once its copy is built instead of pinned.
+    pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, cfg: DecCfg, dt: mlx.mlx_dtype, s: S) !Decoder {
+        var w = try model_mod.loadWeightsSingleFile(allocator, path);
+        var self = Decoder.load(allocator, &w, cfg, dt, s) catch |e| {
+            w.deinit();
+            return e;
+        };
+        w.deinit();
+        errdefer self.deinit();
+        try self.evalWeights();
+        return self;
+    }
+
+    fn headArrays(self: *const Decoder) [11]mlx.mlx_array {
+        return .{ self.x_embed_w, self.x_embed_b, self.register_tokens, self.norm_out_w, self.norm_out_b, self.proj_out_w, self.proj_out_b, self.pq_w, self.pq_b, self.latents_mean, self.latents_std };
+    }
+
+    /// One eval per block, so at most one block's originals are read at a time.
+    fn evalWeights(self: *const Decoder) !void {
+        try evalArrays(&self.headArrays());
+        for (self.blocks) |*b| try evalArrays(&b.arrays());
+    }
+
+    pub fn weightBytes(self: *const Decoder) usize {
+        var n: usize = 0;
+        for (self.headArrays()) |x| n += mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        for (self.blocks) |*b| for (b.arrays()) |x| {
+            n += mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        };
+        return n;
     }
 
     pub fn deinit(self: *Decoder) void {

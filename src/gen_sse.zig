@@ -243,10 +243,19 @@ pub fn jsonEscapeMessage(out: []u8, msg: []const u8) []const u8 {
 
 /// Write a terminal `error` SSE event.
 pub fn sendError(conn: *Conn, msg: []const u8) void {
+    sendMessageEvent(conn, "error", msg);
+}
+
+/// Write a non-terminal `warning` SSE event; the generation carries on after it.
+pub fn sendWarning(conn: *Conn, msg: []const u8) void {
+    sendMessageEvent(conn, "warning", msg);
+}
+
+fn sendMessageEvent(conn: *Conn, comptime kind: []const u8, msg: []const u8) void {
     var esc_buf: [512]u8 = undefined;
     const esc = jsonEscapeMessage(&esc_buf, msg);
     var buf: [640]u8 = undefined;
-    const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"error\",\"message\":\"{s}\"}}\n\n", .{esc}) catch return;
+    const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"" ++ kind ++ "\",\"message\":\"{s}\"}}\n\n", .{esc}) catch return;
     conn.writeAll(ev) catch {};
 }
 
