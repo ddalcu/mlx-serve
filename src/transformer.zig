@@ -43657,67 +43657,44 @@ pub fn prefillDqGemmMinRows(bits: u32) usize {
     return if (bits == 2) 384 else PREFILL_DQ_GEMM_MIN_M;
 }
 
-/// Rows from which one [M,K] x [N,K]^T call takes the route. Pure over its inputs;
-/// `raw` is MLX_SERVE_PREFILL_DQ_GEMM_MIN_ROWS (unparseable is ignored).
+/// Rows from which one [M,K] x [N,K]^T call takes the route. Pure over its inputs.
 /// `prefillDqGemmMinRows` stays the smallest floor any shape gets, which is what the
 /// admission bill needs.
-pub fn prefillDqGemmRowFloor(bits: u32, ultra_nax: bool, n: usize, k: usize, raw: ?[*:0]const u8) usize {
-    if (raw) |r| if (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10)) |v| return v else |_| {};
+pub fn prefillDqGemmRowFloor(bits: u32, ultra_nax: bool, n: usize, k: usize) usize {
     const base = prefillDqGemmMinRows(bits);
     // Off NAX stock qmm is the 32x32 steel tile the base floors were tuned against. On the Ultra's NAX
-    // stock qmm is the fused kernel, which holds out to ~0.9 * min(N, K) rows - except for
-    // K >= 3N, where the dequantized GEMM runs MLX's split-K kernel and wins from the base floor.
-    if (!ultra_nax or bits == 2 or k >= 3 * n) return base;
+    // stock qmm is the fused kernel, which holds out to ~0.9 * min(N, K) rows from K 4096 up. Below
+    // that (K 640, 2560) and at K >= 3N, where the dequantized GEMM runs MLX's split-K kernel,
+    // dequant+GEMM wins from the base floor.
+    if (!ultra_nax or bits == 2 or k < 4096 or k >= 3 * n) return base;
     return @max(base, @min(n, k) * 9 / 10);
 }
 
-test "prefillDqGemmRowFloor: on NAX the floor follows min(N, K), tall-K shapes and 2-bit keep theirs" {
-    // M5 Ultra crossovers, stock NAX qmm vs dequant+GEMM: K 2560 wins from 2048
-    // (Flash-Next), K 5120 from ~4608 and K 6144 from ~5-6.6k (Qwen3.8-27B).
-    try std.testing.expectEqual(@as(usize, 2304), prefillDqGemmRowFloor(4, true, 10240, 2560, null));
-    try std.testing.expectEqual(@as(usize, 4608), prefillDqGemmRowFloor(4, true, 17408, 5120, null));
-    // The smaller dimension sets it: K 6144 crosses near 3k at N 2560 (Flash-Next GDN out,
-    // attn o) but past 6k at N 5120 (27B), so 0.9*min(N, K).
-    try std.testing.expectEqual(@as(usize, 2304), prefillDqGemmRowFloor(4, true, 2560, 6144, null));
-    try std.testing.expectEqual(@as(usize, 4608), prefillDqGemmRowFloor(4, true, 5120, 6144, null));
+test "prefillDqGemmRowFloor: on the Ultra the floor follows min(N, K) for K from 4096, the rest keep theirs" {
+    // M5 Ultra crossovers, stock NAX qmm vs dequant+GEMM: K 640 and 2560 win from 2048
+    // (Flash-Next, including the 2048-row company chunk), K 5120 from ~4608 (Qwen3.8-27B).
+    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 10240, 2560));
+    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 2560, 640));
+    try std.testing.expectEqual(@as(usize, 4608), prefillDqGemmRowFloor(4, true, 17408, 5120));
+    // At K 6144 the smaller dimension sets it: N 2560 (Flash-Next GDN out, attn o) loses 10% at
+    // 2048 rows and crosses near 3k, N 5120 (27B) crosses past 6k.
+    try std.testing.expectEqual(@as(usize, 2304), prefillDqGemmRowFloor(4, true, 2560, 6144));
+    try std.testing.expectEqual(@as(usize, 4608), prefillDqGemmRowFloor(4, true, 5120, 6144));
     // K >= 3N runs MLX's split-K GEMM, which wins from 2048 (27B down, 5120x17408).
-    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 5120, 17408, null));
-    // Off NAX and at 2 bits the M4 Max floors stand.
-    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, false, 17408, 5120, null));
-    try std.testing.expectEqual(@as(usize, 384), prefillDqGemmRowFloor(2, true, 17408, 5120, null));
+    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 5120, 17408));
+    // Off the Ultra and at 2 bits the M4 Max floors stand.
+    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, false, 17408, 5120));
+    try std.testing.expectEqual(@as(usize, 384), prefillDqGemmRowFloor(2, true, 17408, 5120));
     // The admission bill's floor is never above any shape's.
-    try std.testing.expect(prefillDqGemmMinRows(4) <= prefillDqGemmRowFloor(4, true, 10240, 2560, null));
-    // The env pins every shape.
-    try std.testing.expectEqual(@as(usize, 6000), prefillDqGemmRowFloor(4, true, 5120, 17408, "6000"));
-    try std.testing.expectEqual(prefillDqGemmRowFloor(4, true, 17408, 5120, null), prefillDqGemmRowFloor(4, true, 17408, 5120, "junk"));
+    try std.testing.expect(prefillDqGemmMinRows(4) <= prefillDqGemmRowFloor(4, true, 10240, 2560));
 }
 
-var dq_row_floor_env: ??[*:0]const u8 = null;
-
-/// Whether the shape-aware floor applies. Measured on the M5 Ultra (`applegpu_g17d`) only; the
-/// M5 Max (`applegpu_g17s`) crosses the other way on K 5120 (dequant+GEMM wins from 2048 rows,
-/// MLX picks different GEMM tiles per arch suffix), so every other chip keeps the base floor.
-pub fn dqShapeFloorArchFrom(nax: bool, arch: []const u8) bool {
-    return nax and arch.len > 0 and arch[arch.len - 1] == 'd';
-}
-
-test "dqShapeFloorArchFrom: the shape-aware floor is the Ultra's only" {
-    try std.testing.expect(dqShapeFloorArchFrom(true, "applegpu_g17d"));
-    try std.testing.expect(!dqShapeFloorArchFrom(true, "applegpu_g17s"));
-    try std.testing.expect(!dqShapeFloorArchFrom(true, "applegpu_g17g"));
-    try std.testing.expect(!dqShapeFloorArchFrom(false, "applegpu_g17d"));
-    try std.testing.expect(!dqShapeFloorArchFrom(true, ""));
-}
-
-var dq_shape_floor_arch: ?bool = null;
-
+/// The shape-aware floor is measured on the M5 Ultra only. The M5 Max crosses the other way on
+/// K 5120 (dequant+GEMM wins from 2048 rows; MLX picks different GEMM tiles per arch suffix), so
+/// every other chip keeps the base floor.
 fn prefillDqGemmRowFloorNow(bits: u32, n: usize, k: usize) usize {
-    if (dq_row_floor_env == null) dq_row_floor_env = std.c.getenv("MLX_SERVE_PREFILL_DQ_GEMM_MIN_ROWS");
-    if (dq_shape_floor_arch == null) {
-        var arch_buf: [128]u8 = undefined;
-        dq_shape_floor_arch = dqShapeFloorArchFrom(naxAvailable(), gpuArchitecture(&arch_buf) orelse "");
-    }
-    return prefillDqGemmRowFloor(bits, dq_shape_floor_arch.?, n, k, dq_row_floor_env.?);
+    const ultra_nax = naxAvailable() and dualDieArch(verifyArch() orelse "");
+    return prefillDqGemmRowFloor(bits, ultra_nax, n, k);
 }
 
 /// Test seam: forces the route on/off without the environment.
@@ -44521,7 +44498,19 @@ fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.mlx_ar
 /// only in a multi-stream group: they lift a batched verify and slow a solo one.
 pub fn verifySharedFor(arch: []const u8, group_rows: usize) bool {
     if (!std.mem.startsWith(u8, arch, "applegpu_g17")) return false;
-    return !std.mem.endsWith(u8, arch, "d") or group_rows > 1;
+    return !dualDieArch(arch) or group_rows > 1;
+}
+
+/// A dual-die GPU (the Ultra) reports an architecture ending in `d`, e.g. `applegpu_g17d`.
+pub fn dualDieArch(arch: []const u8) bool {
+    return std.mem.endsWith(u8, arch, "d");
+}
+
+test "dualDieArch: only the Ultra's suffix" {
+    try std.testing.expect(dualDieArch("applegpu_g17d"));
+    try std.testing.expect(!dualDieArch("applegpu_g17s"));
+    try std.testing.expect(!dualDieArch("applegpu_g17g"));
+    try std.testing.expect(!dualDieArch(""));
 }
 
 fn verifyArch() ?[]const u8 {
@@ -44711,7 +44700,7 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
         }
     }
     const arch = verifyArch() orelse return null;
-    if (total >= qmvBatchLimit(arch[arch.len - 1] == 'd', k, n)) return null;
+    if (total >= qmvBatchLimit(dualDieArch(arch), k, n)) return null;
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_quantized_matmul(&result, x, w, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
@@ -52593,7 +52582,7 @@ test "verify shared projection preserves solo qmv values across request widths, 
             const x = try attn256RandBf16(prng.random(), &.{ 1, total, k }, s);
             defer _ = mlx.mlx_array_free(x);
             const arch = verifyArch().?;
-            if (total > 24 or total >= qmvBatchLimit(arch[arch.len - 1] == 'd', k, n)) {
+            if (total > 24 or total >= qmvBatchLimit(dualDieArch(arch), k, n)) {
                 try testing.expect((try verifySharedProjection(s, x, w, sc, bi, lengths[0..count])) == null);
                 continue;
             }
