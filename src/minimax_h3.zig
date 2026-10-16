@@ -2842,9 +2842,11 @@ pub const Model = struct {
         shift_a: f64,
         attn_bcast: ?*AttnBroadcast,
         attn_refresh: bool,
+        cancel: ?gen_sse.Progress,
         s: S,
     ) !Output {
         const a = self.allocator;
+        _ = cancel;
         const cfg = self.cfg;
 
         // Embed the two latent streams through their fp32 patch projections.
@@ -4773,7 +4775,7 @@ fn generateOne(
             if (attn_bcast != null and !refresh) bcast_reused += 1;
             const bcast_growth: usize = if (attn_bcast) |*ab| @as(usize, @intCast(AttnBroadcast.rowBytes(model.cfg.hidden_size, model.blocks.len, ab.q8) * layout.seq_len)) -| ab.bytes() else 0;
             mem_cap.step(bcast_growth);
-            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, s);
+            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, progress, s);
             defer out.deinit();
 
             // Per-step JPEG from predicted clean x0 = x - σ·v, using the
@@ -7344,11 +7346,11 @@ test "minimax h3: a streamed DiT forward equals the resident one and leaves no b
     const audio = try toyRand(&.{ rows[2], @intCast(cfg.audio_latents_dim) }, 102, s);
     defer _ = mlx.mlx_array_free(audio);
 
-    var want = try resident.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, s);
+    var want = try resident.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, null, s);
     defer want.deinit();
     // Twice: the second pass runs on the arrays the first one swapped in.
     for (0..2) |_| {
-        var got = try streamed.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, s);
+        var got = try streamed.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, null, s);
         defer got.deinit();
         try expectBitEqual(got.video, want.video, "streamed video", s);
         try expectBitEqual(got.audio, want.audio, "streamed audio", s);
@@ -7359,6 +7361,80 @@ test "minimax h3: a streamed DiT forward equals the resident one and leaves no b
             try testing.expect(!ready);
         };
     }
+}
+
+test "minimax h3: a cancel lands between DiT blocks, and polling it leaves the forward unchanged" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const f32t = mlx.mlx_dtype.float32;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/dit.safetensors", .{pbuf[0..root_len]}, 0);
+    defer a.free(path);
+    const cfg = Config{
+        .hidden_size = 256,
+        .num_layers = 3,
+        .token_refiner_num_layers = 0,
+        .num_attention_heads = 4,
+        .attention_head_dim = 32,
+        .ffn_hidden_size = 128,
+        .latents_dim = 4,
+        .audio_latents_dim = 4,
+        .text_dim = 8,
+        .timestep_input_dim = 32,
+        .time_embed_hidden_size = 32,
+        .time_embed_dim = 32,
+        .rope_inv_freq_len = 4,
+    };
+    if (!try writeToyDit(a, path, cfg, s)) return error.SkipZigTest;
+    var w = try model_mod.loadWeightsSingleFile(a, path);
+    defer w.deinit();
+    var model = try Model.load(a, &w, cfg, f32t, s);
+    defer model.deinit();
+    try model.evalWeights();
+
+    var layout = try PackedLayout.init(a, 4, 2, 4, 4, 3, &.{}, 5);
+    defer layout.deinit();
+    var plan = try buildTimestepPlan(a, &layout, 0.5, 12.0, 3.0, .{});
+    defer plan.deinit();
+    var rope = try buildRope(a, &layout, model.inv_freq, f32t, s);
+    defer rope.deinit();
+    var rows = [3]c_int{ 0, 0, 0 };
+    for (layout.segments) |seg| rows[@intFromEnum(seg.kind.stream())] += @intCast(seg.end - seg.start);
+    const text = try toyRand(&.{ rows[0], @intCast(cfg.hidden_size) }, 100, s);
+    defer _ = mlx.mlx_array_free(text);
+    const video = try toyRand(&.{ rows[1], @intCast(cfg.videoPatchDim()) }, 101, s);
+    defer _ = mlx.mlx_array_free(video);
+    const audio = try toyRand(&.{ rows[2], @intCast(cfg.audio_latents_dim) }, 102, s);
+    defer _ = mlx.mlx_array_free(audio);
+
+    // Leaves after `leave_at` polls (0 = never).
+    const Probe = struct {
+        calls: u32 = 0,
+        leave_at: u32,
+        fn emit(_: *anyopaque, _: []const u8, _: u32, _: u32) void {}
+        fn gone(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.calls == self.leave_at;
+        }
+    };
+
+    var want = try model.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, null, s);
+    defer want.deinit();
+    var stays = Probe{ .leave_at = 0 };
+    var got = try model.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, .{ .ctx = &stays, .cb = Probe.emit, .cancelled_cb = Probe.gone }, s);
+    defer got.deinit();
+    try expectBitEqual(got.video, want.video, "polled video", s);
+    try expectBitEqual(got.audio, want.audio, "polled audio", s);
+    try testing.expectEqual(@as(u32, cfg.num_layers), stays.calls);
+
+    var leaves = Probe{ .leave_at = 2 };
+    try testing.expectError(error.Cancelled, model.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, .{ .ctx = &leaves, .cb = Probe.emit, .cancelled_cb = Probe.gone }, s));
+    try testing.expectEqual(@as(u32, 2), leaves.calls);
 }
 
 /// A toy text-encoder file at `cfg`'s geometry, linears 8-bit like the shipped pack.
