@@ -81,6 +81,17 @@ class Server:
         req = urllib.request.Request(self.base + route, data=data, headers={'Content-Type': 'application/json'})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
+                if body is not None and body.get('stream'):
+                    events, done = [], False
+                    for line in response:
+                        if not line.startswith(b'data:'):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == b'[DONE]':
+                            done = True
+                        elif payload:
+                            events.append(json.loads(payload))
+                    return {'events': events, 'done': done}
                 return json.load(response)
         except urllib.error.HTTPError as error:
             raise AssertionError(f'HTTP {error.code}: {error.read().decode()}') from error
@@ -167,28 +178,75 @@ PROMPTS = {
 }
 
 
-def drafter_measurements(server, reps):
-    defaults = {}
+def drafter_defaults(server):
+    results = {}
     prompt = 'Explain how binary search finds an item in a sorted list.'
-    offset = server.log.stat().st_size
-    defaults['chat'] = server.chat(prompt, drafter=None, tokens=96)
-    logs = server.log.read_bytes()[offset:].decode('utf-8')
-    stats = spec_stats(logs)
-    assert sum(s['attempts'] for s in stats) > 0, 'chat drafting did not engage by default'
-    assert sum(s['accepts'] for s in stats) > 0, 'chat default drafting accepted no tokens'
-    defaults['chat']['spec_stats'] = stats
-    offset = server.log.stat().st_size
-    defaults['messages'] = server.request('/v1/messages', {
-        'model': server.model['id'], 'messages': [{'role': 'user', 'content': prompt}],
-        'temperature': 0, 'top_k': 1, 'seed': 42, 'max_tokens': 96, 'stream': False,
-        'thinking': {'type': 'disabled'}, 'enable_pld': False, 'enable_mtp': False,
-    })
-    logs = server.log.read_bytes()[offset:].decode('utf-8')
-    stats = spec_stats(logs)
-    assert sum(s['attempts'] for s in stats) > 0, 'Anthropic-compatible drafting did not engage by default'
-    assert sum(s['accepts'] for s in stats) > 0, 'Anthropic-compatible drafting accepted no tokens'
-    defaults['messages']['spec_stats'] = stats
-    print('PASS: chat and Anthropic-compatible requests draft by default and accept tokens', flush=True)
+    surfaces = {
+        'chat': ('/v1/chat/completions', {'messages': [{'role': 'user', 'content': prompt}]}),
+        'completions': ('/v1/completions', {'prompt': prompt}),
+        'messages': ('/v1/messages', {'messages': [{'role': 'user', 'content': prompt}],
+                                    'thinking': {'type': 'disabled'}}),
+        'responses': ('/v1/responses', {'input': prompt, 'max_output_tokens': 96,
+                                      'reasoning': {'effort': 'none'}}),
+    }
+    for name, (route, fields) in surfaces.items():
+        for stream in (False, True):
+            for enabled in (None, False):
+                body = dict(fields, model=server.model['id'], max_tokens=96, temperature=0,
+                            top_k=1, seed=42, stream=stream, enable_pld=False, enable_mtp=False,
+                            enable_thinking=False, chat_template_kwargs={'enable_thinking': False})
+                if enabled is not None:
+                    body['enable_drafter'] = enabled
+                offset = server.log.stat().st_size
+                start = time.monotonic()
+                reply = server.request(route, body)
+                result = {'wall_seconds': time.monotonic() - start, 'response': reply}
+                if stream:
+                    events = reply['events']
+                    assert events and all(e.get('error') is None and e.get('type') not in
+                                          ('error', 'response.failed') for e in events), result
+                    if name == 'responses':
+                        assert any(e.get('type') in ('response.completed', 'response.incomplete') and
+                                   e['response'].get('error') is None for e in events), result
+                        text = ''.join(e['delta'] for e in events if e.get('type') == 'response.output_text.delta')
+                    elif name == 'messages':
+                        assert any(e.get('type') == 'message_stop' for e in events), result
+                        text = ''.join(e['delta'].get('text', '') for e in events if e.get('type') == 'content_block_delta')
+                    else:
+                        assert reply['done'], result
+                        assert any(c.get('finish_reason') in ('stop', 'length') for e in events
+                                   for c in e.get('choices', [])), result
+                        text = ''.join(c.get('text', '') if name == 'completions' else
+                                       c.get('delta', {}).get('content', '') or ''
+                                       for e in events for c in e.get('choices', []))
+                else:
+                    assert reply.get('error') is None, result
+                    if name == 'responses':
+                        assert reply['status'] in ('completed', 'incomplete'), result
+                        text = ''.join(c['text'] for item in reply['output'] if item['type'] == 'message'
+                                       for c in item['content'] if c['type'] == 'output_text')
+                    elif name == 'messages':
+                        text = ''.join(c['text'] for c in reply['content'] if c['type'] == 'text')
+                    else:
+                        choice = reply['choices'][0]
+                        text = choice['text'] if name == 'completions' else choice['message'].get('content', '')
+                assert text.strip(), result
+                logs = server.log.read_bytes()[offset:].decode('utf-8')
+                stats = spec_stats(logs)
+                label = f'{name} stream={stream} enable_drafter={enabled}'
+                if enabled is None:
+                    assert sum(s['attempts'] for s in stats) > 0, f'{label}: default drafting did not engage'
+                    assert sum(s['accepts'] for s in stats) > 0, f'{label}: default drafting accepted no tokens'
+                else:
+                    assert not stats, f'{label}: explicit opt-out drafted: {stats}'
+                result['spec_stats'] = stats
+                key = name + ('_stream' if stream else '') + ('_off' if enabled is False else '')
+                results[key] = result
+                print(f'PASS: {label}', flush=True)
+    return results
+
+
+def drafter_measurements(server, reps):
     for enabled in (False, True):
         server.chat('List five practical uses of a dictionary in Python.', drafter=enabled, tokens=64)
     rows = []
@@ -223,7 +281,8 @@ def drafter_measurements(server, reps):
                         'on_median_tok_s': statistics.median(r['decode_tok_s'] for r in on),
                         'drafts_accepted_per_round': accepts / attempts,
                         'attempts': attempts, 'accepts': accepts})
-    return {'defaults': defaults, 'rows': rows, 'summary': summary}
+    # Protocol checks follow the measurements so added cases cannot warm the timed arms.
+    return {'defaults': drafter_defaults(server), 'rows': rows, 'summary': summary}
 
 
 def restore_check(server):
@@ -244,7 +303,7 @@ def main():
     parser.add_argument('--drafter', type=Path)
     parser.add_argument('--binary', type=Path, default=REPO / 'zig-out/bin/mlx-serve')
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--checks', choices=('vision', 'drafter', 'bench', 'restore', 'all'), default='all')
+    parser.add_argument('--checks', choices=('vision', 'defaults', 'drafter', 'bench', 'restore', 'all'), default='all')
     parser.add_argument('--reps', type=int, default=3)
     args = parser.parse_args()
     args.model, args.binary, args.output = args.model.resolve(), args.binary.resolve(), args.output.resolve()
@@ -268,6 +327,8 @@ def main():
             results['vision'] = vision_checks(server, drafter=args.checks == 'all' and args.drafter is not None)
         if args.checks in ('drafter', 'bench', 'all'):
             results['drafter'] = drafter_measurements(server, 1 if args.checks == 'drafter' else args.reps)
+        if args.checks == 'defaults':
+            results['defaults'] = drafter_defaults(server)
         if args.checks == 'restore':
             results['restore'] = restore_check(server)
         results['passed'] = True

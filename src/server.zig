@@ -9895,35 +9895,11 @@ fn handleChatCompletions(
     // `ssmSnapshot`/`ssmRestore` in transformer.zig.
     if (enable_pld) log.info("  pld=enabled (draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
 
-    // Parse enable_drafter: per-request override of the --drafter default.
-    // Auto-disabled when:
-    //   - the server didn't load a drafter (`default_drafter == null`)
-    //   - logprobs are requested (drafter doesn't expose realized log-probs)
-    //   - hybrid SSM architecture (same SSM-state issue as PLD; drafter would
-    //     hit it on the verify forward).
-    // Tools do NOT disable the drafter (same reasoning as PLD above);
-    // equivalence with tools is pinned by tests/test_drafter_tools.sh.
-    // Priority: drafter > PLD > regular. When drafter wins, force PLD off
-    // so logs / state stay consistent.
+    // Tools do not disable the drafter; logprobs require the target's plain path.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    // Plan 05: per-model drafter — when a drafter is loaded for this model,
-    // requests default to ON unless the target is MoE (where verify-forward
-    // routing penalty overwhelms the win). Per-request `enable_drafter` JSON
-    // overrides either way.
-    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
-    if (enable_drafter and lm.drafter == null and lm.dflash == null) {
-        enable_drafter = false; // no drafter loaded; quietly fall through
-    }
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     if (enable_drafter and logprobs_n > 0) {
         log.info("  drafter=disabled (logprobs requested)\n", .{});
-        enable_drafter = false;
-    }
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) {
-        log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
@@ -10331,12 +10307,7 @@ fn handleCompletions(
     else
         server_config.default_enable_pld;
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    if (enable_drafter and lm.drafter == null and lm.dflash == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     if (enable_drafter and enable_pld) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
@@ -11777,28 +11748,62 @@ pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) 
     return has_hybrid_layers and !dflash_loaded;
 }
 
-fn anthropicEnableDrafter(explicit: ?std.json.Value, gemma_loaded: bool, dflash_loaded: bool, is_moe: bool, has_hybrid_layers: bool) bool {
+/// Resolve sidecar admission before the request's logprobs, grammar and yield gates.
+fn requestEnableDrafter(explicit: ?std.json.Value, gemma_loaded: bool, dflash_loaded: bool, is_moe: bool, has_hybrid_layers: bool) bool {
     const enabled = if (explicit) |v| v == .bool and v.bool else (gemma_loaded and !is_moe) or dflash_loaded;
     if (!enabled or (!gemma_loaded and !dflash_loaded)) return false;
     return !archBlocksAssistantSidecar(has_hybrid_layers, dflash_loaded);
 }
 
-test "Anthropic drafter admission: DFlash defaults on for dense and hybrid MoE targets" {
-    for ([_]bool{ false, true }) |is_moe| {
-        for ([_]bool{ false, true }) |hybrid| {
-            try testing.expect(anthropicEnableDrafter(null, false, true, is_moe, hybrid));
-            try testing.expect(anthropicEnableDrafter(.{ .bool = true }, false, true, is_moe, hybrid));
-            try testing.expect(!anthropicEnableDrafter(.{ .bool = false }, false, true, is_moe, hybrid));
-            try testing.expect(!anthropicEnableDrafter(.{ .string = "true" }, false, true, is_moe, hybrid));
-            try testing.expect(!anthropicEnableDrafter(null, false, false, is_moe, hybrid));
-            try testing.expect(!anthropicEnableDrafter(.{ .bool = true }, false, false, is_moe, hybrid));
-            try testing.expectEqual(!is_moe and !hybrid, anthropicEnableDrafter(null, true, false, is_moe, hybrid));
-            try testing.expectEqual(!hybrid, anthropicEnableDrafter(.{ .bool = true }, true, false, is_moe, hybrid));
-            try testing.expect(!anthropicEnableDrafter(.{ .bool = false }, true, false, is_moe, hybrid));
-            const enabled = anthropicEnableDrafter(null, false, true, is_moe, hybrid);
-            try testing.expect(requestSpecModes(false, enabled, false, false, true, false, false, 0, false).use_drafter);
-            try testing.expectEqual(StreamMode.drafter, pickStreamMode(false, enabled, false, false, true, false, false, 0, false));
+test "drafter admission: defaults and explicit opt-in cover every sidecar and architecture" {
+    const Case = struct {
+        gemma: bool,
+        dflash: bool,
+        moe: bool,
+        hybrid: bool,
+        default: bool,
+        explicit: bool,
+    };
+    const cases = [_]Case{
+        .{ .gemma = false, .dflash = false, .moe = false, .hybrid = false, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = true, .hybrid = false, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = false, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = true, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = true, .dflash = false, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = false, .moe = true, .hybrid = false, .default = false, .explicit = true },
+        .{ .gemma = true, .dflash = false, .moe = false, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = true, .dflash = false, .moe = true, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = true, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = true, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = false, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = true, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = true, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = false, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = true, .hybrid = true, .default = true, .explicit = true },
+    };
+    for (cases) |c| {
+        const default = requestEnableDrafter(null, c.gemma, c.dflash, c.moe, c.hybrid);
+        const explicit = requestEnableDrafter(.{ .bool = true }, c.gemma, c.dflash, c.moe, c.hybrid);
+        try testing.expectEqual(c.default, default);
+        try testing.expectEqual(c.explicit, explicit);
+        try testing.expect(!requestEnableDrafter(.{ .bool = false }, c.gemma, c.dflash, c.moe, c.hybrid));
+        for ([_]bool{ default, explicit }) |enabled| {
+            const spec = requestSpecModes(false, enabled, false, c.gemma, c.dflash, false, false, 0, false);
+            try testing.expectEqual(enabled, spec.use_drafter);
+            try testing.expect(!spec.use_mtp and !spec.use_pld);
+            try testing.expectEqual(if (enabled) StreamMode.drafter else .regular, pickStreamMode(false, enabled, false, c.gemma, c.dflash, false, false, 0, false));
         }
+    }
+}
+
+test "drafter admission: present non-boolean overrides disable either sidecar" {
+    for ([_][]const u8{ "null", "\"true\"", "1", "1.0", "[]", "{}" }) |json| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        try testing.expect(!requestEnableDrafter(parsed.value, true, false, false, false));
+        try testing.expect(!requestEnableDrafter(parsed.value, false, true, false, false));
+        try testing.expect(!requestEnableDrafter(parsed.value, false, true, true, true));
     }
 }
 
@@ -17168,7 +17173,7 @@ fn handleAnthropicMessages(
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    var enable_drafter = anthropicEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -19301,13 +19306,7 @@ fn handleResponsesInner(
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter_resp: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter_resp;
-    if (enable_drafter_resp and lm.drafter == null and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
+    var enable_drafter_resp = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content

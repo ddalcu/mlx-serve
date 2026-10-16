@@ -8173,12 +8173,11 @@ pub fn assistantSidecarEnabledForRequest(
 ) bool {
     if (!requested) return false;
     if (!has_vision) return true;
-    const native_captures = config.muse_vision or
-        (config.radio_vision and std.mem.eql(u8, config.model_type, "nemotron_h"));
+    const native_captures = config.muse_vision or config.radio_vision;
     return has_dflash and native_captures and !has_mrope;
 }
 
-test "assistant sidecar vision gate admits Muse DFlash without weakening Qwen M-RoPE" {
+test "drafter admission: vision gate admits Muse DFlash without weakening Qwen M-RoPE" {
     const generic = ModelConfig{};
     const muse = ModelConfig{ .muse_vision = true };
     // Text requests keep the existing shared sidecar behavior.
@@ -8194,7 +8193,7 @@ test "assistant sidecar vision gate admits Muse DFlash without weakening Qwen M-
     try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, &generic));
 }
 
-test "assistant sidecar vision gate admits Nemotron RADIO captures for image and video" {
+test "drafter admission: vision gate admits Nemotron RADIO captures for image and video" {
     for ([_]ModelConfig{
         .{ .model_type = "nemotron_h", .radio_vision = true },
         .{ .model_type = "nemotron_h", .radio_vision = true, .has_hybrid_layers = true, .num_experts = 512 },
@@ -8207,10 +8206,27 @@ test "assistant sidecar vision gate admits Nemotron RADIO captures for image and
     }
     for ([_]ModelConfig{
         .{ .model_type = "nemotron_h" },
-        .{ .model_type = "qwen3_5", .radio_vision = true },
+        .{ .model_type = "qwen3_5_moe", .qwen_vision = true },
         .{ .model_type = "gemma4" },
     }) |config| {
         try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, true, &config));
+    }
+}
+
+test "drafter admission: vision gate keeps other encoders guarded without M-RoPE" {
+    for ([_]ModelConfig{
+        .{ .model_type = "gemma4", .has_vision = true },
+        .{ .model_type = "lfm2", .has_vision = true, .lfm2_vision = true },
+        .{ .model_type = "glm5_next", .has_vision = true, .glm_vision = true },
+        .{ .model_type = "qwen3_5_moe", .has_vision = true, .minicpm_vision = true },
+    }) |config| {
+        // No M-RoPE is necessary, but does not alone admit an unvalidated encoder.
+        try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, true, &config));
+        try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, false, &config));
+        // A text-only turn still accepts either loaded sidecar kind.
+        try testing.expect(assistantSidecarEnabledForRequest(true, false, false, true, &config));
+        try testing.expect(assistantSidecarEnabledForRequest(true, false, false, false, &config));
+        try testing.expect(!assistantSidecarEnabledForRequest(false, false, false, true, &config));
     }
 }
 
