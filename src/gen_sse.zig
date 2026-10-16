@@ -22,6 +22,8 @@ pub const Progress = struct {
     /// the sink is an SSE stream. Cached-velocity H3 steps leave this unused.
     preview_cb: ?*const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void = null,
     preview_opts: preview.Opts = .{},
+    /// Optional sink for `Facts`; null where nothing streams them.
+    facts_cb: ?*const fn (ctx: *anyopaque, facts: Facts) void = null,
     pub fn emit(self: Progress, stage: []const u8, step: u32, total: u32) void {
         self.cb(self.ctx, stage, step, total);
     }
@@ -31,6 +33,10 @@ pub const Progress = struct {
         } else {
             self.emit(stage, step, total);
         }
+    }
+    /// Record facts that every later progress event repeats.
+    pub fn report(self: Progress, facts: Facts) void {
+        if (self.facts_cb) |f| f(self.ctx, facts);
     }
     pub fn wantsPreview(self: Progress) bool {
         return self.preview_cb != null and self.preview_opts.enabled;
@@ -44,6 +50,29 @@ pub const Progress = struct {
     pub fn boundary(self: Progress) bool {
         if (gen_yield) |y| y.step(y.ctx);
         return self.cancelled();
+    }
+};
+
+/// Facts about the run that ride every progress event once known: the window
+/// sampling on a chained run (1-based).
+pub const Facts = struct {
+    window: ?u32 = null,
+    windows: ?u32 = null,
+
+    /// Later reports fill in what they name and keep the rest.
+    fn merged(self: Facts, newer: Facts) Facts {
+        return .{
+            .window = newer.window orelse self.window,
+            .windows = newer.windows orelse self.windows,
+        };
+    }
+
+    /// The `,"key":n` tail spliced into a progress event; empty until a fact is known.
+    fn jsonTail(self: Facts, buf: *[96]u8) []const u8 {
+        var n: usize = 0;
+        if (self.window) |w| n += (std.fmt.bufPrint(buf[n..], ",\"window\":{d}", .{w}) catch unreachable).len;
+        if (self.windows) |w| n += (std.fmt.bufPrint(buf[n..], ",\"windows\":{d}", .{w}) catch unreachable).len;
+        return buf[0..n];
     }
 };
 
@@ -112,11 +141,13 @@ pub const StreamCtx = struct {
     preview: bool = false,
     preview_frames: u32 = 1,
     preview_max_side: u32 = 256,
+    facts: Facts = .{},
     pub fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         if (!self.stream) return;
-        var buf: [256]u8 = undefined;
-        const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}}}\n\n", .{ stage, step, total }) catch return;
+        var tail: [96]u8 = undefined;
+        var buf: [384]u8 = undefined;
+        const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}{s}}}\n\n", .{ stage, step, total, self.facts.jsonTail(&tail) }) catch return;
         self.conn.writeAll(ev) catch {
             self.cancelled = true;
         };
@@ -128,7 +159,8 @@ pub const StreamCtx = struct {
             StreamCtx.cb(ptr, stage, step, total);
             return;
         };
-        const json = preview.formatProgressJson(alloc, stage, step, total, frame) catch {
+        var tail: [96]u8 = undefined;
+        const json = preview.formatProgressJson(alloc, stage, step, total, frame, self.facts.jsonTail(&tail)) catch {
             StreamCtx.cb(ptr, stage, step, total);
             return;
         };
@@ -141,6 +173,10 @@ pub const StreamCtx = struct {
         self.conn.writeAll(ev) catch {
             self.cancelled = true;
         };
+    }
+    fn factsCb(ptr: *anyopaque, facts: Facts) void {
+        const self: *StreamCtx = @ptrCast(@alignCast(ptr));
+        self.facts = self.facts.merged(facts);
     }
     fn cancelledCb(ptr: *anyopaque) bool {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
@@ -167,6 +203,7 @@ pub const StreamCtx = struct {
             .cancelled_cb = StreamCtx.cancelledCb,
             .preview_cb = if (self.preview and self.stream) StreamCtx.previewCb else null,
             .preview_opts = opts,
+            .facts_cb = StreamCtx.factsCb,
         };
     }
 };
@@ -459,6 +496,49 @@ test "preview SSE event carries JPEG b64 and is absent when the flag is off" {
 
     _ = std.c.close(sv[1]);
     _ = std.c.close(sv[0]);
+}
+
+test "reported facts ride every later progress event, preview events too" {
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[0]);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } },
+              std.Io.Threaded.global_single_threaded.io());
+    var sctx = StreamCtx{ .conn = &conn, .allocator = std.testing.allocator, .preview = true };
+    const p = sctx.progress();
+
+    const Ev = struct {
+        fn next(fd: std.posix.fd_t, parsed: *std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
+            var buf: [2048]u8 = undefined;
+            const n = std.c.recv(fd, &buf, buf.len, std.posix.MSG.DONTWAIT);
+            try std.testing.expect(n > 8);
+            const got = buf[0..@intCast(n)];
+            parsed.* = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, got[6 .. got.len - 2], .{});
+            return parsed.value.object;
+        }
+    };
+    var parsed: std.json.Parsed(std.json.Value) = undefined;
+
+    p.emit("Encoding prompt", 0, 30);
+    var o = try Ev.next(sv[1], &parsed);
+    try std.testing.expect(o.get("window") == null and o.get("windows") == null);
+    parsed.deinit();
+
+    p.report(.{ .window = 2, .windows = 3 });
+    p.emit("Generating", 4, 30);
+    o = try Ev.next(sv[1], &parsed);
+    try std.testing.expectEqual(@as(i64, 2), o.get("window").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), o.get("windows").?.integer);
+    parsed.deinit();
+
+    const jpg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xD9 };
+    p.emitPreview("Generating", 5, 30, .{ .jpeg = @constCast(&jpg), .w = 16, .h = 9 });
+    o = try Ev.next(sv[1], &parsed);
+    try std.testing.expectEqual(@as(i64, 3), o.get("windows").?.integer);
+    try std.testing.expect(o.get("preview").?.string.len > 0);
+    parsed.deinit();
 }
 
 test "Progress.wantsPreview is false when the client did not opt in" {

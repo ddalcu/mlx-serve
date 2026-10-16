@@ -4739,9 +4739,9 @@ fn joinWavesCrossfade(allocator: std.mem.Allocator, waves: []const mlx.mlx_array
     return mlx.mlx_array_new_data(buf.ptr, &shp, 2, mlx.mlx_dtype.float32);
 }
 
-/// Progress adapter: prefixes the stage with "Window w/n" and remaps
-/// determinate bars onto the whole chain so the client's meter is monotone
-/// across windows instead of restarting at every seam.
+/// Progress adapter: remaps determinate bars onto the whole chain so the
+/// client's meter is monotone across windows instead of restarting at every
+/// seam. Which window is sampling rides the events as `Facts`.
 const ChainProgress = struct {
     inner: gen_sse.Progress,
     window: u32,
@@ -4749,12 +4749,10 @@ const ChainProgress = struct {
 
     fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
-        var buf: [96]u8 = undefined;
-        const label = std.fmt.bufPrint(&buf, "Window {d}/{d}: {s}", .{ self.window + 1, self.windows, stage }) catch stage;
         if (total > 0)
-            self.inner.emit(label, self.window * total + step, self.windows * total)
+            self.inner.emit(stage, self.window * total + step, self.windows * total)
         else
-            self.inner.emit(label, step, 0);
+            self.inner.emit(stage, step, 0);
     }
     fn cancelledCb(ptr: *anyopaque) bool {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
@@ -4762,12 +4760,14 @@ const ChainProgress = struct {
     }
     fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, frame: @import("preview.zig").Encoded) void {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
-        var buf: [96]u8 = undefined;
-        const label = std.fmt.bufPrint(&buf, "Window {d}/{d}: {s}", .{ self.window + 1, self.windows, stage }) catch stage;
         if (total > 0)
-            self.inner.emitPreview(label, self.window * total + step, self.windows * total, frame)
+            self.inner.emitPreview(stage, self.window * total + step, self.windows * total, frame)
         else
-            self.inner.emitPreview(label, step, 0, frame);
+            self.inner.emitPreview(stage, step, 0, frame);
+    }
+    fn factsCb(ptr: *anyopaque, facts: gen_sse.Facts) void {
+        const self: *ChainProgress = @ptrCast(@alignCast(ptr));
+        self.inner.report(facts);
     }
     fn progress(self: *ChainProgress) gen_sse.Progress {
         return .{
@@ -4776,6 +4776,7 @@ const ChainProgress = struct {
             .cancelled_cb = cancelledCb,
             .preview_cb = if (self.inner.preview_cb != null) previewCb else null,
             .preview_opts = self.inner.preview_opts,
+            .facts_cb = if (self.inner.facts_cb != null) factsCb else null,
         };
     }
 };
@@ -4863,6 +4864,7 @@ fn generateChain(
         if (progress) |p| {
             cp = .{ .inner = p, .window = @intCast(w), .windows = n };
             wprog = cp.progress();
+            p.report(.{ .window = @intCast(w + 1), .windows = n });
         }
 
         const res = try generateOne(allocator, io, paths, wreq, wprog, s);
