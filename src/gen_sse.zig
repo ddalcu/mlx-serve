@@ -13,30 +13,30 @@ const preview = @import("preview.zig");
 /// inner loops can report step/total without importing the HTTP layer.
 pub const Progress = struct {
     ctx: *anyopaque,
-    cb: *const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void,
+    cb: *const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32, chain: Chain) void,
     /// Optional "has the client gone away?" probe. Long inner loops poll it
     /// each step and abort with error.Cancelled — without it a cancelled
     /// request burns the GPU to completion and queues everything behind it.
     cancelled_cb: ?*const fn (ctx: *anyopaque) bool = null,
     /// Opt-in per-step JPEG (issue #208). Null unless the client asked and
     /// the sink is an SSE stream. Cached-velocity H3 steps leave this unused.
-    preview_cb: ?*const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void = null,
+    preview_cb: ?*const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32, chain: Chain, frame: preview.Encoded) void = null,
     preview_opts: preview.Opts = .{},
-    /// Optional sink for `Facts`; null where nothing streams them.
-    facts_cb: ?*const fn (ctx: *anyopaque, facts: Facts) void = null,
     pub fn emit(self: Progress, stage: []const u8, step: u32, total: u32) void {
-        self.cb(self.ctx, stage, step, total);
+        self.emitIn(.{}, stage, step, total);
+    }
+    pub fn emitIn(self: Progress, chain: Chain, stage: []const u8, step: u32, total: u32) void {
+        self.cb(self.ctx, stage, step, total, chain);
     }
     pub fn emitPreview(self: Progress, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void {
-        if (self.preview_cb) |f| {
-            f(self.ctx, stage, step, total, frame);
-        } else {
-            self.emit(stage, step, total);
-        }
+        self.emitPreviewIn(.{}, stage, step, total, frame);
     }
-    /// Record facts that every later progress event repeats.
-    pub fn report(self: Progress, facts: Facts) void {
-        if (self.facts_cb) |f| f(self.ctx, facts);
+    pub fn emitPreviewIn(self: Progress, chain: Chain, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void {
+        if (self.preview_cb) |f| {
+            f(self.ctx, stage, step, total, chain, frame);
+        } else {
+            self.emitIn(chain, stage, step, total);
+        }
     }
     pub fn wantsPreview(self: Progress) bool {
         return self.preview_cb != null and self.preview_opts.enabled;
@@ -53,26 +53,16 @@ pub const Progress = struct {
     }
 };
 
-/// Facts about the run that ride every progress event once known: the window
-/// sampling on a chained run (1-based).
-pub const Facts = struct {
-    window: ?u32 = null,
-    windows: ?u32 = null,
+/// Which window of a chained run an event belongs to (1-based); zero when
+/// the run is not chained.
+pub const Chain = struct {
+    window: u32 = 0,
+    windows: u32 = 0,
 
-    /// Later reports fill in what they name and keep the rest.
-    fn merged(self: Facts, newer: Facts) Facts {
-        return .{
-            .window = newer.window orelse self.window,
-            .windows = newer.windows orelse self.windows,
-        };
-    }
-
-    /// The `,"key":n` tail spliced into a progress event; empty until a fact is known.
-    fn jsonTail(self: Facts, buf: *[96]u8) []const u8 {
-        var n: usize = 0;
-        if (self.window) |w| n += (std.fmt.bufPrint(buf[n..], ",\"window\":{d}", .{w}) catch unreachable).len;
-        if (self.windows) |w| n += (std.fmt.bufPrint(buf[n..], ",\"windows\":{d}", .{w}) catch unreachable).len;
-        return buf[0..n];
+    /// The `,"window":n,"windows":n` members of a progress event; empty when not chained.
+    fn jsonTail(self: Chain, buf: *[64]u8) []const u8 {
+        if (self.windows == 0) return "";
+        return std.fmt.bufPrint(buf, ",\"window\":{d},\"windows\":{d}", .{ self.window, self.windows }) catch unreachable;
     }
 };
 
@@ -141,42 +131,37 @@ pub const StreamCtx = struct {
     preview: bool = false,
     preview_frames: u32 = 1,
     preview_max_side: u32 = 256,
-    facts: Facts = .{},
-    pub fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+    pub fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, chain: Chain) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         if (!self.stream) return;
-        var tail: [96]u8 = undefined;
+        var tail: [64]u8 = undefined;
         var buf: [384]u8 = undefined;
-        const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}{s}}}\n\n", .{ stage, step, total, self.facts.jsonTail(&tail) }) catch return;
+        const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}{s}}}\n\n", .{ stage, step, total, chain.jsonTail(&tail) }) catch return;
         self.conn.writeAll(ev) catch {
             self.cancelled = true;
         };
     }
-    pub fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void {
+    pub fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, chain: Chain, frame: preview.Encoded) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         if (!self.stream) return;
         const alloc = self.allocator orelse {
-            StreamCtx.cb(ptr, stage, step, total);
+            StreamCtx.cb(ptr, stage, step, total, chain);
             return;
         };
-        var tail: [96]u8 = undefined;
-        const json = preview.formatProgressJson(alloc, stage, step, total, frame, self.facts.jsonTail(&tail)) catch {
-            StreamCtx.cb(ptr, stage, step, total);
+        var tail: [64]u8 = undefined;
+        const json = preview.formatProgressJson(alloc, stage, step, total, frame, chain.jsonTail(&tail)) catch {
+            StreamCtx.cb(ptr, stage, step, total, chain);
             return;
         };
         defer alloc.free(json);
         const ev = std.fmt.allocPrint(alloc, "data: {s}\n\n", .{json}) catch {
-            StreamCtx.cb(ptr, stage, step, total);
+            StreamCtx.cb(ptr, stage, step, total, chain);
             return;
         };
         defer alloc.free(ev);
         self.conn.writeAll(ev) catch {
             self.cancelled = true;
         };
-    }
-    fn factsCb(ptr: *anyopaque, facts: Facts) void {
-        const self: *StreamCtx = @ptrCast(@alignCast(ptr));
-        self.facts = self.facts.merged(facts);
     }
     fn cancelledCb(ptr: *anyopaque) bool {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
@@ -203,7 +188,6 @@ pub const StreamCtx = struct {
             .cancelled_cb = StreamCtx.cancelledCb,
             .preview_cb = if (self.preview and self.stream) StreamCtx.previewCb else null,
             .preview_opts = opts,
-            .facts_cb = StreamCtx.factsCb,
         };
     }
 };
@@ -345,7 +329,7 @@ test "jsonEscapeMessage keeps an error body parseable (live: the mode:\"edit\" 4
 test "Progress.cancelled defaults false, reads the probe when set" {
     const H = struct {
         flag: bool,
-        fn emitCb(ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+        fn emitCb(ctx: *anyopaque, stage: []const u8, step: u32, total: u32, _: Chain) void {
             _ = ctx;
             _ = stage;
             _ = step;
@@ -369,7 +353,7 @@ test "Progress.boundary gives the installed scheduler hook its turn, then report
     const H = struct {
         steps: u32 = 0,
         flag: bool = false,
-        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32) void {}
+        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32, _: Chain) void {}
         fn cancelCb(ctx: *anyopaque) bool {
             return @as(*@This(), @ptrCast(@alignCast(ctx))).flag;
         }
@@ -507,7 +491,7 @@ test "preview SSE event carries JPEG b64 and is absent when the flag is off" {
     _ = std.c.close(sv[0]);
 }
 
-test "reported facts ride every later progress event, preview events too" {
+test "a chained window rides its own progress events, preview events too; a plain event carries none" {
     var sv: [2]std.posix.fd_t = undefined;
     try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
     defer _ = std.c.close(sv[0]);
@@ -535,15 +519,14 @@ test "reported facts ride every later progress event, preview events too" {
     try std.testing.expect(o.get("window") == null and o.get("windows") == null);
     parsed.deinit();
 
-    p.report(.{ .window = 2, .windows = 3 });
-    p.emit("Generating", 4, 30);
+    p.emitIn(.{ .window = 2, .windows = 3 }, "Generating", 4, 30);
     o = try Ev.next(sv[1], &parsed);
     try std.testing.expectEqual(@as(i64, 2), o.get("window").?.integer);
     try std.testing.expectEqual(@as(i64, 3), o.get("windows").?.integer);
     parsed.deinit();
 
     const jpg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xD9 };
-    p.emitPreview("Generating", 5, 30, .{ .jpeg = @constCast(&jpg), .w = 16, .h = 9 });
+    p.emitPreviewIn(.{ .window = 2, .windows = 3 }, "Generating", 5, 30, .{ .jpeg = @constCast(&jpg), .w = 16, .h = 9 });
     o = try Ev.next(sv[1], &parsed);
     try std.testing.expectEqual(@as(i64, 3), o.get("windows").?.integer);
     try std.testing.expect(o.get("preview").?.string.len > 0);
@@ -552,7 +535,7 @@ test "reported facts ride every later progress event, preview events too" {
 
 test "Progress.wantsPreview is false when the client did not opt in" {
     const H = struct {
-        fn emitCb(ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+        fn emitCb(ctx: *anyopaque, stage: []const u8, step: u32, total: u32, _: Chain) void {
             _ = ctx;
             _ = stage;
             _ = step;

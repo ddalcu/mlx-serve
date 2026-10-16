@@ -123,7 +123,7 @@ pub fn formatProgressJson(
     step: u32,
     total: u32,
     preview: ?Encoded,
-    /// Pre-rendered `,"key":value` members appended to the object (`gen_sse.Facts`).
+    /// Pre-rendered `,"key":value` members appended to the object (`gen_sse.Chain`).
     extra: []const u8,
 ) ![]u8 {
     var esc_buf: [256]u8 = undefined;

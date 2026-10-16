@@ -3312,7 +3312,7 @@ test "generateCodes yields at frame boundaries and stops on cancel" {
 
     const H = struct {
         yields: u32 = 0,
-        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32) void {}
+        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32, _: sse.Chain) void {}
         fn cancelCb(ctx: *anyopaque) bool {
             return @as(*@This(), @ptrCast(@alignCast(ctx))).yields >= 2;
         }

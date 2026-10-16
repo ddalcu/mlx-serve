@@ -5030,33 +5030,32 @@ fn joinWavesCrossfade(allocator: std.mem.Allocator, waves: []const mlx.mlx_array
 
 /// Progress adapter: remaps determinate bars onto the whole chain so the
 /// client's meter is monotone across windows instead of restarting at every
-/// seam. Which window is sampling rides the events as `Facts`.
+/// seam. Each event names the window it came from (`gen_sse.Chain`).
 const ChainProgress = struct {
     inner: gen_sse.Progress,
     window: u32,
     windows: u32,
 
-    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+    fn chain(self: *const ChainProgress) gen_sse.Chain {
+        return .{ .window = self.window + 1, .windows = self.windows };
+    }
+    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, _: gen_sse.Chain) void {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
         if (total > 0)
-            self.inner.emit(stage, self.window * total + step, self.windows * total)
+            self.inner.emitIn(self.chain(), stage, self.window * total + step, self.windows * total)
         else
-            self.inner.emit(stage, step, 0);
+            self.inner.emitIn(self.chain(), stage, step, 0);
     }
     fn cancelledCb(ptr: *anyopaque) bool {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
         return self.inner.cancelled();
     }
-    fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, frame: @import("preview.zig").Encoded) void {
+    fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, _: gen_sse.Chain, frame: @import("preview.zig").Encoded) void {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
         if (total > 0)
-            self.inner.emitPreview(stage, self.window * total + step, self.windows * total, frame)
+            self.inner.emitPreviewIn(self.chain(), stage, self.window * total + step, self.windows * total, frame)
         else
-            self.inner.emitPreview(stage, step, 0, frame);
-    }
-    fn factsCb(ptr: *anyopaque, facts: gen_sse.Facts) void {
-        const self: *ChainProgress = @ptrCast(@alignCast(ptr));
-        self.inner.report(facts);
+            self.inner.emitPreviewIn(self.chain(), stage, step, 0, frame);
     }
     fn progress(self: *ChainProgress) gen_sse.Progress {
         return .{
@@ -5065,7 +5064,6 @@ const ChainProgress = struct {
             .cancelled_cb = cancelledCb,
             .preview_cb = if (self.inner.preview_cb != null) previewCb else null,
             .preview_opts = self.inner.preview_opts,
-            .facts_cb = if (self.inner.facts_cb != null) factsCb else null,
         };
     }
 };
@@ -5153,7 +5151,6 @@ fn generateChain(
         if (progress) |p| {
             cp = .{ .inner = p, .window = @intCast(w), .windows = n };
             wprog = cp.progress();
-            p.report(.{ .window = @intCast(w + 1), .windows = n });
         }
 
         const res = try generateOne(allocator, io, paths, wreq, wprog, s);
@@ -7238,7 +7235,7 @@ test "minimax h3: the denoise memory cap allows the step's growth plus headroom 
 test "minimax h3: chat runs a denoise boundary under the caller's memory limit, and the next step re-arms the cap" {
     const H = struct {
         seen: usize = 0,
-        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32) void {}
+        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32, _: gen_sse.Chain) void {}
         fn step(ctx: *anyopaque) void {
             _ = mlx.mlx_get_memory_limit(&@as(*@This(), @ptrCast(@alignCast(ctx))).seen);
         }
@@ -7453,7 +7450,7 @@ test "minimax h3: a cancel lands between DiT blocks, and polling it leaves the f
     const Probe = struct {
         calls: u32 = 0,
         leave_at: u32,
-        fn emit(_: *anyopaque, _: []const u8, _: u32, _: u32) void {}
+        fn emit(_: *anyopaque, _: []const u8, _: u32, _: u32, _: gen_sse.Chain) void {}
         fn gone(ptr: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
