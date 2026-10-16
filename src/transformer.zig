@@ -43663,22 +43663,23 @@ pub fn prefillDqGemmMinRows(bits: u32) usize {
 pub fn prefillDqGemmRowFloor(bits: u32, ultra_nax: bool, n: usize, k: usize) usize {
     const base = prefillDqGemmMinRows(bits);
     // Off NAX stock qmm is the 32x32 steel tile the base floors were tuned against. On the Ultra's NAX
-    // stock qmm is the fused kernel, which holds out to ~0.9 * min(N, K) rows from K 4096 up. Below
-    // that (K 640, 2560) and at K >= 3N, where the dequantized GEMM runs MLX's split-K kernel,
-    // dequant+GEMM wins from the base floor.
-    if (!ultra_nax or bits == 2 or k < 4096 or k >= 3 * n) return base;
+    // stock qmm is the fused kernel, which holds out to ~0.9 * min(N, K) rows once both N and K are
+    // 4096 or more. Below that (Flash-Next's K 640, K 2560 and N 2560 shapes) and at K >= 3N, where
+    // the dequantized GEMM runs MLX's split-K kernel, dequant+GEMM wins from the base floor.
+    if (!ultra_nax or bits == 2 or @min(n, k) < 4096 or k >= 3 * n) return base;
     return @max(base, @min(n, k) * 9 / 10);
 }
 
-test "prefillDqGemmRowFloor: on the Ultra the floor follows min(N, K) for K from 4096, the rest keep theirs" {
+test "prefillDqGemmRowFloor: on the Ultra the floor follows min(N, K) from 4096, the rest keep theirs" {
     // M5 Ultra crossovers, stock NAX qmm vs dequant+GEMM: K 640 and 2560 win from 2048
     // (Flash-Next, including the 2048-row company chunk), K 5120 from ~4608 (Qwen3.8-27B).
     try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 10240, 2560));
     try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 2560, 640));
     try std.testing.expectEqual(@as(usize, 4608), prefillDqGemmRowFloor(4, true, 17408, 5120));
-    // At K 6144 the smaller dimension sets it: N 2560 (Flash-Next GDN out, attn o) loses 10% at
-    // 2048 rows and crosses near 3k, N 5120 (27B) crosses past 6k.
-    try std.testing.expectEqual(@as(usize, 2304), prefillDqGemmRowFloor(4, true, 2560, 6144));
+    // At K 6144 the smaller dimension sets it. N 2560 (Flash-Next GDN out, attn o) keeps the base
+    // floor: the Python sweep had stock qmm ahead there, but the server's forward reads 0.9% slower
+    // with stock below 2304 rows (4+4 A/B at 2,247 tokens), so only N >= 4096 gets a raised floor.
+    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 2560, 6144));
     try std.testing.expectEqual(@as(usize, 4608), prefillDqGemmRowFloor(4, true, 5120, 6144));
     // K >= 3N runs MLX's split-K GEMM, which wins from 2048 (27B down, 5120x17408).
     try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 5120, 17408));
