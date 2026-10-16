@@ -237,10 +237,8 @@ final class VideoGenService: ObservableObject {
                                          fast: request.fastRecipe,
                                          streamWeights: request.streamWeights)
             : (0, 0)
-        let samplingShare = request.model.backend == .minimaxH3
-            ? VideoRunReadout.samplingShare(perStep: pricing.perStep, steps: steps, tail: pricing.tail)
-            : VideoRunReadout.ltxSamplingShare
-        // Server facts: each arrives once and rides every later event.
+        let samplingShare = VideoRunReadout.samplingShare(perStep: pricing.perStep, steps: steps, tail: pricing.tail)
+        // A chained run's events name their window; events between windows keep the last one.
         var window: Int? = nil, windows: Int? = nil
         let startedAt = ProcessInfo.processInfo.systemUptime
         for try await ev in api.streamGeneration(

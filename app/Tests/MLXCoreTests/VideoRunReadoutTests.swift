@@ -50,8 +50,14 @@ final class VideoRunReadoutTests: XCTestCase {
 
     func testH3SharePricesTheStepsAgainstTheStagesAroundThem() {
         XCTAssertEqual(VideoRunReadout.samplingShare(perStep: 10, steps: 30, tail: 100), 0.75, accuracy: 1e-9)
-        XCTAssertEqual(VideoRunReadout.samplingShare(perStep: 0, steps: 30, tail: 100),
-                       VideoRunReadout.ltxSamplingShare)
+    }
+
+    /// LTX has no time model, so its bar is plain step/total, kept under 100% by the cap.
+    func testWithoutATimeModelTheBarIsTheStepsAlone() {
+        let share = VideoRunReadout.samplingShare(perStep: 0, steps: 30, tail: 0)
+        XCTAssertEqual(share, 1)
+        XCTAssertEqual(readout(step: 15, share: share).percent, 50)
+        XCTAssertEqual(readout(step: 30, share: share).percent, 99)
     }
 
     func testTheStepClockReportsTheAmortizedLapPastTheFirst() {
