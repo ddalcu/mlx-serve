@@ -7,6 +7,7 @@
 - **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs.
 - **Video progress.** The Video tab shows how far a run is, which step (and window on a chained H3 clip) it is on and how long a step takes, with the elapsed time beside its status.
 - **MiniMax-H3 videos fit on smaller Macs.** The 8-bit model streams its weights from disk while it renders and peaks at 12 GB instead of 45 for a 1120x640 clip, about 6% slower; turn off "Stream weights from disk" to hold them in memory when the model sits on a slow drive.
+- **The H3 time estimate no longer drifts after Turbo runs.** A Turbo run was recorded as a fast-recipe run, so the next estimate came out too long.
 
 ## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
 

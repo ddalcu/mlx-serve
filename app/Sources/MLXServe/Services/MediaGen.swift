@@ -2430,6 +2430,8 @@ struct VideoGenRequest {
     var turbo: Bool = false
     /// H3 weight streaming (`stream_weights`); sent only when off.
     var streamWeights: Bool = true
+    /// Whether the server runs H3's fast recipe: Max quality and Turbo both turn it off.
+    var fastRecipe: Bool { !bestQuality && !turbo }
     /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
     /// by keyframe conditioning. 1 = a single ordinary window.
     var chainWindows: Int = 1
