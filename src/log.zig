@@ -12,6 +12,8 @@
 //! write is swallowed (logging must never take the server down).
 
 const std = @import("std");
+const os_mutex = @import("os_mutex.zig");
+const crt = @import("crt.zig");
 const builtin = @import("builtin");
 
 pub const Level = enum {
@@ -55,13 +57,13 @@ const truncation_marker = "…[mlx-serve: log line truncated]\n";
 
 /// A pthread mutex, not `std.Io.Mutex`: locking the latter needs an `Io`
 /// handle, and log calls arrive from threads that don't carry one.
-var sink_mutex: std.c.pthread_mutex_t = .{};
+var sink_mutex: os_mutex.Mutex = .{};
 
 fn lockSink() void {
-    _ = std.c.pthread_mutex_lock(&sink_mutex);
+    sink_mutex.lock();
 }
 fn unlockSink() void {
-    _ = std.c.pthread_mutex_unlock(&sink_mutex);
+    sink_mutex.unlock();
 }
 
 var sink_fd: c_int = -1;
@@ -90,26 +92,17 @@ pub fn shouldRotate(current_bytes: u64, incoming: usize, max_bytes: u64) bool {
     return current_bytes + incoming > max_bytes;
 }
 
-fn openAppend(path_z: [*:0]const u8, truncate: bool) c_int {
-    return std.c.open(path_z, .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .APPEND = !truncate,
-        .TRUNC = truncate,
-    }, @as(std.c.mode_t, 0o644));
-}
-
 /// `mkdir -p` for the directory holding `path`. Existing components (EEXIST)
 /// are fine; a genuinely unwritable path surfaces later as OpenLogFileFailed.
 fn makeParentDirs(path: []const u8) void {
-    const last_slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
+    const last_slash = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return;
     var buf: [1024]u8 = undefined;
     var i: usize = 1; // skip a leading '/'
     while (i <= last_slash) : (i += 1) {
-        if (i == last_slash or path[i] == '/') {
+        if (i == last_slash or std.fs.path.isSep(path[i])) {
             @memcpy(buf[0..i], path[0..i]);
             buf[i] = 0;
-            _ = std.c.mkdir(@ptrCast(&buf), @as(std.c.mode_t, 0o755));
+            crt.mkdir(@ptrCast(&buf));
         }
     }
 }
@@ -126,16 +119,16 @@ pub fn openFile(path: []const u8, max_bytes: u64) !void {
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
 
-    const fd = openAppend(@ptrCast(&path_z), false);
+    const fd = crt.openWrite(@ptrCast(&path_z), false);
     if (fd < 0) return error.OpenLogFileFailed;
 
     lockSink();
     defer unlockSink();
-    if (sink_fd >= 0) _ = std.c.close(sink_fd);
+    if (sink_fd >= 0) crt.close(sink_fd);
     sink_fd = fd;
     sink_max_bytes = max_bytes;
     // Start the rotation counter at the file's current size.
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    const end = crt.seekEnd(fd);
     sink_bytes = if (end > 0) @intCast(end) else 0;
     @memcpy(sink_path_buf[0..path.len], path);
     sink_path_len = path.len;
@@ -146,7 +139,7 @@ pub fn closeFile() void {
     lockSink();
     defer unlockSink();
     @atomicStore(bool, &sink_active, false, .release);
-    if (sink_fd >= 0) _ = std.c.close(sink_fd);
+    if (sink_fd >= 0) crt.close(sink_fd);
     sink_fd = -1;
     sink_bytes = 0;
     sink_path_len = 0;
@@ -169,9 +162,9 @@ fn rotateLocked() void {
     @memcpy(prev[sink_path_len..][0..2], ".1");
     prev[sink_path_len + 2] = 0;
 
-    if (sink_fd >= 0) _ = std.c.close(sink_fd);
-    _ = std.c.rename(@ptrCast(&live), @ptrCast(&prev));
-    sink_fd = openAppend(@ptrCast(&live), true);
+    if (sink_fd >= 0) crt.close(sink_fd);
+    _ = crt.rename(@ptrCast(&live), @ptrCast(&prev));
+    sink_fd = crt.openWrite(@ptrCast(&live), true);
     sink_bytes = 0;
     if (sink_fd < 0) @atomicStore(bool, &sink_active, false, .release);
 }
@@ -185,7 +178,7 @@ fn writeToSink(bytes: []const u8) void {
 
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = std.c.write(sink_fd, bytes.ptr + off, bytes.len - off);
+        const n = crt.write(sink_fd, bytes[off..]);
         if (n <= 0) return; // ENOSPC / EIO: drop the line, never kill the server
         off += @intCast(n);
     }
@@ -392,7 +385,7 @@ test "file sink: writes lines, honors level, survives reopen, rotates at the cap
 
     // An overlong line is clipped and SAYS SO — a silently-clipped model dump
     // must never read as the model's actual output.
-    _ = std.c.unlink(deep);
+    crt.unlink(deep);
     try openFile(deep, 0);
     const huge: [line_buf_len + 500]u8 = @splat('x');
     info("{s}\n", .{huge});
@@ -404,10 +397,10 @@ test "file sink: writes lines, honors level, survives reopen, rotates at the cap
 }
 
 fn readFileForTest(path: [*:0]const u8, buf: []u8) usize {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(path);
     if (fd < 0) return 0;
-    defer _ = std.c.close(fd);
-    const n = std.c.read(fd, buf.ptr, buf.len);
+    defer crt.close(fd);
+    const n = crt.read(fd, buf);
     return if (n > 0) @intCast(n) else 0;
 }
 

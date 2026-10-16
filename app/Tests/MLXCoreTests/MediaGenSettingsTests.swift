@@ -151,6 +151,40 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(decoded, s)
     }
 
+    /// Slider LoRAs run -1...1 and some -20...20: the slider starts at ±2 and
+    /// only widens when a value outside it is entered, never narrows.
+    func testLoraScaleSliderBoundWidensToFitTheValue() {
+        XCTAssertEqual(LoraScale.sliderBound(for: 0), 2)
+        XCTAssertEqual(LoraScale.sliderBound(for: 1.3), 2)
+        XCTAssertEqual(LoraScale.sliderBound(for: -2), 2)
+        XCTAssertEqual(LoraScale.sliderBound(for: -15), 20)
+        XCTAssertEqual(LoraScale.sliderBound(for: 20), 20)
+        XCTAssertEqual(LoraScale.sliderBound(for: 20.5), 30)
+        XCTAssertEqual(LoraScale.sliderBound(for: LoraScale.limit), LoraScale.limit)
+        XCTAssertEqual(LoraScale.sliderStep(bound: 2), 0.05)
+        XCTAssertEqual(LoraScale.sliderStep(bound: 20), 0.5)
+    }
+
+    func testLoraScaleFloorFollowsTheNegativeToggleAndTamesOverflow() {
+        XCTAssertEqual(LoraScale.clamped(-20, allowsNegative: true), -20)
+        XCTAssertEqual(LoraScale.clamped(-0.35, allowsNegative: true), -0.35)
+        XCTAssertEqual(LoraScale.clamped(-0.35, allowsNegative: false), 0)
+        XCTAssertEqual(LoraScale.clamped(20, allowsNegative: false), 20)
+        XCTAssertEqual(LoraScale.clamped(1e30, allowsNegative: false), LoraScale.limit)
+        XCTAssertEqual(LoraScale.clamped(-.infinity, allowsNegative: true), -LoraScale.limit)
+        XCTAssertEqual(LoraScale.clamped(.nan, allowsNegative: true), 0)
+    }
+
+    /// Blobs saved before the toggle existed: a negative scale keeps working, the rest stay unsigned.
+    func testLoraAdapterWithoutTheToggleKeyDecodesFromItsScale() throws {
+        let old = Data(#"[{"path":"/a.safetensors","scale":-0.75},{"path":"/b.safetensors","scale":0.8}]"#.utf8)
+        let decoded = try JSONDecoder().decode([LoraAdapter].self, from: old)
+        XCTAssertEqual(decoded.map(\.allowsNegative), [true, false])
+        XCTAssertEqual(decoded.map(\.scale), [-0.75, 0.8])
+        let again = try JSONDecoder().decode([LoraAdapter].self, from: JSONEncoder().encode(decoded))
+        XCTAssertEqual(again.map(\.allowsNegative), [true, false])
+    }
+
     /// A blob from before the draft was persisted decodes to the defaults for
     /// the new keys — an empty draft, the media block open, Advanced closed.
     func testVideoBlobWithoutTheDraftKeysStillDecodes() throws {

@@ -730,7 +730,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         .rope_yarn = undefined,
         .split_kernel = try buildSplitKernel(),
     };
-    m.cfg.dsv41_dir = null; // borrowed; the caller's config owns it
+    m.cfg.pack_dir = null; // borrowed; the caller's config owns it
     errdefer {
         for (m.qat_fns) |f| if (f.ctx != null) {
             _ = mlx.mlx_closure_free(f);
@@ -768,7 +768,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         m.ds_block = cfg.dsv4_dspark_block_size;
         m.ds_conf_thr = dsv4.dsparkConfThreshold();
     }
-    if (cfg.dsv41_dir) |dir| try initEngram(m, w, dir);
+    if (cfg.pack_dir) |dir| try initEngram(m, w, dir);
     try evalWeights(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages\n", .{ n_layers, m.engrams.len, n_stages });
     return m;

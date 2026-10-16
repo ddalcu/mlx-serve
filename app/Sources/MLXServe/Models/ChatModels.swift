@@ -598,6 +598,22 @@ struct ModelInfo {
         return nil
     }
 
+    /// The engine serving it, for the tray's badge.
+    var engineBadge: String {
+        switch engineName {
+        case "ane": return "ANE"
+        case "sushi": return "Sushi"
+        case "mlx-stream": return "Stream"
+        default: break
+        }
+        switch engine {
+        case .mlx: return "MLX"
+        case .llama: return "GGUF"
+        case .dsv4: return "DS4"
+        case .mlxGguf: return "MLX GGUF"
+        }
+    }
+
     /// "KV4" / "KV8" while this model stores a quantized KV cache.
     var kvBadge: String? {
         kvQuant == "4" || kvQuant == "8" ? "KV\(kvQuant)" : nil
@@ -667,16 +683,6 @@ enum ServerEngine: String, CaseIterable {
     case dsv4
     /// A `.gguf` served on the MLX path by lib/mlx-serve-gguf (`--mlx-gguf`).
     case mlxGguf
-
-    /// Short human label for the running-model badge / section headings.
-    var label: String {
-        switch self {
-        case .mlx:     return "MLX"
-        case .llama:   return "llama.cpp (GGUF)"
-        case .dsv4:    return "ds4 (DSV4-Flash)"
-        case .mlxGguf: return "mlx-serve-gguf (GGUF on MLX)"
-        }
-    }
 
     /// The MLX forward, whatever the weights' container: MLX-only knobs
     /// (spec decode, kv-quant, prefix cache) apply here.

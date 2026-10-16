@@ -2046,6 +2046,13 @@ Cause: `lora.delta` multiplied the bf16 low-rank product by an f32 scalar ARRAY,
 Fix: `lora.addTo` = one skinny GEMM per adapter and `mlx_addmm`, whose epilogue adds onto the base output in its own dtype. H3 now steps at ~10 s with Turbo. flux/krea/LTX still call `deltaSum` and pay the same tax at their own row counts.
 Guard: `addTo equals y + deltaSum in y's dtype` (lora.zig; the dtype assert is the promotion guard).
 
+## A LoRA at scale 0 still changed the image (2026-10-14)
+
+Defect: a Qwen-Image LoRA attached at `lora_scales: [0]` rendered a different picture from no adapter, so a user could not switch an adapter off by scale.
+Cause: `lora.addTo` called `mlx_addmm(y, xa, bt, alpha=scale, beta=1)`; at `alpha == 0` MLX's addmm does not return `beta*c` at DiT-sized shapes in bf16.
+Fix: `addTo` skips an adapter whose scale is 0 and hands back a copy of `y` when nothing remains. This also repairs H3, which shares `addTo`.
+Guard: `addTo with a zero or tiny scale returns y, at DiT-sized shapes` (lora.zig); live `tests/test_qwen_image_lora.sh` check 2 (scale 0 byte-identical to no adapter).
+
 ## Stable Audio 3: a fractional length came out as clipped noise (2026-10-05)
 
 Defect: a sound effect at any non-whole length (0.5, 0.9, 1.5 s) came out as near-constant full-scale noise; whole seconds sounded right.

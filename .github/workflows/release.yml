@@ -345,6 +345,15 @@ jobs:
           # App resources (tray icon etc.)
           cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
 
+          # The mlx-serve agent skill (AgentSkills.sourceDir) and the opencode2
+          # plugin (AgentBudget.opencode2PluginSourceDir). Mirrors app/build.sh.
+          mkdir -p "$CONTENTS/Resources/agent-skills" "$CONTENTS/Resources/opencode2-mlx-serve"
+          cp -R skills/mlx-serve "$CONTENTS/Resources/agent-skills/"
+          for f in lib/opencode2-mlx-serve/{LICENSE,package.json,tui.tsx} lib/opencode2-mlx-serve/*.ts; do
+            case "$f" in *.test.ts) continue ;; esac
+            cp "$f" "$CONTENTS/Resources/opencode2-mlx-serve/"
+          done
+
           # This .app is assembled by hand, so SwiftPM's SwaTex font bundle
           # must be embedded explicitly (Xcode normally does this for us).
           SWATEX_RESOURCE_BUNDLE="$SWIFT_BIN_PATH/SwaTex_SwaTexRender.bundle"

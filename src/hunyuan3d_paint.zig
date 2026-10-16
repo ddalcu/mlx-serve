@@ -340,39 +340,7 @@ fn normVecKey(w: *const Weights, a: std.mem.Allocator, pfx: []const u8, sub: []c
     return normVec(w, k, s);
 }
 
-/// Load ONE safetensors file into a Weights map (CPU stream — Load::eval_gpu is
-/// Not Implemented). The iterator hands a +1 reference in `value`; transfer it
-/// straight into the map (the model.zig pattern) — copying+dropping leaks.
-fn loadFileWeights(allocator: std.mem.Allocator, model_dir: []const u8, file: []const u8) !Weights {
-    var w = Weights.init(allocator);
-    errdefer w.deinit();
-    const cpu_s = mlx.mlx_default_cpu_stream_new();
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, file }, 0);
-    defer allocator.free(path);
-
-    var tensor_map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-    var meta_map = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, cpu_s));
-
-    const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var value = mlx.mlx_array_new();
-        const rc = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
-        if (rc != 0 or key == null) {
-            _ = mlx.mlx_array_free(value);
-            break;
-        }
-        const owned_key = try allocator.dupe(u8, std.mem.span(key.?));
-        errdefer allocator.free(owned_key);
-        try w.map.put(owned_key, value);
-    }
-    log.info("[hy3d-paint] loaded {d} tensors from {s}\n", .{ w.count(), file });
-    return w;
-}
+const loadFileWeights = model_mod.loadWeightsFile;
 
 // ════════════════════════════════════════════════════════════════════════
 // MixedLinear — fp16 OR affine-quantized, bits/group_size inferred from tensor

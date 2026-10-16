@@ -276,6 +276,17 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
 }
 
+/// The `[spec-stats] mode=` word of an mlx-stream lane: the first word of the plugin's lane name.
+fn laneMode(lane: []const u8) []const u8 {
+    return lane[0 .. std.mem.indexOfScalar(u8, lane, ' ') orelse lane.len];
+}
+
+test "laneMode: the spec-stats mode is the first word of the lane name" {
+    try std.testing.expectEqualStrings("dspark", laneMode("dspark typical 0.3"));
+    try std.testing.expectEqualStrings("mtp", laneMode("mtp typical 0.5 depth 2"));
+    try std.testing.expectEqualStrings("serial", laneMode("serial"));
+}
+
 /// Read an unsigned integer from an environment variable, falling back to
 /// `default` when unset, empty, or unparseable. Uses libc getenv to stay
 /// allocator-free at call sites.
@@ -1000,12 +1011,16 @@ pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) voi
 /// `MLX_SERVE_SUPPRESS_RESERVED=0`. Never fails a load — any error logs and
 /// leaves the mask null (suppression off), and engagement is one-shot-logged
 /// so a silent no-op is visible (the silent-fallback class).
+/// `MLX_SERVE_SUPPRESS_RESERVED=0`: reserved specials and padding rows sample like any other id.
+pub fn suppressionDisabled() bool {
+    const v = std.c.getenv("MLX_SERVE_SUPPRESS_RESERVED") orelse return false;
+    return v[0] == '0';
+}
+
 pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_template: []const u8, eos_ids: []const u32) void {
-    if (std.c.getenv("MLX_SERVE_SUPPRESS_RESERVED")) |v| {
-        if (v[0] == '0') {
-            log.info("[suppress] reserved-token suppression disabled by env\n", .{});
-            return;
-        }
+    if (suppressionDisabled()) {
+        log.info("[suppress] reserved-token suppression disabled by env\n", .{});
+        return;
     }
     const ids = tokenizer_mod.reservedOutputIds(xfm.allocator, tok.flagged_specials, chat_template, eos_ids) catch |err| {
         log.warn("[suppress] derivation failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
@@ -2137,6 +2152,17 @@ pub const Generator = struct {
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dspark_attempted));
+            if (self.xfm.mlx_stream_ext) |m| {
+                // The plugin's lane names the mode (DeepSeek-V4.1: dspark, MiMo: mtp).
+                const lane = mlx_stream.laneName(m);
+                log.info(
+                    "  [spec-stats] mode={s} attempts={d} accepts={d} avg_per_round={d:.2} plugin=mlx-stream lane=\"{s}\"\n",
+                    .{ laneMode(lane), self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, lane },
+                );
+                var lane_buf: [512]u8 = undefined;
+                if (mlx_stream.laneReceipt(m, &lane_buf)) |line| if (line.len > 0) log.info("  [spec-stats] {s}\n", .{line});
+                return;
+            }
             log.info(
                 "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
                 .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
@@ -2608,7 +2634,7 @@ pub const Generator = struct {
         // Spec drafts and verify rows share the serial sampler's keys (and
         // mlx-stream's lane draws from the seed), so an unseeded sampled
         // request gets its own random seed.
-        if ((sampling.keyed or xfm.dsv41_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
+        if ((sampling.keyed or xfm.mlx_stream_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
             var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
             sampling.seed = prng.random().int(u64);
         }
@@ -2624,7 +2650,7 @@ pub const Generator = struct {
         var options = options_in;
         var dspark_active = false;
         var dspark_stochastic = false;
-        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.dsv41_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.mlx_stream_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
             // checkpoint ships stages and the request is CLEAN (no
@@ -2637,7 +2663,7 @@ pub const Generator = struct {
             // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
-            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.dsv41_ext.?);
+            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
             const dspark_env_off = !dsparkEnabled();
             const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
                 DsparkArm.off
@@ -2651,7 +2677,7 @@ pub const Generator = struct {
                 .min_p = sampling.min_p,
                 .seed = sampling.seed orelse 0,
             };
-            const lane_arms = if (xfm.dsv41_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
+            const lane_arms = if (xfm.mlx_stream_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
             if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
                 dspark_active = true;
                 dspark_stochastic = arm == .stochastic;
@@ -4189,7 +4215,7 @@ pub const Generator = struct {
         }
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-        if (self.xfm.dsv41_ext) |m| {
+        if (self.xfm.mlx_stream_ext) |m| {
             const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
             const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
             return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));

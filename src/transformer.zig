@@ -1,4 +1,5 @@
 const std = @import("std");
+const crt = @import("crt.zig");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
@@ -5228,16 +5229,12 @@ fn qsaDumpQsaBlocks(layer: u32, row0: c_int, rows: c_int, kb: c_int, blocks: mlx
     if (path.len == 0 or path.len >= path_z.len) return;
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&path_z), .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .APPEND = true,
-    }, @as(std.c.mode_t, 0o644));
+    const fd = crt.openWrite(@ptrCast(&path_z), false);
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
     var hdr: [128]u8 = undefined;
     const header = std.fmt.bufPrint(&hdr, "layer={d} row0={d} rows={d} kb={d}\n", .{ layer, row0, rows, kb }) catch return;
-    _ = std.c.write(fd, header.ptr, header.len);
+    _ = crt.write(fd, header);
     var buf: [32]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -5245,9 +5242,9 @@ fn qsaDumpQsaBlocks(layer: u32, row0: c_int, rows: c_int, kb: c_int, blocks: mlx
             std.fmt.bufPrint(&buf, "{d}", .{data[i]}) catch return
         else
             std.fmt.bufPrint(&buf, " {d}", .{data[i]}) catch return;
-        _ = std.c.write(fd, piece.ptr, piece.len);
+        _ = crt.write(fd, piece);
     }
-    _ = std.c.write(fd, "\n", 1);
+    _ = crt.write(fd, "\n");
 }
 
 // ── The composed selection arm (the kernel's reference) ──
@@ -11928,7 +11925,7 @@ test "persistent group: forwardWith releases a bound member between batched tick
     }
     p_xfm.dsv4 = null;
     p_xfm.dsv41 = null;
-    p_xfm.dsv41_ext = null;
+    p_xfm.mlx_stream_ext = null;
     p_xfm.bert_layers = null;
     p_xfm.hybrid_layers = null;
     p_xfm.qwen4 = null;
@@ -17151,8 +17148,8 @@ pub const Transformer = struct {
     /// DeepSeek-V4.1 (deepseek_v41): its own module (src/deepseek_v41.zig)
     /// in the same shell, request state on the module.
     dsv41: ?*dsv41_mod.Dsv41Model = null,
-    /// DeepSeek-V4.1's EXL3 repack on mlx-stream (`arch/mlx_stream.zig`): the plugin's module.
-    dsv41_ext: ?*mlx_stream_mod.Model = null,
+    /// An mlx-stream pack (`arch/mlx_stream.zig`: DeepSeek-V4.1's EXL3 repack or MiMo-V2.6-Flash): the plugin's module.
+    mlx_stream_ext: ?*mlx_stream_mod.Model = null,
 
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
@@ -17303,6 +17300,7 @@ pub const Transformer = struct {
         // dispatch to forwardGemma3EncoderWith.
         if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
+        if (config.mimo_stream) return initMlxStream(io, allocator, config, s);
         if (config.isDsv41()) return initDsv41(io, allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
@@ -18772,9 +18770,9 @@ pub const Transformer = struct {
             mdl.deinit();
             self.dsv41 = null;
         }
-        if (self.dsv41_ext) |m| {
+        if (self.mlx_stream_ext) |m| {
             mlx_stream_mod.close(m);
-            self.dsv41_ext = null;
+            self.mlx_stream_ext = null;
         }
         if (self.rht) |reg| {
             reg.deinit();
@@ -20460,7 +20458,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "dsv41_ext" };
+    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext" };
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -20504,14 +20502,14 @@ pub const Transformer = struct {
     /// has DSpark for drafting anyway.
     /// mlx-stream runs its own prompt pass: the generator hands it the whole prompt in one forward.
     pub fn prefillsWholePrompt(self: *const Transformer) bool {
-        return self.dsv41_ext != null;
+        return self.mlx_stream_ext != null;
     }
 
     /// DeepSeek's own DSpark draft stages (V4 or V4.1) loaded on this model.
     pub fn dsparkStages(self: *const Transformer) usize {
         if (self.dsv4) |m| return m.n_mtp;
         if (self.dsv41) |m| return m.n_mtp;
-        if (self.dsv41_ext) |m| return @intFromBool(mlx_stream_mod.blockSize(m) > 0);
+        if (self.mlx_stream_ext) |m| return @intFromBool(mlx_stream_mod.blockSize(m) > 0);
         return 0;
     }
 
@@ -20542,7 +20540,7 @@ pub const Transformer = struct {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
         if (self.dsv41) |mdl| return forwardDsv41WithImpl(self, ctx, token_ids, mdl);
-        if (self.dsv41_ext) |m| return forwardDsv41Stream(self, ctx, token_ids, m);
+        if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma 1 on gemma3 weights, 2 on Gemma 4's) never run causal decode.
         if (self.config.isEmbeddingGemma2()) return self.forwardEmbeddingGemma2With(ctx, token_ids);
@@ -20557,7 +20555,7 @@ pub const Transformer = struct {
     /// Does `forwardWith` route this model through `forwardStandardWith`?
     /// Mirrors the dispatch chain above IN ORDER.
     pub fn usesStandardForward(self: *const Transformer) bool {
-        return self.dsv4 == null and self.dsv41 == null and self.dsv41_ext == null and
+        return self.dsv4 == null and self.dsv41 == null and self.mlx_stream_ext == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention and
             self.hybrid_layers == null and
@@ -20570,7 +20568,7 @@ pub const Transformer = struct {
     /// `DflashModel.bind` gates on this predicate. Mirrors the dispatch chain
     /// above IN ORDER.
     pub fn supportsLayerCapture(self: *const Transformer) bool {
-        return self.dsv4 == null and self.dsv41 == null and self.dsv41_ext == null and
+        return self.dsv4 == null and self.dsv41 == null and self.mlx_stream_ext == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention;
     }
@@ -20707,7 +20705,7 @@ pub const Transformer = struct {
     /// then resets the cache so the first real request starts from clean state.
     /// Idempotent — calling twice is wasted work but not incorrect.
     pub fn warmup(self: *Transformer) !void {
-        if (self.dsv41_ext != null) return; // mlx-stream warms its own kernels at construction
+        if (self.mlx_stream_ext != null) return; // mlx-stream warms its own kernels at construction
         const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
         const decode_shape = [_]c_int{ 1, 1 };
         const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);
@@ -22764,7 +22762,7 @@ pub const Transformer = struct {
         // Built-state question: this path reads `moe_layers` and the GDN
         // ssm entries, so the trunk must actually be that shape.
         if (self.moe_layers == null) return false;
-        if (self.hybrid_layers != null or self.dsv4 != null or self.dsv41 != null or self.dsv41_ext != null) return false;
+        if (self.hybrid_layers != null or self.dsv4 != null or self.dsv41 != null or self.mlx_stream_ext != null) return false;
         // Every layer must be one of the two shapes this path handles.
         for (self.moe_layers.?) |*lw| {
             switch (lw.mlp) {
@@ -31102,7 +31100,7 @@ pub const Transformer = struct {
             const reg = self.rht.?;
             const signs = reg.get(la.out_w) orelse break :fast;
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-            const r = (try gdn_decode.step(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, .{
+            const r = (try gdn_decode.step(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, reg.block, .{
                 .qkv = qkv,
                 .z = z_proj,
                 .a = a_proj,
@@ -45788,8 +45786,8 @@ fn hostIds(self: *Transformer, token_ids: mlx.mlx_array) ![]u32 {
     return ids;
 }
 
-/// DeepSeek-V4.1 on mlx-stream: the plugin runs the request's prompt pass, then decode (`mlx_stream.forward`).
-fn forwardDsv41Stream(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, m: *mlx_stream_mod.Model) !mlx.mlx_array {
+/// An mlx-stream pack: the plugin runs the request's prompt pass, then decode (`mlx_stream.forward`).
+fn forwardMlxStream(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, m: *mlx_stream_mod.Model) !mlx.mlx_array {
     const ids = try hostIds(self, token_ids);
     defer self.allocator.free(ids);
     const logits = try mlx_stream_mod.forward(m, ids, self.s);
@@ -45829,17 +45827,20 @@ fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 /// DeepSeek-V4.1: its pack's Engram tables sit beside the weights; the
 /// DSpark stages load as `deepseek_v41.dsparkWanted` decides.
 fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
-    if (config.dsv41_stream) {
-        const m = try mlx_stream_mod.open(allocator, io, s, &config);
-        errdefer mlx_stream_mod.close(m);
-        var t = try moduleShell(allocator, config, s);
-        t.dsv41_ext = m;
-        return t;
-    }
+    if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
     const mdl = try dsv41_mod.init(allocator, &config, weights, s, .{ .dspark = dsv41_mod.dsparkWanted(&config) });
     errdefer mdl.deinit();
     var t = try moduleShell(allocator, config, s);
     t.dsv41 = mdl;
+    return t;
+}
+
+/// A pack mlx-stream serves (DeepSeek-V4.1's EXL3 repack or a MiMo stream pack): the plugin's module.
+fn initMlxStream(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
+    const m = try mlx_stream_mod.open(allocator, io, s, &config);
+    errdefer mlx_stream_mod.close(m);
+    var t = try moduleShell(allocator, config, s);
+    t.mlx_stream_ext = m;
     return t;
 }
 
@@ -64851,7 +64852,8 @@ test "gdn_decode.step and recur: bit-identical to prework -> recurrence -> norm-
     gdn_decode_fused_override = true;
     defer gdn_decode_fused_override = null;
     // bf16 everywhere, a Hadamard pack's f16 activations over an f32 state, and qwen4_exp's bf16 over f32.
-    for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 }, .{ .bfloat16, .float32 } }) |dts| try gdnDecodeParityCase(s, dts[0], dts[1]);
+    for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 }, .{ .bfloat16, .float32 } }) |dts|
+        for ([_]c_int{ 512, 1024, 2048, 4096 }) |block| try gdnDecodeParityCase(s, dts[0], dts[1], block);
 }
 
 test "gdn_decode.recurSeq: bit-identical to prework -> capture recurrence at verify widths" {
@@ -65662,13 +65664,13 @@ fn gdnDecodeSeqParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(seq_ref_head, seq_got_head, s));
 }
 
-fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
+fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, block: c_int) !void {
     var prng = std.Random.DefaultPrng.init(0xB0B5A1);
     const rnd = prng.random();
     const hk: c_int = 2;
-    const hv: c_int = 8;
     const dk: c_int = 128;
     const dv: c_int = 128;
+    const hv: c_int = @divExact(2 * block, dv);
     const c_dim: c_int = hk * dk * 2 + hv * dv;
     const value_dim: c_int = hv * dv;
 
@@ -65698,9 +65700,10 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
     defer _ = mlx.mlx_array_free(norm_w);
     const eps_arr = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps_arr);
-    var sg: [1024]f32 = undefined;
-    for (&sg) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
-    const signs = mlx.mlx_array_new_data(&sg, &[_]c_int{value_dim}, 1, .float32);
+    const sg = try testing.allocator.alloc(f32, @intCast(value_dim));
+    defer testing.allocator.free(sg);
+    for (sg) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
+    const signs = mlx.mlx_array_new_data(sg.ptr, &[_]c_int{value_dim}, 1, .float32);
     defer _ = mlx.mlx_array_free(signs);
 
     // Composed chain: the three production kernels + the input rotation.
@@ -65763,7 +65766,7 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
     try mlx.check(mlx.mlx_vector_array_get(&state_ref, outputs_vec, 1));
     const flat_ref = (try gdnNormGateFused(s, y_ref, z, 0, value_dim, norm_w, eps_arr, true, hv, dv, 1, 1)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(flat_ref);
-    const rot_ref = try rht.transform(flat_ref, signs, 1024, false, s);
+    const rot_ref = try rht.transform(flat_ref, signs, block, false, s);
     defer _ = mlx.mlx_array_free(rot_ref);
 
     const geo = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
@@ -65783,7 +65786,7 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
         .eps = eps_arr,
         .signs = signs,
     };
-    const got = (try gdn_decode.step(geo, in, s)) orelse return error.FusedDeclined;
+    const got = (try gdn_decode.step(geo, block, in, s)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(got.rot);
     defer _ = mlx.mlx_array_free(got.conv_state);
     defer _ = mlx.mlx_array_free(got.ssm_state);
@@ -66392,7 +66395,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.rht = null;
     t.dsv4 = null;
     t.dsv41 = null;
-    t.dsv41_ext = null;
+    t.mlx_stream_ext = null;
     t.qwen4 = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
@@ -66405,7 +66408,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     try testing.expect(t.ownsModuleDecodeState());
     t.dsv41 = null;
     var fake_ext: mlx_stream_mod.Model = undefined;
-    t.dsv41_ext = &fake_ext;
+    t.mlx_stream_ext = &fake_ext;
     try testing.expect(t.ownsModuleDecodeState());
 }
 

@@ -105,6 +105,7 @@ enum SettingsReset {
                 f("aneImage") { $0.aneImage = $1.aneImage },
                 f("aneVideo") { $0.aneVideo = $1.aneVideo },
                 f("aneAudio") { $0.aneAudio = $1.aneAudio },
+                f("aneSlots") { $0.aneSlots = $1.aneSlots },
             ]
 
         case .engines:

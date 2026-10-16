@@ -17,6 +17,7 @@
 //! broadcasts on `state_cond` so blocked callers wake.
 
 const std = @import("std");
+const crt = @import("crt.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -29,8 +30,10 @@ const token_mask_mod = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
-const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const load_progress = @import("load_progress.zig");
+const arch_ds4 = if (@import("build_options").ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ane = @import("arch/ane_lm.zig");
 const gen_mod = @import("gen.zig");
 const diarization_mod = @import("nemotron_diarization.zig");
 const generate_mod = @import("generate.zig");
@@ -52,11 +55,7 @@ pub const UnloadMark = struct {
 };
 pub var last_unload: UnloadMark = .{};
 
-pub fn monotonicMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
-}
+pub const monotonicMs = crt.monotonicMs;
 
 const Transformer = transformer_mod.Transformer;
 const Weights = model_mod.Weights;
@@ -248,6 +247,9 @@ pub const LoadedModel = struct {
     /// `LlamaEngine` / `llama_ctx`. Mutually exclusive with the safetensors
     /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
     llama_engine: ?*arch_llama.LlamaEngine = null,
+    /// An MLX pack served on the Neural Engine on its own threads (`arch/ane_lm.zig`): like the
+    /// embedded engines, the MLX fields stay null; the tokenizer and chat template are MLX-serve's.
+    ane: ?*arch_ane.Worker = null,
     /// Whether lib/mlx-serve-gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
@@ -305,6 +307,8 @@ pub const LoadedModel = struct {
     /// pending allocation in the budget gate so two loads can't both pass and
     /// oversubscribe GPU memory. Released (zeroed) at markReady/Error/Unloaded.
     load_estimate: u64 = 0,
+    /// What the load is doing while `.loading` (`GET /v1/load-progress`).
+    load_progress: load_progress.Progress = .{},
     state: LoadState,
     /// Allocator-owned error name when state == .error_state. Echoed in
     /// the `/v1/models` snapshot so clients can see why a load failed
@@ -355,11 +359,29 @@ pub const LoadedModel = struct {
     }
 
     /// Requests that may hold an engine session at once: one per llama
-    /// sequence, one for ds4; null for every other engine (no claim).
+    /// sequence, one per ANE slot, one for ds4; null for every other engine (no claim).
     pub fn sessionCapacity(self: *const LoadedModel) ?u32 {
         if (self.llama_ctx) |ctx| return @intCast(ctx.seqs.len);
+        if (self.ane) |w| return @intCast(w.engines.len);
         if (self.ds4_engine != null) return 1;
         return null;
+    }
+
+    /// A drafter is loaded: the GPU's (Gemma assistant or DFlash), or the Neural Engine's
+    /// (its dir in `drafter_path`).
+    pub fn hasDrafter(self: *const LoadedModel) bool {
+        return self.drafter != null or self.dflash != null or (self.ane != null and self.drafter_path.len > 0);
+    }
+
+    /// Served by an engine that is not MLX (no Transformer, no MLX memory).
+    pub fn engineBacked(self: *const LoadedModel) bool {
+        return self.ds4_engine != null or self.llama_engine != null or self.ane != null;
+    }
+
+    fn closeAne(self: *LoadedModel) void {
+        const w = self.ane orelse return;
+        w.close();
+        self.ane = null;
     }
 
     /// Free all owned state. Safe to call regardless of `state` — null
@@ -387,6 +409,7 @@ pub const LoadedModel = struct {
             engine.close();
             self.llama_engine = null;
         }
+        self.closeAne();
         if (self.image_engine) |e| {
             e.deinit();
             self.image_engine = null;
@@ -571,6 +594,7 @@ pub const LoadedModel = struct {
             engine.close();
             self.llama_engine = null;
         }
+        self.closeAne();
         if (self.image_engine) |e| {
             e.deinit();
             self.image_engine = null;
@@ -741,6 +765,9 @@ pub const ModelRegistry = struct {
     /// blocked in `ensureLoaded` (on a `.loading`/`.evicting` entry) wake
     /// here. The mutex is the predicate; the cond-var is the wake signal.
     state_cond: std.Io.Condition,
+    /// Bumped by every entry added and every state change (`/props`
+    /// `registry_generation`): a client re-reads `/v1/models` only when it moved.
+    generation: std.atomic.Value(u64) = .init(0),
 
     /// Running sum of `bytes_resident` across `.ready` entries. Updated
     /// under `mutex` on every state transition.
@@ -876,6 +903,7 @@ pub const ModelRegistry = struct {
         // putNoClobber so we surface a stronger error than overwrite — the
         // earlier `entries.get` guard makes this defensive.
         try self.entries.putNoClobber(stub.id, stub);
+        _ = self.generation.fetchAdd(1, .monotonic);
         return stub;
     }
 
@@ -1073,6 +1101,12 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// An entry's state changed: wake the waiters and move the generation.
+    fn stateChanged(self: *ModelRegistry) void {
+        _ = self.generation.fetchAdd(1, .monotonic);
+        self.state_cond.broadcast(self.io);
+    }
+
     /// Phase D: claim the right to perform a cold load for `entry`. Caller
     /// MUST already hold `mutex`. Transitions `.unloaded` → `.loading` and
     /// broadcasts so any other ensureLoaded callers join the wait. Returns
@@ -1082,7 +1116,7 @@ pub const ModelRegistry = struct {
     pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
         if (entry.state != .unloaded) return false;
         entry.state = .loading;
-        self.state_cond.broadcast(self.io);
+        self.stateChanged();
         return true;
     }
 
@@ -1096,7 +1130,7 @@ pub const ModelRegistry = struct {
         entry.bytes_resident = 0;
         if (entry.error_name) |old| self.allocator.free(old);
         entry.error_name = null;
-        self.state_cond.broadcast(self.io);
+        self.stateChanged();
     }
 
     /// Phase D: begin evicting `entry`. Caller holds `mutex`. Subsequent
@@ -1106,7 +1140,7 @@ pub const ModelRegistry = struct {
     pub fn markEvictingLocked(self: *ModelRegistry, entry: *LoadedModel) void {
         std.debug.assert(entry.state == .ready);
         entry.state = .evicting;
-        self.state_cond.broadcast(self.io);
+        self.stateChanged();
     }
 
     /// Phase D: block until `entry.refcount == 0`. Caller holds `mutex`.
@@ -1129,7 +1163,7 @@ pub const ModelRegistry = struct {
         // pre-eviction value externally — pass-through here is a no-op.)
         entry.state = .unloaded;
         entry.error_name = null;
-        self.state_cond.broadcast(self.io);
+        self.stateChanged();
     }
 
     /// Phase D: count of currently-loaded (`.ready` or `.evicting`) entries.
@@ -1177,8 +1211,9 @@ pub const ModelRegistry = struct {
         mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
     }
 
-    /// What every ready model except a streaming pack holds: the plugin bills only its own bytes, and its
-    /// footprint reads are the whole process's. Caller holds `mutex`.
+    /// What every ready model except the DeepSeek-V4.1 stream pack holds: the plugin bills only its own bytes, and its
+    /// footprint reads are the whole process's. Only DeepSeek-V4.1's module reads the value, so only its own pack is
+    /// left out; a MiMo stream pack's bytes are foreign to it. Caller holds `mutex`.
     pub fn streamForeignBytesLocked(self: *ModelRegistry) u64 {
         var sum: u64 = 0;
         var it = self.entries.valueIterator();
@@ -1309,7 +1344,7 @@ pub const ModelRegistry = struct {
             self.default_promoted = true;
             log.info("[registry] default model -> {s} (latest chat-capable load on a headless server)\n", .{entry.id});
         }
-        self.state_cond.broadcast(self.io);
+        self.stateChanged();
     }
 
     /// Can this READY entry serve chat/completions? Media models (image/
@@ -1351,7 +1386,7 @@ pub const ModelRegistry = struct {
     pub fn unmarkEvictingLocked(self: *ModelRegistry, entry: *LoadedModel) void {
         std.debug.assert(entry.state == .evicting);
         entry.state = .ready;
-        self.state_cond.broadcast(self.io);
+        self.stateChanged();
     }
 
     /// `live_bytes` is what the allocator holds right now (weights + KV + caches + wired
@@ -1395,6 +1430,40 @@ pub const ModelRegistry = struct {
             out[n] = victim;
             n += 1;
         }
+    }
+
+    /// Idle models a load needing `need` bytes of RAM unloads with `room` free, oldest first: as few
+    /// as make it fit, none when it already fits or when even all of them cannot. Marks each
+    /// `.evicting` into `out`. Engines serving mmapped files (ds4, llama.cpp) are skipped: their
+    /// pages already count as free. Caller holds `mutex`.
+    pub fn planRamEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, room: u64, need: u64) usize {
+        if (need <= room) return 0;
+        var idle: [16]*LoadedModel = undefined;
+        var n_idle: usize = 0;
+        var reachable = room;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const e = entry_ptr.*;
+            if (e.state != .ready or e.refcount.load(.acquire) != 0 or std.mem.eql(u8, e.id, exclude_id)) continue;
+            if (e.ds4_engine != null or e.llama_engine != null or n_idle == idle.len) continue;
+            idle[n_idle] = e;
+            n_idle += 1;
+            reachable +|= e.bytes_resident;
+        }
+        if (reachable < need) return 0;
+        std.sort.pdq(*LoadedModel, idle[0..n_idle], {}, struct {
+            fn older(_: void, a: *LoadedModel, b: *LoadedModel) bool {
+                return a.last_used_ns < b.last_used_ns;
+            }
+        }.older);
+        var free = room;
+        var n: usize = 0;
+        while (free < need and n < out.len) : (n += 1) {
+            self.markEvictingLocked(idle[n]);
+            out[n] = idle[n];
+            free +|= idle[n].bytes_resident;
+        }
+        return n;
     }
 
     /// Registry resident-memory cap: the explicit value, else Metal's whole working-set limit
@@ -1470,7 +1539,7 @@ pub const ModelRegistry = struct {
         if (entry.error_name) |old| self.allocator.free(old);
         entry.error_name = self.allocator.dupe(u8, error_name) catch null;
         entry.state = .error_state;
-        self.state_cond.broadcast(self.io);
+        self.stateChanged();
     }
 
     /// Duped copy of the stored load-failure name for `id` (empty/"mlx-serve"
@@ -1555,6 +1624,26 @@ test "ModelRegistry: init/deinit empty" {
     defer reg.deinit();
     try testing.expectEqual(@as(usize, 0), reg.entries.count());
     try testing.expectEqual(@as(u64, 0), reg.current_resident_bytes);
+}
+
+test "ModelRegistry: generation moves with every entry added and every state change" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    var last = reg.generation.load(.monotonic);
+    const e = try reg.registerStub("m", "/path/to/m", 64);
+    try testing.expect(reg.generation.load(.monotonic) > last);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    last = reg.generation.load(.monotonic);
+    try testing.expect(reg.tryBeginLoadLocked(e));
+    try testing.expect(reg.generation.load(.monotonic) > last);
+    last = reg.generation.load(.monotonic);
+    reg.markErrorLocked(e, "LoadFailed");
+    try testing.expect(reg.generation.load(.monotonic) > last);
+    last = reg.generation.load(.monotonic);
+    reg.markUnloadedLocked(e);
+    try testing.expect(reg.generation.load(.monotonic) > last);
 }
 
 test "ModelRegistry: registerStub + setDefault" {
@@ -1832,10 +1921,16 @@ test "ModelRegistry: the streaming pack's foreign bytes are every other ready mo
     defer stream.config = null; // borrowed: the registry frees the configs it owns
     _ = try makeReadyStub(reg, "krea", 14_730_000_000);
     _ = try reg.registerStub("yue2", "yue2", 4_000_000_000); // discovered, never loaded
+    // A second stream pack (MiMo) is foreign to DeepSeek-V4.1's module, the only reader of the value.
+    var mimo_cfg = ModelConfig{};
+    mimo_cfg.mimo_stream = true;
+    const mimo = try makeReadyStub(reg, "mimo", 9_000_000_000);
+    mimo.config = &mimo_cfg;
+    defer mimo.config = null;
 
     reg.mutex.lockUncancelable(reg.io);
     defer reg.mutex.unlock(reg.io);
-    try testing.expectEqual(@as(u64, 14_730_000_000), reg.streamForeignBytesLocked());
+    try testing.expectEqual(@as(u64, 14_730_000_000 + 9_000_000_000), reg.streamForeignBytesLocked());
 }
 
 test "ModelRegistry: ensureLoaded fails on unloaded stub" {
@@ -2188,6 +2283,44 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     reg.mutex.unlock(io);
     try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
     a.refcount.store(0, .release);
+}
+
+test "RAM: idle models unload oldest first, as few as fit the load" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 1000, null);
+    defer reg.deinit();
+    _ = try makeReadyStub(reg, "a", 70); // oldest
+    _ = try makeReadyStub(reg, "b", 10);
+    const c = try beginLoad(reg, "c", 140); // far under the 1000 cap
+
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(usize, 0), reg.planRamEvictionsLocked(c.id, &buf, 140, 140));
+    try testing.expectEqual(@as(usize, 1), reg.planRamEvictionsLocked(c.id, &buf, 80, 140));
+    try testing.expectEqualStrings("a", buf[0].id);
+    try testing.expectEqual(LoadState.evicting, buf[0].state);
+    try testing.expectEqual(LoadState.ready, reg.entries.get("b").?.state);
+}
+
+test "RAM: nothing unloads when even every idle model cannot fit the load, and busy ones never" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 1000, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 40); // oldest, but serving a request
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+    defer a.refcount.store(0, .release);
+    const b = try makeReadyStub(reg, "b", 10);
+    const c = try beginLoad(reg, "c", 100);
+
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(usize, 0), reg.planRamEvictionsLocked(c.id, &buf, 20, 100));
+    try testing.expectEqual(LoadState.ready, b.state);
+    try testing.expectEqual(@as(usize, 1), reg.planRamEvictionsLocked(c.id, &buf, 20, 25));
+    try testing.expectEqualStrings("b", buf[0].id);
+    try testing.expectEqual(LoadState.ready, a.state);
 }
 
 test "reservation: concurrent in-flight load is visible in the budget gate" {

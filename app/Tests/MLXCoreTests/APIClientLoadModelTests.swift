@@ -128,6 +128,20 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertNil(APIClient.parseModelInfo(["id": "a", "meta": [:]]).kvBadge)
     }
 
+    func testTrayNamesTheEngineServingEachModel() {
+        func badge(_ engine: String?) -> String {
+            APIClient.parseModelInfo(["id": "a", "meta": engine.map { ["engine": $0] } ?? [:]]).engineBadge
+        }
+        XCTAssertEqual(badge("ane"), "ANE")
+        XCTAssertEqual(badge("mlx"), "MLX")
+        XCTAssertEqual(badge("llama"), "GGUF")
+        XCTAssertEqual(badge("ds4"), "DS4")
+        XCTAssertEqual(badge("mlx-gguf"), "MLX GGUF")
+        XCTAssertEqual(badge("sushi"), "Sushi")
+        XCTAssertEqual(badge("mlx-stream"), "Stream")
+        XCTAssertEqual(badge(nil), "MLX") // a server that predates the field
+    }
+
     func testParseModelInfoReadsAudioCapability() {
         // Gemma 4 12B advertises "audio" in capabilities + input_modalities.
         let audioModel: [String: Any] = [

@@ -1196,8 +1196,7 @@ pub const Model = struct {
         var cfg = try parseConfig(io, allocator, model_dir, &tok);
         errdefer cfg.deinit();
 
-        // safetensors READS run on the CPU stream (mlx's Load has no GPU impl).
-        const load_s = mlx.mlx_default_cpu_stream_new();
+        const load_s = mlx.weightLoadStream();
         defer _ = mlx.mlx_stream_free(load_s);
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{model_dir}, 0);
         defer allocator.free(path);

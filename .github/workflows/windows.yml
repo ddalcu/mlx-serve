@@ -1,0 +1,102 @@
+name: Windows
+
+# Windows/CUDA build of the mlx-serve server, via scripts/build-windows.ps1 — the
+# same one-shot script a developer runs: RTX 20-50 series (sm_75, sm_86, sm_120).
+# GitHub's runners have no GPU, so this is a compile-and-link gate, a start-up
+# check (every DLL resolves; MLX loads CUDA only on first use) and a downloadable
+# build, not a runtime test.
+#
+# Every slow input is cached by what produced it, as in linux.yml: the stage
+# scripts stamp their outputs with the inputs the cache keys hash, so a hit skips
+# the stage, and CUDA is only installed when the MLX stage has to be rebuilt.
+#
+# Running the zip needs an NVIDIA driver >= 580, the CUDA 13 toolkit (CUDA_PATH)
+# and cuDNN 9 for CUDA 13 (CUDNN_PATH): both engines load those, none ship in it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda:
+    name: cuda (x64)
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      MLX_CUDA_ARCHITECTURES: "75;86;120"
+      ZIG_CPU: x86_64_v3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute pins
+        id: pins
+        shell: bash
+        run: |
+          pin() { git ls-tree HEAD "$1" | awk '{print substr($3,1,12)}'; }
+          echo "submodules=$(git ls-tree HEAD lib | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          echo "mlx=$(pin lib/mlx-src)-$(pin lib/mlxc-src)" >> "$GITHUB_OUTPUT"
+          echo "arch=$(echo "$MLX_CUDA_ARCHITECTURES" | tr ';' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache submodules
+        uses: actions/cache@v4
+        with:
+          path: .git/modules
+          key: submodules-windows-${{ steps.pins.outputs.submodules }}
+          restore-keys: submodules-windows-
+
+      - name: Check out submodules
+        run: git submodule update --init --depth 1 --jobs 8
+
+      # Restored and saved as two steps, so a later failure still keeps the hour-long MLX build.
+      - name: Restore MLX stage
+        id: mlx
+        uses: actions/cache/restore@v4
+        with:
+          path: lib/mlx-win
+          key: mlx-windows-${{ steps.pins.outputs.mlx }}-${{ steps.pins.outputs.arch }}-${{ hashFiles('patches/mlx*.patch', 'scripts/build-mlx-windows.ps1') }}
+
+      - name: Cache llama.cpp stage
+        uses: actions/cache@v4
+        with:
+          path: lib/llama-win
+          key: llama-windows-${{ hashFiles('scripts/fetch-llama.sh') }}
+
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: .zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
+      # Building MLX needs CUDA 13.0 (13.3's nvcc cannot compile its CUTLASS kernels with MSVC).
+      # Not cached: only an MLX stage rebuild needs it.
+      - name: Install CUDA 13.0, cuDNN and Ninja
+        if: steps.mlx.outputs.cache-hit != 'true'
+        run: |
+          choco install ninja -y --no-progress
+          powershell -File scripts\install-cuda-windows.ps1 -Cuda 13.0.3 -Cudnn 9.27.0 -Dest C:\cuda
+          "CUDA_PATH=C:\cuda" >> $env:GITHUB_ENV
+          "CUDNN_PATH=C:\cuda\cudnn" >> $env:GITHUB_ENV
+
+      - name: Build
+        run: powershell -File scripts\build-windows.ps1
+
+      - name: Save MLX stage
+        if: always() && steps.mlx.outputs.cache-hit != 'true' && hashFiles('lib/mlx-win/.version') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: lib/mlx-win
+          key: ${{ steps.mlx.outputs.cache-primary-key }}
+
+      - name: Check the exe starts (every DLL resolves)
+        run: dist\mlx-serve-windows-x64\mlx-serve.exe --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlx-serve-windows-x64-cuda13
+          path: dist/mlx-serve-windows-x64.zip

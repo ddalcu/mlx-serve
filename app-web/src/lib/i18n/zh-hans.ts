@@ -509,6 +509,8 @@ const ZH: Record<string, string> = {
   "Follow the system setting, or force light/dark for this app only.":
     "跟随系统设置，或仅为本应用强制浅色/深色。",
   Frames: "帧数",
+  "Each model loading now: phase, done of total and seconds left":
+    "正在加载的每个模型：阶段、已完成/总数与剩余秒数",
   "Free a model's memory now": "立即释放某个模型占用的内存",
   French: "法语",
   "From a depth map": "从深度图生成",

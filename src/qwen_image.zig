@@ -30,6 +30,7 @@ const mage_flow = @import("mage_flow.zig");
 const qwen_kernels = @import("qwen_image_kernels.zig");
 const qwen_image_edit = @import("qwen_image_edit.zig");
 const model_discovery = @import("model_discovery.zig");
+const lora_mod = @import("lora.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -49,7 +50,7 @@ pub fn resolveSteps(grid: ?[]const f32, steps: u32) u32 {
     return if (steps == 0) DEFAULT_STEPS else steps;
 }
 
-const VAE_DOWNSAMPLE: u32 = 16;
+pub const VAE_DOWNSAMPLE: u32 = 16;
 /// Text encoding stays bf16; the DiT defaults to bf16 and the VAE stays f32.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
 /// Experimental DiT-only dtype override. Unrecognized values preserve the
@@ -62,7 +63,7 @@ fn fusedRopeEnabled(value: ?[*:0]const u8) bool {
     return if (value) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
 }
 
-const MAX_PROMPT_TOKENS: usize = 2048;
+pub const MAX_PROMPT_TOKENS: usize = 2048;
 
 // Raw template string, not the chat template: the checkpoint was trained on it.
 const SYSTEM_PREFIX = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
@@ -745,6 +746,21 @@ pub const EditGeometry = struct {
     }
 };
 
+const BlockLora = struct {
+    q: lora_mod.Slot = .{},
+    k: lora_mod.Slot = .{},
+    v: lora_mod.Slot = .{},
+    o: lora_mod.Slot = .{},
+    proj: lora_mod.Slot = .{},
+    gate: lora_mod.Slot = .{},
+    out: lora_mod.Slot = .{},
+};
+
+/// `lin(x)` plus every adapter attached to it.
+fn linForward(lin: *const MfLinear, slot: *const lora_mod.Slot, x: A, s: S) !A {
+    return lora_mod.addSlot(try lin.forward(x, null, s), x, slot, s);
+}
+
 const Block = struct {
     q: MfLinear,
     k: MfLinear,
@@ -755,6 +771,7 @@ const Block = struct {
     proj: MfLinear,
     gate: MfLinear,
     out: MfLinear,
+    lora: BlockLora = .{},
 
     fn deinit(self: *Block) void {
         inline for (.{ &self.q, &self.k, &self.v, &self.o, &self.proj, &self.gate, &self.out }) |l| l.deinit();
@@ -872,6 +889,37 @@ pub const Dit = struct {
         self.allocator.free(self.blocks);
     }
 
+    /// Attach every adapter in `stack` to its block linear. Returns the number
+    /// of (module, adapter) attachments across the stack; the caller compares
+    /// it with the adapters loaded to reject a file that matched only in part.
+    /// Non-owning: `stack` must outlive the attach.
+    pub fn attachLora(self: *Dit, stack: *const lora_mod.Stack) u32 {
+        self.detachLora();
+        var matched: u32 = 0;
+        var kbuf: [96]u8 = undefined;
+        var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+        for (self.blocks, 0..) |*b, i| {
+            inline for (.{
+                .{ "attn.to_q", "q" },       .{ "attn.to_k", "k" },
+                .{ "attn.to_v", "v" },       .{ "attn.to_out", "o" },
+                .{ "img_mlp.proj", "proj" }, .{ "img_mlp.gate_layer", "gate" },
+                .{ "img_mlp.out", "out" },
+            }) |m| {
+                const key = std.fmt.bufPrint(&kbuf, "transformer_blocks.{d}." ++ m[0], .{i}) catch unreachable;
+                const refs = stack.findAll(key, &rbuf);
+                if (refs.len > 0) {
+                    @field(b.lora, m[1]).set(refs);
+                    matched += @intCast(refs.len);
+                }
+            }
+        }
+        return matched;
+    }
+
+    pub fn detachLora(self: *Dit) void {
+        for (self.blocks) |*b| b.lora = .{};
+    }
+
     /// Timestep embedding rows [2, hidden]: row 0 the sampled t, row 1 t = 0.
     /// The sinusoid (cos half first) is f32, cast to the compute dtype BEFORE
     /// the embedder so an f32 modulation never widens the hidden stream.
@@ -955,10 +1003,10 @@ pub const Dit = struct {
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd].
-    fn headsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const Geometry) !A {
+    fn headsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const y = try lin.forward(x, null, s);
+        const y = try linForward(lin, slot, x, s);
         defer free(y);
         const y4 = try reshape(y, &[_]c_int{ sh[0], sh[1], @intCast(self.cfg.heads), @intCast(self.cfg.head_dim) }, s);
         defer free(y4);
@@ -977,11 +1025,11 @@ pub const Dit = struct {
         const s = self.s;
         const sh = mlx.getShape(x);
         const T = geo.text_len;
-        const q = try self.headsOf(&b.q, b.norm_q, x, geo);
+        const q = try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, geo);
         defer free(q);
-        const k = try self.headsOf(&b.k, b.norm_k, x, geo);
+        const k = try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, geo);
         defer free(k);
-        const v = try self.headsOf(&b.v, null, x, geo);
+        const v = try self.headsOf(&b.v, &b.lora.v, null, x, geo);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
 
@@ -1014,7 +1062,7 @@ pub const Dit = struct {
         defer free(back);
         const flat = try reshape(back, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
         defer free(flat);
-        return b.o.forward(flat, null, s);
+        return linForward(&b.o, &b.lora.o, flat, s);
     }
 
     fn blockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const Geometry, cache: ?*?PrefixKV, cached: bool) !A {
@@ -1034,15 +1082,15 @@ pub const Dit = struct {
         defer free(n2);
         const m_in = try mulA(n2, mod.scale2, s);
         defer free(m_in);
-        const g = try b.gate.forward(m_in, null, s);
+        const g = try linForward(&b.gate, &b.lora.gate, m_in, s);
         defer free(g);
         const sg = try silu(g, s);
         defer free(sg);
-        const p = try b.proj.forward(m_in, null, s);
+        const p = try linForward(&b.proj, &b.lora.proj, m_in, s);
         defer free(p);
         const gp = try mulA(sg, p, s);
         defer free(gp);
-        const mlp = try b.out.forward(gp, null, s);
+        const mlp = try linForward(&b.out, &b.lora.out, gp, s);
         defer free(mlp);
         const gm = try mulA(mlp, mod.gate2, s);
         defer free(gm);
@@ -1175,10 +1223,10 @@ pub const Dit = struct {
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd], edit tables.
-    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const Geometry) !A {
+    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const y = try lin.forward(x, null, s);
+        const y = try linForward(lin, slot, x, s);
         defer free(y);
         const y4 = try reshape(y, &[_]c_int{ sh[0], sh[1], @intCast(self.cfg.heads), @intCast(self.cfg.head_dim) }, s);
         defer free(y4);
@@ -1194,11 +1242,11 @@ pub const Dit = struct {
     fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const q = try self.editHeadsOf(&b.q, b.norm_q, x, rope);
+        const q = try self.editHeadsOf(&b.q, &b.lora.q, b.norm_q, x, rope);
         defer free(q);
-        const k = try self.editHeadsOf(&b.k, b.norm_k, x, rope);
+        const k = try self.editHeadsOf(&b.k, &b.lora.k, b.norm_k, x, rope);
         defer free(k);
-        const v = try self.editHeadsOf(&b.v, null, x, rope);
+        const v = try self.editHeadsOf(&b.v, &b.lora.v, null, x, rope);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
         const attn = if (cached) blk: {
@@ -1217,7 +1265,7 @@ pub const Dit = struct {
         defer free(back);
         const flat = try reshape(back, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
         defer free(flat);
-        return b.o.forward(flat, null, s);
+        return linForward(&b.o, &b.lora.o, flat, s);
     }
 
     fn editBlockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
@@ -1237,15 +1285,15 @@ pub const Dit = struct {
         defer free(n2);
         const m_in = try mulA(n2, mod.scale2, s);
         defer free(m_in);
-        const g = try b.gate.forward(m_in, null, s);
+        const g = try linForward(&b.gate, &b.lora.gate, m_in, s);
         defer free(g);
         const sg = try silu(g, s);
         defer free(sg);
-        const p = try b.proj.forward(m_in, null, s);
+        const p = try linForward(&b.proj, &b.lora.proj, m_in, s);
         defer free(p);
         const gp = try mulA(sg, p, s);
         defer free(gp);
-        const mlp = try b.out.forward(gp, null, s);
+        const mlp = try linForward(&b.out, &b.lora.out, gp, s);
         defer free(mlp);
         const gm = try mulA(mlp, mod.gate2, s);
         defer free(gm);
@@ -2118,6 +2166,9 @@ pub const Engine = struct {
         self.vae = try VaeDecoder.load(io, allocator, self.s, model_dir, self.vae_cfg);
         errdefer self.vae.deinit();
         if (!staged) self.te = try TextEncoder.load(io, allocator, self.s, model_dir, COMPUTE);
+        errdefer if (self.te) |*t| t.deinit();
+        // Resident now, so a request's memory check reads them in live memory.
+        try mlx.evalFields(.{ self.dit, self.vae, self.te });
         logMemory("load");
 
         log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s}, {d} steps{s})\n", .{
@@ -3008,7 +3059,7 @@ test "QwenImage prefix cache matches full forwards across timesteps and conditio
             // Both RoPE implementations must cast Q/K back to compute dtype.
             for ([_]bool{ false, true }) |fused| {
                 dit.fused_rope = fused;
-                const heads = try dit.headsOf(&dit.blocks[0].q, dit.blocks[0].norm_q, head_input, &geo);
+                const heads = try dit.headsOf(&dit.blocks[0].q, &dit.blocks[0].lora.q, dit.blocks[0].norm_q, head_input, &geo);
                 defer free(heads);
                 try testing.expectEqual(dtype, mlx.mlx_array_dtype(heads));
             }
@@ -3472,6 +3523,19 @@ test "QwenImage edit segment walk: adjacent image blocks stay separate" {
 // Whole pipeline on a REAL converted pack (QWEN_IMAGE_E2E_MODEL), text encoder
 // staged. Asserts a finite, non-flat image; QWEN_IMAGE_E2E_OUT=<file.png> keeps
 // it for a look, QWEN_IMAGE_E2E_STEPS / _SIZE / _GUIDANCE override the run.
+test "QwenImage load leaves the DiT and VAE resident (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_E2E_MODEL") orelse return error.SkipZigTest);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const engine = try Engine.load(io, testing.allocator, dir, true);
+    defer engine.deinit();
+    const last_stage = engine.vae.h.stages[engine.vae.h.stages.len - 1];
+    for ([_]A{ engine.dit.img_in.w, engine.dit.blocks[engine.dit.blocks.len - 1].out.w, last_stage.res[0].c1.w }) |w| {
+        var ready = false;
+        _ = mlx._mlx_array_is_available(&ready, w);
+        try testing.expect(ready);
+    }
+}
+
 test "QwenImage e2e on a real pack (env-gated)" {
     const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_E2E_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;

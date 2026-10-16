@@ -56,3 +56,6 @@ pub fn arm(_: *Model, _: ?SamplingParams) bool {
 pub fn round(_: *Model, _: std.mem.Allocator, _: u32, _: u32) !Model.DraftRound {
     return error.MlxStreamNotBuilt;
 }
+pub fn laneReceipt(_: *Model, _: []u8) ?[]const u8 {
+    return null;
+}

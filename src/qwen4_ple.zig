@@ -1,4 +1,5 @@
 const std = @import("std");
+const crt = @import("crt.zig");
 
 pub const EmbeddedSpec = struct { rows: u64, dim: u32, shards: u32, layer_index: u32 = 1 };
 pub const EmbeddedInfo = struct { payload_bytes: u64 };
@@ -91,7 +92,7 @@ const Shard = struct {
 };
 
 const File = struct {
-    fd: std.c.fd_t,
+    fd: c_int,
     map: []align(std.heap.page_size_min) const u8,
     obj: std.json.ObjectMap,
     data_off: usize,
@@ -103,7 +104,7 @@ pub const RowParts = struct {
     biases: []const u8,
 };
 
-pub const Region = struct { fd: std.c.fd_t, off: u64, len: u64 };
+pub const Region = struct { fd: c_int, off: u64, len: u64 };
 
 pub const EmbeddedTable = struct {
     arena: std.heap.ArenaAllocator,
@@ -122,8 +123,8 @@ pub const EmbeddedTable = struct {
 
     pub fn close(self: *EmbeddedTable) void {
         for (self.files) |f| {
-            std.posix.munmap(f.map);
-            _ = std.c.close(f.fd);
+            if (!(comptime @import("builtin").os.tag == .windows)) std.posix.munmap(f.map); // never mapped on Windows
+            crt.close(f.fd);
         }
         self.arena.deinit();
     }
@@ -183,7 +184,7 @@ pub const EmbeddedTable = struct {
             var done: usize = 0;
             while (done < out.len) {
                 const want = @min(out.len - done, 1 << 30);
-                const got = std.c.pread(fd, out[done..].ptr, want, @intCast(t.off + done));
+                const got = crt.pread(fd, out[done..].ptr, want, @intCast(t.off + done));
                 if (got <= 0) return error.EmbeddedPleRead;
                 done += @intCast(got);
             }
@@ -195,7 +196,7 @@ pub const EmbeddedTable = struct {
         const t = where.shard.parts[part];
         if (dst.len != t.len / t.rows) return false;
         const off = t.off + where.local * dst.len;
-        return std.c.pread(self.files[t.file].fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
+        return crt.pread(self.files[t.file].fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 };
 
@@ -209,10 +210,10 @@ fn openFile(a: std.mem.Allocator, model_dir: []const u8, name: []const u8) !File
     const full = std.fmt.bufPrint(&path, "{s}/{s}", .{ model_dir, name }) catch return error.NameTooLong;
     if (full.len >= path.len) return error.NameTooLong;
     path[full.len] = 0;
-    const fd = std.c.open(path[0..full.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(path[0..full.len :0]);
     if (fd < 0) return error.FileNotFound;
-    errdefer _ = std.c.close(fd);
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    errdefer crt.close(fd);
+    const end = crt.seekEnd(fd);
     if (end < 8) return error.EmbeddedPleHeader;
     const size: usize = @intCast(end);
     const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
@@ -235,6 +236,7 @@ fn tensor(file: File, file_id: usize, name: []const u8, dtype: []const u8, elem:
 }
 
 pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTable {
+    if (comptime @import("builtin").os.tag == .windows) return null; // pread/mmap gather is POSIX-only
     if (expected.rows == 0 or expected.dim == 0 or expected.shards == 0 or expected.shards > 1024) return error.EmbeddedPleSpec;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     errdefer arena.deinit();
@@ -278,7 +280,7 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
     var files: std.ArrayList(File) = .empty;
     errdefer for (files.items) |f| {
         std.posix.munmap(f.map);
-        _ = std.c.close(f.fd);
+        crt.close(f.fd);
     };
     var file_ids: std.StringHashMapUnmanaged(usize) = .empty;
     const shards = try a.alloc(Shard, expected.shards);

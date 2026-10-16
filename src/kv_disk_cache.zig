@@ -134,6 +134,7 @@ const LinuxStatfs = extern struct {
 
 const StatfsBuf = if (builtin.os.tag.isDarwin()) DarwinStatfs else LinuxStatfs;
 extern "c" fn statfs(path: [*:0]const u8, buf: *StatfsBuf) c_int;
+extern "kernel32" fn GetDiskFreeSpaceExA(path: [*:0]const u8, avail: *u64, total: *u64, free: ?*u64) callconv(.winapi) i32;
 extern fn msv_volume_free_for_use(path: [*:0]const u8) u64;
 
 pub const VolumeSpace = struct { free: u64, total: u64 };
@@ -145,6 +146,12 @@ pub fn volumeSpace(path: []const u8) ?VolumeSpace {
     if (path.len >= buf.len) return null;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
+    if (comptime builtin.os.tag == .windows) {
+        var avail: u64 = 0;
+        var total: u64 = 0;
+        if (GetDiskFreeSpaceExA(buf[0..path.len :0].ptr, &avail, &total, null) == 0 or total == 0) return null;
+        return .{ .free = avail, .total = total };
+    }
     var st: StatfsBuf = undefined;
     if (statfs(buf[0..path.len :0].ptr, &st) != 0) return null;
     const bsize: u64 = @intCast(@max(st.f_bsize, 0));
@@ -877,8 +884,8 @@ pub const DiskTier = struct {
         if (n_chunks == 0) return error.DiskCacheEmptyEntry;
         self.chunks_loaded_last = n_chunks;
 
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
+        const load_s = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(load_s);
 
         const kinds: []const []const u8 = if (quant.scheme == .off)
             &.{ "k", "v" }
@@ -911,7 +918,7 @@ pub const DiskTier = struct {
             defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
             var meta_map = mlx.mlx_map_string_to_string_new();
             defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-            try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+            try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), load_s));
             // A lazy load holds its file open until eval, so each chunk is evaluated before the
             // next opens; one eval at the end needed a descriptor per chunk.
             const chunk_arrays = mlx.mlx_vector_array_new();
@@ -1005,8 +1012,8 @@ pub const DiskTier = struct {
     /// target model's `ssm_entries` — a mismatch inside a fingerprint dir
     /// means corruption, never a different model.
     fn loadSsmFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize) !transformer_mod.SSMCheckpoint {
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
+        const load_s = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(load_s);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors\x00", .{ self.root, id, pos });
         defer self.allocator.free(path);
         if (fileSize(self.io, path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
@@ -1014,7 +1021,7 @@ pub const DiskTier = struct {
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
         var meta_map = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-        try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+        try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), load_s));
 
         var layers_c: [*:0]const u8 = undefined;
         if (mlx.mlx_map_string_to_string_get(&layers_c, meta_map, "layers") != 0) return error.DiskCacheCorruptSsm;
@@ -1769,15 +1776,15 @@ pub const DiskTier = struct {
             return null;
         }
 
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
+        const load_s = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(load_s);
         const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/spec.safetensors\x00", .{ self.root, e.id }) catch return null;
         defer self.allocator.free(path);
         var tensor_map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
         var meta_map = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-        mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu)) catch return null;
+        mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), load_s)) catch return null;
 
         const prefix: []const u8 = switch (which) {
             .dflash => "d",

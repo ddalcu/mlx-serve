@@ -6,6 +6,7 @@
 //! the head's tensors). Best effort: any failure logs and the model serves
 //! without MTP.
 const std = @import("std");
+const crt = @import("crt.zig");
 const build_options = @import("build_options");
 const model_mod = @import("model.zig");
 const mtp_mod = @import("mtp.zig");
@@ -30,14 +31,14 @@ const Source = union(enum) {
             .local => |dir| {
                 const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, rel }, 0);
                 defer allocator.free(path);
-                const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+                const fd = crt.openRead(path);
                 if (fd < 0) return error.DonorRead;
-                defer _ = std.c.close(fd);
+                defer crt.close(fd);
                 const buf = try allocator.alloc(u8, @intCast(len));
                 errdefer allocator.free(buf);
                 var done: usize = 0;
                 while (done < buf.len) {
-                    const got = std.c.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
+                    const got = crt.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
                     if (got <= 0) return error.DonorRead;
                     done += @intCast(got);
                 }
@@ -210,13 +211,13 @@ fn build(allocator: std.mem.Allocator, io: std.Io, src: Source, model_dir: []con
     // not truncate each other's file; the rename is atomic, last one wins.
     const final_path = try std.fs.path.join(arena, &.{ model_dir, SIDECAR });
     const partial = try std.fmt.allocPrintSentinel(arena, "{s}.{d}.partial", .{ final_path, getpid() }, 0);
-    const fd = std.c.open(partial, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = crt.openWrite(partial, true);
     if (fd < 0) return error.SidecarNotWritable;
     var closed = false;
     defer if (!closed) {
-        _ = std.c.close(fd);
+        crt.close(fd);
     };
-    errdefer _ = std.c.unlink(partial);
+    errdefer crt.unlink(partial);
 
     var len_le: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_le, header.items.len, .little);
@@ -227,17 +228,17 @@ fn build(allocator: std.mem.Allocator, io: std.Io, src: Source, model_dir: []con
         defer allocator.free(bytes);
         try writeAll(fd, bytes);
     }
-    _ = std.c.close(fd);
+    crt.close(fd);
     closed = true;
     try std.Io.Dir.renameAbsolute(partial, final_path, io);
 }
 
 extern "c" fn getpid() c_int;
 
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) !void {
+fn writeAll(fd: c_int, bytes: []const u8) !void {
     var done: usize = 0;
     while (done < bytes.len) {
-        const n = std.c.write(fd, bytes[done..].ptr, bytes.len - done);
+        const n = crt.write(fd, bytes[done..]);
         if (n <= 0) return error.SidecarWrite;
         done += @intCast(n);
     }

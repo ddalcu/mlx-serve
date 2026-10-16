@@ -20,6 +20,11 @@ enum InterfacePrefKey {
     /// "#RRGGBB" ground painted under the default terminal theme; "" = the
     /// theme's own.
     static let terminalBackground = "terminalBackground"
+    /// A `Bundle.main.localizations` code, or anything else = follow the Mac.
+    static let language = "interfaceLanguage"
+    /// The last `AppleLanguages` override this app wrote — the companion that
+    /// tells "follow the Mac" which values in the app domain are ours.
+    static let languageApplied = "interfaceLanguageApplied"
     /// How the Voice, Music and Sound tabs draw the player (`AudioPlayerStyle`).
     static let audioPlayerStyle = "audioPlayerStyle"
 }
@@ -118,6 +123,63 @@ enum AppAppearanceMode: String, CaseIterable, Identifiable {
 
     static var current: AppAppearanceMode {
         AppAppearanceMode(rawValue: UserDefaults.standard.string(forKey: InterfacePrefKey.appearanceMode) ?? "") ?? .system
+    }
+}
+
+/// Settings ▸ Interface ▸ Language: follow the Mac, or one catalog the app
+/// ships. The named rows ARE the bundle's localizations, so a catalog added
+/// later is listed without a code change, and a code a build no longer ships
+/// reads as following the Mac rather than an unselected picker.
+struct AppLanguageChoice: Identifiable, Hashable {
+    /// nil = follow the Mac.
+    let code: String?
+    let label: String
+    var id: String { code ?? "" }
+
+    init(code: String?, label: String) {
+        self.code = code
+        self.label = label
+    }
+
+    /// The only row whose label is a word to translate; every other row is a
+    /// language's own spelling, shown verbatim in the language itself.
+    static let system = AppLanguageChoice(code: nil, label: L10n.text("System Default"))
+
+    /// "System Default" first, then every catalog the bundle ships, each in
+    /// its own spelling.
+    static var all: [AppLanguageChoice] {
+        rows(for: Bundle.main.localizations)
+    }
+
+    /// One row per catalog, in the bundle's own order. `Base` is the
+    /// storyboard shell, not a language, and the bundle lists a code twice
+    /// when it is both declared and shipped — `CFBundleLocalizations` names
+    /// `zh-Hans` and `ko` and an `.lproj` of each ships — so the first
+    /// sighting of a code wins and no language is drawn twice.
+    static func rows(for localizations: [String]) -> [AppLanguageChoice] {
+        var rows: [AppLanguageChoice] = [system]
+        for code in localizations where code != "Base" && !rows.contains(where: { $0.code == code }) {
+            rows.append(AppLanguageChoice(code: code, label: autonym(code)))
+        }
+        return rows
+    }
+
+    private static func autonym(_ code: String) -> String {
+        // Each language named in its own spelling, the script spelled out:
+        // zh-Hans reads 简体中文, the way System Settings lists it. The locale
+        // and the value are the same identifier, so the answer is never a
+        // translation of the name into some other language.
+        NSLocale(localeIdentifier: code).displayName(forKey: .identifier, value: code) ?? code
+    }
+
+    /// The row a stored preference names. Anything the bundle does not ship
+    /// — an empty value, a code a previous build had — is the Mac's own.
+    init(raw: String, localizations: [String]) {
+        if localizations.contains(raw) {
+            self.init(code: raw, label: Self.autonym(raw))
+        } else {
+            self = AppLanguageChoice.system
+        }
     }
 }
 

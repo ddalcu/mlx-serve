@@ -8,22 +8,35 @@
 
 #include "llama.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
-#include <pthread.h>
+#endif
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
 // llama.cpp's staging API for MTP (src/llama-ext.h, not in the xcframework's
 // headers). Exported with C++ linkage, so the mangled names pin these signatures
-// at link time.
-void    llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
-float * llama_get_embeddings_nextn(struct llama_context * ctx);
-float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+// at link time. The Windows release is built by MSVC, whose mangling this toolchain
+// does not produce, so there each one binds to its exported name.
+#ifdef _WIN32
+#define MSVC_NAME(n) __asm__(n)
+#else
+#define MSVC_NAME(n)
+#endif
+void    llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked)
+    MSVC_NAME("?llama_set_embeddings_nextn@@YAXPEAUllama_context@@_N1@Z");
+float * llama_get_embeddings_nextn(struct llama_context * ctx)
+    MSVC_NAME("?llama_get_embeddings_nextn@@YAPEAMPEAUllama_context@@@Z");
+float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i)
+    MSVC_NAME("?llama_get_embeddings_nextn_ith@@YAPEAMPEAUllama_context@@H@Z");
 
 struct mlx_llama_engine {
     struct llama_model *model;
@@ -59,7 +72,7 @@ struct mlx_llama_ctx {
     std::vector<Row> rows;
 };
 
-static pthread_once_t g_backend_once = PTHREAD_ONCE_INIT;
+static std::once_flag g_backend_once;
 
 // llama.cpp and ggml log to stderr by default (the loader dumps every metadata key);
 // route them through mlx-serve's leveled log (src/arch/llama.zig). CONT continues a line.
@@ -73,13 +86,25 @@ static void log_to_mlx_serve(enum ggml_log_level level, const char *text, void *
 static void backend_init_once(void) {
     llama_log_set(log_to_mlx_serve, nullptr);
     llama_backend_init();
-    // The Linux release loads its backends (CUDA, CPU) as plugins, which
-    // ggml looks for beside the executable; ours sit beside libllama.
+    // The Linux and Windows releases load their backends (CUDA, CPU) as plugins,
+    // which ggml looks for beside the executable; ours sit beside libllama.
+    if (ggml_backend_reg_count() != 0) return;
+#ifdef _WIN32
+    HMODULE mod = NULL;
+    char path[MAX_PATH];
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(void *)llama_backend_init, &mod) ||
+        GetModuleFileNameA(mod, path, MAX_PATH) == 0)
+        return;
+    std::string dir(path);
+    ggml_backend_load_all_from_path(dir.substr(0, dir.find_last_of("\\/")).c_str());
+#else
     Dl_info info;
-    if (ggml_backend_reg_count() == 0 && dladdr((void *)llama_backend_init, &info)) {
+    if (dladdr((void *)llama_backend_init, &info)) {
         std::string dir(info.dli_fname);
         ggml_backend_load_all_from_path(dir.substr(0, dir.rfind('/')).c_str());
     }
+#endif
 }
 
 static void copy_err(char *err, size_t errlen, const char *msg) {
@@ -93,7 +118,7 @@ extern "C" {
 
 mlx_llama_engine *mlx_llama_open(const char *gguf_path, int32_t n_gpu_layers, const char *mtp_path,
                                  bool load_mtp, char *err, size_t errlen) {
-    pthread_once(&g_backend_once, backend_init_once);
+    std::call_once(g_backend_once, backend_init_once);
 
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = n_gpu_layers;

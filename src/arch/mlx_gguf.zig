@@ -17,6 +17,7 @@ pub var enabled: bool = false;
 
 /// Resolved .gguf path when this engine serves `model_dir`, else null. Caller frees.
 pub fn servablePath(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
+    if (comptime @import("builtin").os.tag == .windows) return null; // Metal-only engine
     if (!enabled or !model_discovery.isGgufModelPath(io, model_dir)) return null;
     const path = model_discovery.resolveGgufFile(io, allocator, model_dir) catch return null;
     var f = gguf.gguf.File.open(allocator, path) catch {
@@ -38,6 +39,7 @@ pub const Sidecar = enum { config, tokenizer, tokenizer_config, generation_confi
 /// The JSON a model dir would hold in `<which>.json`, null when `model_dir`
 /// is not ours. Caller frees.
 pub fn sidecar(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, which: Sidecar) !?[]u8 {
+    if (comptime @import("builtin").os.tag == .windows) return null; // Metal-only engine
     const path = servablePath(io, allocator, model_dir) orelse return null;
     defer allocator.free(path);
     var f = try gguf.gguf.File.open(allocator, path);
@@ -63,6 +65,7 @@ pub fn weightBytes(io: std.Io, model_dir: []const u8) ?u64 {
 
 /// Fill `out` from the GGUF. False when `model_dir` is not ours.
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, out: *std.StringHashMap(mlx.mlx_array)) !bool {
+    if (comptime @import("builtin").os.tag == .windows) return false; // Metal-only engine
     const path = servablePath(io, allocator, model_dir) orelse return false;
     defer allocator.free(path);
     var f = try gguf.gguf.File.open(allocator, path);

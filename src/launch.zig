@@ -1172,8 +1172,14 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
     defer home.close(io);
     for (try configFiles(arena.allocator(), io, kind, base_url, model, budget, entries)) |f| {
         try home.createDirPath(io, std.fs.path.dirname(f.path).?);
-        try home.writeFile(io, .{ .sub_path = f.path, .data = f.data, .flags = if (f.private) .{ .permissions = .fromMode(0o600) } else .{} });
+        try home.writeFile(io, .{ .sub_path = f.path, .data = f.data, .flags = if (f.private) privateFileFlags() else .{} });
     }
+}
+
+/// Owner-only on POSIX; Windows has no mode bits (files inherit the profile's ACL).
+fn privateFileFlags() std.Io.Dir.CreateFileOptions {
+    if (comptime @import("builtin").os.tag == .windows) return .{};
+    return .{ .permissions = .fromMode(0o600) };
 }
 
 // ── Served launch script (`GET /launch`) ────────────────────────────────
