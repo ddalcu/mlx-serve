@@ -2278,6 +2278,13 @@ pub const DenoiseMemCap = struct {
         _ = mlx.mlx_set_memory_limit(&old, self.prev);
     }
 
+    /// `p.boundary()` under the caller's own limit: the limit is process-wide, and chat decodes
+    /// there. The next `step` re-arms the cap.
+    pub fn boundary(self: DenoiseMemCap, p: gen_sse.Progress) bool {
+        self.end();
+        return p.boundary();
+    }
+
     pub fn limitFor(active: usize, growth: usize, prev: usize) usize {
         return @min(prev, active +| growth +| HEADROOM);
     }
@@ -4744,7 +4751,7 @@ fn generateOne(
                 sc_consec += 1;
                 sc_skipped += 1;
                 if (progress) |p| {
-                    if (p.boundary()) return error.Cancelled;
+                    if (mem_cap.boundary(p)) return error.Cancelled;
                     p.emit("Generating", @intCast(i + 1), req.steps);
                 }
                 log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
@@ -4788,7 +4795,7 @@ fn generateOne(
             // pre-Euler noisy latent. Cached-velocity steps already continued
             // above without a preview. A failed JPEG never fails the job.
             if (progress) |p| {
-                if (p.boundary()) return error.Cancelled;
+                if (mem_cap.boundary(p)) return error.Cancelled;
                 tryEmitH3Preview(p, allocator, "Generating", @intCast(i + 1), req.steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
             }
 
@@ -4831,7 +4838,7 @@ fn generateOne(
             try mlx.check(mlx.mlx_array_eval(video_x));
             try mlx.check(mlx.mlx_array_eval(audio_x));
             if (progress) |p| {
-                if (p.boundary()) return error.Cancelled;
+                if (mem_cap.boundary(p)) return error.Cancelled;
             }
             // Every denoise loop owes a periodic cache clear: MLX's pool is
             // unbounded and these shapes repeat, so without it the process
@@ -7229,6 +7236,34 @@ test "minimax h3: the denoise memory cap allows the step's growth plus headroom 
     var after: usize = 0;
     _ = mlx.mlx_get_memory_limit(&after);
     try testing.expectEqual(before, after);
+}
+
+test "minimax h3: chat runs a denoise boundary under the caller's memory limit, and the next step re-arms the cap" {
+    const H = struct {
+        seen: usize = 0,
+        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32) void {}
+        fn step(ctx: *anyopaque) void {
+            _ = mlx.mlx_get_memory_limit(&@as(*@This(), @ptrCast(@alignCast(ctx))).seen);
+        }
+        fn serve(_: *anyopaque, _: *const std.atomic.Value(bool)) void {}
+        fn wake(_: *anyopaque) void {}
+    };
+    var h = H{};
+    const y = gen_sse.Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
+    gen_sse.gen_yield = &y;
+    defer gen_sse.gen_yield = null;
+    const p = gen_sse.Progress{ .ctx = &h, .cb = H.emitCb };
+    var before: usize = 0;
+    _ = mlx.mlx_get_memory_limit(&before);
+    const cap = DenoiseMemCap.begin();
+    defer cap.end();
+    cap.step(1 << 20);
+    try testing.expect(!cap.boundary(p));
+    try testing.expectEqual(before, h.seen);
+    cap.step(1 << 20);
+    var during: usize = 0;
+    _ = mlx.mlx_get_memory_limit(&during);
+    try testing.expect(during < before);
 }
 
 /// A toy DiT file at the block fixture's geometry: every block carries the fixture's block weights,
