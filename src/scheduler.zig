@@ -2899,6 +2899,7 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     errdefer cc.deinit();
 
     config.applyTokenizer(tok, cc.eos_token);
+    if (config.radio_vision) cc.video_placeholder = "<img>";
 
     return .{ .config = config, .tok = tok, .chat_config = cc };
 }

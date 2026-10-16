@@ -2670,6 +2670,8 @@ const NemotronMtpNames = struct {
 fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const Weights, names: NemotronMtpNames) !MtpModel {
     const N = NemotronMtpNames;
     var kb: [256]u8 = undefined;
+    // The head's MoE runs the uniform expert path; a latent head would draft through the wrong projection.
+    if (weights.get(N.key(&kb, names.moe, "mixer.fc1_latent_proj.weight")) != null) return error.UnsupportedLatentMtpHead;
     const has_shared = weights.get(N.key(&kb, names.moe, "mixer.shared_experts.up_proj.weight")) != null;
     // Every tensor lands in a local that frees itself on error; `m` below is
     // built with no fallible call and takes them all over.

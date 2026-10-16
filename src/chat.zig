@@ -406,12 +406,8 @@ pub fn formatChat(
     effort: ?[]const u8,
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
-    /// RADIO video parts use `<img>` instead of the template's `<video>` literal.
-    radio_video: bool,
 ) ![]u32 {
-    var render_config = chat_config.*;
-    if (radio_video) render_config.video_placeholder = "<img>";
-    const rendered = try renderChatTemplate(allocator, messages, &render_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
 
     var ids = std.ArrayList(u32).empty;
@@ -636,11 +632,11 @@ test "RADIO video placeholders: literal HTML stays text in every role" {
     const config = ChatConfig{
         .chat_template = "{% for m in messages %}{{ m.role + ':' }}{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
         .bos_token = null, .eos_token = null, .add_bos_token = false,
-        .allocator = a, .renders_tool_turn = true,
+        .allocator = a, .renders_tool_turn = true, .video_placeholder = "<img>",
     };
     for ([_][]const u8{ "system", "user", "assistant", "tool" }) |role| {
         const messages = [_]Message{.{ .role = role, .content = "How do I autoplay a <video> element?" }};
-        const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false, true);
+        const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false);
         defer a.free(ids);
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, ids, &.{1001}));
         const text = try tok.decode(a, ids, false);
@@ -655,12 +651,12 @@ test "RADIO video placeholders: only attached clips create video atoms" {
     defer tok.deinit();
     const config = ChatConfig{
         .chat_template = "{% for m in messages %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endfor %}",
-        .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a,
+        .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .video_placeholder = "<img>",
     };
     const clips = [_]VideoData{.{ .pixels = "", .grid_t = 128, .grid_h = 32, .grid_w = 32 }};
     const images = [_]ImageData{.{ .pixels = "", .width = 32, .height = 32 }};
     const messages = [_]Message{.{ .role = "user", .content = "Explain this <video> element and the clip.", .images = &images, .videos = &clips }};
-    const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false, true);
+    const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false);
     defer a.free(ids);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{1001}));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{1000}));

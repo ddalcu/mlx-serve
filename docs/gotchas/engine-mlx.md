@@ -4,7 +4,7 @@ Full histories: live failures, measurements, diagnosis ladders, dead ends. The d
 
 ### A restored LiLiCorr context had no correlation anchor
 
-DFlash prefix snapshots retain assistant K/V but not LiLiCorr's latest target feature. Treating the absent feature as an error killed a restored request before it could continue. The generator now takes one plain round, appends its captured target states, and reconstructs the anchor before resuming speculation. The snapshot layout is unchanged. Guard: `lilicorr missing restored anchor takes a plain round and recovers it`.
+Defect: a request restored from the prefix cache failed under LiLiCorr. Cause: snapshots keep the drafter K/V but not the latest target feature. Fix: take one plain round to capture it, then resume speculation; layout unchanged. Guard: `lilicorr missing restored anchor takes a plain round and recovers it`.
 
 ### `top_p: 0` masked every token and sampled uniform garbage (2026-09-16)
 The nucleus keeps a rank while the mass STRICTLY above it is `< top_p`. Rank 0 sees exactly 0, so a literal `top_p: 0` (what clients send for "greedy") kept nothing: the row went `-inf` everywhere and the categorical draw was uniform over 248k ids ("będziemyWATCH끈 გა stimulation"). 0.001 and up were fine, which is why no sweep ever saw it. Fix: the threshold floors at `floatMin(f32)`, so rank 0 is always inside and `top_p 0` is greedy like `top_k 1`. Guard: `applyTopP at top_p 0 keeps exactly the argmax` (generate.zig) + `tests/test_api_edges.sh` (top_p 0 == temperature 0 live).

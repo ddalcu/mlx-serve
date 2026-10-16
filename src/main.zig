@@ -1408,6 +1408,7 @@ pub fn main(init: std.process.Init) !void {
         scheduler_mod.applyModelSettings(config, chat_config, &settings, enable_mtp);
     }
     config.applyTokenizer(tok, chat_config.eos_token);
+    if (config.radio_vision) chat_config.video_placeholder = "<img>";
 
     const load_vision = config.has_vision and !no_vision;
 
@@ -1591,7 +1592,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .role = "user", .content = user_prompt },
         };
 
-        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false, null, false, false);
+        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false, null, false);
         defer allocator.free(prompt_ids);
 
         // Reset peak memory before generation

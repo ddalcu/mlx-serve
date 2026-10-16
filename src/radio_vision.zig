@@ -119,6 +119,10 @@ pub fn targetPatchesVideo(src_h: u32, src_w: u32) PatchGrid {
             pw = @max(divisor, pw_down);
         }
     }
+    // Past `target / divisor` aspect the short side sits on its floor; trim the long one.
+    if (ph * pw > target) {
+        if (pw > ph) pw = @max(divisor, target / ph / divisor * divisor) else ph = @max(divisor, target / pw / divisor * divisor);
+    }
     if (ph == 0 or pw == 0) return .{ .w = 32, .h = 32 };
     return .{ .w = pw, .h = ph };
 }
@@ -300,29 +304,45 @@ pub const VideoPrepared = struct {
 };
 
 /// Every frame resized to frame 0's video grid, CLIP-normalized, concatenated
-/// as float32 CHW. The encoder repeats a short last tubelet; this buffer does not.
-pub fn prepareVideo(allocator: std.mem.Allocator, rgbs: []const []const u8, hs: []const u32, ws: []const u32) !VideoPrepared {
-    if (rgbs.len == 0 or rgbs.len != hs.len or rgbs.len != ws.len or rgbs.len > std.math.maxInt(u32)) return error.InvalidVisionInput;
-    const grid = targetPatchesVideo(hs[0], ws[0]);
-    const tw = grid.w * PATCH;
-    const th = grid.h * PATCH;
-    const plane: usize = @as(usize, th) * tw;
-    const frame_bytes = plane * 3 * @sizeOf(f32);
-    const buf = try allocator.alloc(u8, rgbs.len * frame_bytes);
-    errdefer allocator.free(buf);
-    for (rgbs, hs, ws, 0..) |rgb, h, w, i| {
-        const bytes: []align(@alignOf(f32)) u8 = @alignCast(buf[i * frame_bytes ..][0..frame_bytes]);
-        try resizeClipChw(allocator, std.mem.bytesAsSlice(f32, bytes), rgb, h, w, th, tw);
+/// as float32 CHW. Frames are added one at a time so a caller can free each
+/// decoded frame before the next. The encoder repeats a short last tubelet; this buffer does not.
+pub const VideoBuilder = struct {
+    buf: []u8,
+    frames: u32,
+    th: u32,
+    tw: u32,
+
+    pub fn init(allocator: std.mem.Allocator, frames: usize, h0: u32, w0: u32) !VideoBuilder {
+        if (frames == 0 or frames > std.math.maxInt(u32)) return error.InvalidVisionInput;
+        const grid = targetPatchesVideo(h0, w0);
+        const th = grid.h * PATCH;
+        const tw = grid.w * PATCH;
+        return .{ .buf = try allocator.alloc(u8, frames * frameBytes(th, tw)), .frames = @intCast(frames), .th = th, .tw = tw };
     }
-    const geom = videoGeometry(@intCast(rgbs.len), th, tw) orelse return error.InvalidVisionInput;
-    return .{
-        .pixels = buf,
-        .frames = geom.frames,
-        .h = th,
-        .w = tw,
-        .tokens = geom.spatial,
-        .groups = geom.groups,
-    };
+
+    fn frameBytes(th: u32, tw: u32) usize {
+        return @as(usize, th) * tw * 3 * @sizeOf(f32);
+    }
+
+    pub fn add(self: *VideoBuilder, allocator: std.mem.Allocator, i: usize, rgb: []const u8, h: u32, w: u32) !void {
+        const fb = frameBytes(self.th, self.tw);
+        const bytes: []align(@alignOf(f32)) u8 = @alignCast(self.buf[i * fb ..][0..fb]);
+        try resizeClipChw(allocator, std.mem.bytesAsSlice(f32, bytes), rgb, h, w, self.th, self.tw);
+    }
+
+    /// Hands `buf` to the result; on error the caller frees it.
+    pub fn finish(self: VideoBuilder) !VideoPrepared {
+        const geom = videoGeometry(self.frames, self.th, self.tw) orelse return error.InvalidVisionInput;
+        return .{ .pixels = self.buf, .frames = geom.frames, .h = self.th, .w = self.tw, .tokens = geom.spatial, .groups = geom.groups };
+    }
+};
+
+pub fn prepareVideo(allocator: std.mem.Allocator, rgbs: []const []const u8, hs: []const u32, ws: []const u32) !VideoPrepared {
+    if (rgbs.len == 0 or rgbs.len != hs.len or rgbs.len != ws.len) return error.InvalidVisionInput;
+    var vb = try VideoBuilder.init(allocator, rgbs.len, hs[0], ws[0]);
+    errdefer allocator.free(vb.buf);
+    for (rgbs, hs, ws, 0..) |rgb, h, w, i| try vb.add(allocator, i, rgb, h, w);
+    return vb.finish();
 }
 
 const Block = struct {
@@ -1286,6 +1306,14 @@ test "radio targetPatches keeps a wide image inside the patch cap" {
     try std.testing.expect(g.w % 2 == 0 and g.h % 2 == 0);
     try std.testing.expect(g.w * g.h <= ENGINE_MAX_PATCHES);
     try std.testing.expect(g.w * g.h >= MIN_PATCHES);
+}
+
+test "radio targetPatchesVideo stays within the patch budget at extreme aspect ratios" {
+    for ([_][2]u32{ .{ 64, 4000 }, .{ 1, 10000 }, .{ 10000, 1 } }) |hw| {
+        const g = targetPatchesVideo(hw[0], hw[1]);
+        try std.testing.expect(g.w * g.h <= VIDEO_TARGET_PATCHES);
+        try std.testing.expect(g.w % DOWNSAMPLE == 0 and g.h % DOWNSAMPLE == 0);
+    }
 }
 
 test "radio targetPatchesVideo snaps 16:9 and 9:16 onto the 1024-patch budget" {

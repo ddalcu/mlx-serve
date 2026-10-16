@@ -14546,7 +14546,7 @@ fn cachedFormatChat(
     else if (lm.llama_engine) |engine|
         try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
     else
-        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, if (lm.config) |c| c.radio_vision else false);
+        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final);
     if (cache_ptr) |cache| if (key_opt) |key| {
         // Insert is best-effort; an OOM in the cache shouldn't fail the
         // request — the user already has their tokenized prompt.
@@ -16480,29 +16480,23 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
 /// raw frame count. Null when any frame is not a decodable image.
 fn decodeRadioVideo(allocator: std.mem.Allocator, frame_urls: []const []const u8) ?chat_mod.VideoData {
     if (frame_urls.len == 0) return null;
-    var rgbs: std.ArrayList([]u8) = .empty;
-    defer {
-        for (rgbs.items) |rgb| allocator.free(rgb);
-        rgbs.deinit(allocator);
+    var vb: ?radio_vision.VideoBuilder = null;
+    for (frame_urls, 0..) |url, i| {
+        const frame = decodeFrameUrl(allocator, url, true) orelse return cancelRadioVideo(allocator, vb);
+        defer frame.deinit(allocator);
+        if (vb == null) vb = radio_vision.VideoBuilder.init(allocator, frame_urls.len, frame.h, frame.w) catch return null;
+        vb.?.add(allocator, i, frame.rgb, frame.h, frame.w) catch return cancelRadioVideo(allocator, vb);
     }
-    var hs: std.ArrayList(u32) = .empty;
-    defer hs.deinit(allocator);
-    var ws: std.ArrayList(u32) = .empty;
-    defer ws.deinit(allocator);
-    for (frame_urls) |url| {
-        const frame = decodeFrameUrl(allocator, url, true) orelse return null;
-        rgbs.append(allocator, frame.rgb) catch {
-            frame.deinit(allocator);
-            return null;
-        };
-        hs.append(allocator, frame.h) catch return null;
-        ws.append(allocator, frame.w) catch return null;
-    }
-    const prepared = radio_vision.prepareVideo(allocator, rgbs.items, hs.items, ws.items) catch return null;
+    const prepared = vb.?.finish() catch return cancelRadioVideo(allocator, vb);
     log.info("  Decoded {d} frames → RADIO video {d}x{d} ({d} tubelets x {d} tokens)\n", .{
         frame_urls.len, prepared.w, prepared.h, prepared.groups, prepared.tokens,
     });
     return .{ .pixels = prepared.pixels, .grid_t = prepared.frames, .grid_h = prepared.h, .grid_w = prepared.w };
+}
+
+fn cancelRadioVideo(allocator: std.mem.Allocator, vb: ?radio_vision.VideoBuilder) ?chat_mod.VideoData {
+    if (vb) |v| allocator.free(v.buf);
+    return null;
 }
 
 /// Decode a `video_url` block's `frames` array into `list`, mirroring

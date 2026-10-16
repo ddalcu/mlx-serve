@@ -36214,9 +36214,12 @@ fn nemotronMoeExpertsRouted(x: mlx.mlx_array, route_x: mlx.mlx_array, nm: *const
     defer _ = mlx.mlx_array_free(x_flat);
     try mlx.check(mlx.mlx_reshape(&x_flat, x, &[_]c_int{ t_count, d_dim }, 2, s));
 
-    var route_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(route_flat);
-    try mlx.check(mlx.mlx_reshape(&route_flat, route_x, &[_]c_int{ t_count, mlx.getShape(route_x)[2] }, 2, s));
+    var route_owned = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(route_owned);
+    const route_flat = if (route_x.ctx == x.ctx) x_flat else blk: {
+        try mlx.check(mlx.mlx_reshape(&route_owned, route_x, &[_]c_int{ t_count, mlx.getShape(route_x)[2] }, 2, s));
+        break :blk route_owned;
+    };
 
     const row_logits = if (cfg.rowExactDecode() and nm.router_rows.ctx != null) try rowqmv.router(route_flat, nm.router_rows, s) else null;
     const logits = row_logits orelse try projectWithConfig(cfg, route_flat, nm.router_w, nm.router_s, nm.router_b, s);
@@ -65305,8 +65308,8 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
     var arrs: [14]mlx.mlx_array = undefined;
     const shapes = [_][]const c_int{
-        &.{ 1, t_len, c_dim },     &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim },            &.{ 1, hv, 128, 128 },
-        &.{ c_dim, 4, 1 },         &.{hv},                   &.{hv},             &.{128},            &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
+        &.{ 1, t_len, c_dim }, &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 },
+        &.{ c_dim, 4, 1 },     &.{hv},                   &.{hv},              &.{128},             &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
         &.{ 1, t_len + 1, c_dim }, &.{ 1, 3, c_dim + 1 },
     };
     for (&arrs, shapes) |*a, sh| a.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
@@ -74638,35 +74641,35 @@ test "glm5_next verify windows of 2..16 rows track the same rows decoded one at 
     };
     // A short tail chunk of a prefix-cache restore is a prefill, not a verify: both modes ride the same rows.
     for ([_]bool{ true, false }) |mode_verify| {
-        var w: usize = 2;
-        while (w <= 16) : (w += 1) {
-            const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
-            // The window in one forward.
-            try xfm.resetCache();
-            _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
-            const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
-            defer _ = mlx.mlx_array_free(got_arr);
-            const got = try qwen4ReadF32(allocator, got_arr, s);
-            defer allocator.free(got);
-            // The same rows one at a time.
-            try xfm.resetCache();
-            _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
-            var worst: f64 = 1.0;
-            var misses: usize = 0;
-            for (0..w) |r| {
-                const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
-                defer _ = mlx.mlx_array_free(one);
-                const want = try qwen4ReadF32(allocator, one, s);
-                defer allocator.free(want);
-                const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
-                worst = @min(worst, cmp.min_cos);
-                misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
-            }
-            std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
-            // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
-            // rows before the wide windows existed): a broken row path lands far below this.
-            try testing.expect(worst > 0.94);
+    var w: usize = 2;
+    while (w <= 16) : (w += 1) {
+        const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
+        // The window in one forward.
+        try xfm.resetCache();
+        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+        const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
+        defer _ = mlx.mlx_array_free(got_arr);
+        const got = try qwen4ReadF32(allocator, got_arr, s);
+        defer allocator.free(got);
+        // The same rows one at a time.
+        try xfm.resetCache();
+        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+        var worst: f64 = 1.0;
+        var misses: usize = 0;
+        for (0..w) |r| {
+            const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
+            defer _ = mlx.mlx_array_free(one);
+            const want = try qwen4ReadF32(allocator, one, s);
+            defer allocator.free(want);
+            const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+            worst = @min(worst, cmp.min_cos);
+            misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
         }
+        std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
+        // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
+        // rows before the wide windows existed): a broken row path lands far below this.
+        try testing.expect(worst > 0.94);
+    }
     }
 }
 

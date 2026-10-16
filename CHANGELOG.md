@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **NVIDIA Nemotron 3.5 Bolt and Super.** The omni packs serve text, images and video (RADIO tower), and draft with their LiLiCorr DFlash drafter on every API.
+- **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs.
+
 ## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
 
 - **Speech to text.** `POST /v1/audio/transcriptions` turns WAV recordings into text in 30 languages with Qwen3-ASR, through the OpenAI SDK's own transcription call, with word and sentence times and SRT/WebVTT subtitles in 11 of them from Qwen3-ForcedAligner, and who said what (`diarized_json`, up to eight speakers) from NVIDIA's Nemotron 3 Diarization; the app downloads both alongside.
