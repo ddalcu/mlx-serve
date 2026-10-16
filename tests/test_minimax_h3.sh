@@ -54,13 +54,12 @@ curl -s "http://127.0.0.1:$PORT/v1/models" | grep -q '"video"' \
   || { echo "FAIL: /v1/models missing video capability"; rc=1; }
 # The NUMBER is the assertion, not the line: the line printed happily while
 # the stub's modality-static model_type routed the bill to the 64.5 GB sum.
-# The three stages are DISJOINT (TE freed before the DiT loads, DiT freed
-# before the VAEs), and the DiT sheds its AdaLN weights, so the 8-bit pack's
-# bill is max(TE 26.28, DiT 32.83x0.65 + turbo 0.73 + 6 activations) = 28.06 —
-# against a 64.5 GB sum and the 38.97 this used to read.
+# The stages are DISJOINT and the weights stream by default, so the 8-bit
+# pack's bill is its biggest stage, the VAE (decoder file + base), above the
+# streamed TE and DiT; never the 64.5 GB sum or the resident plan's ~28.
 PEAK=$(grep -m1 "media peak" "$LOG" | sed -E 's/.*media peak ~([0-9.]+) GB.*/\1/')
-if [ -n "$PEAK" ] && python3 -c "import sys; sys.exit(0 if 24.0 < float('$PEAK') < 32.0 else 1)"; then
-  echo "PASS: media preflight billed the biggest stage (~$PEAK GB, not the ~64.5 sum)"
+if [ -n "$PEAK" ] && python3 -c "import sys; sys.exit(0 if 4.5 < float('$PEAK') < 9.0 else 1)"; then
+  echo "PASS: media preflight billed the biggest streamed stage (~$PEAK GB, not the ~64.5 sum)"
 else
   echo "FAIL: media preflight peak '$PEAK' GB is not the staged bill"; rc=1
 fi
