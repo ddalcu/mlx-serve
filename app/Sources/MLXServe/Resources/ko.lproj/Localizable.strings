@@ -2258,3 +2258,7 @@
 "Loading %@ · %@" = "%1$@ 로드 중 · %2$@";
 "%@ is ready" = "%@ 준비 완료";
 "The model finished loading." = "모델 로드를 마쳤습니다.";
+"Step %lld of %lld" = "스텝 %lld/%lld";
+"Window %lld of %lld · step %lld of %lld" = "윈도우 %lld/%lld · 스텝 %lld/%lld";
+"%.1f s per step" = "스텝당 %.1f초";
+"%.1f min per step" = "스텝당 %.1f분";

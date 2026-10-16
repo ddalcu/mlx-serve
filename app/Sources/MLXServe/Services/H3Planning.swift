@@ -414,6 +414,14 @@ struct H3StepClock {
         durations.append(max(0, now - previous))
     }
 
+    /// The mean lap past the first, or nil before there are two: the same
+    /// amortized step cost `liveEta` prices what is left with.
+    var secondsPerStep: Double? {
+        let laps = durations.dropFirst()
+        guard laps.count >= 2 else { return nil }
+        return laps.reduce(0, +) / Double(laps.count)
+    }
+
     /// Seconds remaining, or nil while there is not enough to say. See
     /// `H3TimeEstimate.liveEta` for why the first lap is discarded.
     func eta(totalSteps: Int, floorPerStep: Double = 0, tail: Double = 0) -> Double? {

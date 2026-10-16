@@ -2152,12 +2152,24 @@ struct VideoGenView: View {
                                 .frame(maxHeight: 220)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                         }
-                        ProgressView(value: Double(step), total: max(1, Double(total)))
-                            .progressViewStyle(.linear)
-                            .frame(width: 240)
-                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
-                        Text(service.startedAt, style: .timer)
-                            .font(.app(.footnote)).monospacedDigit().foregroundStyle(.secondary)
+                        if let readout = service.readout {
+                            ProgressView(value: readout.fraction)
+                                .progressViewStyle(.linear)
+                                .frame(width: 240)
+                            Text(verbatim: (["\(readout.percent)%", readout.stepLine] + [readout.pace].compactMap { $0 })
+                                .joined(separator: " · "))
+                                .font(.app(.footnote)).monospacedDigit()
+                        } else {
+                            ProgressView(value: Double(step), total: max(1, Double(total)))
+                                .progressViewStyle(.linear)
+                                .frame(width: 240)
+                        }
+                        HStack(spacing: 4) {
+                            Text(message)
+                            Text(verbatim: "·")
+                            Text(service.startedAt, style: .timer).monospacedDigit()
+                        }
+                        .font(.app(.footnote)).foregroundStyle(.secondary)
                     }
                 case .completed(let path):
                     completedPreview(path: path)

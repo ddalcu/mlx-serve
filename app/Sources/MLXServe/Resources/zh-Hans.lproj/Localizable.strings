@@ -2270,3 +2270,7 @@
 "Loading %@ · %@" = "正在加载 %@ · %@";
 "%@ is ready" = "%@ 已就绪";
 "The model finished loading." = "模型已加载完成。";
+"Step %lld of %lld" = "第 %lld/%lld 步";
+"Window %lld of %lld · step %lld of %lld" = "窗口 %lld/%lld · 第 %lld/%lld 步";
+"%.1f s per step" = "每步 %.1f 秒";
+"%.1f min per step" = "每步 %.1f 分钟";

@@ -34,6 +34,8 @@ final class VideoGenService: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var livePreview: NSImage? = nil
+    /// Percent, step, pace and workload of the current run; nil until its first progress event.
+    @Published private(set) var readout: VideoRunReadout? = nil
     /// When the current run started; read only while `phase` is `.running`.
     @Published private(set) var startedAt = Date()
     @Published private(set) var recent: [String] = []
@@ -52,7 +54,9 @@ final class VideoGenService: ObservableObject {
         phase = p
         switch p {
         case .running: break
-        default: livePreview = nil
+        default:
+            livePreview = nil
+            readout = nil
         }
     }
 
@@ -95,6 +99,7 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
+        readout = nil
         startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
@@ -207,7 +212,7 @@ final class VideoGenService: ObservableObject {
     /// `progress` events (`label` prefixes the stage, e.g. the shot number) and
     /// return the decoded frames. A server `error` event throws its message.
     private func streamWindow(_ request: VideoGenRequest, body: [String: Any], port: UInt16, gen: Int,
-                              label: String = "") async throws -> DecodedFrames {
+                              label: String = "", shot: Int = 0, shots: Int = 1) async throws -> DecodedFrames {
         let steps = request.steps
         var decoded: DecodedFrames? = nil
         // Live ETA from the run's own cadence — the only estimate that
@@ -225,6 +230,11 @@ final class VideoGenService: ObservableObject {
                                          frames: request.numFrames, steps: steps,
                                          fast: !request.bestQuality && !request.turbo)
             : (0, 0)
+        let samplingShare = request.model.backend == .minimaxH3
+            ? VideoRunReadout.samplingShare(perStep: pricing.perStep, steps: steps, tail: pricing.tail)
+            : VideoRunReadout.ltxSamplingShare
+        // Server facts: each arrives once and rides every later event.
+        var window: Int? = nil, windows: Int? = nil
         let startedAt = ProcessInfo.processInfo.systemUptime
         for try await ev in api.streamGeneration(
             port: port, path: "/v1/video/generations", json: body) {
@@ -242,6 +252,14 @@ final class VideoGenService: ObservableObject {
                 }
                 if let data = MediaSSE.previewJPEG(ev), let img = NSImage(data: data) {
                     setLivePreview(img, for: gen)
+                }
+                window = ev["window"] as? Int ?? window
+                windows = ev["windows"] as? Int ?? windows
+                if gen == generationSeq {
+                    readout = VideoRunReadout.make(
+                        step: step, total: total, window: window, windows: windows,
+                        shot: shot, shots: shots, samplingShare: samplingShare,
+                        secondsPerStep: clock.secondsPerStep)
                 }
                 setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
             case "complete":
@@ -286,6 +304,7 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
+        readout = nil
         startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
@@ -342,7 +361,8 @@ final class VideoGenService: ObservableObject {
                     let body = Self.requestBody(model: modelId, prompt: req.prompt, request: req,
                                                 firstFrameB64: first, lastFrameB64: last)
                     let label = L10n.format("Shot %lld of %lld · ", Int64(i + 1), Int64(shots.count))
-                    let frames = try await streamWindow(req, body: body, port: port, gen: gen, label: label)
+                    let frames = try await streamWindow(req, body: body, port: port, gen: gen, label: label,
+                                                        shot: i, shots: shots.count)
                     setPhase(.running(step: req.steps, total: req.steps, message: label + L10n.text("Encoding mp4…")), for: gen)
                     let url = shotsDir.appendingPathComponent(String(format: "shot-%02d.mp4", i + 1))
                     let png = shotsDir.appendingPathComponent(String(format: "shot-%02d-last.png", i + 1))
