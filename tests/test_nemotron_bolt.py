@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bolt image/video integration and LiLiCorr on/off measurements (stdlib only)."""
+"""Nemotron RADIO image/video integration and LiLiCorr measurements (stdlib only)."""
 import argparse
 import base64
 import hashlib
@@ -43,7 +43,8 @@ class Server:
             sock.bind(('127.0.0.1', 0))
             self.port = sock.getsockname()[1]
         self.base = f'http://127.0.0.1:{self.port}'
-        self.command = [str(args.binary), '--model', str(args.model), '--drafter', str(args.drafter),
+        drafter_flags = ['--drafter', str(args.drafter)] if args.drafter else ['--no-drafter']
+        self.command = [str(args.binary), '--model', str(args.model), *drafter_flags,
                         '--serve', '--host', '127.0.0.1', '--port', str(self.port),
                         '--ctx-size', '32768', '--max-tokens', '256', '--reasoning-budget', '0',
                         '--no-mtp', '--no-pld', '--prefix-cache-entries', '8' if args.checks == 'restore' else '0', '--prefix-cache-disk', 'off',
@@ -112,7 +113,9 @@ def spec_stats(log):
 
 def vision_checks(server):
     assert {'image', 'video'} <= set(server.model['input_modalities']), server.model
-    results = {'literal_html': server.chat('Explain how an HTML <video> element works in one sentence.')}
+    results = {'text': server.chat('What is 17 + 25? Reply with just the integer.', tokens=16)}
+    assert re.search(r'\b42\b', text_of(results['text'])), results['text']
+    results['literal_html'] = server.chat('Explain how an HTML <video> element works in one sentence.')
     assert text_of(results['literal_html']).strip()
     results['image'] = server.chat([
         {'type': 'text', 'text': 'Name the main subject of this image in one sentence.'},
@@ -206,11 +209,16 @@ def main():
     parser.add_argument('--reps', type=int, default=3)
     args = parser.parse_args()
     args.model, args.binary, args.output = args.model.resolve(), args.binary.resolve(), args.output.resolve()
-    args.drafter = (args.drafter or args.model / 'drafter').resolve()
+    if args.drafter is not None:
+        args.drafter = args.drafter.resolve()
+    elif (args.model / 'drafter' / 'config.json').is_file():
+        args.drafter = (args.model / 'drafter').resolve()
+    if args.checks != 'vision' and args.drafter is None:
+        parser.error('drafter checks require --drafter or a model/drafter sidecar')
     assert args.reps > 0
     args.output.mkdir(parents=True, exist_ok=True)
     results = {'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(), 'model': str(args.model),
-               'drafter': str(args.drafter), 'checks': args.checks, 'repetitions': args.reps}
+               'drafter': str(args.drafter) if args.drafter else None, 'checks': args.checks, 'repetitions': args.reps}
     server = Server(args)
     try:
         results['command'] = server.command

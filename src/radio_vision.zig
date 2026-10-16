@@ -1,4 +1,4 @@
-//! RADIO tower + nemotron_omni projector for Nemotron 3.5 Bolt.
+//! RADIO tower + nemotron_omni projector for Nemotron 3.5 Bolt and Super.
 //!
 //! Weights keep the checkpoint names (`vision_model.radio_model.model.*`,
 //! `mlp1.*`). The transformers rename in modeling_radio.py is not applied.
@@ -31,7 +31,6 @@ pub const DOWNSAMPLE: u32 = 2;
 pub const TEMPORAL: u32 = 2;
 /// Patch budget for a video frame (`video_target_num_patches`), pre-shuffle.
 pub const VIDEO_TARGET_PATCHES: u32 = 1024;
-const LN_EPS: f32 = 1e-6;
 const PROJECTOR_EPS: f32 = 1e-5;
 
 /// OPENAI / RADIO CLIP normalization. The tower's input_conditioner is unused;
@@ -380,6 +379,27 @@ fn must(weights: *const Weights, buf: *[320]u8, comptime fmt: []const u8, args: 
     };
 }
 
+fn loadProjectorLinear(weights: *const Weights, base: []const u8, in_dim: u32) !glm_vision.Lin {
+    var buf: [320]u8 = undefined;
+    var linear = glm_vision.Lin{ .w = try must(weights, &buf, "{s}.weight", .{base}) };
+    const shape = mlx.getShape(linear.w);
+    if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0) return error.InvalidVisionWeights;
+    const scales_name = std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch return error.InvalidVisionWeights;
+    if (weights.get(scales_name)) |scales| {
+        linear.scales = scales;
+        const bias_name = std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch return error.InvalidVisionWeights;
+        linear.biases = weights.get(bias_name) orelse .{ .ctx = null };
+        const scale_shape = mlx.getShape(scales);
+        if (mlx.mlx_array_dtype(linear.w) != .uint32 or scale_shape.len != 2 or scale_shape[0] != shape[0]) return error.InvalidVisionWeights;
+        if (linear.biases.ctx != null and !std.mem.eql(c_int, scale_shape, mlx.getShape(linear.biases))) return error.InvalidVisionWeights;
+        linear.qp = transformer.quantParamsFromGeometry(linear.w, scales, linear.biases.ctx != null, in_dim) orelse return error.InvalidVisionWeights;
+        if (linear.qp.?.mode == .affine and linear.biases.ctx == null) return error.InvalidVisionWeights;
+    } else if (shape[1] != in_dim or mlx.mlx_array_dtype(linear.w) == .uint32) {
+        return error.InvalidVisionWeights;
+    }
+    return linear;
+}
+
 fn patchGrid(height: u32, width: u32) !struct { u32, u32 } {
     if (height % PATCH != 0 or width % PATCH != 0) return error.InvalidVisionInput;
     const rows = height / PATCH;
@@ -410,6 +430,7 @@ pub const RadioVision = struct {
     hidden: u32,
     heads: u32,
     head_dim: u32,
+    ln_eps: f32,
     prefix: u32,
     pos_side: u32,
     out_hidden: u32,
@@ -421,9 +442,11 @@ pub const RadioVision = struct {
     pos_table: mlx.mlx_array,
     cls: mlx.mlx_array,
     blocks: []Block,
+    final_norm_w: mlx.mlx_array,
+    final_norm_b: mlx.mlx_array,
     proj_norm: mlx.mlx_array,
-    proj_fc1: mlx.mlx_array,
-    proj_fc2: mlx.mlx_array,
+    proj_fc1: glm_vision.Lin,
+    proj_fc2: glm_vision.Lin,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !RadioVision {
         const s = mlx.gpuStream();
@@ -487,9 +510,24 @@ pub const RadioVision = struct {
         const cls = try must(weights, &buf, "vision_model.radio_model.model.patch_generator.cls_token.token", .{});
         const cls_shape = mlx.getShape(cls);
         if (cls_shape.len != 2 or cls_shape[0] <= 0 or cls_shape[1] != hidden) return error.InvalidVisionWeights;
-        const fc2 = try must(weights, &buf, "mlp1.3.weight", .{});
-        const fc2_shape = mlx.getShape(fc2);
-        if (fc2_shape.len != 2) return error.InvalidVisionWeights;
+        const nested = weights.get("mlp1.layers.0.weight") != null;
+        const proj_norm = try must(weights, &buf, "{s}.0.weight", .{if (nested) "mlp1.layers" else "mlp1"});
+        const norm_shape = mlx.getShape(proj_norm);
+        if (norm_shape.len != 1 or norm_shape[0] != hidden * DOWNSAMPLE * DOWNSAMPLE) return error.InvalidVisionWeights;
+        const fc1 = try loadProjectorLinear(weights, if (nested) "mlp1.layers.1" else "mlp1.1", hidden * DOWNSAMPLE * DOWNSAMPLE);
+        const fc1_shape = mlx.getShape(fc1.w);
+        const fc2 = try loadProjectorLinear(weights, if (nested) "mlp1.layers.3" else "mlp1.3", @intCast(fc1_shape[0]));
+        const fc2_shape = mlx.getShape(fc2.w);
+        var final_w = mlx.mlx_array{ .ctx = null };
+        var final_b = mlx.mlx_array{ .ctx = null };
+        if (config.radio_final_layernorm) {
+            final_w = try must(weights, &buf, "vision_projector.vision_final_layernorm.weight", .{});
+            final_b = try must(weights, &buf, "vision_projector.vision_final_layernorm.bias", .{});
+            for ([_]mlx.mlx_array{ final_w, final_b }) |value| {
+                const shape = mlx.getShape(value);
+                if (shape.len != 1 or shape[0] != hidden) return error.InvalidVisionWeights;
+            }
+        }
 
         log.info("Vision encoder: RADIO (depth={d}, hidden={d}, heads={d}, prefix={d}, pos={d}, out={d}, patch cap={d})\n", .{
             depth, hidden, heads, cls_shape[0], side, fc2_shape[0], ENGINE_MAX_PATCHES,
@@ -500,6 +538,7 @@ pub const RadioVision = struct {
             .hidden = hidden,
             .heads = heads,
             .head_dim = hidden / heads,
+            .ln_eps = config.radio_ln_eps,
             .prefix = @intCast(cls_shape[0]),
             .pos_side = side,
             .out_hidden = @intCast(fc2_shape[0]),
@@ -509,8 +548,10 @@ pub const RadioVision = struct {
             .pos_table = pos_table,
             .cls = cls,
             .blocks = blocks,
-            .proj_norm = try must(weights, &buf, "mlp1.0.weight", .{}),
-            .proj_fc1 = try must(weights, &buf, "mlp1.1.weight", .{}),
+            .final_norm_w = final_w,
+            .final_norm_b = final_b,
+            .proj_norm = proj_norm,
+            .proj_fc1 = fc1,
             .proj_fc2 = fc2,
         };
     }
@@ -655,6 +696,7 @@ pub const RadioVision = struct {
         }
 
         glm_vision.replace(&x, try self.dropPrefix(x));
+        if (self.final_norm_w.ctx != null) glm_vision.replace(&x, try self.layerNorm(x, self.final_norm_w, self.final_norm_b));
         glm_vision.replace(&x, try self.pixelShuffle(x, rows, cols));
         glm_vision.replace(&x, try self.projector(x));
         return x;
@@ -867,16 +909,16 @@ pub const RadioVision = struct {
         var normed = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(normed);
         try mlx.check(mlx.mlx_fast_rms_norm(&normed, x, self.proj_norm, PROJECTOR_EPS, self.s));
-        const up = try self.dense(normed, self.proj_fc1, .{ .ctx = null });
+        const up = try glm_vision.linear(normed, self.proj_fc1, self.s);
         defer _ = mlx.mlx_array_free(up);
         const act = try transformer.reluSquaredOp(up, self.s);
         defer _ = mlx.mlx_array_free(act);
-        return self.dense(act, self.proj_fc2, .{ .ctx = null });
+        return glm_vision.linear(act, self.proj_fc2, self.s);
     }
 
     fn layerNorm(self: *RadioVision, x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array) !mlx.mlx_array {
         var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_fast_layer_norm(&out, x, w, b, LN_EPS, self.s));
+        try mlx.check(mlx.mlx_fast_layer_norm(&out, x, w, b, self.ln_eps, self.s));
         return out;
     }
 
@@ -895,9 +937,13 @@ const RadioFixture = struct {
     weights: Weights,
 
     fn open() !RadioFixture {
+        return openEmbedded(@embedFile("fixtures/radio_tiny.safetensors"));
+    }
+
+    fn openEmbedded(bytes: []const u8) !RadioFixture {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "radio.safetensors", .data = @embedFile("fixtures/radio_tiny.safetensors") });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "radio.safetensors", .data = bytes });
         var buf: [1024]u8 = undefined;
         const dir = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
         return .{ .tmp = tmp, .weights = try model_mod.loadWeightsWithVision(std.testing.io, std.testing.allocator, dir) };
@@ -951,6 +997,96 @@ test "radio reference: full image/video forward and EVS on a decoded clip" {
     const expected = try fx.tensor("video_mask");
     try mlx.check(mlx.mlx_array_eval(expected));
     try std.testing.expectEqualSlices(bool, mlx.mlx_array_data_bool(expected).?[0..mask.len], mask);
+}
+
+test "radio Super reference: native quantized projector and pre-shuffle normalization" {
+    var fx = try RadioFixture.openEmbedded(@embedFile("fixtures/radio_super_tiny.safetensors"));
+    defer fx.deinit();
+    var rv = try RadioVision.init(std.testing.allocator, .{ .radio_num_heads = 2, .radio_final_layernorm = true }, &fx.weights);
+    defer rv.deinit();
+    try std.testing.expectEqual(@as(u32, 4), rv.proj_fc1.qp.?.bits);
+    try std.testing.expectEqual(@as(u32, 64), rv.proj_fc1.qp.?.group_size);
+    try std.testing.expectEqual(@as(u32, 4), rv.proj_fc2.qp.?.bits);
+    try std.testing.expectEqual(@as(u32, 64), rv.proj_fc2.qp.?.group_size);
+    _ = mlx.mlx_stream_free(rv.s);
+    rv.s = mlx.mlx_default_cpu_stream_new();
+    for ([_]bool{ false, true }) |video| {
+        const pixels = try fx.tensor(if (video) "video_pixels" else "image_pixels");
+        const got = if (video) try rv.forwardVideo(pixels) else try rv.forward(pixels);
+        defer _ = mlx.mlx_array_free(got);
+        try expectReferenceTensor(got, try fx.tensor(if (video) "video_features" else "image_features"), rv.s, 2e-5);
+    }
+}
+
+test "radio Super loader: dense nested projector shares the quantized reference" {
+    var fx = try RadioFixture.openEmbedded(@embedFile("fixtures/radio_super_tiny.safetensors"));
+    defer fx.deinit();
+    inline for (.{ "1", "3" }, .{ "projector_linear1_dense", "projector_linear2_dense" }) |layer, reference| {
+        const dense = try fx.tensor(reference);
+        try mlx.check(mlx.mlx_array_set(fx.weights.map.getPtr("mlp1.layers." ++ layer ++ ".weight").?, dense));
+        inline for (.{ "scales", "biases" }) |suffix| {
+            const entry = fx.weights.map.fetchRemove("mlp1.layers." ++ layer ++ "." ++ suffix).?;
+            fx.weights.allocator.free(entry.key);
+            _ = mlx.mlx_array_free(entry.value);
+        }
+    }
+    var rv = try RadioVision.init(std.testing.allocator, .{ .radio_num_heads = 2, .radio_final_layernorm = true }, &fx.weights);
+    defer rv.deinit();
+    try std.testing.expect(rv.proj_fc1.qp == null and rv.proj_fc2.qp == null);
+    _ = mlx.mlx_stream_free(rv.s);
+    rv.s = mlx.mlx_default_cpu_stream_new();
+    const got = try rv.forwardVideo(try fx.tensor("video_pixels"));
+    defer _ = mlx.mlx_array_free(got);
+    try expectReferenceTensor(got, try fx.tensor("video_features"), rv.s, 2e-5);
+}
+
+test "radio Super loader: required final norm and quantization packets are complete" {
+    var fx = try RadioFixture.openEmbedded(@embedFile("fixtures/radio_super_tiny.safetensors"));
+    defer fx.deinit();
+    const config = ModelConfig{ .radio_num_heads = 2, .radio_final_layernorm = true };
+    for ([_][]const u8{ "vision_projector.vision_final_layernorm.bias", "mlp1.layers.1.biases" }) |name| {
+        const removed = fx.weights.map.fetchRemove(name).?;
+        defer fx.weights.map.put(removed.key, removed.value) catch unreachable;
+        if (std.mem.endsWith(u8, name, "layernorm.bias")) {
+            try std.testing.expectError(error.MissingVisionWeights, RadioVision.init(std.testing.allocator, config, &fx.weights));
+        } else {
+            try std.testing.expectError(error.InvalidVisionWeights, RadioVision.init(std.testing.allocator, config, &fx.weights));
+        }
+    }
+    const entry = fx.weights.map.getPtr("mlp1.layers.1.scales").?;
+    const original = entry.*;
+    entry.* = try fx.tensor("mlp1.layers.3.scales");
+    defer entry.* = original;
+    try std.testing.expectError(error.InvalidVisionWeights, RadioVision.init(std.testing.allocator, config, &fx.weights));
+}
+
+test "radio Super reference: bf16 quantized image/video preserve magnitude" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var fx = try RadioFixture.openEmbedded(@embedFile("fixtures/radio_super_tiny.safetensors"));
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    var it = fx.weights.map.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, name, "vision_model.") and !std.mem.startsWith(u8, name, "mlp1.") and !std.mem.startsWith(u8, name, "vision_projector.")) continue;
+        if (mlx.mlx_array_dtype(entry.value_ptr.*) == .uint32) continue;
+        var cast = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&cast, entry.value_ptr.*, .bfloat16, s));
+        _ = mlx.mlx_array_free(entry.value_ptr.*);
+        entry.value_ptr.* = cast;
+    }
+    var rv = try RadioVision.init(std.testing.allocator, .{ .radio_num_heads = 2, .radio_final_layernorm = true }, &fx.weights);
+    defer rv.deinit();
+    for ([_]bool{ false, true }) |video| {
+        const got = if (video) try rv.forwardVideo(try fx.tensor("video_pixels")) else try rv.forward(try fx.tensor("image_pixels"));
+        defer _ = mlx.mlx_array_free(got);
+        const want = try fx.tensor(if (video) "video_features" else "image_features");
+        const c = try glm_vision.cosineSim(got, want, rv.s);
+        const r = try glm_vision.rmsRatio(got, want, rv.s);
+        std.debug.print("[radio-Super] bf16 video={any} cosine={d:.7} rms_ratio={d:.6}\n", .{ video, c, r });
+        try std.testing.expect(c > 0.9999 and r > 0.98 and r < 1.02);
+    }
 }
 
 test "radio reference: bf16 image/video serving preserves reference direction and magnitude" {
@@ -1054,7 +1190,10 @@ test "radio full checkpoint: image/video embeddings and EVS match the official f
     const model_dir = std.mem.span(model_raw);
     var source = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
     defer source.close(io);
-    const json = try source.readFileAlloc(io, "config.hf.json", a, .limited(1024 * 1024));
+    const json = source.readFileAlloc(io, "config.hf.json", a, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try source.readFileAlloc(io, "config.json", a, .limited(1024 * 1024)),
+        else => return err,
+    };
     defer a.free(json);
     var config = try model_mod.parseConfigFromJson(a, json);
     defer config.deinit(a);
@@ -1062,12 +1201,23 @@ test "radio full checkpoint: image/video embeddings and EVS match the official f
     defer tmp.cleanup();
     var path_buf: [1024]u8 = undefined;
     const tower_dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    for (0..3) |i| {
-        const name = try std.fmt.allocPrint(a, "vision-{d:0>5}.safetensors", .{i});
-        defer a.free(name);
-        const from = try std.fmt.allocPrint(a, "{s}/{s}", .{ model_dir, name });
+    const index_json = try source.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 * 1024 * 1024));
+    defer a.free(index_json);
+    const index = try std.json.parseFromSlice(std.json.Value, a, index_json, .{});
+    defer index.deinit();
+    var shards = std.StringHashMap(void).init(a);
+    defer shards.deinit();
+    var entries = index.value.object.get("weight_map").?.object.iterator();
+    while (entries.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, key, "vision_model.") and !std.mem.startsWith(u8, key, "mlp1.") and !std.mem.startsWith(u8, key, "vision_projector.")) continue;
+        try shards.put(entry.value_ptr.string, {});
+    }
+    var names = shards.keyIterator();
+    while (names.next()) |name| {
+        const from = try std.fmt.allocPrint(a, "{s}/{s}", .{ model_dir, name.* });
         defer a.free(from);
-        const to = try std.fmt.allocPrint(a, "{s}/{s}", .{ tower_dir, name });
+        const to = try std.fmt.allocPrint(a, "{s}/{s}", .{ tower_dir, name.* });
         defer a.free(to);
         try std.Io.Dir.symLinkAbsolute(io, from, to, .{});
     }

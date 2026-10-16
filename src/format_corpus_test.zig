@@ -74,7 +74,8 @@ test "format corpus: video atoms come only from media parts and preserve text" {
 test "format corpus: native RADIO capabilities agree before and after load" {
     const model = @import("model.zig");
     const discovery = @import("model_discovery.zig");
-    const cases = [_]struct { source: []const u8, radio: bool }{
+    const cases = [_]struct { source: []const u8, radio: bool, final_norm: bool = false }{
+        .{ .source = @embedFile("fixtures/model-configs/nemotron_h_super_omni.json"), .radio = true, .final_norm = true },
         .{ .source = "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\",\"num_attention_heads\":16},\"llm_config\":{\"model_type\":\"nemotron_h_puzzle\",\"hidden_size\":4096,\"max_position_embeddings\":262144,\"layers_block_type\":[\"mamba\",\"moe\",\"attention\"]}}", .radio = true },
         .{ .source = "{\"model_type\":\"nemotron_h\",\"radio_vision\":true}", .radio = false },
         .{ .source = "{\"model_type\":\"nemotron_h\",\"vision_config\":{}}", .radio = false },
@@ -88,6 +89,7 @@ test "format corpus: native RADIO capabilities agree before and after load" {
         defer config.deinit(testing.allocator);
         try testing.expectEqual(case.radio, config.radio_vision);
         try testing.expectEqual(case.radio, config.has_vision);
+        try testing.expectEqual(case.final_norm, config.radio_final_layernorm);
         const stub = discovery.parseStubMeta(testing.allocator, case.source, true);
         try testing.expectEqual(case.radio, stub.has_vision);
         try testing.expectEqual(case.radio, stub.has_video);

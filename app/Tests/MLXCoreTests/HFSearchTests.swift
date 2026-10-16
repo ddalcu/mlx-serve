@@ -732,6 +732,15 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertNil(m.incompatibleReason)
     }
 
+    func testNemotronVariantTagsAreSupportedArchitectures() {
+        for type in ["nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni"] {
+            let model = mlx(id: "org/Nemotron-MLX-4bit",
+                            tags: ["mlx", "safetensors", type, "image-text-to-text"])
+            XCTAssertTrue(model.isSupportedArchitecture, "\(type) must be recognized in search")
+            XCTAssertNil(model.incompatibleReason)
+        }
+    }
+
     func testGlm5NextIsSupportedButOtherGlmIsNot() {
         // GLM-5.3-Flash packs carry model_type glm5_next (text config glm5_next_text).
         for type in ["glm5_next", "glm5_next_text"] {

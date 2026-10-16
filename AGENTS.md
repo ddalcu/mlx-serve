@@ -150,7 +150,7 @@ Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental)
 | `qwen3_5`, `qwen3_5_moe(_text)` | GatedDeltaNet + optional MoE, shared expert; Qwen3-VL vision. Qwen3.8 packs serve on this arch, and MiniCPM-V 4.7 (`minicpmv4_7`, mlx-vlm layout; SigLIP2 tower + canvas M-RoPE in `minicpm_vision.zig`/`minicpm_canvas.zig`, a pack without the tower serves text) |
 | `prism_hadamard_qwen35` | prism-ml Bonsai 2 = qwen3_5 behind block-1024 Hadamard rotations (`rht.zig`, `hadamard_block` from `modules[].block`); served in the pack's own numerics: f16 activations over its f16 scales, f32 GDN state; fused QKV declines; MTP depth 2 |
 | `qwen3_next` | DeltaNet |
-| `nemotron_h` | Hybrid Mamba2 + NoPE attention; sigmoid/ReLU² MoE, latent projections with full-hidden routing and residual shared expert. Puzzle/omni aliases; native RADIO image/video; LiLiCorr via DFlash. MTP = `mtp_head.safetensors`, depth 2. Detail: reference.md "Nemotron 3.5 Bolt" |
+| `nemotron_h` | Hybrid Mamba2 + NoPE attention; sigmoid/ReLU² MoE, latent projections with full-hidden routing and residual shared expert. Puzzle/omni aliases, flat/nested trunks; RADIO image/video with dense or quantized projector and Super final norm; LiLiCorr via DFlash. MTP = `mtp_head.safetensors`, depth 2. Detail: reference.md "Nemotron 3.5 Bolt and Super" |
 | `lfm2`, `lfm2_moe`, `lfm2_vl` | Hybrid gated conv + attention; `lfm2_moe` = sparse MoE past `num_dense_layers` (sigmoid routing, selection-only `expert_bias`, no shared expert); dense MLP `w1/w3/w2` OR `gate/up/down_proj` (probed); `lfm2_vl` = siglip2 tower + projector, NaFlex 64-256 merged tokens, tiling past `max_image_tokens x 2.0` into 512px tiles + thumbnail (`<|img_row_R_col_C|>`/`<|img_thumbnail|>`) |
 | `hy_v3` | Hunyuan 3 MoE (expert container probed) |
 | `laguna` | poolside Laguna S 2.1 (117.6B-A8.5B): nvfp4 experts, softplus attn out gate, YaRN + sliding, sigmoid routing, UNGATED shared expert. Serial |
@@ -528,6 +528,7 @@ Vision:
 - **A placeholder id the splice mask does not name never reaches the prompt** (`spliceVisionRows` takes `video_token_id`; an id of 0 is UNSET, never token 0: audio-only Qwen3-ASR heard silence); a chunked splice resumes its ROW INDEX (#197, `vision_splice_offset`, `tests/test_vision_chunked_prefill.sh`); every generative forward arm splices vision (scan-pinned).
 - **Per-arch preprocessing**: patch feature order (LFM2-VL channel INNERMOST); two GELUs in one checkpoint (LFM2-VL); NaFlex resample is `bilinear` WITH antialias and TILING is the resolution; muse = aspect-closest grid, Lanczos, CHANNEL-major shuffle (`VisionPreproc.mode`). Guards: `tests/test_lfm2_vision.sh`, `tests/test_muse_vision.sh`.
 - **A processor pixel bound is not the ENGINE's** (`effectivePixelBounds`, `ENGINE_MAX_PIXELS` 1536²).
+- **Nemotron omni's native MTP config requires a final vision LayerNorm BEFORE pixel shuffle**, even if a conversion omitted MTP weights; projector quantization is per linear. Guards: Super RADIO reference fixtures and format corpus.
 
 Media backends:
 - **ACE-Step**: timbre slot = silence latent OR the reference clip's VAE mean (`ref_audio`, #259); a TASK is the context stream + instruction line (`complete`, `cover` with soft clamp THEN hard grid; `fsq.safetensors` separate dense bf16). Guards assert log lines, never output.

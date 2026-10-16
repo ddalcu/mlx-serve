@@ -318,6 +318,23 @@ final class DownloadManagerLayoutTests: XCTestCase {
         }
     }
 
+    func testNemotronVariantsAreSupportedAndChatPickable() {
+        for mt in ["nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni"] {
+            let model = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/models/\(mt)",
+                sizeFormatted: "1 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(model.isSupportedArchitecture, "\(mt) must be recognized locally")
+            XCTAssertTrue(model.isChatPickable, "\(mt) must be available to chat pickers")
+        }
+        let unknown = LocalModel(
+            id: "test:unknown", name: "unknown", path: "/models/unknown",
+            sizeFormatted: "1 GB", modelType: "nemotron_unknown", source: .custom, kind: .base
+        )
+        XCTAssertFalse(unknown.isSupportedArchitecture)
+        XCTAssertFalse(unknown.isChatPickable)
+    }
+
     func testLfm2MoeAndKolibriAreChatPickable() {
         // LFM2.5-8B-A1B / 24B-A2B ship "lfm2_moe", Kolibri-1 "kolibri1"; the server serves both.
         for mt in ["lfm2_moe", "kolibri1"] {

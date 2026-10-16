@@ -17401,8 +17401,12 @@ pub const Transformer = struct {
         var owns_lm_head = false;
 
         {
-            // lm_head prefix: "language_model.model" -> "language_model", "model" -> try root, else -> prefix
-            const lm_prefix = if (std.mem.eql(u8, prefix, "language_model.model")) "language_model" else prefix;
+            // A nested decoder's head is a sibling of model/backbone.
+            const lm_prefix = if (std.mem.eql(u8, prefix, "language_model.model") or
+                (is_nemotron and std.mem.eql(u8, prefix, "language_model.backbone")))
+                "language_model"
+            else
+                prefix;
             // Inkling: the untied head is "{prefix}.unembed" (quantized).
             const maybe_lm_w = if (is_inkling)
                 getWeightFmtOpt(weights, &name_buf, "{s}.unembed.weight", lm_prefix)
@@ -48500,6 +48504,102 @@ test "add_norm: plain and MoE-combine arms match the composed ops" {
         try mlx.check(mlx.mlx_fast_rms_norm(&normed, sum, w, 1e-5, s));
         try cmp(sum, got.h, s, 0);
         try cmp(normed, got.normed, s, 0);
+    }
+}
+
+test "nemotron_h: Super checkpoint dense and affine language layouts load and forward identically" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const allocator = t.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    const Fix = @import("dflash.zig").TinyFix;
+    const native =
+        \\{"model_type":"nemotron_h_omni","llm_config":{"model_type":"nemotron_h",
+        \\"hidden_size":64,"intermediate_size":128,"vocab_size":128,
+        \\"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,
+        \\"layers_block_type":["attention"],"tie_word_embeddings":false}}
+    ;
+    const P = struct {
+        fn weight(map: mlx.mlx_map_string_to_array, name: []const u8, rows: usize, cols: usize, seed: usize, quantized: bool, st: mlx.mlx_stream) !void {
+            if (!quantized) return Fix.putW(map, name, rows, cols, seed, st);
+            const dense = try Fix.bf16Arr(rows, cols, seed, st);
+            defer _ = mlx.mlx_array_free(dense);
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, st));
+            const base = name[0 .. name.len - ".weight".len];
+            for ([_][]const u8{ ".weight", ".scales", ".biases" }, 0..) |suffix, i| {
+                var a = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(a);
+                try mlx.check(mlx.mlx_vector_array_get(&a, triple, i));
+                var buf: [160]u8 = undefined;
+                try Fix.put(map, try std.fmt.bufPrint(&buf, "{s}{s}", .{ base, suffix }), a);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |quantized| {
+        var flat_logits: ?[]f32 = null;
+        defer if (flat_logits) |values| allocator.free(values);
+        for ([_][]const u8{ "backbone", "language_model.backbone" }) |prefix| {
+            var tmp = t.tmpDir(.{});
+            defer tmp.cleanup();
+            var path_buf: [512]u8 = undefined;
+            const path_len = try tmp.dir.realPath(io, &path_buf);
+            const dir = path_buf[0..path_len];
+            const map = mlx.mlx_map_string_to_array_new();
+            defer _ = mlx.mlx_map_string_to_array_free(map);
+            const meta = mlx.mlx_map_string_to_string_new();
+            defer _ = mlx.mlx_map_string_to_string_free(meta);
+            var name: [160]u8 = undefined;
+            try P.weight(map, try std.fmt.bufPrint(&name, "{s}.embeddings.weight", .{prefix}), 128, 64, 1, quantized, s);
+            try Fix.putNorm(map, try std.fmt.bufPrint(&name, "{s}.norm_f.weight", .{prefix}), 64, s);
+            try Fix.putNorm(map, try std.fmt.bufPrint(&name, "{s}.layers.0.norm.weight", .{prefix}), 64, s);
+            const heads = [_]struct { name: []const u8, rows: usize, seed: usize }{
+                .{ .name = "q_proj", .rows = 64, .seed = 10 },
+                .{ .name = "k_proj", .rows = 32, .seed = 20 },
+                .{ .name = "v_proj", .rows = 32, .seed = 30 },
+                .{ .name = "o_proj", .rows = 64, .seed = 40 },
+            };
+            for (heads) |head| try P.weight(map, try std.fmt.bufPrint(&name, "{s}.layers.0.mixer.{s}.weight", .{ prefix, head.name }), head.rows, 64, head.seed, quantized, s);
+            const head_name = if (std.mem.eql(u8, prefix, "backbone")) "lm_head.weight" else "language_model.lm_head.weight";
+            try P.weight(map, head_name, 128, 64, 77, quantized, s);
+            const file = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{dir}, 0);
+            defer allocator.free(file);
+            try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
+            var config = try model_mod.parseConfigFromJson(allocator, native);
+            defer config.deinit(allocator);
+            if (quantized) {
+                config.quant_bits = 4;
+                config.quant_group_size = 64;
+            }
+            var weights = try model_mod.loadModelWeights(io, allocator, dir, &config, false);
+            defer weights.deinit();
+            model_mod.resolveWeightPrefix(&config, &weights);
+            try t.expectEqualStrings(prefix, config.weight_prefix);
+            var xfm = try Transformer.init(io, allocator, config, &weights);
+            defer xfm.deinit();
+            try t.expectEqual(weights.get(head_name).?.ctx, xfm.lm_head_w.ctx);
+            try t.expectEqual(quantized, xfm.lm_head_s.ctx != null);
+            if (quantized) {
+                const base = head_name[0 .. head_name.len - ".weight".len];
+                try t.expectEqual(weights.get(try std.fmt.bufPrint(&name, "{s}.scales", .{base})).?.ctx, xfm.lm_head_s.ctx);
+                try t.expectEqual(weights.get(try std.fmt.bufPrint(&name, "{s}.biases", .{base})).?.ctx, xfm.lm_head_b.ctx);
+            }
+            const ids = mlx.mlx_array_new_data(&[_]i32{ 1, 4, 7 }, &[_]c_int{ 1, 3 }, 2, .int32);
+            defer _ = mlx.mlx_array_free(ids);
+            const logits = try xfm.forward(ids);
+            defer _ = mlx.mlx_array_free(logits);
+            const values = try Fix.readF32(logits, allocator, s);
+            defer allocator.free(values);
+            var magnitude: f32 = 0;
+            for (values) |v| {
+                try t.expect(std.math.isFinite(v));
+                magnitude = @max(magnitude, @abs(v));
+            }
+            try t.expect(magnitude > 0.01);
+            if (flat_logits) |flat| try t.expectEqualSlices(f32, flat, values) else flat_logits = try allocator.dupe(f32, values);
+        }
     }
 }
 

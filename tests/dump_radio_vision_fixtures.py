@@ -7,7 +7,8 @@ Requires torch 2.10.0, torchvision 0.25.0, transformers 5.8.1, safetensors 0.8.0
 numpy 2.5.4 and Pillow 12.3.0. The checkpoint's modeling_radio.py executes
 unchanged; only the independent vision classes/functions are imported from
 modeling_nemotron_h_omni.py, avoiding its CUDA-only Mamba import. No numerical
-reference forward is reimplemented here. A small 2-head, 2-layer tower keeps
+reference forward is reimplemented here. `--variant super` adds the native final
+LayerNorm and an MLX 0.32.3 affine-4 projector. A small 2-head, 2-layer tower keeps
 the checked-in fp32 fixture hermetic. The source MOV has five distinct frames.
 """
 
@@ -75,12 +76,18 @@ for i in 0..<5 {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reference", type=Path, required=True)
-    ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parents[1] / "src/fixtures/radio_tiny.safetensors")
+    ap.add_argument("--variant", choices=("bolt", "super"), default="bolt")
+    ap.add_argument("--out", type=Path)
     args = ap.parse_args()
+    if args.out is None:
+        suffix = "radio_super_tiny" if args.variant == "super" else "radio_tiny"
+        args.out = Path(__file__).resolve().parents[1] / ("src/fixtures/" + suffix + ".safetensors")
+    is_super = args.variant == "super"
+    hidden, proj_hidden, out_hidden = (16, 64, 6) if is_super else (8, 16, 6)
     torch.set_num_threads(1)
     torch.manual_seed(0xB017)
     radio, config, processor, omni = reference_modules(args.reference.resolve())
-    cfg = config.RadioConfig(hidden_size=8, num_attention_heads=2, num_hidden_layers=2,
+    cfg = config.RadioConfig(hidden_size=hidden, num_attention_heads=2, num_hidden_layers=2,
                              num_cls_tokens=1, num_registers=1, summary_idxs=[0],
                              mlp_ratio=2.0, patch_size=16, max_img_size=32,
                              video_temporal_patch_size=2, layerscale_value=1.0)
@@ -88,9 +95,9 @@ def main():
     tower = radio.RadioModel(cfg).float().eval()
     tower.make_preprocessor_external()
     pcfg = types.SimpleNamespace(downsample_ratio=0.5, video_temporal_patch_size=2,
-                                 ps_version="v2", vit_hidden_size=8, projector_hidden_size=16,
-                                 llm_config=types.SimpleNamespace(hidden_size=6),
-                                 vision_final_layernorm=False)
+                                 ps_version="v2", vit_hidden_size=hidden, projector_hidden_size=proj_hidden,
+                                 llm_config=types.SimpleNamespace(hidden_size=out_hidden, num_nextn_predict_layers=int(is_super)),
+                                 vision_config=cfg, vision_final_layernorm=False)
     projector = omni["NemotronH_Omni_Reasoning_V3VisionProjector"](pcfg).float().eval()
     with torch.no_grad():
         for name, value in list(tower.named_parameters()) + list(projector.named_parameters()):
@@ -100,6 +107,18 @@ def main():
                 value.uniform_(0.8, 1.2)
             else:
                 value.uniform_(-0.2, 0.2)
+    packed_projection = {}
+    if is_super:
+        # Quantize once with MLX; NVIDIA executes the dequantized checkpoint truth.
+        import mlx.core as mx
+        for source, target in (("linear1", "1"), ("linear2", "3")):
+            weight = getattr(projector.mlp1, source).weight
+            w, scales, biases = mx.quantize(mx.array(weight.detach().numpy()), group_size=64, bits=4)
+            dequant = mx.dequantize(w, scales, biases, group_size=64, bits=4)
+            with torch.no_grad():
+                weight.copy_(torch.from_numpy(np.array(dequant)))
+            for suffix, value in (("weight", w), ("scales", scales), ("biases", biases)):
+                packed_projection["mlp1.layers." + target + "." + suffix] = torch.from_numpy(np.array(value))
     clip = Path(__file__).resolve().parents[1] / "src/fixtures/radio_clip.mov"
     with tempfile.TemporaryDirectory() as tmp:
         images = decode_clip(clip, Path(tmp))
@@ -137,8 +156,16 @@ def main():
             for suffix in ("weight", "bias"):
                 out[base + "attn.qkv." + suffix] = torch.cat([getattr(getattr(layer.attention.attention, n), suffix) for n in ("query", "key", "value")])
                 out[base + "attn.proj." + suffix] = getattr(layer.attention.output.dense, suffix)
-        for source, target in (("norm.weight", "0.weight"), ("linear1.weight", "1.weight"), ("linear2.weight", "3.weight")):
-            out["mlp1." + target] = projector.mlp1.state_dict()[source]
+        if is_super:
+            out["projector_linear1_dense"] = projector.mlp1.linear1.weight
+            out["projector_linear2_dense"] = projector.mlp1.linear2.weight
+            out["mlp1.layers.0.weight"] = projector.mlp1.norm.weight
+            out.update(packed_projection)
+            for name, value in projector.vision_final_layernorm.state_dict().items():
+                out["vision_projector.vision_final_layernorm." + name] = value
+        else:
+            for source, target in (("norm.weight", "0.weight"), ("linear1.weight", "1.weight"), ("linear2.weight", "3.weight")):
+                out["mlp1." + target] = projector.mlp1.state_dict()[source]
         # The same float interpolation path is tested in both directions, with overshoot.
         rgb = np.random.default_rng(0xB017).integers(0, 256, (8, 9, 3), dtype=np.uint8)
         out["resize_rgb"] = torch.from_numpy(rgb)
@@ -146,13 +173,17 @@ def main():
             raw = torch.from_numpy(rgb).permute(2, 0, 1)[None].float()
             out["resize_" + name] = torch.nn.functional.interpolate(raw, size=size, mode="bicubic", align_corners=False, antialias=True)[0]
     save_file({k: v.detach().contiguous() for k, v in out.items()}, args.out)
-    metadata = {"source": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16", "dtype": "float32",
+    metadata = {"source": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16" if is_super else "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16", "dtype": "float32",
                 "clip_sha256": hashlib.sha256(clip.read_bytes()).hexdigest(),
                 "files_sha256": {name: hashlib.sha256((args.reference / name).read_bytes()).hexdigest()
                                   for name in ("configuration_radio.py", "modeling_radio.py", "modeling_nemotron_h_omni.py", "image_processing_nemotron_h_omni.py")},
                 "versions": {name: importlib.import_module(name).__version__ for name in ("torch", "transformers", "numpy", "safetensors", "PIL")},
-                "geometry": {"hidden_size": 8, "heads": 2, "layers": 2, "patch": 16, "temporal_patch": 2,
-                             "image_grid": [2, 4], "real_video_frames": 5, "projector_hidden": 16, "output_hidden": 6}}
+                "projector": {"quantization": "affine4" if is_super else "dense", "group_size": 64 if is_super else None,
+                              "vision_final_layernorm": is_super},
+                "geometry": {"hidden_size": hidden, "heads": 2, "layers": 2, "patch": 16, "temporal_patch": 2,
+                             "image_grid": [2, 4], "real_video_frames": 5, "projector_hidden": proj_hidden, "output_hidden": out_hidden}}
+    if is_super:
+        metadata["versions"]["mlx"] = importlib.import_module("mlx.core").__version__
     args.out.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"wrote {args.out}: image {tuple(image.shape)}, video {tuple(video.shape)}, features {tuple(feats.shape)}")
 

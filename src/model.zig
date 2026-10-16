@@ -657,6 +657,8 @@ pub const ModelConfig = struct {
     /// Nemotron RADIO tower, selected by `vision_config.model_type`.
     radio_vision: bool = false,
     radio_num_heads: u32 = 0,
+    radio_final_layernorm: bool = false,
+    radio_ln_eps: f32 = 1e-6,
     /// RADIO video EVS drop fraction. 0 keeps every tubelet token. The Bolt
     /// checkpoint uses 0.7; other models leave this at 0.
     video_pruning_rate: f64 = 0,
@@ -4257,6 +4259,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (config.radio_vision) {
             const vc = jsonField(root, "vision_config").?.object;
             if (jsonField(vc, "num_attention_heads")) |v| config.radio_num_heads = try jsonU32(v);
+            if (jsonField(cfg_obj, "num_nextn_predict_layers")) |v| config.radio_final_layernorm = (try jsonU32(v)) > 0;
+            if (jsonField(vc, "layer_norm_eps")) |v| config.radio_ln_eps = try jsonFloat(v);
+            if (config.radio_ln_eps <= 0) return error.InvalidConfigField;
             config.video_pruning_rate = RADIO_VIDEO_PRUNING_RATE_DEFAULT;
             if (jsonField(root, "video_pruning_rate")) |v| {
                 config.video_pruning_rate = try jsonFloat64(v);
@@ -4790,7 +4795,7 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 
 /// Re-point `config.weight_prefix` at the nesting the CHECKPOINT actually uses.
 ///
-/// Which of the two a converter emits is not reliably declared in config.json,
+/// Which nesting a converter emits is not reliably declared in config.json,
 /// so `parseConfigFromJson` guesses from `text_config` presence — wrong for any
 /// checkpoint that nests without declaring one (mlx-community LFM2.5-2.6B:
 /// `Lfm2ForCausalLM`, an EMPTY `vision_config`, every weight under
@@ -4798,8 +4803,8 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 /// `MISSING WEIGHT: model.embed_tokens.weight`). The class has now shipped in
 /// both directions, so the weights get the last word.
 ///
-/// Conservative by construction: only the generic spellings participate
-/// (never an arch with its own — `backbone`, `model.llm`, `""`), and a swap
+/// Conservative by construction: generic trunks share one spelling set;
+/// Nemotron's `backbone` has its own flat/nested pair. A swap
 /// happens only when the configured one holds NOTHING, so every checkpoint
 /// that already loaded binds byte-identically. Scan order puts the most
 /// specific spelling first: a `model.language_model.*` checkpoint also
@@ -4823,7 +4828,12 @@ pub fn narrowHadamardPackTables(config: *const ModelConfig, weights: *Weights, s
 }
 
 pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
-    const candidates = [_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
+    const nemotron_backbone = std.mem.eql(u8, config.model_type, "nemotron_h") and
+        (std.mem.eql(u8, config.weight_prefix, "backbone") or std.mem.eql(u8, config.weight_prefix, "language_model.backbone"));
+    const candidates: []const []const u8 = if (nemotron_backbone)
+        &.{ "backbone", "language_model.backbone" }
+    else
+        &.{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
     var known = false;
     for (candidates) |p| {
         if (std.mem.eql(u8, config.weight_prefix, p)) known = true;
@@ -5555,6 +5565,7 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
         std.mem.startsWith(u8, key, "vision_model.") or
+        std.mem.startsWith(u8, key, "vision_projector.") or
         std.mem.startsWith(u8, key, "mlp1.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
         std.mem.startsWith(u8, key, "merger.") or
@@ -5787,6 +5798,22 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = "backbone" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("backbone", config.weight_prefix);
+    }
+    // Native Nemotron converters may retain the language wrapper. Either
+    // spelling is selected from weights; an already-populated prefix stands.
+    for ([_][]const u8{ "backbone", "language_model.backbone" }) |prefix| {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        const key = try std.fmt.allocPrint(allocator, "{s}.embeddings.weight", .{prefix});
+        defer allocator.free(key);
+        try put(&w, allocator, key);
+        var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = if (std.mem.eql(u8, prefix, "backbone")) "language_model.backbone" else "backbone" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings(prefix, config.weight_prefix);
+        const other = if (std.mem.eql(u8, prefix, "backbone")) "language_model.backbone.embeddings.weight" else "backbone.embeddings.weight";
+        try put(&w, allocator, other);
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings(prefix, config.weight_prefix);
     }
     // A prefix that is a strict PREFIX of the key's first segment must not
     // count as a hit ("model" vs "model_extra.*").
@@ -6265,6 +6292,23 @@ test "shouldKeepWeightKey filters audio and gated vision weights" {
     try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", true));
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
+}
+
+test "shouldKeepWeightKey: Super projector follows the global vision gate" {
+    for ([_][]const u8{
+        "vision_model.radio_model.model.blocks.0.norm1.weight",
+        "vision_projector.mlp1.norm.weight",
+        "vision_projector.mlp1.linear1.weight",
+        "vision_projector.mlp1.linear1.scales",
+        "vision_projector.mlp1.linear2.biases",
+        "vision_projector.vision_final_layernorm.weight",
+        "vision_projector.vision_final_layernorm.bias",
+    }) |name| {
+        try testing.expect(!shouldKeepWeightKey(name, false));
+        try testing.expect(shouldKeepWeightKey(name, true));
+    }
+    try testing.expect(shouldKeepWeightKey("vision_projector_extra.weight", false));
+    try testing.expect(shouldKeepWeightKey("language_model.backbone.layers.0.norm.weight", false));
 }
 
 test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision enabled" {
@@ -9318,6 +9362,7 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
     try testing.expectEqual(LayerBlockType.attention, bolt.layer_block_types[2]);
     try testing.expectEqualStrings("backbone", bolt.weight_prefix);
     try testing.expect(bolt.has_vision and bolt.radio_vision);
+    try testing.expect(!bolt.radio_final_layernorm);
     try testing.expectEqual(@as(u32, 16), bolt.radio_num_heads);
     try testing.expectEqual(@as(f64, 0.7), bolt.video_pruning_rate);
 
@@ -9344,6 +9389,58 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
     const custom = try parseConfigFromJson(testing.allocator, rated);
     try testing.expectEqual(@as(f64, 0.5), custom.video_pruning_rate);
     try testing.expectEqual(@as(u32, 8), custom.radio_num_heads);
+}
+
+test "nemotron_h: Super checkpoint config preserves native language geometry" {
+    var config = try parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/nemotron_h_super_omni.json"));
+    defer config.deinit(testing.allocator);
+    try testing.expectEqualStrings("nemotron_h", config.model_type);
+    try testing.expectEqual(@as(u32, 88), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 4096), config.hidden_size);
+    try testing.expectEqual(@as(u32, 1048576), config.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 512), config.num_experts);
+    try testing.expectEqual(@as(u32, 22), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1024), config.moe_latent_size);
+    try testing.expectEqual(@as(u32, 2688), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 5376), config.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(f32, 5), config.router_scaling_factor);
+    try testing.expect(config.moe_route_norm);
+    try testing.expectEqual(@as(u32, 128), config.mamba_num_heads);
+    try testing.expectEqual(@as(u32, 64), config.mamba_head_dim);
+    try testing.expectEqual(@as(u32, 8), config.mamba_n_groups);
+    try testing.expectEqual(@as(u32, 128), config.ssm_state_size);
+    try testing.expectEqual(@as(u32, 128), config.mamba_chunk_size);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+    try testing.expect(config.radio_vision and config.has_vision);
+    try testing.expect(config.radio_final_layernorm);
+    try testing.expectEqual(@as(f32, 1e-6), config.radio_ln_eps);
+    var blocks: [3]u32 = @splat(0);
+    for (config.layer_block_types[0..config.num_hidden_layers], config.layer_no_rope[0..config.num_hidden_layers]) |kind, no_rope| {
+        try testing.expect(no_rope);
+        switch (kind) {
+            .mamba2 => blocks[0] += 1,
+            .moe => blocks[1] += 1,
+            .attention => blocks[2] += 1,
+            else => return error.UnexpectedSuperBlock,
+        }
+    }
+    try testing.expectEqualSlices(u32, &.{ 40, 40, 8 }, &blocks);
+}
+
+test "nemotron_h: RADIO final LayerNorm epsilon is positive and finite" {
+    const prefix = "{\"model_type\":\"nemotron_h\",\"num_nextn_predict_layers\":1,\"vision_config\":{\"model_type\":\"radio\",\"layer_norm_eps\":";
+    inline for (.{ "0", "-0.01", "1e100", "\"nan\"" }) |epsilon| {
+        try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, prefix ++ epsilon ++ "}}"));
+    }
+    var custom = try parseConfigFromJson(testing.allocator, prefix ++ "0.00001}}");
+    defer custom.deinit(testing.allocator);
+    try testing.expect(custom.radio_final_layernorm);
+    try testing.expectEqual(@as(f32, 0.00001), custom.radio_ln_eps);
+    var optional_null = try parseConfigFromJson(testing.allocator, prefix ++ "null}}");
+    defer optional_null.deinit(testing.allocator);
+    try testing.expect(optional_null.radio_final_layernorm);
+    try testing.expectEqual(@as(f32, 1e-6), optional_null.radio_ln_eps);
 }
 
 test "nemotron_h: RADIO pruning preserves checkpoint decimal precision" {
