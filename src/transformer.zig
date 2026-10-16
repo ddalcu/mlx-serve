@@ -31102,7 +31102,7 @@ pub const Transformer = struct {
             const reg = self.rht.?;
             const signs = reg.get(la.out_w) orelse break :fast;
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-            const r = (try gdn_decode.step(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, .{
+            const r = (try gdn_decode.step(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, reg.block, .{
                 .qkv = qkv,
                 .z = z_proj,
                 .a = a_proj,
@@ -64851,7 +64851,8 @@ test "gdn_decode.step and recur: bit-identical to prework -> recurrence -> norm-
     gdn_decode_fused_override = true;
     defer gdn_decode_fused_override = null;
     // bf16 everywhere, a Hadamard pack's f16 activations over an f32 state, and qwen4_exp's bf16 over f32.
-    for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 }, .{ .bfloat16, .float32 } }) |dts| try gdnDecodeParityCase(s, dts[0], dts[1]);
+    for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 }, .{ .bfloat16, .float32 } }) |dts|
+        for ([_]c_int{ 512, 1024, 2048, 4096 }) |block| try gdnDecodeParityCase(s, dts[0], dts[1], block);
 }
 
 test "gdn_decode.recurSeq: bit-identical to prework -> capture recurrence at verify widths" {
@@ -65662,13 +65663,13 @@ fn gdnDecodeSeqParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(seq_ref_head, seq_got_head, s));
 }
 
-fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
+fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, block: c_int) !void {
     var prng = std.Random.DefaultPrng.init(0xB0B5A1);
     const rnd = prng.random();
     const hk: c_int = 2;
-    const hv: c_int = 8;
     const dk: c_int = 128;
     const dv: c_int = 128;
+    const hv: c_int = @divExact(2 * block, dv);
     const c_dim: c_int = hk * dk * 2 + hv * dv;
     const value_dim: c_int = hv * dv;
 
@@ -65698,9 +65699,10 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
     defer _ = mlx.mlx_array_free(norm_w);
     const eps_arr = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps_arr);
-    var sg: [1024]f32 = undefined;
-    for (&sg) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
-    const signs = mlx.mlx_array_new_data(&sg, &[_]c_int{value_dim}, 1, .float32);
+    const sg = try testing.allocator.alloc(f32, @intCast(value_dim));
+    defer testing.allocator.free(sg);
+    for (sg) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
+    const signs = mlx.mlx_array_new_data(sg.ptr, &[_]c_int{value_dim}, 1, .float32);
     defer _ = mlx.mlx_array_free(signs);
 
     // Composed chain: the three production kernels + the input rotation.
@@ -65763,7 +65765,7 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
     try mlx.check(mlx.mlx_vector_array_get(&state_ref, outputs_vec, 1));
     const flat_ref = (try gdnNormGateFused(s, y_ref, z, 0, value_dim, norm_w, eps_arr, true, hv, dv, 1, 1)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(flat_ref);
-    const rot_ref = try rht.transform(flat_ref, signs, 1024, false, s);
+    const rot_ref = try rht.transform(flat_ref, signs, block, false, s);
     defer _ = mlx.mlx_array_free(rot_ref);
 
     const geo = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
@@ -65783,7 +65785,7 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
         .eps = eps_arr,
         .signs = signs,
     };
-    const got = (try gdn_decode.step(geo, in, s)) orelse return error.FusedDeclined;
+    const got = (try gdn_decode.step(geo, block, in, s)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(got.rot);
     defer _ = mlx.mlx_array_free(got.conv_state);
     defer _ = mlx.mlx_array_free(got.ssm_state);

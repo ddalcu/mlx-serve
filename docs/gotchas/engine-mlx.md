@@ -5705,3 +5705,10 @@ Defect: after each app rebuild a cached Neural Engine model recompiled for minut
 Cause: the ANE service keys a compiled program by the code-signing identifier of the process that compiled it, and `app/build.sh` and the release workflow sign `mlx-serve` without `--identifier`, so codesign named each build `mlx-serve-<hash of the binary>`. A plain `zig build` is linker-signed as `mlx-serve` and restored any entry, which hid it in development.
 Fix: `mlx-serve` embeds an Info.plist (`__TEXT,__info_plist`, `CFBundleIdentifier` `com.dalcu.mlx-core.mlx-serve`, kept referenced from `main` or the linker strips it), which codesign uses as the identifier.
 Guard: none automated. Check with `codesign -f -s - <copy>; codesign -dv <copy>`, which must print that identifier.
+
+## Bonsai 2 2B, 4B and 9B answered in gibberish: a decode kernel sized for one pack's block (2026-10-15)
+
+Defect: prism-ml's Ternary Bonsai 2 2B, 4B and 9B packs loaded and produced word salad from the first token, while the 27B was fine.
+Cause: each pack picks its own Hadamard block (512 for 2B/4B, 4096 for 9B, 1024 for 27B), and the fused one-token GDN kernel (`gdn_decode.step`, its second dispatch: gated norm, then the out_proj rotation) was written for 1024 only. Prefill was correct, but the last prompt token is forwarded alone, so even the first answer token came out of the wrong rotation. Found by matching prism's own loader (mlx-vlm qwen3_5 + their `Packed` module) layer by layer under `MLX_SERVE_LAYER_CAP`: layer 0's GDN output matched on the 4-token prefill and diverged on the 1-token forward.
+Fix: the kernel takes the pack's block as a template (`J` = block / 32, heads per simdgroup derived from it) and `step` takes the block; `rht.kernelBlock` names the four blocks both butterflies serve, 4096 included, so decode and prefill rotate with the same code.
+Guards: `gdn_decode.step and recur` runs every block bit for bit against prework -> recurrence -> norm-gate -> `rht.transform`; `rht: every shipped block's transform` checks both transform paths at all four.
