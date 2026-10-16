@@ -5706,3 +5706,23 @@ Cause: MLX loaded `cublasLt64_13.dll` from its build toolkit; `ggml-cuda.dll`, b
 Fix: no CUDA DLL ships: `patches/mlx-cuda-windows-toolkit-dirs.patch` resolves MLX's DLL folders from the installed toolkit (`CUDA_PATH`, `CUDNN_PATH`; cuDNN's folder also goes on PATH for its sub-libraries), and `mlx.exportCudaHome` puts the same folder first on PATH, so both engines bind one copy.
 Guard: `cudaDllSearchPath: ...`; live, both load orders on the GPU with one `cublas64_13.dll` loaded.
 
+## A rebuild recompiled every cached Neural Engine program (2026-10-15)
+
+Defect: after a new build, a cached Qwen3.8-27B recompiled for minutes on the Neural Engine instead of restoring in seconds.
+Cause: the LM engine's cache variant hashed `round_cost.engineBuildId()`, and a dev build hashes its executable (a release, its git sha). The bridge's cold-compile prune deletes the model's entries tagged with another variant, so the first miss after a rebuild deleted every entry not yet restored, and the rest recompiled.
+Fix: the variant names only the configuration (lanes, contexts, drafter taps). Entries are keyed by program, so a rebuild restores what it still emits, and `rt.cacheSweep` drops the model's entries a finished build did not touch (an older engine's). Builds take turns (`build_mu`): the lineage is process-wide.
+Guard: `cache sweep: after a build, its group's entries it did not touch go; other groups stay` (ane_rt.zig).
+
+## Every app update recompiled every Neural Engine model (2026-10-15)
+
+Defect: after each app rebuild a cached Neural Engine model recompiled for minutes, while restarts of the same build restored it in seconds.
+Cause: the ANE service keys a compiled program by the code-signing identifier of the process that compiled it, and `app/build.sh` and the release workflow sign `mlx-serve` without `--identifier`, so codesign named each build `mlx-serve-<hash of the binary>`. A plain `zig build` is linker-signed as `mlx-serve` and restored any entry, which hid it in development.
+Fix: `mlx-serve` embeds an Info.plist (`__TEXT,__info_plist`, `CFBundleIdentifier` `com.dalcu.mlx-core.mlx-serve`, kept referenced from `main` or the linker strips it), which codesign uses as the identifier.
+Guard: none automated. Check with `codesign -f -s - <copy>; codesign -dv <copy>`, which must print that identifier.
+
+## Bonsai 2 2B, 4B and 9B answered in gibberish: a decode kernel sized for one pack's block (2026-10-15)
+
+Defect: prism-ml's Ternary Bonsai 2 2B, 4B and 9B packs loaded and produced word salad from the first token, while the 27B was fine.
+Cause: each pack picks its own Hadamard block (512 for 2B/4B, 4096 for 9B, 1024 for 27B), and the fused one-token GDN kernel (`gdn_decode.step`, its second dispatch: gated norm, then the out_proj rotation) was written for 1024 only. Prefill was correct, but the last prompt token is forwarded alone, so even the first answer token came out of the wrong rotation. Found by matching prism's own loader (mlx-vlm qwen3_5 + their `Packed` module) layer by layer under `MLX_SERVE_LAYER_CAP`: layer 0's GDN output matched on the 4-token prefill and diverged on the 1-token forward.
+Fix: the kernel takes the pack's block as a template (`J` = block / 32, heads per simdgroup derived from it) and `step` takes the block; `rht.kernelBlock` names the four blocks both butterflies serve, 4096 included, so decode and prefill rotate with the same code.
+Guards: `gdn_decode.step and recur` runs every block bit for bit against prework -> recurrence -> norm-gate -> `rht.transform`; `rht: every shipped block's transform` checks both transform paths at all four.

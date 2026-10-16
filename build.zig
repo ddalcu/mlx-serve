@@ -95,12 +95,13 @@ pub fn build(b: *std.Build) void {
     // that have NO runtime query API (MLX + ggml report themselves at runtime):
     //   --mlx-c-version  pinned mlx-c submodule version; defaults from the
     //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
-    //   --ds4-commit     pinned ds4 submodule short commit (build.sh: `git rev-parse`)
+    //   --ds4-commit     pinned ds4 submodule short commit; defaults from its checked-out
+    //                    commit (readDs4Commit), so the release build reports it too
     //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
     //                    (written by scripts/fetch-llama.sh) so a plain dev build
     //                    still reports it. app/build.sh passes all three.
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
-    const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
+    const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse readDs4Commit(b) orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
 
     const build_options = b.addOptions();
@@ -311,6 +312,9 @@ pub fn build(b: *std.Build) void {
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
+    // that the run's cache key does not see: it reruns every time.
+    if (test_filter != null) run_unit_tests.has_side_effects = true;
     if (qwen_preprocess_fixture) |fixture| {
         run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
         run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
@@ -407,7 +411,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "mas", false);
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
-    build_options.addOption([]const u8, "ds4_commit", b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown");
+    build_options.addOption([]const u8, "ds4_commit", b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse readDs4Commit(b) orelse "unknown");
     build_options.addOption([]const u8, "llama_tag", readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
@@ -532,7 +536,10 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    // Rerun every time when filtered, as on macOS (env-gated tests).
+    if (test_filter != null) run_unit_tests.has_side_effects = true;
+    test_step.dependOn(&run_unit_tests.step);
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/
@@ -1075,6 +1082,22 @@ fn readAppVersion(b: *std.Build) ?[]const u8 {
     const end = std.mem.indexOfPos(u8, bytes, start, "</string>") orelse return null;
     const v = std.mem.trim(u8, bytes[start..end], " \t\r\n");
     return if (v.len > 0) b.dupe(v) else null;
+}
+
+/// The ds4 submodule's checked-out commit, short, read without git: its `.git` file names the
+/// git dir, whose detached HEAD holds the commit.
+fn readDs4Commit(b: *std.Build) ?[]const u8 {
+    const root = buildRootHandle(b);
+    const link = root.readFileAlloc(b.graph.io, "lib/ds4/.git", b.allocator, .limited(512)) catch return null;
+    const line = std.mem.trim(u8, link, " \t\r\n");
+    const prefix = "gitdir: ";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const git_dir = line[prefix.len..];
+    const head_path = b.pathJoin(&.{ if (std.fs.path.isAbsolute(git_dir)) git_dir else b.pathJoin(&.{ "lib/ds4", git_dir }), "HEAD" });
+    const head = root.readFileAlloc(b.graph.io, head_path, b.allocator, .limited(256)) catch return null;
+    const sha = std.mem.trim(u8, head, " \t\r\n");
+    if (sha.len < 7 or std.mem.startsWith(u8, sha, "ref:")) return null;
+    return b.dupe(sha[0..7]);
 }
 
 fn readMlxcPin(b: *std.Build) ?[]const u8 {

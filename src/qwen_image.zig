@@ -49,7 +49,7 @@ pub fn resolveSteps(grid: ?[]const f32, steps: u32) u32 {
     return if (steps == 0) DEFAULT_STEPS else steps;
 }
 
-const VAE_DOWNSAMPLE: u32 = 16;
+pub const VAE_DOWNSAMPLE: u32 = 16;
 /// Text encoding stays bf16; the DiT defaults to bf16 and the VAE stays f32.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
 /// Experimental DiT-only dtype override. Unrecognized values preserve the
@@ -62,7 +62,7 @@ fn fusedRopeEnabled(value: ?[*:0]const u8) bool {
     return if (value) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
 }
 
-const MAX_PROMPT_TOKENS: usize = 2048;
+pub const MAX_PROMPT_TOKENS: usize = 2048;
 
 // Raw template string, not the chat template: the checkpoint was trained on it.
 const SYSTEM_PREFIX = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
@@ -2118,6 +2118,9 @@ pub const Engine = struct {
         self.vae = try VaeDecoder.load(io, allocator, self.s, model_dir, self.vae_cfg);
         errdefer self.vae.deinit();
         if (!staged) self.te = try TextEncoder.load(io, allocator, self.s, model_dir, COMPUTE);
+        errdefer if (self.te) |*t| t.deinit();
+        // Resident now, so a request's memory check reads them in live memory.
+        try mlx.evalFields(.{ self.dit, self.vae, self.te });
         logMemory("load");
 
         log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s}, {d} steps{s})\n", .{
@@ -3472,6 +3475,19 @@ test "QwenImage edit segment walk: adjacent image blocks stay separate" {
 // Whole pipeline on a REAL converted pack (QWEN_IMAGE_E2E_MODEL), text encoder
 // staged. Asserts a finite, non-flat image; QWEN_IMAGE_E2E_OUT=<file.png> keeps
 // it for a look, QWEN_IMAGE_E2E_STEPS / _SIZE / _GUIDANCE override the run.
+test "QwenImage load leaves the DiT and VAE resident (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_E2E_MODEL") orelse return error.SkipZigTest);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const engine = try Engine.load(io, testing.allocator, dir, true);
+    defer engine.deinit();
+    const last_stage = engine.vae.h.stages[engine.vae.h.stages.len - 1];
+    for ([_]A{ engine.dit.img_in.w, engine.dit.blocks[engine.dit.blocks.len - 1].out.w, last_stage.res[0].c1.w }) |w| {
+        var ready = false;
+        _ = mlx._mlx_array_is_available(&ready, w);
+        try testing.expect(ready);
+    }
+}
+
 test "QwenImage e2e on a real pack (env-gated)" {
     const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_E2E_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;

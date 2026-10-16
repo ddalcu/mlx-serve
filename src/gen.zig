@@ -2676,9 +2676,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             engine.backend.qwen_image.dit_cfg,
             if (guidance_scale != 1) 2 else 1,
         );
-        var active: usize = 0;
-        _ = mlx.mlx_get_active_memory(&active);
-        const headroom: u64 = mlx.maxRecommendedWorkingSet() -| @as(u64, active);
+        const headroom = gpuHeadroomBytes();
         const plan = planQwenImageEdit(steps, cache_enabled, base_bill, prefix_bill, headroom) catch {
             log.info("[image] edit bill refused: {d} refs at refres {d} + {d}x{d} target needs {d} MB over the reserve, headroom {d} MB\n", .{
                 gen_opts.edit_image_bytes.len, gen_opts.ref_resolution, width, height, (base_bill -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES) >> 20, headroom >> 20,
@@ -2691,6 +2689,21 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             log.info("[image] edit prefix cache does not fit; using uncached forward (cached bill {d} MB over reserve, headroom {d} MB)\n", .{
                 ((base_bill +| prefix_bill) -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES) >> 20, headroom >> 20,
             });
+        }
+    }
+    // Text-to-image: a canvas past the default size the load reserved can run
+    // past the working set, and that Metal OOM mid-denoise is uncatchable.
+    if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len == 0) {
+        const need = qwenImageGenTransientBytes(width, height);
+        const headroom = gpuHeadroomBytes();
+        if (need > headroom) {
+            log.info("[image] bill refused: {d}x{d} needs {d} MB, headroom {d} MB\n", .{ width, height, need >> 20, headroom >> 20 });
+            const gb = 1024.0 * 1024.0 * 1024.0;
+            var buf: [192]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "{d}x{d} needs ~{d:.1} GB of GPU memory but {d:.1} GB is free: shrink 'size' or unload another model", .{
+                width, height, @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(headroom)) / gb,
+            }) catch "this canvas needs more GPU memory than is free: shrink 'size'";
+            return sendError(conn, 400, msg);
         }
     }
     log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
@@ -4709,8 +4722,26 @@ pub fn stagedPeakBytes(resident: u64, stages: []const u64) u64 {
     return resident + biggest;
 }
 
-/// A 1024² denoise plus the f32 VAE decode, on top of the weights.
-const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = 4 << 30;
+/// What a text-to-image request holds above the weights. The denoise is the
+/// peak (the banded VAE decode stays below it) and grows per joint token: the
+/// canvas's latents plus a full-length prompt.
+const QWEN_IMAGE_GEN_TOKEN_BYTES: u64 = 640 << 10;
+const QWEN_IMAGE_GEN_BASE_BYTES: u64 = 1 << 30;
+
+pub fn qwenImageGenTransientBytes(width: u32, height: u32) u64 {
+    const latents: u64 = @as(u64, width / qwen_image.VAE_DOWNSAMPLE) * (height / qwen_image.VAE_DOWNSAMPLE);
+    return QWEN_IMAGE_GEN_BASE_BYTES + (latents + qwen_image.MAX_PROMPT_TOKENS) * QWEN_IMAGE_GEN_TOKEN_BYTES;
+}
+
+/// The load plan reserves a default-size request.
+const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = qwenImageGenTransientBytes(1024, 1024);
+
+/// What the GPU can still take: Metal's working set less live MLX memory.
+fn gpuHeadroomBytes() u64 {
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    return mlx.maxRecommendedWorkingSet() -| @as(u64, active);
+}
 
 /// Qwen-Image-2.1's text encoder is half the pack and idle for the whole
 /// denoise, so a machine the full set would crowd (past 3/4 of the GPU working
@@ -6544,10 +6575,10 @@ test "Qwen-Image stages its text encoder only where the full set crowds the GPU"
     try std.testing.expectEqual(18 * GB, qwenImagePeakBytesForStaging(9 * GB, 9 * GB, true));
     // Same pack with room to spare: resident, and the bill is everything.
     try std.testing.expect(!qwenImageStagesTextEncoderFromInputs(18 * GB, 48 * GB, null));
-    try std.testing.expectEqual(22 * GB, qwenImagePeakBytesForStaging(9 * GB, 9 * GB, false));
+    try std.testing.expectEqual(18 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImagePeakBytesForStaging(9 * GB, 9 * GB, false));
     // The 4-bit pack on a 16 GB Mac; a small encoder still bills the denoise.
     try std.testing.expect(qwenImageStagesTextEncoderFromInputs(10 * GB, 11 * GB, null));
-    try std.testing.expectEqual(8 * GB, qwenImagePeakBytesForStaging(2 * GB, 4 * GB, true));
+    try std.testing.expectEqual(4 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImagePeakBytesForStaging(2 * GB, 4 * GB, true));
     // Unknown working set never stages.
     try std.testing.expect(!qwenImageStagesTextEncoderFromInputs(18 * GB, 0, null));
 }
@@ -6564,7 +6595,21 @@ test "Qwen-Image low-memory override forces staging without disabling automatic 
     // An encoder larger than the denoise allowance still coexists with the
     // DiT/VAE while encoding; never bill only the smaller denoise residency.
     try std.testing.expectEqual(10 * GB, qwenImagePeakBytesForStaging(5 * GB, 5 * GB, staged));
-    try std.testing.expectEqual(9 * GB, qwenImagePeakBytesForStaging(3 * GB, 5 * GB, staged));
+    try std.testing.expectEqual(5 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImagePeakBytesForStaging(3 * GB, 5 * GB, staged));
+}
+
+test "Qwen-Image text-to-image bill covers the measured peak at every canvas" {
+    const GiB: f64 = 1 << 30;
+    // Peaks above the weights with a full-length prompt, the same on the 4- and 8-bit packs.
+    const measured = [_]struct { w: u32, h: u32, peak: f64 }{
+        .{ .w = 1024, .h = 1024, .peak = 4.40 },
+        .{ .w = 2048, .h = 2048, .peak = 11.85 },
+    };
+    for (measured) |m| {
+        const bill = @as(f64, @floatFromInt(qwenImageGenTransientBytes(m.w, m.h))) / GiB;
+        try testing.expect(bill >= m.peak);
+        try testing.expect(bill < m.peak * 1.1);
+    }
 }
 
 test "Qwen-Image edit dims: explicit floors to /32, no size follows the last reference at 1024²" {
@@ -6608,13 +6653,13 @@ test "Qwen-Image edit residency: the tower pack's heavier transient on the same 
     // Resident: everything coexists — the t2i bill plus the 2 GiB the tower's
     // reference-image working set adds.
     try testing.expectEqual(24 * GB, qwenImageEditPeakBytes(9 * GB, 9 * GB, 48 * GB, true));
-    // No tower: the edit bill IS the t2i bill (transient stays 4 GiB).
-    try testing.expectEqual(22 * GB, qwenImageEditPeakBytes(9 * GB, 9 * GB, 48 * GB, false));
+    // No tower: the edit bill IS the t2i bill.
+    try testing.expectEqual(18 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImageEditPeakBytes(9 * GB, 9 * GB, 48 * GB, false));
     try testing.expectEqual(qwenImagePeakBytes(9 * GB, 9 * GB, 48 * GB), qwenImageEditPeakBytes(9 * GB, 9 * GB, 48 * GB, false));
     // Staged 4-bit pack (TE 2 + rest 4): the 6 GiB edit transient becomes the
-    // biggest stage, where t2i's 4 GiB never was.
+    // biggest stage, above t2i's reserve.
     try testing.expectEqual(10 * GB, qwenImageEditPeakBytes(2 * GB, 4 * GB, 11 * GB, true));
-    try testing.expectEqual(8 * GB, qwenImageEditPeakBytes(2 * GB, 4 * GB, 11 * GB, false));
+    try testing.expectEqual(4 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImageEditPeakBytes(2 * GB, 4 * GB, 11 * GB, false));
 }
 
 test "Qwen-Image edit transient: the request-scope bill scales with refs x ref tokens" {

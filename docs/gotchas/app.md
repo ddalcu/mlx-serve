@@ -884,5 +884,9 @@ binding is available. Window removal preserves the store; deleting a session
 prunes both stores, even without a running turn.
 Guards: `SteeringNotesTests`, `ComposerMarkedTextTests`.
 
+## Qwen-Image infographics came back as gibberish
+
+Defect: Qwen-Image-2.1 garbled the lettering of every infographic, while the title and headline numbers came out right. Cause: the prompt asked for "icons and statistics" without giving their words, so the model invented filler labels, and those render as gibberish; our tokenizer matched Hugging Face's token for token. Enhance made it worse: it asked the chat model for "one or two sentences", which drops the exact words, and `clean` trimmed every quote off both ends, cutting the closing quote of a prompt that ended on quoted text. Fix: the format of Qwen's own prompt enhancer (every string in double quotes with where it sits, exact words for every label, "There is no other text in the image"), shipped as Qwen's Infographics templates and as Enhance's layout rules for a `rendersDenseText` model; `clean` strips only a wrapping pair. Same seed and size, the quoted layout rendered every word. Guards: `PromptRewriterTests`, `testQwenImageOffersInfographicTemplates`.
+
 ## A placeholder over a `TextEditor` ran under its scroller (2026-10-13)
 With "Show scroll bars: Always" (or a mouse attached), the Video prompt's placeholder ran under the editor's scroll bar: "Click" sat on the track. A legacy scroller takes 17 pt from the column the editor's text wraps in; the placeholder is a `Text` laid over the editor at full width. Fix: `.clearOfEditorScroller()` pads it by `EditorScrollerInset.trailing(for: NSScroller.preferredScrollerStyle)` and follows the style-change notification; every laid-over text uses it (Video prompt, Music lyrics and score, New Task goal, the Enhance sheet's thought). Guard: `EditorScrollerInsetTests`.

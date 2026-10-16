@@ -905,7 +905,7 @@ test "custom Metal kernels run on the Metal backend only" {
     try std.testing.expectEqual(builtin.os.tag.isDarwin(), metalKernelsAvailable());
 }
 
-/// Evaluates every array reachable through `value`'s fields (structs, optionals, fixed arrays),
+/// Evaluates every array reachable through `value`'s fields (structs, optionals, arrays, slices),
 /// so weights a loader bound lazily are resident, and billed, before the first request.
 pub fn evalFields(value: anytype) !void {
     const vec = mlx_vector_array_new();
@@ -924,16 +924,17 @@ fn appendFields(vec: mlx_vector_array, value: anytype) void {
         .@"struct" => |st| inline for (st.field_names) |name| appendFields(vec, @field(value, name)),
         .optional => if (value) |v| appendFields(vec, v),
         .array => for (value) |v| appendFields(vec, v),
+        .pointer => |p| if (p.size == .slice) for (value) |v| appendFields(vec, v),
         else => {},
     }
 }
 
-test "evalFields evaluates the arrays nested in structs, optionals and arrays" {
+test "evalFields evaluates the arrays nested in structs, optionals, arrays and slices" {
     if (noGpuBackend()) return error.SkipZigTest;
     const s = gpuStream();
     const one = mlx_array_new_float(1.0);
     defer _ = mlx_array_free(one);
-    var lazy: [4]mlx_array = undefined;
+    var lazy: [5]mlx_array = undefined;
     for (&lazy) |*a| {
         a.* = mlx_array_new();
         try check(mlx_add(a, one, one, s));
@@ -942,8 +943,8 @@ test "evalFields evaluates the arrays nested in structs, optionals and arrays" {
         _ = mlx_array_free(a);
     };
     const Inner = struct { w: mlx_array, none: mlx_array = .{ .ctx = null } };
-    const Outer = struct { inner: Inner, opt: ?mlx_array, rows: [2]mlx_array, n: u32 = 7 };
-    const v = Outer{ .inner = .{ .w = lazy[0] }, .opt = lazy[1], .rows = .{ lazy[2], lazy[3] } };
+    const Outer = struct { inner: Inner, opt: ?mlx_array, rows: [2]mlx_array, blocks: []const Inner, name: []const u8 = "x", n: u32 = 7 };
+    const v = Outer{ .inner = .{ .w = lazy[0] }, .opt = lazy[1], .rows = .{ lazy[2], lazy[3] }, .blocks = &.{.{ .w = lazy[4] }} };
     try evalFields(v);
     for (lazy) |a| {
         var ready = false;

@@ -171,6 +171,26 @@ fn hostTotalMemBytes() u64 {
     return total_mem;
 }
 
+/// Free RAM the plan never touches. MLX wires what it allocates, so planning down to the last
+/// free page leaves the OS nothing to reclaim: a 16 GB Mac died on wired memory (15.4 GB wired,
+/// 14 MB free) with every request admitted.
+/// `device_pool`: the memory is a GPU's own (`mlx.weightsInDeviceMemory`), whose free reading
+/// already counts every process, so no OS share is held back.
+pub fn osReserveBytes(total_ram: u64, device_pool: bool) u64 {
+    if (os_reserve_override) |v| return v;
+    if (device_pool) return 0;
+    return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
+}
+
+/// `--os-reserve-gib N` in bytes; 0 turns the reserve off. Null = the automatic eighth.
+pub var os_reserve_override: ?u64 = null;
+
+pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
+    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
+    if (n > 64) return error.InvalidOsReserve;
+    return @as(u64, n) << 30;
+}
+
 fn hostAvailableMemBytes() u64 {
     if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
@@ -255,6 +275,19 @@ test "memoryPool: device-memory weights bill VRAM, every other platform its host
     const GB: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(15 * GB, memoryPool(true, 15 * GB, 9 * GB)); // Windows: 13 GB fits the card
     try std.testing.expectEqual(20 * GB, memoryPool(false, 15 * GB, 20 * GB)); // managed memory pages to RAM
+}
+
+test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB; none of a GPU's own memory" {
+    const gb: u64 = 1 << 30;
+    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb, false));
+    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb, false));
+    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb, false));
+    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb, false));
+    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, true)); // free VRAM already counts every process
+    os_reserve_override = try parseOsReserveGib("0");
+    defer os_reserve_override = null;
+    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, false));
+    try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
 }
 
 test "computeAvailableBytes sums the reclaimable classes, capped by wired headroom" {

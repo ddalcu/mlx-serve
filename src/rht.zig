@@ -70,9 +70,10 @@ fn kernel() !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
-/// Blocks the kernel holds (J/4 floats per lane, J*32 floats of threadgroup memory).
-fn kernelBlock(block: c_int) bool {
-    return block == 512 or block == 1024 or block == 2048;
+/// Blocks the butterfly kernels (this one and gdn_decode's) hold, the four Prism's runtime
+/// accepts: J/4 floats per lane, J*32 floats of threadgroup memory.
+pub fn kernelBlock(block: c_int) bool {
+    return block == 512 or block == 1024 or block == 2048 or block == 4096;
 }
 
 fn transformKernel(x: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, inverse: bool, n_total: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -450,24 +451,28 @@ fn refHadamard(v: []f32) void {
     for (v) |*e| e.* *= scale;
 }
 
-test "rht: block-1024 transform (kernel + composed) matches the reference butterfly on both sides" {
+test "rht: every shipped block's transform (kernel + composed) matches the reference butterfly on both sides" {
+    for ([_]usize{ 512, 1024, 2048, 4096 }) |block| try expectTransformMatches(block);
+}
+
+fn expectTransformMatches(block: usize) !void {
     const s = mlx.gpuStream();
     const rows: usize = 2;
-    const n: usize = 2048;
-    const block: usize = 1024;
+    const n: usize = 2 * block;
     var prng = std.Random.DefaultPrng.init(7);
     const rnd = prng.random();
     const x = try std.testing.allocator.alloc(f32, rows * n);
     defer std.testing.allocator.free(x);
     for (x) |*e| e.* = rnd.floatNorm(f32);
-    var signs: [n]f32 = undefined;
-    for (&signs) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
+    const signs = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(signs);
+    for (signs) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
 
     const x_shape = [_]c_int{ @intCast(rows), @intCast(n) };
     const s_shape = [_]c_int{@intCast(n)};
     const xa = mlx.mlx_array_new_data(x.ptr, &x_shape, 2, .float32);
     defer _ = mlx.mlx_array_free(xa);
-    const sa = mlx.mlx_array_new_data(&signs, &s_shape, 1, .float32);
+    const sa = mlx.mlx_array_new_data(signs.ptr, &s_shape, 1, .float32);
     defer _ = mlx.mlx_array_free(sa);
 
     const want = try std.testing.allocator.alloc(f32, rows * n);

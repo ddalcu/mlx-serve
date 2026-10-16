@@ -74,6 +74,17 @@ that mlx-serve does not use. Those notices are omitted here as permitted by
 Apache-2.0 section 4(d).
 
 --------------------------------------------------------------------------------
+Qwen-Image
+https://github.com/QwenLM/Qwen-Image
+Copyright Alibaba Qwen team
+Licensed under the Apache License, Version 2.0.
+
+The image Enhance rules for text in a picture (`textLayoutShape` in
+app/Sources/MLXServe/Services/PromptRewriter.swift) are condensed from the
+text-image instructions of `polish_prompt_en` in
+src/examples/tools/prompt_utils_2512.py.
+
+--------------------------------------------------------------------------------
 laya-mlx
 https://github.com/mizorewww/laya-mlx
 Copyright laya-mlx contributors
@@ -251,6 +262,21 @@ cache env var is renamed `MLX_SERVE_ANE_CACHE`. `lib/ane/ane_mlp.m` (the
 per-layer SwiGLU-MLP MIL program builder used by `--ane-prefill`) is an
 mlx-serve addition modeled on the same project's `h3_ane_linear.m` blob
 layout and int8 constexpr-dequantize idioms.
+
+--------------------------------------------------------------------------------
+ANEMLL Forge
+https://github.com/Anemll/anemll-forge
+Copyright (c) 2026 ANEMLL contributors
+Licensed under the MIT License.
+
+Ported (commit 6c572a8), not vendored: `src/arch/ane_qwen35.zig` and `src/arch/ane_dflash.zig` emit, as
+MIL text from MLX packs, the Neural Engine graphs of Forge's builders (`coreai/qwen38_coreai_build.py`,
+`scripts/qwen38_ane_chunk.py`, `scripts/dflash2_gdn_lazy.py`, `coreai/dflash2_coreai_build.py`): the
+lazy-commit Gated DeltaNet and its UT-transform form, the attention over host-owned KV, the fp16 numerics
+(scale-free RMSNorm, tanh SiLU, overflow-safe softplus, q / v range scales, the drafter's residual scale)
+and the DFlash2 drafter's draft / context entries. `src/arch/ane_lm.zig` is an mlx-serve port of Forge's
+host runtime (`scripts/qwen38_coreai_model.py`, `scripts/qwen38_kv_cache.py`): the per-call positions and
+masks, the DeltaNet state ping-pong, the KV commits, the speculative cycle and the selector walk.
 
 --------------------------------------------------------------------------------
 SwaTex

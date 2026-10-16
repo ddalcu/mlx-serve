@@ -508,6 +508,7 @@ struct VoiceGenView: View {
                                            description: Text("Enter text, add a reference voice, and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
+                        LoadingModelsRow()
                         // Audio length is unknown until the model stops (total==0)
                         // → indeterminate bar; encode/decode stages are determinate.
                         if total == 0 {

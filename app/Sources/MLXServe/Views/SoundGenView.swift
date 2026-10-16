@@ -191,6 +191,7 @@ struct SoundGenView: View {
                                        description: Text("Describe a sound and press Generate.").font(.app(.body)))
             case .running(let step, let total, let message):
                 VStack(spacing: 12) {
+                    LoadingModelsRow()
                     if total == 0 {
                         ProgressView().frame(width: 240)
                     } else {

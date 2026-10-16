@@ -2908,6 +2908,9 @@ struct ChatDetailView: View {
                     SteeringNoteRow(note: note, isPaused: true, onPause: { restoreSteeringNote() })
                 }
 
+                // The chat model loading: what it is doing and how long is left.
+                ModelLoadProgressRow()
+
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
                 // same border, so they read as belonging to it.

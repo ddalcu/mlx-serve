@@ -363,6 +363,20 @@ check(cp_plist is not None and first_stamp is not None and cp_plist < first_stam
 check(first_stamp is not None and sign_app is not None and first_stamp < sign_app,
       "the stamp runs BEFORE the bundle is sealed (a later write breaks the signature)")
 
+# ── release.yml assembles its own .app: every resource app/build.sh stages
+# (its App Store-only block aside) must be staged there too, or the DMG ships
+# without it and the app's reader silently falls back to nothing.
+mas_only = set()
+for start in (i for i, l in enumerate(b_code) if re.match(r'if \[ "\$MAS" = "1" \]', l)):
+    end = next(k for k in range(start, len(b_lines)) if b_lines[k] == "fi")
+    mas_only.update(range(start, end + 1))
+res_name = r'\$CONTENTS/Resources/([\w.-]+)'
+built_res = {n for i, l in enumerate(b_code) if i not in mas_only for n in re.findall(res_name, l)}
+release_res = {n for l in lines if not l.lstrip().startswith("#") for n in re.findall(res_name, l)}
+check("agent-skills" in built_res, "app/build.sh's staged resources are readable")
+for n in sorted(built_res):
+    check(n in release_res, f"the release bundle stages Resources/{n} like app/build.sh")
+
 # ── Homebrew push timing: the release is created as a DRAFT, so its assets
 # are not downloadable until it is published. The formula push must fire on
 # the publish transition ONLY — any other trigger reintroduces the window

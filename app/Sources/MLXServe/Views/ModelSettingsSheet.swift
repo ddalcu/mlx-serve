@@ -24,6 +24,11 @@ enum ModelSettingsApply {
         let show = available ?? true
         return (show, show && mtp != false && !dflash)
     }
+
+    /// The server's `ane_lm.archOf` takes dense qwen3_5 and Qwen3 packs.
+    static func offersNeuralEngine(modelType: String?) -> Bool {
+        modelType == "qwen3_5" || modelType == "qwen3_5_text" || modelType == "qwen3"
+    }
 }
 
 struct ModelSettingsSheet: View {
@@ -41,6 +46,8 @@ struct ModelSettingsSheet: View {
     @State private var customKey = ""
     @State private var customValue = ""
     @State private var busy = false
+    /// The save reloads the model; the sheet stays up and shows the load until it is ready.
+    @State private var reloading = false
     @State private var error: String?
     @State private var socket: DrafterSocket = .automatic
     @State private var initialSocket: DrafterSocket = .automatic
@@ -83,6 +90,10 @@ struct ModelSettingsSheet: View {
         request.path.hasSuffix(".gguf") || appState.localModels.first { $0.path == request.path }?.quantFile != nil
     }
 
+    private var offersNeuralEngine: Bool {
+        ModelSettingsApply.offersNeuralEngine(modelType: appState.localModels.first { $0.path == request.path }?.modelType)
+    }
+
     /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
     private var hasInt8PrefillRoute: Bool {
         appState.localModels.first { $0.path == request.path }?.modelType == "prism_hadamard_qwen35"
@@ -114,6 +125,7 @@ struct ModelSettingsSheet: View {
     private var formHeight: CGFloat {
         var n = isGguf ? 2 : 3
         if hasInt8PrefillRoute { n += 1 }
+        if offersNeuralEngine { n += 1 }
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
         if rows.acceptance { n += 2 }
         if live?.loaded == true { n += 1 }
@@ -237,6 +249,16 @@ struct ModelSettingsSheet: View {
                 }
                 .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU.")
                 }
+                if offersNeuralEngine {
+                Picker("Neural Engine", selection: Binding(
+                    get: { override.ane.map { $0 ? 1 : 0 } ?? -1 },
+                    set: { override.ane = $0 < 0 ? nil : $0 == 1 })) {
+                    Text("Default").font(.app(.body)).tag(-1)
+                    Text("On").font(.app(.body)).tag(1)
+                    Text("Off").font(.app(.body)).tag(0)
+                }
+                .help("Runs the model on the Neural Engine, leaving the GPU free. Text only; the first load on this Mac compiles it for minutes.")
+                }
                 Section("Generation defaults") {
                     if override.extra["generation_defaults"] != nil {
                         Text("The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here.")
@@ -311,6 +333,11 @@ struct ModelSettingsSheet: View {
             if let error {
                 Text(error).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
             }
+            if reloading {
+                LoadProgressLine(name: ModelDisplayName.pretty(URL(fileURLWithPath: request.path).lastPathComponent),
+                                 progress: LoadProgress.lookup(server.loadProgress, path: request.path))
+                    .padding(.horizontal, 16)
+            }
             HStack {
                 Spacer()
                 Button { dismiss() } label: { Text("Cancel")
@@ -361,6 +388,8 @@ struct ModelSettingsSheet: View {
             server.stop()
             server.start(modelPath: appState.selectedModelPath, options: appState.serverOptions)
         case .reload:
+            reloading = true
+            defer { reloading = false }
             do {
                 try await server.unloadModel(id: live!.name)
                 _ = try await server.loadModel(id: request.path, setDefault: request.path == appState.selectedModelPath)

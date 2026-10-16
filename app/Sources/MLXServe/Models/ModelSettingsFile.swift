@@ -49,6 +49,8 @@ struct ModelOverride: Equatable {
     var drafter: String?
     /// `int8_prefill`: LOSSY int8-activation prefill (2-bit Prism packs only).
     var int8Prefill: Bool?
+    /// `ane`: serve the model on the Neural Engine instead of the GPU.
+    var ane: Bool?
     /// `chat_template_kwargs`: variables handed to the model's Jinja template
     /// verbatim (`TemplateKwargs` types and names them).
     var templateKwargs: [String: Any] = [:]
@@ -89,6 +91,9 @@ struct ModelOverride: Equatable {
         if let i = rest.removeValue(forKey: "int8_prefill") {
             if let b = i as? Bool { int8Prefill = b }
         }
+        if let a = rest.removeValue(forKey: "ane") {
+            if let b = a as? Bool { ane = b }
+        }
         if let kw = rest.removeValue(forKey: "chat_template_kwargs") as? [String: Any] { templateKwargs = kw }
         if let profile = rest["generation_defaults"] as? [String: Any],
            let data = try? JSONSerialization.data(withJSONObject: profile),
@@ -102,7 +107,7 @@ struct ModelOverride: Equatable {
     var isEmpty: Bool { !hasSettings && extra.isEmpty }
     /// True when any field the sheet edits is set.
     var hasSettings: Bool {
-        alias != nil || ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || mtpGreedyTail != nil || drafter != nil || int8Prefill != nil
+        alias != nil || ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || mtpGreedyTail != nil || drafter != nil || int8Prefill != nil || ane != nil
             || !templateKwargs.isEmpty || !generationDefaults.rules.isEmpty
     }
     var sortedKwargKeys: [String] { templateKwargs.keys.sorted() }
@@ -117,6 +122,7 @@ struct ModelOverride: Equatable {
         if let mtpGreedyTail { out["mtp_greedy_tail"] = mtpGreedyTail }
         if let drafter { out["drafter"] = drafter }
         if let int8Prefill { out["int8_prefill"] = int8Prefill }
+        if let ane { out["ane"] = ane }
         if !templateKwargs.isEmpty { out["chat_template_kwargs"] = templateKwargs }
         if !generationDefaults.rules.isEmpty { out["generation_defaults"] = generationDefaults.json }
         return out
@@ -141,7 +147,7 @@ struct ModelOverride: Equatable {
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
         a.alias == b.alias && a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.mtpGreedyTail == b.mtpGreedyTail && a.drafter == b.drafter
-            && a.int8Prefill == b.int8Prefill && a.generationDefaults == b.generationDefaults
+            && a.int8Prefill == b.int8Prefill && a.ane == b.ane && a.generationDefaults == b.generationDefaults
             && NSDictionary(dictionary: a.templateKwargs).isEqual(to: b.templateKwargs)
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }

@@ -148,11 +148,12 @@ pub fn sanitizeName(buf: []u8, raw: []const u8) []const u8 {
 /// Rebuild `body` with the model value replaced by `bare_id`. `model_value`
 /// MUST be the slice `server.parseModelFromBody` returned — i.e. alias `body`
 /// — so the decide and rewrite layers can never disagree on which bytes are
-/// the model field.
+/// the model field. Anything else (a canonicalised copy) is refused: its
+/// offset would be read off an unrelated pointer.
 pub fn rewriteModelValue(alloc: std.mem.Allocator, body: []const u8, model_value: []const u8, bare_id: []const u8) ![]u8 {
     const at = @intFromPtr(model_value.ptr);
     const base = @intFromPtr(body.ptr);
-    if (at < base or at - base + model_value.len > body.len) return error.ModelValueNotInBody;
+    if (at < base or at - base + model_value.len > body.len) return error.ModelNotInBody;
     const start = at - base;
     const out = try alloc.alloc(u8, body.len - model_value.len + bare_id.len);
     @memcpy(out[0..start], body[0..start]);
@@ -1267,9 +1268,21 @@ test "lan: sanitizeName collapses hostile chars and never returns empty" {
 }
 
 test "lan: rewriteModelValue refuses a model value that is not a slice of the body" {
+    const a = t.allocator;
+    const body = "{\"model\":\"org\\/m@Studio\",\"messages\":[]}";
+    const raw = body[10 .. 10 + "org\\/m@Studio".len];
+    var canon_buf: [64]u8 = undefined;
+    const canon = unescapeJsonSlashes(&canon_buf, raw);
+    try t.expectError(error.ModelNotInBody, rewriteModelValue(a, body, canon, "org/m"));
+    const out = try rewriteModelValue(a, body, raw, "org/m");
+    defer a.free(out);
+    try t.expectEqualStrings("{\"model\":\"org/m\",\"messages\":[]}", out);
+}
+
+test "lan: rewriteModelValue refuses an unescaped Windows path id" {
     const body = "{\"model\":\"C:\\\\m@local\"}";
     const canonical = "C:\\m@local"; // an unescaped copy, as handleConnection used to pass
-    try t.expectError(error.ModelValueNotInBody, rewriteModelValue(t.allocator, body, canonical, "C:\\m"));
+    try t.expectError(error.ModelNotInBody, rewriteModelValue(t.allocator, body, canonical, "C:\\m"));
 }
 
 test "lan: rewriteModelValue splices the aliased model value in place" {
