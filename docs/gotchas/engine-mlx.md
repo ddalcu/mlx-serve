@@ -5698,3 +5698,10 @@ Defect: after a new build, a cached Qwen3.8-27B recompiled for minutes on the Ne
 Cause: the LM engine's cache variant hashed `round_cost.engineBuildId()`, and a dev build hashes its executable (a release, its git sha). The bridge's cold-compile prune deletes the model's entries tagged with another variant, so the first miss after a rebuild deleted every entry not yet restored, and the rest recompiled.
 Fix: the variant names only the configuration (lanes, contexts, drafter taps). Entries are keyed by program, so a rebuild restores what it still emits, and `rt.cacheSweep` drops the model's entries a finished build did not touch (an older engine's). Builds take turns (`build_mu`): the lineage is process-wide.
 Guard: `cache sweep: after a build, its group's entries it did not touch go; other groups stay` (ane_rt.zig).
+
+## Every app update recompiled every Neural Engine model (2026-10-15)
+
+Defect: after each app rebuild a cached Neural Engine model recompiled for minutes, while restarts of the same build restored it in seconds.
+Cause: the ANE service keys a compiled program by the code-signing identifier of the process that compiled it, and `app/build.sh` and the release workflow sign `mlx-serve` without `--identifier`, so codesign named each build `mlx-serve-<hash of the binary>`. A plain `zig build` is linker-signed as `mlx-serve` and restored any entry, which hid it in development.
+Fix: `mlx-serve` embeds an Info.plist (`__TEXT,__info_plist`, `CFBundleIdentifier` `com.dalcu.mlx-core.mlx-serve`, kept referenced from `main` or the linker strips it), which codesign uses as the identifier.
+Guard: none automated. Check with `codesign -f -s - <copy>; codesign -dv <copy>`, which must print that identifier.

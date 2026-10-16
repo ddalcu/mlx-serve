@@ -1496,6 +1496,10 @@ pub const Scheduler = struct {
     offloaded: std.ArrayList(*Slot) = .empty,
     /// Cold Neural Engine builds running on their own threads (`aneBuildThread`).
     ane_builds: std.atomic.Value(u32) = .init(0),
+    /// Neural Engine requests' live metrics: prompt tokens to feed and fed (`Engine.gauges`), and
+    /// tokens generated so far by the ones still decoding; the sampler adds them to the GPU's.
+    ane_prefill_gauges: arch_ane.PrefillGauges = .{},
+    ane_generated: std.atomic.Value(u64) = .init(0),
     /// Phase A4: pending vision-encode requests. The inference thread drains
     /// these in the gap before/after each prefill+decode tick. Posting
     /// broadcasts on `queue_cond` to wake an idle inference thread.
@@ -3378,7 +3382,7 @@ fn runAneSlot(ctx: *anyopaque, engine: *arch_ane.Engine, job: *anyopaque) void {
     runAneRequest(sch, slot, engine) catch |err| {
         if (err == error.Cancelled) return endAneSlot(sch, slot, "cancelled");
         log.err("[ane] request failed: {s}\n", .{@errorName(err)});
-        recordSlotEnd(sch.metrics, slot, .failed);
+        recordAneSlotEnd(sch, slot, .failed);
         slot.markError(@errorName(err));
         return;
     };
@@ -3389,7 +3393,15 @@ fn runAneSlot(ctx: *anyopaque, engine: *arch_ane.Engine, job: *anyopaque) void {
 fn runAneRequest(sch: *Scheduler, slot: *Slot, engine: *arch_ane.Engine) !void {
     if (slot.cancelled.load(.acquire)) return error.Cancelled;
     var prefill_sw = io_util.Stopwatch.init(sch.io);
-    const synced = try engine.sync(slot.full_prompt, &slot.cancelled);
+    engine.gauges = &sch.ane_prefill_gauges;
+    _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
+    const synced = synced: {
+        defer {
+            engine.ungauge();
+            _ = sch.requests_prefilling.fetchSub(1, .monotonic);
+        }
+        break :synced try engine.sync(slot.full_prompt, &slot.cancelled);
+    };
     slot.prompt_tokens = @intCast(slot.full_prompt.len);
     slot.cached_tokens = @intCast(synced.cached);
     slot.prefill_ns = prefill_sw.read();
@@ -3416,7 +3428,7 @@ fn runAneRequest(sch: *Scheduler, slot: *Slot, engine: *arch_ane.Engine) !void {
         var cycles: usize = 0;
         var accepted: usize = 0;
         defer if (cycles > 0) log.info("[ane] spec: {d} cycles, {d}% of drafts accepted, {d:.2} tokens per call\n", .{ cycles, 100 * accepted / (drafts * cycles), @as(f64, @floatFromInt(accepted + cycles)) / @as(f64, @floatFromInt(cycles)) });
-        if (aneEmit(slot, tok)) |reason| return endAneSlot(sch, slot, reason);
+        if (aneEmit(sch, slot, tok)) |reason| return endAneSlot(sch, slot, reason);
         emitted = true;
         while (true) {
             const c = engine.cycle(tok, sampling, prng.random(), slot.eos_token_ids) catch |err| switch (err) {
@@ -3426,12 +3438,12 @@ fn runAneRequest(sch: *Scheduler, slot: *Slot, engine: *arch_ane.Engine) !void {
             cycles += 1;
             accepted += c.accepted;
             slot.decode_ns = decode_sw.read();
-            for (c.tokens[0..c.n]) |t| if (aneEmit(slot, t)) |reason| return endAneSlot(sch, slot, reason);
+            for (c.tokens[0..c.n]) |t| if (aneEmit(sch, slot, t)) |reason| return endAneSlot(sch, slot, reason);
             tok = c.tokens[c.n - 1];
         }
     }
     while (true) {
-        if (!emitted) if (aneEmit(slot, tok)) |reason| return endAneSlot(sch, slot, reason);
+        if (!emitted) if (aneEmit(sch, slot, tok)) |reason| return endAneSlot(sch, slot, reason);
         emitted = false;
         const logits = engine.step(tok) catch |err| switch (err) {
             error.ContextFull => return endAneSlot(sch, slot, "length"),
@@ -3449,19 +3461,26 @@ pub fn aneServes(sampling: SamplingParams, logprobs_n: u32, prompt_logprobs: boo
 }
 
 /// Publish one generated token; the finish reason when the slot ends here.
-fn aneEmit(slot: *Slot, tok: u32) ?[]const u8 {
+fn aneEmit(sch: *Scheduler, slot: *Slot, tok: u32) ?[]const u8 {
     if (generate_mod.isEosId(tok, slot.eos_token_ids)) return "stop";
     slot.pushToken(tok);
     if (tok != 0) slot.was_pad_only = false;
     slot.completion_tokens += 1;
+    _ = sch.ane_generated.fetchAdd(1, .monotonic);
     if (slot.completion_tokens >= slot.max_tokens) return "length";
     if (slot.cancelled.load(.acquire)) return "cancelled";
     return null;
 }
 
+/// Its generated tokens move from the live count to the request totals in one go.
+fn recordAneSlotEnd(sch: *Scheduler, slot: *Slot, outcome: metrics_mod.Outcome) void {
+    _ = sch.ane_generated.fetchSub(slot.completion_tokens, .monotonic);
+    recordSlotEnd(sch.metrics, slot, outcome);
+}
+
 /// Metrics first: once the terminator is out, the connection thread may complete the slot.
 fn endAneSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
-    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, null));
+    recordAneSlotEnd(sch, slot, finishOutcome(reason, null));
     publishSlotTerminator(slot, reason, null);
 }
 

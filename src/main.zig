@@ -28,6 +28,17 @@ const ds4_arch = if (build_options.embedded_engines) @import("arch/ds4.zig") els
 const llama_arch = if (build_options.embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
+
+// codesign names an executable after its embedded Info.plist; without one it makes up a new name for
+// every build, and the Neural Engine keeps compiled programs per signing name: each app update
+// recompiled every model on it.
+const info_plist = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" ++
+    "<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>com.dalcu.mlx-core.mlx-serve</string>" ++
+    "<key>CFBundleName</key><string>mlx-serve</string></dict></plist>\n").*;
+comptime {
+    if (@import("builtin").os.tag == .macos) @export(&info_plist, .{ .name = "mlx_serve_info_plist", .section = "__TEXT,__info_plist" });
+}
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
@@ -470,6 +481,8 @@ fn printUsage(io: std.Io) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Referenced, or the linker strips the unreferenced section.
+    if (@import("builtin").os.tag == .macos) std.mem.doNotOptimizeAway(&info_plist);
     const allocator = init.gpa;
     const io = init.io;
 

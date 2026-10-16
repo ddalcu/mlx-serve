@@ -864,6 +864,12 @@ const Site = struct {
     fused: bool = false,
 };
 
+/// The server's live prefill gauges across engines: prompt tokens still to feed and fed so far.
+pub const PrefillGauges = struct {
+    todo: std.atomic.Value(u64) = .init(0),
+    done: std.atomic.Value(u64) = .init(0),
+};
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -914,6 +920,9 @@ pub const Engine = struct {
     /// The last head call's logits as P contiguous rows, gathered on first use.
     rows: []f16,
     rows_ready: bool = false,
+    /// The server's live gauges (null: none), and what this engine counted into them.
+    gauges: ?*PrefillGauges = null,
+    gauged: [2]u64 = .{ 0, 0 },
     emb_scratch: []f32,
     cache: ?*prefix.Cache = null,
     node: ?*prefix.Node = null,
@@ -1710,6 +1719,7 @@ pub const Engine = struct {
                 out = try self.prefillBlock(ids[i .. i + blk], blk == r);
                 if (self.ingesting(p0, @intCast(blk), ingest_from)) try self.ingest(self.features(.prefill, blk), p0, @intCast(blk), ingest_from.?);
                 try self.fed.appendSlice(self.allocator, ids[i .. i + blk]);
+                self.gauge(.done, blk);
                 i += blk;
                 if (self.cache != null and self.pos >= self.next_cp) self.checkpoint();
             } else {
@@ -1719,10 +1729,27 @@ pub const Engine = struct {
                 if (self.ingesting(self.pos, n, ingest_from)) try self.ingest(self.features(.decode, n), self.pos, n, ingest_from.?);
                 self.accept(n);
                 try self.fed.appendSlice(self.allocator, ids[i .. i + n]);
+                self.gauge(.done, n);
                 i += n;
             }
         }
         return out;
+    }
+
+    /// Count `n` prompt tokens into the live gauges: `.todo` once a sync knows what it will feed,
+    /// `.done` per block fed.
+    fn gauge(self: *Engine, comptime which: enum { todo, done }, n: u64) void {
+        const g = self.gauges orelse return;
+        _ = @field(g, @tagName(which)).fetchAdd(n, .monotonic);
+        self.gauged[@intFromEnum(which)] += n;
+    }
+
+    /// Take back what this engine counted into the gauges: its sync is over.
+    pub fn ungauge(self: *Engine) void {
+        const g = self.gauges orelse return;
+        _ = g.todo.fetchSub(self.gauged[0], .monotonic);
+        _ = g.done.fetchSub(self.gauged[1], .monotonic);
+        self.gauged = .{ 0, 0 };
     }
 
     /// Do positions [p0, p0 + n) reach the drafter's context (from `from` on)?
@@ -1856,6 +1883,7 @@ pub const Engine = struct {
         }
         if (start == 0) self.reset(true);
         const cached = start;
+        self.gauge(.todo, prompt.len - start);
         // A checkpoint before the prompt's last P tokens: a chat's next turn renders this turn's
         // generation prompt differently, so the prefix it shares ends about there.
         const turn = prompt.len -| P;
@@ -2286,6 +2314,19 @@ test "sampling: without a top-k, only tokens near the top are candidates" {
     try std.testing.expectEqual(@as(usize, 3), wide.len);
     try std.testing.expectEqual(@as(u32, 1), wide[0].id);
     try std.testing.expectEqual(@as(usize, 2), dist(&logits, .{ .temperature = 0.1 }, &scratch).?.len);
+}
+
+test "gauges: a sync counts what it will feed and what it fed, and takes both back" {
+    var g: PrefillGauges = .{};
+    var e: Engine = undefined;
+    e.gauges = &g;
+    e.gauged = .{ 0, 0 };
+    e.gauge(.todo, 100);
+    e.gauge(.done, 64);
+    try testing.expectEqual(@as(u64, 100), g.todo.load(.monotonic));
+    try testing.expectEqual(@as(u64, 64), g.done.load(.monotonic));
+    e.ungauge();
+    try testing.expectEqual(@as(u64, 0), g.todo.load(.monotonic) + g.done.load(.monotonic));
 }
 
 test "suppress: reserved ids and padding rows are never drawn" {

@@ -13367,15 +13367,16 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // generated so far by still-decoding slots (the scheduler publishes that
     // aggregate atomically once per decode tick — race-free, no per-token
     // write). Non-zero even mid-request, unlike the completion-only counter.
-    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic);
+    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic) + ctx.scheduler.ane_generated.load(.monotonic);
     ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, inflight));
 
     // The other phase. Prompt-token counters and the prefill-time histogram
     // only advance at request COMPLETION, so a long prefill was invisible: GPU
     // pinned, decode reading 0, prefill reading "—". This gauge moves per
     // prefill chunk and returns to 0 the moment the prefill ends.
-    ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic));
-    ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic));
+    // Neural Engine requests count apart: the GPU's prefill stores its absolute progress.
+    ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic) + ctx.scheduler.ane_prefill_gauges.done.load(.monotonic));
+    ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic) + ctx.scheduler.ane_prefill_gauges.todo.load(.monotonic));
     ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
 }
 
