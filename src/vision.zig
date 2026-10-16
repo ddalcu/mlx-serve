@@ -536,6 +536,13 @@ pub const VisionEncoder = struct {
         return error.NoVideoEncoder;
     }
 
+    /// RADIO video: `frames` is `[N, 3, H, W]` float32. Returns every tubelet's
+    /// soft tokens, `[1, groups * spatial, hidden]`, before EVS.
+    pub fn forwardRadioVideo(self: *VisionEncoder, frames: mlx.mlx_array) !mlx.mlx_array {
+        if (self.radio) |*rv| return rv.forwardVideo(frames);
+        return error.NoVideoEncoder;
+    }
+
     /// A video on EmbeddingGemma 2's tower is its frames, each encoded as an image of its own. `frames` is the
     /// buffer the scheduler views as patch rows; its bytes are `grid_t` float32 CHW frames back to back, each
     /// `grid_h x grid_w` patches. Returns every frame's soft tokens in order, [1, grid_t * n, hidden].

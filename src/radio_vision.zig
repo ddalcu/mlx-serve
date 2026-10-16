@@ -2,10 +2,12 @@
 //!
 //! Weights keep the checkpoint names (`vision_model.radio_model.model.*`,
 //! `mlp1.*`). The transformers rename in modeling_radio.py is not applied.
-//! Images only: a CHW float32 buffer already normalized with CLIP mean/std
-//! becomes `[1, tokens, llm_hidden]` after a 32-block ViT, v2 pixel-shuffle,
-//! and the ReLU² projector. Class and register tokens are dropped. Video
-//! packing is not wired.
+//! A CHW float32 buffer already normalized with CLIP mean/std becomes
+//! `[1, tokens, llm_hidden]` after a 32-block ViT, v2 pixel-shuffle, and the
+//! ReLU² projector. Class and register tokens are dropped. Video packs
+//! `video_temporal_patch_size` frames on the channel axis and projects them
+//! with `patch_generator.video_embedder` instead of the image embedder.
+//! The same tower and projector then run once per tubelet.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -24,6 +26,12 @@ pub const ENGINE_MAX_PATCHES: u32 = 4096;
 pub const MIN_PATCHES: u32 = 1024;
 pub const PATCH: u32 = 16;
 pub const DOWNSAMPLE: u32 = 2;
+/// Frames folded into one tubelet. Matches `video_temporal_patch_size`.
+pub const TEMPORAL: u32 = 2;
+/// Patch budget for a video frame (`video_target_num_patches`), pre-shuffle.
+pub const VIDEO_TARGET_PATCHES: u32 = 1024;
+/// Default EVS drop fraction. The Bolt checkpoint sets this to 0.7.
+pub const VIDEO_PRUNING_RATE: f32 = 0.7;
 const HEADS: u32 = 16;
 const LN_EPS: f32 = 1e-6;
 const PROJECTOR_EPS: f32 = 1e-5;
@@ -82,12 +90,194 @@ pub fn targetPatches(src_h: u32, src_w: u32, budget_in: u32) PatchGrid {
     return .{ .w = tw, .h = th };
 }
 
+fn roundAtLeast1(x: f64) u32 {
+    const r = roundHalfEven(x);
+    if (r < 1) return 1;
+    return @intCast(r);
+}
+
+/// `(w_patches, h_patches)` from `_compute_target_patches_video`.
+/// Aspect is preserved and both dims snap to `DOWNSAMPLE`. The budget is a
+/// fixed patch count, not a cap against the source size: a small frame is
+/// scaled up to the same grid as a large one of the same aspect.
+pub fn targetPatchesVideo(src_h: u32, src_w: u32) PatchGrid {
+    const target: u32 = VIDEO_TARGET_PATCHES;
+    const divisor: u32 = DOWNSAMPLE;
+    if (src_h == 0 or src_w == 0) return .{ .w = 32, .h = 32 };
+    const aspect = @as(f64, @floatFromInt(src_w)) / @as(f64, @floatFromInt(@max(src_h, 1)));
+    var ph: u32 = roundAtLeast1(@sqrt(@as(f64, @floatFromInt(target)) / aspect));
+    var pw: u32 = roundAtLeast1(@sqrt(@as(f64, @floatFromInt(target)) * aspect));
+    if (divisor > 1) {
+        const rem_h = ph % divisor;
+        const rem_w = pw % divisor;
+        const ph_up = ph + if (rem_h != 0) divisor - rem_h else 0;
+        const ph_down = ph - rem_h;
+        const pw_up = pw + if (rem_w != 0) divisor - rem_w else 0;
+        const pw_down = pw - rem_w;
+        if (ph_up * pw_up <= target) {
+            ph = ph_up;
+            pw = pw_up;
+        } else {
+            ph = @max(divisor, ph_down);
+            pw = @max(divisor, pw_down);
+        }
+    }
+    if (ph == 0 or pw == 0) return .{ .w = 32, .h = 32 };
+    return .{ .w = pw, .h = ph };
+}
+
+/// Tubelet grid for pixels already resized to a video patch target.
+/// `pixel_h` / `pixel_w` are the shared frame size. `spatial` is language
+/// tokens per tubelet after the 2×2 shuffle.
+pub const VideoGeom = struct {
+    patch_w: u32,
+    patch_h: u32,
+    token_w: u32,
+    token_h: u32,
+    spatial: u32,
+    groups: u32,
+    frames: u32,
+};
+
+pub fn videoGeometry(frames: u32, pixel_h: u32, pixel_w: u32) ?VideoGeom {
+    if (frames == 0 or pixel_h == 0 or pixel_w == 0) return null;
+    if (pixel_h % PATCH != 0 or pixel_w % PATCH != 0) return null;
+    const patch_h = pixel_h / PATCH;
+    const patch_w = pixel_w / PATCH;
+    if (patch_h % DOWNSAMPLE != 0 or patch_w % DOWNSAMPLE != 0) return null;
+    const token_h = patch_h / DOWNSAMPLE;
+    const token_w = patch_w / DOWNSAMPLE;
+    if (token_h == 0 or token_w == 0) return null;
+    return .{
+        .patch_w = patch_w,
+        .patch_h = patch_h,
+        .token_w = token_w,
+        .token_h = token_h,
+        .spatial = token_h * token_w,
+        .groups = (frames + TEMPORAL - 1) / TEMPORAL,
+        .frames = frames,
+    };
+}
+
+/// One tubelet's label, exactly the processor's no-timestamp form.
+/// Group 0 is `"Frame 1 and frame 2: "`. Later groups lead with `"\n"`.
+/// A short final group omits the padded frame: three frames end at `"\nFrame 3: "`.
+/// Returns empty when `buf` cannot hold the text.
+pub fn videoGroupSegment(buf: []u8, group: u32, frames: u32) []const u8 {
+    var n: usize = 0;
+    if (group > 0) {
+        if (buf.len < 1) return buf[0..0];
+        buf[0] = '\n';
+        n = 1;
+    }
+    var j: u32 = 0;
+    var any = false;
+    while (j < TEMPORAL) : (j += 1) {
+        const fi = group * TEMPORAL + j;
+        if (fi >= frames) break;
+        if (any) {
+            if (n + 5 > buf.len) return buf[0..0];
+            @memcpy(buf[n..][0..5], " and ");
+            n += 5;
+        }
+        const word: []const u8 = if (j == 0) "Frame " else "frame ";
+        if (n + word.len > buf.len) return buf[0..0];
+        @memcpy(buf[n..][0..word.len], word);
+        n += word.len;
+        const num = std.fmt.bufPrint(buf[n..], "{d}", .{fi + 1}) catch return buf[0..0];
+        n += num.len;
+        any = true;
+    }
+    if (!any or n + 2 > buf.len) return buf[0..0];
+    @memcpy(buf[n..][0..2], ": ");
+    n += 2;
+    return buf[0..n];
+}
+
+/// How many language tokens EVS keeps. `int(groups * spatial * (1-q))`, and
+/// never fewer than one tubelet. `q <= 0` keeps the whole clip.
+pub fn evsKeepCount(groups: u32, spatial: u32, q: f32) u32 {
+    const all = groups * spatial;
+    if (!(q > 0) or groups == 0 or spatial == 0) return all;
+    const prod = @as(f64, @floatFromInt(groups)) * @as(f64, @floatFromInt(spatial)) * (1.0 - @as(f64, q));
+    const evs: u32 = @intFromFloat(@trunc(prod));
+    return @max(spatial, evs);
+}
+
+/// Stable descending top-`keep` over `scores`. True means the token stays,
+/// in the original order (the official mask is not a reorder).
+pub fn evsRetentionMask(allocator: std.mem.Allocator, scores: []const f32, keep: usize) ![]bool {
+    const mask = try allocator.alloc(bool, scores.len);
+    if (keep >= scores.len) {
+        @memset(mask, true);
+        return mask;
+    }
+    const order = try allocator.alloc(usize, scores.len);
+    defer allocator.free(order);
+    for (order, 0..) |*slot, i| slot.* = i;
+    std.mem.sort(usize, order, scores, struct {
+        fn less(s: []const f32, a: usize, b: usize) bool {
+            if (s[a] == s[b]) return a < b;
+            return s[a] > s[b];
+        }
+    }.less);
+    @memset(mask, false);
+    for (order[0..keep]) |i| mask[i] = true;
+    return mask;
+}
+
+fn cosine(a: []const f32, b: []const f32) f32 {
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (a, b) |x, y| {
+        const xf: f64 = x;
+        const yf: f64 = y;
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+    }
+    const denom = @sqrt(na) * @sqrt(nb);
+    if (!(denom > 0)) return 0;
+    return @floatCast(dot / denom);
+}
+
+/// Dissimilarity scores for one clip, length `groups * spatial`.
+/// `embeds` is row-major `[groups, spatial, hidden]`. The first tubelet is
+/// 255 so it always outranks a later frame (cosine dissimilarity is at most 2).
+pub fn videoDissimilarity(embeds: []const f32, groups: usize, spatial: usize, hidden: usize, scores: []f32) void {
+    for (0..spatial) |i| scores[i] = 255;
+    var t: usize = 1;
+    while (t < groups) : (t += 1) {
+        for (0..spatial) |i| {
+            const prev = embeds[((t - 1) * spatial + i) * hidden ..][0..hidden];
+            const cur = embeds[(t * spatial + i) * hidden ..][0..hidden];
+            const d = 1 - cosine(prev, cur);
+            scores[t * spatial + i] = if (std.math.isFinite(d)) d else 0;
+        }
+    }
+}
+
 pub const Prepared = struct {
     pixels: []u8,
     h: u32,
     w: u32,
     tokens: u32,
 };
+
+fn writeClipChw(chw: []f32, hwc: []const u8, th: u32, tw: u32) void {
+    const plane: usize = @as(usize, th) * tw;
+    for (0..th) |y| {
+        for (0..tw) |x| {
+            const src = (y * tw + x) * 3;
+            const dst = y * tw + x;
+            inline for (0..3) |c| {
+                const unit = @as(f32, @floatFromInt(hwc[src + c])) / 255.0;
+                chw[c * plane + dst] = (unit - MEAN[c]) / STD[c];
+            }
+        }
+    }
+}
 
 /// PIL bicubic resize (the tower's reference is antialiased torch bicubic) then CLIP norm.
 /// Returned bytes are float32 CHW `[3, H, W]`. `tokens` is the language-token count after shuffle.
@@ -98,23 +288,54 @@ pub fn prepareImage(allocator: std.mem.Allocator, rgb: []const u8, src_h: u32, s
     const resized = try qwen_vision.resizeInterleavedPil(allocator, rgb, src_h, src_w, th, tw, 3, .bicubic);
     defer allocator.free(resized);
     const plane: usize = @as(usize, th) * tw;
+    // Keep the allocation align-1 so callers can free the []u8 pixels. The
+    // write needs an f32 view, and a byte slice does not carry that alignment.
     const buf = try allocator.alloc(u8, plane * 3 * @sizeOf(f32));
-    const chw = std.mem.bytesAsSlice(f32, buf);
-    for (0..th) |y| {
-        for (0..tw) |x| {
-            const src = (y * tw + x) * 3;
-            const dst = y * tw + x;
-            inline for (0..3) |c| {
-                const unit = @as(f32, @floatFromInt(resized[src + c])) / 255.0;
-                chw[c * plane + dst] = (unit - MEAN[c]) / STD[c];
-            }
-        }
-    }
+    const aligned: []align(@alignOf(f32)) u8 = @alignCast(buf);
+    writeClipChw(std.mem.bytesAsSlice(f32, aligned), resized, th, tw);
     return .{
         .pixels = buf,
         .h = th,
         .w = tw,
         .tokens = (grid.h / DOWNSAMPLE) * (grid.w / DOWNSAMPLE),
+    };
+}
+
+pub const VideoPrepared = struct {
+    pixels: []u8,
+    frames: u32,
+    h: u32,
+    w: u32,
+    /// Language tokens in one tubelet, after the shuffle.
+    tokens: u32,
+    groups: u32,
+};
+
+/// Every frame resized to frame 0's video grid, CLIP-normalized, concatenated
+/// as float32 CHW. The encoder repeats a short last tubelet; this buffer does not.
+pub fn prepareVideo(allocator: std.mem.Allocator, rgbs: []const []const u8, hs: []const u32, ws: []const u32) !VideoPrepared {
+    if (rgbs.len == 0 or rgbs.len != hs.len or rgbs.len != ws.len or rgbs.len > std.math.maxInt(u32)) return error.InvalidVisionInput;
+    const grid = targetPatchesVideo(hs[0], ws[0]);
+    const tw = grid.w * PATCH;
+    const th = grid.h * PATCH;
+    const plane: usize = @as(usize, th) * tw;
+    const frame_bytes = plane * 3 * @sizeOf(f32);
+    const buf = try allocator.alloc(u8, rgbs.len * frame_bytes);
+    errdefer allocator.free(buf);
+    for (rgbs, hs, ws, 0..) |rgb, h, w, i| {
+        const resized = try qwen_vision.resizeInterleavedPil(allocator, rgb, h, w, th, tw, 3, .bicubic);
+        defer allocator.free(resized);
+        const bytes: []align(@alignOf(f32)) u8 = @alignCast(buf[i * frame_bytes ..][0..frame_bytes]);
+        writeClipChw(std.mem.bytesAsSlice(f32, bytes), resized, th, tw);
+    }
+    const geom = videoGeometry(@intCast(rgbs.len), th, tw) orelse return error.InvalidVisionInput;
+    return .{
+        .pixels = buf,
+        .frames = geom.frames,
+        .h = th,
+        .w = tw,
+        .tokens = geom.spatial,
+        .groups = geom.groups,
     };
 }
 
@@ -178,6 +399,30 @@ fn must(weights: *const Weights, buf: *[320]u8, comptime fmt: []const u8, args: 
     };
 }
 
+fn patchGrid(height: u32, width: u32) !struct { u32, u32 } {
+    if (height % PATCH != 0 or width % PATCH != 0) return error.InvalidVisionInput;
+    const rows = height / PATCH;
+    const cols = width / PATCH;
+    if (rows % DOWNSAMPLE != 0 or cols % DOWNSAMPLE != 0 or rows == 0 or cols == 0) return error.InvalidVisionInput;
+    return .{ rows, cols };
+}
+
+fn loadVideoEmbedder(weights: *const Weights, hidden: u32) mlx.mlx_array {
+    const name = "vision_model.radio_model.model.patch_generator.video_embedder.weight";
+    const w = weights.get(name) orelse {
+        log.info("RADIO video embedder absent; still images only\n", .{});
+        return .{ .ctx = null };
+    };
+    const sh = mlx.getShape(w);
+    const expect: c_int = @intCast(TEMPORAL * 3 * PATCH * PATCH);
+    if (sh.len != 2 or sh[0] != @as(c_int, @intCast(hidden)) or sh[1] != expect) {
+        log.err("RADIO video embedder shape does not match the temporal pack. Video is off; still images stay on.\n", .{});
+        return .{ .ctx = null };
+    }
+    log.info("RADIO video embedder: in={d} temporal={d}\n", .{ expect, TEMPORAL });
+    return w;
+}
+
 fn scalar(val: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     const f = mlx.mlx_array_new_float(val);
     defer _ = mlx.mlx_array_free(f);
@@ -197,6 +442,9 @@ pub const RadioVision = struct {
     out_hidden: u32,
     pos_owned: bool,
     patch_w: mlx.mlx_array,
+    /// Bias-free `video_embedder`. Null when the checkpoint has no video tower;
+    /// still images keep working.
+    video_w: mlx.mlx_array,
     pos_table: mlx.mlx_array,
     cls: mlx.mlx_array,
     blocks: []Block,
@@ -282,6 +530,7 @@ pub const RadioVision = struct {
             .out_hidden = @intCast(fc2_shape[0]),
             .pos_owned = pos_owned,
             .patch_w = try must(weights, &buf, "vision_model.radio_model.model.patch_generator.embedder.weight", .{}),
+            .video_w = loadVideoEmbedder(weights, hidden),
             .pos_table = pos_table,
             .cls = cls,
             .blocks = blocks,
@@ -304,14 +553,101 @@ pub const RadioVision = struct {
         if (shape.len != 4 or shape[0] != 1 or shape[1] != 3) return error.InvalidVisionInput;
         const height: u32 = @intCast(shape[2]);
         const width: u32 = @intCast(shape[3]);
-        if (height % PATCH != 0 or width % PATCH != 0) return error.InvalidVisionInput;
-        const rows = height / PATCH;
-        const cols = width / PATCH;
-        if (rows % DOWNSAMPLE != 0 or cols % DOWNSAMPLE != 0 or rows == 0 or cols == 0) return error.InvalidVisionInput;
-
+        const rows, const cols = try patchGrid(height, width);
         var x = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&x, pixels, .bfloat16, self.s));
-        glm_vision.replace(&x, try self.patchify(x, rows, cols));
+        defer _ = mlx.mlx_array_free(x);
+        return self.forwardBody(x, rows, cols, 3, self.patch_w);
+    }
+
+    /// frames `[N, 3, H, W]` float32, one clip already at the shared video size.
+    /// A short last tubelet repeats the last real frame. Returns
+    /// `[1, groups * spatial, out_hidden]` before EVS.
+    pub fn forwardVideo(self: *RadioVision, frames: mlx.mlx_array) !mlx.mlx_array {
+        if (self.video_w.ctx == null) return error.MissingVisionWeights;
+        const shape = mlx.getShape(frames);
+        if (shape.len != 4 or shape[1] != 3 or shape[0] <= 0) return error.InvalidVisionInput;
+        const n: u32 = @intCast(shape[0]);
+        const height: u32 = @intCast(shape[2]);
+        const width: u32 = @intCast(shape[3]);
+        const rows, const cols = try patchGrid(height, width);
+        const groups: usize = (n + TEMPORAL - 1) / TEMPORAL;
+
+        var parts = std.ArrayList(mlx.mlx_array).empty;
+        defer {
+            for (parts.items) |p| _ = mlx.mlx_array_free(p);
+            parts.deinit(self.allocator);
+        }
+        for (0..groups) |g| {
+            const tube = try self.packTubelet(frames, @intCast(g), n, height, width);
+            defer _ = mlx.mlx_array_free(tube);
+            var x = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&x, tube, .bfloat16, self.s));
+            const tokens = self.forwardBody(x, rows, cols, TEMPORAL * 3, self.video_w) catch |err| {
+                _ = mlx.mlx_array_free(x);
+                return err;
+            };
+            _ = mlx.mlx_array_free(x);
+            // One tubelet at a time. The tower graph is large and nothing in it is reused.
+            try mlx.check(mlx.mlx_array_eval(tokens));
+            parts.append(self.allocator, tokens) catch |err| {
+                _ = mlx.mlx_array_free(tokens);
+                return err;
+            };
+        }
+        if (parts.items.len == 1) {
+            const only = parts.items[0];
+            parts.items[0] = mlx.mlx_array_new();
+            return only;
+        }
+        const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, self.s));
+        return out;
+    }
+
+    /// EVS keep-mask for the rows `[row_off, row_off + groups*spatial)` of
+    /// `emb` (`[1, rows, hidden]`). The mask is the full pre-prune length.
+    /// `rate <= 0` keeps every row and does not read the tensor.
+    pub fn videoKeepMask(self: *RadioVision, allocator: std.mem.Allocator, emb: mlx.mlx_array, row_off: usize, groups: u32, spatial: u32, rate: f32) ![]bool {
+        const full: usize = @as(usize, groups) * spatial;
+        if (!(rate > 0)) {
+            const mask = try allocator.alloc(bool, full);
+            @memset(mask, true);
+            return mask;
+        }
+        const shape = mlx.getShape(emb);
+        if (shape.len != 3 or shape[0] != 1) return error.InvalidVisionInput;
+        const hidden: usize = @intCast(shape[2]);
+        const total: usize = @intCast(shape[1]);
+        if (hidden == 0 or row_off + full > total) return error.InvalidVisionInput;
+
+        const start = [_]c_int{ 0, @intCast(row_off), 0 };
+        const stop = [_]c_int{ 1, @intCast(row_off + full), @intCast(hidden) };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var sl = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sl);
+        try mlx.check(mlx.mlx_slice(&sl, emb, &start, 3, &stop, 3, &strides, 3, self.s));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_astype(&flat, sl, .float32, self.s));
+        try mlx.check(mlx.mlx_array_eval(flat));
+        if (mlx.mlx_array_size(flat) != full * hidden) return error.InvalidVisionInput;
+        const ptr = mlx.mlx_array_data_float32(flat) orelse return error.InvalidVisionInput;
+        const host = try allocator.alloc(f32, full * hidden);
+        defer allocator.free(host);
+        @memcpy(host, ptr[0 .. full * hidden]);
+        const scores = try allocator.alloc(f32, full);
+        defer allocator.free(scores);
+        videoDissimilarity(host, groups, spatial, hidden, scores);
+        return evsRetentionMask(allocator, scores, evsKeepCount(groups, spatial, rate));
+    }
+
+    fn forwardBody(self: *RadioVision, x_in: mlx.mlx_array, rows: u32, cols: u32, channels: u32, proj: mlx.mlx_array) !mlx.mlx_array {
+        var x = try self.patchify(x_in, rows, cols, channels, proj);
+        errdefer _ = mlx.mlx_array_free(x);
         {
             const pos = try self.posEmbed(rows, cols);
             defer _ = mlx.mlx_array_free(pos);
@@ -349,20 +685,47 @@ pub const RadioVision = struct {
         return x;
     }
 
-    fn patchify(self: *RadioVision, x: mlx.mlx_array, rows: u32, cols: u32) !mlx.mlx_array {
+    /// `[1, T*3, H, W]` for tubelet `g`. A group past the last real frame repeats it.
+    fn packTubelet(self: *RadioVision, frames: mlx.mlx_array, g: u32, n: u32, height: u32, width: u32) !mlx.mlx_array {
+        var slices: [TEMPORAL]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        errdefer {
+            for (slices[0..made]) |a| _ = mlx.mlx_array_free(a);
+        }
+        for (0..TEMPORAL) |j| {
+            const idx: u32 = @min(g * TEMPORAL + @as(u32, @intCast(j)), n - 1);
+            const start = [_]c_int{ @intCast(idx), 0, 0, 0 };
+            const stop = [_]c_int{ @intCast(idx + 1), 3, @intCast(height), @intCast(width) };
+            const strides = [_]c_int{ 1, 1, 1, 1 };
+            slices[j] = mlx.mlx_array_new();
+            made += 1;
+            try mlx.check(mlx.mlx_slice(&slices[j], frames, &start, 4, &stop, 4, &strides, 4, self.s));
+        }
+        const vec = mlx.mlx_vector_array_new_data(&slices, TEMPORAL);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, self.s));
+        for (slices) |a| _ = mlx.mlx_array_free(a);
+        made = 0;
+        return out;
+    }
+
+    fn patchify(self: *RadioVision, x: mlx.mlx_array, rows: u32, cols: u32, channels: u32, proj: mlx.mlx_array) !mlx.mlx_array {
         const ps: c_int = PATCH;
+        const ch: c_int = @intCast(channels);
         var r = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(r);
-        const in_shape = [_]c_int{ 1, 3, @intCast(rows), ps, @intCast(cols), ps };
+        const in_shape = [_]c_int{ 1, ch, @intCast(rows), ps, @intCast(cols), ps };
         try mlx.check(mlx.mlx_reshape(&r, x, &in_shape, 6, self.s));
         var t = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(t);
         const axes = [_]c_int{ 0, 2, 4, 1, 3, 5 };
         try mlx.check(mlx.mlx_transpose_axes(&t, r, &axes, 6, self.s));
-        const flat = [_]c_int{ 1, @intCast(rows * cols), 3 * ps * ps };
+        const flat = [_]c_int{ 1, @intCast(rows * cols), ch * ps * ps };
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_reshape(&out, t, &flat, 3, self.s));
-        const projected = try self.dense(out, self.patch_w, .{ .ctx = null });
+        const projected = try self.dense(out, proj, .{ .ctx = null });
         _ = mlx.mlx_array_free(out);
         return projected;
     }
@@ -573,4 +936,59 @@ test "radio targetPatches keeps a wide image inside the patch cap" {
     try std.testing.expect(g.w % 2 == 0 and g.h % 2 == 0);
     try std.testing.expect(g.w * g.h <= ENGINE_MAX_PATCHES);
     try std.testing.expect(g.w * g.h >= MIN_PATCHES);
+}
+
+test "radio targetPatchesVideo snaps 16:9 and 9:16 onto the 1024-patch budget" {
+    const wide = targetPatchesVideo(1080, 1920);
+    try std.testing.expectEqual(@as(u32, 42), wide.w);
+    try std.testing.expectEqual(@as(u32, 24), wide.h);
+    const tall = targetPatchesVideo(1920, 1080);
+    try std.testing.expectEqual(@as(u32, 24), tall.w);
+    try std.testing.expectEqual(@as(u32, 42), tall.h);
+    const square = targetPatchesVideo(16, 16);
+    try std.testing.expectEqual(@as(u32, 32), square.w);
+    try std.testing.expectEqual(@as(u32, 32), square.h);
+    // 640×480 (4:3) snaps down to 36×28 patches: 38×28 would pass 1024.
+    const sd = targetPatchesVideo(480, 640);
+    try std.testing.expectEqual(@as(u32, 36), sd.w);
+    try std.testing.expectEqual(@as(u32, 28), sd.h);
+    const geom = videoGeometry(3, wide.h * PATCH, wide.w * PATCH).?;
+    try std.testing.expectEqual(@as(u32, 12), geom.token_h);
+    try std.testing.expectEqual(@as(u32, 21), geom.token_w);
+    try std.testing.expectEqual(@as(u32, 252), geom.spatial);
+    try std.testing.expectEqual(@as(u32, 2), geom.groups);
+}
+
+test "radio video labels omit a padded frame and separate tubelets with a newline" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Frame 1 and frame 2: ", videoGroupSegment(&buf, 0, 4));
+    try std.testing.expectEqualStrings("\nFrame 3 and frame 4: ", videoGroupSegment(&buf, 1, 4));
+    try std.testing.expectEqualStrings("\nFrame 3: ", videoGroupSegment(&buf, 1, 3));
+    try std.testing.expectEqualStrings("Frame 1: ", videoGroupSegment(&buf, 0, 1));
+}
+
+test "radio EVS keeps the first tubelet and the most dissimilar later tokens" {
+    // Two tubelets: 30% of the clip is less than one tubelet, so only the first survives.
+    try std.testing.expectEqual(@as(u32, 4), evsKeepCount(2, 4, 0.7));
+    // Ten tubelets: int(10 * 10 * 0.3) = 30, which is above one tubelet.
+    try std.testing.expectEqual(@as(u32, 30), evsKeepCount(10, 10, 0.7));
+    try std.testing.expectEqual(@as(u32, 8), evsKeepCount(2, 4, 0));
+
+    const embeds = [_]f32{
+        1, 0, // tubelet 0, token 0
+        0, 1, // identical to the next tubelet's token 0? token 1 of tubelet 0
+        1, 0, // tubelet 1 token 0, identical to tubelet 0 token 0 → dissimilarity 0
+        1, 0, // tubelet 1 token 1, orthogonal to (0, 1) → dissimilarity 1
+    };
+    var scores: [4]f32 = undefined;
+    videoDissimilarity(&embeds, 2, 2, 2, &scores);
+    try std.testing.expectEqual(@as(f32, 255), scores[0]);
+    try std.testing.expectEqual(@as(f32, 255), scores[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), scores[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), scores[3], 1e-6);
+
+    const hand = [_]f32{ 255, 255, 255, 255, 0.1, 0.9, 0.2, 0.8 };
+    const mask = try evsRetentionMask(std.testing.allocator, &hand, 6);
+    defer std.testing.allocator.free(mask);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, true, false, true, false, true }, mask);
 }

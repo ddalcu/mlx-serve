@@ -7105,7 +7105,7 @@ fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
-        if (has_vision and config.video_token_id != 0) try mods.appendSlice(allocator, ",\"video\"");
+        if (has_vision and (config.video_token_id != 0 or config.radio_vision)) try mods.appendSlice(allocator, ",\"video\"");
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
@@ -14474,7 +14474,7 @@ fn cachedFormatChat(
     else if (lm.llama_engine) |engine|
         try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
     else
-        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final);
+        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, if (lm.config) |c| c.radio_vision else false);
     if (cache_ptr) |cache| if (key_opt) |key| {
         // Insert is best-effort; an OOM in the cache shouldn't fail the
         // request — the user already has their tokenized prompt.
@@ -14916,25 +14916,43 @@ fn collectMediaItems(allocator: std.mem.Allocator, messages: []const chat_mod.Me
     return items.toOwnedSlice(allocator);
 }
 
-fn placeholderKind(token: u32, config: *const model_mod.ModelConfig) ?std.meta.Tag(MediaItem) {
+const MediaTokens = struct {
+    config: *const model_mod.ModelConfig,
+    /// `<img>`. RADIO rewrites the template's `<video>` to this before tokenize,
+    /// so one sentinel stands for the clip. It must not be the image token.
+    video_sentinel: u32 = 0,
+    /// `</img>`, closing each tubelet's kept `<image>` run.
+    img_end: u32 = 0,
+};
+
+fn placeholderKindOf(token: u32, mt: MediaTokens) ?std.meta.Tag(MediaItem) {
     if (token == 0) return null;
-    if (token == config.image_token_id) return .image;
-    if (token == config.video_token_id) return .video;
-    if (token == config.audio_token_id) return .audio;
+    if (token == mt.config.image_token_id) return .image;
+    if (mt.video_sentinel != 0 and token == mt.video_sentinel) return .video;
+    if (token == mt.config.video_token_id) return .video;
+    if (token == mt.config.audio_token_id) return .audio;
     return null;
+}
+
+fn placeholderKind(token: u32, config: *const model_mod.ModelConfig) ?std.meta.Tag(MediaItem) {
+    return placeholderKindOf(token, .{ .config = config });
 }
 
 const MEDIA_PLACEHOLDER_REJECT = "the rendered prompt does not carry one media placeholder per attached item: the chat template failed to render (see the server log), cannot place media in this message, or the text contains a literal media token";
 
 /// The k-th placeholder the template rendered must be item k, by kind.
-fn placeholdersMatch(prompt_ids: []const u32, items: []const MediaItem, config: *const model_mod.ModelConfig) bool {
+fn placeholdersMatchOf(prompt_ids: []const u32, items: []const MediaItem, mt: MediaTokens) bool {
     var k: usize = 0;
     for (prompt_ids) |t| {
-        const kind = placeholderKind(t, config) orelse continue;
+        const kind = placeholderKindOf(t, mt) orelse continue;
         if (k == items.len or std.meta.activeTag(items[k]) != kind) return false;
         k += 1;
     }
     return k == items.len;
+}
+
+fn placeholdersMatch(prompt_ids: []const u32, items: []const MediaItem, config: *const model_mod.ModelConfig) bool {
+    return placeholdersMatchOf(prompt_ids, items, .{ .config = config });
 }
 
 const ExpandedPrompt = struct { ids: []u32, media: []prefix_cache_mod.MediaSpan };
@@ -14949,7 +14967,22 @@ fn expandMediaPlaceholders(
     item_keys: []const u64,
     config: *const model_mod.ModelConfig,
 ) !ExpandedPrompt {
-    if (!placeholdersMatch(prompt_ids, items, config)) return error.MediaPlaceholderMismatch;
+    return expandMedia(allocator, prompt_ids, items, item_tokens, item_keys, .{ .config = config }, ByteTokenizer{}, &.{});
+}
+
+/// `item_keep[k]`, when set, is the pre-EVS mask for a RADIO video. Null keeps
+/// the tower's own run (Qwen, Gemma, still images).
+fn expandMedia(
+    allocator: std.mem.Allocator,
+    prompt_ids: []const u32,
+    items: []const MediaItem,
+    item_tokens: []const usize,
+    item_keys: []const u64,
+    mt: MediaTokens,
+    tok: anytype,
+    item_keep: []const ?[]const bool,
+) !ExpandedPrompt {
+    if (!placeholdersMatchOf(prompt_ids, items, mt)) return error.MediaPlaceholderMismatch;
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
     const media = try allocator.alloc(prefix_cache_mod.MediaSpan, items.len);
@@ -14957,15 +14990,20 @@ fn expandMediaPlaceholders(
     var k: usize = 0;
     var images_before: usize = 0;
     for (prompt_ids) |t| {
-        if (placeholderKind(t, config) == null) {
+        if (placeholderKindOf(t, mt) == null) {
             try ids.append(allocator, t);
             continue;
         }
         const run_start = ids.items.len;
-        try appendMediaRun(allocator, &ids, items[k], item_tokens[k], images_before, config);
+        if (items[k] == .video and mt.config.radio_vision) {
+            const mask: ?[]const bool = if (k < item_keep.len) item_keep[k] else null;
+            try appendRadioVideoRun(allocator, &ids, items[k].video, item_tokens[k], mask, mt, tok);
+        } else {
+            try appendMediaRun(allocator, &ids, items[k], item_tokens[k], images_before, mt.config);
+        }
         images_before += @intFromBool(items[k] == .image);
         var first = run_start;
-        while (first < ids.items.len and placeholderKind(ids.items[first], config) == null) first += 1;
+        while (first < ids.items.len and placeholderKindOf(ids.items[first], mt) == null) first += 1;
         media[k] = .{ .start = @intCast(first), .key = item_keys[k] };
         k += 1;
     }
@@ -15014,6 +15052,47 @@ fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: 
     if (open > 0) try ids.append(allocator, open);
     try ids.appendNTimes(allocator, pad, n);
     if (close > 0) try ids.append(allocator, close);
+}
+
+/// One RADIO clip: each tubelet is its label, `<img>`, the kept `<image>` ids, `</img>`.
+/// The label is tokenized alone so the specials stay atoms. A short last group
+/// omits the frame the encoder repeats. Dropped positions are absent, which is
+/// the sequence EVS leaves after it prunes the full run.
+fn appendRadioVideoRun(
+    allocator: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    vid: *const chat_mod.VideoData,
+    kept: usize,
+    mask: ?[]const bool,
+    mt: MediaTokens,
+    tok: anytype,
+) !void {
+    const geom = radio_vision.videoGeometry(vid.grid_t, vid.grid_h, vid.grid_w) orelse return error.InvalidVisionInput;
+    const full: usize = @as(usize, geom.groups) * geom.spatial;
+    const bits = mask orelse return error.InvalidVisionInput;
+    if (bits.len != full) return error.InvalidVisionInput;
+    if (mt.config.image_token_id == 0 or mt.video_sentinel == 0 or mt.img_end == 0) return error.InvalidVisionInput;
+    if (mt.video_sentinel == mt.config.image_token_id) return error.InvalidVisionInput;
+    var seen: usize = 0;
+    var g: u32 = 0;
+    while (g < geom.groups) : (g += 1) {
+        var buf: [96]u8 = undefined;
+        const label = radio_vision.videoGroupSegment(&buf, g, geom.frames);
+        if (label.len == 0) return error.InvalidVisionInput;
+        const label_ids = try tok.encode(allocator, label);
+        defer allocator.free(label_ids);
+        try ids.appendSlice(allocator, label_ids);
+        try ids.append(allocator, mt.video_sentinel);
+        const base: usize = @as(usize, g) * geom.spatial;
+        var i: usize = 0;
+        while (i < geom.spatial) : (i += 1) {
+            if (!bits[base + i]) continue;
+            try ids.append(allocator, mt.config.image_token_id);
+            seen += 1;
+        }
+        try ids.append(allocator, mt.img_end);
+    }
+    if (seen != kept) return error.InvalidVisionInput;
 }
 
 /// Soft tokens one MiniCPM-V piece contributes: its patch grid after both 2x2 merges (`16x`) or the last (`4x`).
@@ -15148,10 +15227,22 @@ fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
     return h.final();
 }
 
+const EncodedMedia = struct {
+    rows: mlx.mlx_array,
+    /// Parallel to encoder pieces. Empty when nothing was pruned. A mask is the
+    /// full pre-EVS length. Owned by the caller when `len != 0`.
+    item_keep: []?[]bool = &.{},
+};
+
+fn freeKeepMasks(allocator: std.mem.Allocator, keeps: []?[]bool) void {
+    for (keeps) |m| if (m) |s| allocator.free(s);
+    if (keeps.len != 0) allocator.free(keeps);
+}
+
 /// Encode `mp` on the inference thread (the sole mlx caller) and return every
 /// item's soft tokens concatenated in prompt order; `item_tokens[k]` receives
-/// item k's row count.
-fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !mlx.mlx_array {
+/// item k's row count. RADIO video rows are already the EVS keep.
+fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !EncodedMedia {
     const sch = global_scheduler orelse return error.NoScheduler;
     const piece_tokens = try allocator.alloc(usize, mp.pieces.len);
     defer allocator.free(piece_tokens);
@@ -15163,6 +15254,7 @@ fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []con
         .allocator = allocator,
     };
     const arr = sch.encodeVision(&req) catch |err| {
+        if (req.item_keep) |keeps| freeKeepMasks(allocator, keeps);
         if (req.error_name) |e| {
             log.err("Vision encode (via scheduler) failed: {s}\n", .{e});
             allocator.free(e);
@@ -15176,7 +15268,7 @@ fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []con
         for (piece_tokens[p .. p + count]) |t| n.* += t;
         p += count;
     }
-    return arr;
+    return .{ .rows = arr, .item_keep = req.item_keep orelse &.{} };
 }
 
 /// Qwen3-VL interleaved M-RoPE position-id table for a request. `pos` (owned) is
@@ -15276,13 +15368,30 @@ fn prepareMultimodalPrompt(allocator: std.mem.Allocator, lm: *LoadedModel, confi
     return prepareMultimodalItems(allocator, lm, config, items, prompt_ids);
 }
 
+fn radioMediaTokens(lm: *LoadedModel, config: *const model_mod.ModelConfig) MediaTokens {
+    if (!config.radio_vision) return .{ .config = config };
+    const tok = lm.tokenizer orelse return .{ .config = config };
+    return .{
+        .config = config,
+        .video_sentinel = tok.specialTokenId("<img>") orelse 0,
+        .img_end = tok.specialTokenId("</img>") orelse 0,
+    };
+}
+
 /// `prepareMultimodalPrompt` for items a caller already put in placeholder order.
 fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
     if (items.len == 0) return .{};
+    const mt = radioMediaTokens(lm, config);
+    var videos: usize = 0;
+    for (items) |it| videos += @intFromBool(it == .video);
+    if (config.radio_vision and videos > 0 and (mt.video_sentinel == 0 or mt.img_end == 0 or mt.video_sentinel == config.image_token_id)) {
+        log.warn("  media: RADIO video needs distinct <img> and </img> special tokens\n", .{});
+        return error.MediaPlaceholderMismatch;
+    }
     // Before the encode: a mismatch is the client's, and cheap to refuse.
-    if (!placeholdersMatch(prompt_ids.*, items, config)) {
+    if (!placeholdersMatchOf(prompt_ids.*, items, mt)) {
         var rendered: usize = 0;
-        for (prompt_ids.*) |t| rendered += @intFromBool(placeholderKind(t, config) != null);
+        for (prompt_ids.*) |t| rendered += @intFromBool(placeholderKindOf(t, mt) != null);
         log.warn("  media: the prompt renders {d} placeholder(s) for {d} item(s); a `jinja render failed` line above means the generic fallback rendered none\n", .{ rendered, items.len });
         return error.MediaPlaceholderMismatch;
     }
@@ -15294,8 +15403,21 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config
 
     var out: MultimodalPrompt = .{};
     errdefer out.deinit(allocator);
-    out.embeddings = try encodeMediaItems(allocator, lm, items, mp, item_tokens);
-    const expanded = try expandMediaPlaceholders(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, config);
+    const encoded = try encodeMediaItems(allocator, lm, items, mp, item_tokens);
+    defer freeKeepMasks(allocator, encoded.item_keep);
+    out.embeddings = encoded.rows;
+    const item_keep = try allocator.alloc(?[]const bool, items.len);
+    defer allocator.free(item_keep);
+    var piece_at: usize = 0;
+    for (items, item_keep) |item, *slot| {
+        const n = piecesOf(item);
+        slot.* = if (item == .video and piece_at < encoded.item_keep.len) encoded.item_keep[piece_at] else null;
+        piece_at += n;
+    }
+    const expanded = if (lm.tokenizer) |tok|
+        try expandMedia(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, mt, tok, item_keep)
+    else
+        try expandMedia(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, mt, ByteTokenizer{}, item_keep);
     out.media = expanded.media;
     var soft = std.enums.EnumArray(std.meta.Tag(MediaItem), usize).initFill(0);
     for (items, item_tokens) |item, n| {
@@ -16203,6 +16325,7 @@ fn appendEmbeddingText(allocator: std.mem.Allocator, tok: anytype, ids: *std.Arr
 /// HF's video processor. Qwen's clips; EmbeddingGemma 2's (`.gemma_budget`) are `decodeBudgetVideo`'s.
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
     if (vp.mode == .gemma_budget) return decodeBudgetVideo(allocator, frame_urls, vp);
+    if (vp.mode == .radio) return decodeRadioVideo(allocator, frame_urls);
     if (vp.mode != .qwen or frame_urls.len == 0) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
@@ -16277,6 +16400,36 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         frame_urls.len, grid_t, gh, gw, grid_t * n_per_group / (@as(usize, vp.merge) * vp.merge), rw, rh,
     });
     return .{ .pixels = pv_bytes, .grid_t = @intCast(grid_t), .grid_h = gh, .grid_w = gw };
+}
+
+/// RADIO video: every frame resized to frame 0's patch grid, CLIP-normalized,
+/// concatenated as float32 CHW. `grid_h` / `grid_w` are pixels, `grid_t` is the
+/// raw frame count. Null when any frame is not a decodable image.
+fn decodeRadioVideo(allocator: std.mem.Allocator, frame_urls: []const []const u8) ?chat_mod.VideoData {
+    if (frame_urls.len == 0) return null;
+    var rgbs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (rgbs.items) |rgb| allocator.free(rgb);
+        rgbs.deinit(allocator);
+    }
+    var hs: std.ArrayList(u32) = .empty;
+    defer hs.deinit(allocator);
+    var ws: std.ArrayList(u32) = .empty;
+    defer ws.deinit(allocator);
+    for (frame_urls) |url| {
+        const frame = decodeFrameUrl(allocator, url, true) orelse return null;
+        rgbs.append(allocator, frame.rgb) catch {
+            frame.deinit(allocator);
+            return null;
+        };
+        hs.append(allocator, frame.h) catch return null;
+        ws.append(allocator, frame.w) catch return null;
+    }
+    const prepared = radio_vision.prepareVideo(allocator, rgbs.items, hs.items, ws.items) catch return null;
+    log.info("  Decoded {d} frames → RADIO video {d}x{d} ({d} tubelets x {d} tokens)\n", .{
+        frame_urls.len, prepared.w, prepared.h, prepared.groups, prepared.tokens,
+    });
+    return .{ .pixels = prepared.pixels, .grid_t = prepared.frames, .grid_h = prepared.h, .grid_w = prepared.w };
 }
 
 /// Decode a `video_url` block's `frames` array into `list`, mirroring
@@ -22297,6 +22450,84 @@ const ByteTokenizer = struct {
         return out;
     }
 };
+
+test "radio prompt: a video sentinel expands into labeled tubelets and the keep mask" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{};
+    config.radio_vision = true;
+    config.image_token_id = 18;
+    const mt = MediaTokens{ .config = &config, .video_sentinel = 19, .img_end = 20 };
+    const img = [_]chat_mod.ImageData{.{ .pixels = "", .width = 64, .height = 64 }};
+
+    // A still image stays a bare run of `<image>`. The tubelet wrap is video-only.
+    const image_items = [_]MediaItem{.{ .image = &img }};
+    const image_out = try expandMedia(a, &.{ 1, 18, 2 }, &image_items, &.{4}, &.{11}, mt, ByteTokenizer{}, &.{});
+    defer a.free(image_out.ids);
+    defer a.free(image_out.media);
+    try testing.expectEqualSlices(u32, &.{ 1, 18, 18, 18, 18, 2 }, image_out.ids);
+    try testing.expectEqual(@as(u32, 1), image_out.media[0].start);
+
+    // 64×64 is a 4×4 patch grid and 2×2 tokens after the shuffle. Three frames
+    // are two tubelets; the second keeps only its first and third token.
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 64, .grid_w = 64 };
+    const items = [_]MediaItem{ .{ .image = &img }, .{ .video = &clip } };
+    const mask = [_]bool{ true, true, true, true, true, false, true, false };
+    const keeps = [_]?[]const bool{ null, &mask };
+    const out = try expandMedia(a, &.{ 1, 18, 19, 2 }, &items, &.{ 2, 6 }, &.{ 11, 12 }, mt, ByteTokenizer{}, &keeps);
+    defer a.free(out.ids);
+    defer a.free(out.media);
+
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(a);
+    try want.append(a, 1);
+    try want.appendNTimes(a, 18, 2);
+    var buf: [96]u8 = undefined;
+    const lab0 = radio_vision.videoGroupSegment(&buf, 0, 3);
+    var lab0_owned: [96]u8 = undefined;
+    @memcpy(lab0_owned[0..lab0.len], lab0);
+    const ids0 = try ByteTokenizer.encode(.{}, a, lab0_owned[0..lab0.len]);
+    defer a.free(ids0);
+    try want.appendSlice(a, ids0);
+    try want.append(a, 19);
+    try want.appendNTimes(a, 18, 4);
+    try want.append(a, 20);
+    const lab1 = radio_vision.videoGroupSegment(&buf, 1, 3);
+    const ids1 = try ByteTokenizer.encode(.{}, a, lab1);
+    defer a.free(ids1);
+    try want.appendSlice(a, ids1);
+    try want.append(a, 19);
+    try want.appendNTimes(a, 18, 2);
+    try want.append(a, 20);
+    try want.append(a, 2);
+    try testing.expectEqualSlices(u32, want.items, out.ids);
+    try testing.expectEqual(@as(u32, 1), out.media[0].start);
+    try testing.expectEqual(@as(u32, @intCast(3 + lab0.len)), out.media[1].start);
+
+    const bad = [_]bool{true};
+    const bad_keeps = [_]?[]const bool{&bad};
+    const only = [_]MediaItem{.{ .video = &clip }};
+    try testing.expectError(error.InvalidVisionInput, expandMedia(a, &.{ 1, 19, 2 }, &only, &.{6}, &.{1}, mt, ByteTokenizer{}, &bad_keeps));
+}
+
+test "radio video frames share frame 0's patch grid" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{};
+    config.radio_vision = true;
+    const vp = visionPreprocFromConfig(&config);
+    try testing.expectEqual(.radio, vp.mode);
+    // 32×24 is the same 4:3 as a 640×480 frame, so the grid is the clip's grid.
+    const url = try solidPngUrl(a, 32, 24, .{ 10, 20, 30, 255 });
+    defer a.free(url);
+    const frames = [_][]const u8{ url, url };
+    const vid = decodeVideoUrlContent(a, &frames, vp) orelse return error.Undecoded;
+    defer a.free(vid.pixels);
+    try testing.expectEqual(@as(u32, 2), vid.grid_t);
+    try testing.expectEqual(@as(u32, 576), vid.grid_w);
+    try testing.expectEqual(@as(u32, 448), vid.grid_h);
+    try testing.expectEqual(@as(usize, 2 * 3 * 576 * 448 * 4), vid.pixels.len);
+    const broken = [_][]const u8{ url, "data:image/png;base64,AAAA" };
+    try testing.expect(decodeVideoUrlContent(a, &broken, vp) == null);
+}
 
 fn promptFor(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u8, media: *RequestMedia, can_see: bool) !EmbeddingPromptResult {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});

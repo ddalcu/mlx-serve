@@ -77,14 +77,13 @@ pub const AudioData = struct {
     samples: []const u8, // Raw float32-LE bytes (n_samples * 4)
 };
 
-/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
-/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo` /
-/// `QwenVision.forwardVideo`) — the video-equivalent of `ImageData.pixels`'s
-/// Qwen merge-order layout. `grid_t` is a TEMPORAL PATCH count (raw sampled
-/// frames grouped `tps`-at-a-time), not a raw frame count; `grid_h`/`grid_w`
-/// are the shared per-frame patch grid every frame in the video was resized to.
+/// Qwen3-VL stores pre-patchified pixel values for every temporal-patch group.
+/// `grid_t` is that group count and `grid_h` / `grid_w` are the shared patch grid.
+/// RADIO stores concatenated float32 CHW frames. `grid_t` is the raw frame count
+/// (the encoder repeats a short last tubelet) and `grid_h` / `grid_w` are the
+/// shared pixel size.
 pub const VideoData = struct {
-    pixels: []const u8, // merge-order patches [grid_t*(grid_h*grid_w)*feat*4]
+    pixels: []const u8,
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
@@ -405,9 +404,15 @@ pub fn formatChat(
     effort: ?[]const u8,
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
+    /// RADIO has no `<video>` atom. The template still writes that literal;
+    /// rewrite it to `<img>` so tokenization yields one video placeholder.
+    radio_video: bool,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
-    defer allocator.free(rendered);
+    const rendered_raw = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    defer allocator.free(rendered_raw);
+    const rewrite = radio_video and std.mem.indexOf(u8, rendered_raw, "<video>") != null;
+    const rendered = if (rewrite) try rewriteRadioVideoPlaceholder(allocator, rendered_raw) else rendered_raw;
+    defer if (rewrite) allocator.free(rendered);
 
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
@@ -603,6 +608,34 @@ pub fn decodeViaLlama(
         try out.appendSlice(allocator, piece);
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Replace each literal `<video>` with `<img>`. `<video>` is not a special
+/// token on the RADIO tokenizer; `<img>` is, so the prompt gains one id per clip.
+pub fn rewriteRadioVideoPlaceholder(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const needle = "<video>";
+    const repl = "<img>";
+    if (std.mem.indexOf(u8, text, needle) == null) return allocator.dupe(u8, text);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var rest = text;
+    while (std.mem.indexOf(u8, rest, needle)) |at| {
+        try out.appendSlice(allocator, rest[0..at]);
+        try out.appendSlice(allocator, repl);
+        rest = rest[at + needle.len ..];
+    }
+    try out.appendSlice(allocator, rest);
+    return out.toOwnedSlice(allocator);
+}
+
+test "radio rewrite turns each video literal into one img sentinel" {
+    const a = std.testing.allocator;
+    const out = try rewriteRadioVideoPlaceholder(a, "see <video> then <video>");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("see <img> then <img>", out);
+    const same = try rewriteRadioVideoPlaceholder(a, "plain text");
+    defer a.free(same);
+    try std.testing.expectEqualStrings("plain text", same);
 }
 
 /// Render the Jinja chat template with the given messages.

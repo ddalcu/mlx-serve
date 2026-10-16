@@ -1344,7 +1344,9 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
-    meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0;
+    const radio_flag = if (root.get("radio_vision")) |v| v == .bool and v.bool else false;
+    if (radio_flag) meta.has_vision = true;
+    meta.has_video = (meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0) or radio_flag;
     meta.is_aligner = isForcedAligner(root);
     meta.has_transcription = std.mem.eql(u8, mt, "qwen3_asr") and !meta.is_aligner;
     const bidirectional = blk: {
@@ -2374,6 +2376,15 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         // The trained window the loaded row reports (model.zig), not the trunk's 262144.
         try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
         try testing.expect(isSupportedModelType("embedding_gemma2"));
+    }
+    // RADIO video has no video_token_id. The serving flag is the capability.
+    {
+        const on = parseStubMeta(a, "{\"model_type\":\"nemotron_h\",\"radio_vision\":true}", true);
+        try testing.expect(on.has_vision);
+        try testing.expect(on.has_video);
+        const off = parseStubMeta(a, "{\"model_type\":\"nemotron_h\",\"vision_config\":{}}", true);
+        try testing.expect(off.has_vision);
+        try testing.expect(!off.has_video);
     }
     // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
     // root carries only model_type / vision_config / quantization. Reading the

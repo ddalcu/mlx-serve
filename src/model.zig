@@ -655,6 +655,9 @@ pub const ModelConfig = struct {
     /// ships `vision_model.radio_model.*` and `mlp1.*`. A bare vision_config
     /// must not arm this: the generic vision path would load SigLIP instead.
     radio_vision: bool = false,
+    /// RADIO video EVS drop fraction. 0 keeps every tubelet token. The Bolt
+    /// checkpoint uses 0.7; other models leave this at 0.
+    video_pruning_rate: f32 = 0,
     qv_depth: u32 = 0, // ViT transformer blocks
     qv_hidden: u32 = 0, // ViT hidden size
     qv_heads: u32 = 0, // ViT attention heads
@@ -4254,6 +4257,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (v == .bool) config.radio_vision = v.bool;
         }
         config.has_vision = config.radio_vision;
+        if (config.radio_vision) {
+            // Same default as radio_vision.VIDEO_PRUNING_RATE. model.zig cannot
+            // import that module: the tower already imports ModelConfig.
+            config.video_pruning_rate = 0.7;
+            if (jsonField(root, "video_pruning_rate")) |v| {
+                config.video_pruning_rate = try jsonFloat(v);
+            } else if (jsonField(root, "vision_config")) |vc| {
+                if (vc == .object) {
+                    if (vc.object.get("video_pruning_rate")) |v| config.video_pruning_rate = try jsonFloat(v);
+                }
+            }
+        }
         config.hidden_act = .silu;
         config.mamba_mlp_act = .relu_sq;
         config.norm_has_offset = false;
@@ -9288,6 +9303,7 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
     try testing.expectEqualStrings("backbone", bolt.weight_prefix);
     try testing.expect(!bolt.has_vision);
     try testing.expect(!bolt.radio_vision);
+    try testing.expectEqual(@as(f32, 0), bolt.video_pruning_rate);
 
     const flagged =
         \\{
@@ -9301,6 +9317,16 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
     const radio = try parseConfigFromJson(testing.allocator, flagged);
     try testing.expect(radio.radio_vision and radio.has_vision);
     try testing.expectEqual(@as(u32, 18), radio.image_token_id);
+    try testing.expectEqual(@as(f32, 0.7), radio.video_pruning_rate);
+
+    const rated =
+        \\{"model_type":"nemotron_h","hidden_size":4096,"num_hidden_layers":2,
+        \\"num_attention_heads":32,"num_key_value_heads":2,"head_dim":128,
+        \\"vocab_size":131072,"layers_block_type":["mamba","moe"],
+        \\"radio_vision":true,"video_pruning_rate":0.5}
+    ;
+    const custom = try parseConfigFromJson(testing.allocator, rated);
+    try testing.expectEqual(@as(f32, 0.5), custom.video_pruning_rate);
 }
 
 test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {

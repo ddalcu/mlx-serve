@@ -52,6 +52,7 @@ const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const sushi_pack = @import("sushi_pack.zig");
 const vision_mod = @import("vision.zig");
+const radio_vision = @import("radio_vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const restore_dump = @import("restore_dump.zig");
@@ -1138,6 +1139,10 @@ pub const VisionEncodeRequest = struct {
     result: ?mlx.mlx_array = null,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
+    /// RADIO video only, parallel to `items`. A mask is the full pre-EVS row
+    /// count (true = keep). Null entries are not video. Owned by `allocator`
+    /// on success; the caller frees each mask and the array.
+    item_keep: ?[]?[]bool = null,
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
     /// this flips true.
     done: bool = false,
@@ -5624,11 +5629,95 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     }
     for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
 
+    applyRadioVideoEvs(req, vision_enc, &combined) catch |err| {
+        _ = mlx.mlx_array_free(combined);
+        finishVisionRequest(sch, req, @errorName(err));
+        return;
+    };
+
     req.done_mu.lockUncancelable(sch.io);
     defer req.done_mu.unlock(sch.io);
     req.result = combined;
     req.done = true;
     req.done_cond.broadcast(sch.io);
+}
+
+/// Drop RADIO video rows that EVS rejects, and record the keep-mask so the
+/// prompt can delete the same `<image>` positions. Runs on the inference
+/// thread. The encoder cache keeps the unpruned rows; this replaces `combined`.
+fn applyRadioVideoEvs(req: *VisionEncodeRequest, vision_enc: *VisionEncoder, combined: *mlx.mlx_array) !void {
+    const rv = if (vision_enc.radio) |*r| r else return;
+    var videos: usize = 0;
+    for (req.items) |item| videos += @intFromBool(item == .video);
+    if (videos == 0) return;
+
+    const rate: f32 = if (req.model.config) |c| c.video_pruning_rate else radio_vision.VIDEO_PRUNING_RATE;
+    const keeps = try req.allocator.alloc(?[]bool, req.items.len);
+    errdefer req.allocator.free(keeps);
+    @memset(keeps, null);
+    var masks_live = true;
+    errdefer if (masks_live) {
+        for (keeps) |m| if (m) |s| req.allocator.free(s);
+    };
+
+    var any_drop = false;
+    var offset: usize = 0;
+    var kept_total: usize = 0;
+    for (req.items, req.item_tokens, keeps) |item, *ntok, *slot| {
+        const full = ntok.*;
+        if (item == .video) {
+            const g = radio_vision.videoGeometry(item.video.grid_t, item.video.grid_h, item.video.grid_w) orelse return error.InvalidVisionInput;
+            const expect: usize = @as(usize, g.groups) * g.spatial;
+            if (full != expect) return error.InvalidVisionInput;
+            const mask = try rv.videoKeepMask(req.allocator, combined.*, offset, g.groups, g.spatial, rate);
+            var kept: usize = 0;
+            for (mask) |b| kept += @intFromBool(b);
+            if (kept != full) any_drop = true;
+            ntok.* = kept;
+            slot.* = mask;
+            log.info("  RADIO video EVS: {d} frames, {d} tubelets x {d} tokens, kept {d}\n", .{ g.frames, g.groups, g.spatial, kept });
+            kept_total += kept;
+        } else kept_total += full;
+        offset += full;
+    }
+
+    if (any_drop) {
+        if (kept_total == 0) return error.InvalidVisionInput;
+        const indices = try req.allocator.alloc(i32, kept_total);
+        defer req.allocator.free(indices);
+        var row: i32 = 0;
+        var dst: usize = 0;
+        for (req.item_tokens, keeps) |ntok, slot| {
+            if (slot) |mask| {
+                for (mask) |keep| {
+                    if (keep) {
+                        indices[dst] = row;
+                        dst += 1;
+                    }
+                    row += 1;
+                }
+            } else {
+                var i: usize = 0;
+                while (i < ntok) : (i += 1) {
+                    indices[dst] = row;
+                    dst += 1;
+                    row += 1;
+                }
+            }
+        }
+        if (dst != kept_total) return error.InvalidVisionInput;
+        const ishape = [_]c_int{@intCast(indices.len)};
+        const ix = mlx.mlx_array_new_data(indices.ptr, &ishape, 1, .int32);
+        defer _ = mlx.mlx_array_free(ix);
+        var taken = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(taken);
+        try mlx.check(mlx.mlx_take_axis(&taken, combined.*, ix, 1, rv.s));
+        _ = mlx.mlx_array_free(combined.*);
+        combined.* = taken;
+    }
+
+    req.item_keep = keeps;
+    masks_live = false;
 }
 
 /// `[1, n, hidden]` soft tokens for one item.
@@ -5651,6 +5740,16 @@ fn encodeVisionItem(req: *VisionEncodeRequest, vision_enc: anytype, item: Vision
             return vision_enc.forward(pixel_arr);
         },
         .video => |vid| {
+            if (vision_enc.radio != null) {
+                // RADIO stores raw CHW frames. grid_h/grid_w are the shared pixel size.
+                if (vid.grid_t == 0 or vid.grid_h == 0 or vid.grid_w == 0) return error.InvalidVisionInput;
+                const bytes: usize = @as(usize, vid.grid_t) * 3 * vid.grid_h * vid.grid_w * 4;
+                if (vid.pixels.len != bytes) return error.InvalidVisionInput;
+                const shape = [_]c_int{ @intCast(vid.grid_t), 3, @intCast(vid.grid_h), @intCast(vid.grid_w) };
+                const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 4, .float32);
+                defer _ = mlx.mlx_array_free(pixel_arr);
+                return vision_enc.forwardRadioVideo(pixel_arr);
+            }
             const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
             const feat: usize = (vid.pixels.len / 4) / n;
             const shape = [_]c_int{ @intCast(n), @intCast(feat) };
