@@ -7,6 +7,7 @@
 //! a 4-bit affine pack that is exact up to the INT8 step of the row's largest weight.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const DType = enum { u32, bf16, f16, f32, u8, i8, other };
 
@@ -79,7 +80,7 @@ pub const Pack = struct {
     }
 
     pub fn deinit(self: *Pack) void {
-        for (self.maps.items) |m| std.posix.munmap(m.bytes);
+        if (comptime builtin.os.tag != .windows) for (self.maps.items) |m| std.posix.munmap(m.bytes);
         self.maps.deinit(self.allocator);
         self.tensors.deinit(self.allocator);
         self.arena.deinit();
@@ -146,6 +147,7 @@ fn parseDType(s: []const u8) DType {
 }
 
 pub fn mapFile(path: [*:0]const u8) ?[]align(std.heap.page_size_min) const u8 {
+    if (comptime builtin.os.tag == .windows) return null; // the Neural Engine is Apple-only
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);

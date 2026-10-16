@@ -1924,11 +1924,10 @@ const StartupResponder = struct {
     }
 
     fn run(self: *StartupResponder) void {
-        var fds = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         while (!self.done.load(.acquire)) {
-            const ready = std.posix.poll(&fds, 100) catch continue;
+            const ready = socketReadable(self.server.socket.handle, 100) catch continue;
             // Once done, a waiting connection is the accept loop's.
-            if (ready == 0 or self.done.load(.acquire)) continue;
+            if (!ready or self.done.load(.acquire)) continue;
             const accepted = self.server.accept(self.io) catch continue;
             var conn: Conn = undefined;
             Conn.init(&conn, accepted, self.io);
