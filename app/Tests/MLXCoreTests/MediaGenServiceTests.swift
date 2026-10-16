@@ -294,6 +294,20 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(VideoGenService.requestBody(model: "m", prompt: "p", request: ltx, firstFrameB64: nil)["stream_weights"])
     }
 
+    /// A Turbo run turns the fast recipe off, so history records it against the plain recipe:
+    /// a run exactly as long as that predicts calibrates to 1.0.
+    func testTurboRunIsRecordedAgainstThePlainRecipe() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "H3TurboHistory"))
+        defaults.removePersistentDomain(forName: "H3TurboHistory")
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        req.turbo = true
+        let predicted = H3TimeEstimate.seconds(model: .minimaxH3, width: 960, height: 544, frames: 124,
+                                               steps: 8, fast: false, hardware: .anchor)
+        VideoGenService.recordRun(req, steps: 8, measuredSeconds: predicted, defaults: defaults)
+        XCTAssertEqual(H3RunHistory.load(defaults: defaults).speedFactor!, 1.0, accuracy: 0.0001)
+    }
+
     func testStreamingOffBillsTheResidentWeights() {
         let gib = 1024.0 * 1024 * 1024
         for p in [VideoModelPreset.minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA] {

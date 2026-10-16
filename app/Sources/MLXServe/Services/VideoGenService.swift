@@ -284,11 +284,17 @@ final class VideoGenService: ObservableObject {
         // estimate is measured rather than extrapolated. Recorded from
         // the SAMPLING span only — the encode after this is ours, not the
         // model's, and the estimate does not include it.
+        Self.recordRun(request, steps: steps, measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
+        return frames
+    }
+
+    /// One finished run into this Mac's history, priced with the recipe and streaming it ran.
+    static func recordRun(_ request: VideoGenRequest, steps: Int, measuredSeconds: Double,
+                          defaults: UserDefaults = .standard) {
         H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
                               frames: request.numFrames, steps: steps, fast: !request.bestQuality,
-                              streamWeights: request.streamWeights,
-                              measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
-        return frames
+                              streamWeights: request.streamWeights, measuredSeconds: measuredSeconds,
+                              defaults: defaults)
     }
 
     /// A storyboard: one window per shot, each opening on the previous shot's
