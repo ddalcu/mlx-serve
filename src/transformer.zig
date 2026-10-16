@@ -43657,6 +43657,69 @@ pub fn prefillDqGemmMinRows(bits: u32) usize {
     return if (bits == 2) 384 else PREFILL_DQ_GEMM_MIN_M;
 }
 
+/// Rows from which one [M,K] x [N,K]^T call takes the route. Pure over its inputs;
+/// `raw` is MLX_SERVE_PREFILL_DQ_GEMM_MIN_ROWS (unparseable is ignored).
+/// `prefillDqGemmMinRows` stays the smallest floor any shape gets, which is what the
+/// admission bill needs.
+pub fn prefillDqGemmRowFloor(bits: u32, ultra_nax: bool, n: usize, k: usize, raw: ?[*:0]const u8) usize {
+    if (raw) |r| if (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10)) |v| return v else |_| {};
+    const base = prefillDqGemmMinRows(bits);
+    // Off NAX stock qmm is the 32x32 steel tile the base floors were tuned against. On the Ultra's NAX
+    // stock qmm is the fused kernel, which holds out to ~0.9 * min(N, K) rows - except for
+    // K >= 3N, where the dequantized GEMM runs MLX's split-K kernel and wins from the base floor.
+    if (!ultra_nax or bits == 2 or k >= 3 * n) return base;
+    return @max(base, @min(n, k) * 9 / 10);
+}
+
+test "prefillDqGemmRowFloor: on NAX the floor follows min(N, K), tall-K shapes and 2-bit keep theirs" {
+    // M5 Ultra crossovers, stock NAX qmm vs dequant+GEMM: K 2560 wins from 2048
+    // (Flash-Next), K 5120 from ~4608 and K 6144 from ~5-6.6k (Qwen3.8-27B).
+    try std.testing.expectEqual(@as(usize, 2304), prefillDqGemmRowFloor(4, true, 10240, 2560, null));
+    try std.testing.expectEqual(@as(usize, 4608), prefillDqGemmRowFloor(4, true, 17408, 5120, null));
+    // The smaller dimension sets it: K 6144 crosses near 3k at N 2560 (Flash-Next GDN out,
+    // attn o) but past 6k at N 5120 (27B), so 0.9*min(N, K).
+    try std.testing.expectEqual(@as(usize, 2304), prefillDqGemmRowFloor(4, true, 2560, 6144, null));
+    try std.testing.expectEqual(@as(usize, 4608), prefillDqGemmRowFloor(4, true, 5120, 6144, null));
+    // K >= 3N runs MLX's split-K GEMM, which wins from 2048 (27B down, 5120x17408).
+    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, true, 5120, 17408, null));
+    // Off NAX and at 2 bits the M4 Max floors stand.
+    try std.testing.expectEqual(PREFILL_DQ_GEMM_MIN_M, prefillDqGemmRowFloor(4, false, 17408, 5120, null));
+    try std.testing.expectEqual(@as(usize, 384), prefillDqGemmRowFloor(2, true, 17408, 5120, null));
+    // The admission bill's floor is never above any shape's.
+    try std.testing.expect(prefillDqGemmMinRows(4) <= prefillDqGemmRowFloor(4, true, 10240, 2560, null));
+    // The env pins every shape.
+    try std.testing.expectEqual(@as(usize, 6000), prefillDqGemmRowFloor(4, true, 5120, 17408, "6000"));
+    try std.testing.expectEqual(prefillDqGemmRowFloor(4, true, 17408, 5120, null), prefillDqGemmRowFloor(4, true, 17408, 5120, "junk"));
+}
+
+var dq_row_floor_env: ??[*:0]const u8 = null;
+
+/// Whether the shape-aware floor applies. Measured on the M5 Ultra (`applegpu_g17d`) only; the
+/// M5 Max (`applegpu_g17s`) crosses the other way on K 5120 (dequant+GEMM wins from 2048 rows,
+/// MLX picks different GEMM tiles per arch suffix), so every other chip keeps the base floor.
+pub fn dqShapeFloorArchFrom(nax: bool, arch: []const u8) bool {
+    return nax and arch.len > 0 and arch[arch.len - 1] == 'd';
+}
+
+test "dqShapeFloorArchFrom: the shape-aware floor is the Ultra's only" {
+    try std.testing.expect(dqShapeFloorArchFrom(true, "applegpu_g17d"));
+    try std.testing.expect(!dqShapeFloorArchFrom(true, "applegpu_g17s"));
+    try std.testing.expect(!dqShapeFloorArchFrom(true, "applegpu_g17g"));
+    try std.testing.expect(!dqShapeFloorArchFrom(false, "applegpu_g17d"));
+    try std.testing.expect(!dqShapeFloorArchFrom(true, ""));
+}
+
+var dq_shape_floor_arch: ?bool = null;
+
+fn prefillDqGemmRowFloorNow(bits: u32, n: usize, k: usize) usize {
+    if (dq_row_floor_env == null) dq_row_floor_env = std.c.getenv("MLX_SERVE_PREFILL_DQ_GEMM_MIN_ROWS");
+    if (dq_shape_floor_arch == null) {
+        var arch_buf: [128]u8 = undefined;
+        dq_shape_floor_arch = dqShapeFloorArchFrom(naxAvailable(), gpuArchitecture(&arch_buf) orelse "");
+    }
+    return prefillDqGemmRowFloor(bits, dq_shape_floor_arch.?, n, k, dq_row_floor_env.?);
+}
+
 /// Test seam: forces the route on/off without the environment.
 pub var prefill_dq_gemm_override: ?bool = null;
 var prefill_dq_gemm_env_cached: ?bool = null;
@@ -44787,7 +44850,8 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     const last = lastDim(x) orelse return null;
     if (last == 0) return null;
     const rows = mlx.mlx_array_size(x) / @as(usize, @intCast(last));
-    if (rows < prefillDqGemmMinRows(bits)) return null;
+    const n: usize = @intCast(mlx.getShape(w)[0]);
+    if (rows < prefillDqGemmRowFloorNow(bits, n, @intCast(last))) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
 
