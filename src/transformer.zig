@@ -15,6 +15,7 @@ const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const rht = @import("rht.zig");
 const qmv2 = @import("qmv2.zig");
+const qmv_cuda = @import("qmv_cuda.zig");
 const rowqmv = @import("rowqmv.zig");
 const lane_qmm = @import("lane_qmm.zig");
 const lane_attn = @import("lane_attn.zig");
@@ -44721,6 +44722,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     // decode batches) route through the split-K verify kernel when eligible
     // (see VERIFY_QMM_SOURCE) — stock qmm's qmv/steel dead zone.
     if (try verifyQmm(s, x, w, sc, bi, bits, group_size)) |vy| return vy;
+    if (mode == .affine) if (try qmv_cuda.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
 
     // Prefill-width fast path: M >= 2048 dequantizes + runs the steel bf16
     // GEMM (see prefillDqGemm) — stock qmm_t's 32x32x32 tile dead zone.
@@ -52744,7 +52746,7 @@ test "qmatmulBits keeps row-axis MTP kernels out of plain batched projections" {
             if (msv_qmv_rows_kernel != null) std.debug.print("generic projection invoked MTP row-axis kernel: rows={d} bits={d}\n", .{ rows, bits });
             try testing.expect(msv_qmv_rows_kernel == null);
             // The dispatch order of qmatmulBits: simd_qmm takes 8+ rows where no verify tile does.
-            const expected = (try simdQmmDecode(x, w, sc, bi, bits, 64, s)) orelse (try verifyQmm(s, x, w, sc, bi, bits, 64)) orelse blk: {
+            const expected = (try simdQmmDecode(x, w, sc, bi, bits, 64, s)) orelse (try verifyQmm(s, x, w, sc, bi, bits, 64)) orelse (try qmv_cuda.qmm(x, w, sc, bi, bits, 64, s)) orelse blk: {
                 var stock = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_quantized_matmul(&stock, x, w, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", s));
                 break :blk stock;

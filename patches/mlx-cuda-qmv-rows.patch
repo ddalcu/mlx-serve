@@ -12,7 +12,7 @@ Drop this file and its step in build-mlx-linux.sh once lib/mlx-src includes
 it.
 
 diff --git a/docs/src/usage/environment_variables.rst b/docs/src/usage/environment_variables.rst
-index 4641411d9..c2012d530 100644
+index 4641411..c2012d5 100644
 --- a/docs/src/usage/environment_variables.rst
 +++ b/docs/src/usage/environment_variables.rst
 @@ -175,6 +175,13 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
@@ -30,7 +30,7 @@ index 4641411d9..c2012d530 100644
  
     Detect consecutive CUDA cache misses (more than twice the capacity with no
 diff --git a/mlx/backend/cuda/quantized/qmm/qmm.h b/mlx/backend/cuda/quantized/qmm/qmm.h
-index 6991baad1..61f1945c6 100644
+index 6991baa..37f6c8c 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmm.h
 +++ b/mlx/backend/cuda/quantized/qmm/qmm.h
 @@ -5,6 +5,8 @@
@@ -58,62 +58,37 @@ index 6991baad1..61f1945c6 100644
 +  return 1;
 +}
 +
-+// Parsed once until MLX_CUDA_QMV_MAX_ROWS or the device changes.
++// The cap of the first device asked, read once per process.
 +int qmv_max_rows(const cu::Device& device);
 +
  void qmv(
      const array& x,
      const array& w,
 diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
-index 63c847844..68718579f 100644
+index 63c8478..728db42 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmv.cu
 +++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
-@@ -8,8 +8,44 @@
+@@ -8,8 +8,19 @@
  #include <cooperative_groups.h>
  #include <cooperative_groups/reduce.h>
  
 +#include <cstdlib>
-+#include <cstring>
 +
  namespace mlx::core {
  
 +int qmv_max_rows(const cu::Device& device) {
-+  // The parse is cached. A test can still bracket one case: a changed
-+  // variable is picked up, and an empty one falls back to the device.
-+  static int cached_cap = -1;
-+  static int cached_major = -1;
-+  static int cached_minor = -1;
-+  static bool cached_set = false;
-+  static char cached_env[8] = {};
-+
-+  const char* env = std::getenv("MLX_CUDA_QMV_MAX_ROWS");
-+  bool set = env != nullptr && env[0] != '\0';
-+  int major = device.compute_capability_major();
-+  int minor = device.compute_capability_minor();
-+  if (cached_cap >= 0 && cached_major == major && cached_minor == minor &&
-+      cached_set == set &&
-+      (!set || std::strncmp(cached_env, env, sizeof(cached_env)) == 0)) {
-+    return cached_cap;
-+  }
-+  cached_major = major;
-+  cached_minor = minor;
-+  cached_set = set;
-+  cached_env[0] = '\0';
-+  if (set) {
-+    size_t i = 0;
-+    for (; i + 1 < sizeof(cached_env) && env[i] != '\0'; ++i) {
-+      cached_env[i] = env[i];
-+    }
-+    cached_env[i] = '\0';
-+  }
-+  cached_cap = qmv_rows_cap(major, minor, set ? cached_env : nullptr);
-+  return cached_cap;
++  // Read once: the variable and the device do not change in a process.
++  static const int cap = qmv_rows_cap(
++      device.compute_capability_major(),
++      device.compute_capability_minor(),
++      std::getenv("MLX_CUDA_QMV_MAX_ROWS"));
++  return cap;
 +}
 +
  namespace cu {
  
  namespace cg = cooperative_groups;
-@@ -208,6 +244,105 @@ __global__ void qmv_kernel(
+@@ -208,6 +219,105 @@ __global__ void qmv_kernel(
        x, w, scales, biases, global_scale, out, row, w_batch, n, k);
  }
  
@@ -219,7 +194,7 @@ index 63c847844..68718579f 100644
  template <
      int rows_per_block,
      int elems_per_thread,
-@@ -272,6 +407,7 @@ void qmv(
+@@ -272,6 +382,7 @@ void qmv(
      int k,
      int l,
      bool broadcast_w,
@@ -227,7 +202,7 @@ index 63c847844..68718579f 100644
      F&& launch_kernel) {
    constexpr int rows_per_block = 8;
    constexpr int elems_per_thread =
-@@ -283,6 +419,51 @@ void qmv(
+@@ -283,6 +394,51 @@ void qmv(
    void* args[] = {
        &x, &w, &scales, &biases, &global_scale, &out, &n, &k, &broadcast_w};
  
@@ -279,7 +254,7 @@ index 63c847844..68718579f 100644
    dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
      auto* kernel = &qmv_kernel<
          rows_per_block,
-@@ -466,6 +647,7 @@ void qmv(
+@@ -466,6 +622,7 @@ void qmv(
                k,
                l,
                broadcast_w,
@@ -288,7 +263,7 @@ index 63c847844..68718579f 100644
                  encoder.add_kernel_node_raw(
                      kernel, num_blocks, block_dims, {}, 0, args);
 diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
-index 68012cbf3..c3747144b 100644
+index 68012cb..c374714 100644
 --- a/mlx/backend/cuda/quantized/quantized.cpp
 +++ b/mlx/backend/cuda/quantized/quantized.cpp
 @@ -119,7 +119,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -302,7 +277,7 @@ index 68012cbf3..c3747144b 100644
      } else {
        call_qmm_sm80();
 diff --git a/tests/cuda_tests.cpp b/tests/cuda_tests.cpp
-index fee796ee1..31f6a26ae 100644
+index fee796e..ef63fc1 100644
 --- a/tests/cuda_tests.cpp
 +++ b/tests/cuda_tests.cpp
 @@ -2,6 +2,7 @@
@@ -313,15 +288,7 @@ index fee796ee1..31f6a26ae 100644
  #include "mlx/mlx.h"
  
  #ifdef _WIN32
-@@ -11,6 +12,7 @@
- #include <cuda_runtime.h>
- 
- #include <cstdint>
-+#include <cstdlib>
- #include <limits>
- 
- using namespace mlx::core;
-@@ -195,3 +197,40 @@ TEST_CASE("test quantized matmul over a few rows") {
+@@ -195,3 +196,36 @@ TEST_CASE("test quantized matmul over a few rows") {
      }
    }
  }
@@ -339,12 +306,10 @@ index fee796ee1..31f6a26ae 100644
 +  CHECK(qmv_rows_cap(12, 1, "0") == 1);
 +}
 +
-+#ifndef _WIN32
 +TEST_CASE("test quantized matmul rows kernel") {
-+  // Cap 8 sends 2..8 rows through the mat-vec rows kernel, including a
-+  // ragged K. A wider matmul stays on the tiled kernel. Each row matches
-+  // a dequantized reference.
-+  setenv("MLX_CUDA_QMV_MAX_ROWS", "8", 1);
++  // 2..8 rows, including a ragged K, and a 16-row matmul on the tiled kernel.
++  // Each row matches a dequantized reference. The rows kernel runs when the
++  // test binary starts with MLX_CUDA_QMV_MAX_ROWS=8 (the cap is read once).
 +  for (int bits : {4, 8}) {
 +    for (int k : {512, 1088}) {
 +      auto w = random::normal({384, k}, bfloat16);
@@ -359,6 +324,4 @@ index fee796ee1..31f6a26ae 100644
 +      }
 +    }
 +  }
-+  unsetenv("MLX_CUDA_QMV_MAX_ROWS");
 +}
-+#endif

@@ -494,10 +494,10 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
     }
 }
 
-const RmsMax = struct { rms: f32, max: f32 };
+pub const RmsMax = struct { rms: f32, max: f32 };
 
 /// Per-row RMS and worst error of `got` against the f32 `truth` [m, n].
-fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx.mlx_stream) ![]RmsMax {
+pub fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx.mlx_stream) ![]RmsMax {
     var g32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(g32);
     try mlx.check(mlx.mlx_astype(&g32, got, .float32, s));

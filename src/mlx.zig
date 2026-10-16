@@ -849,6 +849,11 @@ pub fn maxBufferLength() usize {
     return defaultDeviceInfoSize("max_buffer_length");
 }
 
+/// The default CUDA device's compute capability (`.major` 12, `.minor` 0 on sm_120); 0 when unknown.
+pub fn cudaComputeCapability(part: enum { major, minor }) usize {
+    return defaultDeviceInfoSize(if (part == .major) "compute_capability_major" else "compute_capability_minor");
+}
+
 fn defaultDeviceInfoSize(key: [*:0]const u8) usize {
     var dev = mlx_device{ .ctx = null };
     _ = mlx_get_default_device(&dev);

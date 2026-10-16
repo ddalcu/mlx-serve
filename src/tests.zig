@@ -38,6 +38,7 @@ test {
     _ = @import("mrope.zig");
     _ = @import("rht.zig");
     _ = @import("qmv2.zig");
+    _ = @import("qmv_cuda.zig");
     _ = @import("moe_gather_ubench.zig");
     _ = @import("moe_affine4.zig");
     _ = @import("hc_decode2.zig");
