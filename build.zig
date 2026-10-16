@@ -52,8 +52,13 @@ pub fn build(b: *std.Build) void {
         break :blk b.fmt("{s}/System/Library/Frameworks", .{sdk});
     };
 
+    // Where webp's headers and libraries are. Unset: Homebrew's prefix, its version read from `brew`. Set: a directory
+    // holding a copy of the formula's include/ and lib/ (a box without Homebrew), its version read from the copy's
+    // lib/pkgconfig.
+    const webp_prefix = b.option([]const u8, "webp-prefix", "Directory holding a copy of webp's include/ and lib/ (unset: Homebrew)");
+    const brew_prefix = webp_prefix orelse "/opt/homebrew";
     if (target.result.os.tag == .macos) {
-        verifyBrewDeps(b);
+        if (webp_prefix) |dir| verifyCopiedDeps(b, dir) else verifyBrewDeps(b);
         verifyMlxStage(b);
     }
 
@@ -71,7 +76,7 @@ pub fn build(b: *std.Build) void {
     // mlx-c staged from the Linux Vulkan fork by scripts/build-mlx-linux.sh.
     // Gated on the TARGET so the Linux exe can be built on any host zig can
     // target; the host gate below still guards the macOS graph.
-    if (target.result.os.tag == .linux) {
+    if (target.result.os.tag == .linux or target.result.os.tag == .windows) {
         addLinuxServe(b, target, optimize);
         return;
     }
@@ -95,12 +100,13 @@ pub fn build(b: *std.Build) void {
     // that have NO runtime query API (MLX + ggml report themselves at runtime):
     //   --mlx-c-version  pinned mlx-c submodule version; defaults from the
     //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
-    //   --ds4-commit     pinned ds4 submodule short commit (build.sh: `git rev-parse`)
+    //   --ds4-commit     pinned ds4 submodule short commit; defaults from its checked-out
+    //                    commit (readDs4Commit), so the release build reports it too
     //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
     //                    (written by scripts/fetch-llama.sh) so a plain dev build
     //                    still reports it. app/build.sh passes all three.
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
-    const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
+    const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse readDs4Commit(b) orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
 
     const build_options = b.addOptions();
@@ -120,9 +126,12 @@ pub fn build(b: *std.Build) void {
     // gets compile-time stubs (src/arch/*_stub.zig, src/ds4_ffi_stub.zig).
     // The stub selection reads this option, NOT `ios` — `ios` keeps its own
     // meaning (low-mem policy, sandboxing assumptions).
-    build_options.addOption(bool, "embedded_engines", true);
+    build_options.addOption(bool, "ds4_engine", true);
+    build_options.addOption(bool, "llama_engine", true);
     // DeepSeek-V4.1's EXL3 repack through mlx-stream (macOS only; Linux and iOS build the stub).
     build_options.addOption(bool, "mlx_stream", true);
+    // `-Dplugin-profile`: the plugin's profile probes (its sdk reads `mlx_host.plugin_profile`) and their C shims.
+    build_options.addOption(bool, "plugin_profile", pluginProfile(b));
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
@@ -164,7 +173,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/include/webp/decode.h", .{brew_prefix}) }, .{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) }, target, optimize, "") },
         },
     });
 
@@ -215,9 +224,12 @@ pub fn build(b: *std.Build) void {
     // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
     addMlxLib(b, mod);
     // webp include/lib paths (homebrew)
-    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) });
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{brew_prefix}) });
     mod.linkSystemLibrary("webp", .{});
+    // A copied prefix's dylibs carry @rpath install names (Homebrew's carry its absolute path): the artifact finds
+    // them in the copy at run time, the bundle in its own lib/.
+    if (webp_prefix) |dir| mod.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{dir}) });
 
     if (macos_sdk_frameworks) |fw_path| {
         mod.addFrameworkPath(.{ .cwd_relative = fw_path });
@@ -259,7 +271,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/include/webp/decode.h", .{brew_prefix}) }, .{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) }, target, optimize, "") },
         },
     });
 
@@ -282,9 +294,10 @@ pub fn build(b: *std.Build) void {
     addMlxStreamModule(b, test_mod, target, optimize);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
-    test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    test_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{brew_prefix}) });
+    test_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{brew_prefix}) });
     test_mod.linkSystemLibrary("webp", .{});
+    if (webp_prefix) |dir| test_mod.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{dir}) });
 
     if (macos_sdk_frameworks) |fw_path| {
         test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
@@ -310,6 +323,9 @@ pub fn build(b: *std.Build) void {
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
+    // that the run's cache key does not see: it reruns every time.
+    if (test_filter != null) run_unit_tests.has_side_effects = true;
     if (qwen_preprocess_fixture) |fixture| {
         run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
         run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
@@ -353,7 +369,7 @@ pub fn build(b: *std.Build) void {
     //    zig-out/ios/<sdk>/lib. `-Dios-include=<dir>` points at the iOS dist's
     //    include dir for third-party headers (webp); defaults to Homebrew's,
     //    whose versions are pinned identical by verifyBrewDeps.
-    const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
+    const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse b.fmt("{s}/include", .{brew_prefix});
     addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
     addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
 }
@@ -394,7 +410,10 @@ fn addPreviewTest(b: *std.Build, target: std.Build.ResolvedTarget) void {
 ///   - libjinja built for the host by the same staging script (the committed
 ///     libjinja.a holds Mach-O objects).
 fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    verifyMlxStageLinux(b);
+    // Windows reuses this graph without ds4, libwebp or Bonjour (src/windows_stubs.c), linking the
+    // MSVC-built mlx + mlx-c staged in lib/mlx-win/{include,lib} and llama.cpp's release DLLs.
+    const windows = target.result.os.tag == .windows;
+    if (!windows) verifyMlxStageLinux(b);
 
     const version = b.option([]const u8, "version", "Version string") orelse readAppVersion(b) orelse "0.0.0-dev";
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
@@ -403,12 +422,14 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "mas", false);
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
-    build_options.addOption([]const u8, "ds4_commit", b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown");
+    build_options.addOption([]const u8, "ds4_commit", b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse readDs4Commit(b) orelse "unknown");
     build_options.addOption([]const u8, "llama_tag", readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
-    build_options.addOption(bool, "embedded_engines", true);
+    build_options.addOption(bool, "ds4_engine", !windows);
+    build_options.addOption(bool, "llama_engine", true);
     build_options.addOption(bool, "mlx_stream", false);
+    build_options.addOption(bool, "plugin_profile", false);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
@@ -444,7 +465,10 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
                 .{ .name = "agent_skills", .module = agent_skills },
                 .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
                 .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-                .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
+                .{ .name = "webp", .module = if (windows)
+                    addCHeaderModule(b, b.path("src/webp_stub.h"), b.path("src"), target, optimize, "")
+                else
+                    addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
             },
         });
 
@@ -452,7 +476,13 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
         addGgufModule(b, mod, target, optimize);
         addExl3Module(b, mod, target, optimize);
-        mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
+        if (windows) {
+            mod.addCSourceFiles(.{
+                .root = b.path("lib/jinja_cpp"),
+                .files = &.{ "caps.cpp", "jinja_string.cpp", "jinja_wrapper.cpp", "lexer.cpp", "parser.cpp", "runtime.cpp", "value.cpp" },
+                .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" },
+            });
+        } else mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
         mod.addIncludePath(b.path("lib/jinja_cpp"));
 
         // stb_image (JPEG/PNG decode) + stb_image_write (PNG encode), xatlas
@@ -471,6 +501,15 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         mod.addCSourceFile(.{ .file = b.path("src/ane_stub.c"), .flags = &.{"-O2"} });
 
         // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
+        if (windows) {
+            mod.addIncludePath(b.path("lib/mlx-win/include"));
+            mod.addLibraryPath(b.path("lib/mlx-win/lib"));
+            mod.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
+            mod.addCSourceFile(.{ .file = b.path("src/windows_stubs.c"), .flags = &.{"-O2"} });
+            addLlamaLib(b, mod);
+            slot.* = mod;
+            continue;
+        }
         addMlxLib(b, mod);
         addDs4LinuxLib(b, mod);
         addLlamaLib(b, mod);
@@ -493,6 +532,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
         .root_module = mods[0],
+        .win32_manifest = if (windows) b.path("src/windows/mlx-serve.manifest") else null,
     });
     b.installArtifact(exe);
 
@@ -508,7 +548,10 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    // Rerun every time when filtered, as on macOS (env-gated tests).
+    if (test_filter != null) run_unit_tests.has_side_effects = true;
+    test_step.dependOn(&run_unit_tests.step);
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/
@@ -631,8 +674,10 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     // unreported. Without these the iOS lib fails to compile ("options has no
     // member named 'mas'/...").
     ios_options.addOption(bool, "mas", true);
-    ios_options.addOption(bool, "embedded_engines", false);
+    ios_options.addOption(bool, "ds4_engine", false);
+    ios_options.addOption(bool, "llama_engine", false);
     ios_options.addOption(bool, "mlx_stream", false);
+    ios_options.addOption(bool, "plugin_profile", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
@@ -871,12 +916,26 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
     // The read pool (pthreads, pread into slot rows), its MTLSharedEvent signal (non-ARC objc), and the MLX
     // event / alloc shims, which include the staged MLX's private headers and link libmlx.
     const csrc = b.pathJoin(&.{ dir, "csrc" });
-    const c: []const []const u8 = if (inject) &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } else &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    // A profile server build (`-Dplugin-profile=true`, never the tests) also compiles the decode profile's command-buffer
+    // timeline shims and the read pool's event-signal log (`-DQ3LD_EVSIG`), which the plugin's profile probes link.
+    const profile = !inject and pluginProfile(b);
+    const c: []const []const u8 = if (inject)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" }
+    else if (profile)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_EVSIG" }
+    else
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
     const cxx: []const []const u8 = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" };
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_lookahead4_exl3.c" }) }, .flags = c });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_event_shim.mm" }) }, .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_event_shim.cpp" }) }, .flags = cxx });
     m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_alloc_shim.cpp" }) }, .flags = cxx });
+    if (profile) {
+        const objc: []const []const u8 = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" };
+        m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "dsv41_cb_timeline.mm" }) }, .flags = objc });
+        m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "dsv41_newbuffer_count.mm" }) }, .flags = objc });
+        m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "dsv41_tl_mlx.cpp" }) }, .flags = cxx });
+    }
     m.addIncludePath(.{ .cwd_relative = csrc });
     m.addIncludePath(b.path("lib/mlx/include"));
     m.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
@@ -894,10 +953,19 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
 fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: ?[]const u8, frameworks: ?[]const u8, root: []const u8, name: []const u8) *std.Build.Step.Compile {
     const host = b.createModule(.{ .root_source_file = b.path("src/plugin_host.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
     addMlxLib(b, host);
+    addExl3Module(b, host, target, optimize);
     if (frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
     for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
     const m = mlxStreamPkg(b, host, mlxStreamDir(b), root, target, optimize, true);
     return b.addTest(.{ .name = name, .root_module = m, .filters = if (filter) |f| &.{f} else &.{} });
+}
+
+/// `-Dplugin-profile`: compile the plugin's profile probes and their shims in; off in every served build. `b.option`
+/// may be declared once; the graphs share this answer.
+var plugin_profile_opt: ?bool = null;
+fn pluginProfile(b: *std.Build) bool {
+    if (plugin_profile_opt == null) plugin_profile_opt = b.option(bool, "plugin-profile", "Compile the mlx-stream plugin's profile probes in (profile builds only)") orelse false;
+    return plugin_profile_opt.?;
 }
 
 /// The plugin checkout: `-Dmlx-stream-dir`, else the `lib/mlx-stream` submodule. `b.option` may be declared
@@ -937,14 +1005,18 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // location so `zig build run` / unit tests resolve it in dev. The app bundle
     // and CLI tarball rewrite that reference to @executable_path/... and re-sign
     // with the Developer ID (see release.yml / app/build.sh).
-    module.addIncludePath(b.path("lib/llama/include"));
-    module.addLibraryPath(b.path("lib/llama/lib"));
+    // Windows: the release's DLLs through import libraries, staged by
+    // `LLAMA_TARGET=windows scripts/fetch-llama.sh`; no rpaths (DLLs ship beside the exe).
+    const os = module.resolved_target.?.result.os.tag;
+    const stage = if (os == .windows) "lib/llama-win" else "lib/llama";
+    module.addIncludePath(b.path(b.fmt("{s}/include", .{stage})));
+    module.addLibraryPath(b.path(b.fmt("{s}/lib", .{stage})));
     // use_pkg_config = .no: a Homebrew `llama.cpp` install ships a llama.pc that
     // would otherwise hijack this link (pulling in /opt/homebrew's version + its
     // separate libggml). We want exactly the pinned dylib staged in lib/llama/lib.
     module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
-    // The macOS dylib merges ggml in; the Linux release keeps it separate.
-    if (module.resolved_target.?.result.os.tag == .linux) {
+    // The macOS dylib merges ggml in; the Linux and Windows releases keep it separate.
+    if (os == .linux or os == .windows) {
         module.linkSystemLibrary("ggml", .{ .use_pkg_config = .no });
         module.linkSystemLibrary("ggml-base", .{ .use_pkg_config = .no });
     }
@@ -967,8 +1039,10 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // root). dyld tries every LC_RPATH entry in order and silently skips
     // ones that don't resolve, so listing both depths here is safe — each
     // binary finds its own and ignores the other.
-    module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/llama/lib" });
-    module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
+    if (os != .windows) {
+        module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/llama/lib" });
+        module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
+    }
 
     // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
     // C++ for llama.cpp's C++-linked NextN staging calls (MTP).
@@ -1046,6 +1120,22 @@ fn readAppVersion(b: *std.Build) ?[]const u8 {
     return if (v.len > 0) b.dupe(v) else null;
 }
 
+/// The ds4 submodule's checked-out commit, short, read without git: its `.git` file names the
+/// git dir, whose detached HEAD holds the commit.
+fn readDs4Commit(b: *std.Build) ?[]const u8 {
+    const root = buildRootHandle(b);
+    const link = root.readFileAlloc(b.graph.io, "lib/ds4/.git", b.allocator, .limited(512)) catch return null;
+    const line = std.mem.trim(u8, link, " \t\r\n");
+    const prefix = "gitdir: ";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const git_dir = line[prefix.len..];
+    const head_path = b.pathJoin(&.{ if (std.fs.path.isAbsolute(git_dir)) git_dir else b.pathJoin(&.{ "lib/ds4", git_dir }), "HEAD" });
+    const head = root.readFileAlloc(b.graph.io, head_path, b.allocator, .limited(256)) catch return null;
+    const sha = std.mem.trim(u8, head, " \t\r\n");
+    if (sha.len < 7 or std.mem.startsWith(u8, sha, "ref:")) return null;
+    return b.dupe(sha[0..7]);
+}
+
 fn readMlxcPin(b: *std.Build) ?[]const u8 {
     const bytes = buildRootHandle(b).readFileAlloc(
         b.graph.io,
@@ -1060,13 +1150,48 @@ fn readMlxcPin(b: *std.Build) ?[]const u8 {
     return null;
 }
 
-const BrewDep = struct { name: []const u8, min: std.SemanticVersion };
+/// A Homebrew formula the macOS graph links: its name, the pkg-config file and header a copied prefix must hold, and
+/// the version floor.
+const BrewDep = struct { name: []const u8, pc: []const u8, header: []const u8, min: std.SemanticVersion };
 
 const required_brew_deps = [_]BrewDep{
     // mlx + mlx-c are NOT brew deps anymore: they are pinned submodules built
     // by scripts/build-mlx.sh (see addMlxLib) so the NAX kernels ship enabled.
-    .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
+    .{ .name = "webp", .pc = "libwebp", .header = "webp/decode.h", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
 };
+
+/// `-Dwebp-prefix=<dir>`: the copy must hold each dependency's header and its pkg-config file, whose `Version:` line
+/// meets the same floor the Homebrew check applies.
+fn verifyCopiedDeps(b: *std.Build, dir: []const u8) void {
+    for (required_brew_deps) |dep| {
+        const header = b.fmt("{s}/include/{s}", .{ dir, dep.header });
+        std.Io.Dir.cwd().access(b.graph.io, header, .{}) catch {
+            std.debug.print("\n[mlx-serve] -Dwebp-prefix={s}: {s} not found\n\n", .{ dir, header });
+            std.process.exit(1);
+        };
+        const pc_path = b.fmt("{s}/lib/pkgconfig/{s}.pc", .{ dir, dep.pc });
+        const pc = std.Io.Dir.cwd().readFileAlloc(b.graph.io, pc_path, b.allocator, .limited(16 * 1024)) catch {
+            std.debug.print("\n[mlx-serve] -Dwebp-prefix={s}: {s} not found (the copy must include lib/pkgconfig)\n\n", .{ dir, pc_path });
+            std.process.exit(1);
+        };
+        var ver_str: ?[]const u8 = null;
+        var lines = std.mem.splitScalar(u8, pc, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "Version:")) ver_str = std.mem.trim(u8, line["Version:".len..], " \t\r");
+        }
+        const have = std.SemanticVersion.parse(ver_str orelse "") catch {
+            std.debug.print("[mlx-serve] cannot read '{s}' version from {s}\n", .{ dep.name, pc_path });
+            std.process.exit(1);
+        };
+        if (have.order(dep.min) == .lt) {
+            std.debug.print(
+                "\n[mlx-serve] -Dwebp-prefix={s}: '{s}' is {d}.{d}.{d}; need >= {d}.{d}.{d}\n\n",
+                .{ dir, dep.name, have.major, have.minor, have.patch, dep.min.major, dep.min.minor, dep.min.patch },
+            );
+            std.process.exit(1);
+        }
+    }
+}
 
 fn verifyBrewDeps(b: *std.Build) void {
     for (required_brew_deps) |dep| {

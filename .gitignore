@@ -15,6 +15,7 @@ zig-out/
 
 # llama.cpp libllama, staged at build time by scripts/fetch-llama.sh (not vendored)
 /lib/llama/
+/lib/llama-win/
 # ...and the same path as a SYMLINK. A trailing slash matches a directory
 # but NOT a symlink, which is how an agent worktree's build-output links got
 # committed onto a branch (7f89301), replacing the lib/ds4 submodule and
@@ -25,6 +26,8 @@ zig-out/
 # (lib/mlx-src + lib/mlxc-src are the vendored sources; these are outputs)
 /lib/mlx/
 /lib/mlx
+# Windows import libraries for the MSVC-built mlx-c (cross-compiled mlx-serve.exe)
+/lib/mlx-win/
 /lib/.mlx-build/
 # Linux counterpart staging work dir (scripts/build-mlx-linux.sh)
 /.work-mlx-linux/

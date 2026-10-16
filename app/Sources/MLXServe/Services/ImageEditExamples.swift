@@ -47,6 +47,94 @@ enum ImagePromptExamples {
         ]),
     ]
 
+    /// Text-to-image layouts for a model that renders dense text
+    /// (`rendersDenseText`), written the way Qwen-Image's own prompt enhancer
+    /// writes them: every string in double quotes with where it sits, nothing
+    /// left for the model to invent (an invented label renders as gibberish),
+    /// and a closing "There is no other text in the image." Each one was
+    /// generated and read back on Qwen-Image 2.1 and its Turbo at 1024 x 1024.
+    /// Enhance shows the first two to the chat model as the format to write.
+    static let infographics = ImagePromptExampleGroup(name: "Infographics", examples: [
+        .init(title: "Key stats",
+              body: """
+                A clean, modern flat-design marketing infographic for a SaaS product, on a white background with soft light-gray card panels, using a palette of royal blue and bright orange. The image is a vertical layout divided into a header and a 2x2 grid of four benefit cards.
+
+                Header: at the top center, the product name "FlowDesk" in large bold dark navy sans-serif letters. Directly below it, a smaller subtitle in medium-gray sans-serif font reads "Work smarter. Ship faster."
+
+                Benefit grid: four rounded white cards with subtle shadows, arranged two by two, each containing a simple flat icon at the top, a very large bold statistic in the middle, and a short label below it.
+                - Top-left card: a blue rocket icon, the statistic "3x" in bold blue, and the label "Faster onboarding" in dark gray.
+                - Top-right card: an orange piggy-bank icon, the statistic "40%" in bold orange, and the label "Lower costs" in dark gray.
+                - Bottom-left card: a blue shield-with-checkmark icon, the statistic "99.9%" in bold blue, and the label "Uptime" in dark gray.
+                - Bottom-right card: an orange headset icon, the statistic "24/7" in bold orange, and the label "Support" in dark gray.
+
+                Footer: at the bottom center, a rounded orange button with white bold text "Start your free trial".
+
+                All text is crisp, correctly spelled and perfectly legible. There is no other text in the image. Professional corporate infographic style, generous whitespace, balanced alignment.
+                """),
+        .init(title: "Step-by-step process",
+              body: """
+                A clean, modern flat-design process infographic on a soft off-white background, using a palette of deep teal, mint green and charcoal. The layout has a title at the top and four numbered steps arranged from left to right, joined by a dashed teal arrow.
+
+                Title: at the top center, the heading "Launch Your Store in 4 Steps" in large bold charcoal sans-serif letters.
+
+                Steps: four equal columns, each with a large teal circle holding a white number, a simple flat icon below it, a bold step name, and one short line of gray text under the name.
+                - Step "1": a storefront icon, the name "Pick a Theme", and the text "40+ designs".
+                - Step "2": a box icon, the name "Add Products", and the text "Photos and prices".
+                - Step "3": a credit-card icon, the name "Set Up Payments", and the text "Cards and Apple Pay".
+                - Step "4": a rocket icon, the name "Go Live", and the text "Share your link".
+
+                Footer: at the bottom center, a wide rounded teal banner with the bold white text "Start your free 14-day trial".
+
+                All text is crisp, correctly spelled and perfectly legible. There is no other text in the image. Minimal corporate infographic style, generous whitespace, even spacing.
+                """),
+        .init(title: "Comparison slide",
+              body: """
+                A modern presentation slide comparing two ways of working, on a white background, with a navy title bar across the top and two equal columns below it.
+
+                Title bar: a navy banner with the bold white title "Spreadsheets vs. FlowDesk" centered in it.
+
+                Left column: a light-gray header strip with the bold dark-gray heading "Spreadsheets", followed by three rows, each a red cross icon and dark-gray text: "Manual updates", "Version conflicts", "No live reports".
+
+                Right column: a teal header strip with the bold white heading "FlowDesk", followed by three rows, each a green check icon and dark-gray text: "Automatic sync", "One source of truth", "Real-time dashboards".
+
+                Bottom: a full-width rounded teal banner under both columns with the bold white text "Teams save 6 hours a week".
+
+                All text is crisp, correctly spelled and perfectly legible. There is no other text in the image. Clean business presentation style, generous whitespace, aligned rows.
+                """),
+        .init(title: "Bar chart",
+              body: """
+                A clean data-visualization infographic on a white background, with a palette of indigo and coral.
+
+                Title: at the top left, the heading "Monthly Active Users" in bold dark indigo sans-serif letters, and below it the gray subtitle "January to April".
+
+                Chart: a vertical bar chart with four bars rising from left to right on a thin gray baseline, with no gridlines. The first three bars are indigo and the last bar is coral. Under each bar is its month: "Jan", "Feb", "Mar", "Apr". Above each bar is its value in bold: "12k", "18k", "26k", "41k".
+
+                Callout: at the top right, a rounded coral box with the bold white text "+240% growth".
+
+                All text is crisp, correctly spelled and perfectly legible. There is no other text in the image. Minimal flat chart style, generous whitespace.
+                """),
+        .init(title: "Event poster",
+              body: """
+                A bold, modern event poster with a deep purple to magenta gradient background, glowing abstract geometric shapes in the corners, and clean white sans-serif typography in a centered layout.
+
+                At the top, small spaced-out uppercase letters read "DESIGN WEEK 2026". In the center, the huge bold headline "THE FUTURE OF TYPE" in white, split over two lines. Below it, a thin white line, then two lines of medium white text: "March 14-16" and "Pier 27, San Francisco". At the bottom, a rounded white button with the bold purple text "Get Tickets".
+
+                All text is crisp, correctly spelled and perfectly legible. There is no other text in the image. Contemporary graphic-design poster style.
+                """),
+        .init(title: "Café menu",
+              body: """
+                A warm, modern café menu board with a dark charcoal chalkboard-style background, cream and mustard-yellow lettering, and small line-drawn coffee illustrations in the corners.
+
+                Title: at the top center, the name "Morning Brew" in a large cream script-style font, with the mustard subtitle "Coffee Menu" in small uppercase letters below it.
+
+                Menu: a single centered list of four drinks, each with the name on the left in cream sans-serif letters, a dotted line, and the price on the right in mustard: "Espresso" "$3.00", "Cappuccino" "$4.50", "Oat Latte" "$5.00", "Cold Brew" "$4.75".
+
+                Footer: at the bottom center, the small cream text "Open daily 7am - 3pm".
+
+                All text is crisp, correctly spelled and perfectly legible. There is no other text in the image. Cozy, modern café branding style.
+                """),
+    ])
+
     // MARK: Editing — the generic instructions any in-context editor handles
 
     private static let contentGroup = ImagePromptExampleGroup(name: "Content", examples: [

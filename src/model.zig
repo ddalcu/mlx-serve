@@ -367,9 +367,10 @@ pub const ModelConfig = struct {
     /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the
     /// config does.
     ngram_table_path: ?[]const u8 = null,
-    /// deepseek_v41: the pack's directory, where its Engram tables sit beside
-    /// the weights. Set by `parseConfig`.
-    dsv41_dir: ?[]const u8 = null,
+    /// The pack's directory: deepseek_v41's Engram tables sit beside the
+    /// weights, and an mlx-stream pack (DeepSeek-V4.1, `mimo_stream`,
+    /// `glm_stream` or `glm5_stream`) loads from it. Set by `parseConfig`.
+    pack_dir: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
     // softplus(fp32) → per-head scalar × attn output (reshaped [..,H,D]) before
@@ -510,6 +511,16 @@ pub const ModelConfig = struct {
     /// streaming repack): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its
     /// weights. Set by `parseConfig`.
     dsv41_stream: bool = false,
+    /// A MiMo pack prepared for mlx-stream (its config declares `expert_streaming`): mlx-stream serves it
+    /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
+    mimo_stream: bool = false,
+    /// A GLM-5.3 pack (`glm_moe_dsa`, its routed experts in an `experts.bin` bank): mlx-stream serves it
+    /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
+    glm_stream: bool = false,
+    /// A GLM-5.3-Flash pack prepared for mlx-stream (`glm5_next`, its config declares `expert_streaming`: the NVFP4
+    /// bank): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its weights; a `glm5_next` config without the
+    /// block is the host's resident arch. Set by `parseConfig`.
+    glm5_stream: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -559,6 +570,8 @@ pub const ModelConfig = struct {
     mtp_greedy_tail_override: ?bool = null,
     /// null = the process default (`MLX_SERVE_BONSAI_INT8_PREFILL`).
     int8_prefill_override: ?bool = null,
+    /// The model's `ane` setting: serve it on the Neural Engine; null follows `--ane`.
+    ane_override: ?bool = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
@@ -1190,6 +1203,16 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
 
+    pub fn isGlmMoeDsa(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "glm_moe_dsa");
+    }
+
+    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3
+    /// pack.
+    pub fn mlxStream(self: *const ModelConfig) bool {
+        return self.dsv41_stream or self.mimo_stream or self.glm_stream or self.glm5_stream;
+    }
+
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }
@@ -1501,6 +1524,8 @@ pub const ModelConfig = struct {
         if (self.isGlm5()) return true;
         // deepseek_v41: DeepSeek's template defaults `thinking_mode` to thinking.
         if (self.isDsv41()) return true;
+        // glm_moe_dsa: the template opens `<think>` on every assistant turn, as glm5_next.
+        if (self.isGlmMoeDsa()) return true;
 
         return false;
     }
@@ -1653,12 +1678,22 @@ pub const ModelConfig = struct {
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
-        if (self.dsv41_dir) |p| allocator.free(p);
-        self.dsv41_dir = null;
+        if (self.pack_dir) |p| allocator.free(p);
+        self.pack_dir = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
     }
 };
+
+/// A MiMo pack prepared for mlx-stream declares its expert bank (`"expert_streaming": {...}`); the plugin's own parse
+/// checks the declaration at load. An upstream MiMo checkpoint declares none and stays on the resident arch.
+fn declaresExpertStreaming(allocator: std.mem.Allocator, content: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const v = parsed.value.object.get("expert_streaming") orelse return false;
+    return v == .object;
+}
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
     const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
@@ -1677,10 +1712,29 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
     if (config.isDsv41()) {
-        config.dsv41_dir = try allocator.dupe(u8, model_dir);
+        config.pack_dir = try allocator.dupe(u8, model_dir);
         const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
         defer allocator.free(bank);
         config.dsv41_stream = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
+    }
+    if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
+        config.pack_dir = try allocator.dupe(u8, model_dir);
+        config.mimo_stream = true;
+    }
+    if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
+        config.pack_dir = try allocator.dupe(u8, model_dir);
+        config.glm5_stream = true;
+    }
+    if (config.isGlmMoeDsa()) {
+        // No in-tree arch serves the 744B: only an mlx-stream pack (the trunk beside an experts.bin bank) loads.
+        const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
+        defer allocator.free(bank);
+        std.Io.Dir.accessAbsolute(io, bank, .{}) catch {
+            log.err("glm_moe_dsa: {s} has no experts.bin; GLM-5.3 runs only from an mlx-stream pack (the trunk beside an experts.bin bank)\n", .{model_dir});
+            return error.GlmMoeDsaNeedsExpertBank;
+        };
+        config.pack_dir = try allocator.dupe(u8, model_dir);
+        config.glm_stream = true;
     }
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
@@ -4108,6 +4162,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.has_vision = false;
             try parseDsv41Fields(cfg_obj, &config);
         }
+    } else if (std.mem.eql(u8, model_type, "glm_moe_dsa")) {
+        // Z.ai GLM-5.3 (glm_moe_dsa), served only by mlx-stream (`parseConfig`). The
+        // host reads the shell fields the common block parsed: vocab, hidden, layers,
+        // eos ids, context, untied head.
+        config.model_type = "glm_moe_dsa";
+        config.has_sliding_window = false;
+        if (jsonField(cfg_obj, "n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = try jsonU32(v);
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
         config.weight_prefix = "model";
@@ -4894,7 +4957,7 @@ fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
-    if (config.dsv41_stream) return Weights.init(allocator); // mlx-stream loads its own
+    if (config.mlxStream()) return Weights.init(allocator); // mlx-stream loads its own
     try admitExl3Backend(config, mlx.metalKernelsAvailable());
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
@@ -4949,7 +5012,7 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
-    const s = mlx.mlx_default_cpu_stream_new();
+    const s = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(s);
 
     const pathz = try allocator.dupeSentinel(u8, abs_path, 0);
@@ -4982,7 +5045,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
-    const s = mlx.mlx_default_cpu_stream_new();
+    const s = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(s);
 
     // The index names the shards; anything else is dead weight (issue #274:
@@ -5112,9 +5175,8 @@ pub fn reportF16Narrowing() void {
     narrowed_1d = 0;
 }
 
-/// Load ONE safetensors file into a Weights map, tensors as stored (lazy).
-/// Safetensors load runs on a CPU stream (Load::eval_gpu is Not Implemented —
-/// the GPU-stream path kills the whole server). The iterator hands a +1
+/// Load ONE safetensors file into a Weights map, tensors as stored (lazy), on
+/// `mlx.weightLoadStream()` (Metal has no GPU `Load`). The iterator hands a +1
 /// reference in `value`; it transfers straight into the map.
 pub fn loadWeightsFile(allocator: std.mem.Allocator, model_dir: []const u8, file: []const u8) !Weights {
     var w = Weights.init(allocator);
@@ -5126,7 +5188,9 @@ pub fn loadWeightsFile(allocator: std.mem.Allocator, model_dir: []const u8, file
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, mlx.mlx_default_cpu_stream_new()));
+    const s = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(s);
+    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
 
     const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
@@ -7469,6 +7533,51 @@ test "deepseek_v41 bills its compressed caches per token, the window per slot" {
     try testing.expectEqual(@as(u64, 32), config.prefillAttnKeys(32));
 }
 
+test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; an upstream MiMo checkpoint is not" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = mimo_v2_pack_json });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var upstream = try parseConfig(io, testing.allocator, dir);
+    defer upstream.deinit(testing.allocator);
+    try testing.expect(upstream.isMimo() and !upstream.mimo_stream and !upstream.mlxStream());
+    const marked = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json, "\"model_type\": \"mimo_v2\",", "\"model_type\": \"mimo_v2_flash\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-mxfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
+    defer testing.allocator.free(marked);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
+    var pack = try parseConfig(io, testing.allocator, dir);
+    defer pack.deinit(testing.allocator);
+    try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream() and !pack.dsv41_stream);
+    try testing.expectEqualStrings(dir, pack.pack_dir.?);
+    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 0), w.count());
+}
+
+test "parseConfig: a glm5_next pack that declares expert_streaming is mlx-stream's; a resident glm5_next config is the host's" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = glm5_next_pack_json });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var resident = try parseConfig(io, testing.allocator, dir);
+    defer resident.deinit(testing.allocator);
+    try testing.expect(resident.isGlm5() and !resident.glm5_stream and !resident.mlxStream());
+    const marked = try std.mem.replaceOwned(u8, testing.allocator, glm5_next_pack_json, "\"model_type\": \"glm5_next\",", "\"model_type\": \"glm5_next\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-nvfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
+    defer testing.allocator.free(marked);
+    try testing.expect(!std.mem.eql(u8, marked, glm5_next_pack_json));
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
+    var pack = try parseConfig(io, testing.allocator, dir);
+    defer pack.deinit(testing.allocator);
+    try testing.expect(pack.isGlm5() and pack.glm5_stream and pack.mlxStream() and !pack.mimo_stream and !pack.glm_stream);
+    try testing.expectEqualStrings(dir, pack.pack_dir.?);
+    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 0), w.count());
+}
+
 test "parseConfig: a deepseek_v41 pack with an EXL3 bank is mlx-stream's, and the host loads none of its weights" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -7484,6 +7593,45 @@ test "parseConfig: a deepseek_v41 pack with an EXL3 bank is mlx-stream's, and th
     defer repack.deinit(testing.allocator);
     try testing.expect(repack.dsv41_stream);
     var w = try loadModelWeights(io, testing.allocator, dir, &repack, false);
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 0), w.count());
+}
+
+const glm_moe_dsa_config =
+    \\{"architectures": ["GlmMoeDsaForCausalLM"], "model_type": "glm_moe_dsa", "vocab_size": 154880,
+    \\ "hidden_size": 6144, "num_hidden_layers": 78, "num_attention_heads": 64, "num_key_value_heads": 64,
+    \\ "head_dim": 192, "max_position_embeddings": 1048576, "tie_word_embeddings": false, "n_routed_experts": 256,
+    \\ "eos_token_id": [154820, 154827, 154829],
+    \\ "quantization": {"group_size": 64, "bits": 4, "model.embed_tokens": {"group_size": 64, "bits": 8}}}
+;
+
+test "parseConfigFromJson glm_moe_dsa: the shell fields the host reads, its three eos ids, thinking on" {
+    const config = try parseConfigFromJson(testing.allocator, glm_moe_dsa_config);
+    try testing.expectEqualStrings("glm_moe_dsa", config.model_type);
+    try testing.expectEqual(@as(u32, 154880), config.vocab_size);
+    try testing.expectEqual(@as(u32, 6144), config.hidden_size);
+    try testing.expectEqual(@as(u32, 78), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 1048576), config.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expect(!config.tie_word_embeddings and !config.has_vision);
+    try testing.expectEqualSlices(u32, &.{ 154820, 154827, 154829 }, config.eos_token_ids[0..config.num_eos_tokens]);
+    try testing.expect(config.defaultEnableThinking(false) and config.defaultEnableThinking(true));
+}
+
+test "parseConfig: a glm_moe_dsa pack with an experts.bin bank is mlx-stream's; without the bank it is refused by name" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = glm_moe_dsa_config });
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    try testing.expectError(error.GlmMoeDsaNeedsExpertBank, parseConfig(io, testing.allocator, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
+    var pack = try parseConfig(io, testing.allocator, dir);
+    defer pack.deinit(testing.allocator);
+    try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.dsv41_stream and !pack.mimo_stream);
+    try testing.expectEqualStrings(dir, pack.pack_dir.?);
+    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
     try testing.expectEqual(@as(u32, 0), w.count());
 }

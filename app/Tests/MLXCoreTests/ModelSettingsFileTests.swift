@@ -62,6 +62,20 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertNil(ModelOverride(json: ["int8_prefill": "yes"]).int8Prefill)
     }
 
+    func testAneRoundTripsAsABoolean() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        var o = ModelOverride()
+        o.ane = true
+        file.set(o, for: "/m/a")
+        try file.save(path: path)
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"ane\" : true"), text)
+        XCTAssertEqual(ModelSettingsFile.load(path: path).override(for: "/m/a")?.ane, true)
+        XCTAssertNil(ModelOverride(json: ["ane": "yes"]).ane)
+        XCTAssertTrue(o.changesLoad(from: ModelOverride()), "the engine is chosen at load")
+    }
+
     /// `chat_template_kwargs` round-trips as one object: the rows the sheet
     /// edits are exactly what the server reads, typed values kept.
     func testChatTemplateKwargsRoundTripAsOneObject() throws {

@@ -12,6 +12,7 @@
 //! `"bits":"16"`) for bit-exact PLE lookups.
 
 const std = @import("std");
+const crt = @import("crt.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const ple_gpu = @import("ple_gpu.zig");
@@ -198,7 +199,7 @@ pub const NgramTable = struct {
     scols: u32,
     /// Kept open for the pool's `pread` gather (page faults on one mapping
     /// serialize on the VM map lock; preads run in parallel).
-    fd: std.c.fd_t = -1,
+    fd: c_int = -1,
     pool: ?*PrefetchPool = null,
     /// Boot-time page-cache warm: the weights load evicts this file, and the
     /// first long prompt then faults 48 rows/token from SSD (38k: 174 s vs
@@ -238,16 +239,17 @@ pub const NgramTable = struct {
     }
 
     pub fn open(path: []const u8) !NgramTable {
+        if (comptime @import("builtin").os.tag == .windows) return error.NgramTableUnsupportedOnWindows;
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
         if (path.len >= pbuf.len) return error.NameTooLong;
         @memcpy(pbuf[0..path.len], path);
         pbuf[path.len] = 0;
-        const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = crt.openRead(pbuf[0..path.len :0]);
         if (fd < 0) return error.FileNotFound;
-        errdefer _ = std.c.close(fd);
+        errdefer crt.close(fd);
         // File size via lseek-to-end: 0.17 has no portable fstat wrapper on
         // Linux (std.c.Stat is void there) and this loader has no `std.Io`.
-        const size: usize = @intCast(@max(std.c.lseek(fd, 0, std.c.SEEK.END), 0));
+        const size: usize = @intCast(@max(crt.seekEnd(fd), 0));
         if (size == 0) return error.StatFailed;
         const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
         errdefer std.posix.munmap(map);
@@ -372,13 +374,13 @@ pub const NgramTable = struct {
         live_warm_total.store(0, .release);
         if (self.pool) |p| p.destroy();
         self.pool = null;
-        if (self.fd >= 0) _ = std.c.close(self.fd);
+        if (self.fd >= 0) crt.close(self.fd);
         self.fd = -1;
         if (self.embedded) |source| {
             source.close();
             std.heap.page_allocator.destroy(source);
             self.embedded = null;
-        } else if (!self.gpu_owns_map) std.posix.munmap(self.map);
+        } else if (!self.gpu_owns_map and !(comptime @import("builtin").os.tag == .windows)) std.posix.munmap(self.map); // never mapped on Windows
     }
 
     /// Sample before background warming; explicit read-path overrides skip calibration.
@@ -494,7 +496,7 @@ pub const NgramTable = struct {
             while (off < r.len) {
                 if (self.warm_stop.load(.acquire)) return;
                 const want: usize = @intCast(@min(r.len - off, WARM_CHUNK));
-                const got = std.c.pread(r.fd, &scratch, want, @intCast(r.off + off));
+                const got = crt.pread(r.fd, &scratch, want, @intCast(r.off + off));
                 if (got <= 0) return;
                 off += @intCast(got);
                 done += @intCast(got);
@@ -580,6 +582,7 @@ pub const NgramTable = struct {
 
     /// One (row, region) pread into the pool's row buffer. False on a short read.
     fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
+        if (comptime @import("builtin").os.tag == .windows) unreachable; // `open` refuses on Windows
         const wl: usize = self.wcols * 4;
         const sl: usize = self.scols * 2;
         const off: usize, const dst: []u8 = switch (region) {
@@ -588,7 +591,7 @@ pub const NgramTable = struct {
             else => .{ self.b_off + r * sl, buf[wl + sl .. wl + 2 * sl] },
         };
         if (self.embedded) |source| return source.preadPart(r, region, dst);
-        return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
+        return crt.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 
 };

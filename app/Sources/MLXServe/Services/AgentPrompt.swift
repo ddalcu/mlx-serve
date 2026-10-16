@@ -227,7 +227,7 @@ enum AgentPrompt {
         return backupPath
     }
 
-    /// Drives the "Update System Prompt and Skills" menu item's enabled state.
+    /// Whether "Update System Prompt and Skills" has anything to replace.
     static func isPromptOrSkillsOutdated() -> Bool {
         isSystemPromptOutdated() || AgentSkills.isOutdated()
     }

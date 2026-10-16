@@ -72,6 +72,16 @@ final class TaskNotifier: NSObject, UNUserNotificationCenterDelegate {
              category: Self.approvalCategory, task: task, run: run)
     }
 
+    /// A model that took a while to load is ready (`LoadProgress.notifiesReady`).
+    func notifyModelReady(name: String) {
+        guard available else { return }
+        let content = UNMutableNotificationContent()
+        content.title = L10n.format("%@ is ready", name)
+        content.body = L10n.text("The model finished loading.")
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
     private func post(title: String, body: String, category: String, task: ScheduledTask, run: TaskRun) {
         guard available else { return }
         let content = UNMutableNotificationContent()

@@ -249,7 +249,6 @@ struct StatusMenuView: View {
         VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
             HStack(spacing: 8) {
                 TraySectionHeader(title: "Server").fixedSize()
-                engineBadge
                 Spacer(minLength: 0)
             }
             TrayCard {
@@ -389,17 +388,20 @@ struct StatusMenuView: View {
                 loadModelAtStart: appState.loadModelAtStart,
                 selectedModelPath: appState.selectedModelPath),
             isLoadingModel: appState.loadingModelPath != nil)
-        return HStack(spacing: 6) {
-            serverPrimaryButton(control)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                serverPrimaryButton(control)
 
-            Button {
-                openServerLog()
-            } label: {
-                Image(systemName: "macwindow.on.rectangle")
+                Button {
+                    openServerLog()
+                } label: {
+                    Image(systemName: "macwindow.on.rectangle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .help("Open Server Log in a separate window (easier copy/paste)")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.regular)
-            .help("Open Server Log in a separate window (easier copy/paste)")
+            ModelLoadProgressRow()
         }
     }
 
@@ -436,18 +438,6 @@ struct StatusMenuView: View {
 
     /// The engine the resident chat model runs on, as the SERVER reports it;
     /// before a load, the file-type guess for the selected model.
-    @ViewBuilder private var engineBadge: some View {
-        if let engine = server.residentChatModel?.engine {
-            EngineBadge(text: engine.label, tint: EngineBadge.tint(engine))
-                .help("Engine the loaded model runs on")
-        } else if let engine = appState.localModels
-            .first(where: { $0.path == appState.selectedModelPath })?.engine
-        {
-            EngineBadge(text: engine.displayName, tint: .secondary)
-                .help("Engine the selected model will run on")
-        }
-    }
-
     // MARK: - Music
 
     /// The Music tab's track while it plays, pauses or a station is on air.
@@ -727,90 +717,104 @@ struct StatusMenuView: View {
         return label
     }
 
-    /// One resident-model slot: modality icon, name, badges (chat quant /
-    /// spec-decode), resident size, and an eject button that unloads it.
+    /// One resident-model slot: modality icon, the whole name, copy and eject buttons; beneath it
+    /// the badges (quant, engine, KV, spec-decode) and the resident size.
     @ViewBuilder
     private func modelSlotRow(_ info: ModelInfo) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: info.slotKind.icon)
-                .font(.app(.caption))
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
-                .help(info.slotKind.label)
-            Text(info.name)
-                .font(.app(.caption).monospaced())
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help(info.slotKind == .chat
-                      ? "\(info.slotKind.label) — \(info.layers) layers, \(info.hiddenSize)-dim"
-                      : info.slotKind.label)
-            if info.quantBits > 0 {
-                Text("\(info.quantBits)-bit")
-                    .font(.app(.caption2).weight(.semibold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(.quaternary)
-                    .clipShape(Capsule())
-            }
-            if let kv = info.kvBadge {
-                Text(kv)
-                    .font(.app(.caption2).weight(.semibold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(.quaternary)
-                    .clipShape(Capsule())
-                    .help("KV cache stored at \(info.kvQuant)-bit")
-            }
-            // Speculative-decoding speedup badge (DFlash family / MTP / drafter).
-            if let badge = info.specDecodeBadge {
-                Text(L10n.text(badge))
-                    .font(.app(.caption2).weight(.semibold))
-                    .foregroundStyle(.green)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Color.green.opacity(0.15))
-                    .clipShape(Capsule())
-                    .help(badge == "+MTP"
-                          ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
-                          : "\(info.drafterStone?.label ?? "Assistant drafter") loaded — faster decode via speculative decoding")
-            }
-            Spacer()
-            if info.bytesResident > 0 {
-                Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))
-                    .font(.app(.caption2).monospaced())
-                    .foregroundStyle(.tertiary)
-            }
-            // Copy the model's full name/id to the clipboard (paste into a curl,
-            // a config file, etc.) — the row truncates it, so copy is the only
-            // way to get the whole string.
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(info.name, forType: .string)
-                copiedModelName = info.name
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if copiedModelName == info.name { copiedModelName = nil }
-                }
-            } label: {
-                Image(systemName: copiedModelName == info.name ? "checkmark" : "doc.on.doc")
-                    .font(.app(.caption2))
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(copiedModelName == info.name ? .green : .secondary)
-            .help("Copy model name")
-            if unloadingIds.contains(info.name) {
-                ProgressView()
-                    .controlSize(.mini)
-                    .help("Unloading — waits for any running request to finish")
-            } else {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: info.slotKind.icon)
+                    .font(.app(.caption))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+                    .help(info.slotKind.label)
+                Text(info.name)
+                    .font(.app(.caption).monospaced())
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(info.slotKind == .chat
+                          ? "\(info.slotKind.label) — \(info.layers) layers, \(info.hiddenSize)-dim"
+                          : info.slotKind.label)
+                Spacer(minLength: 4)
+                // Copy the model's full name/id to the clipboard (paste into a curl,
+                // a config file, etc.).
                 Button {
-                    unloadSlot(info.name)
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(info.name, forType: .string)
+                    copiedModelName = info.name
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        if copiedModelName == info.name { copiedModelName = nil }
+                    }
                 } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.app(.caption))
+                    Image(systemName: copiedModelName == info.name ? "checkmark" : "doc.on.doc")
+                        .font(.app(.caption2))
                 }
                 .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .help("Unload from memory (the model reloads on its next use)")
+                .foregroundStyle(copiedModelName == info.name ? .green : .secondary)
+                .help("Copy model name")
+                if unloadingIds.contains(info.name) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .help("Unloading — waits for any running request to finish")
+                } else {
+                    Button {
+                        unloadSlot(info.name)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.app(.caption))
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Unload from memory (the model reloads on its next use)")
+                }
+            }
+            HStack(spacing: 6) {
+                Spacer()
+                if info.quantBits > 0 {
+                    Text("\(info.quantBits)-bit")
+                        .font(.app(.caption2).weight(.semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.quaternary)
+                        .clipShape(Capsule())
+                }
+                let ane = info.engineBadge == "ANE"
+                Text(verbatim: info.engineBadge)
+                    .font(.app(.caption2).weight(.semibold))
+                    .foregroundStyle(ane ? Color.purple : Color.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(ane ? Color.purple.opacity(0.15) : Color.secondary.opacity(0.15))
+                    .clipShape(Capsule())
+                    .help("Engine serving this model")
+                if let kv = info.kvBadge {
+                    Text(kv)
+                        .font(.app(.caption2).weight(.semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.quaternary)
+                        .clipShape(Capsule())
+                        .help("KV cache stored at \(info.kvQuant)-bit")
+                }
+                // Speculative-decoding speedup badge (DFlash family / MTP / drafter).
+                if let badge = info.specDecodeBadge {
+                    Text(L10n.text(badge))
+                        .font(.app(.caption2).weight(.semibold))
+                        .foregroundStyle(.green)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.green.opacity(0.15))
+                        .clipShape(Capsule())
+                        .help(badge == "+MTP"
+                              ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
+                              : "\(info.drafterStone?.label ?? "Assistant drafter") loaded — faster decode via speculative decoding")
+                }
+                if info.bytesResident > 0 {
+                    Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))
+                        .font(.app(.caption2).monospaced())
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
     }
@@ -1391,26 +1395,3 @@ struct TerminalLogTextView: NSViewRepresentable {
     }
 }
 
-/// The engine name as a tinted capsule, so it reads at a glance.
-struct EngineBadge: View {
-    let text: String
-    let tint: Color
-
-    var body: some View {
-        Text(text)
-            .font(.app(.caption).weight(.semibold))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(tint.opacity(0.15), in: Capsule())
-    }
-
-    static func tint(_ engine: ServerEngine) -> Color {
-        switch engine {
-        case .mlx:     return .accentColor
-        case .mlxGguf: return .teal
-        case .llama:   return .orange
-        case .dsv4:    return .purple
-        }
-    }
-}

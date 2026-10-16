@@ -95,6 +95,7 @@ pub fn wrap(table: *qwen4.NgramTable) !Table {
 /// An embedded pack's shards copied into one anonymous page-aligned mapping in the
 /// `ngram_table.bin` layout, wrapped no-copy; MLX owns the munmap on success.
 fn wrapEmbedded(src: *const qwen4_ple.EmbeddedTable) !Table {
+    if (comptime @import("builtin").os.tag == .windows) return error.PleGpuUnsupportedOnWindows;
     const len: usize = @intCast(std.mem.alignForward(u64, src.repackedLen(), std.heap.pageSize()));
     const map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     var owned = true;

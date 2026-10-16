@@ -1,4 +1,4 @@
-//! Runtime (unfused) LoRA adapters for the image backends (FLUX.2 / Krea-2).
+//! Runtime (unfused) LoRA adapters for the image backends (FLUX.2 / Krea-2 / Qwen-Image 2.1).
 //!
 //! A LoRA safetensors file carries pairs `<module>.lora_A.weight` [r,in] /
 //! `<module>.lora_B.weight` [out,r] (diffusers naming; `lora_down`/`lora_up`,
@@ -122,12 +122,13 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
 // comment above for the taxonomy of naming schemes this covers.
 // ════════════════════════════════════════════════════════════════════════
 
-pub const Arch = enum { flux2, krea2, minimax_h3, generic };
+pub const Arch = enum { flux2, krea2, minimax_h3, qwen_image21, generic };
 
-/// Which third of a fused up-projection a canonical target draws from, when
-/// the source tensor packs several linears together (BFL's fused QKV).
+/// Which piece of a fused up-projection a canonical target draws from, when
+/// the source tensor packs several linears together (BFL's fused QKV in
+/// thirds, Qwen-Image 2.1's fused `gate_up` in halves: gate first, then proj).
 /// `none` means the source and target are already 1:1.
-pub const Split = enum { none, third0, third1, third2 };
+pub const Split = enum { none, third0, third1, third2, half0, half1 };
 
 const AliasRow = struct {
     /// mlx-serve's own module key, e.g. "transformer_blocks.{}.attn.to_q"
@@ -284,11 +285,28 @@ const minimax_h3_table = [_]AliasRow{
     t("final_layer.adaln_proj.linear", "final_layer.adaln_proj.linear"),
 };
 
+// Qwen-Image 2.1: the runtime names are the checkpoint's own. ai-toolkit exports
+// the MLP up-projection FUSED (`img_mlp.gate_up`, rows = gate_layer ++ proj,
+// ComfyUI's `lora.py` reads the halves the same way); the runtime keeps the two
+// linears apart. `to_out.0` arrives here already normalized to `to_out`.
+const qwen_image21_table = [_]AliasRow{
+    t("transformer_blocks.{}.attn.to_q", "transformer_blocks.{}.attn.to_q"),
+    t("transformer_blocks.{}.attn.to_k", "transformer_blocks.{}.attn.to_k"),
+    t("transformer_blocks.{}.attn.to_v", "transformer_blocks.{}.attn.to_v"),
+    t("transformer_blocks.{}.attn.to_out", "transformer_blocks.{}.attn.to_out"),
+    t("transformer_blocks.{}.img_mlp.gate_layer", "transformer_blocks.{}.img_mlp.gate_layer"),
+    ts("transformer_blocks.{}.img_mlp.gate_layer", "transformer_blocks.{}.img_mlp.gate_up", .half0),
+    t("transformer_blocks.{}.img_mlp.proj", "transformer_blocks.{}.img_mlp.proj"),
+    ts("transformer_blocks.{}.img_mlp.proj", "transformer_blocks.{}.img_mlp.gate_up", .half1),
+    t("transformer_blocks.{}.img_mlp.out", "transformer_blocks.{}.img_mlp.out"),
+};
+
 fn archTable(arch: Arch) []const AliasRow {
     return switch (arch) {
         .flux2 => &flux2_table,
         .krea2 => &krea2_table,
         .minimax_h3 => &minimax_h3_table,
+        .qwen_image21 => &qwen_image21_table,
         .generic => &.{},
     };
 }
@@ -407,15 +425,17 @@ pub fn delta(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     return scaled;
 }
 
-/// `y + Σ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ` in y's dtype, `y` borrowed. The rank-r activation is tiny, so
-/// each adapter is one skinny GEMM and an `addmm` whose epilogue adds onto y: no delta tensor, no
-/// scalar pass. Caller must ensure `refs.len >= 1`.
+/// `y + Σ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ` in y's dtype, `y` borrowed, the result always a NEW handle. The
+/// rank-r activation is tiny, so each adapter is one skinny GEMM and an `addmm` whose epilogue adds
+/// onto y: no delta tensor, no scalar pass. An adapter at scale 0 is skipped: MLX's `addmm` does
+/// not return `beta*c` at `alpha == 0`. Caller must ensure `refs.len >= 1`.
 pub fn addTo(y: mlx.mlx_array, x: mlx.mlx_array, refs: []const Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     var acc = y;
     errdefer if (acc.ctx != y.ctx) {
         _ = mlx.mlx_array_free(acc);
     };
     for (refs) |r| {
+        if (r.scale == 0) continue;
         var xa = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xa);
         try mlx.check(mlx.mlx_matmul(&xa, x, r.at, s));
@@ -424,6 +444,12 @@ pub fn addTo(y: mlx.mlx_array, x: mlx.mlx_array, refs: []const Ref, s: mlx.mlx_s
         try mlx.check(mlx.mlx_addmm(&next, acc, xa, r.bt, r.scale, 1.0, s));
         if (acc.ctx != y.ctx) _ = mlx.mlx_array_free(acc);
         acc = next;
+    }
+    if (acc.ctx == y.ctx) {
+        var same = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(same);
+        try mlx.check(mlx.mlx_array_set(&same, y));
+        return same;
     }
     return acc;
 }
@@ -454,6 +480,30 @@ pub fn deltaSum(x: mlx.mlx_array, refs: []const Ref, s: mlx.mlx_stream) !mlx.mlx
 /// couple of concept adapters) while keeping the per-linear footprint a
 /// fixed-size array instead of a heap allocation on the hot path.
 pub const MAX_LORAS: usize = 8;
+
+/// The adapters attached to ONE linear, applied at RUN TIME and never folded into the base weight:
+/// merging rounds the delta away in bf16 and requantizes it away on quantized bases. Non-owning: the
+/// arrays belong to the `Stack` that produced the refs, which must outlive the slot.
+pub const Slot = struct {
+    refs: [MAX_LORAS]Ref = undefined,
+    count: u8 = 0,
+
+    pub fn set(self: *Slot, refs: []const Ref) void {
+        self.count = @intCast(refs.len);
+        @memcpy(self.refs[0..refs.len], refs);
+    }
+    pub fn active(self: *const Slot) []const Ref {
+        return self.refs[0..self.count];
+    }
+};
+
+/// `y + Σ deltas` when anything is attached, `y` unchanged otherwise. Consumes `y` either way, so a
+/// call site is one line around the base linear's output.
+pub fn addSlot(y: mlx.mlx_array, x: mlx.mlx_array, slot: *const Slot, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (slot.count == 0) return y;
+    defer _ = mlx.mlx_array_free(y);
+    return addTo(y, x, slot.active(), s);
+}
 
 /// One loaded adapter pair, keyed by the module it targets.
 pub const Entry = struct {
@@ -529,6 +579,13 @@ pub const Stack = struct {
             }
         }
         return out[0..n];
+    }
+
+    /// Adapter modules loaded across every file — what a full attach matches.
+    pub fn entryCount(self: *const Stack) u32 {
+        var n: u32 = 0;
+        for (self.files[0..self.count]) |f| n += @intCast(f.entries.len);
+        return n;
     }
 };
 
@@ -663,7 +720,7 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     try validatePath(path);
     const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
-    const s = mlx.mlx_default_cpu_stream_new();
+    const s = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(s);
 
     var tensor_map = mlx.mlx_map_string_to_array_new();
@@ -758,17 +815,17 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         //
         // Canonicalize the module name(s) for the target architecture. A
         // fused source tensor (e.g. BFL's packed img_attn.qkv) fans out to
-        // up to MAX_FANOUT canonical targets — one per `Split` third — and
+        // up to MAX_FANOUT canonical targets — one per `Split` piece — and
         // EVERY match needs its own Entry, or two of every three fused
         // targets (to_k/to_v) would silently never get an adapter attached.
         var canon_bufs: [MAX_FANOUT]CanonBuf = undefined;
         var canon_out: [MAX_FANOUT]CanonMatch = undefined;
         const matches = canonicalize(e.key_ptr.*, p.flat, arch, &canon_bufs, &canon_out);
         for (matches) |m| {
-            const idx = splitIndex(m.split);
+            const piece = splitPiece(m.split);
             const at = try prepTransposed(p.a, s);
             errdefer _ = mlx.mlx_array_free(at);
-            const bt = if (idx) |i| try prepTransposedThird(p.b, i, s) else try prepTransposed(p.b, s);
+            const bt = if (piece) |pc| try prepTransposedPiece(p.b, pc, s) else try prepTransposed(p.b, s);
             errdefer _ = mlx.mlx_array_free(bt);
             // A per-module `.alpha` tensor is MORE SPECIFIC than a file-wide
             // declaration, so it wins; the file's own metadata is the default
@@ -789,28 +846,33 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     return .{ .allocator = allocator, .entries = try entries.toOwnedSlice(allocator) };
 }
 
-/// `Split` → which third (0/1/2) of a 3-way fused source it draws from, or
-/// `null` for an already-1:1 (`.none`) match.
-fn splitIndex(sp: Split) ?u2 {
+const SplitPiece = struct { idx: u2, parts: u2 };
+
+/// `Split` → which piece (`idx` of `parts` equal ones) of a fused source it
+/// draws from, or `null` for an already-1:1 (`.none`) match.
+fn splitPiece(sp: Split) ?SplitPiece {
     return switch (sp) {
         .none => null,
-        .third0 => 0,
-        .third1 => 1,
-        .third2 => 2,
+        .third0 => .{ .idx = 0, .parts = 3 },
+        .third1 => .{ .idx = 1, .parts = 3 },
+        .third2 => .{ .idx = 2, .parts = 3 },
+        .half0 => .{ .idx = 0, .parts = 2 },
+        .half1 => .{ .idx = 1, .parts = 2 },
     };
 }
 
-/// [n, k] → the `idx`-th of 3 equal chunks along axis 0, still `[n/3, k]`
-/// and untransposed. Used for the up-projection's output axis — always
-/// split for a fused target (mirrors mflux's `_split_qkv_up`). The
+/// [n, k] → the `piece.idx`-th of `piece.parts` equal chunks along axis 0, still
+/// `[n/parts, k]` and untransposed. Used for the up-projection's output axis —
+/// always split for a fused target (mirrors mflux's `_split_qkv_up`). The
 /// down-projection is never split this way; see the shared-A note in
-/// `loadFile`.
-fn sliceThird(w: mlx.mlx_array, idx: u2, s: mlx.mlx_stream) !mlx.mlx_array {
+/// `loadFile`. A B whose rows do not divide is a corrupt file, not a rounding.
+fn sliceRows(w: mlx.mlx_array, piece: SplitPiece, s: mlx.mlx_stream) !mlx.mlx_array {
     const shape = mlx.getShape(w);
-    const n = shape[0];
-    const third = @divTrunc(n, 3);
-    const start = [_]c_int{ third * @as(c_int, idx), 0 };
-    const stop = [_]c_int{ third * (@as(c_int, idx) + 1), shape[1] };
+    const parts: c_int = piece.parts;
+    if (@rem(shape[0], parts) != 0) return error.BadLoraShape;
+    const rows = @divExact(shape[0], parts);
+    const start = [_]c_int{ rows * @as(c_int, piece.idx), 0 };
+    const stop = [_]c_int{ rows * (@as(c_int, piece.idx) + 1), shape[1] };
     const strides = [_]c_int{ 1, 1 };
     var res = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(res);
@@ -818,12 +880,12 @@ fn sliceThird(w: mlx.mlx_array, idx: u2, s: mlx.mlx_stream) !mlx.mlx_array {
     return res;
 }
 
-/// [n, k] → materialized bf16 [k, n/3] for the `idx`-th third, pre-transposed
+/// [n, k] → materialized bf16 [k, n/parts] for one piece, pre-transposed
 /// exactly like `prepTransposed`.
-fn prepTransposedThird(w: mlx.mlx_array, idx: u2, s: mlx.mlx_stream) !mlx.mlx_array {
-    const piece = try sliceThird(w, idx, s);
-    defer _ = mlx.mlx_array_free(piece);
-    return prepTransposed(piece, s);
+fn prepTransposedPiece(w: mlx.mlx_array, piece: SplitPiece, s: mlx.mlx_stream) !mlx.mlx_array {
+    const rows = try sliceRows(w, piece, s);
+    defer _ = mlx.mlx_array_free(rows);
+    return prepTransposed(rows, s);
 }
 
 fn prepTransposed(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -1010,6 +1072,117 @@ test "addTo equals y + deltaSum in y's dtype, for one adapter and a stack" {
     }
 }
 
+fn testBf16Matrix(al: std.mem.Allocator, rows: usize, cols: usize, seed: f32, sm: mlx.mlx_stream) !mlx.mlx_array {
+    const host = try al.alloc(f32, rows * cols);
+    defer al.free(host);
+    for (host, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.37 + seed);
+    const shape = [_]c_int{ @intCast(rows), @intCast(cols) };
+    const f32a = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(f32a);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f32a, .bfloat16, sm));
+    return out;
+}
+
+test "addTo with a zero or tiny scale returns y, at DiT-sized shapes" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const M = 1024;
+    const K = 512;
+    const R = 16;
+    const N = 768;
+    const mk = testBf16Matrix;
+    const x = try mk(a, M, K, 0.1, s);
+    defer _ = mlx.mlx_array_free(x);
+    const y = try mk(a, M, N, 0.7, s);
+    defer _ = mlx.mlx_array_free(y);
+    const at = try mk(a, K, R, 1.3, s);
+    defer _ = mlx.mlx_array_free(at);
+    const bt = try mk(a, R, N, 2.1, s);
+    defer _ = mlx.mlx_array_free(bt);
+    var y32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y32);
+    try mlx.check(mlx.mlx_astype(&y32, y, .float32, s));
+    _ = mlx.mlx_array_eval(y32);
+    const yp = mlx.mlx_array_data_float32(y32) orelse return error.NoData;
+    for ([_]f32{ 0.0, 1e-6 }) |sc| {
+        const got = try addTo(y, x, &.{.{ .at = at, .bt = bt, .scale = sc }}, s);
+        defer _ = mlx.mlx_array_free(got);
+        var g32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g32);
+        try mlx.check(mlx.mlx_astype(&g32, got, .float32, s));
+        _ = mlx.mlx_array_eval(g32);
+        const gp = mlx.mlx_array_data_float32(g32) orelse return error.NoData;
+        var max_abs: f32 = 0;
+        for (0..M * N) |i| {
+            try testing.expect(std.math.isFinite(gp[i]));
+            max_abs = @max(max_abs, @abs(gp[i] - yp[i]));
+        }
+        try testing.expect(max_abs < 0.05);
+    }
+}
+
+test "addTo applies a negative or large scale with its sign, at DiT-sized shapes" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const M = 1024;
+    const K = 512;
+    const R = 16;
+    const N = 768;
+    const x = try testBf16Matrix(a, M, K, 0.1, s);
+    defer _ = mlx.mlx_array_free(x);
+    const y = try testBf16Matrix(a, M, N, 0.7, s);
+    defer _ = mlx.mlx_array_free(y);
+    const at = try testBf16Matrix(a, K, R, 1.3, s);
+    defer _ = mlx.mlx_array_free(at);
+    const bt = try testBf16Matrix(a, R, N, 2.1, s);
+    defer _ = mlx.mlx_array_free(bt);
+
+    // The truth is the unscaled delta and y in f32; a sign error is 200% off, bf16 rounding ~1%.
+    var x32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x32);
+    var y32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y32);
+    var at32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(at32);
+    var bt32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bt32);
+    try mlx.check(mlx.mlx_astype(&x32, x, .float32, s));
+    try mlx.check(mlx.mlx_astype(&y32, y, .float32, s));
+    try mlx.check(mlx.mlx_astype(&at32, at, .float32, s));
+    try mlx.check(mlx.mlx_astype(&bt32, bt, .float32, s));
+    var xa = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xa);
+    var d32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d32);
+    try mlx.check(mlx.mlx_matmul(&xa, x32, at32, s));
+    try mlx.check(mlx.mlx_matmul(&d32, xa, bt32, s));
+    _ = mlx.mlx_array_eval(y32);
+    _ = mlx.mlx_array_eval(d32);
+    const yp = mlx.mlx_array_data_float32(y32) orelse return error.NoData;
+    const dp = mlx.mlx_array_data_float32(d32) orelse return error.NoData;
+    var d_max: f32 = 0;
+    for (dp[0 .. M * N]) |v| d_max = @max(d_max, @abs(v));
+
+    for ([_]f32{ -1.0, -0.5, -20.0, 20.0 }) |sc| {
+        const got = try addTo(y, x, &.{.{ .at = at, .bt = bt, .scale = sc }}, s);
+        defer _ = mlx.mlx_array_free(got);
+        var g32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g32);
+        try mlx.check(mlx.mlx_astype(&g32, got, .float32, s));
+        _ = mlx.mlx_array_eval(g32);
+        const gp = mlx.mlx_array_data_float32(g32) orelse return error.NoData;
+        var max_err: f32 = 0;
+        for (0..M * N) |i| {
+            try testing.expect(std.math.isFinite(gp[i]));
+            max_err = @max(max_err, @abs(gp[i] - (yp[i] + sc * dp[i])));
+        }
+        try testing.expect(max_err < 0.05 * @abs(sc) * d_max + 0.05);
+    }
+}
+
 test "Stack.findAll collects one Ref per file and folds in that file's user scale" {
     const a = testing.allocator;
     // Two hand-built files: both carry "m.shared", only the first carries
@@ -1079,7 +1252,7 @@ test "Stack.matches is the no-op-reuse gate: order and scales are part of identi
     try testing.expect(!st.matches(&.{ "/a.safetensors", "/b.safetensors", "/c.safetensors" }, &.{ 1.0, 0.5, 1.0 }));
 }
 
-test "prepTransposedThird slices a fused up-projection into the right q/k/v third" {
+test "prepTransposedPiece slices a fused up-projection into the right q/k/v third" {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     // Fused B [out_fused=6, r=1]: rows 0-1 = "q" third, 2-3 = "k" third,
@@ -1090,7 +1263,7 @@ test "prepTransposedThird slices a fused up-projection into the right q/k/v thir
     const b = mlx.mlx_array_new_data(&bv, &bs, 2, .float32);
     defer _ = mlx.mlx_array_free(b);
 
-    const bt1 = try prepTransposedThird(b, 1, s);
+    const bt1 = try prepTransposedPiece(b, .{ .idx = 1, .parts = 3 }, s);
     defer _ = mlx.mlx_array_free(bt1);
     _ = mlx.mlx_array_eval(bt1);
     const shape = mlx.getShape(bt1);
@@ -1391,7 +1564,7 @@ test "arch tables: every canonical target has a SELF row" {
     // recognized because the canonical name is also listed as an alias. A new
     // row added without its self row would silently stop resolving Kohya
     // exports for that module.
-    inline for (.{ Arch.flux2, Arch.krea2, Arch.minimax_h3 }) |arch| {
+    inline for (.{ Arch.flux2, Arch.krea2, Arch.minimax_h3, Arch.qwen_image21 }) |arch| {
         const table = archTable(arch);
         for (table) |row| {
             var found = false;
@@ -1422,6 +1595,85 @@ test "canonicalize resolves Kohya flat-scheme module names, not just dotted ones
     const flat = canonicalize("double_blocks_3_img_attn_qkv", true, .flux2, &bufs, &out);
     try testing.expectEqual(@as(usize, 3), flat.len);
     try testing.expectEqualStrings("transformer_blocks.3.attn.to_q", flat[0].canon);
+}
+
+test "canonicalize: Qwen-Image 2.1's fused img_mlp.gate_up fans out to gate_layer (first half) and proj (second half)" {
+    var bufs: [MAX_FANOUT]CanonBuf = undefined;
+    var out: [MAX_FANOUT]CanonMatch = undefined;
+
+    for ([_]bool{ false, true }) |flat| {
+        const name = if (flat) "transformer_blocks_7_img_mlp_gate_up" else "transformer_blocks.7.img_mlp.gate_up";
+        const m = canonicalize(name, flat, .qwen_image21, &bufs, &out);
+        try testing.expectEqual(@as(usize, 2), m.len);
+        try testing.expectEqualStrings("transformer_blocks.7.img_mlp.gate_layer", m[0].canon);
+        try testing.expectEqual(Split.half0, m[0].split);
+        try testing.expectEqualStrings("transformer_blocks.7.img_mlp.proj", m[1].canon);
+        try testing.expectEqual(Split.half1, m[1].split);
+    }
+
+    // An export that already carries the two halves separately resolves 1:1.
+    const own = canonicalize("transformer_blocks.2.img_mlp.proj", false, .qwen_image21, &bufs, &out);
+    try testing.expectEqual(@as(usize, 1), own.len);
+    try testing.expectEqualStrings("transformer_blocks.2.img_mlp.proj", own[0].canon);
+    try testing.expectEqual(Split.none, own[0].split);
+}
+
+test "loadFile: a Qwen-Image 2.1 gate_up adapter splits B into gate/proj halves and shares A" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &pbuf);
+    const path = try std.fmt.allocPrint(a, "{s}/gate_up.safetensors", .{pbuf[0..root_len]});
+    defer a.free(path);
+
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    const in_dim = 4;
+    const half = 3;
+    const r = 2;
+    var av: [r * in_dim]f32 = undefined;
+    for (&av, 0..) |*v, i| v.* = @floatFromInt(i);
+    // Rows 0..half carry 1.0 (the gate half), rows half.. carry 2.0 (proj).
+    var bv: [2 * half * r]f32 = undefined;
+    for (&bv, 0..) |*v, i| v.* = if (i / r < half) 1.0 else 2.0;
+    const ash = [_]c_int{ r, in_dim };
+    const bsh = [_]c_int{ 2 * half, r };
+    const aarr = mlx.mlx_array_new_data(&av, &ash, 2, .float32);
+    const barr = mlx.mlx_array_new_data(&bv, &bsh, 2, .float32);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "diffusion_model.transformer_blocks.0.img_mlp.gate_up.lora_A.weight", aarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "diffusion_model.transformer_blocks.0.img_mlp.gate_up.lora_B.weight", barr);
+    _ = mlx.mlx_array_free(aarr);
+    _ = mlx.mlx_array_free(barr);
+    const mmap = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    const pathz = try a.dupeSentinel(u8, path, 0);
+    defer a.free(pathz);
+    try mlx.check(mlx.mlx_save_safetensors(pathz, tmap, mmap));
+
+    var file = try loadFile(a, path, .qwen_image21);
+    defer file.deinit();
+    try testing.expectEqual(@as(usize, 2), file.entries.len);
+
+    const gate = file.find("transformer_blocks.0.img_mlp.gate_layer") orelse return error.MissingGate;
+    const proj = file.find("transformer_blocks.0.img_mlp.proj") orelse return error.MissingProj;
+    for ([_]struct { e: *const Entry, want: f32 }{ .{ .e = gate, .want = 1.0 }, .{ .e = proj, .want = 2.0 } }) |c| {
+        const at_shape = mlx.getShape(c.e.at);
+        const bt_shape = mlx.getShape(c.e.bt);
+        try testing.expectEqual(@as(c_int, in_dim), at_shape[0]); // A shared, full rank
+        try testing.expectEqual(@as(c_int, r), at_shape[1]);
+        try testing.expectEqual(@as(c_int, r), bt_shape[0]);
+        try testing.expectEqual(@as(c_int, half), bt_shape[1]); // B split in two
+        var f32_bt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32_bt);
+        try mlx.check(mlx.mlx_astype(&f32_bt, c.e.bt, .float32, s));
+        _ = mlx.mlx_array_eval(f32_bt);
+        const d = mlx.mlx_array_data_float32(f32_bt) orelse return error.NoData;
+        for (d[0 .. r * half]) |v| try testing.expectApproxEqAbs(c.want, v, 1e-4);
+    }
 }
 
 test "loadFile rejects relative/empty paths (openFileAbsolute UB class)" {

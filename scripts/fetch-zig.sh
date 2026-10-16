@@ -17,8 +17,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEST="$REPO_ROOT/.zig-toolchain"
 STAMP="$DEST/.version"
 
+case "$(uname -s)" in
+  Darwin) OS="macos" ;;
+  Linux) OS="linux" ;;
+  MINGW*|MSYS*|CYGWIN*) OS="windows" ;; # Git Bash
+  *) echo "[fetch-zig] ERROR: unsupported OS $(uname -s)" >&2; exit 1 ;;
+esac
+if [ "$OS" = windows ]; then EXE=zig.exe; EXT=zip; else EXE=zig; EXT=tar.xz; fi
+
 # Idempotent: skip when the staged copy already matches the pinned version.
-if [ -f "$STAMP" ] && [ -x "$DEST/zig" ]; then
+if [ -f "$STAMP" ] && [ -x "$DEST/$EXE" ]; then
   if [ "$(cat "$STAMP")" = "$ZIG_VERSION" ]; then
     echo "[fetch-zig] .zig-toolchain already at $ZIG_VERSION — nothing to do"
     exit 0
@@ -33,38 +41,31 @@ case "$(uname -m)" in
   x86_64) ARCH="x86_64" ;;
   *) echo "[fetch-zig] ERROR: unsupported arch $(uname -m)" >&2; exit 1 ;;
 esac
-case "$(uname -s)" in
-  Darwin) OS="macos" ;;
-  Linux) OS="linux" ;;
-  *) echo "[fetch-zig] ERROR: unsupported OS $(uname -s)" >&2; exit 1 ;;
-esac
-
-ASSET="zig-${ARCH}-${OS}-${ZIG_VERSION}.tar.xz"
+ASSET="zig-${ARCH}-${OS}-${ZIG_VERSION}.${EXT}"
 URL="https://ziglang.org/download/${ZIG_VERSION}/${ASSET}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "[fetch-zig] downloading $URL"
-curl -fSL --retry 3 -o "$TMP/zig.tar.xz" "$URL"
+curl -fSL --retry 3 -o "$TMP/$ASSET" "$URL"
 
 echo "[fetch-zig] extracting"
-tar xf "$TMP/zig.tar.xz" -C "$TMP"
+if [ "$EXT" = zip ]; then unzip -q "$TMP/$ASSET" -d "$TMP"; else tar xf "$TMP/$ASSET" -C "$TMP"; fi
 
 EXTRACTED="$TMP/zig-${ARCH}-${OS}-${ZIG_VERSION}"
-if [ ! -x "$EXTRACTED/zig" ]; then
+if [ ! -x "$EXTRACTED/$EXE" ]; then
   echo "[fetch-zig] ERROR: no zig executable in $ASSET" >&2
   exit 1
 fi
 
 rm -rf "$DEST"
-mkdir -p "$DEST"
-cp -R "$EXTRACTED"/. "$DEST"/
+mv "$EXTRACTED" "$DEST" # a rename on one volume: Git Bash's cp takes minutes over Zig's ~16k files
 
 echo "$ZIG_VERSION" > "$STAMP"
 
 echo "[fetch-zig] staged Zig ($ZIG_VERSION):"
-echo "  $DEST/zig ($("$DEST/zig" version))"
+echo "  $DEST/$EXE ($("$DEST/$EXE" version))"
 echo ""
 echo "  Add it to PATH for this shell:"
 echo "    export PATH=\"$DEST:\$PATH\""

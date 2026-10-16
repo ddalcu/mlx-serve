@@ -127,6 +127,10 @@ check "api_key_env outranks the literal key" $r "$resp"
 resp=$(curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{"model":"unlisted@stub","messages":[]}')
 [ "$(echo "$resp" | jq -r '.model')" = "unlisted" ] && r=PASS || r=FAIL
 check "unlisted model on a known provider is forwarded, not 404'd here" $r "$resp"
+# Swift's JSON writers send `org\/repo`: the escaped spelling is what gets replaced.
+resp=$(curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{"model":"org\/stub-model@stub","messages":[]}')
+[ "$(echo "$resp" | jq -r '.model')" = "org/stub-model" ] && curl -sf "$BASE/health" >/dev/null && r=PASS || r=FAIL
+check "an escaped org\\/repo id is forwarded bare and the server stays up" $r "$resp"
 
 echo "[3] streaming relays de-chunked SSE"
 stream=$(curl -s -N "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \

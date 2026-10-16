@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
 - **NVIDIA Nemotron 3.5 Bolt and Super.** The omni packs serve text, images and video (RADIO tower), and draft with their LiLiCorr DFlash drafter on every API.
 - **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs.
 
@@ -12,9 +13,11 @@
 - **MiniCPM-V 4.7 sees.** OpenBMB's MiniCPM-V 4.7 reads images, from screenshots to pages of small print: large pictures are cut into crops so fine text stays legible, and a pack without the vision tower still answers text.
 - **Agents make films.** The mlx-serve skill walks a coding agent from a brief to a finished music video, trailer or release film: it writes and sings the song, times every word and beat, renders the shots on your Mac and cuts them to the music. Storyboards in the app join more smoothly too: a shot can end on a picture you choose, and every join fades.
 - **Sushi packs draft.** MiMo-V2.6-Flash Sushi packs draft with their own MTP heads and read their FP8 attention weights in place, about 105 tokens per second instead of 32 on an M5 Ultra, and GLM-5.3-Flash Sushi packs use the DFlash2 drafter they ship with, 94 instead of 66 on code.
+- **LoRAs for Qwen-Image 2.1.** Character and style LoRAs now work with Qwen-Image 2.1, Turbo or not, for generating and for instruction edits, and several can be stacked; the app's LoRA picker is enabled for it, and an adapter set to scale 0 now leaves the image unchanged, as it should for MiniMax-H3 too.
+- **Slider LoRAs with negative and large strengths.** A LoRA scale may be negative to reverse its effect or far past 1 (some published sliders run -20 to 20) on every image and video model; the app's strength slider now spans -2 to 2, widens when you type a larger value, and takes any number up to ±100.
 - **Coding agents in one line.** `curl -fsSL https://mlxserve.com/agent.sh | sh` sets up pi, Claude Code, oh-my-pi, OpenCode or Grok against your server, and agents started from the web console's Code Launcher no longer quit on launch.
 - **Use a Mac that shares with a key.** When another Mac shares its models behind an API key, it shows up in Settings > LAN Sharing as needing a key; enter it there and its models appear in your pickers. Headless: `~/.mlx-serve/lan-keys.json`.
-- **Fixes.** DeepSeek-V4-Flash GGUFs open again with default settings, a picture sent as a plain image URL string reaches the model instead of being silently dropped, a damaged LAN key file can no longer stall peer discovery, and LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 downloads are no longer marked unsupported in the app.
+- **Fixes.** Bonsai 2 2B, 4B and 9B now supported, DeepSeek-V4-Flash GGUFs open again with default settings, a picture sent as a plain image URL string reaches the model instead of being silently dropped, a damaged LAN key file can no longer stall peer discovery, LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 downloads are no longer marked unsupported in the app, the downloaded app ships the mlx-serve agent skill and the OpenCode 2 plugin again, and Agent > Update System Prompt and Skills to Latest… no longer stays grayed out.
 
 ---
 

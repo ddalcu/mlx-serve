@@ -69,6 +69,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
 | `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model). DeepSeek-V4.1 runs the stages its pack ships unless `--no-mtp` |
 | `--ssd-streaming` | off | ds4 / DeepSeek-V4-Flash GGUF only: stream expert weights from SSD instead of holding the whole model in RAM |
+| `--ane` | off | Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine instead of the GPU, contexts up to 64K (a model's `"ane"` in `model-settings.json` wins); the first load on a Mac compiles its programs (minutes, then cached) |
+| `--ane-slots N` | `1` | Requests each Neural Engine model runs at once (1..4); slots share the weights, each adds its own KV and state |
 | `--prefill-chunk N` | `8192` | Max tokens forwarded per prefill chunk (auto-capped further per model); lower it to cut prefill peak memory |
 | `--no-decode-attn-quant` | on | Disable the decode-only requant of dense bf16 attention weights (the "Fast decode for bf16-attention models" toggle) |
 | `--kv-quant {off,4,8}` | off | KV-cache quantization scheme (MLX path) |
@@ -93,7 +95,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
 | `--idle-evict-secs N` | off | Unload models nobody is using after this many idle seconds |
 | `--no-warmup-eager` | off | Skip the eager warmup at boot (benchmarking / minimal-footprint deployments) |
-| `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies) |
+| `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies). Either way, a load that would not fit in free RAM first unloads idle models when that makes it fit |
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 | `--log-file PATH` | `~/.mlx-serve/logs/` | Where the server log goes |

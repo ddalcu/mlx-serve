@@ -32,7 +32,10 @@ const build_options = @import("build_options");
 // engine panics (ds4/llama unavailable on iOS) are never reached at runtime
 // anyway; this only governs how an unexpected panic terminates.
 pub const panic = std.debug.simple_panic;
-// pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
+// pub: lib/mlx-serve-gguf and lib/sushi reach mlx, log and io_util through their host root (`mlx_host`). iOS builds
+// no mlx-stream plugin (src/arch/mlx_stream_stub.zig refuses its packs), so this root does not carry the plugin's names
+// of plugin_host.zig (sushi_exl3, dsa_nax), and plugin_host_check.zig does not check it; mtp_acceptance is the plugin
+// SDK's too (`sdk.acceptance`), kept as main.zig has it, and nothing on iOS reads it.
 pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");

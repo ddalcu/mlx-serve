@@ -217,8 +217,8 @@ fn padSymmetric(x: mlx.mlx_array, axis: usize, size: c_int, s: S) !struct { arr:
 
 /// Load `vae_diffusion_decoder.safetensors` and pre-transpose every 2-D linear
 /// weight into `[in, out]`, so the forward never transposes again.
-pub fn load(allocator: std.mem.Allocator, path: [:0]const u8, cpu_s: S) !ltx.Component {
-    var comp = try ltx.loadComponent(allocator, path, cpu_s);
+pub fn load(allocator: std.mem.Allocator, path: [:0]const u8, load_s: S) !ltx.Component {
+    var comp = try ltx.loadComponent(allocator, path, load_s);
     errdefer comp.deinit();
     var transposed: u32 = 0;
     var it = comp.map.iterator();
@@ -229,9 +229,9 @@ pub fn load(allocator: std.mem.Allocator, path: [:0]const u8, cpu_s: S) !ltx.Com
             _ = mlx.mlx_array_eval(arr);
             continue;
         }
-        const t = try transposeTo(arr, &[_]c_int{ 1, 0 }, cpu_s);
+        const t = try transposeTo(arr, &[_]c_int{ 1, 0 }, load_s);
         defer _ = mlx.mlx_array_free(t);
-        const c = try contig(t, cpu_s);
+        const c = try contig(t, load_s);
         _ = mlx.mlx_array_eval(c);
         _ = mlx.mlx_array_free(arr);
         e.value_ptr.* = c;

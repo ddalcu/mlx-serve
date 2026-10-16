@@ -12,6 +12,10 @@ import AppKit
 @main
 struct MLXCoreEntryPoint {
     static func main() {
+        // Before anything localizes a string: a catalog is read per process.
+        AppLanguageOverride.install(
+            preference: UserDefaults.standard.string(forKey: InterfacePrefKey.language),
+            localizations: Bundle.main.localizations)
         let args = CommandLine.arguments.dropFirst()
         if args.first == "bench" { BenchmarkCLI.main(Array(args.dropFirst())) }
         let env = ProcessInfo.processInfo.environment
@@ -286,11 +290,12 @@ struct MLXCoreApp: App {
 
                 // Pull in the latest built-in prompt and skills when ours have moved
                 // ahead of the on-disk copies. Backs up the user's edits first.
+                // Always enabled: this scene observes nothing, so a disabled
+                // check would go stale; the flow says when nothing is outdated.
                 Button {
                     AgentPrompt.runSystemPromptUpdateFlow()
                 } label: { Text("Update System Prompt and Skills to Latest…")
                     .font(.app(.body)) }
-                .disabled(!AgentPrompt.isPromptOrSkillsOutdated())
 
                 Button {
                     let path = NSString(string: "~/.mlx-serve/memory.md").expandingTildeInPath

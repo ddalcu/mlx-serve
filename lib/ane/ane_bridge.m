@@ -152,10 +152,14 @@ static bool bridge_cache_restore(NSString *identifier, NSString *directory) {
 
 static char lineage_group[128];
 static char lineage_variant[32];
+/* When the current lineage was named: every entry its build restores or
+ * stores is touched after it (`msv_ane_cache_sweep`). */
+static NSTimeInterval lineage_since;
 
 void msv_ane_cache_lineage(const char *group, const char *variant) {
     snprintf(lineage_group, sizeof lineage_group, "%s", group ? group : "");
     snprintf(lineage_variant, sizeof lineage_variant, "%s", variant ? variant : "");
+    lineage_since = [NSDate date].timeIntervalSince1970;
 }
 
 /* Tag an entry with the current lineage (no-op when untagged). A build that
@@ -222,15 +226,18 @@ static void bridge_cache_prune(void) {
         NSString *path = [root stringByAppendingPathComponent:name];
         unsigned long long bytes = bridge_dir_bytes(files, path);
         NSArray<NSString *> *lineage = bridge_entry_lineage(path);
-        if (lineage && lineage_group[0] &&
-            [lineage[0] isEqualToString:@(lineage_group)] &&
-            ![lineage[1] isEqualToString:@(lineage_variant)]) {
+        bool same_group = lineage && lineage_group[0] &&
+            [lineage[0] isEqualToString:@(lineage_group)];
+        if (same_group && ![lineage[1] isEqualToString:@(lineage_variant)]) {
             [files removeItemAtPath:path error:nil];
             continue;
         }
+        total += bytes;
+        // The set being built is never evicted: its entries not yet restored
+        // would be recompiled, evicting more of the set in turn.
+        if (same_group) continue;
         NSDate *date = [[files attributesOfItemAtPath:path error:nil]
             fileModificationDate] ?: [NSDate distantPast];
-        total += bytes;
         [entries addObject:@[ date, name, @(bytes) ]];
     }
     unsigned long long cap = bridge_cache_cap_bytes();
@@ -250,6 +257,25 @@ static void bridge_cache_prune(void) {
         [files removeItemAtPath:[root stringByAppendingPathComponent:entry[1]]
                           error:nil];
         total -= [entry[2] unsignedLongLongValue];
+    }
+}
+
+void msv_ane_cache_prune(void) { bridge_cache_prune(); }
+
+/* A build of the current group is done: the group's entries it did not touch
+ * (an older engine's, whose programs it no longer emits) go. Whole seconds:
+ * filesystem times may be truncated. */
+void msv_ane_cache_sweep(void) {
+    if (!lineage_group[0]) return;
+    NSString *root = [bridge_cache_root() stringByAppendingPathComponent:@"entries"];
+    NSFileManager *files = [NSFileManager defaultManager];
+    for (NSString *name in [files contentsOfDirectoryAtPath:root error:nil]) {
+        NSString *path = [root stringByAppendingPathComponent:name];
+        NSArray<NSString *> *lineage = bridge_entry_lineage(path);
+        if (!lineage || ![lineage[0] isEqualToString:@(lineage_group)]) continue;
+        NSDate *date = [[files attributesOfItemAtPath:path error:nil] fileModificationDate];
+        if (!date || date.timeIntervalSince1970 < floor(lineage_since))
+            [files removeItemAtPath:path error:nil];
     }
 }
 
@@ -330,6 +356,153 @@ static bool bridge_has_symbol_api(id in_memory_model) {
         [model respondsToSelector:@selector(procedureInfoForProcedureIndex:)];
 }
 
+/* Whether a failed compile is one of the compiler's nondeterministic internal errors ("Couldn't do
+ * topological sort", "Attention branch must have ..."): the same program compiles on a later try. */
+static bool bridge_retryable(NSError *failure) {
+    NSString *text = failure.description;
+    return text && [text rangeOfString:@"Compiler internal error"].location != NSNotFound;
+}
+
+#define BRIDGE_COMPILE_TRIES 10
+/* A bare failure ("ANECCompile() FAILED", a load with no error) can pass on a retry when several
+ * builds are in flight. */
+#define BRIDGE_BARE_TRIES 3
+
+/* Load `model`, again after a pause when the runtime refuses. */
+static BOOL bridge_load(id model, NSDictionary *options, NSError **failure) {
+    for (int attempt = 0;; attempt++) {
+        *failure = nil;
+        if (((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+                model, @selector(loadWithQoS:options:error:), 21, options, failure))
+            return YES;
+        if (attempt + 1 >= BRIDGE_BARE_TRIES) return NO;
+        usleep(200000);
+    }
+}
+
+/* Compile (or restore from the compile cache) and load the program in `descriptor` as `model`;
+ * the staging directory it serves from is returned in `staging` (the framework's contract: it
+ * stays for the model's life). Returns false with `error` set and nothing left on disk. */
+static bool bridge_compile_load(const char *name, id model, NSData *program,
+                                NSData *weights, NSDictionary *compile_options,
+                                NSDictionary *options, NSString **staging, bool *cache_hit,
+                                char *error, size_t error_size) {
+    NSError *failure = nil;
+    NSString *identifier = ((id(*)(id, SEL))objc_msgSend)(
+        model, @selector(hexStringIdentifier));
+    // Staging MUST stay in $TMPDIR: the compile/load runs in aned, a
+    // separate daemon that cannot read this user's home directory
+    // (ANECCompile() fails bare on a ~/.mlx-serve staging path —
+    // measured 2026-08-17). Only the persistent cache entries live
+    // under ~/.mlx-serve/ane-cache; $TMPDIR and home share the APFS
+    // Data volume, so the hardlink mirror stays free.
+    //
+    // The staging LOCATION is the framework's contract, not ours:
+    // _ANEInMemoryModel saves and compiles at $TMPDIR/<identifier>
+    // exactly (moving our writes under a subdirectory fails EVERY
+    // compile with a bare ANECCompile() FAILED — measured). A killed or
+    // crashed server never frees its staging, and the leaked dirs
+    // (8-20 GB per big model) marched the disk to 0 across restarts —
+    // at which point the framework's own model save fails ("Write
+    // weightsFilePath failed" in the unified log) and surfaces as a
+    // bare "compile failed: ?" with silent partial layer coverage
+    // (live 2026-08-18: 112 -> 63 -> 36 -> 29 programs as the orphans
+    // accumulated). So each dir gets a pid MARKER file, and the first
+    // create of a process reaps any marked dir whose owner is dead.
+    static dispatch_once_t reap_once;
+    dispatch_once(&reap_once, ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *tmp = NSTemporaryDirectory();
+        for (NSString *entry in [fm contentsOfDirectoryAtPath:tmp error:nil]) {
+            NSString *dir = [tmp stringByAppendingPathComponent:entry];
+            NSString *marker = [dir stringByAppendingPathComponent:@"msv-ane.pid"];
+            NSString *owner_text = [NSString stringWithContentsOfFile:marker
+                                                             encoding:NSUTF8StringEncoding
+                                                                error:nil];
+            if (!owner_text) continue;
+            pid_t owner = (pid_t)owner_text.integerValue;
+            if (owner <= 0 || owner == getpid()) continue;
+            // ESRCH = the owning process is gone; EPERM = alive but
+            // not ours to signal — keep those.
+            if (kill(owner, 0) != 0 && errno == ESRCH)
+                [fm removeItemAtPath:dir error:nil];
+        }
+    });
+    NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
+    NSFileManager *files = [NSFileManager defaultManager];
+    bool cache = msv_ane_cache_enabled();
+    bool cached = cache && bridge_cache_restore(identifier, directory);
+    if (cached) bridge_cache_tag(bridge_cache_entry(identifier));
+    if (!cached) bridge_write_sources(directory, program, weights);
+    [[NSString stringWithFormat:@"%d", getpid()]
+        writeToFile:[directory stringByAppendingPathComponent:@"msv-ane.pid"]
+         atomically:YES
+           encoding:NSUTF8StringEncoding
+              error:nil];
+    bool loaded = cached && bridge_load(model, options, &failure);
+    if (cached && !loaded) {
+        failure = nil;
+        bridge_write_sources(directory, program, weights);
+    }
+    if (!loaded) {
+        bool compiled = false;
+        for (int attempt = 0; attempt < BRIDGE_COMPILE_TRIES && !compiled; attempt++) {
+            failure = nil;
+            compiled = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+                model, @selector(compileWithQoS:options:error:), 21, compile_options, &failure);
+            if (!compiled && !bridge_retryable(failure) && attempt + 1 >= BRIDGE_BARE_TRIES) break;
+        }
+        if (!compiled) {
+            bridge_fail(error, error_size, "ANE %s compile failed: %s", name,
+                        failure ? failure.localizedDescription.UTF8String : "?");
+            if (failure && failure.userInfo[NSUnderlyingErrorKey])
+                bridge_fail(error, error_size, "ANE %s compile failed: %s", name,
+                            [failure.userInfo[NSUnderlyingErrorKey] description].UTF8String);
+            [files removeItemAtPath:directory error:nil];
+            return false;
+        }
+        if (!bridge_load(model, options, &failure)) {
+            bridge_fail(error, error_size, "ANE %s load failed: %s", name,
+                        failure ? failure.localizedDescription.UTF8String : "?");
+            [files removeItemAtPath:directory error:nil];
+            return false;
+        }
+        if (cache) {
+            bridge_cache_prune();
+            bridge_cache_store(identifier, directory);
+        }
+    }
+    /* The staging weights blob and MIL text are COMPILE inputs only —
+     * the warm-restore path loads AND SERVES from a mirror that never
+     * had them (bridge_cache_store skips both) — so they are deleted
+     * once the net is loaded, halving the cold build's staging burst
+     * (the ~2x-compiled-bytes burst that ran the disk out mid-build,
+     * bare "compile failed" from layer ~50 on). The COMPILED artifacts
+     * must stay for the handle's life: aned demand-reads the program
+     * from staging during serving, so deleting the whole directory
+     * passes a single immediate eval and then fails later evals with
+     * "ANEProgramProcessRequestDirect ... Program Inference error"
+     * (measured, 352 failures over one 32k benchmark serve). */
+    [files removeItemAtPath:[directory stringByAppendingPathComponent:@"weights"] error:nil];
+    [files removeItemAtPath:[directory stringByAppendingPathComponent:@"model.mil"] error:nil];
+    *staging = directory;
+    *cache_hit = loaded;
+    return true;
+}
+
+static id bridge_descriptor(NSData *program, NSData *weights) {
+    return ((id(*)(Class, SEL, id, id, id))objc_msgSend)(
+        NSClassFromString(@"_ANEInMemoryModelDescriptor"),
+        @selector(modelWithMILText:weights:optionsPlist:), program,
+        @{@"@model_path/weights/weight.bin": @{@"offset": @0, @"data": weights}}, nil);
+}
+
+static id bridge_model(id descriptor) {
+    return ((id(*)(Class, SEL, id))objc_msgSend)(
+        NSClassFromString(@"_ANEInMemoryModel"),
+        @selector(inMemoryModelWithDescriptor:), descriptor);
+}
+
 msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
                                   void *weight_bytes_owned, size_t weight_bytes,
                                   IOSurfaceRef *input_surfaces,
@@ -350,143 +523,34 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
         return NULL;
     }
     @autoreleasepool {
-        NSError *failure = nil;
         NSData *weights = [NSData dataWithBytesNoCopy:weight_bytes_owned
                                                length:weight_bytes
                                          freeWhenDone:YES];
         NSData *program = [NSData dataWithBytes:mil length:strlen(mil)];
-        Class descriptorClass =
-            NSClassFromString(@"_ANEInMemoryModelDescriptor");
-        Class modelClass = NSClassFromString(@"_ANEInMemoryModel");
         Class requestClass = NSClassFromString(@"_ANERequest");
         Class surfaceClass = NSClassFromString(@"_ANEIOSurfaceObject");
-        id descriptor = ((id(*)(Class, SEL, id, id, id))objc_msgSend)(
-            descriptorClass, @selector(modelWithMILText:weights:optionsPlist:),
-            program, @{@"@model_path/weights/weight.bin":
-                       @{@"offset": @0, @"data": weights}}, nil);
+        id descriptor = bridge_descriptor(program, weights);
         if (!descriptor) {
             bridge_fail(error, error_size, "ANE %s descriptor rejected", name);
             free(handle);
             return NULL;
         }
-        id model = ((id(*)(Class, SEL, id))objc_msgSend)(
-            modelClass, @selector(inMemoryModelWithDescriptor:), descriptor);
+        id model = bridge_model(descriptor);
         if (!model) {
             bridge_fail(error, error_size, "ANE %s model rejected", name);
             free(handle);
             return NULL;
         }
-        NSString *identifier = ((id(*)(id, SEL))objc_msgSend)(
-            model, @selector(hexStringIdentifier));
-        // Staging MUST stay in $TMPDIR: the compile/load runs in aned, a
-        // separate daemon that cannot read this user's home directory
-        // (ANECCompile() fails bare on a ~/.mlx-serve staging path —
-        // measured 2026-08-17). Only the persistent cache entries live
-        // under ~/.mlx-serve/ane-cache; $TMPDIR and home share the APFS
-        // Data volume, so the hardlink mirror stays free.
-        //
-        // The staging LOCATION is the framework's contract, not ours:
-        // _ANEInMemoryModel saves and compiles at $TMPDIR/<identifier>
-        // exactly (moving our writes under a subdirectory fails EVERY
-        // compile with a bare ANECCompile() FAILED — measured). A killed or
-        // crashed server never frees its staging, and the leaked dirs
-        // (8-20 GB per big model) marched the disk to 0 across restarts —
-        // at which point the framework's own model save fails ("Write
-        // weightsFilePath failed" in the unified log) and surfaces as a
-        // bare "compile failed: ?" with silent partial layer coverage
-        // (live 2026-08-18: 112 -> 63 -> 36 -> 29 programs as the orphans
-        // accumulated). So each dir gets a pid MARKER file, and the first
-        // create of a process reaps any marked dir whose owner is dead.
-        static dispatch_once_t reap_once;
-        dispatch_once(&reap_once, ^{
-            NSFileManager *fm = [NSFileManager defaultManager];
-            NSString *tmp = NSTemporaryDirectory();
-            for (NSString *entry in
-                 [fm contentsOfDirectoryAtPath:tmp error:nil]) {
-                NSString *dir = [tmp stringByAppendingPathComponent:entry];
-                NSString *marker =
-                    [dir stringByAppendingPathComponent:@"msv-ane.pid"];
-                NSString *owner_text =
-                    [NSString stringWithContentsOfFile:marker
-                                              encoding:NSUTF8StringEncoding
-                                                 error:nil];
-                if (!owner_text) continue;
-                pid_t owner = (pid_t)owner_text.integerValue;
-                if (owner <= 0 || owner == getpid()) continue;
-                // ESRCH = the owning process is gone; EPERM = alive but
-                // not ours to signal — keep those.
-                if (kill(owner, 0) != 0 && errno == ESRCH)
-                    [fm removeItemAtPath:dir error:nil];
-            }
-        });
-        NSString *directory = [NSTemporaryDirectory()
-            stringByAppendingPathComponent:identifier];
-        NSFileManager *files = [NSFileManager defaultManager];
-        bool cache = msv_ane_cache_enabled();
-        bool cached = cache && bridge_cache_restore(identifier, directory);
-        if (cached) bridge_cache_tag(bridge_cache_entry(identifier));
-        if (!cached) bridge_write_sources(directory, program, weights);
-        [[NSString stringWithFormat:@"%d", getpid()]
-            writeToFile:[directory stringByAppendingPathComponent:@"msv-ane.pid"]
-             atomically:YES
-               encoding:NSUTF8StringEncoding
-                  error:nil];
-        handle->staging_directory = strdup(directory.UTF8String);
         NSDictionary *options = bridge_options(ane_instance);
         double started = bridge_seconds();
-        bool loaded = cached &&
-            ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                model, @selector(loadWithQoS:options:error:), 21, options,
-                &failure);
-        if (cached && !loaded) {
-            failure = nil;
-            bridge_write_sources(directory, program, weights);
+        NSString *directory = nil;
+        bool loaded = false;
+        if (!bridge_compile_load(name, model, program, weights, options, options, &directory,
+                                 &loaded, error, error_size)) {
+            free(handle);
+            return NULL;
         }
-        if (!loaded) {
-            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(compileWithQoS:options:error:), 21,
-                    options, &failure)) {
-                bridge_fail(error, error_size, "ANE %s compile failed: %s",
-                            name, failure ?
-                            failure.localizedDescription.UTF8String : "?");
-                [files removeItemAtPath:directory error:nil];
-                free(handle->staging_directory);
-                free(handle);
-                return NULL;
-            }
-            if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                    model, @selector(loadWithQoS:options:error:), 21, options,
-                    &failure)) {
-                bridge_fail(error, error_size, "ANE %s load failed: %s", name,
-                            failure ?
-                            failure.localizedDescription.UTF8String : "?");
-                [files removeItemAtPath:directory error:nil];
-                free(handle->staging_directory);
-                free(handle);
-                return NULL;
-            }
-            if (cache) {
-                bridge_cache_prune();
-                bridge_cache_store(identifier, directory);
-            }
-        }
-        /* The staging weights blob and MIL text are COMPILE inputs only —
-         * the warm-restore path loads AND SERVES from a mirror that never
-         * had them (bridge_cache_store skips both) — so they are deleted
-         * once the net is loaded, halving the cold build's staging burst
-         * (the ~2x-compiled-bytes burst that ran the disk out mid-build,
-         * bare "compile failed" from layer ~50 on). The COMPILED artifacts
-         * must stay for the handle's life: aned demand-reads the program
-         * from staging during serving, so deleting the whole directory
-         * passes a single immediate eval and then fails later evals with
-         * "ANEProgramProcessRequestDirect ... Program Inference error"
-         * (measured, 352 failures over one 32k benchmark serve). */
-        [files removeItemAtPath:
-            [directory stringByAppendingPathComponent:@"weights"]
-                          error:nil];
-        [files removeItemAtPath:
-            [directory stringByAppendingPathComponent:@"model.mil"]
-                          error:nil];
+        handle->staging_directory = strdup(directory.UTF8String);
         handle->cache_hit = loaded;
         handle->compile_seconds = bridge_seconds() - started;
         NSMutableArray *inputs = [NSMutableArray array];
@@ -643,4 +707,314 @@ double msv_ane_model_compile_seconds(const msv_ane_model *handle) {
 
 bool msv_ane_model_cache_hit(const msv_ane_model *handle) {
     return handle ? handle->cache_hit : false;
+}
+
+/* ── programs: several functions, several outputs, bound by name ── */
+
+struct msv_ane_program {
+    void *models;      /* NSArray of _ANEInMemoryModel, one per instance */
+    void *attributes;  /* NSDictionary: the first instance's modelAttributes */
+    void *options;
+    char *staging_directory;
+    double compile_seconds;
+    bool cache_hit;
+};
+
+struct msv_ane_request {
+    void *model;
+    void *request;
+    void *options;
+};
+
+static NSDictionary *program_attributes(msv_ane_program *p) {
+    return (__bridge NSDictionary *)p->attributes;
+}
+
+static NSDictionary *program_procedure(msv_ane_program *p, uint32_t proc) {
+    NSArray *procs = program_attributes(p)[@"ANEFModelDescription"][@"ANEFModelProcedures"];
+    for (NSDictionary *d in procs)
+        if ([d[@"ANEFModelProcedureID"] unsignedIntValue] == proc) return d;
+    return proc < procs.count ? procs[proc] : nil;
+}
+
+static NSString *program_procedure_name(msv_ane_program *p, uint32_t proc) {
+    NSDictionary *map = program_attributes(p)[@"ANEFModelDescription"][@"kANEFModelProcedureNameToIDMapKey"];
+    for (NSString *key in map)
+        if ([map[key] unsignedIntValue] == proc) return key;
+    return nil;
+}
+
+/* The live I/O list of `proc` (its NetworkStatusList entry, by procedure name). */
+static NSArray *program_live(msv_ane_program *p, uint32_t proc, int output) {
+    NSArray *nets = program_attributes(p)[@"NetworkStatusList"];
+    NSString *pname = program_procedure_name(p, proc);
+    NSDictionary *net = nil;
+    for (NSDictionary *n in nets)
+        if (pname && [n[@"Name"] isEqualToString:pname]) net = n;
+    if (!net && proc < nets.count) net = nets[proc];
+    return net[output ? @"LiveOutputList" : @"LiveInputList"];
+}
+
+static NSArray *program_indices(msv_ane_program *p, uint32_t proc, int output) {
+    return program_procedure(p, proc)[output ? @"ANEFModelOutputSymbolIndexArray"
+                                             : @"ANEFModelInputSymbolIndexArray"];
+}
+
+/* Staging directories are named by program content, so two live programs of one text (a
+ * weight-free program on two packs of one shape) share one, and aned reads it while serving: only
+ * the last program to go removes it. */
+static NSMutableDictionary<NSString *, NSNumber *> *bridge_staging_users(void) {
+    static NSMutableDictionary *users;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ users = [NSMutableDictionary dictionary]; });
+    return users;
+}
+
+static void bridge_staging_retain(const char *directory) {
+    NSMutableDictionary *users = bridge_staging_users();
+    @synchronized(users) {
+        NSString *key = @(directory);
+        users[key] = @([users[key] intValue] + 1);
+    }
+}
+
+/* Whether this was the directory's last user. */
+static bool bridge_staging_release(const char *directory) {
+    NSMutableDictionary *users = bridge_staging_users();
+    @synchronized(users) {
+        NSString *key = @(directory);
+        int left = [users[key] intValue] - 1;
+        if (left > 0) {
+            users[key] = @(left);
+            return false;
+        }
+        [users removeObjectForKey:key];
+        return true;
+    }
+}
+
+msv_ane_program *msv_ane_program_create(const char *name, const char *mil,
+                                        void *weights_owned, size_t weight_bytes,
+                                        uint32_t instances, const uint32_t *ane_hints,
+                                        char *error, size_t error_size) {
+    if (!instances) instances = 1;
+    if (!msv_ane_bridge_available()) {
+        free(weights_owned);
+        bridge_fail(error, error_size, "the Neural Engine bridge is unavailable");
+        return NULL;
+    }
+    msv_ane_program *p = calloc(1, sizeof(*p));
+    if (!p) {
+        free(weights_owned);
+        bridge_fail(error, error_size, "out of memory creating ANE %s", name);
+        return NULL;
+    }
+    @autoreleasepool {
+        NSData *weights = [NSData dataWithBytesNoCopy:weights_owned length:weight_bytes freeWhenDone:YES];
+        NSData *program = [NSData dataWithBytes:mil length:strlen(mil)];
+        id descriptor = bridge_descriptor(program, weights);
+        NSMutableArray *models = [NSMutableArray array];
+        NSMutableArray *options_list = [NSMutableArray array];
+        double started = bridge_seconds();
+        for (uint32_t i = 0; i < instances; i++) {
+            NSDictionary *options = bridge_options(ane_hints ? (int)ane_hints[i] : 0);
+            [options_list addObject:options];
+            id model = descriptor ? bridge_model(descriptor) : nil;
+            if (!model) {
+                bridge_fail(error, error_size, "ANE %s model rejected", name);
+                goto fail;
+            }
+            if (i == 0) {
+                NSString *directory = nil;
+                if (!bridge_compile_load(name, model, program, weights, @{}, options, &directory,
+                                         &p->cache_hit, error, error_size))
+                    goto fail;
+                p->staging_directory = strdup(directory.UTF8String);
+                bridge_staging_retain(p->staging_directory);
+            } else {
+                /* Same identifier, same staging directory: the second load maps the compiled
+                 * program the first one made (one weight copy, its own queue). */
+                NSError *failure = nil;
+                if (!bridge_load(model, options, &failure)) {
+                    bridge_fail(error, error_size, "ANE %s instance %u load failed: %s", name, i,
+                                failure ? failure.localizedDescription.UTF8String : "?");
+                    goto fail;
+                }
+            }
+            [models addObject:model];
+        }
+        p->compile_seconds = bridge_seconds() - started;
+        p->models = (__bridge_retained void *)models;
+        p->options = (__bridge_retained void *)options_list;
+        {
+            id inner = bridge_inner_model(models[0]);
+            NSDictionary *attrs = [inner respondsToSelector:@selector(modelAttributes)] ?
+                ((id(*)(id, SEL))objc_msgSend)(inner, @selector(modelAttributes)) : nil;
+            if (![attrs isKindOfClass:[NSDictionary class]] || !attrs[@"NetworkStatusList"]) {
+                bridge_fail(error, error_size, "ANE %s: no model attributes to bind by", name);
+                msv_ane_program_free(p);
+                return NULL;
+            }
+            p->attributes = (__bridge_retained void *)attrs;
+        }
+        return p;
+    fail:
+        for (id m in models) {
+            NSError *failure = nil;
+            ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(m, @selector(unloadWithQoS:error:), 21, &failure);
+        }
+        if (p->staging_directory) {
+            if (bridge_staging_release(p->staging_directory))
+                [[NSFileManager defaultManager] removeItemAtPath:@(p->staging_directory) error:nil];
+            free(p->staging_directory);
+        }
+        free(p);
+        return NULL;
+    }
+}
+
+void msv_ane_program_free(msv_ane_program *p) {
+    if (!p) return;
+    @autoreleasepool {
+        if (p->models) {
+            NSArray *models = (__bridge_transfer NSArray *)p->models;
+            for (id m in models) {
+                NSError *failure = nil;
+                ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(m, @selector(unloadWithQoS:error:), 21, &failure);
+            }
+        }
+        if (p->attributes) {
+            id a = (__bridge_transfer id)p->attributes;
+            (void)a;
+        }
+        if (p->options) {
+            id o = (__bridge_transfer id)p->options;
+            (void)o;
+        }
+        if (p->staging_directory) {
+            if (bridge_staging_release(p->staging_directory)) {
+                [[NSFileManager defaultManager] removeItemAtPath:@(p->staging_directory) error:nil];
+                if (!msv_ane_cache_enabled())
+                    bridge_cache_evict(strrchr(p->staging_directory, '/') + 1);
+            }
+            free(p->staging_directory);
+        }
+    }
+    free(p);
+}
+
+int msv_ane_program_procedure(msv_ane_program *p, const char *function) {
+    NSDictionary *map = program_attributes(p)[@"ANEFModelDescription"][@"kANEFModelProcedureNameToIDMapKey"];
+    NSNumber *id_ = map[@(function)];
+    return id_ ? id_.intValue : -1;
+}
+
+uint32_t msv_ane_program_io_count(msv_ane_program *p, uint32_t proc, int output) {
+    return (uint32_t)program_indices(p, proc, output).count;
+}
+
+int msv_ane_program_io(msv_ane_program *p, uint32_t proc, int output, uint32_t index,
+                       msv_ane_io *out) {
+    @autoreleasepool {
+        NSArray *indices = program_indices(p, proc, output);
+        if (index >= indices.count) return 0;
+        NSArray *symbols = program_attributes(p)[@"ANEFModelDescription"]
+            [output ? @"kANEFModelOutputSymbolsArrayKey" : @"kANEFModelInputSymbolsArrayKey"];
+        NSString *symbol = symbols[[indices[index] unsignedIntValue]];
+        NSDictionary *live = nil;
+        for (NSDictionary *d in program_live(p, proc, output))
+            if ([d[@"Symbol"] isEqualToString:symbol] || [d[@"Name"] isEqualToString:symbol]) live = d;
+        if (!live) return 0;
+        memset(out, 0, sizeof(*out));
+        NSString *bare = [[symbol componentsSeparatedByString:@"@"] firstObject];
+        snprintf(out->name, sizeof out->name, "%s", bare.UTF8String);
+        NSString *type = live[@"Type"];
+        out->dtype = [type isEqualToString:@"Float16"] ? 0 : [type isEqualToString:@"Float32"] ? 1 :
+                     [type isEqualToString:@"Int8"] ? 2 : [type isEqualToString:@"UInt8"] ? 3 : 9;
+        out->batches = [live[@"Batches"] unsignedIntValue];
+        out->channels = [live[@"Channels"] unsignedIntValue];
+        out->depth = [live[@"Depth"] unsignedIntValue];
+        out->height = [live[@"Height"] unsignedIntValue];
+        out->width = [live[@"Width"] unsignedIntValue];
+        out->batch_stride = [live[@"BatchStride"] unsignedLongLongValue];
+        out->depth_stride = [live[@"DepthStride"] unsignedLongLongValue];
+        out->plane_stride = [live[@"PlaneStride"] unsignedLongLongValue];
+        out->row_stride = [live[@"RowStride"] unsignedLongLongValue];
+        return 1;
+    }
+}
+
+msv_ane_request *msv_ane_request_create(msv_ane_program *p, uint32_t instance, uint32_t proc,
+                                        IOSurfaceRef *inputs, uint32_t input_count,
+                                        IOSurfaceRef *outputs, uint32_t output_count,
+                                        char *error, size_t error_size) {
+    @autoreleasepool {
+        NSArray *models = (__bridge NSArray *)p->models;
+        if (instance >= models.count) {
+            bridge_fail(error, error_size, "ANE instance %u of %lu", instance, (unsigned long)models.count);
+            return NULL;
+        }
+        NSArray *in_idx = program_indices(p, proc, 0);
+        NSArray *out_idx = program_indices(p, proc, 1);
+        if (in_idx.count != input_count || out_idx.count != output_count) {
+            bridge_fail(error, error_size, "ANE procedure %u takes %lu inputs and %lu outputs, got %u and %u",
+                        proc, (unsigned long)in_idx.count, (unsigned long)out_idx.count, input_count, output_count);
+            return NULL;
+        }
+        Class surfaceClass = NSClassFromString(@"_ANEIOSurfaceObject");
+        NSMutableArray *ins = [NSMutableArray array], *outs = [NSMutableArray array];
+        for (uint32_t i = 0; i < input_count; i++)
+            [ins addObject:((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(surfaceClass, @selector(objectWithIOSurface:), inputs[i])];
+        for (uint32_t i = 0; i < output_count; i++)
+            [outs addObject:((id(*)(Class, SEL, IOSurfaceRef))objc_msgSend)(surfaceClass, @selector(objectWithIOSurface:), outputs[i])];
+        id request = ((id(*)(Class, SEL, id, id, id, id, id, id, id))objc_msgSend)(
+            NSClassFromString(@"_ANERequest"),
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            ins, in_idx, outs, out_idx, nil, nil, @(proc));
+        if (!request) {
+            bridge_fail(error, error_size, "ANE request rejected for procedure %u", proc);
+            return NULL;
+        }
+        msv_ane_request *r = calloc(1, sizeof(*r));
+        if (!r) return NULL;
+        r->model = (__bridge_retained void *)models[instance];
+        r->request = (__bridge_retained void *)request;
+        r->options = (__bridge_retained void *)((__bridge NSArray *)p->options)[instance];
+        return r;
+    }
+}
+
+int msv_ane_request_eval(msv_ane_request *r, char *error, size_t error_size) {
+    int ok = 0;
+    @autoreleasepool {
+        NSError *failure = nil;
+        ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
+            (__bridge id)r->model, @selector(evaluateWithQoS:options:request:error:), 21,
+            (__bridge id)r->options, (__bridge id)r->request, &failure) ? 1 : 0;
+        if (!ok)
+            bridge_fail(error, error_size, "ANE evaluation failed: %s",
+                        failure ? failure.localizedDescription.UTF8String : "?");
+    }
+    return ok;
+}
+
+void msv_ane_request_free(msv_ane_request *r) {
+    if (!r) return;
+    @autoreleasepool {
+        id m = (__bridge_transfer id)r->model;
+        id q = (__bridge_transfer id)r->request;
+        id o = (__bridge_transfer id)r->options;
+        (void)m;
+        (void)q;
+        (void)o;
+    }
+    free(r);
+}
+
+double msv_ane_program_compile_seconds(const msv_ane_program *p) {
+    return p ? p->compile_seconds : 0.0;
+}
+
+bool msv_ane_program_cache_hit(const msv_ane_program *p) {
+    return p ? p->cache_hit : false;
 }

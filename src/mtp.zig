@@ -2207,7 +2207,7 @@ fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_
         if (shards.len == 0) return error.MissingMtpWeight;
         var weights = model_mod.Weights.init(allocator);
         errdefer weights.deinit();
-        const s = mlx.mlx_default_cpu_stream_new();
+        const s = mlx.weightLoadStream();
         defer _ = mlx.mlx_stream_free(s);
         for (shards) |sh| {
             const p = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, sh });

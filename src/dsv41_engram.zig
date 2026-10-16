@@ -2,6 +2,7 @@
 //! the on-disk tables it indexes, and the gated add into the residual stream.
 //! The tables (~100 GB a layer) are read from disk per lookup, never loaded.
 const std = @import("std");
+const crt = @import("crt.zig");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const qwen4_ple = @import("qwen4_ple.zig");
@@ -226,7 +227,7 @@ fn unpackTokenMap(map: []u32, raw: []const u8) !void {
 /// records (code bytes, then one e8m0 scale per 32), or an MLX affine
 /// table inside a safetensors shard (weight / scales / biases tensors).
 pub const Table = struct {
-    fd: std.c.fd_t,
+    fd: c_int,
     rows: u64,
     head_dim: u32,
     mode: model.QuantMode,
@@ -241,7 +242,7 @@ pub const Table = struct {
     b_off: u64 = 0,
 
     pub fn close(self: *Table) void {
-        _ = std.c.close(self.fd);
+        crt.close(self.fd);
     }
 
     /// Bytes this table occupies inside the pack's safetensors shards (read by
@@ -253,6 +254,7 @@ pub const Table = struct {
     /// Layer `layer`'s table in `dir`; `index` is its position among the
     /// config's Engram layers.
     pub fn open(gpa: std.mem.Allocator, dir_path: []const u8, index: usize, layer: usize, rows: u64, head_dim: u32) !Table {
+        if (comptime @import("builtin").os.tag == .windows) return error.EngramUnsupportedOnWindows; // its tables open through std.c.open
         _ = index;
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
@@ -272,7 +274,7 @@ pub const Table = struct {
                 if (std.mem.indexOfAny(u8, ly.file, "/\\") != null) return error.EngramManifest;
                 const path = try std.fmt.allocPrint(a, "engram/{s}", .{ly.file});
                 const fd = try openAt(a, dir_path, path);
-                errdefer _ = std.c.close(fd);
+                errdefer crt.close(fd);
                 if (fileSize(fd) != rows * rec) return error.EngramTableSize;
                 return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = 0, .w_stride = rec, .wlen = head_dim, .s_off = head_dim, .s_stride = rec, .slen = head_dim / 32 };
             }
@@ -294,13 +296,13 @@ pub const Table = struct {
             file = f.string;
         }
         const fd = try openAt(a, dir_path, file.?);
-        errdefer _ = std.c.close(fd);
+        errdefer crt.close(fd);
         var hl: [8]u8 = undefined;
-        if (std.c.pread(fd, &hl, 8, 0) != 8) return error.EngramTableHeader;
+        if (crt.pread(fd, &hl, 8, 0) != 8) return error.EngramTableHeader;
         const hlen = std.mem.readInt(u64, &hl, .little);
         if (hlen > 16 << 20) return error.EngramTableHeader;
         const hbuf = try a.alloc(u8, @intCast(hlen));
-        if (std.c.pread(fd, hbuf.ptr, hbuf.len, 8) != @as(isize, @intCast(hlen))) return error.EngramTableHeader;
+        if (crt.pread(fd, hbuf.ptr, hbuf.len, 8) != @as(isize, @intCast(hlen))) return error.EngramTableHeader;
         const hdr = std.json.parseFromSliceLeaky(std.json.Value, a, hbuf, .{}) catch return error.EngramTableHeader;
         if (hdr != .object) return error.EngramTableHeader;
         const size = fileSize(fd);
@@ -403,17 +405,17 @@ pub const Table = struct {
 const PAR_MIN_ROWS = 512;
 const PAR_THREADS = 16;
 
-fn preadAll(fd: std.c.fd_t, dst: []u8, off: u64) bool {
-    return std.c.pread(fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
+fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
+    return crt.pread(fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
 }
 
-fn fileSize(fd: std.c.fd_t) u64 {
-    return @intCast(@max(std.c.lseek(fd, 0, std.c.SEEK.END), 0));
+fn fileSize(fd: c_int) u64 {
+    return @intCast(@max(crt.seekEnd(fd), 0));
 }
 
-fn openAt(a: std.mem.Allocator, dir_path: []const u8, name: []const u8) !std.c.fd_t {
+fn openAt(a: std.mem.Allocator, dir_path: []const u8, name: []const u8) !c_int {
     const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir_path, name }, 0);
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(path);
     if (fd < 0) return error.FileNotFound;
     return fd;
 }

@@ -31,8 +31,25 @@ struct LoraAddWell: View {
 struct LoraAdapterRow: View {
     @Binding var lora: LoraAdapter
     let remove: () -> Void
+    /// Slider half-range. Grows when a value outside it is entered and never
+    /// shrinks, so the thumb does not jump under a drag.
+    @State private var bound: Double
+
+    init(lora: Binding<LoraAdapter>, remove: @escaping () -> Void) {
+        _lora = lora
+        self.remove = remove
+        _bound = State(initialValue: LoraScale.sliderBound(for: lora.wrappedValue.scale))
+    }
 
     var body: some View {
+        let negative = lora.allowsNegative
+        let scale = Binding(get: { lora.scale },
+                            set: { lora.scale = LoraScale.clamped($0, allowsNegative: negative) })
+        let allowsNegative = Binding(get: { lora.allowsNegative }, set: { on in
+            lora.allowsNegative = on
+            lora.scale = LoraScale.clamped(lora.scale, allowsNegative: on)
+        })
+        let shown = max(bound, LoraScale.sliderBound(for: lora.scale))
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Image(systemName: "paintpalette")
@@ -43,6 +60,11 @@ struct LoraAdapterRow: View {
                     .truncationMode(.middle)
                     .help(lora.path)
                 Spacer()
+                Toggle("Negative", isOn: allowsNegative)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .font(.app(.caption))
+                    .help("Let the strength go below 0 for slider-style LoRAs; a negative value reverses the effect.")
                 Button(action: remove) {
                     Image(systemName: "xmark.circle.fill")
                 }
@@ -52,14 +74,19 @@ struct LoraAdapterRow: View {
             }
             HStack(spacing: 8) {
                 Text("Scale").font(.app(.rowTitle))
-                Slider(value: $lora.scale, in: 0...2, step: 0.05)
-                // Fixed width: a readout that sizes to its digits drags the
+                Slider(value: scale, in: (negative ? -shown : 0)...shown, step: LoraScale.sliderStep(bound: shown))
+                // Fixed width: a field that sizes to its digits drags the
                 // slider's right edge every time the value crosses a width.
-                Text(String(format: "%.2f", lora.scale))
+                TextField("", value: scale, format: .number.grouping(.never).precision(.fractionLength(0...2)))
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
                     .font(.app(.caption).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 34, alignment: .trailing)
+                    .frame(width: 64)
+                    .help(negative
+                          ? "Strength. Negative values reverse the effect; type a value to go past the slider (±\(Int(LoraScale.limit)) max)."
+                          : "Strength. Type a value to go past the slider (\(Int(LoraScale.limit)) max); tick Negative to go below 0.")
             }
+            .onChange(of: lora.scale) { _, value in bound = max(bound, LoraScale.sliderBound(for: value)) }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

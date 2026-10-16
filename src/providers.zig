@@ -9,6 +9,8 @@
 //! Transport is the system `curl` (TLS, HTTP/2, proxies for free — the same
 //! choice `cli.zig` made for Hugging Face).
 const std = @import("std");
+const crt = @import("crt.zig");
+const os_mutex = @import("os_mutex.zig");
 const log = @import("log.zig");
 const lan = @import("lan.zig");
 
@@ -334,7 +336,7 @@ pub const Providers = struct {
     io: std.Io,
     path: []u8,
     own_port: u16 = 0,
-    mu: std.c.pthread_mutex_t = .{},
+    mu: os_mutex.Mutex = .{},
     slots: []Slot = &.{},
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = .init(false),
@@ -393,7 +395,7 @@ pub const Providers = struct {
         }
         p.alloc.free(configs);
         const slots = p.alloc.realloc(slots_all, kept) catch slots_all[0..kept];
-        _ = std.c.pthread_mutex_lock(&p.mu);
+        p.mu.lock();
         for (slots) |*s| for (p.slots) |*old| if (std.mem.eql(u8, old.cfg.name, s.cfg.name)) {
             s.rows = old.rows;
             s.up = old.up;
@@ -401,21 +403,21 @@ pub const Providers = struct {
         };
         const stale = p.slots;
         p.slots = slots;
-        _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.unlock();
         p.freeSlots(stale);
         p.probe_asap.store(true, .release);
         return slots.len;
     }
 
     pub fn count(p: *Providers) usize {
-        _ = std.c.pthread_mutex_lock(&p.mu);
-        defer _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.lock();
+        defer p.mu.unlock();
         return p.slots.len;
     }
 
     pub fn isProvider(p: *Providers, name: []const u8) bool {
-        _ = std.c.pthread_mutex_lock(&p.mu);
-        defer _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.lock();
+        defer p.mu.unlock();
         for (p.slots) |s| if (std.mem.eql(u8, s.cfg.name, name)) return true;
         return false;
     }
@@ -425,8 +427,8 @@ pub const Providers = struct {
     /// provider's own 404 is the honest answer for an unknown model.
     pub fn lookup(p: *Providers, alloc: std.mem.Allocator, id: []const u8) ?Upstream {
         const rid = lan.splitRemoteId(id) orelse return null;
-        _ = std.c.pthread_mutex_lock(&p.mu);
-        defer _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.lock();
+        defer p.mu.unlock();
         for (p.slots) |s| if (std.mem.eql(u8, s.cfg.name, rid.peer)) {
             const url = alloc.dupe(u8, s.cfg.url) catch return null;
             const key = if (s.cfg.api_key) |k| alloc.dupe(u8, k) catch {
@@ -445,8 +447,8 @@ pub const Providers = struct {
 
     pub fn entryFor(p: *Providers, alloc: std.mem.Allocator, id: []const u8) ?[]u8 {
         const rid = lan.splitRemoteId(id) orelse return null;
-        _ = std.c.pthread_mutex_lock(&p.mu);
-        defer _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.lock();
+        defer p.mu.unlock();
         for (p.slots) |s| if (std.mem.eql(u8, s.cfg.name, rid.peer)) {
             for (s.rows) |m| if (std.mem.eql(u8, m.id, rid.bare)) return alloc.dupe(u8, m.entry_json) catch null;
         };
@@ -454,8 +456,8 @@ pub const Providers = struct {
     }
 
     pub fn appendEntries(p: *Providers, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
-        _ = std.c.pthread_mutex_lock(&p.mu);
-        defer _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.lock();
+        defer p.mu.unlock();
         for (p.slots) |s| for (s.rows) |m| {
             if (buf.items.len > 0) try buf.append(alloc, ',');
             try buf.appendSlice(alloc, m.entry_json);
@@ -464,8 +466,8 @@ pub const Providers = struct {
 
     /// `{"providers":[{"name","url","up","models":N}]}` for the app's health dots.
     pub fn statusJson(p: *Providers, alloc: std.mem.Allocator) ![]u8 {
-        _ = std.c.pthread_mutex_lock(&p.mu);
-        defer _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.lock();
+        defer p.mu.unlock();
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(alloc);
         var w: std.Io.Writer.Allocating = .fromArrayList(alloc, &buf);
@@ -495,10 +497,10 @@ pub const Providers = struct {
 
     fn probeAll(p: *Providers) void {
         // Snapshot the configs so the network calls run unlocked.
-        _ = std.c.pthread_mutex_lock(&p.mu);
+        p.mu.lock();
         const n = p.slots.len;
         var names = p.alloc.alloc([]u8, n) catch {
-            _ = std.c.pthread_mutex_unlock(&p.mu);
+            p.mu.unlock();
             return;
         };
         var ok: usize = 0;
@@ -506,7 +508,7 @@ pub const Providers = struct {
             names[i] = p.alloc.dupe(u8, s.cfg.name) catch break;
             ok += 1;
         }
-        _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.unlock();
         defer {
             for (names[0..ok]) |nm| p.alloc.free(nm);
             p.alloc.free(names);
@@ -520,8 +522,8 @@ pub const Providers = struct {
     fn probeOne(p: *Providers, name: []const u8) void {
         var cfg_copy: ?Config = null;
         {
-            _ = std.c.pthread_mutex_lock(&p.mu);
-            defer _ = std.c.pthread_mutex_unlock(&p.mu);
+            p.mu.lock();
+            defer p.mu.unlock();
             for (p.slots) |s| if (std.mem.eql(u8, s.cfg.name, name)) {
                 cfg_copy = dupeConfig(p.alloc, s.cfg) catch null;
             };
@@ -549,8 +551,8 @@ pub const Providers = struct {
         };
         const rows = rowsFor(p.alloc, answer, cfg) catch return;
 
-        _ = std.c.pthread_mutex_lock(&p.mu);
-        defer _ = std.c.pthread_mutex_unlock(&p.mu);
+        p.mu.lock();
+        defer p.mu.unlock();
         for (p.slots) |*s| if (std.mem.eql(u8, s.cfg.name, name)) {
             const was_up = s.up;
             const had = s.rows.len;
@@ -607,8 +609,7 @@ fn threadMain(p: *Providers) void {
             since_probe = 0;
             p.probeAll();
         }
-        const ts = std.c.timespec{ .sec = 1, .nsec = 0 };
-        _ = std.c.nanosleep(&ts, null);
+        crt.sleepMs(1000);
         since_probe += 1;
     }
 }
@@ -698,7 +699,7 @@ pub fn proxyChat(alloc: std.mem.Allocator, io: std.Io, up: Upstream, body: []con
         child.stdin.?.close(io);
         child.stdin = null;
     }
-    const fd = child.stdout.?.handle;
+    const out = child.stdout.?;
 
     // Head first: everything up to the blank line, then relay our own head
     // (curl already decoded any chunking, so the upstream framing headers
@@ -709,7 +710,7 @@ pub fn proxyChat(alloc: std.mem.Allocator, io: std.Io, up: Upstream, body: []con
     const head_end = while (true) {
         if (std.mem.indexOf(u8, acc.items, "\r\n\r\n")) |at| break at;
         if (acc.items.len > 64 * 1024) return error.ProviderUnreachable;
-        const n = pollRead(fd, &buf, conn) catch return error.ProviderUnreachable;
+        const n = pollRead(out, &buf, conn) catch return error.ProviderUnreachable;
         if (n == 0) return error.ProviderUnreachable;
         acc.appendSlice(alloc, buf[0..n]) catch return error.ProviderUnreachable;
     };
@@ -719,7 +720,7 @@ pub fn proxyChat(alloc: std.mem.Allocator, io: std.Io, up: Upstream, body: []con
     conn.writeAll(our_head) catch return;
     if (acc.items.len > head_end + 4) conn.writeAll(acc.items[head_end + 4 ..]) catch return;
     while (true) {
-        const n = pollRead(fd, &buf, conn) catch return;
+        const n = pollRead(out, &buf, conn) catch return;
         if (n == 0) return;
         conn.writeAll(buf[0..n]) catch return;
     }
@@ -727,7 +728,16 @@ pub fn proxyChat(alloc: std.mem.Allocator, io: std.Io, up: Upstream, body: []con
 
 /// Blocking read with a 1 s client-disconnect probe, so an abandoned chat
 /// tears curl down instead of paying the provider for the whole answer.
-fn pollRead(fd: std.posix.fd_t, buf: []u8, conn: anytype) !usize {
+fn pollRead(out: std.Io.File, buf: []u8, conn: anytype) !usize {
+    if (comptime @import("builtin").os.tag == .windows) {
+        const client = struct {
+            fn gone(c: @TypeOf(conn)) bool {
+                return c.peerClosed();
+            }
+        };
+        return @import("win_io.zig").readPolled(out.handle, buf, conn, client.gone) catch |e| if (e == error.Stopped) error.ClientGone else e;
+    }
+    const fd = out.handle;
     while (true) {
         var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
         const ready = std.posix.poll(&fds, 1000) catch return error.ReadFailed;
@@ -740,6 +750,8 @@ fn pollRead(fd: std.posix.fd_t, buf: []u8, conn: anytype) !usize {
         return @intCast(n);
     }
 }
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests

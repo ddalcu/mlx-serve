@@ -63,8 +63,9 @@ const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
-const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (@import("build_options").ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ane = @import("arch/ane_lm.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
@@ -155,6 +156,10 @@ pub const LoadParams = struct {
     /// perf-plan-aug-17 P5). Opt-in, lossy by design; every refusal is a
     /// named `[ane]` line and the model serves GPU-only.
     ane_prefill: bool = false,
+    /// `--ane`: serve the qwen3_5 dense packs on the Neural Engine (a model's `ane` setting wins).
+    ane: bool = false,
+    /// Engines on one load of each Neural Engine model (`--ane-slots`): that many requests run at once.
+    ane_slots: u32 = 1,
     /// The server's prefill-chunk pin (`server.pinPrefillChunk`), passed as a
     /// pointer because the scheduler deliberately has no server.zig import.
     /// The ANE build compiles fixed-shape tiles against THIS width — resolving
@@ -660,7 +665,7 @@ pub const Slot = struct {
         // allocations — the engine owns its own KV cache, vision is not
         // supported, and the forward path bypasses `ForwardCtx`. Build
         // sentinel-empty fields so `Slot.deinit` is well-defined on both paths.
-        const is_embedded = params.model.ds4_engine != null or params.model.llama_engine != null;
+        const is_embedded = params.model.engineBacked();
 
         // Per-slot KVCache, honoring the process-level kv-quant setting. For
         // embedded slots the engine owns its own cache — we initialize a
@@ -1228,6 +1233,8 @@ pub const LoadRequest = struct {
     mtp_depth: u32 = 0,
     /// `--ane-prefill` survives cold loads (the flag-eater class).
     ane_prefill: bool = false,
+    ane: bool = false,
+    ane_slots: u32 = 1,
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
     ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
 
@@ -1267,6 +1274,8 @@ pub const LoadRequest = struct {
     /// `registry.accountEvictedLocked`, then `registry.finalizeEvictionLocked`.
     /// Borrows the conn thread's stack buffer; valid until `done`.
     evict_entries: []*LoadedModel = &.{},
+    /// The Neural Engine refused the model (`aneAdmit`, `aneBuild`): the GPU loads it.
+    ane_declined: bool = false,
 
     /// Output: error name on failure (owned by `allocator`; conn thread
     /// frees). Null on success.
@@ -1418,6 +1427,8 @@ pub const Scheduler = struct {
     ds4_ssd_streaming: bool,
     /// `--ane-prefill`, retained for cold loads (same class as `mtp_enabled`).
     ane_prefill: bool,
+    ane: bool,
+    ane_slots: u32,
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32,
     ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64,
     /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
@@ -1484,6 +1495,14 @@ pub const Scheduler = struct {
     queue_cond: std.Io.Condition,
     pending: std.ArrayList(*Slot),
     decoding: std.ArrayList(*Slot),
+    /// Slots a Neural Engine worker runs (`runAneSlot`), off the inference thread.
+    offloaded: std.ArrayList(*Slot) = .empty,
+    /// Cold Neural Engine builds running on their own threads (`aneBuildThread`).
+    ane_builds: std.atomic.Value(u32) = .init(0),
+    /// Neural Engine requests' live metrics: prompt tokens to feed and fed (`Engine.gauges`), and
+    /// tokens generated so far by the ones still decoding; the sampler adds them to the GPU's.
+    ane_prefill_gauges: arch_ane.PrefillGauges = .{},
+    ane_generated: std.atomic.Value(u64) = .init(0),
     /// Phase A4: pending vision-encode requests. The inference thread drains
     /// these in the gap before/after each prefill+decode tick. Posting
     /// broadcasts on `queue_cond` to wake an idle inference thread.
@@ -1620,6 +1639,8 @@ pub const Scheduler = struct {
             .ds4_dspark = params.ds4_dspark,
             .ds4_ssd_streaming = params.ds4_ssd_streaming,
             .ane_prefill = params.ane_prefill,
+            .ane = params.ane,
+            .ane_slots = params.ane_slots,
             .ane_chunk_resolver = params.ane_chunk_resolver,
             .ane_headroom_resolver = params.ane_headroom_resolver,
             .no_drafter = params.no_drafter,
@@ -1691,6 +1712,8 @@ pub const Scheduler = struct {
         self.queue_mu.unlock(self.io);
 
         if (self.inference_thread) |t| t.join();
+        // A build in flight still writes its entry and request.
+        while (self.ane_builds.load(.acquire) > 0) std.Io.sleep(self.io, .fromMilliseconds(10), .real) catch {};
 
         // Freed below the join: the publisher is gone, so this is the last writer.
         if (self.hot_cache_digests.len > 0) {
@@ -1705,6 +1728,7 @@ pub const Scheduler = struct {
         self.pending.deinit(self.allocator);
         for (self.decoding.items) |slot| slot.deinit();
         self.decoding.deinit(self.allocator);
+        self.offloaded.deinit(self.allocator);
         for (self.cleanup_queue.items) |slot| slot.deinit();
         self.cleanup_queue.deinit(self.allocator);
         // Vision/embed queues should be empty (encodeVision/computeEmbedding
@@ -1810,10 +1834,11 @@ pub const Scheduler = struct {
         return self.decoding.items.len;
     }
 
+    /// Another request this one could batch with is live. Neural Engine slots never join a group.
     pub fn hasCompany(self: *Scheduler) bool {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
-        return self.in_flight > 0;
+        return self.in_flight > self.offloaded.items.len;
     }
 
     /// Submit a new request. Builds a Slot, queues it, returns the handle.
@@ -1830,6 +1855,7 @@ pub const Scheduler = struct {
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        if (params.model.ane != null and !aneServes(params.sampling, params.logprobs_n, params.prompt_logprobs)) return error.NeuralEngineUnsupported;
         // Every decode path reads the prompt's last token; `""` on a BOS-less vocab encodes to none.
         if (params.prompt_ids.len == 0) return error.EmptyPrompt;
         const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
@@ -1857,6 +1883,25 @@ pub const Scheduler = struct {
             slot.holds_session = true;
         }
 
+        if (params.model.ane) |w| {
+            // The worker holds `in_pass` until it lets the slot go; `complete` waits that out.
+            _ = slot.in_pass.fetchAdd(1, .acq_rel);
+            self.offloaded.append(self.allocator, slot) catch |err| {
+                _ = slot.in_pass.fetchSub(1, .release);
+                if (slot.holds_session) self.releaseSessionLocked(slot);
+                return err;
+            };
+            w.post(slot) catch |err| {
+                _ = self.offloaded.pop();
+                _ = slot.in_pass.fetchSub(1, .release);
+                if (slot.holds_session) self.releaseSessionLocked(slot);
+                return err;
+            };
+            self.in_flight += 1;
+            // A parked inference thread re-reads `holdsSleepWhileParked`.
+            self.queue_cond.broadcast(self.io);
+            return slot;
+        }
         self.pending.append(self.allocator, slot) catch |err| {
             // Release the session claim before bubbling the error — the caller
             // never gets the slot, so `complete` won't run for it.
@@ -1915,6 +1960,10 @@ pub const Scheduler = struct {
                 break;
             }
         }
+        for (self.offloaded.items, 0..) |s, j| if (s == slot) {
+            _ = self.offloaded.swapRemove(j);
+            break;
+        };
 
         // Release the session claim (if this slot held it) so the next queued
         // request can claim it AND reuse the KV prefix it now holds. Done before
@@ -1956,6 +2005,7 @@ pub const Scheduler = struct {
         defer self.queue_mu.unlock(self.io);
         for (self.pending.items) |slot| slot.cancel();
         for (self.decoding.items) |slot| slot.cancel();
+        for (self.offloaded.items) |slot| slot.cancel();
     }
 
     /// The media residency bill for an entry, or 0 when it is not a media
@@ -2056,6 +2106,12 @@ pub const Scheduler = struct {
         else
             null;
         const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
+        // A Neural Engine load holds int8 copies of the pack's 4- to 8-bit weights, and its KV.
+        const ane_bytes: ?u64 = if (mlx_text and aneWanted(owned.config, self.ane))
+            (if (arch_ane.archOf(owned.config)) |a| arch_ane.loadBytes(a, self.ane_slots) else |_| null)
+        else
+            null;
+        const gate_model_bytes: ?u64 = if (ane_bytes) |b| @max(b, resident_model_bytes orelse 0) else resident_model_bytes;
 
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
@@ -2083,14 +2139,19 @@ pub const Scheduler = struct {
                 }
             }
 
+            // One stream pack at a time reads the process's foreign-bytes value (DeepSeek-V4.1, GLM-5.3).
+            const foreign_reader = try self.registry.foreignReaderVictimLocked(entry.id, owned.config);
+
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
+            // From the claim: while victims unload or the queue waits, not the last load's numbers.
+            entry.load_progress.start(io_util.nowMsMonotonic(self.io));
             _ = entry.refcount.fetchAdd(1, .acq_rel);
             pinned = true;
 
             // Estimate post-load bytes (see `gateEstimateBytes` for why a media
             // entry cannot be billed by its directory's size).
-            const estimated: u64 = gateEstimateBytes(media_peak, resident_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size) +
+            const estimated: u64 = gateEstimateBytes(media_peak, gate_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size) +
                 pleTableBill(self.io, owned.config);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
@@ -2104,7 +2165,7 @@ pub const Scheduler = struct {
             // (multi-victim). On failure — every other resident model is pinned
             // by an in-flight request — roll back and surface a 503 instead of
             // loading anyway and crashing.
-            const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
+            const n = self.registry.planEvictionsLocked(entry.id, foreign_reader, &victims_buf, mlxActiveBytes()) orelse {
                 // Name the numbers. A refusal that logs NOTHING sends the user
                 // hunting for a concurrent request that does not exist: on an
                 // idle server the cause is always the static cap (#126), and
@@ -2168,6 +2229,8 @@ pub const Scheduler = struct {
             .ds4_dspark = self.ds4_dspark,
             .ds4_ssd_streaming = self.ds4_ssd_streaming,
             .ane_prefill = self.ane_prefill,
+            .ane = self.ane,
+            .ane_slots = self.ane_slots,
             .ane_chunk_resolver = self.ane_chunk_resolver,
             .ane_headroom_resolver = self.ane_headroom_resolver,
             .evict_entries = victims_buf[0..n_victims],
@@ -2829,6 +2892,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.int8_prefill_override = o.int8_prefill;
+    config.ane_override = o.ane;
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;
@@ -2883,7 +2947,10 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     if (gen_mod.incompleteMediaDir(io, allocator, model_dir)) {
         return error.IncompleteMediaPack;
     }
+    return preloadTextCpuState(allocator, io, model_dir);
+}
 
+fn preloadTextCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !CpuState {
     const config = try allocator.create(ModelConfig);
     errdefer allocator.destroy(config);
     config.* = try model_mod.parseConfig(io, allocator, model_dir);
@@ -3120,7 +3187,6 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
 }
@@ -3210,9 +3276,217 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
+}
+
+/// Whether this load serves on the Neural Engine: the model's `ane` setting, else `--ane`.
+pub fn aneWanted(config: *const ModelConfig, flag: bool) bool {
+    return config.ane_override orelse flag;
+}
+
+/// An MLX pack on the Neural Engine: build its programs (a model's first load on this Mac compiles
+/// them, minutes; cached after) and start its worker. Installs the CPU state like the llama arm, but
+/// the inference thread's current model stays: the ANE model runs beside it. False when the model
+/// cannot run there (by name in the log); the caller then serves it on the GPU.
+fn doLoadAneOnInferenceThread(sch: *Scheduler, params: anytype) !bool {
+    const arch = aneAdmit(sch, params) orelse return false;
+    return aneBuild(sch, params, arch);
+}
+
+/// The model's Neural Engine layout, its RAM made and its preflight passed; null serves it on the
+/// GPU (by name in the log). Inference thread: making room frees MLX models.
+fn aneAdmit(sch: *Scheduler, params: anytype) ?arch_ane.Arch {
+    const arch = arch_ane.archOf(params.config) catch {
+        log.warn("[ane] {s} ({s}) does not run on the Neural Engine (dense qwen3_5 and Qwen3 packs only); serving it on the GPU\n", .{ params.model_dir, params.config.model_type });
+        return null;
+    };
+    // Its own preflight: the int8 copies outweigh a 4-bit pack's shards, and the GPU arm checks those.
+    const need = arch_ane.loadBytes(arch, params.ane_slots);
+    makeRoomInRam(sch, params.entry.id, need);
+    if (!skip_mem_preflight) {
+        const avail = availForLoad(sch.io, need);
+        if (memInsufficientForLoad(need, avail)) {
+            log.warn("[ane] {s} needs ~{d:.1} GB on the Neural Engine, {d:.1} GB available; serving it on the GPU\n", .{
+                params.model_dir,
+                @as(f64, @floatFromInt(loadRequirementBytes(need))) / 1_073_741_824.0,
+                @as(f64, @floatFromInt(avail)) / 1_073_741_824.0,
+            });
+            return null;
+        }
+    }
+    return arch;
+}
+
+/// Build (or restore) the programs and publish the model; false when the build failed (the GPU
+/// then serves it). Never calls MLX, so a cold load runs it on its own thread (`aneBuildThread`).
+fn aneBuild(sch: *Scheduler, params: anytype, arch: arch_ane.Arch) !bool {
+    log.info("[ane] opening {s}\n", .{params.model_dir});
+    // The hot prefix cache's switches: its entry cap counts checkpoints here, each a full DeltaNet state.
+    const limits: ?arch_ane.CacheLimits = if (params.prefix_cache_capacity > 0 and params.prefix_cache_ram_enabled and params.ssm_checkpoint_stride > 0)
+        .{ .max_bytes = params.prefix_cache_mem_bytes, .max_states = params.prefix_cache_capacity, .stride = params.ssm_checkpoint_stride }
+    else
+        null;
+    // The drafter resolves as on the GPU: launch flags, the per-model setting, else the pack's own.
+    const chosen_drafter = drafterFor(params.no_drafter, params.drafter_dir, params.config.drafter_override);
+    const in_dir_drafter: ?[]u8 = if (chosen_drafter == null) dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir) else null;
+    defer if (in_dir_drafter) |d| sch.allocator.free(d);
+    const drafter: ?[]const u8 = if (chosen_drafter) |d| (if (d.len > 0) d else null) else in_dir_drafter;
+    // The GPU's sampling rule (`installSuppressMask`): reserved specials and padding rows are never drawn.
+    const off = generate_mod.suppressionDisabled();
+    const suppress_ids: []u32 = if (off) &.{} else tokenizer_mod.reservedOutputIds(sch.allocator, params.tok.flagged_specials, params.chat_config.chat_template, params.config.eosTokenSlice()) catch &.{};
+    defer sch.allocator.free(suppress_ids);
+    const defined_vocab: u32 = if (off) 0 else if (params.config.unpadded_vocab_size > 0) params.config.unpadded_vocab_size else @intCast(params.tok.definedVocabSize());
+    const worker = arch_ane.openPool(sch.allocator, sch.io, params.model_dir, arch, .{
+        .slots = params.ane_slots,
+        .drafter = drafter,
+        .progress = &params.entry.load_progress,
+        .suppress_ids = suppress_ids,
+        .defined_vocab = defined_vocab,
+    }, limits, sch, runAneSlot) catch |err| {
+        log.err("[ane] {s} not loaded on the Neural Engine ({s}); serving it on the GPU\n", .{ params.model_dir, @errorName(err) });
+        return false;
+    };
+    errdefer worker.close();
+    const drafter_path: []const u8 = if (drafter != null and worker.engines[0].drafter != null) try sch.allocator.dupe(u8, drafter.?) else "";
+    // The engine's top rung, or less where the pack was trained to less.
+    const trained = params.config.max_position_embeddings;
+    const max_pos = if (trained > 0) @min(trained, worker.engines[0].model.maxPositions()) else worker.engines[0].model.maxPositions();
+    params.config.max_position_embeddings = max_pos;
+    // What the engine holds is the context it advertises, whatever `--ctx-size` asks.
+    params.config.ctx_override = if (params.config.ctx_override > 0) @min(params.config.ctx_override, max_pos) else max_pos;
+    const entry = params.entry;
+    entry.ane = worker;
+    entry.releaseRetainedCpuState();
+    entry.config = params.config;
+    entry.tokenizer = params.tok;
+    entry.chat_config = params.chat_config;
+    entry.weights = null;
+    entry.transformer = null;
+    entry.vision_encoder = null;
+    entry.drafter = null;
+    entry.dflash = null;
+    entry.drafter_block_size = 0;
+    entry.drafter_path = drafter_path;
+    entry.prefix_cache = null;
+    if (params.tokenize_cache_entries > 0) {
+        entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(sch.allocator, params.tokenize_cache_entries);
+    }
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.markReadyLocked(entry, worker.engines[0].model.weight_bytes + worker.stateBytes());
+    sch.registry.mutex.unlock(sch.io);
+    return true;
+}
+
+/// One request on a Neural Engine worker thread: sync the engine to the prompt, then sample, publish
+/// and feed one token at a time. Never calls MLX, so it ends the slot itself instead of `finishSlot`.
+fn runAneSlot(ctx: *anyopaque, engine: *arch_ane.Engine, job: *anyopaque) void {
+    const sch: *Scheduler = @ptrCast(@alignCast(ctx));
+    const slot: *Slot = @ptrCast(@alignCast(job));
+    defer _ = slot.in_pass.fetchSub(1, .release);
+    runAneRequest(sch, slot, engine) catch |err| {
+        if (err == error.Cancelled) return endAneSlot(sch, slot, "cancelled");
+        log.err("[ane] request failed: {s}\n", .{@errorName(err)});
+        recordAneSlotEnd(sch, slot, .failed);
+        slot.markError(@errorName(err));
+        return;
+    };
+    // After the terminator: the next turn of this conversation starts from here.
+    engine.checkpoint();
+}
+
+fn runAneRequest(sch: *Scheduler, slot: *Slot, engine: *arch_ane.Engine) !void {
+    if (slot.cancelled.load(.acquire)) return error.Cancelled;
+    var prefill_sw = io_util.Stopwatch.init(sch.io);
+    engine.gauges = &sch.ane_prefill_gauges;
+    _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
+    const synced = synced: {
+        defer {
+            engine.ungauge();
+            _ = sch.requests_prefilling.fetchSub(1, .monotonic);
+        }
+        break :synced try engine.sync(slot.full_prompt, &slot.cancelled);
+    };
+    slot.prompt_tokens = @intCast(slot.full_prompt.len);
+    slot.cached_tokens = @intCast(synced.cached);
+    slot.prefill_ns = prefill_sw.read();
+    slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+    slot.state = .decoding;
+    const seed = slot.sampling.seed orelse blk: {
+        var r: u64 = undefined;
+        sch.io.random(std.mem.asBytes(&r));
+        break :blk r;
+    };
+    var prng = std.Random.DefaultPrng.init(seed);
+    const sampling: arch_ane.Sampling = .{
+        .temperature = slot.sampling.temperature,
+        .top_k = slot.sampling.top_k,
+        .top_p = slot.sampling.top_p,
+        .min_p = slot.sampling.min_p orelse 0,
+    };
+    var decode_sw = io_util.Stopwatch.init(sch.io);
+    var tok = engine.draw(synced.logits, sampling, prng.random());
+    var emitted = false;
+    // DFlash2: each cycle commits `tok` plus the accepted drafts and yields the drafts and the next token.
+    if (engine.drafter != null) {
+        const drafts: usize = arch_ane.P - 1;
+        var cycles: usize = 0;
+        var accepted: usize = 0;
+        defer if (cycles > 0) log.info("[ane] spec: {d} cycles, {d}% of drafts accepted, {d:.2} tokens per call\n", .{ cycles, 100 * accepted / (drafts * cycles), @as(f64, @floatFromInt(accepted + cycles)) / @as(f64, @floatFromInt(cycles)) });
+        if (aneEmit(sch, slot, tok)) |reason| return endAneSlot(sch, slot, reason);
+        emitted = true;
+        while (true) {
+            const c = engine.cycle(tok, sampling, prng.random(), slot.eos_token_ids) catch |err| switch (err) {
+                error.ContextFull => break, // the last positions take one token per call
+                else => return err,
+            };
+            cycles += 1;
+            accepted += c.accepted;
+            slot.decode_ns = decode_sw.read();
+            for (c.tokens[0..c.n]) |t| if (aneEmit(sch, slot, t)) |reason| return endAneSlot(sch, slot, reason);
+            tok = c.tokens[c.n - 1];
+        }
+    }
+    while (true) {
+        if (!emitted) if (aneEmit(sch, slot, tok)) |reason| return endAneSlot(sch, slot, reason);
+        emitted = false;
+        const logits = engine.step(tok) catch |err| switch (err) {
+            error.ContextFull => return endAneSlot(sch, slot, "length"),
+            else => return err,
+        };
+        slot.decode_ns = decode_sw.read();
+        tok = engine.draw(logits, sampling, prng.random());
+    }
+}
+
+/// Whether a Neural Engine model honors the request: its engine samples the raw logits, so a grammar,
+/// penalties, logprobs or a forced tool call would be ignored. A thinking budget is not enforced.
+pub fn aneServes(sampling: SamplingParams, logprobs_n: u32, prompt_logprobs: bool) bool {
+    return !sampling.shapesLogits() and sampling.tool_force == null and logprobs_n == 0 and !prompt_logprobs;
+}
+
+/// Publish one generated token; the finish reason when the slot ends here.
+fn aneEmit(sch: *Scheduler, slot: *Slot, tok: u32) ?[]const u8 {
+    if (generate_mod.isEosId(tok, slot.eos_token_ids)) return "stop";
+    slot.pushToken(tok);
+    if (tok != 0) slot.was_pad_only = false;
+    slot.completion_tokens += 1;
+    _ = sch.ane_generated.fetchAdd(1, .monotonic);
+    if (slot.completion_tokens >= slot.max_tokens) return "length";
+    if (slot.cancelled.load(.acquire)) return "cancelled";
+    return null;
+}
+
+/// Its generated tokens move from the live count to the request totals in one go.
+fn recordAneSlotEnd(sch: *Scheduler, slot: *Slot, outcome: metrics_mod.Outcome) void {
+    _ = sch.ane_generated.fetchSub(slot.completion_tokens, .monotonic);
+    recordSlotEnd(sch.metrics, slot, outcome);
+}
+
+/// Metrics first: once the terminator is out, the connection thread may complete the slot.
+fn endAneSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+    recordAneSlotEnd(sch, slot, finishOutcome(reason, null));
+    publishSlotTerminator(slot, reason, null);
 }
 
 /// The post-load residency bill the eviction gate reserves, in bytes.
@@ -3380,7 +3654,6 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
 }
@@ -3455,7 +3728,7 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
 fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
     const total = modelDiskBytes(io, model_dir);
-    if (config.dsv41_stream) return mlx_stream.loadBytes(allocator, io, config);
+    if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
     if (config.isDsv41()) return dsv41_mod.residentDiskBytes(allocator, model_dir, config, total);
     if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
     const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
@@ -3711,7 +3984,8 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "llama",                     "ds4_mtp",                   "ds4_dspark",
         "ds4_ssd_streaming",         "no_drafter",                "draft_block_size",
         "draft_block_size_explicit", "ane_prefill",               "ane_chunk_resolver",
-        "ane_headroom_resolver",     "prefix_cache_mem_resolver",
+        "ane_headroom_resolver",     "prefix_cache_mem_resolver", "ane_slots",
+        "ane",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -3790,6 +4064,16 @@ fn waitForUnload(need: u64, avail: u64, mark: model_registry_mod.UnloadMark, now
 
 fn loadAvail(_: std.Io) u64 {
     return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+}
+
+/// RAM a load can still take beside everything resident: what the OS grants less the reserve it
+/// keeps (iOS's per-process headroom already is what the process may take). Null when unreadable.
+fn loadRamRoom() ?u64 {
+    const proc = status.getProcAvailableMemBytes();
+    if (proc > 0) return proc;
+    const host = status.getAvailableMemBytes();
+    if (host == 0) return null;
+    return host -| status.osReserveBytes(status.getTotalMemBytes(), mlx.weightsInDeviceMemory());
 }
 
 fn pauseLoadAvail(io: std.Io) void {
@@ -4169,6 +4453,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const Ty = @TypeOf(params);
     const TyInfo = @typeInfo(Ty);
     const Inner = if (TyInfo == .pointer) TyInfo.pointer.child else Ty;
+    params.entry.load_progress.start(io_util.nowMsMonotonic(sch.io));
+    const ane_declined = if (@hasField(Inner, "ane_declined")) params.ane_declined else false;
+    if (@hasField(Inner, "ane") and aneWanted(params.config, params.ane) and !ane_declined and try doLoadAneOnInferenceThread(sch, params)) return;
     if (@hasField(Inner, "ds4_path") and params.ds4_path.len > 0) {
         try doLoadDs4OnInferenceThread(sch, params);
         return;
@@ -4211,6 +4498,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     else
         null;
     defer if (in_dir_drafter) |p| sch.allocator.free(p);
+    makeRoomInRam(sch, params.entry.id, model_bytes);
     if (!skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
@@ -4246,6 +4534,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 return error.InsufficientMemory;
             },
         }
+    }
+
+    {
+        const sidecar = chosen_drafter orelse in_dir_drafter orelse "";
+        const total = model_bytes + (if (sidecar.len > 0) modelDiskBytes(sch.io, sidecar) else 0);
+        params.entry.load_progress.beginReading(total, status.getAppMemFootprintMb(), io_util.nowMsMonotonic(sch.io));
     }
 
     // Allocate the drafter_path dupe up front so the post-publish step
@@ -4817,6 +5111,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // on this thread's stream. ~600-900 ms at boot but the first user request
     // skips a cold path — observed savings on Gemma 4 E4B 4-bit.
     if (params.warmup_eager) {
+        params.entry.load_progress.begin(.warming_up, 0, io_util.nowMsMonotonic(sch.io));
         const warmup_start = std.Io.Timestamp.now(sch.io, .awake);
         xfm_ptr.warmup() catch |err| {
             log.warn("Warmup failed ({s}); continuing without it — first request may be slow.\n", .{@errorName(err)});
@@ -4913,6 +5208,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
         entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated()) .min_span_recency else .min_span;
+        // Same gate, same constant as the disk tier below (#794):
+        // merge/shed thinning never migrates the grid floor upward on the long-context line,
+        // so the dense low anchors survive from generation all the way to disk.
+        entry.prefix_cache.?.ssm_low_anchors = if (params.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
@@ -4953,6 +5252,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
+            // Same gate: the long-context thin keeps the two lowest checkpoints so a
+            // prompt that forked early (a client-side injection block) still has a
+            // shallow restore anchor; every other arch keeps the plain spread.
+            entry.prefix_cache.?.disk.?.ssm_low_anchors = if (params.config.longCtxGated() or !ram_prefix_cache)
+                kv_disk_cache.SSM_DISK_LOW_ANCHORS
+            else
+                0;
         }
         // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
         // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.
@@ -5003,7 +5309,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = vision_ptr;
     sch.drafter = drafter_ptr;
     sch.dflash = dflash_ptr;
-    if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
+    // The connection thread bills chat against the view, so a model that cannot chat never takes it.
+    if (entry.prefix_cache) |*hc| {
+        if (ModelRegistry.chatCapable(entry)) sch.hot_prefix_cache = hc;
+    }
     publishHotCacheResidency(sch);
 }
 
@@ -5019,7 +5328,9 @@ pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 /// load-time clamp read the machine with the other models on it and was never revisited, so
 /// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
 /// entries are excluded from the read so a full cache cannot ratchet itself down.
-fn reviseHotCacheBudgets(sch: *Scheduler) void {
+/// `grow_only`: the free figure lags an unload's freed pages, so a revise that follows one may
+/// raise a budget but never lower it; lowering evicts entries the settled figure would keep.
+fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
     const resolve = sch.prefix_cache_mem_resolver orelse return;
     sch.registry.mutex.lockUncancelable(sch.io);
     // The resolver publishes the process-global budget the admission guard reads, so the
@@ -5034,12 +5345,32 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
             if (!hc.ram_enabled) continue;
             const config = entry.config orelse continue;
             var idle: u64 = 0;
-            hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
+            const budget = resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle);
+            if (grow_only and prefix_cache_mod.HotPrefixCache.budgetShrinks(hc.max_kv_bytes, budget)) continue;
+            hc.setBudget(budget);
             hc.ssd_idle_mem = idle;
         }
     }
     sch.registry.mutex.unlock(sch.io);
     publishHotCacheResidency(sch);
+}
+
+/// The view must not outlive its cache: before `leaving`'s cache is freed, hand the view to
+/// another resident chat model's, the default's when it has one, or to none.
+fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
+    const view = sch.hot_prefix_cache orelse return;
+    if (leaving.prefix_cache == null or view != &leaving.prefix_cache.?) return;
+    sch.hot_prefix_cache = null;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry == leaving or entry.state != .ready or !ModelRegistry.chatCapable(entry)) continue;
+        const hc = if (entry.prefix_cache) |*h| h else continue;
+        sch.hot_prefix_cache = hc;
+        if (std.mem.eql(u8, sch.registry.default_id, entry.id)) break;
+    }
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
@@ -5135,6 +5466,11 @@ fn flushOwedDiskSlices(sch: *Scheduler) bool {
     return still;
 }
 
+/// Neural Engine requests run on their workers while this thread parks, and still keep the Mac awake.
+fn holdsSleepWhileParked(sch: *const Scheduler) bool {
+    return sch.offloaded.items.len > 0;
+}
+
 fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     return sch.pending.items.len > 0 or
         sch.decoding.items.len > 0 or
@@ -5176,6 +5512,10 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     } else {
         // Startup load runs before the wait loop can acquire.
         sleep_inhibit.setActive(true);
+        // `.loading` while it runs, so the startup responder's `/v1/load-progress` lists it.
+        sch.registry.mutex.lockUncancelable(sch.io);
+        _ = sch.registry.tryBeginLoadLocked(params.entry);
+        sch.registry.mutex.unlock(sch.io);
         if (doLoadOnInferenceThread(sch, params)) |_| {
             log.info("Model ready (loaded on inference thread).\n", .{});
             signalStarted(sch);
@@ -5232,10 +5572,27 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         _ = drainSideQueues(sch);
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
-        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch, load_req == null);
         if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
         if (chatPass(sch, .main) == .shutdown) break;
+    }
+    closeGlmModels(sch);
+}
+
+/// At shutdown, on the inference thread: GLM-5.3's module synchronizes its stream as it frees, and MLX finds that
+/// stream only on this thread, not on the one that joins it (`Scheduler.deinit`, where every other model unloads as
+/// before; "There is no Stream(gpu, 0) in current thread", mlx-c stream.cpp).
+fn closeGlmModels(sch: *Scheduler) void {
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry| {
+        const x = entry.*.transformer orelse continue;
+        if (!x.config.glm_stream) continue;
+        const m = x.mlx_stream_ext orelse continue;
+        mlx_stream.close(m);
+        x.mlx_stream_ext = null;
     }
 }
 
@@ -5329,7 +5686,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                     continue;
                 }
                 // No later tick runs while parked, so release here.
-                sleep_inhibit.setActive(false);
+                sleep_inhibit.setActive(holdsSleepWhileParked(sch));
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             // Hold until the loop parks again.
@@ -5381,7 +5738,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
 
     if (sch.budget_revise_sw) |sw| {
         if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
-        if (n_prefill > 0) reviseHotCacheBudgets(sch);
+        if (n_prefill > 0) reviseHotCacheBudgets(sch, true);
     }
 
     // 2. Prefill each pending slot (heavy; mlx ops on this thread).
@@ -5832,16 +6189,15 @@ fn logWiredPolicy(r: mlx.WiredPolicyResult) void {
     }
 }
 
-fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
-    // Step 1: evict victims (if any) BEFORE the load, so peak GPU residency
-    // never holds the old + new model at once. unloadResident() drops
-    // mlx_arrays — same thread-stream invariant as cleanup_queue drain.
-    for (req.evict_entries) |victim| {
+/// Free `victims` (each marked `.evicting`, nobody holding it) on this thread.
+fn evictResident(sch: *Scheduler, victims: []const *LoadedModel) void {
+    for (victims) |victim| {
         const victim_bytes = victim.bytes_resident; // unloadResident zeroes it
         log.info("[registry] evicting model id={s} ({d:.2} GB resident)\n", .{
             victim.id,
             @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
+        moveHotCacheViewOff(sch, victim);
         victim.unloadResident();
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
@@ -5852,40 +6208,102 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // BEFORE the load: its preflight reads OS-level availability, and the
     // parked pool would make it refuse a load that fits.
     _ = mlx.mlx_clear_cache();
+}
+
+/// Unloads idle models, oldest first, when that lets a load of `weights` fit in RAM: as few as fit
+/// it, none when it already fits or when even all of them cannot (`planRamEvictionsLocked`). Runs
+/// past `--skip-mem-preflight` too: an idle model reloads, an overcommitted Mac kills the server.
+fn makeRoomInRam(sch: *Scheduler, keep_id: []const u8, weights: u64) void {
+    const room = loadRamRoom() orelse return;
+    const need = loadRequirementBytes(weights);
+    var victims: [16]*LoadedModel = undefined;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    const n = sch.registry.planRamEvictionsLocked(keep_id, &victims, room, need);
+    sch.registry.mutex.unlock(sch.io);
+    if (n == 0) return;
+    log.info("[registry] {s} needs ~{d:.1} GB beside {d:.1} GB of free RAM: unloading {d} idle model(s)\n", .{
+        keep_id,
+        @as(f64, @floatFromInt(need)) / 1_073_741_824.0,
+        @as(f64, @floatFromInt(room)) / 1_073_741_824.0,
+        n,
+    });
+    evictResident(sch, victims[0..n]);
+}
+
+fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
+    // Step 1: evict victims (if any) BEFORE the load, so peak GPU residency
+    // never holds the old + new model at once. unloadResident() drops
+    // mlx_arrays — same thread-stream invariant as cleanup_queue drain.
+    evictResident(sch, req.evict_entries);
+    req.evict_entries = &.{};
+
+    // A Neural Engine build runs on its own thread while the GPU keeps serving.
+    if (!req.ane_declined and aneWanted(req.config, req.ane)) {
+        req.entry.load_progress.start(io_util.nowMsMonotonic(sch.io));
+        if (aneAdmit(sch, req)) |arch| {
+            _ = sch.ane_builds.fetchAdd(1, .acq_rel);
+            const t = std.Thread.spawn(.{}, aneBuildThread, .{ sch, req, arch }) catch return aneBuildThread(sch, req, arch);
+            t.detach();
+            return;
+        }
+        req.ane_declined = true;
+    }
 
     // Step 2: the actual load. On error, mark .error_state and signal done
     // (conn thread frees pre-parsed CPU state — ownership stays on req on
     // the failure path).
     const had_error = mlx.errorPending();
     doLoadOnInferenceThread(sch, req) catch |err| {
-        log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
         // The load's own MLX error is reported here; latched, it would fail the next request.
         mlx.dropLatchedErrorUnless(had_error);
-        sch.registry.mutex.lockUncancelable(sch.io);
-        if (err == error.InsufficientMemory) {
-            // A memory-preflight refusal is transient, not a property of the
-            // checkpoint: the 503 tells the user to free memory and retry, so
-            // the entry must go back to .unloaded — stuck in .error_state the
-            // retry would fail fast until a server restart (#144).
-            sch.registry.markUnloadedLocked(req.entry);
-        } else {
-            // markErrorLocked dupes the error name onto the entry; the
-            // conn thread reads it back from the entry, not from req.
-            sch.registry.markErrorLocked(req.entry, @errorName(err));
-        }
-        sch.registry.mutex.unlock(sch.io);
-        finishLoadRequest(sch, req, @errorName(err));
-        return;
+        return failLoadRequest(sch, req, err);
     };
+    // Re-apply so `fit` capacity covers everything this load brought in
+    // (MTP head / drafter / vision land after the mid-load apply).
+    logWiredPolicy(mlx.applyWiredPolicy());
+    readyLoadRequest(sch, req);
+}
 
+/// A cold Neural Engine load's build, minutes on a first load: done, or back on the load queue
+/// for the GPU when the build declines. Never calls MLX.
+fn aneBuildThread(sch: *Scheduler, req: *LoadRequest, arch: arch_ane.Arch) void {
+    defer _ = sch.ane_builds.fetchSub(1, .acq_rel);
+    const built = aneBuild(sch, req, arch) catch |err| return failLoadRequest(sch, req, err);
+    if (built) return readyLoadRequest(sch, req);
+    req.ane_declined = true;
+    sch.queue_mu.lockUncancelable(sch.io);
+    const queued = if (sch.shutdown.load(.acquire)) error.Shutdown else sch.load_queue.insert(sch.allocator, 0, req);
+    sch.queue_cond.broadcast(sch.io);
+    sch.queue_mu.unlock(sch.io);
+    queued catch |err| failLoadRequest(sch, req, err);
+}
+
+fn readyLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     log.info("[registry] model id={s} ready ({d:.2} GB resident)\n", .{
         req.entry.id,
         @as(f64, @floatFromInt(req.entry.bytes_resident)) / 1_073_741_824.0,
     });
-    // Re-apply so `fit` capacity covers everything this load brought in
-    // (MTP head / drafter / vision land after the mid-load apply).
-    logWiredPolicy(mlx.applyWiredPolicy());
     finishLoadRequest(sch, req, null);
+}
+
+/// Mark the entry and signal the waiter (conn thread frees pre-parsed CPU state — ownership stays
+/// on req on the failure path).
+fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror) void {
+    log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
+    sch.registry.mutex.lockUncancelable(sch.io);
+    if (err == error.InsufficientMemory) {
+        // A memory-preflight refusal is transient, not a property of the
+        // checkpoint: the 503 tells the user to free memory and retry, so
+        // the entry must go back to .unloaded — stuck in .error_state the
+        // retry would fail fast until a server restart (#144).
+        sch.registry.markUnloadedLocked(req.entry);
+    } else {
+        // markErrorLocked dupes the error name onto the entry; the
+        // conn thread reads it back from the entry, not from req.
+        sch.registry.markErrorLocked(req.entry, @errorName(err));
+    }
+    sch.registry.mutex.unlock(sch.io);
+    finishLoadRequest(sch, req, @errorName(err));
 }
 
 fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
@@ -6062,6 +6480,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         entry.id,
         @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
     });
+    moveHotCacheViewOff(sch, entry);
     entry.unloadResident();
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
@@ -6077,10 +6496,9 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.vision_encoder = null;
         sch.drafter = null;
         sch.dflash = null;
-        sch.hot_prefix_cache = null;
-        publishHotCacheResidency(sch);
         if (hot_cache_budget_invalidate) |f| f();
     }
+    publishHotCacheResidency(sch);
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
     sch.registry.finalizeEvictionLocked(entry);
@@ -6582,6 +7000,8 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
     recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+    // mlx-stream: the arch's request end (GLM-5.3's decode line), before the terminator.
+    if (slot.model.transformer) |x| if (x.mlx_stream_ext) |m| mlx_stream.end(m);
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
@@ -7087,10 +7507,12 @@ pub fn companyStreak(streak: u8, has_company: bool) u8 {
     return if (has_company) streak +| 1 else 0;
 }
 
-/// Spec modes that give way to the batched group once a slot has company: the DFlash
-/// family everywhere, PLD on CUDA, where a batched tick costs about one plain step.
-pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool) bool {
-    return mode == .dflash or mode == .dspark or (mode == .pld and cuda);
+/// Spec modes that give way to the batched group once a slot has company: DSpark, DFlash on a
+/// sparse target (its wide verify reads every expert the block routes to), PLD on CUDA. A dense
+/// DFlash slot yields only to a crowd (`crowd` others): below it the yielded slot ticks plain
+/// beside the MTP verify group instead of inside it, which costs everyone a forward.
+pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool, sparse_target: bool, others: usize, crowd: usize) bool {
+    return mode == .dspark or (mode == .dflash and (sparse_target or others >= crowd)) or (mode == .pld and cuda);
 }
 
 /// The first request of a burst was admitted alone, so it armed speculation and ticks
@@ -7100,12 +7522,15 @@ fn specYieldTick(active: []const *Slot) void {
         const gen = if (s.legacy_gen) |*g| g else continue;
         if (gen.spec_disabled_runtime) continue;
         const mode = slotSpecMode(s, gen);
-        if (!yieldsToCompany(mode, mlx.cudaAvailable())) continue;
-        var company = false;
+        var others: usize = 0;
         for (active) |o| {
-            if (o != s and o.model == s.model) company = true;
+            if (o != s and o.model == s.model) others += 1;
         }
-        s.company_ticks = companyStreak(s.company_ticks, company);
+        if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), others, mtpCrowdThresholdFor(s))) {
+            s.company_ticks = 0;
+            continue;
+        }
+        s.company_ticks = companyStreak(s.company_ticks, others > 0);
         if (s.company_ticks >= COMPANY_YIELD_TICKS) gen.yieldSpecToCompany(@tagName(mode));
     }
 }
@@ -7468,7 +7893,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.dsv41_ext != null);
+        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.mlx_stream_ext != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -7527,7 +7952,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
     const resumed: u64 = if (xfm_ptr.dsv41) |mdl|
         try dsv41_mod.resumePrompt(mdl, slot.full_prompt)
-    else if (xfm_ptr.dsv41_ext) |m|
+    else if (xfm_ptr.mlx_stream_ext) |m|
         try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
     else
         0;
@@ -7808,6 +8233,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp and !use_dflash,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
+            .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,
             .ssm_checkpoint_pos_offset = hot_matched,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.
@@ -8710,7 +9136,7 @@ test "the inference loop parks without holding the sleep-inhibition assertion" {
     const pass_start = std.mem.indexOf(u8, source, "fn chatPass(") orelse return error.MissingChatPass;
     const pass_end = std.mem.indexOfPos(u8, source, pass_start + 1, "\nfn ") orelse return error.MissingChatPassEnd;
     const pass = source[pass_start..pass_end];
-    const drop = std.mem.indexOf(u8, pass, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
+    const drop = std.mem.indexOf(u8, pass, "sleep_inhibit.setActive(holdsSleepWhileParked(sch));") orelse return error.MissingSleepRelease;
     const park = std.mem.indexOf(u8, pass, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
     const hold = std.mem.indexOfPos(u8, pass, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
     try testing.expect(drop < park);
@@ -11698,14 +12124,21 @@ test "companyStreak: only consecutive ticks with company count" {
     try testing.expectEqual(@as(u8, 0), companyStreak(1, false));
 }
 
-test "yieldsToCompany: the DFlash family everywhere, PLD only on CUDA" {
-    for ([_]SpecTickMode{ .dflash, .dspark }) |m| {
-        try testing.expect(yieldsToCompany(m, false));
-        try testing.expect(yieldsToCompany(m, true));
-    }
-    try testing.expect(yieldsToCompany(.pld, true));
-    try testing.expect(!yieldsToCompany(.pld, false));
-    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true));
+test "yieldsToCompany: DSpark and sparse-target DFlash everywhere, PLD only on CUDA" {
+    try testing.expect(yieldsToCompany(.dspark, false, false, 1, 5));
+    try testing.expect(yieldsToCompany(.dspark, true, true, 1, 5));
+    try testing.expect(yieldsToCompany(.dflash, false, true, 1, 5));
+    try testing.expect(yieldsToCompany(.dflash, true, true, 1, 5));
+    try testing.expect(yieldsToCompany(.pld, true, false, 1, 5));
+    try testing.expect(!yieldsToCompany(.pld, false, false, 1, 5));
+    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true, true, 9, 5));
+}
+
+test "yieldsToCompany: a dense DFlash slot keeps speculating until the others are a crowd" {
+    try testing.expect(!yieldsToCompany(.dflash, false, false, 1, 5));
+    try testing.expect(!yieldsToCompany(.dflash, true, false, 4, 5));
+    try testing.expect(yieldsToCompany(.dflash, false, false, 5, 5));
+    try testing.expect(yieldsToCompany(.dflash, false, false, 7, 5));
 }
 
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {
@@ -11953,3 +12386,122 @@ test "loop recovery: an answer-side loop and an unarmed request are still cut" {
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
 }
+
+test "company: a Neural Engine slot never batches, so it does not count" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.offloaded = .empty;
+    defer sch.offloaded.deinit(testing.allocator);
+    var ane: Slot = undefined;
+    try sch.offloaded.append(testing.allocator, &ane);
+    sch.in_flight = 1;
+    try testing.expect(!sch.hasCompany());
+    sch.in_flight = 2;
+    try testing.expect(sch.hasCompany());
+}
+
+test "a parked inference thread keeps the Mac awake only while Neural Engine requests run" {
+    var sch: Scheduler = undefined;
+    sch.offloaded = .empty;
+    defer sch.offloaded.deinit(testing.allocator);
+    try testing.expect(!holdsSleepWhileParked(&sch));
+    var ane: Slot = undefined;
+    try sch.offloaded.append(testing.allocator, &ane);
+    try testing.expect(holdsSleepWhileParked(&sch));
+}
+
+test "aneServes: plain sampling only; a grammar, a penalty, logprobs or a forced tool call is refused" {
+    try testing.expect(aneServes(.{ .temperature = 0.7, .top_p = 0.9, .top_k = 20 }, 0, false));
+    try testing.expect(!aneServes(.{ .repeat_penalty = 1.1 }, 0, false));
+    try testing.expect(!aneServes(.{ .presence_penalty = 0.5 }, 0, false));
+    try testing.expect(!aneServes(.{ .constraint = @ptrFromInt(8) }, 0, false));
+    try testing.expect(!aneServes(.{ .tool_force = @ptrFromInt(8) }, 0, false));
+    try testing.expect(!aneServes(.{}, 5, false));
+    try testing.expect(!aneServes(.{}, 0, true));
+    // A thinking budget is not enforced, but the answer is still the model's own.
+    try testing.expect(aneServes(.{ .think_bound = @ptrFromInt(8) }, 0, false));
+}
+
+test "hot-cache view: a model's cache leaving takes the view with it, to the default chat model first" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var chat_cfg = model_mod.ModelConfig{};
+    chat_cfg.model_type = "qwen3_5";
+    var tts_cfg = model_mod.ModelConfig{};
+    tts_cfg.model_type = "kokoro";
+    const a = try reg.registerStub("a", "/m/a", 64);
+    const b = try reg.registerStub("b", "/m/b", 64);
+    const c = try reg.registerStub("c", "/m/c", 64);
+    const tts = try reg.registerStub("tts", "/m/tts", 64);
+    defer for ([_]*LoadedModel{ a, b, c, tts }) |e| {
+        e.config = null;
+    };
+    for ([_]*LoadedModel{ a, b, c, tts }) |e| {
+        e.config = &chat_cfg;
+        e.state = .ready;
+        e.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    }
+    tts.config = &tts_cfg;
+    reg.default_id = "c";
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = reg.io;
+
+    // Another model leaving does not touch the view.
+    sch.hot_prefix_cache = &a.prefix_cache.?;
+    moveHotCacheViewOff(&sch, b);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &a.prefix_cache.?), sch.hot_prefix_cache);
+    // The owner leaving hands it to the default chat model, never to a media model.
+    moveHotCacheViewOff(&sch, a);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &c.prefix_cache.?), sch.hot_prefix_cache);
+    // With no other chat model resident, the view is dropped, never left on a freed cache.
+    b.state = .unloaded;
+    a.state = .unloaded;
+    moveHotCacheViewOff(&sch, c);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, null), sch.hot_prefix_cache);
+}
+
+fn budget200Mb(_: *model_mod.ModelConfig, _: u64, _: BudgetRevise, idle: *u64) u64 {
+    idle.* = 0;
+    return 200 << 20;
+}
+
+test "hot-cache view: a revise that follows an unload raises a budget but never lowers it" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    const m = try reg.registerStub("m", "/m/m", 64);
+    defer m.config = null;
+    m.config = &cfg;
+    m.state = .ready;
+    m.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    const hc = &m.prefix_cache.?;
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = reg.io;
+    sch.allocator = testing.allocator;
+    sch.current_model = null;
+    sch.hot_prefix_cache = null;
+    sch.prefix_cache_mem_resolver = budget200Mb;
+    sch.prefix_cache_mem_bytes = 0;
+    sch.metrics = null;
+    sch.digest_mu = .init;
+    sch.hot_cache_digests = &.{};
+    sch.digest_residency = 0;
+    sch.resident_hot_cache_bytes = std.atomic.Value(u64).init(0);
+    sch.reclaimable_hot_cache_bytes = std.atomic.Value(u64).init(0);
+
+    hc.max_kv_bytes = 600 << 20;
+    reviseHotCacheBudgets(&sch, true);
+    try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+    hc.max_kv_bytes = 100 << 20;
+    reviseHotCacheBudgets(&sch, true);
+    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
+    // A load's revise is honest both ways.
+    hc.max_kv_bytes = 600 << 20;
+    reviseHotCacheBudgets(&sch, false);
+    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
+}
+

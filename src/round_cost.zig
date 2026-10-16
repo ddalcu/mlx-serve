@@ -18,6 +18,8 @@
 //! token per bucket. Kept out of the width grid (a serial tick is not a round), it answers
 //! the one question no width can: is speculation worth running here at all?
 const std = @import("std");
+const crt = @import("crt.zig");
+const os_mutex = @import("os_mutex.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const transformer_mod = @import("transformer.zig");
@@ -868,6 +870,7 @@ pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
 }
 
 fn qwen4ProfileArmed() bool {
+    if (comptime @import("builtin").os.tag == .windows) return false; // no `environ` in the Windows CRT; Qwen4 never runs there
     var i: usize = 0;
     while (std.c.environ[i]) |entry| : (i += 1) {
         const s = std.mem.span(entry);
@@ -891,11 +894,11 @@ pub fn storeShouldWrite(persist_on: bool, diag_armed: bool, key_len: usize) bool
 
 var build_id_buf: [64]u8 = undefined;
 var build_id_len: usize = 0;
-var build_id_mu: std.c.pthread_mutex_t = .{};
+var build_id_mu: os_mutex.Mutex = .{};
 
 pub fn engineBuildId() []const u8 {
-    _ = std.c.pthread_mutex_lock(&build_id_mu);
-    defer _ = std.c.pthread_mutex_unlock(&build_id_mu);
+    build_id_mu.lock();
+    defer build_id_mu.unlock();
     if (build_id_len != 0) return build_id_buf[0..build_id_len];
     var h = std.hash.Fnv1a_64.init();
     if (buildIdReadsExe(build_options.git_sha)) mixExeBytes(&h) else h.update(build_options.git_sha);
@@ -915,12 +918,12 @@ pub fn buildIdReadsExe(git_sha: []const u8) bool {
 fn mixExeBytes(h: *std.hash.Fnv1a_64) void {
     var path_buf: [4096]u8 = undefined;
     const path = exePath(&path_buf) orelse return;
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(path.ptr);
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
     var buf: [65536]u8 = undefined;
     while (true) {
-        const got = std.c.read(fd, &buf, buf.len);
+        const got = crt.read(fd, &buf);
         if (got < 0) {
             const e = std.c._errno().*;
             if (e == @backingInt(std.c.E.INTR)) continue;
@@ -983,9 +986,9 @@ fn fileExists(path: []const u8) bool {
     if (path.len >= pbuf.len) return false;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(pbuf[0..path.len :0]);
     if (fd < 0) return false;
-    _ = std.c.close(fd);
+    crt.close(fd);
     return true;
 }
 
@@ -1001,12 +1004,12 @@ pub fn fileFingerprint(path: []const u8) ?u64 {
     if (path.len >= pbuf.len) return null;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(pbuf[0..path.len :0]);
     if (fd < 0) return null;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
     // Size via lseek-to-end: std.c.Stat/fstat are Darwin-only in 0.17, and
     // this fingerprint runs on the Linux build too (libmlx.so gets mixed in).
-    const size: u64 = @intCast(@max(std.c.lseek(fd, 0, std.c.SEEK.END), 0));
+    const size: u64 = @intCast(@max(crt.seekEnd(fd), 0));
     if (size == 0) return null;
     var h = std.hash.Fnv1a_64.init();
     h.update(std.mem.asBytes(&size));
@@ -1017,7 +1020,7 @@ pub fn fileFingerprint(path: []const u8) ?u64 {
         var buf: [65536]u8 = undefined;
         var done: usize = 0;
         while (done < buf.len) {
-            const got = std.c.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
+            const got = crt.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
             if (got < 0) {
                 if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
                 return null;

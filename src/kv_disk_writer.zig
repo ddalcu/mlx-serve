@@ -5,6 +5,7 @@
 //! bytes for a directory about to be removed. POSIX syscalls: this runs off the main thread.
 
 const std = @import("std");
+const crt = @import("crt.zig");
 const log = @import("log.zig");
 
 /// One staged file; both buffers are owned by the queue once `submit` accepts them.
@@ -389,12 +390,12 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
     tmp_buf[path.len + 4] = 0;
     const tmp: [:0]const u8 = tmp_buf[0 .. path.len + 4 :0];
 
-    const fd = std.c.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = crt.openWrite(tmp.ptr, true);
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
+        const n = crt.write(fd, bytes[off..]);
         if (n < 0) {
             const e = std.c._errno().*;
             if (e == @intFromEnum(std.c.E.INTR) or e == @intFromEnum(std.c.E.AGAIN)) continue;
@@ -409,7 +410,7 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
     @memcpy(final_buf[0..path.len], path);
     final_buf[path.len] = 0;
     const final: [:0]const u8 = final_buf[0..path.len :0];
-    if (std.c.rename(tmp.ptr, final.ptr) != 0) return error.RenameFailed;
+    if (crt.rename(tmp.ptr, final.ptr) != 0) return error.RenameFailed;
 }
 
 // ── Tests ──

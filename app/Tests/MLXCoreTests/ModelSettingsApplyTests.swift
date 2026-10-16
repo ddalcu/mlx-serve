@@ -43,6 +43,19 @@ final class ModelSettingsMtpRowsTests: XCTestCase {
     }
 }
 
+/// Mirrors the server's `ane_lm.archOf`: dense qwen3_5 and Qwen3 packs (MoE and Prism packs stay on the GPU).
+final class ModelSettingsNeuralEngineRowTests: XCTestCase {
+    func testOnlyDenseQwenPacksOfferTheNeuralEngine() {
+        XCTAssertTrue(ModelSettingsApply.offersNeuralEngine(modelType: "qwen3_5"))
+        XCTAssertTrue(ModelSettingsApply.offersNeuralEngine(modelType: "qwen3_5_text"))
+        XCTAssertTrue(ModelSettingsApply.offersNeuralEngine(modelType: "qwen3"))
+        for t in ["qwen3_5_moe", "qwen3_5_moe_text", "qwen3_moe", "prism_hadamard_qwen35", "qwen4_exp", "llama", ""] {
+            XCTAssertFalse(ModelSettingsApply.offersNeuralEngine(modelType: t), t)
+        }
+        XCTAssertFalse(ModelSettingsApply.offersNeuralEngine(modelType: nil))
+    }
+}
+
 /// Mirrors the server's `mtp.dirAdvertisesMtp`: sidecar file, index marker, or qwen4's own head.
 final class LocalMtpHeadProbeTests: XCTestCase {
     private func dir(_ name: String) throws -> String {

@@ -26,6 +26,12 @@ Third, the feature did not survive contact with its own clients. `GET /props` fe
 
 Guards: `tests/test_idle_evict.sh` (evicts when idle, reloads under all three concurrent readers, RSS flat across cycles that all end with nothing resident, and still resident with the flag off), `testing.allocator` on the reload-frees test, and behavioural tests on each `.loading` predicate. The locking itself is comment-pinned — a source scan is the obvious guard and this repo bans them.
 
+### Two models under the registry cap still killed the server (2026-10-15)
+
+The registry's resident cap defaults to Metal's working-set limit (230 GB on a 256 GB M5 Ultra), and the planner evicted only past it. With Flash Next 4.7bpw (70 GB) loaded and idle, a load of the 8-bit pack (128 GB) evicted nothing, 198 GB being under the cap, while two other mlx-serve processes held 59 GB. macOS ran out of memory: jetsam killed idle daemons, then the server. No crash report, and the log just stops (SIGKILL loses its buffered tail). The app ran with `--skip-mem-preflight`, and the preflight only ever refused anyway.
+
+Fix: before a load reads weights, the inference thread unloads IDLE models, oldest first, until it fits in what the OS grants less `osReserveBytes` (`makeRoomInRam`, `planRamEvictionsLocked`): measured there, with nothing else loading, and none at all when even every idle model cannot make room. It runs past `--skip-mem-preflight`; RAM alone never refuses a load. `[registry] <id> needs ~X GB beside Y GB of free RAM: unloading N idle model(s)` names it. The tell for this class: `log show` lines with `OS_REASON_JETSAM` / `JETSAM_REASON_MEMORY_IDLE_EXIT` in the seconds before the server's `proc_exit`. Guard: the two `RAM:` tests in `model_registry.zig`.
+
 ### Only the latest turn's images reached the model (2026-09-23)
 
 Defect: pi reading page1..3 of a spec mid-task saw page3 only. Flash invented a 5-digit SKU
@@ -135,6 +141,10 @@ Live 2026-07-21 (two-Mac LAN session): the app tray showed "No models yet" while
 Found while adding Model Settings aliases (#520), before release. The keyless LAN gate read the body's `model` and, for any name that was not a registry id, checked the DEFAULT model against the share list. Dispatch then resolved the same name as an alias and served a different model. With the default shared and the aliased model not shared, a LAN client reached the unshared model by its alias (200, and the model cold-loaded).
 Fix: one resolver, `resolveRequestModelId` (exact id, path, then alias, then on `/api/` the untagged alias and Ollama's short-name match), called by dispatch, `lanShareDenial`, `/v1/load-model`, `/v1/unload-model` and `/api/show`. It also closes the older Ollama short-name case on the gate.
 Guard: `tests/test_model_alias.sh` [2] (a shared symlinked twin as the default; red on revert: 200 and the unshared model loaded) + the `resolveRequestModelId` alias unit test.
+
+### An escaped `org\/repo@peer` id killed the server (SIGBUS in `lan.rewriteModelValue`, 2026-10-15)
+
+`lan.rewriteModelValue` finds the model value's offset by subtracting the body's pointer from the value's, so the value must be a slice OF the body. `handleConnection` later canonicalised the id into a 512-byte stack buffer (`unescapeJsonSlashes`, for Swift's `\/`) and handed THAT copy to both proxies. Any client that escapes slashes (Swift's JSON writers by default) naming `org/repo@peer` or `org/repo@provider` made the offset wrap; the assert is compiled out of ReleaseFast, and the memcpy ran off the heap. Fix: the proxies get the raw body slice for the splice and the canonical id for the lookup (`proxiedBody`); the rewrite refuses a value outside the body (`error.ModelNotInBody`). Guards: `lan: rewriteModelValue refuses a model value that is not a slice of the body`; `tests/test_providers.sh` "an escaped org\/repo id is forwarded bare and the server stays up".
 
 ### @peer proxying is bounded by the TUNNEL MARKER, not by loopback-ness (sandbox 403 class)
 Live 2026-07-21: pi/hermes running in the Agent Sandbox VM got `403 "Remote (@peer) model ids are host-local"` for the model the host app was happily chatting on. The guest reaches the host over the VM NAT interface (`192.168.64.1`), so it is non-loopback BY CONSTRUCTION — and both the keyless LAN gate (`lanShareDenial`) and the proxy dispatch required loopback to initiate an @peer hop. Worse, with `--api-key` set the gate is skipped but dispatch still required loopback, so a keyed guest request naming @peer fell through to the unknown-id strip and would have been answered by the LOCAL default model silently. The loop/amplification bound never actually needed loopback: `lan.tunnel` has always stamped `X-MLX-LAN: 1` on every request it forwards, and the forwarded body carries the BARE id. New rule: any DIRECT client (loopback app, sandbox guest, phone on the LAN) may initiate exactly ONE hop; a request carrying the tunnel marker is never proxied again (`isTunneledRequest` at the gate AND at dispatch). Access-wise this exposes nothing new — the peer's own share gate still governs its models, and a LAN client could always ask the peer directly. Guards: `lanShareDenial` + `isTunneledRequest` tests (server.zig); `tests/test_lan_share.sh` "tunneled request never hops again" / "direct @peer id proxies" / "non-loopback client of B chats on @peer model".
@@ -2473,12 +2483,21 @@ Cause: restore already served the text before the first media item, but every di
 skipped media entries outright: the SSD-first capture in `commitWithMediaState`, both
 `spillDeclinedToDisk` call sites, and the plain `flushPendingDisk`.
 
-Fix: the writers persist `HotPrefixCache.diskTokens`, the record cut at the first item (the KV
-extent follows `tokens.len`, checkpoints past it are skipped). No spec snapshot rides a media
-turn, since it covers rows past the cut. The disk key stays token-only and never holds an image row.
-A hybrid restores only from an SSM checkpoint, so its record stops at the last checkpoint below
-the item (`HotPrefixCache.hybrid`, set at load) and nothing is written when there is none.
-Guard: `an image turn persists the text before its first item to the SSD tier`.
+Fix (v8): the writers persisted the record CUT at the first item — the disk key was token-only
+and never held an image row; a hybrid's record stopped at its last checkpoint below the item
+(`HotPrefixCache.hybrid`, set at load) and nothing was written when there was none. No spec
+snapshot rode a media turn, since it covers rows past the cut.
+
+Reversed in v9 (#782): the token-only floor made the state a media turn actually holds
+unaddressable, so deep image sessions could not persist past their first item. The disk
+identity is now (tokens, spans): the writers persist the FULL record — image rows included,
+keyed on each item's pixel key — and the clamp moved from commit time to match time
+(`mediaSharedBound` per entry): a re-sent turn with agreeing spans reads its media rows back
+near the prompt tail, a divergent span list stops below the first item whose start or pixel
+key differs, and a text turn stops at the entry's first item — exactly where the old commit
+floor sat. Spec payloads (dflash/MTP) still ride text-only turns. The AGENTS.md SSD-tier rule
+carries the v9 wording.
+Guard: `an image turn persists its full media-keyed prefix to the SSD tier`.
 
 ## A streamed Responses turn reported no prompt-cache hit
 
@@ -2672,6 +2691,23 @@ Fix: before refusing, `checkAttentionMemory` unloads idle resident models least 
 after each, via `fitAfterUnloadingIdle`.
 Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
 
+## An embedding model's load hid the chat model's warm cache (#854)
+
+Defect: with bge-small loaded beside a chat model, the next agent turn was refused right after the
+previous one ended (`~0MB resident hot cache`), then the make-room unload emptied the chat model's
+cache, the conversation's checkpoint included.
+
+Cause: every load pointed `sch.hot_prefix_cache` at the loaded model's cache (an encoder's, a TTS
+model's), and the gen, ds4 and llama.cpp loaders cleared it. The connection thread bills residency
+and digests from that view, so the chat model's warm entry read as 0 and the turn billed cold. The
+revise after the unload then lowered the budget on a free figure read mid-unload.
+
+Fix: only a chat-capable MLX load takes the view; before a model's cache is freed (unload or
+load-time eviction) `moveHotCacheViewOff` hands it to the default chat model's cache, or any resident
+one, or none; a revise that follows an unload only raises budgets (`budgetShrinks`).
+Guard: `hot-cache view: a model's cache leaving takes the view with it, to the default chat model first`
+and `hot-cache view: a revise that follows an unload raises a budget but never lowers it` (scheduler.zig).
+
 ## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
 
 Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and
@@ -2687,3 +2723,11 @@ Guard: `context sizer: the prompt-cache reserve never takes more than half the r
 
 ### An agent started from a piped script got `/dev/tty`, which Bun agents and Grok cannot watch on macOS
 The served `/launch` script (the console's Code Launcher, `curl … | sh`) arrives on stdin, so its tail reopened `/dev/tty` for the agent. pi worked (Node; libuv falls back to `select()` for that device); Claude Code, oh-my-pi and OpenCode (Bun) died on `EINVAL: invalid argument, kqueue`, Grok exited at once, and omp's unanswered terminal queries landed in the user's shell as `1;2c1;2c…`. `/dev/tty` is its own device node, not the terminal it reaches (`tty` reads `/dev/tty`, not `/dev/ttys002`), and macOS kqueue refuses it. Fix: the agent's stdin is a dup of whichever of stderr/stdout is the terminal, `/dev/tty` only when neither is (`launch.remoteScript`), and the redirect rides the agent's `exec`: the served script is still being read from stdin, so a bare `exec 0<&2` made `sh` wait on the terminal for the rest of it; `website/agent.sh` writes the setup script to `~/.mlx-serve/launch-<agent>.sh` and execs it with the terminal as stdin, which also covers servers older than the fix. Guards: a fake agent records `tty` under `expect` (`tests/test_launch_script.sh` [6], `tests/test_website_agent_install.sh` [3]).
+
+### A Windows path id broke /v1/models and crashed the proxies (2026-10-14)
+
+Defect: on Windows `/v1/models` was invalid JSON (`"id":"C:\Users\..."`), so the provider probe listed 0 models, and a proxied `<path>@provider` request killed the server (integer overflow, no log line).
+Cause: three model-row emitters spliced the id raw with `"id":"{s}"`; and `handleConnection` canonicalized the id once, then handed that COPY to the LAN and provider proxies, whose `rewriteModelValue` finds the model field by pointer offset into the body. Any id the unescape changed (a Swift client's `org\/name@peer` too) pointed outside the body.
+Fix: the emitters write `jsonEscape(id)`; `unescapeJsonSlashes` also collapses `\\`; the proxies take the raw body slice and splice the re-escaped bare id; `rewriteModelValue` returns `error.ModelValueNotInBody` instead of computing an offset outside the body.
+Guard: `renderModelEntry: a Windows path id stays valid JSON`, `lan: rewriteModelValue refuses a model value that is not a slice of the body`, the Windows case in `lan: JSON-escaped slashes canonicalize`.
+

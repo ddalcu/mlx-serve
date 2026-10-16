@@ -64,6 +64,7 @@ const supported_model_types = [_][]const u8{
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
+    "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE), the mlx-stream pack (experts streamed from experts.bin)
     "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk, text/image/video embeddings)
     "minicpmv4_7", // openbmb MiniCPM-V 4.7 (Qwen3.5 trunk + SigLIP2 tower)
     "qwen3_asr", // Qwen3-ASR speech recognition (qwen3 trunk + audio tower)
@@ -2236,6 +2237,8 @@ test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
     try testing.expect(isSupportedModelType("glm5_next"));
     try testing.expect(isSupportedModelType("glm5_next_text"));
     try testing.expect(isSupportedModelType("deepseek_v41"));
+    try testing.expect(isSupportedModelType("glm_moe_dsa"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("glm_moe_dsa"));
 }
 
 test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {

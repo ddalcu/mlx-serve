@@ -26,6 +26,8 @@ final class HostEscapeAuditTests: XCTestCase {
             "osascript + login shell to symlink into /usr/local/bin. Runtime-gated on the compile-time BuildFeatures.cliInstaller flag (false under MAS_BUILD); UI hidden with it.",
         "CLILauncher.swift":
             "login zsh to detect+launch claude/pi/opencode. Runtime-gated on the compile-time BuildFeatures.cliLauncher flag (false under MAS_BUILD); UI hidden with it.",
+        "AppRelaunch.swift":
+            "sleep + /usr/bin/open to relaunch the app's own bundle after a change that only lands on the next start — the Settings ▸ Interface ▸ Language row and UpdateChecker's swap-in-place share this one helper, and the bundle path rides as a positional argument. MAS live behavior is a release-validation item.",
         "UpdateChecker.swift":
             "hdiutil/ditto to swap the installed .app. Runtime-gated on the compile-time BuildFeatures.selfUpdate flag (false under MAS_BUILD); UI hidden with it.",
         "LoginShellEnv.swift":

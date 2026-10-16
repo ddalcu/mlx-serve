@@ -48,7 +48,7 @@ The deeper the seam, the less of our stack the model gets for free. Use the shal
 |---|---|---|---|
 | Format | detection, the JSON a model directory would hold, the tensor map, kernels for its encodings | the arch, KV cache, batching, spec decode, prefix cache | mlx-serve-gguf |
 | Weight encoding | config parse and load checks, the matmul over its weights | the arch and everything above it | EXL3 (from sushi) |
-| Arch | a model's forward, its kernels and decode state, its weight loading and memory bill | HTTP, the template, tool calls, sampling, stops, scheduling, admission | mlx-stream (DeepSeek-V4.1's EXL3 repack) |
+| Arch | a model's forward, its kernels and decode state, its weight loading and memory bill | HTTP, the template, tool calls, sampling, stops, scheduling, admission | mlx-stream (DeepSeek-V4.1's EXL3 repack, MiMo-V2.6-Flash, GLM-5.3) |
 
 Not a seam: **opaque engines.** ds4 and llama.cpp keep their bridges (`src/arch/ds4.zig`, `src/arch/llama.zig`).
 
@@ -139,15 +139,23 @@ share code: each serves a different arch, and their kernels are tuned to it.
 
 ## Example: mlx-stream (arch seam)
 
-[mlx-stream](https://github.com/davidtai/mlx-stream) (pinned from our fork `ddalcu/mlx-stream`, upstream `main` plus a test fix) serves
-DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk). It owns the model: the arch, its Metal
+[mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`; the pin, 7d29eaa, is on the `main` branch of davidtai/mlx-stream) serves
+DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
+prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`) and, as its third,
+GLM-5.3 (`glm_moe_dsa`, the trunk beside an `experts.bin` bank). It owns the model: the arch, its Metal
 kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
 resume of one conversation, its weight loading past the page cache and its memory bill. Its `sdk` module (`sdk/`)
 holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepseek_v41.zig`).
 
-- **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`);
-  `loadModelWeights` loads nothing for it.
+- **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`), a
+  `mimo_v2` config that declares `expert_streaming` (`ModelConfig.mimo_stream`) and a `glm_moe_dsa` directory with
+  `experts.bin` (`ModelConfig.glm_stream`; without the bank it is refused by name, `GlmMoeDsaNeedsExpertBank`: no
+  in-tree arch serves it); `ModelConfig.mlxStream()` is any of them, and `loadModelWeights` loads nothing for it. The
+  glue holds one arch per model (`plugin.arch` for V4.1, `plugin.mimo.arch` for MiMo, `plugin.glm.arch` for GLM-5.3)
+  and leaves out at comptime the entry points an arch does not declare.
 - **Glue** (`src/arch/mlx_stream.zig`):
+  - settings (GLM-5.3): after the parse, the arch's `applySettings` receives the model's `model-settings.json` entry
+    (`.null` without one), then the manual context (`ctx_size`, else `--ctx-size`), which wins;
   - `loadBytes`: the preflight's bill, from the GPU ceiling, the wired margin and the memory in use before the load
     (sampled first, as the plugin's admission fills rows on top of it);
   - `open` / `close`: the plugin loads its weights and builds the module;
@@ -158,14 +166,17 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
     `SamplingParams` (temperature, top_p, top_k, min_p, a seed even when the request sent none) and every `round`
     passes them: greedy requests at the lane's typical acceptance, sampled ones by the plugin's exact speculative
     sampling;
-  - `contextLength`: the billed prompts plus the generation past them, which the host advertises.
-- **Host arms.** `Transformer.dsv41_ext` (init, forward, deinit; the generator hands it the whole prompt in one
+  - `end`: the request's end on the inference thread, before its terminator (the arch's `requestEnd`, GLM-5.3's);
+  - `contextLength`: the billed prompts plus the generation past them, which the host advertises (GLM-5.3: its
+    arch's `maxOutput` with the model's settings, as the pack's last parse read it).
+- **Host arms.** `Transformer.mlx_stream_ext` (init, forward, deinit; the generator hands it the whole prompt in one
   forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the
-  server's context and prompt bill.
+  server's context and prompt bill. GLM-5.3's module closes on the inference thread at shutdown (it synchronizes its
+  stream as it frees), and the hot prefix cache stays off for it.
 - **Build.** The `lib/mlx-stream` submodule, or `-Dmlx-stream-dir=/abs/path`: two modules (`sdk`, `mlx_stream`), its
   C sources against the staged MLX, its suite in `zig build test`, its conformance suite (a CPU-lane binary of its
   own, which checks the plugin against the linked MLX) as `zig build mlx-stream-conformance`. macOS only; the
-  Linux and iOS graphs build `src/arch/mlx_stream_stub.zig`, which refuses the repack by name.
+  Linux and iOS graphs build `src/arch/mlx_stream_stub.zig`, which refuses these packs by name.
 
 ## Rules for plugin code
 

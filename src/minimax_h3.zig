@@ -1055,43 +1055,13 @@ pub const Config = struct {
 
 // ── Weights ─────────────────────────────────────────────────────────────────
 
-/// The low-rank adapters attached to ONE linear, applied at RUN TIME:
-/// `y = base(x) + Σᵢ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ`. Never folded into the base
-/// weight — the reference node is explicit that merging rounds the delta away
-/// in bf16 and requantizes it away on quantized bases, and both our packs are
-/// quantized.
-///
-/// Non-owning, exactly like flux/krea: the arrays belong to the `lora.Stack`
-/// the generation holds, which outlives the model. The Turbo LoRA is simply
-/// the first file in that stack — it IS a LoRA, so it gets no private path.
-const LoraSlot = struct {
-    refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
-    count: u8 = 0,
-
-    fn set(self: *LoraSlot, refs: []const lora_mod.Ref) void {
-        self.count = @intCast(refs.len);
-        @memcpy(self.refs[0..refs.len], refs);
-    }
-    fn active(self: *const LoraSlot) []const lora_mod.Ref {
-        return self.refs[0..self.count];
-    }
-};
-
-/// `y + Σ deltas` when anything is attached; `y` unchanged otherwise.
-/// Consumes `y` either way, so call sites stay one-line.
-fn loraAdd(y: mlx.mlx_array, x: mlx.mlx_array, slot: LoraSlot, s: S) !mlx.mlx_array {
-    if (slot.count == 0) return y;
-    defer _ = mlx.mlx_array_free(y);
-    return lora_mod.addTo(y, x, slot.active(), s);
-}
-
 const AttnW = struct {
     qkv: MfLinear,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
     out: MfLinear,
-    qkv_lora: LoraSlot = .{},
-    out_lora: LoraSlot = .{},
+    qkv_lora: lora_mod.Slot = .{},
+    out_lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !AttnW {
         const qkv_p = try std.fmt.allocPrint(a, "{s}.qkv_proj", .{prefix});
@@ -1118,8 +1088,8 @@ const AttnW = struct {
 const MlpW = struct {
     fc1: MfLinear, // [2*ffn, hidden] — gate and up FUSED
     fc2: MfLinear,
-    fc1_lora: LoraSlot = .{},
-    fc2_lora: LoraSlot = .{},
+    fc1_lora: lora_mod.Slot = .{},
+    fc2_lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !MlpW {
         const p1 = try std.fmt.allocPrint(a, "{s}.fc1", .{prefix});
@@ -1290,7 +1260,7 @@ const AdalnW = struct {
     /// reference node re-injects on pruned bases — so hooking `forward` covers
     /// BOTH the precompute path and the per-step MINIMAX_H3_ADALN_PRECOMPUTE=0
     /// path, and the pair is freed with the weight after precompute.
-    lora: LoraSlot = .{},
+    lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, expand: u32, modalities: u32, dt: mlx.mlx_dtype, s: S) !AdalnW {
         const p = try std.fmt.allocPrint(a, "{s}.linear", .{prefix});
@@ -1317,7 +1287,7 @@ const AdalnW = struct {
         const inp = if (apply_silu) try siluA(t_emb, s) else try contig(t_emb, s);
         defer _ = mlx.mlx_array_free(inp);
         const y_base = try self.linear.forward(inp, self.bias, s);
-        const y = try loraAdd(y_base, inp, self.lora, s);
+        const y = try lora_mod.addSlot(y_base, inp, &self.lora, s);
         defer _ = mlx.mlx_array_free(y);
         const m: c_int = @intCast(mlx.getShape(y)[0]);
         const rows = m * @as(c_int, @intCast(self.modalities));
@@ -1677,7 +1647,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     const hd: c_int = @intCast(cfg.attention_head_dim);
 
     const qkv_base = try aw.qkv.forward(x, null, s);
-    const qkv = try loraAdd(qkv_base, x, aw.qkv_lora, s);
+    const qkv = try lora_mod.addSlot(qkv_base, x, &aw.qkv_lora, s);
     defer _ = mlx.mlx_array_free(qkv);
     var t = try qkvHeadMajor(aw, qkv, cfg, rope, s);
     defer for (&t) |*p| {
@@ -1715,7 +1685,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     const flat = try reshape(bc, &[_]c_int{ n, h * hd }, s);
     defer _ = mlx.mlx_array_free(flat);
     const out_base = try aw.out.forward(flat, null, s);
-    return loraAdd(out_base, flat, aw.out_lora, s);
+    return lora_mod.addSlot(out_base, flat, &aw.out_lora, s);
 }
 
 /// silu(gate) * up over the fused [S, 2*ffn] fc1 output.
@@ -1734,12 +1704,12 @@ fn swigluAct(y: mlx.mlx_array, s: S) !mlx.mlx_array {
 /// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
 fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     const y_base = try mw.fc1.forward(x, null, s);
-    const y = try loraAdd(y_base, x, mw.fc1_lora, s);
+    const y = try lora_mod.addSlot(y_base, x, &mw.fc1_lora, s);
     defer _ = mlx.mlx_array_free(y);
     const act = try swigluAct(y, s);
     defer _ = mlx.mlx_array_free(act);
     const o_base = try mw.fc2.forward(act, null, s);
-    return loraAdd(o_base, act, mw.fc2_lora, s);
+    return lora_mod.addSlot(o_base, act, &mw.fc2_lora, s);
 }
 
 // ── Modulation over packed segments ─────────────────────────────────────────
@@ -2457,7 +2427,7 @@ pub const Model = struct {
                 lp(v, w.fc1_lora);
                 lp(v, w.fc2_lora);
             }
-            fn lp(v: mlx.mlx_vector_array, slot: LoraSlot) void {
+            fn lp(v: mlx.mlx_vector_array, slot: lora_mod.Slot) void {
                 for (slot.active()) |r| {
                     arr(v, r.at);
                     arr(v, r.bt);
@@ -2517,7 +2487,7 @@ pub const Model = struct {
         // point: a whole-stack total cannot tell "the style LoRA matched 40
         // modules" from "the Turbo file is missing 40 of its own".
         const bind = struct {
-            fn f(st: *const lora_mod.Stack, key: []const u8, slot: *LoraSlot, rb: *[lora_mod.MAX_LORAS]lora_mod.Ref, cnt: *[lora_mod.MAX_LORAS]u32) void {
+            fn f(st: *const lora_mod.Stack, key: []const u8, slot: *lora_mod.Slot, rb: *[lora_mod.MAX_LORAS]lora_mod.Ref, cnt: *[lora_mod.MAX_LORAS]u32) void {
                 var n: usize = 0;
                 for (st.files[0..st.count], st.scales[0..st.count], 0..) |*fl, user_scale, fi| {
                     const e = fl.find(key) orelse continue;
@@ -7038,7 +7008,7 @@ test "minimax h3: chain math — delivered frames, overlap width, cross-fade sea
     try testing.expectEqualSlices(f32, &s1, j3);
 }
 
-test "minimax h3: loraAdd sums every attached adapter onto the base output" {
+test "minimax h3: addSlot sums every attached adapter onto the base output" {
     const s = mlx.gpuStream();
     const f32t = mlx.mlx_dtype.float32;
 
@@ -7061,7 +7031,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     // Turbo at 1.0 plus a style adapter at 0.5 — the stacking case, on the
     // same linear. expected[m][o] = 1.5 * Σ_r (Σ_i X[m][i]·AT[i][r])·BT[r][o].
-    var slot: LoraSlot = .{};
+    var slot: lora_mod.Slot = .{};
     slot.set(&[_]lora_mod.Ref{
         .{ .at = at, .bt = bt, .scale = 1.0 },
         .{ .at = at, .bt = bt, .scale = 0.5 },
@@ -7070,7 +7040,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
     const zbuf = [_]f32{ 0, 0, 0, 0, 0, 0, 0, 0 }; // zero base: the deltas alone come back
     const shZ = [_]c_int{ 2, 4 };
     const zero = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
-    const got = try loraAdd(zero, x, slot, s); // consumes `zero`
+    const got = try lora_mod.addSlot(zero, x, &slot, s); // consumes `zero`
     defer _ = mlx.mlx_array_free(got);
     try mlx.check(mlx.mlx_array_eval(got));
     const raw = mlx.mlx_array_data_float32(got) orelse return error.NoData;
@@ -7087,10 +7057,10 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     // An empty slot is the identity — and returns the SAME handle, since the
     // no-adapter path must cost nothing on a 50-block DiT.
-    const empty: LoraSlot = .{};
+    const empty: lora_mod.Slot = .{};
     const base2 = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
     defer _ = mlx.mlx_array_free(base2);
-    const same = try loraAdd(base2, x, empty, s);
+    const same = try lora_mod.addSlot(base2, x, &empty, s);
     try testing.expectEqual(base2.ctx, same.ctx);
 }
 

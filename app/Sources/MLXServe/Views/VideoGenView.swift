@@ -2144,6 +2144,7 @@ struct VideoGenView: View {
                     ContentUnavailableView("No generation yet", systemImage: "film", description: Text("Enter a prompt and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
+                        LoadingModelsRow()
                         if let img = service.livePreview {
                             Image(nsImage: img)
                                 .resizable()

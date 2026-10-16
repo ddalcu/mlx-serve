@@ -463,9 +463,10 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)."
     )
 
-    /// Qwen-Image-2.1 is undistilled and ~1 MP-trained: a step costs the same
-    /// at any shape, so the menu stays at the sizes a 40-step run finishes in
-    /// reasonable time on a laptop.
+    /// Qwen-Image-2.1's card recommends about 4 MP; the server caps a side at
+    /// 2048, so the 1 MP shapes come again at that cap, where small text gets
+    /// the pixels it needs. 1 MP stays the default: a 2048 run costs several
+    /// times as long.
     private static let qwenImageResolutions: [ResolutionOption] = [
         .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
         .init(width: 768,  height: 768,  label: "768 × 768 (square, fast)"),
@@ -474,6 +475,11 @@ struct ImageModelPreset: Identifiable, Hashable {
         .init(width: 1248, height: 832,  label: "1248 × 832 (landscape 3:2)"),
         .init(width: 1344, height: 768,  label: "1344 × 768 (landscape 16:9)"),
         .init(width: 768,  height: 1344, label: "768 × 1344 (portrait 9:16)"),
+        .init(width: 2048, height: 2048, label: "2048 × 2048 (square, finest text)"),
+        .init(width: 1360, height: 2048, label: "1360 × 2048 (portrait 2:3, finest text)"),
+        .init(width: 2048, height: 1360, label: "2048 × 1360 (landscape 3:2, finest text)"),
+        .init(width: 2048, height: 1152, label: "2048 × 1152 (landscape 16:9, finest text)"),
+        .init(width: 1152, height: 2048, label: "1152 × 2048 (portrait 9:16, finest text)"),
     ]
 
     private static let qwenImageQuality: [QualityPreset: ImageQualitySettings] = [
@@ -2173,7 +2179,7 @@ struct ImageGenRequest {
     /// Extra in-context reference images for edit mode (FLUX.2
     /// multi-reference): "replace the face in image 1 with the face from
     /// image 2". Sent as `ref_images` beside the primary source; the server
-    /// takes at most 3.
+    /// takes at most `ImageModelPreset.maxReferenceImages`.
     var refImagePaths: [String] = []
     /// Conditioning rebalance (Advanced): global multiplier on the prompt
     /// embeddings. 1.0 = off.
@@ -2224,10 +2230,26 @@ extension ImageModelPreset {
     }
 
     /// Instruction editing (in-context reference conditioning) is a trained
-    /// capability: FLUX.2-klein, and the Mage-Flow-Edit checkpoint. Krea and
-    /// Mage-Flow Turbo (txt2img) can only do renoise variations.
+    /// capability: FLUX.2-klein, the Mage-Flow-Edit checkpoint, and
+    /// Qwen-Image-2.1 (a unified t2i + edit checkpoint). Krea and Mage-Flow
+    /// Turbo (txt2img) can only do renoise variations.
     var supportsReferenceEdit: Bool {
-        variant == .flux2Klein4B || variant == .flux2Klein9B || variant == .flux2Klein9BBase || variant == .mageFlowEditTurbo
+        switch variant {
+        case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
+            return true
+        case .krea2Turbo, .mageFlowTurbo:
+            return false
+        }
+    }
+
+    /// Reference images an edit takes beside the source — the server's
+    /// `gen.editRefCap` minus the source itself (10 total for Qwen-Image, 4
+    /// for the other editors).
+    var maxReferenceImages: Int {
+        switch variant {
+        case .qwenImage21, .qwenImage21Turbo: return 9
+        default: return 3
+        }
     }
 
     /// Real classifier-free guidance (`guidance_scale` + negative prompt) —
@@ -2256,11 +2278,11 @@ extension ImageModelPreset {
         }
     }
 
-    /// Runtime LoRA adapters attach to the DiT (`gen.ImageEngine.setLora`).
+    /// Runtime LoRA adapters attach to the DiT (`gen.ImageEngine.setLoras`).
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
     var supportsLoRA: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo: return false
         default: return true
         }
     }
@@ -2282,12 +2304,19 @@ extension ImageModelPreset {
     /// The fixed step count for a distilled preset (its `.good` profile).
     var fixedSteps: Int { settings(.good).steps }
 
+    /// Lays out whole pages of text (infographics, slides, posters), verified
+    /// live: the Infographics templates and Enhance's layout rules follow it.
+    var rendersDenseText: Bool { variant == .qwenImage21 || variant == .qwenImage21Turbo }
+
     /// Starter prompts for the Examples menu, for the mode the pane is in.
     /// An instruction-tuned editor's repertoire IS its prompt vocabulary — the
     /// only way to discover that it can produce a depth map or de-rain a photo
     /// is to be shown the sentence that does it.
     func promptExamples(editing: Bool) -> [ImagePromptExampleGroup] {
-        guard editing && supportsReferenceEdit else { return ImagePromptExamples.textToImage }
+        guard editing && supportsReferenceEdit else {
+            return rendersDenseText ? ImagePromptExamples.textToImage + [ImagePromptExamples.infographics]
+                                    : ImagePromptExamples.textToImage
+        }
         switch variant {
         case .mageFlowEditTurbo: return ImagePromptExamples.mageFlowEdit
         default: return ImagePromptExamples.genericEdit

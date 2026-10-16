@@ -366,13 +366,7 @@ final class UpdateChecker: ObservableObject {
         mounted = false
 
         await MainActor.run { self.willRelaunch?() }
-        // Detached child survives our exit; the sleep lets this process quit
-        // fully before `open` starts the new bundle.
-        let relaunch = Process()
-        relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
-        relaunch.arguments = ["-c", "sleep 1; /usr/bin/open \"\(dest.path)\""]
-        try? relaunch.run()
-        await MainActor.run { NSApplication.shared.terminate(nil) }
+        await MainActor.run { AppRelaunch.relaunch(at: dest.path) }
     }
 
     /// Run a tool to completion without blocking the cooperative pool.

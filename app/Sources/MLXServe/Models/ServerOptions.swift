@@ -124,6 +124,9 @@ struct ServerOptions: Codable, Equatable {
     var aneImage: Bool = false
     var aneVideo: Bool = false
     var aneAudio: Bool = false
+    /// `--ane-slots`: requests each Neural Engine model runs at once. Slots share the weights and
+    /// the engines, so they split one stream's speed; each adds its own KV and state.
+    var aneSlots: Int = 1
 
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
@@ -507,6 +510,7 @@ struct ServerOptions: Codable, Equatable {
         aneImage == other.aneImage &&
         aneVideo == other.aneVideo &&
         aneAudio == other.aneAudio &&
+        aneSlots == other.aneSlots &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         hotPrefixCacheEnabled == other.hotPrefixCacheEnabled &&
@@ -676,6 +680,7 @@ struct ServerOptions: Codable, Equatable {
         if aneImage { args += ["--ane-image"] }
         if aneVideo { args += ["--ane-video"] }
         if aneAudio { args += ["--ane-audio"] }
+        if aneSlots > 1 { args += ["--ane-slots", "\(aneSlots)"] }
         // Decode attention requant: tri-state — undecided emits NOTHING (the
         // server default keeps laguna on and dsv4's comp_in dense); an
         // explicit choice emits its flag, and the positive form is what opts
@@ -892,6 +897,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneImage) { aneImage = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneVideo) { aneVideo = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .aneSlots) { aneSlots = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         let storedPrefixEntries = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries)
@@ -1113,6 +1119,10 @@ extension ServerOptions {
             explainer: "Generate music faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
+        "aneSlots": .init(
+            title: "Neural Engine requests at once",
+            explainer: "How many requests a model on the Neural Engine answers together; they share its speed, and each adds its own memory.",
+            needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
             explainer: "Speeds up replies that repeat text from the conversation, like code edits.",

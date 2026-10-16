@@ -1,5 +1,6 @@
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const std = @import("std");
+const crt = @import("crt.zig");
 const build_options = @import("build_options");
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
 pub const mlx = @import("mlx.zig");
@@ -11,6 +12,13 @@ const transformer_mod = @import("transformer.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");
+/// Sushi's EXL3 routed experts, for the plugins that reach them through their host root (`mlx_host`).
+pub const sushi_exl3 = @import("sushi_exl3");
+pub const dsa_nax = @import("dsa_nax.zig");
+comptime {
+    // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
+    @import("plugin_host_check.zig").reexports(@This());
+}
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -20,12 +28,25 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const ane_lm = @import("arch/ane_lm.zig");
+const status = @import("status.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
-const ds4_arch = if (build_options.embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const llama_arch = if (build_options.embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const ds4_arch = if (build_options.ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_options.llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
+
+// codesign names an executable after its embedded Info.plist; without one it makes up a new name for
+// every build, and the Neural Engine keeps compiled programs per signing name: each app update
+// recompiled every model on it.
+const info_plist = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" ++
+    "<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>com.dalcu.mlx-core.mlx-serve</string>" ++
+    "<key>CFBundleName</key><string>mlx-serve</string></dict></plist>\n").*;
+comptime {
+    if (@import("builtin").os.tag == .macos) @export(&info_plist, .{ .name = "mlx_serve_info_plist", .section = "__TEXT,__info_plist" });
+}
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
@@ -35,24 +56,25 @@ const ane_mod = @import("ane.zig");
 const ple_gpu = @import("ple_gpu.zig");
 
 pub const VERSION: []const u8 = build_options.version;
+/// `-Dplugin-profile`: the mlx-stream plugin's sdk reads this (`mlx_host.plugin_profile`) to compile its profile probes in.
+pub const plugin_profile: bool = build_options.plugin_profile;
 
 // ggml runtime version (llama.cpp), linked into the macOS exe. Referenced only
 // by the `--version` report, which runs before any engine init.
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
 
-// The embedded llama.cpp engine links on macOS and Linux builds (embedded_engines);
+// The embedded llama.cpp engine links on macOS, Linux and Windows builds (llama_engine);
 // elsewhere the stub engine replaces it, so the libllama symbols above are
 // not referenced and `--version` reports these placeholders instead.
 fn ggmlEngineVersion() []const u8 {
-    if (comptime !build_options.embedded_engines) return "unavailable (no embedded llama.cpp)";
+    if (comptime !build_options.llama_engine) return "unavailable (no embedded llama.cpp)";
     return std.mem.span(ggml_version());
 }
 fn ggmlEngineCommit() []const u8 {
-    if (comptime !build_options.embedded_engines) return "";
+    if (comptime !build_options.llama_engine) return "";
     return std.mem.span(ggml_commit());
 }
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // GGUF file-format version — the compiled `GGUF_VERSION` in
 // lib/llama/include/gguf.h. Keep in sync if a llama.cpp bump changes it.
@@ -79,6 +101,10 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
+// `--ane`: serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine; `--ane-slots`: requests each such
+// model runs at once. File-level for the same reason.
+var ane_serve: bool = false;
+var ane_slots: u32 = 1;
 // `--ane-image/--ane-video/--ane-audio` + `--ane-split`: the media DiTs' MLP
 // offload, published as ONE value (`ane.media_offload`) after the parse.
 var ane_media: ane_mod.MediaOffload = .{};
@@ -92,6 +118,7 @@ fn replThreadMain(allocator: std.mem.Allocator, io: std.Io, port: u16) void {
     cli_mod.runRepl(allocator, io, port) catch |err| {
         log.warn("chat REPL exited: {s}\n", .{@errorName(err)});
     };
+    if (comptime @import("builtin").os.tag == .windows) std.process.exit(0);
     std.posix.raise(std.posix.SIG.TERM) catch {};
 }
 
@@ -202,6 +229,14 @@ fn printUsage(io: std.Io) void {
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
         \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
+        \\  --ane               Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine
+        \\                        instead of the GPU (a model's "ane" setting in
+        \\                        model-settings.json wins). The first load on a
+        \\                        Mac builds and compiles its ANE programs (cached).
+        \\  --ane-slots <n>     Requests each Neural Engine model runs at once, 1..4
+        \\                        (default: 1). Slots share the weights; each adds
+        \\                        its own KV and state (2 slots: ~1.75x the
+        \\                        decode throughput on an M5 Ultra).
         \\  --ane-image         Run a share of each image DiT block's MLP on the
         \\  --ane-video           Neural Engine beside the GPU (Krea / MiniMax-H3 /
         \\  --ane-audio           ACE-Step; int8/fp16, lossy; off by default). The
@@ -456,6 +491,9 @@ fn printUsage(io: std.Io) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    crt.exportHomeDefault();
+    // Referenced, or the linker strips the unreferenced section.
+    if (@import("builtin").os.tag == .macos) std.mem.doNotOptimizeAway(&info_plist);
     const allocator = init.gpa;
     const io = init.io;
 
@@ -789,6 +827,14 @@ pub fn main(init: std.process.Init) !void {
             // are named [ane] log lines at load; MLX_SERVE_ANE_SPLIT tunes
             // the row share.
             ane_prefill = true;
+        } else if (std.mem.eql(u8, args[i], "--ane")) {
+            ane_serve = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-slots") and i + 1 < args.len) {
+            i += 1;
+            ane_slots = ane_lm.parseSlots(args[i]) catch {
+                log.err("--ane-slots: expected an integer 1..{d}, got '{s}'\n", .{ ane_lm.max_slots, args[i] });
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {
@@ -807,7 +853,7 @@ pub fn main(init: std.process.Init) !void {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
             // serial. deepseek_v4.initModel reads the env at model load.
-            _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+            crt.setEnv("MLX_SERVE_DSV4_DSPARK", "1");
             // Same flag, embedded engine: arm ds4's DSpark runtime when a
             // DSpark support GGUF sits beside a served .gguf model.
             ds4_dspark = true;
@@ -925,7 +971,7 @@ pub fn main(init: std.process.Init) !void {
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
+            status.os_reserve_override = status.parseOsReserveGib(args[i]) catch {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -1489,6 +1535,8 @@ pub fn main(init: std.process.Init) !void {
             .mtp_head_kv_quant = mtp_head_kv_quant,
             .mtp_depth = depth_bounds.active.max,
             .ane_prefill = ane_prefill,
+            .ane = ane_serve,
+            .ane_slots = ane_slots,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
             .ane_headroom_resolver = server_mod.aneGateHeadroom,
             .load_vision = load_vision,
@@ -1914,6 +1962,8 @@ fn runGenServe(
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
+        .ane = ane_serve,
+        .ane_slots = ane_slots,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
         .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
@@ -2061,6 +2111,8 @@ fn runHeadlessServe(
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
+        .ane = ane_serve,
+        .ane_slots = ane_slots,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
         .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,

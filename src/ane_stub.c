@@ -7,8 +7,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#ifndef _WIN32
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 typedef struct MsvAneMlp MsvAneMlp;
 typedef struct MsvAneBank MsvAneBank;
@@ -24,6 +26,64 @@ void msv_ane_cache_variant(const char *group, char *out, int out_len) {
     (void)group;
     (void)out;
     (void)out_len;
+}
+void msv_ane_cache_prune(void) {}
+void msv_ane_cache_sweep(void) {}
+
+// lib/ane/ane_bridge.h's LM engine programs (src/arch/ane_rt.zig).
+typedef struct msv_ane_program msv_ane_program;
+typedef struct msv_ane_request msv_ane_request;
+int msv_ane_bridge_available(void) { return 0; }
+void *msv_ane_bridge_surface(size_t bytes) {
+    (void)bytes;
+    return NULL;
+}
+msv_ane_program *msv_ane_program_create(const char *name, const char *mil, void *weights,
+                                        size_t weight_bytes, uint32_t instances,
+                                        const uint32_t *ane_hints, char *error, size_t error_size) {
+    (void)name; (void)mil; (void)weights; (void)weight_bytes; (void)instances; (void)ane_hints;
+    if (error != NULL && error_size > 0)
+        snprintf(error, error_size, "ANE unavailable on this platform");
+    return NULL;
+}
+void msv_ane_program_free(msv_ane_program *program) { (void)program; }
+int msv_ane_program_procedure(msv_ane_program *program, const char *function) {
+    (void)program; (void)function;
+    return -1;
+}
+uint32_t msv_ane_program_io_count(msv_ane_program *program, uint32_t procedure, int output) {
+    (void)program; (void)procedure; (void)output;
+    return 0;
+}
+int msv_ane_program_io(msv_ane_program *program, uint32_t procedure, int output,
+                       uint32_t index, void *out) {
+    (void)program; (void)procedure; (void)output; (void)index; (void)out;
+    return -1;
+}
+msv_ane_request *msv_ane_request_create(msv_ane_program *program, uint32_t instance,
+                                        uint32_t procedure, void *const *inputs, uint32_t n_in,
+                                        void *const *outputs, uint32_t n_out,
+                                        char *error, size_t error_size) {
+    (void)program; (void)instance; (void)procedure; (void)inputs; (void)n_in;
+    (void)outputs; (void)n_out;
+    if (error != NULL && error_size > 0)
+        snprintf(error, error_size, "ANE unavailable on this platform");
+    return NULL;
+}
+int msv_ane_request_eval(msv_ane_request *request, char *error, size_t error_size) {
+    (void)request;
+    if (error != NULL && error_size > 0)
+        snprintf(error, error_size, "ANE unavailable on this platform");
+    return -1;
+}
+void msv_ane_request_free(msv_ane_request *request) { (void)request; }
+double msv_ane_program_compile_seconds(const msv_ane_program *program) {
+    (void)program;
+    return 0;
+}
+_Bool msv_ane_program_cache_hit(const msv_ane_program *program) {
+    (void)program;
+    return 0;
 }
 
 MsvAnePlane *msv_ane_plane_create(size_t bytes) {
@@ -111,6 +171,7 @@ uint64_t msv_volume_free_for_use(const char *path) {
     return 0;
 }
 
+#ifndef _WIN32
 // Avahi's libdns_sd compat layer (Linux Bonjour) does not implement
 // DNSServiceGetAddrInfo, so resolve the peer's host with getaddrinfo (nss-mdns /
 // systemd-resolved answer .local) and deliver every IPv4 answer synchronously:
@@ -135,3 +196,4 @@ int DNSServiceGetAddrInfo(void **ref, unsigned int flags, unsigned int interface
     freeaddrinfo(res);
     return 0;
 }
+#endif

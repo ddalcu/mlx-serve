@@ -772,7 +772,8 @@ pub const ImageEngine = struct {
             const arch: lora_mod.Arch = switch (self.backend) {
                 .flux => .flux2,
                 .krea => .krea2,
-                .mage_flow, .qwen_image => .generic,
+                .mage_flow => .generic,
+                .qwen_image => .qwen_image21,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -784,8 +785,10 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
-            .qwen_image => 0, // no LoRA key mapping yet (matches mflux)
+            .qwen_image => |q| q.dit.attachLora(&stack),
         };
+        if (matched != 0 and matched != stack.entryCount())
+            log.warn("[lora] attached {d} of {d} adapter module(s); the rest target modules this model does not have\n", .{ matched, stack.entryCount() });
         if (matched == 0) {
             stack.deinit();
             return error.LoraNoMatch;
@@ -799,7 +802,8 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
-            .mage_flow, .qwen_image => {}, // no LoRA attached
+            .qwen_image => |q| q.dit.detachLora(),
+            .mage_flow => {}, // no LoRA attached
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -1588,14 +1592,14 @@ pub const LtxVideoEngine = struct {
         self.model_dir = try allocator.dupe(u8, model_dir);
         errdefer allocator.free(self.model_dir);
 
-        const cpu_s = mlx.mlx_default_cpu_stream_new();
+        const load_s = mlx.weightLoadStream();
         self.s = mlx.mlx_default_gpu_stream_new();
 
         // Initial transformer: prefer DISTILLED (the correct one-stage default —
         // the dev model without CFG produces visibly worse output); fall back to
         // dev for bundles downloaded before transformer-distilled shipped.
         const initial: TransformerVariant = if (self.hasVariant(io, .distilled)) .distilled else .dev;
-        self.transformer = try loadTransformerVariant(allocator, model_dir, initial, cpu_s);
+        self.transformer = try loadTransformerVariant(allocator, model_dir, initial, load_s);
         self.transformer_variant = initial;
         errdefer self.transformer.deinit();
         if (initial == .dev)
@@ -1603,23 +1607,23 @@ pub const LtxVideoEngine = struct {
 
         const cp = try std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{model_dir}, 0);
         defer allocator.free(cp);
-        self.connector = try ltx.loadComponent(allocator, cp, cpu_s);
+        self.connector = try ltx.loadComponent(allocator, cp, load_s);
         errdefer self.connector.deinit();
         const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_decoder.safetensors", .{model_dir}, 0);
         defer allocator.free(vp);
-        self.vae = try ltx.loadComponent(allocator, vp, cpu_s);
+        self.vae = try ltx.loadComponent(allocator, vp, load_s);
         errdefer self.vae.deinit();
         var it = self.vae.map.iterator();
         while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*); // VAE conv graph wants materialized weights
 
         // Optional audio VAE + vocoder → the generated video gets a sound track.
         // Absent (video-only checkpoints, or not yet downloaded) is graceful.
-        self.audio = loadAudioVae(io, allocator, model_dir, cpu_s);
+        self.audio = loadAudioVae(io, allocator, model_dir, load_s);
         errdefer if (self.audio) |*a| a.deinit();
 
         // Optional VAE encoder → image-to-video (first-frame conditioning) and
         // the two-stage latent (de)normalization. Absent is graceful → t2v only.
-        self.vae_encoder = loadVaeEncoder(io, allocator, model_dir, cpu_s);
+        self.vae_encoder = loadVaeEncoder(io, allocator, model_dir, load_s);
         errdefer if (self.vae_encoder) |*e| e.deinit();
 
         self.tok = try tok_mod.loadTokenizerAny(io, allocator, self.gemma_dir);
@@ -1640,8 +1644,8 @@ pub const LtxVideoEngine = struct {
         if (self.transformer_variant == want) return;
         log.info("[video] swapping transformer: {s} -> {s}\n", .{ @tagName(self.transformer_variant), @tagName(want) });
         self.transformer.deinit();
-        const cpu_s = mlx.mlx_default_cpu_stream_new();
-        self.transformer = try loadTransformerVariant(self.allocator, self.model_dir, want, cpu_s);
+        const load_s = mlx.weightLoadStream();
+        self.transformer = try loadTransformerVariant(self.allocator, self.model_dir, want, load_s);
         self.transformer_variant = want;
         // The fresh Component boots with `lora = null` — re-install the
         // attached adapter so a mid-pipeline swap (Stage2Swap) keeps it.
@@ -1702,8 +1706,8 @@ pub const LtxVideoEngine = struct {
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}.safetensors", .{ self.model_dir, ltx.UPSAMPLER_PREFIX }, 0) catch return error.MissingUpsampler;
         if (!fileExists(io, p)) return error.MissingUpsampler;
-        const cpu_s = mlx.mlx_default_cpu_stream_new();
-        var comp = try ltx.loadComponent(self.allocator, p, cpu_s);
+        const load_s = mlx.weightLoadStream();
+        var comp = try ltx.loadComponent(self.allocator, p, load_s);
         var it = comp.map.iterator();
         while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*); // conv graph wants materialized weights
         self.upsampler = comp;
@@ -1719,8 +1723,8 @@ pub const LtxVideoEngine = struct {
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ self.model_dir, diffvae_fwd.FILE_NAME }, 0) catch return error.MissingDiffusionDecoder;
         if (!fileExists(io, p)) return error.MissingDiffusionDecoder;
-        const cpu_s = mlx.mlx_default_cpu_stream_new();
-        self.diffusion_decoder = try diffvae_fwd.load(self.allocator, p, cpu_s);
+        const load_s = mlx.weightLoadStream();
+        self.diffusion_decoder = try diffvae_fwd.load(self.allocator, p, load_s);
         return &self.diffusion_decoder.?;
     }
 
@@ -1740,23 +1744,23 @@ pub const LtxVideoEngine = struct {
     }
 };
 
-fn loadTransformerVariant(allocator: std.mem.Allocator, model_dir: []const u8, variant: TransformerVariant, cpu_s: mlx.mlx_stream) !ltx.Component {
+fn loadTransformerVariant(allocator: std.mem.Allocator, model_dir: []const u8, variant: TransformerVariant, load_s: mlx.mlx_stream) !ltx.Component {
     const tp = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, variant.fileName() }, 0);
     defer allocator.free(tp);
-    return ltx.loadComponent(allocator, tp, cpu_s);
+    return ltx.loadComponent(allocator, tp, load_s);
 }
 
 /// Load the LTX VAE encoder (`vae_encoder.safetensors`, ~0.6 GB, MLX-layout
 /// bf16) from the model dir for image-to-video. Absent → null (I2V disabled,
 /// text-to-video unaffected). Mirrors `loadAudioVae`.
-fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, cpu_s: mlx.mlx_stream) ?ltx.Component {
+fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, load_s: mlx.mlx_stream) ?ltx.Component {
     var p: [1024]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&p, "{s}/vae_encoder.safetensors", .{model_dir}, 0) catch return null;
     if (!fileExists(io, path)) {
         log.info("[video] no vae_encoder.safetensors in {s} — image-to-video disabled (text-to-video only)\n", .{model_dir});
         return null;
     }
-    var comp = ltx.loadComponent(allocator, path, cpu_s) catch |e| {
+    var comp = ltx.loadComponent(allocator, path, load_s) catch |e| {
         log.warn("[video] vae_encoder load failed ({}) — image-to-video disabled\n", .{e});
         return null;
     };
@@ -2228,7 +2232,7 @@ fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h
 /// Load the LTX audio VAE + vocoder (`audio_vae.safetensors` + `vocoder.safetensors`,
 /// the q4 MLX-layout files from `dgrauet/ltx-2.3-mlx-q4`) from the model dir, or
 /// from `$LTX_AUDIO_DIR`. Both files absent → null (the video stays silent).
-fn loadAudioVae(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, cpu_s: mlx.mlx_stream) ?ltx.Component {
+fn loadAudioVae(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, load_s: mlx.mlx_stream) ?ltx.Component {
     // The directory holding the two audio files: model dir, or an override.
     const dir: []const u8 = if (std.c.getenv("LTX_AUDIO_DIR")) |env| blk: {
         const e = std.mem.span(env);
@@ -2242,7 +2246,7 @@ fn loadAudioVae(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8,
         log.info("[video] no audio VAE/vocoder in {s} — generated video will be silent\n", .{dir});
         return null;
     }
-    var comp = ltx_audio.loadAudioComponents(allocator, audio_path, voc_path, cpu_s) catch |e| {
+    var comp = ltx_audio.loadAudioComponents(allocator, audio_path, voc_path, load_s) catch |e| {
         log.warn("[video] audio VAE load failed ({}) — video will be silent\n", .{e});
         return null;
     };
@@ -2676,9 +2680,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             engine.backend.qwen_image.dit_cfg,
             if (guidance_scale != 1) 2 else 1,
         );
-        var active: usize = 0;
-        _ = mlx.mlx_get_active_memory(&active);
-        const headroom: u64 = mlx.maxRecommendedWorkingSet() -| @as(u64, active);
+        const headroom = gpuHeadroomBytes();
         const plan = planQwenImageEdit(steps, cache_enabled, base_bill, prefix_bill, headroom) catch {
             log.info("[image] edit bill refused: {d} refs at refres {d} + {d}x{d} target needs {d} MB over the reserve, headroom {d} MB\n", .{
                 gen_opts.edit_image_bytes.len, gen_opts.ref_resolution, width, height, (base_bill -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES) >> 20, headroom >> 20,
@@ -2691,6 +2693,21 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             log.info("[image] edit prefix cache does not fit; using uncached forward (cached bill {d} MB over reserve, headroom {d} MB)\n", .{
                 ((base_bill +| prefix_bill) -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES) >> 20, headroom >> 20,
             });
+        }
+    }
+    // Text-to-image: a canvas past the default size the load reserved can run
+    // past the working set, and that Metal OOM mid-denoise is uncatchable.
+    if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len == 0) {
+        const need = qwenImageGenTransientBytes(width, height);
+        const headroom = gpuHeadroomBytes();
+        if (need > headroom) {
+            log.info("[image] bill refused: {d}x{d} needs {d} MB, headroom {d} MB\n", .{ width, height, need >> 20, headroom >> 20 });
+            const gb = 1024.0 * 1024.0 * 1024.0;
+            var buf: [192]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "{d}x{d} needs ~{d:.1} GB of GPU memory but {d:.1} GB is free: shrink 'size' or unload another model", .{
+                width, height, @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(headroom)) / gb,
+            }) catch "this canvas needs more GPU memory than is free: shrink 'size'";
+            return sendError(conn, 400, msg);
         }
     }
     log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
@@ -4657,7 +4674,7 @@ pub fn freeStubCpuState(allocator: std.mem.Allocator, s: *StubCpuState) void {
 /// transformer/, vae/, text_encoder/; LTX keeps them top-level). Returns 0 on
 /// any read failure (treated as "unknown" → the registry skips the byte cap).
 pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
-    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     return sumSafetensorsIn(io, dir);
@@ -4709,8 +4726,26 @@ pub fn stagedPeakBytes(resident: u64, stages: []const u64) u64 {
     return resident + biggest;
 }
 
-/// A 1024² denoise plus the f32 VAE decode, on top of the weights.
-const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = 4 << 30;
+/// What a text-to-image request holds above the weights. The denoise is the
+/// peak (the banded VAE decode stays below it) and grows per joint token: the
+/// canvas's latents plus a full-length prompt.
+const QWEN_IMAGE_GEN_TOKEN_BYTES: u64 = 640 << 10;
+const QWEN_IMAGE_GEN_BASE_BYTES: u64 = 1 << 30;
+
+pub fn qwenImageGenTransientBytes(width: u32, height: u32) u64 {
+    const latents: u64 = @as(u64, width / qwen_image.VAE_DOWNSAMPLE) * (height / qwen_image.VAE_DOWNSAMPLE);
+    return QWEN_IMAGE_GEN_BASE_BYTES + (latents + qwen_image.MAX_PROMPT_TOKENS) * QWEN_IMAGE_GEN_TOKEN_BYTES;
+}
+
+/// The load plan reserves a default-size request.
+const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = qwenImageGenTransientBytes(1024, 1024);
+
+/// What the GPU can still take: Metal's working set less live MLX memory.
+fn gpuHeadroomBytes() u64 {
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    return mlx.maxRecommendedWorkingSet() -| @as(u64, active);
+}
 
 /// Qwen-Image-2.1's text encoder is half the pack and idle for the whole
 /// denoise, so a machine the full set would crowd (past 3/4 of the GPU working
@@ -5010,7 +5045,7 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
 /// readable — 0 means "unknown", which every caller treats as "do not block".
 pub fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
-    if (path.len == 0 or path[0] != '/') return 0; // openDirAbsolute UB class
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return 0; // openDirAbsolute UB class
     var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return 0;
     defer d.close(io);
     return sumSafetensorsIn(io, d);
@@ -5034,7 +5069,7 @@ fn ltxTextEncoderBytes(io: std.Io) u64 {
 }
 
 pub fn estimatePeakResidentBytes(io: std.Io, model_dir: []const u8, model_type: []const u8) u64 {
-    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     const in_dir = estimatePeakResidentBytesInDir(io, dir, model_type, model_dir);
@@ -5708,6 +5743,23 @@ test "parseLoraFields: a LoRA path is accepted only from this machine (#540)" {
     }
     // No LoRA fields detaches, from anyone.
     try testing.expectEqual(@as(usize, 0), try parseLoraFields(a, "{\"prompt\":\"p\"}", &paths, &scales, false));
+}
+
+test "parseLoraFields: scales may be negative or far beyond 1, in every request shape" {
+    const a = testing.allocator;
+    var paths: [lora_mod.MAX_LORAS][]u8 = undefined;
+    var scales: [lora_mod.MAX_LORAS]f32 = undefined;
+    const Case = struct { body: []const u8, want: []const f32 };
+    const cases = [_]Case{
+        .{ .body = "{\"lora_paths\":[\"/a\",\"/b\"],\"lora_scales\":[-1, 20]}", .want = &.{ -1, 20 } },
+        .{ .body = "{\"lora_paths\":[\"/a\",\"/b\"],\"lora_scales\":\"-20 12.5\"}", .want = &.{ -20, 12.5 } },
+        .{ .body = "{\"lora_path\":\"/a\",\"lora_scale\":-12.5}", .want = &.{-12.5} },
+    };
+    for (cases) |c| {
+        const n = try parseLoraFields(a, c.body, &paths, &scales, true);
+        defer for (paths[0..n]) |p| a.free(p);
+        try testing.expectEqualSlices(f32, c.want, scales[0..n]);
+    }
 }
 
 test "openaiEditFormToJson: everything we can't honor is an explicit error" {
@@ -6544,10 +6596,10 @@ test "Qwen-Image stages its text encoder only where the full set crowds the GPU"
     try std.testing.expectEqual(18 * GB, qwenImagePeakBytesForStaging(9 * GB, 9 * GB, true));
     // Same pack with room to spare: resident, and the bill is everything.
     try std.testing.expect(!qwenImageStagesTextEncoderFromInputs(18 * GB, 48 * GB, null));
-    try std.testing.expectEqual(22 * GB, qwenImagePeakBytesForStaging(9 * GB, 9 * GB, false));
+    try std.testing.expectEqual(18 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImagePeakBytesForStaging(9 * GB, 9 * GB, false));
     // The 4-bit pack on a 16 GB Mac; a small encoder still bills the denoise.
     try std.testing.expect(qwenImageStagesTextEncoderFromInputs(10 * GB, 11 * GB, null));
-    try std.testing.expectEqual(8 * GB, qwenImagePeakBytesForStaging(2 * GB, 4 * GB, true));
+    try std.testing.expectEqual(4 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImagePeakBytesForStaging(2 * GB, 4 * GB, true));
     // Unknown working set never stages.
     try std.testing.expect(!qwenImageStagesTextEncoderFromInputs(18 * GB, 0, null));
 }
@@ -6564,7 +6616,21 @@ test "Qwen-Image low-memory override forces staging without disabling automatic 
     // An encoder larger than the denoise allowance still coexists with the
     // DiT/VAE while encoding; never bill only the smaller denoise residency.
     try std.testing.expectEqual(10 * GB, qwenImagePeakBytesForStaging(5 * GB, 5 * GB, staged));
-    try std.testing.expectEqual(9 * GB, qwenImagePeakBytesForStaging(3 * GB, 5 * GB, staged));
+    try std.testing.expectEqual(5 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImagePeakBytesForStaging(3 * GB, 5 * GB, staged));
+}
+
+test "Qwen-Image text-to-image bill covers the measured peak at every canvas" {
+    const GiB: f64 = 1 << 30;
+    // Peaks above the weights with a full-length prompt, the same on the 4- and 8-bit packs.
+    const measured = [_]struct { w: u32, h: u32, peak: f64 }{
+        .{ .w = 1024, .h = 1024, .peak = 4.40 },
+        .{ .w = 2048, .h = 2048, .peak = 11.85 },
+    };
+    for (measured) |m| {
+        const bill = @as(f64, @floatFromInt(qwenImageGenTransientBytes(m.w, m.h))) / GiB;
+        try testing.expect(bill >= m.peak);
+        try testing.expect(bill < m.peak * 1.1);
+    }
 }
 
 test "Qwen-Image edit dims: explicit floors to /32, no size follows the last reference at 1024²" {
@@ -6608,13 +6674,13 @@ test "Qwen-Image edit residency: the tower pack's heavier transient on the same 
     // Resident: everything coexists — the t2i bill plus the 2 GiB the tower's
     // reference-image working set adds.
     try testing.expectEqual(24 * GB, qwenImageEditPeakBytes(9 * GB, 9 * GB, 48 * GB, true));
-    // No tower: the edit bill IS the t2i bill (transient stays 4 GiB).
-    try testing.expectEqual(22 * GB, qwenImageEditPeakBytes(9 * GB, 9 * GB, 48 * GB, false));
+    // No tower: the edit bill IS the t2i bill.
+    try testing.expectEqual(18 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImageEditPeakBytes(9 * GB, 9 * GB, 48 * GB, false));
     try testing.expectEqual(qwenImagePeakBytes(9 * GB, 9 * GB, 48 * GB), qwenImageEditPeakBytes(9 * GB, 9 * GB, 48 * GB, false));
     // Staged 4-bit pack (TE 2 + rest 4): the 6 GiB edit transient becomes the
-    // biggest stage, where t2i's 4 GiB never was.
+    // biggest stage, above t2i's reserve.
     try testing.expectEqual(10 * GB, qwenImageEditPeakBytes(2 * GB, 4 * GB, 11 * GB, true));
-    try testing.expectEqual(8 * GB, qwenImageEditPeakBytes(2 * GB, 4 * GB, 11 * GB, false));
+    try testing.expectEqual(4 * GB + QWEN_IMAGE_GEN_TRANSIENT_BYTES, qwenImageEditPeakBytes(2 * GB, 4 * GB, 11 * GB, false));
 }
 
 test "Qwen-Image edit transient: the request-scope bill scales with refs x ref tokens" {

@@ -3,11 +3,12 @@
 //! prework + recurrence + norm-gate + rotation. K1 runs one head over SPLIT threadgroups, each
 //! recomputing the conv/silu/q-k norm prework for its head (cheaper than a
 //! barrier between kernels) before its slice of the recurrence rows. K2 does
-//! the per-head gated RMS norm for a 1024 block (8 heads) and rotates it for
-//! out_proj. Bit-identical to the composed chain.
+//! the per-head gated RMS norm over one Hadamard block of heads and rotates it
+//! for out_proj. Bit-identical to the composed chain.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const rht = @import("rht.zig");
 
 const HEADER =
     \\inline float msv_log1p(float x) {
@@ -105,13 +106,13 @@ const K1_SOURCE =
 ;
 
 const K2_SOURCE =
-    \\constexpr int J = 32, S = 4, P = J / S;
-    \\threadgroup float tg[1024];
+    \\constexpr int S = 4, P = J / S, HPS = J * 32 / (DV * S);
+    \\threadgroup float tg[J * 32];
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint base = threadgroup_position_in_grid.x * 1024;
-    \\for (int hh = 0; hh < 2; ++hh) {
-    \\  uint hb = base + (sg * 2 + hh) * DV;
+    \\uint base = threadgroup_position_in_grid.x * (J * 32);
+    \\for (int hh = 0; hh < HPS; ++hh) {
+    \\  uint hb = base + (sg * HPS + hh) * DV;
     \\  float xs[4];
     \\  float sumsq = 0.0f;
     \\  for (int i = 0; i < 4; ++i) { xs[i] = float(y[hb + lane * 4 + i]); sumsq += xs[i] * xs[i]; }
@@ -137,7 +138,7 @@ const K2_SOURCE =
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\for (int p = 0; p < P; ++p) tg[(sg * P + p) * 32 + lane] = v[p];
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const float scale = rsqrt(1024.0f);
+    \\const float scale = rsqrt(float(J * 32));
     \\for (uint p = sg; p < P; p += S) {
     \\  float w[S];
     \\  for (int q = 0; q < S; ++q) w[q] = tg[(q * P + p) * 32 + lane];
@@ -478,11 +479,12 @@ pub const Outputs = struct { rot: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_
 const CfgKey = struct { g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype };
 var cfg_key: ?CfgKey = null;
 var cfg1: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
+const Cfg2Key = struct { vd: c_int, dv: c_int, dt: mlx.mlx_dtype, block: c_int };
+var cfg2_key: ?Cfg2Key = null;
 var cfg2: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
 
 fn buildConfigs(g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
-    const vd = g.hv * g.dv;
     const c1 = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c1);
     const y_shape = [_]c_int{ 1, 1, g.hv, g.dv };
@@ -498,19 +500,24 @@ fn buildConfigs(g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "GT", gateDtype(dt, st)));
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c1, kv[0], kv[1]));
+    if (cfg1.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(cfg1);
+    cfg1 = c1;
+    cfg_key = .{ .g = g, .dt = dt, .st = st };
+}
+
+fn buildConfig2(key: Cfg2Key) !void {
     const c2 = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c2);
-    const rot_shape = [_]c_int{ 1, 1, vd };
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c2, &rot_shape, 3, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c2, @divExact(vd, 1024) * 128, 1, 1));
+    const rot_shape = [_]c_int{ 1, 1, key.vd };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c2, &rot_shape, 3, key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c2, @divExact(key.vd, key.block) * 128, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c2, 128, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c2, "T", dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c2, "DV", g.dv));
-    if (cfg1.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(cfg1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c2, "T", key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c2, "DV", key.dv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c2, "J", @divExact(key.block, 32)));
     if (cfg2.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(cfg2);
-    cfg1 = c1;
     cfg2 = c2;
-    cfg_key = .{ .g = g, .dt = dt, .st = st };
+    cfg2_key = key;
 }
 
 pub const Recur = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array };
@@ -550,16 +557,20 @@ pub fn recur(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Recur {
 }
 
 /// Null when the geometry or dtypes are outside the kernels (caller keeps the chain).
-pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
+/// `block`: the pack's Hadamard block, a whole number of heads per simdgroup.
+pub fn step(g: Geometry, block: c_int, in: Inputs, s: mlx.mlx_stream) !?Outputs {
     if (!mlx.streamIsGpu(s)) return null;
     for ([_]mlx.mlx_array{ in.z, in.norm_w }) |arr|
         if (mlx.mlx_array_dtype(arr) != mlx.mlx_array_dtype(in.qkv)) return null;
     if (!inputsFit(g, 1, in, true) or !sizeIs(in.signs, g.hv * g.dv)) return null;
+    if (!rht.kernelBlock(block) or @rem(g.hv * g.dv, block) != 0 or @rem(block, 4 * g.dv) != 0) return null;
     const r = (try recur(g, in, s)) orelse return null;
     defer _ = mlx.mlx_array_free(r.y);
     errdefer _ = mlx.mlx_array_free(r.conv_state);
     errdefer _ = mlx.mlx_array_free(r.ssm_state);
     if (k2_cache == null) k2_cache = try makeKernel("msv_gdn_decode_normgate_rot", &.{ "y", "z", "norm_w", "eps", "signs" }, &.{"rot"}, K2_SOURCE, "");
+    const key2 = Cfg2Key{ .vd = g.hv * g.dv, .dv = g.dv, .dt = mlx.mlx_array_dtype(in.qkv), .block = block };
+    if (cfg2_key == null or !std.meta.eql(cfg2_key.?, key2)) try buildConfig2(key2);
 
     const in2 = [_]mlx.mlx_array{ r.y, in.z, in.norm_w, in.eps, in.signs };
     const v2 = mlx.mlx_vector_array_new_data(&in2, in2.len);
