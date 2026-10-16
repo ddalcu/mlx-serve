@@ -2734,3 +2734,10 @@ Cause: three model-row emitters spliced the id raw with `"id":"{s}"`; and `handl
 Fix: the emitters write `jsonEscape(id)`; `unescapeJsonSlashes` also collapses `\\`; the proxies take the raw body slice and splice the re-escaped bare id; `rewriteModelValue` returns `error.ModelValueNotInBody` instead of computing an offset outside the body.
 Guard: `renderModelEntry: a Windows path id stays valid JSON`, `lan: rewriteModelValue refuses a model value that is not a slice of the body`, the Windows case in `lan: JSON-escaped slashes canonicalize`.
 
+## A cancelled H3 video kept the GPU for the rest of its step
+
+Defect: pressing Cancel on a large H3 clip showed "cancelled" in the app while the server kept generating for minutes.
+Cause: the denoise loop polled `Progress.boundary` only between steps, and one step is ONE lazy graph over all 60 DiT blocks, evaluated at the end; at 1120x640 x 192f a step ran 2 to 9 minutes. Polling more often inside the graph build would not help, since nothing runs until the eval.
+Fix: `Model.forward` takes the progress probe and, when given one, evaluates the residual stream after each block and returns `error.Cancelled` when the client left. Same bits, no measurable cost (median step 33.6 s vs 33.8 s at 640x352 x 97f streamed); a disconnect now lands in about a second. The first early return also hit a latent double free: the input pieces were freed after the concat but stayed under their `errdefer`.
+Guard: `minimax h3: a cancel lands between DiT blocks, and polling it leaves the forward unchanged`.
+
