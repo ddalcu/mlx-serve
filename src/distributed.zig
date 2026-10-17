@@ -82,6 +82,34 @@ pub const LayerSpan = struct {
     }
 };
 
+/// Tensor-parallel rank: its slice of every MoE expert's intermediate width (gate/up
+/// rows, down columns), the routed experts and the shared one alike.
+pub const Shard = struct {
+    rank: u32,
+    size: u32,
+
+    /// Which projection of an expert `key` names: gate/up split their rows, down its columns.
+    pub fn expertAxis(key: []const u8) ?enum { rows, cols } {
+        if (std.mem.startsWith(u8, key, "mtp.") or std.mem.indexOf(u8, key, ".mtp.") != null) return null;
+        if (std.mem.indexOf(u8, key, ".switch_mlp.") == null and std.mem.indexOf(u8, key, ".shared_expert.") == null) return null;
+        const tail = for ([_][]const u8{ ".weight", ".scales", ".biases" }) |sfx| {
+            if (std.mem.endsWith(u8, key, sfx)) break key[0 .. key.len - sfx.len];
+        } else return null;
+        if (std.mem.endsWith(u8, tail, ".gate_proj") or std.mem.endsWith(u8, tail, ".up_proj")) return .rows;
+        if (std.mem.endsWith(u8, tail, ".down_proj")) return .cols;
+        return null;
+    }
+
+    /// Copies this rank's part of axis `mid` of a row-major `[outer, mid, inner]` buffer.
+    pub fn slice(self: Shard, out: []u8, buf: []const u8, outer: usize, mid: usize, inner: usize) void {
+        const part = mid / self.size;
+        for (0..outer) |o| {
+            const src = (o * mid + self.rank * part) * inner;
+            @memcpy(out[o * part * inner ..][0 .. part * inner], buf[src..][0 .. part * inner]);
+        }
+    }
+};
+
 /// The digits of the first `layers.<N>.` in `key`.
 fn trunkLayerAt(key: []const u8) ?struct { lo: usize, hi: usize } {
     var from: usize = 0;
@@ -177,6 +205,7 @@ const VERSION: i32 = 1;
 const Msg = [8]i32;
 const OP_FORWARD: i32 = 1;
 const OP_STOP: i32 = 2;
+const OP_MOE: i32 = 3;
 
 fn sendMsg(link: *const Link, m: Msg, dst: u32, s: mlx.mlx_stream) !void {
     const shape = [_]c_int{8};
@@ -237,7 +266,9 @@ pub fn chooseSplit(layers: u32, interval: u32, avail0: u64, avail1: u64) u32 {
 pub const Peer = struct {
     link: Link,
     mode: Mode,
+    /// Pipeline: this rank's layers. Tensor: every layer (`span.end == span.total`).
     span: LayerSpan,
+    shard: ?Shard = null,
     model_dir: []const u8,
     ready: bool = false,
     /// Tokens the worker's caches hold. Every forward must continue them or start over at 0.
@@ -252,23 +283,42 @@ pub const Peer = struct {
             return error.DistPeerDiverged;
         }
         const sh = mlx.getShape(h);
-        const hdr_host: Msg = .{ OP_FORWARD, sh[0], sh[1], @intCast(offset & 0x7fffffff), @intCast(offset >> 31), sh[2], @intFromEnum(mlx.mlx_array_dtype(h)), 0 };
+        try self.sendOrdered(.{ OP_FORWARD, sh[0], sh[1], @intCast(offset & 0x7fffffff), @intCast(offset >> 31), sh[2], @intFromEnum(mlx.mlx_array_dtype(h)), 0 }, &.{h});
+        self.peer_pos = offset + @as(usize, @intCast(sh[1]));
+        return self.link.recv(sh, mlx.mlx_array_dtype(h), 1, s);
+    }
+
+    /// Tensor mode: one MoE layer's input and router logits to the worker.
+    pub fn sendMoe(self: *Peer, x: mlx.mlx_array, logits: mlx.mlx_array, layer: u32) !void {
+        if (!self.ready) try self.awaitReady(.{ .ctx = null });
+        const xs = mlx.getShape(x);
+        const ls = mlx.getShape(logits);
+        try self.sendOrdered(.{ OP_MOE, xs[0], xs[1], xs[2], ls[ls.len - 1], @intFromEnum(mlx.mlx_array_dtype(x)), @intCast(layer), @intFromEnum(mlx.mlx_array_dtype(logits)) }, &.{ x, logits });
+    }
+
+    /// The worker's reply, shaped like this rank's own partial.
+    pub fn recvLike(self: *Peer, like: mlx.mlx_array) !mlx.mlx_array {
+        return self.link.recv(mlx.getShape(like), mlx.mlx_array_dtype(like), 1, .{ .ctx = null });
+    }
+
+    /// Header, then each payload, chained so the comm stream runs them in order, and
+    /// queued now (async) so a receive built after them cannot overtake them.
+    fn sendOrdered(self: *Peer, hdr_host: Msg, payload: []const mlx.mlx_array) !void {
         const shape = [_]c_int{8};
         const hdr = mlx.mlx_array_new_data(&hdr_host, &shape, 1, .int32);
         defer _ = mlx.mlx_array_free(hdr);
-        const hdr_sent = try self.link.send(hdr, 1, s);
-        defer _ = mlx.mlx_array_free(hdr_sent);
-        const ordered = try dependsOn(h, hdr_sent);
-        defer _ = mlx.mlx_array_free(ordered);
-        const sent = try self.link.send(ordered, 1, s);
-        defer _ = mlx.mlx_array_free(sent);
-        {
-            const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{sent}, 1);
-            defer _ = mlx.mlx_vector_array_free(v);
-            try mlx.check(mlx.mlx_async_eval(v));
+        var last = try self.link.send(hdr, 1, .{ .ctx = null });
+        defer _ = mlx.mlx_array_free(last);
+        for (payload) |p| {
+            const ordered = try dependsOn(p, last);
+            defer _ = mlx.mlx_array_free(ordered);
+            const sent = try self.link.send(ordered, 1, .{ .ctx = null });
+            _ = mlx.mlx_array_free(last);
+            last = sent;
         }
-        self.peer_pos = offset + @as(usize, @intCast(sh[1]));
-        return self.link.recv(sh, mlx.mlx_array_dtype(h), 1, s);
+        const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{last}, 1);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_async_eval(v));
     }
 
     fn awaitReady(self: *Peer, s: mlx.mlx_stream) !void {
@@ -277,7 +327,10 @@ pub const Peer = struct {
             log.err("[dist] the worker failed to load its layers (code {d})\n", .{m[1]});
             return error.DistWorkerLoadFailed;
         }
-        log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ self.span.end, self.span.total, m[2] });
+        if (self.mode == .pipeline)
+            log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ self.span.end, self.span.total, m[2] })
+        else
+            log.info("[dist] worker ready: its half of every expert resident, {d} MiB\n", .{m[2]});
         self.ready = true;
     }
 };
@@ -305,15 +358,24 @@ pub fn peer() ?*Peer {
 
 /// The trunk span this process serves for `model_dir`, if it is the distributed model.
 pub fn spanFor(model_dir: []const u8) ?LayerSpan {
+    const p = peerFor(model_dir) orelse return null;
+    return if (p.mode == .pipeline) p.span else null;
+}
+
+/// The expert slice this process serves for `model_dir`, in tensor mode.
+pub fn shardFor(model_dir: []const u8) ?Shard {
+    const p = peerFor(model_dir) orelse return null;
+    return p.shard;
+}
+
+fn peerFor(model_dir: []const u8) ?*Peer {
     const p = peer() orelse return null;
-    if (!std.mem.eql(u8, std.fs.path.basename(p.model_dir), std.fs.path.basename(model_dir))) return null;
-    return p.span;
+    return if (std.mem.eql(u8, std.fs.path.basename(p.model_dir), std.fs.path.basename(model_dir))) p else null;
 }
 
 /// Rank 0 at startup: joins the group, checks the worker found the same model,
 /// splits the layers by free memory (or at `split`), and tells the worker its span.
 pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model_dir: []const u8, split: ?u32) !void {
-    if (mode != .pipeline) return error.DistModeUnsupported;
     var link = try Link.open(io, cfg);
     errdefer link.deinit();
     const s = mlx.mlx_default_cpu_stream_new();
@@ -327,6 +389,13 @@ pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode
         return error.DistModelMismatch;
     }
     const n = mc.num_hidden_layers;
+    if (mode == .tensor) {
+        if (mc.num_experts == 0) return error.DistTensorNeedsMoe;
+        try sendMsg(&link, .{ MAGIC, @intFromEnum(mode), 0, @intCast(n), @intCast(n), 0, 0, 0 }, 1, s);
+        log.info("[dist] tensor: each expert split in two, this Mac ({d} MiB free) + the worker ({d} MiB free of {d})\n", .{ mine.avail_mib, theirs.avail_mib, theirs.total_mib });
+        peer_slot = .{ .link = link, .mode = mode, .span = .{ .start = 0, .end = n, .total = n }, .shard = .{ .rank = 0, .size = 2 }, .model_dir = try allocator.dupe(u8, model_dir) };
+        return;
+    }
     const k = split orelse chooseSplit(n, mc.full_attention_interval, @as(u64, @intCast(mine.avail_mib)), @as(u64, @intCast(theirs.avail_mib)));
     if (k == 0 or k >= n or (mc.full_attention_interval != 0 and k % mc.full_attention_interval != 0)) return error.DistSplitOffInterval;
     try sendMsg(&link, .{ MAGIC, @intFromEnum(mode), @intCast(k), @intCast(n), @intCast(n), 0, 0, 0 }, 1, s);
@@ -363,10 +432,14 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     try sendMsg(&link, Hello.of(&config).msg(), 0, cs);
     const plan = try recvMsg(&link, 0, cs);
     if (plan[0] != MAGIC) return error.DistProtocolMismatch;
+    const mode: Mode = @enumFromInt(plan[1]);
     const span: LayerSpan = .{ .start = @intCast(plan[2]), .end = @intCast(plan[3]), .total = @intCast(plan[4]) };
-    log.info("[dist] worker: layers {d}..{d} of {d} ({s})\n", .{ span.start, span.end, span.total, @tagName(@as(Mode, @enumFromInt(plan[1]))) });
+    if (mode == .pipeline)
+        log.info("[dist] worker: layers {d}..{d} of {d} (pipeline)\n", .{ span.start, span.end, span.total })
+    else
+        log.info("[dist] worker: half of every expert (tensor)\n", .{});
 
-    var xfm = load(io, allocator, dir, &config, span) catch |err| {
+    var xfm = load(io, allocator, dir, &config, mode, span) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(&link, .{ MAGIC, 1, 0, 0, 0, 0, 0, 0 }, 0, cs) catch {};
         return err;
@@ -404,6 +477,18 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
                 forwards += 1;
                 if (forwards % 256 == 0) log.info("[dist] worker: {d} forwards, at {d} tokens\n", .{ forwards, t.moe_seq_offset });
             },
+            OP_MOE => {
+                const x = try link.recv(&.{ m[1], m[2], m[3] }, @enumFromInt(m[5]), 0, t.s);
+                defer _ = mlx.mlx_array_free(x);
+                const logits = try link.recv(&.{ m[1], m[2], m[4] }, @enumFromInt(m[7]), 0, t.s);
+                defer _ = mlx.mlx_array_free(logits);
+                const out = try t.moeExpertsRouted(x, @intCast(m[6]), logits);
+                defer _ = mlx.mlx_array_free(out);
+                const sent = try link.send(out, 0, t.s);
+                defer _ = mlx.mlx_array_free(sent);
+                try evalOne(sent);
+                forwards += 1;
+            },
             else => return error.DistBadMessage,
         }
     }
@@ -412,9 +497,12 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
 
 const Loaded = struct { w: model_mod.Weights, t: transformer_mod.Transformer };
 
-fn load(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, config: *model_mod.ModelConfig, span: LayerSpan) !Loaded {
+fn load(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, config: *model_mod.ModelConfig, mode: Mode, span: LayerSpan) !Loaded {
     if (!config.isQwen4()) return error.DistArchUnsupported;
-    try config.applyLayerSpan(span);
+    switch (mode) {
+        .pipeline => try config.applyLayerSpan(span),
+        .tensor => try config.applyShard(.{ .rank = 1, .size = 2 }),
+    }
     var w = try model_mod.loadModelWeights(io, allocator, dir, config, false);
     errdefer w.deinit();
     var t = try transformer_mod.Transformer.init(io, allocator, config.*, &w);
@@ -565,4 +653,17 @@ test "chooseSplit: a 2:1 memory split puts two thirds of the layers on rank 0, o
     try std.testing.expectEqual(@as(u32, 24), chooseSplit(48, 4, 100, 100));
     try std.testing.expectEqual(@as(u32, 44), chooseSplit(48, 4, 1000, 1));
     try std.testing.expectEqual(@as(u32, 4), chooseSplit(48, 4, 1, 1000));
+}
+
+test "Shard: gate/up keep a band of rows per expert, down a band of columns" {
+    try std.testing.expect(Shard.expertAxis("language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight").? == .rows);
+    try std.testing.expect(Shard.expertAxis("language_model.model.layers.3.mlp.shared_expert.down_proj.scales").? == .cols);
+    try std.testing.expect(Shard.expertAxis("language_model.model.layers.3.mlp.switch_mlp.gate_proj.expert_scale") == null);
+    try std.testing.expect(Shard.expertAxis("language_model.model.layers.3.mlp.shared_expert_gate.weight") == null);
+    try std.testing.expect(Shard.expertAxis("mtp.layers.0.mlp.switch_mlp.up_proj.weight") == null);
+    // [2 experts, 4 rows, 2 bytes]: rank 1 of 2 keeps rows 2..3 of each expert.
+    const buf = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17 };
+    var out: [8]u8 = undefined;
+    (Shard{ .rank = 1, .size = 2 }).slice(&out, &buf, 2, 4, 2);
+    try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6, 7, 14, 15, 16, 17 }, &out);
 }

@@ -342,6 +342,8 @@ pub const ModelConfig = struct {
     linear_attn_tail_from: u32 = 0,
     /// Pipeline-parallel rank: the trunk layers this process holds (`applyLayerSpan`).
     dist_span: ?distributed.LayerSpan = null,
+    /// Tensor-parallel rank: its slice of each MoE expert (`applyShard`).
+    dist_shard: ?distributed.Shard = null,
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
@@ -933,6 +935,15 @@ pub const ModelConfig = struct {
         self.ple_layer_idx = if (self.ple_layer_idx >= @as(i32, @intCast(st)) and self.ple_layer_idx < @as(i32, @intCast(span.end))) self.ple_layer_idx - @as(i32, @intCast(st)) else -1;
         self.num_hidden_layers = span.len();
         self.dist_span = span;
+    }
+
+    /// The expert widths one tensor-parallel rank holds.
+    pub fn applyShard(self: *ModelConfig, sh: distributed.Shard) !void {
+        const quantum = sh.size * 64; // every shipped group size divides a 64-aligned part
+        if (self.moe_intermediate_size % quantum != 0 or self.shared_expert_intermediate_size % quantum != 0) return error.DistShardOffGroup;
+        self.moe_intermediate_size /= sh.size;
+        self.shared_expert_intermediate_size /= sh.size;
+        self.dist_shard = sh;
     }
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
@@ -5047,6 +5058,34 @@ pub fn retainSpan(weights: *Weights, span: distributed.LayerSpan) !void {
     weights.map = kept;
 }
 
+/// Keeps this tensor-parallel rank's slice of every expert projection (still lazy, so a
+/// tensor is read once and only its part survives the batch eval). ModelOpt's routed
+/// banks arrive already sliced (`modelopt_pack.buildBanks`).
+fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !void {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        const axis = distributed.Shard.expertAxis(kv.key_ptr.*) orelse continue;
+        if (banks_sliced and std.mem.indexOf(u8, kv.key_ptr.*, ".switch_mlp.") != null) continue;
+        const shape = mlx.getShape(kv.value_ptr.*);
+        const ax: usize = if (axis == .rows) shape.len - 2 else shape.len - 1;
+        const part: c_int = @divExact(shape[ax], @as(c_int, @intCast(sh.size)));
+        var start: [4]c_int = @splat(0);
+        var stop: [4]c_int = undefined;
+        const strides: [4]c_int = @splat(1);
+        @memcpy(stop[0..shape.len], shape);
+        start[ax] = part * @as(c_int, @intCast(sh.rank));
+        stop[ax] = start[ax] + part;
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, kv.value_ptr.*, &start, shape.len, &stop, shape.len, &strides, shape.len, s));
+        const owned = try @import("transformer.zig").materializedOwnedCopy(s, view);
+        _ = mlx.mlx_array_free(kv.value_ptr.*);
+        kv.value_ptr.* = owned;
+    }
+}
+
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
     if (config.mlxStream()) return Weights.init(allocator); // mlx-stream loads its own
@@ -5059,6 +5098,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
     if (config.dist_span == null) if (distributed.spanFor(model_dir)) |sp| try config.applyLayerSpan(sp);
+    if (config.dist_shard == null) if (distributed.shardFor(model_dir)) |sh| try config.applyShard(sh);
     var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
@@ -5066,8 +5106,9 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     if (config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
-        try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, s, config.swiglu_limit > 0.0, config.dist_span);
+        try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, s, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
     }
+    if (config.dist_shard) |sh| try shardExperts(&weights, sh, config.modelopt);
     if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
         defer reportF16Narrowing();

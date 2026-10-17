@@ -17197,6 +17197,9 @@ pub const Transformer = struct {
     qwen4: ?*qwen4_mod.Qwen4State = null,
     /// Pipeline rank 0: the worker holding the trunk's later layers (`distributed.Peer`).
     dist_peer: ?*distributed.Peer = null,
+    /// Tensor-parallel rank 0: the worker holding the other slice of every expert. Its
+    /// part is stateless, so nothing about scheduling or caching changes.
+    dist_tp: ?*distributed.Peer = null,
     /// Run the qwen4 residual streams in f32 (QWEN4_STREAM_F32=1, or set by
     /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
     /// fixture is the tighter bar for the MATH.
@@ -17952,8 +17955,8 @@ pub const Transformer = struct {
             }
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
-            // A pipeline rank without the PLE layer never reads the table.
-            if (config.ple_layer_idx >= 0) {
+            // A pipeline rank without the PLE layer, or a tensor worker, never reads the table.
+            if (config.ple_layer_idx >= 0 and !(if (config.dist_shard) |sh| sh.rank != 0 else false)) {
                 st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
                 if (st.gpu == null) st.table.calibrateArm();
                 // The weights load just evicted the table from page cache; an embedded pack's GPU
@@ -18045,6 +18048,7 @@ pub const Transformer = struct {
             .final_norm = final_norm,
             .qwen4 = qwen4_state,
             .dist_peer = if (config.dist_span) |sp| if (sp.first()) distributed.peer() else null else null,
+            .dist_tp = if (config.dist_shard) |sh| if (sh.rank == 0) distributed.peer() else null else null,
             .qwen4_mixer = qwen4_mixer,
             .qwen4_mtp = qwen4_mtp,
             .lm_head_w = lm_head_w,
@@ -26066,7 +26070,7 @@ pub const Transformer = struct {
             defer pre2.deinit();
             try prof.lap(pre2.mixed, .hc_read);
             const mlp_out = if (si.mlp) try standinRef(pre2.mixed) else switch (lw.mlp) {
-                .moe => |*mw| try self.moeMLP(pre2.mixed, mw),
+                .moe => |*mw| if (self.dist_tp) |tp| try self.moeTensorParallel(tp, pre2.mixed, mw, li) else try self.moeMLP(pre2.mixed, mw),
                 .dense => |*dw| try self.denseMLP(pre2.mixed, dw),
             };
             defer _ = mlx.mlx_array_free(mlp_out);
@@ -33138,6 +33142,27 @@ pub const Transformer = struct {
 
     pub fn moeMLP(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         return self.moeMLP2(x, x, mw);
+    }
+
+    /// Tensor-parallel MoE: this rank's slice of every expert plus the worker's, both
+    /// routed by the logits computed here so the two halves pick the same experts.
+    fn moeTensorParallel(self: *Transformer, tp: *distributed.Peer, x: mlx.mlx_array, mw: *const MoeMlpWeights, layer: u32) !mlx.mlx_array {
+        const logits = try self.moeRouterLogits(x, mw);
+        defer _ = mlx.mlx_array_free(logits);
+        try tp.sendMoe(x, logits, layer);
+        const mine = try self.moeMLP2WithRouter(x, x, mw, logits, false);
+        defer _ = mlx.mlx_array_free(mine);
+        const theirs = try tp.recvLike(mine);
+        defer _ = mlx.mlx_array_free(theirs);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&out, mine, theirs, self.s));
+        return out;
+    }
+
+    /// The worker's half of `moeTensorParallel`: its expert slices under rank 0's routing.
+    pub fn moeExpertsRouted(self: *Transformer, x: mlx.mlx_array, layer: u32, logits: mlx.mlx_array) !mlx.mlx_array {
+        const mw = &self.moe_layers.?[layer].mlp.moe;
+        return self.moeMLP2WithRouter(x, x, mw, logits, false);
     }
 
     /// GLM-5-Next one-token MoE (`glm5.moeDecode`): routed and shared experts in two dispatches.
