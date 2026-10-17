@@ -6024,12 +6024,12 @@ fn memoryRefusalMessage(
     avail_mb: u64,
     bill: AdmissionBill,
 ) ![]u8 {
-    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.evictionCredit() / (1024 * 1024) });
+    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, of which ~{d}MB can be reclaimed, which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.evictionCredit() / (1024 * 1024) });
 }
 
 /// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
 /// estimator the guard uses, re-asked after the hot cache gave back everything it could.
-const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory after reclaiming the evictable prefix-cache entries; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
 
 /// The figures of the `PrefillDoesNotFit` this connection thread last drained, read once by
 /// `mapGenerationError`: the error name alone cannot carry them past `slotFailure`.
@@ -6041,7 +6041,7 @@ fn prefillNoFitMessage(buf: []u8) []const u8 {
     const refusal = prefill_refusal orelse return PREFILL_NOFIT_MSG;
     prefill_refusal = null;
     const mb = 1024 * 1024;
-    return std.fmt.bufPrint(buf, "This prompt ({d} tokens) does not fit in GPU memory even after freeing the prefix cache: it requires ~{d}MB GPU memory but only ~{d}MB is available. It was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine.", .{ refusal.tokens, refusal.needed / mb, refusal.available / mb }) catch PREFILL_NOFIT_MSG;
+    return std.fmt.bufPrint(buf, "This prompt ({d} tokens) does not fit in GPU memory after reclaiming the evictable prefix-cache entries: it requires ~{d}MB GPU memory but only ~{d}MB is available. It was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine.", .{ refusal.tokens, refusal.needed / mb, refusal.available / mb }) catch PREFILL_NOFIT_MSG;
 }
 
 /// A generation failure as the wire sees it: one status, one message, both dialects' type.
@@ -6199,9 +6199,11 @@ pub const AdmissionBill = struct {
     available: u64 = 0,
     /// Bytes the hot prefix cache is holding. Reported in a refusal, never credited (see `reclaimable`).
     evictable: u64 = 0,
-    /// The part of `evictable` an eviction can prove it will return: residency minus the
-    /// largest entry (a restore pins at most one).
+    /// Eviction base excluding checked-out slots, less the largest restore candidate.
     reclaimable: u64 = 0,
+    /// Bytes protected by checked-out slots in the published cache snapshot.
+    checked_out: u64 = 0,
+    cache: scheduler_mod.HotCacheAdmissionSnapshot = .{},
     /// The prefill width this bill was taken at, so a refusal can name it.
     chunk: u64 = 0,
 
@@ -6616,30 +6618,53 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     // grows. Adding the resident entry here again would invent a third copy
     // and reject long warm prompts (and even cache misses) spuriously.
     const needed: u64 = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, chunk, warm);
-    // Published number, never the pointer: `hot_prefix_cache` is inference-thread state, freed
-    // on every model switch. Stale by at most one entry, which is all a hint has to be.
-    const evictable: u64 = if (global_scheduler) |sch|
-        sch.resident_hot_cache_bytes.load(.monotonic)
+    const cache = if (global_scheduler) |sch|
+        scheduler_mod.hotCacheAdmissionSnapshotFor(sch, prompt_tokens)
     else
-        0;
-    // Prompt-aware when the caller has the ids: an entry this prompt could not restore from is
-    // genuinely evictable. Still a published snapshot, never the cache pointer.
-    const reclaimable: u64 = if (global_scheduler) |sch|
-        if (prompt_tokens) |toks|
-            scheduler_mod.reclaimableHotCacheBytesFor(sch, toks)
-        else
-            sch.reclaimable_hot_cache_bytes.load(.monotonic)
-    else
-        0;
-    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
+        scheduler_mod.HotCacheAdmissionSnapshot{};
+    return .{ .needed = needed, .available = available, .evictable = cache.resident, .reclaimable = cache.reclaimable, .checked_out = cache.checked_out, .cache = cache, .chunk = chunk };
 }
 
-/// Bytes of the resident hot cache this prompt pins: residency less what an eviction can prove
-/// it will return. Non-zero means an entry this prompt would restore from is holding memory
-/// that neither goes back nor has to be allocated again; the connection thread cannot price
-/// how much, so it defers to the inference thread's `WarmPrefix` bill.
+/// Resident bytes protected by a potential restore, excluding checked-out slots.
+/// The inference thread prices the actual restore with its `WarmPrefix` bill.
 pub fn pinnedResidentBytes(bill: AdmissionBill) u64 {
-    return bill.evictable -| bill.evictionCredit();
+    return bill.evictable -| bill.evictionCredit() -| bill.checked_out;
+}
+
+/// A cold bill can reject once neither a warm prefix nor a live sibling can change it. The
+/// live-sibling defer binds only after `idle_unloaded` (a queued sibling must never shield an
+/// idle model from the unload arm) and only while the shortfall is at most what live slots hold.
+pub fn deferColdAdmission(bill: AdmissionBill, live_slots: usize, live_kv_bytes: u64, idle_unloaded: bool) bool {
+    if (bill.fits()) return false;
+    if (pinnedResidentBytes(bill) > 0) return true;
+    return idle_unloaded and live_slots > 0 and
+        bill.needed -| bill.available -| bill.evictionCredit() <= live_kv_bytes;
+}
+
+test "cold admission defers a miss and short prompt while a sibling is live" {
+    const t = std.testing;
+    // No own-prefix credit here. A live sibling can release its KV even without checking
+    // out a hot-cache entry (the second shape) — but only after the idle-model unload has
+    // run, and only while the shortfall is at most what the live slots hold (20 vs 19 flips).
+    const miss = AdmissionBill{ .needed = 30, .available = 10, .evictable = 15, .checked_out = 15 };
+    const short = AdmissionBill{ .needed = 30, .available = 10 };
+    try t.expect(deferColdAdmission(miss, 1, 20, true));
+    try t.expect(deferColdAdmission(short, 1, 20, true));
+    try t.expect(!deferColdAdmission(short, 1, 19, true));
+    try t.expect(!deferColdAdmission(short, 1, 20, false));
+    try t.expect(!deferColdAdmission(short, 0, 100, true));
+}
+
+test "checked-out residency is not the incoming request's own prefix" {
+    const t = std.testing;
+    const bill = AdmissionBill{ .needed = 30, .available = 10, .evictable = 22, .reclaimable = 5, .checked_out = 15 };
+    try t.expectEqual(@as(u64, 2), pinnedResidentBytes(bill));
+    // A warm-share defer precedes the unload arm: a restore makes evicting an idle
+    // model unnecessary.
+    try t.expect(deferColdAdmission(bill, 0, 0, false));
+    const other_only = AdmissionBill{ .needed = 30, .available = 10, .evictable = 15, .checked_out = 15 };
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(other_only));
+    try t.expect(!deferColdAdmission(other_only, 0, 100, true));
 }
 
 /// What the admission guard decided, from one bill so the log line and the arm agree: fits
@@ -6704,13 +6729,14 @@ fn logAdmissionDecision(bill: AdmissionBill) void {
 /// Inference-thread predicate behind the scheduler's admission hook: does this request fit
 /// right now, with live memory re-read? Every input is forwarded, none defaulted (a hardcoded
 /// `kv_override = null` priced a `kv_quant: 4` request at fp16 and evicted a cache for nothing).
-pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) bool {
-    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) scheduler_mod.PrefillAdmissionNumbers {
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
         .will_donate = warm_will_donate,
         .mtp_on = enable_mtp,
-    }).fits();
+    });
+    return .{ .needed = bill.needed, .available = bill.available, .chunk = @intCast(bill.chunk), .cache = bill.cache };
 }
 
 /// {needed, available} of the cold bill, live memory re-read, for the scheduler's sibling ledger.
@@ -6720,30 +6746,22 @@ pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: u
 }
 
 /// The inference thread's refusal, quoting the numbers it compared; returns {needed, available} for the client.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) [2]u64 {
-    // The same warm inputs the probe was refused on, the checkout decision included.
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
-        .matched_tokens = warm_matched,
-        .capacity_tokens = warm_capacity,
-        .will_donate = warm_will_donate,
-        .mtp_on = enable_mtp,
-    });
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, numbers: scheduler_mod.PrefillAdmissionNumbers) [2]u64 {
     const mb = 1024 * 1024;
-    // "Narrowest width tried" is only true where the ladder was walked.
     const width_note: []const u8 = if (perRequestPrefillChunkEnabled(config)) "the narrowest width tried" else "the pinned width";
-    // The comparison first (`fitsAfterEviction` spelled out), then the residency as context, with
-    // the part eviction cannot take named.
-    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available + ~{d}MB the hot cache can give back (~{d}MB resident, ~{d}MB of it pinned by this request's own prefix) — refused before prefill\n", .{
+    const own_prefix = numbers.cache.eviction_base -| numbers.cache.reclaimable;
+    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available + ~{d}MB reclaimable hot cache (~{d}MB resident, ~{d}MB checked out, ~{d}MB own-prefix candidate) — refused before prefill\n", .{
         prompt_len,
-        bill.needed / mb,
-        bill.chunk,
+        numbers.needed / mb,
+        numbers.chunk,
         width_note,
-        bill.available / mb,
-        bill.evictionCredit() / mb,
-        bill.evictable / mb,
-        pinnedResidentBytes(bill) / mb,
+        numbers.available / mb,
+        numbers.cache.reclaimable / mb,
+        numbers.cache.resident / mb,
+        numbers.cache.checked_out / mb,
+        own_prefix / mb,
     });
-    return .{ bill.needed, bill.available };
+    return .{ numbers.needed, numbers.available };
 }
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool, enable_mtp: bool, media_bytes: u64) !bool {
@@ -6768,7 +6786,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     // Warm deferral. The bill above is cold; a non-zero `pinnedResidentBytes` means an entry
     // this prompt would restore from is holding bytes that will neither be allocated nor
     // reclaimed. How many is knowable only on the inference thread, which bills with `WarmPrefix`.
-    if (needed > available and pinnedResidentBytes(bill) > 0) {
+    if (deferColdAdmission(bill, bill.cache.live_slots, bill.cache.live_kv_bytes, false)) {
         log.info("  prompt {d} tokens needs ~{d}MB cold, ~{d}MB available, and ~{d}MB of hot cache is a prefix this prompt would SHARE — deferring to the prefill, which bills the warm request\n", .{
             prompt_len, needed / (1024 * 1024), available / (1024 * 1024), pinnedResidentBytes(bill) / (1024 * 1024),
         });
@@ -6801,12 +6819,20 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         var rebill = Rebill{ .sch = sch, .keep = lm.id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked = unchunked_prefill, .enable_mtp = enable_mtp, .media_bytes = media_bytes };
         if (fitAfterUnloadingIdle(&rebill, Rebill.fits, Rebill.unloadOne)) return true;
     };
+    // A finishing sibling can release KV — but only up to what it holds: a shortfall
+    // past that is refused now, not parked at the head of `pending`. This defer sits
+    // AFTER the unload arm above, so a live sibling never shields an idle model's residency.
+    if (deferColdAdmission(bill, bill.cache.live_slots, bill.cache.live_kv_bytes, true)) {
+        log.info("  prompt {d} tokens needs ~{d}MB cold, ~{d}MB available, ~{d}MB own-prefix candidate, ~{d}MB checked out, {d} live slots — deferring to the scheduler for warm admission\n", .{
+            prompt_len, bill.needed / (1024 * 1024), bill.available / (1024 * 1024), pinnedResidentBytes(bill) / (1024 * 1024), bill.checked_out / (1024 * 1024), bill.cache.live_slots,
+        });
+        return true;
+    }
     if (bill.needed > bill.available) {
         const needed_mb = bill.needed / (1024 * 1024);
         const avail_mb = bill.available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
-        // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
-        // is evictable here by construction (the withheld case took the deferral arm).
+        // Quote the same bill, including protected residency that eviction cannot return.
         const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill);
         defer allocator.free(msg);
         countRejected();
@@ -25203,8 +25229,6 @@ test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
     try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
     try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
     try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
-    // The hot cache appears once, as `evictable`, read as the published atomic.
-    try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
     try t.expect(std.mem.indexOf(u8, body, "sch." ++ "hot_prefix_cache") == null);
     try t.expect(std.mem.indexOf(u8, body, ".hot_prefix_cache.?") == null);
     try t.expect(std.mem.indexOf(u8, body, "needed = needed +") == null);
@@ -27392,8 +27416,16 @@ test "prefillAdmissionBill: every arch carries the evict-to-admit credits (#492)
     const t = std.testing;
     const MB: u64 = 1024 * 1024;
     var sch: scheduler_mod.Scheduler = undefined;
-    sch.resident_hot_cache_bytes = .init(9000 * MB);
-    sch.reclaimable_hot_cache_bytes = .init(8000 * MB);
+    sch.io = std.testing.io;
+    sch.digest_mu = .init;
+    sch.queue_mu = .init;
+    sch.decoding = .empty;
+    sch.hot_cache_digests = &.{};
+    sch.digest_residency = 9000 * MB;
+    sch.digest_eviction_base = 8000 * MB;
+    sch.digest_checked_out = 0;
+    sch.digest_reclaimable = 8000 * MB;
+    sch.resident_live_kv_bytes = .init(0);
     global_scheduler = &sch;
     defer global_scheduler = null;
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "llama", "gemma4", "qwen4_exp" }) |mt| {
@@ -27440,12 +27472,12 @@ test "memoryRefusalMessage: the 400 quotes the hot-cache credits the guard compa
     });
     defer t.allocator.free(rich);
     try t.expect(std.mem.indexOf(u8, rich, "holds ~1500MB more") != null);
-    try t.expect(std.mem.indexOf(u8, rich, "(~900MB") != null);
+    try t.expect(std.mem.indexOf(u8, rich, "of which ~900MB") != null);
 
     const cold = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB });
     defer t.allocator.free(cold);
     try t.expectEqualStrings(
-        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, of which ~0MB can be reclaimed, which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
         cold,
     );
 }
