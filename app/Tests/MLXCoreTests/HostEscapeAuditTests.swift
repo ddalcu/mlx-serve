@@ -22,6 +22,8 @@ final class HostEscapeAuditTests: XCTestCase {
 
     /// file name → why its spawns are still here.
     private static let known: [String: String] = [
+        "ClusterSetup.swift":
+            "ibv_devinfo to list the Thunderbolt RDMA ports, and ifconfig behind the macOS admin prompt to give one its cluster address — Settings ▸ Cluster only. RDMA (JACCL) is unreachable from the App Sandbox anyway, so the Thunderbolt cluster is a Developer-ID feature.",
         "CLIInstaller.swift":
             "osascript + login shell to symlink into /usr/local/bin. Runtime-gated on the compile-time BuildFeatures.cliInstaller flag (false under MAS_BUILD); UI hidden with it.",
         "CLILauncher.swift":

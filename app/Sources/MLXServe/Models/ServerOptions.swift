@@ -611,6 +611,11 @@ struct ServerOptions: Codable, Equatable {
         return min(requested, ceiling)
     }
 
+    /// `--model-dir` per folder, in order: the one place the flag is spelled.
+    static func modelDirArgs(_ dirs: [String]) -> [String] {
+        dirs.filter { !$0.isEmpty }.flatMap { ["--model-dir", $0] }
+    }
+
     func toCLIArgs(modelDirOverride: String? = nil,
                    physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
         toCLIArgs(modelDirs: modelDirOverride.map { [$0] } ?? [],
@@ -638,9 +643,7 @@ struct ServerOptions: Codable, Equatable {
         if !logToFile {
             args += ["--log-file", "off"]
         }
-        for dir in modelDirs where !dir.isEmpty {
-            args += ["--model-dir", dir]
-        }
+        args += Self.modelDirArgs(modelDirs)
         if ctxSize > 0 {
             args += ["--ctx-size", "\(ctxSize)"]
         }

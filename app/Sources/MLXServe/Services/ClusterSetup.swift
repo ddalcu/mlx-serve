@@ -90,7 +90,7 @@ enum ClusterSetup {
     static func workerArgs(_ o: ServerOptions, modelDirs: [String], ports: () -> [RdmaPort] = ClusterSetup.ports) -> [String]? {
         guard let dev = device(o, ports: ports) else { return nil }
         return ["worker", "--coordinator", coordinator(o), "--device", dev]
-            + modelDirs.flatMap { ["--model-dir", $0] }
+            + ServerOptions.modelDirArgs(modelDirs)
     }
 
     /// The shell line that gives `interface` this Mac's cluster address (until restart).
