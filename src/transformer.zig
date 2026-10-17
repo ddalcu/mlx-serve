@@ -5,6 +5,7 @@ const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
+const distributed = @import("distributed.zig");
 const ple_gpu = @import("ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
@@ -17194,6 +17195,8 @@ pub const Transformer = struct {
     // through forwardQwen4With. `qwen4_mixer` is the final hyper-connection
     // read that replaces model.norm.
     qwen4: ?*qwen4_mod.Qwen4State = null,
+    /// Pipeline rank 0: the worker holding the trunk's later layers (`distributed.Peer`).
+    dist_peer: ?*distributed.Peer = null,
     /// Run the qwen4 residual streams in f32 (QWEN4_STREAM_F32=1, or set by
     /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
     /// fixture is the tighter bar for the MATH.
@@ -17949,11 +17952,14 @@ pub const Transformer = struct {
             }
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
-            st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
-            if (st.gpu == null) st.table.calibrateArm();
-            // The weights load just evicted the table from page cache; an embedded pack's GPU
-            // arm holds its own copy.
-            if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
+            // A pipeline rank without the PLE layer never reads the table.
+            if (config.ple_layer_idx >= 0) {
+                st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
+                if (st.gpu == null) st.table.calibrateArm();
+                // The weights load just evicted the table from page cache; an embedded pack's GPU
+                // arm holds its own copy.
+                if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
+            }
             qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
@@ -18038,6 +18044,7 @@ pub const Transformer = struct {
             .emb_scale = emb_scale,
             .final_norm = final_norm,
             .qwen4 = qwen4_state,
+            .dist_peer = if (config.dist_span) |sp| if (sp.first()) distributed.peer() else null else null,
             .qwen4_mixer = qwen4_mixer,
             .qwen4_mtp = qwen4_mtp,
             .lm_head_w = lm_head_w,
@@ -20472,7 +20479,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext" };
+    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext", "dist_peer" };
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -20531,7 +20538,7 @@ pub const Transformer = struct {
         // qwen4_exp: GDN per-position capture + PLE window/token capture +
         // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
         // head's verify can rewind. dsv4 cannot.
-        return self.qwen4_mtp != null;
+        return self.qwen4_mtp != null and self.dist_peer == null;
     }
 
     /// Is this arch's MTP head the checkpoint's OWN trained layer AND measured
@@ -25949,6 +25956,16 @@ pub const Transformer = struct {
     /// through per-stream scalar gates; the n-gram PLE adds to the streams
     /// before its layer; the final mixer replaces model.norm.
     fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        return self.forwardQwen4Impl(ctx, token_ids, null);
+    }
+
+    /// A later pipeline rank's forward: its layers over the `[B, L, hc*hidden]`
+    /// stream the previous rank handed over, returning the stream for the next one.
+    pub fn forwardQwen4Stream(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array) !mlx.mlx_array {
+        return self.forwardQwen4Impl(ctx, .{ .ctx = null }, stream);
+    }
+
+    fn forwardQwen4Impl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, stream_in: ?mlx.mlx_array) !mlx.mlx_array {
         self.fwd_gen +%= 1; // per-forward QSA scratch key
         const ml = self.moe_layers.?;
         const cfg = &self.config;
@@ -25959,23 +25976,27 @@ pub const Transformer = struct {
         self.spec_capture_ssm = ctx.capture_ssm_seq;
         defer self.spec_capture_ssm = false;
 
-        // Vision rows splice into the `hidden`-wide embeddings BEFORE the
-        // hyper-connection tile (the reference masked_scatters, then repeats).
-        var emb = try self.embedding(token_ids);
-        {
-            errdefer _ = mlx.mlx_array_free(emb);
-            emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
+        var h = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(h);
+        if (stream_in) |st| {
+            try mlx.check(mlx.mlx_array_set(&h, st));
+        } else {
+            // Vision rows splice into the `hidden`-wide embeddings BEFORE the
+            // hyper-connection tile (the reference masked_scatters, then repeats).
+            var emb = try self.embedding(token_ids);
+            {
+                errdefer _ = mlx.mlx_array_free(emb);
+                emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
+            }
+            defer _ = mlx.mlx_array_free(emb);
+            const reps = [_]c_int{ 1, 1, hc };
+            try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
         }
-        defer _ = mlx.mlx_array_free(emb);
-        const x_shape = mlx.getShape(emb);
+        const x_shape = mlx.getShape(h);
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
 
-        const reps = [_]c_int{ 1, 1, hc };
-        var h = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
-        errdefer _ = mlx.mlx_array_free(h);
         if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
@@ -26084,6 +26105,18 @@ pub const Transformer = struct {
             dt.layer(h, layer_idx);
         }
 
+        if (stream_in != null or self.dist_peer != null) try self.hcFlush(&h, batch, seq_len, &pending);
+        if (stream_in != null) {
+            ctx.moe_seq_offset.* += @intCast(seq_len);
+            return h;
+        }
+        if (self.dist_peer) |peer| {
+            // The hop's sends are queued before its receive, so the PLE leaf must be filled now.
+            if (ctx.ple_pending != null) try self.flushDeferredPle(ctx);
+            const back = try peer.hop(h, offset, self.s);
+            _ = mlx.mlx_array_free(h);
+            h = back;
+        }
         if (ctx.capture_stream_all != null or ctx.capture_hidden != null or ctx.capture_hidden_all != null) try self.hcFlush(&h, batch, seq_len, &pending);
         ctx.moe_seq_offset.* += @intCast(seq_len);
         dt.end(h);

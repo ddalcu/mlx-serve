@@ -10,6 +10,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transcription = @import("transcription.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
+const distributed = @import("distributed.zig");
 const qwen4_ple = @import("qwen4_ple.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
@@ -339,6 +340,8 @@ pub const ModelConfig = struct {
     // ragged tail after the last WHOLE group never gets linear attention.
     // 0 = no tail bound, which is every other hybrid arch (qwen3_next, lfm2).
     linear_attn_tail_from: u32 = 0,
+    /// Pipeline-parallel rank: the trunk layers this process holds (`applyLayerSpan`).
+    dist_span: ?distributed.LayerSpan = null,
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
@@ -913,6 +916,23 @@ pub const ModelConfig = struct {
             return self.num_global_key_value_heads;
         }
         return self.num_key_value_heads;
+    }
+
+    /// Turn this config into the short model one pipeline rank serves: layers
+    /// `[span.start, span.end)` renumbered from 0, every per-layer table shifted with them.
+    pub fn applyLayerSpan(self: *ModelConfig, span: distributed.LayerSpan) !void {
+        if (span.total != self.num_hidden_layers or span.end > span.total or span.start >= span.end) return error.DistLayerSpanMismatch;
+        // The interval rule `(i + 1) % interval` stays true only for a seam on a group boundary.
+        if (self.full_attention_interval != 0 and span.start % self.full_attention_interval != 0) return error.DistSplitOffInterval;
+        const st = span.start;
+        inline for (.{ "num_attention_heads_per_layer", "layer_no_rope", "dsv4_compress_ratios", "layer_is_global", "layer_block_types" }) |f| {
+            const arr = &@field(self, f);
+            if (st < arr.len) std.mem.copyForwards(@TypeOf(arr[0]), arr[0 .. arr.len - st], arr[st..]);
+        }
+        if (self.linear_attn_tail_from != 0) self.linear_attn_tail_from -|= st;
+        self.ple_layer_idx = if (self.ple_layer_idx >= @as(i32, @intCast(st)) and self.ple_layer_idx < @as(i32, @intCast(span.end))) self.ple_layer_idx - @as(i32, @intCast(st)) else -1;
+        self.num_hidden_layers = span.len();
+        self.dist_span = span;
     }
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
@@ -5003,6 +5023,30 @@ fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
     return error.Exl3NeedsMetal;
 }
 
+/// Keeps the tensors one pipeline rank holds, under their renumbered names (`LayerSpan.remap`).
+pub fn retainSpan(weights: *Weights, span: distributed.LayerSpan) !void {
+    const a = weights.allocator;
+    var kept = std.StringHashMap(mlx.mlx_array).init(a);
+    errdefer kept.deinit();
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        var buf: [512]u8 = undefined;
+        const name = span.remap(kv.key_ptr.*, &buf) orelse {
+            _ = mlx.mlx_array_free(kv.value_ptr.*);
+            a.free(kv.key_ptr.*);
+            continue;
+        };
+        if (name.ptr == kv.key_ptr.*.ptr) {
+            try kept.put(kv.key_ptr.*, kv.value_ptr.*);
+        } else {
+            try kept.put(try a.dupe(u8, name), kv.value_ptr.*);
+            a.free(kv.key_ptr.*);
+        }
+    }
+    weights.map.deinit();
+    weights.map = kept;
+}
+
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
     if (config.mlxStream()) return Weights.init(allocator); // mlx-stream loads its own
@@ -5014,12 +5058,15 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
+    if (config.dist_span == null) if (distributed.spanFor(model_dir)) |sp| try config.applyLayerSpan(sp);
     var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
     errdefer weights.deinit();
+    // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
+    if (config.dist_span) |sp| try retainSpan(&weights, sp);
     if (config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
-        try modelopt_pack.adapt(&weights, model_dir, config.num_hidden_layers, s, config.swiglu_limit > 0.0);
+        try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, s, config.swiglu_limit > 0.0, config.dist_span);
     }
     if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {

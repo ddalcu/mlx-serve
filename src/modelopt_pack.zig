@@ -2,6 +2,7 @@
 //! reinterpreted in place, NVFP4 routed experts stacked into banks with their csf-compressed
 //! scales decoded at load, per-expert `weight_scale_2` kept beside each bank.
 const std = @import("std");
+const distributed = @import("distributed.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
@@ -56,7 +57,7 @@ pub fn mlxName(a: std.mem.Allocator, key: []const u8, mtp_layer: ?u32) ![]u8 {
 /// Renames every loaded tensor to the mlx-lm layout, reinterprets fp weight bytes as the u32
 /// words MLX packs, dequantizes the vision tower's linears to bf16 (its encoder runs dense),
 /// then adds the routed-expert banks read from `model_dir`.
-pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, s: mlx.mlx_stream, clamped: bool) !void {
+pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, s: mlx.mlx_stream, clamped: bool, span: ?distributed.LayerSpan) !void {
     const a = weights.allocator;
     var old = weights.map;
     weights.map = std.StringHashMap(mlx.mlx_array).init(a);
@@ -110,7 +111,7 @@ pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, s: mlx.m
         errdefer a.free(sname);
         try putShared(weights, sname, scales.?);
     }
-    try buildBanks(weights, model_dir, mtp_layer, status.memoryPressureLevel, clamped);
+    try buildBanks(weights, model_dir, mtp_layer, status.memoryPressureLevel, clamped, span);
 }
 
 /// FP8_PB_WO: e4m3 codes `[R, C]` with one f32 scale per 128x128 tile (`[R/128, 1, C/128, 1]`), as bf16.
@@ -400,7 +401,17 @@ fn fillRound(round: []Bank, src: *const Source) void {
 /// before the clamp) and `expert_scale` is the down scale alone.
 /// `pressure` is read before each round: once the OS is paging, the load stops by name rather
 /// than take the machine down with it.
-fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressure: *const fn () u32, clamped: bool) !void {
+/// A bank's layer base under this rank's numbering.
+fn spanBase(a: std.mem.Allocator, base: []const u8, span: ?distributed.LayerSpan) ![]const u8 {
+    const sp = span orelse return base;
+    var buf: [512]u8 = undefined;
+    const key = try std.fmt.bufPrint(&buf, "{s}.", .{base});
+    var out: [512]u8 = undefined;
+    const r = sp.remap(key, &out) orelse return error.DistLayerSpanMismatch;
+    return a.dupe(u8, r[0 .. r.len - 1]);
+}
+
+fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressure: *const fn () u32, clamped: bool, span: ?distributed.LayerSpan) !void {
     var src = try openSource(model_dir);
     defer src.deinit();
     const a = src.arena.allocator();
@@ -408,6 +419,8 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressur
     var lit = src.locs.keyIterator();
     while (lit.next()) |k| {
         if (!std.mem.endsWith(u8, k.*, ".gate_proj.weight")) continue;
+        var nb: [512]u8 = undefined;
+        if (span) |sp| if (sp.remap(k.*, &nb) == null) continue;
         const at = std.mem.indexOf(u8, k.*, ".mlp.experts.").?;
         const tail = k.*[at + ".mlp.experts.".len ..];
         const e = try std.fmt.parseInt(u32, tail[0..std.mem.indexOfScalar(u8, tail, '.').?], 10);
@@ -437,7 +450,7 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressur
         fillRound(round, &src);
         for (round) |*b| {
             if (b.err) |e| return e;
-            const dst = try mlxName(a, b.base, mtp_layer);
+            const dst = try mlxName(a, try spanBase(a, b.base, span), mtp_layer);
             const E: c_int = @intCast(b.experts);
             try putCopy(weights, b.w, &.{ E, @intCast(b.rows), @intCast(b.in / 8) }, .uint32, "{s}.mlp.switch_mlp.{s}.weight", .{ dst, PROJS[b.proj] });
             try putCopy(weights, b.sc, &.{ E, @intCast(b.rows), @intCast(b.in / 16) }, .uint8, "{s}.mlp.switch_mlp.{s}.scales", .{ dst, PROJS[b.proj] });
@@ -453,7 +466,7 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressur
         if (b.proj != 0) continue;
         const up = banks.items[i + 1].gs;
         const down = banks.items[i + 2].gs;
-        const dst = try mlxName(a, b.base, mtp_layer);
+        const dst = try mlxName(a, try spanBase(a, b.base, span), mtp_layer);
         try putArray(weights, try bf16Array(b.gs, s), "{s}.mlp.switch_mlp.gate_proj.expert_scale", .{dst});
         if (clamped) {
             try putArray(weights, try bf16Array(up, s), "{s}.mlp.switch_mlp.up_proj.expert_scale", .{dst});
@@ -829,7 +842,7 @@ test "ModelOpt banks: every expert's bytes and global scales land in its layer's
     var weights = Weights.init(a);
     defer weights.deinit();
     probe_calls = 0;
-    try buildBanks(&weights, path, null, countingPressure, false);
+    try buildBanks(&weights, path, null, countingPressure, false, null);
     try expectMiniBanks(&weights, 7, 3);
     try std.testing.expectEqual((21 + BANKS_PER_ROUND - 1) / BANKS_PER_ROUND, probe_calls);
 }
@@ -846,7 +859,7 @@ test "ModelOpt banks: memory pressure stops the load between rounds, by name, wi
     probe_trips_at = 3;
     defer probe_trips_at = std.math.maxInt(usize);
     probe_calls = 0;
-    try std.testing.expectError(error.InsufficientMemory, buildBanks(&weights, path, null, countingPressure, false));
+    try std.testing.expectError(error.InsufficientMemory, buildBanks(&weights, path, null, countingPressure, false, null));
     try std.testing.expectEqual(@as(usize, 3), probe_calls);
     // Two rounds of six banks (weights + scales) were already MLX's when the third was refused.
     try std.testing.expectEqual(@as(u32, 2 * BANKS_PER_ROUND * 2), weights.map.count());
@@ -894,7 +907,7 @@ test "ModelOpt banks: a clamped SwiGLU keeps the up scale apart, to scale up bef
     var weights = Weights.init(a);
     defer weights.deinit();
     probe_calls = 0;
-    try buildBanks(&weights, path, null, countingPressure, true);
+    try buildBanks(&weights, path, null, countingPressure, true, null);
     for (0..2) |l| {
         for ([_][]const u8{ "switch_mlp.gate_proj.expert_scale", "switch_mlp.up_proj.expert_scale", "switch_mlp.expert_scale" }, 0..) |name, k| {
             const key = try std.fmt.allocPrint(a, "language_model.model.layers.{d}.mlp.{s}", .{ l, name });

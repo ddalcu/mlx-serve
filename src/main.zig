@@ -588,6 +588,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "serve")) {
             arg_start = 2;
             use_default_models_root = true;
+        } else if (std.mem.eql(u8, cmd, "worker")) {
+            @import("distributed.zig").cmdWorker(io, allocator, args[2..]) catch std.process.exit(1);
+            return;
         } else if (std.mem.eql(u8, cmd, "dist-probe")) {
             @import("distributed.zig").cmdProbe(io, args[2..]) catch std.process.exit(1);
             return;
@@ -599,7 +602,7 @@ pub fn main(init: std.process.Init) !void {
             try launch_mod.cmdLaunch(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, serve, or dist-probe)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, serve, worker, or dist-probe)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -629,6 +632,11 @@ pub fn main(init: std.process.Init) !void {
     var top_p_flag: ?f32 = null;
     var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
+    // `--dist pipeline`: this server is rank 0 of a multi-Mac group (see distributed.zig).
+    var dist_mode: ?@import("distributed.zig").Mode = null;
+    var dist_coordinator: ?[]const u8 = null;
+    var dist_device: ?[]const u8 = null;
+    var dist_split: ?u32 = null;
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
@@ -727,6 +735,21 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--top-k") and i + 1 < args.len) {
             i += 1;
             top_k_flag = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--dist") and i + 1 < args.len) {
+            i += 1;
+            dist_mode = @import("distributed.zig").Mode.parse(args[i]) orelse {
+                log.err("--dist takes pipeline or tensor, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--dist-coordinator") and i + 1 < args.len) {
+            i += 1;
+            dist_coordinator = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dist-device") and i + 1 < args.len) {
+            i += 1;
+            dist_device = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dist-split") and i + 1 < args.len) {
+            i += 1;
+            dist_split = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
             i += 1;
             ctx_size = try std.fmt.parseInt(u32, args[i], 10);
@@ -1404,6 +1427,19 @@ pub fn main(init: std.process.Init) !void {
             try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
             return;
         }
+    }
+
+    if (dist_mode) |mode| {
+        const coordinator = dist_coordinator orelse {
+            log.err("--dist needs --dist-coordinator IP:PORT (this Mac's address the worker connects to)\n", .{});
+            std.process.exit(1);
+        };
+        const device = dist_device orelse {
+            log.err("--dist needs --dist-device rdma_enX (the RDMA port facing the worker; see `ibv_devinfo`)\n", .{});
+            std.process.exit(1);
+        };
+        log.info("[dist] waiting for the worker at {s}...\n", .{coordinator});
+        try @import("distributed.zig").connect(io, allocator, .{ .rank = 0, .coordinator = coordinator, .device = device }, mode, model_dir, dist_split);
     }
 
     // Parse config — heap allocate so the LoadedModel can take ownership
