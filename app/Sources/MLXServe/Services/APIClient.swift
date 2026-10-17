@@ -330,6 +330,20 @@ class APIClient {
         }
     }
 
+    /// POST /v1/video/pause — ask (or withdraw) a pause of the running video job `id`.
+    func setVideoPause(port: UInt16, id: String, pause: Bool) async throws {
+        var request = URLRequest(url: serverURL(port: port, path: "/v1/video/pause"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 10
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["id": id, "pause": pause])
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.badStatus(code: code, detail: APIError.errorDetail(fromBody: data))
+        }
+    }
+
     /// POST a media-generation endpoint with `stream:true` and yield each parsed
     /// SSE `data:` event as a dictionary (`{type:"progress"|"complete"|"error", …}`)
     /// against the MAIN server port. Replaces `NativeGenServer.postStream`. The

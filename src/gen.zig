@@ -4088,6 +4088,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     }
 
     if (want_stream) try conn.writeAll(sse.headers);
+    sctx.beginPause();
+    defer sctx.endPause();
 
     const paths = try engine.paths(allocator);
     defer {
@@ -4362,6 +4364,8 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     var sctx = videoStreamCtx(conn, allocator, body, want_stream);
     const prog: ?ltx.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
+    sctx.beginPause();
+    defer sctx.endPause();
 
     var frames = switch (pipeline) {
         .one_stage => blk: {

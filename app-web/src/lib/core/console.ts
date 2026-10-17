@@ -211,6 +211,13 @@ const apiReference = [
   },
   {
     method: "POST",
+    path: "/v1/video/pause",
+    description: N(
+      "Pause or resume a streaming video run after its current step \u00b7 by the stream's job id",
+    ),
+  },
+  {
+    method: "POST",
     path: "/v1/3d/generations",
     description: N(
       "Hunyuan3D-2.1 \u00b7 one photo \u2192 GLB mesh \u00b7 optional PBR texturing",

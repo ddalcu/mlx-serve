@@ -6558,15 +6558,24 @@ const GenYield = struct {
     }
 
     fn serveUntil(ctx: *anyopaque, done: *const std.atomic.Value(bool)) void {
-        const gy: *GenYield = @ptrCast(@alignCast(ctx));
+        @as(*GenYield, @ptrCast(@alignCast(ctx))).serve(done, null);
+    }
+
+    fn serveFor(ctx: *anyopaque, ns: u64) void {
+        @as(*GenYield, @ptrCast(@alignCast(ctx))).serve(null, ns);
+    }
+
+    /// Serve chat until `done` is set or about `ns` has passed, whichever comes first.
+    fn serve(gy: *GenYield, done: ?*const std.atomic.Value(bool), ns: ?u64) void {
         const sch = gy.sch;
-        while (!done.load(.acquire)) {
+        const sw = io_util.Stopwatch.init(sch.io);
+        while (!(if (done) |d| d.load(.acquire) else false) and (if (ns) |n| sw.read() < n else true)) {
             if (gy.pass() == .ran) continue;
             // Idle: park until a submission or the worker wakes us. The timeout covers a
             // submission that landed between the pass and this lock.
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            if (done.load(.acquire)) break;
+            if (done) |d| if (d.load(.acquire)) break;
             const deadline = (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }).toDeadline(sch.io);
             sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, deadline) catch {};
         }
@@ -6590,7 +6599,7 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     const req = reqs[0];
     req.model.gen_busy = true;
     var gy = GenYield{ .sch = sch, .step_sw = io_util.Stopwatch.init(sch.io) };
-    const hook = gen_sse.Yield{ .ctx = &gy, .step = GenYield.step, .serve_until = GenYield.serveUntil, .wake = GenYield.wake };
+    const hook = gen_sse.Yield{ .ctx = &gy, .step = GenYield.step, .serve_until = GenYield.serveUntil, .wake = GenYield.wake, .serve_for = GenYield.serveFor };
     gen_sse.gen_yield = &hook;
     // The whole estimated peak, though live memory already holds part of it: the side that
     // cannot OOM.

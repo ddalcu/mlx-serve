@@ -640,6 +640,8 @@ const ZH: Record<string, string> = {
   Korean: "韩语",
   "LTX-Video or MiniMax-H3 · text / image / audio → video with its own soundtrack · frames + PCM":
     "LTX-Video 或 MiniMax-H3 · 文本 / 图像 / 音频 → 自带音轨的视频 · 帧 + PCM",
+  "Pause or resume a streaming video run after its current step · by the stream's job id":
+    "在当前步骤结束后暂停或继续流式视频生成 · 按流的 job id",
   Landscape: "风景",
   Language: "语言",
   Large: "大",
