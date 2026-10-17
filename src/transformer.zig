@@ -17956,7 +17956,7 @@ pub const Transformer = struct {
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
             // A pipeline rank without the PLE layer, or a tensor worker, never reads the table.
-            if (config.ple_layer_idx >= 0 and !(if (config.dist_shard) |sh| sh.rank != 0 else false)) {
+            if (config.pleLocalLayer() != null and !(if (config.dist_shard) |sh| sh.rank != 0 else false)) {
                 st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
                 if (st.gpu == null) st.table.calibrateArm();
                 // The weights load just evicted the table from page cache; an embedded pack's GPU
@@ -34783,7 +34783,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             var hb: [96]u8 = undefined;
             lw.hc_attn = try loadHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.attn_hyper_connection", .{ prefix, li }) catch unreachable, true, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
             lw.hc_mlp = try loadHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.mlp_hyper_connection", .{ prefix, li }) catch unreachable, true, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
-            if (config.ple_layer_idx == @as(i32, @intCast(li))) {
+            if (config.pleLocalLayer() == li) {
                 lw.ple = try loadPleWeights(weights, name_buf, prefix, li, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
             }
         }
@@ -35863,7 +35863,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         const has_ple = try allocator.alloc(bool, moe_layers.len);
         defer allocator.free(has_ple);
         for (moe_layers, 0..) |*lw, i| has_ple[i] = lw.ple != null;
-        if (!model_mod.qwen4PleInstalledAt(has_ple, config.ple_layer_idx)) {
+        if (!model_mod.qwen4PleInstalledAt(has_ple, if (config.pleLocalLayer()) |l| @intCast(l) else -1)) {
             log.err("[qwen4] the PLE was not installed at layer {d} ({d} layers carry PLE weights)\n", .{ config.ple_layer_idx, std.mem.count(bool, has_ple, &.{true}) });
             return error.Qwen4PleNotInstalled;
         }

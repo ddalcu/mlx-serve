@@ -932,7 +932,6 @@ pub const ModelConfig = struct {
             if (st < arr.len) std.mem.copyForwards(@TypeOf(arr[0]), arr[0 .. arr.len - st], arr[st..]);
         }
         if (self.linear_attn_tail_from != 0) self.linear_attn_tail_from -|= st;
-        self.ple_layer_idx = if (self.ple_layer_idx >= @as(i32, @intCast(st)) and self.ple_layer_idx < @as(i32, @intCast(span.end))) self.ple_layer_idx - @as(i32, @intCast(st)) else -1;
         self.num_hidden_layers = span.len();
         self.dist_span = span;
     }
@@ -944,6 +943,16 @@ pub const ModelConfig = struct {
         self.moe_intermediate_size /= sh.size;
         self.shared_expert_intermediate_size /= sh.size;
         self.dist_shard = sh;
+    }
+
+    /// The PLE's layer among this process's layers; null when another pipeline rank holds it.
+    /// `ple_layer_idx` stays the checkpoint's absolute index (it names the n-gram shards).
+    pub fn pleLocalLayer(self: *const ModelConfig) ?u32 {
+        if (self.ple_layer_idx < 0) return null;
+        const abs: u32 = @intCast(self.ple_layer_idx);
+        const st: u32 = if (self.dist_span) |sp| sp.start else 0;
+        if (abs < st or abs - st >= self.num_hidden_layers) return null;
+        return abs - st;
     }
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
@@ -2159,7 +2168,8 @@ fn validateQwen4Config(config: *const ModelConfig) !void {
         if (config.indexer_compress_ratio == 0) return error.InvalidQwen4Indexer;
         if (config.indexer_budget < config.indexer_compress_ratio) return error.InvalidQwen4Indexer;
     }
-    if (config.ple_layer_idx < 0 or config.ple_layer_idx >= @as(i64, config.num_hidden_layers)) {
+    const layers: i64 = if (config.dist_span) |sp| sp.total else config.num_hidden_layers;
+    if (config.ple_layer_idx < 0 or config.ple_layer_idx >= layers) {
         return error.InvalidQwen4PleLayer;
     }
 }
@@ -10807,4 +10817,21 @@ test "Weights.dropPrefix drops one block's tensors and nothing that merely start
     try std.testing.expect(w.get("blocks.10.attn.q.weight") != null and w.get("blocks.2.attn.q.weight") != null and w.get("norm.weight") != null);
     w.dropPrefix("absent.");
     try std.testing.expectEqual(@as(u32, 3), w.count());
+}
+
+test "applyLayerSpan: the PLE stays at its absolute layer and is local only to the rank holding it" {
+    var c: ModelConfig = std.mem.zeroes(ModelConfig);
+    c.num_hidden_layers = 48;
+    c.full_attention_interval = 4;
+    c.ple_layer_idx = 1;
+    var tail = c;
+    try tail.applyLayerSpan(.{ .start = 32, .end = 48, .total = 48 });
+    try std.testing.expectEqual(@as(u32, 16), tail.num_hidden_layers);
+    try std.testing.expectEqual(@as(i32, 1), tail.ple_layer_idx);
+    try std.testing.expect(tail.pleLocalLayer() == null);
+    try std.testing.expect(tail.isLinearLayer(0) and !tail.isLinearLayer(3));
+    var head = c;
+    try head.applyLayerSpan(.{ .start = 0, .end = 32, .total = 48 });
+    try std.testing.expectEqual(@as(u32, 1), head.pleLocalLayer().?);
+    try std.testing.expectError(error.DistSplitOffInterval, c.applyLayerSpan(.{ .start = 30, .end = 48, .total = 48 }));
 }
