@@ -31,6 +31,21 @@ Since v26.8.6, sliding-window models trim every attention read to their window: 
 
 The gain grows with the conversation; below roughly 8k there is nothing to trim yet.
 
+## W8A8 prefill (NAX GPUs)
+
+`--w8a8-prefill` (or `MLX_SERVE_W8A8_PREFILL=1`) is an **opt-in, lossy** prompt-processing route for affine 4-bit, group-64 LLM checkpoints on GPUs with neural accelerators (M5-class and later; other Macs log a warning and keep the stock path). Prompt-width projections (64 rows or more) run on the `--w8a8` kernels: the 4-bit weight is converted on each call to int8 behind the same block-256 Hadamard rotation (nothing extra stays resident), the activations are rotated and quantized per token, and the int8 x int8 product runs on the tensor units. Decode, speculative verify and the lm_head keep the exact 4-bit path; only the prompt's KV/SSM state differs slightly.
+
+Measured on an M6 (32 GB), `tests/bench.sh` against the same binary with the route off, median of two runs per point:
+
+| Prompt tokens | 512 | 4K | 8K | 16K |
+|---|---|---|---|---|
+| Qwen3.8-27B 4-bit + DFlash, prefill | **+22%** | **+34%** | **+32%** | **+32%** |
+| Qwen3.5-9B 4-bit, prefill | **+28%** | **+53%** | **+54%** | **+52%** |
+
+The 9B rows ran both arms with `MLX_SERVE_PREFILL_DQ_GEMM=0`: its 4096-row chunks otherwise take the dequant+GEMM route, which is slower than qmm on the M6.
+
+Decode is unchanged within run-to-run noise. On greedy requests the next-token KL divergence against the route off is 0.0004–0.0009 (27B) and 0.001–0.004 (9B); two runs of the stock path differ by 0, and the stock path itself moves by 0.0003–0.0006 (27B) and 0.0006–0.0013 (9B) between prefill chunk sizes or a cold and a warm prefix cache. Treat it like `--ane-prefill`: a speed-for-exactness trade you turn on knowingly.
+
 ## Tuning
 
 The defaults are already the fast path. **If you have plenty of RAM, the fastest configuration is the one you get out of the box.** Every speed-relevant knob is a memory-for-speed trade in one direction or the other.
