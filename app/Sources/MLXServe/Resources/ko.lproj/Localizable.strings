@@ -2265,3 +2265,4 @@
 "Match first frame" = "첫 프레임에 맞추기";
 "Matches your first frame (%@). Smaller renders faster." = "첫 프레임(%@)에 맞춥니다. 작을수록 빠르게 렌더링됩니다.";
 "Your first frame (%@) will be cropped to fit this size." = "첫 프레임(%@)이 이 크기에 맞게 잘립니다.";
+"%@ renders shot %lld again: %@ would take longer to finish it" = "%@에서 샷 %lld을(를) 다시 렌더링합니다: %@에서 끝내려면 더 오래 걸립니다";

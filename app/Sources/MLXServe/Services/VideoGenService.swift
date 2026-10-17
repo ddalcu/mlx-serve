@@ -435,6 +435,7 @@ final class VideoGenService: ObservableObject {
         var dispatcher = ShotDispatcher(costs: costs, factors: devices.map { H3TimeEstimate.speedFactor(peer: $0.peer).factor })
         var urls = [URL?](repeating: nil, count: requests.count)
         var lanes: [Int: (shot: Int, step: Int, total: Int)] = [:]
+        var rendering: [Int: Task<(mp4: URL, last: URL), Error>] = [:]
         var lastError: Error?
         let t0 = ProcessInfo.processInfo.systemUptime
         func report() {
@@ -456,21 +457,55 @@ final class VideoGenService: ObservableObject {
                     try await Task.sleep(for: .seconds(2))
                     continue
                 }
+                if let other = lanes.first(where: { $0.value.shot == s })?.key {
+                    log.append(L10n.format("%@ renders shot %lld again: %@ would take longer to finish it",
+                                           StoryboardCluster.name(devices[d]), Int64(s + 1),
+                                           StoryboardCluster.name(devices[other])))
+                }
                 lanes[d] = (s, 0, requests[s].steps)
                 report()
-                do {
-                    let out = try await renderShot(requests[s], model: devices[d].modelId, index: s, in: dir, port: port,
-                                                   gen: gen, label: "", peer: devices[d].peer) { step, total in
+                // Speed from the steps after the first, which also carries the load.
+                var firstStep: (step: Int, at: Double)?
+                var liveFactor: Double?
+                let job = Task { @MainActor in
+                    try await renderShot(requests[s], model: devices[d].modelId, index: s, in: dir, port: port,
+                                         gen: gen, label: "", peer: devices[d].peer) { step, total in
                         lanes[d] = (s, step, total)
                         report()
+                        let at = ProcessInfo.processInfo.systemUptime
+                        guard let f = firstStep else { firstStep = (step, at); return }
+                        if step - f.step >= 3, total > 0 {
+                            liveFactor = (at - f.at) / (costs[s] * Double(step - f.step) / Double(total))
+                            dispatcher.measured(d, factor: liveFactor!)
+                        }
                     }
+                }
+                rendering[d] = job
+                do {
+                    let out = try await withTaskCancellationHandler { try await job.value } onCancel: { job.cancel() }
+                    rendering[d] = nil
+                    guard urls[s] == nil else { continue }
                     urls[s] = out.mp4
-                    dispatcher.finished(d)
                     dispatcher.measured(d, factor: (ProcessInfo.processInfo.systemUptime - t0 - now) / costs[s])
+                    for j in dispatcher.finished(d) { rendering[j]?.cancel() }
                     lanes[d] = nil
                     report()
                 } catch {
-                    if Task.isCancelled || Self.isCancellation(error) { throw error }
+                    rendering[d] = nil
+                    if Task.isCancelled { throw error }
+                    if urls[s] != nil {
+                        // Another Mac finished this shot first: keep what this one showed of its speed.
+                        lanes[d] = nil
+                        report()
+                        if let peer = devices[d].peer, let f = liveFactor {
+                            let r = requests[s]
+                            H3RunHistory.remember(model: r.model, width: r.width, height: r.height, frames: r.numFrames,
+                                                  steps: r.steps, fast: !r.bestQuality && !r.turbo,
+                                                  measuredSeconds: f * costs[s], peer: peer)
+                        }
+                        continue
+                    }
+                    if Self.isCancellation(error) { throw error }
                     lastError = error
                     dispatcher.failed(d, shot: s)
                     lanes[d] = nil

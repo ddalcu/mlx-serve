@@ -2277,3 +2277,4 @@
 "Match first frame" = "匹配首帧";
 "Matches your first frame (%@). Smaller renders faster." = "与首帧一致（%@）。尺寸越小，渲染越快。";
 "Your first frame (%@) will be cropped to fit this size." = "首帧（%@）将被裁剪以适应此尺寸。";
+"%@ renders shot %lld again: %@ would take longer to finish it" = "%@ 重新渲染第 %lld 个镜头：%@ 完成它需要更久";

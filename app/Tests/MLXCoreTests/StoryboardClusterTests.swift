@@ -55,4 +55,36 @@ final class StoryboardClusterTests: XCTestCase {
         d.finished(0)
         XCTAssertTrue(d.done)
     }
+    /// A Mac guessed as fast as this one turns out 7x slower: once this Mac runs out of
+    /// shots it renders that shot again, and the first copy to finish wins.
+    func testAnIdleMacRerunsAShotASlowerMacIsStillOn() {
+        var d = ShotDispatcher(costs: [10, 10], factors: [1, 1])
+        XCTAssertEqual(d.next(for: 0, now: 0), 0)
+        XCTAssertEqual(d.next(for: 1, now: 0), 1)
+        d.measured(1, factor: 7)
+        XCTAssertEqual(d.finished(0), [])
+        XCTAssertEqual(d.next(for: 0, now: 10), 1)
+        XCTAssertEqual(d.finished(0), [1], "the slow copy is the one to cancel")
+        XCTAssertTrue(d.done)
+    }
+
+    /// No second copy of a shot that is about to finish where it is.
+    func testNoRerunOfAShotThatEndsSoonAnyway() {
+        var d = ShotDispatcher(costs: [10, 12], factors: [1, 1])
+        XCTAssertEqual(d.next(for: 0, now: 0), 1)
+        XCTAssertEqual(d.next(for: 1, now: 0), 0)
+        _ = d.finished(1)
+        XCTAssertNil(d.next(for: 1, now: 10))
+    }
+
+    /// With a slow Mac misjudged, the film still ends when this Mac alone would end it.
+    func testAMisjudgedSlowMacNeverMakesTheFilmLater() {
+        var d = ShotDispatcher(costs: [10, 10], factors: [1, 1])
+        _ = d.next(for: 0, now: 0)
+        _ = d.next(for: 1, now: 0)
+        d.measured(1, factor: 7)
+        _ = d.finished(0)
+        _ = d.next(for: 0, now: 10)
+        XCTAssertEqual(d.busyUntil[0], 20, accuracy: 1e-9)
+    }
 }

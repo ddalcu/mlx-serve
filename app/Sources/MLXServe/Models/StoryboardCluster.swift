@@ -78,57 +78,95 @@ enum StoryboardCluster {
 /// would finish it soonest given what that device already holds; the free device
 /// starts its largest planned shot, or waits when the plan gives it none. So a
 /// slow machine takes a shot only when that brings the end of the film closer.
+/// Once nothing is left to start, a free device renders again the shot that would
+/// end last where it runs, when it would finish it well before: a machine whose
+/// speed was guessed wrong never makes the film end later than the others alone.
 struct ShotDispatcher {
     let costs: [Double]
     private(set) var factors: [Double]
     private(set) var pending: [Int]
-    /// Predicted end of each device's current shot; nil while idle.
-    private var running: [Double?]
+    /// The shot each device is rendering and when it started it; nil while idle.
+    private var shot: [Int?]
+    private var started: [Double]
     private var alive: [Bool]
+
+    /// A second copy starts only when the first would take this much longer to finish.
+    static let rerunGain = 1.25
 
     init(costs: [Double], factors: [Double]) {
         self.costs = costs
         self.factors = factors
         pending = costs.indices.sorted { costs[$0] > costs[$1] }
-        running = Array(repeating: nil, count: factors.count)
+        shot = Array(repeating: nil, count: factors.count)
+        started = Array(repeating: 0, count: factors.count)
         alive = Array(repeating: true, count: factors.count)
     }
 
-    var busyUntil: [Double] { running.map { $0 ?? 0 } }
-    var done: Bool { pending.isEmpty && running.allSatisfy { $0 == nil } }
-    func idle(_ device: Int) -> Bool { running[device] == nil }
+    /// Predicted end of each device's current shot (0 while idle).
+    var busyUntil: [Double] { factors.indices.map { end($0) ?? 0 } }
+    var done: Bool { pending.isEmpty && shot.allSatisfy { $0 == nil } }
+    func idle(_ device: Int) -> Bool { shot[device] == nil }
     func usable(_ device: Int) -> Bool { alive[device] }
+
+    private func end(_ d: Int) -> Double? { shot[d].map { started[d] + costs[$0] * factors[d] } }
 
     /// The shot `device` should start at `now`, or nil to stay idle for now.
     mutating func next(for device: Int, now: Double) -> Int? {
-        guard alive[device], running[device] == nil else { return nil }
-        var load = factors.indices.map { alive[$0] ? max(running[$0] ?? now, now) : .infinity }
+        guard alive[device], shot[device] == nil else { return nil }
+        var load = factors.indices.map { alive[$0] ? max(end($0) ?? now, now) : .infinity }
         for (k, s) in pending.enumerated() {
             let ends = factors.indices.map { load[$0] + costs[s] * factors[$0] }
             let best = ends.indices.min { ends[$0] < ends[$1] || (ends[$0] == ends[$1] && $0 == device) }!
             if best == device {
                 pending.remove(at: k)
-                running[device] = ends[best]
-                return s
+                return start(s, on: device, now: now)
             }
             load[best] = ends[best]
         }
-        return nil
+        guard pending.isEmpty else { return nil }
+        // Nothing left to start: take over the shot that ends last, run once so far.
+        let costs = costs, mineFactor = factors[device]
+        let mine = { (s: Int) in costs[s] * mineFactor }
+        let rerun = factors.indices
+            .compactMap { j -> (shot: Int, end: Double)? in
+                guard let s = shot[j], let e = end(j), shot.filter({ $0 == s }).count == 1 else { return nil }
+                return (s, e)
+            }
+            .filter { $0.end - now > mine($0.shot) * Self.rerunGain }
+            .max { $0.end < $1.end }
+        return rerun.map { start($0.shot, on: device, now: now) }
+    }
+
+    private mutating func start(_ s: Int, on device: Int, now: Double) -> Int {
+        shot[device] = s
+        started[device] = now
+        return s
     }
 
     var anyAlive: Bool { alive.contains(true) }
 
-    mutating func finished(_ device: Int) { running[device] = nil }
+    /// `device` finished its shot; returns the devices still rendering another copy
+    /// of it, now idle, whose copies the caller cancels.
+    @discardableResult
+    mutating func finished(_ device: Int) -> [Int] {
+        guard let s = shot[device] else { return [] }
+        shot[device] = nil
+        let others = factors.indices.filter { shot[$0] == s }
+        for j in others { shot[j] = nil }
+        return others
+    }
 
-    /// A device whose shot failed leaves the run; its shot goes back in line.
-    mutating func failed(_ device: Int, shot: Int) {
+    /// A device whose shot failed leaves the run; its shot goes back in line
+    /// unless another copy of it is still rendering.
+    mutating func failed(_ device: Int, shot s: Int) {
         alive[device] = false
-        running[device] = nil
-        pending.append(shot)
+        shot[device] = nil
+        guard !shot.contains(s) else { return }
+        pending.append(s)
         pending.sort { costs[$0] > costs[$1] }
     }
 
-    /// A measured speed replaces the guess as soon as a device finishes a shot.
+    /// A measured speed replaces the guess: from a shot's progress, and when it finishes.
     mutating func measured(_ device: Int, factor: Double) {
         guard factor.isFinite, factor > 0 else { return }
         factors[device] = factor
