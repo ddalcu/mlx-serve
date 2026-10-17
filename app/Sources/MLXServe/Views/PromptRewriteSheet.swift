@@ -40,6 +40,8 @@ struct PromptRewriteSheet: View {
 
     let title: String
     var clip: ClipLength? = nil
+    /// The text the rewrite starts from. With a clip it is shown until Write is pressed.
+    var source: String? = nil
     let request: (Int) -> PromptRewriter.Request
     /// Called on Apply with the slider's seconds, only when it was moved.
     var onApplyClip: ((Int) -> Void)? = nil
@@ -51,6 +53,8 @@ struct PromptRewriteSheet: View {
 
     @State private var text: String = ""
     @State private var clipSeconds = 0
+    /// A clip sheet waits on Write, so the input and the length can be checked first.
+    @State private var started = false
     /// The length the text in the box was written for.
     @State private var writtenSeconds = 0
     @State private var isWriting = false
@@ -75,23 +79,38 @@ struct PromptRewriteSheet: View {
                     }
                 }
             }
-            TextEditor(text: $text)
-                .font(.app(.body))
-                .frame(minHeight: 220)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
-                .overlay(alignment: .topLeading) {
-                    // The think, until the answer starts: proof the model is working.
-                    if isWriting, text.isEmpty, !progress.thought.isEmpty {
-                        Text(verbatim: String(progress.thought.suffix(1200)))
-                            .font(.app(.caption)).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                            .padding(8)
-                            .clearOfEditorScroller()
-                            .clipped()
-                            .allowsHitTesting(false)
-                    }
+            if awaitingWrite {
+                ScrollView {
+                    Text(verbatim: source ?? "")
+                        .font(.app(.body))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
                 }
-            if let error = error ?? (isWriting ? nil : applyError?(text, writtenSeconds)) {
+                .frame(minHeight: 220, alignment: .top)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+            } else {
+                TextEditor(text: $text)
+                    .font(.app(.body))
+                    .frame(minHeight: 220)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+                    .overlay(alignment: .topLeading) {
+                        // The think, until the answer starts: proof the model is working.
+                        if isWriting, text.isEmpty, !progress.thought.isEmpty {
+                            Text(verbatim: String(progress.thought.suffix(1200)))
+                                .font(.app(.caption)).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                                .padding(8)
+                                .clearOfEditorScroller()
+                                .clipped()
+                                .allowsHitTesting(false)
+                        }
+                    }
+            }
+            if awaitingWrite {
+                Text("Check the prompt and clip length, then Write.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            } else if let error = error ?? (isWriting ? nil : applyError?(text, writtenSeconds)) {
                 Text(error).font(.app(.caption)).foregroundStyle(.red)
             } else if blindToFirstFrame {
                 Text("Your chat model can't see images, so this was written without your first frame and the video may cut away from it. A vision chat model fixes that.")
@@ -115,30 +134,41 @@ struct PromptRewriteSheet: View {
                 }
             }
             HStack {
-                Button { start() } label: { Text("Try again")
-                    .font(.app(.body)) }.disabled(isWriting)
+                if !awaitingWrite {
+                    Button { start() } label: { Text("Try again")
+                        .font(.app(.body)) }.disabled(isWriting)
+                }
                 Spacer()
                 Button { dismiss() } label: { Text("Cancel")
                     .font(.app(.body)) }.keyboardShortcut(.cancelAction)
-                Button {
-                    onApply(text)
-                    if let clip, clipSeconds != clip.initial { onApplyClip?(clipSeconds) }
-                    dismiss()
-                } label: { Text("Apply")
-                    .font(.app(.body)) }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(isWriting || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || applyError?(text, writtenSeconds) != nil)
+                if awaitingWrite {
+                    Button { start() } label: { Text("Write")
+                        .font(.app(.body)) }
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Button {
+                        onApply(text)
+                        if let clip, clipSeconds != clip.initial { onApplyClip?(clipSeconds) }
+                        dismiss()
+                    } label: { Text("Apply")
+                        .font(.app(.body)) }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(isWriting || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  || applyError?(text, writtenSeconds) != nil)
+                }
             }
         }
         .padding(16)
         .frame(width: 520)
-        .onAppear { clipSeconds = clip?.initial ?? 0; start() }
+        .onAppear { clipSeconds = clip?.initial ?? 0; if clip == nil { start() } }
         .onDisappear { job?.cancel() }
     }
 
+    private var awaitingWrite: Bool { clip != nil && !started }
+
     private func start() {
         job?.cancel()
+        started = true
         text = ""
         error = nil
         progress = RewriteProgress()

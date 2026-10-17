@@ -237,6 +237,7 @@ struct VideoGenView: View {
         .sheet(isPresented: $showEnhance) {
             PromptRewriteSheet(
                 title: storyboardOn ? "Write storyboard" : "Rewrite video prompt", clip: enhanceLength,
+                source: prompt,
                 request: { seconds in
                     let firstFrame = firstFrameImageURL.flatMap { try? Data(contentsOf: $0) }
                     return plansStoryboard(seconds)
