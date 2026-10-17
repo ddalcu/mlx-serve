@@ -70,10 +70,7 @@ pub const LayerSpan = struct {
     /// The name tensor `key` loads under on this rank, or null when it belongs to
     /// another: `key` itself, or the renumbered trunk name written into `buf`.
     pub fn remap(self: LayerSpan, key: []const u8, buf: []u8) ?[]const u8 {
-        const head_only = std.mem.startsWith(u8, key, "mtp.") or std.mem.indexOf(u8, key, ".mtp.") != null or
-            std.mem.indexOf(u8, key, "visual") != null or std.mem.indexOf(u8, key, "vision") != null or
-            std.mem.indexOf(u8, key, "audio") != null;
-        if (head_only) return if (self.first()) key else null;
+        if (headOnly(key)) return if (self.first()) key else null;
         const at = trunkLayerAt(key) orelse return key;
         const n = std.fmt.parseInt(u32, key[at.lo..at.hi], 10) catch return key;
         if (n < self.start or n >= self.end) return null;
@@ -90,7 +87,7 @@ pub const Shard = struct {
 
     /// Which projection of an expert `key` names: gate/up split their rows, down its columns.
     pub fn expertAxis(key: []const u8) ?enum { rows, cols } {
-        if (std.mem.startsWith(u8, key, "mtp.") or std.mem.indexOf(u8, key, ".mtp.") != null) return null;
+        if (headOnly(key)) return null;
         if (std.mem.indexOf(u8, key, ".switch_mlp.") == null and std.mem.indexOf(u8, key, ".shared_expert.") == null) return null;
         const tail = for ([_][]const u8{ ".weight", ".scales", ".biases" }) |sfx| {
             if (std.mem.endsWith(u8, key, sfx)) break key[0 .. key.len - sfx.len];
@@ -109,6 +106,13 @@ pub const Shard = struct {
         }
     }
 };
+
+/// Tensors only rank 0 reads: the MTP head and the vision/audio towers.
+pub fn headOnly(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "mtp.") or std.mem.indexOf(u8, key, ".mtp.") != null or
+        std.mem.indexOf(u8, key, "visual") != null or std.mem.indexOf(u8, key, "vision") != null or
+        std.mem.indexOf(u8, key, "audio") != null;
+}
 
 /// The digits of the first `layers.<N>.` in `key`.
 fn trunkLayerAt(key: []const u8) ?struct { lo: usize, hi: usize } {
@@ -278,11 +282,13 @@ pub const Peer = struct {
     /// queued (async) ahead of the receive so the comm stream runs them in that order.
     pub fn hop(self: *Peer, h: mlx.mlx_array, offset: usize, s: mlx.mlx_stream) !mlx.mlx_array {
         if (!self.ready) try self.awaitReady(s);
+        const sh = mlx.getShape(h);
+        log.debug("[dist] hop at {d}: {d}x{d} rows (worker holds {d})\n", .{ offset, sh[0], sh[1], self.peer_pos });
         if (offset != 0 and offset != self.peer_pos) {
             log.err("[dist] forward at {d} but the worker holds {d} tokens: its caches cannot follow this reuse\n", .{ offset, self.peer_pos });
+            std.debug.dumpCurrentStackTrace(.{});
             return error.DistPeerDiverged;
         }
-        const sh = mlx.getShape(h);
         try self.sendOrdered(.{ OP_FORWARD, sh[0], sh[1], @intCast(offset & 0x7fffffff), @intCast(offset >> 31), sh[2], @intFromEnum(mlx.mlx_array_dtype(h)), 0 }, &.{h});
         self.peer_pos = offset + @as(usize, @intCast(sh[1]));
         return queuedRecv(&self.link, sh, mlx.mlx_array_dtype(h), 1);
@@ -335,25 +341,15 @@ pub const Peer = struct {
     }
 };
 
-/// Rows past which a receive is waited for on the host before any GPU work reads it.
-const LAZY_RECV_ROWS: usize = 16;
-
-/// A receive queued the moment it is built, so it pairs with the peer's send even when
-/// nobody evaluates what reads it (a warmup that drops its output would leave the
-/// peer's reply to be read by the next forward). Past `LAZY_RECV_ROWS` the host waits
-/// for it: a GPU command buffer waiting seconds on a CPU event trips Metal's watchdog.
+/// A receive completed on the host before anything reads it. A lazy one lets a GPU command
+/// buffer wait on it, and MLX signals a buffer's events only when the whole buffer ends: the
+/// buffer that computes the payload can then also hold the wait for the reply to it, which
+/// deadlocks until Metal's watchdog kills it. Done here, the receive also pairs with the
+/// peer's send even when nobody reads it (a warmup that drops its output).
 fn queuedRecv(link: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32) !mlx.mlx_array {
     const r = try link.recv(shape, dtype, src, .{ .ctx = null });
     errdefer _ = mlx.mlx_array_free(r);
-    var rows: usize = 1;
-    for (shape[0 .. shape.len - 1]) |d| rows *= @intCast(d);
-    if (rows > LAZY_RECV_ROWS) {
-        try evalOne(r);
-    } else {
-        const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{r}, 1);
-        defer _ = mlx.mlx_vector_array_free(v);
-        try mlx.check(mlx.mlx_async_eval(v));
-    }
+    try evalOne(r);
     return r;
 }
 
@@ -372,6 +368,15 @@ fn dependsOn(x: mlx.mlx_array, dep: mlx.mlx_array) !mlx.mlx_array {
 }
 
 var peer_slot: ?Peer = null;
+
+/// Rank 0 at shutdown: releases the worker. A peer that vanishes mid-protocol crashes the
+/// other side inside Apple's RDMA library, so the group always ends with this message.
+pub fn shutdown() void {
+    const p = peer() orelse return;
+    if (!p.ready) return;
+    sendMsg(&p.link, .{ OP_STOP, 0, 0, 0, 0, 0, 0, 0 }, 1, .{ .ctx = null }) catch return;
+    log.info("[dist] worker released\n", .{});
+}
 
 /// Rank 0's peer, once `connect` has run.
 pub fn peer() ?*Peer {

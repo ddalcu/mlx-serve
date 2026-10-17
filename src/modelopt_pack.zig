@@ -421,6 +421,7 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressur
         if (!std.mem.endsWith(u8, k.*, ".gate_proj.weight")) continue;
         var nb: [512]u8 = undefined;
         if (span) |sp| if (sp.remap(k.*, &nb) == null) continue;
+        if (shard) |sh| if (sh.rank != 0 and distributed.headOnly(k.*)) continue;
         const at = std.mem.indexOf(u8, k.*, ".mlp.experts.").?;
         const tail = k.*[at + ".mlp.experts.".len ..];
         const e = try std.fmt.parseInt(u32, tail[0..std.mem.indexOfScalar(u8, tail, '.').?], 10);
@@ -460,7 +461,7 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressur
             defer pageFree(w_part);
             var sc_part: []align(std.heap.page_size_min) u8 = &.{};
             defer pageFree(sc_part);
-            if (shard) |sh| {
+            if (shard) |sh| if (!distributed.headOnly(b.base)) {
                 w_part = try pageAlloc(b.w.len / sh.size);
                 sc_part = try pageAlloc(b.sc.len / sh.size);
                 if (b.proj < 2) {
@@ -474,10 +475,10 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressur
                 }
                 w = w_part;
                 sc = sc_part;
-            }
+            };
             try putCopy(weights, w, &.{ E, @intCast(rows), @intCast(in / 8) }, .uint32, "{s}.mlp.switch_mlp.{s}.weight", .{ dst, PROJS[b.proj] });
             try putCopy(weights, sc, &.{ E, @intCast(rows), @intCast(in / 16) }, .uint8, "{s}.mlp.switch_mlp.{s}.scales", .{ dst, PROJS[b.proj] });
-            bytes += b.w.len + b.sc.len;
+            bytes += w.len + sc.len;
             pageFree(b.w);
             pageFree(b.sc);
             b.w = &.{};

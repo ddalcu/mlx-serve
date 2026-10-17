@@ -2328,6 +2328,7 @@ pub fn serve(
         if (remaining > 0)
             log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
     }
+    @import("distributed.zig").shutdown();
 
     deinitGlobalResponseStore();
 

@@ -98,7 +98,8 @@ test "mxfp8 qmv: 1..8 rows no worse than MLX's matmul against the fp32 truth (K 
     const xfm = @import("transformer.zig");
     xfm.device_gen_override = .{ .gen = 16, .phone = false }; // the gate is a perf choice; the numerics are checked on every Mac
     defer xfm.device_gen_override = null;
-    for ([_][2]c_int{ .{ 640, 2560 }, .{ 2560, 640 } }) |nk| try mxfp8Case(nk[0], nk[1]);
+    // 320: a tensor-parallel rank's half of a 640-wide expert.
+    for ([_][2]c_int{ .{ 640, 2560 }, .{ 2560, 640 }, .{ 320, 2560 }, .{ 2560, 320 } }) |nk| try mxfp8Case(nk[0], nk[1]);
 }
 
 test "mxfp8 qmv: only the measured GPU generations (M4, M5) take the kernel" {

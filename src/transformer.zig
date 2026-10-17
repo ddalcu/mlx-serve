@@ -24663,6 +24663,12 @@ pub const Transformer = struct {
         else
             return null;
         var mcfg = config;
+        // The head's experts stay whole on a tensor-parallel rank 0 (`distributed.headOnly`).
+        if (mcfg.dist_shard) |sh| {
+            mcfg.moe_intermediate_size *= sh.size;
+            mcfg.shared_expert_intermediate_size *= sh.size;
+            mcfg.dist_shard = null;
+        }
         mcfg.weight_prefix = mtp_prefix;
         mcfg.num_hidden_layers = 1;
         mcfg.full_attention_interval = 1; // layer 0 is the full-attention layer

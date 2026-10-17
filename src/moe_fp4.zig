@@ -362,13 +362,17 @@ fn row(a: mlx.mlx_array, r: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     return flat;
 }
 
-test "moe fp4 decode: gate+up+SwiGLU and the weighted down match fp32 truth per token (mxfp4, nvfp4; width 640, per-expert gate scale)" {
+test "moe fp4 decode: gate+up+SwiGLU and the weighted down match fp32 truth per token (mxfp4, nvfp4; widths 640 and a tensor rank's 320, per-expert gate scale)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try fp4DecodeCase(640);
+    try fp4DecodeCase(320);
+}
+
+fn fp4DecodeCase(I: c_int) !void {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4D1E0F4);
     const rnd = prng.random();
     const E: c_int = 16;
-    const I: c_int = 640;
     const H: c_int = 1536;
     const R: c_int = 3;
     const TOPK: c_int = 8;

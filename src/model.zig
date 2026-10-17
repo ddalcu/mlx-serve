@@ -5044,8 +5044,17 @@ fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
     return error.Exl3NeedsMetal;
 }
 
-/// Keeps the tensors one pipeline rank holds, under their renumbered names (`LayerSpan.remap`).
-pub fn retainSpan(weights: *Weights, span: distributed.LayerSpan) !void {
+/// A tensor worker never runs the MTP head or the towers.
+const TensorWorker = struct {
+    fn remap(_: TensorWorker, key: []const u8, _: []u8) ?[]const u8 {
+        return if (distributed.headOnly(key)) null else key;
+    }
+};
+
+/// Keeps the tensors one rank holds, under the names `keep.remap` gives them
+/// (`LayerSpan`: its layers renumbered; `TensorWorker`: all but the head-only towers).
+pub fn retainSpan(weights: *Weights, keep: anytype) !void {
+    const span = keep;
     const a = weights.allocator;
     var kept = std.StringHashMap(mlx.mlx_array).init(a);
     errdefer kept.deinit();
@@ -5113,6 +5122,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainSpan(&weights, sp);
+    if (config.dist_shard) |sh| if (sh.rank != 0) try retainSpan(&weights, TensorWorker{});
     if (config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
