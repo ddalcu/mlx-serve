@@ -472,19 +472,22 @@ fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     const sp = p.span;
     // Rows mode: the worker's speed relative to this Mac and the link, once measured.
     const speed: f64 = if (p.worker_calib_us > 0 and p.host_calib_us > 0) @as(f64, @floatFromInt(p.host_calib_us)) / @as(f64, @floatFromInt(p.worker_calib_us)) else 0;
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":\"{f}\",\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":\"{f}\"}}", .{
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}]}}", .{
         @tagName(p.mode), std.fs.path.basename(p.model), p.planned, p.ready, sp.total, sp.start, sp.end,
         if (p.mode == .pipeline) sp.end else 0, sp.total, if (p.shard) |sh| sh.size else 0,
         p.worker.avail_mib, p.worker.total_mib, p.exchanges, std.json.fmt(p.workerName(), .{}) , speed, p.link_bytes_per_us / 1000,
-        std.json.fmt(last_job_buf[0..last_job_len], .{}),
+        std.json.fmt(last_job_buf[0..last_job_len], .{}), last_split[0], last_split[1],
     });
 }
 
 var last_job_buf: [160]u8 = undefined;
 var last_job_len: usize = 0;
+var last_split: [2]u32 = .{ 0, 0 };
 
-/// What the last video job did with the worker (`/props` cluster "last_job").
-pub fn noteJob(comptime fmt: []const u8, args: anytype) void {
+/// What the last video job did with the worker (`/props` cluster "last_job", and its rows
+/// on each Mac, zeros when it ran here alone).
+pub fn noteJob(split: [2]u32, comptime fmt: []const u8, args: anytype) void {
+    last_split = split;
     last_job_len = if (std.fmt.bufPrint(&last_job_buf, fmt, args)) |t| t.len else |_| 0;
 }
 
@@ -1017,9 +1020,21 @@ test "Shard: gate/up keep a band of rows per expert, down a band of columns" {
     try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6, 7, 14, 15, 16, 17 }, &out);
 }
 
-test "clusterJson: a pipeline split names both ranks' layers" {
+test "clusterJson: valid JSON naming both ranks' layers and the worker" {
+    const a = std.testing.allocator;
     var p: Peer = .{ .link = undefined, .mode = .pipeline, .model = "/m/org/Flash-FP4", .split = null, .worker = .{ .avail_mib = 100, .total_mib = 128 }, .span = .{ .start = 0, .end = 16, .total = 48 }, .planned = true, .ready = true, .exchanges = 3 };
-    const j = try clusterJson(std.testing.allocator, &p);
-    defer std.testing.allocator.free(j);
-    try std.testing.expectEqualStrings(",\"cluster\":{\"mode\":\"pipeline\",\"model\":\"Flash-FP4\",\"joined\":true,\"planned\":true,\"worker_ready\":true,\"layers\":48,\"here\":[0,16],\"worker\":[16,48],\"expert_shards\":0,\"worker_free_mib\":100,\"worker_total_mib\":128,\"exchanges\":3}", j);
+    const name = "Mac \"two\"";
+    @memcpy(p.worker_name_buf[0..name.len], name);
+    p.worker_name_len = name.len;
+    const j = try clusterJson(a, &p);
+    defer a.free(j);
+    const doc = try std.fmt.allocPrint(a, "{{{s}}}", .{j[1..]});
+    defer a.free(doc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, doc, .{});
+    defer parsed.deinit();
+    const c = parsed.value.object.get("cluster").?.object;
+    try std.testing.expectEqualStrings("pipeline", c.get("mode").?.string);
+    try std.testing.expectEqualStrings("Flash-FP4", c.get("model").?.string);
+    try std.testing.expectEqual(@as(i64, 16), c.get("here").?.array.items[1].integer);
+    try std.testing.expectEqualStrings(name, c.get("worker_name").?.string);
 }

@@ -154,8 +154,9 @@ pub fn calibrate(model: *const h3.Model, io: std.Io, s: S) !u64 {
     const rows: c_int = @intCast(CALIB_ROWS);
     const hidden: c_int = @intCast(model.cfg.hidden_size);
     const half: c_int = @intCast(model.cfg.rotDim() / 2);
-    const key = mlx.mlx_array_new_int(0);
+    var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0));
     const t_emb = try model.timeEmbedAs(&.{500.0}, s);
     defer _ = mlx.mlx_array_free(t_emb);
     var rope: h3.RopeTables = .{ .cos = mlx.mlx_array_new(), .sin = mlx.mlx_array_new() };
@@ -231,14 +232,14 @@ pub fn begin(pack_dir: []const u8, io: std.Io, model: *h3.Model, turbo: bool, us
     const cut = forced orelse chooseCut(rows, p.host_calib_us, p.worker_calib_us, p.link_bytes_per_us, kv_row, @intCast(model.blocks.len)) orelse
         return alone("{d} rows: the swap would cost more than the worker saves", .{rows});
     try distributed.sendOp(&p.link, .{ distributed.OP_H3_JOB, @intFromBool(turbo), @intFromBool(bcast), 0, 0, 0, 0, 0 });
-    distributed.noteJob("split {d}/{d} rows", .{ cut, rows - cut });
+    distributed.noteJob(.{ cut, rows - cut }, "split {d}/{d} rows", .{ cut, rows - cut });
     log.info("[h3-split] {d} rows: {d} here, {d} on the worker\n", .{ rows, cut, rows - cut });
     p.exchanges += 1;
     return .{ .split = .{ .link = &p.link, .rank = 0, .rows = rows, .cut = cut } };
 }
 
 fn alone(comptime fmt: []const u8, args: anytype) ?Job {
-    distributed.noteJob("alone: " ++ fmt, args);
+    distributed.noteJob(.{ 0, 0 }, "alone: " ++ fmt, args);
     log.info("[h3-split] this job runs here alone: " ++ fmt ++ "\n", args);
     return null;
 }
