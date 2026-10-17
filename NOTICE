@@ -130,6 +130,16 @@ matmul2d tensor extents and strides in our NAX kernel are dflash's working
 convention.
 
 --------------------------------------------------------------------------------
+FlashInfer (Local Inference Lab fork)
+https://github.com/local-inference-lab/flashinfer
+Copyright FlashInfer contributors
+Licensed under the Apache License, Version 2.0.
+
+Used in mlx-serve (`src/modelopt_pack.zig`, `decodeCsf32`): the `csf_32x2_v1`
+NVFP4 scale-block layout, ported from
+`flashinfer/experimental/b12x/loader/_csf_blocks.py`.
+
+--------------------------------------------------------------------------------
 oMLX, by jundot
 Copyright oMLX contributors
 Licensed under the Apache License, Version 2.0.

@@ -9,9 +9,10 @@ const model_discovery = @import("model_discovery.zig");
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 
+/// Also serves NVIDIA's ModelOpt GLM pack, which ships the same source layout.
 pub fn adapt(config: *const ModelConfig, weights: *Weights, s: mlx.mlx_stream) !void {
-    if (config.exl3 == null) return;
-    if (config.isMimo()) {
+    if (config.exl3 == null and !config.modelopt) return;
+    if (config.isMimo() and config.exl3 != null) {
         try dequantFp8Trunk(config, weights, s);
     }
     if (config.isGlm5()) {
@@ -277,7 +278,7 @@ fn solveQkvTp(q: u64, k: u64, v: u64, scale_rows: u64) !u32 {
 }
 
 /// e4m3 codes `[tp * per, K]` with their 128x128 f32 tile scales, as bf16 `[tp, per, K]`.
-fn dequantSlabs(codes: mlx.mlx_array, scales: mlx.mlx_array, tp: u32, per: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn dequantSlabs(codes: mlx.mlx_array, scales: mlx.mlx_array, tp: u32, per: u32, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.getShape(codes);
     const k: c_int = sh[1];
     const kb = @divExact(k, FP8_BLOCK);

@@ -209,7 +209,7 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
     const topk: c_int = ish[1];
     if (gate_scale) |g| if (mlx.mlx_array_dtype(g) != dt) return null;
     if (shared) |sh| {
-        if (rows != 1 or mlx.mlx_array_dtype(sh.down) != dt or mlx.mlx_array_dtype(sh.logit) != dt or mlx.mlx_array_size(sh.down) != @as(usize, @intCast(hidden))) return null;
+        if (rows != 1 or mlx.mlx_array_dtype(sh.down) != dt or mlx.mlx_array_dtype(sh.logit) != dt or mlx.mlx_array_size(sh.logit) != 1 or mlx.mlx_array_size(sh.down) != @as(usize, @intCast(hidden))) return null;
     }
 
     const full_header = [2][:0]const u8{ E2M1_HEADER ++ NV_SCALE ++ DOT16, E2M1_HEADER ++ MX_SCALE ++ DOT16 };
@@ -413,5 +413,97 @@ test "moe fp4 decode: gate+up+SwiGLU and the weighted down match fp32 truth per 
             std.debug.print("[moe-fp4] {s} token {d}: rel rms err vs fp32 truth {d:.5}\n", .{ f.name, r, rel });
             try testing.expect(rel < 0.02);
         }
+    }
+}
+
+test "moe fp4 decode: one-expert bank views and the fused shared expert match fp32 truth (mxfp4, nvfp4; one token)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x5A4E0F4);
+    const rnd = prng.random();
+    const E: c_int = 16;
+    const I: c_int = 640;
+    const H: c_int = 1536;
+    const TOPK: c_int = 8;
+    const Fmt = struct { name: [:0]const u8, gs: c_int, mode: @import("model.zig").QuantMode };
+    for ([_]Fmt{ .{ .name = "mxfp4", .gs = 32, .mode = .mxfp4 }, .{ .name = "nvfp4", .gs = 16, .mode = .nvfp4 } }) |f| {
+        var banks: [3]Bank = undefined;
+        var deq: [3]mlx.mlx_array = undefined;
+        const shapes = [3][3]c_int{ .{ E, I, H }, .{ E, I, H }, .{ E, H, I } };
+        for (&banks, &deq, shapes) |*b, *d, sh| {
+            const w = try randBf16(rnd, &sh, 0.2, s);
+            defer _ = mlx.mlx_array_free(w);
+            const q = try quant(w, f.gs, f.name, s);
+            b.* = q.b;
+            d.* = q.deq;
+        }
+        defer for (banks, deq) |b, d| {
+            _ = mlx.mlx_array_free(b.w);
+            _ = mlx.mlx_array_free(b.s);
+            _ = mlx.mlx_array_free(d);
+        };
+        var owned: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (owned.items) |a| _ = mlx.mlx_array_free(a);
+            owned.deinit(testing.allocator);
+        }
+        const A4 = moe_affine4.Bank;
+        const views = (try moe_affine4.bindViews(A4{ .w = banks[0].w, .s = banks[0].s, .b = .{ .ctx = null } }, A4{ .w = banks[1].w, .s = banks[1].s, .b = .{ .ctx = null } }, A4{ .w = banks[2].w, .s = banks[2].s, .b = .{ .ctx = null } }, &owned, testing.allocator, s)) orelse return error.SkipZigTest;
+
+        const x = try randBf16(rnd, &.{ 1, H }, 2.0, s);
+        defer _ = mlx.mlx_array_free(x);
+        const idx = [8]u32{ 3, 0, 15, 7, 9, 1, 12, 5 };
+        const inds = mlx.mlx_array_new_data(&idx, &[_]c_int{ 1, TOPK }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(inds);
+        const scores = try randBf16(rnd, &.{ 1, TOPK }, 0.5, s);
+        defer _ = mlx.mlx_array_free(scores);
+        const sdown = try randBf16(rnd, &.{H}, 1.0, s);
+        defer _ = mlx.mlx_array_free(sdown);
+        const logit = try randBf16(rnd, &.{1}, 1.0, s);
+        defer _ = mlx.mlx_array_free(logit);
+        const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+
+        const plain = (try decode(s, x, banks[0], banks[1], banks[2], null, null, null, inds, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
+        defer _ = mlx.mlx_array_free(plain);
+        const viewed = (try decode(s, x, banks[0], banks[1], banks[2], views, null, null, inds, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
+        defer _ = mlx.mlx_array_free(viewed);
+        const fused = (try decode(s, x, banks[0], banks[1], banks[2], views, null, .{ .down = sdown, .logit = logit }, inds, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
+        defer _ = mlx.mlx_array_free(fused);
+        // Views bind the same bytes: the output is bit-identical.
+        try testing.expectEqual(@as(f32, 0), try xfm.maxAbsDiffF32(plain, viewed, s));
+
+        var f32o = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32o);
+        try mlx.check(mlx.mlx_astype(&f32o, fused, .float32, s));
+        var sd32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sd32);
+        try mlx.check(mlx.mlx_astype(&sd32, sdown, .float32, s));
+        var lg32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lg32);
+        try mlx.check(mlx.mlx_astype(&lg32, logit, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(f32o));
+        try mlx.check(mlx.mlx_array_eval(sd32));
+        try mlx.check(mlx.mlx_array_eval(lg32));
+        const po = mlx.mlx_array_data_float32(f32o).?;
+        const psd = mlx.mlx_array_data_float32(sd32).?;
+        const gate = 1.0 / (1.0 + @exp(-mlx.mlx_array_data_float32(lg32).?[0]));
+        const xr = try row(x, 0, s);
+        defer _ = mlx.mlx_array_free(xr);
+        const ir = try row(inds, 0, s);
+        defer _ = mlx.mlx_array_free(ir);
+        const sr = try row(scores, 0, s);
+        defer _ = mlx.mlx_array_free(sr);
+        const pt = try truthRow(deq, xr, ir, sr, s);
+        defer testing.allocator.free(pt);
+        var se: f64 = 0;
+        var st: f64 = 0;
+        for (pt, 0..) |t0, i| {
+            const t = t0 + gate * psd[i];
+            se += (po[i] - t) * (po[i] - t);
+            st += t * t;
+        }
+        const rel = @sqrt(se / st);
+        std.debug.print("[moe-fp4] {s} views+shared: rel rms err vs fp32 truth {d:.5}\n", .{ f.name, rel });
+        try testing.expect(rel < 0.02);
     }
 }

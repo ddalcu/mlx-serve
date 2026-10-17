@@ -355,7 +355,8 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
         if (parts[0].rows != parts[1].rows or parts[0].rows != parts[2].rows or (form == .affine and parts[1].cols != parts[2].cols)) return error.EmbeddedPleRegion;
         if (@as(u64, parts[0].cols) * 8 != expected.dim or parts[1].cols == 0 or expected.dim % parts[1].cols != 0) return error.EmbeddedPleGeometry;
         const gs = expected.dim / parts[1].cols;
-        if (gs == 0 or gs > 1024 or (i != 0 and (parts[0].cols != wcols or parts[1].cols != scols or gs != group_size))) return error.EmbeddedPleGeometry;
+        // The NVFP4 readers (CPU dequant, GPU gather) are written for 16-value groups only.
+        if (gs == 0 or gs > 1024 or (form == .nvfp4 and gs != 16) or (i != 0 and (parts[0].cols != wcols or parts[1].cols != scols or gs != group_size))) return error.EmbeddedPleGeometry;
         for (parts[0..nparts], 0..) |p, x| for (parts[0..x]) |q| {
             if (p.file == q.file and regionsOverlap(p.off, p.off + p.len, q.off, q.off + q.len)) return error.EmbeddedPleOverlap;
         };
@@ -440,13 +441,18 @@ pub fn writeFixture(td: *std.testing.TmpDir, variant: FixtureVariant) !void {
 /// A ModelOpt NVFP4 table under `tensors/`: rows 0-1 in shard 0, row 2 in shard 1, dim 32. Row r's
 /// codes are all `r + 1`, its two e4m3 group scales 1.0 and 2.0, the global scale 0.5.
 pub fn writeNvfp4Fixture(td: *std.testing.TmpDir) !void {
+    return writeNvfp4FixtureGroups(td, false);
+}
+
+/// `wide`: one scale per 32-value row, i.e. a group of 32 the NVFP4 readers cannot take.
+pub fn writeNvfp4FixtureGroups(td: *std.testing.TmpDir, comptime wide: bool) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const p = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.";
     try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ p ++ "shard_0.weight\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_0.weight_scale\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_1.weight\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_1.weight_scale\":\"tensors/a.safetensors\",\"" ++ p ++ "weight_scale_2\":\"tensors/a.safetensors\"}}" });
     const header = "{\"" ++ p ++ "shard_0.weight\":{\"dtype\":\"U8\",\"shape\":[2,16],\"data_offsets\":[0,32]}," ++
-        "\"" ++ p ++ "shard_0.weight_scale\":{\"dtype\":\"F8_E4M3\",\"shape\":[2,2],\"data_offsets\":[32,36]}," ++
+        "\"" ++ p ++ "shard_0.weight_scale\":{\"dtype\":\"F8_E4M3\",\"" ++ (if (wide) "shape\":[2,1],\"data_offsets\":[32,34]" else "shape\":[2,2],\"data_offsets\":[32,36]") ++ "}," ++
         "\"" ++ p ++ "shard_1.weight\":{\"dtype\":\"U8\",\"shape\":[1,16],\"data_offsets\":[36,52]}," ++
-        "\"" ++ p ++ "shard_1.weight_scale\":{\"dtype\":\"F8_E4M3\",\"shape\":[1,2],\"data_offsets\":[52,54]}," ++
+        "\"" ++ p ++ "shard_1.weight_scale\":{\"dtype\":\"F8_E4M3\",\"" ++ (if (wide) "shape\":[1,1],\"data_offsets\":[52,53]" else "shape\":[1,2],\"data_offsets\":[52,54]") ++ "}," ++
         "\"" ++ p ++ "weight_scale_2\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[56,60]}}";
     var data: [60]u8 = @splat(0);
     for (0..3) |r| {

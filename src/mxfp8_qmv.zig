@@ -24,6 +24,9 @@ var engaged = false;
 /// `w` [N, K/4] u32 e4m3 words, `sc` [N, K/32] e8m0.
 pub fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
+    // Measured on M4 (g16) only; other generations keep MLX's kernel until someone measures them.
+    const g = @import("transformer.zig").deviceGeneration();
+    if (g.gen != 16 or g.phone) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .bfloat16 and dt != .float16) return null;
     const wsh = mlx.getShape(w);
@@ -33,7 +36,7 @@ pub fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_
     const K = wsh[1] * 4;
     if (ssh[0] != N or ssh[1] * 32 != K) return null;
     const xsh = mlx.getShape(x);
-    if (xsh.len == 0 or xsh[xsh.len - 1] != K) return null;
+    if (xsh.len == 0 or xsh.len > 8 or xsh[xsh.len - 1] != K) return null;
     var rows: c_int = 1;
     for (xsh[0 .. xsh.len - 1]) |d| rows *= d;
     if (rows < 1 or rows > MAX_ROWS) return null;
@@ -93,6 +96,26 @@ fn randBf16(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_a
 test "mxfp8 qmv: 1..8 rows no worse than MLX's matmul against the fp32 truth (K a whole step and not)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     for ([_][2]c_int{ .{ 640, 2560 }, .{ 2560, 640 } }) |nk| try mxfp8Case(nk[0], nk[1]);
+}
+
+test "mxfp8 qmv: an unmeasured GPU generation keeps MLX's matmul" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const xfm = @import("transformer.zig");
+    defer xfm.device_gen_override = null;
+    const s = mlx.gpuStream();
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 640, 640 }, 2, .uint32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_zeros(&sc, &[_]c_int{ 640, 80 }, 2, .uint8, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ 1, 2560 }, 2, .bfloat16, s));
+    for ([_]u32{ 13, 15, 17 }) |gen| {
+        xfm.device_gen_override = .{ .gen = gen, .phone = false };
+        try std.testing.expect((try linear(x, w, sc, s)) == null);
+    }
 }
 
 fn mxfp8Case(N: c_int, K: c_int) !void {

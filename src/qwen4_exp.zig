@@ -687,7 +687,7 @@ const PrefetchPool = struct {
         for (self.threads[0..started]) |t| t.join();
     }
 
-    /// Fan the `3 * rows.len` preads over the workers; rows land in `bufs`.
+    /// Fan the per-row part preads over the workers; rows land in `bufs`.
     fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
         _ = self.runs.fetchAdd(1, .monotonic);
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -717,9 +717,10 @@ const PrefetchPool = struct {
             const table = self.table.?;
             const rows = self.rows;
             self.mu.unlock(io);
+            const parts = embedded_ple.partCount(table.fmt);
             var i = idx;
-            while (i < rows.len * 3) : (i += N) {
-                if (!table.preadSite(@intCast(rows[i / 3]), i % 3, &self.bufs[i / 3])) _ = self.failed.fetchAdd(1, .acq_rel);
+            while (i < rows.len * parts) : (i += N) {
+                if (!table.preadSite(@intCast(rows[i / parts]), i % parts, &self.bufs[i / parts])) _ = self.failed.fetchAdd(1, .acq_rel);
             }
             _ = self.pending.fetchSub(1, .acq_rel);
         }
@@ -1050,6 +1051,21 @@ test "embedded PLE reads a ModelOpt NVFP4 table in a subdirectory" {
     table.gather(&.{ 2, 0, 1 }, &gathered, 0);
     try std.testing.expectEqualSlices(f32, &rows[2], gathered[0..32]);
     try std.testing.expectEqualSlices(f32, &rows[1], gathered[64..96]);
+    if (table.pool) |p| {
+        var pooled: [3 * 32]f32 = undefined;
+        try std.testing.expect(table.gatherPooled(p, &.{ 2, 0, 1 }, &pooled));
+        try std.testing.expectEqualSlices(f32, &gathered, &pooled);
+    }
+}
+
+test "embedded PLE refuses an NVFP4 table whose group is not 16" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeNvfp4FixtureGroups(&td, true);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    try std.testing.expectError(error.EmbeddedPleGeometry, embedded_ple.openEmbedded(path_buf[0..path_len], .{ .rows = 3, .dim = 32, .shards = 2 }));
 }
 
 test "embedded PLE rows and gathers match the merged table" {

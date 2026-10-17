@@ -4981,7 +4981,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     if (config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
-        try modelopt_pack.adapt(&weights, model_dir, s);
+        try modelopt_pack.adapt(&weights, model_dir, config.num_hidden_layers, s);
     }
     if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
@@ -4991,7 +4991,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         defer _ = mlx.mlx_stream_free(s);
         try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
     }
-    if (config.exl3 != null) {
+    if (config.exl3 != null or config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
         try sushi_pack.adapt(config, &weights, s);
@@ -5098,8 +5098,8 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         try loadSafetensorsFile(allocator, &weights, path, s, shard_opts);
         file_count += 1;
     }
-    // An index may name shards in a subdirectory (NVIDIA's `tensors/`); the scan above sees the root only.
-    if (referenced) |r| {
+    // A ModelOpt index may name shards in a subdirectory (NVIDIA's `tensors/`); the scan above sees the root only.
+    if (opts.modelopt) if (referenced) |r| {
         var kit = r.keyIterator();
         while (kit.next()) |name| {
             if (std.mem.indexOfScalar(u8, name.*, '/') == null or std.mem.indexOf(u8, name.*, "..") != null) continue;
@@ -5112,7 +5112,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
             try loadSafetensorsFile(allocator, &weights, path, s, shard_opts);
             file_count += 1;
         }
-    }
+    };
 
     // Incomplete-checkpoint guard. A dir with config/tokenizer but no (or no
     // usable) *.safetensors is the classic interrupted-download shape: the

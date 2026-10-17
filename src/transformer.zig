@@ -33738,7 +33738,7 @@ pub const Transformer = struct {
             moe_reduced = true;
             shared_fused = shared_down != null;
             cost_arm = 1;
-        } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
+        } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias or (swigluClampLimit(&self.config) orelse 1) != 0) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
             try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
@@ -34625,8 +34625,11 @@ fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: bool, h
         try owned_bf16.append(allocator, scaled);
         out.down_w = try transposeBf16Weight(scaled, s);
         try owned_bf16.append(allocator, out.down_w);
-        out.down_rows = try rows.view(scaled, owned_bf16, allocator, s);
-        out.up_rows = try rows.view(weights.get(std.fmt.bufPrint(&nb, "{s}.input_mix_weight_up.weight", .{base}) catch unreachable).?, owned_bf16, allocator, s);
+        const up_src = weights.get(std.fmt.bufPrint(&nb, "{s}.input_mix_weight_up.weight", .{base}) catch unreachable).?;
+        if (mlx.mlx_array_dtype(down_src) == .bfloat16 and mlx.mlx_array_dtype(up_src) == .bfloat16) {
+            out.down_rows = try rows.view(scaled, owned_bf16, allocator, s);
+            out.up_rows = try rows.view(up_src, owned_bf16, allocator, s);
+        }
     } else try scaleTriple(&out.down_w, &out.down_s, &out.down_b, inv_hc, owned_bf16, allocator, s);
     if (with_inject) {
         const inj = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.block_inject_weight", .{base}) catch unreachable, hc * hidden, owned_bf16, allocator, s);
@@ -45271,6 +45274,27 @@ test "a quantized block_inject_weight loads as the dense checkpoint holding its 
     };
 }
 
+test "dense hc weights read as packed bf16 rows only when both are bf16" {
+    const s = mlx.gpuStream();
+    const alloc = std.testing.allocator;
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(alloc);
+    }
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float16 }) |dt| {
+        var w = Weights.init(alloc);
+        defer w.deinit();
+        for ([_][]const u8{ "hc.input_mix_weight_down.weight", "hc.input_mix_weight_up.weight", "hc.hc_norm.weight" }, [_][2]c_int{ .{ 8, 256 }, .{ 256, 8 }, .{ 256, 1 } }) |name, sh| {
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_ones(&a, &sh, if (sh[1] == 1) 1 else 2, dt, s));
+            try w.map.put(try alloc.dupe(u8, name), a);
+        }
+        const hw = try loadHcWeights(&w, "hc", false, 4, 64, &owned, alloc, s);
+        try std.testing.expectEqual(dt == .bfloat16, hw.down_rows.ctx != null and hw.up_rows.ctx != null);
+    }
+}
+
 test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row kernels, 3-bit is not; vision and mtp never count" {
     const Q = struct {
         fn put(w: *Weights, base: []const u8, bits: c_int) !void {
@@ -45579,6 +45603,9 @@ pub fn loadRoutedMoeAt(weights: *const Weights, name_buf: *[256]u8, base: []cons
         .route_norm = config.moe_route_norm,
         .route_scale = config.router_scaling_factor,
         .shared_ungated = true,
+        // ModelOpt NVFP4 banks: each expert's gate scale and its up x down product.
+        .per_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.expert_scale"),
+        .gate_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.gate_proj.expert_scale") orelse .{ .ctx = null },
     };
     try maybeTransposeForBf16(&mw.router_w, mw.router_s, owned_bf16, allocator, s);
     // GLM-5-Next routes in f32 (`moe_router_dtype`).
