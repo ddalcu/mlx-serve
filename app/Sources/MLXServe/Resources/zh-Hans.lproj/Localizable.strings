@@ -2277,3 +2277,7 @@
 "%.1f min per step" = "每步 %.1f 分钟";
 "Stream weights from disk (less memory)" = "从磁盘流式读取权重（省内存）";
 "On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run." = "开启（默认）：文本编码器和视频模型在运行时逐层从磁盘读取，峰值内存占用减少约 60%，速度慢约 5%。强烈建议使用快速 SSD。关闭：两者在整个运行期间都保留在内存中。";
+"Neural Accelerator int8 (M5)" = "神经加速器 int8（M5）";
+"Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "在 M5 Mac 上更快生成图像和视频，略有损失；关闭后 4 位模型占用更少内存。";
+"Spec" = "投机";
+"Spec off" = "投机已关";

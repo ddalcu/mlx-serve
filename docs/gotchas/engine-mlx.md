@@ -275,7 +275,7 @@ MLX's M5 neural-accelerator (NAX) kernels are gated at CMake configure time: Met
 A single `msv_attn_p256` CAUSAL dispatch scanning the whole KV monopolizes the GPU long enough at high kv_len to trip **macOS IOGPU interactivity preemption**, the penalty scaling with dispatch wallclock — invisible to µbenches (isolated kernel) and short-kv ratio gates, which is why the arm won every µbench yet lost every live ratio-gated A/B monotonically. Fix (ported from oMLX `qwen35_fa256_attention.py`): cap per-dispatch work at `batch·Hq·qL·keys ≤ budget` (`MLX_SERVE_FUSED_256_BUDGET`), splitting the key axis into BK-aligned dispatches with the FA-2 online-softmax state (m/l/unnormalized O) carried through fp32 buffers — register-precision-exact, so BIT-IDENTICAL to single-dispatch (pinned by a test + a dispatch-count engagement seam). Implementation trap: MLX's `metal_kernel` codegen binds sub-4KB inputs in the `constant` address space and larger in `device`, so carry reads must use direct indexing (`o_in[base + i]`), never a typed `const device float*` — a compile error only on the arm you didn't test first.
 
 ### Stock qmm_t at prefill widths is a ~10% dead zone — dequant + steel GEMM route (2026-07-22)
-Stock MLX qmm_t picks a 32×32×32 tile that stalls at M≥2048 on qwen shapes. `prefillDqGemm` (M≥2048, affine 2/3/4/5/6/8, `MLX_SERVE_PREFILL_DQ_GEMM=0` kill) dequantizes weights to a bf16 [N,K] transient and runs the dense steel GEMM near-peak — the per-call dequant costs <1 ms and repeats sizes per layer (allocator-cache-friendly); decode/verify widths never route; numerics differ only by bf16 weight rounding (no-worse-than-stock pinned). Trap: `boundedPrefillChunk`'s score-budget formula once shrank the 64K chunk below the route's 2048 floor — it silently never engaged at 64K (the ladder's weakest rung) until the fused-causal chunk policy (`min(base, 4096)`, no formula shrink) replaced it.
+Stock MLX qmm_t picks a 32×32×32 tile that stalls at M≥2048 on qwen shapes. `prefillDqGemm` (M≥2048, affine 2/3/4/5/6/8, `MLX_SERVE_PREFILL_DQ_GEMM=0` kill) dequantizes weights to a bf16 [N,K] transient and runs the dense steel GEMM near-peak — the per-call dequant costs <1 ms and repeats sizes per layer (allocator-cache-friendly); decode/verify widths never route; numerics differ only by bf16 weight rounding (no-worse-than-stock pinned). Trap: `boundedPrefillChunk`'s score-budget formula once shrank the 64K chunk below the route's 2048 floor — it silently never engaged at 64K (the ladder's weakest rung) until the fused-causal chunk policy (`min(base, 4096)`, no formula shrink) replaced it. The 2048 floor was tuned against that steel tile; on the M5 Ultra stock qmm is the fused NAX kernel, which beats the route below about 0.9·min(N, K) rows, so there the floor is per call (`prefillDqGemmRowFloor`): `max(2048, 0.9·min(N, K))` once both N and K are 4096 or more. Below that (Flash-Next's K 2560 and 640 and N 2560, which the 2048-row company chunk hits) and at K ≥ 3N, where the dense GEMM runs MLX's split-K kernel, the route still wins from 2048. The crossover depends on the chip's GEMM tiles, which MLX picks per arch suffix: the M5 Max crosses the other way, so only a dual-die arch (`dualDieArch`, `…d`) gets the shape-aware floor and every other chip keeps 2048.
 
 ### Sharpened-stochastic MTP drafting (Lightning scheme) LOSES to greedy argmax on low-entropy content — negative result, machinery kept opt-in (2026-07-22)
 Ported oMLX Lightning's scheme faithfully (drafts from a fixed sharper dist temp 0.6/top-p 0.95/top-k 20, full Leviathan `min(1,p/q)` accept, `normalize(max(p−q,0))` rejection — distribution-exact for ANY q, toy-vocab test). On low-entropy code/agent content greedy WINS: sharp acceptance is `1 − TV(p,q)`, greedy is `p(argmax_q)`; when the target is near-deterministic (temp-0.6 code sharpens p toward one-hot) `p(argmax) ≈ 1` while TV is dominated by the head's spread mass. Their "collapses to 10–20%" claim is about HIGH-entropy prose (the opposite regime). Keep it wired (`MLX_SERVE_MTP_DRAFT_GREEDY=0`) — the exact-residual machinery is correct and may win on prose. **It does — see the next section; the proposal is now chosen per request.**
@@ -1219,48 +1219,16 @@ documented next step; gemma's head_dim 256 needs a different lane mapping.
 Fourth mining pass over the mlxfast-challenge tree, executing the "next round" list from
 `docs/perf-next-levers.md`. Outcomes, in the order attempted:
 
-### Certified lm_head prune: kernels sound, argmax provable, LIVE NULL — ships opt-in
+### Certified lm_head prune: a µbench win the live graph does not keep — deleted
 
-Port of `LagunaLmHeadPrune.swift` (notes/68): an init-time MXFP8-g32 copy of the dense
-bf16 lm_head (half the bytes), one coarse GEMV emitting per-row coarse logit + a
-CERTIFIED bound (half-ulp e4m3 cells + a 2^-15 rounding allowance, top cell 186) + a bf16
-pre-fill; a dense one-byte candidate mask (`coarse+delta >= max(coarse-delta) - |L|/64`);
-an exact pass whose per-row arithmetic textually replicates the stock
-`gemv_bfloat16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` (verified to be what MLX dispatches
-for this matvec) so every candidate row is bit-identical to the stock GEMV. Every
-argmax-reachable row is provably a candidate; every non-candidate is provably below the
-winner; the emitted token is the stock token.
-
-Three lessons:
-
-1. **The gate is REQUEST-level and must be known at init.** The pruned row is exact
-   at candidates and coarse elsewhere — enough for an argmax, not for a tail
-   distribution. `ForwardCtx.argmax_only` is set by the Generator (greedy or top-1, no
-   penalties, no logprobs, no grammar), and logprobs had to move into `InitOptions`:
-   the split-prefill final-token forward is a single-row dispatch that runs BEFORE any
-   post-init `gen.logprobs_n = n` write, so a logprobs request would have had its first
-   token's logprobs computed from a pruned row.
-2. **A hermetic parity test cannot see reduction order at this scale.** A deliberate
-   perturbation of the exact kernel's accumulation order (grouped instead of sequential)
-   STILL passed the bit-equality test: an f32 last-ulp difference almost always vanishes
-   in the final bf16 cast, and catching one empirically needs ~hundreds of thousands of
-   casts. The live >=160-token greedy on/off run (16M casts) is the real bit-identity
-   bar — same lesson as round 3's fused-QKV divergence at byte 164.
-3. **The µbench-vs-live class, third instance, with the strongest live design yet.**
-   µbench at the real [100352, 2048] geometry, with a separated-winner weight matrix
-   reproducing the LIVE candidate regime (median ~19 of 100352 candidates, measured by
-   `MLX_SERVE_LMHEAD_PRUNE_TRACE=1`): dense 1.04 -> pruned 0.63 ms/iter, a ~0.4 ms/token
-   saving. Live: an INTERLEAVED same-boot A/B — the gate is per-request, and
-   `presence_penalty: 1e-9` clears `argmax_only` while the lazy greedy sampler never
-   applies penalties, so the dense arm is byte-identical work in the SAME boot,
-   alternating per generation, and thermal drift cancels per pair. 20 rounds: median
-   +0.84% per pair, 3/20 wins; the on-arm's early −1.8% advantage decays within a few
-   generations while the off arm stays flat. The µbench saving does not survive the
-   live graph, and the boot-level A/B that "showed" −1.3%/+1.6% was just drift. Where
-   the ~0.5 ms goes live remains unattributed (candidates stay tiny all boot — traced;
-   the threshold chain and select are flat in the stage bisection; the exact pass with
-   a zero mask costs ~0.02 ms net). Shipped `MLX_SERVE_LMHEAD_PRUNE=1` opt-in with the
-   trace + µbench left in place for whoever picks it up.
+Port of `LagunaLmHeadPrune.swift`: a coarse MXFP8 copy of the dense bf16 head bounds every
+row's logit, and only rows that can still win run an exact replica of the stock GEMV. The
+µbench at Laguna XS geometry went 1.04 -> 0.63 ms, but a same-boot interleaved live A/B won
+3 of 20 pairs, and a 5-bit certified readout of Flash Next's 8-bit head (2026-10) repeated
+it: +1.4-2% on greedy one-row decode only; a top-20 draw left ~11% of the vocabulary as
+candidates and multi-row verify ran slower than stock. Both also took their threshold over
+reserved rows, so a top-ranked suppressed token could hide the real winner. The opt-in prune
+was deleted; a head-readout lever is judged by the live A/B, never the µbench.
 
 ### MoE down-path tail fusion: −1.5%, bit-identical, default ON
 

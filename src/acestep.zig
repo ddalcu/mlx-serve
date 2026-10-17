@@ -41,6 +41,8 @@ const ane = @import("ane.zig");
 
 const S = mlx.mlx_stream;
 const Weights = model_mod.Weights;
+const w8a8 = @import("w8a8.zig");
+const int8_attn = @import("int8_attn.zig");
 
 // ── architecture facts (converted config.json mirrors these; the checkpoint
 // family has exactly one member so they double as defaults) ─────────────────
@@ -328,6 +330,18 @@ fn ropeInPlace(x: mlx.mlx_array, hd: c_int, theta: f32, s: S) !mlx.mlx_array {
     try mlx.check(mlx.mlx_fast_rope(&o, x, hd, false, mlx.mlx_optional_float.some(theta), 1.0, 0, .{ .ctx = null }, s));
     return o;
 }
+/// Unmasked attention merged to [1, T, H*128]: on the int8 kernel when the route takes it
+/// (`--w8a8`), else sdpa then `mergeHeads`.
+fn attnMerged(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) !mlx.mlx_array {
+    if (w8a8.enabled) if (try int8_attn.attention(q, k, v, scale, s)) |o| {
+        defer _ = mlx.mlx_array_free(o);
+        const sh = mlx.getShape(o);
+        return reshape(o, &[_]c_int{ 1, sh[0], sh[1] }, s);
+    };
+    const at = try sdpa(q, k, v, scale, null, "", s);
+    defer _ = mlx.mlx_array_free(at);
+    return mergeHeads(at, s);
+}
 fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, mask: ?mlx.mlx_array, mode: [*:0]const u8, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     const null_a = mlx.mlx_array{ .ctx = null };
@@ -360,7 +374,10 @@ fn lin(w: *const Weights, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []cons
     const in_features: u32 = @intCast(xsh[xsh.len - 1]);
 
     var o = mlx.mlx_array_new();
-    if (w.get(sk)) |scales| {
+    if (w.w8.get(prefix)) |q| {
+        _ = mlx.mlx_array_free(o);
+        o = try w8a8.forward(x, q, s);
+    } else if (w.get(sk)) |scales| {
         const wq = try getW(w, wk);
         const qb = try getW(w, bk);
         const w_cols: u32 = @intCast(mlx.getShape(wq)[1]);
@@ -1001,12 +1018,11 @@ fn ditLayer(e: *const Engine, a: std.mem.Allocator, li: u32, h_in: mlx.mlx_array
     defer _ = mlx.mlx_array_free(qr);
     const kr = try ropeInPlace(kn, hd, cfg.rope_theta, s);
     defer _ = mlx.mlx_array_free(kr);
-    const attn = if (sliding_mask) |m|
-        try sdpa(qr, kr, vh, scale, m, "array", s)
-    else
-        try sdpa(qr, kr, vh, scale, null, "", s);
-    defer _ = mlx.mlx_array_free(attn);
-    const merged = try mergeHeads(attn, s);
+    const merged = if (sliding_mask) |m| blk: {
+        const attn = try sdpa(qr, kr, vh, scale, m, "array", s);
+        defer _ = mlx.mlx_array_free(attn);
+        break :blk try mergeHeads(attn, s);
+    } else try attnMerged(qr, kr, vh, scale, s);
     defer _ = mlx.mlx_array_free(merged);
     const sa_out = try lin(w, a, merged, try std.fmt.allocPrint(a, "{s}.self_attn.o_proj", .{pfx}), s);
     defer _ = mlx.mlx_array_free(sa_out);
@@ -1026,9 +1042,7 @@ fn ditLayer(e: *const Engine, a: std.mem.Allocator, li: u32, h_in: mlx.mlx_array
     const cqn_w = try getW(w, try std.fmt.allocPrint(a, "{s}.cross_attn.q_norm.weight", .{pfx}));
     const cqn = try rmsNorm(cqh, cqn_w, cfg.eps, s);
     defer _ = mlx.mlx_array_free(cqn);
-    const cattn = try sdpa(cqn, cross_k, cross_v, scale, null, "", s);
-    defer _ = mlx.mlx_array_free(cattn);
-    const cmerged = try mergeHeads(cattn, s);
+    const cmerged = try attnMerged(cqn, cross_k, cross_v, scale, s);
     defer _ = mlx.mlx_array_free(cmerged);
     const ca_out = try lin(w, a, cmerged, try std.fmt.allocPrint(a, "{s}.cross_attn.o_proj", .{pfx}), s);
     defer _ = mlx.mlx_array_free(ca_out);
@@ -1865,6 +1879,11 @@ pub const Engine = struct {
         self.w = try loadFileWeights(allocator, model_dir, "model.safetensors");
         errdefer self.w.deinit();
         if (self.w.get("silence_latent") == null) return error.MissingAceStepWeight;
+        // The ANE seam reads the packed DiT weights; the packs are 8-bit g64.
+        if (w8a8.enabled and !ane.media_offload.audio) {
+            const n = try self.w.w8.convert(allocator, &self.w.map, .{ .base = "decoder.layers.0.self_attn.q_proj", .in_features = self.cfg.hidden }, self.s);
+            log.info("[acestep] int8: {d} DiT linears\n", .{n});
+        }
         self.vae_w = try loadFileWeights(allocator, model_dir, "vae.safetensors");
         errdefer self.vae_w.deinit();
         self.fsq_w = null;
@@ -3280,4 +3299,58 @@ test "acestep instrumental flag reaches the same reference marker as empty lyric
     try std.testing.expectEqualStrings(empty, flagged);
     try std.testing.expectEqualStrings("# Languages\nen\n\n# Lyric\n[Instrumental]<|endoftext|>", flagged);
     try std.testing.expectEqualStrings("[verse]\nhi", resolveLyrics(false, "[verse]\nhi"));
+}
+
+/// One DiT forward on seeded noise (300 latent frames, 96 condition rows), velocity as f32;
+/// `resident` receives the MLX bytes the loaded engine holds.
+fn aceProbe(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, resident: *usize) !mlx.mlx_array {
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    const e = try Engine.load(io, a, model_dir, false);
+    defer e.deinit();
+    const s = e.s;
+    const cond = try w8a8.randn(&.{ 1, 96, 2560 }, 3, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(cond);
+    var cross = try buildCrossKv(e, a, cond, s);
+    defer cross.deinit(a);
+    const xt = try w8a8.randn(&.{ 1, 300, 64 }, 1, .float32, s);
+    defer _ = mlx.mlx_array_free(xt);
+    const ctx = try w8a8.randn(&.{ 1, 300, 128 }, 2, .float32, s);
+    defer _ = mlx.mlx_array_free(ctx);
+    const v = try ditForward(e, a, xt, 0.5, ctx, &cross, s);
+    defer _ = mlx.mlx_array_free(v);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, v, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    w8a8.dropMemo(); // job-end state: the last activation is not weights
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    resident.* = after -| before;
+    return out;
+}
+
+// The lossy int8 route against the same pack's packed forward. ACESTEP_TEST_MODEL.
+test "ACE-Step DiT: the w8a8 route stays within its bar of the packed forward" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const model_dir = std.mem.span(std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = false;
+    var packed_bytes: usize = 0;
+    const want = try aceProbe(io, a, model_dir, &packed_bytes);
+    defer _ = mlx.mlx_array_free(want);
+    w8a8.enabled = true;
+    var int8_bytes: usize = 0;
+    const got = try aceProbe(io, a, model_dir, &int8_bytes);
+    defer _ = mlx.mlx_array_free(got);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const g = try w8a8.agreement(got, want, s);
+    std.debug.print("[acestep dit w8a8] cos={d:.6} rms_ratio={d:.6} resident packed={d} int8={d}\n", .{ g.cos, g.rms_ratio, packed_bytes, int8_bytes });
+    try testing.expect(g.cos < 0.99999); // the route engaged: a packed-numerics output would be identical
+    try testing.expect(g.cos > 0.997);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.02);
+    try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(io, model_dir, &.{"model.safetensors"}));
 }

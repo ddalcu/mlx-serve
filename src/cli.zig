@@ -122,6 +122,8 @@ pub const Resolved = struct {
     gguf_group: []const u8 = "",
     /// Set by `pullRepo` with `gguf_group`: the one MTP draft head pulled beside it (`pickMtpSidecar`).
     gguf_mtp: []const u8 = "",
+    /// Set by `pullRepo`: the root index's `weight_map`. A shard it names is part of the pack at any depth.
+    indexed: ?std.json.Value = null,
 };
 
 /// Short name / repo ref → HF repo id. Accepts:
@@ -458,15 +460,17 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
-    const config_json: ?[]u8 = for (files) |f| {
-        if (!std.mem.eql(u8, f.path, "config.json")) continue;
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/config.json", .{resolved.repo});
-        defer allocator.free(url);
-        break curlFetch(allocator, io, url) catch null;
-    } else null;
+    const config_json = try fetchListed(allocator, io, resolved.repo, files, "config.json");
     defer if (config_json) |c| allocator.free(c);
     const media = isMediaListing(allocator, files, config_json);
+    const index_json = try fetchListed(allocator, io, resolved.repo, files, "model.safetensors.index.json");
+    defer if (index_json) |j| allocator.free(j);
+    const index = if (index_json) |j| std.json.parseFromSlice(std.json.Value, allocator, j, .{}) catch null else null;
+    defer if (index) |p| p.deinit();
     var r = resolved;
+    if (index) |p| if (p.value == .object) {
+        r.indexed = p.value.object.get("weight_map");
+    };
     if (r.gguf_file.len == 0) r.gguf_group = try chooseGgufGroup(allocator, io, files, r.quant, reporter) orelse "";
     if (r.gguf_group.len > 0) r.gguf_mtp = pickMtpSidecar(files, r.gguf_group);
 
@@ -517,7 +521,27 @@ fn wantedFile(resolved: Resolved, path: []const u8, media: bool) bool {
     }
     if (resolved.gguf_group.len > 0 and std.mem.endsWith(u8, path, ".gguf"))
         return std.mem.eql(u8, path, resolved.gguf_mtp) or std.mem.eql(u8, ggufGroup(path) orelse return false, resolved.gguf_group);
-    return if (media) shouldDownloadFile(path) else shouldDownload(path);
+    if (media) return shouldDownloadFile(path);
+    return shouldDownload(path) or indexNames(resolved.indexed, path);
+}
+
+/// Whether an index's `weight_map` names `path` as a shard: the checkpoint's own parts list.
+fn indexNames(weight_map: ?std.json.Value, path: []const u8) bool {
+    const wm = weight_map orelse return false;
+    if (wm != .object) return false;
+    for (wm.object.values()) |v| if (v == .string and std.mem.eql(u8, v.string, path)) return true;
+    return false;
+}
+
+/// The body of `name` from the repo's `main`, when the listing has it and it can be fetched.
+fn fetchListed(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, files: []const RepoFile, name: []const u8) !?[]u8 {
+    for (files) |f| {
+        if (!std.mem.eql(u8, f.path, name)) continue;
+        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ repo, name });
+        defer allocator.free(url);
+        return curlFetch(allocator, io, url) catch null;
+    }
+    return null;
 }
 
 /// The quant group a GGUF file belongs to: its path without the split suffix
@@ -1050,6 +1074,23 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(shouldDownload("experts.bin"));
     try testing.expect(!shouldDownload("receipts/convert.json"));
     try testing.expect(!shouldDownload("encoding/encoding.py"));
+}
+
+test "cli: a nested shard the index names is part of the pack" {
+    const index =
+        \\{"weight_map": {"embed.weight": "model-00001-of-00002.safetensors",
+        \\                "vision_embedder.pos_embedding": "optiq/optiq_vision.safetensors"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, index, .{});
+    defer parsed.deinit();
+    const without = Resolved{ .repo = "mlx-community/humanizer-12b-OptiQ-4bit" };
+    const with = Resolved{ .repo = without.repo, .indexed = parsed.value.object.get("weight_map") };
+
+    try testing.expect(!wantedFile(without, "optiq/optiq_vision.safetensors", false));
+    try testing.expect(wantedFile(with, "optiq/optiq_vision.safetensors", false));
+    try testing.expect(wantedFile(with, "model-00001-of-00002.safetensors", false));
+    try testing.expect(!wantedFile(with, "optiq/metadata.json", false)); // not named by the index
+    try testing.expect(!wantedFile(with, "original/model.safetensors", false));
 }
 
 test "cli: a media pack's pull keeps its component folders (#362)" {

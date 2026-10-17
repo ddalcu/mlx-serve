@@ -481,6 +481,9 @@ pub const Slot = struct {
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
+    /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
+    /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
+    boundary_max_tail: ?usize = null,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -1472,6 +1475,14 @@ pub const Scheduler = struct {
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
     promise_ledger: PromiseLedger = .{},
+    /// Inference thread only. Greater than 0 while a prefill started at a chunk boundary runs: it may
+    /// tick decoders at its own boundaries but never admits.
+    boundary_depth: u8 = 0,
+    /// The prefill whose chunk boundary is hosting a nested admission; counted as company for memory.
+    boundary_outer: ?*Slot = null,
+    /// The request being prefilled at that boundary; in no queue, so `cancelAllInFlight` reads it here.
+    /// Guarded by `queue_mu`.
+    boundary_slot: ?*Slot = null,
     /// A running media job's estimated peak, kept off chat admitted between its steps.
     gen_reserve_bytes: u64 = 0,
 
@@ -2012,6 +2023,7 @@ pub const Scheduler = struct {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
         for (self.pending.items) |slot| slot.cancel();
+        if (self.boundary_slot) |slot| slot.cancel();
         if (self.prefilling_from < self.n_prefilling) {
             for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| slot.cancel();
         }
@@ -2761,7 +2773,8 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     if (cfg.longCtxGated()) return false;
     if (slot.model.transformer == null) return false;
     const numbers_fn = prefill_admission_numbers orelse return false;
-    const live = liveDecodingCount(sch);
+    // A prefill hosting a nested admission holds memory but is in no list: it is company too.
+    const live = liveDecodingCount(sch) + @intFromBool(sch.boundary_outer != null);
     if (live == 0) sch.promise_ledger = .{};
     const bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null), slot.enable_mtp);
     var active_now: usize = 0;
@@ -2779,6 +2792,77 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
         log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> 20 });
     }
     return true;
+}
+
+test "boundaryEligible: a small plain request is admitted only under a share, never nested, never beside an exclusive model" {
+    const base_cand: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .module_state = false, .tail = 31 };
+    const base_ctx: BoundaryCtx = .{ .share = 0.5, .nested = false, .outer_exclusive = false, .decoding = 2, .max_concurrent = 8, .max_tail = BOUNDARY_MAX_TAIL };
+    try testing.expect(boundaryEligible(base_cand, base_ctx));
+
+    var x = base_ctx;
+    x.share = 0;
+    try testing.expect(!boundaryEligible(base_cand, x));
+    x = base_ctx;
+    x.nested = true;
+    try testing.expect(!boundaryEligible(base_cand, x));
+    x = base_ctx;
+    x.outer_exclusive = true;
+    try testing.expect(!boundaryEligible(base_cand, x));
+    x = base_ctx;
+    x.decoding = x.max_concurrent;
+    try testing.expect(!boundaryEligible(base_cand, x));
+
+    var c = base_cand;
+    c.exclusive = true;
+    try testing.expect(!boundaryEligible(c, base_ctx));
+    c = base_cand;
+    c.has_media = true;
+    try testing.expect(!boundaryEligible(c, base_ctx));
+    c = base_cand;
+    c.prompt_logprobs = true;
+    try testing.expect(!boundaryEligible(c, base_ctx));
+    c = base_cand;
+    c.generator_path = false;
+    try testing.expect(!boundaryEligible(c, base_ctx));
+    c = base_cand;
+    c.module_state = true;
+    try testing.expect(!boundaryEligible(c, base_ctx));
+
+    // The limit is inclusive.
+    c = base_cand;
+    c.tail = base_ctx.max_tail;
+    try testing.expect(boundaryEligible(c, base_ctx));
+    c.tail = base_ctx.max_tail + 1;
+    try testing.expect(!boundaryEligible(c, base_ctx));
+}
+
+test "BoundaryBudget: stops at the count or the time cap, whichever comes first" {
+    var b: BoundaryBudget = .{ .max_count = 2, .ns_cap = 1000 };
+    try testing.expect(b.mayStart());
+    b.charge(10);
+    try testing.expect(b.mayStart());
+    b.charge(10);
+    try testing.expect(!b.mayStart());
+
+    var t: BoundaryBudget = .{ .max_count = 5, .ns_cap = 100 };
+    t.charge(100);
+    try testing.expect(!t.mayStart());
+
+    var s: BoundaryBudget = .{ .max_count = 5, .ns_cap = std.math.maxInt(u64), .spent_ns = std.math.maxInt(u64) - 1 };
+    s.charge(10);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), s.spent_ns);
+}
+
+test "orderByTail: ascending by uncached tail, stable for equal tails" {
+    const tails = [_]usize{ 500, 31, 31, 2000 };
+    var order: [4]usize = undefined;
+    orderByTail(&tails, &order);
+    try testing.expectEqualSlices(usize, &.{ 1, 2, 0, 3 }, &order);
+
+    var one: [1]usize = undefined;
+    orderByTail(&[_]usize{7}, &one);
+    try testing.expectEqualSlices(usize, &.{0}, &one);
+    orderByTail(&[_]usize{}, order[0..0]);
 }
 
 test "promiseMaterialized: a promise is dropped once the slot is decoding steadily" {
@@ -5704,6 +5788,80 @@ fn drainSideQueues(sch: *Scheduler) bool {
 const ChatPassMode = enum { main, yield };
 const ChatPassResult = enum { shutdown, idle, ran };
 
+/// What became of a slot `prefillAdmitted` took through admission and prefill.
+const AdmitOutcome = enum {
+    /// Prefilled and appended to `decoding`.
+    decoding,
+    /// Finished before or during its prefill (cancelled).
+    finished,
+    /// Failed; the slot carries the error.
+    errored,
+    /// Does not fit beside live requests yet: the caller puts it back in `pending`.
+    held,
+    /// After the hot-cache restore the uncached tail is over the slot's boundary limit.
+    tail_too_large,
+};
+
+/// One admitted slot's cancelled check, memory hold, prefill (with the one QSA-gap retry), first-token
+/// publish and move into `decoding`. The caller holds the slot's `in_pass`.
+fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
+    if (slot.cancelled.load(.acquire)) {
+        // finishSlot (not raw markFinished) so the metrics sink
+        // counts the cancellation; safe pre-prefill — commit
+        // no-ops with legacy_gen==null.
+        finishSlot(sch, slot, "cancelled");
+        return .finished;
+    }
+    if (slotHoldsForMemory(sch, slot)) return .held;
+    var prefill_sw = io_util.Stopwatch.init(sch.io);
+    var qsa_gap_retried = false;
+    prefill: while (true) {
+        runPrefill(sch, slot) catch |err| {
+            if (err == error.Cancelled) {
+                log.info("[scheduler] prefill aborted: client disconnected\n", .{});
+                finishSlot(sch, slot, "cancelled");
+                return .finished;
+            }
+            if (err == error.BoundaryTailTooLarge) return .tail_too_large;
+            if (err == error.QsaHistoryGap and !qsa_gap_retried) {
+                if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
+                emptySlotCache(slot);
+                if (slot.legacy_gen) |*g| {
+                    g.deinit(slot.allocator);
+                    slot.legacy_gen = null;
+                }
+                slot.skip_prefix_cache = true;
+                log.warn("[hot-cache] restored entry failed the QSA history check — dropped, cold prefill\n", .{});
+                qsa_gap_retried = true;
+                continue :prefill;
+            }
+            log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
+            slot.markError(@errorName(err));
+            return .errored;
+        };
+        break :prefill;
+    }
+    if (slot.state == .errored or slot.cancelled.load(.acquire)) return .errored;
+    slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+    publishFirstToken(slot);
+    if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
+        slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
+    });
+    // Exact time-to-first-token: elapsed from request arrival
+    // (Slot.init, pre-queue-wait) to prefill completion. Captured
+    // here rather than derived by subtraction in finishSlot, so a
+    // slot that finishes mid-tick can't skew it (metrics TTFT fix).
+    slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+    sch.queue_mu.lockUncancelable(sch.io);
+    sch.decoding.append(sch.allocator, slot) catch |err| {
+        sch.queue_mu.unlock(sch.io);
+        slot.markError(@errorName(err));
+        return .errored;
+    };
+    sch.queue_mu.unlock(sch.io);
+    return .decoding;
+}
+
 /// One admission -> prefill -> decode tick -> cull pass. `.main` parks while there is no
 /// work at all; `.yield` runs inside a media job, so it never parks and never touches the
 /// load, unload or gen queues. `.ran` = something advanced.
@@ -5785,6 +5943,23 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         if (n_prefill > 0) reviseHotCacheBudgets(sch, true);
     }
 
+    // A batch admitted together prefills in order. A long cold prompt first would hold every short
+    // request in the batch until it ends, and the chunk-boundary hook never sees them because
+    // they already left `pending`. With a decode share, the smallest uncached tail goes first.
+    if (n_prefill > 1 and prefillDecodeShare() > 0) {
+        var tails: [to_prefill.len]usize = undefined;
+        var order: [to_prefill.len]usize = undefined;
+        for (to_prefill[0..n_prefill], 0..) |s, i| tails[i] = slotUncachedTail(s);
+        orderByTail(tails[0..n_prefill], order[0..n_prefill]);
+        var sorted: [to_prefill.len]*Slot = undefined;
+        for (order[0..n_prefill], 0..) |src, i| sorted[i] = to_prefill[src];
+        @memcpy(to_prefill[0..n_prefill], sorted[0..n_prefill]);
+        // `prefilling_from` counts positions in this order.
+        sch.queue_mu.lockUncancelable(sch.io);
+        @memcpy(sch.prefilling[0..n_prefill], to_prefill[0..n_prefill]);
+        sch.queue_mu.unlock(sch.io);
+    }
+
     // 2. Prefill each pending slot (heavy; mlx ops on this thread).
     //    The inference thread is the sole mlx caller post-cleanup, so
     //    no per-tick stream rebind / mutex coexistence is needed.
@@ -5810,82 +5985,24 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             // token waits for the LAST slot's prefill (the TTFT
             // staircase collapse).
             if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
-            if (slot.cancelled.load(.acquire)) {
-                // finishSlot (not raw markFinished) so the metrics sink
-                // counts the cancellation; safe pre-prefill — commit
-                // no-ops with legacy_gen==null.
-                finishSlot(sch, slot, "cancelled");
-                ran = true;
-                continue;
-            }
-            if (slotHoldsForMemory(sch, slot)) {
-                // Back to the head of `pending`, in order; the decode tick below runs first.
-                sch.queue_mu.lockUncancelable(sch.io);
-                defer sch.queue_mu.unlock(sch.io);
-                sch.n_prefilling = pi; // back in `pending`, which `cancelAllInFlight` walks
-                var r = n_prefill;
-                while (r > pi) {
-                    r -= 1;
-                    sch.pending.insert(sch.allocator, 0, to_prefill[r]) catch {
-                        to_prefill[r].markError("OutOfMemory");
-                    };
-                    if (r > pi) _ = to_prefill[r].in_pass.fetchSub(1, .acq_rel);
-                }
-                break;
-            }
-            ran = true;
-            var prefill_sw = io_util.Stopwatch.init(sch.io);
-            var qsa_gap_retried = false;
-            prefill: while (true) {
-                runPrefill(sch, slot) catch |err| {
-                    if (err == error.Cancelled) {
-                        log.info("[scheduler] prefill aborted: client disconnected\n", .{});
-                        finishSlot(sch, slot, "cancelled");
-                        break :prefill;
+            switch (prefillAdmitted(sch, slot)) {
+                .held => {
+                    // Back to the head of `pending`, in order; the decode tick below runs first.
+                    sch.queue_mu.lockUncancelable(sch.io);
+                    defer sch.queue_mu.unlock(sch.io);
+                    sch.n_prefilling = pi; // back in `pending`, which `cancelAllInFlight` walks
+                    var r = n_prefill;
+                    while (r > pi) {
+                        r -= 1;
+                        sch.pending.insert(sch.allocator, 0, to_prefill[r]) catch {
+                            to_prefill[r].markError("OutOfMemory");
+                        };
+                        if (r > pi) _ = to_prefill[r].in_pass.fetchSub(1, .acq_rel);
                     }
-                    if (err == error.QsaHistoryGap and !qsa_gap_retried) {
-                        if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
-                        if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
-                        if (slot.model.transformer) |xf| {
-                            slot.cache.truncate(0, xf.s) catch {};
-                            xf.resetQsaPooledRope();
-                            xf.qwen4MtpResetOwned(slot.enable_mtp);
-                        }
-                        if (slot.legacy_gen) |*g| {
-                            g.deinit(slot.allocator);
-                            slot.legacy_gen = null;
-                        }
-                        slot.moe_seq_offset = 0;
-                        slot.cached_tokens = 0;
-                        slot.skip_prefix_cache = true;
-                        log.warn("[hot-cache] restored entry failed the QSA history check — dropped, cold prefill\n", .{});
-                        qsa_gap_retried = true;
-                        continue :prefill;
-                    }
-                    log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
-                    slot.markError(@errorName(err));
-                    break :prefill;
-                };
-                break :prefill;
+                    break;
+                },
+                .decoding, .finished, .errored, .tail_too_large => ran = true,
             }
-            if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
-            slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
-            publishFirstToken(slot);
-            if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
-                slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
-            });
-            // Exact time-to-first-token: elapsed from request arrival
-            // (Slot.init, pre-queue-wait) to prefill completion. Captured
-            // here rather than derived by subtraction in finishSlot, so a
-            // slot that finishes mid-tick can't skew it (metrics TTFT fix).
-            slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
-            sch.queue_mu.lockUncancelable(sch.io);
-            sch.decoding.append(sch.allocator, slot) catch |err| {
-                sch.queue_mu.unlock(sch.io);
-                slot.markError(@errorName(err));
-                continue;
-            };
-            sch.queue_mu.unlock(sch.io);
         }
     }
 
@@ -6506,6 +6623,7 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
 fn runGenJobs(reqs: []*GenRequest) void {
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
+    defer @import("w8a8.zig").dropMemo(); // the last activation (and its int8 copy) would stay pinned until the next job
     const req = reqs[0];
     if (reqs.len == 1) req.run(req.ctx) else {
         var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;
@@ -7658,6 +7776,176 @@ pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32) u32 {
     return if (cap == 0) width else @min(width, cap);
 }
 
+/// The largest uncached tail a request may have to be prefilled between another prefill's chunks:
+/// one decode-share chunk, so the nested prefill costs the outer about one chunk of time.
+pub const BOUNDARY_MAX_TAIL: usize = DECODE_SHARE_PREFILL_CHUNK;
+/// Requests admitted at one chunk boundary, across its admission scan and the gaps between its owed
+/// decode ticks. The wall-time cap in `BoundaryBudget` is the real bound.
+pub const BOUNDARY_MAX_COUNT: u32 = 4;
+
+/// What the boundary gate reads about a pending request.
+pub const BoundaryCand = struct {
+    exclusive: bool,
+    has_media: bool,
+    prompt_logprobs: bool,
+    generator_path: bool,
+    /// Module-side per-request state (qwen4_exp) that a declined restore would reset under the outer.
+    module_state: bool,
+    /// Uncached tail, from `peekMatchedTokens`.
+    tail: usize,
+};
+
+pub const BoundaryCtx = struct {
+    share: f32,
+    /// A prefill started at a boundary may tick decoders at its own boundaries but never admits.
+    nested: bool,
+    outer_exclusive: bool,
+    decoding: usize,
+    max_concurrent: usize,
+    max_tail: usize,
+};
+
+/// May this pending request be prefilled at the outer prefill's chunk boundary?
+pub fn boundaryEligible(c: BoundaryCand, x: BoundaryCtx) bool {
+    if (x.share <= 0 or x.nested or x.outer_exclusive) return false;
+    if (c.exclusive or c.has_media or c.prompt_logprobs or !c.generator_path or c.module_state) return false;
+    if (x.decoding >= x.max_concurrent) return false;
+    return c.tail <= x.max_tail;
+}
+
+/// What one boundary may spend on nested prefills, so the outer always advances.
+pub const BoundaryBudget = struct {
+    max_count: u32,
+    ns_cap: u64,
+    count: u32 = 0,
+    spent_ns: u64 = 0,
+
+    pub fn mayStart(self: BoundaryBudget) bool {
+        return self.count < self.max_count and self.spent_ns < self.ns_cap;
+    }
+
+    pub fn charge(self: *BoundaryBudget, ns: u64) void {
+        self.count += 1;
+        self.spent_ns +|= ns;
+    }
+};
+
+/// Stable ascending order of `tails` written to `order` as indices: smallest uncached tail first.
+pub fn orderByTail(tails: []const usize, order: []usize) void {
+    for (order[0..tails.len], 0..) |*o, i| o.* = i;
+    const by = struct {
+        fn lessThan(t: []const usize, a: usize, b: usize) bool {
+            return t[a] < t[b];
+        }
+    };
+    std.sort.insertion(usize, order[0..tails.len], tails, by.lessThan);
+}
+
+/// Undo a hot-cache restore the slot has not started on: hand the checkout back and empty the
+/// slot's cache, so the request can wait in `pending` and restore again when its turn comes.
+fn resetRestoredSlot(slot: *Slot) void {
+    if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), "tail over the boundary limit");
+    emptySlotCache(slot);
+    slot.restored_entry = 0;
+}
+
+/// Back to a cold slot: no restored KV, SSM state or module-side qwen4 state.
+fn emptySlotCache(slot: *Slot) void {
+    if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
+    if (slot.model.transformer) |xf| {
+        slot.cache.truncate(0, xf.s) catch {};
+        xf.resetQsaPooledRope();
+        xf.qwen4MtpResetOwned(slot.enable_mtp);
+    }
+    slot.moe_seq_offset = 0;
+    slot.cached_tokens = 0;
+}
+
+/// The first pending request that passes the boundary gate, removed from `pending` with its
+/// `in_pass` held. `outer` is the prefill whose chunk boundary this is.
+fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    var decoding: usize = 0;
+    for (sch.decoding.items) |s| {
+        if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+        decoding += 1;
+    }
+    const x: BoundaryCtx = .{
+        .share = prefillDecodeShare(),
+        .nested = sch.boundary_depth > 0,
+        .outer_exclusive = slotExclusiveDecode(outer),
+        .decoding = decoding,
+        .max_concurrent = sch.max_concurrent,
+        .max_tail = BOUNDARY_MAX_TAIL,
+    };
+    const n = @min(sch.pending.items.len, 32);
+    for (sch.pending.items[0..n], 0..) |s, i| {
+        if (s.cancelled.load(.acquire)) continue;
+        const c: BoundaryCand = .{
+            .exclusive = slotExclusiveDecode(s),
+            .has_media = s.vision_embeddings != null or s.media.len > 0,
+            .prompt_logprobs = s.prompt_logprobs,
+            .generator_path = s.model.transformer != null and s.model.ds4_engine == null and s.model.llama_engine == null,
+            .module_state = if (s.model.transformer) |xf| xf.config.isQwen4() else false,
+            .tail = slotUncachedTail(s),
+        };
+        if (!boundaryEligible(c, x)) continue;
+        _ = s.in_pass.fetchAdd(1, .acq_rel);
+        _ = sch.pending.orderedRemove(i);
+        sch.boundary_slot = s;
+        return s;
+    }
+    return null;
+}
+
+/// At a chunk boundary of `ic.slot`'s prefill: admit and prefill small pending requests, so their
+/// first token does not wait for the whole prefill. The decode ticks that follow include them.
+/// `budget` is the boundary's, shared by its admission scan and the gaps between its owed ticks.
+/// Returns the wall time spent.
+fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget) u64 {
+    const sch = ic.sch;
+    if (share <= 0 or sch.boundary_depth > 0) return 0;
+    var total = io_util.Stopwatch.init(sch.io);
+    while (budget.mayStart()) {
+        const slot = takeBoundaryCandidate(sch, ic.slot) orelse break;
+        var sw = io_util.Stopwatch.init(sch.io);
+        slot.boundary_max_tail = BOUNDARY_MAX_TAIL;
+        sch.boundary_depth += 1;
+        sch.boundary_outer = ic.slot;
+        const saved_tokens = sch.inflight_prefill_tokens.load(.monotonic);
+        const saved_expected = sch.inflight_prefill_expected.load(.monotonic);
+        const outcome = prefillAdmitted(sch, slot);
+        // runPrefill zeroes the progress gauges on exit; the outer prefill's go back.
+        sch.inflight_prefill_tokens.store(saved_tokens, .monotonic);
+        sch.inflight_prefill_expected.store(saved_expected, .monotonic);
+        sch.boundary_outer = null;
+        sch.boundary_depth -= 1;
+        slot.boundary_max_tail = null;
+        const wait = outcome == .held or outcome == .tail_too_large;
+        // Back to the head of `pending` before `in_pass` drops, so `complete` never sees a slot that
+        // is in no list.
+        sch.queue_mu.lockUncancelable(sch.io);
+        sch.boundary_slot = null;
+        if (wait) sch.pending.insert(sch.allocator, 0, slot) catch slot.markError("OutOfMemory");
+        sch.queue_mu.unlock(sch.io);
+        _ = slot.in_pass.fetchSub(1, .acq_rel);
+        if (wait) break;
+        if (outcome == .decoding) log.info("[boundary] admitted a {d}-token request beside a {d}-token prefill\n", .{ slot.prompt_tokens, ic.slot.full_prompt.len });
+        budget.charge(sw.read());
+    }
+    return total.read();
+}
+
+/// The tokens `slot` would still have to prefill, from a read-only peek at the hot cache. A slot
+/// that skips the cache, or carries media (media rows are never matched by token), counts whole.
+fn slotUncachedTail(slot: *Slot) usize {
+    const total = slot.full_prompt.len;
+    if (slot.skip_prefix_cache or slot.media.len > 0) return total;
+    const hc = if (slot.model.prefix_cache) |*p| p else return total;
+    return total - @min(total, hc.peekMatchedTokens(slot.full_prompt, slot.has_tools, slot.cache.config, slot.ssm_entries != null));
+}
+
 pub const OwedTicks = struct { ticks: u32, spent_ns: u64 };
 
 /// The ticks after a boundary's first one: run until none is owed or the decoders run out
@@ -7817,6 +8105,16 @@ fn chunkWidthCb(
     return decodeShareWidthCap(next, wc.sch.liveDecodingCount(), prefillDecodeShare());
 }
 
+/// What the owed-tick loop runs between boundaries: admit what arrived, then tick. Returns the
+/// admission time plus the tick's (0 only when nothing ran, which ends the loop).
+const OwedTickCtx = struct { ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget };
+
+fn admitThenTick(opaque_ctx: *anyopaque) u64 {
+    const t: *OwedTickCtx = @ptrCast(@alignCast(opaque_ctx));
+    const nested = admitSmallAtBoundary(t.ic, t.share, t.budget);
+    return interleaveDecodeTick(t.ic.sch) +| nested;
+}
+
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
     if (ic.ticks == 0) {
@@ -7824,10 +8122,16 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     }
     const chunk_ns = ic.chunk_sw.read();
     const share = prefillDecodeShare();
+    // Small pending requests first, so the ticks below include them; their time is hosted time. A
+    // request that arrives during the owed ticks is admitted between them, so no newcomer waits
+    // longer than the chunk in flight.
+    var budget: BoundaryBudget = .{ .max_count = BOUNDARY_MAX_COUNT, .ns_cap = decodeShareBudgetNs(chunk_ns, share) };
+    const nested_ns = admitSmallAtBoundary(ic, share, &budget);
     const first_ns = interleaveDecodeTick(ic.sch);
-    const r = runOwedDecodeTicks(share, chunk_ns, first_ns, ic.sch, interleaveDecodeTickOpaque);
+    var owed: OwedTickCtx = .{ .ic = ic, .share = share, .budget = &budget };
+    const r = runOwedDecodeTicks(share, chunk_ns +| nested_ns, first_ns, &owed, admitThenTick);
     ic.ticks += r.ticks;
-    ic.decode_ns +|= r.spent_ns;
+    ic.decode_ns +|= r.spent_ns +| nested_ns;
     {
         ic.sch.queue_mu.lockUncancelable(ic.sch.io);
         defer ic.sch.queue_mu.unlock(ic.sch.io);
@@ -8100,6 +8404,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         }
     }
 
+    // A request admitted at another prefill's chunk boundary must not turn into a long prefill of its
+    // own: the restore covered less than the pre-filter peeked (SSD tier, lien, QSA gap, a checkout
+    // taken meanwhile). Nothing has been forwarded yet, so hand the entry back and let it wait.
+    if (slot.boundary_max_tail) |max_tail| if (prefill_tokens.len > max_tail) {
+        resetRestoredSlot(slot);
+        return error.BoundaryTailTooLarge;
+    };
+
     // Phase 1 (perf-plan): forward the SSM-checkpoint stride from the
     // LoadedModel so the prefill loop snapshots SSM state at stride-aligned
     // positions for hybrid archs. Plain-attn models have empty ssm_entries
@@ -8330,9 +8642,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 null,
             // The install above is process-wide, so it is not the arch gate.
             .adaptive_chunk_width = adaptiveChunkWidthFor(width_ctx.cfg),
-            // Init's argmax-only gate must see logprobs BEFORE the split-
-            // prefill final-token forward runs — a post-init field write is
-            // too late for the certified lm_head prune.
+            // Init reads logprobs in the split-prefill final-token forward,
+            // before any post-init field write.
             .logprobs_n = slot.logprobs_n,
             .prompt_logprobs = if (slot.prompt_logprobs) slot.freshPromptLogprobs() else null,
         },
@@ -12469,6 +12780,26 @@ test "company: a Neural Engine slot never batches, so it does not count" {
     try testing.expect(!sch.hasCompany());
     sch.in_flight = 2;
     try testing.expect(sch.hasCompany());
+}
+
+test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancelled too" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.offloaded = .empty;
+    sch.prefilling_from = 0;
+    sch.n_prefilling = 0;
+    var slot: Slot = undefined;
+    slot.io = testing.io;
+    slot.cancelled = .init(false);
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    sch.boundary_slot = &slot;
+    sch.cancelAllInFlight();
+    try testing.expect(slot.cancelled.load(.acquire));
 }
 
 test "a parked inference thread keeps the Mac awake only while Neural Engine requests run" {

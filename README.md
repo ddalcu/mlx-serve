@@ -199,7 +199,7 @@ Some of the fastest Metal paths in the engine started as someone else's work, an
 - [MTPLX](https://github.com/youssofal/mtplx) by Youssof Altoukhi (Apache-2.0), the verify-width split-K quantized matmul family and the M5 NAX tensor-ops tile. Their own preferred credit line: *Powered by MTPLX by Youssof Altoukhi.*
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) (Apache-2.0), the matmul2d convention the NAX tile is built on, reached through MTPLX.
 - oMLX by jundot (Apache-2.0), the GatedDeltaNet blocked-sequence prefill kernel and the chunked-dispatch budget that keeps long-context prefill off the macOS preemption cliff.
-- [mlxfast-challenge](https://github.com/Layr-Labs/mlxfast-challenge) by Layr Labs (MIT), the certified lm_head prune.
+- [mlxfast-challenge](https://github.com/Layr-Labs/mlxfast-challenge) by Layr Labs (MIT), the decode-attention requant, the fused QK-norm + RoPE kernel and the fused MoE down-reduce tail.
 
 Full licenses and the required attributions are in [NOTICE](NOTICE). If we missed you, please open a PR — happy to add anyone who landed code, fixtures, or a fix here.
 

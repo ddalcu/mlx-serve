@@ -124,6 +124,14 @@ struct ServerOptions: Codable, Equatable {
     var aneImage: Bool = false
     var aneVideo: Bool = false
     var aneAudio: Bool = false
+    /// `--w8a8` / `--no-w8a8`: image, video, music and 3D transformers run as rotated int8 x int8 on
+    /// M5-class GPUs (lossy, faster). The server turns it on by itself only with NAX (M5 family) and
+    /// 64 GiB of RAM, so this default is the same function and BOTH choices are emitted.
+    var w8a8: Bool = ServerOptions.defaultW8a8(
+        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, isM5Family: AnePrefillAdvice.liveIsM5Family)
+    static func defaultW8a8(physicalMemoryBytes: UInt64, isM5Family: Bool) -> Bool {
+        isM5Family && physicalMemoryBytes >= 64 * 1_073_741_824
+    }
     /// `--ane-slots`: requests each Neural Engine model runs at once. Slots share the weights and
     /// the engines, so they split one stream's speed; each adds its own KV and state.
     var aneSlots: Int = 1
@@ -510,6 +518,7 @@ struct ServerOptions: Codable, Equatable {
         aneImage == other.aneImage &&
         aneVideo == other.aneVideo &&
         aneAudio == other.aneAudio &&
+        w8a8 == other.w8a8 &&
         aneSlots == other.aneSlots &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
@@ -680,6 +689,7 @@ struct ServerOptions: Codable, Equatable {
         if aneImage { args += ["--ane-image"] }
         if aneVideo { args += ["--ane-video"] }
         if aneAudio { args += ["--ane-audio"] }
+        args += [w8a8 ? "--w8a8" : "--no-w8a8"]
         if aneSlots > 1 { args += ["--ane-slots", "\(aneSlots)"] }
         // Decode attention requant: tri-state — undecided emits NOTHING (the
         // server default keeps laguna on and dsv4's comp_in dense); an
@@ -897,6 +907,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneImage) { aneImage = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneVideo) { aneVideo = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .w8a8) { w8a8 = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .aneSlots) { aneSlots = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
@@ -1119,6 +1130,10 @@ extension ServerOptions {
             explainer: "Generate music faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
+        "w8a8": .init(
+            title: "Neural Accelerator int8 (M5)",
+            explainer: "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models.",
+            needsRestart: true),
         "aneSlots": .init(
             title: "Neural Engine requests at once",
             explainer: "How many requests a model on the Neural Engine answers together; they share its speed, and each adds its own memory.",

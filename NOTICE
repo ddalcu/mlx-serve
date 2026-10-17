@@ -36,6 +36,15 @@ The joint schema head, input encoding and SystemOne response mapping in
 src/clef.zig are adapted from joint_schema_model.py and clef_mlx.py.
 
 --------------------------------------------------------------------------------
+SageAttention
+https://github.com/thu-ml/SageAttention
+Licensed under the Apache License, Version 2.0.
+
+The int8 attention recipe in src/int8_attn.zig (Q int8 per token, K smoothed and
+int8 per key block, P int8 against each block's row max, V int8 per channel)
+follows the SageAttention papers; the Metal kernels are our own.
+
+--------------------------------------------------------------------------------
 MTPLX
 https://github.com/youssofal/mtplx
 Copyright 2026 Youssof Altoukhi
@@ -428,12 +437,9 @@ mlxfast-challenge
 https://github.com/Layr-Labs/mlxfast-challenge
 Copyright (c) 2026 Layr Labs, Inc.
 
-Four decode fast paths in `src/transformer.zig` were derived from their tree
+Three decode fast paths in `src/transformer.zig` were derived from their tree
 over two porting rounds in July 2026:
 
-  * The certified lm_head prune, a port of `LagunaLmHeadPrune.swift`: an MXFP8
-    coarse GEMV producing a certified per-row bound, a mask, and an exact pass
-    over the surviving candidates.
   * Decode-only dense-attention requant (`--decode-attn-quant`): int8 side
     copies of dense attention weights served at decode widths, with real
     nvfp4-g16 copies on the tail layers at their measured split point.
@@ -442,13 +448,11 @@ over two porting rounds in July 2026:
   * The fused MoE down + router-weighting + K-reduction tail, from their fused
     routed down-reduce, including its measured 4-rows-per-simdgroup choice.
 
-Modifications by mlx-serve: all four were written in Zig against mlx-c rather
+Modifications by mlx-serve: all three were written in Zig against mlx-c rather
 than Swift. The down-reduce kernel's per-row arithmetic is our own `gatherQmv`
 body with their fusion structure around it; the QK-norm+RoPE kernel extracts
 cos/sin by a probe row through stock `mlx_fast_rope` instead of re-deriving the
-angles; the lm_head prune is gated on argmax-only requests and ships opt-in
-behind `MLX_SERVE_LMHEAD_PRUNE=1` after our own A/B measured it slower in the
-live graph than in a microbenchmark.
+angles.
 
 --------------------------------------------------------------------------------
 qwen-3.8-mtp-challenge

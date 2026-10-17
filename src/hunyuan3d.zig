@@ -43,6 +43,8 @@ const mc = @import("marching_cubes.zig");
 const glb = @import("glb.zig");
 
 const Weights = model_mod.Weights;
+const w8a8 = @import("w8a8.zig");
+const int8_attn = @import("int8_attn.zig");
 const S = mlx.mlx_stream;
 
 const LN_EPS: f32 = 1e-6;
@@ -214,6 +216,9 @@ pub const MixedLinear = struct {
     bits: u32 = 0,
     group_size: u32 = 0,
 
+    /// The int8 copy that REPLACES `w`/`scales`/`biases` (`--w8a8`), built by `toW8a8`.
+    w8: ?w8a8.Weight = null,
+
     /// `in_features` is the module's input dim (known per call); used only on
     /// the quantized path to solve (bits, group_size) from packed geometry.
     pub fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, s: S) !MixedLinear {
@@ -254,7 +259,13 @@ pub const MixedLinear = struct {
         return .{ .quantized = false, .w = wt, .add_bias = ownOpt(w, ak) };
     }
 
+    /// Replace the packed weights with their int8 copy when the route takes this shape.
+    pub fn toW8a8(self: *MixedLinear, s: S) !void {
+        self.w8 = try w8a8.takeLinear(&self.w, &self.scales, &self.biases, self.bits, self.group_size, s);
+    }
+
     pub fn deinit(self: *MixedLinear) void {
+        if (self.w8) |*q| q.deinit();
         _ = mlx.mlx_array_free(self.w);
         if (self.quantized) {
             _ = mlx.mlx_array_free(self.scales);
@@ -267,7 +278,10 @@ pub const MixedLinear = struct {
         const xh = try astype(x, .float16, s); // engine computes in f16
         defer _ = mlx.mlx_array_free(xh);
         var o = mlx.mlx_array_new();
-        if (self.quantized) {
+        if (self.w8) |*q| {
+            _ = mlx.mlx_array_free(o);
+            o = try w8a8.forwardAs(xh, q, .float16, s);
+        } else if (self.quantized) {
             try mlx.check(mlx.mlx_quantized_matmul(&o, xh, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
         } else {
             try mlx.check(mlx.mlx_matmul(&o, xh, self.w, s));
@@ -898,7 +912,8 @@ const DitAttn = struct {
         const v = try transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(v);
         const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(@as(u32, @intCast(hd)))));
-        const attn = try sdpa(q, k, v, scale, s);
+        const o8 = if (w8a8.enabled) try int8_attn.attentionHeads(q, k, v, scale, s) else null;
+        const attn = o8 orelse try sdpa(q, k, v, scale, s);
         defer _ = mlx.mlx_array_free(attn);
         const merged = try mergeHeads(attn, s);
         defer _ = mlx.mlx_array_free(merged);
@@ -1100,6 +1115,21 @@ const DitBlock = struct {
     norm3_b: mlx.mlx_array,
     ffn: Ffn,
     skip: ?Skip,
+    /// The token-GEMM linears go int8 (`--w8a8`): attention, the dense / shared-expert MLP and the skip fuse.
+    /// Routed experts, the gate and the embedders stay packed.
+    fn toW8a8(self: *DitBlock, s: S) !void {
+        for ([_]*DitAttn{ &self.attn1, &self.attn2 }) |at| {
+            for ([_]*MixedLinear{ &at.q, &at.k, &at.v, &at.out }) |l| try l.toW8a8(s);
+        }
+        const mlp: *Mlp = switch (self.ffn) {
+            .mlp => |*m| m,
+            .moe => |*m| &m.shared,
+        };
+        try mlp.fc1.toW8a8(s);
+        try mlp.fc2.toW8a8(s);
+        if (self.skip) |*sk| try sk.lin.toW8a8(s);
+    }
+
     fn deinit(self: *DitBlock) void {
         _ = mlx.mlx_array_free(self.norm1_w);
         _ = mlx.mlx_array_free(self.norm1_b);
@@ -1376,6 +1406,10 @@ pub fn loadDit(allocator: std.mem.Allocator, cfg: Hy3dConfig, model_dir: []const
                 .norm_w = try normVec(&w, knw, s),
                 .norm_b = try normVec(&w, knb, s),
             };
+        }
+        if (w8a8.enabled) {
+            try blk.toW8a8(s);
+            w.dropBlock("blocks.{d}.", i);
         }
     }
     // FinalLayer.norm_final is affine LayerNorm in the reference — the
@@ -2734,4 +2768,66 @@ test "hy3d oracle: e2e SDF grid matches reference" {
         const hi = ref_n * 11 / 10;
         try testing.expect(nvert >= lo and nvert <= hi);
     }
+}
+
+/// One DiT forward on seeded noise (batch 2 like the CFG pair), velocity as f32; `resident` receives
+/// the MLX bytes the loaded DiT holds after it.
+fn dit3dProbe(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, resident: *usize, load_peak: *usize) !mlx.mlx_array {
+    const s = mlx.mlx_default_gpu_stream_new();
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    const cfg = try readConfigFile(io, a, model_dir);
+    _ = mlx.mlx_reset_peak_memory();
+    var dit = try loadDit(a, cfg, model_dir, s);
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    load_peak.* = peak -| before;
+    defer dit.deinit();
+    const lat = try w8a8.randn(&.{ 2, @intCast(cfg.num_latents), @intCast(cfg.embed_dim) }, 1, .float16, s);
+    defer _ = mlx.mlx_array_free(lat);
+    const ctx = try w8a8.randn(&.{ 2, @intCast(cfg.dinoTokens()), @intCast(cfg.context_dim) }, 2, .float16, s);
+    defer _ = mlx.mlx_array_free(ctx);
+    const v = try dit.forward(lat, ctx, 0.5);
+    defer _ = mlx.mlx_array_free(v);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, v, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    w8a8.dropMemo(); // job-end state: the last activation is not weights
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    resident.* = after -| before;
+    return out;
+}
+
+// The lossy int8 route against the same pack's packed forward. HY3D_TEST_MODEL.
+test "hy3d DiT: the w8a8 route stays within its bar of the packed forward" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const model_dir = std.mem.span(std.c.getenv("HY3D_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = false;
+    var packed_bytes: usize = 0;
+    var packed_peak: usize = 0;
+    const want = try dit3dProbe(io, a, model_dir, &packed_bytes, &packed_peak);
+    defer _ = mlx.mlx_array_free(want);
+    w8a8.enabled = true;
+    var int8_bytes: usize = 0;
+    var int8_peak: usize = 0;
+    const got = try dit3dProbe(io, a, model_dir, &int8_bytes, &int8_peak);
+    defer _ = mlx.mlx_array_free(got);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const g = try w8a8.agreement(got, want, s);
+    std.debug.print("[hy3d dit w8a8] cos={d:.6} rms_ratio={d:.6} resident packed={d} int8={d}\n", .{ g.cos, g.rms_ratio, packed_bytes, int8_bytes });
+    try testing.expect(g.cos < 0.99999); // the route engaged: a packed-numerics output would be identical
+    try testing.expect(g.cos > 0.99);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.03);
+    try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(io, model_dir, &.{"dit.safetensors"}));
+    // Loading converts block by block and frees each block's packed arrays, and the experts load lazily
+    // at the first forward: the peak while loading stays well under the final size, where a map that kept
+    // the packed arrays would reach it.
+    std.debug.print("[hy3d dit w8a8] load peak packed={d} int8={d}\n", .{ packed_peak, int8_peak });
+    try testing.expect(int8_peak < int8_bytes / 5 * 4);
 }

@@ -36,6 +36,9 @@ const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
 const MfLinear = mage_flow.MfLinear;
+const w8a8 = @import("w8a8.zig");
+const dit_kernels = @import("dit_kernels.zig");
+const int8_attn = @import("int8_attn.zig");
 const TextEncoder = mage_flow.TextEncoder;
 const VisionTower = mage_flow.VisionTower;
 const stb = @import("stb");
@@ -51,7 +54,7 @@ pub fn resolveSteps(grid: ?[]const f32, steps: u32) u32 {
 }
 
 pub const VAE_DOWNSAMPLE: u32 = 16;
-/// Text encoding stays bf16; the DiT defaults to bf16 and the VAE stays f32.
+/// Text encoding stays bf16; the DiT defaults to bf16 and the VAE runs f16.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
 /// Experimental DiT-only dtype override. Unrecognized values preserve the
 /// checkpoint's default; text encoding and VAE decoding keep their own dtypes.
@@ -756,9 +759,25 @@ const BlockLora = struct {
     out: lora_mod.Slot = .{},
 };
 
+/// Milliseconds since `t0`, restarting it: consecutive calls time consecutive stages.
+fn stageMs(io: std.Io, t0: *std.Io.Timestamp) u64 {
+    const ns = t0.untilNow(io, .awake).nanoseconds;
+    t0.* = std.Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ns, 1_000_000));
+}
+
 /// `lin(x)` plus every adapter attached to it.
 fn linForward(lin: *const MfLinear, slot: *const lora_mod.Slot, x: A, s: S) !A {
     return lora_mod.addSlot(try lin.forward(x, null, s), x, slot, s);
+}
+
+/// `silu(g) * p`, consuming both.
+fn gluMul(g: A, p: A, s: S) !A {
+    defer free(g);
+    defer free(p);
+    const sg = try silu(g, s);
+    defer free(sg);
+    return mulA(sg, p, s);
 }
 
 const Block = struct {
@@ -772,8 +791,14 @@ const Block = struct {
     gate: MfLinear,
     out: MfLinear,
     lora: BlockLora = .{},
+    /// q, k, v rows in one int8 weight (the three linears are views of it), and
+    /// gate/proj interleaved for the SwiGLU epilogue, which REPLACES them (`--w8a8`).
+    qkv: ?w8a8.Weight = null,
+    gp: ?w8a8.Weight = null,
 
     fn deinit(self: *Block) void {
+        if (self.qkv) |*q| q.deinit();
+        if (self.gp) |*q| q.deinit();
         inline for (.{ &self.q, &self.k, &self.v, &self.o, &self.proj, &self.gate, &self.out }) |l| l.deinit();
         free(self.norm_q);
         free(self.norm_k);
@@ -878,6 +903,11 @@ pub const Dit = struct {
                 .gate = try loadLinear(&w, a, H, dtype, s, p ++ "img_mlp.gate_layer", .{i}),
                 .out = try loadLinear(&w, a, H * cfg.mlp_ratio, dtype, s, p ++ "img_mlp.out", .{i}),
             };
+            inline for (.{ &b.q, &b.k, &b.v, &b.o, &b.proj, &b.gate }) |l| try l.toW8a8(s);
+            try b.out.toW8a8(s);
+            b.qkv = try w8a8.fuse(&.{ &b.q.w8, &b.k.w8, &b.v.w8 }, .stack, s);
+            b.gp = try w8a8.fuse(&.{ &b.gate.w8, &b.proj.w8 }, .interleave, s);
+            if (w8a8.enabled) w.dropBlock("transformer_blocks.{d}.", i);
         }
         return self;
     }
@@ -1019,17 +1049,36 @@ pub const Dit = struct {
         return transpose(yr, &perm, s);
     }
 
+    /// q, k, v heads-major from one int8 GEMM and one norm+RoPE kernel; null when
+    /// the fused weight is absent or the call is outside it.
+    fn fusedHeads(self: *const Dit, b: *const Block, x: A, geo: *const Geometry) !?dit_kernels.QkvHeads {
+        const f = if (b.qkv) |*q| q else return null;
+        if (b.lora.q.count + b.lora.k.count + b.lora.v.count != 0 or self.cfg.head_dim != 128) return null;
+        const sh = mlx.getShape(x);
+        if (sh[0] != 1) return null;
+        const xc = try astype(x, self.dtype, self.s);
+        defer free(xc);
+        const y = try w8a8.forward(xc, f, self.s);
+        defer free(y);
+        const y2 = try reshape(y, &[_]c_int{ sh[1], @intCast(f.n) }, self.s);
+        defer free(y2);
+        const hq: c_int = @intCast(self.cfg.heads * self.cfg.head_dim);
+        const h: c_int = @intCast(self.cfg.heads);
+        return try dit_kernels.qkvHeads(y2, .{ .heads = h, .kv_heads = h, .q_off = 0, .k_off = hq, .v_off = 2 * hq }, b.norm_q, b.norm_k, geo.cos, geo.sin, self.cfg.eps, false, self.s);
+    }
+
     /// Block-causal attention as the reference segments it: causal over the
     /// text prefix, then the image block against the whole sequence.
     fn attention(self: *const Dit, b: *const Block, x: A, geo: *const Geometry, cache: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
         const T = geo.text_len;
-        const q = try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, geo);
+        const fused = try self.fusedHeads(b, x, geo);
+        const q = if (fused) |f| f.q else try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, geo);
         defer free(q);
-        const k = try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, geo);
+        const k = if (fused) |f| f.k else try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, geo);
         defer free(k);
-        const v = try self.headsOf(&b.v, &b.lora.v, null, x, geo);
+        const v = if (fused) |f| f.v else try self.headsOf(&b.v, &b.lora.v, null, x, geo);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
 
@@ -1044,6 +1093,28 @@ pub const Dit = struct {
         defer if (full_v) |a| free(a);
         const qi = try sliceAxis(q, 2, T, sh[1], s);
         defer free(qi);
+        if (w8a8.enabled) if (try int8_attn.attention(qi, full_k orelse k, full_v orelse v, scale, s)) |img8| {
+            defer free(img8);
+            const all = if (T == 0) try contig(img8, s) else blk: {
+                const qt = try sliceAxis(q, 2, 0, T, s);
+                defer free(qt);
+                const kt = try sliceAxis(k, 2, 0, T, s);
+                defer free(kt);
+                const vt = try sliceAxis(v, 2, 0, T, s);
+                defer free(vt);
+                const txt_out = try sdpa(qt, kt, vt, scale, "causal", s);
+                defer free(txt_out);
+                const tt = try transpose(txt_out, &[_]c_int{ 0, 2, 1, 3 }, s);
+                defer free(tt);
+                const tf = try reshape(tt, &[_]c_int{ T, sh[2] }, s);
+                defer free(tf);
+                break :blk try concat(&.{ tf, img8 }, 0, s);
+            };
+            defer free(all);
+            const flat = try reshape(all, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
+            defer free(flat);
+            return linForward(&b.o, &b.lora.o, flat, s);
+        };
         const img_out = try sdpa(qi, full_k orelse k, full_v orelse v, scale, "", s);
         defer free(img_out);
         const joined = if (T == 0) try contig(img_out, s) else blk: {
@@ -1065,6 +1136,31 @@ pub const Dit = struct {
         return linForward(&b.o, &b.lora.o, flat, s);
     }
 
+    /// `silu(gate(x)) * proj(x)`. With the interleaved int8 weight that is one
+    /// GEMM with the SwiGLU in its epilogue; an attached adapter needs the two
+    /// projections apart, so it takes the plain GEMM and splits it.
+    fn swiglu(self: *const Dit, b: *const Block, x: A) !A {
+        const s = self.s;
+        if (b.gp) |*f| {
+            const xc = try astype(x, self.dtype, s);
+            defer free(xc);
+            if (b.lora.gate.count + b.lora.proj.count == 0) return w8a8.forwardSwiglu(xc, f, s);
+            const pair = try w8a8.forwardPair(xc, f, s);
+            const g = try lora_mod.addSlot(pair.gate, xc, &b.lora.gate, s);
+            const p = lora_mod.addSlot(pair.up, xc, &b.lora.proj, s) catch |e| {
+                free(g);
+                return e;
+            };
+            return gluMul(g, p, s);
+        }
+        const g = try linForward(&b.gate, &b.lora.gate, x, s);
+        const p = linForward(&b.proj, &b.lora.proj, x, s) catch |e| {
+            free(g);
+            return e;
+        };
+        return gluMul(g, p, s);
+    }
+
     fn blockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const Geometry, cache: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const n1 = try layerNorm(x, self.cfg.eps, s);
@@ -1082,13 +1178,7 @@ pub const Dit = struct {
         defer free(n2);
         const m_in = try mulA(n2, mod.scale2, s);
         defer free(m_in);
-        const g = try linForward(&b.gate, &b.lora.gate, m_in, s);
-        defer free(g);
-        const sg = try silu(g, s);
-        defer free(sg);
-        const p = try linForward(&b.proj, &b.lora.proj, m_in, s);
-        defer free(p);
-        const gp = try mulA(sg, p, s);
+        const gp = try self.swiglu(b, m_in);
         defer free(gp);
         const mlp = try linForward(&b.out, &b.lora.out, gp, s);
         defer free(mlp);
@@ -1285,13 +1375,7 @@ pub const Dit = struct {
         defer free(n2);
         const m_in = try mulA(n2, mod.scale2, s);
         defer free(m_in);
-        const g = try linForward(&b.gate, &b.lora.gate, m_in, s);
-        defer free(g);
-        const sg = try silu(g, s);
-        defer free(sg);
-        const p = try linForward(&b.proj, &b.lora.proj, m_in, s);
-        defer free(p);
-        const gp = try mulA(sg, p, s);
+        const gp = try self.swiglu(b, m_in);
         defer free(gp);
         const mlp = try linForward(&b.out, &b.lora.out, gp, s);
         defer free(mlp);
@@ -1407,7 +1491,16 @@ fn segmentSdpaWalk(q: A, k: A, v: A, geo: *const EditGeometry, scale: f32, s: S,
     return joined;
 }
 
-// ── VAE (f32, NHWC inside) ──
+// ── VAE (NHWC inside) ──
+
+/// The VAE's compute dtype: f16 decodes within ~56 dB of the reference's f32 and
+/// lets every conv run on the half-precision matrix path.
+const vae_dt: mlx.mlx_dtype = .float16;
+
+fn vaeCast(x: A, s: S) !A {
+    defer free(x);
+    return astype(x, vae_dt, s);
+}
 
 const Conv = struct {
     w: A, // OHWI
@@ -1437,9 +1530,9 @@ const Conv = struct {
             break :blk try contig(t, s);
         };
         defer free(tc);
-        const wf = try astype(tc, .float32, s);
+        const wf = try astype(tc, vae_dt, s);
         errdefer free(wf);
-        return .{ .w = wf, .b = try loadVecF32(w, a, fmt ++ ".bias", args, s) };
+        return .{ .w = wf, .b = try vaeCast(try loadVecF32(w, a, fmt ++ ".bias", args, s), s) };
     }
 
     fn deinit(self: *Conv) void {
@@ -1521,7 +1614,7 @@ fn bandRows(x_shape: []const c_int, out_ch: c_int, grow: c_int) c_int {
 fn loadVaeNorm(w: *const Weights, a: std.mem.Allocator, s: S, comptime fmt: []const u8, args: anytype) !A {
     const g = try loadVecF32(w, a, fmt ++ ".gamma", args, s);
     defer free(g);
-    return reshape(g, &[_]c_int{-1}, s);
+    return vaeCast(try reshape(g, &[_]c_int{-1}, s), s);
 }
 
 /// x/‖x‖₂ · √C · gamma over channels IS rms_norm (‖x‖₂/√C = rms), and the fused
@@ -1761,7 +1854,7 @@ const Stage = struct {
             const nh = try r.forward(h, s);
             free(h);
             h = nh;
-            // Full-resolution stages are GBs of f32: never let resnets stack lazily.
+            // Full-resolution stages are GBs: never let resnets stack lazily.
             try mlx.check(mlx.mlx_array_eval(h));
         }
         return h;
@@ -1819,7 +1912,7 @@ fn channelVec(vals: []const f32, s: S) !A {
     const sh = [_]c_int{@intCast(vals.len)};
     const raw = mlx.mlx_array_new_data(vals.ptr, &sh, 1, .float32);
     defer free(raw);
-    return contig(raw, s);
+    return vaeCast(try contig(raw, s), s);
 }
 
 /// Everything both halves of the VAE share: stem, stages, mid block, head.
@@ -1898,7 +1991,7 @@ pub const VaeDecoder = struct {
     /// The fourth channel is native alpha; preserve it for transparent PNG output.
     pub fn decodeRgba(self: *const VaeDecoder, latent: A) !A {
         const s = self.h.s;
-        const lf = try astype(latent, .float32, s);
+        const lf = try astype(latent, vae_dt, s);
         defer free(lf);
         const nhwc = try transpose(lf, &[_]c_int{ 0, 2, 3, 1 }, s);
         defer free(nhwc);
@@ -1919,7 +2012,9 @@ pub const VaeDecoder = struct {
             try mlx.check(mlx.mlx_array_eval(x));
         }
         defer free(x);
-        const out = try self.h.head(x);
+        const hx = try self.h.head(x);
+        defer free(hx);
+        const out = try astype(hx, .float32, s);
         defer free(out);
         return transpose(out, &[_]c_int{ 0, 3, 1, 2 }, s);
     }
@@ -2280,7 +2375,9 @@ pub const Engine = struct {
             if (cfgActive(opts)) "two forwards per step" else "one forward per step", if (opts.init_image != null) " img2img" else "",
         });
         if (progress) |p| p.emit("Encoding prompt", 0, n_steps);
+        var stage_t0 = std.Io.Timestamp.now(self.io, .awake);
         const cond = try self.encodeConditioning(allocator, prompt, opts);
+        const prompt_ms = stageMs(self.io, &stage_t0);
         defer free(cond.pos);
         defer if (cond.neg) |n| free(n);
         logMemory("prompt encode");
@@ -2345,6 +2442,7 @@ pub const Engine = struct {
             }
         }
 
+        const denoise_ms = stageMs(self.io, &stage_t0);
         logMemory("denoise");
         if (progress) |p| p.emit("Decoding image", run, run);
         const grid = try reshape(img, &[_]c_int{ 1, @intCast(lat_h), @intCast(lat_w), z }, s);
@@ -2354,6 +2452,7 @@ pub const Engine = struct {
         const decoded = if (opts.transparent) try self.vae.decodeRgba(latent) else try self.vae.decode(latent);
         defer free(decoded);
         try mlx.check(mlx.mlx_array_eval(decoded));
+        log.info("[qwen-image] stages: prompt {d} ms, denoise {d} ms ({d} steps), vae decode {d} ms\n", .{ prompt_ms, denoise_ms, run, stageMs(self.io, &stage_t0) });
         logMemory("vae decode");
         return denormImage(decoded, s);
     }
@@ -2783,7 +2882,11 @@ test "QwenImage VAE convs load the same from OIHW and OHWI packs" {
             var conv = try Conv.load(&w, a, s, "c", .{});
             defer conv.deinit();
             try testing.expectEqualSlices(c_int, &ohwi, mlx.getShape(conv.w));
-            try testing.expectEqual(@as(f32, 0), try maxAbsDiff(conv.w, want, s));
+            const want_vae = try astype(want, vae_dt, s); // the VAE stores its weights in f16
+            defer free(want_vae);
+            const got = try astype(conv.w, .float32, s); // maxAbsDiff reads f32
+            defer free(got);
+            try testing.expectEqual(@as(f32, 0), try maxAbsDiff(got, want_vae, s));
         }
     }
 }
@@ -3207,6 +3310,128 @@ test "QwenImage DiT parity (env-gated)" {
     defer free(out16);
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out16));
     try testing.expect((try parity(out16, try f.get("dit_out"), s)).cos > 0.99);
+}
+
+/// One DiT forward on seeded noise (16 x 16 latent tokens + 64 text rows), as f32;
+/// `resident` receives the MLX bytes the loaded DiT holds.
+fn qwenProbe(io: std.Io, a: std.mem.Allocator, s: S, dir: []const u8, cfg: DitConfig, resident: *usize) !A {
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    var dit = try Dit.load(io, a, s, dir, cfg, .bfloat16);
+    defer dit.deinit();
+    const img = try w8a8.randn(&.{ 1, 256, @intCast(cfg.in_ch) }, 1, .bfloat16, s);
+    defer free(img);
+    const txt = try w8a8.randn(&.{ 1, 64, @intCast(cfg.context) }, 2, .bfloat16, s);
+    defer free(txt);
+    var geo = try Geometry.init(a, cfg, 64, 16, 16);
+    defer geo.deinit();
+    const out = try dit.forward(img, txt, 0.5, &geo);
+    defer free(out);
+    const f = try astype(out, .float32, s);
+    try mlx.check(mlx.mlx_array_eval(f));
+    // Weights are lazy until the first forward has read them.
+    w8a8.dropMemo(); // job-end state: the last activation is not weights
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    resident.* = after -| before;
+    return f;
+}
+
+// The lossy int8 route against the same pack's packed forward (no reference fixture
+// needed). QWEN_IMAGE_TEST_MODEL.
+test "QwenImage DiT: the w8a8 route stays within its bar of the packed forward" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cfg = try DitConfig.parse(io, a, dir);
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = false;
+    var packed_bytes: usize = 0;
+    const want = try qwenProbe(io, a, s, dir, cfg, &packed_bytes);
+    defer free(want);
+    w8a8.enabled = true;
+    var int8_bytes: usize = 0;
+    const got = try qwenProbe(io, a, s, dir, cfg, &int8_bytes);
+    defer free(got);
+    const g = try w8a8.agreement(got, want, s);
+    std.debug.print("[qwen-image dit w8a8] cos={d:.6} rms_ratio={d:.6} resident packed={d} int8={d}\n", .{ g.cos, g.rms_ratio, packed_bytes, int8_bytes });
+    try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(io, dir, &.{ "transformer/diffusion_pytorch_model-00001-of-00002.safetensors", "transformer/diffusion_pytorch_model-00002-of-00002.safetensors" }));
+    try testing.expect(g.cos < 0.99999); // the route engaged: a packed-numerics output would be identical
+    try testing.expect(g.cos > 0.99);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.03);
+}
+
+test "QwenImage block: an adapter on the fused int8 gate/proj equals the same adapter on the separate projections" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = true;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var dit = try TinyPrefixModel.init(.bfloat16, s); // only its stream and dtype are read
+    defer dit.deinit();
+    var blocks: [2]Block = undefined;
+    for (&blocks) |*b| {
+        b.* = .{
+            .q = undefined,
+            .k = undefined,
+            .v = undefined,
+            .o = undefined,
+            .norm_q = try TinyPrefixModel.tensor(&.{16}, 1.3, 1),
+            .norm_k = try TinyPrefixModel.tensor(&.{16}, 1.7, 1),
+            .proj = try TinyPrefixModel.linear(256, 512, 0.5, .bfloat16, s),
+            .gate = try TinyPrefixModel.linear(256, 512, 0.6, .bfloat16, s),
+            .out = undefined,
+        };
+        inline for (.{ &b.proj, &b.gate }) |l| try l.toW8a8(s);
+    }
+    defer for (&blocks) |*b| {
+        b.gate.deinit();
+        b.proj.deinit();
+        if (b.gp) |*q| q.deinit();
+        free(b.norm_q);
+        free(b.norm_k);
+    };
+    const fused = &blocks[0];
+    const apart = &blocks[1];
+    fused.gp = try w8a8.fuse(&.{ &fused.gate.w8, &fused.proj.w8 }, .interleave, s);
+    try testing.expect(fused.gp != null and fused.gate.w8 == null and apart.gp == null);
+
+    const x = try w8a8.randn(&.{ 1, 300, 256 }, 20, .bfloat16, s);
+    defer free(x);
+    const plain_f = try dit.swiglu(fused, x);
+    defer free(plain_f);
+    const plain_a = try dit.swiglu(apart, x);
+    defer free(plain_a);
+    const p0 = try w8a8.agreement(plain_f, plain_a, s);
+    std.debug.print("[qwen swiglu] plain fused vs apart cos={d:.6} rms={d:.6}\n", .{ p0.cos, p0.rms_ratio });
+    try testing.expect(p0.cos > 0.999);
+
+    var refs: [2]lora_mod.Ref = undefined;
+    for (&refs, 0..) |*r, i| {
+        r.* = .{ .at = try w8a8.randn(&.{ 256, 4 }, 30 + i, .bfloat16, s), .bt = try w8a8.randn(&.{ 4, 512 }, 40 + i, .bfloat16, s), .scale = 0.05 };
+    }
+    defer for (refs) |r| {
+        free(r.at);
+        free(r.bt);
+    };
+    for (&blocks) |*b| {
+        b.lora.gate.set(refs[0..1]);
+        b.lora.proj.set(refs[1..2]);
+    }
+    const lora_f = try dit.swiglu(fused, x);
+    defer free(lora_f);
+    const lora_a = try dit.swiglu(apart, x);
+    defer free(lora_a);
+    const p1 = try w8a8.agreement(lora_f, lora_a, s);
+    const p2 = try w8a8.agreement(lora_f, plain_f, s);
+    std.debug.print("[qwen swiglu] lora fused vs apart cos={d:.6}; lora vs plain cos={d:.6}\n", .{ p1.cos, p2.cos });
+    try testing.expect(p1.cos > 0.999);
+    try testing.expect(p2.cos < 0.999); // the adapter moved the output
 }
 
 test "QwenImage VAE parity (env-gated)" {

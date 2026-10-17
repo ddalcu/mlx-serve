@@ -208,6 +208,21 @@ enum ModelBrowserUse {
         return (m, modality)
     }
 
+    /// The build a shelf repo's split button uses: its only one on disk, unless
+    /// that is already the selected model. Two builds leave the choice to the menu.
+    static func shelfPrimaryUse(onDisk paths: [String], selected: String?) -> String? {
+        guard paths.count == 1, let only = paths.first else { return nil }
+        return selected.map(normalize) == normalize(only) ? nil : only
+    }
+
+    /// The decision checkpoint (Laya, Kev, D1) at `path`: My Models offers it a
+    /// Use that opens Decisions, so Discover does too.
+    static func decisionModel(atPath path: String?, in models: [LocalModel]) -> LocalModel? {
+        guard let path, !path.isEmpty else { return nil }
+        let wanted = normalize(path)
+        return models.first { normalize($0.path) == wanted && isDecisionModelType($0.modelType) }
+    }
+
     private static func normalize(_ path: String) -> String {
         var p = (path as NSString).standardizingPath
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }

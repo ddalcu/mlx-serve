@@ -36,6 +36,8 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const lora_mod = @import("lora.zig");
+const w8a8 = @import("w8a8.zig");
+const int8_attn = @import("int8_attn.zig");
 const diffvae = @import("ltx_diffvae.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 
@@ -170,6 +172,9 @@ pub const Component = struct {
     // A Stack may hold several simultaneously-attached adapters; their
     // deltas are summed (lora.deltaSum), never merged.
     lora: ?*const lora_mod.Stack = null,
+    /// Int8 copies of the DiT block linears that REPLACE their packed `<base>.weight/.scales/.biases`
+    /// (`--w8a8`); `dQLin` reads them.
+    w8: w8a8.Overlay = .{},
 
     pub fn deinit(self: *Component) void {
         var it = self.map.iterator();
@@ -178,6 +183,12 @@ pub const Component = struct {
             self.allocator.free(e.key_ptr.*);
         }
         self.map.deinit();
+        self.w8.deinit(self.allocator);
+    }
+
+    /// Whether the linear behind `weight_key` (`<base>.weight`) is present, packed or int8.
+    pub fn hasWeight(self: *const Component, weight_key: []const u8) bool {
+        return self.map.contains(weight_key) or self.w8.has(weight_key);
     }
 
     pub fn get(self: *const Component, key: []const u8) ?mlx.mlx_array {
@@ -198,6 +209,17 @@ pub const Component = struct {
         return @intCast(self.map.count());
     }
 };
+
+/// The transformer component: loaded, then its block linears to int8 where the route takes them.
+pub fn loadTransformer(allocator: std.mem.Allocator, path: [:0]const u8, load_s: S, s: S) !Component {
+    var comp = try loadComponent(allocator, path, load_s);
+    errdefer comp.deinit();
+    if (w8a8.enabled) {
+        const n = try comp.w8.convert(allocator, &comp.map, .{ .base = "transformer.transformer_blocks.0.attn1.to_q", .in_features = (LtxConfig{}).videoDim() }, s);
+        log.info("[ltx] int8: {d} block linears\n", .{n});
+    }
+    return comp;
+}
 
 /// Load one `*.safetensors` file (absolute path) into a Component map.
 pub fn loadComponent(allocator: std.mem.Allocator, path: [:0]const u8, s: S) !Component {
@@ -1907,20 +1929,25 @@ fn ditAdaLNSingle(comp: *const Component, alloc: std.mem.Allocator, t_sin: mlx.m
 /// When a LoRA is installed on the Component, adds scale·(x@Aᵀ)@Bᵀ unfused
 /// (same contract as the image backends' QLinear.forward).
 fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, base: []const u8, s: S) !mlx.mlx_array {
-    const wk = try std.fmt.allocPrint(alloc, "{s}.weight", .{base});
-    defer alloc.free(wk);
-    const sk = try std.fmt.allocPrint(alloc, "{s}.scales", .{base});
-    defer alloc.free(sk);
-    const bk = try std.fmt.allocPrint(alloc, "{s}.biases", .{base});
-    defer alloc.free(bk);
     const lbk = try std.fmt.allocPrint(alloc, "{s}.bias", .{base});
     defer alloc.free(lbk);
-    const wq = comp.get(wk) orelse return error.MissingDitWeight;
-    const sc = comp.get(sk) orelse return error.MissingDitWeight;
-    const bi = comp.get(bk) orelse return error.MissingDitWeight;
-    const qp = try quantGeom(wq, sc, lastDim(x));
     var mm = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
+    if (comp.w8.get(base)) |q| {
+        _ = mlx.mlx_array_free(mm);
+        mm = try w8a8.forwardAs(x, q, mlx.mlx_array_dtype(x), s);
+    } else {
+        const wk = try std.fmt.allocPrint(alloc, "{s}.weight", .{base});
+        defer alloc.free(wk);
+        const sk = try std.fmt.allocPrint(alloc, "{s}.scales", .{base});
+        defer alloc.free(sk);
+        const bk = try std.fmt.allocPrint(alloc, "{s}.biases", .{base});
+        defer alloc.free(bk);
+        const wq = comp.get(wk) orelse return error.MissingDitWeight;
+        const sc = comp.get(sk) orelse return error.MissingDitWeight;
+        const bi = comp.get(bk) orelse return error.MissingDitWeight;
+        const qp = try quantGeom(wq, sc, lastDim(x));
+        try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
+    }
     if (comp.lora != null) {
         var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
         const refs = loraRefsFor(comp, base, &rbuf);
@@ -2002,10 +2029,10 @@ fn loraModulePresent(comp: *const Component, module: []const u8) bool {
     for (candidates) |cand| {
         const mod = cand orelse continue;
         if (std.fmt.bufPrint(&kbuf, "transformer.{s}.weight", .{mod})) |key| {
-            if (comp.map.contains(key)) return true;
+            if (comp.hasWeight(key)) return true;
         } else |_| {}
         if (std.fmt.bufPrint(&kbuf, "{s}.weight", .{mod})) |key| {
-            if (comp.map.contains(key)) return true;
+            if (comp.hasWeight(key)) return true;
         } else |_| {}
     }
     return false;
@@ -2276,7 +2303,12 @@ fn ditAttention(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_arr
     const null_arr = mlx.mlx_array{ .ctx = null };
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qh, kh, vh, scale, "", null_arr, null_arr, false, s));
+    // The STG skip replaces the output with v, so the kernel only serves a normal pass.
+    const o8: ?mlx.mlx_array = if (w8a8.enabled and !skip_to_values) try int8_attn.attentionHeads(qh, kh, vh, scale, s) else null;
+    if (o8) |o| {
+        _ = mlx.mlx_array_free(attn);
+        attn = o;
+    } else try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qh, kh, vh, scale, "", null_arr, null_arr, false, s));
     if (skip_to_values) {
         // STG perturbation (full skip at B=1): replace the attention output with
         // the value projection — reference `out*mask + v*(1-mask)` with mask=0,
@@ -6666,4 +6698,87 @@ test "loadComponent releases every tensor on deinit (phantom-ref leak class)" {
     // A leaked reference keeps the 1 MB buffer active forever; allow small
     // allocator slack but nowhere near the tensor size.
     try testing.expect(after <= before + 128 * 1024);
+}
+
+/// One DiT forward on seeded noise (3 x 8 x 8 video tokens, 9 audio tokens, 128 text rows),
+/// both velocities as f32; `resident` receives the MLX bytes the loaded transformer holds.
+fn ltxProbe(allocator: std.mem.Allocator, s: S, path: [:0]const u8, resident: *usize) ![2]mlx.mlx_array {
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    var comp = try loadTransformer(allocator, path, mlx.weightLoadStream(), s);
+    defer comp.deinit();
+    const vlat = try w8a8.randn(&.{ 1, 192, 128 }, 1, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(vlat);
+    const alat = try w8a8.randn(&.{ 1, 9, 128 }, 2, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(alat);
+    const vtext = try w8a8.randn(&.{ 1, 128, 4096 }, 3, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(vtext);
+    const atext = try w8a8.randn(&.{ 1, 128, 2048 }, 4, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(atext);
+    var vpos: [192 * 3]f32 = undefined;
+    for (0..192) |n| {
+        vpos[n * 3] = @as(f32, @floatFromInt(n / 64)) * 0.25;
+        vpos[n * 3 + 1] = @as(f32, @floatFromInt((n / 8) % 8)) * 32.0;
+        vpos[n * 3 + 2] = @as(f32, @floatFromInt(n % 8)) * 32.0;
+    }
+    var apos: [9]f32 = undefined;
+    for (&apos, 0..) |*a, i| a.* = @as(f32, @floatFromInt(i)) * 0.04;
+    const out = try ditForward(&comp, allocator, .{}, vlat, alat, 0.7, vtext, atext, &vpos, &apos, null, null, .{}, s);
+    defer _ = mlx.mlx_array_free(out.v);
+    defer _ = mlx.mlx_array_free(out.a);
+    var res: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    try mlx.check(mlx.mlx_astype(&res[0], out.v, .float32, s));
+    try mlx.check(mlx.mlx_astype(&res[1], out.a, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(res[0]));
+    try mlx.check(mlx.mlx_array_eval(res[1]));
+    w8a8.dropMemo(); // job-end state: the last activation is not weights
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    resident.* = after -| before;
+    return res;
+}
+
+// The lossy int8 route against the same pack's packed forward. LTX_TEST_MODEL.
+test "LTX DiT: the w8a8 route stays within its bar of the packed forward" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/transformer-distilled.safetensors", .{dir}, 0);
+    defer a.free(path);
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = false;
+    var packed_bytes: usize = 0;
+    const want = try ltxProbe(a, s, path, &packed_bytes);
+    defer for (want) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    w8a8.enabled = true;
+    var int8_bytes: usize = 0;
+    const got = try ltxProbe(a, s, path, &int8_bytes);
+    defer for (got) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    // Seeded noise through 48 blocks is far harsher than a real latent: the floors sit just under what it measures.
+    for (got, want, [_][]const u8{ "video", "audio" }, [_]f64{ 0.96, 0.997 }) |g, w, name, floor| {
+        const ag = try w8a8.agreement(g, w, s);
+        std.debug.print("[ltx dit w8a8 {s}] cos={d:.6} rms_ratio={d:.6}\n", .{ name, ag.cos, ag.rms_ratio });
+        try testing.expect(ag.cos < 0.99999); // the route engaged
+        try testing.expect(ag.cos > floor);
+        try testing.expectApproxEqAbs(@as(f64, 1.0), ag.rms_ratio, 0.02);
+    }
+    std.debug.print("[ltx dit w8a8] resident packed={d} int8={d}\n", .{ packed_bytes, int8_bytes });
+    try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(testing.io, dir, &.{"transformer-distilled.safetensors"}));
+}
+
+test "LTX LoRA presence sees a linear whose packed arrays an int8 copy replaced" {
+    var comp = Component{ .map = std.StringHashMap(mlx.mlx_array).init(testing.allocator), .allocator = testing.allocator };
+    defer comp.deinit();
+    const base = try testing.allocator.dupe(u8, "transformer.transformer_blocks.0.attn1.to_q");
+    try comp.w8.map.put(testing.allocator, base, .{ .wq = mlx.mlx_array_new(), .ws = mlx.mlx_array_new(), .n = 64, .k = 256 });
+    try testing.expect(comp.hasWeight("transformer.transformer_blocks.0.attn1.to_q.weight"));
+    try testing.expect(loraModulePresent(&comp, "transformer_blocks.0.attn1.to_q"));
+    try testing.expect(!loraModulePresent(&comp, "transformer_blocks.0.attn1.to_k"));
 }

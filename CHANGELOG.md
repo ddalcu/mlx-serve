@@ -4,11 +4,14 @@
 
 - **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
 - **NVIDIA Nemotron 3.5 Bolt and Super.** The omni packs serve text, images and video (RADIO tower), and draft with their LiLiCorr DFlash drafter on every API.
-- **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs.
+- **Faster images, video, music and 3D on M5 Macs with 64 GB.** Krea, Qwen-Image 2.1, MageFlow, FLUX.2 klein, LTX, MiniMax-H3, ACE-Step, Music 3 and Hunyuan3D run their transformers in int8 on the Neural Accelerators, 1.2x to 2x faster end to end on an M5 Ultra (Krea 1024² 10.7 to 5.4 s, Qwen-Image 1024² 7.3 to 3.9 s, FLUX klein 3.0 to 1.9 s, LTX 13.2 to 9.4 s); it is on by default from 64 GB of RAM and `--w8a8` or Settings > Neural Accelerator int8 turns it on below that. Output stays the same picture, sound or mesh but can differ in detail or, on few-step models like MageFlow, in pose; 4-bit packs hold more memory while loaded (Krea mixed-4-8 by 3.5 GB, FLUX klein by 1.7 GB, LTX Q4 by about 8 GB), and `--no-w8a8` turns it off.
+- **Faster VAEs.** Krea and Qwen-Image decode their pictures in half precision.
+- **Model Browser.** My Models shows what each model overrides (engine, speculation, KV cache, sampling, template kwargs) in a Settings column, and Discover offers Use on decision models and, for a repo with one build on disk, a Use button beside its quant menu.
 - **Video progress.** The Video tab shows how far a run is, which step (and window on a chained H3 clip) it is on and how long a step takes, with the elapsed time beside its status.
 - **MiniMax-H3 videos fit on smaller Macs.** The 8-bit model streams its weights from disk while it renders and peaks at about 11 GB instead of 33 for a 768x448 clip, at the same speed; turn off "Stream weights from disk" to hold them in memory when the model sits on a slow drive. A clip that will not fit is refused with the numbers, priced on what streaming actually holds. A new "8-bit attention cache" option roughly halves the fast recipe's cache on long clips, at a slight cost in quality.
 - **Cancelling an H3 video stops it within seconds.** The server used to finish the current denoising step first, which takes minutes on large clips.
 - **The H3 time estimate no longer drifts after Turbo runs.** A Turbo run was recorded as a fast-recipe run, so the next estimate came out too long.
+- **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs. A download, in the app and with `mlx-serve pull`, now fetches every file a model's shard index names, so OptiQ packs that keep weights in a subfolder no longer show "Missing shards".
 
 ## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
 
