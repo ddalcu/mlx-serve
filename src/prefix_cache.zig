@@ -781,6 +781,9 @@ pub const HotPrefixCache = struct {
         // machinery (needsSsmEntries class).
         // GLM-5.3 on mlx-stream keeps its decode state on the plugin's module the same way.
         if (std.mem.eql(u8, config.model_type, "deepseek_v4") or config.isDsv41() or config.glm_stream) return false;
+        // A pipeline worker holds the later layers' state at the live position only: a restore
+        // here would rewind this rank and not the worker.
+        if (config.dist_span != null) return false;
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
@@ -10182,4 +10185,11 @@ test "HotPrefixCache v9: a media turn persists media-keyed deep state; same span
         try testing.expectEqual(@as(usize, 300), res_t.matched);
         try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm_t[0].conv_state, 0, s));
     }
+}
+
+test "shouldUse: a pipeline cluster's rank 0 keeps no prefix cache" {
+    var cfg: model_mod.ModelConfig = .{};
+    try std.testing.expect(HotPrefixCache.shouldUse(&cfg, true));
+    cfg.dist_span = .{ .start = 0, .end = 16, .total = 48 };
+    try std.testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
