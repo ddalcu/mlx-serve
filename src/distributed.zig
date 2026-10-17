@@ -710,13 +710,13 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     var soak: u64 = 0;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--soak") and i + 1 < args.len) {
-            soak = std.fmt.parseInt(u64, args[i + 1], 10) catch return error.InvalidArgs;
-            i += 1;
+    var ai: usize = 0;
+    while (ai < args.len) : (ai += 1) {
+        if (std.mem.eql(u8, args[ai], "--soak") and ai + 1 < args.len) {
+            soak = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
         } else if (n_rest < rest.len) {
-            rest[n_rest] = args[i];
+            rest[n_rest] = args[ai];
             n_rest += 1;
         }
     }
