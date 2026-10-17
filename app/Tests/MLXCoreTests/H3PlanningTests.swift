@@ -315,6 +315,53 @@ final class H3PlanningTests: XCTestCase {
         }
     }
 
+    /// A chained window is a whole generation again (load, encode, denoise, decode), and every
+    /// window after the first also carries the previous window's last frame as a keyframe row.
+    func testChainedWindowsCostEveryWindowAndTheirKeyframeRows() {
+        let one = H3TimeEstimate.seconds(model: h3, width: 960, height: 544, frames: 124, steps: 30, fast: true)
+        XCTAssertEqual(H3TimeEstimate.seconds(model: h3, width: 960, height: 544, frames: 124, steps: 30,
+                                              fast: true, windows: 1), one, accuracy: 0.001)
+        let three = H3TimeEstimate.seconds(model: h3, width: 960, height: 544, frames: 124, steps: 30,
+                                           fast: true, windows: 3)
+        XCTAssertGreaterThan(three, 3 * one, "windows two and three carry a keyframe row")
+        XCTAssertLessThan(three, 3.1 * one)
+        // The text under Generate reads the same chained number.
+        let text = H3TimeEstimate.describeBest(model: h3, width: 960, height: 544, shotFrames: [124], steps: 30,
+                                               fast: true, chainWindows: 3, history: H3RunHistory(records: []))
+        XCTAssertEqual(text, H3TimeEstimate.describe(seconds: three, source: .hardwareModel(.current)))
+    }
+
+    /// A finished chained run is compared against a chained prediction: against a one-window
+    /// prediction a 3-window run teaches the history this Mac is 3x slower than it is.
+    func testHistoryRecordsAChainedRunAgainstEveryWindow() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "H3ChainHistory"))
+        defaults.removePersistentDomain(forName: "H3ChainHistory")
+        let predicted = H3TimeEstimate.seconds(model: h3, width: 960, height: 544, frames: 124, steps: 30,
+                                               fast: true, hardware: .anchor, windows: 3)
+        H3RunHistory.remember(model: h3, width: 960, height: 544, frames: 124, steps: 30, fast: true,
+                              streamWeights: true, windows: 3, measuredSeconds: predicted, defaults: defaults)
+        XCTAssertEqual(H3RunHistory.load(defaults: defaults).speedFactor!, 1.0, accuracy: 0.0001)
+    }
+
+    /// The step counter runs on across a chain, so the lap that closes a window's first step
+    /// spans the previous window's decode and the reload: it prices no step. Every window
+    /// still to come pays its own load and decode.
+    func testLiveEtaAcrossChainedWindowsSkipsTheSeamAndCountsEachWindowsTail() {
+        var clock = H3StepClock()
+        // Two windows of 4 steps: the server numbers them 0...4 and 4...8.
+        clock.observe(step: 0, window: 1, windows: 2, at: 0)
+        clock.observe(step: 1, window: 1, windows: 2, at: 100)   // encode + graph build
+        clock.observe(step: 2, window: 1, windows: 2, at: 110)
+        clock.observe(step: 3, window: 1, windows: 2, at: 120)
+        XCTAssertEqual(clock.eta(totalSteps: 8, tail: 40)!, 10 * 5 + 40 * 2, accuracy: 0.001)
+        clock.observe(step: 4, window: 1, windows: 2, at: 130)
+        clock.observe(step: 4, window: 2, windows: 2, at: 300)   // window 2 encodes
+        clock.observe(step: 5, window: 2, windows: 2, at: 400)   // decode + reload + first step
+        clock.observe(step: 6, window: 2, windows: 2, at: 410)
+        XCTAssertEqual(clock.eta(totalSteps: 8, tail: 40)!, 10 * 2 + 40, accuracy: 0.001)
+        XCTAssertEqual(clock.secondsPerStep!, 10, accuracy: 0.001)
+    }
+
     /// Cost is super-linear in rows: at a matched 124 frames, 1344x768 measured
     /// 2.9x the time of 960x544 while costing 1.98x the pixels. A model that is
     /// merely linear in pixels under-promises the wide canvas by ~50%.

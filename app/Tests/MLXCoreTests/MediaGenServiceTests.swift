@@ -308,6 +308,19 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(H3RunHistory.load(defaults: defaults).speedFactor!, 1.0, accuracy: 0.0001)
     }
 
+    /// A chained run is recorded against every window it ran.
+    func testChainedRunIsRecordedAgainstEveryWindow() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "H3ChainRecord"))
+        defaults.removePersistentDomain(forName: "H3ChainRecord")
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        req.chainWindows = 3
+        let predicted = H3TimeEstimate.seconds(model: .minimaxH3, width: 960, height: 544, frames: 124,
+                                               steps: 30, fast: req.fastRecipe, hardware: .anchor, windows: 3)
+        VideoGenService.recordRun(req, steps: 30, measuredSeconds: predicted, defaults: defaults)
+        XCTAssertEqual(H3RunHistory.load(defaults: defaults).speedFactor!, 1.0, accuracy: 0.0001)
+    }
+
     func testStreamingOffBillsTheResidentWeights() {
         let gib = 1024.0 * 1024 * 1024
         for p in [VideoModelPreset.minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA] {

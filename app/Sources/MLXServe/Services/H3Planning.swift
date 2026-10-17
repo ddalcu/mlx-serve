@@ -311,14 +311,19 @@ enum H3TimeEstimate {
 
     /// End-to-end seconds for one generation, including load, text encode and
     /// VAE decode — a "sampling only" number is not what a user is waiting for.
+    /// A chained run is `windows` whole generations, each after the first
+    /// opening on the previous window's last frame as a keyframe row.
     static func seconds(model: VideoModelPreset, width: Int, height: Int, frames: Int,
                         steps: Int, fast: Bool, streamWeights: Bool = true, hardware: H3Hardware = .current,
-                        promptTokens: Int = 250) -> Double {
-        let r = H3Plan.rows(width: width, height: height, frames: frames, promptTokens: promptTokens)
-        let perStep = denseStepSeconds(rows: r) * (fast ? fastFactor(steps: steps) : 1.0)
-            * streamFactor(model: model, streamWeights: streamWeights)
+                        promptTokens: Int = 250, windows: Int = 1) -> Double {
         let vae = vaeAnchorSeconds * (Double(width) * Double(height) * Double(frames)) / vaeAnchorPixels
-        let anchorSeconds = perStep * Double(steps) + fixedSeconds + vae
+        let anchorSeconds = (0..<max(1, windows)).reduce(0.0) { sum, w in
+            let r = H3Plan.rows(width: width, height: height, frames: frames, promptTokens: promptTokens,
+                                keyframes: w > 0 ? 1 : 0)
+            let perStep = denseStepSeconds(rows: r) * (fast ? fastFactor(steps: steps) : 1.0)
+                * streamFactor(model: model, streamWeights: streamWeights)
+            return sum + perStep * Double(steps) + fixedSeconds + vae
+        }
         let cores = hardware.gpuCores > 0 ? Double(hardware.gpuCores) : Double(H3Hardware.anchor.gpuCores)
         return anchorSeconds * (Double(H3Hardware.anchor.gpuCores) / cores)
     }
@@ -352,9 +357,15 @@ enum H3TimeEstimate {
     /// events, stays in the number instead of arriving as a surprise stall.
     static func liveEta(stepDurations: [Double], totalSteps: Int,
                         floorPerStep: Double = 0, tail: Double = 0) -> Double? {
-        let laps = Array(stepDurations.dropFirst())
+        liveEta(laps: Array(stepDurations.dropFirst()), stepsDone: stepDurations.count,
+                totalSteps: totalSteps, floorPerStep: floorPerStep, tail: tail)
+    }
+
+    /// `laps` are the ones that price a step; `stepsDone` counts every step taken.
+    static func liveEta(laps: [Double], stepsDone: Int, totalSteps: Int,
+                        floorPerStep: Double = 0, tail: Double = 0) -> Double? {
         guard laps.count >= 2, totalSteps > 0 else { return nil }
-        let remaining = totalSteps - stepDurations.count
+        let remaining = totalSteps - stepsDone
         guard remaining > 0 else { return tail }
         let mean = max(laps.reduce(0, +) / Double(laps.count), floorPerStep)
         return mean * Double(remaining) + tail
@@ -393,12 +404,13 @@ enum H3TimeEstimate {
 
     /// A storyboard is one run per shot, so its time is their sum.
     static func describeBest(model: VideoModelPreset, width: Int, height: Int, shotFrames: [Int],
-                             steps: Int, fast: Bool, streamWeights: Bool = true, alongside: String? = nil,
-                             history: H3RunHistory = .load()) -> String {
+                             steps: Int, fast: Bool, streamWeights: Bool = true, chainWindows: Int = 1,
+                             alongside: String? = nil, history: H3RunHistory = .load()) -> String {
         func total(_ hardware: H3Hardware) -> Double {
             shotFrames.reduce(0) {
                 $0 + seconds(model: model, width: width, height: height, frames: $1,
-                             steps: steps, fast: fast, streamWeights: streamWeights, hardware: hardware)
+                             steps: steps, fast: fast, streamWeights: streamWeights, hardware: hardware,
+                             windows: chainWindows)
             }
         }
         if history.speedFactor != nil {
@@ -443,32 +455,45 @@ enum H3TimeEstimate {
 /// Progress events are not one-per-step-in-order: a stage label change repeats
 /// a step number, and the load / encode stages report before sampling starts.
 /// Only a step that moves FORWARD closes a lap.
+///
+/// A chained run numbers its steps on across windows (window w's steps follow
+/// window w-1's), so the first lap of every window spans what ran between them
+/// (decode, reload, encode, graph build) and, like step 0, prices no step.
 struct H3StepClock {
     private var lastStamp: Double?
     private var lastStep: Int = -1
+    private var window = 1, windows = 1
+    private var openingLap = true
     private(set) var durations: [Double] = []
+    /// The laps that price a step: every window's opening lap left out.
+    private var laps: [Double] = []
 
     init() {}
 
-    mutating func observe(step: Int, at now: Double = ProcessInfo.processInfo.systemUptime) {
+    mutating func observe(step: Int, window: Int? = nil, windows: Int? = nil,
+                          at now: Double = ProcessInfo.processInfo.systemUptime) {
+        if let window, window != self.window { self.window = window; openingLap = true }
+        if let windows { self.windows = windows }
         defer { if step > lastStep { lastStep = step; lastStamp = now } }
         guard step > lastStep, let previous = lastStamp else { return }
-        durations.append(max(0, now - previous))
+        let lap = max(0, now - previous)
+        durations.append(lap)
+        if openingLap { openingLap = false } else { laps.append(lap) }
     }
 
-    /// The mean lap past the first, or nil before there are two: the same
-    /// amortized step cost `liveEta` prices what is left with.
+    /// The mean step lap, or nil before there are two: the same amortized step
+    /// cost `liveEta` prices what is left with.
     var secondsPerStep: Double? {
-        let laps = durations.dropFirst()
         guard laps.count >= 2 else { return nil }
         return laps.reduce(0, +) / Double(laps.count)
     }
 
-    /// Seconds remaining, or nil while there is not enough to say. See
-    /// `H3TimeEstimate.liveEta` for why the first lap is discarded.
+    /// Seconds remaining, or nil while there is not enough to say. `tail` is one
+    /// window's after-sampling cost, paid again by every window still to finish.
     func eta(totalSteps: Int, floorPerStep: Double = 0, tail: Double = 0) -> Double? {
-        H3TimeEstimate.liveEta(stepDurations: durations, totalSteps: totalSteps,
-                               floorPerStep: floorPerStep, tail: tail)
+        H3TimeEstimate.liveEta(laps: laps, stepsDone: durations.count, totalSteps: totalSteps,
+                               floorPerStep: floorPerStep,
+                               tail: tail * Double(max(1, windows - window + 1)))
     }
 }
 
@@ -525,12 +550,12 @@ struct H3RunHistory: Codable {
 
     /// Record one finished run against what the anchor model predicted for it.
     static func remember(model: VideoModelPreset, width: Int, height: Int, frames: Int,
-                         steps: Int, fast: Bool, streamWeights: Bool, measuredSeconds: Double,
+                         steps: Int, fast: Bool, streamWeights: Bool, windows: Int = 1, measuredSeconds: Double,
                          defaults: UserDefaults = .standard) {
         guard model.backend == .minimaxH3 else { return }
         let predicted = H3TimeEstimate.seconds(model: model, width: width, height: height, frames: frames,
                                                steps: steps, fast: fast, streamWeights: streamWeights,
-                                               hardware: .anchor)
+                                               hardware: .anchor, windows: windows)
         var h = load(defaults: defaults)
         h.record(predictedOnAnchor: predicted, measured: measuredSeconds)
         h.save(defaults: defaults)

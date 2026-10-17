@@ -1089,7 +1089,8 @@ struct VideoGenView: View {
                                        streamWeights: streamWeights, cache8bit: attnCache8bit)
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
-            shotFrames: frames, steps: steps, fast: effectiveFast, streamWeights: streamWeights, alongside: peak
+            shotFrames: frames, steps: steps, fast: effectiveFast, streamWeights: streamWeights,
+            chainWindows: model.supportsChainedWindows && !storyboardOn ? chainWindows : 1, alongside: peak
         )
     }
 

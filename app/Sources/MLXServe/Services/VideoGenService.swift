@@ -241,7 +241,9 @@ final class VideoGenService: ObservableObject {
                 let step = ev["step"] as? Int ?? 0
                 let total = ev["total"] as? Int ?? steps
                 let stage = ev["stage"] as? String ?? L10n.text("Generating")
-                clock.observe(step: step)
+                window = ev["window"] as? Int ?? window
+                windows = ev["windows"] as? Int ?? windows
+                clock.observe(step: step, window: window, windows: windows)
                 var message = label + L10n.format("%@…", L10n.text(stage))
                 if let eta = clock.eta(totalSteps: max(total, 1),
                                        floorPerStep: pricing.perStep, tail: pricing.tail),
@@ -251,8 +253,6 @@ final class VideoGenService: ObservableObject {
                 if let data = MediaSSE.previewJPEG(ev), let img = NSImage(data: data) {
                     setLivePreview(img, for: gen)
                 }
-                window = ev["window"] as? Int ?? window
-                windows = ev["windows"] as? Int ?? windows
                 if gen == generationSeq {
                     readout = VideoRunReadout.make(
                         step: step, total: total, window: window, windows: windows,
@@ -285,7 +285,9 @@ final class VideoGenService: ObservableObject {
                           defaults: UserDefaults = .standard) {
         H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
                               frames: request.numFrames, steps: steps, fast: request.fastRecipe,
-                              streamWeights: request.streamWeights, measuredSeconds: measuredSeconds,
+                              streamWeights: request.streamWeights,
+                              windows: request.model.supportsChainedWindows ? request.chainWindows : 1,
+                              measuredSeconds: measuredSeconds,
                               defaults: defaults)
     }
 
