@@ -2188,7 +2188,7 @@ private struct NeuralEngineSectionContent: View {
                 }
             }
         }
-        if let m = meta["w8a8"] {
+        if let m = meta["w8a8"], AnePrefillAdvice.liveIsM5Family { // inert without NAX: hidden off the M5 family
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.w8a8)) {
                 Toggle("", isOn: opts.w8a8).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }

@@ -125,11 +125,12 @@ struct ServerOptions: Codable, Equatable {
     var aneVideo: Bool = false
     var aneAudio: Bool = false
     /// `--w8a8` / `--no-w8a8`: image, video, music and 3D transformers run as rotated int8 x int8 on
-    /// M5-class GPUs (lossy, faster). The server turns it on by itself only from 64 GiB of RAM (it also
-    /// needs NAX, which the route checks), so this default mirrors that and BOTH choices are emitted.
-    var w8a8: Bool = ServerOptions.defaultW8a8(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
-    static func defaultW8a8(physicalMemoryBytes: UInt64) -> Bool {
-        physicalMemoryBytes >= 64 * 1_073_741_824
+    /// M5-class GPUs (lossy, faster). The server turns it on by itself only with NAX (M5 family) and
+    /// 64 GiB of RAM, so this default is the same function and BOTH choices are emitted.
+    var w8a8: Bool = ServerOptions.defaultW8a8(
+        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, isM5Family: AnePrefillAdvice.liveIsM5Family)
+    static func defaultW8a8(physicalMemoryBytes: UInt64, isM5Family: Bool) -> Bool {
+        isM5Family && physicalMemoryBytes >= 64 * 1_073_741_824
     }
     /// `--ane-slots`: requests each Neural Engine model runs at once. Slots share the weights and
     /// the engines, so they split one stream's speed; each adds its own KV and state.

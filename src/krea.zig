@@ -1756,7 +1756,7 @@ pub fn detachLora(dit: *Dit) void {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// B3. Autoencoder — Qwen-Image 3D causal VAE (decode path only, T=1, f32).
+// B3. Autoencoder — Qwen-Image 3D causal VAE (decode path only, T=1, f16).
 //     Raw diffusers tensor names; conv weights transposed to MLX layout at load.
 // ════════════════════════════════════════════════════════════════════════
 

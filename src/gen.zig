@@ -4693,12 +4693,19 @@ pub fn estimateResidentWeightBytes(io: std.Io, model_dir: []const u8, model_type
 /// `--w8a8` converts re-billed at its int8 copy (4-bit packs grow, bf16 halves).
 fn residentWeightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 {
     const sum = sumSafetensorsIn(io, dir);
-    const converts = std.mem.startsWith(u8, model_type, "krea") or std.mem.startsWith(u8, model_type, "qwen_image") or
-        std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow") or
-        std.mem.startsWith(u8, model_type, "flux2") or std.mem.eql(u8, model_type, "acestep") or
-        std.mem.eql(u8, model_type, "minimax_music3") or std.mem.startsWith(u8, model_type, "hunyuan3d");
-    if (!converts or aneKeepsPacked(model_type)) return sum;
+    if (!(convertsW8a8(model_type) orelse false) or aneKeepsPacked(model_type)) return sum;
     return sum -| ditBytes(io, dir, false) + ditBytes(io, dir, true);
+}
+
+/// Whether a media type's DiT loaders convert under `--w8a8` (null: nobody classified it). The bill
+/// reads this, so a type that converts and is missing here would be under-billed into an uncatchable
+/// Metal OOM; the test below refuses an unclassified entry of `media_model_types`.
+fn convertsW8a8(model_type: []const u8) ?bool {
+    const converts = [_][]const u8{ "flux2", "krea", "mage_flow", "mageflow", "acestep", "AudioVideo", "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image" };
+    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization" };
+    for (converts) |p| if (std.mem.startsWith(u8, model_type, p)) return true;
+    for (packed_only) |p| if (std.mem.startsWith(u8, model_type, p)) return false;
+    return null;
 }
 
 /// The engines whose ANE seam reads the packed DiT weights, so `--ane-*` keeps them packed (the loaders
@@ -7043,6 +7050,16 @@ test "residency bill: ACE-Step, Music3, Hunyuan3D and LTX DiT shards are billed 
     const f1 = try Pack.shard(tmp.dir, "transformer-dev.safetensors", "transformer.transformer_blocks.0.attn1.to_q");
     _ = try Pack.shard(tmp.dir, "transformer-distilled.safetensors", "transformer.transformer_blocks.0.attn1.to_q");
     try std.testing.expectEqual(f1 - 18432 + 33280, estimatePeakResidentBytesIn(io, tmp.dir, "AudioVideo"));
+}
+
+test "every media model type says whether --w8a8 converts it, so the bill cannot miss an engine" {
+    for (media_model_types) |mt| if (convertsW8a8(mt) == null) {
+        std.debug.print("media type '{s}' is not classified in convertsW8a8\n", .{mt});
+        return error.UnclassifiedMediaType;
+    };
+    try std.testing.expect(convertsW8a8("krea2_turbo").? and convertsW8a8("flux2_klein").? and convertsW8a8("AudioVideo").?);
+    try std.testing.expect(!convertsW8a8("kokoro").? and !convertsW8a8("stable_audio3").?);
+    try std.testing.expect(convertsW8a8("a_future_engine") == null);
 }
 
 test "media markers are per-TYPE, not per-modality" {

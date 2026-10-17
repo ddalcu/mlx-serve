@@ -39,6 +39,9 @@ enum AnePrefillAdvice {
         return brand.split(separator: " ").contains("M5")
     }
 
+    /// Whether this Mac is M5-family (the NAX hardware), computed once like `liveCaution`.
+    static let liveIsM5Family: Bool = isM5Family(chipBrandString())
+
     /// The live advice for this machine, computed once — the chip and the
     /// RAM don't change at runtime, and a SwiftUI body re-evaluates often.
     static let liveCaution: String? = caution(
