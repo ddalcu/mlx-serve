@@ -1763,6 +1763,10 @@ pub const DiskTier = struct {
         self.allocator.free(e.ssm_bytes);
         e.ssm_positions = ssm_res.positions;
         e.ssm_bytes = ssm_res.bytes;
+        // The arrays are the entry's from here: disarm the errdefer, or a failed
+        // writeMeta frees what the entry owns and the next removal double-frees.
+        ssm_res.positions = &.{};
+        ssm_res.bytes = &.{};
         if (qsa_res.inherited) {
             e.inherited_qsa = true;
         } else if (qsa_res.bytes > 0) {
@@ -7033,6 +7037,57 @@ test "DiskTier: a failing synchronous writeMeta frees the final path exactly onc
     if (tier.writeMeta(e)) |_| {
         return error.WriteMetaUnexpectedlySucceeded;
     } else |_| {}
+}
+
+test "DiskTier: an SSM-only append whose meta write fails keeps the entry's arrays owned" {
+    // `appendSsmOnly` moves ssm_res's arrays into the entry BEFORE writeMeta; the
+    // errdefer must not outlive that transfer, or a failed meta write leaves the
+    // entry owning freed arrays and the next removal double-frees them.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssmonly-metaerr", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var src_a = buildHybridEntries(s, 1000.0, 2000.0);
+    defer freeHybridEntries(&src_a);
+    var cps_a = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src_a, 256, s)};
+    defer cps_a[0].deinit(testing.allocator);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps_a, s);
+    try testing.expectEqual(@as(usize, 1), tier.entries.items[0].ssm_positions.len);
+
+    // meta.json becomes a DIRECTORY: the append's checkpoint file lands, the arrays
+    // transfer, and only the final meta rename fails.
+    const meta = try std.fmt.allocPrint(testing.allocator, "{s}/fp-ssmonly-metaerr/e1/meta.json", .{base});
+    defer testing.allocator.free(meta);
+    std.Io.Dir.deleteFileAbsolute(io, meta) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, meta);
+
+    var src_b = buildHybridEntries(s, 3000.0, 4000.0);
+    defer freeHybridEntries(&src_b);
+    var cps_b = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src_b, 384, s)};
+    defer cps_b[0].deinit(testing.allocator);
+    if (tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &.{}, &cps_b, null, null, s)) |_| {
+        return error.AppendCommitUnexpectedlySucceeded;
+    } else |_| {}
+
+    // The entry still owns both arrays whole — removing it must not double-free.
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(usize, 2), e.ssm_positions.len);
+    try testing.expectEqual(@as(usize, 2), e.ssm_bytes.len);
+    try testing.expectEqual(@as(u32, 256), e.ssm_positions[0]);
+    try testing.expectEqual(@as(u32, 384), e.ssm_positions[1]);
+    tier.invalidateNewest();
+    try testing.expectEqual(@as(usize, 0), tier.entryCount());
 }
 
 test "materializeContiguous: the fresh-handle errdefer never outlives the transfer" {
