@@ -26,6 +26,13 @@ enum StoryboardCluster {
         }
     }
 
+    /// The device a shot's `machine` choice names in `devices` (this Mac first); nil = any,
+    /// or a machine that is not there now.
+    static func pin(_ machine: String?, in devices: [RenderDevice]) -> Int? {
+        guard let machine else { return nil }
+        return machine.isEmpty ? 0 : devices.firstIndex { $0.peer == machine }
+    }
+
     /// What the pane calls a machine.
     static func name(_ device: RenderDevice) -> String {
         device.peer ?? L10n.text("This Mac")
@@ -60,16 +67,26 @@ enum StoryboardCluster {
     /// Wall seconds for `costs` (each shot's seconds on the anchor machine) on
     /// devices whose speeds are `factors` (seconds per anchor second).
     static func wallSeconds(costs: [Double], factors: [Double]) -> Double {
-        var d = ShotDispatcher(costs: costs, factors: factors)
+        simulate(costs: costs, factors: factors, pins: []).seconds
+    }
+
+    /// The run `ShotDispatcher` plans: when it ends, and the machine each shot starts on
+    /// (`pins` = the machine the user chose per shot, nil = any).
+    static func simulate(costs: [Double], factors: [Double], pins: [Int?]) -> (seconds: Double, machine: [Int]) {
+        var d = ShotDispatcher(costs: costs, factors: factors, pins: pins)
+        var machine = [Int](repeating: 0, count: costs.count)
+        var claimed = Set<Int>()
         var t = 0.0
         while true {
-            for i in factors.indices where d.idle(i) { _ = d.next(for: i, now: t) }
+            for i in factors.indices where d.idle(i) {
+                if let s = d.next(for: i, now: t), claimed.insert(s).inserted { machine[s] = i }
+            }
             guard let soonest = d.busyUntil.indices.filter({ !d.idle($0) }).map({ d.busyUntil[$0] }).min()
             else { break }
             t = soonest
             for i in factors.indices where !d.idle(i) && d.busyUntil[i] <= t { d.finished(i) }
         }
-        return t
+        return (t, machine)
     }
 }
 
@@ -89,13 +106,16 @@ struct ShotDispatcher {
     private var shot: [Int?]
     private var started: [Double]
     private var alive: [Bool]
+    /// The device the user put each shot on; nil = whichever plans best.
+    private var pins: [Int?]
 
     /// A second copy starts only when the first would take this much longer to finish.
     static let rerunGain = 1.25
 
-    init(costs: [Double], factors: [Double]) {
+    init(costs: [Double], factors: [Double], pins: [Int?] = []) {
         self.costs = costs
         self.factors = factors
+        self.pins = costs.indices.map { $0 < pins.count ? pins[$0].flatMap { factors.indices.contains($0) ? $0 : nil } : nil }
         pending = costs.indices.sorted { costs[$0] > costs[$1] }
         shot = Array(repeating: nil, count: factors.count)
         started = Array(repeating: 0, count: factors.count)
@@ -115,6 +135,14 @@ struct ShotDispatcher {
         guard alive[device], shot[device] == nil else { return nil }
         var load = factors.indices.map { alive[$0] ? max(end($0) ?? now, now) : .infinity }
         for (k, s) in pending.enumerated() {
+            if let p = pins[s] {
+                if p == device {
+                    pending.remove(at: k)
+                    return start(s, on: device, now: now)
+                }
+                load[p] += costs[s] * factors[p]
+                continue
+            }
             let ends = factors.indices.map { load[$0] + costs[s] * factors[$0] }
             let best = ends.indices.min { ends[$0] < ends[$1] || (ends[$0] == ends[$1] && $0 == device) }!
             if best == device {
@@ -129,7 +157,7 @@ struct ShotDispatcher {
         let mine = { (s: Int) in costs[s] * mineFactor }
         let rerun = factors.indices
             .compactMap { j -> (shot: Int, end: Double)? in
-                guard let s = shot[j], let e = end(j), shot.filter({ $0 == s }).count == 1 else { return nil }
+                guard let s = shot[j], pins[s] == nil, let e = end(j), shot.filter({ $0 == s }).count == 1 else { return nil }
                 return (s, e)
             }
             .filter { $0.end - now > mine($0.shot) * Self.rerunGain }
@@ -161,6 +189,7 @@ struct ShotDispatcher {
     mutating func failed(_ device: Int, shot s: Int) {
         alive[device] = false
         shot[device] = nil
+        for i in pins.indices where pins[i] == device { pins[i] = nil }
         guard !shot.contains(s) else { return }
         pending.append(s)
         pending.sort { costs[$0] > costs[$1] }

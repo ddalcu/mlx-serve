@@ -949,21 +949,134 @@ struct VideoGenView: View {
         return c
     }
 
-    private func thunderboltNote(_ c: ClusterInfo) -> some View {
-        let advice = ClusterVideoAdvice.of(c)
-        let tooSlow: Bool = { if case .tooSlow = advice { return true } else { return false } }()
-        return Label {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(verbatim: L10n.format("Thunderbolt cluster with %@",
-                                           c.workerName.isEmpty ? L10n.text("the worker") : ClusterVideoAdvice.shortName(c.workerName)))
-                    .font(.app(.caption).weight(.semibold))
-                Text(verbatim: advice.text(worker: c.workerName)).font(.app(.caption2)).foregroundStyle(.secondary)
-            }
-        } icon: {
-            Image(systemName: tooSlow ? "tortoise" : "bolt.horizontal.fill")
-                .foregroundStyle(tooSlow ? Color.orange : Color.accentColor)
+    /// The Mac paired by Thunderbolt, by name.
+    private func partnerName(_ c: ClusterInfo) -> String {
+        c.workerName.isEmpty ? L10n.text("the other Mac") : ClusterVideoAdvice.shortName(c.workerName)
+    }
+
+    /// The paired Mac when it makes each video on this Mac faster.
+    private var pairPartner: String? {
+        guard let tb = thunderbolt else { return nil }
+        switch ClusterVideoAdvice.of(tb) {
+        case .shares, .largeOnly: return partnerName(tb)
+        case .unmeasured, .tooSlow: return nil
         }
-        .help(L10n.text("Set up in Settings ▸ Cluster. Each video decides on its own whether splitting its steps is faster."))
+    }
+
+    /// This Mac, then every network machine taking part.
+    private var shotDevices: [RenderDevice] {
+        [RenderDevice(modelId: "", peer: nil)] + clusterPeers.filter { !clusterOff.contains($0.id) }
+    }
+
+    /// Seconds per anchor second on each device; this Mac counts its Thunderbolt partner.
+    private func speedFactors(_ devices: [RenderDevice]) -> [Double] {
+        devices.map { d in
+            guard d.peer == nil, let tb = thunderbolt, pairPartner != nil else { return H3TimeEstimate.speedFactor(peer: d.peer).factor }
+            let split = H3TimeEstimate.speedFactor(peer: ClusterInfo.thunderboltPeer)
+            return split.measured ? split.factor : H3TimeEstimate.speedFactor(peer: nil).factor / ClusterVideoAdvice.stepSpeedup(tb)
+        }
+    }
+
+    private var shotCosts: [Double] {
+        shotFrames.map {
+            H3TimeEstimate.seconds(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                   frames: $0, steps: steps, fast: effectiveFast, hardware: .anchor)
+        }
+    }
+
+    /// Which device each shot is planned on, and when the storyboard ends: at once across
+    /// the machines when every join has a picture, else one shot after another.
+    private var shotPlan: (seconds: Double, machine: [Int]) {
+        let devices = shotDevices
+        let costs = shotCosts
+        let factors = speedFactors(devices)
+        let pins = shots.map { StoryboardCluster.pin($0.machine, in: devices) }
+        if devices.count > 1, clusterReady {
+            return StoryboardCluster.simulate(costs: costs, factors: factors, pins: pins)
+        }
+        let machine = pins.map { $0 ?? 0 }
+        return (zip(costs, machine).reduce(0) { $0 + $1.0 * factors[$1.1] }, machine)
+    }
+
+    /// What the pane calls a device, with this Mac's Thunderbolt partner.
+    private func deviceName(_ d: RenderDevice) -> String {
+        guard let peer = d.peer else {
+            return pairPartner.map { L10n.format("This Mac + %@", $0) } ?? L10n.text("This Mac")
+        }
+        return peer
+    }
+
+    /// One line on where this video renders: this Mac, this Mac with its Thunderbolt
+    /// partner, or a machine on the network.
+    @ViewBuilder private var renderPlan: some View {
+        if model.backend == .minimaxH3 || lanModel != nil {
+            VStack(alignment: .leading, spacing: 3) {
+                if storyboardOn, !shots.isEmpty, lanModel == nil {
+                    let plan = shotPlan
+                    let devices = shotDevices
+                    ForEach(devices.indices.filter { plan.machine.contains($0) }, id: \.self) { d in
+                        let numbers = plan.machine.indices.filter { plan.machine[$0] == d }.map { String($0 + 1) }
+                        planLine(d == 0 ? (pairPartner != nil ? .pair : .here) : .network,
+                                 L10n.format("%@: shots %@", deviceName(devices[d]), numbers.joined(separator: ", ")))
+                    }
+                } else if let lanModel {
+                    planLine(.network, L10n.format("Renders on %@, over your network.", String(lanModel.split(separator: "@").last ?? "")))
+                } else if let partner = pairPartner {
+                    planLine(.pair, L10n.format("This Mac and %@ make this video together, over Thunderbolt.", partner))
+                } else if let tb = thunderbolt, case .tooSlow = ClusterVideoAdvice.of(tb) {
+                    planLine(.here, L10n.format("Renders on this Mac. %@, paired by Thunderbolt, is too slow to make one video faster.", partnerName(tb)))
+                } else if let tb = thunderbolt {
+                    planLine(.pair, L10n.format("Renders on this Mac, with %@ over Thunderbolt when that is faster. The first video measures it.", partnerName(tb)))
+                } else {
+                    planLine(.here, L10n.text("Renders on this Mac."))
+                }
+            }
+            .help(L10n.text("Network machines each take whole shots and work on their own. A Mac paired by a Thunderbolt cable works on the same video as this one. Set both up in Settings ▸ Cluster."))
+        }
+    }
+
+    private enum PlanRoute { case here, pair, network }
+
+    private func planLine(_ route: PlanRoute, _ text: String) -> some View {
+        let (symbol, color): (String, Color) = switch route {
+        case .here: ("desktopcomputer", .secondary)
+        case .pair: ("bolt.horizontal.fill", .purple)
+        case .network: ("network", .teal)
+        }
+        return Label { Text(verbatim: text).foregroundStyle(.secondary) } icon: { Image(systemName: symbol).foregroundStyle(color) }
+            .font(.app(.caption))
+    }
+
+    /// Where one shot renders: any machine (the plan picks), this Mac, or a network machine.
+    private func shotMachineMenu(_ shot: Binding<StoryboardSegment>, index: Int) -> some View {
+        let devices = shotDevices
+        let pinned = StoryboardCluster.pin(shot.wrappedValue.machine, in: devices)
+        let plan = shotPlan.machine
+        let on = pinned ?? (index < plan.count ? plan[index] : 0)
+        let route: PlanRoute = on == 0 ? (pairPartner != nil ? .pair : .here) : .network
+        let label = pinned == nil
+            ? L10n.format("Any machine · %@", deviceName(devices[on]))
+            : deviceName(devices[on])
+        return Menu {
+            Button { shot.wrappedValue.machine = nil } label: { Text("Any machine (fastest)") }
+            Divider()
+            Button { shot.wrappedValue.machine = "" } label: {
+                Label(deviceName(devices[0]) + (pairPartner != nil ? " · Thunderbolt" : ""),
+                      systemImage: pairPartner != nil ? "bolt.horizontal.fill" : "desktopcomputer")
+            }
+            ForEach(devices.dropFirst()) { d in
+                Button { shot.wrappedValue.machine = d.peer } label: {
+                    Label(L10n.format("%@ · network", d.peer ?? ""), systemImage: "network")
+                }
+            }
+        } label: {
+            planLine(route, label)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(route == .pair
+              ? L10n.format("Rendered by this Mac and %@ together, over Thunderbolt.", pairPartner ?? "")
+              : route == .network ? L10n.text("Rendered whole by this machine, over your network.") : L10n.text("Rendered by this Mac."))
     }
 
     private var clusterReady: Bool {
@@ -975,15 +1088,16 @@ struct VideoGenView: View {
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: "point.3.connected.trianglepath.dotted")
-                Text("Your cluster").font(.app(.caption).weight(.semibold))
-                Text("This Mac").font(.app(.caption)).padding(.horizontal, 6).padding(.vertical, 2)
+                Text("Machines for this storyboard").font(.app(.caption).weight(.semibold))
+                Label(deviceName(shotDevices[0]), systemImage: pairPartner != nil ? "bolt.horizontal.fill" : "desktopcomputer")
+                    .font(.app(.caption)).padding(.horizontal, 6).padding(.vertical, 2)
                     .background(Capsule().fill(Color.accentColor.opacity(0.15)))
                 ForEach(peers) { p in
                     let on = !clusterOff.contains(p.id)
                     Button {
                         if on { clusterOff.insert(p.id) } else { clusterOff.remove(p.id) }
                     } label: {
-                        Label(StoryboardCluster.name(p), systemImage: on ? "checkmark.circle.fill" : "circle")
+                        Label(L10n.format("%@ · network", StoryboardCluster.name(p)), systemImage: on ? "checkmark.circle.fill" : "circle")
                             .font(.app(.caption))
                     }
                     .buttonStyle(.borderless)
@@ -1068,6 +1182,9 @@ struct VideoGenView: View {
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(L10n.format("Shot %lld", Int64(index + 1))).font(.app(.caption).weight(.semibold))
+                if shotDevices.count > 1 || pairPartner != nil {
+                    shotMachineMenu(shot, index: index)
+                }
                 Spacer()
                 Text(verbatim: Storyboard.lengthLabel(clampedSeconds(shot.wrappedValue.seconds)))
                     .font(.app(.caption).monospacedDigit())
@@ -1217,16 +1334,11 @@ struct VideoGenView: View {
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         if storyboardOn, shots.isEmpty { return nil }
-        let peers = clusterPeers.filter { !clusterOff.contains($0.id) }
-        if !peers.isEmpty, clusterReady {
-            let costs = shotFrames.map {
-                H3TimeEstimate.seconds(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                       frames: $0, steps: steps, fast: effectiveFast, hardware: .anchor)
-            }
-            let factors = ([nil] + peers.map(\.peer)).map { H3TimeEstimate.speedFactor(peer: $0).factor }
-            let alone = StoryboardCluster.wallSeconds(costs: costs, factors: [factors[0]])
-            let cluster = StoryboardCluster.wallSeconds(costs: costs, factors: factors)
-            return StoryboardCluster.describe(alone: alone, cluster: cluster, machines: peers.count + 1)
+        if storyboardOn, shotDevices.count > 1 || pairPartner != nil {
+            let plan = shotPlan
+            let alone = shotCosts.reduce(0, +) * H3TimeEstimate.speedFactor(peer: nil).factor
+            let machines = Set(plan.machine).count + (pairPartner != nil && plan.machine.contains(0) ? 1 : 0)
+            return StoryboardCluster.describe(alone: alone, cluster: plan.seconds, machines: machines)
         }
         let frames = storyboardOn ? shotFrames : [numFrames]
         if let tb = thunderbolt, ClusterVideoAdvice.stepSpeedup(tb) > 1 {
@@ -2302,9 +2414,7 @@ struct VideoGenView: View {
                 Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
                     .font(.app(.caption2)).foregroundStyle(.orange)
             }
-            if let tb = thunderbolt {
-                thunderboltNote(tb)
-            }
+            renderPlan
             if !service.isRunning, let est = timeEstimate {
                 Text(L10n.text(est))
                     .font(.app(.caption))
@@ -2686,7 +2796,7 @@ struct VideoGenView: View {
     /// A storyboard runs its shots; anything else is one request.
     private func run(_ req: VideoGenRequest) {
         guard storyboardOn else { return service.generate(req, server: server) }
-        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1, $0.endFramePath) },
+        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1, $0.endFramePath, $0.machine) },
                                    peers: clusterPeers.filter { !clusterOff.contains($0.id) }, server: server)
     }
 

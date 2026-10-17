@@ -53,10 +53,17 @@ enum ClusterSetup {
         return parsePorts(String(decoding: data, as: UTF8.self))
     }
 
-    /// The IPv4 address on `interface`, nil when it has none.
+    /// The IPv4 address on `interface`, nil when it has none: the cluster's own when the port
+    /// carries several (a self-assigned 169.254 one beside it).
     static func ipv4(on interface: String) -> String? {
+        let all = ipv4s(on: interface)
+        return all.first { $0.hasPrefix(linkSubnet + ".") } ?? all.first
+    }
+
+    private static func ipv4s(on interface: String) -> [String] {
+        var out: [String] = []
         var head: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&head) == 0 else { return nil }
+        guard getifaddrs(&head) == 0 else { return [] }
         defer { freeifaddrs(head) }
         var cur = head
         while let ifa = cur {
@@ -65,10 +72,10 @@ enum ClusterSetup {
                   let addr = ifa.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) else { continue }
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             if getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
-                return String(cString: host)
+                out.append(String(cString: host))
             }
         }
-        return nil
+        return out
     }
 
     /// The port this Mac uses: the chosen one, else the first that is up.
@@ -106,9 +113,12 @@ enum ClusterSetup {
             + ServerOptions.modelDirArgs(modelDirs)
     }
 
-    /// The shell line that gives `interface` this Mac's cluster address (until restart).
+    /// The shell line that gives `interface` this Mac's cluster address (until restart),
+    /// dropping the other role's first: a Mac that led and now joins would dial itself.
     static func addressCommand(interface: String, role: ClusterRole) -> String {
-        "/sbin/ifconfig \(interface) inet \(linkAddress(role)) netmask 255.255.255.0 alias"
+        let other = linkAddress(role == .worker ? .host : .worker)
+        return "/sbin/ifconfig \(interface) inet \(other) -alias 2>/dev/null; "
+            + "/sbin/ifconfig \(interface) inet \(linkAddress(role)) netmask 255.255.255.0 alias"
     }
 
     /// Runs `addressCommand` behind the macOS admin prompt; the error text, or nil on success.
@@ -195,7 +205,7 @@ enum ClusterVideoAdvice: Equatable {
         case .largeOnly(let r):
             return L10n.format("%@ runs at %@ this Mac's speed: only the largest videos gain; the rest run here.", name, Self.times(r))
         case .tooSlow(let r):
-            return L10n.format("%@ runs at %@ this Mac's speed, too slow to help with steps, so videos run here. Storyboard shots can still go to it over LAN sharing.",
+            return L10n.format("%@ runs at %@ this Mac's speed, too slow to make one video faster, so videos stay on this Mac. It can still take whole storyboard shots over your network.",
                                name, Self.times(r))
         }
     }
@@ -214,4 +224,80 @@ enum ClusterVideoAdvice: Equatable {
     }
 
     private static func times(_ r: Double) -> String { String(format: "%.1f×", r) }
+}
+
+/// Where this Mac stands with a Thunderbolt pair: two Macs joined by a cable that work on
+/// the same job. The Cluster page shows one of these with one button.
+enum ThunderboltPair: Equatable {
+    /// No RDMA ports: Thunderbolt pairing is turned off in Recovery.
+    case off
+    /// RDMA is on but no cable is in a Thunderbolt 5 port.
+    case noCable
+    /// A cable is in and this Mac is not paired. `leader` is a Mac on the network that
+    /// leads a pair and waits for one to join it.
+    case ready(leader: String?)
+    /// Paired, but the port lost its address (a restart): one click gives it back.
+    case reconnect(ClusterRole)
+    /// This Mac leads: `partner` is the other Mac once it has joined.
+    case leading(partner: String?)
+    /// This Mac helps the Mac that leads.
+    case helping
+
+    static func of(ports: [RdmaPort], role: ClusterRole, hasAddress: Bool,
+                   cluster: ClusterInfo?, leader: String?) -> ThunderboltPair {
+        if ports.isEmpty { return role == .off ? .off : .reconnect(role) }
+        guard ports.contains(where: \.active) else { return .noCable }
+        switch role {
+        case .off: return .ready(leader: leader)
+        case _ where !hasAddress: return .reconnect(role)
+        case .host:
+            guard let c = cluster, c.joined else { return .leading(partner: nil) }
+            return .leading(partner: c.workerName.isEmpty ? L10n.text("the other Mac") : ClusterVideoAdvice.shortName(c.workerName))
+        case .worker: return .helping
+        }
+    }
+
+    /// A pair leader's `/health`: the model it leads with while no Mac has joined it.
+    static func waitingLeader(health: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: health) as? [String: Any],
+              let tb = json["thunderbolt"] as? [String: Any],
+              let model = tb["leads"] as? String, tb["joined"] as? Bool == false else { return nil }
+        return model
+    }
+}
+
+/// The video the Cluster page times every machine on: the Video window's current one
+/// when it is an H3 video, else a 5-second 832×480 clip on the H3 pack.
+struct ReferenceClip: Equatable {
+    let model: VideoModelPreset
+    let width: Int
+    let height: Int
+    let frames: Int
+    let steps: Int
+    let fast: Bool
+
+    static func current(_ s: VideoGenSettings = .load()) -> ReferenceClip {
+        if let m = VideoModelPreset.all.first(where: { $0.id == s.modelId }), m.backend == .minimaxH3 {
+            let r = s.concreteResolution(for: m)
+            return ReferenceClip(model: m, width: r.width, height: r.height, frames: s.numFrames,
+                                 steps: s.steps, fast: !s.bestQuality && !(s.turbo && m.supportsTurbo))
+        }
+        let m = VideoModelPreset.minimaxH3Q4
+        return ReferenceClip(model: m, width: 832, height: 480, frames: 121,
+                             steps: m.settings(.good).steps, fast: true)
+    }
+
+    /// "a 10-second 800 × 640 video".
+    var label: String {
+        L10n.format("a %lld-second %lld × %lld video", Int64(max(1, Int((Double(frames) / 24).rounded()))),
+                    Int64(width), Int64(height))
+    }
+
+    /// Seconds on a machine (`peer` nil = this Mac), and whether that machine's speed was measured.
+    func seconds(peer: String?) -> (seconds: Double, measured: Bool) {
+        let anchor = H3TimeEstimate.seconds(model: model, width: width, height: height, frames: frames,
+                                            steps: steps, fast: fast, hardware: .anchor)
+        let f = H3TimeEstimate.speedFactor(peer: peer)
+        return (anchor * f.factor, f.measured)
+    }
 }

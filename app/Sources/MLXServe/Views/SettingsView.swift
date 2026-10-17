@@ -132,8 +132,9 @@ struct SettingsView: View {
         }
         SettingsSection(
             category: .lanSharing,
-            subtitle: "Share models with other machines on your network, use theirs, and run one model across two Macs over Thunderbolt; restart the server to apply changes."
+            subtitle: "Use your other machines. Over your network, each one takes whole jobs; a Mac joined to this one by a Thunderbolt cable works on the same job with it."
         ) {
+            ClusterMapView(worker: appState.clusterWorker)
             LanSharingSectionContent()
             ThunderboltClusterSectionContent()
         }
@@ -945,6 +946,13 @@ private struct LanSharingSectionContent: View {
     }
 
     var body: some View {
+        SearchableRow(searchText: ["Network", "LAN sharing"], separatorGap: nil) {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Over your network", systemImage: "network").font(.app(.headline)).padding(.top, 8)
+                Text("Any machine on your network, Mac or Linux, can take whole jobs: a chat, a picture, a storyboard shot. It works over Wi-Fi or Ethernet, and each machine works on its own.")
+                    .font(.app(.caption)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
         if let m = meta["lanShareEnabled"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareEnabled)) {
                 Toggle("", isOn: $appState.serverOptions.lanShareEnabled)
@@ -1034,12 +1042,19 @@ private struct LanSharingSectionContent: View {
     }
 }
 
-/// Settings ▸ Cluster, Thunderbolt half: one model across two Macs over RDMA.
+/// Settings ▸ Cluster, Thunderbolt half: two Macs on one cable working on the same job.
+/// One button pairs them; the controls behind it sit under Advanced.
 private struct ThunderboltClusterSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @Environment(\.settingsSearchQuery) private var query
     @State private var ports: [RdmaPort] = []
     @State private var setupError: String?
+    /// A Mac on the network that leads a pair and waits for one to join.
+    @State private var leader: String?
+    @State private var leadInstead = false
+    @State private var pairModel = ""
+    @State private var showAdvanced = false
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
@@ -1052,9 +1067,161 @@ private struct ThunderboltClusterSectionContent: View {
     }
 
     var body: some View {
-        SearchableRow(searchText: ["Thunderbolt", "RDMA", "cluster"], separatorGap: nil) {
-            Text("Thunderbolt cluster").font(.app(.headline)).padding(.top, 8)
+        SearchableRow(searchText: ["Thunderbolt", "RDMA", "pair", "cluster"], separatorGap: nil) {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Thunderbolt pair", systemImage: "bolt.horizontal.fill").font(.app(.headline)).padding(.top, 12)
+                Text("Two Macs joined by a Thunderbolt 5 cable work on the same job together: one video made faster, or a chat model too big for one Mac. Only the two Macs on the cable take part.")
+                    .font(.app(.caption)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
         }
+        SearchableRow(searchText: ["Pair", "Join", "Thunderbolt"], separatorGap: nil) {
+            pairCard
+        }
+        .task { await watch() }
+        SearchableRow(searchText: ["Advanced", "Thunderbolt"], separatorGap: nil) {
+            Button { showAdvanced.toggle() } label: {
+                Label(showAdvanced ? L10n.text("Hide advanced Thunderbolt settings") : L10n.text("Advanced Thunderbolt settings"),
+                      systemImage: showAdvanced ? "chevron.down" : "chevron.right")
+                    .font(.app(.caption))
+            }
+            .buttonStyle(.link)
+        }
+        if showAdvanced || !query.isEmpty { advancedRows }
+    }
+
+    private var pair: ThunderboltPair {
+        let up = ports.first(where: \.active)
+        let addressed = up.map { ClusterSetup.ipv4(on: $0.interface) == ClusterSetup.linkAddress(options.clusterRole) } ?? false
+        return .of(ports: ports, role: options.clusterRole, hasAddress: addressed, cluster: server.cluster, leader: leader)
+    }
+
+    /// The models a pair can run, video first.
+    private var pairable: [LocalModel] {
+        let models = appState.localModels.filter { ClusterSetup.servableTypes.contains($0.modelType) }
+        let video = models.filter { $0.modelType == "minimax_h3" }.sorted { $0.name < $1.name }
+        let chat = models.filter { $0.modelType != "minimax_h3" }.sorted { $0.name < $1.name }
+        return video + chat
+    }
+
+    /// The cable comes and goes, and a Mac on the network may start leading: look again every few seconds.
+    private func watch() async {
+        while !Task.isCancelled {
+            ports = await Task.detached { ClusterSetup.ports() }.value
+            if case .ready = pair, !server.lanPeerURLs.isEmpty {
+                leader = await ThunderboltPairing.waitingLeader(among: server.lanPeerURLs)
+            } else {
+                leader = nil
+            }
+            try? await Task.sleep(for: .seconds(5))
+        }
+    }
+
+    @ViewBuilder private var pairCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch pair {
+            case .off:
+                status(L10n.text("Thunderbolt pairing is turned off on this Mac."), "bolt.slash", .secondary)
+                Text("To turn it on, on both Macs: shut down, then hold the power button until Options appears and open it. Choose Utilities ▸ Terminal, type rdma_ctl enable, press Return, and restart.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            case .noCable:
+                status(L10n.text("Connect the other Mac to this one with a Thunderbolt 5 cable."), "cable.connector", .secondary)
+            case .ready(let leader):
+                if let leader, !leadInstead {
+                    status(L10n.format("%@ is waiting to pair with this Mac.", leader), "bolt.horizontal.circle", .accentColor)
+                    HStack(spacing: 12) {
+                        Button { setupError = ThunderboltPairing.join(appState: appState, ports: ports) } label: {
+                            Text(L10n.format("Join %@", leader)).font(.app(.body))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button { leadInstead = true } label: { Text("Lead from this Mac instead").font(.app(.caption)) }
+                            .buttonStyle(.link)
+                    }
+                } else {
+                    status(L10n.text("A Mac is connected to this one by Thunderbolt."), "bolt.horizontal.circle", .accentColor)
+                    leadControls
+                }
+                Text("macOS asks for your password once, to set up the cable.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            case .reconnect(let role):
+                status(L10n.text("Paired, but the cable needs setting up again after a restart."), "arrow.triangle.2.circlepath", .orange)
+                Button { setupError = ThunderboltPairing.reconnect(role, appState: appState, ports: ports) } label: {
+                    Text("Reconnect").font(.app(.body))
+                }
+                .buttonStyle(.borderedProminent)
+            case .leading(let partner):
+                if let partner {
+                    status(L10n.format("Paired with %@ for %@.", partner, server.cluster?.model ?? ""), "bolt.horizontal.fill", .green)
+                    if let c = server.cluster, c.mode == "rows" {
+                        VideoClusterAdviceRow(cluster: c)
+                    } else if let c = server.cluster, c.planned, c.layers > 0 {
+                        ClusterSplitBar(cluster: c)
+                    }
+                } else {
+                    status(L10n.text("Waiting for the other Mac. On it, open Settings ▸ Cluster and click Join."), "hourglass", .secondary)
+                }
+                unpairButton
+            case .helping:
+                HelperStatus(worker: appState.clusterWorker)
+                unpairButton
+            }
+            if let setupError {
+                Text(verbatim: setupError).font(.app(.caption)).foregroundStyle(.red)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// Which model the pair runs, and the button that makes this Mac lead it.
+    @ViewBuilder private var leadControls: some View {
+        let models = pairable
+        if models.isEmpty {
+            Text("A pair runs MiniMax-H3 (video) or Qwen3.8-Flash-Next (chat). Download one on both Macs to use it.")
+                .font(.app(.caption)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        } else {
+            HStack(spacing: 8) {
+                Text("Use the pair for").font(.app(.caption))
+                Picker("", selection: $pairModel) {
+                    ForEach(models, id: \.path) { m in
+                        Text(verbatim: pairLabel(m)).tag(m.path)
+                    }
+                }
+                .labelsHidden().frame(maxWidth: 320)
+            }
+            .onAppear { if !models.contains(where: { $0.path == pairModel }) { pairModel = models[0].path } }
+            HStack(spacing: 12) {
+                Button { setupError = ThunderboltPairing.lead(model: pairModel, appState: appState, ports: ports) } label: {
+                    Text("Pair").font(.app(.body))
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(pairModel.isEmpty)
+                Button { setupError = ThunderboltPairing.join(appState: appState, ports: ports) } label: {
+                    Text("Join the Mac that leads instead").font(.app(.caption))
+                }
+                .buttonStyle(.link)
+            }
+            Text("This Mac leads and restarts its server; then click Join on the other Mac. Both need the same model.")
+                .font(.app(.caption2)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func pairLabel(_ m: LocalModel) -> String {
+        let use: String = m.modelType == "minimax_h3" ? L10n.text("video") : L10n.text("chat")
+        return "\(m.name) · \(use)"
+    }
+
+    private var unpairButton: some View {
+        Button { ThunderboltPairing.unpair(appState: appState); leadInstead = false } label: { Text("Unpair").font(.app(.body)) }
+    }
+
+    private func status(_ text: String, _ symbol: String, _ color: Color) -> some View {
+        Label { Text(verbatim: text).font(.app(.body)).fixedSize(horizontal: false, vertical: true) } icon: {
+            Image(systemName: symbol).foregroundStyle(color)
+        }
+    }
+
+    @ViewBuilder private var advancedRows: some View {
         if let m = meta["clusterRole"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterRole)) {
                 Picker("", selection: $appState.serverOptions.clusterRole) {
@@ -1138,11 +1305,6 @@ private struct ThunderboltClusterSectionContent: View {
         SettingsRow(title: L10n.text("Status"), explainer: L10n.format("The worker joins at %@.", ClusterSetup.coordinator(options, ports: { ports }))) {
             Text(verbatim: clusterStatus).font(.app(.caption)).foregroundStyle(.secondary)
         }
-        if let c = server.cluster, c.mode == "rows", c.joined {
-            VideoClusterAdviceRow(cluster: c)
-        } else if let c = server.cluster, c.planned, c.layers > 0 {
-            ClusterSplitBar(cluster: c)
-        }
     }
 
     private var videoModel: Bool {
@@ -1190,6 +1352,187 @@ private struct WorkerStatusRow: View {
             case .failed(let why): Text(verbatim: why).font(.app(.caption)).foregroundStyle(.red)
             }
         }
+    }
+}
+
+/// The Thunderbolt pair card's line while this Mac helps the one that leads.
+private struct HelperStatus: View {
+    @ObservedObject var worker: ClusterWorker
+
+    var body: some View {
+        switch worker.state {
+        case .stopped, .waiting:
+            Label(L10n.text("Joined. Waiting for the Mac that leads to start its job."), systemImage: "hourglass")
+                .font(.app(.body))
+        case .loading(let what):
+            Label(L10n.format("Loading %@ to help the Mac that leads", what), systemImage: "arrow.down.circle")
+                .font(.app(.body))
+        case .ready(let what):
+            Label(L10n.format("Helping the Mac that leads with %@", what), systemImage: "bolt.horizontal.fill")
+                .font(.app(.body)).foregroundStyle(.green)
+        case .failed(let why):
+            Label(why, systemImage: "exclamationmark.triangle").font(.app(.body)).foregroundStyle(.red)
+        }
+    }
+}
+
+/// The top of Settings ▸ Cluster: this Mac, the Mac paired with it by Thunderbolt, and the
+/// machines on the network, each with how long it takes for the same video.
+private struct ClusterMapView: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+    @ObservedObject var worker: ClusterWorker
+
+    var body: some View {
+        let clip = ReferenceClip.current()
+        let mine = clip.seconds(peer: nil)
+        SearchableRow(searchText: ["Cluster", "machines", "Thunderbolt", "network"], separatorGap: nil) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .center, spacing: 0) {
+                    MachineCard(name: thisMac, kind: L10n.text("This Mac"), symbol: "desktopcomputer",
+                                time: Self.time(mine.seconds, measured: mine.measured), tint: .accentColor)
+                    if let partner {
+                        ThunderboltLink()
+                        MachineCard(name: partner, kind: L10n.text("Paired by Thunderbolt"), symbol: "laptopcomputer",
+                                    time: partnerTime(mine.seconds), tint: .purple)
+                    }
+                    Spacer(minLength: 0)
+                }
+                if let together = together(mine.seconds) {
+                    Label(together, systemImage: "bolt.horizontal.fill")
+                        .font(.app(.caption)).foregroundStyle(.purple)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(spacing: 6) {
+                    Image(systemName: "network")
+                    Text("Over your network: each machine takes whole jobs")
+                    Rectangle().stroke(style: StrokeStyle(lineWidth: 1, dash: [4, 3])).frame(height: 1)
+                }
+                .font(.app(.caption)).foregroundStyle(.secondary)
+                let peers = networkMachines
+                if peers.isEmpty {
+                    Text(appState.serverOptions.lanDiscoverEnabled
+                         ? L10n.text("No other machines found yet. They show up here when they share models.")
+                         : L10n.text("Turn on finding network models below to see your other machines."))
+                        .font(.app(.caption)).foregroundStyle(.secondary)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(peers, id: \.self) { name in
+                                MachineCard(name: name, kind: L10n.text("On your network"), symbol: "network",
+                                            time: peerTime(name, clip: clip), tint: .teal)
+                            }
+                        }
+                    }
+                }
+                Text(L10n.format("Times are for %@, as set in the Video window.", clip.label))
+                    .font(.app(.caption2)).foregroundStyle(.tertiary)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.06)))
+        }
+    }
+
+    private var thisMac: String {
+        let n = appState.serverOptions.lanName
+        return n.isEmpty ? (Host.current().localizedName ?? L10n.text("This Mac")) : n
+    }
+
+    /// The Mac on the other end of the cable, once paired.
+    private var partner: String? {
+        switch appState.serverOptions.clusterRole {
+        case .host:
+            guard let c = server.cluster, c.joined else { return nil }
+            return c.workerName.isEmpty ? L10n.text("The other Mac") : ClusterVideoAdvice.shortName(c.workerName)
+        case .worker:
+            if case .ready = worker.state { return L10n.text("The Mac that leads") }
+            return nil
+        case .off:
+            return nil
+        }
+    }
+
+    private func partnerTime(_ mine: Double) -> String {
+        guard let c = server.cluster, c.workerSpeed > 0 else { return L10n.text("Measured with the first video") }
+        return L10n.format("%@ on its own", H3TimeEstimate.duration(mine / c.workerSpeed))
+    }
+
+    /// What the pair does for one video, in minutes.
+    private func together(_ mine: Double) -> String? {
+        guard let c = server.cluster, c.joined else { return nil }
+        guard c.mode == "rows" else { return L10n.format("Together they run %@.", c.model) }
+        let name = partner ?? L10n.text("The other Mac")
+        switch ClusterVideoAdvice.of(c) {
+        case .unmeasured:
+            return L10n.text("Together over Thunderbolt: the first video measures how much faster they are.")
+        case .tooSlow:
+            return L10n.format("%@ is too slow to make one video faster, so videos stay on this Mac. It can still take whole storyboard shots over your network.", name)
+        case .shares, .largeOnly:
+            let measured = H3TimeEstimate.speedFactor(peer: ClusterInfo.thunderboltPeer)
+            let clip = ReferenceClip.current()
+            let both = measured.measured ? clip.seconds(peer: ClusterInfo.thunderboltPeer).seconds : mine / ClusterVideoAdvice.stepSpeedup(c)
+            guard both < mine - 30 else {
+                return L10n.text("Together over Thunderbolt: about as fast as this Mac alone for this video; larger videos gain more.")
+            }
+            return L10n.format("Together over Thunderbolt: %@ for this video, %@ sooner than this Mac alone.",
+                               H3TimeEstimate.duration(both), H3TimeEstimate.duration(mine - both).replacingOccurrences(of: "about ", with: ""))
+        }
+    }
+
+    /// Every machine on the network but the paired one.
+    private var networkMachines: [String] {
+        var names = Set(server.lanPeerURLs.keys)
+        names.formUnion(server.allModels.compactMap(\.lanPeer))
+        if let c = server.cluster, c.joined { names = names.filter { !StoryboardCluster.sameMachine($0, c.workerName) } }
+        return names.sorted()
+    }
+
+    private func peerTime(_ name: String, clip: ReferenceClip) -> String {
+        let serves = StoryboardCluster.peers(of: clip.model.repo, lanModels: server.lanModels(capability: "video"))
+            .contains { $0.peer == name }
+        guard serves else { return L10n.format("No %@", (clip.model.repo as NSString).lastPathComponent) }
+        let t = clip.seconds(peer: name)
+        return t.measured ? H3TimeEstimate.duration(t.seconds) : L10n.text("Measured with its first shot")
+    }
+
+    static func time(_ seconds: Double, measured: Bool) -> String {
+        measured ? H3TimeEstimate.duration(seconds) : L10n.format("%@ (estimate)", H3TimeEstimate.duration(seconds))
+    }
+}
+
+/// One machine on the Cluster map.
+private struct MachineCard: View {
+    let name: String
+    let kind: String
+    let symbol: String
+    let time: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label { Text(verbatim: name).font(.app(.body).weight(.semibold)).lineLimit(1) } icon: {
+                Image(systemName: symbol).foregroundStyle(tint)
+            }
+            Text(verbatim: kind).font(.app(.caption2)).foregroundStyle(.secondary)
+            Label { Text(verbatim: time).font(.app(.caption)) } icon: { Image(systemName: "film") }
+                .foregroundStyle(.secondary)
+        }
+        .padding(8)
+        .frame(width: 190, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(tint.opacity(0.10)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(tint.opacity(0.45), lineWidth: 1))
+    }
+}
+
+/// The cable between the two paired Macs: one job, both machines.
+private struct ThunderboltLink: View {
+    var body: some View {
+        VStack(spacing: 2) {
+            Image(systemName: "bolt.fill").foregroundStyle(.purple)
+            Rectangle().fill(Color.purple).frame(height: 3)
+            Text("Same job").font(.app(.caption2)).foregroundStyle(.purple)
+        }
+        .frame(width: 80)
     }
 }
 

@@ -142,16 +142,21 @@ class APIClient {
         try await fetchModelList(port: port).models
     }
 
-    /// `/v1/models` whole: the rows plus the LAN peers that refused us for want of a key.
-    func fetchModelList(port: UInt16) async throws -> (models: [ModelInfo], lanNeedsKey: [String]) {
+    /// `/v1/models` whole: the rows, the LAN peers that refused us for want of a key, and
+    /// every peer's address.
+    func fetchModelList(port: UInt16) async throws -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: URL]) {
         let (data, _) = try await session.data(from: serverURL(port: port, path: "/v1/models"))
         return Self.parseModelsBody(data)
     }
 
-    static func parseModelsBody(_ data: Data) -> (models: [ModelInfo], lanNeedsKey: [String]) {
+    static func parseModelsBody(_ data: Data) -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: URL]) {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let dataArr = json["data"] as? [[String: Any]] else { return ([], []) }
-        return (dataArr.map { parseModelInfo($0) }, json["lan_needs_key"] as? [String] ?? [])
+              let dataArr = json["data"] as? [[String: Any]] else { return ([], [], [:]) }
+        var peers: [String: URL] = [:]
+        for p in json["lan_peers"] as? [[String: Any]] ?? [] {
+            if let name = p["name"] as? String, let url = (p["url"] as? String).flatMap(URL.init(string:)) { peers[name] = url }
+        }
+        return (dataArr.map { parseModelInfo($0) }, json["lan_needs_key"] as? [String] ?? [], peers)
     }
 
     // Internal (not private) so unit tests can exercise the capability/meta

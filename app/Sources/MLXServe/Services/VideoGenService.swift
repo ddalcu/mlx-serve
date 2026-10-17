@@ -319,7 +319,7 @@ final class VideoGenService: ObservableObject {
     /// shot; shots already written stay on disk if a later one fails.
     /// `peers` = LAN machines serving the same pack: with a picture at every
     /// join, shots render on them and this Mac at once (`renderAcross`).
-    func generateStoryboard(_ base: VideoGenRequest, shots: [(prompt: String, frames: Int, endFrame: String?)],
+    func generateStoryboard(_ base: VideoGenRequest, shots: [(prompt: String, frames: Int, endFrame: String?, machine: String?)],
                             peers: [RenderDevice] = [], server: ServerManager) {
         guard !shots.isEmpty, shots.allSatisfy({ !$0.prompt.isBlank }) else {
             phase = .failed(L10n.text("Every shot needs a prompt."))
@@ -352,9 +352,9 @@ final class VideoGenService: ObservableObject {
             do {
                 try FileManager.default.createDirectory(at: shotsDir, withIntermediateDirectories: true)
                 // Each join's picture, cropped to the canvas once, before any shot: the
-                // two shots meeting there read the same pixels (H3 crops a last frame
-                // and stretches a first), and one the server cannot read (HEIC, a file
-                // gone offline) stops the run now rather than shots later.
+                // two shots meeting there read the same pixels whatever machine renders
+                // them, and one the server cannot read (HEIC, a file gone offline) stops
+                // the run now rather than shots later.
                 var endFrames = [String?](repeating: nil, count: shots.count)
                 let (canvasW, canvasH) = (base.width, base.height)
                 for i in shots.indices.dropLast() {
@@ -376,15 +376,17 @@ final class VideoGenService: ObservableObject {
                 loadedId = unloadId
                 var shotURLs: [URL] = []
                 var settings: [String] = []
+                let devices = [RenderDevice(modelId: modelId, peer: nil)] + peers
                 if !peers.isEmpty, StoryboardCluster.joinsAnchored(endFrames) {
                     shotIndex = nil
-                    let devices = [RenderDevice(modelId: modelId, peer: nil)] + peers
                     let requests = shots.indices.map { i in
                         Storyboard.shotRequest(base: base, prompt: shots[i].prompt, frames: shots[i].frames,
                                                index: i, count: shots.count,
                                                previousLastFrame: i > 0 ? endFrames[i - 1] : nil, endFrame: endFrames[i])
                     }
-                    shotURLs = try await renderAcross(devices, requests: requests, in: shotsDir, port: port, gen: gen)
+                    shotURLs = try await renderAcross(devices, requests: requests,
+                                                      pins: shots.map { StoryboardCluster.pin($0.machine, in: devices) },
+                                                      in: shotsDir, port: port, gen: gen)
                     settings = requests.indices.map { "--- shot \($0 + 1) ---\n" + Self.settingsText(requests[$0], modelId: modelId) }
                 } else {
                     var lastFrame: String? = nil
@@ -394,9 +396,12 @@ final class VideoGenService: ObservableObject {
                         let req = Storyboard.shotRequest(base: base, prompt: shot.prompt, frames: shot.frames,
                                                          index: i, count: shots.count, previousLastFrame: lastFrame,
                                                          endFrame: endFrame)
+                        // One after another, each on the machine chosen for it (this Mac by default).
+                        let device = devices[StoryboardCluster.pin(shot.machine, in: devices) ?? 0]
                         let label = L10n.format("Shot %lld of %lld · ", Int64(i + 1), Int64(shots.count))
-                        let out = try await renderShot(req, model: modelId, index: i, in: shotsDir, port: port,
-                                                       gen: gen, label: label)
+                            + (device.peer.map { L10n.format("on %@ · ", $0) } ?? "")
+                        let out = try await renderShot(req, model: device.modelId, index: i, in: shotsDir, port: port,
+                                                       gen: gen, label: label, peer: device.peer)
                         shotURLs.append(out.mp4)
                         lastFrame = Storyboard.nextOpening(keyframe: endFrame, renderedLastFrame: out.last.path)
                         settings.append("--- shot \(i + 1) ---\n" + Self.settingsText(req, modelId: modelId))
@@ -426,13 +431,14 @@ final class VideoGenService: ObservableObject {
     /// Every shot at once across `devices` (this Mac first), one shot per machine
     /// at a time, as `ShotDispatcher` plans them; a machine that fails leaves the
     /// run and its shot goes to another. Returns the shots' mp4s in film order.
-    private func renderAcross(_ devices: [RenderDevice], requests: [VideoGenRequest], in dir: URL,
+    private func renderAcross(_ devices: [RenderDevice], requests: [VideoGenRequest], pins: [Int?], in dir: URL,
                               port: UInt16, gen: Int) async throws -> [URL] {
         let costs = requests.map {
             H3TimeEstimate.seconds(model: $0.model, width: $0.width, height: $0.height, frames: $0.numFrames,
                                    steps: $0.steps, fast: !$0.bestQuality && !$0.turbo, hardware: .anchor)
         }
-        var dispatcher = ShotDispatcher(costs: costs, factors: devices.map { H3TimeEstimate.speedFactor(peer: $0.peer).factor })
+        var dispatcher = ShotDispatcher(costs: costs, factors: devices.map { H3TimeEstimate.speedFactor(peer: $0.peer).factor },
+                                        pins: pins)
         var urls = [URL?](repeating: nil, count: requests.count)
         var lanes: [Int: (shot: Int, step: Int, total: Int)] = [:]
         var rendering: [Int: Task<(mp4: URL, last: URL), Error>] = [:]

@@ -87,4 +87,30 @@ final class StoryboardClusterTests: XCTestCase {
         _ = d.next(for: 0, now: 10)
         XCTAssertEqual(d.busyUntil[0], 20, accuracy: 1e-9)
     }
+    /// A shot the user put on a machine renders there, however slow it is.
+    func testAPinnedShotRendersOnItsMachine() {
+        let plan = StoryboardCluster.simulate(costs: [10, 10], factors: [1, 7], pins: [nil, 1])
+        XCTAssertEqual(plan.machine, [0, 1])
+        XCTAssertEqual(plan.seconds, 70, accuracy: 1e-9)
+        XCTAssertEqual(StoryboardCluster.simulate(costs: [10, 10], factors: [1, 7], pins: [nil, nil]).machine, [0, 0])
+    }
+
+    /// No second copy of a pinned shot elsewhere: the user chose where it runs.
+    func testAPinnedShotIsNeverRerunElsewhere() {
+        var d = ShotDispatcher(costs: [10, 10], factors: [1, 1], pins: [nil, 1])
+        XCTAssertEqual(d.next(for: 0, now: 0), 0)
+        XCTAssertEqual(d.next(for: 1, now: 0), 1)
+        d.measured(1, factor: 7)
+        d.finished(0)
+        XCTAssertNil(d.next(for: 0, now: 10))
+    }
+
+    /// A pinned machine that fails gives its shot to the others.
+    func testAFailedMachinesPinnedShotGoesToAnother() {
+        var d = ShotDispatcher(costs: [10, 10], factors: [1, 1], pins: [1, 1])
+        XCTAssertNil(d.next(for: 0, now: 0))
+        XCTAssertNotNil(d.next(for: 1, now: 0))
+        d.failed(1, shot: 0)
+        XCTAssertNotNil(d.next(for: 0, now: 1))
+    }
 }

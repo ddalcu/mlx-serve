@@ -18,6 +18,8 @@ class ServerManager: ObservableObject {
     private var loadProgressPoll: Task<Void, Never>?
     /// LAN peers running with --api-key that we hold no working key for.
     @Published var lanPeersNeedingKey: [String] = []
+    /// Every LAN peer's address, for reading its `/health` (a Thunderbolt pair leader).
+    @Published var lanPeerURLs: [String: URL] = [:]
     /// Chat target when the user picked a LAN model in the tray: the remote
     /// routing id (`<model>@<peer>`). nil = the local server's default model.
     /// Persisted so the choice survives relaunch; cleared by picking a local
@@ -661,9 +663,10 @@ class ServerManager: ObservableObject {
     }
 
     func refreshModels() async {
-        if let (all, needsKey) = try? await api.fetchModelList(port: port) {
+        if let (all, needsKey, peers) = try? await api.fetchModelList(port: port) {
             allModels = all
             lanPeersNeedingKey = needsKey
+            lanPeerURLs = peers
             // Headless servers sort no default first, so the head row can be an unloaded stub.
             modelInfo = all.first { $0.loaded && $0.lanPeer == nil }
         }

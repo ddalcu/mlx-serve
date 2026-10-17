@@ -2588,7 +2588,9 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
-        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        const body = try @import("distributed.zig").healthJson(allocator);
+        defer allocator.free(body);
+        try sendResponse(stream, "200 OK", "application/json", body);
         return;
     }
     // The console. It belongs here, above resolution, for the same reason
@@ -7593,17 +7595,22 @@ fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
     if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
 
-    // Keyed peers we hold no working key for, so the app can ask for one.
-    var locked = std.ArrayList(u8).empty;
-    defer locked.deinit(allocator);
-    if (!lan_filtered) if (g_lan) |l| try l.appendPeersNeedingKey(allocator, &locked);
-    if (locked.items.len > 0) return std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{s}],"lan_needs_key":[{s}]}}
-    , .{ entries_buf.items, locked.items });
-
+    // Keyed peers we hold no working key for, so the app can ask for one, and every
+    // peer's address, so the app can read its `/health`.
+    var extras = std.ArrayList(u8).empty;
+    defer extras.deinit(allocator);
+    if (!lan_filtered) if (g_lan) |l| {
+        var list = std.ArrayList(u8).empty;
+        defer list.deinit(allocator);
+        try l.appendPeersNeedingKey(allocator, &list);
+        if (list.items.len > 0) try extras.print(allocator, ",\"lan_needs_key\":[{s}]", .{list.items});
+        list.clearRetainingCapacity();
+        try l.appendPeerAddresses(allocator, &list);
+        if (list.items.len > 0) try extras.print(allocator, ",\"lan_peers\":[{s}]", .{list.items});
+    };
     return std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{s}]}}
-    , .{entries_buf.items});
+        \\{{"object":"list","data":[{s}]{s}}}
+    , .{ entries_buf.items, extras.items });
 }
 
 /// A `/v1/models` row with its Model Settings `alias` as the first field; `id`

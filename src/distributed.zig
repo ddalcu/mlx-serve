@@ -504,6 +504,20 @@ pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     });
 }
 
+/// `/health`, which any machine on the network may read: when this server leads a
+/// Thunderbolt pair, its model and whether the other Mac has joined, so that Mac's app
+/// can offer to join it.
+pub fn healthJson(allocator: std.mem.Allocator) ![]u8 {
+    const g = group orelse return allocator.dupe(u8, "{\"status\":\"ok\"}");
+    return pairHealthJson(allocator, std.fs.path.basename(g.model), joined.load(.acquire));
+}
+
+fn pairHealthJson(allocator: std.mem.Allocator, model: []const u8, has_joined: bool) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"status\":\"ok\",\"thunderbolt\":{{\"leads\":{f},\"joined\":{}}}}}", .{
+        std.json.fmt(model, .{}), has_joined,
+    });
+}
+
 fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     const sp = p.span;
     while (!last_job_mu.tryLock()) std.atomic.spinLoopHint();
@@ -1124,4 +1138,15 @@ test "findModel pairs the host's copy of a name, not another quantization of it"
     try std.testing.expectEqualStrings(b, found);
     try std.testing.expectError(error.DistModelMismatch, findModel(io, allocator, &.{root}, "Flash", 42));
     try std.testing.expect((try findModel(io, allocator, &.{root}, "Other", 42)) == null);
+}
+
+test "healthJson names the model a Thunderbolt pair leads, as valid JSON" {
+    const a = std.testing.allocator;
+    const j = try pairHealthJson(a, "MiniMax \"H3\"", false);
+    defer a.free(j);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
+    defer parsed.deinit();
+    const tb = parsed.value.object.get("thunderbolt").?.object;
+    try std.testing.expectEqualStrings("MiniMax \"H3\"", tb.get("leads").?.string);
+    try std.testing.expect(!tb.get("joined").?.bool);
 }

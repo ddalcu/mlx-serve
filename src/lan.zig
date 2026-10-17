@@ -290,6 +290,13 @@ extern "c" fn DNSServiceRefDeallocate(ref: DNSServiceRef) void;
 
 pub const Remote = struct { ip4: [4]u8, port: u16 };
 
+fn appendPeerAddress(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), display: []const u8, ip4: [4]u8, port: u16) !void {
+    if (buf.items.len > 0) try buf.append(alloc, ',');
+    try buf.print(alloc, "{{\"name\":{f},\"url\":\"http://{d}.{d}.{d}.{d}:{d}\"}}", .{
+        std.json.fmt(display, .{}), ip4[0], ip4[1], ip4[2], ip4[3], port,
+    });
+}
+
 const Peer = struct {
     display: []u8, // sanitized instance name — also the hash key
     ip4: [4]u8,
@@ -485,6 +492,14 @@ pub const Lan = struct {
             if (buf.items.len > 0) try buf.append(alloc, ',');
             try buf.print(alloc, "\"{s}\"", .{p.display});
         };
+    }
+
+    /// Every reachable peer as `{"name":…,"url":"http://a.b.c.d:port"}`, comma-separated.
+    pub fn appendPeerAddresses(l: *Lan, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+        l.mu.lock();
+        defer l.mu.unlock();
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| try appendPeerAddress(alloc, buf, p.display, p.ip4, p.port);
     }
 
     /// Ask the browser thread to re-attempt every known service NOW instead
@@ -1570,4 +1585,19 @@ test "lan: discovery sends the peer's key, and a keyed peer's 401 reads as Unaut
     defer freePeerModels(a, models);
     try t.expectEqual(@as(usize, 1), models.len);
     try t.expectEqualStrings("gemma", models[0].id);
+}
+
+test "appendPeerAddress lists each peer's name and URL as JSON" {
+    const a = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    try appendPeerAddress(a, &buf, "M4Max", .{ 192, 168, 137, 3 }, 11234);
+    try appendPeerAddress(a, &buf, "5060-linux", .{ 192, 168, 2, 76 }, 11400);
+    const j = try std.fmt.allocPrint(a, "[{s}]", .{buf.items});
+    defer a.free(j);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("http://192.168.137.3:11234", parsed.value.array.items[0].object.get("url").?.string);
+    try std.testing.expectEqualStrings("5060-linux", parsed.value.array.items[1].object.get("name").?.string);
 }
