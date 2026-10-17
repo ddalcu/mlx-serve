@@ -237,6 +237,11 @@ fn printUsage(io: std.Io) void {
         \\                        (default: 1). Slots share the weights; each adds
         \\                        its own KV and state (2 slots: ~1.75x the
         \\                        decode throughput on an M5 Ultra).
+        \\  --w8a8-prefill      Run prompt-width 4-bit affine LLM projections as
+        \\                        rotated int8 x int8 on the tensor units (NAX GPUs,
+        \\                        M5-class and later; ignored elsewhere). Lossy, off
+        \\                        by default; decode and spec verify stay 4-bit.
+        \\                        Also MLX_SERVE_W8A8_PREFILL=1.
         \\  --ane-image         Run a share of each image DiT block's MLP on the
         \\  --ane-video           Neural Engine beside the GPU (Krea / MiniMax-H3 /
         \\  --ane-audio           ACE-Step; int8/fp16, lossy; off by default). The
@@ -850,6 +855,8 @@ pub fn main(init: std.process.Init) !void {
             @import("w8a8.zig").enabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-w8a8")) {
             @import("w8a8.zig").enabled = false;
+        } else if (std.mem.eql(u8, args[i], "--w8a8-prefill")) {
+            @import("w8a8.zig").prefill_cli = true;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {

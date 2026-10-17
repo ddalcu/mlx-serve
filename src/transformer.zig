@@ -27,6 +27,7 @@ const sushi_pack = @import("sushi_pack.zig");
 const qmv_nax2 = @import("qmv_nax2.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const qmm_int8 = @import("qmm_int8.zig");
+const w8a8 = @import("w8a8.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
@@ -17233,6 +17234,8 @@ pub const Transformer = struct {
     /// LOSSY int8-activation prefill (`qmm_int8`), per model: allocated when its
     /// `int8_prefill` setting (else the process default) turns the route on.
     int8_cache: ?*qmm_int8.Cache = null,
+    /// LOSSY rotated-int8 prefill (`w8a8.prefillQmm`, `--w8a8-prefill`): allocated only on a NAX GPU.
+    w8a8_prefill: ?*w8a8.PrefillCache = null,
 
     // When non-null, the next forward pass captures the post-final-norm
     // hidden state at the last position into the pointed-to array
@@ -17957,6 +17960,17 @@ pub const Transformer = struct {
             int8_cache = try allocator.create(qmm_int8.Cache);
             int8_cache.?.* = .{};
         }
+        var w8a8_prefill: ?*w8a8.PrefillCache = null;
+        errdefer if (w8a8_prefill) |c| allocator.destroy(c);
+        if (w8a8.prefillRequested()) {
+            if (naxAvailable() and mlx.metalKernelsAvailable()) {
+                w8a8_prefill = try allocator.create(w8a8.PrefillCache);
+                w8a8_prefill.?.* = .{};
+                log.info("[w8a8-prefill] on: prompt-width 4-bit affine projections run rotated int8 x int8 (lossy; decode and verify stay 4-bit)\n", .{});
+            } else {
+                log.warn("[w8a8-prefill] requested but this GPU has no neural accelerators (NAX, M5-class): ignored, stock qmm\n", .{});
+            }
+        }
         var rht_registry: ?*rht.Registry = null;
         errdefer if (rht_registry) |reg| {
             reg.deinit();
@@ -18092,6 +18106,7 @@ pub const Transformer = struct {
             .rht = rht_registry,
             .ternary_2bit = ternary_2bit,
             .int8_cache = int8_cache,
+            .w8a8_prefill = w8a8_prefill,
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
@@ -18819,6 +18834,11 @@ pub const Transformer = struct {
             self.allocator.destroy(c);
             self.int8_cache = null;
         }
+        if (self.w8a8_prefill) |c| {
+            c.deinit();
+            self.allocator.destroy(c);
+            self.w8a8_prefill = null;
+        }
         if (self.compiled_forward) |cf| _ = mlx.mlx_closure_free(cf);
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
@@ -18950,6 +18970,9 @@ pub const Transformer = struct {
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
         // first touch — x's inner dim pins (bits, group_size) exactly.
         const qp = self.quantParamsHinted(w, sc, lastDim(x));
+        // OPT-IN and LOSSY: prompt-width 4-bit affine calls through rotated int8; declines below
+        // w8a8.PREFILL_MIN_ROWS rows (decode, spec verify) and outside its shapes.
+        if (self.w8a8_prefill) |pc| if (qp.mode == .affine) if (try w8a8.prefillQmm(pc, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
         // The 2-bit kernels (qmv2.zig) serve Prism packs: Hadamard ones, and
         // ternary ones without rotations. Every other 2-bit pack keeps stock qmm.
         if (self.rht) |reg| {

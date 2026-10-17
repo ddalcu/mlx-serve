@@ -695,6 +695,46 @@ pub fn gemm(act: Act, w: *const Weight, dt: mlx.mlx_dtype, swiglu: bool, s: mlx.
     return y;
 }
 
+/// A 32 x 128 tile on two simdgroups with K in one run, for prompt-width LLM chunks: past
+/// PREFILL_LONG_ROWS it beats the tall tile on the M6, and its store's extents drop the padding.
+const GEMM_LONG =
+    \\const int M = xq_shape[0], K = xq_shape[1], N = wq_shape[0];
+    \\using TA = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+    \\auto A = TA((device int8_t*)xq, dextents<int32_t, 2>(K, M));
+    \\auto B = TA((device int8_t*)wq, dextents<int32_t, 2>(K, N));
+    \\auto C = tensor<device T, dextents<int32_t, 2>, tensor_inline>(y, dextents<int32_t, 2>(N, M));
+    \\constexpr auto desc = matmul2d_descriptor(32, 128, static_cast<int>(dynamic_extent), false, true, false);
+    \\matmul2d<desc, execution_simdgroups<2>> op;
+    \\const int m0 = threadgroup_position_in_grid.y * 32, n0 = threadgroup_position_in_grid.x * 128;
+    \\auto mA = A.slice(0, m0);
+    \\auto mB = B.slice(0, n0);
+    \\auto mC = C.slice(n0, m0);
+    \\auto cT = op.template get_destination_cooperative_tensor<decltype(mA), decltype(mB), int32_t>();
+    \\for (uint16_t i = 0; i < cT.get_capacity(); ++i) cT[i] = 0;
+    \\op.run(mA, mB, cT);
+    \\auto oT = op.template get_destination_cooperative_tensor<decltype(mA), decltype(mB), T>();
+    \\for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+    \\  auto idx = cT.get_multidimensional_index(i);
+    \\  const int n = min(n0 + idx[0], N - 1), m = min(m0 + idx[1], M - 1);
+    \\  oT[i] = T(float(cT[i]) * xs[m] * ws[n]);
+    \\}
+    \\oT.store(mC);
+;
+
+var gemm_long_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn gemmLong(act: Act, w: *const Weight, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+    const m = mlx.getShape(act.xq)[0];
+    if (gemm_long_kernel == null) gemm_long_kernel = try newKernel("msv_w8a8_gemm_long", &.{ "xq", "wq", "xs", "ws" }, &.{"y"}, GEMM_LONG, HEADER);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ m, w.n }, 2, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(w.n + 127, 128) * 64, @divTrunc(m + 31, 32), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 64, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    return applyOne(gemm_long_kernel.?, &.{ act.xq, w.wq, act.xs, w.ws }, cfg, s);
+}
+
 // Sibling projections (q/k/v/gate, gate/up) read one activation, so its
 // quantization is kept for the next call on the same array. The memo retains
 // `memo_x`, so its address cannot be reused by another activation meanwhile.
@@ -794,6 +834,220 @@ fn forwardImpl(x: mlx.mlx_array, w: *const Weight, swiglu: bool, s: mlx.mlx_stre
     osh[sh.len - 1] = if (swiglu) @divExact(w.n, 2) else w.n;
     var y = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&y, y2, &osh, sh.len, s));
+    return y;
+}
+
+// ── LLM prefill: 4-bit affine weights converted per call ──
+//
+// OPT-IN and LOSSY (`--w8a8-prefill`): prompt-width calls of 4-bit g64 affine LLM linears take the
+// route above with the int8 copy rebuilt from the packed weight on every call, so nothing extra stays
+// resident. Forwards under PREFILL_MIN_ROWS (decode, spec verify) keep the exact 4-bit path.
+
+pub const PREFILL_MIN_ROWS: c_int = 64;
+/// Up to this many rows a whole number of 128-row tiles takes `gemm`; anything else takes `gemmLong`.
+pub const PREFILL_LONG_ROWS: c_int = 1536;
+
+/// Set by `--w8a8-prefill`.
+pub var prefill_cli: bool = false;
+var prefill_env: ?bool = null;
+
+/// `--w8a8-prefill` or `MLX_SERVE_W8A8_PREFILL=1`; off by default.
+pub fn prefillRequested() bool {
+    if (prefill_cli) return true;
+    if (prefill_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_W8A8_PREFILL");
+    prefill_env = raw != null and raw.?[0] == '1';
+    return prefill_env.?;
+}
+
+/// Bytes of the per-call int8 copy of an `[n, k]` weight.
+pub fn prefillCopyBytes(n: u64, k: u64) u64 {
+    return n * k + 4 * n;
+}
+
+/// Per-weight rotated row scales, owned by the model whose weights they derive from (freed in its deinit).
+pub const PrefillCache = struct {
+    map: std.AutoHashMapUnmanaged(usize, mlx.mlx_array) = .{},
+
+    pub fn deinit(self: *PrefillCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |a| _ = mlx.mlx_array_free(a.*);
+        self.map.deinit(std.heap.c_allocator);
+        self.* = .{};
+    }
+};
+
+// dims = [tiled, ntot, r0, nt, kg, kw, n]. MLX layout: w [n, kw], scales/biases [n, kg]. Tiled
+// (lane_qmm.tileInPlace): w [ntot/nt][kg][nt][8], (scale, bias) pairs [kg][ntot][2] spanning the
+// scales buffer then the biases buffer; the view starts at row r0.
+const FETCH4 =
+    \\#define FETCH4(n, kw, q, s, b) { \
+    \\  const int g_ = (kw) / 8, i_ = (kw) % 8, KG_ = dims[4]; \
+    \\  if (dims[0]) { \
+    \\    const int r_ = dims[2] + int(n), NT_ = dims[3], NTOT_ = dims[1]; \
+    \\    q = w[((size_t)((r_ / NT_) * KG_ + g_) * NT_ + (r_ % NT_)) * 8 + i_]; \
+    \\    const size_t e_ = ((size_t)g_ * NTOT_ + r_) * 2, h_ = (size_t)KG_ * NTOT_; \
+    \\    s = float(e_ < h_ ? scales[e_] : biases[e_ - h_]); \
+    \\    b = float(e_ + 1 < h_ ? scales[e_ + 1] : biases[e_ + 1 - h_]); \
+    \\  } else { \
+    \\    q = w[(size_t)(n) * dims[5] + (kw)]; \
+    \\    s = float(scales[(size_t)(n) * KG_ + g_]); b = float(biases[(size_t)(n) * KG_ + g_]); \
+    \\  } }
+    \\
+;
+
+/// Lane l on 256-block `ch` of row `n` loads packed word ch*32 + l (positions 8l..8l+7, the layout
+/// RQ_SOURCE rotates in), dequantizes, applies the signs and runs the same transform.
+const ROT4 =
+    \\#define ROT4(n, ch, v) { \
+    \\  uint q_; float s_, b_; \
+    \\  FETCH4(n, (ch) * 32 + int(lane), q_, s_, b_); \
+    \\  const int base_ = (ch) * 256 + int(lane) * 8; \
+    \\  for (int p = 0; p < 8; p++) v[p] = (float((q_ >> (4 * p)) & 0xf) * s_ + b_) * signs[base_ + p]; \
+    \\  for (int h = 1; h < 8; h <<= 1) \
+    \\    for (int p = 0; p < 8; p++) if ((p & h) == 0) { float a_ = v[p], c_ = v[p + h]; v[p] = a_ + c_; v[p + h] = a_ - c_; } \
+    \\  for (uint m_ = 1; m_ < 32; m_ <<= 1) { \
+    \\    const float sgn_ = (lane & m_) ? -1.0f : 1.0f; \
+    \\    for (int p = 0; p < 8; p++) v[p] = fma(sgn_, v[p], simd_shuffle_xor(v[p], m_)); \
+    \\  } \
+    \\  for (int p = 0; p < 8; p++) v[p] *= 0.0625f; }
+    \\
+;
+
+/// One threadgroup (8 simdgroups) per row: ws[n] = amax of the rotated row / 127.
+const ROWSCALE4_SOURCE = FETCH4 ++ ROT4 ++
+    \\const uint n = threadgroup_position_in_grid.y;
+    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    \\const int nch = dims[5] / 32;
+    \\threadgroup float red[8];
+    \\float amax = 0.0f, v[8];
+    \\for (int ch = int(sg); ch < nch; ch += 8) {
+    \\  ROT4(n, ch, v);
+    \\  for (int p = 0; p < 8; p++) amax = max(amax, abs(v[p]));
+    \\}
+    \\amax = simd_max(amax);
+    \\if (lane == 0) red[sg] = amax;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\amax = red[0];
+    \\for (int i = 1; i < 8; i++) amax = max(amax, red[i]);
+    \\if (sg == 0 && lane == 0) ws[n] = max(amax / 127.0f, 1.0e-20f);
+;
+
+/// One simdgroup per (row, 256-block): rotated int8 codes against the row's kept scale.
+const CONVERT4_SOURCE = FETCH4 ++ ROT4 ++
+    \\const uint n = threadgroup_position_in_grid.y;
+    \\const int ch = int(threadgroup_position_in_grid.x);
+    \\const uint lane = thread_index_in_simdgroup;
+    \\float v[8];
+    \\ROT4(n, ch, v);
+    \\const float inv = 1.0f / ws[n];
+    \\char4 lo, hi;
+    \\for (int p = 0; p < 4; p++) {
+    \\  lo[p] = char(clamp(rint(v[p] * inv), -127.0f, 127.0f));
+    \\  hi[p] = char(clamp(rint(v[p + 4] * inv), -127.0f, 127.0f));
+    \\}
+    \\device int8_t* o = wq + (size_t)n * (dims[5] * 8) + ch * 256 + int(lane) * 8;
+    \\*(device char4*)o = lo;
+    \\*(device char4*)(o + 4) = hi;
+;
+
+var rowscale4_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var convert4_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var prefill_logged = false;
+
+fn applyOne(k: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, cfg: mlx.mlx_fast_metal_kernel_config, s: mlx.mlx_stream) !mlx.mlx_array {
+    const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, s));
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_vector_array_get(&o, ov, 0));
+    return o;
+}
+
+/// A packed 4-bit weight wherever its codes and (scale, bias) pairs live, plus the kernels' `dims`.
+const Packed4 = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, dims: mlx.mlx_array, n: c_int, k: c_int };
+
+fn packed4(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, n: c_int, k: c_int) !?Packed4 {
+    const kg = mlx.getShape(sc)[1];
+    const kw = @divExact(k, 8);
+    const ti = try @import("lane_qmm.zig").tiledInfo(w);
+    if (ti) |t| if (t.bits != 4) return null;
+    const d = if (ti) |t| [_]i32{ 1, t.ntot, t.r0, t.nt, kg, kw, n } else [_]i32{ 0, n, 0, 0, kg, kw, n };
+    const dims = mlx.mlx_array_new_data(&d, &[_]c_int{7}, 1, .int32);
+    return if (ti) |t| .{ .w = t.w, .sc = t.st, .bi = t.bt, .dims = dims, .n = n, .k = k } else .{ .w = w, .sc = sc, .bi = bi, .dims = dims, .n = n, .k = k };
+}
+
+/// The row scales of `w`, computed on its first touch and kept.
+fn rowScale4(cache: *PrefillCache, key: usize, p: Packed4, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (cache.map.get(key)) |a| return a;
+    if (rowscale4_kernel == null) rowscale4_kernel = try newKernel("msv_w8a8_rowscale4", &.{ "w", "scales", "biases", "signs", "dims" }, &.{"ws"}, ROWSCALE4_SOURCE, "");
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{p.n}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, p.n, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    const ws = try applyOne(rowscale4_kernel.?, &.{ p.w, p.sc, p.bi, try signsFor(p.k, .float32, s), p.dims }, cfg, s);
+    errdefer _ = mlx.mlx_array_free(ws);
+    try mlx.check(mlx.mlx_array_eval(ws));
+    try cache.map.put(std.heap.c_allocator, key, ws);
+    return ws;
+}
+
+fn convert4(p: Packed4, ws: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (convert4_kernel == null) convert4_kernel = try newKernel("msv_w8a8_convert4", &.{ "w", "scales", "biases", "signs", "dims", "ws" }, &.{"wq"}, CONVERT4_SOURCE, "");
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ p.n, p.k }, 2, .int8));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * @divExact(p.k, BLOCK), p.n, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+    return applyOne(convert4_kernel.?, &.{ p.w, p.sc, p.bi, try signsFor(p.k, .float32, s), p.dims, ws }, cfg, s);
+}
+
+/// `x @ dequant(w)^T` for a 4-bit g64 affine weight in MLX's or lane_qmm's tiled layout, or null
+/// when the call is off the route (the caller keeps stock qmm).
+pub fn prefillQmm(cache: *PrefillCache, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (bits != 4 or group_size != 64 or !mlx.streamIsGpu(s) or !nax()) return null;
+    if (w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
+    const dt = mlx.mlx_array_dtype(x);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    const xs = mlx.getShape(x);
+    if (xs.len == 0) return null;
+    const k = xs[xs.len - 1];
+    const rows = @divExact(@as(c_int, @intCast(mlx.mlx_array_size(x))), k);
+    const wsh = mlx.getShape(w);
+    if (rows < PREFILL_MIN_ROWS or wsh.len != 2 or wsh[1] * 8 != k) return null;
+    if (@rem(k, BLOCK) != 0 or @rem(wsh[0], 64) != 0 or mlx.mlx_array_dtype(w) != .uint32) return null;
+    const p = (try packed4(w, sc, bi, wsh[0], k)) orelse return null;
+    defer _ = mlx.mlx_array_free(p.dims);
+    const ws = try rowScale4(cache, @intFromPtr(w.ctx), p, s);
+    const wq = try convert4(p, ws, s);
+    defer _ = mlx.mlx_array_free(wq);
+    const wt = Weight{ .wq = wq, .ws = ws, .n = p.n, .k = k };
+    if (!prefill_logged) {
+        prefill_logged = true;
+        log.info("[w8a8-prefill] engaged (LOSSY: rotated int8 at prompt width): first call M={d} N={d} K={d}\n", .{ rows, p.n, k });
+    }
+    // No memo: an LLM forward never hands sibling projections one array, and a retained activation
+    // made short prompts slower than stock.
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows, k }, 2, s));
+    var act = try quantize(x2, s);
+    defer act.deinit();
+    // `gemm`'s edge tile stores element by element, which cost more than the int8 GEMM saved.
+    const tall = rows <= PREFILL_LONG_ROWS and @rem(rows, 128) == 0;
+    const y2 = if (tall) try gemm(act, &wt, dt, false, s) else try gemmLong(act, &wt, dt, s);
+    defer _ = mlx.mlx_array_free(y2);
+    var osh: [8]c_int = undefined;
+    if (xs.len > osh.len) return null;
+    @memcpy(osh[0..xs.len], xs);
+    osh[xs.len - 1] = p.n;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_reshape(&y, y2, &osh, xs.len, s));
     return y;
 }
 
@@ -1346,3 +1600,80 @@ test "w8a8 serves f16 activations as they are: right answer, one quantization fo
     try mlx.check(mlx.mlx_matmul(&ref, xf, wtr, s));
     try testing.expect(try relRms(y, ref, s) < 0.03);
 }
+
+/// A 4-bit g64 affine weight [n, k] from normal values, packed by MLX.
+fn packedWeight(n: c_int, k: c_int, seed: u64, s: mlx.mlx_stream) ![3]mlx.mlx_array {
+    const w = try randomWeight(n, k, seed, s);
+    defer _ = mlx.mlx_array_free(w);
+    var wb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wb);
+    try mlx.check(mlx.mlx_astype(&wb, w, .bfloat16, s));
+    var v = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_quantize(&v, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var out: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    for (&out, 0..) |*a, i| {
+        try mlx.check(mlx.mlx_vector_array_get(a, v, i));
+        try mlx.check(mlx.mlx_array_eval(a.*));
+    }
+    return out;
+}
+
+test "w8a8 prefill: a 4-bit weight converted per call stays within the int8 bar, MLX and tiled layouts" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const lane_qmm = @import("lane_qmm.zig");
+    // 512 rows take the tall tile; 300 the long one, with an edge tile on both axes (N 320).
+    for ([_]bool{ false, true }) |tile| for ([_]c_int{ 512, 300 }) |m| {
+        const pw = try packedWeight(320, 512, 11, s);
+        defer for (pw) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        var wd = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wd);
+        try mlx.check(mlx.mlx_dequantize(&wd, pw[0], pw[1], pw[2], mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true }, s));
+        const x = try outlierInput(m, 512, 12, s);
+        defer _ = mlx.mlx_array_free(x);
+        const ref = try denseRef(x, wd, s);
+        defer _ = mlx.mlx_array_free(ref);
+        try mlx.check(mlx.mlx_array_eval(ref));
+        const owner: usize = 0x8a8;
+        defer if (tile) lane_qmm.release(owner);
+        if (tile) {
+            try mlx.check(mlx.mlx_synchronize(s));
+            try testing.expect(try lane_qmm.tileInPlace(owner, pw[0], pw[1], pw[2], 4, 64, &.{}, s) > 0);
+        }
+        var cache: PrefillCache = .{};
+        defer cache.deinit();
+        dropMemo();
+        defer dropMemo();
+        const y = (try prefillQmm(&cache, x, pw[0], pw[1], pw[2], 4, 64, s)) orelse return error.RouteDeclined;
+        defer _ = mlx.mlx_array_free(y);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
+        try testing.expect(try relRms(y, ref, s) < 0.02);
+    };
+}
+
+test "w8a8 prefill declines decode and verify widths, and widths off the store tile" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var cache: PrefillCache = .{};
+    defer cache.deinit();
+    const wide = try packedWeight(128, 512, 13, s);
+    defer for (wide) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const narrow = try packedWeight(48, 512, 14, s);
+    defer for (narrow) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const x16 = try outlierInput(16, 512, 15, s);
+    defer _ = mlx.mlx_array_free(x16);
+    try testing.expect((try prefillQmm(&cache, x16, wide[0], wide[1], wide[2], 4, 64, s)) == null);
+    const x128 = try outlierInput(128, 512, 16, s);
+    defer _ = mlx.mlx_array_free(x128);
+    try testing.expect((try prefillQmm(&cache, x128, narrow[0], narrow[1], narrow[2], 4, 64, s)) == null);
+}
+
