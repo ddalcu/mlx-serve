@@ -18983,6 +18983,9 @@ pub const Transformer = struct {
             if (try qmv_nax2.qmm(x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
             if (try qmv2.qmm(x, w, sc, bi, qp.bits, qp.group_size, true, false, self.s)) |y| return y;
         }
+        // OPT-IN and LOSSY: 4-bit affine weights at prompt width read int8 activations.
+        // The LM head stays exact: serving projects one row, only echo scores whole prompts.
+        if (qp.bits == 4 and qp.mode == .affine and w.ctx != self.lm_head_w.ctx) if (self.int8_cache) |ic| if (try qmm_int8.qmm4(ic, x, w, sc, bi, qp.group_size, self.s)) |y| return y;
         if (self.config.rowExactDecode() and qp.mode == .affine) {
             if (try rowExactQmm(&self.config, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
         }

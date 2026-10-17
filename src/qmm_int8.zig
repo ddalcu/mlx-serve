@@ -1,9 +1,10 @@
-//! OPT-IN, LOSSY int8-activation prefill route for 2-bit Prism packs on M5.
+//! OPT-IN, LOSSY int8-activation prefill route for 2-bit Prism packs and
+//! 4-bit affine packs on M5.
 //!
-//! Default OFF. `MLX_SERVE_BONSAI_INT8_PREFILL=1` turns it on. Unlike every
-//! other 2-bit route in this tree it is NOT lossless: the activation is
-//! quantized to int8 per 128-group, so committed tokens can differ from the
-//! stock path and greedy serial/speculative byte-equality no longer holds.
+//! Default OFF. `MLX_SERVE_BONSAI_INT8_PREFILL=1` (or a model's `int8_prefill`
+//! setting) turns it on. It is NOT lossless: the activation is quantized to
+//! int8 per weight group, so committed tokens can differ from the stock path
+//! and greedy serial/speculative byte-equality no longer holds.
 //!
 //! Why it can win at all: at prompt width the packed projections are
 //! COMPUTE-bound, and the tensor unit's int8 x int8 rate is about twice its
@@ -22,9 +23,12 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = std.log.scoped(.qmm_int8);
+const msv_log = @import("log.zig");
 
 pub const MIN_ROWS: c_int = 64;
 pub const GS: c_int = 128;
+/// 4-bit packs: the rows from which the int8 GEMM (quantizer included) beats stock qmm.
+pub const MIN_ROWS_4: c_int = 64;
 
 var env_enabled: ?bool = null;
 /// The process default (a model's `int8_prefill` setting overrides it).
@@ -246,6 +250,143 @@ pub const ROTQ_SOURCE =
     \\}
 ;
 
+/// 4-bit affine: per weight group acc += as*s*C, with each lane unpacking whole words (both nibble
+/// planes; `QUANT4_SOURCE` permutes K to match). The bias term SUM_g ra[m,g]*b[n,g] is one half
+/// tensor-op matmul per tile (ra = as*rowsum/KT, b x KT: both stay in half range).
+pub const SOURCE4 =
+    \\const int K = xq_shape[1];
+    \\const int MPAD = xq_shape[0];
+    \\const int N = w_shape[0];
+    \\const int NP = scales_shape[1];
+    \\const int Kg = K / KT;
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const int ms = int(threadgroup_position_in_grid.y) * 32;
+    \\const int ns = int(threadgroup_position_in_grid.x) * 128 + 32 * int(simdgroup_index_in_threadgroup);
+    \\if (ns >= N) return;
+    \\constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+    \\    32, 32, KT, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+    \\mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    \\tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, MPAD));
+    \\auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+    \\thread uint32_t* bw = (thread uint32_t*)&bT;
+    \\auto tA0 = A.template slice<KT, 32>(0, ms);
+    \\auto cT = op.template get_destination_cooperative_tensor<
+    \\    metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(bT)>, int32_t>();
+    \\const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
+    \\const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
+    \\const int nb = ns + fn;
+    \\const int mb = ms + fm;
+    \\float acc[32];
+    \\#pragma clang loop unroll(full)
+    \\for (int i = 0; i < 32; i++) acc[i] = 0.0f;
+    \\const int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));
+    \\const uint kq = 2 * ((lane >> 3) & 1) + (lane & 1);
+    \\constexpr int WL = KT / 32;
+    \\const device uint* wc[4];
+    \\#pragma clang loop unroll(full)
+    \\for (int c = 0; c < 4; c++) wc[c] = w + (size_t)min(ns + nl + 8 * c, N - 1) * (K / 8) + kq * WL;
+    \\for (int g = 0; g < Kg; g++) {
+    \\  uint wv[4][WL];
+    \\#pragma clang loop unroll(full)
+    \\  for (int c = 0; c < 4; c++)
+    \\#pragma clang loop unroll(full)
+    \\    for (int j = 0; j < WL; j++) wv[c][j] = wc[c][g * (KT / 8) + j];
+    \\#pragma clang loop unroll(full)
+    \\  for (int c = 0; c < 4; c++)
+    \\#pragma clang loop unroll(full)
+    \\    for (int j = 0; j < WL; j++) {
+    \\      bw[c + 8 * j] = wv[c][j] & 0x0F0F0F0Fu;
+    \\      bw[c + 8 * j + 4] = (wv[c][j] >> 4) & 0x0F0F0F0Fu;
+    \\    }
+    \\  auto tA = A.template slice<KT, 32>(g * KT, ms);
+    \\  op.run(tA, bT, cT);
+    \\  float4 sv[2];
+    \\  float av[4];
+    \\#pragma clang loop unroll(full)
+    \\  for (int h = 0; h < 2; h++) sv[h] = float4(*(const device vec<ST, 4>*)(scales + (size_t)g * NP + nb + 16 * h));
+    \\#pragma clang loop unroll(full)
+    \\  for (int q = 0; q < 4; q++) av[q] = ascale[(size_t)(mb + 8 * q) * Kg + g];
+    \\#pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 32; i++) {
+    \\    const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
+    \\    acc[i] = fma(av[mh] * sv[(i >> 3) & 1][i & 3], float(cT[i]), acc[i]);
+    \\  }
+    \\}
+    \\{
+    \\  constexpr auto d2 = mpp::tensor_ops::matmul2d_descriptor(
+    \\      32, 32, static_cast<int>(metal::dynamic_extent), false, false, false,
+    \\      mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+    \\  mpp::tensor_ops::matmul2d<d2, metal::execution_simdgroup> op2;
+    \\  tensor<device half, dextents<int, 2>, tensor_inline> RA((device half*)ra, dextents<int, 2>(Kg, MPAD));
+    \\  tensor<device half, dextents<int, 2>, tensor_inline> BB((device half*)biases, dextents<int, 2>(NP, Kg));
+    \\  auto tR = RA.slice(0, ms);
+    \\  auto tB = BB.slice(ns, 0);
+    \\  auto cB = op2.template get_destination_cooperative_tensor<decltype(tR), decltype(tB), float>();
+    \\  op2.run(tR, tB, cB);
+    \\#pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 32; i++) acc[i] += cB[i];
+    \\}
+    \\#pragma clang loop unroll(full)
+    \\for (int i = 0; i < 32; i += 4) {
+    \\  const int nn = nb + 16 * ((i >> 3) & 1);
+    \\  const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+    \\  device T* yr = y + (size_t)mm * N + nn;
+    \\  if (nn + 3 < N) {
+    \\    *(device vec<T, 4>*)yr = vec<T, 4>(float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]));
+    \\  } else {
+    \\#pragma clang loop unroll(full)
+    \\    for (int c = 0; c < 4; c++) if (nn + c < N) yr[c] = static_cast<T>(acc[i + c]);
+    \\  }
+    \\}
+;
+
+/// The 4-bit route's quantizer: one simdgroup per row, KT/8 lanes per group, 8
+/// codes each. Word t of a group belongs to lane class t / (KT/32), slot
+/// t % (KT/32): its even codes land at 32*slot + 4*class, its odd codes 16 on.
+pub const QUANT4_SOURCE =
+    \\const int K = x_shape[1];
+    \\const int Kg = K / KT;
+    \\constexpr int LPG = KT / 8;
+    \\constexpr int GPP = 32 / LPG;
+    \\constexpr int WL = KT / 32;
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const uint row = threadgroup_position_in_grid.y * 4 + simdgroup_index_in_threadgroup;
+    \\// Rows past the input's are the tile's padding: they quantize as zeros.
+    \\const bool live = int(row) < x_shape[0];
+    \\const device T* xr = x + (size_t)(live ? row : 0) * K;
+    \\const int t = int(lane % LPG);
+    \\for (int g0 = 0; g0 < Kg; g0 += GPP) {
+    \\  const int g = g0 + int(lane / LPG);
+    \\  float v[8];
+    \\  float a = 0.0f;
+    \\  if (live && g < Kg) {
+    \\    const vec<T, 8> xv = *(const device vec<T, 8>*)(xr + g * KT + t * 8);
+    \\    for (int i = 0; i < 8; i++) { v[i] = float(xv[i]); a = max(a, abs(v[i])); }
+    \\  } else {
+    \\    for (int i = 0; i < 8; i++) v[i] = 0.0f;
+    \\  }
+    \\  for (uint o = 1; o < LPG; o <<= 1) a = max(a, simd_shuffle_xor(a, o));
+    \\  const float sc = max(a / 127.0f, 1.0e-20f);
+    \\  float rs = 0.0f;
+    \\  char q[8];
+    \\  for (int i = 0; i < 8; i++) {
+    \\    const float qq = clamp(rint(v[i] / sc), -127.0f, 127.0f);
+    \\    rs += qq;
+    \\    q[(i & 1) * 4 + (i >> 1)] = (char)qq;
+    \\  }
+    \\  for (uint o = 1; o < LPG; o <<= 1) rs += simd_shuffle_xor(rs, o);
+    \\  if (g < Kg) {
+    \\    device char* o = (device char*)xq + (size_t)row * K + g * KT + 32 * (t % WL) + 4 * (t / WL);
+    \\    *(device char4*)(o) = char4(q[0], q[1], q[2], q[3]);
+    \\    *(device char4*)(o + 16) = char4(q[4], q[5], q[6], q[7]);
+    \\    if (t == 0) {
+    \\      ascale[(size_t)row * Kg + g] = sc;
+    \\      ra[(size_t)row * Kg + g] = static_cast<half>(sc * rs * (1.0f / KT));
+    \\    }
+    \\  }
+    \\}
+;
+
 var quant_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const QKey = struct { m: c_int, k: c_int, dt: mlx.mlx_dtype };
 var quant_cfg: std.AutoHashMapUnmanaged(QKey, mlx.mlx_fast_metal_kernel_config) = .{};
@@ -324,6 +465,55 @@ pub fn quantizeRows(x2: mlx.mlx_array, rows: c_int, k: c_int, s: mlx.mlx_stream)
     return .{ .xq = xq, .ascale = ascale, .rsum = rsum };
 }
 
+var quant4_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const Q4Key = struct { m: c_int, k: c_int, kt: c_int, dt: mlx.mlx_dtype };
+var quant4_cfg: std.AutoHashMapUnmanaged(Q4Key, mlx.mlx_fast_metal_kernel_config) = .{};
+
+fn quant4Config(key: Q4Key) !mlx.mlx_fast_metal_kernel_config {
+    if (quant4_cfg.get(key)) |c| return c;
+    const kg = @divExact(key.k, key.kt);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.m, key.k }, 2, .int8));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.m, kg }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.m, kg }, 2, .float16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128, @divExact(key.m, 4), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KT", key.kt));
+    try quant4_cfg.put(std.heap.c_allocator, key, cfg);
+    return cfg;
+}
+
+/// The 4-bit route's activation: `rsum` holds `as * rowsum / KT` in half.
+/// `rows` is a multiple of 32 and may exceed x2's row count (tile padding).
+pub fn quantizeRows4(x2: mlx.mlx_array, rows: c_int, k: c_int, kt: c_int, s: mlx.mlx_stream) !Quantized {
+    quantize_calls += 1;
+    if (quant4_kernel == null) {
+        const in_names = [_][*:0]const u8{"x"};
+        const out_names = [_][*:0]const u8{ "xq", "ascale", "ra" };
+        const iv = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const kk = mlx.mlx_fast_metal_kernel_new("msv_int8_quant4", iv, ov, QUANT4_SOURCE, "", true, false);
+        if (kk.ctx == null) return error.MetalKernelCompileFailed;
+        quant4_kernel = kk;
+    }
+    const inputs = [_]mlx.mlx_array{x2};
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, quant4_kernel.?, iv, try quant4Config(.{ .m = rows, .k = k, .kt = kt, .dt = mlx.mlx_array_dtype(x2) }), s));
+    var res: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (res) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    for (&res, 0..) |*r, i| try mlx.check(mlx.mlx_vector_array_get(r, outs, i));
+    return .{ .xq = res[0], .ascale = res[1], .rsum = res[2] };
+}
+
 fn retained(a: mlx.mlx_array) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&r, a));
@@ -339,6 +529,7 @@ fn retainedQ(q: Quantized) !Quantized {
 /// (keyed like `rht.Registry`'s memo: the shape storage a retained handle pins).
 var memo_x: mlx.mlx_array = .{ .ctx = null };
 var memo_signs: ?*anyopaque = null;
+var memo_kt4: c_int = 0;
 var memo_q: ?Quantized = null;
 
 var rotq_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -383,20 +574,29 @@ pub fn rotateQuantizeRows(x2: mlx.mlx_array, signs: mlx.mlx_array, rows: c_int, 
 /// The rotation to fuse into the quantizer: `H(signs * x)` per 1024 block.
 pub const Rotation = struct { signs: mlx.mlx_array };
 
-fn quantizedFor(x: mlx.mlx_array, x2: mlx.mlx_array, rot: ?Rotation, rows: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
+/// `kt4` names the activation layout: 0 for the 2-bit route's, else the 4-bit
+/// route's weight group size. A memo hit needs the same layout, since one
+/// activation can feed weights of different bits or groups (mixed packs).
+fn quantizedFor(x: mlx.mlx_array, x2: mlx.mlx_array, rot: ?Rotation, rows: c_int, k: c_int, kt4: c_int, s: mlx.mlx_stream) !Quantized {
     const sig: ?*anyopaque = if (rot) |r| r.signs.ctx else null;
     if (memo_q) |mq| {
         // Identity, not shape: the shape pointer names the array itself, and the memo
         // retains `memo_x`, so its address cannot be reused by another activation.
-        if (mlx.mlx_array_shape(memo_x) == mlx.mlx_array_shape(x) and memo_signs == sig) return retainedQ(mq);
+        if (mlx.mlx_array_shape(memo_x) == mlx.mlx_array_shape(x) and memo_signs == sig and memo_kt4 == kt4) return retainedQ(mq);
     }
-    var q = if (rot) |r| try rotateQuantizeRows(x2, r.signs, rows, k, s) else try quantizeRows(x2, rows, k, s);
+    var q = if (rot) |r|
+        try rotateQuantizeRows(x2, r.signs, rows, k, s)
+    else if (kt4 != 0)
+        try quantizeRows4(x2, rows, k, kt4, s)
+    else
+        try quantizeRows(x2, rows, k, s);
     errdefer q.deinit();
     if (memo_q) |*mq| mq.deinit();
     if (memo_x.ctx != null) _ = mlx.mlx_array_free(memo_x);
     memo_q = null;
     memo_x = try retained(x);
     memo_signs = sig;
+    memo_kt4 = kt4;
     memo_q = try retainedQ(q);
     return q;
 }
@@ -430,6 +630,7 @@ pub fn dropMemo() void {
     memo_q = null;
     memo_x = .{ .ctx = null };
     memo_signs = null;
+    memo_kt4 = 0;
 }
 
 fn transposed(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -453,6 +654,147 @@ fn derivedCached(cache: *Cache, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx
     const d = Derived{ .scT = scT, .biT = biT };
     try cache.map.put(std.heap.c_allocator, key, d);
     return d;
+}
+
+/// `a` [N, Kg] -> [Kg, NP] with a zero tail, NP = N rounded up to 128, so a
+/// tile past N reads zeros instead of the next group's row.
+fn transposedPadded(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const n = mlx.getShape(a)[0];
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_transpose(&t, a, s));
+    var p = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p);
+    const zero = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(zero);
+    try mlx.check(mlx.mlx_pad(&p, t, &[_]c_int{1}, 1, &[_]c_int{0}, 1, &[_]c_int{@divTrunc(n + 127, 128) * 128 - n}, 1, zero, "constant", s));
+    var c = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, p, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    return c;
+}
+
+/// The 4-bit route's constants: the scales group-major and the biases as half
+/// times the group size (the tile-end matmul's operand), both padded.
+fn derived4Cached(cache: *Cache, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, kt: c_int, s: mlx.mlx_stream) !Derived {
+    const key = @intFromPtr(w.ctx);
+    if (cache.map.get(key)) |c| return c;
+    const scT = try transposedPadded(sc, s);
+    errdefer _ = mlx.mlx_array_free(scT);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_astype(&b32, bi, .float32, s));
+    var bk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bk);
+    const ktf = mlx.mlx_array_new_float(@floatFromInt(kt));
+    defer _ = mlx.mlx_array_free(ktf);
+    try mlx.check(mlx.mlx_multiply(&bk, b32, ktf, s));
+    var bh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bh);
+    try mlx.check(mlx.mlx_astype(&bh, bk, .float16, s));
+    const biT = try transposedPadded(bh, s);
+    const d = Derived{ .scT = scT, .biT = biT };
+    try cache.map.put(std.heap.c_allocator, key, d);
+    return d;
+}
+
+var kernel4_cache: ?mlx.mlx_fast_metal_kernel = null;
+const Cfg4Key = struct { n: c_int, mpad: c_int, kt: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype };
+var cfg4_cache: std.AutoHashMapUnmanaged(Cfg4Key, mlx.mlx_fast_metal_kernel_config) = .{};
+var engaged4_logged = false;
+/// 4-bit route launches, for the engagement tests and A/B proof.
+pub var engaged4: u64 = 0;
+
+fn kernel4() !mlx.mlx_fast_metal_kernel {
+    if (kernel4_cache) |k| return k;
+    const in_names = [_][*:0]const u8{ "xq", "w", "scales", "biases", "ascale", "ra" };
+    const out_names = [_][*:0]const u8{"y"};
+    const iv = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("msv_qmm_int8_prefill4", iv, ov, SOURCE4, HEADER, true, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    kernel4_cache = k;
+    return k;
+}
+
+fn config4For(key: Cfg4Key) !mlx.mlx_fast_metal_kernel_config {
+    if (cfg4_cache.get(key)) |c| return c;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.mpad, key.n }, 2, key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * @divTrunc(key.n + 127, 128), @divExact(key.mpad, 32), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "ST", key.st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KT", key.kt));
+    try cfg4_cache.put(std.heap.c_allocator, key, cfg);
+    return cfg;
+}
+
+/// `x @ w.T` for 4-bit affine weights at prompt width (`MIN_ROWS_4`), LOSSY like `qmm`; null
+/// outside the route. Its own entry so only the caller's 4-bit gate reaches it.
+pub fn qmm4(cache: *Cache, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (bi.ctx == null or !mlx.streamIsGpu(s)) return null;
+    if (!@import("transformer.zig").naxAvailable()) return null;
+    if (group_size != 32 and group_size != 64 and group_size != 128) return null;
+    const dt = mlx.mlx_array_dtype(x);
+    if (dt != .float16 and dt != .bfloat16) return null;
+    const st = mlx.mlx_array_dtype(sc);
+    if (st != .float16 and st != .bfloat16 and st != .float32) return null;
+    const xs = mlx.getShape(x);
+    const ws = mlx.getShape(w);
+    if (xs.len == 0 or xs.len > 8 or ws.len != 2) return null;
+    var m: c_int = 1;
+    for (xs[0 .. xs.len - 1]) |d| m *= d;
+    const k = xs[xs.len - 1];
+    const n = ws[0];
+    const kt: c_int = @intCast(group_size);
+    if (m < MIN_ROWS_4 or @rem(k, kt) != 0 or ws[1] * 8 != k) return null;
+
+    const mpad = @divTrunc(m + 31, 32) * 32;
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ m, k }, 2, s));
+    var q = try quantizedFor(x, x2, null, mpad, k, kt, s);
+    defer q.deinit();
+    const d = try derived4Cached(cache, w, sc, bi, kt, s);
+
+    engaged4 += 1;
+    if (!engaged4_logged) {
+        engaged4_logged = true;
+        msv_log.info("[int8-prefill] 4-bit engaged (LOSSY: activations quantized to int8 per {d}): first call M={d} N={d} K={d}\n", .{ kt, m, n, k });
+    }
+    msv_log.debug("[int8-prefill] 4-bit M={d} N={d} K={d}\n", .{ m, n, k });
+    const inputs = [_]mlx.mlx_array{ q.xq, w, d.scT, d.biT, q.ascale, q.rsum };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try kernel4(), iv, try config4For(.{ .n = n, .mpad = mpad, .kt = kt, .dt = dt, .st = st }), s));
+    var yy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(yy);
+    try mlx.check(mlx.mlx_vector_array_get(&yy, outs, 0));
+    return try unpadRows(yy, xs, m, n, mpad, s);
+}
+
+/// `[mpad, n]` -> x's leading shape with last dim n.
+fn unpadRows(yy: mlx.mlx_array, xs: []const c_int, m: c_int, n: c_int, mpad: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var ysl = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ysl);
+    if (mpad == m) {
+        try mlx.check(mlx.mlx_array_set(&ysl, yy));
+    } else {
+        try mlx.check(mlx.mlx_slice(&ysl, yy, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ m, n }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    }
+    var out_shape: [8]c_int = undefined;
+    @memcpy(out_shape[0..xs.len], xs);
+    out_shape[xs.len - 1] = n;
+    var r = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&r, ysl, &out_shape, xs.len, s));
+    return r;
 }
 
 var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
@@ -491,7 +833,7 @@ fn configFor(key: CfgKey) !mlx.mlx_fast_metal_kernel_config {
     return cfg;
 }
 
-/// `x @ w.T` with the activation quantized to int8 per 128-group, or null when
+/// `x @ w.T` with the activation quantized to int8 per weight group, or null when
 /// the shape/dtype is outside the route (caller keeps whatever it would do).
 /// LOSSY BY CONSTRUCTION — see the module comment.
 pub fn qmm(
@@ -558,7 +900,7 @@ fn qmmImpl(
     var x2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x2);
     try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ m, k }, 2, s));
-    var q = try quantizedFor(x, x2, rot, mpad, k, s);
+    var q = try quantizedFor(x, x2, rot, mpad, k, 0, s);
     defer q.deinit();
     const d = try derivedCached(cache, w, sc, bi, bneg, s);
 
@@ -575,19 +917,7 @@ fn qmmImpl(
     var yy = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(yy);
     try mlx.check(mlx.mlx_vector_array_get(&yy, outs, 0));
-    var ysl = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ysl);
-    if (mpad == m) {
-        try mlx.check(mlx.mlx_array_set(&ysl, yy));
-    } else {
-        try mlx.check(mlx.mlx_slice(&ysl, yy, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ m, n }, 2, &[_]c_int{ 1, 1 }, 2, s));
-    }
-    var out_shape: [8]c_int = undefined;
-    @memcpy(out_shape[0..xs.len], xs);
-    out_shape[xs.len - 1] = n;
-    var r = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&r, ysl, &out_shape, xs.len, s));
-    return r;
+    return try unpadRows(yy, xs, m, n, mpad, s);
 }
 
 // ── tests ──
@@ -889,4 +1219,161 @@ test "qmm_int8: a fresh cache derives its own constants for a reused weight hand
     const v1 = mlx.mlx_array_data_float32(y1).?;
     // Scales tripled, so every output triples (to f16 rounding).
     for (0..@intCast(m * n)) |i| try std.testing.expectApproxEqAbs(3.0 * v0[i], v1[i], 0.02 * @abs(v1[i]) + 0.05);
+}
+
+// The 4-bit bar: relative rms error against the fp32 product of the same
+// dequantized weights stays under 1.2% (int8 per group predicts ~0.6%).
+test "qmm_int8 4-bit: error stays within the int8 bar at prompt width (g64)" {
+    try requireNax();
+    try expectWithinBar4(MIN_ROWS_4, 512, 1024, 64, false);
+}
+
+test "qmm_int8 4-bit: a row count that is not a whole tile keeps the bar" {
+    try requireNax();
+    try expectWithinBar4(MIN_ROWS_4 + 2, 384, 512, 64, false);
+}
+
+test "qmm_int8 4-bit: widths that are not whole tiles keep the bar and write no column past N" {
+    try requireNax();
+    try expectWithinBar4(MIN_ROWS_4, 320, 512, 64, false);
+    try expectWithinBar4(MIN_ROWS_4 + 5, 100, 512, 64, false);
+}
+
+test "qmm_int8 4-bit: group sizes 32 and 128 keep the bar" {
+    try requireNax();
+    try expectWithinBar4(MIN_ROWS_4, 256, 512, 32, false);
+    try expectWithinBar4(MIN_ROWS_4, 256, 1024, 128, false);
+}
+
+test "qmm_int8 4-bit: massive activation channels stay finite and within the bar" {
+    try requireNax();
+    try expectWithinBar4(MIN_ROWS_4, 256, 1024, 64, true);
+}
+
+fn expectWithinBar4(m: c_int, n: c_int, k: c_int, gs: c_int, outliers: bool) !void {
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const mu: usize = @intCast(m);
+    const nu: usize = @intCast(n);
+    const ku: usize = @intCast(k);
+    var prng = std.Random.DefaultPrng.init(17);
+    const rnd = prng.random();
+    const codes = try std.testing.allocator.alloc(u32, nu * ku / 8);
+    defer std.testing.allocator.free(codes);
+    for (codes) |*wd| wd.* = rnd.int(u32);
+    const gu: usize = @intCast(gs);
+    const sb = try std.testing.allocator.alloc(f32, 2 * nu * ku / gu);
+    defer std.testing.allocator.free(sb);
+    for (sb[0 .. nu * ku / gu]) |*e| e.* = 0.002 + 0.01 * rnd.float(f32);
+    for (sb[nu * ku / gu ..]) |*e| e.* = -0.08 + 0.04 * rnd.float(f32);
+    const wq = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ n, @divExact(k, 8) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(wq);
+    const sb32 = mlx.mlx_array_new_data(sb.ptr, &[_]c_int{ 2 * n, @divExact(k, gs) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(sb32);
+    var sbh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sbh);
+    try mlx.check(mlx.mlx_astype(&sbh, sb32, .bfloat16, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_slice(&sc, sbh, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ n, @divExact(k, gs) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_slice(&bi, sbh, &[_]c_int{ n, 0 }, 2, &[_]c_int{ 2 * n, @divExact(k, gs) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+
+    var wt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_dequantize(&wt, wq, sc, bi, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    var wtt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wtt);
+    try mlx.check(mlx.mlx_transpose(&wtt, wt, s));
+
+    const xv = try std.testing.allocator.alloc(f32, mu * ku);
+    defer std.testing.allocator.free(xv);
+    for (xv) |*e| e.* = rnd.floatNorm(f32);
+    if (outliers) for (0..mu) |r| {
+        xv[r * ku + 7] = 3000.0;
+        xv[r * ku + 300] = -1500.0;
+    };
+    const x32 = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ m, k }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+    var xr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xr);
+    try mlx.check(mlx.mlx_astype(&xr, x, .float32, s));
+    var truth_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(truth_a);
+    try mlx.check(mlx.mlx_matmul(&truth_a, xr, wtt, s));
+    try mlx.check(mlx.mlx_array_eval(truth_a));
+    const truth = mlx.mlx_array_data_float32(truth_a).?[0 .. mu * nu];
+
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const before = engaged4;
+    const got = (try qmm4(&cache, x, wq, sc, bi, @intCast(gs), s)) orelse return error.RouteDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expectEqual(before + 1, engaged4);
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
+    try std.testing.expectEqualSlices(c_int, &[_]c_int{ m, n }, mlx.getShape(got));
+    const eg = try errVsTruth(got, truth, mu, nu, s);
+    var ts: f64 = 0;
+    for (truth) |t| ts += @as(f64, t) * @as(f64, t);
+    const rel = eg.rms / @as(f32, @floatCast(@sqrt(ts / @as(f64, @floatFromInt(mu * nu)))));
+    std.debug.print("[qmm_int8] 4-bit M={d} N={d} K={d} g{d}{s}: {d:.3}% relative rms\n", .{ m, n, k, gs, if (outliers) " outliers" else "", rel * 100.0 });
+    try std.testing.expect(rel < 0.012);
+}
+
+test "qmm_int8 4-bit: declines below its row floor, on the CPU stream, and for an unknown group" {
+    const k: c_int = 512;
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 128, @divExact(k, 8) }, 2, .uint32, mlx.gpuStream()));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ 128, @divExact(k, 64) }, 2, .bfloat16, mlx.gpuStream()));
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const cases = [_]struct { m: c_int, gs: u32, cpu: bool }{
+        .{ .m = MIN_ROWS_4 - 1, .gs = 64, .cpu = false },
+        .{ .m = MIN_ROWS_4, .gs = 64, .cpu = true },
+        .{ .m = MIN_ROWS_4, .gs = 16, .cpu = false },
+    };
+    for (cases) |c| {
+        const s = if (c.cpu) mlx.mlx_default_cpu_stream_new() else mlx.gpuStream();
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ c.m, k }, 2, .bfloat16, s));
+        try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm4(&cache, x, w, sc, sc, c.gs, s));
+    }
+}
+
+test "qmm_int8 4-bit: one activation quantizes once per weight group size" {
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const k: c_int = 512;
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_random_uniform(&x, mlx.mlx_array_new_float(-1.0), mlx.mlx_array_new_float(1.0), &[_]c_int{ MIN_ROWS_4, k }, 2, .bfloat16, .{ .ctx = null }, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 128, @divExact(k, 8) }, 2, .uint32, s));
+    var sc64 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc64);
+    try mlx.check(mlx.mlx_ones(&sc64, &[_]c_int{ 128, @divExact(k, 64) }, 2, .bfloat16, s));
+    var sc32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc32);
+    try mlx.check(mlx.mlx_ones(&sc32, &[_]c_int{ 128, @divExact(k, 32) }, 2, .bfloat16, s));
+    var w2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w2);
+    try mlx.check(mlx.mlx_zeros(&w2, &[_]c_int{ 128, @divExact(k, 8) }, 2, .uint32, s));
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const before = quantize_calls;
+    for ([_]struct { w: mlx.mlx_array, sc: mlx.mlx_array, gs: u32 }{ .{ .w = w, .sc = sc64, .gs = 64 }, .{ .w = w, .sc = sc64, .gs = 64 }, .{ .w = w2, .sc = sc32, .gs = 32 } }) |c| {
+        const y = (try qmm4(&cache, x, c.w, c.sc, c.sc, c.gs, s)) orelse return error.RouteDeclined;
+        _ = mlx.mlx_array_free(y);
+    }
+    try std.testing.expectEqual(before + 2, quantize_calls);
 }

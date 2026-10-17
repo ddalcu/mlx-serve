@@ -15,7 +15,7 @@ pub const Override = struct {
     mtp: ?bool = null,
     mtp_acceptance: ?mtp_acceptance.Mode = null,
     mtp_greedy_tail: ?bool = null,
-    /// LOSSY int8-activation prefill for 2-bit Prism packs (`qmm_int8`).
+    /// LOSSY int8-activation prefill for 2-bit Prism and 4-bit affine packs (`qmm_int8`).
     int8_prefill: ?bool = null,
     /// Serve this model on the Neural Engine (`arch/ane_lm.zig`) instead of the GPU.
     ane: ?bool = null,
