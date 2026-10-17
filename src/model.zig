@@ -1153,8 +1153,8 @@ pub const ModelConfig = struct {
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
         if (self.rope_llama3 != null) return "llama3-rope-v1";
-        // A pool's completing indexer row stores the pool's key in its gate half.
-        if (self.isGlm5()) return "glm5-pooled-keys-v1";
+        // A pool's completing indexer row stores the pool's key in its gate half; v2: the KDA q/k norm epsilon.
+        if (self.isGlm5()) return "glm5-pooled-keys-v2";
         // A restored bf16 state would keep running bf16: every GDN kernel takes its state's dtype.
         if (self.ssm_state_f32) return "gdn-f32-state-v1";
         return null;
@@ -5199,7 +5199,8 @@ pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool
 }
 
 /// An f32 layer-norm weight beside bf16 activations (NVIDIA's ModelOpt GLM pack stores
-/// `post_attention_layernorm` f32): `rms_norm` promotes to the weight's dtype, so the MoE reads f32
+/// `post_attention_layernorm` f32; the loader narrows it for ModelOpt packs only, the one
+/// reference measured): `rms_norm` promotes to the weight's dtype, so the MoE reads f32
 /// and the fused hyper-connection read declines. Narrowed like the f16 norms; the f32 per-channel
 /// state tables (`A_log`, `dt_bias`, `hc_*`, `e_score_correction_bias`) are not norms and stay f32, and a
 /// vision tower keeps the f32 its reference runs in.
@@ -5335,7 +5336,7 @@ pub fn loadSafetensorsFile(
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
         if (!(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
-            !opts.keep_f16 and (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) or narrowsLoadedF32Norm(key_str, ndim, mlx.mlx_array_dtype(value))) and
+            !opts.keep_f16 and (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) or (opts.modelopt and narrowsLoadedF32Norm(key_str, ndim, mlx.mlx_array_dtype(value)))) and
             (ndim != 1 or narrow1dEnabled()))
         {
             var cast = mlx.mlx_array_new();
@@ -6798,8 +6799,8 @@ test "ModelConfig: glm5_next binds KDA, sparse latent attention, mHC and the cla
     var config = try parseConfigFromJson(testing.allocator, glm5_next_pack_json);
     defer config.deinit(testing.allocator);
     try testing.expect(config.isGlm5());
-    // Its indexer rows carry pooled keys: an older SSD cache root never restores into it.
-    try testing.expectEqualStrings("glm5-pooled-keys-v1", config.cacheLayoutNamespace().?);
+    // Its indexer rows carry pooled keys and its KDA state is built from the reference's q/k norm: an older SSD cache root never restores into it.
+    try testing.expectEqualStrings("glm5-pooled-keys-v2", config.cacheLayoutNamespace().?);
     try testing.expect(!config.isMla());
     try testing.expectEqualStrings("language_model.model", config.weight_prefix);
     // Layers 3 and 7 are sparse attention, the rest KDA.
@@ -7725,6 +7726,26 @@ test "loadWeightsOpt deepseek_v41: tensors nested under language_model. (oMLX's 
     defer w.deinit();
     try testing.expect(w.get("norm.weight") != null);
     try testing.expectEqual(@as(u32, 1), w.count());
+}
+
+test "loadWeightsOpt: an f32 trunk norm narrows to bf16 for a ModelOpt pack, any other keeps its dtype" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const name = "model.language_model.layers.0.post_attention_layernorm.weight";
+    const hdr = "{\"" ++ name ++ "\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+    var shard: [8 + hdr.len + 8]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &shard });
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    for ([_]bool{ true, false }) |modelopt| {
+        var w = try loadWeightsOpt(io, testing.allocator, dir, .{ .modelopt = modelopt });
+        defer w.deinit();
+        const want: mlx.mlx_dtype = if (modelopt and narrow1dEnabled()) .bfloat16 else .float32;
+        try testing.expectEqual(want, mlx.mlx_array_dtype(w.get(name).?));
+    }
 }
 
 test "ModelConfig deepseek_v41: shapes the forward does not implement are refused by name" {
