@@ -588,6 +588,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "serve")) {
             arg_start = 2;
             use_default_models_root = true;
+        } else if (std.mem.eql(u8, cmd, "dist-probe")) {
+            @import("distributed.zig").cmdProbe(io, args[2..]) catch std.process.exit(1);
+            return;
         } else if (std.mem.eql(u8, cmd, "launch")) {
             if (args.len < 3) {
                 log.err("usage: mlx-serve launch <agent> — supported: {s}\n", .{launch_mod.AgentKind.names});
@@ -596,7 +599,7 @@ pub fn main(init: std.process.Init) !void {
             try launch_mod.cmdLaunch(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, serve, or dist-probe)\n", .{cmd});
             std.process.exit(1);
         }
     }

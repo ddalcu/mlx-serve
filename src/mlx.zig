@@ -249,6 +249,20 @@ pub extern "c" fn mlx_array_data_int32(arr: mlx_array) ?[*]const i32;
 pub extern "c" fn mlx_array_data_uint32(arr: mlx_array) ?[*]const u32;
 pub extern "c" fn mlx_array_data_uint8(arr: mlx_array) ?[*]const u8;
 
+// Distributed (mlx-c distributed.h / distributed_group.h); JACCL = RDMA over Thunderbolt 5
+pub const mlx_distributed_group = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_distributed_group_new() mlx_distributed_group;
+pub extern "c" fn mlx_distributed_is_available(bk: ?[*:0]const u8) bool;
+pub extern "c" fn mlx_distributed_init(res: *mlx_distributed_group, strict: bool, bk: ?[*:0]const u8) c_int;
+pub extern "c" fn mlx_distributed_group_free(group: mlx_distributed_group) c_int;
+pub extern "c" fn mlx_distributed_group_rank(group: mlx_distributed_group) c_int;
+pub extern "c" fn mlx_distributed_group_size(group: mlx_distributed_group) c_int;
+pub extern "c" fn mlx_distributed_all_sum(res: *mlx_array, x: mlx_array, group: mlx_distributed_group, s: mlx_stream) c_int;
+pub extern "c" fn mlx_distributed_all_gather(res: *mlx_array, x: mlx_array, group: mlx_distributed_group, s: mlx_stream) c_int;
+pub extern "c" fn mlx_distributed_send(res: *mlx_array, x: mlx_array, dst: c_int, group: mlx_distributed_group, s: mlx_stream) c_int;
+pub extern "c" fn mlx_distributed_recv(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, src: c_int, group: mlx_distributed_group, s: mlx_stream) c_int;
+pub extern "c" fn mlx_distributed_recv_like(res: *mlx_array, x: mlx_array, src: c_int, group: mlx_distributed_group, s: mlx_stream) c_int;
+
 // Vector array
 pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
 pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array;
