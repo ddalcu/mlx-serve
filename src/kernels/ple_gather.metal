@@ -26,7 +26,18 @@ const ulong row = ulong(r + params[53 + h]);
 
 const long bits = params[6];
 ushort q16;
-if (bits == 16) {
+if (params[86] != 0) {
+  // NVFP4: e2m1 code (low nibble first) times its e4m3 group scale times the global scale, in
+  // NgramTable.dequantNvfp4Row's order. Bit placement into half scales them by 2^-14 and 2^-8.
+  const uint b = uint(table[ulong(params[10]) + row * ulong(params[8]) * 4 + ulong(i / 2)]);
+  const uint c = (b >> uint((i % 2) * 4)) & 0xFu;
+  const float e2m1 = float(as_type<half>(ushort(((c & 0x7u) << 9) | ((c & 0x8u) << 12)))) * 16384.0f;
+  const uint sb = uint(table[ulong(params[11]) + row * ulong(params[9]) + ulong(i / 16)]);
+  const float e4m3 = float(as_type<half>(ushort(((sb & 0x7Fu) << 7) | ((sb & 0x80u) << 8)))) * 256.0f;
+  const float sc = e4m3 * as_type<float>(uint(params[85]));
+  const uint u = as_type<uint>(e2m1 * sc);
+  q16 = ushort((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+} else if (bits == 16) {
   q16 = ple_u16(table, ulong(params[10]) + (row * ulong(DIM) + ulong(i)) * 2);
 } else {
   const ulong off = ulong(i * bits);

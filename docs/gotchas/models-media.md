@@ -2,6 +2,10 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### ModelOpt's NVFP4 global scale is not MLX's (NVIDIA Flash Next FP4)
+
+NVIDIA's pack loaded and chatted, but every image read as "a blank white canvas". The vision tower's NVFP4 linears were dequantized with `weight_scale_2` passed as MLX's `global_scale`. ModelOpt stores `weight_scale_2 = amax / (448 x 6)`; MLX's kernels divide its `global_scale` by 448 x 6 themselves, so every weight came out 2688x too small. Fix: `modelopt_pack.dequantDense` multiplies by 448 x 6 first. Guard: `ModelOpt NVFP4 dense dequant` checks code x e4m3 x `weight_scale_2` exactly. The routed experts never meet MLX's convention: their per-expert scales ride the gate and the routing weight.
+
 ### RADIO configuration and numerics must follow the checkpoint
 
 Defect: native omni packs loaded text-only. Cause: vision keyed on a private `radio_vision` flag instead of `vision_config.model_type: "radio"`. Fix: loader and discovery share `model_discovery.hasRadioVision`; preprocessing follows the official float32 antialiased bicubic and float32 CPE (PIL's uint8 step moved pixels). Guards: native RADIO config tests, format corpus, the executed fp32 fixtures (cosine plus RMS ratio).

@@ -61,6 +61,8 @@ test {
     _ = @import("mimo_mtp.zig");
     _ = @import("glm_mtp.zig");
     _ = @import("sushi_pack.zig");
+    _ = @import("modelopt_pack.zig");
+    _ = @import("mxfp8_qmv.zig");
     _ = @import("dec_attn.zig");
     _ = @import("nax_attention.zig");
     _ = @import("glm5_next.zig");

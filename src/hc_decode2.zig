@@ -34,6 +34,7 @@ const ND_SOURCE =
     \\constexpr int K = HC * H;
     \\// A slot's 16 values are WPL words at 2/4/8 bits, else two 8-value packs of BITS bytes.
     \\constexpr bool WORD = (32 % BITS) == 0;
+    \\constexpr bool DENSE = BITS == 16;
     \\constexpr int VPW = WORD ? 32 / BITS : 8;
     \\constexpr int WPL = 16 / VPW;
     \\constexpr int KW = K / VPW;
@@ -69,8 +70,8 @@ const ND_SOURCE =
     \\          for (int e = 0; e < WPL; ++e) pr[r][i][e] = hc_pack8<BITS>(wb + e * BITS);
     \\        }
     \\        const size_t gi = (size_t)(n0 + r) * KG + (size_t)((base + slot * 16) / GS);
-    \\        ps[r][i] = float(dw_s[gi]);
-    \\        pb[r][i] = float(dw_b[gi]);
+    \\        ps[r][i] = DENSE ? 1.0f : float(dw_s[DENSE ? 0 : gi]);
+    \\        pb[r][i] = DENSE ? 0.0f : float(dw_b[DENSE ? 0 : gi]);
     \\      }
     \\    }
     \\  }
@@ -121,7 +122,7 @@ const ND_SOURCE =
     \\        float d = 0.0f;
     \\        for (int w = 0; w < WPL; ++w) {
     \\          if constexpr (WORD) {
-    \\            for (int j = 0; j < VPW; ++j) d += xr[w * VPW + j] * float((pw[r][i][w] >> (j * BITS)) & MASK);
+    \\            for (int j = 0; j < VPW; ++j) d += xr[w * VPW + j] * hc_val<T, DENSE>((pw[r][i][w] >> (j * BITS)) & MASK);
     \\          } else {
     \\            for (int j = 0; j < VPW; ++j) d += xr[w * VPW + j] * float(uint(pr[r][i][w] >> (j * BITS)) & MASK);
     \\          }
@@ -169,6 +170,7 @@ const U2_SOURCE =
     \\const int row = int(threadgroup_position_in_grid.z);
     \\const int j = int(threadgroup_position_in_grid.y) * COLS + int(sg);
     \\constexpr bool WORD = (32 % BITS) == 0;
+    \\constexpr bool DENSE = BITS == 16;
     \\constexpr int VPW = WORD ? 32 / BITS : 8;
     \\constexpr int R_by_p = R / VPW;
     \\constexpr int R_by_gs = R / GS;
@@ -192,8 +194,8 @@ const U2_SOURCE =
     \\      if constexpr (WORD) pw[h][i] = uw_q[hrow * R_by_p + (size_t)pack];
     \\      else pr[h][i] = hc_pack8<BITS>((const device uchar*)uw_q + hrow * (size_t)(R * BITS / 8) + (size_t)pack * BITS);
     \\      const size_t gi = hrow * R_by_gs + (size_t)((pack * VPW) / GS);
-    \\      ps[h][i] = float(uw_s[gi]);
-    \\      pb[h][i] = float(uw_b[gi]);
+    \\      ps[h][i] = DENSE ? 1.0f : float(uw_s[DENSE ? 0 : gi]);
+    \\      pb[h][i] = DENSE ? 0.0f : float(uw_b[DENSE ? 0 : gi]);
     \\    }
     \\  }
     \\}
@@ -219,7 +221,12 @@ const U2_SOURCE =
     \\  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     \\  for (int i = 0; i < RIT; ++i) {
     \\    const int pack = int(lane) + 32 * i;
-    \\    if (pack < R_by_p) {
+    \\    if (pack < R_by_p && DENSE) {
+    \\      // Two bf16 values a word.
+    \\      const int k_base = pack * VPW;
+    \\      a0 += float(acts[k_base]) * hc_val<T, true>(pw[h][i] & 0xFFFFu);
+    \\      a1 += float(acts[k_base + 1]) * hc_val<T, true>(pw[h][i] >> 16);
+    \\    } else if (pack < R_by_p) {
     \\      const int k_base = pack * VPW;
     \\      for (int ki = 0; ki < VPW; ki += 4) {
     \\        const int k = k_base + ki;
@@ -352,14 +359,20 @@ pub fn maxRows() c_int {
 /// Values per pack the HC kernels read: one word at 2/4/8 bits, 8 values in BITS bytes at 3/5/6.
 pub fn packValues(bits: u32) ?c_int {
     return switch (bits) {
-        2, 4, 8 => @intCast(32 / bits),
+        2, 4, 8, 16 => @intCast(32 / bits),
         3, 5, 6 => 8,
         else => null,
     };
 }
 
 /// Eight B-bit values packed in B bytes (3/5/6-bit), little-endian as mx.quantize lays them out.
+/// `hc_val`: a packed code as a float, or (16-bit dense) the raw weight's bits.
 pub const PACK8_HEADER =
+    \\template <typename T, bool DENSE>
+    \\inline float hc_val(uint q) {
+    \\  if (DENSE) return float(as_type<T>(ushort(q)));
+    \\  return float(q);
+    \\}
     \\template <int B>
     \\inline ulong hc_pack8(const device uchar* p) {
     \\  ulong r = 0;
@@ -468,9 +481,12 @@ pub fn read(
     if (!enabled() or !mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .bfloat16 and dt != .float16) return null;
-    inline for (.{ nw, ds, db, us, ub }) |a| {
+    const dense = bits == 16;
+    if (nw.ctx == null or mlx.mlx_array_dtype(nw) != dt) return null;
+    if (!dense) inline for (.{ ds, db, us, ub }) |a| {
         if (a.ctx == null or mlx.mlx_array_dtype(a) != dt) return null;
-    }
+    };
+    if (dense and dt != .bfloat16) return null;
     if (iw.ctx != null and mlx.mlx_array_dtype(iw) != dt) return null;
     const vpw = packValues(bits) orelse return null;
     const b: c_int = @intCast(bits);
@@ -530,16 +546,18 @@ pub fn read(
     var nd_out: [3]mlx.mlx_array = undefined;
     const wo = if (pend) |p| p.out else nw;
     const wi = if (pend) |p| p.inj else nw;
-    try run(nd_kernel.?, cfgs.nd, &.{ x, nw, if (inj == 1) iw else nw, eps, wo, wi, dw, ds, db }, s, &nd_out);
+    // Dense weights carry no scales; the kernel never reads the operands bound in their place.
+    const dsb: [4]mlx.mlx_array = if (dense) .{ nw, nw, nw, nw } else .{ ds, db, us, ub };
+    try run(nd_kernel.?, cfgs.nd, &.{ x, nw, if (inj == 1) iw else nw, eps, wo, wi, dw, dsb[0], dsb[1] }, s, &nd_out);
     defer _ = mlx.mlx_array_free(nd_out[0]);
     defer _ = mlx.mlx_array_free(nd_out[1]);
     errdefer _ = mlx.mlx_array_free(nd_out[2]);
     var upmix: [2]mlx.mlx_array = undefined;
     if (cfgs.upv != null and aligned16(uw)) {
-        try run(up_v_kernel.?, cfgs.upv.?, &.{ nd_out[0], nd_out[1], uw, us, ub }, s, &upmix);
+        try run(up_v_kernel.?, cfgs.upv.?, &.{ nd_out[0], nd_out[1], uw, dsb[2], dsb[3] }, s, &upmix);
         served_vec += 1;
     } else {
-        try run(up_kernel.?, cfgs.up, &.{ nd_out[0], nd_out[1], uw, us, ub }, s, &upmix);
+        try run(up_kernel.?, cfgs.up, &.{ nd_out[0], nd_out[1], uw, dsb[2], dsb[3] }, s, &upmix);
     }
     var stream = nd_out[2];
     if (wr == 0) {

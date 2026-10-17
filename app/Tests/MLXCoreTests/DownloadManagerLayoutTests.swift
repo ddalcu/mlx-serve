@@ -163,6 +163,17 @@ final class DownloadManagerLayoutTests: XCTestCase {
                                "engram/engram-L1.bin", "engram/engram-residents.safetensors"])
     }
 
+    /// NVIDIA ModelOpt packs keep their shards in `tensors/`; same rule as `cli.shouldDownload`.
+    func testSelectNeededFilesIncludesModelOptTensorsFolder() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 4_000],
+            ["path": "model.safetensors.index.json", "type": "file", "size": 47_000_000],
+            ["path": "tensors/model-00001-of-00021.safetensors", "type": "file", "size": 5_000_000_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+        XCTAssertEqual(paths, ["config.json", "model.safetensors.index.json", "tensors/model-00001-of-00021.safetensors"])
+    }
+
     /// oMLX OptiQ repos ship the MTP head as `optiq/mtp.safetensors` (a sibling
     /// of mlx-serve's `mtp/` layout) alongside `optiq/optiq_vision.safetensors`.
     /// The head must be pulled (server auto-loads it, delta-norms folded at load)

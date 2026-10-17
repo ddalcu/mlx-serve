@@ -922,12 +922,10 @@ pub const MtpModel = struct {
     fn maybeBuildDraftRerank(self: *MtpModel, target: *Transformer) void {
         const mode = draftRerankMode();
         if (mode == .off) return;
-        if (target.lm_head_s.ctx == null) return; // dense bf16 head — row-gather rerank unbuilt/unmeasured
         if (mode == .auto and self.m5NaxCostProfile(target) != .generic) return;
         const w_shape = mlx.getShape(target.lm_head_w);
         if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return;
-        const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
-        if (head_qp.bits <= 2) return; // nothing coarser to gain
+        if (target.lm_head_s.ctx != null and headQuantParams(&target.config, target.lm_head_w, target.lm_head_s).bits <= 2) return; // nothing coarser to gain
 
         // The ONE env read: the built head carries its width from here on.
         const rc = buildRerankCoarse(self.s, target, rerankCoarseBits()) orelse return;
@@ -1056,11 +1054,12 @@ pub const RerankCoarse = struct {
 /// every refusal returns null and the caller keeps its full-readout path.
 pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?RerankCoarse {
     if (bits == 0) return null;
-    if (target.lm_head_s.ctx == null) return null; // dense bf16 - row-gather rerank unbuilt/unmeasured
     if (target.rht != null) return null;
     const w_shape = mlx.getShape(target.lm_head_w);
     if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return null;
-    const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    // A dense bf16 head ([V, H], 16 bits) always reads more than the coarse copy.
+    const dense = target.lm_head_s.ctx == null;
+    const head_qp: transformer_mod.QuantParams = if (dense) .{ .bits = 16, .group_size = 0, .mode = .affine } else headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
     if (bits >= head_qp.bits) return null; // no byte saving over the head we already read
 
     var rc = requantizeRows(
@@ -1253,10 +1252,20 @@ fn rerankShortlistRow(
 
     // Re-score the shortlist through the trunk head's own rows: gathered
     // packed rows are self-contained (w [V, K*bits/32], scales/biases
-    // [V, K/gs]), so a 32-row quantized matmul is exact.
-    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    // [V, K/gs]), so a 32-row quantized matmul is exact; dense rows are a plain matmul.
     var w32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(w32);
+    if (target.lm_head_s.ctx == null) {
+        try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
+        var wt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt);
+        try mlx.check(mlx.mlx_transpose(&wt, w32, s));
+        var dense = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense);
+        try mlx.check(mlx.mlx_matmul(&dense, x_row, wt, s));
+        return .{ .cands = cands, .exact = dense, .rows = rows };
+    }
+    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
     var s32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(s32);
     var b32 = mlx.mlx_array_new();
@@ -5967,6 +5976,17 @@ pub const RerankFixture = struct {
         return .{ .xfm = xfm, .dense = dense, .vocab = vocab, .hidden = hidden };
     }
 
+    /// The same head left dense: `lm_head_w` the bf16 [V, H] rows, no scales.
+    pub fn initDense(s: mlx.mlx_stream, vocab: c_int, hidden: c_int, seed: u64) !RerankFixture {
+        var fx = try init(s, vocab, hidden, 8, 64, seed);
+        _ = mlx.mlx_array_free(fx.xfm.lm_head_s);
+        _ = mlx.mlx_array_free(fx.xfm.lm_head_b);
+        try mlx.check(mlx.mlx_array_set(&fx.xfm.lm_head_w, fx.dense));
+        fx.xfm.lm_head_s = mlx.mlx_array_new();
+        fx.xfm.lm_head_b = mlx.mlx_array_new();
+        return fx;
+    }
+
     pub fn deinit(self: *RerankFixture) void {
         _ = mlx.mlx_array_free(self.dense);
         _ = mlx.mlx_array_free(self.xfm.lm_head_w);
@@ -6622,4 +6642,45 @@ test "mtp: TensorFold's Nemotron-H head (`mtp-4bit.safetensors`, layers.0/1 name
     try testing.expect(m.mlp == .nemotron_moe);
     try testing.expect(m.mlp.nemotron_moe.shared != null);
     try testing.expectEqualSlices(c_int, &.{ 8, 4 }, mlx.getShape(m.mlp.nemotron_moe.router_w));
+}
+
+test "draft rerank on a dense bf16 head: shortlisted rows re-score to the full readout's logits" {
+    if (mlx.noGpuBackend()) return;
+    mlx.installErrorHandler();
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var fx = try RerankFixture.initDense(s, TOP32_MIN_ROWS + 96, 256, 0xDE45E);
+    defer fx.deinit();
+    const coarse = buildRerankCoarse(s, &fx.xfm, 2) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    var logged = false;
+    const x = try fx.randomX(s, 3);
+    defer _ = mlx.mlx_array_free(x);
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    var wt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_transpose(&wt, fx.dense, s));
+    try mlx.check(mlx.mlx_matmul(&full, x, wt, s));
+    const ex = try readRow(allocator, s, full, @intCast(fx.vocab));
+    defer allocator.free(ex);
+    const sl = (try rerankShortlist(s, &fx.xfm, &slot, &logged, x, null)) orelse return error.RerankDeclined;
+    defer {
+        _ = mlx.mlx_array_free(sl.cands);
+        _ = mlx.mlx_array_free(sl.exact);
+    }
+    const got = try readRow(allocator, s, sl.exact, 32);
+    defer allocator.free(got);
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    try mlx.check(mlx.mlx_astype(&ids, sl.cands, .int32, s));
+    try mlx.check(mlx.mlx_array_eval(ids));
+    const pid = mlx.mlx_array_data_int32(ids).?;
+    for (0..32) |i| try testing.expectApproxEqAbs(ex[@intCast(pid[i])], got[i], 1e-2);
+    var eb: [512]u8 = undefined;
+    if (mlx.takeError(&eb)) |m| {
+        std.debug.print("latched: {s}\n", .{m});
+        return error.MlxErrorLatched;
+    }
 }

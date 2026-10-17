@@ -178,16 +178,16 @@ fn oneExpert(a: mlx.mlx_array, owned: *std.ArrayList(mlx.mlx_array), allocator: 
     return v;
 }
 
-/// Views for banks that carry scales and biases (null otherwise); the caller keeps `owned` alive
-/// as long as the banks.
+/// Views for quantized banks (null for dense ones); fp banks carry no biases and their views none.
+/// The caller keeps `owned` alive as long as the banks.
 pub fn bindViews(gate: Bank, up: Bank, down: Bank, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !?Views {
     if (!viewsOn()) return null;
     inline for (.{ gate, up, down }) |bk| {
-        if (bk.s.ctx == null or bk.b.ctx == null) return null;
+        if (bk.s.ctx == null) return null;
     }
     var out: Views = undefined;
     inline for (.{ "gate", "up", "down" }, .{ gate, up, down }) |name, bk| {
-        @field(out, name) = .{ .w = try oneExpert(bk.w, owned, allocator, s), .s = try oneExpert(bk.s, owned, allocator, s), .b = try oneExpert(bk.b, owned, allocator, s) };
+        @field(out, name) = .{ .w = try oneExpert(bk.w, owned, allocator, s), .s = try oneExpert(bk.s, owned, allocator, s), .b = if (bk.b.ctx == null) bk.b else try oneExpert(bk.b, owned, allocator, s) };
     }
     return out;
 }

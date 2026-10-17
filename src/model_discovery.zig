@@ -405,7 +405,7 @@ pub fn peekMfluxFlux2(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir)
 /// or null when there is no usable index (single-file packs, media packs).
 pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(void) {
     const a = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 * 1024 * 1024)) catch return null;
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 * 1024 * 1024)) catch return null;
     defer a.free(raw);
     var parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch return null;
     defer parsed.deinit();

@@ -3708,6 +3708,14 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
         if (st.kind != .file) continue;
         total += @intCast(st.size);
     }
+    if (referenced) |r| {
+        var kit = r.keyIterator();
+        while (kit.next()) |name| {
+            if (std.mem.indexOfScalar(u8, name.*, '/') == null or std.mem.indexOf(u8, name.*, "..") != null) continue;
+            const st = dir.statFile(io, name.*, .{}) catch continue;
+            if (st.kind == .file) total += @intCast(st.size);
+        }
+    }
     return total;
 }
 

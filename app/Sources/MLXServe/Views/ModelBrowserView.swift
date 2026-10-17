@@ -635,7 +635,7 @@ private struct DiscoverPane: View {
                 .cornerRadius(8)
 
                 // Weight-format filter: MLX (safetensors), GGUF (llama.cpp /
-                // ds4), or Both. Re-runs the search on change.
+                // ds4), or Other (ModelOpt packs served as published). Re-runs the search on change.
                 Picker("Format", selection: $searchService.format) {
                     ForEach(ModelFormat.allCases) { f in
                         Text(L10n.text(f.label)).tag(f)

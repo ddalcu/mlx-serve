@@ -1309,6 +1309,7 @@
 "From a normal map" = "노멀 맵에서";
 "Remove this reference" = "이 참조 제거";
 "Unsupported architecture" = "지원되지 않는 아키텍처";
+"Unsupported ModelOpt layout" = "지원되지 않는 ModelOpt 레이아웃";
 "**choice** picks one of your options.\n`\"criteria\": [\"billing\", \"sales\"]`" = "**choice**는 선택지 중 하나를 고릅니다.\n`\"criteria\": [\"billing\", \"sales\"]`";
 "Voice clip" = "음성 클립";
 "percolating" = "생각을 거르는 중";

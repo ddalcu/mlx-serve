@@ -272,7 +272,7 @@ pub fn isTorchShadowBin(path: []const u8) bool {
 
 pub fn shouldDownload(path: []const u8) bool {
     if (std.mem.indexOfScalar(u8, path, '/')) |_| {
-        const sidecar_dirs = [_][]const u8{ "mtp/", "drafter/", "g2p/", "speech_tokenizer/", "engram/" };
+        const sidecar_dirs = [_][]const u8{ "mtp/", "drafter/", "g2p/", "speech_tokenizer/", "engram/", "tensors/" };
         for (sidecar_dirs) |d| {
             if (std.mem.startsWith(u8, path, d)) break;
         } else return false;
@@ -1048,6 +1048,8 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(shouldDownload("engram/engram-L1.bin"));
     try testing.expect(shouldDownload("engram-token-map.u32"));
     try testing.expect(shouldDownload("experts.bin"));
+    // NVIDIA ModelOpt packs keep their shards in `tensors/`.
+    try testing.expect(shouldDownload("tensors/model-00001-of-00021.safetensors"));
     try testing.expect(!shouldDownload("receipts/convert.json"));
     try testing.expect(!shouldDownload("encoding/encoding.py"));
 }

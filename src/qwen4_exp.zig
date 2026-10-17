@@ -211,6 +211,7 @@ pub const NgramTable = struct {
     /// when its last reference drops, so a kernel still in flight never reads freed pages.
     gpu_owns_map: bool = false,
     embedded: ?*embedded_ple.EmbeddedTable = null,
+    fmt: embedded_ple.Format = .affine,
 
     pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !NgramTable {
         var source = (try embedded_ple.openEmbedded(model_dir, expected)) orelse return error.EmbeddedPleMissing;
@@ -229,6 +230,7 @@ pub const NgramTable = struct {
             .wcols = ptr.wcols,
             .scols = ptr.scols,
             .embedded = ptr,
+            .fmt = ptr.fmt,
         };
         if (plePrefetchEnabled()) table.pool = PrefetchPool.create() catch null;
         return table;
@@ -441,7 +443,7 @@ pub const NgramTable = struct {
     /// fails; `out` is then partial and the caller re-reads it serially.
     fn gatherPooled(self: *const NgramTable, p: *PrefetchPool, row_ids: []const i64, out: []f32) bool {
         const wl: usize = self.wcols * 4;
-        const sl: usize = self.scols * 2;
+        const sl: usize = self.scols * embedded_ple.scaleBytes(self.fmt);
         var start: usize = 0;
         while (start < row_ids.len) : (start += PrefetchPool.MAX_ROWS) {
             const end = @min(start + PrefetchPool.MAX_ROWS, row_ids.len);
@@ -540,6 +542,7 @@ pub const NgramTable = struct {
     }
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
+        if (self.fmt == .nvfp4) return dequantNvfp4Row(words, scales, self.embedded.?.scale, out[0..self.dim]);
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         // An embedded pack's global weight scale; 1.0 leaves every other table exact.
         const ws: f32 = if (self.embedded) |source| source.scale else 1.0;
@@ -564,7 +567,7 @@ pub const NgramTable = struct {
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
         // Raw BF16 arm rides no pool (single region, no dequant): serial walk.
         if (self.bits == 16) return self.gatherSerial(row_ids, out);
-        const need: usize = self.wcols * 4 + self.scols * 4;
+        const need: usize = self.wcols * 4 + self.scols * embedded_ple.scaleBytes(self.fmt) * 2;
         // Avoid pool wakeups on resident tables unless calibration or long KV warrants them.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         if (wide) self.refreshAfterWarm();
@@ -584,7 +587,7 @@ pub const NgramTable = struct {
     fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
         if (comptime @import("builtin").os.tag == .windows) unreachable; // `open` refuses on Windows
         const wl: usize = self.wcols * 4;
-        const sl: usize = self.scols * 2;
+        const sl: usize = self.scols * embedded_ple.scaleBytes(self.fmt);
         const off: usize, const dst: []u8 = switch (region) {
             0 => .{ self.w_off + r * wl, buf[0..wl] },
             1 => .{ self.s_off + r * sl, buf[wl .. wl + sl] },
@@ -595,6 +598,31 @@ pub const NgramTable = struct {
     }
 
 };
+
+const E2M1 = [16]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6 };
+
+const E4M3: [256]f32 = blk: {
+    @setEvalBranchQuota(100_000);
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*v, b| {
+        const e: i32 = @intCast((b >> 3) & 15);
+        const m: f32 = @floatFromInt(b & 7);
+        const mag = if (e == 0) m / 8.0 * std.math.pow(f32, 2, -6) else (1 + m / 8.0) * std.math.pow(f32, 2, @as(f32, @floatFromInt(e - 7)));
+        v.* = if (b & 0x80 != 0) -mag else mag;
+    }
+    break :blk t;
+};
+
+/// One NVFP4 row: e2m1 codes low nibble first, an e4m3 scale per 16, times the table's global scale.
+fn dequantNvfp4Row(codes: []const u8, scales: []const u8, global: f32, out: []f32) void {
+    for (0..out.len / 16) |g| {
+        const sc = E4M3[scales[g]] * global;
+        for (codes[g * 8 ..][0..8], 0..) |b, j| {
+            out[g * 16 + 2 * j] = E2M1[b & 15] * sc;
+            out[g * 16 + 2 * j + 1] = E2M1[b >> 4] * sc;
+        }
+    }
+}
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
 /// the cold 32 GB table (~100 us), 48 per token: serial mmap faults were ~5 ms
@@ -1001,6 +1029,27 @@ test "embedded PLE rows carry the pack's global weight scale" {
         table.row(5, &gathered[i]);
     }
     for (gathered[0], gathered[1]) |unit, doubled| try std.testing.expectEqual(unit * 2, doubled);
+}
+
+test "embedded PLE reads a ModelOpt NVFP4 table in a subdirectory" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeNvfp4Fixture(&td);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var table = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 3, .dim = 32, .shards = 2 });
+    defer table.close();
+    const e2m1 = [_]f32{ 0.5, 1.0, 1.5 };
+    var rows: [3][32]f32 = undefined;
+    for (0..3) |r| {
+        table.row(r, &rows[r]);
+        for (rows[r], 0..) |v, i| try std.testing.expectEqual(e2m1[r] * @as(f32, if (i < 16) 1.0 else 2.0) * 0.5, v);
+    }
+    var gathered: [3 * 32]f32 = undefined;
+    table.gather(&.{ 2, 0, 1 }, &gathered, 0);
+    try std.testing.expectEqualSlices(f32, &rows[2], gathered[0..32]);
+    try std.testing.expectEqualSlices(f32, &rows[1], gathered[64..96]);
 }
 
 test "embedded PLE rows and gathers match the merged table" {

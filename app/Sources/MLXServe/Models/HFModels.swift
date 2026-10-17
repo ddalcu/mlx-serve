@@ -348,6 +348,16 @@ struct HFModel: Identifiable, Codable {
 
     private static let unsupportedQuantizationTokens: [String] = ["mxfp6"]
 
+    /// An NVIDIA ModelOpt checkpoint (`modelopt_pack.zig` serves it as published).
+    var isModelOptRepo: Bool {
+        (tags ?? []).contains { $0.lowercased() == "modelopt" }
+    }
+
+    /// ModelOpt packs verified to load. ModelOpt is a toolkit, not a layout: two packs of one
+    /// model differ (csf vs dense scales, an NVFP4 vs FP8 n-gram table, MXFP8 vs NVFP4
+    /// linears), so the model_type cannot tell a servable pack from one refused at load.
+    static let verifiedModelOptRepos: Set<String> = ["nvidia/Qwen3.8-Flash-Next-FP4-Local"]
+
     /// Human-readable reason why this model isn't compatible. The row renders
     /// it verbatim, so the lookup runs here. `mlx-serve` is the repo's own name.
     var incompatibleReason: String? {
@@ -363,6 +373,9 @@ struct HFModel: Identifiable, Codable {
         }
         if let quant = unsupportedQuantization {
             return L10n.format("Unsupported quantization (%@)", quant)
+        }
+        if isModelOptRepo, !Self.verifiedModelOptRepos.contains(id) {
+            return L10n.text("Unsupported ModelOpt layout")
         }
         return nil
     }
@@ -491,7 +504,7 @@ struct HFModel: Identifiable, Codable {
                 guard let bits = packedBitWidth(forId: id) else { return nil }
                 bytesPerParam = (bits + 0.5) / 8
             case "F16", "BF16", "U16", "I16": bytesPerParam = 2
-            case "I8", "U8": bytesPerParam = 1
+            case "I8", "U8", "F8_E4M3", "F8_E5M2", "F8_E8M0": bytesPerParam = 1
             case let d where d.contains("4"): bytesPerParam = 0.5
             default: bytesPerParam = 2
             }

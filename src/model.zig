@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const sushi_pack = @import("sushi_pack.zig");
+const modelopt_pack = @import("modelopt_pack.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transcription = @import("transcription.zig");
@@ -360,6 +361,8 @@ pub const ModelConfig = struct {
     /// Routed experts in EXL3 (Sushi packs, `expert_quant` in config.json),
     /// served by lib/sushi; null = the pack's own affine banks.
     exl3: ?sushi_exl3.Spec = null,
+    /// An NVIDIA ModelOpt checkpoint served as published (`modelopt_pack`).
+    modelopt: bool = false,
     /// The TEXT config's own eos (its first entry): the n-gram hash's segment
     /// reset token, independent of the generation-time stop set.
     ngram_eos: u32 = 0,
@@ -2673,6 +2676,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
     }
 
+    if (modelopt_pack.declared(outer)) {
+        config.modelopt = true;
+        config.quant_bits = 4;
+        config.quant_group_size = 16;
+        config.quant_mode = .nvfp4;
+    }
+
     // EOS tokens
     if (jsonField(root, "eos_token_id")) |v| {
         switch (v) {
@@ -4925,7 +4935,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// `dsv41` also reads past the page cache (`nocache_reader`): its weights all load at init, and a pack near the
 /// RAM size would have them compressed under the file cache.
 /// `index_owners`: a tensor two shards carry loads from the shard the index names.
-pub const LoadOpts = struct { vision: bool = false, audio_tower: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
 
 pub const Owners = std.StringHashMapUnmanaged([]const u8);
 
@@ -4966,8 +4976,13 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
     errdefer weights.deinit();
+    if (config.modelopt) {
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        try modelopt_pack.adapt(&weights, model_dir, s);
+    }
     if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
         defer reportF16Narrowing();
@@ -5082,6 +5097,21 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         if (owners) |*o| shard_opts.owners = o;
         try loadSafetensorsFile(allocator, &weights, path, s, shard_opts);
         file_count += 1;
+    }
+    // An index may name shards in a subdirectory (NVIDIA's `tensors/`); the scan above sees the root only.
+    if (referenced) |r| {
+        var kit = r.keyIterator();
+        while (kit.next()) |name| {
+            if (std.mem.indexOfScalar(u8, name.*, '/') == null or std.mem.indexOf(u8, name.*, "..") != null) continue;
+            const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, name.* }, 0);
+            defer allocator.free(path);
+            log.info("Loading {s}...\n", .{name.*});
+            var shard_opts = opts;
+            shard_opts.shard = name.*;
+            if (owners) |*o| shard_opts.owners = o;
+            try loadSafetensorsFile(allocator, &weights, path, s, shard_opts);
+            file_count += 1;
+        }
     }
 
     // Incomplete-checkpoint guard. A dir with config/tokenizer but no (or no
@@ -5611,6 +5641,7 @@ test "Qwen4 folded f16 keeps generic narrowing after convention resolution" {
 
 /// `shouldKeepWeightKey`, plus Qwen3-ASR's `audio_tower.*` under the same media gate.
 fn keepsTensor(key: []const u8, opts: LoadOpts) bool {
+    if (opts.modelopt and modelopt_pack.skipsAtLoad(key)) return false;
     if (opts.audio_tower and opts.vision and std.mem.startsWith(u8, key, "audio_tower.")) return true;
     return shouldKeepWeightKey(key, opts.vision);
 }
