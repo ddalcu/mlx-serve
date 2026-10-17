@@ -177,7 +177,7 @@ pub const Link = struct {
     // (streams are thread-local); MLX fences the GPU work they read.
 
     /// Lazy send of `x` to `dst`; the returned array must be evaluated (or depended on).
-    pub fn send(self: *const Link, x: mlx.mlx_array, dst: u32, _: mlx.mlx_stream) !mlx.mlx_array {
+    pub fn send(self: *const Link, x: mlx.mlx_array, dst: u32) !mlx.mlx_array {
         const cs = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cs);
         var r = mlx.mlx_array_new();
@@ -185,7 +185,7 @@ pub const Link = struct {
         return r;
     }
 
-    pub fn recv(self: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32, _: mlx.mlx_stream) !mlx.mlx_array {
+    pub fn recv(self: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32) !mlx.mlx_array {
         const cs = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cs);
         var r = mlx.mlx_array_new();
@@ -193,7 +193,7 @@ pub const Link = struct {
         return r;
     }
 
-    pub fn allSum(self: *const Link, x: mlx.mlx_array, _: mlx.mlx_stream) !mlx.mlx_array {
+    pub fn allSum(self: *const Link, x: mlx.mlx_array) !mlx.mlx_array {
         const cs = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cs);
         var r = mlx.mlx_array_new();
@@ -211,17 +211,17 @@ const OP_FORWARD: i32 = 1;
 const OP_STOP: i32 = 2;
 const OP_MOE: i32 = 3;
 
-fn sendMsg(link: *const Link, m: Msg, dst: u32, s: mlx.mlx_stream) !void {
+fn sendMsg(link: *const Link, m: Msg, dst: u32) !void {
     const shape = [_]c_int{8};
     const a = mlx.mlx_array_new_data(&m, &shape, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
-    const r = try link.send(a, dst, s);
+    const r = try link.send(a, dst);
     defer _ = mlx.mlx_array_free(r);
     try evalOne(r);
 }
 
-fn recvMsg(link: *const Link, src: u32, s: mlx.mlx_stream) !Msg {
-    const r = try link.recv(&.{8}, .int32, src, s);
+fn recvMsg(link: *const Link, src: u32) !Msg {
+    const r = try link.recv(&.{8}, .int32, src);
     defer _ = mlx.mlx_array_free(r);
     try evalOne(r);
     const d = mlx.mlx_array_data_int32(r) orelse return error.DistBadMessage;
@@ -304,13 +304,12 @@ pub const Peer = struct {
 
     /// Hands the stream to the worker and returns its output stream. Lazy: the sends are
     /// queued (async) ahead of the receive so the comm stream runs them in that order.
-    pub fn hop(self: *Peer, h: mlx.mlx_array, offset: usize, s: mlx.mlx_stream) !mlx.mlx_array {
-        if (!self.ready) try self.awaitReady(s);
+    pub fn hop(self: *Peer, h: mlx.mlx_array, offset: usize) !mlx.mlx_array {
+        if (!self.ready) try self.awaitReady();
         const sh = mlx.getShape(h);
         log.debug("[dist] hop at {d}: {d}x{d} rows (worker holds {d})\n", .{ offset, sh[0], sh[1], self.peer_pos });
         if (offset != 0 and offset != self.peer_pos) {
             log.err("[dist] forward at {d} but the worker holds {d} tokens: its caches cannot follow this reuse\n", .{ offset, self.peer_pos });
-            std.debug.dumpCurrentStackTrace(.{});
             return error.DistPeerDiverged;
         }
         try self.sendOrdered(.{ OP_FORWARD, sh[0], sh[1], @intCast(offset & 0x7fffffff), @intCast(offset >> 31), sh[2], @intFromEnum(mlx.mlx_array_dtype(h)), 0 }, &.{h});
@@ -321,16 +320,16 @@ pub const Peer = struct {
 
     /// Tensor mode: one MoE layer's input and router logits to the worker.
     pub fn sendMoe(self: *Peer, x: mlx.mlx_array, logits: mlx.mlx_array, layer: u32) !void {
-        if (!self.ready) try self.awaitReady(.{ .ctx = null });
+        if (!self.ready) try self.awaitReady();
         const xs = mlx.getShape(x);
         const ls = mlx.getShape(logits);
         self.exchanges += 1;
         try self.sendOrdered(.{ OP_MOE, xs[0], xs[1], xs[2], ls[ls.len - 1], @intFromEnum(mlx.mlx_array_dtype(x)), @intCast(layer), @intFromEnum(mlx.mlx_array_dtype(logits)) }, &.{ x, logits });
     }
 
-    /// The worker's reply, shaped like this rank's own partial.
-    pub fn recvLike(self: *Peer, like: mlx.mlx_array) !mlx.mlx_array {
-        return queuedRecv(&self.link, mlx.getShape(like), mlx.mlx_array_dtype(like), 1);
+    /// The worker's partial for the layer input `x`: its shape and dtype.
+    pub fn recvLike(self: *Peer, x: mlx.mlx_array) !mlx.mlx_array {
+        return queuedRecv(&self.link, mlx.getShape(x), mlx.mlx_array_dtype(x), 1);
     }
 
     /// Header, then each payload, chained so the comm stream runs them in order, and
@@ -339,12 +338,12 @@ pub const Peer = struct {
         const shape = [_]c_int{8};
         const hdr = mlx.mlx_array_new_data(&hdr_host, &shape, 1, .int32);
         defer _ = mlx.mlx_array_free(hdr);
-        var last = try self.link.send(hdr, 1, .{ .ctx = null });
+        var last = try self.link.send(hdr, 1);
         defer _ = mlx.mlx_array_free(last);
         for (payload) |p| {
             const ordered = try dependsOn(p, last);
             defer _ = mlx.mlx_array_free(ordered);
-            const sent = try self.link.send(ordered, 1, .{ .ctx = null });
+            const sent = try self.link.send(ordered, 1);
             _ = mlx.mlx_array_free(last);
             last = sent;
         }
@@ -353,8 +352,8 @@ pub const Peer = struct {
         try mlx.check(mlx.mlx_async_eval(v));
     }
 
-    fn awaitReady(self: *Peer, s: mlx.mlx_stream) !void {
-        const m = try recvMsg(&self.link, 1, s);
+    fn awaitReady(self: *Peer) !void {
+        const m = try recvMsg(&self.link, 1);
         if (m[0] != MAGIC or m[1] != 0) {
             switch (m[1]) {
                 NOT_FOUND => log.err("[dist] the worker has no model named {s} in its model folders\n", .{self.model}),
@@ -377,7 +376,7 @@ pub const Peer = struct {
 /// deadlocks until Metal's watchdog kills it. Done here, the receive also pairs with the
 /// peer's send even when nobody reads it (a warmup that drops its output).
 fn queuedRecv(link: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32) !mlx.mlx_array {
-    const r = try link.recv(shape, dtype, src, .{ .ctx = null });
+    const r = try link.recv(shape, dtype, src);
     errdefer _ = mlx.mlx_array_free(r);
     try evalOne(r);
     return r;
@@ -430,7 +429,7 @@ fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
 pub fn shutdown() void {
     const p = peer() orelse return;
     if (!p.ready) return;
-    sendMsg(&p.link, .{ OP_STOP, 0, 0, 0, 0, 0, 0, 0 }, 1, .{ .ctx = null }) catch return;
+    sendMsg(&p.link, .{ OP_STOP, 0, 0, 0, 0, 0, 0, 0 }, 1) catch return;
     log.info("[dist] worker released\n", .{});
 }
 
@@ -451,7 +450,7 @@ pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Pa
             log.err("[dist] {s} is served with a worker: start `mlx-serve worker` on the other Mac first\n", .{std.fs.path.basename(g.model)});
             return error.DistWorkerNotJoined;
         }
-        const worker = try Hello.parse(try recvMsg(&joined_link, 1, .{ .ctx = null }));
+        const worker = try Hello.parse(try recvMsg(&joined_link, 1));
         log.info("[dist] worker: {d} MiB free of {d}\n", .{ worker.avail_mib, worker.total_mib });
         peer_slot = .{ .link = joined_link, .mode = g.mode, .model = g.model, .split = g.split, .worker = worker };
     }
@@ -483,7 +482,7 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig) !void {
         },
     }
     const name = std.fs.path.basename(self.model);
-    try sendMsg(&self.link, pl.msg(name.len), 1, .{ .ctx = null });
+    try sendMsg(&self.link, pl.msg(name.len), 1);
     try sendBytes(&self.link, name, 1);
     self.planned = true;
 }
@@ -491,13 +490,13 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig) !void {
 fn sendBytes(link: *const Link, bytes: []const u8, dst: u32) !void {
     const a = mlx.mlx_array_new_data(bytes.ptr, &[_]c_int{@intCast(bytes.len)}, 1, .uint8);
     defer _ = mlx.mlx_array_free(a);
-    const r = try link.send(a, dst, .{ .ctx = null });
+    const r = try link.send(a, dst);
     defer _ = mlx.mlx_array_free(r);
     try evalOne(r);
 }
 
 fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
-    const r = try link.recv(&[_]c_int{@intCast(out.len)}, .uint8, src, .{ .ctx = null });
+    const r = try link.recv(&[_]c_int{@intCast(out.len)}, .uint8, src);
     defer _ = mlx.mlx_array_free(r);
     try evalOne(r);
     @memcpy(out, (mlx.mlx_array_data_uint8(r) orelse return error.DistBadMessage)[0..out.len]);
@@ -574,10 +573,9 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
         else => return err,
     };
     defer link.deinit();
-    const cs: mlx.mlx_stream = .{ .ctx = null };
-    try sendMsg(&link, Hello.here().msg(), 0, cs);
+    try sendMsg(&link, Hello.here().msg(), 0);
     log.info("[dist] worker: joined, waiting for the host to load a model\n", .{});
-    const pmsg = try recvMsg(&link, 0, cs);
+    const pmsg = try recvMsg(&link, 0);
     const pl = try Plan.parse(pmsg);
     var name_buf: [256]u8 = undefined;
     const name_len: usize = @intCast(pmsg[5]);
@@ -591,7 +589,7 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
 
     const fail = struct {
         fn send(l: *const Link, code: i32) void {
-            sendMsg(l, .{ MAGIC, code, 0, 0, 0, 0, 0, 0 }, 0, .{ .ctx = null }) catch {};
+            sendMsg(l, .{ MAGIC, code, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         }
     };
     const dir = (try findModel(io, allocator, roots.items, name)) orelse {
@@ -616,14 +614,14 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     defer xfm.w.deinit();
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
-    try sendMsg(&link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0, cs);
+    try sendMsg(&link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
 
     const t = &xfm.t;
     var ctx = t.defaultCtx();
     var forwards: u64 = 0;
     while (true) {
-        const m = try recvMsg(&link, 0, cs);
+        const m = try recvMsg(&link, 0);
         switch (m[0]) {
             OP_STOP => break,
             OP_FORWARD => {
@@ -637,9 +635,19 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
                 const shape = [_]c_int{ m[1], m[2], m[5] };
                 const h = try queuedRecv(&link, &shape, @enumFromInt(m[6]), 0);
                 defer _ = mlx.mlx_array_free(h);
-                const out = try t.forwardQwen4Stream(&ctx, h);
-                defer _ = mlx.mlx_array_free(out);
-                const sent = try link.send(out, 0, t.s);
+                const raw = try t.forwardQwen4Stream(&ctx, h);
+                defer _ = mlx.mlx_array_free(raw);
+                // Rank 0 receives exactly the bytes it sent: JACCL sizes its buffers from the byte count.
+                if (!std.mem.eql(c_int, mlx.getShape(raw), mlx.getShape(h))) return error.DistBadMessage;
+                var out = raw;
+                if (mlx.mlx_array_dtype(raw) != mlx.mlx_array_dtype(h)) {
+                    out = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_astype(&out, raw, mlx.mlx_array_dtype(h), t.s));
+                }
+                defer if (out.ctx != raw.ctx) {
+                    _ = mlx.mlx_array_free(out);
+                };
+                const sent = try link.send(out, 0);
                 defer _ = mlx.mlx_array_free(sent);
                 try evalOne(sent);
                 forwards += 1;
@@ -650,9 +658,18 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
                 defer _ = mlx.mlx_array_free(x);
                 const logits = try queuedRecv(&link, &.{ m[1], m[2], m[4] }, @enumFromInt(m[7]), 0);
                 defer _ = mlx.mlx_array_free(logits);
-                const out = try t.moeExpertsRouted(x, @intCast(m[6]), logits);
-                defer _ = mlx.mlx_array_free(out);
-                const sent = try link.send(out, 0, t.s);
+                const raw = try t.moeExpertsRouted(x, @intCast(m[6]), logits);
+                defer _ = mlx.mlx_array_free(raw);
+                if (!std.mem.eql(c_int, mlx.getShape(raw), mlx.getShape(x))) return error.DistBadMessage;
+                var out = raw;
+                if (mlx.mlx_array_dtype(raw) != mlx.mlx_array_dtype(x)) {
+                    out = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_astype(&out, raw, mlx.mlx_array_dtype(x), t.s));
+                }
+                defer if (out.ctx != raw.ctx) {
+                    _ = mlx.mlx_array_free(out);
+                };
+                const sent = try link.send(out, 0);
                 defer _ = mlx.mlx_array_free(sent);
                 try evalOne(sent);
                 forwards += 1;
@@ -709,17 +726,17 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         for (0..iters + 5) |i| {
             var sw = io_util.Stopwatch.init(io);
             if (link.rank == 0) {
-                const sent = try link.send(x, other, s);
+                const sent = try link.send(x, other);
                 defer _ = mlx.mlx_array_free(sent);
                 try evalOne(sent);
-                const back = try link.recv(&shape, .float32, other, s);
+                const back = try link.recv(&shape, .float32, other);
                 defer _ = mlx.mlx_array_free(back);
                 try evalOne(back);
             } else {
-                const got = try link.recv(&shape, .float32, other, s);
+                const got = try link.recv(&shape, .float32, other);
                 defer _ = mlx.mlx_array_free(got);
                 try evalOne(got);
-                const sent = try link.send(got, other, s);
+                const sent = try link.send(got, other);
                 defer _ = mlx.mlx_array_free(sent);
                 try evalOne(sent);
             }
@@ -744,7 +761,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         var v: f32 = 0;
         for (0..iters + 5) |i| {
             var sw = io_util.Stopwatch.init(io);
-            const r = try link.allSum(x, s);
+            const r = try link.allSum(x);
             defer _ = mlx.mlx_array_free(r);
             try evalOne(r);
             if (i >= 5) total += sw.read();

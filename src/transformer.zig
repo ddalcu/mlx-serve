@@ -17964,7 +17964,8 @@ pub const Transformer = struct {
                 if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
             }
             qwen4_state = st;
-            qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
+            // A pipeline split's head would read the last layer's stream, which lives on the worker.
+            qwen4_mtp = if (config.dist_span != null) null else try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         }
 
@@ -20542,7 +20543,7 @@ pub const Transformer = struct {
         // qwen4_exp: GDN per-position capture + PLE window/token capture +
         // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
         // head's verify can rewind. dsv4 cannot.
-        return self.qwen4_mtp != null and self.dist_peer == null;
+        return self.qwen4_mtp != null;
     }
 
     /// Is this arch's MTP head the checkpoint's OWN trained layer AND measured
@@ -26123,7 +26124,7 @@ pub const Transformer = struct {
         if (self.dist_peer) |peer| {
             // The hop's sends are queued before its receive, so the PLE leaf must be filled now.
             if (ctx.ple_pending != null) try self.flushDeferredPle(ctx);
-            const back = try peer.hop(h, offset, self.s);
+            const back = try peer.hop(h, offset);
             _ = mlx.mlx_array_free(h);
             h = back;
         }
@@ -33158,7 +33159,7 @@ pub const Transformer = struct {
         try tp.sendMoe(x, logits, layer);
         const mine = try self.moeMLP2WithRouter(x, x, mw, logits, false);
         defer _ = mlx.mlx_array_free(mine);
-        const theirs = try tp.recvLike(mine);
+        const theirs = try tp.recvLike(x);
         defer _ = mlx.mlx_array_free(theirs);
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_add(&out, mine, theirs, self.s));
