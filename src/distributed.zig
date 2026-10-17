@@ -297,6 +297,8 @@ pub const Peer = struct {
     shard: ?Shard = null,
     planned: bool = false,
     ready: bool = false,
+    /// Exchanges with the worker since the group formed (`/props` cluster).
+    exchanges: u64 = 0,
     /// Tokens the worker's caches hold. Every forward must continue them or start over at 0.
     peer_pos: usize = 0,
 
@@ -313,6 +315,7 @@ pub const Peer = struct {
         }
         try self.sendOrdered(.{ OP_FORWARD, sh[0], sh[1], @intCast(offset & 0x7fffffff), @intCast(offset >> 31), sh[2], @intFromEnum(mlx.mlx_array_dtype(h)), 0 }, &.{h});
         self.peer_pos = offset + @as(usize, @intCast(sh[1]));
+        self.exchanges += 1;
         return queuedRecv(&self.link, sh, mlx.mlx_array_dtype(h), 1);
     }
 
@@ -321,6 +324,7 @@ pub const Peer = struct {
         if (!self.ready) try self.awaitReady(.{ .ctx = null });
         const xs = mlx.getShape(x);
         const ls = mlx.getShape(logits);
+        self.exchanges += 1;
         try self.sendOrdered(.{ OP_MOE, xs[0], xs[1], xs[2], ls[ls.len - 1], @intFromEnum(mlx.mlx_array_dtype(x)), @intCast(layer), @intFromEnum(mlx.mlx_array_dtype(logits)) }, &.{ x, logits });
     }
 
@@ -394,6 +398,22 @@ fn dependsOn(x: mlx.mlx_array, dep: mlx.mlx_array) !mlx.mlx_array {
 }
 
 var peer_slot: ?Peer = null;
+
+/// The `/props` "cluster" object (with its leading comma), empty when this server is
+/// not rank 0 of a group: what the app draws the split from.
+pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
+    const p = peer() orelse return allocator.dupe(u8, "");
+    return clusterJson(allocator, p);
+}
+
+fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
+    const sp = p.span;
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d}}}", .{
+        @tagName(p.mode), std.fs.path.basename(p.model), p.planned, p.ready, sp.total, sp.start, sp.end,
+        if (p.mode == .pipeline) sp.end else 0, sp.total, if (p.shard) |sh| sh.size else 0,
+        p.worker.avail_mib, p.worker.total_mib, p.exchanges,
+    });
+}
 
 /// Rank 0 at shutdown: releases the worker. A peer that vanishes mid-protocol crashes the
 /// other side inside Apple's RDMA library, so the group always ends with this message.
@@ -778,4 +798,11 @@ test "Shard: gate/up keep a band of rows per expert, down a band of columns" {
     var out: [8]u8 = undefined;
     (Shard{ .rank = 1, .size = 2 }).slice(&out, &buf, 2, 4, 2);
     try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6, 7, 14, 15, 16, 17 }, &out);
+}
+
+test "clusterJson: a pipeline split names both ranks' layers" {
+    var p: Peer = .{ .link = undefined, .mode = .pipeline, .model = "/m/org/Flash-FP4", .split = null, .worker = .{ .avail_mib = 100, .total_mib = 128 }, .span = .{ .start = 0, .end = 16, .total = 48 }, .planned = true, .ready = true, .exchanges = 3 };
+    const j = try clusterJson(std.testing.allocator, &p);
+    defer std.testing.allocator.free(j);
+    try std.testing.expectEqualStrings(",\"cluster\":{\"mode\":\"pipeline\",\"model\":\"Flash-FP4\",\"planned\":true,\"worker_ready\":true,\"layers\":48,\"here\":[0,16],\"worker\":[16,48],\"expert_shards\":0,\"worker_free_mib\":100,\"worker_total_mib\":128,\"exchanges\":3}", j);
 }
