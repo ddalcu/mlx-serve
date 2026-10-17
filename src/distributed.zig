@@ -796,15 +796,19 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
 }
 
 fn soakLink(io: std.Io, link: *const Link, other: u32, n: u64, s: mlx.mlx_stream) !void {
-    const shape = [_]c_int{10240};
-    var x = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_ones(&x, &shape, 1, .bfloat16, s));
-    defer _ = mlx.mlx_array_free(x);
-    try evalOne(x);
+    // Both ranks draw the same sizes: 1..2400 rows of a 20 KB stream, the range real hops span.
+    var rng = std.Random.DefaultPrng.init(0x5eed);
     var sw = io_util.Stopwatch.init(io);
+    var bytes: u64 = 0;
     for (0..n) |k| {
+        const rows: c_int = rng.random().intRangeAtMost(c_int, 1, 2400);
+        const shape = [_]c_int{ 1, rows, 10240 };
         if (link.rank == 0) {
-            try sendMsg(link, .{ OP_FORWARD, @intCast(k & 0x7fffffff), 0, 0, 0, 0, 0, 0 }, other);
+            var x = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_ones(&x, &shape, 3, .bfloat16, s));
+            defer _ = mlx.mlx_array_free(x);
+            try evalOne(x);
+            try sendMsg(link, .{ OP_FORWARD, rows, @intCast(k & 0x7fffffff), 0, 0, 0, 0, 0 }, other);
             const sent = try link.send(x, other);
             defer _ = mlx.mlx_array_free(sent);
             try evalOne(sent);
@@ -812,7 +816,8 @@ fn soakLink(io: std.Io, link: *const Link, other: u32, n: u64, s: mlx.mlx_stream
             defer _ = mlx.mlx_array_free(back);
             try evalOne(back);
         } else {
-            _ = try recvMsg(link, other);
+            const m = try recvMsg(link, other);
+            if (m[1] != rows) return error.DistBadMessage;
             const got = try link.recv(&shape, .bfloat16, other);
             defer _ = mlx.mlx_array_free(got);
             try evalOne(got);
@@ -820,8 +825,12 @@ fn soakLink(io: std.Io, link: *const Link, other: u32, n: u64, s: mlx.mlx_stream
             defer _ = mlx.mlx_array_free(sent);
             try evalOne(sent);
         }
-        if ((k + 1) % 10000 == 0) log.info("[dist-probe] soak: {d} round trips, {d} us each\n", .{ k + 1, sw.read() / 1000 / 10000 });
-        if ((k + 1) % 10000 == 0) sw = io_util.Stopwatch.init(io);
+        bytes += @as(u64, @intCast(rows)) * 20480;
+        if ((k + 1) % 1000 == 0) {
+            log.info("[dist-probe] soak: {d} round trips, {d} MB each way in {d} ms\n", .{ k + 1, bytes >> 20, sw.read() / std.time.ns_per_ms });
+            sw = io_util.Stopwatch.init(io);
+            bytes = 0;
+        }
     }
     log.info("[dist-probe] soak: {d} round trips clean\n", .{n});
 }

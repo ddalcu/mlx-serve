@@ -139,6 +139,11 @@ fn printUsage(io: std.Io) void {
         \\  list                Show downloaded models
         \\  serve               Start the server over ~/.mlx-serve/models
         \\                      (every pulled model loads on demand by name)
+        \\  worker              Lend this Mac to another Mac's --dist host:
+        \\                      --coordinator <ip:port> --device <rdma_enX>
+        \\                      [--model-dir <dir>]... (default ~/.mlx-serve/models)
+        \\  dist-probe          Measure the RDMA link: --rank 0|1 --coordinator
+        \\                      <ip:port> --device <rdma_enX> [--soak N]
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
         \\                      hermes, aider, zcode); starts the MLX Core app if the
@@ -490,6 +495,14 @@ fn printUsage(io: std.Io) void {
         \\                        proxied to that host. Off by default.
         \\  --lan-name <name>   Bonjour instance name for --lan-share
         \\                        (default: this Mac's hostname).
+        \\  --dist <pipeline|tensor>  Serve --dist-model across this Mac and a
+        \\                        worker over Thunderbolt RDMA: pipeline splits the
+        \\                        layers, tensor splits every MoE expert. Qwen3.8-
+        \\                        Flash-Next only; the worker runs `mlx-serve worker`.
+        \\  --dist-model <dir>  The model the two Macs serve (default: --model)
+        \\  --dist-coordinator <ip:port>  This Mac's address the worker dials
+        \\  --dist-device <rdma_enX>  The RDMA port facing the worker (`ibv_devinfo`)
+        \\  --dist-split <n>    Pipeline: layers kept here (default: by free memory)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --log-file <path>   Persist the server log ("off" disables).
         \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
