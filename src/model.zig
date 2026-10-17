@@ -5007,7 +5007,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     if (config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
-        try modelopt_pack.adapt(&weights, model_dir, config.num_hidden_layers, s);
+        try modelopt_pack.adapt(&weights, model_dir, config.num_hidden_layers, s, config.swiglu_limit > 0.0);
     }
     if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {

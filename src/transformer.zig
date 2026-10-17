@@ -15051,6 +15051,8 @@ pub const MoeMlpWeights = struct {
     per_expert_scale: ?mlx.mlx_array = null,
     /// ModelOpt NVFP4 banks: each expert's gate global scale [E], applied before the activation.
     gate_expert_scale: mlx.mlx_array = .{ .ctx = null },
+    /// The same for `up` when the activation clamps it (GLM): the scale must land before the clamp.
+    up_expert_scale: mlx.mlx_array = .{ .ctx = null },
     // Hy3 (hy_v3) sigmoid routing: f32 [num_experts] bias added to the sigmoid
     // scores for top-k SELECTION only (weights come from the unbiased scores).
     // Non-null expert_bias routes moeMLP2 through hy3RoutingChain.
@@ -33840,6 +33842,7 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(up_out);
                 try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
                 try self.addExpertBias(&up_out, mw.switch_up_bias, sorted_inds);
+                try self.scaleExperts(&up_out, mw.up_expert_scale, sorted_inds);
 
                 // gpt_oss swaps the activation itself, not just its inputs.
                 break :blk if (cfg.swiglu_limit > 0.0)
@@ -35729,6 +35732,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 .shared_expert_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.biases") orelse mlx.mlx_array_new(),
                 .per_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.expert_scale"),
                 .gate_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.expert_scale") orelse .{ .ctx = null },
+                .up_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.expert_scale") orelse .{ .ctx = null },
             } };
             if (config.exl3) |spec| try checkExl3Bank(&lw.mlp.moe, config, spec);
             {
@@ -45050,6 +45054,7 @@ pub fn loadRoutedMoeAt(weights: *const Weights, name_buf: *[256]u8, base: []cons
         // ModelOpt NVFP4 banks: each expert's gate scale and its up x down product.
         .per_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.expert_scale"),
         .gate_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.gate_proj.expert_scale") orelse .{ .ctx = null },
+        .up_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.up_proj.expert_scale") orelse .{ .ctx = null },
     };
     try maybeTransposeForBf16(&mw.router_w, mw.router_s, owned_bf16, allocator, s);
     // GLM-5-Next routes in f32 (`moe_router_dtype`).

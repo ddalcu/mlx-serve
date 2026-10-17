@@ -161,6 +161,20 @@ pub fn getAvailableMemBytes() u64 {
     return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostAvailableMemBytes());
 }
 
+/// The kernel's memory-pressure level: 1 normal, 2 warning, 4 critical; 0 where the OS has no such reading.
+pub fn memoryPressureLevel() u32 {
+    if (comptime !builtin.os.tag.isDarwin()) return 0;
+    var level: c_int = 0;
+    var len: usize = @sizeOf(c_int);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", @ptrCast(&level), &len, null, 0) != 0) return 0;
+    return if (level > 0) @intCast(level) else 0;
+}
+
+/// Warning or worse: the OS is already compressing and swapping to make room.
+pub fn underMemoryPressure(level: u32) bool {
+    return level >= 2;
+}
+
 /// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
 fn hostTotalMemBytes() u64 {
     if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullTotalPhys;
@@ -458,4 +472,17 @@ test "gpuCoreCount reads the GPU's core count" {
     const n = gpuCoreCount();
     if (n == 0) return error.SkipZigTest; // a VM exposes no AGX accelerator entry
     try std.testing.expect(n >= 7 and n <= 256);
+}
+
+test "underMemoryPressure: warning and critical stop a bulk allocation, normal and unreadable do not" {
+    try std.testing.expect(!underMemoryPressure(0));
+    try std.testing.expect(!underMemoryPressure(1));
+    try std.testing.expect(underMemoryPressure(2));
+    try std.testing.expect(underMemoryPressure(4));
+}
+
+test "memoryPressureLevel reads the kernel's level on macOS" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const level = memoryPressureLevel();
+    try std.testing.expect(level == 1 or level == 2 or level == 4);
 }

@@ -8,6 +8,7 @@ const log = @import("log.zig");
 const crt = @import("crt.zig");
 const Weights = @import("model.zig").Weights;
 const sushi_pack = @import("sushi_pack.zig");
+const status = @import("status.zig");
 
 /// True for a config whose `quantization_config.quant_method` is `modelopt`.
 pub fn declared(root: std.json.ObjectMap) bool {
@@ -46,15 +47,16 @@ pub fn mlxName(a: std.mem.Allocator, key: []const u8, mtp_layer: ?u32) ![]u8 {
         rest = key[p[0].len..];
         break;
     };
-    const suffix = ".weight_scale";
-    if (std.mem.endsWith(u8, rest, suffix)) return std.fmt.allocPrint(a, "{s}{s}.scales", .{ head, rest[0 .. rest.len - suffix.len] });
+    const suffix = "weight_scale";
+    if (std.mem.endsWith(u8, rest, suffix) and (rest.len == suffix.len or rest[rest.len - suffix.len - 1] == '.'))
+        return std.fmt.allocPrint(a, "{s}{s}scales", .{ head, rest[0 .. rest.len - suffix.len] });
     return std.fmt.allocPrint(a, "{s}{s}", .{ head, rest });
 }
 
 /// Renames every loaded tensor to the mlx-lm layout, reinterprets fp weight bytes as the u32
 /// words MLX packs, dequantizes the vision tower's linears to bf16 (its encoder runs dense),
 /// then adds the routed-expert banks read from `model_dir`.
-pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, s: mlx.mlx_stream) !void {
+pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, s: mlx.mlx_stream, clamped: bool) !void {
     const a = weights.allocator;
     var old = weights.map;
     weights.map = std.StringHashMap(mlx.mlx_array).init(a);
@@ -108,7 +110,7 @@ pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, s: mlx.m
         errdefer a.free(sname);
         try putShared(weights, sname, scales.?);
     }
-    try buildBanks(weights, model_dir, mtp_layer);
+    try buildBanks(weights, model_dir, mtp_layer, status.memoryPressureLevel, clamped);
 }
 
 /// FP8_PB_WO: e4m3 codes `[R, C]` with one f32 scale per 128x128 tile (`[R/128, 1, C/128, 1]`), as bf16.
@@ -156,6 +158,16 @@ fn putShared(weights: *Weights, name: []u8, v: mlx.mlx_array) !void {
 
 const Loc = struct { file: u32, off: u64, len: u64, rows: u32, cols: u32 };
 
+const Span = struct { start: u64, end: u64 };
+
+/// The pages that cover `len` bytes at `off`. `F_NOCACHE` only holds for page-aligned offsets,
+/// lengths and buffers; tensors sit at arbitrary offsets, and an unaligned read goes through the
+/// page cache whatever the flag says (a 165 GB load filled ~120 GB of cache).
+fn alignedSpan(off: u64, len: u64) Span {
+    const page: u64 = std.heap.page_size_min;
+    return .{ .start = off / page * page, .end = std.mem.alignForward(u64, off + len, page) };
+}
+
 /// Byte locations of every routed-expert tensor, read from the shard headers.
 const Source = struct {
     arena: std.heap.ArenaAllocator,
@@ -171,15 +183,34 @@ const Source = struct {
         var buf: [256]u8 = undefined;
         return self.locs.get(std.fmt.bufPrint(&buf, fmt, args) catch return null);
     }
+};
 
-    fn read(self: *const Source, l: Loc, dst: []u8) !void {
+/// One thread's page-aligned staging buffer and the reads that go through it.
+const Reader = struct {
+    src: *const Source,
+    stage: []align(std.heap.page_size_min) u8 = &.{},
+
+    fn deinit(self: *Reader) void {
+        pageFree(self.stage);
+    }
+
+    fn read(self: *Reader, l: Loc, dst: []u8) !void {
         if (dst.len != l.len) return error.ModelOptTensorSize;
+        const span = alignedSpan(l.off, l.len);
+        const size: usize = @intCast(span.end - span.start);
+        if (self.stage.len < size) {
+            pageFree(self.stage);
+            self.stage = &.{};
+            self.stage = try pageAlloc(size);
+        }
+        const skip: usize = @intCast(l.off - span.start);
         var done: usize = 0;
-        while (done < dst.len) {
-            const got = crt.pread(self.fds.items[l.file], dst[done..].ptr, dst.len - done, @intCast(l.off + done));
+        while (done < skip + dst.len) {
+            const got = crt.pread(self.src.fds.items[l.file], self.stage[done..].ptr, size - done, @intCast(span.start + done));
             if (got <= 0) return error.ModelOptRead;
             done += @intCast(got);
         }
+        @memcpy(dst, self.stage[skip..][0..dst.len]);
     }
 };
 
@@ -274,17 +305,19 @@ const Bank = struct {
         self.gs = try std.heap.page_allocator.alloc(f32, self.experts);
         var scratch: std.ArrayList(u8) = .empty;
         defer scratch.deinit(std.heap.page_allocator);
+        var rd: Reader = .{ .src = src };
+        defer rd.deinit();
         for (0..self.experts) |e| {
-            try src.read(src.get("{s}.mlp.experts.{d}.{s}.weight", .{ b, e, pj }) orelse return error.ModelOptMissingExpert, self.w[e * wlen ..][0..wlen]);
+            try rd.read(src.get("{s}.mlp.experts.{d}.{s}.weight", .{ b, e, pj }) orelse return error.ModelOptMissingExpert, self.w[e * wlen ..][0..wlen]);
             const dst = self.sc[e * slen ..][0..slen];
             if (src.get("{s}.mlp.experts.{d}.{s}.weight_scale.nvfp4_csf_fixed", .{ b, e, pj })) |fx| {
                 const ex = src.get("{s}.mlp.experts.{d}.{s}.weight_scale.nvfp4_csf_exceptions", .{ b, e, pj }) orelse return error.ModelOptMissingExpert;
                 try scratch.resize(std.heap.page_allocator, fx.len + ex.len + 4);
                 const fbytes = scratch.items[0..fx.len];
-                try src.read(fx, fbytes);
+                try rd.read(fx, fbytes);
                 const off = std.mem.alignForward(usize, fx.len, 4);
                 const ebytes: []align(4) u8 = @alignCast(scratch.items[off..][0..ex.len]);
-                try src.read(ex, ebytes);
+                try rd.read(ex, ebytes);
                 try decodeCsf(fbytes, std.mem.bytesAsSlice(u32, ebytes), w0.rows, cols, dst);
             } else if (src.get("{s}.mlp.experts.{d}.{s}.weight_scale.csf32_bases", .{ b, e, pj })) |bl| {
                 var locs: [4]Loc = .{ bl, undefined, undefined, undefined };
@@ -295,15 +328,15 @@ const Bank = struct {
                 for (locs, 0..) |l, i| at[i + 1] = std.mem.alignForward(usize, at[i] + l.len, 2);
                 try scratch.resize(std.heap.page_allocator, at[4]);
                 const parts: []align(2) u8 = @alignCast(scratch.items);
-                for (locs, 0..) |l, i| try src.read(l, parts[at[i]..][0..l.len]);
+                for (locs, 0..) |l, i| try rd.read(l, parts[at[i]..][0..l.len]);
                 const offs: []align(2) u8 = @alignCast(parts[at[2]..][0..locs[2].len]);
                 const excs: []align(2) u8 = @alignCast(parts[at[3]..][0..locs[3].len]);
                 try decodeCsf32(parts[0..bl.len], parts[at[1]..][0..locs[1].len], std.mem.bytesAsSlice(u16, offs), std.mem.bytesAsSlice(u16, excs), w0.rows, cols, dst);
             } else {
-                try src.read(src.get("{s}.mlp.experts.{d}.{s}.weight_scale", .{ b, e, pj }) orelse return error.ModelOptMissingExpert, dst);
+                try rd.read(src.get("{s}.mlp.experts.{d}.{s}.weight_scale", .{ b, e, pj }) orelse return error.ModelOptMissingExpert, dst);
             }
             var g: [4]u8 = undefined;
-            try src.read(src.get("{s}.mlp.experts.{d}.{s}.weight_scale_2", .{ b, e, pj }) orelse return error.ModelOptMissingExpert, &g);
+            try rd.read(src.get("{s}.mlp.experts.{d}.{s}.weight_scale_2", .{ b, e, pj }) orelse return error.ModelOptMissingExpert, &g);
             self.gs[e] = @bitCast(std.mem.readInt(u32, &g, .little));
         }
     }
@@ -317,22 +350,12 @@ fn pageFree(m: []align(std.heap.page_size_min) u8) void {
     if (m.len > 0) std.heap.page_allocator.free(m);
 }
 
-const Owned = struct { mem: []align(std.heap.page_size_min) u8 };
-
-fn onRelease(payload: ?*anyopaque) callconv(.c) void {
-    const o: *Owned = @ptrCast(@alignCast(payload.?));
-    pageFree(o.mem);
-    std.heap.page_allocator.destroy(o);
-}
-
-/// `mem` as an MLX array without a copy where Metal accepts the buffer; MLX owns the unmap.
-fn wrapOwned(mem: []align(std.heap.page_size_min) u8, shape: []const c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
-    const o = try std.heap.page_allocator.create(Owned);
-    errdefer std.heap.page_allocator.destroy(o);
-    o.* = .{ .mem = mem };
-    const arr = mlx.mlx_array_new_data_managed_payload(mem.ptr, shape.ptr, @intCast(shape.len), dtype, o, onRelease);
-    if (arr.ctx == null) return error.ModelOptWrap;
-    return arr;
+/// `data` copied into an MLX array: MLX's allocator wires its memory, which the pageable scratch
+/// it came from is not.
+fn putCopy(weights: *Weights, data: []const u8, shape: []const c_int, dtype: mlx.mlx_dtype, comptime fmt: []const u8, args: anytype) !void {
+    const arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), dtype);
+    if (arr.ctx == null) return error.ModelOptAlloc;
+    try putArray(weights, arr, fmt, args);
 }
 
 /// Stores `arr` under a formatted key; on failure frees both.
@@ -353,10 +376,31 @@ fn bf16Array(vals: []const f32, s: mlx.mlx_stream) !mlx.mlx_array {
     return out;
 }
 
+/// Banks read per round. A round's scratch is ordinary pageable memory, so it stays small; every
+/// finished bank is copied into MLX's own memory before the next round starts.
+const BANKS_PER_ROUND = 6;
+
+fn fillOne(b: *Bank, src: *const Source) void {
+    b.fill(src) catch |e| {
+        b.err = e;
+    };
+}
+
+fn fillRound(round: []Bank, src: *const Source) void {
+    var threads: [BANKS_PER_ROUND]?std.Thread = @splat(null);
+    for (round[1..], 1..) |*b, i| threads[i] = std.Thread.spawn(.{}, fillOne, .{ b, src }) catch null;
+    fillOne(&round[0], src);
+    for (round[1..], 1..) |*b, i| if (threads[i]) |t| t.join() else fillOne(b, src);
+}
+
 /// Every layer's routed experts as `switch_mlp` banks: `<proj>.weight` u32 [E, out, in/8],
 /// `<proj>.scales` e4m3 [E, out, in/16]; the gate's global scales as `gate_proj.expert_scale`
-/// (applied before the SiLU), up x down folded into the routing weight as `expert_scale`.
-fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32) !void {
+/// (applied before the SiLU), up x down folded into the routing weight as `expert_scale`. A clamped
+/// SwiGLU limits `up` itself, so there the up scale stays apart (`up_proj.expert_scale`, applied
+/// before the clamp) and `expert_scale` is the down scale alone.
+/// `pressure` is read before each round: once the OS is paging, the load stops by name rather
+/// than take the machine down with it.
+fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressure: *const fn () u32, clamped: bool) !void {
     var src = try openSource(model_dir);
     defer src.deinit();
     const a = src.arena.allocator();
@@ -380,38 +424,30 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32) !void {
         if (b.gs.len > 0) std.heap.page_allocator.free(b.gs);
     };
 
-    const Pool = struct {
-        next: std.atomic.Value(usize) = .init(0),
-        fn work(pool: *@This(), list: []Bank, source: *const Source) void {
-            while (true) {
-                const i = pool.next.fetchAdd(1, .monotonic);
-                if (i >= list.len) return;
-                list[i].fill(source) catch |e| {
-                    list[i].err = e;
-                };
-            }
-        }
-    };
-    var pool: Pool = .{};
-    var threads: [12]?std.Thread = @splat(null);
-    for (&threads) |*t| t.* = std.Thread.spawn(.{}, Pool.work, .{ &pool, banks.items, &src }) catch null;
-    pool.work(banks.items, &src);
-    for (threads) |t| if (t) |th| th.join();
-
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var bytes: u64 = 0;
-    for (banks.items) |*b| {
-        if (b.err) |e| return e;
-        const dst = try mlxName(a, b.base, mtp_layer);
-        const E: c_int = @intCast(b.experts);
-        const w_arr = try wrapOwned(b.w, &.{ E, @intCast(b.rows), @intCast(b.in / 8) }, .uint32);
-        bytes += b.w.len + b.sc.len;
-        b.w = &.{};
-        try putArray(weights, w_arr, "{s}.mlp.switch_mlp.{s}.weight", .{ dst, PROJS[b.proj] });
-        const s_arr = try wrapOwned(b.sc, &.{ E, @intCast(b.rows), @intCast(b.in / 16) }, .uint8);
-        b.sc = &.{};
-        try putArray(weights, s_arr, "{s}.mlp.switch_mlp.{s}.scales", .{ dst, PROJS[b.proj] });
+    var done: usize = 0;
+    while (done < banks.items.len) {
+        if (status.underMemoryPressure(pressure())) {
+            log.err("[modelopt] the OS is paging: stopped after {d} of {d} expert banks ({d:.1} GB). Quit other apps to free memory, then retry\n", .{ done, banks.items.len, @as(f64, @floatFromInt(bytes)) / 1073741824.0 });
+            return error.InsufficientMemory;
+        }
+        const round = banks.items[done..@min(done + BANKS_PER_ROUND, banks.items.len)];
+        fillRound(round, &src);
+        for (round) |*b| {
+            if (b.err) |e| return e;
+            const dst = try mlxName(a, b.base, mtp_layer);
+            const E: c_int = @intCast(b.experts);
+            try putCopy(weights, b.w, &.{ E, @intCast(b.rows), @intCast(b.in / 8) }, .uint32, "{s}.mlp.switch_mlp.{s}.weight", .{ dst, PROJS[b.proj] });
+            try putCopy(weights, b.sc, &.{ E, @intCast(b.rows), @intCast(b.in / 16) }, .uint8, "{s}.mlp.switch_mlp.{s}.scales", .{ dst, PROJS[b.proj] });
+            bytes += b.w.len + b.sc.len;
+            pageFree(b.w);
+            pageFree(b.sc);
+            b.w = &.{};
+            b.sc = &.{};
+        }
+        done += round.len;
     }
     for (banks.items, 0..) |*b, i| {
         if (b.proj != 0) continue;
@@ -419,10 +455,30 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32) !void {
         const down = banks.items[i + 2].gs;
         const dst = try mlxName(a, b.base, mtp_layer);
         try putArray(weights, try bf16Array(b.gs, s), "{s}.mlp.switch_mlp.gate_proj.expert_scale", .{dst});
-        for (up, down) |*u, d| u.* *= d;
-        try putArray(weights, try bf16Array(up, s), "{s}.mlp.switch_mlp.expert_scale", .{dst});
+        if (clamped) {
+            try putArray(weights, try bf16Array(up, s), "{s}.mlp.switch_mlp.up_proj.expert_scale", .{dst});
+            try putArray(weights, try bf16Array(down, s), "{s}.mlp.switch_mlp.expert_scale", .{dst});
+        } else {
+            for (up, down) |*u, d| u.* *= d;
+            try putArray(weights, try bf16Array(up, s), "{s}.mlp.switch_mlp.expert_scale", .{dst});
+        }
     }
     log.info("[modelopt] {d} expert banks over {d} layers, {d:.1} GB (NVFP4, csf scales decoded)\n", .{ banks.items.len, experts.count(), @as(f64, @floatFromInt(bytes)) / 1073741824.0 });
+}
+
+/// Bytes the decoded banks take beyond the pack's expert tensors on disk: csf-compressed scales are
+/// stored as one e4m3 byte per 16 weights. 0 when the headers cannot be read (the load names that).
+pub fn bankExpansionBytes(model_dir: []const u8) u64 {
+    var src = openSource(model_dir) catch return 0;
+    defer src.deinit();
+    var disk: u64 = 0;
+    var decoded: u64 = 0;
+    var it = src.locs.iterator();
+    while (it.next()) |kv| {
+        disk += kv.value_ptr.len;
+        if (std.mem.endsWith(u8, kv.key_ptr.*, ".weight")) decoded += kv.value_ptr.len + kv.value_ptr.len / 8;
+    }
+    return decoded -| disk;
 }
 
 /// `csf_32x2_v1` scales of one [rows, cols] NVFP4 matrix (FlashInfer's `_csf_blocks.py`): blocks of
@@ -572,6 +628,7 @@ test "ModelOpt names map onto the mlx-lm layout" {
         .{ "model.language_model.layers.3.self_attn.q_proj.weight", "language_model.model.layers.3.self_attn.q_proj.weight" },
         .{ "model.language_model.layers.3.self_attn.q_proj.weight_scale", "language_model.model.layers.3.self_attn.q_proj.scales" },
         .{ "lm_head.weight", "language_model.lm_head.weight" },
+        .{ "lm_head.weight_scale", "language_model.lm_head.scales" },
         .{ "mtp.layers.0.self_attn.k_norm.weight", "language_model.mtp.layers.0.self_attn.k_norm.weight" },
         .{ "model.visual.blocks.0.attn.qkv.weight_scale", "model.visual.blocks.0.attn.qkv.scales" },
         .{ "model.language_model.layers.45.eh_proj.weight", "language_model.mtp.0.eh_proj.weight" },
@@ -640,4 +697,215 @@ test "ModelOpt NVFP4 dense dequant: code x e4m3 scale x weight_scale_2" {
     const got = mlx.mlx_array_data_float32(f).?;
     const e2m1 = [16]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6 };
     for (0..32) |i| try std.testing.expectEqual(e2m1[i % 16] * @as(f32, if (i < 16) 2.0 else 1.0) * 0.25, got[i]);
+}
+
+var probe_calls: usize = 0;
+var probe_trips_at: usize = std.math.maxInt(usize);
+
+/// A pressure reading that counts its calls and turns to "warning" from call number `probe_trips_at`.
+fn countingPressure() u32 {
+    probe_calls += 1;
+    return if (probe_calls >= probe_trips_at) 2 else 1;
+}
+
+fn miniByte(l: usize, e: usize, p: usize, i: usize, salt: u8) u8 {
+    return @truncate(l *% 131 +% e *% 31 +% p *% 7 +% i *% 3 +% salt);
+}
+
+/// Global scales are powers of two, so the bf16 products `buildBanks` stores are exact.
+fn miniScale2(l: usize, e: usize, p: usize) f32 {
+    return switch (p) {
+        0 => @floatFromInt(@as(u32, 1) << @intCast(e % 3)),
+        1 => @floatFromInt(@as(u32, 1) << @intCast(l % 2)),
+        else => 0.5,
+    };
+}
+
+/// A ModelOpt pack of `layers` MoE layers x `experts` experts (4 rows, 16 inputs, plain e4m3 scales).
+const MiniPack = struct {
+    layers: usize,
+    experts: usize,
+    /// Weight bytes per row (the layer has 4 rows).
+    cols: usize = 8,
+    /// Scale tensor stored beside each weight: plain e4m3 by default, a csf part when its name and size say so.
+    scale_suffix: []const u8 = "weight_scale",
+    scale_len: ?usize = null,
+};
+
+pub fn writeMiniPack(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, pack: MiniPack) !void {
+    const layers = pack.layers;
+    const experts = pack.experts;
+    const wlen = 4 * pack.cols;
+    const slen = pack.scale_len orelse wlen / 8;
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(a);
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(a);
+    try hdr.append(a, '{');
+    for (0..layers) |l| for (0..experts) |e| for (PROJS, 0..) |pj, p| {
+        const stem = try std.fmt.allocPrint(a, "model.language_model.layers.{d}.mlp.experts.{d}.{s}", .{ l, e, pj });
+        defer a.free(stem);
+        const wshape = try std.fmt.allocPrint(a, "[4,{d}]", .{pack.cols});
+        defer a.free(wshape);
+        const sshape = try std.fmt.allocPrint(a, "[{d}]", .{slen});
+        defer a.free(sshape);
+        const parts = [_]struct { suffix: []const u8, dtype: []const u8, shape: []const u8, len: usize }{
+            .{ .suffix = "weight", .dtype = "U8", .shape = wshape, .len = wlen },
+            .{ .suffix = pack.scale_suffix, .dtype = "U8", .shape = sshape, .len = slen },
+            .{ .suffix = "weight_scale_2", .dtype = "F32", .shape = "[1]", .len = 4 },
+        };
+        for (parts, 0..) |part, k| {
+            const at = data.items.len;
+            if (k == 2) {
+                var g: [4]u8 = undefined;
+                std.mem.writeInt(u32, &g, @bitCast(miniScale2(l, e, p)), .little);
+                try data.appendSlice(a, &g);
+            } else for (0..part.len) |i| try data.append(a, miniByte(l, e, p, i, @intCast(k)));
+            const entry = try std.fmt.allocPrint(a, "{s}\"{s}.{s}\":{{\"dtype\":\"{s}\",\"shape\":{s},\"data_offsets\":[{d},{d}]}}", .{ if (hdr.items.len > 1) "," else "", stem, part.suffix, part.dtype, part.shape, at, data.items.len });
+            defer a.free(entry);
+            try hdr.appendSlice(a, entry);
+        }
+    };
+    try hdr.append(a, '}');
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, hdr.items.len, .little);
+    try file.appendSlice(a, &len);
+    try file.appendSlice(a, hdr.items);
+    try file.appendSlice(a, data.items);
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file.items });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.0.gate_proj.weight\":\"model.safetensors\"}}" });
+}
+
+fn tmpPath(a: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    return std.fmt.allocPrint(a, "{s}/.zig-cache/tmp/{s}", .{ std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr))), tmp.sub_path });
+}
+
+fn expectMiniBanks(weights: *const Weights, layers: usize, experts: usize) !void {
+    const a = std.testing.allocator;
+    for (0..layers) |l| {
+        for (PROJS, 0..) |pj, p| {
+            for ([_][]const u8{ "weight", "scales" }, 0..) |what, k| {
+                const key = try std.fmt.allocPrint(a, "language_model.model.layers.{d}.mlp.switch_mlp.{s}.{s}", .{ l, pj, what });
+                defer a.free(key);
+                const arr = weights.get(key) orelse return error.MissingBank;
+                try mlx.check(mlx.mlx_array_eval(arr));
+                const per: usize = if (k == 0) 32 else 4;
+                try std.testing.expectEqual(experts * per, mlx.mlx_array_size(arr) * (if (k == 0) @as(usize, 4) else 1));
+                const bytes = mlx.mlx_array_data_uint8(if (k == 0) blk: {
+                    var v = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_view(&v, arr, .uint8, mlx.mlx_default_cpu_stream_new()));
+                    try mlx.check(mlx.mlx_array_eval(v));
+                    break :blk v;
+                } else arr).?;
+                for (0..experts) |e| for (0..per) |i|
+                    try std.testing.expectEqual(miniByte(l, e, p, i, @intCast(k)), bytes[e * per + i]);
+            }
+        }
+        for ([_][]const u8{ "switch_mlp.gate_proj.expert_scale", "switch_mlp.expert_scale" }, 0..) |name, k| {
+            const key = try std.fmt.allocPrint(a, "language_model.model.layers.{d}.mlp.{s}", .{ l, name });
+            defer a.free(key);
+            const arr = weights.get(key) orelse return error.MissingBank;
+            try mlx.check(mlx.mlx_array_eval(arr));
+            const got = mlx.mlx_array_data_bfloat16(arr).?;
+            for (0..experts) |e| {
+                const want: f32 = if (k == 0) miniScale2(l, e, 0) else miniScale2(l, e, 1) * miniScale2(l, e, 2);
+                try std.testing.expectEqual(@as(u16, @intCast(@as(u32, @bitCast(want)) >> 16)), got[e]);
+            }
+        }
+    }
+}
+
+test "ModelOpt banks: every expert's bytes and global scales land in its layer's banks" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeMiniPack(a, std.testing.io, tmp.dir, .{ .layers = 7, .experts = 3 });
+    const path = try tmpPath(a, &tmp);
+    defer a.free(path);
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    probe_calls = 0;
+    try buildBanks(&weights, path, null, countingPressure, false);
+    try expectMiniBanks(&weights, 7, 3);
+    try std.testing.expectEqual((21 + BANKS_PER_ROUND - 1) / BANKS_PER_ROUND, probe_calls);
+}
+
+test "ModelOpt banks: memory pressure stops the load between rounds, by name, with the finished banks published" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeMiniPack(a, std.testing.io, tmp.dir, .{ .layers = 7, .experts = 3 });
+    const path = try tmpPath(a, &tmp);
+    defer a.free(path);
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    probe_trips_at = 3;
+    defer probe_trips_at = std.math.maxInt(usize);
+    probe_calls = 0;
+    try std.testing.expectError(error.InsufficientMemory, buildBanks(&weights, path, null, countingPressure, false));
+    try std.testing.expectEqual(@as(usize, 3), probe_calls);
+    // Two rounds of six banks (weights + scales) were already MLX's when the third was refused.
+    try std.testing.expectEqual(@as(u32, 2 * BANKS_PER_ROUND * 2), weights.map.count());
+}
+
+test "ModelOpt banks: the resident bill is the decoded banks, not the compressed scales on disk" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 2 layers x 3 experts x 3 projections: a 256-byte weight decodes to 256 + 256/8 = 288, its disk
+    // span is 256 + a 10-byte csf scale + the 4-byte global scale = 270.
+    try writeMiniPack(a, std.testing.io, tmp.dir, .{ .layers = 2, .experts = 3, .cols = 64, .scale_suffix = "weight_scale.nvfp4_csf_fixed", .scale_len = 10 });
+    const path = try tmpPath(a, &tmp);
+    defer a.free(path);
+    try std.testing.expectEqual(@as(u64, 18 * 18), bankExpansionBytes(path));
+    // Plain scales are stored as decoded: nothing to add.
+    var plain = std.testing.tmpDir(.{});
+    defer plain.cleanup();
+    try writeMiniPack(a, std.testing.io, plain.dir, .{ .layers = 2, .experts = 3 });
+    const plain_path = try tmpPath(a, &plain);
+    defer a.free(plain_path);
+    try std.testing.expectEqual(@as(u64, 0), bankExpansionBytes(plain_path));
+}
+
+test "ModelOpt reads: a tensor is read through the pages that cover it, so F_NOCACHE holds" {
+    const P: u64 = std.heap.page_size_min;
+    const inside = alignedSpan(P + 5, 100);
+    try std.testing.expectEqual(P, inside.start);
+    try std.testing.expectEqual(2 * P, inside.end);
+    const straddle = alignedSpan(P - 4, 8);
+    try std.testing.expectEqual(@as(u64, 0), straddle.start);
+    try std.testing.expectEqual(2 * P, straddle.end);
+    const exact = alignedSpan(2 * P, P);
+    try std.testing.expectEqual(2 * P, exact.start);
+    try std.testing.expectEqual(3 * P, exact.end);
+}
+
+test "ModelOpt banks: a clamped SwiGLU keeps the up scale apart, to scale up before the clamp" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeMiniPack(a, std.testing.io, tmp.dir, .{ .layers = 2, .experts = 3 });
+    const path = try tmpPath(a, &tmp);
+    defer a.free(path);
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    probe_calls = 0;
+    try buildBanks(&weights, path, null, countingPressure, true);
+    for (0..2) |l| {
+        for ([_][]const u8{ "switch_mlp.gate_proj.expert_scale", "switch_mlp.up_proj.expert_scale", "switch_mlp.expert_scale" }, 0..) |name, k| {
+            const key = try std.fmt.allocPrint(a, "language_model.model.layers.{d}.mlp.{s}", .{ l, name });
+            defer a.free(key);
+            const arr = weights.get(key) orelse return error.MissingBank;
+            try mlx.check(mlx.mlx_array_eval(arr));
+            const got = mlx.mlx_array_data_bfloat16(arr).?;
+            for (0..3) |e| {
+                const want: f32 = miniScale2(l, e, k); // gate, up, and the down scale alone
+                try std.testing.expectEqual(@as(u16, @intCast(@as(u32, @bitCast(want)) >> 16)), got[e]);
+            }
+        }
+    }
 }

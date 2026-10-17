@@ -51,6 +51,7 @@ const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const sushi_pack = @import("sushi_pack.zig");
+const modelopt_pack = @import("modelopt_pack.zig");
 const vision_mod = @import("vision.zig");
 const radio_vision = @import("radio_vision.zig");
 const chat_mod = @import("chat.zig");
@@ -3744,7 +3745,13 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
     try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
 }
 
+/// A ModelOpt pack also bills the banks' decoded scales, which are smaller on disk.
 fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
+    const shards = try shardResidentBytes(allocator, io, model_dir, config);
+    return if (config.modelopt) shards +| modelopt_pack.bankExpansionBytes(model_dir) else shards;
+}
+
+fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
     const total = modelDiskBytes(io, model_dir);
     if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
@@ -3754,6 +3761,23 @@ fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: [
     if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     if (info.payload_bytes > total) return error.InvalidEmbeddedNgramTable;
     return total - info.payload_bytes;
+}
+
+test "residentModelDiskBytes: a ModelOpt pack is billed its decoded expert banks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try modelopt_pack.writeMiniPack(a, io, tmp.dir, .{ .layers = 2, .experts = 3, .cols = 64, .scale_suffix = "weight_scale.nvfp4_csf_fixed", .scale_len = 10 });
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const path = try std.fmt.allocPrint(a, "{s}/.zig-cache/tmp/{s}", .{ std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr))), tmp.sub_path });
+    defer a.free(path);
+    const on_disk = modelDiskBytes(io, path);
+    var config: model_mod.ModelConfig = .{ .model_type = "glm5_next" };
+    try std.testing.expectEqual(on_disk, try residentModelDiskBytes(a, io, path, &config));
+    config.modelopt = true;
+    try std.testing.expectEqual(on_disk + 18 * 18, try residentModelDiskBytes(a, io, path, &config));
 }
 
 fn residentGateBytes(validated: ?u64, discovered: ?u64, mlx_text: bool) ?u64 {
