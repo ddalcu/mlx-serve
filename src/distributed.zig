@@ -285,7 +285,7 @@ pub const Peer = struct {
         const sh = mlx.getShape(h);
         try self.sendOrdered(.{ OP_FORWARD, sh[0], sh[1], @intCast(offset & 0x7fffffff), @intCast(offset >> 31), sh[2], @intFromEnum(mlx.mlx_array_dtype(h)), 0 }, &.{h});
         self.peer_pos = offset + @as(usize, @intCast(sh[1]));
-        return self.link.recv(sh, mlx.mlx_array_dtype(h), 1, s);
+        return queuedRecv(&self.link, sh, mlx.mlx_array_dtype(h), 1);
     }
 
     /// Tensor mode: one MoE layer's input and router logits to the worker.
@@ -298,7 +298,7 @@ pub const Peer = struct {
 
     /// The worker's reply, shaped like this rank's own partial.
     pub fn recvLike(self: *Peer, like: mlx.mlx_array) !mlx.mlx_array {
-        return self.link.recv(mlx.getShape(like), mlx.mlx_array_dtype(like), 1, .{ .ctx = null });
+        return queuedRecv(&self.link, mlx.getShape(like), mlx.mlx_array_dtype(like), 1);
     }
 
     /// Header, then each payload, chained so the comm stream runs them in order, and
@@ -334,6 +334,28 @@ pub const Peer = struct {
         self.ready = true;
     }
 };
+
+/// Rows past which a receive is waited for on the host before any GPU work reads it.
+const LAZY_RECV_ROWS: usize = 16;
+
+/// A receive queued the moment it is built, so it pairs with the peer's send even when
+/// nobody evaluates what reads it (a warmup that drops its output would leave the
+/// peer's reply to be read by the next forward). Past `LAZY_RECV_ROWS` the host waits
+/// for it: a GPU command buffer waiting seconds on a CPU event trips Metal's watchdog.
+fn queuedRecv(link: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32) !mlx.mlx_array {
+    const r = try link.recv(shape, dtype, src, .{ .ctx = null });
+    errdefer _ = mlx.mlx_array_free(r);
+    var rows: usize = 1;
+    for (shape[0 .. shape.len - 1]) |d| rows *= @intCast(d);
+    if (rows > LAZY_RECV_ROWS) {
+        try evalOne(r);
+    } else {
+        const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{r}, 1);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_async_eval(v));
+    }
+    return r;
+}
 
 /// `x` that evaluates only after `dep`.
 fn dependsOn(x: mlx.mlx_array, dep: mlx.mlx_array) !mlx.mlx_array {
@@ -467,7 +489,7 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
                     return error.DistPeerDiverged;
                 }
                 const shape = [_]c_int{ m[1], m[2], m[5] };
-                const h = try link.recv(&shape, @enumFromInt(m[6]), 0, t.s);
+                const h = try queuedRecv(&link, &shape, @enumFromInt(m[6]), 0);
                 defer _ = mlx.mlx_array_free(h);
                 const out = try t.forwardQwen4Stream(&ctx, h);
                 defer _ = mlx.mlx_array_free(out);
@@ -475,12 +497,12 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
                 defer _ = mlx.mlx_array_free(sent);
                 try evalOne(sent);
                 forwards += 1;
-                if (forwards % 256 == 0) log.info("[dist] worker: {d} forwards, at {d} tokens\n", .{ forwards, t.moe_seq_offset });
+                if (m[1] * m[2] > 1 or forwards % 256 == 0) log.info("[dist] worker: forward {d}: {d}x{d} rows, now at {d} tokens\n", .{ forwards, m[1], m[2], t.moe_seq_offset });
             },
             OP_MOE => {
-                const x = try link.recv(&.{ m[1], m[2], m[3] }, @enumFromInt(m[5]), 0, t.s);
+                const x = try queuedRecv(&link, &.{ m[1], m[2], m[3] }, @enumFromInt(m[5]), 0);
                 defer _ = mlx.mlx_array_free(x);
-                const logits = try link.recv(&.{ m[1], m[2], m[4] }, @enumFromInt(m[7]), 0, t.s);
+                const logits = try queuedRecv(&link, &.{ m[1], m[2], m[4] }, @enumFromInt(m[7]), 0);
                 defer _ = mlx.mlx_array_free(logits);
                 const out = try t.moeExpertsRouted(x, @intCast(m[6]), logits);
                 defer _ = mlx.mlx_array_free(out);
