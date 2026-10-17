@@ -31,7 +31,7 @@ final class ClusterWorker: ObservableObject {
             if case .loading(let what) = current { return .ready(what) }
             return .ready("")
         }
-        if line.contains("[dist] worker: ") && (line.contains("(pipeline)") || line.contains("(tensor)")) {
+        if line.contains("[dist] worker: ") && (line.contains("(pipeline)") || line.contains("(tensor)") || line.contains("(video steps)")) {
             let what = line.components(separatedBy: "[dist] worker: ").last?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return .loading(what)

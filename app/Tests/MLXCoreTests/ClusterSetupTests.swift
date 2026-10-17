@@ -85,4 +85,39 @@ final class ClusterSetupTests: XCTestCase {
         XCTAssertEqual(live?.layers, 48)
         XCTAssertEqual(live?.workerReady, true)
     }
+
+    /// `/props` "cluster" for video steps: the worker's name, speed and the last split.
+    func testVideoClusterInfoParses() {
+        let c = ClusterInfo.parse(["cluster": ["mode": "rows", "model": "H3-4bit", "joined": true, "planned": true,
+                                               "worker_ready": true, "worker_name": "Davids-MBP.local", "worker_speed": 0.42,
+                                               "link_gbps": 8.9, "last_job": "split 4000/3000 rows", "split_rows": [4000, 3000]]])
+        XCTAssertEqual(c?.workerName, "Davids-MBP.local")
+        XCTAssertEqual(c?.lastSplit, true)
+        XCTAssertEqual(c?.serves("/Users/x/.mlx-serve/models/ddalcu/H3-4bit"), true)
+        XCTAssertEqual(c?.serves("/m/H3-8bit"), false)
+    }
+
+    /// The worker's measured speed decides the advice; nothing measured yet says so.
+    func testVideoAdviceFollowsTheWorkersSpeed() {
+        var c = ClusterInfo(mode: "rows", model: "H3", joined: true, planned: true, workerReady: true, layers: 0, here: 0)
+        XCTAssertEqual(ClusterVideoAdvice.of(c), .unmeasured)
+        XCTAssertEqual(ClusterVideoAdvice.stepSpeedup(c), 1)
+        c.workerSpeed = 1.0
+        XCTAssertEqual(ClusterVideoAdvice.of(c), .shares(speed: 1.0))
+        XCTAssertEqual(ClusterVideoAdvice.stepSpeedup(c), 1.8, accuracy: 1e-9)
+        c.workerSpeed = 0.4
+        XCTAssertEqual(ClusterVideoAdvice.of(c), .largeOnly(speed: 0.4))
+        c.workerSpeed = 0.2
+        XCTAssertEqual(ClusterVideoAdvice.of(c), .tooSlow(speed: 0.2))
+        XCTAssertEqual(ClusterVideoAdvice.stepSpeedup(c), 1)
+        XCTAssertTrue(ClusterVideoAdvice.tooSlow(speed: 0.2).text(worker: "Davids-MBP.local").hasPrefix("Davids-MBP runs at 0.2×"))
+    }
+
+    /// A LAN peer named after the worker's host is the same Mac.
+    func testLanPeerMatchesTheWorkersHost() {
+        XCTAssertTrue(StoryboardCluster.sameMachine("Davids-MBP", "Davids-MBP.local"))
+        XCTAssertTrue(StoryboardCluster.sameMachine("davids mbp", "Davids-MBP"))
+        XCTAssertFalse(StoryboardCluster.sameMachine("5060-linux", "Davids-MBP.local"))
+        XCTAssertFalse(StoryboardCluster.sameMachine(nil, "Davids-MBP"))
+    }
 }

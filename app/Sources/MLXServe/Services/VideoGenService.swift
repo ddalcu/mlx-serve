@@ -266,9 +266,16 @@ final class VideoGenService: ObservableObject {
         // estimate is measured rather than extrapolated. Recorded from
         // the SAMPLING span only — the encode after this is ours, not the
         // model's, and the estimate does not include it.
+        let measured = ProcessInfo.processInfo.systemUptime - startedAt
+        // A local video whose steps the Thunderbolt worker shared learns its own speed.
+        var key = peer
+        if key == nil, request.model.backend == .minimaxH3,
+           let c = try? await api.fetchProps(port: port)?.cluster, c.lastSplit, c.serves(request.model.repo) {
+            key = ClusterInfo.thunderboltPeer
+        }
         H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
                               frames: request.numFrames, steps: steps, fast: !request.bestQuality && !request.turbo,
-                              measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt, peer: peer)
+                              measuredSeconds: measured, peer: key)
         return frames
     }
 

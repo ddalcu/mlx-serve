@@ -19,6 +19,8 @@ struct RdmaPort: Equatable {
 /// 169.254/16 and would route the worker's call to the host away from the cable.
 enum ClusterSetup {
     static let port = 32323
+    /// Model types a cluster serves: Flash Next by layers or experts, H3 by video steps.
+    static let servableTypes: Set<String> = ["qwen4_exp", "minimax_h3"]
     static let linkSubnet = "10.254.77"
     static func linkAddress(_ role: ClusterRole) -> String { "\(linkSubnet).\(role == .worker ? 2 : 1)" }
 
@@ -128,12 +130,88 @@ struct ClusterInfo: Equatable {
     var layers: Int
     /// Layers this Mac holds (`here` = [0, n)).
     var here: Int
+    /// The worker's host name, as its LAN sharing names it.
+    var workerName: String = ""
+    /// Video steps (`mode == "rows"`): the worker's speed against this Mac's (0 until
+    /// measured), the link in GB/s, and what the last video did ("split …" or "alone: …").
+    var workerSpeed: Double = 0
+    var linkGbps: Double = 0
+    var lastJob: String = ""
+    /// The last video's rows on each Mac; zeros when it ran here alone.
+    var splitRows: [Int] = []
+    var workerFreeMib: Int = 0
+
+    var lastSplit: Bool { splitRows.count == 2 && splitRows[1] > 0 }
+
+    /// The run-history key for videos whose steps were split with the worker.
+    static let thunderboltPeer = "thunderbolt"
+
+    /// Whether this cluster serves the pack in `dir` (the server matches by folder name).
+    func serves(_ dir: String) -> Bool { !model.isEmpty && (dir as NSString).lastPathComponent == model }
 
     static func parse(_ json: [String: Any]) -> ClusterInfo? {
         guard let c = json["cluster"] as? [String: Any] else { return nil }
         return ClusterInfo(mode: c["mode"] as? String ?? "", model: c["model"] as? String ?? "",
                            joined: c["joined"] as? Bool ?? false, planned: c["planned"] as? Bool ?? false,
                            workerReady: c["worker_ready"] as? Bool ?? false, layers: c["layers"] as? Int ?? 0,
-                           here: (c["here"] as? [Int])?.last ?? 0)
+                           here: (c["here"] as? [Int])?.last ?? 0,
+                           workerName: c["worker_name"] as? String ?? "",
+                           workerSpeed: (c["worker_speed"] as? NSNumber)?.doubleValue ?? 0,
+                           linkGbps: (c["link_gbps"] as? NSNumber)?.doubleValue ?? 0,
+                           lastJob: c["last_job"] as? String ?? "",
+                           splitRows: c["split_rows"] as? [Int] ?? [],
+                           workerFreeMib: c["worker_free_mib"] as? Int ?? 0)
     }
+}
+
+/// What splitting video steps with the worker is worth, from the measured speeds. The server
+/// decides each job on its own; this is the guidance the app shows around that decision.
+enum ClusterVideoAdvice: Equatable {
+    /// Joined, but nothing measured yet: the first video measures both Macs and the link.
+    case unmeasured
+    /// About as fast as this Mac: large videos share every step.
+    case shares(speed: Double)
+    /// Slower: only the largest videos gain, the rest run here.
+    case largeOnly(speed: Double)
+    /// Much slower: splitting would save little, so videos run here.
+    case tooSlow(speed: Double)
+
+    static func of(_ c: ClusterInfo) -> ClusterVideoAdvice {
+        let r = c.workerSpeed
+        if r <= 0 { return .unmeasured }
+        if r >= 0.6 { return .shares(speed: r) }
+        return r >= 0.3 ? .largeOnly(speed: r) : .tooSlow(speed: r)
+    }
+
+    /// One sentence naming the other Mac.
+    func text(worker: String) -> String {
+        let name = worker.isEmpty ? L10n.text("The other Mac") : ClusterVideoAdvice.shortName(worker)
+        switch self {
+        case .unmeasured:
+            return L10n.text("The first video measures both Macs and the link, then each video uses the other Mac when that is faster.")
+        case .shares(let r):
+            return L10n.format("%@ runs at %@ this Mac's speed: every step of a large video is shared, up to %@ faster.",
+                               name, Self.times(r), Self.times(1 + r * 0.8))
+        case .largeOnly(let r):
+            return L10n.format("%@ runs at %@ this Mac's speed: only the largest videos gain; the rest run here.", name, Self.times(r))
+        case .tooSlow(let r):
+            return L10n.format("%@ runs at %@ this Mac's speed, too slow to help with steps, so videos run here. Storyboard shots can still go to it over LAN sharing.",
+                               name, Self.times(r))
+        }
+    }
+
+    /// The worker's speed as a speed-up factor the estimate can divide by: the measured share
+    /// minus what the swaps cost, never below 1.
+    static func stepSpeedup(_ c: ClusterInfo) -> Double {
+        switch of(c) {
+        case .shares(let r), .largeOnly(let r): return max(1, 1 + r * 0.8)
+        default: return 1
+        }
+    }
+
+    static func shortName(_ host: String) -> String {
+        host.hasSuffix(".local") ? String(host.dropLast(6)) : host
+    }
+
+    private static func times(_ r: Double) -> String { String(format: "%.1f×", r) }
 }

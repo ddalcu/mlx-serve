@@ -42,6 +42,16 @@ enum StoryboardCluster {
                            H3TimeEstimate.duration(saved).replacingOccurrences(of: "about ", with: ""))
     }
 
+    /// Whether a LAN peer name and a host name are one Mac: LAN sharing names a Mac by its
+    /// host name unless told otherwise, with or without ".local".
+    static func sameMachine(_ peer: String?, _ host: String) -> Bool {
+        guard let peer, !host.isEmpty else { return false }
+        func key(_ s: String) -> String {
+            String(ClusterVideoAdvice.shortName(s).lowercased().filter { $0.isLetter || $0.isNumber })
+        }
+        return key(peer) == key(host)
+    }
+
     /// Every join but the film's end has a picture.
     static func joinsAnchored(_ endFrames: [String?]) -> Bool {
         endFrames.dropLast().allSatisfy { $0 != nil }

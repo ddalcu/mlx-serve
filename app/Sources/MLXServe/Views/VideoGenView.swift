@@ -915,10 +915,37 @@ struct VideoGenView: View {
         }
     }
 
-    /// Network machines serving this exact pack: they render shots beside this Mac.
+    /// Network machines serving this exact pack: they render shots beside this Mac. A Mac
+    /// already sharing every step over Thunderbolt is busy with this Mac's shots, so it is left out.
     private var clusterPeers: [RenderDevice] {
         guard storyboardOn, lanModel == nil, model.backend == .minimaxH3 else { return [] }
-        return StoryboardCluster.peers(of: model.repo, lanModels: server.lanModels(capability: "video"))
+        let peers = StoryboardCluster.peers(of: model.repo, lanModels: server.lanModels(capability: "video"))
+        guard let tb = thunderbolt else { return peers }
+        return peers.filter { !StoryboardCluster.sameMachine($0.peer, tb.workerName) }
+    }
+
+    /// The Thunderbolt cluster when it serves this pack: its worker shares the video's steps.
+    private var thunderbolt: ClusterInfo? {
+        guard model.backend == .minimaxH3, lanModel == nil, let c = server.cluster,
+              c.joined, c.serves(model.repo) else { return nil }
+        return c
+    }
+
+    private func thunderboltNote(_ c: ClusterInfo) -> some View {
+        let advice = ClusterVideoAdvice.of(c)
+        let tooSlow: Bool = { if case .tooSlow = advice { return true } else { return false } }()
+        return Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verbatim: L10n.format("Thunderbolt cluster with %@",
+                                           c.workerName.isEmpty ? L10n.text("the worker") : ClusterVideoAdvice.shortName(c.workerName)))
+                    .font(.app(.caption).weight(.semibold))
+                Text(verbatim: advice.text(worker: c.workerName)).font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+        } icon: {
+            Image(systemName: tooSlow ? "tortoise" : "bolt.horizontal.fill")
+                .foregroundStyle(tooSlow ? Color.orange : Color.accentColor)
+        }
+        .help(L10n.text("Set up in Settings ▸ Cluster. Each video decides on its own whether splitting its steps is faster."))
     }
 
     private var clusterReady: Bool {
@@ -1183,9 +1210,20 @@ struct VideoGenView: View {
             let cluster = StoryboardCluster.wallSeconds(costs: costs, factors: factors)
             return StoryboardCluster.describe(alone: alone, cluster: cluster, machines: peers.count + 1)
         }
+        let frames = storyboardOn ? shotFrames : [numFrames]
+        if let tb = thunderbolt, ClusterVideoAdvice.stepSpeedup(tb) > 1 {
+            let anchor = frames.reduce(0.0) {
+                $0 + H3TimeEstimate.seconds(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                            frames: $1, steps: steps, fast: effectiveFast, hardware: .anchor)
+            }
+            let alone = anchor * H3TimeEstimate.speedFactor(peer: nil).factor
+            let split = H3TimeEstimate.speedFactor(peer: ClusterInfo.thunderboltPeer)
+            let both = split.measured ? anchor * split.factor : alone / ClusterVideoAdvice.stepSpeedup(tb)
+            return StoryboardCluster.describe(alone: alone, cluster: min(both, alone), machines: 2)
+        }
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
-            shotFrames: storyboardOn ? shotFrames : [numFrames], steps: steps, fast: effectiveFast
+            shotFrames: frames, steps: steps, fast: effectiveFast
         )
     }
 
@@ -2245,6 +2283,9 @@ struct VideoGenView: View {
             } else if !storyboardOn, !payloadFits {
                 Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
                     .font(.app(.caption2)).foregroundStyle(.orange)
+            }
+            if let tb = thunderbolt {
+                thunderboltNote(tb)
             }
             if !service.isRunning, let est = timeEstimate {
                 Text(L10n.text(est))

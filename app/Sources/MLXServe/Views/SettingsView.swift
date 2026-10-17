@@ -1114,14 +1114,19 @@ private struct ThunderboltClusterSectionContent: View {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterModelPath)) {
                 Picker("", selection: $appState.serverOptions.clusterModelPath) {
                     Text("Choose…").tag("")
-                    ForEach(appState.localModels.filter { $0.modelType == "qwen4_exp" }, id: \.path) { m in
+                    ForEach(appState.localModels.filter { ClusterSetup.servableTypes.contains($0.modelType) }, id: \.path) { m in
                         Text(verbatim: m.name).tag(m.path)
                     }
                 }
                 .labelsHidden().frame(width: 260)
             }
         }
-        if let m = meta["clusterMode"] {
+        if videoModel {
+            SettingsRow(title: L10n.text("How it splits"),
+                        explainer: L10n.text("Both Macs keep the whole video pack loaded, so the worker needs the same pack and the room for it. Every step's frames are split between the two over the cable, by each Mac's measured speed.")) {
+                Text("Video steps").font(.app(.caption)).foregroundStyle(.secondary)
+            }
+        } else if let m = meta["clusterMode"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterMode)) {
                 Picker("", selection: $appState.serverOptions.clusterMode) {
                     Text("By layers").tag(ClusterMode.pipeline)
@@ -1133,9 +1138,15 @@ private struct ThunderboltClusterSectionContent: View {
         SettingsRow(title: L10n.text("Status"), explainer: L10n.format("The worker joins at %@.", ClusterSetup.coordinator(options, ports: { ports }))) {
             Text(verbatim: clusterStatus).font(.app(.caption)).foregroundStyle(.secondary)
         }
-        if let c = server.cluster, c.planned, c.layers > 0 {
+        if let c = server.cluster, c.mode == "rows", c.joined {
+            VideoClusterAdviceRow(cluster: c)
+        } else if let c = server.cluster, c.planned, c.layers > 0 {
             ClusterSplitBar(cluster: c)
         }
+    }
+
+    private var videoModel: Bool {
+        appState.localModels.first { $0.path == options.clusterModelPath }?.modelType == "minimax_h3"
     }
 
     private var clusterStatus: String {
@@ -1143,6 +1154,11 @@ private struct ThunderboltClusterSectionContent: View {
             return options.clusterModelPath.isEmpty ? L10n.text("Choose a model") : L10n.text("Starts with the server")
         }
         if !c.joined { return L10n.text("Waiting for the worker") }
+        let worker = c.workerName.isEmpty ? L10n.text("The worker") : ClusterVideoAdvice.shortName(c.workerName)
+        if videoModel {
+            if !c.planned { return L10n.format("%@ joined; it loads %@ with the first video", worker, c.model) }
+            return c.workerReady ? L10n.format("%@ holds %@ for video steps", worker, c.model) : L10n.format("%@ is loading %@", worker, c.model)
+        }
         if !c.planned { return L10n.format("Worker joined; it loads its part with %@", c.model) }
         return c.workerReady ? L10n.format("Serving %@ on both Macs", c.model) : L10n.text("The worker is loading its part")
     }
@@ -1174,6 +1190,47 @@ private struct WorkerStatusRow: View {
             case .failed(let why): Text(verbatim: why).font(.app(.caption)).foregroundStyle(.red)
             }
         }
+    }
+}
+
+/// Video steps: how fast the worker is against this Mac, what that means, and what the last
+/// video did, with its row split as two bars.
+private struct VideoClusterAdviceRow: View {
+    let cluster: ClusterInfo
+
+    var body: some View {
+        let advice = ClusterVideoAdvice.of(cluster)
+        VStack(alignment: .leading, spacing: 4) {
+            Label {
+                Text(verbatim: advice.text(worker: cluster.workerName)).font(.app(.caption))
+            } icon: {
+                Image(systemName: { if case .tooSlow = advice { return "tortoise" } else { return "bolt.horizontal" } }())
+                    .foregroundStyle({ if case .tooSlow = advice { return Color.orange } else { return Color.accentColor } }())
+            }
+            if cluster.linkGbps > 0 {
+                Text(verbatim: L10n.format("Link: %@ GB/s each way · %@ free on the worker",
+                                           String(format: "%.1f", cluster.linkGbps),
+                                           ByteCountFormatter.string(fromByteCount: Int64(cluster.workerFreeMib) << 20, countStyle: .memory)))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+            if cluster.lastSplit {
+                let here = Double(cluster.splitRows[0]) / Double(max(1, cluster.splitRows[0] + cluster.splitRows[1]))
+                GeometryReader { g in
+                    HStack(spacing: 2) {
+                        RoundedRectangle(cornerRadius: 3).fill(Color.accentColor).frame(width: max(4, g.size.width * here - 1))
+                        RoundedRectangle(cornerRadius: 3).fill(Color.purple).frame(width: max(4, g.size.width * (1 - here) - 1))
+                    }
+                }
+                .frame(height: 10)
+                Text(verbatim: L10n.format("Last video: %lld%% of every step here, %lld%% on the worker",
+                                           Int64((here * 100).rounded()), Int64(((1 - here) * 100).rounded())))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            } else if cluster.lastJob.hasPrefix("alone: ") {
+                Text(verbatim: L10n.format("Last video ran here alone: %@", String(cluster.lastJob.dropFirst(7))))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 
