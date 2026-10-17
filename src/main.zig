@@ -637,6 +637,7 @@ pub fn main(init: std.process.Init) !void {
     var dist_coordinator: ?[]const u8 = null;
     var dist_device: ?[]const u8 = null;
     var dist_split: ?u32 = null;
+    var dist_model: ?[]const u8 = null;
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
@@ -747,6 +748,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--dist-device") and i + 1 < args.len) {
             i += 1;
             dist_device = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dist-model") and i + 1 < args.len) {
+            i += 1;
+            dist_model = args[i];
         } else if (std.mem.eql(u8, args[i], "--dist-split") and i + 1 < args.len) {
             i += 1;
             dist_split = try std.fmt.parseInt(u32, args[i], 10);
@@ -1398,6 +1402,23 @@ pub fn main(init: std.process.Init) !void {
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
+    if (dist_mode) |mode| {
+        const coordinator = dist_coordinator orelse {
+            log.err("--dist needs --dist-coordinator IP:PORT (this Mac's address the worker connects to)\n", .{});
+            std.process.exit(1);
+        };
+        const device = dist_device orelse {
+            log.err("--dist needs --dist-device rdma_enX (the RDMA port facing the worker; see `ibv_devinfo`)\n", .{});
+            std.process.exit(1);
+        };
+        const group_model = dist_model orelse if (model_dir.len > 0) model_dir else {
+            log.err("--dist needs --dist-model DIR (or --model): the model the two Macs serve together\n", .{});
+            std.process.exit(1);
+        };
+        log.info("[dist] waiting for the worker at {s}...\n", .{coordinator});
+        try @import("distributed.zig").connect(io, allocator, .{ .rank = 0, .coordinator = coordinator, .device = device }, mode, group_model, dist_split);
+    }
+
     if (serve_mode) {
         // Headless boot: `--model-dir` given, no `--model`. Start with no
         // primary model; everything (chat + media) loads on demand through the
@@ -1427,19 +1448,6 @@ pub fn main(init: std.process.Init) !void {
             try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
             return;
         }
-    }
-
-    if (dist_mode) |mode| {
-        const coordinator = dist_coordinator orelse {
-            log.err("--dist needs --dist-coordinator IP:PORT (this Mac's address the worker connects to)\n", .{});
-            std.process.exit(1);
-        };
-        const device = dist_device orelse {
-            log.err("--dist needs --dist-device rdma_enX (the RDMA port facing the worker; see `ibv_devinfo`)\n", .{});
-            std.process.exit(1);
-        };
-        log.info("[dist] waiting for the worker at {s}...\n", .{coordinator});
-        try @import("distributed.zig").connect(io, allocator, .{ .rank = 0, .coordinator = coordinator, .device = device }, mode, model_dir, dist_split);
     }
 
     // Parse config — heap allocate so the LoadedModel can take ownership

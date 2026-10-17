@@ -234,29 +234,47 @@ fn mib(b: u64) i32 {
     return @intCast(@min(b >> 20, std.math.maxInt(i32)));
 }
 
-/// What a worker reports before it loads: its memory and the model it found on its disk.
+/// What a worker reports on joining: its memory.
 const Hello = struct {
     avail_mib: i32,
     total_mib: i32,
-    layers: i32,
-    hidden: i32,
-    vocab: i32,
-    experts: i32,
 
-    fn of(cfg: *const model_mod.ModelConfig) Hello {
-        return .{ .avail_mib = mib(status.getAvailableMemBytes()), .total_mib = mib(status.getTotalMemBytes()), .layers = @intCast(cfg.num_hidden_layers), .hidden = @intCast(cfg.hidden_size), .vocab = @intCast(cfg.vocab_size), .experts = @intCast(cfg.num_experts) };
+    fn here() Hello {
+        return .{ .avail_mib = mib(status.getAvailableMemBytes()), .total_mib = mib(status.getTotalMemBytes()) };
     }
     fn msg(h: Hello) Msg {
-        return .{ MAGIC, VERSION, h.avail_mib, h.total_mib, h.layers, h.hidden, h.vocab, h.experts };
+        return .{ MAGIC, VERSION, h.avail_mib, h.total_mib, 0, 0, 0, 0 };
     }
     fn parse(m: Msg) !Hello {
         if (m[0] != MAGIC or m[1] != VERSION) return error.DistProtocolMismatch;
-        return .{ .avail_mib = m[2], .total_mib = m[3], .layers = m[4], .hidden = m[5], .vocab = m[6], .experts = m[7] };
-    }
-    fn sameModel(a: Hello, b: Hello) bool {
-        return a.layers == b.layers and a.hidden == b.hidden and a.vocab == b.vocab and a.experts == b.experts;
+        return .{ .avail_mib = m[2], .total_mib = m[3] };
     }
 };
+
+/// What rank 0 asks a worker to load: the model by folder name, checked against
+/// the worker's own copy by geometry, and its part of it.
+const Plan = struct {
+    mode: Mode,
+    span: LayerSpan,
+    hidden: i32,
+    experts: i32,
+
+    fn msg(p: Plan, name_len: usize) Msg {
+        return .{ MAGIC, @intFromEnum(p.mode), @intCast(p.span.start), @intCast(p.span.end), @intCast(p.span.total), @intCast(name_len), p.hidden, p.experts };
+    }
+    fn parse(m: Msg) !Plan {
+        if (m[0] != MAGIC) return error.DistProtocolMismatch;
+        return .{ .mode = @enumFromInt(m[1]), .span = .{ .start = @intCast(m[2]), .end = @intCast(m[3]), .total = @intCast(m[4]) }, .hidden = m[6], .experts = m[7] };
+    }
+    fn matches(p: Plan, cfg: *const model_mod.ModelConfig) bool {
+        return cfg.num_hidden_layers == p.span.total and cfg.hidden_size == p.hidden and cfg.num_experts == p.experts;
+    }
+};
+
+/// Worker failure codes in its READY message (0 = ready).
+const NOT_FOUND: i32 = 2;
+const MISMATCH: i32 = 3;
+const LOAD_FAILED: i32 = 1;
 
 /// The seam that splits `layers` by free memory, on a full-attention group boundary.
 pub fn chooseSplit(layers: u32, interval: u32, avail0: u64, avail1: u64) u32 {
@@ -270,10 +288,14 @@ pub fn chooseSplit(layers: u32, interval: u32, avail0: u64, avail1: u64) u32 {
 pub const Peer = struct {
     link: Link,
     mode: Mode,
-    /// Pipeline: this rank's layers. Tensor: every layer (`span.end == span.total`).
-    span: LayerSpan,
+    /// The model the group serves, by folder name (`--dist-model`, else `--model`).
+    model: []const u8,
+    split: ?u32,
+    worker: Hello,
+    /// Set by the first load of `model` (`planFor`), reused by every reload.
+    span: LayerSpan = .{ .start = 0, .end = 0, .total = 0 },
     shard: ?Shard = null,
-    model_dir: []const u8,
+    planned: bool = false,
     ready: bool = false,
     /// Tokens the worker's caches hold. Every forward must continue them or start over at 0.
     peer_pos: usize = 0,
@@ -330,7 +352,11 @@ pub const Peer = struct {
     fn awaitReady(self: *Peer, s: mlx.mlx_stream) !void {
         const m = try recvMsg(&self.link, 1, s);
         if (m[0] != MAGIC or m[1] != 0) {
-            log.err("[dist] the worker failed to load its layers (code {d})\n", .{m[1]});
+            switch (m[1]) {
+                NOT_FOUND => log.err("[dist] the worker has no model named {s} in its model folders\n", .{self.model}),
+                MISMATCH => log.err("[dist] the worker's copy of {s} has a different geometry\n", .{self.model}),
+                else => log.err("[dist] the worker failed to load its part of {s}\n", .{self.model}),
+            }
             return error.DistWorkerLoadFailed;
         }
         if (self.mode == .pipeline)
@@ -383,92 +409,151 @@ pub fn peer() ?*Peer {
     return if (peer_slot) |*p| p else null;
 }
 
-/// The trunk span this process serves for `model_dir`, if it is the distributed model.
-pub fn spanFor(model_dir: []const u8) ?LayerSpan {
-    const p = peerFor(model_dir) orelse return null;
-    return if (p.mode == .pipeline) p.span else null;
-}
+/// What this rank holds of `model_dir`'s model when it is the group's model: on the first
+/// load the split is chosen and the worker told to load its part; reloads reuse it.
+pub const Part = union(enum) { span: LayerSpan, shard: Shard };
 
-/// The expert slice this process serves for `model_dir`, in tensor mode.
-pub fn shardFor(model_dir: []const u8) ?Shard {
-    const p = peerFor(model_dir) orelse return null;
-    return p.shard;
-}
-
-fn peerFor(model_dir: []const u8) ?*Peer {
+pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Part {
     const p = peer() orelse return null;
-    return if (std.mem.eql(u8, std.fs.path.basename(p.model_dir), std.fs.path.basename(model_dir))) p else null;
+    if (!std.mem.eql(u8, std.fs.path.basename(p.model), std.fs.path.basename(model_dir))) return null;
+    if (!p.planned) try plan(p, config);
+    return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
 }
 
-/// Rank 0 at startup: joins the group, checks the worker found the same model,
-/// splits the layers by free memory (or at `split`), and tells the worker its span.
-pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model_dir: []const u8, split: ?u32) !void {
+fn plan(self: *Peer, config: *const model_mod.ModelConfig) !void {
+    if (!config.isQwen4()) {
+        log.err("[dist] {s}: this architecture ({s}) has no multi-Mac path yet\n", .{ self.model, config.model_type });
+        return error.DistArchUnsupported;
+    }
+    const n = config.num_hidden_layers;
+    var pl: Plan = .{ .mode = self.mode, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts) };
+    switch (self.mode) {
+        .tensor => {
+            if (config.num_experts == 0) return error.DistTensorNeedsMoe;
+            self.shard = .{ .rank = 0, .size = 2 };
+            log.info("[dist] tensor: each expert of {s} split across this Mac and the worker\n", .{std.fs.path.basename(self.model)});
+        },
+        .pipeline => {
+            const mine: u64 = status.getAvailableMemBytes() >> 20;
+            const k = self.split orelse chooseSplit(n, config.full_attention_interval, mine, @intCast(self.worker.avail_mib));
+            if (k == 0 or k >= n or (config.full_attention_interval != 0 and k % config.full_attention_interval != 0)) return error.DistSplitOffInterval;
+            self.span = .{ .start = 0, .end = k, .total = n };
+            pl.span = .{ .start = k, .end = n, .total = n };
+            log.info("[dist] pipeline: layers 0..{d} of {s} here ({d} MiB free), {d}..{d} on the worker ({d} MiB free of {d})\n", .{ k, std.fs.path.basename(self.model), mine, k, n, self.worker.avail_mib, self.worker.total_mib });
+        },
+    }
+    const name = std.fs.path.basename(self.model);
+    try sendMsg(&self.link, pl.msg(name.len), 1, .{ .ctx = null });
+    try sendBytes(&self.link, name, 1);
+    self.planned = true;
+}
+
+fn sendBytes(link: *const Link, bytes: []const u8, dst: u32) !void {
+    const a = mlx.mlx_array_new_data(bytes.ptr, &[_]c_int{@intCast(bytes.len)}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(a);
+    const r = try link.send(a, dst, .{ .ctx = null });
+    defer _ = mlx.mlx_array_free(r);
+    try evalOne(r);
+}
+
+fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
+    const r = try link.recv(&[_]c_int{@intCast(out.len)}, .uint8, src, .{ .ctx = null });
+    defer _ = mlx.mlx_array_free(r);
+    try evalOne(r);
+    @memcpy(out, (mlx.mlx_array_data_uint8(r) orelse return error.DistBadMessage)[0..out.len]);
+}
+
+/// Rank 0 at startup: joins the group and hears the worker's memory. The split waits
+/// for `model` to load (`planFor`).
+pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32) !void {
     var link = try Link.open(io, cfg);
     errdefer link.deinit();
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    var mc = try model_mod.parseConfig(io, allocator, model_dir);
-    defer mc.deinit(allocator);
-    const mine = Hello.of(&mc);
-    const theirs = try Hello.parse(try recvMsg(&link, 1, s));
-    if (!mine.sameModel(theirs)) {
-        log.err("[dist] the worker loaded a different model ({d} layers, hidden {d}, vocab {d}) than {s}\n", .{ theirs.layers, theirs.hidden, theirs.vocab, model_dir });
-        return error.DistModelMismatch;
-    }
-    const n = mc.num_hidden_layers;
-    if (mode == .tensor) {
-        if (mc.num_experts == 0) return error.DistTensorNeedsMoe;
-        try sendMsg(&link, .{ MAGIC, @intFromEnum(mode), 0, @intCast(n), @intCast(n), 0, 0, 0 }, 1, s);
-        log.info("[dist] tensor: each expert split in two, this Mac ({d} MiB free) + the worker ({d} MiB free of {d})\n", .{ mine.avail_mib, theirs.avail_mib, theirs.total_mib });
-        peer_slot = .{ .link = link, .mode = mode, .span = .{ .start = 0, .end = n, .total = n }, .shard = .{ .rank = 0, .size = 2 }, .model_dir = try allocator.dupe(u8, model_dir) };
-        return;
-    }
-    const k = split orelse chooseSplit(n, mc.full_attention_interval, @as(u64, @intCast(mine.avail_mib)), @as(u64, @intCast(theirs.avail_mib)));
-    if (k == 0 or k >= n or (mc.full_attention_interval != 0 and k % mc.full_attention_interval != 0)) return error.DistSplitOffInterval;
-    try sendMsg(&link, .{ MAGIC, @intFromEnum(mode), @intCast(k), @intCast(n), @intCast(n), 0, 0, 0 }, 1, s);
-    log.info("[dist] pipeline: layers 0..{d} here ({d} MiB free), {d}..{d} on the worker ({d} MiB free of {d})\n", .{ k, mine.avail_mib, k, n, theirs.avail_mib, theirs.total_mib });
-    peer_slot = .{ .link = link, .mode = mode, .span = .{ .start = 0, .end = k, .total = n }, .model_dir = try allocator.dupe(u8, model_dir) };
+    const worker = try Hello.parse(try recvMsg(&link, 1, .{ .ctx = null }));
+    log.info("[dist] worker joined: {d} MiB free of {d}; {s} mode for {s}\n", .{ worker.avail_mib, worker.total_mib, @tagName(mode), std.fs.path.basename(model) });
+    peer_slot = .{ .link = link, .mode = mode, .model = try allocator.dupe(u8, model), .split = split, .worker = worker };
 }
 
-/// `mlx-serve worker --model DIR --coordinator IP:PORT --device rdma_enX`: joins rank 0's
-/// group, loads the span it is given, then runs forwards until rank 0 stops it.
+/// The folder named `name` in `roots` (`<root>/<name>` or `<root>/<org>/<name>`).
+fn findModel(io: std.Io, allocator: std.mem.Allocator, roots: []const []const u8, name: []const u8) !?[]u8 {
+    for (roots) |root| {
+        const direct = try std.fs.path.join(allocator, &.{ root, name, "config.json" });
+        defer allocator.free(direct);
+        if (std.Io.Dir.cwd().statFile(io, direct, .{})) |_| return try std.fs.path.join(allocator, &.{ root, name }) else |_| {}
+        var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |e| {
+            if (e.kind != .directory) continue;
+            const p = try std.fs.path.join(allocator, &.{ root, e.name, name, "config.json" });
+            defer allocator.free(p);
+            if (std.Io.Dir.cwd().statFile(io, p, .{})) |_| return try std.fs.path.join(allocator, &.{ root, e.name, name }) else |_| {}
+        }
+    }
+    return null;
+}
+
+/// `mlx-serve worker --coordinator IP:PORT --device rdma_enX [--model-dir DIR]...`: joins
+/// rank 0's group, loads the part of the model rank 0 names (found by folder name in its own
+/// model folders, `~/.mlx-serve/models` by default), then runs forwards until rank 0 stops it.
 pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
-    var model_dir: ?[]const u8 = null;
+    var roots: std.ArrayList([]const u8) = .empty;
+    defer roots.deinit(allocator);
     var rest: std.ArrayList([]const u8) = .empty;
     defer rest.deinit(allocator);
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
-            model_dir = args[i + 1];
+        if (std.mem.eql(u8, args[i], "--model-dir") and i + 1 < args.len) {
+            try roots.append(allocator, args[i + 1]);
             i += 1;
         } else try rest.append(allocator, args[i]);
     }
+    var home_root: ?[]u8 = null;
+    defer if (home_root) |h| allocator.free(h);
+    if (roots.items.len == 0) {
+        home_root = try @import("cli.zig").modelsRootPath(allocator, std.mem.span(std.c.getenv("HOME") orelse "/tmp"));
+        try roots.append(allocator, home_root.?);
+    }
     try rest.appendSlice(allocator, &.{ "--rank", "1" });
     const cfg = try parseArgs(rest.items);
-    const dir = model_dir orelse {
-        log.err("usage: mlx-serve worker --model DIR --coordinator IP:PORT --device rdma_enX\n", .{});
-        return error.InvalidArgs;
-    };
-    var config = try model_mod.parseConfig(io, allocator, dir);
-    defer config.deinit(allocator);
 
     var link = try Link.open(io, cfg);
     defer link.deinit();
-    const cs = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cs);
-    try sendMsg(&link, Hello.of(&config).msg(), 0, cs);
-    const plan = try recvMsg(&link, 0, cs);
-    if (plan[0] != MAGIC) return error.DistProtocolMismatch;
-    const mode: Mode = @enumFromInt(plan[1]);
-    const span: LayerSpan = .{ .start = @intCast(plan[2]), .end = @intCast(plan[3]), .total = @intCast(plan[4]) };
-    if (mode == .pipeline)
-        log.info("[dist] worker: layers {d}..{d} of {d} (pipeline)\n", .{ span.start, span.end, span.total })
+    const cs: mlx.mlx_stream = .{ .ctx = null };
+    try sendMsg(&link, Hello.here().msg(), 0, cs);
+    log.info("[dist] worker: joined, waiting for the host to load a model\n", .{});
+    const pmsg = try recvMsg(&link, 0, cs);
+    const pl = try Plan.parse(pmsg);
+    var name_buf: [256]u8 = undefined;
+    const name_len: usize = @intCast(pmsg[5]);
+    if (name_len == 0 or name_len > name_buf.len) return error.DistBadMessage;
+    try recvBytes(&link, name_buf[0..name_len], 0);
+    const name = name_buf[0..name_len];
+    if (pl.mode == .pipeline)
+        log.info("[dist] worker: {s} layers {d}..{d} of {d} (pipeline)\n", .{ name, pl.span.start, pl.span.end, pl.span.total })
     else
-        log.info("[dist] worker: half of every expert (tensor)\n", .{});
+        log.info("[dist] worker: {s}, half of every expert (tensor)\n", .{name});
 
-    var xfm = load(io, allocator, dir, &config, mode, span) catch |err| {
+    const fail = struct {
+        fn send(l: *const Link, code: i32) void {
+            sendMsg(l, .{ MAGIC, code, 0, 0, 0, 0, 0, 0 }, 0, .{ .ctx = null }) catch {};
+        }
+    };
+    const dir = (try findModel(io, allocator, roots.items, name)) orelse {
+        log.err("[dist] worker: no model named {s} in {s}\n", .{ name, roots.items[0] });
+        fail.send(&link, NOT_FOUND);
+        return error.DistModelNotFound;
+    };
+    defer allocator.free(dir);
+    var config = try model_mod.parseConfig(io, allocator, dir);
+    defer config.deinit(allocator);
+    if (!pl.matches(&config)) {
+        log.err("[dist] worker: {s} here has a different geometry than the host's\n", .{dir});
+        fail.send(&link, MISMATCH);
+        return error.DistModelMismatch;
+    }
+    var xfm = load(io, allocator, dir, &config, pl.mode, pl.span) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
-        sendMsg(&link, .{ MAGIC, 1, 0, 0, 0, 0, 0, 0 }, 0, cs) catch {};
+        fail.send(&link, LOAD_FAILED);
         return err;
     };
     defer xfm.t.deinit();

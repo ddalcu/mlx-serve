@@ -5116,8 +5116,10 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    if (config.dist_span == null) if (distributed.spanFor(model_dir)) |sp| try config.applyLayerSpan(sp);
-    if (config.dist_shard == null) if (distributed.shardFor(model_dir)) |sh| try config.applyShard(sh);
+    if (config.dist_span == null and config.dist_shard == null) if (try distributed.planFor(model_dir, config)) |part| switch (part) {
+        .span => |sp| try config.applyLayerSpan(sp),
+        .shard => |sh| try config.applyShard(sh),
+    };
     var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
