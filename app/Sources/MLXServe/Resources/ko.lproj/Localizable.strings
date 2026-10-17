@@ -2263,3 +2263,6 @@
 "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "M5 Mac에서 이미지와 영상을 더 빨리 만들며 약간의 손실이 있습니다. 끄면 4비트 모델이 메모리를 덜 씁니다.";
 "Spec" = "추측";
 "Spec off" = "추측 꺼짐";
+"Cancel pause" = "일시 정지 취소";
+"Pausing after this step" = "이 단계가 끝나면 일시 정지합니다";
+"Pauses after the current step. Chat keeps working while paused; the model stays in memory." = "현재 단계가 끝나면 일시 정지합니다. 일시 정지 중에도 채팅은 계속 작동하며 모델은 메모리에 남아 있습니다.";

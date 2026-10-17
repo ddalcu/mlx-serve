@@ -40,9 +40,11 @@ pub const Progress = struct {
         return f(self.ctx);
     }
     /// The per-step poll: gives chat its turn on the inference thread (when a
-    /// scheduler hook is installed), then reports whether the client left.
+    /// scheduler hook is installed), holds while the job is paused, then reports
+    /// whether the client left.
     pub fn boundary(self: Progress) bool {
         if (gen_yield) |y| y.step(y.ctx);
+        if (gen_pause) |sc| sc.holdWhilePaused();
         return self.cancelled();
     }
 };
@@ -55,12 +57,49 @@ pub const Yield = struct {
     /// Serve chat until `done` is set; `wake` interrupts its idle wait.
     serve_until: *const fn (ctx: *anyopaque, done: *const std.atomic.Value(bool)) void,
     wake: *const fn (ctx: *anyopaque) void,
+    /// Serve chat for about `ns` nanoseconds (a paused job's wait). Null: nothing to wait on.
+    serve_for: ?*const fn (ctx: *anyopaque, ns: u64) void = null,
 };
 
 /// Installed by the scheduler around a media job, on the inference thread only.
 /// Thread-local rather than a `Progress` field so every wrapper that rebuilds a
 /// `Progress` (H3's chained windows, LTX's windows) keeps it.
 pub threadlocal var gen_yield: ?*const Yield = null;
+
+/// The running job's stream while it is pausable (`StreamCtx.beginPause`), on the
+/// inference thread only; thread-local for the same reason as `gen_yield`.
+pub threadlocal var gen_pause: ?*StreamCtx = null;
+
+/// Pause for a streaming video job (`POST /v1/video/pause`). Media jobs run one at a time
+/// on the inference thread, so the state is global; every store names the job's token, so
+/// a request for a finished job never lands on the next one.
+pub const pause = struct {
+    var running: std.atomic.Value(u64) = .init(0);
+    var requested: std.atomic.Value(u64) = .init(0);
+
+    pub fn begin() u64 {
+        var tok: u64 = 0;
+        while (tok == 0) std.c.arc4random_buf(@ptrCast(&tok), @sizeOf(u64));
+        running.store(tok, .release);
+        return tok;
+    }
+    pub fn end(tok: u64) void {
+        _ = running.cmpxchgStrong(tok, 0, .acq_rel, .acquire);
+        _ = requested.cmpxchgStrong(tok, 0, .acq_rel, .acquire);
+    }
+    /// Ask (or withdraw) a pause; false when no running job has this token.
+    pub fn set(tok: u64, on: bool) bool {
+        if (tok == 0 or running.load(.acquire) != tok) return false;
+        if (on) requested.store(tok, .release) else _ = requested.cmpxchgStrong(tok, 0, .acq_rel, .acquire);
+        return true;
+    }
+    pub fn isRequested(tok: u64) bool {
+        return tok != 0 and requested.load(.acquire) == tok;
+    }
+};
+
+/// A paused job serves chat in slices this long between checks for resume.
+const PAUSE_SLICE_NS: u64 = 100 * std.time.ns_per_ms;
 
 fn ReturnOf(comptime func: anytype) type {
     return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
@@ -112,6 +151,8 @@ pub const StreamCtx = struct {
     preview: bool = false,
     preview_frames: u32 = 1,
     preview_max_side: u32 = 256,
+    /// Non-zero while this job is pausable; its hex is the `id` of the `job` event.
+    pause_token: u64 = 0,
     pub fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         if (!self.stream) return;
@@ -154,6 +195,38 @@ pub const StreamCtx = struct {
             return true;
         }
         return false;
+    }
+    fn event(self: *StreamCtx, ev: []const u8) void {
+        self.conn.writeAll(ev) catch {
+            self.cancelled = true;
+        };
+    }
+    /// Make a streaming job pausable: announce its id, and let `boundary` hold on it.
+    pub fn beginPause(self: *StreamCtx) void {
+        if (!self.stream) return;
+        self.pause_token = pause.begin();
+        var buf: [64]u8 = undefined;
+        self.event(std.fmt.bufPrint(&buf, "data: {{\"type\":\"job\",\"id\":\"{x:0>16}\"}}\n\n", .{self.pause_token}) catch unreachable);
+        gen_pause = self;
+    }
+    pub fn endPause(self: *StreamCtx) void {
+        if (self.pause_token == 0) return;
+        if (gen_pause == self) gen_pause = null;
+        pause.end(self.pause_token);
+        self.pause_token = 0;
+    }
+    /// Wait out a pause: chat keeps the inference thread, keepalives hold the stream open,
+    /// and a client that leaves ends the wait (the caller's cancel poll sees it).
+    fn holdWhilePaused(self: *StreamCtx) void {
+        if (!pause.isRequested(self.pause_token)) return;
+        const y = gen_yield orelse return;
+        const serve_for = y.serve_for orelse return;
+        self.event("data: {\"type\":\"paused\"}\n\n");
+        while (pause.isRequested(self.pause_token) and !cancelledCb(self)) {
+            serve_for(y.ctx, PAUSE_SLICE_NS);
+            if (self.conn.keepaliveDue()) self.event(": keepalive\n\n");
+        }
+        if (!self.cancelled) self.event("data: {\"type\":\"resumed\"}\n\n");
     }
     pub fn progress(self: *StreamCtx) Progress {
         const opts = (preview.Opts{
@@ -473,4 +546,118 @@ test "Progress.wantsPreview is false when the client did not opt in" {
     var dummy: u8 = 0;
     const p = Progress{ .ctx = &dummy, .cb = H.emitCb };
     try std.testing.expect(!p.wantsPreview());
+}
+
+const PauseTest = struct {
+    sv: [2]std.posix.fd_t = undefined,
+    conn: Conn = undefined,
+    sctx: StreamCtx = undefined,
+    /// Slices the hold asked chat to serve; `resume_at` withdraws the pause at that slice,
+    /// `leave_at` hangs up the client.
+    slices: u32 = 0,
+    resume_at: u32 = 0,
+    leave_at: u32 = 0,
+
+    fn init(t: *PauseTest) !void {
+        try std.testing.expect(std.c.socketpair(1, 1, 0, &t.sv) == 0);
+        Conn.init(&t.conn, .{ .socket = .{ .handle = t.sv[0], .address = undefined } },
+                  std.Io.Threaded.global_single_threaded.io());
+        t.sctx = .{ .conn = &t.conn };
+    }
+    fn deinit(t: *PauseTest) void {
+        t.sctx.endPause();
+        _ = std.c.close(t.sv[0]);
+        if (t.sv[1] >= 0) _ = std.c.close(t.sv[1]);
+    }
+    fn step(_: *anyopaque) void {}
+    fn serve(_: *anyopaque, _: *const std.atomic.Value(bool)) void {}
+    fn wake(_: *anyopaque) void {}
+    fn serveFor(ctx: *anyopaque, _: u64) void {
+        const t: *PauseTest = @ptrCast(@alignCast(ctx));
+        t.slices += 1;
+        if (t.slices == t.resume_at) _ = pause.set(t.sctx.pause_token, false);
+        if (t.slices == t.leave_at) {
+            _ = std.c.close(t.sv[1]);
+            t.sv[1] = -1;
+        }
+    }
+    fn hook(t: *PauseTest) Yield {
+        return .{ .ctx = t, .step = step, .serve_until = serve, .wake = wake, .serve_for = serveFor };
+    }
+    /// The `type` of every event on the wire so far, in order.
+    fn types(t: *PauseTest, out: *[8][]const u8, store: *[4096]u8) ![]const []const u8 {
+        const n = std.c.recv(t.sv[1], store, store.len, std.posix.MSG.DONTWAIT);
+        if (n <= 0) return out[0..0];
+        var k: usize = 0;
+        var it = std.mem.splitSequence(u8, store[0..@intCast(n)], "\n\n");
+        while (it.next()) |ev| {
+            const at = std.mem.indexOf(u8, ev, "\"type\":\"") orelse continue;
+            const rest = ev[at + 8 ..];
+            out[k] = rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse continue];
+            k += 1;
+        }
+        return out[0..k];
+    }
+};
+
+test "a paused job holds at the step boundary while chat is served, then resumes" {
+    var t = PauseTest{ .resume_at = 3 };
+    try t.init();
+    defer t.deinit();
+    const y = t.hook();
+    gen_yield = &y;
+    defer gen_yield = null;
+    t.sctx.beginPause();
+    try std.testing.expect(t.sctx.pause_token != 0);
+    try std.testing.expect(pause.set(t.sctx.pause_token, true));
+
+    try std.testing.expect(!t.sctx.progress().boundary()); // not a cancel
+    try std.testing.expectEqual(@as(u32, 3), t.slices);
+    var out: [8][]const u8 = undefined;
+    var store: [4096]u8 = undefined;
+    const got = try t.types(&out, &store);
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try std.testing.expectEqualStrings("job", got[0]);
+    try std.testing.expectEqualStrings("paused", got[1]);
+    try std.testing.expectEqualStrings("resumed", got[2]);
+}
+
+test "a pause withdrawn before the boundary never holds" {
+    var t = PauseTest{};
+    try t.init();
+    defer t.deinit();
+    const y = t.hook();
+    gen_yield = &y;
+    defer gen_yield = null;
+    t.sctx.beginPause();
+    try std.testing.expect(pause.set(t.sctx.pause_token, true));
+    try std.testing.expect(pause.set(t.sctx.pause_token, false));
+    try std.testing.expect(!t.sctx.progress().boundary());
+    try std.testing.expectEqual(@as(u32, 0), t.slices);
+}
+
+test "a client that leaves while paused cancels the job" {
+    var t = PauseTest{ .leave_at = 2 };
+    try t.init();
+    defer t.deinit();
+    const y = t.hook();
+    gen_yield = &y;
+    defer gen_yield = null;
+    t.sctx.beginPause();
+    try std.testing.expect(pause.set(t.sctx.pause_token, true));
+    try std.testing.expect(t.sctx.progress().boundary());
+    try std.testing.expectEqual(@as(u32, 2), t.slices);
+}
+
+test "a pause token binds ONE job: a finished job's id pauses nothing" {
+    const a = pause.begin();
+    pause.end(a);
+    try std.testing.expect(!pause.set(a, true));
+    const b = pause.begin();
+    defer pause.end(b);
+    try std.testing.expect(a != b and b != 0);
+    try std.testing.expect(!pause.isRequested(b));
+    try std.testing.expect(!pause.set(0, true));
+    try std.testing.expect(pause.set(b, true));
+    try std.testing.expect(pause.isRequested(b));
 }
