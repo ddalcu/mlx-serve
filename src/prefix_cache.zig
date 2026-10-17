@@ -1121,6 +1121,17 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
+    /// Tokens a RAM restore would cover for a text prompt, read without touching any state. A
+    /// pre-filter only: the SSD tier, a lien, a QSA gap or a checkout taken since can still change
+    /// what the real lookup restores.
+    pub fn peekMatchedTokens(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, require_ssm_checkpoint: bool) usize {
+        const m = self.findBestRestorableMatch(prompt_ids, has_tools, &.{}, quant_config, require_ssm_checkpoint, null) orelse return 0;
+        if (!require_ssm_checkpoint) return m.shared;
+        const cps = self.entries.items[m.idx].ssm_checkpoints orelse return 0;
+        const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse return 0;
+        return cp.pos;
+    }
+
     /// A sliding ring restores only where it still holds the window behind the match; a full
     /// match restores one token short.
     fn ringRestores(snap: *const KVCacheSnapshot, matched: usize, prompt_len: usize) bool {
@@ -4240,6 +4251,70 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
 // sit just AFTER that boundary. An older entry for the same pixels may have a
 // slightly shorter token match with a usable checkpoint. Picking by raw token
 // match alone turns that recoverable case into a full cold prefill.
+test "HotPrefixCache: peekMatchedTokens reads the match without touching the cache" {
+    var cache = HotPrefixCache.init(testing.allocator, 4);
+    defer cache.deinit();
+
+    const ids_a = try testing.allocator.dupe(u32, &[_]u32{ 1, 2, 3, 4, 5 });
+    const ids_b = try testing.allocator.dupe(u32, &[_]u32{ 1, 2, 3, 9, 9, 9 });
+    for ([_][]u32{ ids_a, ids_b }, 1..) |ids, used| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = ids,
+            .has_tools = false,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = @intCast(used),
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+            .ssm_checkpoints = null,
+            .ssm_bytes = 0,
+        });
+    }
+    const dense = kv_quant.KVQuantConfig.dense;
+
+    try testing.expectEqual(@as(usize, 5), cache.peekMatchedTokens(&[_]u32{ 1, 2, 3, 4, 5, 6 }, false, dense, false));
+    try testing.expectEqual(@as(usize, 6), cache.peekMatchedTokens(&[_]u32{ 1, 2, 3, 9, 9, 9, 7 }, false, dense, false));
+    try testing.expectEqual(@as(usize, 0), cache.peekMatchedTokens(&[_]u32{ 9, 9 }, false, dense, false));
+    // A different tool context never restores.
+    try testing.expectEqual(@as(usize, 0), cache.peekMatchedTokens(&[_]u32{ 1, 2, 3, 4, 5, 6 }, true, dense, false));
+    // A checked-out entry belongs to another slot: it is invisible, and the peek leaves it checked out.
+    cache.entries.items[0].checked_out_by = 7;
+    try testing.expectEqual(@as(usize, 3), cache.peekMatchedTokens(&[_]u32{ 1, 2, 3, 4, 5, 6 }, false, dense, false));
+    try testing.expectEqual(@as(?usize, 7), cache.entries.items[0].checked_out_by);
+    try testing.expect(cache.last_restored_used == null);
+}
+
+test "HotPrefixCache: peekMatchedTokens agrees with the hybrid lookup on the restorable checkpoint" {
+    const s = mlx.gpuStream();
+    const older_tokens = [_]u32{ 1, 2, 3, 4, 5, 90, 91, 92, 93, 94 };
+    const newer_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 80, 81, 82 };
+    const lookup_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 70, 71, 72 };
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    var older_cache = try KVCache.init(testing.allocator, 3);
+    defer older_cache.deinit();
+    try testFillCache(&older_cache, s, 3, older_tokens.len);
+    var older_ssm = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&older_ssm);
+    const older_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    older_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &older_ssm, 4, s);
+    _ = try hc.commitWithState(&older_cache, &older_tokens, false, &.{}, older_cps, null, null);
+
+    var newer_cache = try KVCache.init(testing.allocator, 3);
+    defer newer_cache.deinit();
+    try testFillCache(&newer_cache, s, 3, newer_tokens.len);
+    var newer_ssm = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&newer_ssm);
+    const newer_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    // The raw match with this entry is 7, so a checkpoint at 8 cannot restore it.
+    newer_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &newer_ssm, 8, s);
+    _ = try hc.commitWithState(&newer_cache, &newer_tokens, false, &.{}, newer_cps, null, null);
+
+    // The raw match is 7 but only the older entry's checkpoint at 4 can restore: the peek says 4.
+    try testing.expectEqual(@as(usize, 4), hc.peekMatchedTokens(&lookup_tokens, false, older_cache.config, true));
+}
+
 test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry" {
     const s = mlx.gpuStream();
     const media = [_]MediaSpan{.{ .start = 0, .key = 0xdecaf }};
