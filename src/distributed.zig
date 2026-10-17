@@ -2,6 +2,7 @@
 //! Thunderbolt 5, macOS 26.2+). Rank 0 is the server; every other rank is a
 //! worker that executes what rank 0 tells it, in lockstep.
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const crt = @import("crt.zig");
 const io_util = @import("io_util.zig");
@@ -139,6 +140,7 @@ pub const Link = struct {
 
     /// Joins the group. Blocks until every rank has connected to the coordinator.
     pub fn open(io: std.Io, cfg: Config) !Link {
+        if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
         if (!mlx.mlx_distributed_is_available("jaccl")) {
             log.err("[dist] JACCL is unavailable: RDMA over Thunderbolt needs macOS 26.2+ and `rdma_ctl enable` (Recovery)\n", .{});
             return error.RdmaUnavailable;
@@ -218,7 +220,7 @@ pub const Link = struct {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC: i32 = 0x4D4C5853; // "MLXS"
-const VERSION: i32 = 2;
+const VERSION: i32 = 3;
 pub const Msg = [8]i32;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP: i32 = 2;
@@ -289,8 +291,8 @@ const Hello = struct {
     }
 };
 
-/// What rank 0 asks a worker to load: the model by folder name, checked against
-/// the worker's own copy by geometry, and its part of it.
+/// What rank 0 asks a worker to load: the model by folder name, then its `modelIdentity`,
+/// checked against the worker's own copy, and its part of it.
 const Plan = struct {
     mode: Mode,
     span: LayerSpan,
@@ -307,7 +309,34 @@ const Plan = struct {
     fn matches(p: Plan, cfg: *const model_mod.ModelConfig) bool {
         return cfg.num_hidden_layers == p.span.total and cfg.hidden_size == p.hidden and cfg.num_experts == p.experts;
     }
+    fn send(p: Plan, link: *const Link, model_dir: []const u8) !void {
+        const g = group.?;
+        const id = try modelIdentity(g.io, g.allocator, model_dir);
+        const name = std.fs.path.basename(model_dir);
+        try sendMsg(link, p.msg(name.len), 1);
+        try sendBytes(link, name, 1);
+        try sendMsg(link, .{ MAGIC, @bitCast(@as(u32, @truncate(id))), @bitCast(@as(u32, @truncate(id >> 32))), 0, 0, 0, 0, 0 }, 1);
+    }
 };
+
+/// One copy of a model: its `config.json` and the path and size of every weight file under
+/// it, so two folders of one name in another quantization or revision never pair.
+fn modelIdentity(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !u64 {
+    var dir = try std.Io.Dir.cwd().openDir(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    const cfg = try dir.readFileAlloc(io, "config.json", allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(cfg);
+    var id = std.hash.Wyhash.hash(0, cfg);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |e| {
+        if ((e.kind != .file and e.kind != .sym_link) or !(std.mem.endsWith(u8, e.basename, ".safetensors") or std.mem.endsWith(u8, e.basename, ".bin"))) continue;
+        const st = try e.dir.statFile(io, e.basename, .{});
+        // Summed, so the walk's order does not matter.
+        id +%= std.hash.Wyhash.hash(st.size, e.path);
+    }
+    return id;
+}
 
 /// Worker failure codes in its READY message (0 = ready).
 const NOT_FOUND: i32 = 2;
@@ -412,7 +441,7 @@ pub const Peer = struct {
             self.failed = true;
             switch (m[1]) {
                 NOT_FOUND => log.err("[dist] the worker has no model named {s} in its model folders\n", .{self.model}),
-                MISMATCH => log.err("[dist] the worker's copy of {s} has a different geometry\n", .{self.model}),
+                MISMATCH => log.err("[dist] the worker's copy of {s} is not the same model (quantization, revision or geometry)\n", .{self.model}),
                 else => log.err("[dist] the worker failed to load its part of {s}\n", .{self.model}),
             }
             return error.DistWorkerLoadFailed;
@@ -460,7 +489,7 @@ var peer_slot: ?Peer = null;
 
 /// The group this server leads (`--dist`): set at startup, while a thread waits
 /// for the worker to join; the handshake runs when the group's model loads.
-const Group = struct { mode: Mode, model: []const u8, split: ?u32 };
+const Group = struct { io: std.Io, allocator: std.mem.Allocator, mode: Mode, model: []const u8, split: ?u32 };
 var group: ?Group = null;
 var joined = std.atomic.Value(bool).init(false);
 var joined_link: Link = undefined;
@@ -525,7 +554,7 @@ pub const Part = union(enum) { span: LayerSpan, shard: Shard };
 pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Part {
     if (!serves(model_dir)) return null;
     const p = try join();
-    if (!p.planned) try plan(p, config);
+    if (!p.planned) try plan(p, config, model_dir);
     return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
 }
 
@@ -536,14 +565,12 @@ pub fn serves(model_dir: []const u8) bool {
 }
 
 /// Rows mode: the worker told to load the group's video model whole, and ready.
-pub fn planRows(hidden: i32, blocks: i32) !*Peer {
+pub fn planRows(model_dir: []const u8, hidden: i32, blocks: i32) !*Peer {
     const p = try join();
     if (!p.planned) {
         p.mode = .rows;
-        const name = std.fs.path.basename(p.model);
         const pl: Plan = .{ .mode = .rows, .span = .{ .start = 0, .end = @intCast(blocks), .total = @intCast(blocks) }, .hidden = hidden, .experts = 0 };
-        try sendMsg(&p.link, pl.msg(name.len), 1);
-        try sendBytes(&p.link, name, 1);
+        try pl.send(&p.link, model_dir);
         p.planned = true;
     }
     if (!p.ready) try p.awaitReady();
@@ -568,7 +595,7 @@ fn join() !*Peer {
     return &peer_slot.?;
 }
 
-fn plan(self: *Peer, config: *const model_mod.ModelConfig) !void {
+fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8) !void {
     if (!config.isQwen4()) {
         log.err("[dist] {s}: this architecture ({s}) has no multi-Mac path yet\n", .{ self.model, config.model_type });
         return error.DistArchUnsupported;
@@ -591,9 +618,7 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig) !void {
             log.info("[dist] pipeline: layers 0..{d} of {s} here ({d} MiB free), {d}..{d} on the worker ({d} MiB free of {d})\n", .{ k, std.fs.path.basename(self.model), mine, k, n, self.worker.avail_mib, self.worker.total_mib });
         },
     }
-    const name = std.fs.path.basename(self.model);
-    try sendMsg(&self.link, pl.msg(name.len), 1);
-    try sendBytes(&self.link, name, 1);
+    try pl.send(&self.link, model_dir);
     self.planned = true;
 }
 
@@ -616,7 +641,7 @@ fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
 /// serves meanwhile. Only the RDMA link opens there; every message runs on the
 /// inference thread, when `model` loads (`planFor`).
 pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32) !void {
-    group = .{ .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
+    group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
     t.detach();
 }
@@ -630,22 +655,33 @@ fn waitForWorker(io: std.Io, cfg: Config) void {
     log.info("[dist] worker joined; it loads its part with {s}\n", .{std.fs.path.basename(group.?.model)});
 }
 
-/// The folder named `name` in `roots` (`<root>/<name>` or `<root>/<org>/<name>`).
-fn findModel(io: std.Io, allocator: std.mem.Allocator, roots: []const []const u8, name: []const u8) !?[]u8 {
+/// The folder named `name` in `roots` (`<root>/<name>` or `<root>/<org>/<name>`) whose
+/// `modelIdentity` is `id`; `error.DistModelMismatch` when only other copies of that name exist.
+fn findModel(io: std.Io, allocator: std.mem.Allocator, roots: []const []const u8, name: []const u8, id: u64) !?[]u8 {
+    var seen = false;
     for (roots) |root| {
-        const direct = try std.fs.path.join(allocator, &.{ root, name, "config.json" });
-        defer allocator.free(direct);
-        if (std.Io.Dir.cwd().statFile(io, direct, .{})) |_| return try std.fs.path.join(allocator, &.{ root, name }) else |_| {}
+        if (try sameModel(io, allocator, &.{ root, name }, id, &seen)) |p| return p;
         var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch continue;
         defer dir.close(io);
         var it = dir.iterate();
         while (it.next(io) catch null) |e| {
             if (e.kind != .directory) continue;
-            const p = try std.fs.path.join(allocator, &.{ root, e.name, name, "config.json" });
-            defer allocator.free(p);
-            if (std.Io.Dir.cwd().statFile(io, p, .{})) |_| return try std.fs.path.join(allocator, &.{ root, e.name, name }) else |_| {}
+            if (try sameModel(io, allocator, &.{ root, e.name, name }, id, &seen)) |p| return p;
         }
     }
+    return if (seen) error.DistModelMismatch else null;
+}
+
+fn sameModel(io: std.Io, allocator: std.mem.Allocator, parts: []const []const u8, id: u64, seen: *bool) !?[]u8 {
+    const p = try std.fs.path.join(allocator, parts);
+    errdefer allocator.free(p);
+    const here = modelIdentity(io, allocator, p) catch {
+        allocator.free(p);
+        return null;
+    };
+    seen.* = true;
+    if (here == id) return p;
+    allocator.free(p);
     return null;
 }
 
@@ -653,6 +689,8 @@ fn findModel(io: std.Io, allocator: std.mem.Allocator, roots: []const []const u8
 /// rank 0's group, loads the part of the model rank 0 names (found by folder name in its own
 /// model folders, `~/.mlx-serve/models` by default), then runs forwards until rank 0 stops it.
 pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    // JACCL (RDMA over Thunderbolt) exists only on macOS.
+    if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
     var roots: std.ArrayList([]const u8) = .empty;
     defer roots.deinit(allocator);
     var rest: std.ArrayList([]const u8) = .empty;
@@ -696,6 +734,9 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     if (name_len == 0 or name_len > name_buf.len) return error.DistBadMessage;
     try recvBytes(&link, name_buf[0..name_len], 0);
     const name = name_buf[0..name_len];
+    const idm = try recvMsg(&link, 0);
+    if (idm[0] != MAGIC) return error.DistProtocolMismatch;
+    const id = @as(u64, @as(u32, @bitCast(idm[1]))) | @as(u64, @as(u32, @bitCast(idm[2]))) << 32;
     switch (pl.mode) {
         .pipeline => log.info("[dist] worker: {s} layers {d}..{d} of {d} (pipeline)\n", .{ name, pl.span.start, pl.span.end, pl.span.total }),
         .tensor => log.info("[dist] worker: {s}, half of every expert (tensor)\n", .{name}),
@@ -707,7 +748,12 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
             sendMsg(l, .{ MAGIC, code, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         }
     };
-    const dir = (try findModel(io, allocator, roots.items, name)) orelse {
+    const found = findModel(io, allocator, roots.items, name, id) catch |err| {
+        if (err == error.DistModelMismatch) log.err("[dist] worker: {s} here is not the host's copy (quantization or revision)\n", .{name});
+        fail.send(&link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
+        return err;
+    };
+    const dir = found orelse {
         log.err("[dist] worker: no model named {s} in {s}\n", .{ name, roots.items[0] });
         fail.send(&link, NOT_FOUND);
         return error.DistModelNotFound;
@@ -1050,4 +1096,32 @@ test "clusterJson: valid JSON naming both ranks' layers and the worker" {
     try std.testing.expectEqualStrings("Flash-FP4", c.get("model").?.string);
     try std.testing.expectEqual(@as(i64, 16), c.get("here").?.array.items[1].integer);
     try std.testing.expectEqualStrings(name, c.get("worker_name").?.string);
+}
+
+test "findModel pairs the host's copy of a name, not another quantization of it" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "org-a/Flash", "org-b/Flash" }, [_][]const u8{ "4bit", "8bit" }) |dir, q| {
+        try tmp.dir.createDirPath(io, dir);
+        const cfg = try std.fmt.allocPrint(allocator, "{s}/config.json", .{dir});
+        defer allocator.free(cfg);
+        try tmp.dir.writeFile(io, .{ .sub_path = cfg, .data = q });
+        const w = try std.fmt.allocPrint(allocator, "{s}/model.safetensors", .{dir});
+        defer allocator.free(w);
+        try tmp.dir.writeFile(io, .{ .sub_path = w, .data = q });
+    }
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd)));
+    const root = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(root);
+    const b = try std.fmt.allocPrint(allocator, "{s}/org-b/Flash", .{root});
+    defer allocator.free(b);
+
+    const found = (try findModel(io, allocator, &.{root}, "Flash", try modelIdentity(io, allocator, b))).?;
+    defer allocator.free(found);
+    try std.testing.expectEqualStrings(b, found);
+    try std.testing.expectError(error.DistModelMismatch, findModel(io, allocator, &.{root}, "Flash", 42));
+    try std.testing.expect((try findModel(io, allocator, &.{root}, "Other", 42)) == null);
 }

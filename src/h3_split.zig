@@ -216,7 +216,7 @@ pub fn begin(pack_dir: []const u8, io: std.Io, model: *h3.Model, turbo: bool, us
     const name = std.fs.path.basename(pack_dir);
     if (!resident) return alone("this Mac could not keep {s} loaded between jobs", .{name});
     if (user_loras > 0) return alone("the request's LoRAs live on this Mac only", .{});
-    const p = distributed.planRows(@intCast(model.cfg.hidden_size), @intCast(model.blocks.len)) catch |err| switch (err) {
+    const p = distributed.planRows(pack_dir, @intCast(model.cfg.hidden_size), @intCast(model.blocks.len)) catch |err| switch (err) {
         error.DistWorkerNotJoined => return alone("the worker Mac has not joined", .{}),
         error.DistWorkerLoadFailed => return alone("the worker could not load {s}", .{name}),
         else => return err,

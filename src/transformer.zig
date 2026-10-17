@@ -25693,6 +25693,9 @@ pub const Transformer = struct {
     pub var qwen4_trace: ?*Qwen4Trace = null;
 
     fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx) bool {
+        // A tensor shard's MoE is half of each expert until `moeTensorParallel` adds the
+        // peer's half; the grouped arm calls `moeVerifyRows` directly and would skip it.
+        if (self.dist_tp != null) return false;
         if (self.qwen4 == null or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
             token_rows.len < 2 or token_rows.len > 8 or token_rows.len != ctxs.len or
             self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32)
@@ -71872,6 +71875,41 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
         try testing.expect(try qsaArraysAllEqual(ref_all[0], all[i], s));
     }
     std.debug.print("[mtp verify] deferred PLE: row 1 failure cleared both claims and preserved history; recovered logits and hidden equal solo\n", .{});
+}
+
+test "a tensor-parallel rank 0 never takes the grouped verify, whose MoE skips the exchange" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    xfm.compileMoeRouting();
+
+    var ids: [256]i32 = undefined;
+    for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % 40000);
+    const prompts = [2][]const i32{ ids[0..96], ids[64..160] };
+    var slots = try L10VerifySlots.init(allocator, &xfm, config.num_hidden_layers, prompts);
+    defer slots.deinit(allocator);
+    var rows: [2]mlx.mlx_array = undefined;
+    defer for (rows) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    const shape = [_]c_int{ 1, 1 };
+    for (0..2) |i| rows[i] = mlx.mlx_array_new_data(@ptrCast(ids[200 + i * 8 ..][0..1].ptr), &shape, 2, .int32);
+    const ctxs = [_]*ForwardCtx{ &slots.group[0].ctx, &slots.group[1].ctx };
+
+    if (!xfm.qwen4VerifyRowsEligible(&rows, &ctxs)) return error.SkipZigTest;
+    var peer: distributed_mod.Peer = undefined;
+    xfm.dist_tp = &peer;
+    defer xfm.dist_tp = null;
+    try testing.expect(!xfm.qwen4VerifyRowsEligible(&rows, &ctxs));
 }
 
 test "deferred PLE at N rows: every row's capacity is checked against its OWN width" {
