@@ -100,6 +100,10 @@ struct VideoGenView: View {
     @State private var livePreview: Bool = false
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, recipe off.
     @State private var turbo: Bool = false
+    /// H3 streams its weights from disk (server default); off holds them in memory.
+    @State private var streamWeights: Bool = true
+    /// H3's fast-recipe attention cache stored 8-bit (less memory, slightly lossy).
+    @State private var attnCache8bit: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -861,7 +865,8 @@ struct VideoGenView: View {
     private var shotLadder: [Int] {
         let opts = model.frameOptions(width: effectiveSize.width, height: effectiveSize.height)
         let cap = RAMChecker.safeFrameCap(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                          available: RAMChecker.totalGB, fast: effectiveFast)
+                                          available: RAMChecker.totalGB, fast: effectiveFast,
+                                          streamWeights: streamWeights, cache8bit: attnCache8bit)
         let fits = opts.filter { $0 <= cap }
         return fits.isEmpty ? Array(opts.prefix(1)) : fits
     }
@@ -1029,7 +1034,9 @@ struct VideoGenView: View {
             width: effectiveSize.width,
             height: effectiveSize.height,
             available: total,
-            fast: effectiveFast
+            fast: effectiveFast,
+            streamWeights: streamWeights,
+            cache8bit: attnCache8bit
         )
         guard model.backend == .minimaxH3 else {
             guard numFrames > cap else { return nil }
@@ -1040,19 +1047,33 @@ struct VideoGenView: View {
         // fits" and "nothing fits", and a Mac too small to load the pack saw
         // no warning at all at exactly 124 frames.
         guard !H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged, availableGB: total) else { return nil }
+                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged, streamWeights: streamWeights,
+                           cache8bit: attnCache8bit, availableGB: total) else { return nil }
         let gib = 1024.0 * 1024.0 * 1024.0
         let need = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged)) / gib
+                                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged,
+                                           streamWeights: streamWeights, cache8bit: attnCache8bit)) / gib
         var out = String(format: "Needs about %.0f GB at this size and length; your Mac has %d GB. ", need, total)
         let floorFits = H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                    frames: cap, fast: effectiveFast, turbo: turboEngaged, availableGB: total)
+                                    frames: cap, fast: effectiveFast, turbo: turboEngaged, streamWeights: streamWeights,
+                                    cache8bit: attnCache8bit, availableGB: total)
         out += floorFits && cap < numFrames ? "About \(cap) frames fits here" : "Try a smaller resolution"
-        if effectiveFast {
+        if !streamWeights {
+            let streamed = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                                   frames: numFrames, fast: effectiveFast, turbo: turboEngaged,
+                                                   cache8bit: attnCache8bit)) / gib
+            out += String(format: ", or turn on Stream the model from disk (%.0f GB)", streamed)
+        } else if effectiveFast, !attnCache8bit {
+            let q8 = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                             frames: numFrames, fast: true, cache8bit: true)) / gib
+            if q8 < need - 2 {
+                out += String(format: ", or turn on Quantize the attention cache (%.0f GB)", q8)
+            }
+        } else if effectiveFast {
             let slow = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                                frames: numFrames, fast: false)) / gib
             if slow < need - 2 {
-                out += String(format: ", or turn on Max quality to drop the step cache (%.0f GB, but several times slower)", slow)
+                out += String(format: ", or turn on Compute every step in full to drop the step cache (%.0f GB, but about 2.5 times slower)", slow)
             }
         }
         return out + "."
@@ -1062,9 +1083,14 @@ struct VideoGenView: View {
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         if storyboardOn, shots.isEmpty { return nil }
+        let frames = storyboardOn ? shotFrames : [numFrames]
+        let peak = H3Plan.describePeak(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                       shotFrames: frames, fast: effectiveFast, turbo: turboEngaged,
+                                       streamWeights: streamWeights, cache8bit: attnCache8bit)
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
-            shotFrames: storyboardOn ? shotFrames : [numFrames], steps: steps, fast: effectiveFast
+            shotFrames: frames, steps: steps, fast: effectiveFast, streamWeights: streamWeights,
+            chainWindows: model.supportsChainedWindows && !storyboardOn ? chainWindows : 1, alongside: peak
         )
     }
 
@@ -1842,12 +1868,14 @@ struct VideoGenView: View {
                           help: "Same seed + same settings reproduces the clip. Paste one to rerun someone else's.")
                 Spacer()
             }
+            Text("The same seed with the same settings gives the same clip. Change it for another take of the same prompt.")
+                .font(.app(.caption2)).foregroundStyle(.secondary)
             if model.supportsTurbo {
                 // A Binding, not `onChange`: the snap below is for the USER's
                 // flip. `applyQualityDefaults` also turns Turbo off, and an
                 // `onChange` would then overwrite the tier's steps with 30 —
                 // reading every tier as Custom.
-                Toggle("Turbo (distilled 4-step sampling)", isOn: Binding(
+                Toggle("Turbo mode", isOn: Binding(
                     get: { turbo },
                     set: { on in
                         turbo = on
@@ -1869,30 +1897,63 @@ struct VideoGenView: View {
                     }))
                     .font(.app(.caption))
                     .help("Runs the Turbo distillation LoRA: 4 steps instead of 30, about twice as fast end to end. Slightly softer detail and harder light than a full render. The adapter ships with the model; packs downloaded before it existed fetch it once, on the first run with this on.")
+                Text("4 steps instead of 30, about twice as fast. Detail comes out a little softer and light a little harder.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
                 if turboFetchDecision == .fetch {
-                    Text("Turbo needs a \(TurboLoraFetch.approxMB) MB adapter this pack predates — it downloads once, and Generate waits for it.")
+                    Text("Turbo needs a \(TurboLoraFetch.approxMB) MB adapter that isn't in this download yet. It downloads once, and Generate waits for it.")
                         .font(.app(.caption2)).foregroundStyle(.secondary)
                 } else if turboFetchDecision == .unavailableRemotely {
-                    Text("Turbo runs on the Mac hosting this model; it needs the adapter in ITS copy of the pack.")
+                    Text("Turbo runs on the Mac that hosts this model, so the adapter has to be in that Mac's copy.")
                         .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
             if model.supportsDiffusionDecoder {
-                Toggle("Diffusion decoder (sharper, slower)", isOn: $diffusionDecoder)
+                Toggle("Sharper video decoder", isOn: $diffusionDecoder)
                     .font(.app(.caption))
                     .help("Off (default): the plain convolutional decoder. On: LTX's own diffusion decoder — the one their published clips use. It denoises the frames instead of interpolating them, so fine texture and edges come out sharper. The decode itself takes about 21 s for a 97-frame clip at 768x512; measured end to end against the plain decoder in the same session the difference was inside run-to-run variance.")
+                Text("Denoises the frames instead of interpolating them, so texture and edges come out sharper. The decode takes about 21 s for a 97-frame clip.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
             if model.supportsFastRecipe {
-                Toggle("Max quality (slower)", isOn: $bestQuality)
+                Toggle("Compute every step in full", isOn: $bestQuality)
                     .font(.app(.caption))
-                    .help("Off (default): the fast recipe — step caching + attention reuse, about 2.8x faster at 768p. On: every denoising step is fully computed; marginally better detail for final renders, and it drops the step cache, which is what makes a long clip fit in memory. Turbo runs without the recipe anyway, so this has nothing to add there.")
+                    .help("Off (default): the fast recipe reuses work between steps (step caching and attention reuse). On: every denoising step is computed in full, which is about 2.5 times slower and gives marginally better detail. It also drops the attention cache, for up to about 70% less peak memory, more on longer and larger clips. That is what makes a long clip fit. Turbo runs without the recipe anyway, so this has nothing to add there.")
                     // Under turbo the recipe is already off server-side; a
                     // toggle that could not change anything is a dead control.
                     .disabled(turboEngaged)
+                if turboEngaged {
+                    Text("Turbo already computes every step in full, so this changes nothing.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                } else {
+                    Text("Turns off the shortcut that reuses work between steps: slightly better detail and up to about 70% less peak memory, but about 2.5 times slower.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
             }
-            Toggle("Show live preview while generating (~1% slower)", isOn: $livePreview)
+            if model.supportsFastRecipe {
+                Toggle("Quantize the attention cache", isOn: $attnCache8bit)
+                    .font(.app(.caption))
+                    .help("Off (default): the fast recipe keeps its attention cache in bf16. On: the cache is stored 8-bit, for up to about 30% less peak memory. It is about 1% slower, and the video comes out slightly different from the bf16 cache's. Computing every step in full and Turbo keep no cache, so this does nothing there.")
+                    .disabled(!effectiveFast)
+                if effectiveFast {
+                    Text("Stores the attention cache in 8 bits: up to about 30% less peak memory, and about 1% slower. The video comes out slightly different.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                } else {
+                    Text("With every step computed in full, or Turbo on, there is no attention cache, so this changes nothing.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
+            }
+            if model.supportsWeightStreaming {
+                Toggle("Stream the model from disk", isOn: $streamWeights)
+                    .font(.app(.caption))
+                    .help("On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run.")
+                Text("Reads the models from disk as they run: about 60% less peak memory, about 5% slower. Best on a fast SSD.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+            Toggle("Live preview", isOn: $livePreview)
                 .font(.app(.caption))
-                .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It is not free — every step solves for the clean latent and copies the previewed frame to the CPU.")
+                .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It costs about 1% in speed: every step solves for the clean latent and copies the previewed frame to the CPU.")
+            Text("Shows a rough still of each step while it runs, about 1% slower. The finished clip comes out sharper than the preview.")
+                .font(.app(.caption2)).foregroundStyle(.secondary)
 
             if model.supportsLoRA { loraSection }
         }
@@ -1903,6 +1964,8 @@ struct VideoGenView: View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
             Text("Style LoRAs").font(.app(.headline).weight(.semibold))
+            Text("Adapter files (.safetensors) that change the look or teach the model a subject. Up to 8 stack, each with its own strength.")
+                .font(.app(.caption2)).foregroundStyle(.secondary)
             ForEach(Array(loras.enumerated()), id: \.element.id) { index, _ in
                 LoraAdapterRow(lora: $loras[index]) {
                     loras.remove(at: index)
@@ -2129,7 +2192,7 @@ struct VideoGenView: View {
                 Text(L10n.text(est))
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
-                    .help("Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU.")
+                    .help("Time is estimated from measured runs and this Mac's GPU, and varies with what else is using the GPU. Peak memory usage is the most memory this size and length are planned to need.")
             }
         }
     }
@@ -2152,12 +2215,24 @@ struct VideoGenView: View {
                                 .frame(maxHeight: 220)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                         }
-                        ProgressView(value: Double(step), total: max(1, Double(total)))
-                            .progressViewStyle(.linear)
-                            .frame(width: 240)
-                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
-                        Text(service.startedAt, style: .timer)
-                            .font(.app(.footnote)).monospacedDigit().foregroundStyle(.secondary)
+                        if let readout = service.readout {
+                            ProgressView(value: readout.fraction)
+                                .progressViewStyle(.linear)
+                                .frame(width: 240)
+                            Text(verbatim: (["\(readout.percent)%", readout.stepLine] + [readout.pace].compactMap { $0 })
+                                .joined(separator: " · "))
+                                .font(.app(.footnote)).monospacedDigit()
+                        } else {
+                            ProgressView(value: Double(step), total: max(1, Double(total)))
+                                .progressViewStyle(.linear)
+                                .frame(width: 240)
+                        }
+                        HStack(spacing: 4) {
+                            Text(message)
+                            Text(verbatim: "·")
+                            Text(service.startedAt, style: .timer).monospacedDigit()
+                        }
+                        .font(.app(.footnote)).foregroundStyle(.secondary)
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -2241,6 +2316,8 @@ struct VideoGenView: View {
         // Turbo restores BEFORE the steps clamp: its range reaches below the
         // preset's floor, and clamping first would bounce a saved 8 up to 16.
         turbo = s.turbo && model.supportsTurbo
+        streamWeights = s.streamWeights
+        attnCache8bit = s.attnCache8bit
         // Clamp into the slider ranges — a value persisted by the old wider
         // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
         steps = min(effectiveStepsRange.upperBound, max(effectiveStepsRange.lowerBound, s.steps))
@@ -2336,6 +2413,8 @@ struct VideoGenView: View {
         s.bestQuality = bestQuality
         s.diffusionDecoder = diffusionDecoder
         s.turbo = turbo
+        s.streamWeights = streamWeights
+        s.attnCache8bit = attnCache8bit
         s.promptHeight = PromptEditorHeight.clamp(promptHeight)
         s.loras = loras
         s.prompt = prompt
@@ -2459,6 +2538,8 @@ struct VideoGenView: View {
             // Belt-and-braces with the requestBody gate (turbo state survives
             // preset switches, like the reference files below).
             turbo: turboEngaged,
+            streamWeights: streamWeights,
+            attnCache8bit: attnCache8bit,
             // Gated here too: the stepper's value survives a preset switch,
             // and only the fl2va partition has a keyframe row to chain.
             chainWindows: model.supportsChainedWindows ? chainWindows : 1,

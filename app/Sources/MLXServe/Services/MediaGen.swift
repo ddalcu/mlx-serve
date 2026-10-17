@@ -666,6 +666,10 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// answers a named 400 saying where to get it. FL2VA packs only until the
     /// LoRA has been eyeballed on the REF2VA DiT.
     var supportsTurbo: Bool = false
+    /// H3 streams its text encoder's layers and DiT's blocks from disk (server `stream_weights`,
+    /// default on). Turning it off holds them in memory: faster where the disk is slow, ~20 GB
+    /// more on the 8-bit pack (`ditResidentUnstreamedGB`, `stagedPeakUnstreamedGB`).
+    var supportsWeightStreaming: Bool = false
     /// Chained-window long clips (server `chain_windows`): N windows joined by
     /// fl2va keyframe conditioning, so the REF2VA pack cannot serve it.
     var supportsChainedWindows: Bool = false
@@ -726,16 +730,25 @@ struct VideoModelPreset: Identifiable, Hashable {
         return String(format: "%.1f s — ", seconds) + testedFrameFloorNote
     }
     /// Weights resident DURING sampling, in GB. Distinct from `approxRAMGB`,
-    /// which is the staged LOAD peak (`max(TE, DiT) + VAEs`): by the time the
-    /// DiT is stepping, the text encoder has been run and freed. Only the H3
-    /// memory model reads it; 0 means "not modelled".
+    /// which is the staged LOAD peak: by the time the DiT is stepping, the text
+    /// encoder has been run and freed, and H3's blocks stream from disk (the
+    /// server's `H3_DIT_STREAM_PCT` of the file; `--ane-video` keeps them all
+    /// resident, which the server's own warning prices). Only the H3 memory
+    /// model reads it; 0 means "not modelled".
     var ditResidentGB: Double = 0
-    /// The staged LOAD peak from the pack's actual file sizes, in GiB.
+    /// `ditResidentGB` with streaming off: the DiT after precompute frees its AdaLN weights.
+    var ditResidentUnstreamedGB: Double = 0
+    /// The staged LOAD peak from the pack's actual file sizes, in GiB. H3's text
+    /// encoder streams its layers (the server's `H3_TE_STREAM_BYTES`), so the
+    /// video decoder (its file + the VAE stage base) is the biggest; the audio
+    /// VAE loads after it is freed.
     /// `approxRAMGB` is the rounded-up version of this and drives the coarse
     /// "does this Mac have enough RAM at all" alert, where erring high is free.
     /// The frame model is not that: rounding 22.8 up to 26 costs a 32 GB Mac
     /// the 4-bit pack it exists for. 0 falls back to `approxRAMGB`.
     var stagedPeakGB: Double = 0
+    /// `stagedPeakGB` with streaming off: the text encoder held whole.
+    var stagedPeakUnstreamedGB: Double = 0
     /// The pack carries its OWN text encoder. LTX 2.3 borrows the shared
     /// `mlx-community/gemma-3-12b-it-4bit` download (also a chat model, so it
     /// is a separate bundle component); 2.5 ships a Lightricks fine-tune of
@@ -1124,6 +1137,7 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// frame ladder, same fast recipe. One factory so they cannot drift.
     private static func minimaxH3Preset(repo: String, name: String,
                                         downloadGB: Int, ramGB: Int, ditGB: Double, stagedGB: Double,
+                                        ditFullGB: Double, teFullGB: Double,
                                         description: String,
                                         supportsReferences: Bool = false) -> VideoModelPreset {
         // The model's own range: MiniMax states 4-15 s at 24 fps, and the
@@ -1195,6 +1209,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             // chain through), so both flags are the partition's complement —
             // derived here so the two fl2va presets cannot drift apart.
             supportsTurbo: !supportsReferences,
+            supportsWeightStreaming: true,
             supportsChainedWindows: !supportsReferences,
             supportsLastFrame: !supportsReferences,
             // MiniMax publishes no step count at all — no default, no range, no
@@ -1214,7 +1229,9 @@ struct VideoModelPreset: Identifiable, Hashable {
             testedFrameFloor: statedMin,
             testedFrameFloorNote: "below MiniMax's stated 4-second minimum. Good for trying a prompt or a step count cheaply; motion and the soundtrack degrade outside the trained range.",
             ditResidentGB: ditGB,
-            stagedPeakGB: stagedGB
+            ditResidentUnstreamedGB: ditFullGB,
+            stagedPeakGB: stagedGB,
+            stagedPeakUnstreamedGB: max(stagedGB, teFullGB)
         )
     }
 
@@ -1222,21 +1239,25 @@ struct VideoModelPreset: Identifiable, Hashable {
         repo: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit",
         name: "MiniMax-H3 (Hailuo 3.0) 8-bit — video + native audio",
         downloadGB: 69,
-        ramGB: 44,
-        ditGB: 20.46,
-        stagedGB: 38.24,
+        ramGB: 27,
+        ditGB: 1.64,
+        stagedGB: 5.63,
+        ditFullGB: 20.46,
+        teFullGB: 26.28,
         description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Clips run from 5 to 15 seconds. It is slow, and how slow depends heavily on the settings — the estimate under the Generate button is live, and 960 × 544 is several times quicker than the widescreen canvas."
     )
 
     /// The 4-bit pack: same speed (the DiT is compute-bound), ~40 GB download
-    /// and a ~25 GB staged peak — the pick for 32-48 GB Macs.
+    /// and less to hold while sampling — the pick for 32-48 GB Macs.
     static let minimaxH3Q4: VideoModelPreset = minimaxH3Preset(
         repo: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit",
         name: "MiniMax-H3 (Hailuo 3.0) 4-bit — video + native audio, low RAM",
         downloadGB: 40,
-        ramGB: 26,
-        ditGB: 11.11,
-        stagedGB: 22.82,
+        ramGB: 16,
+        ditGB: 0.87,
+        stagedGB: 5.63,
+        ditFullGB: 11.11,
+        teFullGB: 14.72,
         description: "The 4-bit build of MiniMax-H3: same generation speed, a 40 GB download instead of 69, and it fits comfortably on 32 GB Macs. Slightly softer detail than the 8-bit build — pick that one if you have 48 GB or more."
     )
 
@@ -1248,9 +1269,11 @@ struct VideoModelPreset: Identifiable, Hashable {
         repo: "ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit",
         name: "MiniMax-H3 (Hailuo 3.0) REF2VA 8-bit — references + native audio",
         downloadGB: 69,
-        ramGB: 44,
-        ditGB: 20.46,
-        stagedGB: 38.24,
+        ramGB: 27,
+        ditGB: 1.64,
+        stagedGB: 5.63,
+        ditFullGB: 20.46,
+        teFullGB: 26.28,
         description: "The reference-conditioned MiniMax-H3: attach up to 9 images, 3 clips and 3 audio references and the generation follows them for character, style and scene continuity. Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1>. Same speed and soundtrack as the standard pack; every reference adds tokens to every sampling step, so more references means slower.",
         supportsReferences: true
     )
@@ -2405,6 +2428,13 @@ struct VideoGenRequest {
     var loras: [LoraAdapter] = []
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, fast recipe off.
     var turbo: Bool = false
+    /// H3 weight streaming (`stream_weights`); sent only when off.
+    var streamWeights: Bool = true
+    /// H3's fast-recipe attention cache stored 8-bit (`attn_cache_8bit`): about
+    /// half its memory, slightly lossy. Sent only when on.
+    var attnCache8bit: Bool = false
+    /// Whether the server runs H3's fast recipe: "Compute every step in full" and Turbo both turn it off.
+    var fastRecipe: Bool { !bestQuality && !turbo }
     /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
     /// by keyframe conditioning. 1 = a single ordinary window.
     var chainWindows: Int = 1
@@ -2637,10 +2667,11 @@ enum RAMChecker {
     /// 124-frame floor, so it fires always). A backend with its own memory
     /// model answers for itself.
     static func safeFrameCap(model: VideoModelPreset, width: Int, height: Int, available: Int,
-                             fast: Bool = true) -> Int {
+                             fast: Bool = true, streamWeights: Bool = true, cache8bit: Bool = false) -> Int {
         if model.backend == .minimaxH3 {
             return H3Plan.frameCap(model: model, width: width, height: height,
-                                   availableGB: available, fast: fast)
+                                   availableGB: available, fast: fast, streamWeights: streamWeights,
+                                   cache8bit: cache8bit)
         }
         let pixelMP = Double(width * height) / 1_000_000.0
         let headroom = max(0, available - model.approxRAMGB)

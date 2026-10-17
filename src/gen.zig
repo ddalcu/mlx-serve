@@ -3925,6 +3925,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // from ckpt500, which needed the extra steps to firm up. 30 stays the
     // non-turbo default.
     const turbo = sse.bodyWantsTrue(body, "turbo");
+    const stream_weights = h3StreamWeights(body);
+    const attn_cache_8bit = sse.bodyWantsTrue(body, "attn_cache_8bit");
     if (turbo and !engine.hasTurboLora(io, allocator))
         return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
@@ -3958,7 +3960,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         return sendError(conn, 400, reason);
     const want_stream = sse.bodyWantsTrue(body, "stream");
     const preview_req = sse.parsePreview(body);
-    log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, want_stream, preview_req.enabled });
+    log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} stream_weights={} loras={d} chain={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, stream_weights, lora_n, chain_windows, want_stream, preview_req.enabled });
 
     // fl2va keyframes. NOT graceful (the a2vid rule: the user asked for THIS
     // frame): an undecodable image is a named 400, never a silent t2va. The
@@ -4052,38 +4054,48 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     var sctx = videoStreamCtx(conn, allocator, body, want_stream);
     const prog: ?sse.Progress = sctx.progress();
     // The load gate bills the model, not the request: the request's own activations price the
-    // resident plan, and when that does not fit, the staged DiT stage is checked here, before
-    // any stage loads, since the Metal OOM mid-step is uncatchable.
+    // resident plan, and when that does not fit, each stage is checked here, before any loads: the
+    // Metal OOM mid-step is uncatchable and takes the whole server down.
     const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo, minimax_h3.envStr("MINIMAX_H3_STEP_CACHE"), minimax_h3.envStr("MINIMAX_H3_ATTN_BCAST"));
     const cfg = minimax_h3.Config{};
-    const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, cfg.num_layers) * cfg.hidden_size * 2 else 0;
+    const bcast_row: u64 = if (speed.bcast_k > 0) minimax_h3.AttnBroadcast.rowBytes(cfg.hidden_size, cfg.num_layers, attn_cache_8bit) else 0;
     const rows = h3RequestRows(width, height, shape.frame_count, @intCast(n_kf));
     const activations = h3ActivationBytes(rows, bcast_row);
     const plan = h3ResidentFor(engine, io, allocator, activations);
+    var reason_buf: [384]u8 = undefined;
+    var msg_buf: [640]u8 = undefined;
     if (plan == null) {
-        const dit = h3DitResidentBytes(h3DitBytes(io, engine.model_dir), minimax_h3.adalnPrecomputeOn()) +
+        const dit = h3DitResidentBytes(h3DitBytes(io, engine.model_dir), minimax_h3.adalnPrecomputeOn(), minimax_h3.ditStreamOn(stream_weights)) +
             (if (turbo) packFileBytes(io, allocator, engine.model_dir, "turbo_lora.safetensors") else 0);
         var active: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
         const bill = h3CanvasBill(dit, activations, metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active, mlx.cudaAvailable());
-        if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
-            const gb = 1024.0 * 1024.0 * 1024.0;
-            var buf: [320]u8 = undefined;
-            const with_cache = bcast_row > 0;
-            const msg = std.fmt.bufPrint(&buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
-                width,
-                height,
-                shape.frame_count,
-                @as(f64, @floatFromInt(bill.need)) / gb,
-                @as(f64, @floatFromInt(dit)) / gb,
-                if (mlx.cudaAvailable()) " paged to RAM" else "",
-                @as(f64, @floatFromInt(activations)) / gb,
-                rows,
-                if (with_cache) " with the fast recipe's attention cache" else "",
-                @as(f64, @floatFromInt(bill.avail)) / gb,
-                if (with_cache) ", or \"turbo\", which keeps no attention cache" else "",
-            }) catch "the canvas does not fit in memory: use a smaller canvas or fewer frames";
-            return sendError(conn, 400, msg);
+        const held = minimax_h3.chainDeliveredFrames(chain_windows, shape.frame_count) - shape.frame_count;
+        const vae = h3VaeStageBytes(packFileBytes(io, allocator, engine.model_dir, "video_vae.safetensors"), width, height, shape.frame_count, held);
+        const te = h3TeResidentBytes(packFileBytes(io, allocator, engine.model_dir, "text_encoder.safetensors"), stream_weights);
+        const gb = 1024.0 * 1024.0 * 1024.0;
+        const avail_gb = @as(f64, @floatFromInt(bill.avail)) / gb;
+        const with_cache = bcast_row > 0;
+        const short: ?H3Shortfall = if (dit > 0) h3Shortfall(te, vae, bill.need, bill.avail) else null;
+        if (short) |stage| {
+            const reason = switch (stage) {
+                .text_encoder => std.fmt.bufPrint(&reason_buf, "holding the text encoder needs ~{d:.1} GB but {d:.1} GB is available", .{ @as(f64, @floatFromInt(te)) / gb, avail_gb }),
+                .vae => std.fmt.bufPrint(&reason_buf, "{d}x{d} x {d} frames needs ~{d:.1} GB to decode the video but {d:.1} GB is available", .{ width, height, shape.frame_count, @as(f64, @floatFromInt(vae)) / gb, avail_gb }),
+                .denoise => std.fmt.bufPrint(&reason_buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available", .{
+                    width,                                           height, shape.frame_count,
+                    @as(f64, @floatFromInt(bill.need)) / gb,         @as(f64, @floatFromInt(dit)) / gb,
+                    if (mlx.cudaAvailable()) " paged to RAM" else "", @as(f64, @floatFromInt(activations)) / gb,
+                    rows,                                            if (with_cache) " with the fast recipe's attention cache" else "",
+                    avail_gb,
+                }),
+            } catch "the request does not fit in available memory";
+            const fix = switch (stage) {
+                .text_encoder => "\"stream_weights\": true streams it from disk",
+                .vae => "use a smaller canvas or fewer frames",
+                .denoise => if (!stream_weights) "use a smaller canvas or fewer frames, or \"stream_weights\": true" else if (with_cache) "use a smaller canvas or fewer frames, or \"turbo\", which keeps no attention cache" else "use a smaller canvas or fewer frames",
+            };
+            const msg = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ reason, fix }) catch reason;
+            return sendErrorType(conn, 400, "insufficient_memory", msg);
         }
     }
 
@@ -4109,6 +4121,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .seed = seed,
         .speed = speed,
         .turbo = turbo,
+        .stream_weights = stream_weights,
+        .attn_cache_8bit = attn_cache_8bit,
         .lora_paths = lora_paths[0..lora_n],
         .lora_scales = lora_scales[0..lora_n],
         .chain_windows = chain_windows,
@@ -4939,6 +4953,11 @@ pub fn ltxPeakBytes(dir_sum: u64, spare_transformer: u64, text_encoder: u64) u64
 /// safe.
 pub const H3_DIT_RESIDENT_PCT: u64 = 65;
 
+/// Percent of `transformer.safetensors` resident while the blocks stream (`minimax_h3.ditStreamOn`):
+/// the refiner, AdaLN tables and small layers (0.92 GB of the 8-bit pack's 35.2 GB) plus the
+/// blocks read ahead of the GPU within a step.
+pub const H3_DIT_STREAM_PCT: u64 = 5;
+
 /// MiniMax Music 3's non-weight working set at the request caps: batch-2 KV
 /// cache for 36 layers at 9000 frames + 5000 prompt tokens (~4.1 GB), the
 /// bf16 frame-hidden buffer (~0.6 GB), and DiT/vocoder window transients.
@@ -4949,30 +4968,55 @@ pub const MUSIC3_GEN_BUFFER_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// VAE tile (~3 GB). The stages run one after another; billed at the larger.
 pub const YUE2_GEN_BUFFER_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
+/// The text-encoder term of the H3 bill. Streaming (request `stream_weights`), the stage holds the
+/// embedding table, the vision tower when a prompt presents one, and about a layer read ahead.
+pub const H3_TE_STREAM_BYTES: u64 = 4 << 30;
+
+pub fn h3TeResidentBytes(te_file: u64, stream: bool) u64 {
+    return if (stream) @min(te_file, H3_TE_STREAM_BYTES) else te_file;
+}
+
+/// MiniMax-H3's `stream_weights`: absent means on, so only an explicit `false` keeps the text
+/// encoder and DiT resident for the run.
+pub fn h3StreamWeights(body: []const u8) bool {
+    return sse.bodyBool(body, "stream_weights") orelse true;
+}
+
 /// The DiT term of the H3 bill. `precompute` mirrors
 /// MINIMAX_H3_ADALN_PRECOMPUTE: with it off the modulation weights are never
 /// freed and the whole file stays resident, so the shed size would under-bill
-/// by ~12 GiB into an uncatchable Metal OOM.
-pub fn h3DitResidentBytes(dit_file: u64, precompute: bool) u64 {
+/// by ~12 GiB into an uncatchable Metal OOM. `stream` mirrors `minimax_h3.ditStreamOn`.
+pub fn h3DitResidentBytes(dit_file: u64, precompute: bool, stream: bool) u64 {
     if (!precompute) return dit_file;
-    return dit_file * H3_DIT_RESIDENT_PCT / 100;
+    return dit_file * (if (stream) H3_DIT_STREAM_PCT else H3_DIT_RESIDENT_PCT) / 100;
 }
 
 /// MiniMax-H3's staged residency plan, as a bill. `minimax_h3.generate` runs
 /// three DISJOINT stages: the text encoder is loaded, run and FREED before the
-/// DiT loads (`Model.load` is scoped), and the DiT is released before the VAEs
-/// load — so the peak is the BIGGEST stage, never a sum. The two VAEs are one
-/// stage: the video decoder is still resident when the audio one loads.
-/// `dit_resident` is post-AdaLN-precompute (`h3DitResidentBytes`), which the
-/// file size overstates by ~39%. The generating stages carry the smallest
-/// request's transients; `handleVideoH3` prices each request's own (they scale
-/// with pixels x frames, which a per-model gate cannot see). The text encoder
-/// is one forward over a few hundred prompt rows and carries none.
-pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u64 {
-    const vaes = video_vae + audio_vae;
-    const generating = @max(dit_resident, vaes);
-    if (te == 0 and generating == 0) return 0; // unknown dir → never block
-    return stagedPeakBytes(0, &.{ te, generating + H3_REQUEST_BASE_BYTES });
+/// DiT loads (`Model.load` is scoped), the DiT is released before the video VAE
+/// loads, and the video decoder is freed before the audio one loads — so the
+/// peak is the BIGGEST stage, never a sum. `dit_resident` is post-AdaLN-precompute
+/// (`h3DitResidentBytes`), which the file size overstates by ~39%. The generating
+/// stages carry the smallest request's transients; `handleVideoH3` prices each
+/// request's own (they scale with pixels x frames, which a per-model gate cannot
+/// see). The text encoder is one forward over a few hundred prompt rows and carries none.
+pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64) u64 {
+    if (te == 0 and dit_resident == 0 and video_vae == 0) return 0; // unknown dir → never block
+    return stagedPeakBytes(0, &.{ te, dit_resident + H3_REQUEST_BASE_BYTES, h3VaeStageBytes(video_vae, 0, 0, 0, 0) });
+}
+
+/// The VAE stage of one window, measured (process footprint, 8-bit pack, 8M-138M decoded pixels):
+/// the video decoder, a base, and what the capped decode holds per decoded pixel
+/// (`minimax_h3.VAE_DECODE_KEEP_PER_PX` plus the decoded chunks), plus the f32 pixels of the
+/// `held_frames` earlier chain windows keep. The audio decode, the RGB conversion and the send
+/// come after the decoder is freed and hold less.
+pub const H3_VAE_BASE_BYTES: u64 = 800 << 20;
+pub const H3_VAE_PIXEL_BYTES: u64 = 40;
+
+pub fn h3VaeStageBytes(video_vae: u64, width: u32, height: u32, frames: u32, held_frames: u32) u64 {
+    if (video_vae == 0) return 0;
+    const frame_px = @as(u64, width) * height;
+    return video_vae + H3_VAE_BASE_BYTES + frame_px * (@as(u64, frames) * H3_VAE_PIXEL_BYTES + @as(u64, held_frames) * 12);
 }
 
 /// Sequence rows one window puts through the DiT: video latents on the 32-pixel grid, stereo
@@ -4983,11 +5027,11 @@ pub fn h3RequestRows(width: u32, height: u32, frames: u32, keyframes: u32) u64 {
     return (shape.latent_t + keyframes) * frame_rows + 2 * @as(u64, shape.audio_t);
 }
 
-/// What one denoising run holds above its weights, per sequence row (process footprint on an
-/// M5 Pro, 8.9k-37.7k rows): the per-step transients, plus the fast recipe's per-block attention
-/// cache (`bcast_row_bytes` = layers x hidden x bf16) while that recipe is on.
-pub const H3_ROW_BYTES: u64 = 384 * 1024;
-const H3_REQUEST_BASE_BYTES: u64 = 1 << 30;
+/// What one denoising run holds above its weights (process footprint, 7.4k-40.6k rows, with
+/// `minimax_h3.DenoiseMemCap`): a base plus the per-step transients per sequence row, plus the
+/// fast recipe's per-block attention cache (`bcast_row_bytes`, `AttnBroadcast.rowBytes`).
+pub const H3_ROW_BYTES: u64 = 144 * 1024;
+const H3_REQUEST_BASE_BYTES: u64 = 5 << 29;
 
 pub fn h3ActivationBytes(rows: u64, bcast_row_bytes: u64) u64 {
     return H3_REQUEST_BASE_BYTES + rows * (H3_ROW_BYTES + bcast_row_bytes);
@@ -5013,6 +5057,17 @@ pub fn h3AvailBytes(host_avail: u64, gpu_limit: u64, gpu_active: u64) u64 {
     if (host_avail == 0) return 0;
     if (gpu_limit == 0) return host_avail;
     return @min(host_avail, gpu_limit -| gpu_active);
+}
+
+/// The H3 stage a request's bill says will not fit in `avail`, or null (also when `avail` is unknown).
+pub const H3Shortfall = enum { text_encoder, vae, denoise };
+
+pub fn h3Shortfall(te: u64, vae: u64, need: u64, avail: u64) ?H3Shortfall {
+    if (avail == 0) return null;
+    if (te > need and te > vae and te > avail) return .text_encoder;
+    if (vae > need and vae > avail) return .vae;
+    if (need > avail) return .denoise;
+    return null;
 }
 
 /// What a staged DiT run is checked against: the bytes it needs and the bytes that hold them.
@@ -5063,16 +5118,17 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         // The Turbo LoRA (when the pack ships one) is resident ALONGSIDE the
         // DiT and precompute does not free it, so it rides the DiT term at
         // full size — billed whenever present, since the gate estimate is
-        // per-model, not per-request.
+        // per-model, not per-request. Weights bill streamed, the request
+        // default; a request that keeps them resident is priced by its own warning.
         const dit = h3DitResidentBytes(
             ditBytes(io, dir, !aneKeepsPacked(model_type)),
             minimax_h3.adalnPrecomputeOn(),
+            minimax_h3.ditStreamOn(true),
         ) + sz(io, dir, "turbo_lora.safetensors");
         return h3PeakBytes(
-            sz(io, dir, "text_encoder.safetensors"),
+            h3TeResidentBytes(sz(io, dir, "text_encoder.safetensors"), true),
             dit,
             sz(io, dir, "video_vae.safetensors"),
-            sz(io, dir, "audio_vae.safetensors"),
         );
     }
     if (std.mem.startsWith(u8, model_type, "qwen_image")) {
@@ -5183,6 +5239,11 @@ fn sendBytes(conn: *Conn, allocator: std.mem.Allocator, content_type: []const u8
 }
 
 fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
+    return sendErrorType(conn, code, null, msg);
+}
+
+/// `err_type` names the kind of refusal (`insufficient_memory`), so a client can tell it from the rest.
+fn sendErrorType(conn: *Conn, code: u16, err_type: ?[]const u8, msg: []const u8) !void {
     // A refusal that logs nothing is invisible the moment a client drops the
     // body (live 2026-08-06: the app's stream path showed a bare "HTTP 400"
     // while the log showed a clean load→unload and nothing else).
@@ -5190,10 +5251,13 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     // Escape at the SINK: several of these messages quote a field value
     // (`mode:"edit"`), which went onto the wire as raw quotes inside a JSON
     // string — an unparseable body. See `sse.jsonEscapeMessage`.
-    var esc_buf: [512]u8 = undefined;
+    var esc_buf: [768]u8 = undefined;
     const esc = sse.jsonEscapeMessage(&esc_buf, msg);
-    var body_buf: [640]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, "{{\"error\":{{\"message\":\"{s}\"}}}}", .{esc}) catch return;
+    var body_buf: [896]u8 = undefined;
+    const body = if (err_type) |ty|
+        std.fmt.bufPrint(&body_buf, "{{\"error\":{{\"message\":\"{s}\",\"type\":\"{s}\"}}}}", .{ esc, ty }) catch return
+    else
+        std.fmt.bufPrint(&body_buf, "{{\"error\":{{\"message\":\"{s}\"}}}}", .{esc}) catch return;
     var hdr: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{ code, body.len }) catch return;
     try conn.writeAllNoFlush(head);
@@ -6845,35 +6909,55 @@ test "LTX bills ONE transformer variant, plus the text encoder its dir cannot se
 test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint ones" {
     const GB: u64 = 1024 * 1024 * 1024;
     const act = H3_REQUEST_BASE_BYTES;
-    // Three disjoint stages: the TE is freed before the DiT loads, the DiT is
-    // freed before the VAEs load. Billing any two together refuses a Mac that
-    // would work — the VAEs used to be added to the DiT term.
-    try std.testing.expectEqual(35 * GB + act, h3PeakBytes(28 * GB, 35 * GB, 5 * GB, 1 * GB));
-    // The two VAEs DO coexist (the video decoder is still resident when the
-    // audio one loads), so they are one stage.
-    try std.testing.expectEqual(9 * GB + act, h3PeakBytes(4 * GB, 3 * GB, 5 * GB, 4 * GB));
+    // Four disjoint stages: the TE is freed before the DiT loads, the DiT before the
+    // video VAE, the video decoder before the audio one. Billing any two together
+    // refuses a Mac that would work — the VAEs used to be added to the DiT term.
+    try std.testing.expectEqual(35 * GB + act, h3PeakBytes(28 * GB, 35 * GB, 5 * GB));
+    try std.testing.expectEqual(h3VaeStageBytes(9 * GB, 0, 0, 0, 0), h3PeakBytes(4 * GB, 3 * GB, 9 * GB));
     // The TE stage carries no generation transients — one forward over a few
     // hundred prompt rows. Adding them to it is what refused the 8-bit pack.
-    try std.testing.expectEqual(48 * GB, h3PeakBytes(48 * GB, 35 * GB, 5 * GB, 1 * GB));
+    try std.testing.expectEqual(48 * GB, h3PeakBytes(48 * GB, 35 * GB, 5 * GB));
     // All-unknown must stay 0: the preflight treats 0 as "unknown, never block".
-    try std.testing.expectEqual(@as(u64, 0), h3PeakBytes(0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), h3PeakBytes(0, 0, 0));
 
     // The real 8-bit pack on a 48 GB Mac (auto cap 29.95 GiB): 26.28 TE,
     // 32.83 DiT + 0.73 turbo, 4.85 + 0.56 VAEs. Measured process peak 26 GB.
     const MB: u64 = 1024 * 1024;
     const real = h3PeakBytes(
         26_910 * MB,
-        h3DitResidentBytes(33_618 * MB, true) + 747 * MB,
+        h3DitResidentBytes(33_618 * MB, true, false) + 747 * MB,
         4_966 * MB,
-        573 * MB,
     );
     try std.testing.expect(real < 29 * GB); // fits the 48 GB Mac's auto cap
     try std.testing.expect(real > 24 * GB); // and stays above the measured peak
 
-    // The 4-bit pack's files: the text encoder is the biggest stage (measured 14.23 GB resident
+    // The 4-bit pack's files, encoder resident: it is the biggest stage (measured 14.23 GB resident
     // vs the DiT's 11.44 at 832x480 x 22 frames), not the DiT plus a worst-case canvas.
     const te4: u64 = 15_804_791_921;
-    try std.testing.expectEqual(te4, h3PeakBytes(te4, h3DitResidentBytes(18_698_813_290, true) + 779_849_816, 5_207_808_496, 605_254_808));
+    try std.testing.expectEqual(te4, h3PeakBytes(te4, h3DitResidentBytes(18_698_813_290, true, false) + 779_849_816, 5_207_808_496));
+}
+
+test "h3 VAE stage covers the measured decode peaks without billing a canvas twice" {
+    const MiB: f64 = 1024 * 1024;
+    const video_vae: u64 = 5_207_808_496; // the 8-bit pack's video_vae.safetensors
+    // Process-footprint peaks of the video decode, 8-bit FL2VA pack, MiB.
+    const Case = struct { w: u32, h: u32, f: u32, peak: f64 };
+    const cases = [_]Case{
+        .{ .w = 512, .h = 288, .f = 56, .peak = 5.71 * 1024 },
+        .{ .w = 1120, .h = 640, .f = 56, .peak = 7.05 * 1024 },
+        .{ .w = 512, .h = 288, .f = 192, .peak = 6.52 * 1024 },
+        .{ .w = 768, .h = 448, .f = 124, .peak = 6.93 * 1024 },
+        .{ .w = 1120, .h = 640, .f = 192, .peak = 10.42 * 1024 },
+    };
+    for (cases) |c| {
+        const bill = @as(f64, @floatFromInt(h3VaeStageBytes(video_vae, c.w, c.h, c.f, 0))) / MiB;
+        try std.testing.expect(bill >= c.peak);
+        try std.testing.expect(bill < c.peak + 1024);
+    }
+    // A chained window also holds the earlier windows' f32 pixels.
+    try std.testing.expectEqual(h3VaeStageBytes(video_vae, 512, 288, 192, 0) + 512 * 288 * 191 * 12, h3VaeStageBytes(video_vae, 512, 288, 192, 191));
+    // The per-model gate bills the smallest request: the decoder and the base, no canvas.
+    try std.testing.expectEqual(h3VaeStageBytes(video_vae, 0, 0, 0, 0), h3PeakBytes(2 << 30, 1 << 30, video_vae));
 }
 
 test "h3 request rows: latent frames on the 32-pixel grid, stereo audio, one frame of rows per keyframe" {
@@ -6882,18 +6966,39 @@ test "h3 request rows: latent frames on the 32-pixel grid, stereo audio, one fra
     try std.testing.expectEqual(@as(u64, 12846 + 2 * 336), h3RequestRows(768, 448, 124, 2));
 }
 
-test "h3 request bill stays above the measured peaks and refuses the canvas that died (#764)" {
+test "h3 request bill covers every measured step peak without over-billing it, and refuses the canvas that died (#764)" {
+    const GiB: f64 = 1 << 30;
+    const q8 = minimax_h3.AttnBroadcast.rowBytes(5376, 50, true);
+    const bf16 = minimax_h3.AttnBroadcast.rowBytes(5376, 50, false);
+    // Process peak of a denoise step minus the resident DiT (18.56 GiB) and the Turbo LoRA file,
+    // measured on the 8-bit pack (M4 Max): the bill must cover it with under 2.5 GiB to spare.
+    const Run = struct { rows: u64, bcast: u64, above_dit: f64 };
+    const runs = [_]Run{
+        .{ .rows = 7414, .bcast = q8, .above_dit = 23.51 - 18.56 },
+        .{ .rows = 16676, .bcast = q8, .above_dit = 27.08 - 18.56 },
+        .{ .rows = 16694, .bcast = 0, .above_dit = 22.36 - 18.56 },
+        .{ .rows = 37728, .bcast = 0, .above_dit = 26.65 - 18.56 - 0.73 }, // turbo
+        .{ .rows = 40558, .bcast = q8, .above_dit = 35.52 - 18.56 },
+    };
+    for (runs) |r| {
+        const bill = @as(f64, @floatFromInt(h3ActivationBytes(r.rows, r.bcast))) / GiB;
+        try std.testing.expect(bill >= r.above_dit);
+        try std.testing.expect(bill < r.above_dit + 2.5);
+    }
+    // 1536x672 with two keyframes and a bf16 cache died with 32.58 GB available (4-bit pack).
+    const dit = h3DitResidentBytes(18_698_813_290, true, false);
+    try std.testing.expect(dit + h3ActivationBytes(h3RequestRows(1536, 672, 124, 2), bf16) > 33 * (1 << 30));
+}
+
+test "h3 shortfall names the stage that does not fit, and nothing when it all fits or memory is unknown" {
     const GB: u64 = 1 << 30;
-    const dit = h3DitResidentBytes(18_698_813_290, true); // the 4-bit FL2VA pack
-    const lora: u64 = 779_849_816;
-    const bcast: u64 = 50 * 5376 * 2;
-    // Process peaks measured on an M5 Pro 48 GB at 124 frames.
-    try std.testing.expect(dit + lora + h3ActivationBytes(37718, 0) >= 26 * GB); // 1344x768 turbo: 26 GB
-    try std.testing.expect(dit + lora + h3ActivationBytes(37718, 0) < 28 * GB);
-    try std.testing.expect(dit + h3ActivationBytes(19292, bcast) >= 28 * GB); // 960x544 fast recipe: 28 GB
-    try std.testing.expect(dit + h3ActivationBytes(19292, bcast) < 31 * GB); // and a 48 GB Mac with 31.5 GB free still serves it
-    // 1536x672 with two keyframes under the fast recipe died with 32.58 GB available.
-    try std.testing.expect(dit + h3ActivationBytes(h3RequestRows(1536, 672, 124, 2), bcast) > 33 * GB);
+    // Held text encoder bigger than the denoise and the decode, past what is free.
+    try std.testing.expectEqual(@as(?H3Shortfall, .text_encoder), h3Shortfall(28 * GB, 7 * GB, 20 * GB, 24 * GB));
+    // A long canvas whose decode outgrows the denoise.
+    try std.testing.expectEqual(@as(?H3Shortfall, .vae), h3Shortfall(4 * GB, 30 * GB, 20 * GB, 24 * GB));
+    try std.testing.expectEqual(@as(?H3Shortfall, .denoise), h3Shortfall(4 * GB, 7 * GB, 30 * GB, 24 * GB));
+    try std.testing.expectEqual(@as(?H3Shortfall, null), h3Shortfall(4 * GB, 7 * GB, 20 * GB, 24 * GB));
+    try std.testing.expectEqual(@as(?H3Shortfall, null), h3Shortfall(40 * GB, 40 * GB, 40 * GB, 0));
 }
 
 test "h3 residency is priced on the request's activations, so a warm set yields to a big canvas (#764)" {
@@ -6902,7 +7007,7 @@ test "h3 residency is priced on the request's activations, so a warm set yields 
     const dit_file: u64 = 18_698_813_290;
     const vaes: u64 = 5_207_808_496 + 605_254_808;
     const lora: u64 = 779_849_816;
-    const bcast: u64 = 50 * 5376 * 2;
+    const bcast: u64 = minimax_h3.AttnBroadcast.rowBytes(5376, 50, true);
     const margin = h3ResidentMargin(64 * GB);
     // A 64 GB Mac with 60 GB free keeps the set warm for a small turbo run...
     const small = h3ResidentBytes(te, dit_file, vaes, lora, h3ActivationBytes(h3RequestRows(768, 448, 124, 0), 0));
@@ -6919,11 +7024,55 @@ test "h3 DiT term sheds the AdaLN weights precompute frees — unless it is off"
     // 20.19 GiB resident once precomputeAdaln frees the 13B modulation
     // weights, so the file size over-bills the DiT by ~12 GiB.
     const eight_bit: u64 = 32 * GB;
-    try std.testing.expect(h3DitResidentBytes(eight_bit, true) < eight_bit);
-    try std.testing.expect(h3DitResidentBytes(eight_bit, true) >= 20 * GB);
+    try std.testing.expect(h3DitResidentBytes(eight_bit, true, false) < eight_bit);
+    try std.testing.expect(h3DitResidentBytes(eight_bit, true, false) >= 20 * GB);
     // MINIMAX_H3_ADALN_PRECOMPUTE=0 never frees them, so the whole file stays
     // resident and billing the shed size would be an uncatchable OOM.
-    try std.testing.expectEqual(eight_bit, h3DitResidentBytes(eight_bit, false));
+    try std.testing.expectEqual(eight_bit, h3DitResidentBytes(eight_bit, false, false));
+}
+
+test "h3 streamed DiT bills what stays resident and still covers the measured denoise peak" {
+    const GiB: f64 = 1 << 30;
+    const file: u64 = 35_248_980_296; // the 8-bit pack's transformer.safetensors
+    const dit = h3DitResidentBytes(file, true, true);
+    // 0.92 GB measured resident with the blocks streaming, plus their read-ahead.
+    try std.testing.expect(dit > 920_000_000 and @as(f64, @floatFromInt(dit)) / GiB < 2.0);
+    // Process peaks of streamed denoise steps (fast recipe), 512x288 x 56 and 1120x640 x 192; the
+    // row term was fit on resident runs, which held ~2 GiB more transients at 40k rows.
+    const q8 = minimax_h3.AttnBroadcast.rowBytes(5376, 50, true);
+    for ([_]struct { rows: u64, peak: f64 }{ .{ .rows = 2652, .peak = 2.76 }, .{ .rows = 40558, .peak = 15.77 } }) |r| {
+        const bill = @as(f64, @floatFromInt(dit + h3ActivationBytes(r.rows, q8))) / GiB;
+        try std.testing.expect(bill >= r.peak and bill < r.peak + 5.0);
+    }
+}
+
+test "h3 stream_weights defaults on, and a request can keep the weights resident" {
+    try std.testing.expect(h3StreamWeights("{}"));
+    try std.testing.expect(h3StreamWeights("{\"stream_weights\": true}"));
+    try std.testing.expect(!h3StreamWeights("{\"stream_weights\": false}"));
+}
+
+test "h3 resident DiT bill covers the measured denoise peak with streaming off" {
+    const GiB: f64 = 1 << 30;
+    const dit = h3DitResidentBytes(35_248_980_296, true, false); // the 8-bit pack's transformer.safetensors
+    const q8 = minimax_h3.AttnBroadcast.rowBytes(5376, 50, true);
+    // Process peak of a "stream_weights": false run, 1120x640 x 124 i2v with the fast recipe.
+    const bill = @as(f64, @floatFromInt(dit + h3ActivationBytes(h3RequestRows(1120, 640, 124, 1), q8))) / GiB;
+    try std.testing.expect(bill >= 30.96 and bill < 30.96 + 5.0);
+}
+
+test "h3 streamed text encoder bills what stays resident and still covers the measured stage peak" {
+    const GiB: u64 = 1 << 30;
+    const file: u64 = 28_222_741_760; // the 8-bit pack's text_encoder.safetensors
+    try std.testing.expectEqual(file, h3TeResidentBytes(file, false));
+    const te = h3TeResidentBytes(file, true);
+    // Process peaks of the streamed stage, 8-bit pack: 2.17 GiB text-only, 2.86 GiB with the vision tower.
+    const vision_peak: u64 = 2_930 * 1024 * 1024;
+    try std.testing.expect(te >= vision_peak and te < vision_peak + 2 * GiB);
+    try std.testing.expectEqual(@as(u64, 300), h3TeResidentBytes(300, true)); // never above the file
+    // Streamed, the 8-bit pack's staged peak is the VAE stage, not the encoder.
+    const MB: u64 = 1024 * 1024;
+    try std.testing.expectEqual(h3VaeStageBytes(4_966 * MB, 0, 0, 0, 0), h3PeakBytes(te, h3DitResidentBytes(35_248_980_296, true, true) + 747 * MB, 4_966 * MB));
 }
 
 test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
@@ -6953,15 +7102,17 @@ test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
     tmp.dir.deleteFile(io, "transformer-dev.safetensors") catch {};
     tmp.dir.deleteFile(io, "transformer-distilled.safetensors") catch {};
 
-    // H3: max(TE 300, DiT 500*65% + activations, VAEs 120+30 + activations).
-    try std.testing.expectEqual(325 + H3_REQUEST_BASE_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    // H3: max(TE 300, DiT term of 500 + activations, the video VAE stage); streamed, the DiT term is 25.
+    const dit = h3DitResidentBytes(500, minimax_h3.adalnPrecomputeOn(), minimax_h3.ditStreamOn(true));
+    const vae = h3VaeStageBytes(120, 0, 0, 0, 0);
+    try std.testing.expectEqual(@max(dit + H3_REQUEST_BASE_BYTES, vae), estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
 
     // A pack shipping the Turbo LoRA bills it on the DiT term (it is resident
     // ALONGSIDE the DiT and precompute does not free it), whenever present —
     // the gate estimate is per-model, not per-request.
-    const b80: [80]u8 = @splat('x');
-    try tmp.dir.writeFile(io, .{ .sub_path = "turbo_lora.safetensors", .data = &b80 });
-    try std.testing.expectEqual(405 + H3_REQUEST_BASE_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    const b200: [200]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "turbo_lora.safetensors", .data = &b200 });
+    try std.testing.expectEqual(@max(dit + 200 + H3_REQUEST_BASE_BYTES, vae), estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
     tmp.dir.deleteFile(io, "turbo_lora.safetensors") catch {};
     // Any other media type: the plain sum over the dir (the safe default —
     // a backend without a declared residency plan must not under-bill).

@@ -43,46 +43,72 @@ enum H3Plan {
         return video + audioT * audioChannels + promptTokens + keyframes * frameRows
     }
 
-    /// The fast recipe's attention-broadcast cache: one `[S, hidden]` bf16 per
-    /// block, held for the whole run. At long frame counts THIS is what runs a
-    /// Mac out of memory, not the weights — 58 GB at 1344x768 x 362 frames.
+    /// The fast recipe's attention-broadcast cache: one `[S, hidden]` per block,
+    /// held for the whole run, bf16, or 8-bit with a bf16 scale and bias per 64
+    /// when the request asks (`attn_cache_8bit`, `AttnBroadcast.rowBytes`). At long
+    /// frame counts THIS is what runs a Mac out of memory, not the weights.
     /// Linear in rows: the [S, S] score matrix is never materialized (SDPA is
     /// fused), which is the only reason a 108k-row sequence is possible at all.
-    static func pabCacheBytes(rows: Int) -> UInt64 {
-        UInt64(rows) * UInt64(hiddenSize) * 2 * UInt64(blocks)
+    static func pabCacheBytes(rows: Int, cache8bit: Bool = false) -> UInt64 {
+        UInt64(rows) * UInt64(cache8bit ? hiddenSize + hiddenSize / 64 * 4 : hiddenSize * 2) * UInt64(blocks)
     }
 
-    /// Per-step transients (qkv, attention output, the 14336-wide MLP
-    /// intermediate, the residual stream). Estimated from the tensor widths
-    /// rather than measured, and rounded UP for the reason in the type comment.
-    static let activationBytesPerRow: UInt64 = 96 * 1024
+    /// What a denoise step holds above the DiT: a base plus per-row transients.
+    /// Mirrors the server's `H3_REQUEST_BASE_BYTES` / `H3_ROW_BYTES` (measured process footprint).
+    static let requestBaseBytes: UInt64 = 5 << 29
+    static let activationBytesPerRow: UInt64 = 144 * 1024
 
     /// The Turbo LoRA rides resident beside the DiT when engaged (744 MB bf16
     /// on disk, rounded up — the server bills the real file the same way).
     static let turboLoraBytes: UInt64 = 800 * 1024 * 1024
 
+    /// The video decode stage, mirroring the server's `h3VaeStageBytes`: the
+    /// decoder file, a base, and what the capped decode holds per delivered
+    /// pixel; frames held from earlier chained windows add their f32 pixels.
+    /// The VAEs are shared by every H3 pack, so the file size is one constant.
+    static let videoVaeBytes: UInt64 = 5_207_808_496
+    static let vaeBaseBytes: UInt64 = 800 << 20
+    static let vaePixelBytes: UInt64 = 40
+    static func vaeStageBytes(width: Int, height: Int, frames: Int, heldFrames: Int = 0) -> UInt64 {
+        let px = UInt64(max(0, width)) * UInt64(max(0, height))
+        return videoVaeBytes + vaeBaseBytes
+            + px * (UInt64(max(0, frames)) * vaePixelBytes + UInt64(max(0, heldFrames)) * 12)
+    }
+
     /// Peak unified memory for one generation, in bytes.
     ///
     /// During sampling the text encoder is already freed, so the resident set is
-    /// the DiT plus the cache plus activations. The staged LOAD peak
-    /// (`max(TE, DiT) + VAEs`, the preset's `approxRAMGB`) is the floor — a run
-    /// that samples cheaply still had to get the weights in.
+    /// the DiT (its blocks stream from disk unless `streamWeights` is off) plus the
+    /// cache plus activations; the video decode is its own stage after it. The
+    /// staged LOAD peak (the preset's `stagedPeakGB`) is the floor.
     static func peakBytes(model: VideoModelPreset, width: Int, height: Int,
                           frames: Int, fast: Bool, turbo: Bool = false,
+                          streamWeights: Bool = true, cache8bit: Bool = false,
                           promptTokens: Int = 250) -> UInt64 {
         let gb: UInt64 = 1024 * 1024 * 1024
-        let stagedGB = model.stagedPeakGB > 0 ? model.stagedPeakGB : Double(model.approxRAMGB)
+        let held = !streamWeights && model.supportsWeightStreaming
+        let declaredStaged = held ? model.stagedPeakUnstreamedGB : model.stagedPeakGB
+        let stagedGB = declaredStaged > 0 ? declaredStaged : Double(model.approxRAMGB)
         let loadPeak = UInt64(stagedGB * Double(gb))
         guard model.backend == .minimaxH3 else { return UInt64(model.approxRAMGB) * gb }
         let r = rows(width: width, height: height, frames: frames, promptTokens: promptTokens)
         // Turbo forces the fast recipe off server-side, so its callers pass
         // fast=false and the broadcast cache never bills; the LoRA itself
         // rides beside the DiT.
-        let sampling = UInt64(Double(model.ditResidentGB) * Double(gb))
-            + (fast ? pabCacheBytes(rows: r) : 0)
+        let sampling = UInt64((held ? model.ditResidentUnstreamedGB : model.ditResidentGB) * Double(gb))
+            + (fast ? pabCacheBytes(rows: r, cache8bit: cache8bit) : 0)
             + (turbo ? turboLoraBytes : 0)
-            + UInt64(r) * activationBytesPerRow
-        return max(loadPeak, sampling)
+            + requestBaseBytes + UInt64(r) * activationBytesPerRow
+        return max(loadPeak, sampling, vaeStageBytes(width: width, height: height, frames: frames))
+    }
+
+    /// "12 GB peak memory usage": the plan `fits` checks, for the longest shot of a run.
+    static func describePeak(model: VideoModelPreset, width: Int, height: Int, shotFrames: [Int],
+                             fast: Bool, turbo: Bool = false, streamWeights: Bool = true,
+                             cache8bit: Bool = false) -> String {
+        let peak = peakBytes(model: model, width: width, height: height, frames: shotFrames.max() ?? 0,
+                             fast: fast, turbo: turbo, streamWeights: streamWeights, cache8bit: cache8bit)
+        return L10n.format("%.0f GB peak memory usage", Double(peak) / (1024 * 1024 * 1024))
     }
 
     /// How much of a Mac's memory a generation may plan to use. 0.80 is not a
@@ -101,8 +127,10 @@ enum H3Plan {
     /// "nothing fits". A Mac too small to load the pack at all would otherwise
     /// see no warning at exactly 124 frames.
     static func fits(model: VideoModelPreset, width: Int, height: Int,
-                     frames: Int, fast: Bool, turbo: Bool = false, availableGB: Int) -> Bool {
-        peakBytes(model: model, width: width, height: height, frames: frames, fast: fast, turbo: turbo)
+                     frames: Int, fast: Bool, turbo: Bool = false, streamWeights: Bool = true,
+                     cache8bit: Bool = false, availableGB: Int) -> Bool {
+        peakBytes(model: model, width: width, height: height, frames: frames, fast: fast, turbo: turbo,
+                  streamWeights: streamWeights, cache8bit: cache8bit)
             <= budgetBytes(availableGB: availableGB)
     }
 
@@ -110,11 +138,13 @@ enum H3Plan {
     /// frame ladder. Never returns less than the ladder floor — ask `fits`
     /// whether that floor is itself reachable.
     static func frameCap(model: VideoModelPreset, width: Int, height: Int,
-                         availableGB: Int, fast: Bool = true) -> Int {
+                         availableGB: Int, fast: Bool = true, streamWeights: Bool = true,
+                         cache8bit: Bool = false) -> Int {
         let budget = budgetBytes(availableGB: availableGB)
         var best = model.frameOptions.first ?? 124
         for n in model.frameOptions {
-            if peakBytes(model: model, width: width, height: height, frames: n, fast: fast) <= budget { best = n }
+            if peakBytes(model: model, width: width, height: height, frames: n, fast: fast,
+                         streamWeights: streamWeights, cache8bit: cache8bit) <= budget { best = n }
         }
         return best
     }
@@ -281,15 +311,29 @@ enum H3TimeEstimate {
 
     /// End-to-end seconds for one generation, including load, text encode and
     /// VAE decode — a "sampling only" number is not what a user is waiting for.
+    /// A chained run is `windows` whole generations, each after the first
+    /// opening on the previous window's last frame as a keyframe row.
     static func seconds(model: VideoModelPreset, width: Int, height: Int, frames: Int,
-                        steps: Int, fast: Bool, hardware: H3Hardware = .current,
-                        promptTokens: Int = 250) -> Double {
-        let r = H3Plan.rows(width: width, height: height, frames: frames, promptTokens: promptTokens)
-        let perStep = denseStepSeconds(rows: r) * (fast ? fastFactor(steps: steps) : 1.0)
+                        steps: Int, fast: Bool, streamWeights: Bool = true, hardware: H3Hardware = .current,
+                        promptTokens: Int = 250, windows: Int = 1) -> Double {
         let vae = vaeAnchorSeconds * (Double(width) * Double(height) * Double(frames)) / vaeAnchorPixels
-        let anchorSeconds = perStep * Double(steps) + fixedSeconds + vae
+        let anchorSeconds = (0..<max(1, windows)).reduce(0.0) { sum, w in
+            let r = H3Plan.rows(width: width, height: height, frames: frames, promptTokens: promptTokens,
+                                keyframes: w > 0 ? 1 : 0)
+            let perStep = denseStepSeconds(rows: r) * (fast ? fastFactor(steps: steps) : 1.0)
+                * streamFactor(model: model, streamWeights: streamWeights)
+            return sum + perStep * Double(steps) + fixedSeconds + vae
+        }
         let cores = hardware.gpuCores > 0 ? Double(hardware.gpuCores) : Double(H3Hardware.anchor.gpuCores)
         return anchorSeconds * (Double(H3Hardware.anchor.gpuCores) / cores)
+    }
+
+    /// A denoise step's cost when the weights stream from disk, against the resident
+    /// anchor: a streamed 1120x640 x 124 denoise took 1495 s where the resident one took 1416.
+    static let streamedStepFactor = 1495.4 / 1415.6
+
+    static func streamFactor(model: VideoModelPreset, streamWeights: Bool) -> Double {
+        streamWeights && model.supportsWeightStreaming ? streamedStepFactor : 1.0
     }
 
     /// Seconds still to go, from the step cadence of a run in flight, or nil
@@ -313,9 +357,15 @@ enum H3TimeEstimate {
     /// events, stays in the number instead of arriving as a surprise stall.
     static func liveEta(stepDurations: [Double], totalSteps: Int,
                         floorPerStep: Double = 0, tail: Double = 0) -> Double? {
-        let laps = Array(stepDurations.dropFirst())
+        liveEta(laps: Array(stepDurations.dropFirst()), stepsDone: stepDurations.count,
+                totalSteps: totalSteps, floorPerStep: floorPerStep, tail: tail)
+    }
+
+    /// `laps` are the ones that price a step; `stepsDone` counts every step taken.
+    static func liveEta(laps: [Double], stepsDone: Int, totalSteps: Int,
+                        floorPerStep: Double = 0, tail: Double = 0) -> Double? {
         guard laps.count >= 2, totalSteps > 0 else { return nil }
-        let remaining = totalSteps - stepDurations.count
+        let remaining = totalSteps - stepsDone
         guard remaining > 0 else { return tail }
         let mean = max(laps.reduce(0, +) / Double(laps.count), floorPerStep)
         return mean * Double(remaining) + tail
@@ -327,10 +377,11 @@ enum H3TimeEstimate {
     /// any, else the hardware model. `speedFactor` is one scalar, so scaling
     /// the parts equals scaling the whole.
     static func livePricing(model: VideoModelPreset, width: Int, height: Int, frames: Int,
-                            steps: Int, fast: Bool,
+                            steps: Int, fast: Bool, streamWeights: Bool = true,
                             history: H3RunHistory = .load()) -> (perStep: Double, tail: Double) {
         let r = H3Plan.rows(width: width, height: height, frames: frames, promptTokens: 250)
         let perStep = denseStepSeconds(rows: r) * (fast ? fastFactor(steps: steps) : 1.0)
+            * streamFactor(model: model, streamWeights: streamWeights)
         let vae = vaeAnchorSeconds * (Double(width) * Double(height) * Double(frames)) / vaeAnchorPixels
         let tail = fixedSeconds + vae
         if history.speedFactor != nil {
@@ -345,30 +396,32 @@ enum H3TimeEstimate {
     /// "about 50 min" / "about 3 h 20 min", with where the number came from.
     /// Prefers this Mac's own history when it has any.
     static func describeBest(model: VideoModelPreset, width: Int, height: Int, frames: Int,
-                             steps: Int, fast: Bool,
+                             steps: Int, fast: Bool, streamWeights: Bool = true, alongside: String? = nil,
                              history: H3RunHistory = .load()) -> String {
         describeBest(model: model, width: width, height: height, shotFrames: [frames],
-                     steps: steps, fast: fast, history: history)
+                     steps: steps, fast: fast, streamWeights: streamWeights, alongside: alongside, history: history)
     }
 
     /// A storyboard is one run per shot, so its time is their sum.
     static func describeBest(model: VideoModelPreset, width: Int, height: Int, shotFrames: [Int],
-                             steps: Int, fast: Bool,
-                             history: H3RunHistory = .load()) -> String {
+                             steps: Int, fast: Bool, streamWeights: Bool = true, chainWindows: Int = 1,
+                             alongside: String? = nil, history: H3RunHistory = .load()) -> String {
         func total(_ hardware: H3Hardware) -> Double {
             shotFrames.reduce(0) {
                 $0 + seconds(model: model, width: width, height: height, frames: $1,
-                             steps: steps, fast: fast, hardware: hardware)
+                             steps: steps, fast: fast, streamWeights: streamWeights, hardware: hardware,
+                             windows: chainWindows)
             }
         }
         if history.speedFactor != nil {
             return describe(seconds: history.apply(toAnchorSeconds: total(.anchor)),
-                            source: .ownHistory(runs: history.runs))
+                            source: .ownHistory(runs: history.runs), alongside: alongside)
         }
-        return describe(seconds: total(.current), source: .hardwareModel(.current))
+        return describe(seconds: total(.current), source: .hardwareModel(.current), alongside: alongside)
     }
 
-    static func describe(seconds: Double, source: H3EstimateSource) -> String {
+    /// `alongside` is a second figure stated with the time ("12 GB peak memory usage").
+    static func describe(seconds: Double, source: H3EstimateSource, alongside: String? = nil) -> String {
         let provenance: String
         switch source {
         case .hardwareModel(let hw):
@@ -376,7 +429,8 @@ enum H3TimeEstimate {
         case .ownHistory(let runs):
             provenance = runs == 1 ? "based on your last run" : "based on your last \(runs) runs"
         }
-        return "\(duration(seconds)) — \(provenance)"
+        let figures = alongside.map { "\(duration(seconds)) and \($0)" } ?? duration(seconds)
+        return "\(figures) — \(provenance)"
     }
 
     /// Coarse on purpose: a job measured in hours does not have a meaningful
@@ -401,24 +455,45 @@ enum H3TimeEstimate {
 /// Progress events are not one-per-step-in-order: a stage label change repeats
 /// a step number, and the load / encode stages report before sampling starts.
 /// Only a step that moves FORWARD closes a lap.
+///
+/// A chained run numbers its steps on across windows (window w's steps follow
+/// window w-1's), so the first lap of every window spans what ran between them
+/// (decode, reload, encode, graph build) and, like step 0, prices no step.
 struct H3StepClock {
     private var lastStamp: Double?
     private var lastStep: Int = -1
+    private var window = 1, windows = 1
+    private var openingLap = true
     private(set) var durations: [Double] = []
+    /// The laps that price a step: every window's opening lap left out.
+    private var laps: [Double] = []
 
     init() {}
 
-    mutating func observe(step: Int, at now: Double = ProcessInfo.processInfo.systemUptime) {
+    mutating func observe(step: Int, window: Int? = nil, windows: Int? = nil,
+                          at now: Double = ProcessInfo.processInfo.systemUptime) {
+        if let window, window != self.window { self.window = window; openingLap = true }
+        if let windows { self.windows = windows }
         defer { if step > lastStep { lastStep = step; lastStamp = now } }
         guard step > lastStep, let previous = lastStamp else { return }
-        durations.append(max(0, now - previous))
+        let lap = max(0, now - previous)
+        durations.append(lap)
+        if openingLap { openingLap = false } else { laps.append(lap) }
     }
 
-    /// Seconds remaining, or nil while there is not enough to say. See
-    /// `H3TimeEstimate.liveEta` for why the first lap is discarded.
+    /// The mean step lap, or nil before there are two: the same amortized step
+    /// cost `liveEta` prices what is left with.
+    var secondsPerStep: Double? {
+        guard laps.count >= 2 else { return nil }
+        return laps.reduce(0, +) / Double(laps.count)
+    }
+
+    /// Seconds remaining, or nil while there is not enough to say. `tail` is one
+    /// window's after-sampling cost, paid again by every window still to finish.
     func eta(totalSteps: Int, floorPerStep: Double = 0, tail: Double = 0) -> Double? {
-        H3TimeEstimate.liveEta(stepDurations: durations, totalSteps: totalSteps,
-                               floorPerStep: floorPerStep, tail: tail)
+        H3TimeEstimate.liveEta(laps: laps, stepsDone: durations.count, totalSteps: totalSteps,
+                               floorPerStep: floorPerStep,
+                               tail: tail * Double(max(1, windows - window + 1)))
     }
 }
 
@@ -475,11 +550,12 @@ struct H3RunHistory: Codable {
 
     /// Record one finished run against what the anchor model predicted for it.
     static func remember(model: VideoModelPreset, width: Int, height: Int, frames: Int,
-                         steps: Int, fast: Bool, measuredSeconds: Double,
+                         steps: Int, fast: Bool, streamWeights: Bool, windows: Int = 1, measuredSeconds: Double,
                          defaults: UserDefaults = .standard) {
         guard model.backend == .minimaxH3 else { return }
         let predicted = H3TimeEstimate.seconds(model: model, width: width, height: height, frames: frames,
-                                               steps: steps, fast: fast, hardware: .anchor)
+                                               steps: steps, fast: fast, streamWeights: streamWeights,
+                                               hardware: .anchor, windows: windows)
         var h = load(defaults: defaults)
         h.record(predictedOnAnchor: predicted, measured: measuredSeconds)
         h.save(defaults: defaults)

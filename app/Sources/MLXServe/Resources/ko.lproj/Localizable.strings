@@ -239,7 +239,7 @@
 "STG scale" = "STG 스케일";
 "People" = "인물";
 "Stop recording and attach" = "녹음 중단 후 첨부";
-"Max quality (slower)" = "최고 품질(더 느림)";
+"Compute every step in full" = "모든 단계를 완전히 계산";
 "Pages this answer drew on" = "이 답변이 참고한 페이지";
 "About MLX-Serve" = "MLX-Serve 정보";
 "Cancelled" = "취소됨";
@@ -293,7 +293,7 @@
 "Fixed at %@ steps — this model is distilled for a %@-step schedule, so more steps cost time without adding detail." = "%@단계로 고정됨 — 이 모델은 %@단계 스케줄로 증류되었으므로 단계를 늘려도 시간만 더 걸리고 디테일은 늘지 않습니다.";
 "1024 × 768 (4:3 landscape) — 1.8x slower" = "1024 × 768 (4:3 가로) — 1.8배 느림";
 "Optional — the reference audio alone clones the voice" = "선택 사항 — 참조 오디오만으로도 음성을 복제합니다";
-"Diffusion decoder (sharper, slower)" = "디퓨전 디코더(더 선명, 더 느림)";
+"Sharper video decoder" = "더 선명한 영상 디코더";
 "Describe a style, optionally add lyrics, and press Generate." = "스타일을 설명하고, 필요하면 가사를 추가한 후 생성을 누르세요.";
 "DSpark draft stages (DeepSeek‑V4)" = "DSpark 드래프트 단계(DeepSeek‑V4)";
 "concocting" = "구상 중";
@@ -529,7 +529,8 @@
 "Cancel" = "취소";
 "Enable MCP & Send" = "MCP 활성화 및 보내기";
 "Enable MCP first?" = "먼저 MCP를 활성화할까요?";
-"Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU." = "측정된 실행과 이 Mac의 GPU를 기준으로 추정한 값입니다. 실제 시간은 GPU를 사용하는 다른 작업에 따라 달라집니다.";
+"Time is estimated from measured runs and this Mac's GPU, and varies with what else is using the GPU. Peak memory usage is the most memory this size and length are planned to need." = "시간은 측정된 실행과 이 Mac의 GPU를 기준으로 추정하며, GPU를 사용하는 다른 작업에 따라 달라집니다. 최대 메모리 사용량은 이 크기와 길이에 필요할 것으로 계산된 최대 메모리입니다.";
+"%.0f GB peak memory usage" = "최대 메모리 사용량 %.0f GB";
 "Enhance…" = "개선…";
 "Generate spoken audio" = "음성 오디오 생성";
 "Needs more memory than this Mac has" = "이 Mac보다 더 많은 메모리가 필요함";
@@ -839,7 +840,7 @@
 "Record audio for the model to hear" = "모델이 들을 오디오 녹음";
 "Generated audio" = "생성된 오디오";
 "Server not running" = "서버가 실행 중이 아님";
-"Turbo (distilled 4-step sampling)" = "터보(증류 4스텝 샘플링)";
+"Turbo mode" = "터보 모드";
 "Stopped" = "중단됨";
 "using shell with `grep -r` or a different search pattern" = "셸에서 `grep -r`을 사용하거나 다른 검색 패턴 사용";
 "Run Benchmark" = "벤치마크 실행";
@@ -977,7 +978,7 @@
 "Gemma 4 31B (8-bit)" = "Gemma 4 31B(8비트)";
 "the guest network never came up — no ssh mirror on localhost:%lld" = "게스트 네트워크가 시작되지 않았습니다. localhost:%lld에 SSH 미러가 없습니다";
 "Add haze" = "안개 추가";
-"Turbo runs on the Mac hosting this model; it needs the adapter in ITS copy of the pack." = "터보는 이 모델을 호스팅하는 Mac에서 실행되므로 해당 Mac의 팩에 어댑터가 있어야 합니다.";
+"Turbo runs on the Mac that hosts this model, so the adapter has to be in that Mac's copy." = "터보는 이 모델을 호스팅하는 Mac에서 실행되므로 어댑터가 그 Mac의 사본에 있어야 합니다.";
 "Jazz trio" = "재즈 트리오";
 "This is one of the built-in agents. Duplicate it to make it yours." = "내장 에이전트 중 하나입니다. 복제하여 나만의 에이전트로 만드세요.";
 "Apply on the next chat request — no restart needed." = "다음 채팅 요청부터 적용 — 다시 시작할 필요 없음.";
@@ -1403,7 +1404,7 @@
 "Layer weights (%lld numbers, comma or space separated)" = "레이어 가중치(%lld개 숫자, 쉼표 또는 공백으로 구분)";
 "2-stage HQ" = "2단계 HQ";
 "Starting..." = "시작 중...";
-"Turbo needs a %@ MB adapter this pack predates — it downloads once, and Generate waits for it." = "터보에는 이 팩보다 나중에 나온 %@ MB 어댑터가 필요합니다 — 한 번만 다운로드되며, 생성은 다운로드가 끝날 때까지 기다립니다.";
+"Turbo needs a %@ MB adapter that isn't in this download yet. It downloads once, and Generate waits for it." = "터보에는 이 다운로드에 아직 없는 %@ MB 어댑터가 필요합니다. 한 번만 다운로드되며, 생성은 다운로드가 끝날 때까지 기다립니다.";
 "models" = "모델";
 "Style prompt" = "스타일 프롬프트";
 "Edit File" = "파일 편집";
@@ -1914,7 +1915,7 @@
 "%lld models" = "모델 %lld개";
 "Cinematic ambient" = "시네마틱 앰비언트";
 "Discard" = "폐기";
-"Turbo needs a %lld MB adapter this pack predates — it downloads once, and Generate waits for it." = "터보에는 이 모델 패키지에 없는 %lld MB 어댑터가 필요합니다. 한 번 다운로드하며, 완료될 때까지 생성을 기다립니다.";
+"Turbo needs a %lld MB adapter that isn't in this download yet. It downloads once, and Generate waits for it." = "터보에는 이 다운로드에 아직 없는 %lld MB 어댑터가 필요합니다. 한 번만 다운로드되며, 생성은 다운로드가 끝날 때까지 기다립니다.";
 "Generate an image" = "이미지 생성";
 "Voice clone clip" = "음성 복제 클립";
 "~7.1 GB, needs 16 GB+ RAM — also the LTX-Video text encoder" = "~7.1 GB, 16 GB 이상 RAM 필요 — LTX-Video 텍스트 인코더로도 사용";
@@ -2052,7 +2053,7 @@
 "Rewrite video prompt" = "비디오 프롬프트 다시 쓰기";
 "Parallel sequences" = "병렬 시퀀스";
 "Set by source image…" = "원본 이미지에 맞춰 설정…";
-"Show live preview while generating (~1% slower)" = "생성 중 실시간 미리보기 표시(약 1% 느려짐)";
+"Live preview" = "실시간 미리보기";
 "Source image(s)" = "원본 이미지";
 "The source image does not fit this model." = "원본 이미지가 이 모델에 맞지 않습니다.";
 "optional" = "선택 사항";
@@ -2258,7 +2259,24 @@
 "Loading %@ · %@" = "%1$@ 로드 중 · %2$@";
 "%@ is ready" = "%@ 준비 완료";
 "The model finished loading." = "모델 로드를 마쳤습니다.";
+"Step %lld of %lld" = "스텝 %lld/%lld";
+"Window %lld of %lld · step %lld of %lld" = "윈도우 %lld/%lld · 스텝 %lld/%lld";
+"%.1f s per step" = "스텝당 %.1f초";
+"%.1f min per step" = "스텝당 %.1f분";
+"Stream the model from disk" = "디스크에서 모델 스트리밍";
+"On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run." = "켜짐(기본값): 텍스트 인코더와 비디오 모델을 실행하면서 디스크에서 레이어 단위로 읽어, 최대 RAM 사용량이 약 60% 줄고 속도는 약 5% 느려집니다. 빠른 SSD 사용을 적극 권장합니다. 꺼짐: 실행하는 동안 둘 다 메모리에 유지합니다.";
 "Neural Accelerator int8 (M5)" = "Neural Accelerator int8 (M5)";
 "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "M5 Mac에서 이미지와 영상을 더 빨리 만들며 약간의 손실이 있습니다. 끄면 4비트 모델이 메모리를 덜 씁니다.";
 "Spec" = "추측";
 "Spec off" = "추측 꺼짐";
+"The same seed with the same settings gives the same clip. Change it for another take of the same prompt." = "같은 시드와 같은 설정이면 같은 클립이 나옵니다. 같은 프롬프트로 다른 결과를 보려면 바꾸세요.";
+"4 steps instead of 30, about twice as fast. Detail comes out a little softer and light a little harder." = "30단계 대신 4단계로 약 두 배 빠릅니다. 디테일은 조금 부드러워지고 빛은 조금 강해집니다.";
+"Denoises the frames instead of interpolating them, so texture and edges come out sharper. The decode takes about 21 s for a 97-frame clip." = "프레임을 보간하지 않고 노이즈를 제거해 질감과 윤곽이 더 선명해집니다. 97프레임 클립의 디코딩은 약 21초 걸립니다.";
+"Turbo already computes every step in full, so this changes nothing." = "터보는 이미 모든 단계를 완전히 계산하므로 이 설정은 아무것도 바꾸지 않습니다.";
+"Turns off the shortcut that reuses work between steps: slightly better detail and up to about 70% less peak memory, but about 2.5 times slower." = "단계 사이에 작업을 재사용하는 지름길을 끕니다. 디테일이 약간 좋아지고 최대 메모리가 최대 약 70% 줄지만 약 2.5배 느립니다.";
+"Reads the models from disk as they run: about 60% less peak memory, about 5% slower. Best on a fast SSD." = "실행하면서 모델을 디스크에서 읽습니다. 최대 메모리는 약 60% 줄고 속도는 약 5% 느려집니다. 빠른 SSD에서 가장 좋습니다.";
+"Stores the attention cache in 8 bits: up to about 30% less peak memory, and about 1% slower. The video comes out slightly different." = "어텐션 캐시를 8비트로 저장합니다. 최대 메모리가 최대 약 30% 줄고, 속도는 약 1% 느려집니다. 영상이 약간 다르게 나옵니다.";
+"With every step computed in full, or Turbo on, there is no attention cache, so this changes nothing." = "모든 단계를 완전히 계산하거나 터보를 켜면 어텐션 캐시가 없으므로 이 설정은 아무것도 바꾸지 않습니다.";
+"Shows a rough still of each step while it runs, about 1% slower. The finished clip comes out sharper than the preview." = "실행 중 각 단계의 대략적인 정지 이미지를 보여 주며 약 1% 느려집니다. 완성된 클립은 미리보기보다 선명합니다.";
+"Adapter files (.safetensors) that change the look or teach the model a subject. Up to 8 stack, each with its own strength." = "모습을 바꾸거나 모델에 대상을 가르치는 어댑터 파일(.safetensors)입니다. 최대 8개를 겹칠 수 있고 각각 강도를 따로 정합니다.";
+"Quantize the attention cache" = "어텐션 캐시 양자화";

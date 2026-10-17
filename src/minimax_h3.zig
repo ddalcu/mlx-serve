@@ -1318,23 +1318,52 @@ const BlockW = struct {
     adaln: ?AdalnW,
 
     fn load(w: *const Weights, a: std.mem.Allocator, idx: u32, cfg: Config, dt: mlx.mlx_dtype, s: S) !BlockW {
+        var r = try loadTrunk(w, a, idx, cfg, dt, s);
+        errdefer r.deinit();
+        const adaln_p = try std.fmt.allocPrint(a, "blocks.{d}.adaln_proj", .{idx});
+        defer a.free(adaln_p);
+        r.adaln = try AdalnW.load(w, a, adaln_p, cfg, 6, 3, dt, s);
+        return r;
+    }
+
+    /// The norms, attention and MLP; `adaln` stays null.
+    fn loadTrunk(w: *const Weights, a: std.mem.Allocator, idx: u32, cfg: Config, dt: mlx.mlx_dtype, s: S) !BlockW {
         const pfx = try std.fmt.allocPrint(a, "blocks.{d}", .{idx});
         defer a.free(pfx);
         const attn_p = try std.fmt.allocPrint(a, "{s}.attn", .{pfx});
         defer a.free(attn_p);
         const mlp_p = try std.fmt.allocPrint(a, "{s}.mlp", .{pfx});
         defer a.free(mlp_p);
-        const adaln_p = try std.fmt.allocPrint(a, "{s}.adaln_proj", .{pfx});
-        defer a.free(adaln_p);
-        var r: BlockW = .{
-            .norm1 = try ownWeightAs(w, a, pfx, ".norm1.weight", dt, s),
-            .norm2 = try ownWeightAs(w, a, pfx, ".norm2.weight", dt, s),
-            .attn = try AttnW.load(w, a, attn_p, cfg, dt, s),
-            .mlp = try MlpW.load(w, a, mlp_p, cfg, dt, s),
-            .adaln = try AdalnW.load(w, a, adaln_p, cfg, 6, 3, dt, s),
+        const norm1 = try ownWeightAs(w, a, pfx, ".norm1.weight", dt, s);
+        errdefer _ = mlx.mlx_array_free(norm1);
+        const norm2 = try ownWeightAs(w, a, pfx, ".norm2.weight", dt, s);
+        errdefer _ = mlx.mlx_array_free(norm2);
+        var attn = try AttnW.load(w, a, attn_p, cfg, dt, s);
+        errdefer attn.deinit();
+        return .{ .norm1 = norm1, .norm2 = norm2, .attn = attn, .mlp = try MlpW.load(w, a, mlp_p, cfg, dt, s), .adaln = null };
+    }
+
+    /// Swap in fresh LAZY trunk arrays from `w`, adapters and AdaLN kept. A graph already built on
+    /// the old arrays holds them until it runs, so each weight is read for that graph and freed after.
+    fn reloadTrunk(self: *BlockW, w: *const Weights, a: std.mem.Allocator, idx: u32, cfg: Config, dt: mlx.mlx_dtype, s: S) !void {
+        var t = try loadTrunk(w, a, idx, cfg, dt, s);
+        t.attn.qkv_lora = self.attn.qkv_lora;
+        t.attn.out_lora = self.attn.out_lora;
+        t.mlp.fc1_lora = self.mlp.fc1_lora;
+        t.mlp.fc2_lora = self.mlp.fc2_lora;
+        t.adaln = self.adaln;
+        self.adaln = null;
+        self.deinit();
+        self.* = t;
+    }
+
+    fn trunkArrays(self: *const BlockW) [16]mlx.mlx_array {
+        const at = &self.attn;
+        const ml = &self.mlp;
+        return .{
+            self.norm1,   self.norm2,      at.qkv.w,  at.qkv.scales, at.qkv.biases, at.q_norm,     at.k_norm, at.out.w,
+            at.out.scales, at.out.biases, ml.fc1.w, ml.fc1.scales, ml.fc1.biases, ml.fc2.w, ml.fc2.scales, ml.fc2.biases,
         };
-        errdefer r.deinit();
-        return r;
     }
     fn deinit(self: *BlockW) void {
         _ = mlx.mlx_array_free(self.norm1);
@@ -2141,19 +2170,133 @@ pub const SparseSpec = struct {
 
 pub const AttnBroadcast = struct {
     allocator: std.mem.Allocator,
-    /// Per block: the cached attention output [S, hidden]; null ctx = empty.
-    blocks: []mlx.mlx_array,
+    /// Per block: the attention output [S, hidden] of the last refresh. 8-bit affine (w, scales,
+    /// biases) when `q8` and the width groups by 64, else bf16 in `w` alone; null ctx = empty.
+    blocks: []Entry,
+    q8: bool,
 
-    pub fn init(allocator: std.mem.Allocator, n_blocks: usize) !AttnBroadcast {
-        const blocks = try allocator.alloc(mlx.mlx_array, n_blocks);
-        for (blocks) |*b| b.* = .{ .ctx = null };
-        return .{ .allocator = allocator, .blocks = blocks };
+    const Entry = struct { w: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array };
+    const GROUP = 64;
+    const empty: mlx.mlx_array = .{ .ctx = null };
+
+    pub fn init(allocator: std.mem.Allocator, n_blocks: usize, q8: bool) !AttnBroadcast {
+        const blocks = try allocator.alloc(Entry, n_blocks);
+        for (blocks) |*b| b.* = .{ .w = empty, .scales = empty, .biases = empty };
+        return .{ .allocator = allocator, .blocks = blocks, .q8 = q8 };
     }
     pub fn deinit(self: *AttnBroadcast) void {
-        for (self.blocks) |b| if (b.ctx != null) {
-            _ = mlx.mlx_array_free(b);
-        };
+        for (self.blocks) |*b| freeEntry(b);
         self.allocator.free(self.blocks);
+    }
+    fn freeEntry(b: *Entry) void {
+        inline for (.{ &b.w, &b.scales, &b.biases }) |p| if (p.ctx != null) {
+            _ = mlx.mlx_array_free(p.*);
+            p.* = empty;
+        };
+    }
+
+    /// Bytes the cache holds per sequence row across `n_blocks` blocks (scales and biases bf16).
+    pub fn rowBytes(hidden: u64, n_blocks: u64, q8: bool) u64 {
+        const per_block = if (q8 and hidden % GROUP == 0) hidden + hidden / GROUP * 4 else hidden * 2;
+        return n_blocks * per_block;
+    }
+
+    pub fn has(self: *const AttnBroadcast, bi: usize) bool {
+        return self.blocks[bi].w.ctx != null;
+    }
+
+    /// Caches `at` for block `bi`, replacing the last refresh. Returns `at` itself (owned), tied to
+    /// the cache write so the 8-bit copy is made while `at` is live and its bf16 buffer can go.
+    pub fn store(self: *AttnBroadcast, bi: usize, at: mlx.mlx_array, s: S) !mlx.mlx_array {
+        const b = &self.blocks[bi];
+        freeEntry(b);
+        const shape = mlx.mlx_array_shape(at);
+        const width = shape[mlx.mlx_array_ndim(at) - 1];
+        if (!self.q8 or @mod(width, GROUP) != 0) {
+            b.w = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&b.w, at);
+            var out = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&out, at);
+            return out;
+        }
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, at, mlx.mlx_optional_int.some(GROUP), mlx.mlx_optional_int.some(8), "affine", empty, s));
+        inline for (.{ &b.w, &b.scales, &b.biases }, 0..) |p, k| {
+            p.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(p, triple, k));
+        }
+        const iv = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{at}, 1);
+        defer _ = mlx.mlx_vector_array_free(iv);
+        const dv = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ b.w, b.scales, b.biases }, 3);
+        defer _ = mlx.mlx_vector_array_free(dv);
+        var ov = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ov);
+        try mlx.check(mlx.mlx_depends(&ov, iv, dv));
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+        return out;
+    }
+
+    /// The cached output of block `bi` in bf16, owned by the caller.
+    pub fn load(self: *const AttnBroadcast, bi: usize, s: S) !mlx.mlx_array {
+        const b = self.blocks[bi];
+        var out = mlx.mlx_array_new();
+        if (b.scales.ctx == null) {
+            _ = mlx.mlx_array_set(&out, b.w);
+            return out;
+        }
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_dequantize(&out, b.w, b.scales, b.biases, mlx.mlx_optional_int.some(GROUP), mlx.mlx_optional_int.some(8), "affine", empty, mlx.mlx_optional_dtype{}, s));
+        return out;
+    }
+
+    /// What the cache holds now.
+    pub fn bytes(self: *const AttnBroadcast) usize {
+        var n: usize = 0;
+        for (self.blocks) |b| inline for (.{ b.w, b.scales, b.biases }) |x| {
+            if (x.ctx != null) n += mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        };
+        return n;
+    }
+};
+
+/// Holds a denoise step to one block's working set. MLX encodes up to 10 command buffers ahead of
+/// the GPU, each holding its outputs, unless active memory is past its limit: then it waits.
+pub const DenoiseMemCap = struct {
+    prev: usize,
+
+    pub const HEADROOM: usize = 512 << 20;
+
+    pub fn begin() DenoiseMemCap {
+        var prev: usize = 0;
+        _ = mlx.mlx_get_memory_limit(&prev);
+        return .{ .prev = prev };
+    }
+
+    /// `growth`: bytes the step keeps beyond what is active now (the broadcast cache's first fill).
+    pub fn step(self: DenoiseMemCap, growth: usize) void {
+        var active: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        var old: usize = 0;
+        _ = mlx.mlx_set_memory_limit(&old, limitFor(active, growth, self.prev));
+    }
+
+    pub fn end(self: DenoiseMemCap) void {
+        var old: usize = 0;
+        _ = mlx.mlx_set_memory_limit(&old, self.prev);
+    }
+
+    /// `p.boundary()` under the caller's own limit: the limit is process-wide, and chat decodes
+    /// there. The next `step` re-arms the cap.
+    pub fn boundary(self: DenoiseMemCap, p: gen_sse.Progress) bool {
+        self.end();
+        return p.boundary();
+    }
+
+    pub fn limitFor(active: usize, growth: usize, prev: usize) usize {
+        return @min(prev, active +| growth +| HEADROOM);
     }
 };
 
@@ -2264,6 +2407,8 @@ pub const Model = struct {
     /// count is known and torn down with the model.
     ane_eng: ?*ane.AnePrefill = null,
     ane_rest: []AneRestMlp = &.{},
+    /// Set by `streamFrom`: the blocks' trunk weights are read inside each forward, never held.
+    stream_path: ?[]u8 = null,
 
     pub fn load(allocator: std.mem.Allocator, w: *Weights, cfg: Config, dt: mlx.mlx_dtype, s: S) !Model {
         var m: Model = undefined;
@@ -2274,6 +2419,7 @@ pub const Model = struct {
         m.sparse_policy = .off;
         m.ane_eng = null;
         m.ane_rest = &.{};
+        m.stream_path = null;
 
         const f32t = mlx.mlx_dtype.float32;
         // These stay fp32 because the CHECKPOINT stores them fp32 — the patch
@@ -2330,6 +2476,14 @@ pub const Model = struct {
         if (self.final_adaln) |*fa| fa.deinit();
         if (self.adaln_tables) |*t| t.deinit();
         self.aneDeinit();
+        if (self.stream_path) |p| self.allocator.free(p);
+    }
+
+    /// Stream the 50 blocks' trunk weights from `path` (the file this model was loaded from): each
+    /// forward reads them as its graph runs and frees them after. Call before `evalWeights`.
+    pub fn streamFrom(self: *Model, path: []const u8) !void {
+        std.debug.assert(self.stream_path == null);
+        self.stream_path = try self.allocator.dupe(u8, path);
     }
 
     fn aneDeinit(self: *Model) void {
@@ -2470,10 +2624,12 @@ pub const Model = struct {
             push.ml(vec, &b.mlp);
         }
         for (self.blocks) |*b| {
-            push.arr(vec, b.norm1);
-            push.arr(vec, b.norm2);
-            push.at(vec, &b.attn);
-            push.ml(vec, &b.mlp);
+            if (self.stream_path == null) {
+                push.arr(vec, b.norm1);
+                push.arr(vec, b.norm2);
+                push.at(vec, &b.attn);
+                push.ml(vec, &b.mlp);
+            } else for ([_]lora_mod.Slot{ b.attn.qkv_lora, b.attn.out_lora, b.mlp.fc1_lora, b.mlp.fc2_lora }) |slot| push.lp(vec, slot);
             if (b.adaln) |*ad| {
                 push.lin(vec, &ad.linear);
                 push.arr(vec, ad.bias);
@@ -2709,6 +2865,7 @@ pub const Model = struct {
         shift_a: f64,
         attn_bcast: ?*AttnBroadcast,
         attn_refresh: bool,
+        cancel: ?gen_sse.Progress,
         s: S,
     ) !Output {
         const a = self.allocator;
@@ -2751,6 +2908,7 @@ pub const Model = struct {
         }
         var h = try concat(pieces, 0, s);
         for (pieces) |p| _ = mlx.mlx_array_free(p);
+        built = 0;
         errdefer _ = mlx.mlx_array_free(h);
 
         // t_emb is only needed when modulation still runs from weights; with
@@ -2789,6 +2947,10 @@ pub const Model = struct {
         defer _ = mlx.mlx_array_free(eps_a);
         const fused: ?FusedMod = if (row_mod.ctx != null) .{ .row_mod = row_mod, .eps = eps_a } else null;
 
+        // Streaming: each block takes fresh lazy weights from this map once its graph is built.
+        var stream_w: ?Weights = if (self.stream_path) |p| try model_mod.loadWeightsSingleFile(a, p) else null;
+        defer if (stream_w) |*w| w.deinit();
+
         for (self.blocks, 0..) |*b, bi| {
             var mods: [6]mlx.mlx_array = undefined;
             var mods_owned = true;
@@ -2811,12 +2973,10 @@ pub const Model = struct {
             // is re-applied at the current timestep (PAB semantics). Profile
             // arms bypass the cache so ablation stays honest.
             var at: mlx.mlx_array = undefined;
-            var at_owned = true;
             const cacheable = attn_bcast != null and self.ablate == .none;
-            if (cacheable and !attn_refresh and attn_bcast.?.blocks[bi].ctx != null) {
+            if (cacheable and !attn_refresh and attn_bcast.?.has(bi)) {
                 try applyPending(&h, &pend, plan.runs, a, s);
-                at = attn_bcast.?.blocks[bi];
-                at_owned = false;
+                at = try attn_bcast.?.load(bi, s);
             } else {
                 const m1 = try gateNormMod(&h, &pend, b.norm1, mods[0], mods[1], fused, plan.runs, a, cfg.norm_eps, s);
                 defer _ = mlx.mlx_array_free(m1);
@@ -2829,20 +2989,25 @@ pub const Model = struct {
                 };
                 at = if (self.ablate == .attn) try contig(m1, s) else try attnForward(&b.attn, m1, cfg, rope, self.ablate, spec, s);
                 if (cacheable) {
-                    if (attn_bcast.?.blocks[bi].ctx != null) _ = mlx.mlx_array_free(attn_bcast.?.blocks[bi]);
-                    attn_bcast.?.blocks[bi] = at;
-                    at_owned = false;
+                    const fresh = at;
+                    defer _ = mlx.mlx_array_free(fresh);
+                    at = try attn_bcast.?.store(bi, fresh, s);
                 }
             }
-            defer if (at_owned) {
-                _ = mlx.mlx_array_free(at);
-            };
+            defer _ = mlx.mlx_array_free(at);
             pend = PendingGate.init(at, mods[2]);
             const m2 = try gateNormMod(&h, &pend, b.norm2, mods[3], mods[4], fused, plan.runs, a, cfg.norm_eps, s);
             defer _ = mlx.mlx_array_free(m2);
             const mo = if (self.ablate == .mlp) try contig(m2, s) else try self.mlpMaybeAne(&b.mlp, m2, bi, s);
             defer _ = mlx.mlx_array_free(mo);
             pend = PendingGate.init(mo, mods[5]);
+            if (stream_w) |*w| try b.reloadTrunk(w, a, @intCast(bi), cfg, self.dtype, s);
+            // A step is one graph that runs for minutes at large sizes: run it block by block
+            // so a client that left stops the GPU here, not at the end of the step.
+            if (cancel) |p| {
+                try mlx.check(mlx.mlx_array_eval(h));
+                if (p.cancelled()) return error.Cancelled;
+            }
         }
         try applyPending(&h, &pend, plan.runs, a, s);
         defer _ = mlx.mlx_array_free(h);
@@ -2946,6 +3111,59 @@ const TeLayerW = struct {
     up_w: MfLinear,
     down_w: MfLinear,
 
+    fn load(w: *const Weights, a: std.mem.Allocator, idx: usize, cfg: TeConfig, dt: mlx.mlx_dtype, s: S) !TeLayerW {
+        const p = try std.fmt.allocPrint(a, "model.layers.{d}", .{idx});
+        defer a.free(p);
+        const names = .{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
+        const in_dims = [7]c_int{ cfg.hidden, cfg.hidden, cfg.hidden, cfg.heads * cfg.head_dim, cfg.hidden, cfg.hidden, cfg.intermediate };
+        var lin: [7]MfLinear = undefined;
+        var n_lin: usize = 0;
+        errdefer for (lin[0..n_lin]) |*l| l.deinit();
+        inline for (names, 0..) |nm, j| {
+            const full = try std.fmt.allocPrint(a, "{s}.{s}", .{ p, nm });
+            defer a.free(full);
+            lin[j] = try MfLinear.load(w, a, full, @intCast(in_dims[j]), dt, s);
+            n_lin += 1;
+        }
+        // Norm weights stay f32: mlx_fast_rms_norm upcasts activations, and
+        // a bf16 norm weight reintroduces the late-layer outlier divergence
+        // mage_flow.zig documents.
+        const suffixes = [4][]const u8{ ".input_layernorm.weight", ".post_attention_layernorm.weight", ".self_attn.q_norm.weight", ".self_attn.k_norm.weight" };
+        var nw: [4]mlx.mlx_array = undefined;
+        var n_nw: usize = 0;
+        errdefer for (nw[0..n_nw]) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        for (suffixes, 0..) |sfx, j| {
+            nw[j] = try ownWeightAs(w, a, p, sfx, mlx.mlx_dtype.float32, s);
+            n_nw += 1;
+        }
+        return .{
+            .input_ln = nw[0],
+            .post_ln = nw[1],
+            .qw = lin[0],
+            .kw = lin[1],
+            .vw = lin[2],
+            .ow = lin[3],
+            .q_norm = nw[2],
+            .k_norm = nw[3],
+            .gate_w = lin[4],
+            .up_w = lin[5],
+            .down_w = lin[6],
+        };
+    }
+
+    fn arrays(self: *const TeLayerW) [25]mlx.mlx_array {
+        var out: [25]mlx.mlx_array = undefined;
+        out[0..4].* = .{ self.input_ln, self.post_ln, self.q_norm, self.k_norm };
+        var i: usize = 4;
+        inline for (.{ &self.qw, &self.kw, &self.vw, &self.ow, &self.gate_w, &self.up_w, &self.down_w }) |f| {
+            out[i..][0..3].* = .{ f.w, f.scales, f.biases };
+            i += 3;
+        }
+        return out;
+    }
+
     fn deinit(self: *TeLayerW) void {
         inline for (.{ &self.qw, &self.kw, &self.vw, &self.ow, &self.gate_w, &self.up_w, &self.down_w }) |f| f.deinit();
         inline for (.{ self.input_ln, self.post_ln, self.q_norm, self.k_norm }) |f| _ = mlx.mlx_array_free(f);
@@ -3001,6 +3219,8 @@ pub const TextEncoder = struct {
     /// Loaded only when a caller intends to present vision blocks — the tower
     /// is 529 tensors of the same file and costs ~1 GB resident.
     vision: ?mage_flow.VisionTower = null,
+    /// Set by `streamFrom`: the layers' weights are read inside each forward, never held.
+    stream_path: ?[]u8 = null,
 
     pub fn load(allocator: std.mem.Allocator, w: *const Weights, cfg: TeConfig, dt: mlx.mlx_dtype, s: S) !TextEncoder {
         var self: TextEncoder = undefined;
@@ -3008,6 +3228,7 @@ pub const TextEncoder = struct {
         self.cfg = cfg;
         self.dtype = dt;
         self.vision = null;
+        self.stream_path = null;
         const raw = try ownWeight(w, "model.embed_tokens.weight");
         defer _ = mlx.mlx_array_free(raw);
         self.embed_table = try astype(raw, dt, s);
@@ -3015,34 +3236,11 @@ pub const TextEncoder = struct {
 
         self.layers = try allocator.alloc(TeLayerW, cfg.layers);
         errdefer allocator.free(self.layers);
-        const a = allocator;
+        var n: usize = 0;
+        errdefer for (self.layers[0..n]) |*l| l.deinit();
         for (self.layers, 0..) |*layer, i| {
-            const p = try std.fmt.allocPrint(a, "model.layers.{d}", .{i});
-            defer a.free(p);
-            const names = .{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
-            var lin: [7]MfLinear = undefined;
-            const in_dims = [7]c_int{ cfg.hidden, cfg.hidden, cfg.hidden, cfg.heads * cfg.head_dim, cfg.hidden, cfg.hidden, cfg.intermediate };
-            inline for (names, 0..) |nm, j| {
-                const full = try std.fmt.allocPrint(a, "{s}.{s}", .{ p, nm });
-                defer a.free(full);
-                lin[j] = try MfLinear.load(w, a, full, @intCast(in_dims[j]), dt, s);
-            }
-            // Norm weights stay f32: mlx_fast_rms_norm upcasts activations, and
-            // a bf16 norm weight reintroduces the late-layer outlier divergence
-            // mage_flow.zig documents.
-            layer.* = .{
-                .input_ln = try ownWeightAs(w, a, p, ".input_layernorm.weight", mlx.mlx_dtype.float32, s),
-                .post_ln = try ownWeightAs(w, a, p, ".post_attention_layernorm.weight", mlx.mlx_dtype.float32, s),
-                .qw = lin[0],
-                .kw = lin[1],
-                .vw = lin[2],
-                .ow = lin[3],
-                .q_norm = try ownWeightAs(w, a, p, ".self_attn.q_norm.weight", mlx.mlx_dtype.float32, s),
-                .k_norm = try ownWeightAs(w, a, p, ".self_attn.k_norm.weight", mlx.mlx_dtype.float32, s),
-                .gate_w = lin[4],
-                .up_w = lin[5],
-                .down_w = lin[6],
-            };
+            layer.* = try TeLayerW.load(w, allocator, i, cfg, dt, s);
+            n += 1;
         }
         return self;
     }
@@ -3060,12 +3258,20 @@ pub const TextEncoder = struct {
         for (self.layers) |*l| l.deinit();
         self.allocator.free(self.layers);
         if (self.vision) |*v| v.deinit();
+        if (self.stream_path) |p| self.allocator.free(p);
+    }
+
+    /// Stream the layers' weights from `path` (the file this encoder was loaded from): each forward
+    /// reads them as its graph runs and frees them after. Nothing may evaluate them before.
+    pub fn streamFrom(self: *TextEncoder, path: []const u8) !void {
+        std.debug.assert(self.stream_path == null);
+        self.stream_path = try self.allocator.dupe(u8, path);
     }
 
     /// Raw prompt ids (NO special tokens) -> [L, hidden] layer-50 hidden state.
     /// Deliberately NOT final-normed: the checkpoint ships no `model.norm` and
     /// the reference sets `layer_norm_hidden_state=False`.
-    pub fn encode(self: *const TextEncoder, ids: []const i32, s: S) !mlx.mlx_array {
+    pub fn encode(self: *TextEncoder, ids: []const i32, s: S) !mlx.mlx_array {
         const seq: c_int = @intCast(ids.len);
         const cfg = self.cfg;
 
@@ -3083,8 +3289,10 @@ pub const TextEncoder = struct {
         const mask = try causalMask(seq, self.dtype, s);
         defer _ = mlx.mlx_array_free(mask);
 
-        for (self.layers) |*layer| {
-            const nx = try self.layerForward(layer, x, mask, rope, seq, s);
+        var sw = try self.openStream();
+        defer if (sw) |*w| w.deinit();
+        for (0..self.layers.len) |li| {
+            const nx = try self.layerStep(if (sw) |*w| w else null, li, x, mask, rope, seq, s);
             _ = mlx.mlx_array_free(x);
             x = nx;
         }
@@ -3104,7 +3312,7 @@ pub const TextEncoder = struct {
     ///     layers at the vision rows, and
     ///   - the vision rows carry adaLN modality tag 0 in the DiT, widened over
     ///     the flanking delimiters.
-    pub fn encodeItems(self: *const TextEncoder, allocator: std.mem.Allocator, items: []const PresentItem, s: S) !EncodedPrompt {
+    pub fn encodeItems(self: *TextEncoder, allocator: std.mem.Allocator, items: []const PresentItem, s: S) !EncodedPrompt {
         const cfg = self.cfg;
         var n_vision: usize = 0;
         for (items) |it| if (it == .vision) {
@@ -3186,8 +3394,10 @@ pub const TextEncoder = struct {
         defer _ = mlx.mlx_array_free(mask);
 
         // 4. Layers, with the DeepStack taps folded in after the first three.
-        for (self.layers, 0..) |*layer, li| {
-            const nx = try self.layerForward(layer, x, mask, rope, seq, s);
+        var sw = try self.openStream();
+        defer if (sw) |*w| w.deinit();
+        for (0..self.layers.len) |li| {
+            const nx = try self.layerStep(if (sw) |*w| w else null, li, x, mask, rope, seq, s);
             _ = mlx.mlx_array_free(x);
             x = nx;
             if (li < 3 and spans.items.len > 0 and deepstackEnabled()) {
@@ -3206,6 +3416,34 @@ pub const TextEncoder = struct {
             .hidden = out,
             .tags = try h3v.tokenTags(allocator, seq_u, spans.items),
         };
+    }
+
+    /// The map a streamed forward takes fresh layer arrays from. Freed before the graph runs, so
+    /// the graph holds the only handle to each weight it reads.
+    fn openStream(self: *const TextEncoder) !?Weights {
+        const p = self.stream_path orelse return null;
+        return try model_mod.loadWeightsSingleFile(self.allocator, p);
+    }
+
+    /// Layer `li`'s graph on `x`; streaming, the layer then swaps in fresh lazy arrays from `sw`.
+    fn layerStep(self: *TextEncoder, sw: ?*const Weights, li: usize, x: mlx.mlx_array, mask: mlx.mlx_array, rope: RopeTables, seq: c_int, s: S) !mlx.mlx_array {
+        const nx = try self.layerForward(&self.layers[li], x, mask, rope, seq, s);
+        if (sw) |w| {
+            errdefer _ = mlx.mlx_array_free(nx);
+            const fresh = try TeLayerW.load(w, self.allocator, li, self.cfg, self.dtype, s);
+            self.layers[li].deinit();
+            self.layers[li] = fresh;
+        }
+        return nx;
+    }
+
+    /// One layer's weight bytes: the run-ahead a streamed forward is allowed.
+    pub fn layerBytes(self: *const TextEncoder) usize {
+        var n: usize = 0;
+        for (self.layers[0].arrays()) |x| {
+            if (x.ctx != null) n += mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        }
+        return n;
     }
 
     fn embedIds(self: *const TextEncoder, ids: []const i32, s: S) !mlx.mlx_array {
@@ -3563,6 +3801,13 @@ pub const GenRequest = struct {
     /// Loaded as the FIRST file of the same stack the user's adapters ride —
     /// it is a LoRA, so it gets no private code path.
     turbo: bool = false,
+    /// Stream the text encoder's layers and the DiT's blocks from disk instead of holding them
+    /// (request `stream_weights`, default on): ~20 GB less for the 8-bit pack, each pass slower
+    /// by what the disk takes to read them. A resident set never streams.
+    stream_weights: bool = true,
+    /// Store the fast recipe's attention cache 8-bit (request `attn_cache_8bit`, default off):
+    /// about half its bytes, LOSSY, so a render differs slightly from the bf16 cache's.
+    attn_cache_8bit: bool = false,
     /// Style LoRAs stacked on the DiT: absolute `.safetensors` paths and their
     /// strengths (parallel arrays; a missing scale is 1.0 at the caller). They
     /// sum with each other and with Turbo, never merge — order is irrelevant
@@ -4300,6 +4545,16 @@ fn generateOne(
         // needs it — a keyframe with vision blocks off, or an audio-only ref
         // set, does not.
         if (needs_vision and te.vision == null) try te.loadVision(&tw.?, s);
+        // A map handle would keep every weight the forward reads.
+        if (tw) |*w| w.deinit();
+        tw = null;
+        const mem_cap = DenoiseMemCap.begin();
+        defer mem_cap.end();
+        if (te_local != null and req.stream_weights) {
+            try te.streamFrom(paths.text_encoder);
+            mem_cap.step(te.layerBytes());
+            log.info("[minimax-h3] text encoder: layer weights stream from disk (\"stream_weights\": false keeps them resident)\n", .{});
+        }
         var e = try te.encodeItems(allocator, present.items, s);
         errdefer e.deinit();
         try mlx.check(mlx.mlx_array_eval(e.hidden));
@@ -4393,6 +4648,10 @@ fn generateOne(
             try model.precomputeAdaln(ts, s);
             log.info("[minimax-h3] adaln precomputed for {d} timesteps; 13B modulation weights released\n", .{ts.len});
         }
+        if (req.resident == null and ditStreamOn(req.stream_weights)) {
+            try model.streamFrom(paths.dit);
+            log.info("[minimax-h3] dit: block weights stream from disk each step (\"stream_weights\": false keeps them resident)\n", .{});
+        }
         try model.evalWeights();
         // ANE MLP offload for this run's row count (opt-in; declines under a
         // LoRA, so a Turbo run stays GPU-only).
@@ -4419,13 +4678,15 @@ fn generateOne(
         // MINIMAX_H3_ATTN_BCAST=<k> recomputes every block's attention branch
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
-        // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
+        // [S, hidden] per block, 8-bit (`AttnBroadcast.rowBytes`).
         const speed = req.speed;
         log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.turbo });
         const bcast_k: u32 = speed.bcast_k;
-        var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
+        var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len, req.attn_cache_8bit) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
         var bcast_reused: u32 = 0;
+        const mem_cap = DenoiseMemCap.begin();
+        defer mem_cap.end();
 
         // ── step cache (TeaCache-style velocity reuse, OPT-IN) ──
         // Adjacent steps at high sigma produce highly-correlated velocities
@@ -4509,7 +4770,7 @@ fn generateOne(
                 sc_consec += 1;
                 sc_skipped += 1;
                 if (progress) |p| {
-                    if (p.boundary()) return error.Cancelled;
+                    if (mem_cap.boundary(p)) return error.Cancelled;
                     p.emit("Generating", @intCast(i + 1), req.steps);
                 }
                 log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
@@ -4544,14 +4805,16 @@ fn generateOne(
 
             const refresh = attnBroadcastRefresh(i, req.steps, bcast_k);
             if (attn_bcast != null and !refresh) bcast_reused += 1;
-            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, s);
+            const bcast_growth: usize = if (attn_bcast) |*ab| @as(usize, @intCast(AttnBroadcast.rowBytes(model.cfg.hidden_size, model.blocks.len, ab.q8) * layout.seq_len)) -| ab.bytes() else 0;
+            mem_cap.step(bcast_growth);
+            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, progress, s);
             defer out.deinit();
 
             // Per-step JPEG from predicted clean x0 = x - σ·v, using the
             // pre-Euler noisy latent. Cached-velocity steps already continued
             // above without a preview. A failed JPEG never fails the job.
             if (progress) |p| {
-                if (p.boundary()) return error.Cancelled;
+                if (mem_cap.boundary(p)) return error.Cancelled;
                 tryEmitH3Preview(p, allocator, "Generating", @intCast(i + 1), req.steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
             }
 
@@ -4594,7 +4857,7 @@ fn generateOne(
             try mlx.check(mlx.mlx_array_eval(video_x));
             try mlx.check(mlx.mlx_array_eval(audio_x));
             if (progress) |p| {
-                if (p.boundary()) return error.Cancelled;
+                if (mem_cap.boundary(p)) return error.Cancelled;
             }
             // Every denoise loop owes a periodic cache clear: MLX's pool is
             // unbounded and these shapes repeat, so without it the process
@@ -4623,13 +4886,13 @@ fn generateOne(
 
     if (progress) |p| p.emit("Decoding video", req.steps, req.steps);
     _ = phase_timer.lapMs();
-    var vw = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
-    defer vw.deinit();
-    var dec = try vae_mod.Decoder.load(allocator, &vw, .{}, dt, s);
-    defer dec.deinit();
-    const pixels = try vae_mod.decode(&dec, zlat, allocator, s);
+    // Scoped: the video decoder is freed before the audio VAE loads.
+    const pixels = blk: {
+        var dec = try vae_mod.Decoder.loadFile(allocator, paths.vae, .{}, dt, s);
+        defer dec.deinit();
+        break :blk try decodeVideo(&dec, zlat, allocator, s);
+    };
     errdefer _ = mlx.mlx_array_free(pixels);
-    try mlx.check(mlx.mlx_array_eval(pixels));
     _ = mlx.mlx_clear_cache();
     log.info("[minimax-h3] video decoded in {d} ms (load+decode)\n", .{phase_timer.lapMs()});
 
@@ -4640,10 +4903,17 @@ fn generateOne(
     var audio_wave: ?mlx.mlx_array = null;
     if (paths.audio_vae) |apath| {
         if (progress) |p| p.emit("Decoding audio", req.steps, req.steps);
-        var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
-        defer aw.deinit();
-        const wave = try audio_mod.decode(allocator, &aw, audio_latent, dt, s);
-        try mlx.check(mlx.mlx_array_eval(wave));
+        const wave = blk: {
+            var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
+            defer aw.deinit();
+            // Capped at what is live: run-ahead otherwise held ~5 GiB of decoder transients.
+            const cap = DenoiseMemCap.begin();
+            defer cap.end();
+            cap.step(0);
+            const w = try audio_mod.decode(allocator, &aw, audio_latent, dt, s);
+            try mlx.check(mlx.mlx_array_eval(w));
+            break :blk w;
+        };
         audio_wave = wave;
         _ = mlx.mlx_clear_cache();
         log.info("[minimax-h3] audio decoded: {d} samples/ch at {d} Hz ({d} ms)\n", .{ mlx.getShape(wave)[1], audio_mod.SAMPLE_RATE, phase_timer.lapMs() });
@@ -4658,6 +4928,25 @@ fn generateOne(
         .height = @intCast(pshape[3]),
         .width = @intCast(pshape[4]),
     };
+}
+
+/// What the video decode keeps beyond its weights, per decoded pixel: the bf16 chunks and their
+/// concat, then the denormalize chain's f32 input and output.
+pub const VAE_DECODE_KEEP_PER_PX: usize = 36;
+
+/// The decode ends in six full-video f32 ops; encoded ahead, MLX holds every one of them.
+fn decodeVideo(dec: *const @import("minimax_h3_vae.zig").Decoder, z: mlx.mlx_array, allocator: std.mem.Allocator, s: S) !mlx.mlx_array {
+    const vae = @import("minimax_h3_vae.zig");
+    const shp = mlx.getShape(z);
+    const frames: usize = vae.planTemporal(@intCast(shp[2])).output_frames;
+    const px = frames * @as(usize, @intCast(shp[3] * shp[4])) * vae.VAE_RATIO * vae.VAE_RATIO;
+    const cap = DenoiseMemCap.begin();
+    defer cap.end();
+    cap.step(px * VAE_DECODE_KEEP_PER_PX);
+    const out = try vae.decode(dec, z, allocator, s);
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
 }
 
 // ── Chained windows ─────────────────────────────────────────────────────────
@@ -4761,35 +5050,34 @@ fn joinWavesCrossfade(allocator: std.mem.Allocator, waves: []const mlx.mlx_array
     return mlx.mlx_array_new_data(buf.ptr, &shp, 2, mlx.mlx_dtype.float32);
 }
 
-/// Progress adapter: prefixes the stage with "Window w/n" and remaps
-/// determinate bars onto the whole chain so the client's meter is monotone
-/// across windows instead of restarting at every seam.
+/// Progress adapter: remaps determinate bars onto the whole chain so the
+/// client's meter is monotone across windows instead of restarting at every
+/// seam. Each event names the window it came from (`gen_sse.Chain`).
 const ChainProgress = struct {
     inner: gen_sse.Progress,
     window: u32,
     windows: u32,
 
-    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+    fn chain(self: *const ChainProgress) gen_sse.Chain {
+        return .{ .window = self.window + 1, .windows = self.windows };
+    }
+    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, _: gen_sse.Chain) void {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
-        var buf: [96]u8 = undefined;
-        const label = std.fmt.bufPrint(&buf, "Window {d}/{d}: {s}", .{ self.window + 1, self.windows, stage }) catch stage;
         if (total > 0)
-            self.inner.emit(label, self.window * total + step, self.windows * total)
+            self.inner.emitIn(self.chain(), stage, self.window * total + step, self.windows * total)
         else
-            self.inner.emit(label, step, 0);
+            self.inner.emitIn(self.chain(), stage, step, 0);
     }
     fn cancelledCb(ptr: *anyopaque) bool {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
         return self.inner.cancelled();
     }
-    fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, frame: @import("preview.zig").Encoded) void {
+    fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, _: gen_sse.Chain, frame: @import("preview.zig").Encoded) void {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
-        var buf: [96]u8 = undefined;
-        const label = std.fmt.bufPrint(&buf, "Window {d}/{d}: {s}", .{ self.window + 1, self.windows, stage }) catch stage;
         if (total > 0)
-            self.inner.emitPreview(label, self.window * total + step, self.windows * total, frame)
+            self.inner.emitPreviewIn(self.chain(), stage, self.window * total + step, self.windows * total, frame)
         else
-            self.inner.emitPreview(label, step, 0, frame);
+            self.inner.emitPreviewIn(self.chain(), stage, step, 0, frame);
     }
     fn progress(self: *ChainProgress) gen_sse.Progress {
         return .{
@@ -4975,7 +5263,22 @@ fn generateChain(
 
 /// [1,3,F,H,W] in [-1,1] -> tightly packed [F,H,W,3] u8. Caller owns.
 pub fn pixelsToRgb8(allocator: std.mem.Allocator, res: *const GenResult, s: S) ![]u8 {
-    const p = try transpose(res.pixels, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
+    const out = blk: {
+        const u8a = try rgb8Lazy(res.pixels, s);
+        defer _ = mlx.mlx_array_free(u8a);
+        try mlx.check(mlx.mlx_array_eval(u8a));
+        const n: usize = @intCast(mlx.mlx_array_size(u8a));
+        const raw = mlx.mlx_array_data_uint8(u8a) orelse return error.NoPixelData;
+        break :blk try allocator.dupe(u8, raw[0..n]);
+    };
+    _ = mlx.mlx_clear_cache();
+    return out;
+}
+
+/// The chain's handles are freed BEFORE the eval: a live handle pins its buffer through it, and
+/// then every full-video f32 step is held at once instead of donated in place.
+fn rgb8Lazy(pixels: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const p = try transpose(pixels, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
     defer _ = mlx.mlx_array_free(p);
     const pc = try contig(p, s);
     defer _ = mlx.mlx_array_free(pc);
@@ -4987,12 +5290,7 @@ pub fn pixelsToRgb8(allocator: std.mem.Allocator, res: *const GenResult, s: S) !
     defer _ = mlx.mlx_array_free(k);
     const scaled = try mulA(shifted, k, s);
     defer _ = mlx.mlx_array_free(scaled);
-    const u8a = try astype(scaled, mlx.mlx_dtype.uint8, s);
-    defer _ = mlx.mlx_array_free(u8a);
-    try mlx.check(mlx.mlx_array_eval(u8a));
-    const n: usize = @intCast(mlx.mlx_array_size(u8a));
-    const raw = mlx.mlx_array_data_uint8(u8a) orelse return error.NoPixelData;
-    return allocator.dupe(u8, raw[0..n]);
+    return astype(scaled, mlx.mlx_dtype.uint8, s);
 }
 
 /// Stereo [2, L] f32 -> interleaved little-endian 16-bit PCM. Caller owns.
@@ -5161,6 +5459,18 @@ fn envU32(name: [:0]const u8, dflt: u32) u32 {
 pub fn adalnPrecomputeOn() bool {
     const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse return true;
     return !std.mem.eql(u8, raw, "0");
+}
+
+/// Whether a run that keeps no DiT between requests streams the blocks' trunk weights from disk
+/// each step (`Model.streamFrom`), given the request's `stream_weights`. Shared with the bill in `gen`.
+pub fn ditStreamOn(want: bool) bool {
+    return streamsDit(want, ane.media_offload.video, adalnPrecomputeOn());
+}
+
+/// The ANE offload builds its programs from resident weights, and with precompute off the AdaLN
+/// weights stay resident anyway.
+pub fn streamsDit(want: bool, ane_video: bool, precompute: bool) bool {
+    return want and !ane_video and precompute;
 }
 
 fn allFinite(x: mlx.mlx_array, s: S) !bool {
@@ -6859,6 +7169,611 @@ test "minimax h3: the broadcast schedule scales down to few-step runs" {
     }
 }
 
+fn bcastTestInput(rows: usize, width: usize, s: S) !mlx.mlx_array {
+    const buf = try testing.allocator.alloc(f32, rows * width);
+    defer testing.allocator.free(buf);
+    for (buf, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.37) * (1.0 + @as(f32, @floatFromInt(i % 7)));
+    const shape = [_]c_int{ @intCast(rows), @intCast(width) };
+    const f = mlx.mlx_array_new_data(buf.ptr, &shape, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(f);
+    return astype(f, mlx.mlx_dtype.bfloat16, s);
+}
+
+/// Max |a - b| over every element, and max |a|, in f32.
+fn bcastTestDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: S) ![2]f32 {
+    const af = try astype(a, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(af);
+    const bf = try astype(b, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(bf);
+    try mlx.check(mlx.mlx_array_eval(af));
+    try mlx.check(mlx.mlx_array_eval(bf));
+    const n = mlx.mlx_array_size(af);
+    const ad = mlx.mlx_array_data_float32(af).?[0..n];
+    const bd = mlx.mlx_array_data_float32(bf).?[0..n];
+    var diff: f32 = 0;
+    var mag: f32 = 0;
+    for (ad, bd) |x, y| {
+        diff = @max(diff, @abs(x - y));
+        mag = @max(mag, @abs(x));
+    }
+    return .{ diff, mag };
+}
+
+test "minimax h3: the 8-bit broadcast cache holds half the bytes and returns its input within 8-bit error" {
+    const s = mlx.gpuStream();
+    const rows = 16;
+    const width = 256;
+    const x = try bcastTestInput(rows, width, s);
+    defer _ = mlx.mlx_array_free(x);
+    var ab = try AttnBroadcast.init(testing.allocator, 2, true);
+    defer ab.deinit();
+    try testing.expect(!ab.has(1));
+    const used = try ab.store(1, x, s);
+    defer _ = mlx.mlx_array_free(used);
+    try mlx.check(mlx.mlx_array_eval(used));
+    try testing.expect(ab.has(1));
+    try testing.expectEqual(AttnBroadcast.rowBytes(width, 1, true) * rows, ab.bytes());
+    try testing.expect(ab.bytes() * 100 < rows * width * 2 * 54);
+    // The refresh step itself reads its exact output; only the broadcast steps read the 8-bit copy.
+    try testing.expectEqual(@as(f32, 0), (try bcastTestDiff(used, x, s))[0]);
+    const back = try ab.load(1, s);
+    defer _ = mlx.mlx_array_free(back);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(back));
+    const d = try bcastTestDiff(back, x, s);
+    // One 8-bit step of the group's range plus the bf16 rounding of scale, bias and output; 4-bit is ~8x this.
+    try testing.expect(d[0] > 0);
+    try testing.expect(d[0] <= d[1] * 3.0 / 255.0);
+}
+
+test "minimax h3: the broadcast cache stays bf16 when 8-bit is off or the width does not group" {
+    const s = mlx.gpuStream();
+    for ([_]struct { q8: bool, width: usize }{ .{ .q8 = false, .width = 256 }, .{ .q8 = true, .width = 96 } }) |c| {
+        const x = try bcastTestInput(4, c.width, s);
+        defer _ = mlx.mlx_array_free(x);
+        var ab = try AttnBroadcast.init(testing.allocator, 1, c.q8);
+        defer ab.deinit();
+        const used = try ab.store(0, x, s);
+        defer _ = mlx.mlx_array_free(used);
+        const back = try ab.load(0, s);
+        defer _ = mlx.mlx_array_free(back);
+        try testing.expectEqual(@as(f32, 0), (try bcastTestDiff(back, x, s))[0]);
+        try testing.expectEqual(4 * c.width * 2, ab.bytes());
+    }
+    try testing.expectEqual(@as(u64, 50 * 5376 * 2), AttnBroadcast.rowBytes(5376, 50, false));
+}
+
+/// Peak MLX memory above what was active, while evaluating a chain of 64 MB matmuls.
+fn chainPeakAbove(links: usize, s: S) !usize {
+    const n: c_int = 4096;
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_full(&w, &[_]c_int{ n, n }, 2, mlx.mlx_array_new_float(1.0 / 4096.0), mlx.mlx_dtype.float32, s));
+    try mlx.check(mlx.mlx_array_eval(w));
+    var x = try contig(w, s);
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_array_eval(x));
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_reset_peak_memory();
+    for (0..links) |_| {
+        var y = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&y, x, w, s));
+        _ = mlx.mlx_array_free(x);
+        x = y;
+    }
+    try mlx.check(mlx.mlx_array_eval(x));
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    return peak -| active;
+}
+
+test "minimax h3: past its memory limit MLX waits for the GPU instead of encoding ahead" {
+    const s = mlx.gpuStream();
+    const ahead = try chainPeakAbove(12, s);
+    var cap = DenoiseMemCap.begin();
+    defer cap.end();
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    var old: usize = 0;
+    _ = mlx.mlx_set_memory_limit(&old, active);
+    const held = try chainPeakAbove(12, s);
+    // Unheld, several 64 MB outputs are in flight; held, about one link's input and output.
+    try testing.expect(held * 2 < ahead);
+}
+
+test "minimax h3: the denoise memory cap allows the step's growth plus headroom and restores the old limit" {
+    try testing.expectEqual(@as(usize, 10 + 3 + DenoiseMemCap.HEADROOM), DenoiseMemCap.limitFor(10, 3, std.math.maxInt(usize)));
+    try testing.expectEqual(@as(usize, 7), DenoiseMemCap.limitFor(10, 3, 7)); // a tighter limit stays
+    var before: usize = 0;
+    _ = mlx.mlx_get_memory_limit(&before);
+    {
+        const cap = DenoiseMemCap.begin();
+        defer cap.end();
+        cap.step(1 << 20);
+        var during: usize = 0;
+        _ = mlx.mlx_get_memory_limit(&during);
+        var active: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        try testing.expectEqual(DenoiseMemCap.limitFor(active, 1 << 20, before), during);
+    }
+    var after: usize = 0;
+    _ = mlx.mlx_get_memory_limit(&after);
+    try testing.expectEqual(before, after);
+}
+
+test "minimax h3: chat runs a denoise boundary under the caller's memory limit, and the next step re-arms the cap" {
+    const H = struct {
+        seen: usize = 0,
+        fn emitCb(_: *anyopaque, _: []const u8, _: u32, _: u32, _: gen_sse.Chain) void {}
+        fn step(ctx: *anyopaque) void {
+            _ = mlx.mlx_get_memory_limit(&@as(*@This(), @ptrCast(@alignCast(ctx))).seen);
+        }
+        fn serve(_: *anyopaque, _: *const std.atomic.Value(bool)) void {}
+        fn wake(_: *anyopaque) void {}
+    };
+    var h = H{};
+    const y = gen_sse.Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
+    gen_sse.gen_yield = &y;
+    defer gen_sse.gen_yield = null;
+    const p = gen_sse.Progress{ .ctx = &h, .cb = H.emitCb };
+    var before: usize = 0;
+    _ = mlx.mlx_get_memory_limit(&before);
+    const cap = DenoiseMemCap.begin();
+    defer cap.end();
+    cap.step(1 << 20);
+    try testing.expect(!cap.boundary(p));
+    try testing.expectEqual(before, h.seen);
+    cap.step(1 << 20);
+    var during: usize = 0;
+    _ = mlx.mlx_get_memory_limit(&during);
+    try testing.expect(during < before);
+}
+
+/// A toy DiT file at the block fixture's geometry: every block carries the fixture's block weights,
+/// the rest is random. Returns false when the fixture is unreadable.
+fn writeToyDit(a: std.mem.Allocator, path: [:0]const u8, cfg: Config, s: S) !bool {
+    var fx = model_mod.loadWeightsSingleFile(a, "src/fixtures/minimax_h3_dit.safetensors") catch return false;
+    defer fx.deinit();
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    var kbuf: [128]u8 = undefined;
+    var it = fx.map.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        if (std.mem.startsWith(u8, k, "x.")) continue;
+        for (0..cfg.num_layers) |i| {
+            _ = mlx.mlx_map_string_to_array_insert(tmap, try std.fmt.bufPrintSentinel(&kbuf, "blocks.{d}.{s}", .{ i, k }, 0), e.value_ptr.*);
+        }
+    }
+    const hid: c_int = @intCast(cfg.hidden_size);
+    const vp: c_int = @intCast(cfg.videoPatchDim());
+    const ad: c_int = @intCast(cfg.audio_latents_dim);
+    const teh: c_int = @intCast(cfg.time_embed_hidden_size);
+    const ted: c_int = @intCast(cfg.time_embed_dim);
+    const Spec = struct { name: [:0]const u8, shape: []const c_int };
+    const specs = [_]Spec{
+        .{ .name = "video_patch_proj.weight", .shape = &.{ hid, vp } },
+        .{ .name = "video_patch_proj.bias", .shape = &.{hid} },
+        .{ .name = "audio_patch_proj.weight", .shape = &.{ hid, ad } },
+        .{ .name = "audio_patch_proj.bias", .shape = &.{hid} },
+        .{ .name = "condition_proj.weight", .shape = &.{ hid, @intCast(cfg.text_dim) } },
+        .{ .name = "condition_proj.bias", .shape = &.{hid} },
+        .{ .name = "time_embedder.proj_in.weight", .shape = &.{ teh, @intCast(cfg.timestep_input_dim) } },
+        .{ .name = "time_embedder.proj_in.bias", .shape = &.{teh} },
+        .{ .name = "time_embedder.proj_out.weight", .shape = &.{ ted, teh } },
+        .{ .name = "time_embedder.proj_out.bias", .shape = &.{ted} },
+        .{ .name = "rope.inv_freq", .shape = &.{@intCast(cfg.rope_inv_freq_len)} },
+        .{ .name = "token_refiner.final_norm.weight", .shape = &.{hid} },
+        .{ .name = "final_layer.norm.weight", .shape = &.{hid} },
+        .{ .name = "final_layer.adaln_proj.linear.weight", .shape = &.{ 2 * hid, ted } },
+        .{ .name = "final_layer.adaln_proj.linear.bias", .shape = &.{2 * hid} },
+        .{ .name = "final_layer.video_out.weight", .shape = &.{ vp, hid } },
+        .{ .name = "final_layer.video_out.bias", .shape = &.{vp} },
+        .{ .name = "final_layer.audio_out.weight", .shape = &.{ ad, hid } },
+        .{ .name = "final_layer.audio_out.bias", .shape = &.{ad} },
+    };
+    for (specs, 0..) |sp, i| {
+        const x = try toyRand(sp.shape, i, s);
+        defer _ = mlx.mlx_array_free(x);
+        _ = mlx.mlx_map_string_to_array_insert(tmap, sp.name, x);
+    }
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(path, tmap, meta));
+    return true;
+}
+
+fn toyRand(shape: []const c_int, seed: u64, s: S) !mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var f = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&f, shape.ptr, shape.len, .float32, 0.0, 0.1, key, s));
+    return f;
+}
+
+test "minimax h3: a streamed DiT forward equals the resident one and leaves no block weight read" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const f32t = mlx.mlx_dtype.float32;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/dit.safetensors", .{pbuf[0..root_len]}, 0);
+    defer a.free(path);
+    const cfg = Config{
+        .hidden_size = 256,
+        .num_layers = 3,
+        .token_refiner_num_layers = 0,
+        .num_attention_heads = 4,
+        .attention_head_dim = 32,
+        .ffn_hidden_size = 128,
+        .latents_dim = 4,
+        .audio_latents_dim = 4,
+        .text_dim = 8,
+        .timestep_input_dim = 32,
+        .time_embed_hidden_size = 32,
+        .time_embed_dim = 32,
+        .rope_inv_freq_len = 4,
+    };
+    if (!try writeToyDit(a, path, cfg, s)) return error.SkipZigTest;
+
+    const load = struct {
+        fn f(al: std.mem.Allocator, p: []const u8, c: Config, st: S) !Model {
+            var w = try model_mod.loadWeightsSingleFile(al, p);
+            defer w.deinit();
+            return Model.load(al, &w, c, mlx.mlx_dtype.float32, st);
+        }
+    }.f;
+    var resident = try load(a, path, cfg, s);
+    defer resident.deinit();
+    try resident.evalWeights();
+    var streamed = try load(a, path, cfg, s);
+    defer streamed.deinit();
+    try streamed.streamFrom(path);
+    try streamed.evalWeights();
+
+    var layout = try PackedLayout.init(a, 4, 2, 4, 4, 3, &.{}, 5);
+    defer layout.deinit();
+    var plan = try buildTimestepPlan(a, &layout, 0.5, 12.0, 3.0, .{});
+    defer plan.deinit();
+    var rope = try buildRope(a, &layout, resident.inv_freq, f32t, s);
+    defer rope.deinit();
+    var rows = [3]c_int{ 0, 0, 0 };
+    for (layout.segments) |seg| rows[@intFromEnum(seg.kind.stream())] += @intCast(seg.end - seg.start);
+    const text = try toyRand(&.{ rows[0], @intCast(cfg.hidden_size) }, 100, s);
+    defer _ = mlx.mlx_array_free(text);
+    const video = try toyRand(&.{ rows[1], @intCast(cfg.videoPatchDim()) }, 101, s);
+    defer _ = mlx.mlx_array_free(video);
+    const audio = try toyRand(&.{ rows[2], @intCast(cfg.audio_latents_dim) }, 102, s);
+    defer _ = mlx.mlx_array_free(audio);
+
+    var want = try resident.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, null, s);
+    defer want.deinit();
+    // Twice: the second pass runs on the arrays the first one swapped in.
+    for (0..2) |_| {
+        var got = try streamed.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, null, s);
+        defer got.deinit();
+        try expectBitEqual(got.video, want.video, "streamed video", s);
+        try expectBitEqual(got.audio, want.audio, "streamed audio", s);
+        for (streamed.blocks) |*b| for (b.trunkArrays()) |x| {
+            if (x.ctx == null) continue;
+            var ready = true;
+            _ = mlx._mlx_array_is_available(&ready, x);
+            try testing.expect(!ready);
+        };
+    }
+}
+
+test "minimax h3: a cancel lands between DiT blocks, and polling it leaves the forward unchanged" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const f32t = mlx.mlx_dtype.float32;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/dit.safetensors", .{pbuf[0..root_len]}, 0);
+    defer a.free(path);
+    const cfg = Config{
+        .hidden_size = 256,
+        .num_layers = 3,
+        .token_refiner_num_layers = 0,
+        .num_attention_heads = 4,
+        .attention_head_dim = 32,
+        .ffn_hidden_size = 128,
+        .latents_dim = 4,
+        .audio_latents_dim = 4,
+        .text_dim = 8,
+        .timestep_input_dim = 32,
+        .time_embed_hidden_size = 32,
+        .time_embed_dim = 32,
+        .rope_inv_freq_len = 4,
+    };
+    if (!try writeToyDit(a, path, cfg, s)) return error.SkipZigTest;
+    var w = try model_mod.loadWeightsSingleFile(a, path);
+    defer w.deinit();
+    var model = try Model.load(a, &w, cfg, f32t, s);
+    defer model.deinit();
+    try model.evalWeights();
+
+    var layout = try PackedLayout.init(a, 4, 2, 4, 4, 3, &.{}, 5);
+    defer layout.deinit();
+    var plan = try buildTimestepPlan(a, &layout, 0.5, 12.0, 3.0, .{});
+    defer plan.deinit();
+    var rope = try buildRope(a, &layout, model.inv_freq, f32t, s);
+    defer rope.deinit();
+    var rows = [3]c_int{ 0, 0, 0 };
+    for (layout.segments) |seg| rows[@intFromEnum(seg.kind.stream())] += @intCast(seg.end - seg.start);
+    const text = try toyRand(&.{ rows[0], @intCast(cfg.hidden_size) }, 100, s);
+    defer _ = mlx.mlx_array_free(text);
+    const video = try toyRand(&.{ rows[1], @intCast(cfg.videoPatchDim()) }, 101, s);
+    defer _ = mlx.mlx_array_free(video);
+    const audio = try toyRand(&.{ rows[2], @intCast(cfg.audio_latents_dim) }, 102, s);
+    defer _ = mlx.mlx_array_free(audio);
+
+    // Leaves after `leave_at` polls (0 = never).
+    const Probe = struct {
+        calls: u32 = 0,
+        leave_at: u32,
+        fn emit(_: *anyopaque, _: []const u8, _: u32, _: u32, _: gen_sse.Chain) void {}
+        fn gone(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.calls == self.leave_at;
+        }
+    };
+
+    var want = try model.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, null, s);
+    defer want.deinit();
+    var stays = Probe{ .leave_at = 0 };
+    var got = try model.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, .{ .ctx = &stays, .cb = Probe.emit, .cancelled_cb = Probe.gone }, s);
+    defer got.deinit();
+    try expectBitEqual(got.video, want.video, "polled video", s);
+    try expectBitEqual(got.audio, want.audio, "polled audio", s);
+    try testing.expectEqual(@as(u32, cfg.num_layers), stays.calls);
+
+    var leaves = Probe{ .leave_at = 2 };
+    try testing.expectError(error.Cancelled, model.forward(&layout, &plan, text, video, audio, rope, 0.5, 12.0, 3.0, null, false, .{ .ctx = &leaves, .cb = Probe.emit, .cancelled_cb = Probe.gone }, s));
+    try testing.expectEqual(@as(u32, 2), leaves.calls);
+}
+
+/// A toy text-encoder file at `cfg`'s geometry, linears 8-bit like the shipped pack.
+fn writeToyTe(path: [:0]const u8, cfg: TeConfig, s: S) !void {
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    var kbuf: [128]u8 = undefined;
+    var seed: u64 = 0;
+    const emb = try toyRand(&.{ 64, cfg.hidden }, seed, s);
+    defer _ = mlx.mlx_array_free(emb);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "model.embed_tokens.weight", emb);
+    const qd = cfg.heads * cfg.head_dim;
+    const kvd = cfg.kv_heads * cfg.head_dim;
+    const Lin = struct { name: []const u8, out: c_int, in: c_int };
+    const lins = [_]Lin{
+        .{ .name = "self_attn.q_proj", .out = qd, .in = cfg.hidden },
+        .{ .name = "self_attn.k_proj", .out = kvd, .in = cfg.hidden },
+        .{ .name = "self_attn.v_proj", .out = kvd, .in = cfg.hidden },
+        .{ .name = "self_attn.o_proj", .out = cfg.hidden, .in = qd },
+        .{ .name = "mlp.gate_proj", .out = cfg.intermediate, .in = cfg.hidden },
+        .{ .name = "mlp.up_proj", .out = cfg.intermediate, .in = cfg.hidden },
+        .{ .name = "mlp.down_proj", .out = cfg.hidden, .in = cfg.intermediate },
+    };
+    const Norm = struct { name: []const u8, dim: c_int };
+    const norms = [_]Norm{
+        .{ .name = "input_layernorm", .dim = cfg.hidden },
+        .{ .name = "post_attention_layernorm", .dim = cfg.hidden },
+        .{ .name = "self_attn.q_norm", .dim = cfg.head_dim },
+        .{ .name = "self_attn.k_norm", .dim = cfg.head_dim },
+    };
+    for (0..cfg.layers) |li| {
+        for (lins) |l| {
+            seed += 1;
+            const wt = try toyRand(&.{ l.out, l.in }, seed, s);
+            defer _ = mlx.mlx_array_free(wt);
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, wt, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, s));
+            for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |part, pi| {
+                var x = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x);
+                try mlx.check(mlx.mlx_vector_array_get(&x, triple, pi));
+                _ = mlx.mlx_map_string_to_array_insert(tmap, try std.fmt.bufPrintSentinel(&kbuf, "model.layers.{d}.{s}.{s}", .{ li, l.name, part }, 0), x);
+            }
+        }
+        for (norms) |n| {
+            seed += 1;
+            const x = try toyRand(&.{n.dim}, seed, s);
+            defer _ = mlx.mlx_array_free(x);
+            _ = mlx.mlx_map_string_to_array_insert(tmap, try std.fmt.bufPrintSentinel(&kbuf, "model.layers.{d}.{s}.weight", .{ li, n.name }, 0), x);
+        }
+    }
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(path, tmap, meta));
+}
+
+test "minimax h3: a streamed text encoder equals the resident one and leaves no layer weight read" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/te.safetensors", .{pbuf[0..root_len]}, 0);
+    defer a.free(path);
+    const cfg = TeConfig{ .hidden = 128, .heads = 4, .kv_heads = 2, .head_dim = 32, .intermediate = 128, .layers = 3 };
+    try writeToyTe(path, cfg, s);
+
+    const load = struct {
+        fn f(al: std.mem.Allocator, p: []const u8, c: TeConfig, st: S) !TextEncoder {
+            var w = try model_mod.loadWeightsSingleFile(al, p);
+            defer w.deinit();
+            return TextEncoder.load(al, &w, c, mlx.mlx_dtype.float32, st);
+        }
+    }.f;
+    var resident = try load(a, path, cfg, s);
+    defer resident.deinit();
+    var streamed = try load(a, path, cfg, s);
+    defer streamed.deinit();
+    try streamed.streamFrom(path);
+
+    const ids = [_]i32{ 3, 9, 1, 40, 7, 22 };
+    const items = [_]PresentItem{.{ .text = &ids }};
+    var want = try resident.encodeItems(a, &items, s);
+    defer want.deinit();
+    try mlx.check(mlx.mlx_array_eval(want.hidden));
+    // Twice: the second pass runs on the arrays the first one swapped in.
+    for (0..2) |_| {
+        var got = try streamed.encodeItems(a, &items, s);
+        defer got.deinit();
+        try mlx.check(mlx.mlx_array_eval(got.hidden));
+        try expectBitEqual(got.hidden, want.hidden, "streamed text encoder", s);
+        for (streamed.layers) |*l| for (l.arrays()) |x| {
+            if (x.ctx == null) continue;
+            var ready = true;
+            _ = mlx._mlx_array_is_available(&ready, x);
+            try testing.expect(!ready);
+        };
+    }
+}
+
+fn writeToyVideoVae(path: [:0]const u8, cfg: @import("minimax_h3_vae.zig").DecCfg, ff: c_int, s: S) !void {
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    const dim: c_int = @intCast(cfg.dim());
+    const in_ch: c_int = @intCast(cfg.in_channels);
+    const T = struct { name: []const u8, shape: []const c_int };
+    var buf: [64]T = undefined;
+    var names: [64][96]u8 = undefined;
+    var n: usize = 0;
+    const add = struct {
+        fn f(b: []T, nm: [][96]u8, k: *usize, name: []const u8, shape: []const c_int) void {
+            @memcpy(nm[k.*][0..name.len], name);
+            b[k.*] = .{ .name = nm[k.*][0..name.len], .shape = shape };
+            k.* += 1;
+        }
+    }.f;
+    const out_patch: c_int = @intCast(cfg.outPatchDim());
+    const pq = [_]c_int{ in_ch, in_ch, 1, 1, 1 };
+    const tables = [_]c_int{in_ch};
+    const xe = [_]c_int{ dim, in_ch };
+    const vec = [_]c_int{dim};
+    const reg = [_]c_int{ 1, @intCast(cfg.num_register_tokens), dim };
+    const po = [_]c_int{ out_patch, dim };
+    const pob = [_]c_int{out_patch};
+    const qkv = [_]c_int{ 3 * dim, dim };
+    const qkvb = [_]c_int{3 * dim};
+    const sq = [_]c_int{ dim, dim };
+    const w1 = [_]c_int{ 2 * ff, dim };
+    const w1b = [_]c_int{2 * ff};
+    const w2 = [_]c_int{ dim, ff };
+    add(&buf, &names, &n, "post_quant_conv.weight", &pq);
+    add(&buf, &names, &n, "post_quant_conv.bias", &tables);
+    add(&buf, &names, &n, "latents_mean", &tables);
+    add(&buf, &names, &n, "latents_std", &tables);
+    add(&buf, &names, &n, "decoder.x_embedder.weight", &xe);
+    add(&buf, &names, &n, "decoder.x_embedder.bias", &vec);
+    add(&buf, &names, &n, "decoder.register_tokens", &reg);
+    add(&buf, &names, &n, "decoder.norm_out.weight", &vec);
+    add(&buf, &names, &n, "decoder.norm_out.bias", &vec);
+    add(&buf, &names, &n, "decoder.proj_out.weight", &po);
+    add(&buf, &names, &n, "decoder.proj_out.bias", &pob);
+    const block = [_]T{
+        .{ .name = "norm1.weight", .shape = &vec },        .{ .name = "norm2.weight", .shape = &vec },
+        .{ .name = "scale1", .shape = &vec },              .{ .name = "scale2", .shape = &vec },
+        .{ .name = "attn.to_qkv.weight", .shape = &qkv },  .{ .name = "attn.to_qkv.bias", .shape = &qkvb },
+        .{ .name = "attn.to_out.weight", .shape = &sq },   .{ .name = "attn.to_out.bias", .shape = &vec },
+        .{ .name = "ff.w1.weight", .shape = &w1 },         .{ .name = "ff.w1.bias", .shape = &w1b },
+        .{ .name = "ff.w2.weight", .shape = &w2 },         .{ .name = "ff.w2.bias", .shape = &vec },
+    };
+    for (0..cfg.layers) |li| for (block) |b| {
+        var kb: [96]u8 = undefined;
+        add(&buf, &names, &n, try std.fmt.bufPrint(&kb, "decoder.transformer_blocks.{d}.{s}", .{ li, b.name }), b.shape);
+    };
+    var kbuf: [96]u8 = undefined;
+    for (buf[0..n], 0..) |t, i| {
+        const x = try toyRand(t.shape, 1000 + i, s);
+        defer _ = mlx.mlx_array_free(x);
+        var h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h);
+        try mlx.check(mlx.mlx_astype(&h, x, .float16, s));
+        _ = mlx.mlx_map_string_to_array_insert(tmap, try std.fmt.bufPrintSentinel(&kbuf, "{s}", .{t.name}, 0), h);
+    }
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(path, tmap, meta));
+}
+
+test "minimax h3: a video decoder loaded from its file holds one copy of its weights and decodes the same pixels" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const vae = @import("minimax_h3_vae.zig");
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/video_vae.safetensors", .{pbuf[0..root_len]}, 0);
+    defer a.free(path);
+    const cfg = vae.DecCfg{ .layers = 3, .heads = 4, .head_dim = 32 };
+    try writeToyVideoVae(path, cfg, 1024, s);
+
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    var dec = try vae.Decoder.loadFile(a, path, cfg, .bfloat16, s);
+    defer dec.deinit();
+    _ = mlx.mlx_synchronize(s);
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    // The bar: the bf16 weights are materialized, and nothing else (the f16 originals) stays.
+    const one_copy = dec.weightBytes();
+    try testing.expect(after -| before >= one_copy * 3 / 4);
+    try testing.expect(after -| before <= one_copy * 5 / 4);
+
+    var w = try model_mod.loadWeightsSingleFile(a, path);
+    defer w.deinit();
+    var ref = try vae.Decoder.load(a, &w, cfg, .bfloat16, s);
+    defer ref.deinit();
+    const z = try toyRand(&.{ 1, @intCast(cfg.in_channels), 2, 2, 2 }, 7, s);
+    defer _ = mlx.mlx_array_free(z);
+    const want = try vae.decode(&ref, z, a, s);
+    defer _ = mlx.mlx_array_free(want);
+    const got = try vae.decode(&dec, z, a, s);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try expectBitEqual(got, want, "file-loaded video decoder", s);
+}
+
+test "minimax h3: the rgb conversion holds the f32 copy and the bytes, not every step of its chain" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const shape = [_]c_int{ 1, 3, 8, 256, 512 };
+    var res = GenResult{ .pixels = try toyRand(&shape, 3, s), .audio_latent = mlx.mlx_array_new(), .frame_count = 8, .width = 512, .height = 256 };
+    defer res.deinit();
+    try mlx.check(mlx.mlx_array_eval(res.pixels));
+    const values: usize = mlx.mlx_array_size(res.pixels);
+    _ = mlx.mlx_clear_cache();
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_reset_peak_memory();
+    const rgb = try pixelsToRgb8(a, &res, s);
+    defer a.free(rgb);
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    // The bar: the transposed f32 copy (4 B a value) and the u8 result (1), with slack for one more byte.
+    try testing.expect(peak -| active <= values * 6);
+    try testing.expectEqual(values, rgb.len);
+}
+
 test "minimax h3: the measured >=30-step schedules are unchanged" {
     // The fast recipe's 2.67x was measured at 30 steps (and 50 is the app's
     // .superQuality preset) — scaling the gates for short runs must not move
@@ -7481,4 +8396,11 @@ test "add_norm: fused gate + rmsnorm + modulation is bit-equal to modGate -> rms
         try expectBitEqual(got.normed, want, if (with_add) "gated norm+mod" else "norm+mod", s);
         if (with_add) try expectBitEqual(got.h, h1, "gated residual", s);
     }
+}
+
+test "minimax h3: the DiT streams when the request asks, unless a path needs it resident" {
+    try std.testing.expect(streamsDit(true, false, true));
+    try std.testing.expect(!streamsDit(false, false, true)); // "stream_weights": false
+    try std.testing.expect(!streamsDit(true, true, true)); // the ANE builds its programs from resident weights
+    try std.testing.expect(!streamsDit(true, false, false)); // precompute off keeps the AdaLN weights anyway
 }

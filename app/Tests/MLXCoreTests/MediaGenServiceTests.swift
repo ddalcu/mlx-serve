@@ -256,10 +256,10 @@ final class MediaGenServiceTests: XCTestCase {
 
     func testTurboBillsTheLoraBesideTheDiT() {
         // Turbo forces the recipe off (fast: false) and adds the resident
-        // LoRA to the sampling term. On the REAL packs the staged load floor
-        // (max(TE, DiT) + VAEs) already covers it at every servable geometry —
-        // billing must still be monotone there — so the exact +lora mechanism
-        // is pinned on a mutated preset whose sampling term dominates.
+        // LoRA to the sampling term. On the REAL packs another stage can
+        // already cover it — billing must still be monotone there — so the
+        // exact +lora mechanism is pinned on a mutated preset whose sampling
+        // term dominates the load floor and the VAE stage.
         let base = H3Plan.peakBytes(model: .minimaxH3, width: 960, height: 544,
                                     frames: 124, fast: false)
         let turboReal = H3Plan.peakBytes(model: .minimaxH3, width: 960, height: 544,
@@ -268,10 +268,88 @@ final class MediaGenServiceTests: XCTestCase {
 
         var tiny = VideoModelPreset.minimaxH3
         tiny.stagedPeakGB = 1
-        tiny.ditResidentGB = 1
+        tiny.ditResidentGB = 20
         let b = H3Plan.peakBytes(model: tiny, width: 960, height: 544, frames: 124, fast: false)
         let t = H3Plan.peakBytes(model: tiny, width: 960, height: 544, frames: 124, fast: false, turbo: true)
         XCTAssertEqual(t - b, H3Plan.turboLoraBytes)
+    }
+
+    func testStreamWeightsIsAnH3ToggleSentOnlyWhenTurnedOff() {
+        for p in [VideoModelPreset.minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA] {
+            XCTAssertTrue(p.supportsWeightStreaming, "\(p.id) streams its weights")
+        }
+        for p in VideoModelPreset.all where p.backend != .minimaxH3 {
+            XCTAssertFalse(p.supportsWeightStreaming, "\(p.id) must not advertise weight streaming")
+        }
+        // On is the server's default, so the field is sent only to turn it off.
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        XCTAssertNil(VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)["stream_weights"])
+        req.streamWeights = false
+        XCTAssertEqual(VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)["stream_weights"] as? Bool, false)
+        // A switch to a model without the capability must not carry the field along.
+        var ltx = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 768, height: 512,
+                                  numFrames: 97, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        ltx.streamWeights = false
+        XCTAssertNil(VideoGenService.requestBody(model: "m", prompt: "p", request: ltx, firstFrameB64: nil)["stream_weights"])
+    }
+
+    /// A Turbo run turns the fast recipe off, so history records it against the plain recipe:
+    /// a run exactly as long as that predicts calibrates to 1.0.
+    func testTurboRunIsRecordedAgainstThePlainRecipe() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "H3TurboHistory"))
+        defaults.removePersistentDomain(forName: "H3TurboHistory")
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        req.turbo = true
+        let predicted = H3TimeEstimate.seconds(model: .minimaxH3, width: 960, height: 544, frames: 124,
+                                               steps: 8, fast: false, hardware: .anchor)
+        VideoGenService.recordRun(req, steps: 8, measuredSeconds: predicted, defaults: defaults)
+        XCTAssertEqual(H3RunHistory.load(defaults: defaults).speedFactor!, 1.0, accuracy: 0.0001)
+    }
+
+    /// A chained run is recorded against every window it ran.
+    func testChainedRunIsRecordedAgainstEveryWindow() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "H3ChainRecord"))
+        defaults.removePersistentDomain(forName: "H3ChainRecord")
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        req.chainWindows = 3
+        let predicted = H3TimeEstimate.seconds(model: .minimaxH3, width: 960, height: 544, frames: 124,
+                                               steps: 30, fast: req.fastRecipe, hardware: .anchor, windows: 3)
+        VideoGenService.recordRun(req, steps: 30, measuredSeconds: predicted, defaults: defaults)
+        XCTAssertEqual(H3RunHistory.load(defaults: defaults).speedFactor!, 1.0, accuracy: 0.0001)
+    }
+
+    func testStreamingOffBillsTheResidentWeights() {
+        let gib = 1024.0 * 1024 * 1024
+        for p in [VideoModelPreset.minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA] {
+            let on = H3Plan.peakBytes(model: p, width: 960, height: 544, frames: 124, fast: true)
+            let off = H3Plan.peakBytes(model: p, width: 960, height: 544, frames: 124, fast: true, streamWeights: false)
+            XCTAssertGreaterThan(off, on, "\(p.id): holding the weights costs memory")
+            XCTAssertGreaterThan(p.ditResidentUnstreamedGB, p.ditResidentGB)
+            XCTAssertGreaterThan(p.stagedPeakUnstreamedGB, p.stagedPeakGB)
+        }
+        // Measured on the 8-bit pack with "stream_weights": false: a 25.96 GiB text-encoder stage
+        // and a 30.96 GiB denoise peak at 1120x640 x 124 with the fast recipe and the 8-bit cache.
+        let h3 = VideoModelPreset.minimaxH3
+        XCTAssertGreaterThanOrEqual(h3.stagedPeakUnstreamedGB, 25.96)
+        let bill = Double(H3Plan.peakBytes(model: h3, width: 1120, height: 640, frames: 124, fast: true, streamWeights: false,
+                                           cache8bit: true)) / gib
+        XCTAssertGreaterThanOrEqual(bill, 30.96)
+        XCTAssertLessThan(bill, 30.96 + 5)
+    }
+
+    /// The 8-bit cache is opt-in and rides only a request that runs the fast recipe.
+    func testRequestBodySendsThe8BitCacheOnlyWhenAsked() {
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        func body() -> [String: Any] { VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil) }
+        XCTAssertNil(body()["attn_cache_8bit"])
+        req.attnCache8bit = true
+        XCTAssertEqual(body()["attn_cache_8bit"] as? Bool, true)
+        req.bestQuality = true // no fast recipe, no cache to store
+        XCTAssertNil(body()["attn_cache_8bit"])
     }
 
     func testStreamStartFailureSurfacesTheServersOwnMessage() {

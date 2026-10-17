@@ -123,6 +123,8 @@ pub fn formatProgressJson(
     step: u32,
     total: u32,
     preview: ?Encoded,
+    /// Pre-rendered `,"key":value` members appended to the object (`gen_sse.Chain`).
+    extra: []const u8,
 ) ![]u8 {
     var esc_buf: [256]u8 = undefined;
     const esc = jsonEscape(&esc_buf, stage);
@@ -133,14 +135,14 @@ pub fn formatProgressJson(
         _ = std.base64.standard.Encoder.encode(b64, p.jpeg);
         return std.fmt.allocPrint(
             allocator,
-            "{{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d},\"preview\":\"{s}\",\"mime\":\"{s}\",\"w\":{d},\"h\":{d}}}",
-            .{ esc, step, total, b64, p.mime, p.w, p.h },
+            "{{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d},\"preview\":\"{s}\",\"mime\":\"{s}\",\"w\":{d},\"h\":{d}{s}}}",
+            .{ esc, step, total, b64, p.mime, p.w, p.h, extra },
         );
     }
     return std.fmt.allocPrint(
         allocator,
-        "{{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}}}",
-        .{ esc, step, total },
+        "{{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}{s}}}",
+        .{ esc, step, total, extra },
     );
 }
 
@@ -668,7 +670,7 @@ test "jpegFromLatent: a latent whose channel count is not the map's is refused" 
 
 test "formatProgressJson: default event has no preview key" {
     const a = std.testing.allocator;
-    const s = try formatProgressJson(a, "Generating", 8, 30, null);
+    const s = try formatProgressJson(a, "Generating", 8, 30, null, "");
     defer a.free(s);
     try std.testing.expectEqualStrings(
         "{\"type\":\"progress\",\"stage\":\"Generating\",\"step\":8,\"total\":30}",
@@ -683,7 +685,7 @@ test "formatProgressJson: preview event is parseable JSON with JPEG b64" {
     const a = std.testing.allocator;
     const jpg = [_]u8{ 0xFF, 0xD8, 0xFF, 0x00 };
     const enc = Encoded{ .jpeg = @constCast(&jpg), .w = 256, .h = 144 };
-    const s = try formatProgressJson(a, "Generating", 8, 30, enc);
+    const s = try formatProgressJson(a, "Generating", 8, 30, enc, "");
     defer a.free(s);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, s, .{});
     defer parsed.deinit();

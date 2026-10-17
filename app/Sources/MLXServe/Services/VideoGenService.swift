@@ -34,6 +34,8 @@ final class VideoGenService: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var livePreview: NSImage? = nil
+    /// Percent, step, pace and workload of the current run; nil until its first progress event.
+    @Published private(set) var readout: VideoRunReadout? = nil
     /// When the current run started; read only while `phase` is `.running`.
     @Published private(set) var startedAt = Date()
     @Published private(set) var recent: [String] = []
@@ -52,7 +54,9 @@ final class VideoGenService: ObservableObject {
         phase = p
         switch p {
         case .running: break
-        default: livePreview = nil
+        default:
+            livePreview = nil
+            readout = nil
         }
     }
 
@@ -95,6 +99,7 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
+        readout = nil
         startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
@@ -207,7 +212,7 @@ final class VideoGenService: ObservableObject {
     /// `progress` events (`label` prefixes the stage, e.g. the shot number) and
     /// return the decoded frames. A server `error` event throws its message.
     private func streamWindow(_ request: VideoGenRequest, body: [String: Any], port: UInt16, gen: Int,
-                              label: String = "") async throws -> DecodedFrames {
+                              label: String = "", shot: Int = 0, shots: Int = 1) async throws -> DecodedFrames {
         let steps = request.steps
         var decoded: DecodedFrames? = nil
         // Live ETA from the run's own cadence — the only estimate that
@@ -216,15 +221,18 @@ final class VideoGenService: ObservableObject {
         var clock = H3StepClock()
         // Floor + tail for the live number (H3 only; LTX keeps the
         // plain lap mean — its laps are near-uniform and it has no
-        // pre-run model to floor against). `fast` is effectiveFast:
-        // turbo forces the server recipe off, never !bestQuality alone.
+        // pre-run model to floor against).
         let pricing: (perStep: Double, tail: Double) =
             request.model.backend == .minimaxH3
             ? H3TimeEstimate.livePricing(model: request.model,
                                          width: request.width, height: request.height,
                                          frames: request.numFrames, steps: steps,
-                                         fast: !request.bestQuality && !request.turbo)
+                                         fast: request.fastRecipe,
+                                         streamWeights: request.streamWeights)
             : (0, 0)
+        let samplingShare = VideoRunReadout.samplingShare(perStep: pricing.perStep, steps: steps, tail: pricing.tail)
+        // A chained run's events name their window; events between windows keep the last one.
+        var window: Int? = nil, windows: Int? = nil
         let startedAt = ProcessInfo.processInfo.systemUptime
         for try await ev in api.streamGeneration(
             port: port, path: "/v1/video/generations", json: body) {
@@ -233,7 +241,9 @@ final class VideoGenService: ObservableObject {
                 let step = ev["step"] as? Int ?? 0
                 let total = ev["total"] as? Int ?? steps
                 let stage = ev["stage"] as? String ?? L10n.text("Generating")
-                clock.observe(step: step)
+                window = ev["window"] as? Int ?? window
+                windows = ev["windows"] as? Int ?? windows
+                clock.observe(step: step, window: window, windows: windows)
                 var message = label + L10n.format("%@…", L10n.text(stage))
                 if let eta = clock.eta(totalSteps: max(total, 1),
                                        floorPerStep: pricing.perStep, tail: pricing.tail),
@@ -242,6 +252,12 @@ final class VideoGenService: ObservableObject {
                 }
                 if let data = MediaSSE.previewJPEG(ev), let img = NSImage(data: data) {
                     setLivePreview(img, for: gen)
+                }
+                if gen == generationSeq {
+                    readout = VideoRunReadout.make(
+                        step: step, total: total, window: window, windows: windows,
+                        shot: shot, shots: shots, samplingShare: samplingShare,
+                        secondsPerStep: clock.secondsPerStep)
                 }
                 setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
             case "complete":
@@ -260,10 +276,19 @@ final class VideoGenService: ObservableObject {
         // estimate is measured rather than extrapolated. Recorded from
         // the SAMPLING span only — the encode after this is ours, not the
         // model's, and the estimate does not include it.
-        H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
-                              frames: request.numFrames, steps: steps, fast: !request.bestQuality,
-                              measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
+        Self.recordRun(request, steps: steps, measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
         return frames
+    }
+
+    /// One finished run into this Mac's history, priced with the recipe and streaming it ran.
+    static func recordRun(_ request: VideoGenRequest, steps: Int, measuredSeconds: Double,
+                          defaults: UserDefaults = .standard) {
+        H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
+                              frames: request.numFrames, steps: steps, fast: request.fastRecipe,
+                              streamWeights: request.streamWeights,
+                              windows: request.model.supportsChainedWindows ? request.chainWindows : 1,
+                              measuredSeconds: measuredSeconds,
+                              defaults: defaults)
     }
 
     /// A storyboard: one window per shot, each opening on the previous shot's
@@ -286,6 +311,7 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
+        readout = nil
         startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
@@ -342,7 +368,8 @@ final class VideoGenService: ObservableObject {
                     let body = Self.requestBody(model: modelId, prompt: req.prompt, request: req,
                                                 firstFrameB64: first, lastFrameB64: last)
                     let label = L10n.format("Shot %lld of %lld · ", Int64(i + 1), Int64(shots.count))
-                    let frames = try await streamWindow(req, body: body, port: port, gen: gen, label: label)
+                    let frames = try await streamWindow(req, body: body, port: port, gen: gen, label: label,
+                                                        shot: i, shots: shots.count)
                     setPhase(.running(step: req.steps, total: req.steps, message: label + L10n.text("Encoding mp4…")), for: gen)
                     let url = shotsDir.appendingPathComponent(String(format: "shot-%02d.mp4", i + 1))
                     let png = shotsDir.appendingPathComponent(String(format: "shot-%02d-last.png", i + 1))
@@ -590,6 +617,8 @@ final class VideoGenService: ObservableObject {
         // and emitted only when engaged — the server's defaults are the
         // absent-field behavior.
         if request.model.supportsTurbo, request.turbo { body["turbo"] = true }
+        if request.model.supportsWeightStreaming, !request.streamWeights { body["stream_weights"] = false }
+        if request.model.supportsFastRecipe, request.fastRecipe, request.attnCache8bit { body["attn_cache_8bit"] = true }
         if request.model.supportsChainedWindows, request.chainWindows > 1 {
             body["chain_windows"] = request.chainWindows
         }
@@ -692,13 +721,19 @@ final class VideoGenService: ObservableObject {
             lines.append("stg_scale: \(String(format: "%.2f", request.stgScale))")
         }
         if request.model.supportsFastRecipe {
-            lines.append("fast_recipe: \(!request.bestQuality && !request.turbo)")
+            lines.append("fast_recipe: \(request.fastRecipe)")
         }
         if request.model.supportsDiffusionDecoder {
             lines.append("decoder: \(request.diffusionDecoder ? "diffusion" : "convolution")")
         }
         if request.model.supportsTurbo {
             lines.append("turbo: \(request.turbo)")
+        }
+        if request.model.supportsWeightStreaming {
+            lines.append("stream_weights: \(request.streamWeights)")
+        }
+        if request.model.supportsFastRecipe, request.fastRecipe {
+            lines.append("attn_cache_8bit: \(request.attnCache8bit)")
         }
         if request.model.supportsChainedWindows {
             lines.append("chain_windows: \(max(request.chainWindows, 1))")

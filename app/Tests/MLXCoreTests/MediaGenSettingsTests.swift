@@ -120,6 +120,8 @@ final class MediaGenSettingsTests: XCTestCase {
         s.bestQuality = true
         s.diffusionDecoder = true
         s.turbo = true
+        s.streamWeights = false
+        s.attnCache8bit = true
         s.stage2Steps = 4
         s.cfgAudioScale = 5.5
         s.chainWindows = 3

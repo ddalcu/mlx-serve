@@ -537,6 +537,7 @@ pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
 // ── Memory management ──
 pub extern "c" fn mlx_clear_cache() c_int;
 pub extern "c" fn mlx_set_memory_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_get_memory_limit(res: *usize) c_int;
 pub extern "c" fn mlx_set_cache_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_set_wired_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;

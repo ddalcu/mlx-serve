@@ -6,8 +6,9 @@
 # pcm_s16le stereo track of the RIGHT lengths (frame count snapped to the
 # model's 17k+5 ladder), the named-400 surface (LoRA is the one field the
 # backend cannot honor in any form; a non-/32 canvas; chat against a video
-# model), SSE progress -> complete, and the staged-residency media preflight
-# engagement line (max(TE,DiT)+VAEs, never the 64.5 GB sum).
+# model), SSE progress -> complete, the staged-residency media preflight
+# engagement line (max(TE,DiT)+VAEs, never the 64.5 GB sum), and a disconnect
+# mid-step freeing the GPU within seconds.
 #
 # Usage: [H3_MODEL=<dir>] ./tests/test_minimax_h3.sh [port]
 set -uo pipefail
@@ -53,13 +54,12 @@ curl -s "http://127.0.0.1:$PORT/v1/models" | grep -q '"video"' \
   || { echo "FAIL: /v1/models missing video capability"; rc=1; }
 # The NUMBER is the assertion, not the line: the line printed happily while
 # the stub's modality-static model_type routed the bill to the 64.5 GB sum.
-# The three stages are DISJOINT (TE freed before the DiT loads, DiT freed
-# before the VAEs), and the DiT sheds its AdaLN weights, so the 8-bit pack's
-# bill is max(TE 26.28, DiT 32.83x0.65 + turbo 0.73 + 6 activations) = 28.06 —
-# against a 64.5 GB sum and the 38.97 this used to read.
+# The stages are DISJOINT and the weights stream by default, so the 8-bit
+# pack's bill is its biggest stage, the VAE (decoder file + base), above the
+# streamed TE and DiT; never the 64.5 GB sum or the resident plan's ~28.
 PEAK=$(grep -m1 "media peak" "$LOG" | sed -E 's/.*media peak ~([0-9.]+) GB.*/\1/')
-if [ -n "$PEAK" ] && python3 -c "import sys; sys.exit(0 if 24.0 < float('$PEAK') < 32.0 else 1)"; then
-  echo "PASS: media preflight billed the biggest stage (~$PEAK GB, not the ~64.5 sum)"
+if [ -n "$PEAK" ] && python3 -c "import sys; sys.exit(0 if 4.5 < float('$PEAK') < 9.0 else 1)"; then
+  echo "PASS: media preflight billed the biggest streamed stage (~$PEAK GB, not the ~64.5 sum)"
 else
   echo "FAIL: media preflight peak '$PEAK' GB is not the staged bill"; rc=1
 fi
@@ -451,6 +451,48 @@ assert aud > 0 and aud % 4 == 0, f"audio cond rows {aud} are not two equal-lengt
 print(f"PASS: ref2va engagement — image#1/video#1/audio#2 in order, {vis} visual + {aud} audio cond rows")
 PY
   [ $? -eq 0 ] || rc=1
+fi
+
+# [8] a client that leaves mid-step frees the GPU within seconds. A step is one
+# graph that runs for tens of seconds at this canvas; the forward polls between
+# DiT blocks, so the cancel line lands well inside the bound. Sized so a dense
+# step outlasts it: a forward that only polls between steps fails here.
+CANCEL_SIZE="${H3_CANCEL_SIZE:-960x544}"
+CANCEL_BOUND="${H3_CANCEL_BOUND:-10}"
+CW=${CANCEL_SIZE%x*}; CH=${CANCEL_SIZE#*x}
+SSE_CANCEL=/tmp/test_minimax_h3_sse_cancel.txt
+: >"$SSE_CANCEL"
+curl -sN --max-time 1800 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d "{\"prompt\":\"a slow pan over dunes\",\"num_frames\":124,\"width\":$CW,\"height\":$CH,\"steps\":30,\"seed\":3,\"fast\":false,\"stream\":true}" \
+  >"$SSE_CANCEL" &
+CANCEL_CURL=$!
+IN_LOOP=0
+for i in $(seq 1 1200); do
+  grep -q '"stage":"Generating"' "$SSE_CANCEL" 2>/dev/null && { IN_LOOP=1; break; }
+  kill -0 $CANCEL_CURL 2>/dev/null || break
+  sleep 0.5
+done
+if [ "$IN_LOOP" = "1" ]; then
+  CANCELS_BEFORE=$(grep -c '\[video\] generation cancelled' "$LOG")
+  kill $CANCEL_CURL 2>/dev/null; wait $CANCEL_CURL 2>/dev/null
+  T0=$(python3 -c 'import time; print(time.time())')
+  WAITED=""
+  for i in $(seq 1 480); do
+    if [ "$(grep -c '\[video\] generation cancelled' "$LOG")" -gt "$CANCELS_BEFORE" ]; then
+      WAITED=$(python3 -c "import time; print(f'{time.time() - $T0:.1f}')"); break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$WAITED" ]; then
+    echo "FAIL: no cancel line within 120 s of the disconnect"; tail -5 "$LOG"; rc=1
+  elif python3 -c "import sys; sys.exit(0 if $WAITED <= $CANCEL_BOUND else 1)"; then
+    echo "PASS: disconnect mid-step -> cancelled after ${WAITED} s (bound ${CANCEL_BOUND} s)"
+  else
+    echo "FAIL: cancel took ${WAITED} s, past the ${CANCEL_BOUND} s bound"; rc=1
+  fi
+else
+  kill $CANCEL_CURL 2>/dev/null
+  echo "FAIL: the ${CANCEL_SIZE} run never reached a Generating step"; tail -c 300 "$SSE_CANCEL"; tail -5 "$LOG"; rc=1
 fi
 
 if [ $rc -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
