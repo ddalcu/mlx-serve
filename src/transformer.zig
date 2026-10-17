@@ -33318,7 +33318,7 @@ pub const Transformer = struct {
         return true;
     }
 
-    /// MXFP4 banks at decode and verify widths: `moe_fp4`'s two dispatches over
+    /// fp4 banks at decode and verify widths: `moe_fp4`'s two dispatches over
     /// every token's own experts. Writes the weighted sum [B,S,D] into `out`;
     /// false when the kernels decline.
     fn moeFp4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights, mode: QuantMode, group_size: u32, shared: ?moe_affine4.Shared) !bool {
@@ -33340,8 +33340,12 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&sc2, norm_scores, &.{ rows, k }, 2, self.s));
         const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(expert_x), std.heap.c_allocator);
         const Bank = moe_fp4.Bank;
-        const gate_scale: ?mlx.mlx_array = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null;
-        const y = (try moe_fp4.decode(self.s, x2, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s }, mw.bank_views, gate_scale, shared, ind_u, sc2, sigtab, mode, group_size)) orelse return false;
+        const scales: moe_fp4.Scales = .{
+            .gate = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
+            .up = if (mw.up_expert_scale.ctx != null) mw.up_expert_scale else null,
+            .clamp = swigluClampLimit(&self.config) orelse return false,
+        };
+        const y = (try moe_fp4.decode(self.s, x2, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s }, mw.bank_views, scales, shared, ind_u, sc2, sigtab, mode, group_size)) orelse return false;
         defer _ = mlx.mlx_array_free(y);
         try mlx.check(mlx.mlx_reshape(out, y, &.{ xs[0], xs[1], xs[2] }, 3, self.s));
         return true;
@@ -33670,7 +33674,7 @@ pub const Transformer = struct {
         var cost_arm: u8 = 4;
 
         const fp4_shared: ?moe_affine4.Shared = if (B * S == 1) if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null else null;
-        if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), gate_qp.mode, up_qp.mode, down_qp.mode) and
+        if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), mlx.mlx_array_dtype(expert_x), gate_qp.mode, up_qp.mode, down_qp.mode) and
             try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.mode, gate_qp.group_size, fp4_shared))
         {
             moe_reduced = true;
@@ -74253,14 +74257,14 @@ test "mimo decode copies: a short prompt chunk prefills dense, a verify window r
     try testing.expect(!mimoDecodeCopies(true, 2, false, false, 1));
 }
 
-/// The MXFP4 MoE decode kernels bake plain `silu(gate) * up` and read no expert biases:
-/// a pack with either keeps the composed chain, like the row kernels below it.
-/// `clamp` is `swigluClampLimit`: 0 = no clamp, null = a clamp no kernel serves.
-fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, gate: model_mod.QuantMode, up: model_mod.QuantMode, down: model_mod.QuantMode) bool {
-    return rows <= moe_fp4.MAX_ROWS and !has_expert_bias and (clamp orelse 1) == 0 and (gate == .mxfp4 or gate == .nvfp4) and up == gate and down == gate;
+/// The fp4 MoE decode kernels read no expert biases, and apply a SwiGLU clamp only as a whole-number
+/// limit: a pack with a bias, or `clamp` null (`swigluClampLimit`: a clamp no kernel serves), keeps the
+/// composed chain, as does an activation that is not 16-bit (the SwiGLU table covers 16-bit patterns).
+fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, act: mlx.mlx_dtype, gate: model_mod.QuantMode, up: model_mod.QuantMode, down: model_mod.QuantMode) bool {
+    return rows <= moe_fp4.MAX_ROWS and !has_expert_bias and clamp != null and (act == .bfloat16 or act == .float16) and (gate == .mxfp4 or gate == .nvfp4) and up == gate and down == gate;
 }
 
-test "moe fp4 decode: expert biases or a clamped SwiGLU keep the composed chain" {
+test "moe fp4 decode: expert biases or a clamp no kernel serves keep the composed chain" {
     var cfg: ModelConfig = undefined;
     cfg.swiglu_limit = 0;
     cfg.swiglu_clamp = false;
@@ -74268,14 +74272,17 @@ test "moe fp4 decode: expert biases or a clamped SwiGLU keep the composed chain"
     cfg.swiglu_limit = 10;
     cfg.swiglu_clamp = true;
     try testing.expectEqual(@as(?u32, 10), swigluClampLimit(&cfg));
-    try testing.expect(moeFp4DecodeEligible(1, false, 0, .mxfp4, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, true, 0, .mxfp4, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, false, 10, .mxfp4, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, false, null, .mxfp4, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .affine, .mxfp4, .mxfp4));
-    try testing.expect(moeFp4DecodeEligible(1, false, 0, .nvfp4, .nvfp4, .nvfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .nvfp4, .mxfp4, .nvfp4));
-    try testing.expect(!moeFp4DecodeEligible(moe_fp4.MAX_ROWS + 1, false, 0, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(moeFp4DecodeEligible(1, false, 0, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, true, 0, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(moeFp4DecodeEligible(1, false, 10, .bfloat16, .nvfp4, .nvfp4, .nvfp4));
+    // An f32 stream (an f32 norm weight upstream) has no sigmoid table: decline, never throw.
+    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .float32, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(moeFp4DecodeEligible(1, false, 0, .float16, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, null, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .bfloat16, .affine, .mxfp4, .mxfp4));
+    try testing.expect(moeFp4DecodeEligible(1, false, 0, .bfloat16, .nvfp4, .nvfp4, .nvfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .bfloat16, .nvfp4, .mxfp4, .nvfp4));
+    try testing.expect(!moeFp4DecodeEligible(moe_fp4.MAX_ROWS + 1, false, 0, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
 }
 
 test "glm5_next: oMLX 0.7.1's layout (one fused conv1d, forget_gate.*) gives the published layout's logits bit for bit (GLM5_MODEL)" {

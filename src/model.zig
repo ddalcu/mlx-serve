@@ -5198,6 +5198,16 @@ pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool
     return ndim == 1;
 }
 
+/// An f32 layer-norm weight beside bf16 activations (NVIDIA's ModelOpt GLM pack stores
+/// `post_attention_layernorm` f32): `rms_norm` promotes to the weight's dtype, so the MoE reads f32
+/// and the fused hyper-connection read declines. Narrowed like the f16 norms; the f32 per-channel
+/// state tables (`A_log`, `dt_bias`, `hc_*`, `e_score_correction_bias`) are not norms and stay f32, and a
+/// vision tower keeps the f32 its reference runs in.
+pub fn narrowsLoadedF32Norm(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool {
+    return dtype == .float32 and ndim == 1 and std.mem.indexOf(u8, key, "language_model.") != null and
+        (std.mem.endsWith(u8, key, "layernorm.weight") or std.mem.endsWith(u8, key, "language_model.norm.weight"));
+}
+
 /// Kill switch for the 1-D arm (`MLX_SERVE_F16_NARROW_1D=0`). A load-time
 /// dtype normalization is invisible once the model is up, so a one-boot A/B
 /// switch is the only way to attribute a future f16-checkpoint regression to
@@ -5325,7 +5335,7 @@ pub fn loadSafetensorsFile(
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
         if (!(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
-            !opts.keep_f16 and narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
+            !opts.keep_f16 and (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) or narrowsLoadedF32Norm(key_str, ndim, mlx.mlx_array_dtype(value))) and
             (ndim != 1 or narrow1dEnabled()))
         {
             var cast = mlx.mlx_array_new();
@@ -9279,6 +9289,22 @@ test "narrowsLoadedF16 catches per-channel tables, not matmul operands" {
     try testing.expect(!narrowsLoadedF16("model.layers.0.input_layernorm.weight", 1, .bfloat16));
     try testing.expect(!narrowsLoadedF16("model.layers.0.mlp.down_proj.weight", 2, .uint32));
     try testing.expect(!narrowsLoadedF16("model.layers.0.mlp.down_proj.scales", 2, .bfloat16));
+}
+
+test "narrowsLoadedF32Norm takes f32 layer norms, not f32 state tables or other-dtype norms" {
+    try testing.expect(narrowsLoadedF32Norm("model.language_model.layers.3.post_attention_layernorm.weight", 1, .float32));
+    try testing.expect(narrowsLoadedF32Norm("model.language_model.layers.3.input_layernorm.weight", 1, .float32));
+    try testing.expect(narrowsLoadedF32Norm("model.language_model.norm.weight", 1, .float32));
+    // Stay f32 by design: hyper-connection norm and tables, recurrent-state constants, routing bias.
+    try testing.expect(!narrowsLoadedF32Norm("model.language_model.layers.3.attn_hyper_connection.hc_norm.weight", 1, .float32));
+    try testing.expect(!narrowsLoadedF32Norm("model.language_model.layers.3.hc_ffn_base", 1, .float32));
+    try testing.expect(!narrowsLoadedF32Norm("model.language_model.layers.3.self_attn.A_log", 1, .float32));
+    try testing.expect(!narrowsLoadedF32Norm("model.language_model.layers.3.mlp.gate.e_score_correction_bias", 1, .float32));
+    // A vision tower runs in its reference's f32: only the language trunk's norms narrow.
+    try testing.expect(!narrowsLoadedF32Norm("vision_projector.vision_final_layernorm.weight", 1, .float32));
+    // Already the engine's dtype, or not a vector.
+    try testing.expect(!narrowsLoadedF32Norm("model.language_model.layers.3.post_attention_layernorm.weight", 1, .bfloat16));
+    try testing.expect(!narrowsLoadedF32Norm("model.language_model.layers.3.post_attention_layernorm.weight", 2, .float32));
 }
 
 test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {
