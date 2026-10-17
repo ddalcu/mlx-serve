@@ -77,9 +77,9 @@ pub const pause = struct {
     var running: std.atomic.Value(u64) = .init(0);
     var requested: std.atomic.Value(u64) = .init(0);
 
-    pub fn begin() u64 {
+    pub fn begin(io: std.Io) u64 {
         var tok: u64 = 0;
-        while (tok == 0) std.c.arc4random_buf(@ptrCast(&tok), @sizeOf(u64));
+        while (tok == 0) io.random(std.mem.asBytes(&tok));
         running.store(tok, .release);
         return tok;
     }
@@ -204,7 +204,7 @@ pub const StreamCtx = struct {
     /// Make a streaming job pausable: announce its id, and let `boundary` hold on it.
     pub fn beginPause(self: *StreamCtx) void {
         if (!self.stream) return;
-        self.pause_token = pause.begin();
+        self.pause_token = pause.begin(self.conn.io);
         var buf: [64]u8 = undefined;
         self.event(std.fmt.bufPrint(&buf, "data: {{\"type\":\"job\",\"id\":\"{x:0>16}\"}}\n\n", .{self.pause_token}) catch unreachable);
         gen_pause = self;
@@ -650,10 +650,11 @@ test "a client that leaves while paused cancels the job" {
 }
 
 test "a pause token binds ONE job: a finished job's id pauses nothing" {
-    const a = pause.begin();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = pause.begin(io);
     pause.end(a);
     try std.testing.expect(!pause.set(a, true));
-    const b = pause.begin();
+    const b = pause.begin(io);
     defer pause.end(b);
     try std.testing.expect(a != b and b != 0);
     try std.testing.expect(!pause.isRequested(b));
