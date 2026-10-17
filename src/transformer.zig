@@ -31336,6 +31336,7 @@ pub const Transformer = struct {
                 .conv_w = la.conv1d_w,
                 .q_scale = inv_scale_sq,
                 .k_scale = inv_sqrt_sc,
+                .qk_eps = cfg.gdnQkNormEps(),
                 .hk = num_k_heads,
                 .hv = num_v_heads,
                 .dk = dk,
@@ -31447,12 +31448,12 @@ pub const Transformer = struct {
 
             var q_norm = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_norm);
-            try mlx.check(mlx.mlx_fast_rms_norm(&q_norm, q_heads, ones_w, 1e-6, self.s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&q_norm, q_heads, ones_w, cfg.gdnQkNormEps(), self.s));
             try mlx.check(mlx.mlx_multiply(&q_scaled, q_norm, inv_scale_sq, self.s));
 
             var k_norm = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(k_norm);
-            try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, ones_w, 1e-6, self.s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, ones_w, cfg.gdnQkNormEps(), self.s));
             try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, self.s));
         }
 
@@ -31730,7 +31731,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_reshape(&heads, flat, &[_]c_int{ batch, seq, hk, dk }, 4, s));
             var nrm = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(nrm);
-            try mlx.check(mlx.mlx_fast_rms_norm(&nrm, heads, self.gdn_ones_w.?, 1e-6, s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&nrm, heads, self.gdn_ones_w.?, self.config.gdnQkNormEps(), s));
             var scaled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(scaled);
             try mlx.check(mlx.mlx_multiply(&scaled, nrm, case[2], s));
@@ -39077,7 +39078,7 @@ const GDN_PREWORK_SOURCE =
     \\}
     \\if (is_q || is_k) {
     \\    sumsq = simd_sum(sumsq);
-    \\    float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
+    \\    float inv = metal::precise::rsqrt(sumsq / float(DK) + qk_eps);
     \\    const T scale = is_q ? q_scale : k_scale;
     \\    uint out_base = (row * uint(HK) + head) * uint(DK) + lane * 4;
     \\    for (uint i = 0; i < 4; ++i) {
@@ -39195,7 +39196,7 @@ fn gdnDecodeRecurEnabled() bool {
 
 fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
     if (gdn_prework_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale", "b_in", "a_in", "A_log", "dt_bias", "sigtab", "seq" };
+    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale", "b_in", "a_in", "A_log", "dt_bias", "sigtab", "seq", "qk_eps" };
     const output_names = [_][*:0]const u8{ "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -39262,6 +39263,7 @@ pub const GdnPreworkArgs = struct {
     conv_w: mlx.mlx_array, // [C, 4, 1] bf16
     q_scale: mlx.mlx_array, // 0-dim bf16 (1/dk)
     k_scale: mlx.mlx_array, // 0-dim bf16 (1/sqrt(dk))
+    qk_eps: f32 = 1e-6, // `ModelConfig.gdnQkNormEps`
     hk: c_int,
     hv: c_int,
     dk: c_int,
@@ -39330,7 +39332,9 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     const kernel = try getGdnPreworkKernel();
     const seq_arr = mlx.mlx_array_new_int(in.seq);
     defer _ = mlx.mlx_array_free(seq_arr);
-    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try sigmoidTableFor(s, dt) else in.qkv, seq_arr };
+    const eps_arr = mlx.mlx_array_new_float(in.qk_eps);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try sigmoidTableFor(s, dt) else in.qkv, seq_arr, eps_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
@@ -66652,7 +66656,7 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
     defer if (config.ngram_table_path) |p| allocator.free(p);
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
@@ -73714,6 +73718,33 @@ test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2
     try testing.expect(worst > 0.995 and agree == @as(usize, @intCast(T - t_pre)));
 }
 
+test "glm5_next KDA q/k norm equals fla's l2norm on keys as small as the checkpoint's" {
+    // Bar: the prework's rms_norm(x, gdnQkNormEps) / sqrt(dk) is x / sqrt(sum(x^2) + 1e-6) within 1e-4.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const cfg: model_mod.ModelConfig = .{ .model_type = "glm5_next", .linear_key_head_dim = 128 };
+    const dk: usize = 128;
+    var prng = std.Random.DefaultPrng.init(7);
+    var xv: [4 * dk]f32 = undefined;
+    for (&xv) |*x| x.* = 0.005 * prng.random().floatNorm(f32);
+    const x = mlx.mlx_array_new_data(&xv, &[_]c_int{ 4, @intCast(dk) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{@intCast(dk)}, 1, .float32, s));
+    var n = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(n);
+    try mlx.check(mlx.mlx_fast_rms_norm(&n, x, ones, cfg.gdnQkNormEps(), s));
+    const got = try qwen4ReadF32(testing.allocator, n, s);
+    defer testing.allocator.free(got);
+    for (0..4) |r| {
+        var sum: f64 = 0;
+        for (xv[r * dk ..][0..dk]) |v| sum += @as(f64, v) * v;
+        const inv = 1.0 / @sqrt(sum + 1e-6);
+        for (0..dk) |i| try testing.expectApproxEqRel(xv[r * dk + i] * inv, got[r * dk + i] / @sqrt(@as(f64, dk)), 1e-4);
+    }
+}
+
 test "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_next (GLM5_MODEL, GLM5_FIXTURE)" {
     // A tiny random GLM-5-Next in the published layout (tests/dump_glm5_next_fixtures.py);
     // logits from mlx-vlm's glm5_next in bf16. 40 tokens in 4-token pools against a
@@ -73729,7 +73760,7 @@ test "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_n
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
@@ -73809,7 +73840,7 @@ test "glm5_next DFlash capture: the tapped layers' hyper-connection mean tracks 
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
@@ -74005,7 +74036,7 @@ test "glm5_next batched decode: a three-slot tick tracks three serial decodes (G
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
@@ -74258,7 +74289,7 @@ test "glm5_next: oMLX 0.7.1's layout (one fused conv1d, forget_gate.*) gives the
     const Logits = struct {
         fn of(io_: std.Io, alloc: std.mem.Allocator, cfg_in: model_mod.ModelConfig, dir: []const u8, omlx: bool, st: mlx.mlx_stream) ![]f32 {
             var cfg = cfg_in;
-            var w = try model_mod.loadWeights(io_, alloc, dir);
+            var w = try model_mod.loadModelWeights(io_, alloc, dir, &cfg, false);
             defer w.deinit();
             model_mod.resolveWeightPrefix(&cfg, &w);
             if (omlx) for (0..cfg.num_hidden_layers) |li| {

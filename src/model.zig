@@ -1254,6 +1254,13 @@ pub const ModelConfig = struct {
         return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
     }
 
+    /// Epsilon of the per-head q/k RMS norm in the linear-attention prework. GLM's reference
+    /// normalizes with fla's l2norm (1e-6 on the SUM of squares), which is 1e-6/dk on the mean;
+    /// its post-conv keys are small enough that 1e-6 on the mean shrank them ~2%.
+    pub fn gdnQkNormEps(self: *const ModelConfig) f32 {
+        return if (self.isGlm5()) 1e-6 / @as(f32, @floatFromInt(self.linear_key_head_dim)) else 1e-6;
+    }
+
     /// The pooling op /v1/embeddings runs: the explicit signal, else masked
     /// mean (the historical default — correct for MiniLM and EmbeddingGemma).
     pub fn effectivePooling(self: *const ModelConfig) PoolingMode {

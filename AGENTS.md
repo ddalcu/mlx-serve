@@ -488,6 +488,7 @@ Kernels + numerics:
 - **qwen4 residual stream is bf16; the f32 fixture is the MATH oracle** (`QWEN4_STREAM_F32=1`; `qwen4 fixture bf16` pins streams at 0.999).
 - **A fusion on a small dense model pays only by shortening the DEPENDENT chain** (`fuseRowGroup` at decode width only, `fusedResidualNorm`, `tableGateMul`, `fusedGatedConvStep`, `fusedGeluPleProj`).
 - **Gates**: a lower bound may REPLACE the formula (KDA `kdaUsesBoundedGate`); per-head vs per-channel gating is an INDEXING contract (`gdnKernelSource(vectorized, …)`). A struct in a generic fn must capture its comptime params.
+- **A norm's epsilon sits where the REFERENCE puts it**: fla's l2norm adds it to the SUM, `rms_norm` to the MEAN (`gdnQkNormEps`: GLM 1e-6/dk); GLM's small post-conv keys came out 1.8% short per KDA layer at 1e-6.
 - **Prefill perf kernels A/B PER ARCH before default-on** (`gdnBlockedEligible`, `prefillDqGemm`). dsv4 decode glue is FUSED (`dsv4_emit_win`, `dsv4_dec_chain`). A sparse-attention PATTERN cannot be tuned into correctness (H3, DEAD).
 - **Memory**: RSS is blind to Metal (`/props` `active_bytes`); a live handle pins its buffer through the eval, so free a step's intermediates BEFORE evaluating it; a weights MAP outliving the model pins every buffer; `iterator_next` hands a +1; `mlx_array_new_data` COPIES shape-worth of bytes; Metal at the working-set edge returns ZEROS before it aborts.
 - **Tokenizer**: special-token splitting only in `Tokenizer.encode` (first-byte buckets); any per-position loop over a vocab-derived collection needs an index.

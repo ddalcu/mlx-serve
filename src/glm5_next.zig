@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const dsa = @import("dsa_nax.zig");
+const Scope = @import("mlx_scope.zig").Scope;
 
 pub const HC: c_int = 4;
 const MIX: c_int = (2 + HC) * HC;
@@ -226,7 +227,7 @@ fn mixes(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array, eps: 
     const sh = mlx.getShape(stream);
     // A threadgroup per 8 rows streams the whole `fn`: at decode widths that is one core
     // reading 1.5 MB per sublayer, and MLX's GEMV spreads it instead.
-    if (sh[0] * sh[1] < MIXES_KERNEL_MIN_ROWS) {
+    if (sh[0] * sh[1] < MIXES_KERNEL_MIN_ROWS or !mlx.streamIsGpu(s)) {
         var y = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y);
         try mlx.check(mlx.mlx_astype(&y, stream, .float32, s));
@@ -292,6 +293,7 @@ pub fn collapse(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array
     if (sh.len != 4 or sh[2] != HC or @rem(sh[3], 4) != 0) return error.Glm5HcShape;
     const m = try mixes(s, stream, fn_rows, norm_eps);
     defer _ = mlx.mlx_array_free(m);
+    if (!mlx.streamIsGpu(s)) return collapseOps(s, stream, m, scale, base, iters, hc_eps);
     const kernel = collapse_kernel orelse blk: {
         const ins = [_][*:0]const u8{ "x_in", "mixes", "scale", "base" };
         const outs = [_][*:0]const u8{ "collapsed", "post", "comb" };
@@ -331,6 +333,36 @@ pub fn collapse(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array
     try mlx.check(mlx.mlx_vector_array_get(&out.post, ov, 1));
     try mlx.check(mlx.mlx_vector_array_get(&out.comb, ov, 2));
     return out;
+}
+
+/// `collapse` as MLX ops, where custom Metal kernels cannot run (CUDA).
+fn collapseOps(s: mlx.mlx_stream, stream: mlx.mlx_array, m: mlx.mlx_array, scale: mlx.mlx_array, base: mlx.mlx_array, iters: u32, eps: f32) !Collapsed {
+    var sc = Scope.init(std.heap.page_allocator, s);
+    defer sc.deinit();
+    const sh = mlx.getShape(stream);
+    const Gate = struct {
+        fn z(c: *Scope, mix: mlx.mlx_array, sv: mlx.mlx_array, bv: mlx.mlx_array, k: c_int, lo: c_int, hi: c_int) !mlx.mlx_array {
+            return c.add(try c.mul(try c.slice(mix, 2, lo, hi), try c.slice(sv, 0, k, k + 1)), try c.slice(bv, 0, lo, hi));
+        }
+        /// Each row (axis -1) or column (axis -2) divided by its sum + eps.
+        fn norm(c: *Scope, r: mlx.mlx_array, axis: c_int, e: f32) !mlx.mlx_array {
+            return c.div(r, try c.addS(try c.sumAxis(r, axis), e));
+        }
+    };
+    const pre = try sc.addS(try sc.sigmoid(try Gate.z(&sc, m, scale, base, 0, 0, HC)), eps);
+    const post = try sc.mulS(try sc.sigmoid(try Gate.z(&sc, m, scale, base, 1, HC, 2 * HC)), 2.0);
+    const v = try sc.reshape(try Gate.z(&sc, m, scale, base, 2, 2 * HC, MIX), &.{ sh[0], sh[1], HC, HC });
+    var r = try sc.addS(try Gate.norm(&sc, try sc.exp(try sc.sub(v, try sc.maxAxis(v, -1))), -1, eps), eps);
+    r = try Gate.norm(&sc, r, -2, eps);
+    for (1..iters) |_| r = try Gate.norm(&sc, try Gate.norm(&sc, r, -1, eps), -2, eps);
+    // Four f32 multiply-adds, as the kernel does: an f32 matmul rounds through TF32 on CUDA.
+    const sf = try sc.astype(stream, .float32);
+    var x = try sc.zeros(&.{ sh[0], sh[1], sh[3] }, .float32);
+    for (0..HC) |i| {
+        const ic: c_int = @intCast(i);
+        x = try sc.add(x, try sc.mul(try sc.slice(pre, 2, ic, ic + 1), try sc.reshape(try sc.slice(sf, 2, ic, ic + 1), &.{ sh[0], sh[1], sh[3] })));
+    }
+    return .{ .x = sc.out(try sc.astype(x, mlx.mlx_array_dtype(stream))), .post = sc.out(post), .comb = sc.out(r) };
 }
 
 // One token, after oMLX `decode_kernels.py` `hc_pre_fused` (Apache-2.0, see NOTICE): the
@@ -628,6 +660,7 @@ var expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// `post * x + comb^T @ stream`, in f32, back to the stream's dtype: the new stream.
 pub fn expand(s: mlx.mlx_stream, x: mlx.mlx_array, stream: mlx.mlx_array, c: *const Collapsed) !mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return expandOps(s, x, stream, c);
     const sh = mlx.getShape(stream);
     const dt = mlx.mlx_array_dtype(stream);
     const kern = expand_kernel orelse blk: {
@@ -663,6 +696,22 @@ pub fn expand(s: mlx.mlx_stream, x: mlx.mlx_array, stream: mlx.mlx_array, c: *co
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     return out;
+}
+
+/// `expand` as MLX ops: post * x + comb^T @ stream as f32 multiply-adds (no TF32 matmul),
+/// rounded once to the stream's dtype.
+fn expandOps(s: mlx.mlx_stream, x: mlx.mlx_array, stream: mlx.mlx_array, c: *const Collapsed) !mlx.mlx_array {
+    var sc = Scope.init(std.heap.page_allocator, s);
+    defer sc.deinit();
+    const sh = mlx.getShape(stream);
+    const sf = try sc.astype(stream, .float32);
+    var out = try sc.mul(try sc.reshape(c.post, &.{ sh[0], sh[1], HC, 1 }), try sc.reshape(try sc.astype(x, .float32), &.{ sh[0], sh[1], 1, sh[3] }));
+    for (0..HC) |j| {
+        const jc: c_int = @intCast(j);
+        const comb_j = try sc.reshape(try sc.slice(c.comb, 2, jc, jc + 1), &.{ sh[0], sh[1], HC, 1 });
+        out = try sc.add(out, try sc.mul(comb_j, try sc.slice(sf, 2, jc, jc + 1)));
+    }
+    return sc.out(try sc.astype(out, mlx.mlx_array_dtype(stream)));
 }
 
 // ── DeepSeek sparse attention: token selection ─────────────────────────
@@ -736,6 +785,7 @@ pub fn withPooledKeys(s: mlx.mlx_stream, prev: mlx.mlx_array, chunk: mlx.mlx_arr
     const csh = mlx.getShape(chunk);
     const dt = mlx.mlx_array_dtype(chunk);
     const prev_len: c_int = @min(pos0, mlx.getShape(prev)[1]);
+    if (!mlx.streamIsGpu(s)) return withPooledKeysOps(s, prev, chunk, ape, pos0, prev_len, ix);
     const kern = pooled_rows_kernel orelse blk: {
         const ins = [_][*:0]const u8{ "prev", "chunk", "ape", "dims" };
         const outs = [_][*:0]const u8{"out"};
@@ -760,6 +810,35 @@ pub fn withPooledKeys(s: mlx.mlx_stream, prev: mlx.mlx_array, chunk: mlx.mlx_arr
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     }
     return applyOne(s, kern, cfg, &.{ prev, chunk, ape, dims });
+}
+
+/// `withPooledKeys` as MLX ops: every row pools the `kpool` rows ending at it (rows before
+/// the cache read as zeros), and only a pool's completing row keeps the result.
+fn withPooledKeysOps(s: mlx.mlx_stream, prev: mlx.mlx_array, chunk: mlx.mlx_array, ape: mlx.mlx_array, pos0: c_int, prev_len: c_int, ix: Indexer) !mlx.mlx_array {
+    var sc = Scope.init(std.heap.page_allocator, s);
+    defer sc.deinit();
+    const csh = mlx.getShape(chunk);
+    const dt = mlx.mlx_array_dtype(chunk);
+    const lead = try sc.zeros(&.{ csh[0], ix.kpool - 1 - prev_len, csh[2] }, dt);
+    const rows = try sc.concat(&.{ lead, try sc.slice(prev, 1, 0, prev_len), chunk }, 1);
+    var win: [16]mlx.mlx_array = undefined;
+    if (ix.kpool > win.len) return error.Glm5HcShape;
+    for (win[0..@intCast(ix.kpool)], 0..) |*w, j| w.* = try sc.reshape(try sc.slice(rows, 1, @intCast(j), @as(c_int, @intCast(j)) + csh[1]), &.{ csh[0], csh[1], 1, csh[2] });
+    const w4 = try sc.concat(win[0..@intCast(ix.kpool)], 2);
+    const logits = try sc.add(try sc.astype(try sc.slice(w4, 3, ix.head_dim, 2 * ix.head_dim), .float32), ape);
+    var o = mlx.mlx_array_new();
+    const probs = try sc.res(mlx.mlx_softmax_axis(&o, logits, 2, true, s), &o);
+    const prod = try sc.mul(try sc.astype(probs, dt), try sc.slice(w4, 3, 0, ix.head_dim));
+    const pooled = try sc.reshape(try sc.astype(try sc.sumAxis(try sc.astype(prod, .float32), 2), dt), &.{ csh[0], csh[1], ix.head_dim });
+    var done = mlx.mlx_array_new();
+    const pos = try sc.res(mlx.mlx_arange(&done, @floatFromInt(pos0 + 1), @floatFromInt(pos0 + 1 + csh[1]), 1, .int32, s), &done);
+    var rem = mlx.mlx_array_new();
+    const r = try sc.res(mlx.mlx_remainder(&rem, pos, try sc.keep(mlx.mlx_array_new_int(ix.kpool)), s), &rem);
+    var is0 = mlx.mlx_array_new();
+    const completes = try sc.reshape(try sc.res(mlx.mlx_equal(&is0, r, try sc.keep(mlx.mlx_array_new_int(0)), s), &is0), &.{ 1, csh[1], 1 });
+    var g = mlx.mlx_array_new();
+    const gate = try sc.res(mlx.mlx_where(&g, completes, pooled, try sc.slice(chunk, 2, ix.head_dim, 2 * ix.head_dim), s), &g);
+    return sc.out(try sc.concat(&.{ try sc.slice(chunk, 2, 0, ix.head_dim), gate }, 2));
 }
 
 /// [B, P, Dh] keys of the first `p` pools: the completing rows' gate halves.
@@ -803,6 +882,7 @@ var expand_sel_kernel: ?mlx.mlx_fast_metal_kernel = null;
 /// int32 [B, S, topk + kpool - 1] token indices from the selected pools `sel` [B, S, select_k].
 fn expandSelection(s: mlx.mlx_stream, sel: mlx.mlx_array, q_start: c_int, p: c_int, ix: Indexer) !mlx.mlx_array {
     const ssh = mlx.getShape(sel);
+    if (!mlx.streamIsGpu(s)) return expandSelectionOps(s, sel, q_start, p, ix);
     const kern = expand_sel_kernel orelse blk: {
         const ins = [_][*:0]const u8{ "selected", "qpos" };
         const outs = [_][*:0]const u8{"out"};
@@ -837,6 +917,53 @@ fn expandSelection(s: mlx.mlx_stream, sel: mlx.mlx_array, q_start: c_int, p: c_i
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     return out;
+}
+
+/// `expandSelection` as MLX ops: each selected pool's tokens where the pool is complete by
+/// the row's position, -1 up to `topk`, then the row's own unfinished pool.
+fn expandSelectionOps(s: mlx.mlx_stream, sel: mlx.mlx_array, q_start: c_int, p: c_int, ix: Indexer) !mlx.mlx_array {
+    var sc = Scope.init(std.heap.page_allocator, s);
+    defer sc.deinit();
+    const ssh = mlx.getShape(sel);
+    const I = struct {
+        fn n(c: *Scope, v: c_int) !mlx.mlx_array {
+            return c.keep(mlx.mlx_array_new_int(v));
+        }
+        fn iota(c: *Scope, len: c_int, start: c_int, shape: []const c_int) !mlx.mlx_array {
+            var o = mlx.mlx_array_new();
+            return c.reshape(try c.res(mlx.mlx_arange(&o, @floatFromInt(start), @floatFromInt(start + len), 1, .int32, c.s), &o), shape);
+        }
+        fn op(c: *Scope, comptime f: anytype, x: mlx.mlx_array, y: mlx.mlx_array) !mlx.mlx_array {
+            var o = mlx.mlx_array_new();
+            return c.res(f(&o, x, y, c.s), &o);
+        }
+        fn where(c: *Scope, cond: mlx.mlx_array, x: mlx.mlx_array) !mlx.mlx_array {
+            var o = mlx.mlx_array_new();
+            return c.res(mlx.mlx_where(&o, cond, x, try n(c, -1), c.s), &o);
+        }
+    };
+    const kp = try I.n(&sc, ix.kpool);
+    const sel_w = ssh[2] * ix.kpool;
+    const qp = try I.iota(&sc, ssh[0] * ssh[1], q_start, &.{ ssh[0], ssh[1], 1 });
+    var o = mlx.mlx_array_new();
+    const pool = try sc.res(mlx.mlx_repeat_axis(&o, try sc.astype(sel, .int32), ix.kpool, 2, s), &o);
+    const tok = try sc.add(try sc.mul(pool, kp), try I.op(&sc, mlx.mlx_remainder, try I.iota(&sc, sel_w, 0, &.{ 1, 1, sel_w }), kp));
+    const pool_end = try sc.sub(try sc.mul(try sc.add(pool, try I.n(&sc, 1)), kp), try I.n(&sc, 1));
+    const valid = try I.op(&sc, mlx.mlx_logical_and, try I.op(&sc, mlx.mlx_less, pool, try I.n(&sc, p)), try I.op(&sc, mlx.mlx_less_equal, pool_end, qp));
+    var parts: [3]mlx.mlx_array = undefined;
+    var np: usize = 0;
+    parts[np] = try I.where(&sc, valid, tok);
+    np += 1;
+    if (ix.topk > sel_w) {
+        parts[np] = try sc.add(try sc.zeros(&.{ ssh[0], ssh[1], ix.topk - sel_w }, .int32), try I.n(&sc, -1));
+        np += 1;
+    }
+    const tail = try I.op(&sc, mlx.mlx_remainder, try sc.add(qp, try I.n(&sc, 1)), kp);
+    const t = try I.iota(&sc, ix.kpool - 1, 0, &.{ 1, 1, ix.kpool - 1 });
+    const tail_tok = try sc.add(try sc.sub(try sc.add(qp, try I.n(&sc, 1)), tail), t);
+    parts[np] = try sc.broadcast(try I.where(&sc, try I.op(&sc, mlx.mlx_less, t, tail), tail_tok), &.{ ssh[0], ssh[1], ix.kpool - 1 });
+    np += 1;
+    return sc.out(try sc.concat(parts[0..np], 2));
 }
 
 /// `x` that also evaluates `dep`: a cache row nothing in this forward reads (the indexer below
@@ -1824,10 +1951,11 @@ test "glm5 mHC mixes and expand kernels match the op chain" {
         const fn_rows = mlx.mlx_array_new_data(wv.ptr, &[_]c_int{ MIX, HC * d }, 2, .float32);
         defer _ = mlx.mlx_array_free(fn_rows);
 
-        // mixes vs rms_norm(stream) @ fn^T in f64 (MLX's f32 matmul rounds on the tensor units).
+        // mixes vs rms_norm(stream) @ fn^T in f64 (MLX's f32 matmul rounds on the tensor units;
+        // off Metal the op chain's matmul rounds through TF32, past this bar).
         const got = try mixes(s, stream, fn_rows, 1e-5);
         defer _ = mlx.mlx_array_free(got);
-        {
+        if (mlx.streamIsGpu(s)) {
             const a = try readF32(got, s, alloc);
             defer alloc.free(a);
             const ssv = try readF32(stream, s, alloc);
@@ -1868,6 +1996,115 @@ test "glm5 mHC mixes and expand kernels match the op chain" {
             try testing.expectApproxEqAbs(acc, of[(r * 4 + i) * D + k], 0.02 + 0.004 * @abs(acc));
         };
     }
+}
+
+test "glm5 op-chain collapse and selection expand follow the kernels' arithmetic" {
+    // Bar: collapseOps matches an f64 transcription of COLLAPSE_SOURCE (1e-5), expandSelectionOps
+    // matches EXPAND_SEL_SOURCE exactly; both run on any backend.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    const rows = 5;
+    const d = 64;
+    var sv: [rows * HC * d]f32 = undefined;
+    for (&sv) |*x| x.* = rand.floatNorm(f32);
+    var mv: [rows * MIX]f32 = undefined;
+    for (&mv) |*x| x.* = 2.0 * rand.floatNorm(f32);
+    var bv: [MIX]f32 = undefined;
+    for (&bv) |*x| x.* = 0.5 * rand.floatNorm(f32);
+    const scv = [3]f32{ 0.7, 1.3, 0.9 };
+    const eps: f64 = 1e-6;
+    const stream = mlx.mlx_array_new_data(&sv, &[_]c_int{ 1, rows, HC, d }, 4, .float32);
+    defer _ = mlx.mlx_array_free(stream);
+    const m = mlx.mlx_array_new_data(&mv, &[_]c_int{ 1, rows, MIX }, 3, .float32);
+    defer _ = mlx.mlx_array_free(m);
+    const scale = mlx.mlx_array_new_data(&scv, &[_]c_int{3}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scale);
+    const base = mlx.mlx_array_new_data(&bv, &[_]c_int{MIX}, 1, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    var c = try collapseOps(s, stream, m, scale, base, 20, @floatCast(eps));
+    defer c.deinit();
+    const gx = try readF32(c.x, s, alloc);
+    defer alloc.free(gx);
+    const gp = try readF32(c.post, s, alloc);
+    defer alloc.free(gp);
+    const gc = try readF32(c.comb, s, alloc);
+    defer alloc.free(gc);
+    const sig = struct {
+        fn f(z: f64) f64 {
+            return 1.0 / (1.0 + @exp(-z));
+        }
+    }.f;
+    for (0..rows) |r| {
+        const mr = mv[r * MIX ..][0..MIX];
+        var pre: [4]f64 = undefined;
+        var cm: [4][4]f64 = undefined;
+        for (0..4) |i| {
+            pre[i] = sig(mr[i] * scv[0] + bv[i]) + eps;
+            try testing.expectApproxEqAbs(2.0 * sig(mr[4 + i] * scv[1] + bv[4 + i]), gp[r * 4 + i], 1e-5);
+            var mx: f64 = -std.math.inf(f64);
+            for (0..4) |j| {
+                cm[i][j] = mr[8 + 4 * i + j] * scv[2] + bv[8 + 4 * i + j];
+                mx = @max(mx, cm[i][j]);
+            }
+            var sum: f64 = 0;
+            for (0..4) |j| {
+                cm[i][j] = @exp(cm[i][j] - mx);
+                sum += cm[i][j];
+            }
+            for (0..4) |j| cm[i][j] = cm[i][j] / (sum + eps) + eps;
+        }
+        for (0..20) |it| {
+            if (it > 0) for (0..4) |i| {
+                var sum: f64 = 0;
+                for (0..4) |j| sum += cm[i][j];
+                for (0..4) |j| cm[i][j] /= sum + eps;
+            };
+            for (0..4) |j| {
+                var sum: f64 = 0;
+                for (0..4) |i| sum += cm[i][j];
+                for (0..4) |i| cm[i][j] /= sum + eps;
+            }
+        }
+        for (0..4) |i| for (0..4) |j| try testing.expectApproxEqAbs(cm[i][j], gc[r * 16 + i * 4 + j], 1e-5);
+        for (0..d) |k| {
+            var acc: f64 = 0;
+            for (0..4) |i| acc += pre[i] * sv[(r * 4 + i) * d + k];
+            try testing.expectApproxEqAbs(acc, gx[r * d + k], 1e-5);
+        }
+    }
+
+    // Selection expand: pools past `p` or not yet complete at the query's position read -1.
+    const ix: Indexer = .{ .topk = 16, .kpool = 4, .heads = 1, .head_dim = 1 };
+    const sel_k = 3;
+    const q_start = 9;
+    const p = 4;
+    const selv = [rows * sel_k]i32{ 0, 1, 2, 3, 4, 1, 2, 0, 5, 1, 3, 2, 4, 0, 1 };
+    const sel = mlx.mlx_array_new_data(&selv, &[_]c_int{ 1, rows, sel_k }, 3, .int32);
+    defer _ = mlx.mlx_array_free(sel);
+    const got = try expandSelectionOps(s, sel, q_start, p, ix);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    const out_w: usize = @intCast(ix.topk + ix.kpool - 1);
+    try testing.expectEqualSlices(c_int, &[_]c_int{ 1, rows, @intCast(out_w) }, mlx.getShape(got));
+    const gv = (mlx.mlx_array_data_int32(got) orelse return error.MlxArrayDataNull)[0 .. rows * out_w];
+    for (0..rows) |r| for (0..out_w) |col| {
+        const qp: i32 = q_start + @as(i32, @intCast(r));
+        var v: i32 = -1;
+        if (col < sel_k * 4) {
+            const sp = selv[r * sel_k + col / 4];
+            if (sp < p and (sp + 1) * 4 - 1 <= qp) v = sp * 4 + @as(i32, @intCast(col % 4));
+        } else if (col >= ix.topk) {
+            const t: i32 = @intCast(col - @as(usize, @intCast(ix.topk)));
+            const tail = @mod(qp + 1, 4);
+            if (t < tail) v = qp + 1 - tail + t;
+        }
+        try testing.expectEqual(v, gv[r * out_w + col]);
+    };
 }
 
 test "glm5 NAX indexer scores equal relu(q . k) * w summed over heads, causally masked" {
@@ -1933,6 +2170,7 @@ test "glm5 one-token hcPre chain matches collapse, rms_norm and expand" {
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(21);
     const rand = prng.random();
@@ -2037,6 +2275,7 @@ test "glm5 hcPre over R rows equals R one-row dispatches, up to the widest verif
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(33);
     const rand = prng.random();
@@ -2158,6 +2397,7 @@ test "glm5 one-query indexer scores match the NAX scorer over the pooled keys" {
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(17);
     const rand = prng.random();
@@ -2216,6 +2456,7 @@ test "glm5 one-query top-k expands the chronological top pools, ties to the lowe
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(23);
     const rand = prng.random();
@@ -2275,6 +2516,7 @@ test "glm5 one-token per-head qmv matches MLX's batched quantized matmul" {
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(31);
     const rand = prng.random();
@@ -2424,6 +2666,7 @@ test "glm5 a deferred expand over R rows rebuilds the materialized stream and fe
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(77);
     const rand = prng.random();

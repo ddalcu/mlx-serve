@@ -57,7 +57,7 @@ fn getKernel(which: usize) !mlx.mlx_fast_metal_kernel {
 }
 
 pub fn norm(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, iw: mlx.mlx_array, eps: mlx.mlx_array, batch: c_int, seq: c_int, pending: ?Pending) !?Norm {
-    if (!geometry(batch, seq) or iw.ctx == null) return null;
+    if (!mlx.streamIsGpu(s) or !geometry(batch, seq) or iw.ctx == null) return null;
     const ws = mlx.getShape(w);
     if (ws.len != 2) return null;
     const hc = ws[0];
@@ -121,7 +121,7 @@ pub fn sigmoidTable(s: mlx.mlx_stream) !mlx.mlx_array {
 }
 
 pub fn mix(s: mlx.mlx_stream, up: mlx.mlx_array, normalized: mlx.mlx_array, batch: c_int, seq: c_int) !?mlx.mlx_array {
-    if (!geometry(batch, seq) or mlx.mlx_array_dtype(up) != .bfloat16 or mlx.mlx_array_dtype(normalized) != .bfloat16) return null;
+    if (!mlx.streamIsGpu(s) or !geometry(batch, seq) or mlx.mlx_array_dtype(up) != .bfloat16 or mlx.mlx_array_dtype(normalized) != .bfloat16) return null;
     const shape4 = mlx.getShape(normalized);
     if (shape4.len != 4) return null;
     const hc = shape4[2];

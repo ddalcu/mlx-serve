@@ -205,6 +205,14 @@ pub const Scope = struct {
         var o = mlx.mlx_array_new();
         return sc.res(mlx.mlx_divide(&o, x, y, sc.s), &o);
     }
+    pub fn sumAxis(sc: *Scope, x: A, axis: c_int) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_sum_axis(&o, x, axis, true, sc.s), &o);
+    }
+    pub fn maxAxis(sc: *Scope, x: A, axis: c_int) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_max_axis(&o, x, axis, true, sc.s), &o);
+    }
     pub fn exp(sc: *Scope, x: A) !A {
         var o = mlx.mlx_array_new();
         return sc.res(mlx.mlx_exp(&o, x, sc.s), &o);
