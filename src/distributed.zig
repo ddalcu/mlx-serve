@@ -706,12 +706,27 @@ fn evalOne(a: mlx.mlx_array) !void {
 /// joins the group and measures round trips at the sizes inference moves
 /// (one decode row of a hyper-connection stream, a prefill chunk) and all_sum.
 pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
-    const cfg = try parseArgs(args);
+    // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
+    var soak: u64 = 0;
+    var rest: [16][]const u8 = undefined;
+    var n_rest: usize = 0;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--soak") and i + 1 < args.len) {
+            soak = std.fmt.parseInt(u64, args[i + 1], 10) catch return error.InvalidArgs;
+            i += 1;
+        } else if (n_rest < rest.len) {
+            rest[n_rest] = args[i];
+            n_rest += 1;
+        }
+    }
+    const cfg = try parseArgs(rest[0..n_rest]);
     var link = try Link.open(io, cfg);
     defer link.deinit();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const other: u32 = if (link.rank == 0) 1 else 0;
+    if (soak > 0) return soakLink(io, &link, other, soak, s);
 
     const sizes = [_]c_int{ 1, 5120, 10240, 262144, 6553600 }; // f32 elements: 4 B .. 25 MB
     for (sizes) |n| {
@@ -778,6 +793,37 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         log.info("[dist-probe] all_sum bf16 {d:>9} B: mean {d:>9.1} us (sum check {d} == {d})\n", .{ n * 2, @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(iters)) / 1000.0, v, n * @as(c_int, @intCast(link.size)) });
     }
     log.info("[dist-probe] done\n", .{});
+}
+
+fn soakLink(io: std.Io, link: *const Link, other: u32, n: u64, s: mlx.mlx_stream) !void {
+    const shape = [_]c_int{10240};
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_ones(&x, &shape, 1, .bfloat16, s));
+    defer _ = mlx.mlx_array_free(x);
+    try evalOne(x);
+    var sw = io_util.Stopwatch.init(io);
+    for (0..n) |k| {
+        if (link.rank == 0) {
+            try sendMsg(link, .{ OP_FORWARD, @intCast(k & 0x7fffffff), 0, 0, 0, 0, 0, 0 }, other);
+            const sent = try link.send(x, other);
+            defer _ = mlx.mlx_array_free(sent);
+            try evalOne(sent);
+            const back = try link.recv(&shape, .bfloat16, other);
+            defer _ = mlx.mlx_array_free(back);
+            try evalOne(back);
+        } else {
+            _ = try recvMsg(link, other);
+            const got = try link.recv(&shape, .bfloat16, other);
+            defer _ = mlx.mlx_array_free(got);
+            try evalOne(got);
+            const sent = try link.send(got, other);
+            defer _ = mlx.mlx_array_free(sent);
+            try evalOne(sent);
+        }
+        if ((k + 1) % 10000 == 0) log.info("[dist-probe] soak: {d} round trips, {d} us each\n", .{ k + 1, sw.read() / 1000 / 10000 });
+        if ((k + 1) % 10000 == 0) sw = io_util.Stopwatch.init(io);
+    }
+    log.info("[dist-probe] soak: {d} round trips clean\n", .{n});
 }
 
 pub fn parseArgs(args: []const []const u8) !Config {

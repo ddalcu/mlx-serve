@@ -5053,15 +5053,14 @@ const TensorWorker = struct {
 
 /// Keeps the tensors one rank holds, under the names `keep.remap` gives them
 /// (`LayerSpan`: its layers renumbered; `TensorWorker`: all but the head-only towers).
-pub fn retainSpan(weights: *Weights, keep: anytype) !void {
-    const span = keep;
+fn retainPart(weights: *Weights, keep: anytype) !void {
     const a = weights.allocator;
     var kept = std.StringHashMap(mlx.mlx_array).init(a);
     errdefer kept.deinit();
     var it = weights.map.iterator();
     while (it.next()) |kv| {
         var buf: [512]u8 = undefined;
-        const name = span.remap(kv.key_ptr.*, &buf) orelse {
+        const name = keep.remap(kv.key_ptr.*, &buf) orelse {
             _ = mlx.mlx_array_free(kv.value_ptr.*);
             a.free(kv.key_ptr.*);
             continue;
@@ -5123,8 +5122,8 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
-    if (config.dist_span) |sp| try retainSpan(&weights, sp);
-    if (config.dist_shard) |sh| if (sh.rank != 0) try retainSpan(&weights, TensorWorker{});
+    if (config.dist_span) |sp| try retainPart(&weights, sp);
+    if (config.dist_shard) |sh| if (sh.rank != 0) try retainPart(&weights, TensorWorker{});
     if (config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);

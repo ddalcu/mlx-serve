@@ -267,7 +267,7 @@ final class VideoGenService: ObservableObject {
         // the SAMPLING span only — the encode after this is ours, not the
         // model's, and the estimate does not include it.
         H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
-                              frames: request.numFrames, steps: steps, fast: !request.bestQuality,
+                              frames: request.numFrames, steps: steps, fast: !request.bestQuality && !request.turbo,
                               measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt, peer: peer)
         return frames
     }
