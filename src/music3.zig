@@ -30,6 +30,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
+const w8a8 = @import("w8a8.zig");
 const tok_mod = @import("tokenizer.zig");
 const wav_mod = @import("wav.zig");
 const sse = @import("gen_sse.zig");
@@ -842,11 +843,20 @@ const QLin = struct {
     bias: mlx.mlx_array = .{ .ctx = null },
     bits: u32 = 0,
     gs: u32 = 0,
+    /// The int8 copy that replaced `w` (`--w8a8`); `w` is then null.
+    w8: ?*const w8a8.Weight = null,
+
+    fn rows(self: *const QLin) u32 {
+        return if (self.w8) |q| @intCast(q.n) else rowsOf(self.w);
+    }
 
     /// Same ops as `lin` (bit-identical by construction).
     fn forward(self: *const QLin, x: mlx.mlx_array, s: S) !mlx.mlx_array {
         var o = mlx.mlx_array_new();
-        if (self.sc.ctx != null) {
+        if (self.w8) |q| {
+            _ = mlx.mlx_array_free(o);
+            o = try w8a8.forward(x, q, s);
+        } else if (self.sc.ctx != null) {
             try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.sc, self.bi, true, mlx.mlx_optional_int.some(@intCast(self.gs)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
         } else {
             var wt = mlx.mlx_array_new();
@@ -881,6 +891,11 @@ fn resolveQLin(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_f
     const ak = try std.fmt.allocPrint(a, "{s}.bias", .{prefix});
     defer a.free(ak);
 
+    if (w.w8.get(prefix)) |q8| {
+        var q = QLin{ .w = .{ .ctx = null }, .w8 = q8 };
+        if (w.get(ak)) |bias| q.bias = bias;
+        return q;
+    }
     var q = QLin{ .w = try getW(w, wk) };
     if (w.get(sk)) |scales| {
         q.sc = scales;
@@ -1991,6 +2006,10 @@ pub const Engine = struct {
         self.mix = try buildMix(&self.ce_w, self.s);
         errdefer _ = mlx.mlx_array_free(self.mix);
         try readFourier(&self.dit_w, &self.fourier_w);
+        if (w8a8.enabled) {
+            const n = try self.dit_w.w8.convert(allocator, &self.dit_w.map, .{ .base = "transformer_blocks.0.attn.to_q", .in_features = self.cfg.dit_hidden }, self.s);
+            log.info("[music3] int8: {d} DiT linears\n", .{n});
+        }
         try maybeRequantDepth(&self.dd_w, self.cfg, self.s);
         self.pruned_head = try buildPrunedHead(self.cfg, &self.lm_w, self.s);
         errdefer if (self.pruned_head) |*ph| ph.deinit();
@@ -2083,7 +2102,7 @@ pub const Engine = struct {
             bw.v = try resolveQLin(&self.dit_w, a, try std.fmt.allocPrint(a, "{s}.attn.to_v", .{pfx}), cfg.dit_hidden);
             bw.o = try resolveQLin(&self.dit_w, a, try std.fmt.allocPrint(a, "{s}.attn.to_out.0", .{pfx}), cfg.dit_heads * cfg.dit_head_dim);
             bw.ff_in = try resolveQLin(&self.dit_w, a, try std.fmt.allocPrint(a, "{s}.ff_in", .{pfx}), cfg.dit_hidden);
-            bw.ff_out = try resolveQLin(&self.dit_w, a, try std.fmt.allocPrint(a, "{s}.ff_out", .{pfx}), rowsOf(bw.ff_in.w) / 2);
+            bw.ff_out = try resolveQLin(&self.dit_w, a, try std.fmt.allocPrint(a, "{s}.ff_out", .{pfx}), bw.ff_in.rows() / 2);
         }
         self.dit_proj_in = try resolveQLin(&self.dit_w, a, "proj_in", cfg.dit_in_ch * 2 + cfg.dit_cond);
         self.dit_time1 = try resolveQLin(&self.dit_w, a, "time_embed.linear_1", cfg.dit_fourier);
@@ -3225,4 +3244,54 @@ test "music3 caption facts: instrumental clause leads, then bpm, then key" {
     defer a.free(c);
     try std.testing.expectEqualStrings(
         "ambient\nInstrumental only: no vocals, no singing, no lyrics. BPM: 70. Key: A minor.", c);
+}
+
+/// One DiT forward on seeded noise (64 latent frames, batch 2 like the CFG pair), velocity as f32;
+/// `resident` receives the MLX bytes the loaded engine holds after it.
+fn dit3Probe(io: std.Io, a: std.mem.Allocator, resident: *usize) !mlx.mlx_array {
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    const e = try testEngine(io, a);
+    defer e.deinit();
+    const lats = try w8a8.randn(&.{ 2, 64, 128 }, 1, .float32, e.s);
+    defer _ = mlx.mlx_array_free(lats);
+    const conds = try w8a8.randn(&.{ 2, 64, 2048 }, 2, .float32, e.s);
+    defer _ = mlx.mlx_array_free(conds);
+    const v = try ditForward(e, a, lats, 0.5, conds);
+    defer _ = mlx.mlx_array_free(v);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, v, .float32, e.s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    w8a8.dropMemo(); // job-end state: the last activation is not weights
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    resident.* = after -| before;
+    return out;
+}
+
+// The lossy int8 route against the same pack's packed forward. MUSIC3_TEST_MODEL.
+test "music3 DiT: the w8a8 route stays within its bar of the packed forward" {
+    if (!transformer_mod.naxAvailable()) return error.SkipZigTest;
+    _ = std.c.getenv("MUSIC3_TEST_MODEL") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = false;
+    var packed_bytes: usize = 0;
+    const want = try dit3Probe(io, a, &packed_bytes);
+    defer _ = mlx.mlx_array_free(want);
+    w8a8.enabled = true;
+    var int8_bytes: usize = 0;
+    const got = try dit3Probe(io, a, &int8_bytes);
+    defer _ = mlx.mlx_array_free(got);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const g = try w8a8.agreement(got, want, s);
+    std.debug.print("[music3 dit w8a8] cos={d:.6} rms_ratio={d:.6} resident packed={d} int8={d}\n", .{ g.cos, g.rms_ratio, packed_bytes, int8_bytes });
+    try testing.expect(g.cos < 0.99999); // the route engaged: a packed-numerics output would be identical
+    try testing.expect(g.cos > 0.998);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.02);
+    const dir = std.mem.span(std.c.getenv("MUSIC3_TEST_MODEL").?);
+    try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(io, dir, &.{"transformer.safetensors"}));
 }

@@ -4,6 +4,8 @@
 
 - **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
 - **NVIDIA Nemotron 3.5 Bolt and Super.** The omni packs serve text, images and video (RADIO tower), and draft with their LiLiCorr DFlash drafter on every API.
+- **Faster images, video, music and 3D on M5 Macs with 64 GB.** Krea, Qwen-Image 2.1, MageFlow, FLUX.2 klein, LTX, MiniMax-H3, ACE-Step, Music 3 and Hunyuan3D run their transformers in int8 on the Neural Accelerators, 1.2x to 2x faster end to end on an M5 Ultra (Krea 1024² 10.7 to 5.4 s, Qwen-Image 1024² 7.3 to 3.9 s, FLUX klein 3.0 to 1.9 s, LTX 13.2 to 9.4 s); it is on by default from 64 GB of RAM and `--w8a8` or Settings > Neural Accelerator int8 turns it on below that. Output stays the same picture, sound or mesh but can differ in detail or, on few-step models like MageFlow, in pose; 4-bit packs hold more memory while loaded (Krea mixed-4-8 by 3.5 GB, FLUX klein by 1.7 GB, LTX Q4 by about 8 GB), and `--no-w8a8` turns it off.
+- **Faster VAEs.** Krea and Qwen-Image decode their pictures in half precision.
 - **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs.
 
 ## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo

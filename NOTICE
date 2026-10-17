@@ -36,6 +36,15 @@ The joint schema head, input encoding and SystemOne response mapping in
 src/clef.zig are adapted from joint_schema_model.py and clef_mlx.py.
 
 --------------------------------------------------------------------------------
+SageAttention
+https://github.com/thu-ml/SageAttention
+Licensed under the Apache License, Version 2.0.
+
+The int8 attention recipe in src/int8_attn.zig (Q int8 per token, K smoothed and
+int8 per key block, P int8 against each block's row max, V int8 per channel)
+follows the SageAttention papers; the Metal kernels are our own.
+
+--------------------------------------------------------------------------------
 MTPLX
 https://github.com/youssofal/mtplx
 Copyright 2026 Youssof Altoukhi

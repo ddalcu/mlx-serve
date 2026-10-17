@@ -4798,6 +4798,9 @@ fn jsonFloat(v: std.json.Value) !f32 {
 pub const Weights = struct {
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
+    /// Int8 copies of block linears that replace their packed arrays (`--w8a8`); only the media
+    /// DiTs that read through a name-keyed map fill it.
+    w8: @import("w8a8.zig").Overlay = .{},
 
     pub fn init(allocator: std.mem.Allocator) Weights {
         return .{
@@ -4813,6 +4816,7 @@ pub const Weights = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.map.deinit();
+        self.w8.deinit(self.allocator);
     }
 
     pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
@@ -4826,6 +4830,28 @@ pub const Weights = struct {
             _ = mlx.mlx_array_free(p.*);
             p.* = arr;
         }
+    }
+
+    /// Drop every entry named `prefix...` and free its array: a loader that built a block from them (its
+    /// structs hold their own refs) lets the originals go before the next block loads, which is when an
+    /// int8 copy and the packed weight it replaced would otherwise both be resident.
+    pub fn dropPrefix(self: *Weights, prefix: []const u8) void {
+        var found = true;
+        while (found) {
+            found = false;
+            var it = self.map.iterator();
+            while (it.next()) |e| if (std.mem.startsWith(u8, e.key_ptr.*, prefix)) {
+                self.remove(e.key_ptr.*);
+                found = true;
+                break;
+            };
+        }
+    }
+
+    /// `dropPrefix` for the `idx`-th block of a stack, named by `fmt` (`"blocks.{d}."`).
+    pub fn dropBlock(self: *Weights, comptime fmt: []const u8, idx: usize) void {
+        var buf: [128]u8 = undefined;
+        self.dropPrefix(std.fmt.bufPrint(&buf, fmt, .{idx}) catch return);
     }
 
     /// Drop `name` and free its array (a loader that copied it elsewhere lets the original go).
@@ -10590,4 +10616,17 @@ test "minicpmv4_7 resolves its tokenizer-only image tokens by string" {
     try testing.expectEqual(@as(u32, 248091), config.mcv_image_id_end);
     try testing.expectEqual(@as(u32, 15), config.mcv_digit_ids[0]);
     try testing.expectEqual(@as(u32, 24), config.mcv_digit_ids[9]);
+}
+
+test "Weights.dropPrefix drops one block's tensors and nothing that merely starts like it" {
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    for ([_][]const u8{ "blocks.1.attn.q.weight", "blocks.1.attn.q.scales", "blocks.10.attn.q.weight", "blocks.2.attn.q.weight", "norm.weight" }) |k|
+        try w.map.put(try std.testing.allocator.dupe(u8, k), mlx.mlx_array_new_float(1.0));
+    w.dropPrefix("blocks.1.");
+    try std.testing.expectEqual(@as(u32, 3), w.count());
+    try std.testing.expect(w.get("blocks.1.attn.q.weight") == null and w.get("blocks.1.attn.q.scales") == null);
+    try std.testing.expect(w.get("blocks.10.attn.q.weight") != null and w.get("blocks.2.attn.q.weight") != null and w.get("norm.weight") != null);
+    w.dropPrefix("absent.");
+    try std.testing.expectEqual(@as(u32, 3), w.count());
 }

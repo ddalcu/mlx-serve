@@ -6506,6 +6506,7 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
 fn runGenJobs(reqs: []*GenRequest) void {
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
+    defer @import("w8a8.zig").dropMemo(); // the last activation (and its int8 copy) would stay pinned until the next job
     const req = reqs[0];
     if (reqs.len == 1) req.run(req.ctx) else {
         var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;

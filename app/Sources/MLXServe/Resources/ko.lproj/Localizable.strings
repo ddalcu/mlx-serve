@@ -2258,3 +2258,5 @@
 "Loading %@ · %@" = "%1$@ 로드 중 · %2$@";
 "%@ is ready" = "%@ 준비 완료";
 "The model finished loading." = "모델 로드를 마쳤습니다.";
+"Neural Accelerator int8 (M5)" = "Neural Accelerator int8 (M5)";
+"Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "M5 Mac에서 이미지와 영상을 더 빨리 만들며 약간의 손실이 있습니다. 끄면 4비트 모델이 메모리를 덜 씁니다.";

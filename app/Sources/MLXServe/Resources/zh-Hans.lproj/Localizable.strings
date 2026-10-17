@@ -2270,3 +2270,5 @@
 "Loading %@ · %@" = "正在加载 %@ · %@";
 "%@ is ready" = "%@ 已就绪";
 "The model finished loading." = "模型已加载完成。";
+"Neural Accelerator int8 (M5)" = "神经加速器 int8（M5）";
+"Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "在 M5 Mac 上更快生成图像和视频，略有损失；关闭后 4 位模型占用更少内存。";
