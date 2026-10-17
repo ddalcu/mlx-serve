@@ -1624,6 +1624,7 @@ pub const DiskTier = struct {
         errdefer {
             self.allocator.free(new_entry.tokens);
             self.allocator.free(new_entry.chunk_bytes);
+            self.allocator.free(new_entry.media);
         }
 
         if (extend_idx) |i| {
@@ -7088,6 +7089,76 @@ test "DiskTier: an SSM-only append whose meta write fails keeps the entry's arra
     try testing.expectEqual(@as(u32, 384), e.ssm_positions[1]);
     tier.invalidateNewest();
     try testing.expectEqual(@as(usize, 0), tier.entryCount());
+}
+
+test "DiskTier: a new entry whose meta write fails frees the media spans it duped" {
+    // The new_entry errdefer must free every array the commit owns, the media dupe included.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-metaerr", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // meta.json is a DIRECTORY before the first commit: the entry's chunks land
+    // and only the final meta rename fails.
+    const meta = try std.fmt.allocPrint(testing.allocator, "{s}/fp-media-metaerr/e1/meta.json", .{base});
+    defer testing.allocator.free(meta);
+    try std.Io.Dir.cwd().createDirPath(io, meta);
+
+    const spans = [_]MediaSpan{ .{ .start = 100, .key = 0xA0 }, .{ .start = 300, .key = 0xB0 } };
+    if (tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s)) |_| {
+        return error.AppendCommitUnexpectedlySucceeded;
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 0), tier.entryCount());
+}
+
+test "DiskTier: an extend commit whose meta write fails frees the media spans it duped" {
+    // The extend path shares the new_entry errdefer: the failed write frees the
+    // dupe and leaves the entry it was extending untouched.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ext-media-metaerr", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [900]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const spans = [_]MediaSpan{ .{ .start = 100, .key = 0xA0 }, .{ .start = 300, .key = 0xB0 } };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, &spans, null, null, null, s);
+    try testing.expectEqual(@as(u32, 600), tier.entries.items[0].kv_len);
+
+    // meta.json becomes a DIRECTORY: the extension's chunks land in the entry's
+    // dir and only the final meta rename fails.
+    const meta = try std.fmt.allocPrint(testing.allocator, "{s}/fp-ext-media-metaerr/e1/meta.json", .{base});
+    defer testing.allocator.free(meta);
+    std.Io.Dir.deleteFileAbsolute(io, meta) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, meta);
+
+    try fillCache(&cache, s, 3, 300, 8, 4800.0, .float32);
+    if (tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, &spans, null, null, null, s)) |_| {
+        return error.AppendCommitUnexpectedlySucceeded;
+    } else |_| {}
+
+    // The old entry stands as it was: same record, same spans, nothing committed.
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 600), tier.entries.items[0].kv_len);
+    try testing.expectEqual(@as(usize, 2), tier.entries.items[0].media.len);
 }
 
 test "materializeContiguous: the fresh-handle errdefer never outlives the transfer" {
