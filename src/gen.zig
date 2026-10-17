@@ -1772,65 +1772,16 @@ fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 }
 
 /// Decode a PNG/JPEG image (raw file bytes) → BCFHW `[1,3,1,target_h,target_w]`
-/// bf16 in [-1,1], bilinear-resized (matches the reference `x/127.5 - 1`
-/// normalization; the resize is bilinear, not LANCZOS — close enough for the
-/// first-frame anchor and not parity-tested). Returns null on decode failure.
+/// bf16 in [-1,1] (the reference `x/127.5 - 1`), cropped to the target's shape
+/// like `decodeImageToBCHW`: the video starts from this frame, so a stretch
+/// distorts every frame after it. Returns null on decode failure.
 fn decodeImageToBCFHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32, s: mlx.mlx_stream) ?mlx.mlx_array {
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var ch: c_int = 0;
-    const src_ptr = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &ch, 3) orelse return null;
-    defer stb.stbi_image_free(src_ptr);
-    const sw: usize = @intCast(w);
-    const sh: usize = @intCast(h);
-    if (sw == 0 or sh == 0) return null;
-    const src = src_ptr[0 .. sw * sh * 3];
-
-    const th: usize = target_h;
-    const tw: usize = target_w;
-    const out = allocator.alloc(f32, 3 * th * tw) catch return null;
-    defer allocator.free(out);
-
-    const clampIdx = struct {
-        fn f(v: isize, n: usize) usize {
-            if (v < 0) return 0;
-            const uv: usize = @intCast(v);
-            return if (uv >= n) n - 1 else uv;
-        }
-    }.f;
-
-    var oy: usize = 0;
-    while (oy < th) : (oy += 1) {
-        const fy = (@as(f32, @floatFromInt(oy)) + 0.5) * @as(f32, @floatFromInt(sh)) / @as(f32, @floatFromInt(th)) - 0.5;
-        const fy0 = @floor(fy);
-        const wy = fy - fy0;
-        const y0 = clampIdx(@intFromFloat(fy0), sh);
-        const y1 = clampIdx(@as(isize, @intFromFloat(fy0)) + 1, sh);
-        var ox: usize = 0;
-        while (ox < tw) : (ox += 1) {
-            const fx = (@as(f32, @floatFromInt(ox)) + 0.5) * @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(tw)) - 0.5;
-            const fx0 = @floor(fx);
-            const wx = fx - fx0;
-            const x0 = clampIdx(@intFromFloat(fx0), sw);
-            const x1 = clampIdx(@as(isize, @intFromFloat(fx0)) + 1, sw);
-            var c: usize = 0;
-            while (c < 3) : (c += 1) {
-                const p00: f32 = @floatFromInt(src[(y0 * sw + x0) * 3 + c]);
-                const p10: f32 = @floatFromInt(src[(y0 * sw + x1) * 3 + c]);
-                const p01: f32 = @floatFromInt(src[(y1 * sw + x0) * 3 + c]);
-                const p11: f32 = @floatFromInt(src[(y1 * sw + x1) * 3 + c]);
-                const top = p00 * (1.0 - wx) + p10 * wx;
-                const bot = p01 * (1.0 - wx) + p11 * wx;
-                const v = top * (1.0 - wy) + bot * wy;
-                out[c * th * tw + oy * tw + ox] = v / 127.5 - 1.0;
-            }
-        }
-    }
-
-    const arr = mlx.mlx_array_new_data(out.ptr, &[_]c_int{ 1, 3, 1, @intCast(th), @intCast(tw) }, 5, .float32);
-    defer _ = mlx.mlx_array_free(arr);
+    const bchw = decodeImageToBCHW(allocator, encoded, target_h, target_w) orelse return null;
+    defer _ = mlx.mlx_array_free(bchw);
+    const pm1 = unitToPm1BCFHW(bchw, target_h, target_w, s) catch return null;
+    defer _ = mlx.mlx_array_free(pm1);
     var bf = mlx.mlx_array_new();
-    if (mlx.mlx_astype(&bf, arr, .bfloat16, s) != 0) {
+    if (mlx.mlx_astype(&bf, pm1, .bfloat16, s) != 0) {
         _ = mlx.mlx_array_free(bf);
         return null;
     }
@@ -3988,8 +3939,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
                 const decodeAt = struct {
                     fn f(a: std.mem.Allocator, bytes: []const u8, anchor: minimax_h3.KeyframeAnchor, th: u32, tw: u32) ?mlx.mlx_array {
                         return switch (anchor) {
-                            // first = geometry anchor, plain STRETCH;
-                            // last = follower, aspect-preserving center-COVER.
+                            // Both cropped to the canvas; the last frame stays f32.
                             .first => decodeImageToBCFHW(a, bytes, th, tw, mlx.gpuStream()),
                             .last => blk: {
                                 const bchw = decodeImageToBCHW(a, bytes, th, tw) orelse break :blk null;
@@ -6408,6 +6358,34 @@ test "decodeImageToBCHW covers with a center crop instead of stretching" {
     for (0..n) |i| mean += d[i];
     mean /= @floatFromInt(n);
     try testing.expect(mean > 0.9); // stretch gives ~0.5 here
+}
+
+test "decodeImageToBCFHW crops a first frame of another shape instead of stretching it" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // 100x50 source, white only in its centered square: a 50x50 frame covers it in white.
+    const W = 100;
+    const H = 50;
+    var rgb: [W * H * 3]u8 = undefined;
+    for (0..H) |y| for (0..W) |x| {
+        const v: u8 = if (x >= 25 and x < 75) 255 else 0;
+        @memset(rgb[(y * W + x) * 3 ..][0..3], v);
+    };
+    const png_bytes = try png_mod.encodeRgb(a, &rgb, W, H);
+    defer a.free(png_bytes);
+    const arr = decodeImageToBCFHW(a, png_bytes, 50, 50, s) orelse return error.DecodeFailed;
+    defer _ = mlx.mlx_array_free(arr);
+    try testing.expectEqualSlices(c_int, &.{ 1, 3, 1, 50, 50 }, mlx.getShape(arr));
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    _ = mlx.mlx_array_eval(f);
+    const d = mlx.mlx_array_data_float32(f) orelse return error.NoData;
+    var mean: f64 = 0;
+    for (0..3 * 50 * 50) |i| mean += d[i];
+    mean /= 3 * 50 * 50;
+    try testing.expect(mean > 0.9); // a stretch gives ~0
 }
 
 test "iterJsonStringArray walks ref_images entries" {

@@ -2276,4 +2276,4 @@
 "Custom size…" = "自定义尺寸…";
 "Match first frame" = "匹配首帧";
 "Matches your first frame (%@). Smaller renders faster." = "与首帧一致（%@）。尺寸越小，渲染越快。";
-"Your first frame (%@) will be stretched to this size." = "首帧（%@）将被拉伸到此尺寸。";
+"Your first frame (%@) will be cropped to fit this size." = "首帧（%@）将被裁剪以适应此尺寸。";

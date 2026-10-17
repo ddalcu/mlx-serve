@@ -25,9 +25,8 @@ struct SourceCanvasChoice: Identifiable, Equatable {
 /// what it samples: anything on the grid inside the range generates. So the
 /// candidates are enumerated FROM THE GRID, and the starting frame's aspect
 /// ratio is what picks among them. Without this, a 16:9 photo could only be
-/// generated at one of the shipped 16:9 rows, and everything else stretched
-/// the picture (the server resizes a first frame to the canvas without
-/// letterboxing or cropping).
+/// generated at one of the shipped 16:9 rows, and everything else lost the
+/// picture's edges (the server center-crops a first frame to the canvas).
 enum AspectCanvases {
     /// How far a canvas may be off the source's aspect. At 3% the distortion
     /// is not noticeable; past it the shape visibly changes, which is the one

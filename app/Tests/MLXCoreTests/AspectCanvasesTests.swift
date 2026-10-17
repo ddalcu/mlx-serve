@@ -1,9 +1,8 @@
 import XCTest
 @testable import MLXCore
 
-/// A starting frame is resized to the canvas by the server with no letterbox
-/// and no crop, so a canvas that does not match its shape stretches the
-/// picture. The model's shipped resolution list is a curated set, not its
+/// A starting frame is center-cropped to the canvas by the server, so a canvas
+/// that does not match its shape cuts the picture's edges off. The model's shipped resolution list is a curated set, not its
 /// limit, so the canvases come from the GRID.
 final class AspectCanvasesTests: XCTestCase {
 

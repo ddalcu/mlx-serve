@@ -2264,4 +2264,4 @@
 "Custom size…" = "사용자 지정 크기…";
 "Match first frame" = "첫 프레임에 맞추기";
 "Matches your first frame (%@). Smaller renders faster." = "첫 프레임(%@)에 맞춥니다. 작을수록 빠르게 렌더링됩니다.";
-"Your first frame (%@) will be stretched to this size." = "첫 프레임(%@)이 이 크기로 늘어납니다.";
+"Your first frame (%@) will be cropped to fit this size." = "첫 프레임(%@)이 이 크기에 맞게 잘립니다.";

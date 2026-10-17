@@ -37,8 +37,8 @@ struct VideoGenView: View {
     @State private var lanModel: String? = nil
     @State private var quality: QualityPreset = .good
     /// Pixel size of the picked first frame, read from the file's metadata
-    /// when it arrives. The server stretches the frame to the canvas, so its
-    /// shape sets the clip's (`frameLadder`).
+    /// when it arrives. The server crops the frame to the canvas, so its
+    /// shape sets the clip's (`frameLadder`) and nothing is cut off.
     @State private var firstFrameSize: (width: Int, height: Int)? = nil
     /// The size fields shown over the first frame's slider, at the user's ask.
     @State private var customClipSize = false
@@ -704,11 +704,11 @@ struct VideoGenView: View {
     }
 
     /// Under the size fields when a first frame is set: whether the frame will
-    /// be stretched, and the way back to its shape.
+    /// be cropped, and the way back to its shape.
     private var firstFrameMismatch: some View {
         HStack(spacing: 8) {
             if let size = firstFrameSize, AspectCanvases.deviation(of: currentCanvas, from: size) > AspectCanvases.maxDeviation {
-                Label(L10n.format("Your first frame (%@) will be stretched to this size.",
+                Label(L10n.format("Your first frame (%@) will be cropped to fit this size.",
                                   AspectCanvases.ratioLabel(width: size.width, height: size.height)),
                       systemImage: "exclamationmark.triangle")
                     .font(.app(.caption2)).foregroundStyle(.orange)
