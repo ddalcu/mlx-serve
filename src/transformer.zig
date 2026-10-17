@@ -19337,8 +19337,10 @@ pub const Transformer = struct {
         // first touch — x's inner dim pins (bits, group_size) exactly.
         const qp = self.quantParamsHinted(w, sc, lastDim(x));
         // OPT-IN and LOSSY: prompt-width 4-bit affine calls through rotated int8; declines below
-        // w8a8.PREFILL_MIN_ROWS rows (decode, spec verify) and outside its shapes.
-        if (self.w8a8_prefill) |pc| if (qp.mode == .affine) if (try w8a8.prefillQmm(pc, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
+        // w8a8.PREFILL_MIN_ROWS rows (decode, spec verify) and outside its shapes. The lm_head stays
+        // exact (its logits are the model's distribution), and so does a weight with Hadamard signs.
+        if (self.w8a8_prefill) |pc| if (qp.mode == .affine and w.ctx != self.lm_head_w.ctx and !self.hasRhtSigns(w))
+            if (try w8a8.prefillQmm(pc, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
         // The 2-bit kernels (qmv2.zig) serve Prism packs: Hadamard ones, and
         // ternary ones without rotations. Every other 2-bit pack keeps stock qmm.
         if (self.rht) |reg| {
@@ -19367,6 +19369,11 @@ pub const Transformer = struct {
             if (try rowExactQmm(&self.config, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
         }
         return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
+    }
+
+    inline fn hasRhtSigns(self: *const Transformer, w: mlx.mlx_array) bool {
+        const reg = self.rht orelse return false;
+        return reg.get(w) != null;
     }
 
     /// Final logits projection. For dense bf16 the lm_head weight is [vocab, hidden]
@@ -75447,4 +75454,118 @@ test "Metal-only kernels decline on a stream without them, so the MLX-op path ru
     const rotated = try rht.transform(a, signs, 1024, false, s);
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_array_eval(rotated));
+}
+
+/// MLX-packed 4-bit g64 affine [n, k] weight from seeded normal values.
+fn w8a8TestPacked(n: c_int, k: c_int, seed: u64, s: mlx.mlx_stream) ![3]mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ n, k }, 2, .bfloat16, 0.0, 0.02, key, s));
+    var v = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_quantize(&v, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var out: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    for (&out, 0..) |*a, i| {
+        try mlx.check(mlx.mlx_vector_array_get(a, v, i));
+        try mlx.check(mlx.mlx_array_eval(a.*));
+    }
+    return out;
+}
+
+fn w8a8TestInput(m: c_int, k: c_int, seed: u64, s: mlx.mlx_stream) !mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ m, k }, 2, .bfloat16, 0.0, 1.0, key, s));
+    return x;
+}
+
+fn w8a8BitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var v: bool = false;
+    _ = mlx.mlx_array_item_bool(&v, eq);
+    return v;
+}
+
+test "w8a8 prefill: a 64-row lm_head projection stays stock qmm bit for bit while a projection takes the route" {
+    if (!naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const head = try w8a8TestPacked(256, 1024, 41, s);
+    defer for (head) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const x = try w8a8TestInput(64, 1024, 42, s);
+    defer _ = mlx.mlx_array_free(x);
+    var pc: w8a8.PrefillCache = .{};
+    defer pc.deinit();
+    var t: Transformer = undefined;
+    t.config = .{};
+    t.bits_cache = .{};
+    t.rht = null;
+    t.int8_cache = null;
+    t.ternary_2bit = false;
+    t.w8a8_prefill = &pc;
+    t.s = s;
+    t.lm_head_w = head[0];
+    t.lm_head_s = head[1];
+    t.lm_head_b = head[2];
+    var stock = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stock);
+    try mlx.check(mlx.mlx_quantized_matmul(&stock, x, head[0], head[1], head[2], true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    const logits = try t.lmHeadProject(x);
+    defer _ = mlx.mlx_array_free(logits);
+    try std.testing.expect(try w8a8BitEqual(logits, stock, s));
+    // The same weight as an ordinary projection does take the route (int8 output differs).
+    const proj = try w8a8TestPacked(256, 1024, 41, s);
+    defer for (proj) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const y = try t.qmatmul(x, proj[0], proj[1], proj[2]);
+    defer _ = mlx.mlx_array_free(y);
+    try std.testing.expect(!try w8a8BitEqual(y, stock, s));
+}
+
+test "w8a8 prefill: a weight with Hadamard signs declines the route" {
+    if (!naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const k: c_int = 1024;
+    const pw = try w8a8TestPacked(256, k, 43, s);
+    defer for (pw) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const x = try w8a8TestInput(64, k, 44, s);
+    defer _ = mlx.mlx_array_free(x);
+    var sg: [1024]f32 = undefined;
+    for (&sg, 0..) |*v, i| v.* = if (i % 3 == 0) -1.0 else 1.0;
+    const signs = mlx.mlx_array_new_data(&sg, &[_]c_int{k}, 1, .float32);
+    defer _ = mlx.mlx_array_free(signs);
+    var reg = rht.Registry.init(std.testing.allocator, 1024);
+    defer reg.deinit();
+    try reg.register(pw[0], signs, signs);
+    var pc: w8a8.PrefillCache = .{};
+    defer pc.deinit();
+    var t: Transformer = undefined;
+    t.config = .{};
+    t.bits_cache = .{};
+    t.rht = &reg;
+    t.int8_cache = null;
+    t.ternary_2bit = false;
+    t.s = s;
+    t.lm_head_w = .{ .ctx = null };
+    t.w8a8_prefill = null;
+    const off = try t.qmatmul(x, pw[0], pw[1], pw[2]);
+    defer _ = mlx.mlx_array_free(off);
+    try mlx.check(mlx.mlx_array_eval(off));
+    reg.dropMemo();
+    t.w8a8_prefill = &pc;
+    const on = try t.qmatmul(x, pw[0], pw[1], pw[2]);
+    defer _ = mlx.mlx_array_free(on);
+    try std.testing.expect(try w8a8BitEqual(on, off, s));
 }

@@ -478,11 +478,24 @@ const HEADER =
     \\
 ;
 
+/// The 256-point transform of one block with lane l holding its elements l*8 .. l*8+7 in `v[8]`:
+/// three in-register butterfly stages, five shuffle stages, then the 1/16 scale.
+const H256 =
+    \\#define H256(v) { \
+    \\  for (int h_ = 1; h_ < 8; h_ <<= 1) \
+    \\    for (int p_ = 0; p_ < 8; p_++) if ((p_ & h_) == 0) { float a_ = v[p_], b_ = v[p_ + h_]; v[p_] = a_ + b_; v[p_ + h_] = a_ - b_; } \
+    \\  for (uint m_ = 1; m_ < 32; m_ <<= 1) { \
+    \\    const float sgn_ = (lane & m_) ? -1.0f : 1.0f; \
+    \\    for (int p_ = 0; p_ < 8; p_++) v[p_] = fma(sgn_, v[p_], simd_shuffle_xor(v[p_], m_)); \
+    \\  } \
+    \\  for (int p_ = 0; p_ < 8; p_++) v[p_] *= 0.0625f; }
+    \\
+;
+
 /// One threadgroup (8 simdgroups) per row; lane l of a simdgroup holds elements
-/// l*8 .. l*8+7 of each 256-block, so the 256-point transform is three
-/// in-register butterfly stages and five shuffle stages. The row's amax reduces
-/// across the threadgroup before anything is written.
-const RQ_SOURCE =
+/// l*8 .. l*8+7 of each 256-block for `H256`. The row's amax reduces across the
+/// threadgroup before anything is written.
+const RQ_SOURCE = H256 ++
     \\const int K = x_shape[1];
     \\const uint row = threadgroup_position_in_grid.y;
     \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
@@ -496,13 +509,8 @@ const RQ_SOURCE =
     \\  if (ch >= nch) break;
     \\  const int base = ch * 256 + int(lane) * 8;
     \\  for (int p = 0; p < 8; p++) v[c][p] = float(xr[base + p]) * float(signs[base + p]);
-    \\  for (int h = 1; h < 8; h <<= 1)
-    \\    for (int p = 0; p < 8; p++) if ((p & h) == 0) { float a = v[c][p], b = v[c][p + h]; v[c][p] = a + b; v[c][p + h] = a - b; }
-    \\  for (uint m = 1; m < 32; m <<= 1) {
-    \\    const float sgn = (lane & m) ? -1.0f : 1.0f;
-    \\    for (int p = 0; p < 8; p++) v[c][p] = fma(sgn, v[c][p], simd_shuffle_xor(v[c][p], m));
-    \\  }
-    \\  for (int p = 0; p < 8; p++) { v[c][p] *= 0.0625f; amax = max(amax, abs(v[c][p])); }
+    \\  H256(v[c]);
+    \\  for (int p = 0; p < 8; p++) amax = max(amax, abs(v[c][p]));
     \\}
     \\amax = simd_max(amax);
     \\if (lane == 0) red[sg] = amax;
@@ -897,20 +905,14 @@ const FETCH4 =
 ;
 
 /// Lane l on 256-block `ch` of row `n` loads packed word ch*32 + l (positions 8l..8l+7, the layout
-/// RQ_SOURCE rotates in), dequantizes, applies the signs and runs the same transform.
-const ROT4 =
+/// `H256` reads), dequantizes, applies the signs and runs the transform.
+const ROT4 = H256 ++
     \\#define ROT4(n, ch, v) { \
     \\  uint q_; float s_, b_; \
     \\  FETCH4(n, (ch) * 32 + int(lane), q_, s_, b_); \
     \\  const int base_ = (ch) * 256 + int(lane) * 8; \
     \\  for (int p = 0; p < 8; p++) v[p] = (float((q_ >> (4 * p)) & 0xf) * s_ + b_) * signs[base_ + p]; \
-    \\  for (int h = 1; h < 8; h <<= 1) \
-    \\    for (int p = 0; p < 8; p++) if ((p & h) == 0) { float a_ = v[p], c_ = v[p + h]; v[p] = a_ + c_; v[p + h] = a_ - c_; } \
-    \\  for (uint m_ = 1; m_ < 32; m_ <<= 1) { \
-    \\    const float sgn_ = (lane & m_) ? -1.0f : 1.0f; \
-    \\    for (int p = 0; p < 8; p++) v[p] = fma(sgn_, v[p], simd_shuffle_xor(v[p], m_)); \
-    \\  } \
-    \\  for (int p = 0; p < 8; p++) v[p] *= 0.0625f; }
+    \\  H256(v); }
     \\
 ;
 
