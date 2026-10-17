@@ -3165,6 +3165,8 @@ pub fn fusedSdpa256Prefill(
     if (window > 0) {
         if (!fused256Enabled()) return null;
     } else {
+        // Opt-in int8 Q/K causal arm on NAX (lossy); null when off or ineligible.
+        if (try @import("nax_attention.zig").attention256Int8(s, q, k, v, scale)) |q8| return q8;
         if (fused256CausalMode() == .off) return null;
         // The band arm stays ours (mlx's NAX kernel takes no band); the
         // causal arm yields to the stock fused kernel on NAX.

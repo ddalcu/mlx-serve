@@ -96,10 +96,12 @@ template <
     bool FIRST,
     bool LAST,
     typename AccumType,
+    typename QT,
     typename StridePtr,
     typename SinkPtr,
-    typename StatePtr>
-METAL_FUNC void attention_nax_bdv(
+    typename StatePtr,
+    typename ScalePtr>
+METAL_FUNC void attention_nax_bdv_qt(
     const device T* Q,
     const device T* K,
     const device T* V,
@@ -114,8 +116,16 @@ METAL_FUNC void attention_nax_bdv(
     threadgroup AccumType* xchg,
     uint simd_group_id,
     uint simd_lane_id,
-    uint3 tid) {
+    uint3 tid,
+    const device QT* Qq,
+    const device QT* Kq,
+    ScalePtr q_scale,
+    ScalePtr k_scale) {
   ulong3 tidl{tid.x, tid.y, tid.z};
+  // int8 Q / K (SageAttention): row-contiguous [B, H, qL, BD] / [B, Hkv, kL,
+  // BD] copies; scores accumulate in int32 and are scaled by the Q tile's and
+  // the key block's scales. P and V stay in T.
+  constexpr bool kQ8 = sizeof(QT) == 1;
 
   const int64_t Q_strides[3] = {q_str[0], q_str[1], q_str[2]};
   const int64_t K_strides[3] = {k_str[0], k_str[1], k_str[2]};
@@ -246,12 +256,23 @@ METAL_FUNC void attention_nax_bdv(
   K += int64_t(kb_lo) * BK * K_strides[2];
   V += int64_t(kb_lo) * BK * V_strides[2];
 
+  const int q_ld = kQ8 ? BD : int(Q_strides[2]);
+  const int k_ld = kQ8 ? BD : int(K_strides[2]);
+  const device QT* Qp = kQ8
+      ? Qq + ((int64_t(tid.z) * params->H + tid.y) * params->qL + int64_t(tid.x) * BQ + tm) * BD + d_part * (BD / WN)
+      : (const device QT*)Q;
+  const device QT* Kp = kQ8
+      ? Kq + ((int64_t(tid.z) * (params->H / params->gqa_factor) + kv_head_idx) * params->kL + int64_t(kb_lo) * BK) * BD + d_part * (BD / WN)
+      : (const device QT*)K;
+  const int64_t ks_row = (int64_t(tid.z) * (params->H / params->gqa_factor) + kv_head_idx) * params->NK;
+  const float q_s = kQ8 ? q_scale[(int64_t(tid.z) * params->H + tid.y) * params->NQ + tid.x] : 1.0f;
+
   // Query fragments, loaded once and kept in registers.
-  NAXTile<T, TQ, TD> Qreg;
+  NAXTile<QT, TQ, TD> Qreg;
   if (!align_Q && is_last_q) {
-    Qreg.load_rows(Q, int(Q_strides[2]), lim_rows_q);
+    Qreg.load_rows(Qp, q_ld, lim_rows_q);
   } else {
-    Qreg.load(Q, int(Q_strides[2]));
+    Qreg.load(Qp, q_ld);
   }
 
   // Loop over KV seq length
@@ -263,34 +284,47 @@ METAL_FUNC void attention_nax_bdv(
     stile_t Stile;
 
     Stile.clear();
+    NAXTile<int, TQ, TK> Si;
+    if constexpr (kQ8) Si.clear();
+    const float qk_s = kQ8 ? q_s * k_scale[ks_row + kb] : 1.0f;
 
     OMLX_NAX_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
       OMLX_NAX_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
         auto qk_step = [&](short id) {
-          NAXTile<T, 1, 1> Qtile;
-          NAXTile<T, 2, 1> Ktile;
+          NAXTile<QT, 1, 1> Qtile;
+          NAXTile<QT, 2, 1> Ktile;
 
-          const int K_load_off = ik * kU * int(K_strides[2]) + id * kU;
+          const int Kq_load_off = ik * kU * k_ld + id * kU;
 
           Qtile.frag_at(0, 0) = Qreg.frag_at(iq, id);
 
           if (!align_K && is_last_k) {
-            Ktile.load_rows(
-                K + K_load_off, int(K_strides[2]), lim_rows_k - ik * kU);
+            Ktile.load_rows(Kp + Kq_load_off, k_ld, lim_rows_k - ik * kU);
           } else {
-            Ktile.load(K + K_load_off, int(K_strides[2]));
+            Ktile.load(Kp + Kq_load_off, k_ld);
           }
 
-          stile_t::NAXFrag_t::mma(
-              Stile.frag_at(iq, ik),
-              Stile.frag_at(iq, ik + 1),
-              Qtile.frag_at(0, 0),
-              metal::false_type{},
-              Ktile.frag_at(0, 0),
-              Ktile.frag_at(1, 0),
-              metal::true_type{});
+          if constexpr (kQ8) {
+            stile_t::NAXFrag_t::mma(
+                Si.frag_at(iq, ik),
+                Si.frag_at(iq, ik + 1),
+                Qtile.frag_at(0, 0),
+                metal::false_type{},
+                Ktile.frag_at(0, 0),
+                Ktile.frag_at(1, 0),
+                metal::true_type{});
+          } else {
+            stile_t::NAXFrag_t::mma(
+                Stile.frag_at(iq, ik),
+                Stile.frag_at(iq, ik + 1),
+                Qtile.frag_at(0, 0),
+                metal::false_type{},
+                Ktile.frag_at(0, 0),
+                Ktile.frag_at(1, 0),
+                metal::true_type{});
+          }
         };
         if constexpr (WN == 2) {
           // The head-dim split kernel keeps static fragment indices.
@@ -302,6 +336,15 @@ METAL_FUNC void attention_nax_bdv(
 #pragma clang loop unroll_count(4)
           for (short id = 0; id < TD; id++) {
             qk_step(id);
+          }
+        }
+
+        if constexpr (kQ8) {
+          constexpr short kEPF = stile_t::NAXFrag_t::kElemsPerFrag;
+          OMLX_NAX_UNROLL
+          for (short i = 0; i < kEPF; i++) {
+            Stile.frag_at(iq, ik)[i] = float(Si.frag_at(iq, ik)[i]) * qk_s;
+            Stile.frag_at(iq, ik + 1)[i] = float(Si.frag_at(iq, ik + 1)[i]) * qk_s;
           }
         }
 
@@ -510,6 +553,7 @@ METAL_FUNC void attention_nax_bdv(
 
     // Prepare for next iteration
     K += BK * int(K_strides[2]);
+    Kp += BK * k_ld;
     V += BK * int(V_strides[2]);
   }
 
@@ -550,6 +594,47 @@ METAL_FUNC void attention_nax_bdv(
   } else {
     Otile.store(O, int(O_strides[2]));
   }
+}
+
+template <
+    typename T,
+    int BQ,
+    int BK,
+    int BD,
+    int BDV,
+    int WM,
+    int WN,
+    bool align_Q,
+    bool align_K,
+    bool do_causal,
+    int WINDOW,
+    bool has_sinks,
+    bool FIRST,
+    bool LAST,
+    typename AccumType,
+    typename StridePtr,
+    typename SinkPtr,
+    typename StatePtr>
+METAL_FUNC void attention_nax_bdv(
+    const device T* Q,
+    const device T* K,
+    const device T* V,
+    device T* O,
+    const device AttnParams* params,
+    StridePtr q_str,
+    StridePtr k_str,
+    StridePtr v_str,
+    SinkPtr sinks,
+    StatePtr Sin,
+    device float* Sout,
+    threadgroup AccumType* xchg,
+    uint simd_group_id,
+    uint simd_lane_id,
+    uint3 tid) {
+  attention_nax_bdv_qt<T, BQ, BK, BD, BDV, WM, WN, align_Q, align_K, do_causal, WINDOW, has_sinks, FIRST, LAST,
+                       AccumType, T>(
+      Q, K, V, O, params, q_str, k_str, v_str, sinks, Sin, Sout, xchg, simd_group_id, simd_lane_id, tid, Q, K,
+      (const device float*)nullptr, (const device float*)nullptr);
 }
 
 } // namespace omlx_nax
