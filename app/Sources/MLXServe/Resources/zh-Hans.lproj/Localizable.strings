@@ -2275,3 +2275,6 @@
 "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "在 M5 Mac 上更快生成图像和视频，略有损失；关闭后 4 位模型占用更少内存。";
 "Spec" = "投机";
 "Spec off" = "投机已关";
+"Cancel pause" = "取消暂停";
+"Pausing after this step" = "将在此步骤结束后暂停";
+"Pauses after the current step. Chat keeps working while paused; the model stays in memory." = "在当前步骤结束后暂停。暂停期间聊天仍可使用，模型保留在内存中。";

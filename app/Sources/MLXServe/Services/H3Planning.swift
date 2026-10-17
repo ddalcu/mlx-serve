@@ -414,6 +414,11 @@ struct H3StepClock {
         durations.append(max(0, now - previous))
     }
 
+    /// Time the job sat paused counts toward no lap.
+    mutating func excludePause(_ seconds: Double) {
+        if let s = lastStamp { lastStamp = s + seconds }
+    }
+
     /// Seconds remaining, or nil while there is not enough to say. See
     /// `H3TimeEstimate.liveEta` for why the first lap is discarded.
     func eta(totalSteps: Int, floorPerStep: Double = 0, tail: Double = 0) -> Double? {

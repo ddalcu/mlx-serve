@@ -185,6 +185,12 @@ ffmpeg -f rawvideo -pix_fmt rgb24 -s 768x512 -r 24 -i frames.rgb \
 The `audio_*` fields appear only when the model made sound. Video renders take
 minutes and hold a lot of memory: one at a time, unload the model after.
 
+Pause a streaming run with `POST /v1/video/pause` `{"id": "<id>", "pause": true}`,
+where `<id>` comes from the stream's first event, `{"type":"job","id":"…"}`. It
+pauses after the step that is running (`{"type":"paused"}`); `"pause": false`
+withdraws a pending pause or resumes (`{"type":"resumed"}`). The model stays in
+memory while paused.
+
 ## 3D: `POST /v1/3d/generations`
 
 | field | notes |

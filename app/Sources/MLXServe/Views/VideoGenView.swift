@@ -2096,6 +2096,7 @@ struct VideoGenView: View {
         VStack(spacing: 8) {
             HStack {
                 if service.isRunning {
+                    if service.canPause { pauseButton }
                     Button(role: .destructive) {
                         service.cancel()
                     } label: {
@@ -2125,6 +2126,10 @@ struct VideoGenView: View {
                 Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
                     .font(.app(.caption2)).foregroundStyle(.orange)
             }
+            if service.canPause, service.pause.state == .pausing {
+                Text("Pausing after this step")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
             if !service.isRunning, let est = timeEstimate {
                 Text(L10n.text(est))
                     .font(.app(.caption))
@@ -2132,6 +2137,30 @@ struct VideoGenView: View {
                     .help("Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU.")
             }
         }
+    }
+
+    @ViewBuilder private var pauseButton: some View {
+        Group {
+            switch service.pause.state {
+            case .running:
+                Button { service.requestPause() } label: {
+                    Label("Pause", systemImage: "pause.circle").font(.app(.body))
+                        .frame(maxWidth: .infinity)
+                }
+                .help("Pauses after the current step. Chat keeps working while paused; the model stays in memory.")
+            case .pausing:
+                Button { service.cancelPause() } label: {
+                    Label("Cancel pause", systemImage: "arrow.uturn.backward.circle").font(.app(.body))
+                        .frame(maxWidth: .infinity)
+                }
+            case .paused:
+                Button { service.resume() } label: {
+                    Label("Resume", systemImage: "play.circle").font(.app(.body))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .buttonStyle(.bordered)
     }
 
     private var previewArea: some View {
@@ -2155,9 +2184,13 @@ struct VideoGenView: View {
                         ProgressView(value: Double(step), total: max(1, Double(total)))
                             .progressViewStyle(.linear)
                             .frame(width: 240)
-                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
-                        Text(service.startedAt, style: .timer)
-                            .font(.app(.footnote)).monospacedDigit().foregroundStyle(.secondary)
+                        if service.pause.state == .paused {
+                            Text("Paused").font(.app(.footnote)).foregroundStyle(.secondary)
+                        } else {
+                            Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
+                            Text(service.startedAt, style: .timer)
+                                .font(.app(.footnote)).monospacedDigit().foregroundStyle(.secondary)
+                        }
                     }
                 case .completed(let path):
                     completedPreview(path: path)

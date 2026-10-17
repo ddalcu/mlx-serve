@@ -39,6 +39,7 @@ const model_discovery = @import("model_discovery.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const arch_llama = if (@import("build_options").llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
+const gen_sse = @import("gen_sse.zig");
 const transcription_mod = @import("transcription.zig");
 const forced_align_mod = @import("forced_align.zig");
 const diarization_mod = @import("nemotron_diarization.zig");
@@ -862,6 +863,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/responses/compact",
     "/v1/unload-model",
     "/v1/video/generations",
+    "/v1/video/pause",
 };
 
 /// Is `path` an endpoint this server serves at all (any method)?
@@ -2687,6 +2689,10 @@ fn handleConnection(
         };
         defer allocator.free(body);
         try sendResponse(stream, "200 OK", "application/json", body);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/pause")) {
+        try handleVideoPause(allocator, stream, request_body);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/unload-model")) {
@@ -8283,6 +8289,31 @@ test "an unload body naming an unrecognised key is a 400, not the default model"
 /// `POST /v1/unload-model` `{"model": id}`. Frees the model's resident GPU
 /// state (the stub stays registered so it can reload). Idempotent. Returns a
 /// small status payload confirming the model is unloaded.
+const VideoPause = struct { token: u64, pause: bool };
+
+/// `{"id": "<the job event's id>", "pause": true|false}`; null when malformed.
+fn parseVideoPause(allocator: std.mem.Allocator, body: []const u8) ?VideoPause {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const id = parsed.value.object.get("id") orelse return null;
+    const on = parsed.value.object.get("pause") orelse return null;
+    if (id != .string or on != .bool) return null;
+    const token = std.fmt.parseInt(u64, id.string, 16) catch return null;
+    return .{ .token = token, .pause = on.bool };
+}
+
+/// Pause, resume, or withdraw a pending pause of the running streaming video job. The
+/// job confirms on its own stream (`paused` at its next step boundary, then `resumed`).
+fn handleVideoPause(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
+    const req = parseVideoPause(allocator, request_body) orelse
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Pause takes {\"id\": \"<job id>\", \"pause\": true|false}", 400);
+    if (!gen_sse.pause.set(req.token, req.pause))
+        return sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No running video job with that id", 404);
+    var buf: [64]u8 = undefined;
+    try sendResponse(stream, "200 OK", "application/json", try std.fmt.bufPrint(&buf, "{{\"id\":\"{x:0>16}\",\"pause\":{}}}", .{ req.token, req.pause }));
+}
+
 fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
     const scheduler = global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
@@ -27850,4 +27881,15 @@ test "proxiedBody: a Windows path id is spliced back escaped, so the forwarded b
     const out = try proxiedBody(a, body, raw, "C:\\m");
     defer a.free(out);
     try std.testing.expectEqualStrings("{\"model\":\"C:\\\\m\"}", out);
+}
+
+test "video pause body: a hex job id and a pause flag, anything else is refused" {
+    const on = parseVideoPause(std.testing.allocator, "{\"id\":\"00ff00ff00ff00ff\",\"pause\":true}").?;
+    try std.testing.expectEqual(@as(u64, 0x00ff00ff00ff00ff), on.token);
+    try std.testing.expect(on.pause);
+    try std.testing.expect(!parseVideoPause(std.testing.allocator, "{\"id\":\"1\",\"pause\":false}").?.pause);
+    try std.testing.expect(parseVideoPause(std.testing.allocator, "{\"id\":\"1\"}") == null);
+    try std.testing.expect(parseVideoPause(std.testing.allocator, "{\"id\":\"zz\",\"pause\":true}") == null);
+    try std.testing.expect(parseVideoPause(std.testing.allocator, "{\"id\":1,\"pause\":true}") == null);
+    try std.testing.expect(parseVideoPause(std.testing.allocator, "not json") == null);
 }
