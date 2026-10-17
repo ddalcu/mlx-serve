@@ -2433,9 +2433,6 @@ struct VideoGenRequest {
     /// H3's fast-recipe attention cache stored 8-bit (`attn_cache_8bit`): about
     /// half its memory, slightly lossy. Sent only when on.
     var attnCache8bit: Bool = false
-    /// Run past the server's memory check (`ignore_memory_check`): set only by
-    /// the "Start anyway" answer to an `insufficient_memory` refusal.
-    var ignoreMemoryCheck: Bool = false
     /// Whether the server runs H3's fast recipe: Max quality and Turbo both turn it off.
     var fastRecipe: Bool { !bestQuality && !turbo }
     /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined

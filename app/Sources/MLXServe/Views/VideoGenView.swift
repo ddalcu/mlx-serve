@@ -2206,12 +2206,6 @@ struct VideoGenView: View {
                             Text(service.startedAt, style: .timer).monospacedDigit()
                         }
                         .font(.app(.footnote)).foregroundStyle(.secondary)
-                        if let warning = service.memoryWarning {
-                            Label { Text(verbatim: warning) } icon: { Image(systemName: "exclamationmark.triangle") }
-                                .font(.app(.footnote)).foregroundStyle(.orange)
-                                .multilineTextAlignment(.center)
-                                .frame(maxWidth: 420)
-                        }
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -2223,11 +2217,6 @@ struct VideoGenView: View {
                     } description: {
                         Text(msg)
                     } actions: {
-                        if service.refusedForMemory {
-                            Button { tryGenerate(ignoreMemoryCheck: true) } label: { Text("Start anyway")
-                                .font(.app(.body)) }
-                                .help("The free-memory reading undercounts what macOS can release on demand (cached files, idle apps), so a run it refuses can still fit. If it does run out of memory, the whole server stops, and any chat or agent on it with it.")
-                        }
                         Button { showLogWindow() } label: { Text("Show log")
                             .font(.app(.body)) }
                     }
@@ -2493,7 +2482,7 @@ struct VideoGenView: View {
     /// total. macOS's "available" reading is misleading on unified memory
     /// (idle apps get paged out under pressure) — using it as a hard gate
     /// blocked legitimate runs, so we let the user override.
-    private func tryGenerate(ignoreMemoryCheck: Bool = false) {
+    private func tryGenerate() {
         let req = VideoGenRequest(
             model: model,
             prompt: prompt,
@@ -2524,7 +2513,6 @@ struct VideoGenView: View {
             turbo: turboEngaged,
             streamWeights: streamWeights,
             attnCache8bit: attnCache8bit,
-            ignoreMemoryCheck: ignoreMemoryCheck,
             // Gated here too: the stepper's value survives a preset switch,
             // and only the fl2va partition has a keyframe row to chain.
             chainWindows: model.supportsChainedWindows ? chainWindows : 1,

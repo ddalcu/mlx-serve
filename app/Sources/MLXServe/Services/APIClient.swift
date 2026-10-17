@@ -23,14 +23,9 @@ enum SSEEvent {
 /// truncated server output (typically a JSON error from mlx-serve, e.g. "Prompt too long").
 enum APIError: LocalizedError {
     case badStatus(code: Int, detail: String)
-    /// A media request the server billed past free memory (`"type":"insufficient_memory"`);
-    /// resending with `ignore_memory_check` runs it anyway.
-    case insufficientMemory(detail: String)
 
     var errorDescription: String? {
         switch self {
-        case .insufficientMemory(let detail):
-            return detail
         case .badStatus(let code, let detail):
             // Friendly message for the most common failure: combined system prompt + tools blew past the
             // model's context window. Tool-heavy MCP servers can do this on their own.
@@ -62,20 +57,6 @@ enum APIError: LocalizedError {
         let s = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return s.isEmpty ? "stream start failed" : String(s.prefix(300))
-    }
-
-    /// The server's error `type`, when the body names one.
-    static func errorType(fromBody data: Data) -> String? {
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let err = obj["error"] as? [String: Any] else { return nil }
-        return err["type"] as? String
-    }
-
-    /// The error a non-200 media stream start throws: the server's refusals stay typed.
-    static func streamStartError(code: Int, body: Data) -> APIError {
-        let detail = errorDetail(fromBody: body)
-        if errorType(fromBody: body) == "insufficient_memory" { return .insufficientMemory(detail: detail) }
-        return .badStatus(code: code, detail: detail)
     }
 
     private static func looksLikeContextOverflow(_ detail: String) -> Bool {
@@ -381,7 +362,7 @@ class APIClient {
                             raw.append(b)
                             if raw.count > 2048 { break }
                         }
-                        throw APIError.streamStartError(code: code, body: raw)
+                        throw APIError.badStatus(code: code, detail: APIError.errorDetail(fromBody: raw))
                     }
                     for try await line in bytes.lines {
                         guard line.hasPrefix("data: ") else { continue }

@@ -34,10 +34,6 @@ final class VideoGenService: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var livePreview: NSImage? = nil
-    /// The server's `warning` event for the current run (a canvas past the memory it sees free).
-    @Published private(set) var memoryWarning: String? = nil
-    /// The last run failed on the server's memory check; the pane offers to run it anyway.
-    @Published private(set) var refusedForMemory = false
     /// Percent, step, pace and workload of the current run; nil until its first progress event.
     @Published private(set) var readout: VideoRunReadout? = nil
     /// When the current run started; read only while `phase` is `.running`.
@@ -103,8 +99,6 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
-        memoryWarning = nil
-        refusedForMemory = false
         readout = nil
         startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
@@ -209,7 +203,6 @@ final class VideoGenService: ObservableObject {
                     return
                 }
                 await releaseIfNeeded()
-                if gen == generationSeq { refusedForMemory = Self.isMemoryRefusal(error) }
                 setPhase(.failed(error.localizedDescription), for: gen)
             }
         }
@@ -267,8 +260,6 @@ final class VideoGenService: ObservableObject {
                         secondsPerStep: clock.secondsPerStep)
                 }
                 setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
-            case "warning":
-                if gen == generationSeq { memoryWarning = ev["message"] as? String }
             case "complete":
                 decoded = await offMain { Self.decodeFrames(ev) }
             case "error":
@@ -287,13 +278,6 @@ final class VideoGenService: ObservableObject {
         // model's, and the estimate does not include it.
         Self.recordRun(request, steps: steps, measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
         return frames
-    }
-
-    /// Whether a failure is the server's memory refusal, which a resend with
-    /// `ignore_memory_check` would run.
-    nonisolated static func isMemoryRefusal(_ error: Error) -> Bool {
-        if case APIError.insufficientMemory = error { return true }
-        return false
     }
 
     /// One finished run into this Mac's history, priced with the recipe and streaming it ran.
@@ -325,8 +309,6 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
-        memoryWarning = nil
-        refusedForMemory = false
         readout = nil
         startedAt = Date()
         phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
@@ -422,7 +404,6 @@ final class VideoGenService: ObservableObject {
                 let message = shotIndex.map {
                     L10n.format("Shot %lld of %lld: %@", Int64($0 + 1), Int64(shots.count), error.localizedDescription)
                 } ?? error.localizedDescription
-                if gen == generationSeq { refusedForMemory = Self.isMemoryRefusal(error) }
                 setPhase(.failed(message), for: gen)
             }
         }
@@ -636,7 +617,6 @@ final class VideoGenService: ObservableObject {
         if request.model.supportsTurbo, request.turbo { body["turbo"] = true }
         if request.model.supportsWeightStreaming, !request.streamWeights { body["stream_weights"] = false }
         if request.model.supportsFastRecipe, request.fastRecipe, request.attnCache8bit { body["attn_cache_8bit"] = true }
-        if request.ignoreMemoryCheck { body["ignore_memory_check"] = true }
         if request.model.supportsChainedWindows, request.chainWindows > 1 {
             body["chain_windows"] = request.chainWindows
         }
