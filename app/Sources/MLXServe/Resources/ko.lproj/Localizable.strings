@@ -85,7 +85,6 @@
 "1216 × 832 (landscape 3:2)" = "1216 × 832 (가로 3:2)";
 "Apply one or more LoRA adapters to the video model for a custom style. Several can stack at once." = "비디오 모델에 LoRA 어댑터를 하나 이상 적용해 사용자 지정 스타일을 만듭니다. 여러 개를 동시에 겹쳐 쓸 수 있습니다.";
 "Tools are confined to this path. Use an absolute path. Suggestion: ~/.mlx-serve/workspace (the default cwd for all MCP servers)." = "도구는 이 경로 안으로 제한됩니다. 절대 경로를 사용하세요. 권장: ~/.mlx-serve/workspace (모든 MCP 서버의 기본 작업 폴더).";
-"Consider its cropping or adding a letterbox." = "자르거나 레터박스를 추가해 보세요.";
 "Texture (PBR)" = "텍스처(PBR)";
 "Models, comma-separated — only these are exposed; empty = all the provider lists" = "쉼표로 구분한 모델 — 이 모델만 노출됩니다. 비워 두면 제공자가 나열하는 모든 모델";
 "No workspace set" = "작업 공간이 설정되지 않음";
@@ -384,7 +383,6 @@
 "Korean" = "한국어";
 "Text on a sign" = "표지판 위 텍스트";
 "Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Put spoken lines in quotation marks, and end with the overall soundscape. Example: “A lighthouse keeper climbs a spiral staircase at dusk, oil lantern swinging…”" = "촬영 감독처럼 피사체, 동작, 카메라 움직임, 조명, 배경을 4–8문장으로 설명하세요. 대사는 따옴표로 감싸고 전체 음향 환경으로 마무리하세요. 예: “해 질 무렵 등대지기가 흔들리는 석유등을 들고 나선 계단을 오른다…”";
-"Set by starting frame…" = "시작 프레임으로 설정…";
 "Fixed at %lld steps — this model is distilled for a %lld-step schedule, so more steps cost time without adding detail." = "%lld단계로 고정됩니다. 이 모델은 %lld단계 일정으로 증류되어, 단계를 늘려도 세부 묘사는 늘지 않고 시간만 더 걸립니다.";
 "Identity" = "정체성";
 "Not enough free memory to load the model. Using the most right now: %@ — quitting these frees about %@. You can also turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n" = "모델을 로드할 여유 메모리가 부족합니다. 현재 가장 많이 사용하는 앱: %@ — 종료하면 약 %@를 확보할 수 있습니다. 설정 ▸ 메모리 사전 검사 건너뛰기를 켜거나 더 작은 모델을 선택할 수도 있습니다.\n\n";
@@ -546,7 +544,6 @@
 "Qwen3-TTS 0.6B bf16 (full precision, ~2.5 GB)" = "Qwen3-TTS 0.6B bf16(전체 정밀도, ~2.5GB)";
 "↑↓ move · ↩ switch · esc close" = "↑↓ 이동 · ↩ 전환 · esc 닫기";
 "Manage Agents…" = "에이전트 관리…";
-"Sizes this model ships with, and sizes that match the starting frame." = "이 모델이 제공하는 크기와 시작 프레임에 맞는 크기입니다.";
 "%@, %lld steps%@, %lld frames (~%.1fs)" = "%@, %lld단계%@, %lld프레임(약 %.1f초)";
 "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." = "이 어댑터에서는 최소 4단계부터 선명하며, 단계를 늘리면 조금 더 개선됩니다. 입자가 지나치게 날카로우면 LoRA 배율을 0.8-0.95로 낮추고, 잔상이 생기면 1.05-1.2로 높이세요.";
 "the guest kernel could not be read" = "게스트 커널을 읽지 못했습니다";
@@ -1358,7 +1355,6 @@
 "Open" = "열기";
 "Hot prefix cache size: how many separate KV snapshots to keep across requests. Lets multi-turn chats skip re-prefilling shared system prompts. 0 disables. Auto-capped on RAM-limited Macs (a 16 GB Mac caps to 1) — on hybrid SSM models each entry pins large KV + state snapshots that can otherwise fill memory." = "핫 프리픽스 캐시 크기: 요청 간에 유지할 개별 KV 스냅샷 수입니다. 멀티턴 채팅에서 공유 시스템 프롬프트의 프리필을 다시 하지 않아도 됩니다. 0이면 비활성화됩니다. RAM이 제한된 Mac에서는 자동으로 제한됩니다(16GB Mac은 1개) — 하이브리드 SSM 모델에서는 각 항목이 큰 KV 및 상태 스냅샷을 고정하므로 그렇지 않으면 메모리가 가득 찰 수 있습니다.";
 "Choose photo…" = "사진 선택…";
-"Selected first frame's picture does not fit this model." = "선택한 첫 프레임 이미지가 이 모델에 맞지 않습니다.";
 "Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later." = "복제할 음성 녹음을 추가하세요. 정규화되어 ~/.mlx-serve/voice-clips에 보관되므로 나중에 어떤 에이전트든 사용할 수 있습니다.";
 "Requires the hermes CLI: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash" = "hermes CLI 필요: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash";
 "Advanced (overrides Quality preset)" = "고급(품질 프리셋보다 우선)";
@@ -2263,3 +2259,9 @@
 "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "M5 Mac에서 이미지와 영상을 더 빨리 만들며 약간의 손실이 있습니다. 끄면 4비트 모델이 메모리를 덜 씁니다.";
 "Spec" = "추측";
 "Spec off" = "추측 꺼짐";
+"Sizes this model ships with." = "이 모델이 제공하는 크기입니다.";
+"Clip size" = "클립 크기";
+"Custom size…" = "사용자 지정 크기…";
+"Match first frame" = "첫 프레임에 맞추기";
+"Matches your first frame (%@). Smaller renders faster." = "첫 프레임(%@)에 맞춥니다. 작을수록 빠르게 렌더링됩니다.";
+"Your first frame (%@) will be stretched to this size." = "첫 프레임(%@)이 이 크기로 늘어납니다.";

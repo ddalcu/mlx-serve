@@ -108,4 +108,31 @@ final class AspectCanvasesTests: XCTestCase {
         XCTAssertEqual(choices.count, 5)
         XCTAssertEqual(choices.map(\.name), ["largest", "large", "medium", "small", "smallest"])
     }
+    /// The clip-size slider under a first frame: its shape at every size the
+    /// grid has, smallest first, ending at the picture's own size.
+    func testTheLadderKeepsThePicturesShapeUpToItsOwnSize() {
+        let ladder = AspectCanvases.ladder(sourceWidth: 1536, sourceHeight: 864, grid: ltx)
+        XCTAssertGreaterThan(ladder.count, 3)
+        XCTAssertEqual(ladder.map(\.area), ladder.map(\.area).sorted())
+        XCTAssertEqual(ladder.last?.id, "1536x864")
+        for c in ladder {
+            XCTAssertLessThanOrEqual(abs(Double(c.width) / Double(c.height) - 16.0 / 9.0) / (16.0 / 9.0),
+                                     AspectCanvases.maxDeviation, c.id)
+        }
+    }
+
+    func testAPictureLargerThanTheGridTopsOutAtTheLargestCanvas() {
+        XCTAssertEqual(AspectCanvases.ladder(sourceWidth: 4096, sourceHeight: 2304, grid: ltx).last?.id, "1920x1088")
+    }
+
+    /// A new picture keeps the size the user had picked, in its own shape.
+    func testANewPictureKeepsTheCurrentSizeClass() {
+        let portrait = AspectCanvases.ladder(sourceWidth: 1080, sourceHeight: 1920, grid: ltx)
+        let pick = AspectCanvases.nearest(portrait, area: 1280 * 704)
+        XCTAssertNotNil(pick)
+        XCTAssertLessThan(pick!.width, pick!.height)
+        for c in portrait {
+            XCTAssertGreaterThanOrEqual(abs(c.area - 1280 * 704), abs(pick!.area - 1280 * 704), c.id)
+        }
+    }
 }

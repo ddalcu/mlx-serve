@@ -466,7 +466,6 @@
 "Connecting…" = "正在连接…";
 "Connection String (DSN)" = "连接字符串（DSN）";
 "Connection lost" = "连接已断开";
-"Consider its cropping or adding a letterbox." = "可考虑裁剪，或补上黑边。";
 "Content" = "内容";
 "Context" = "上下文";
 "Context size" = "上下文长度";
@@ -1479,7 +1478,6 @@
 "Select or create a working directory" = "选择或创建工作目录";
 "Select the image the clip should land on. The first frame sets the size; this one is fitted to it." = "选择片段最终落到的图片。首帧决定尺寸；这张会适配到该尺寸。";
 "Selected" = "已选择";
-"Selected first frame's picture does not fit this model." = "所选首帧的图片不符合此模型。";
 "Selecting this agent loads its model; “Current” leaves whatever is running alone." = "选择此 Agent 会加载它的模型；“当前”则保持正在运行的模型不变。";
 "Send Anyway" = "仍然发送";
 "Sends these numbers plus the server settings, your chip, GPU cores, memory and macOS version. No account, nothing identifying." = "会发送这些数据以及服务器设置、芯片、GPU 核心数、内存和 macOS 版本。无需账号，不含任何身份信息。";
@@ -1492,7 +1490,6 @@
 "Sessions" = "会话";
 "Set by %@" = "由 %@ 设置";
 "Set by source image…" = "按源图片设置…";
-"Set by starting frame…" = "由起始帧决定…";
 "Set by the agent %@. Edit the agent to change it." = "由 Agent %@ 设置。要修改请编辑该 Agent。";
 "Settings" = "设置";
 "Settings clip" = "设置中的片段";
@@ -1526,7 +1523,6 @@
 "Simulate" = "模拟";
 "Size" = "大小";
 "Size on Disk" = "磁盘占用";
-"Sizes this model ships with, and sizes that match the starting frame." = "此模型自带的尺寸，以及与起始帧匹配的尺寸。";
 "Skip memory pre-flight check" = "跳过内存预检";
 "Slack Bot Token" = "Slack 机器人令牌";
 "Slack Team ID" = "Slack 团队 ID";
@@ -2275,3 +2271,9 @@
 "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "在 M5 Mac 上更快生成图像和视频，略有损失；关闭后 4 位模型占用更少内存。";
 "Spec" = "投机";
 "Spec off" = "投机已关";
+"Sizes this model ships with." = "此模型自带的尺寸。";
+"Clip size" = "片段尺寸";
+"Custom size…" = "自定义尺寸…";
+"Match first frame" = "匹配首帧";
+"Matches your first frame (%@). Smaller renders faster." = "与首帧一致（%@）。尺寸越小，渲染越快。";
+"Your first frame (%@) will be stretched to this size." = "首帧（%@）将被拉伸到此尺寸。";

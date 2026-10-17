@@ -37,9 +37,11 @@ struct VideoGenView: View {
     @State private var lanModel: String? = nil
     @State private var quality: QualityPreset = .good
     /// Pixel size of the picked first frame, read from the file's metadata
-    /// when it arrives. The shape it gives is what the "Set by starting frame"
-    /// menu offers canvases for.
+    /// when it arrives. The server stretches the frame to the canvas, so its
+    /// shape sets the clip's (`frameLadder`).
     @State private var firstFrameSize: (width: Int, height: Int)? = nil
+    /// The size fields shown over the first frame's slider, at the user's ask.
+    @State private var customClipSize = false
     // Held as text so a half-typed size is allowed while editing.
     @State private var customWidthText: String = "704"
     @State private var customHeightText: String = "448"
@@ -176,10 +178,18 @@ struct VideoGenView: View {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
-        // The menu offers canvases for the picture's shape, so the shape has
-        // to be read when the picture changes, and forgotten when it goes.
+        // A new picture sets the clip's shape, at about the size the clip had.
         .onChange(of: firstFrameImageURL) { _, url in
-            firstFrameSize = url.flatMap { AspectCanvases.pixelSize(of: $0) }
+            let size = url.flatMap { AspectCanvases.pixelSize(of: $0) }
+            firstFrameSize = size
+            guard !hydrating, let size else { return }
+            customClipSize = false
+            snapToFirstFrame(ladder(for: size))
+        }
+        // A tier that changes the grid moves a matching clip to its new step.
+        .onChange(of: frameLadder) { old, new in
+            guard !hydrating, !customClipSize, old.contains(currentCanvas), !new.contains(currentCanvas) else { return }
+            snapToFirstFrame(new)
         }
         // TTS finished → attach the spoken line as the a2vid clip.
         .onChange(of: tts.phase) { _, phase in
@@ -612,12 +622,17 @@ struct VideoGenView: View {
     private var clipSizeSection: some View {
         let verdict = customResolutionVerdict
         return VStack(alignment: .leading, spacing: 6) {
-            // Bottom, not centre: the fields carry a heading above them, and
-            // centring the row puts the button halfway up that heading.
-            HStack(alignment: .bottom, spacing: 8) {
-                clipSizeFields
-                Spacer(minLength: 8)
-                presetsMenu
+            if matchesFirstFrame {
+                firstFrameSizeSlider
+            } else {
+                // Bottom, not centre: the fields carry a heading above them, and
+                // centring the row puts the button halfway up that heading.
+                HStack(alignment: .bottom, spacing: 8) {
+                    clipSizeFields
+                    Spacer(minLength: 8)
+                    presetsMenu
+                }
+                if !frameLadder.isEmpty { firstFrameMismatch }
             }
             if let hint = clipSizeHint(verdict) {
                 Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
@@ -659,50 +674,49 @@ struct VideoGenView: View {
         }
     }
 
-    /// Canvases matching the starting frame's shape. A submenu of Presets
-    /// rather than a button of its own: it answers the same question, and one
-    /// control leaves the row room it does not have to fight for.
-    @ViewBuilder
-    private var startingFrameMenu: some View {
-        let canvases = startingFrameCanvases
-        if firstFrameImageURL == nil {
-            // Disabled as a plain ITEM, not as a disabled submenu: a submenu
-            // still opens on hover, and an empty one that opens reads as a
-            // bug rather than as "pick a picture first".
-            Button {} label: { Text("Set by starting frame…")
-                .font(.app(.body)) }
-                .disabled(true)
-        } else {
-            Menu {
-                if canvases.isEmpty {
-                    // Two rows, because `NSMenu` renders a title on one line
-                    // and drops the newline.
-                    Button {} label: { Text("Selected first frame's picture does not fit this model.")
-                        .font(.app(.body)) }
-                        .disabled(true)
-                    Button {} label: { Text("Consider its cropping or adding a letterbox.")
-                        .font(.app(.body)) }
-                        .disabled(true)
-                } else {
-                    Section("Matching \(startingFrameRatio ?? "the starting frame")") {
-                        // The source's own size is a different kind of answer
-                        // from the spread below it: it does not rescale.
-                        ForEach(canvases.filter(\.isSourceSize)) { choice in
-                            Button(choiceLabel(choice)) {
-                                setClipSize(width: choice.canvas.width, height: choice.canvas.height)
-                            }
-                        }
-                        if canvases.contains(where: \.isSourceSize) { Divider() }
-                        ForEach(canvases.filter { !$0.isSourceSize }) { choice in
-                            Button(choiceLabel(choice)) {
-                                setClipSize(width: choice.canvas.width, height: choice.canvas.height)
-                            }
-                        }
-                    }
-                }
-            } label: {
-                Text("Set by starting frame…").font(.app(.body))
+    /// The clip size while it follows the first frame: one slider over the
+    /// picture's shape, from the smallest canvas up to the picture's own size.
+    private var firstFrameSizeSlider: some View {
+        let steps = frameLadder
+        let index = steps.firstIndex(of: currentCanvas) ?? steps.count - 1
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(L10n.text("Clip size"))
+                    .font(.app(.subheadline).weight(.semibold))
+                Spacer()
+                Button { customClipSize = true } label: { Text("Custom size…").font(.app(.caption)) }
+                    .buttonStyle(.link)
             }
+            HStack(spacing: 10) {
+                if steps.count > 1 {
+                    Slider(value: Binding(get: { Double(index) }, set: { v in
+                        let c = steps[min(steps.count - 1, max(0, Int(v.rounded())))]
+                        if c != currentCanvas { setClipSize(width: c.width, height: c.height) }
+                    }), in: 0...Double(steps.count - 1), step: 1)
+                }
+                Text(verbatim: "\(currentCanvas.width) × \(currentCanvas.height)")
+                    .font(.app(.body).monospacedDigit())
+                    .fixedSize()
+            }
+            Text(L10n.format("Matches your first frame (%@). Smaller renders faster.", startingFrameRatio ?? ""))
+                .font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Under the size fields when a first frame is set: whether the frame will
+    /// be stretched, and the way back to its shape.
+    private var firstFrameMismatch: some View {
+        HStack(spacing: 8) {
+            if let size = firstFrameSize, AspectCanvases.deviation(of: currentCanvas, from: size) > AspectCanvases.maxDeviation {
+                Label(L10n.format("Your first frame (%@) will be stretched to this size.",
+                                  AspectCanvases.ratioLabel(width: size.width, height: size.height)),
+                      systemImage: "exclamationmark.triangle")
+                    .font(.app(.caption2)).foregroundStyle(.orange)
+            }
+            Button { customClipSize = false; snapToFirstFrame(frameLadder) } label: {
+                Text("Match first frame").font(.app(.caption))
+            }
+            .buttonStyle(.link)
         }
     }
 
@@ -721,13 +735,11 @@ struct VideoGenView: View {
                     }
                 }
             }
-            Divider()
-            startingFrameMenu
         } label: {
             clipMenuLabel("Presets")
         }
         .modifier(PaneChipMenu())
-        .help("Sizes this model ships with, and sizes that match the starting frame.")
+        .help("Sizes this model ships with.")
     }
 
     private func clipMenuLabel(_ title: String) -> some View {
@@ -757,26 +769,31 @@ struct VideoGenView: View {
         return out
     }
 
-    /// No ratio per row: every row has the same one, and the section heading
-    /// above them already says which.
-    private func choiceLabel(_ choice: SourceCanvasChoice) -> String {
-        var out = "\(choice.canvas.width) × \(choice.canvas.height)"
-        if let name = choice.name { out += " - \(name)" }
-        return out
-    }
-
     private var startingFrameRatio: String? {
         guard let size = firstFrameSize else { return nil }
         return AspectCanvases.ratioLabel(width: size.width, height: size.height)
     }
 
-    /// Recomputed with the tier, because the grid tightens to /64 on the
-    /// two-stage pipelines, and with the picture, because it is the picture's
-    /// shape being matched.
-    private var startingFrameCanvases: [SourceCanvasChoice] {
-        guard let size = firstFrameSize else { return [] }
-        let grid = model.resolutionGrid(twoStage: effectiveMode != .oneStage)
-        return AspectCanvases.choices(sourceWidth: size.width, sourceHeight: size.height, grid: grid)
+    /// The first frame's shape at every size this tier samples, smallest first;
+    /// empty without one. The grid tightens to /64 on two-stage pipelines.
+    private var frameLadder: [AspectCanvas] {
+        firstFrameSize.map(ladder(for:)) ?? []
+    }
+
+    private func ladder(for size: (width: Int, height: Int)) -> [AspectCanvas] {
+        AspectCanvases.ladder(sourceWidth: size.width, sourceHeight: size.height,
+                              grid: model.resolutionGrid(twoStage: effectiveMode != .oneStage))
+    }
+
+    private var currentCanvas: AspectCanvas { AspectCanvas(width: effectiveSize.width, height: effectiveSize.height) }
+
+    /// The clip follows the first frame: the slider stands in for the size fields.
+    private var matchesFirstFrame: Bool { !customClipSize && frameLadder.contains(currentCanvas) }
+
+    /// The step nearest the clip's current size, so a new picture keeps the size class.
+    private func snapToFirstFrame(_ steps: [AspectCanvas]) {
+        guard let c = AspectCanvases.nearest(steps, area: currentCanvas.area) else { return }
+        setClipSize(width: c.width, height: c.height)
     }
 
     /// Written into the fields, over a focused one too: the user picked a size
@@ -844,7 +861,7 @@ struct VideoGenView: View {
         }
         let range = 1...Storyboard.longestPlannedStory
         let initial = storyboardOn
-            ? (shots.isEmpty ? 60 : storyboardSeconds)
+            ? (shots.isEmpty ? 16 : storyboardSeconds)
             : Int((Double(numFrames) / Double(fps)).rounded())
         let longest = Storyboard.plannedRange(shotSeconds).upperBound
         return .init(initial: min(range.upperBound, max(1, initial)), range: range, note: { seconds in
