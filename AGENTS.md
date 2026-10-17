@@ -138,6 +138,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 - **One story per gotcha, one line per rule.** A gotcha entry is the defect, the cause, the fix and the guard in under 20 lines, written once after the work lands. No round-by-round logs, no ledgers, no "what the reviewer said". CHANGELOG: one user-facing sentence per change, no provisional numbers.
 - **New model support starts from mlx-lm's layout**: before writing a converter or loader, read mlx-lm's model file (merged or open PR) and the MLX packs already on Hugging Face, and match their weight names, config keys and quant layout so packs load across engines. Invent only what mlx-lm has no answer for.
 - **One feature, one PR**: UI + Zig in the same PR; split only genuinely unrelated features.
+- **Search before building**: grep the code AND `gh pr list --state all --search "<topic>"` (open + merged) before the first line. Two int8-prefill PRs (#885, #890) and a duplicate Q/K quantizer (#891 vs #881) landed because nobody did. Overlap → extend that PR or ask the maintainer.
 
 ## Supported architectures
 
