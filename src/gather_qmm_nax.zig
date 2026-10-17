@@ -5,7 +5,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 
 const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
-/// `mx`: an MXFP4 bank (uint8 e8m0 scales, no biases) instead of affine.
+/// `mx`: an FP4 bank (uint8 scales, no biases: e8m0 per 32 for MXFP4, e4m3 per 16 for NVFP4) instead of affine.
 const CanaryKey = struct { plan: Plan, bits: u32, group: u32, align_n: bool, align_k: bool, mx: bool };
 const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, limit: u32 = 0 };
 var scan_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -36,7 +36,7 @@ fn plan(rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) Plan {
 fn supported(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, row_map: ?mlx.mlx_array) bool {
     if (x.ctx == null or w.ctx == null or sc.ctx == null or idx.ctx == null) return false;
     if (mx) {
-        if (bits != 4 or group != 32 or bi.ctx != null or mlx.mlx_array_dtype(sc) != .uint8) return false;
+        if (bits != 4 or (group != 32 and group != 16) or bi.ctx != null or mlx.mlx_array_dtype(sc) != .uint8) return false;
     } else {
         if (bi.ctx == null) return false;
         if (bits != 4 and bits != 8) return false;
@@ -249,7 +249,7 @@ fn canary(key: CanaryKey, s: mlx.mlx_stream) !bool {
     try mlx.check(mlx.mlx_random_normal(&wf, &w_shape, 3, .bfloat16, 0, 0.05, random_key, s));
     var q = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(q);
-    try mlx.check(mlx.mlx_quantize(&q, wf, mlx.mlx_optional_int.some(@intCast(key.group)), mlx.mlx_optional_int.some(@intCast(key.bits)), modeName(key.mx), .{}, s));
+    try mlx.check(mlx.mlx_quantize(&q, wf, mlx.mlx_optional_int.some(@intCast(key.group)), mlx.mlx_optional_int.some(@intCast(key.bits)), modeName(key.mx, key.group), .{}, s));
     const w = try outputAt(q, 0);
     defer _ = mlx.mlx_array_free(w);
     const sc = try outputAt(q, 1);
@@ -284,7 +284,7 @@ fn canary(key: CanaryKey, s: mlx.mlx_stream) !bool {
 fn stockGather(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, ids: mlx.mlx_array, bits: u32, group: u32, mx: bool, s: mlx.mlx_stream) !mlx.mlx_array {
     var ref = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(ref);
-    try mlx.check(mlx.mlx_gather_qmm(&ref, x, w, sc, bi, .{}, ids, true, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), modeName(mx), true, s));
+    try mlx.check(mlx.mlx_gather_qmm(&ref, x, w, sc, bi, .{}, ids, true, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), modeName(mx, group), true, s));
     return ref;
 }
 
@@ -292,7 +292,7 @@ fn stockGather(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
 fn floatReferenceClose(got: mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, ids: mlx.mlx_array, bits: u32, group: u32, mx: bool, s: mlx.mlx_stream) !bool {
     var wd = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wd);
-    try mlx.check(mlx.mlx_dequantize(&wd, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), modeName(mx), .{}, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&wd, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), modeName(mx, group), .{}, .{ .value = .float32, .has_value = true }, s));
     var gathered = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gathered);
     try mlx.check(mlx.mlx_take_axis(&gathered, wd, ids, 0, s));
@@ -336,8 +336,9 @@ fn withinPeak(got: mlx.mlx_array, ref: mlx.mlx_array, s: mlx.mlx_stream) !bool {
     return std.math.isFinite(err) and err <= scale / 64;
 }
 
-fn modeName(mx: bool) [*:0]const u8 {
-    return if (mx) "mxfp4" else "affine";
+/// An FP4 bank is MXFP4 at group 32 (e8m0 scales) or NVFP4 at group 16 (e4m3 scales).
+fn modeName(mx: bool, group: u32) [*:0]const u8 {
+    return if (!mx) "affine" else if (group == 16) "nvfp4" else "mxfp4";
 }
 
 fn armed(key: CanaryKey, s: mlx.mlx_stream) bool {
@@ -421,7 +422,7 @@ fn canaryMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) !bool {
     defer _ = mlx.mlx_vector_array_free(q);
     const group = mlx.mlx_optional_int.some(@intCast(key.group));
     const bits = mlx.mlx_optional_int.some(@intCast(key.bits));
-    try mlx.check(mlx.mlx_quantize(&q, wf, group, bits, modeName(key.mx), .{}, s));
+    try mlx.check(mlx.mlx_quantize(&q, wf, group, bits, modeName(key.mx, key.group), .{}, s));
     const w = try outputAt(q, 0);
     defer _ = mlx.mlx_array_free(w);
     const sc = try outputAt(q, 1);
@@ -447,7 +448,7 @@ fn canaryMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) !bool {
     try mlx.check(mlx.mlx_multiply(&uf, wf, two_bf16, s));
     var uq = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(uq);
-    try mlx.check(mlx.mlx_quantize(&uq, uf, group, bits, modeName(key.mx), .{}, s));
+    try mlx.check(mlx.mlx_quantize(&uq, uf, group, bits, modeName(key.mx, key.group), .{}, s));
     const uw = try outputAt(uq, 0);
     defer _ = mlx.mlx_array_free(uw);
     const us = try outputAt(uq, 1);
@@ -690,7 +691,7 @@ fn randomBank(experts: c_int, n: c_int, k: c_int, bits: u32, group: u32, mx: boo
     try mlx.check(mlx.mlx_random_normal(&wf, &[_]c_int{ experts, n, k }, 3, .bfloat16, 0, 0.05, key, s));
     var q = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(q);
-    try mlx.check(mlx.mlx_quantize(&q, wf, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), modeName(mx), .{}, s));
+    try mlx.check(mlx.mlx_quantize(&q, wf, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), modeName(mx, group), .{}, s));
     const w = try outputAt(q, 0);
     errdefer _ = mlx.mlx_array_free(w);
     const sc = try outputAt(q, 1);
@@ -714,16 +715,20 @@ test "segmented NAX sorted gather matches stock across Flash Next and quantizati
     for (cases) |case| try testCase(case.rows, case.experts, case.n, case.k, case.bits, case.group, false, s);
 }
 
-test "segmented NAX sorted gather matches stock bit for bit on MXFP4 banks (MiMo shapes)" {
+test "segmented NAX sorted gather matches stock bit for bit on FP4 banks (MXFP4 MiMo shapes, NVFP4 Flash Next shapes)" {
     try requireNax();
     const s = mlx.gpuStream();
     // 65536 rows = an 8192-token top-8 chunk, past the 32768-row offset the stock kernel once overflowed.
-    const cases = [_]struct { rows: c_int, experts: c_int, n: c_int, k: c_int }{
-        .{ .rows = 65536, .experts = 256, .n = 2048, .k = 4096 },
-        .{ .rows = 65536, .experts = 256, .n = 4096, .k = 2048 },
-        .{ .rows = 2048, .experts = 32, .n = 64, .k = 128 },
+    const cases = [_]struct { rows: c_int, experts: c_int, n: c_int, k: c_int, group: u32 }{
+        .{ .rows = 65536, .experts = 256, .n = 2048, .k = 4096, .group = 32 },
+        .{ .rows = 65536, .experts = 256, .n = 4096, .k = 2048, .group = 32 },
+        .{ .rows = 2048, .experts = 32, .n = 64, .k = 128, .group = 32 },
+        .{ .rows = 81920, .experts = 512, .n = 640, .k = 2560, .group = 16 },
+        .{ .rows = 81920, .experts = 512, .n = 2560, .k = 640, .group = 16 },
+        .{ .rows = 2048, .experts = 32, .n = 64, .k = 128, .group = 16 },
+        .{ .rows = 4096, .experts = 32, .n = 96, .k = 96, .group = 16 },
     };
-    for (cases) |c| try testCase(c.rows, c.experts, c.n, c.k, 4, 32, true, s);
+    for (cases) |c| try testCase(c.rows, c.experts, c.n, c.k, 4, c.group, true, s);
 }
 
 test "segmented NAX sorted gather row map and paired SwiGLU match composed projections" {
@@ -735,6 +740,7 @@ test "segmented NAX sorted gather row map and paired SwiGLU match composed proje
         .{ .tokens = 3301, .bits = 4, .group = 64 },
         .{ .tokens = 3301, .bits = 8, .group = 32 },
         .{ .tokens = 3301, .bits = 4, .group = 32, .mx = true },
+        .{ .tokens = 3301, .bits = 4, .group = 16, .mx = true },
     };
     for (cases) |case| {
         const rows = case.tokens * 10;
@@ -780,8 +786,8 @@ test "segmented NAX sorted gather row map and paired SwiGLU match composed proje
         defer _ = mlx.mlx_vector_array_free(up_q);
         const group = mlx.mlx_optional_int.some(@intCast(case.group));
         const bits = mlx.mlx_optional_int.some(@intCast(case.bits));
-        try mlx.check(mlx.mlx_quantize(&gate_q, gate_f, group, bits, modeName(case.mx), .{}, s));
-        try mlx.check(mlx.mlx_quantize(&up_q, up_f, group, bits, modeName(case.mx), .{}, s));
+        try mlx.check(mlx.mlx_quantize(&gate_q, gate_f, group, bits, modeName(case.mx, case.group), .{}, s));
+        try mlx.check(mlx.mlx_quantize(&up_q, up_f, group, bits, modeName(case.mx, case.group), .{}, s));
         const gw = try outputAt(gate_q, 0);
         defer _ = mlx.mlx_array_free(gw);
         const gs = try outputAt(gate_q, 1);
@@ -913,7 +919,7 @@ test "segmented NAX sorted gather µbench vs stock at 8192-token chunks (MLX_SER
     const tokens: c_int = 8192;
     const alloc = std.testing.allocator;
     const sigtab = try @import("hc_prefill.zig").sigmoidTable(s);
-    // MiMo-V2.6 (MXFP4, top-8) and Qwen3.8-Flash-Next (4-bit g64, top-10) expert shapes.
+    // MiMo-V2.6 (MXFP4, top-8) and Qwen3.8-Flash-Next (4-bit g64 and NVIDIA's NVFP4, top-10) expert shapes.
     const Shape = struct { name: []const u8, experts: c_int, top_k: c_int, n: c_int, k: c_int, bits: u32, group: u32, mx: bool, paired: bool = false };
     const shapes = [_]Shape{
         .{ .name = "mimo gate 4096->2048", .experts = 256, .top_k = 8, .n = 2048, .k = 4096, .bits = 4, .group = 32, .mx = true },
@@ -922,6 +928,9 @@ test "segmented NAX sorted gather µbench vs stock at 8192-token chunks (MLX_SER
         .{ .name = "flash-next gate 2560->640", .experts = 512, .top_k = 10, .n = 640, .k = 2560, .bits = 4, .group = 64, .mx = false },
         .{ .name = "flash-next gate+up+SwiGLU", .experts = 512, .top_k = 10, .n = 640, .k = 2560, .bits = 4, .group = 64, .mx = false, .paired = true },
         .{ .name = "flash-next down 640->2560", .experts = 512, .top_k = 10, .n = 2560, .k = 640, .bits = 4, .group = 64, .mx = false },
+        .{ .name = "flash-next nvfp4 gate 2560->640", .experts = 512, .top_k = 10, .n = 640, .k = 2560, .bits = 4, .group = 16, .mx = true },
+        .{ .name = "flash-next nvfp4 gate+up+SwiGLU", .experts = 512, .top_k = 10, .n = 640, .k = 2560, .bits = 4, .group = 16, .mx = true, .paired = true },
+        .{ .name = "flash-next nvfp4 down 640->2560", .experts = 512, .top_k = 10, .n = 2560, .k = 640, .bits = 4, .group = 16, .mx = true },
     };
     for (shapes) |shape| {
         const rows = tokens * shape.top_k;

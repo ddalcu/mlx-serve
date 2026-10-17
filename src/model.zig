@@ -58,6 +58,11 @@ pub const QuantMode = enum {
     pub fn hasBiases(self: QuantMode) bool {
         return self == .affine;
     }
+
+    /// The e2m1 nibble modes (byte scales, no biases): MXFP4 g32, NVFP4 g16.
+    pub fn isFp4(self: QuantMode) bool {
+        return self == .mxfp4 or self == .nvfp4;
+    }
 };
 
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };

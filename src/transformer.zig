@@ -33770,7 +33770,7 @@ pub const Transformer = struct {
             const gate_experts = mlx.getShape(mw.switch_gate_w)[0];
             const row_block = total_inds >= 16 and gate_experts > 0 and @divTrunc(total_inds, gate_experts) >= 4;
             if (input_view == null and !self.verifyFeatureEnabled(.routing, skip_shared, B, S) and
-                row_block and nax_available and gate_qp.mode == up_qp.mode and (gate_qp.mode == .affine or gate_qp.mode == .mxfp4))
+                row_block and nax_available and gate_qp.mode == up_qp.mode and (gate_qp.mode == .affine or gate_qp.mode.isFp4()))
             {
                 var x_tok = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(x_tok);
@@ -33781,10 +33781,11 @@ pub const Transformer = struct {
                 const clamp = swigluClampLimit(cfg);
                 if (self.compiled_geglu == null and swigluFusedEnabled() and cfg.hidden_act == .silu and clamp != null and
                     mw.switch_gate_bias.ctx == null and mw.switch_up_bias.ctx == null and
+                    mw.gate_expert_scale.ctx == null and mw.up_expert_scale.ctx == null and
                     gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
                 {
                     const sigtab = try @import("hc_prefill.zig").sigmoidTable(self.s);
-                    if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, gate_qp.bits, gate_qp.group_size, gate_qp.mode == .mxfp4, nax_available, self.s)) |act3| {
+                    if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s)) |act3| {
                         // The kernel writes [M, 1, n]; the down gather below takes [M, n] like the squeezed stock path.
                         defer _ = mlx.mlx_array_free(act3);
                         var act = mlx.mlx_array_new();
@@ -33795,8 +33796,8 @@ pub const Transformer = struct {
                     }
                 }
                 if (fused_act == null) {
-                    mapped_gate = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode == .mxfp4, nax_available, self.s);
-                    mapped_up = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode == .mxfp4, nax_available, self.s);
+                    mapped_gate = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s);
+                    mapped_up = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode.isFp4(), nax_available, self.s);
                     if (mapped_gate == null or mapped_up == null) {
                         if (mapped_gate) |value| _ = mlx.mlx_array_free(value);
                         if (mapped_up) |value| _ = mlx.mlx_array_free(value);
@@ -43148,8 +43149,8 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
         // correctly.
         try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_idx, rhs_idx, false, s));
     } else {
-        if (sorted and lhs_idx.ctx == null and (mode == .affine or mode == .mxfp4)) {
-            if (try gather_qmm_nax.sortedGather(x, w, sc, bi, rhs_idx, bits, group_size, mode == .mxfp4, verifyQmmNaxAvailable(), s)) |out| {
+        if (sorted and lhs_idx.ctx == null and (mode == .affine or mode.isFp4())) {
+            if (try gather_qmm_nax.sortedGather(x, w, sc, bi, rhs_idx, bits, group_size, mode.isFp4(), verifyQmmNaxAvailable(), s)) |out| {
                 _ = mlx.mlx_array_free(res.*);
                 res.* = out;
                 return;

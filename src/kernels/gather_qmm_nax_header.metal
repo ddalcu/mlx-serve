@@ -184,8 +184,9 @@ struct AffineQ {
   }
 };
 
-// MXFP4: e2m1 nibbles under an e8m0 scale per 32, no biases (the bias pointer
-// is a dummy). Decoded as MLX's fp4_e2m1 / fp8_e8m0 do; s * v is exact in fp32.
+// FP4: e2m1 nibbles under a byte scale per GS, no biases (the bias pointer is a
+// dummy): e8m0 per 32 (MXFP4) or e4m3 per 16 (NVFP4). Decoded as MLX's fp4_e2m1 /
+// fp8_e8m0 / fp8_e4m3 do; s * v is exact in fp32.
 template <typename T, int GS>
 struct Fp4Q {
   using WT = T;
@@ -203,6 +204,11 @@ struct Fp4Q {
   }
   METAL_FUNC P params(const int g) const thread {
     const uint b = scales[g];
+    if constexpr (GS == 16) {
+      const uint v = b & 0x7Fu;
+      const ushort u = ushort((v << 7) | (((v + 1u) >> 7) << 14) | ((b & 0x80u) << 8));
+      return P{float(as_type<half>(u)) * 256.0f};
+    }
     return P{as_type<float>(b == 0u ? 0x400000u : (b << 23))};
   }
   METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
