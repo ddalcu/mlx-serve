@@ -1062,18 +1062,18 @@ struct VideoGenView: View {
             let streamed = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                                    frames: numFrames, fast: effectiveFast, turbo: turboEngaged,
                                                    cache8bit: attnCache8bit)) / gib
-            out += String(format: ", or turn on Stream weights from disk (%.0f GB)", streamed)
+            out += String(format: ", or turn on Stream the model from disk (%.0f GB)", streamed)
         } else if effectiveFast, !attnCache8bit {
             let q8 = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                              frames: numFrames, fast: true, cache8bit: true)) / gib
             if q8 < need - 2 {
-                out += String(format: ", or turn on the 8-bit attention cache (%.0f GB)", q8)
+                out += String(format: ", or turn on Quantize the attention cache (%.0f GB)", q8)
             }
         } else if effectiveFast {
             let slow = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
                                                frames: numFrames, fast: false)) / gib
             if slow < need - 2 {
-                out += String(format: ", or turn on Max quality to drop the step cache (%.0f GB, but several times slower)", slow)
+                out += String(format: ", or turn on Compute every step in full to drop the step cache (%.0f GB, but about 2.5 times slower)", slow)
             }
         }
         return out + "."
@@ -1868,12 +1868,14 @@ struct VideoGenView: View {
                           help: "Same seed + same settings reproduces the clip. Paste one to rerun someone else's.")
                 Spacer()
             }
+            Text("The same seed with the same settings gives the same clip. Change it for another take of the same prompt.")
+                .font(.app(.caption2)).foregroundStyle(.secondary)
             if model.supportsTurbo {
                 // A Binding, not `onChange`: the snap below is for the USER's
                 // flip. `applyQualityDefaults` also turns Turbo off, and an
                 // `onChange` would then overwrite the tier's steps with 30 —
                 // reading every tier as Custom.
-                Toggle("Turbo (distilled 4-step sampling)", isOn: Binding(
+                Toggle("Turbo mode", isOn: Binding(
                     get: { turbo },
                     set: { on in
                         turbo = on
@@ -1895,41 +1897,63 @@ struct VideoGenView: View {
                     }))
                     .font(.app(.caption))
                     .help("Runs the Turbo distillation LoRA: 4 steps instead of 30, about twice as fast end to end. Slightly softer detail and harder light than a full render. The adapter ships with the model; packs downloaded before it existed fetch it once, on the first run with this on.")
+                Text("4 steps instead of 30, about twice as fast. Detail comes out a little softer and light a little harder.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
                 if turboFetchDecision == .fetch {
-                    Text("Turbo needs a \(TurboLoraFetch.approxMB) MB adapter this pack predates — it downloads once, and Generate waits for it.")
+                    Text("Turbo needs a \(TurboLoraFetch.approxMB) MB adapter that isn't in this download yet. It downloads once, and Generate waits for it.")
                         .font(.app(.caption2)).foregroundStyle(.secondary)
                 } else if turboFetchDecision == .unavailableRemotely {
-                    Text("Turbo runs on the Mac hosting this model; it needs the adapter in ITS copy of the pack.")
+                    Text("Turbo runs on the Mac that hosts this model, so the adapter has to be in that Mac's copy.")
                         .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
             if model.supportsDiffusionDecoder {
-                Toggle("Diffusion decoder (sharper, slower)", isOn: $diffusionDecoder)
+                Toggle("Sharper video decoder", isOn: $diffusionDecoder)
                     .font(.app(.caption))
                     .help("Off (default): the plain convolutional decoder. On: LTX's own diffusion decoder — the one their published clips use. It denoises the frames instead of interpolating them, so fine texture and edges come out sharper. The decode itself takes about 21 s for a 97-frame clip at 768x512; measured end to end against the plain decoder in the same session the difference was inside run-to-run variance.")
+                Text("Denoises the frames instead of interpolating them, so texture and edges come out sharper. The decode takes about 21 s for a 97-frame clip.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
             if model.supportsFastRecipe {
-                Toggle("Max quality (slower)", isOn: $bestQuality)
+                Toggle("Compute every step in full", isOn: $bestQuality)
                     .font(.app(.caption))
-                    .help("Off (default): the fast recipe — step caching + attention reuse, about 2.8x faster at 768p. On: every denoising step is fully computed; marginally better detail for final renders, and it drops the step cache, which is what makes a long clip fit in memory. Turbo runs without the recipe anyway, so this has nothing to add there.")
+                    .help("Off (default): the fast recipe reuses work between steps (step caching and attention reuse). On: every denoising step is computed in full, which is about 2.5 times slower and gives marginally better detail. It also drops the attention cache, for up to about 70% less peak memory, more on longer and larger clips. That is what makes a long clip fit. Turbo runs without the recipe anyway, so this has nothing to add there.")
                     // Under turbo the recipe is already off server-side; a
                     // toggle that could not change anything is a dead control.
                     .disabled(turboEngaged)
-            }
-            if model.supportsWeightStreaming {
-                Toggle("Stream weights from disk (less memory)", isOn: $streamWeights)
-                    .font(.app(.caption))
-                    .help("On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run.")
+                if turboEngaged {
+                    Text("Turbo already computes every step in full, so this changes nothing.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                } else {
+                    Text("Turns off the shortcut that reuses work between steps: slightly better detail and up to about 70% less peak memory, but about 2.5 times slower.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
             }
             if model.supportsFastRecipe {
-                Toggle("8-bit attention cache (less memory, slightly lossy)", isOn: $attnCache8bit)
+                Toggle("Quantize the attention cache", isOn: $attnCache8bit)
                     .font(.app(.caption))
-                    .help("Off (default): the fast recipe keeps its attention cache in bf16. On: the cache is stored 8-bit, about half its memory, which matters most on long clips. The video comes out slightly different from the bf16 cache's. Max quality and Turbo keep no cache, so this does nothing there.")
+                    .help("Off (default): the fast recipe keeps its attention cache in bf16. On: the cache is stored 8-bit, for up to about 30% less peak memory. It is about 1% slower, and the video comes out slightly different from the bf16 cache's. Computing every step in full and Turbo keep no cache, so this does nothing there.")
                     .disabled(!effectiveFast)
+                if effectiveFast {
+                    Text("Stores the attention cache in 8 bits: up to about 30% less peak memory, and about 1% slower. The video comes out slightly different.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                } else {
+                    Text("With every step computed in full, or Turbo on, there is no attention cache, so this changes nothing.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
             }
-            Toggle("Show live preview while generating (~1% slower)", isOn: $livePreview)
+            if model.supportsWeightStreaming {
+                Toggle("Stream the model from disk", isOn: $streamWeights)
+                    .font(.app(.caption))
+                    .help("On (default): the text encoder and the video model are read from disk layer by layer as they run, which uses about 60% less peak RAM and is about 5% slower. A fast SSD is highly recommended. Off: both stay in memory for the whole run.")
+                Text("Reads the models from disk as they run: about 60% less peak memory, about 5% slower. Best on a fast SSD.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+            Toggle("Live preview", isOn: $livePreview)
                 .font(.app(.caption))
-                .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It is not free — every step solves for the clean latent and copies the previewed frame to the CPU.")
+                .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It costs about 1% in speed: every step solves for the clean latent and copies the previewed frame to the CPU.")
+            Text("Shows a rough still of each step while it runs, about 1% slower. The finished clip comes out sharper than the preview.")
+                .font(.app(.caption2)).foregroundStyle(.secondary)
 
             if model.supportsLoRA { loraSection }
         }
@@ -1940,6 +1964,8 @@ struct VideoGenView: View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
             Text("Style LoRAs").font(.app(.headline).weight(.semibold))
+            Text("Adapter files (.safetensors) that change the look or teach the model a subject. Up to 8 stack, each with its own strength.")
+                .font(.app(.caption2)).foregroundStyle(.secondary)
             ForEach(Array(loras.enumerated()), id: \.element.id) { index, _ in
                 LoraAdapterRow(lora: $loras[index]) {
                     loras.remove(at: index)
