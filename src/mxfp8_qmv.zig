@@ -106,6 +106,7 @@ test "mxfp8 qmv: only the measured GPU generations (M4, M5) take the kernel" {
     const xfm = @import("transformer.zig");
     defer xfm.device_gen_override = null;
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var w = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(w);
     try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 640, 640 }, 2, .uint32, s));
