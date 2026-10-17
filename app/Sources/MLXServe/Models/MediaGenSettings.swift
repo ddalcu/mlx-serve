@@ -443,8 +443,8 @@ struct VideoGenSettings: Codable, Equatable {
     var turbo: Bool = false
     /// H3 weight streaming from disk (`stream_weights`, default on).
     var streamWeights: Bool = true
-    /// H3's fast-recipe attention cache stored 8-bit (`attn_cache_8bit`, default on: very slightly lossy).
-    var attnCache8bit: Bool = true
+    /// H3's fast-recipe attention cache stored 8-bit (`attn_cache_8bit`, default off: lossy).
+    var attnCache8bit: Bool = false
     /// Steps in LTX's two-stage refine pass. 0 = Auto (the server's own "all 3").
     var stage2Steps: Int = 0
     /// Audio-guidance strength for audio-to-video. The LTX reference default.
