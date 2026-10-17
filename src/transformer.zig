@@ -13085,13 +13085,13 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
 
     moe_rows_fused_override = true;
     defer moe_rows_fused_override = null;
-    try t.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, 10, false));
-    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(2, 1, 10, false));
-    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false));
+    try t.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, 10, false, false));
+    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(2, 1, 10, false, false));
+    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false, false));
     moe_rows_fused_override = false;
-    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false));
-    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, 10, false));
-    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(4, 2, 10, false));
+    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false, false));
+    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, 10, false, false));
+    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(4, 2, 10, false, false));
 
     try t.expect(!qsaScoreFusedActiveFor(2, 4, 128));
     try t.expect(!qsaScoreFusedActiveFor(4, 4, 128));
@@ -33683,7 +33683,7 @@ pub const Transformer = struct {
             moe_reduced = true;
             shared_fused = shared_down != null;
             cost_arm = 1;
-        } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias or (swigluClampLimit(&self.config) orelse 1) != 0) == .rows and
+        } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias, (swigluClampLimit(&self.config) orelse 1) != 0) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
             try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
@@ -42102,13 +42102,15 @@ fn moeVerifyRowsFor(env: ?[]const u8) bool {
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
 
 /// ONE place decides the decode MoE arm: fused rows for S == 1 and
-/// 2 <= B <= 8, or B == 1 and 2 <= S <= 8 (verify), without expert bias; the
+/// 2 <= B <= 8, or B == 1 and 2 <= S <= 8 (verify), without expert bias or a clamp; the
 /// single-row gatherQmv at B == 1; the sorted chain otherwise, and whenever a
 /// stand-in diagnostic wants the stock path.
-fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int, has_expert_bias: bool) MoeDecodeDispatchArm {
+fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int, has_expert_bias: bool, clamped: bool) MoeDecodeDispatchArm {
+    // A per-expert bias or a clamped SwiGLU: the fused rows kernels apply neither, only the composed chain does.
+    const composed = has_expert_bias or clamped;
     const total_inds: c_int = B * S * K;
-    const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias;
-    const stock = has_expert_bias or qwen4Standin().moe_gateup or qwen4Standin().moe_down;
+    const do_sort = B * S > 1 or total_inds >= 64 or composed;
+    const stock = composed or qwen4Standin().moe_gateup or qwen4Standin().moe_down;
     if (S == 1 and B >= 2 and B <= 8 and moeRowsFusedEnabled() and !stock) return .rows;
     if (B == 1 and S >= 2 and S <= 8 and moeVerifyRowsEnabled() and !stock) return .rows;
     if (do_sort) return .sorted;
@@ -51992,17 +51994,30 @@ test "moe decode dispatch: rows vs sorted vs gatherQmv" {
     const K: c_int = 10;
     var b: c_int = 2;
     while (b <= 8) : (b += 1) {
-        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(b, 1, K, false));
+        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(b, 1, K, false, false));
     }
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(9, 1, K, false));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, K, false));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, true));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(9, 1, K, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, K, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, true, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, K, false, false));
     qwen4_standin_override = .{ .moe_gateup = true };
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false, false));
     qwen4_standin_override = .{ .moe_down = true };
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false, false));
     qwen4_standin_override = .{};
+}
+
+test "moe dispatch: a clamped SwiGLU declines the rows arm, at batched decode and at verify widths" {
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    qwen4_standin_override = .{};
+    defer qwen4_standin_override = null;
+    // The rows kernels apply no clamp (GLM-5.3's limit 10): the composed chain runs instead.
+    try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false, true));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(8, 1, 10, false, true));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, 4, 10, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, 10, false, true));
 }
 
 test "moe decode dispatch: single-slot verify widths take the rows arm when enabled" {
@@ -52013,16 +52028,16 @@ test "moe decode dispatch: single-slot verify widths take the rows arm when enab
     const K: c_int = 10;
     var s: c_int = 2;
     while (s <= 8) : (s += 1) {
-        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, s, K, false));
+        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, s, K, false, false));
     }
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 9, K, false));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, true));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 4, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 9, K, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, true, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 4, K, false, false));
     qwen4_standin_override = .{ .moe_gateup = true };
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false, false));
     qwen4_standin_override = .{};
     moe_verify_rows_override = false;
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false, false));
 
     try std.testing.expect(moeVerifyRowsFor(null));
     try std.testing.expect(!moeVerifyRowsFor("0"));
