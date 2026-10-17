@@ -84,6 +84,8 @@ Decode speed in v26.10.2 on an M5 Ultra with 256 GB, on a code prompt, with spec
 
 On an M4 Max, the same models decode 9% to 56% faster than they did in v26.8. Every release is measured the same way in [benchmarks.md](benchmarks.md); speculative decoding and tuning are in [docs/performance.md](docs/performance.md).
 
+On Macs with neural accelerators (M5-class and later), `--w8a8-prefill` turns on an opt-in, lossy rotated-int8 route for prompt processing of 4-bit models: +22% to +34% prefill on Qwen3.8-27B 4-bit with its DFlash drafter on an M6, decode unchanged. Scope, quality and numbers are in [docs/performance.md](docs/performance.md#w8a8-prefill-nax-gpus).
+
 ## Docs
 
 - [Integrations](docs/integrations.md): Claude Code, Codex, OpenCode, pi, Zed and more
