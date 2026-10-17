@@ -187,6 +187,16 @@ final class MediaModelResolutionTests: XCTestCase {
         XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/mesh", in: models)?.modality, .mesh)
     }
 
+    func testADecisionCheckpointResolvesToItsOwnUse() {
+        // Decisions are the third half of the catalogue: My Models offers a Use for them,
+        // so a Discover row on the same checkpoint must resolve it too.
+        let models = [local("laya", path: "/m/laya"), local("qwen3", path: "/m/chat"), local("acestep", path: "/m/music")]
+        XCTAssertEqual(ModelBrowserUse.decisionModel(atPath: "/m/laya", in: models)?.path, "/m/laya")
+        XCTAssertNil(ModelBrowserUse.decisionModel(atPath: "/m/chat", in: models))
+        XCTAssertNil(ModelBrowserUse.decisionModel(atPath: "/m/music", in: models))
+        XCTAssertNil(ModelBrowserUse.decisionModel(atPath: nil, in: models))
+    }
+
     func testPathMatchingIsAsForgivingAsTheChatHalf() {
         // Same normalization, or the two halves would disagree about which row
         // a path belongs to.

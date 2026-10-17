@@ -71,6 +71,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--ssd-streaming` | off | ds4 / DeepSeek-V4-Flash GGUF only: stream expert weights from SSD instead of holding the whole model in RAM |
 | `--ane` | off | Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine instead of the GPU, contexts up to 64K (a model's `"ane"` in `model-settings.json` wins); the first load on a Mac compiles its programs (minutes, then cached) |
 | `--ane-slots N` | `1` | Requests each Neural Engine model runs at once (1..4); slots share the weights, each adds its own KV and state |
+| `--w8a8` / `--no-w8a8` | on with an M5-class GPU and 64 GiB RAM, else off | Image, video, music and 3D models (Krea, Qwen-Image, MageFlow, FLUX.2 klein, LTX, MiniMax-H3, ACE-Step, Music 3, Hunyuan3D) run their transformer linears and, at head_dim 128, attention as rotated int8 x int8 on the Neural Accelerators: faster, slightly lossy, and the int8 copy replaces the packed weights (a 4-bit pack holds more memory, a bf16 pack half). `--w8a8` opts in on a smaller Mac, `--no-w8a8` keeps the packed weights |
 | `--prefill-chunk N` | `8192` | Max tokens forwarded per prefill chunk (auto-capped further per model); lower it to cut prefill peak memory |
 | `--no-decode-attn-quant` | on | Disable the decode-only requant of dense bf16 attention weights (the "Fast decode for bf16-attention models" toggle) |
 | `--kv-quant {off,4,8}` | off | KV-cache quantization scheme (MLX path) |

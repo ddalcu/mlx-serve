@@ -243,6 +243,11 @@ fn printUsage(io: std.Io) void {
         \\                        share is calibrated once per Mac and model on
         \\                        the first request (~1 s) and reused; the server
         \\                        declines by name where the copy does not fit.
+        \\  --w8a8 / --no-w8a8  Run image, video, music and 3D DiT linears as rotated
+        \\                        per-row int8 x int8 on the Neural Accelerators
+        \\                        (lossy, faster; 4-bit packs hold more memory, bf16
+        \\                        packs half). On by default only on an M5-class
+        \\                        GPU with 64 GiB of RAM; --w8a8 opts in below that.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
         \\  --mtp               No-op: a loaded MTP head drafts by default,
@@ -653,6 +658,7 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
+    @import("w8a8.zig").enabled = @import("w8a8.zig").defaultOn(transformer_mod.naxAvailable(), ane_mod.totalMemBytes());
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
@@ -840,6 +846,10 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--ane-slots: expected an integer 1..{d}, got '{s}'\n", .{ ane_lm.max_slots, args[i] });
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--w8a8")) {
+            @import("w8a8.zig").enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--no-w8a8")) {
+            @import("w8a8.zig").enabled = false;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {

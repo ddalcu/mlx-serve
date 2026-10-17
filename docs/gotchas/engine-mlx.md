@@ -1219,48 +1219,16 @@ documented next step; gemma's head_dim 256 needs a different lane mapping.
 Fourth mining pass over the mlxfast-challenge tree, executing the "next round" list from
 `docs/perf-next-levers.md`. Outcomes, in the order attempted:
 
-### Certified lm_head prune: kernels sound, argmax provable, LIVE NULL — ships opt-in
+### Certified lm_head prune: a µbench win the live graph does not keep — deleted
 
-Port of `LagunaLmHeadPrune.swift` (notes/68): an init-time MXFP8-g32 copy of the dense
-bf16 lm_head (half the bytes), one coarse GEMV emitting per-row coarse logit + a
-CERTIFIED bound (half-ulp e4m3 cells + a 2^-15 rounding allowance, top cell 186) + a bf16
-pre-fill; a dense one-byte candidate mask (`coarse+delta >= max(coarse-delta) - |L|/64`);
-an exact pass whose per-row arithmetic textually replicates the stock
-`gemv_bfloat16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` (verified to be what MLX dispatches
-for this matvec) so every candidate row is bit-identical to the stock GEMV. Every
-argmax-reachable row is provably a candidate; every non-candidate is provably below the
-winner; the emitted token is the stock token.
-
-Three lessons:
-
-1. **The gate is REQUEST-level and must be known at init.** The pruned row is exact
-   at candidates and coarse elsewhere — enough for an argmax, not for a tail
-   distribution. `ForwardCtx.argmax_only` is set by the Generator (greedy or top-1, no
-   penalties, no logprobs, no grammar), and logprobs had to move into `InitOptions`:
-   the split-prefill final-token forward is a single-row dispatch that runs BEFORE any
-   post-init `gen.logprobs_n = n` write, so a logprobs request would have had its first
-   token's logprobs computed from a pruned row.
-2. **A hermetic parity test cannot see reduction order at this scale.** A deliberate
-   perturbation of the exact kernel's accumulation order (grouped instead of sequential)
-   STILL passed the bit-equality test: an f32 last-ulp difference almost always vanishes
-   in the final bf16 cast, and catching one empirically needs ~hundreds of thousands of
-   casts. The live >=160-token greedy on/off run (16M casts) is the real bit-identity
-   bar — same lesson as round 3's fused-QKV divergence at byte 164.
-3. **The µbench-vs-live class, third instance, with the strongest live design yet.**
-   µbench at the real [100352, 2048] geometry, with a separated-winner weight matrix
-   reproducing the LIVE candidate regime (median ~19 of 100352 candidates, measured by
-   `MLX_SERVE_LMHEAD_PRUNE_TRACE=1`): dense 1.04 -> pruned 0.63 ms/iter, a ~0.4 ms/token
-   saving. Live: an INTERLEAVED same-boot A/B — the gate is per-request, and
-   `presence_penalty: 1e-9` clears `argmax_only` while the lazy greedy sampler never
-   applies penalties, so the dense arm is byte-identical work in the SAME boot,
-   alternating per generation, and thermal drift cancels per pair. 20 rounds: median
-   +0.84% per pair, 3/20 wins; the on-arm's early −1.8% advantage decays within a few
-   generations while the off arm stays flat. The µbench saving does not survive the
-   live graph, and the boot-level A/B that "showed" −1.3%/+1.6% was just drift. Where
-   the ~0.5 ms goes live remains unattributed (candidates stay tiny all boot — traced;
-   the threshold chain and select are flat in the stage bisection; the exact pass with
-   a zero mask costs ~0.02 ms net). Shipped `MLX_SERVE_LMHEAD_PRUNE=1` opt-in with the
-   trace + µbench left in place for whoever picks it up.
+Port of `LagunaLmHeadPrune.swift`: a coarse MXFP8 copy of the dense bf16 head bounds every
+row's logit, and only rows that can still win run an exact replica of the stock GEMV. The
+µbench at Laguna XS geometry went 1.04 -> 0.63 ms, but a same-boot interleaved live A/B won
+3 of 20 pairs, and a 5-bit certified readout of Flash Next's 8-bit head (2026-10) repeated
+it: +1.4-2% on greedy one-row decode only; a top-20 draw left ~11% of the vocabulary as
+candidates and multi-row verify ran slower than stock. Both also took their threshold over
+reserved rows, so a top-ranked suppressed token could hide the real winner. The opt-in prune
+was deleted; a head-readout lever is judged by the live A/B, never the µbench.
 
 ### MoE down-path tail fusion: −1.5%, bit-identical, default ON
 

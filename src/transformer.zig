@@ -13265,7 +13265,7 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
                             const eq_stream = try qsaArraysAllEqual(solo_out[k].stream, bout[k].stream, s);
                             var row_mix = try xfm.hcRead(bout[k].stream, &xfm.qwen4_mtp.?.mixer, 1, 1);
                             defer row_mix.deinit();
-                            const row_logits = try xfm.lmHeadProject(row_mix.mixed, false);
+                            const row_logits = try xfm.lmHeadProject(row_mix.mixed);
                             defer _ = mlx.mlx_array_free(row_logits);
                             const eq_readout = try qsaArraysAllEqual(row_logits, bout[k].logits, s);
                             std.debug.print("[mtp mlx_equal] N={d} depth={d} step={d} row={d} logits=NE stream={} readout={}\n", .{ N, depth, d, k, eq_stream, eq_readout });
@@ -15684,13 +15684,6 @@ pub const ForwardCtx = struct {
     /// and by the LTX text encoder (which wants the residual stream, not a
     /// next token).
     skip_lm_head: bool = false,
-    /// Set by the Generator when this request consumes ONLY the argmax of
-    /// the logits (greedy or top-1 sampling, no logit-modifying penalties,
-    /// no per-token logprobs, no grammar mask). Gates the certified lm_head
-    /// prune, whose output row is bit-identical at every candidate slot and
-    /// certified-below-the-winner elsewhere — exactly enough for an argmax,
-    /// not for a tail distribution. Default false = dense path everywhere.
-    argmax_only: bool = false,
     /// Batched decode over a GatedDeltaNet trunk (`forwardMoeBatchedDecode`).
     /// Non-null means: this forward runs at `batch == batch_slots.len`,
     /// `seq_len == 1`, and every per-slot KV cache lives on the slot ctxs
@@ -17133,12 +17126,6 @@ pub const Transformer = struct {
     /// each request's own estimate starts.
     mtp_depth_acc: f32 = 0.8,
     mtp_depth_rounds: u32 = 0,
-    /// Certified lm_head prune (mlxfast notes/68 class): MXFP8 g32 coarse
-    /// copy of a dense bf16 lm_head, built lazily on the first eligible
-    /// argmax-only decode. `lm_head_prune_tried` marks the probe so a
-    /// declined head is never re-quantized per token.
-    lm_head_prune: ?LmHeadPrune = null,
-    lm_head_prune_tried: bool = false,
     /// Per-token cos|sin rows for the fused QK-norm+RoPE kernel, one slot per
     /// rope family (0 = default/sliding base, 1 = YaRN freqs). Keyed by
     /// offset: every layer of one decode step shares the row, the next token
@@ -18889,10 +18876,6 @@ pub const Transformer = struct {
             };
             self.attn_dq.deinit(self.allocator);
         }
-        if (self.lm_head_prune) |p| {
-            _ = mlx.mlx_array_free(p.codes);
-            _ = mlx.mlx_array_free(p.scales);
-        }
         for (&self.qk_angle_cache) |*slot| {
             if (slot.arr.ctx != null) _ = mlx.mlx_array_free(slot.arr);
         }
@@ -19008,13 +18991,8 @@ pub const Transformer = struct {
     /// and is NOT pre-transposed at load (when tied it aliases emb_w, which must stay
     /// [vocab, hidden] for the embedding lookup), so we project via a lazy transposed
     /// view. Quantized models fall through to the standard gather/qmm path unchanged.
-    /// `argmax_only` (the Generator's request-level gate, via ForwardCtx) permits the
-    /// certified prune on eligible single-row decode dispatches; false = always dense.
-    inline fn lmHeadProject(self: *const Transformer, x: mlx.mlx_array, argmax_only: bool) !mlx.mlx_array {
+    inline fn lmHeadProject(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
         if (self.lm_head_s.ctx == null) {
-            if (argmax_only) {
-                if (try self.lmHeadPruneFor(x)) |pruned| return pruned;
-            }
             const wt = try transposeBf16Weight(self.lm_head_w, self.s); // [hidden, vocab] view
             defer _ = mlx.mlx_array_free(wt);
             var result = mlx.mlx_array_new();
@@ -19022,41 +19000,6 @@ pub const Transformer = struct {
             return result;
         }
         return self.qmatmul(x, self.lm_head_w, self.lm_head_s, self.lm_head_b);
-    }
-
-    /// Certified lm_head prune dispatch: all gates, the lazy one-time MXFP8
-    /// coarse-copy build, and the three-kernel pruned projection. Returns null
-    /// on any decline (caller keeps the dense path); never errors a request
-    /// out on a build failure.
-    fn lmHeadPruneFor(self: *const Transformer, x: mlx.mlx_array) !?mlx.mlx_array {
-        if (!lmHeadPruneEnabled()) return null;
-        // Single-row decode only: [1, 1, hidden]. Verify/prefill widths keep
-        // the dense weight (the coarse pass is a one-row GEMV).
-        const xsh = mlx.getShape(x);
-        if (xsh.len != 3 or xsh[0] != 1 or xsh[1] != 1) return null;
-        if (mlx.mlx_array_dtype(x) != .bfloat16) return null;
-        const mut = @constCast(self);
-        if (!mut.lm_head_prune_tried) {
-            mut.lm_head_prune_tried = true;
-            const wsh = mlx.getShape(self.lm_head_w);
-            if (lmHeadPruneEligible(wsh, mlx.mlx_array_dtype(self.lm_head_w), self.lm_head_s.ctx != null)) {
-                mut.lm_head_prune = buildLmHeadPruneCopy(self.s, self.lm_head_w) catch null;
-            }
-            if (mut.lm_head_prune == null) {
-                // A declined prune is output-identical to the fallback —
-                // without this line it reads as a null result.
-                log.info("[lm_head] certified prune declined: dense head {any} outside the kernel geometry (bf16 [V%32==0, K%1024==0])\n", .{mlx.getShape(self.lm_head_w)});
-            }
-        }
-        const prune = &(mut.lm_head_prune orelse return null);
-        if (xsh[2] != prune.hidden) return null;
-        const out = try lmHeadPruneProject(self.s, prune, self.lm_head_w, x);
-        if (!lmhead_prune_engaged) {
-            lmhead_prune_engaged = true;
-            const mb = @divTrunc(@as(i64, prune.vocab) * @as(i64, prune.hidden) * 9, 8 * 1024 * 1024);
-            log.info("[lm_head] certified prune engaged: vocab={d} hidden={d} (mxfp8 coarse copy ~{d} MB; MLX_SERVE_LMHEAD_PRUNE=0 restores dense)\n", .{ prune.vocab, prune.hidden, mb });
-        }
-        return out;
     }
 
     /// Resolve per-weight quant params without an activation hint — for callers
@@ -20647,7 +20590,7 @@ pub const Transformer = struct {
     /// THIS head — the reference applies the bare Linear (no softcap /
     /// output_multiplier; both are monotone, so draft argmax is unaffected).
     pub fn lmHeadForDraft(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
-        return self.lmHeadProject(x, false);
+        return self.lmHeadProject(x);
     }
 
     /// Re-orders every trunk projection the lane matmul serves into its tiled
@@ -20707,7 +20650,7 @@ pub const Transformer = struct {
 
     /// The quantized head's first `rows` vocab rows only (a draft vocabulary).
     pub fn lmHeadRowsForDraft(self: *const Transformer, x: mlx.mlx_array, rows: c_int) !mlx.mlx_array {
-        if (self.lm_head_s.ctx == null) return self.lmHeadProject(x, false);
+        if (self.lm_head_s.ctx == null) return self.lmHeadProject(x);
         var parts: [3]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null }, .{ .ctx = null } };
         defer for (parts) |p| {
             if (p.ctx != null) _ = mlx.mlx_array_free(p);
@@ -21940,7 +21883,7 @@ pub const Transformer = struct {
         }
 
         if (self.embedding_mode or ctx.skip_lm_head) return final_normed;
-        var logits = try self.lmHeadProject(final_normed, ctx.argmax_only);
+        var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
 
         // MuseGlimmer: pre-scale logits by output_multiplier BEFORE the softcap
@@ -22267,7 +22210,7 @@ pub const Transformer = struct {
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
 
-        var logits = try self.lmHeadProject(final_normed, false);
+        var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
 
         if (self.output_mult) |m| {
@@ -25240,7 +25183,7 @@ pub const Transformer = struct {
             var xrow = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(xrow);
             try mlx.check(mlx.mlx_slice(&xrow, x, &starts, @intCast(sh.len), &stops, @intCast(sh.len), &strides, @intCast(sh.len), self.s));
-            parts[row] = if (lm_head) try self.lmHeadProject(xrow, false) else try self.qmatmul(xrow, w, sc, bi);
+            parts[row] = if (lm_head) try self.lmHeadProject(xrow) else try self.qmatmul(xrow, w, sc, bi);
         }
         return concatAxis0(self.s, parts[0..n]);
     }
@@ -25624,7 +25567,7 @@ pub const Transformer = struct {
             return .{ .logits = .{ .ctx = null }, .stream = h, .mixed = mix.mixed };
         }
         defer _ = mlx.mlx_array_free(mix.mixed);
-        const logits = try self.lmHeadProject(mix.mixed, false);
+        const logits = try self.lmHeadProject(mix.mixed);
         return .{ .logits = logits, .stream = h };
     }
 
@@ -25959,7 +25902,7 @@ pub const Transformer = struct {
                 mix.mixed
             else blk: {
                 defer _ = mlx.mlx_array_free(mix.mixed);
-                break :blk try self.lmHeadProject(mix.mixed, row.ctx.argmax_only);
+                break :blk try self.lmHeadProject(mix.mixed);
             };
             out_logits[i] = logits;
             out_last[i] = last;
@@ -25990,7 +25933,7 @@ pub const Transformer = struct {
                     log.info("[batched] vocabulary verify projection engaged (slots={d})\n", .{initialized});
                 }
             } else {
-                for (rows[0..initialized], 0..) |row, i| out_logits[i] = try self.lmHeadProject(lmhead_inputs[i], row.ctx.argmax_only);
+                for (0..initialized) |i| out_logits[i] = try self.lmHeadProject(lmhead_inputs[i]);
             }
         }
         self.fwd_gen = generation;
@@ -26168,7 +26111,7 @@ pub const Transformer = struct {
         const final = mix.mixed;
         if (self.embedding_mode or ctx.skip_lm_head) return final;
         errdefer _ = mlx.mlx_array_free(final);
-        const logits = try self.lmHeadProject(final, ctx.argmax_only);
+        const logits = try self.lmHeadProject(final);
         _ = mlx.mlx_array_free(final);
         return logits;
     }
@@ -26290,7 +26233,7 @@ pub const Transformer = struct {
         if (ctx.capture_hidden_all) |target_all| _ = mlx.mlx_array_set(target_all, final_normed);
         if (self.embedding_mode or ctx.skip_lm_head) return final_normed;
         defer _ = mlx.mlx_array_free(final_normed);
-        return self.lmHeadProject(final_normed, ctx.argmax_only);
+        return self.lmHeadProject(final_normed);
     }
 
     /// One GLM-5-Next sublayer (attention when `attn`, else the MLP) inside its
@@ -27138,7 +27081,7 @@ pub const Transformer = struct {
             }
             return final_normed;
         }
-        var logits = try self.lmHeadProject(final_normed, ctx.argmax_only);
+        var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
 
         // Inkling: slice the padded vocab rows off (201024 → 200058) so
@@ -27554,7 +27497,7 @@ pub const Transformer = struct {
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
-        var logits = try self.lmHeadProject(final_normed, false);
+        var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
 
         if (self.softcap_scalar != null) {
@@ -27726,13 +27669,13 @@ pub const Transformer = struct {
             try captureHidden(ctx, if (self.config.mtpReadsFinalNorm()) final_normed else h, self.s);
             _ = mlx.mlx_array_free(h);
             if (self.embedding_mode or ctx.skip_lm_head) return final_normed;
-            const logits = try self.lmHeadProject(final_normed, ctx.argmax_only);
+            const logits = try self.lmHeadProject(final_normed);
             _ = mlx.mlx_array_free(final_normed);
             return logits;
         } else {
             try captureHidden(ctx, h, self.s);
             if (self.embedding_mode or ctx.skip_lm_head) return h;
-            const logits = try self.lmHeadProject(h, ctx.argmax_only);
+            const logits = try self.lmHeadProject(h);
             _ = mlx.mlx_array_free(h);
             return logits;
         }
@@ -39907,505 +39850,6 @@ fn buildAttnDqCopy(s: mlx.mlx_stream, w: mlx.mlx_array, nvfp4: bool) !?AttnDqCop
     _ = mlx.mlx_array_eval(copy.s);
     if (copy.b.ctx != null) _ = mlx.mlx_array_eval(copy.b);
     return copy;
-}
-
-// ── Certified lm_head prune (port of mlxfast-challenge LagunaLmHeadPrune.swift, notes/68) ──
-//
-// Stock decode lm_head reads the full dense bf16 [V, K] weight per token at
-// the DRAM wall. For argmax-only requests (ForwardCtx.argmax_only) this
-// replaces it with:
-//   1. COARSE: one fused GEMV over an init-time MXFP8 copy (gs32 e8m0+e4m3,
-//      half the bytes) producing per-row coarse logit c_i, a CERTIFIED bound
-//      delta_i, and a bf16 pre-fill of the output row.
-//      delta_i = d_i*(1+gamma) + 2*gamma*m_i with
-//      d_i = sum_g sd_g * sum_{j in g} |x_j| * hs8(code_ij)
-//          >= sum_j |x_j| * |w_ij - what_ij|   (half-ulp cells, top cell 186)
-//      and m_i = sum_j |x_j| * |what_ij|, so delta_i covers BOTH the
-//      quantization error and both kernels' float rounding (depth <= 96
-//      roundings/element-path << gamma = 2^-15 relative).
-//   2. SELECT: a dense one-byte mask marking rows with
-//      c_i + delta_i >= max_j(c_j - delta_j) - beta, beta = |L|/64 (>= 2 bf16
-//      ulps at the logit scale, so a non-candidate's bf16(coarse) is PROVABLY
-//      strictly below the winner's bf16 value). No host readback, no atomics.
-//   3. EXACT: each simdgroup owns a FIXED block of four output rows and runs
-//      the full bf16 GEMV only when one of its rows is marked, writing coarse
-//      values otherwise. The per-row arithmetic is a TEXTUAL replica of the
-//      stock `gemv_bfloat16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` (what MLX
-//      dispatches for this exact matvec — same lane partition, same
-//      sequential f32 order, same vec4 loads, same simd tree, one bf16 cast),
-//      so every candidate row is bit-identical to the stock full GEMV's.
-// Every argmax-reachable row is a candidate (an exact-max row always clears
-// the threshold) and every non-candidate is certified strictly below the
-// winner, so the emitted token is the stock token. Kill switch
-// MLX_SERVE_LMHEAD_PRUNE=0; gated per request by the Generator (greedy/top-1,
-// no penalties, no logprobs, no grammar — the spec-disable precedent).
-const LmHeadPrune = struct {
-    codes: mlx.mlx_array, // [V, K/4] uint32 — e4m3 codes, 4 per word, byte order = element order
-    scales: mlx.mlx_array, // [V, K/32] uint8 — e8m0 group scales
-    vocab: c_int,
-    hidden: c_int,
-};
-
-var lmhead_prune_engaged: bool = false;
-pub var lmhead_prune_override: ?bool = null; // test seam
-var lmhead_prune_env: ?bool = null;
-
-/// Ships OPT-IN (default OFF, 2026-07-29): the kernels are sound — µbench at
-/// the real [100352, 2048] geometry reads dense 1.04 -> pruned 0.63 ms/iter
-/// with the live candidate regime (median ~19 rows) — but the LIVE
-/// interleaved same-boot A/B (presence_penalty=1e-9 as the per-request
-/// dense control, 20 rounds, matched prompts) measured steady-state
-/// +0.84% median per-pair, 3/20 wins: the µbench saving does not survive
-/// the live graph. µbench-vs-live class; the number picks the default.
-/// MLX_SERVE_LMHEAD_PRUNE=1 opts in (argmax provably stock either way).
-pub const LMHEAD_PRUNE_DEFAULT = false;
-
-fn lmHeadPruneEnabled() bool {
-    if (lmhead_prune_override) |v| return v;
-    if (lmhead_prune_env) |v| return v;
-    const enabled = blk: {
-        if (std.c.getenv("MLX_SERVE_LMHEAD_PRUNE")) |raw| {
-            break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-        }
-        break :blk LMHEAD_PRUNE_DEFAULT;
-    };
-    lmhead_prune_env = enabled;
-    return enabled;
-}
-
-var lmhead_prune_trace_cached: ?bool = null;
-fn lmHeadPruneTraceEnabled() bool {
-    if (lmhead_prune_trace_cached) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_LMHEAD_PRUNE_TRACE");
-    const enabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
-    lmhead_prune_trace_cached = enabled;
-    return enabled;
-}
-
-/// Whether a dense lm_head fits the prune kernels' own geometry: bf16 [V, K]
-/// with V in whole 32-row exact-pass blocks and K in whole 1024-element lane
-/// strides (32 lanes x 32-element groups x K/1024 groups per lane).
-fn lmHeadPruneEligible(w_shape: []const c_int, dtype: mlx.mlx_dtype, has_scales: bool) bool {
-    if (has_scales) return false; // quantized head: the bound needs the scales-based form (v2)
-    if (dtype != .bfloat16) return false;
-    if (w_shape.len != 2) return false;
-    if (w_shape[0] <= 0 or w_shape[1] <= 0) return false;
-    if (@rem(w_shape[0], 32) != 0) return false;
-    if (@rem(w_shape[1], 1024) != 0) return false;
-    return true;
-}
-
-/// Kernel header: bit-exact MXFP8 element decoders + the certified
-/// half-cell-width construction, all inlinable and libm-free (exponent-bit
-/// construction, exact for every code — replicas of MLX's fp8.h semantics).
-const LMHEAD_PRUNE_HEADER =
-    \\// e8m0 decode: bits<<23 as f32; bits==0 -> 2^-127. Exact.
-    \\static inline float mlxserve_e8m0_decode(uint8_t b) {
-    \\    if (b == 0u) {
-    \\        return as_type<float>(0x00400000u);  // 2^-127
-    \\    }
-    \\    return as_type<float>(uint(b) << 23);
-    \\}
-    \\
-    \\// Bit-parallel e4m3fn decode of one packed word (4 codes) into 4 floats.
-    \\// Per byte b the half bit pattern is sign<<15 | (b&127)<<7 — fp8.h's
-    \\// (b&127)<<7 construction with the sign applied as the half sign bit.
-    \\// IEEE multiply is sign-magnitude symmetric, so (sign-packed half)*256h
-    \\// equals sign*((b&127)-half * 256h) bit-for-bit for every code,
-    \\// including -0 (code 0x80). Decoded floats are byte order b0..b3.
-    \\static inline float4 mlxserve_e4m3_decode4(uint w) {
-    \\    uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
-    \\    uint hs = w >> 8;
-    \\    uint hi = ((hs & 0x007F007Fu) << 7) | ((hs & 0x00800080u) << 8);
-    \\    half2 h02 = as_type<half2>(lo) * half2((half)256.0f);
-    \\    half2 h13 = as_type<half2>(hi) * half2((half)256.0f);
-    \\    return float4(float(h02.x), float(h13.x), float(h02.y), float(h13.y));
-    \\}
-;
-
-/// Coarse pass: one simdgroup per row (8 rows / 256-thread threadgroup), each
-/// lane owning K/1024 consecutive 32-element groups. Word-parallel e4m3
-/// decode, vectorized half-ulp table (max-form: 2^(max(e,1)-11), top code
-/// 0x7E -> 186 covering the open saturated cell), x loaded as ushort4 and
-/// converted bf16->f32 by the exact bits<<16 construction.
-const LMHEAD_COARSE_SOURCE =
-    \\constexpr float GAMMA = 0x1p-15f;
-    \\constexpr uint K = uint(HID);
-    \\constexpr uint GPL = K / 1024;
-    \\constexpr uint SG = K / 32;
-    \\uint row = threadgroup_position_in_grid.x * 8 +
-    \\    simdgroup_index_in_threadgroup;
-    \\uint lane = thread_index_in_simdgroup;
-    \\const device uint* crow = codes + size_t(row) * (K / 4);
-    \\const device uint8_t* srow = scales + size_t(row) * SG;
-    \\float c_acc = 0.0f;
-    \\float d_acc = 0.0f;
-    \\float m_acc = 0.0f;
-    \\for (uint gg = 0; gg < GPL; ++gg) {
-    \\    uint g = GPL * lane + gg;
-    \\    float sd = mlxserve_e8m0_decode(srow[g]);
-    \\    const device uint4* cptr = (const device uint4*)(crow + g * 8);
-    \\    uint4 packed0 = cptr[0];
-    \\    uint4 packed1 = cptr[1];
-    \\    float cg = 0.0f;
-    \\    float dg = 0.0f;
-    \\    float mg = 0.0f;
-    \\    const device ushort4* xrow = (const device ushort4*)((const device ushort*)x + g * 32);
-    \\    #pragma clang loop unroll(full)
-    \\    for (uint w = 0; w < 8; ++w) {
-    \\        uint word = (w < 4u) ? packed0[w & 3u] : packed1[w & 3u];
-    \\        float4 cv4 = mlxserve_e4m3_decode4(word);
-    \\        // bf16 -> f32 is exactly bits<<16 for every value class.
-    \\        float4 xv4 = as_type<float4>(uint4(xrow[w]) << 16);
-    \\        float4 ax4 = metal::abs(xv4);
-    \\        uint4 b4 = (uint4(word) >> uint4(0u, 8u, 16u, 24u)) & 255u;
-    \\        uint4 mag4 = b4 & 127u;
-    \\        uint4 e4 = mag4 >> 3;
-    \\        float4 hsf = as_type<float4>((metal::max(e4, uint4(1u)) + 116u) << 23);
-    \\        float4 hs4 = metal::select(hsf, float4(186.0f), mag4 == 126u);
-    \\        float4 acv4 = metal::abs(cv4);
-    \\        #pragma clang loop unroll(full)
-    \\        for (uint kk = 0; kk < 4; ++kk) {
-    \\            float cv = cv4[kk];
-    \\            float xv = xv4[kk];
-    \\            float ax = ax4[kk];
-    \\            cg += xv * cv;
-    \\            dg += ax * hs4[kk];
-    \\            mg += ax * acv4[kk];
-    \\        }
-    \\    }
-    \\    c_acc += sd * cg;
-    \\    d_acc += sd * dg;
-    \\    m_acc += sd * mg;
-    \\}
-    \\c_acc = simd_sum(c_acc);
-    \\d_acc = simd_sum(d_acc);
-    \\m_acc = simd_sum(m_acc);
-    \\if (lane == 0) {
-    \\    coarse[row] = c_acc;
-    \\    delta[row] = d_acc * (1.0f + GAMMA) + (2.0f * GAMMA) * m_acc;
-    \\    coarse_bf[row] = bfloat16_t(c_acc);
-    \\}
-;
-
-/// GPU candidate marking: one byte per vocabulary row. A dense mask rather
-/// than a compacted list because the exact pass owns a FIXED output block per
-/// simdgroup and keys on "is row r a candidate?" — cheaper and race-free.
-const LMHEAD_SELECT_SOURCE =
-    \\uint i = thread_position_in_grid.x;
-    \\is_cand[i] = (coarse[i] + delta[i] >= thr[0]) ? uint8_t(1) : uint8_t(0);
-;
-
-/// Exact pass: textual replica of the stock gemv (see section comment) over a
-/// simdgroup's fixed 4-row block, dispatched only when a row is marked. Every
-/// vocabulary slot is written by exactly one lane on exactly one path.
-const LMHEAD_EXACT_SOURCE =
-    \\constexpr uint VOCAB = uint(V);
-    \\constexpr uint K = uint(HID);
-    \\constexpr uint NITER = K / 128;
-    \\uint tgid = threadgroup_position_in_grid.x;
-    \\uint sgid = simdgroup_index_in_threadgroup;
-    \\uint lane = thread_index_in_simdgroup;
-    \\// This simdgroup's fixed four output rows; VOCAB % 32 == 0 so the grid
-    \\// tiles it exactly (the bounds tests are belt-and-braces).
-    \\uint base = tgid * 32 + sgid * 4;
-    \\// Simdgroup-uniform: every lane reads the same four mask bytes.
-    \\bool any_candidate = false;
-    \\#pragma unroll
-    \\for (uint tm = 0; tm < 4; ++tm) {
-    \\    uint r = base + tm;
-    \\    any_candidate = any_candidate || (r < VOCAB && is_cand[r] != 0);
-    \\}
-    \\if (!any_candidate) {
-    \\    if (lane < 4 && base + lane < VOCAB) {
-    \\        assembled[base + lane] = coarse_bf[base + lane];
-    \\    }
-    \\    return;
-    \\}
-    \\// --- stock gemv replica begin (gemv.h GEMVKernel::run, kAligned) ---
-    \\thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\thread T inter[4];
-    \\thread float v_coeff[4];
-    \\uint bn = lane * 4;
-    \\for (uint i = 0; i < NITER; ++i) {
-    \\    vec<T, 4> xv = *((const device vec<T, 4>*)(x + bn));
-    \\    v_coeff[0] = float(xv.x);
-    \\    v_coeff[1] = float(xv.y);
-    \\    v_coeff[2] = float(xv.z);
-    \\    v_coeff[3] = float(xv.w);
-    \\    #pragma unroll
-    \\    for (uint tm = 0; tm < 4; ++tm) {
-    \\        const device T* mrow = lm_head + size_t(base + tm) * K;
-    \\        vec<T, 4> mv = *((const device vec<T, 4>*)(mrow + bn));
-    \\        inter[0] = mv.x;
-    \\        inter[1] = mv.y;
-    \\        inter[2] = mv.z;
-    \\        inter[3] = mv.w;
-    \\        result[tm] += inter[0] * v_coeff[0];
-    \\        result[tm] += inter[1] * v_coeff[1];
-    \\        result[tm] += inter[2] * v_coeff[2];
-    \\        result[tm] += inter[3] * v_coeff[3];
-    \\    }
-    \\    bn += 128;
-    \\}
-    \\#pragma unroll
-    \\for (uint tm = 0; tm < 4; ++tm) {
-    \\    #pragma unroll
-    \\    for (ushort sn = 16; sn >= 1; sn >>= 1) {
-    \\        result[tm] += simd_shuffle_down(result[tm], sn);
-    \\    }
-    \\}
-    \\// --- stock gemv replica end ---
-    \\if (lane == 0) {
-    \\    #pragma unroll
-    \\    for (uint tm = 0; tm < 4; ++tm) {
-    \\        uint r = base + tm;
-    \\        if (r < VOCAB) {
-    \\            assembled[r] = (is_cand[r] != 0)
-    \\                ? T(result[tm])
-    \\                : coarse_bf[r];
-    \\        }
-    \\    }
-    \\}
-;
-
-var lmhead_coarse_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var lmhead_select_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var lmhead_exact_kernel: ?mlx.mlx_fast_metal_kernel = null;
-
-fn getLmHeadKernel(
-    slot: *?mlx.mlx_fast_metal_kernel,
-    name: [*:0]const u8,
-    input_names: []const [*:0]const u8,
-    output_names: []const [*:0]const u8,
-    source: [*:0]const u8,
-    header: [*:0]const u8,
-) !mlx.mlx_fast_metal_kernel {
-    if (slot.*) |k| return k;
-    const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
-    defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(output_names.ptr, output_names.len);
-    defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
-    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
-    slot.* = kernel;
-    return kernel;
-}
-
-const LmHeadCfgKey = struct { vocab: c_int, hidden: c_int };
-var lmhead_coarse_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var lmhead_select_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var lmhead_exact_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var lmhead_cfg_key: LmHeadCfgKey = .{ .vocab = 0, .hidden = 0 };
-
-/// (Re)build the three cached kernel configs for a (vocab, hidden) geometry.
-/// A config rebuilt per call is a CPU-side tax that reads as kernel cost —
-/// the gatherQmv lesson; one key guards all three (they change together).
-fn lmHeadPruneConfigs(vocab: c_int, hidden: c_int) !void {
-    const key = LmHeadCfgKey{ .vocab = vocab, .hidden = hidden };
-    if (lmhead_coarse_cfg != null and std.meta.eql(lmhead_cfg_key, key)) return;
-    if (lmhead_coarse_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-    if (lmhead_select_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-    if (lmhead_exact_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-    lmhead_coarse_cfg = null;
-    lmhead_select_cfg = null;
-    lmhead_exact_cfg = null;
-
-    const vshape = [_]c_int{vocab};
-    {
-        const config = mlx.mlx_fast_metal_kernel_config_new();
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &vshape, 1, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &vshape, 1, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &vshape, 1, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divExact(vocab, 8) * 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HID", hidden));
-        lmhead_coarse_cfg = config;
-    }
-    {
-        const config = mlx.mlx_fast_metal_kernel_config_new();
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &vshape, 1, .uint8));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, vocab, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
-        lmhead_select_cfg = config;
-    }
-    {
-        const config = mlx.mlx_fast_metal_kernel_config_new();
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &vshape, 1, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divExact(vocab, 32) * 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "V", vocab));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HID", hidden));
-        lmhead_exact_cfg = config;
-    }
-    lmhead_cfg_key = key;
-}
-
-/// Quantize the dense bf16 lm_head into the MXFP8 g32 coarse copy (e4m3
-/// codes + e8m0 scales, half the bytes). Eagerly materialized — the one-time
-/// build must never ride a token's graph.
-fn buildLmHeadPruneCopy(s: mlx.mlx_stream, w: mlx.mlx_array) !?LmHeadPrune {
-    const wsh = mlx.getShape(w);
-    var parts = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(parts);
-    try mlx.check(mlx.mlx_quantize(
-        &parts,
-        w,
-        mlx.mlx_optional_int.some(32),
-        mlx.mlx_optional_int.some(8),
-        "mxfp8",
-        .{ .ctx = null },
-        s,
-    ));
-    if (mlx.mlx_vector_array_size(parts) != 2) return null;
-    var p = LmHeadPrune{
-        .codes = mlx.mlx_array_new(),
-        .scales = mlx.mlx_array_new(),
-        .vocab = wsh[0],
-        .hidden = wsh[1],
-    };
-    try mlx.check(mlx.mlx_vector_array_get(&p.codes, parts, 0));
-    try mlx.check(mlx.mlx_vector_array_get(&p.scales, parts, 1));
-    _ = mlx.mlx_array_eval(p.codes);
-    _ = mlx.mlx_array_eval(p.scales);
-    return p;
-}
-
-/// Run one metal kernel and unpack its outputs into `outs`.
-fn lmHeadApply(
-    kernel: mlx.mlx_fast_metal_kernel,
-    config: mlx.mlx_fast_metal_kernel_config,
-    inputs: []const mlx.mlx_array,
-    outs: []mlx.mlx_array,
-    s: mlx.mlx_stream,
-) !void {
-    const inputs_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
-    defer _ = mlx.mlx_vector_array_free(inputs_vec);
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != outs.len) return error.MetalKernelBadOutputCount;
-    for (outs, 0..) |*o, i| {
-        o.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(o, outputs_vec, i));
-    }
-}
-
-/// Coarse GEMV over the MXFP8 copy. Returns {coarse f32, delta f32,
-/// coarse_bf bf16}, each [V]; caller owns all three. Split out so the bound-
-/// soundness test can assert |exact_i - coarse_i| <= delta_i directly — the
-/// prune is only correct if the bound is sound, so the bound itself is
-/// what gets tested, not just the assembled output.
-fn lmHeadPruneCoarse(s: mlx.mlx_stream, prune: *const LmHeadPrune, x_flat: mlx.mlx_array) ![3]mlx.mlx_array {
-    try lmHeadPruneConfigs(prune.vocab, prune.hidden);
-    const kernel = try getLmHeadKernel(
-        &lmhead_coarse_kernel,
-        "mlxserve_lmhead_mxfp8_coarse",
-        &.{ "x", "codes", "scales" },
-        &.{ "coarse", "delta", "coarse_bf" },
-        LMHEAD_COARSE_SOURCE,
-        LMHEAD_PRUNE_HEADER,
-    );
-    var outs: [3]mlx.mlx_array = undefined;
-    const inputs = [_]mlx.mlx_array{ x_flat, prune.codes, prune.scales };
-    try lmHeadApply(kernel, lmhead_coarse_cfg.?, &inputs, &outs, s);
-    return outs;
-}
-
-/// The pruned projection: full [1,1,V] bf16 logits row, bit-identical to the
-/// stock pass in every candidate slot and certified strictly below the winner
-/// elsewhere, so the downstream argmax emits the stock token.
-fn lmHeadPruneProject(s: mlx.mlx_stream, prune: *const LmHeadPrune, w: mlx.mlx_array, x: mlx.mlx_array) !mlx.mlx_array {
-    var x_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_flat);
-    const flat_shape = [_]c_int{prune.hidden};
-    try mlx.check(mlx.mlx_reshape(&x_flat, x, &flat_shape, 1, s));
-
-    const coarse_outs = try lmHeadPruneCoarse(s, prune, x_flat);
-    const coarse = coarse_outs[0];
-    const delta = coarse_outs[1];
-    const coarse_bf = coarse_outs[2];
-    defer _ = mlx.mlx_array_free(coarse);
-    defer _ = mlx.mlx_array_free(delta);
-    defer _ = mlx.mlx_array_free(coarse_bf);
-
-    // Threshold: L = max(coarse - delta); thr = L - |L|/64. `max` is
-    // associative in IEEE 754, so the reduction is bitwise stable regardless
-    // of tree shape; 1/64 is a power of two, so the multiply is exact.
-    var lower = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(lower);
-    try mlx.check(mlx.mlx_subtract(&lower, coarse, delta, s));
-    var l = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(l);
-    try mlx.check(mlx.mlx_max(&l, lower, false, s));
-    var labs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(labs);
-    try mlx.check(mlx.mlx_abs(&labs, l, s));
-    const beta_scale = mlx.mlx_array_new_float(1.0 / 64.0);
-    defer _ = mlx.mlx_array_free(beta_scale);
-    var margin = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(margin);
-    try mlx.check(mlx.mlx_multiply(&margin, labs, beta_scale, s));
-    var thr0 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(thr0);
-    try mlx.check(mlx.mlx_subtract(&thr0, l, margin, s));
-    var thr = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(thr);
-    const one_shape = [_]c_int{1};
-    try mlx.check(mlx.mlx_reshape(&thr, thr0, &one_shape, 1, s));
-
-    const select_kernel = try getLmHeadKernel(
-        &lmhead_select_kernel,
-        "mlxserve_lmhead_select",
-        &.{ "coarse", "delta", "thr" },
-        &.{"is_cand"},
-        LMHEAD_SELECT_SOURCE,
-        "",
-    );
-    var select_outs: [1]mlx.mlx_array = undefined;
-    const select_inputs = [_]mlx.mlx_array{ coarse, delta, thr };
-    try lmHeadApply(select_kernel, lmhead_select_cfg.?, &select_inputs, &select_outs, s);
-    const is_cand = select_outs[0];
-    defer _ = mlx.mlx_array_free(is_cand);
-
-    // Diagnostic only (forces a sync per token): candidate-set size. A prune
-    // whose candidate set is most of the vocabulary saves nothing — this is
-    // the first thing to read when the live A/B disappoints.
-    if (lmHeadPruneTraceEnabled()) {
-        var cand_sum = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cand_sum);
-        var cand32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cand32);
-        if (mlx.mlx_astype(&cand32, is_cand, .int32, s) == 0 and
-            mlx.mlx_sum(&cand_sum, cand32, false, s) == 0 and
-            mlx.mlx_array_eval(cand_sum) == 0)
-        {
-            var total: i32 = 0;
-            _ = mlx.mlx_array_item_int32(&total, cand_sum);
-            log.info("[lm_head] prune trace: candidates={d}/{d}\n", .{ total, prune.vocab });
-        }
-    }
-
-    const exact_kernel = try getLmHeadKernel(
-        &lmhead_exact_kernel,
-        "mlxserve_lmhead_exact_block",
-        &.{ "coarse_bf", "lm_head", "x", "is_cand" },
-        &.{"assembled"},
-        LMHEAD_EXACT_SOURCE,
-        "",
-    );
-    var exact_outs: [1]mlx.mlx_array = undefined;
-    const exact_inputs = [_]mlx.mlx_array{ coarse_bf, w, x_flat, is_cand };
-    try lmHeadApply(exact_kernel, lmhead_exact_cfg.?, &exact_inputs, &exact_outs, s);
-    const assembled = exact_outs[0];
-    defer _ = mlx.mlx_array_free(assembled);
-
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    const out_shape = [_]c_int{ 1, 1, prune.vocab };
-    try mlx.check(mlx.mlx_reshape(&out, assembled, &out_shape, 3, s));
-    return out;
 }
 
 /// Concatenate q/k/v into one projection. Dense weights are pre-transposed to
@@ -64228,487 +63672,6 @@ test "moe down+reduce fused: declines outside its envelope" {
     const scq = mlx.mlx_array_new_data(sdata.ptr, &s_shape, 3, .uint8);
     defer _ = mlx.mlx_array_free(scq);
     try std.testing.expect((try gatherQmvDownReduce(s, x, w, scq, no_arr, inds, scores_f32, 4, 16, .nvfp4)) == null);
-}
-
-test "lm-head prune: eligibility is the kernels' own geometry" {
-    const t = std.testing;
-    // Laguna XS: bf16 [100352, 2048] — the shipped target.
-    try t.expect(lmHeadPruneEligible(&.{ 100352, 2048 }, .bfloat16, false));
-    // Any bf16 head in whole 32-row / 1024-col blocks qualifies.
-    try t.expect(lmHeadPruneEligible(&.{ 512, 1024 }, .bfloat16, false));
-    // Quantized head: the bound needs the scales-based form — out of v1 scope.
-    try t.expect(!lmHeadPruneEligible(&.{ 100352, 2048 }, .bfloat16, true));
-    // f16/f32 heads: the exact kernel replicates the bf16 gemv only.
-    try t.expect(!lmHeadPruneEligible(&.{ 100352, 2048 }, .float16, false));
-    try t.expect(!lmHeadPruneEligible(&.{ 100352, 2048 }, .float32, false));
-    // Geometry: V % 32, K % 1024, 2-D.
-    try t.expect(!lmHeadPruneEligible(&.{ 100353, 2048 }, .bfloat16, false));
-    try t.expect(!lmHeadPruneEligible(&.{ 100352, 2560 }, .bfloat16, false));
-    try t.expect(!lmHeadPruneEligible(&.{2048}, .bfloat16, false));
-}
-
-test "lm-head prune: ships OPT-IN (measured null live); the override seam reaches the gate" {
-    const t = std.testing;
-    // Flipping this to true requires a live interleaved A/B that wins — see
-    // the constant's comment for the 2026-07-29 numbers that set it false.
-    try t.expect(LMHEAD_PRUNE_DEFAULT == false);
-    lmhead_prune_override = true;
-    defer lmhead_prune_override = null;
-    try t.expect(lmHeadPruneEnabled());
-    lmhead_prune_override = false;
-    try t.expect(!lmHeadPruneEnabled());
-}
-
-/// Dense reference replicating lmHeadProject's stock branch exactly:
-/// transposed-view matmul over the bf16 [V, K] weight.
-fn lmHeadDenseRef(s: mlx.mlx_stream, w: mlx.mlx_array, x: mlx.mlx_array) !mlx.mlx_array {
-    const wt = try transposeBf16Weight(w, s);
-    defer _ = mlx.mlx_array_free(wt);
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_matmul(&result, x, wt, s));
-    return result;
-}
-
-/// Read an array into an owned f32 slice (test helper).
-fn lmHeadTestF32(allocator: std.mem.Allocator, a: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
-    var a32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a32);
-    try mlx.check(mlx.mlx_astype(&a32, a, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(a32));
-    const data = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
-    const n = mlx.mlx_array_size(a32);
-    return try allocator.dupe(f32, data[0..n]);
-}
-
-test "lm-head prune: certified bound is sound on random rows (test the bound, not the output)" {
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0x10ADED);
-    const rnd = prng.random();
-    const t = std.testing;
-
-    const V: c_int = 64;
-    const K: c_int = 2048;
-    const w_shape = [_]c_int{ V, K };
-    const w = try attn256RandBf16(rnd, &w_shape, s);
-    defer _ = mlx.mlx_array_free(w);
-    const prune = (try buildLmHeadPruneCopy(s, w)) orelse return error.CopyDeclined;
-    defer _ = mlx.mlx_array_free(prune.codes);
-    defer _ = mlx.mlx_array_free(prune.scales);
-
-    for (0..4) |_| {
-        const x_shape = [_]c_int{ 1, 1, K };
-        const x = try attn256RandBf16(rnd, &x_shape, s);
-        defer _ = mlx.mlx_array_free(x);
-        var x_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_flat);
-        const flat_shape = [_]c_int{K};
-        try mlx.check(mlx.mlx_reshape(&x_flat, x, &flat_shape, 1, s));
-
-        const outs = try lmHeadPruneCoarse(s, &prune, x_flat);
-        defer for (outs) |o| {
-            _ = mlx.mlx_array_free(o);
-        };
-        const coarse = try lmHeadTestF32(t.allocator, outs[0], s);
-        defer t.allocator.free(coarse);
-        const delta = try lmHeadTestF32(t.allocator, outs[1], s);
-        defer t.allocator.free(delta);
-
-        // Near-real reference: f32 matmul (rounding ~2^-24 · m, far inside
-        // the bound's 2·gamma·m float-rounding allowance).
-        var xf = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(xf);
-        try mlx.check(mlx.mlx_astype(&xf, x_flat, .float32, s));
-        var wf = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wf);
-        try mlx.check(mlx.mlx_astype(&wf, w, .float32, s));
-        const perm = [_]c_int{ 1, 0 };
-        var wft = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wft);
-        try mlx.check(mlx.mlx_transpose_axes(&wft, wf, &perm, 2, s));
-        var exact_arr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(exact_arr);
-        try mlx.check(mlx.mlx_matmul(&exact_arr, xf, wft, s));
-        const exact = try lmHeadTestF32(t.allocator, exact_arr, s);
-        defer t.allocator.free(exact);
-
-        var some_slack = false;
-        for (0..@intCast(V)) |i| {
-            // Soundness: the certified interval must contain the true logit.
-            try t.expect(@abs(exact[i] - coarse[i]) <= delta[i]);
-            try t.expect(delta[i] > 0.0);
-            if (exact[i] != coarse[i]) some_slack = true;
-        }
-        // Non-degeneracy: a coarse pass that returns the exact values means
-        // the kernel silently read the dense weight, not the mxfp8 copy.
-        try t.expect(some_slack);
-    }
-}
-
-test "lm-head prune: assembled row — argmax == dense, candidates bit-identical, rest certified below" {
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0x10AD2);
-    const rnd = prng.random();
-    const t = std.testing;
-
-    const V: c_int = 512;
-    const K: c_int = 2048;
-    const checkRow = struct {
-        fn f(
-            tt: anytype,
-            s_: mlx.mlx_stream,
-            prune: *const LmHeadPrune,
-            w_: mlx.mlx_array,
-            x_: mlx.mlx_array,
-        ) !usize {
-            const dense = try lmHeadDenseRef(s_, w_, x_);
-            defer _ = mlx.mlx_array_free(dense);
-            const pruned = try lmHeadPruneProject(s_, prune, w_, x_);
-            defer _ = mlx.mlx_array_free(pruned);
-            const dv = try lmHeadTestF32(tt.allocator, dense, s_);
-            defer tt.allocator.free(dv);
-            const pv = try lmHeadTestF32(tt.allocator, pruned, s_);
-            defer tt.allocator.free(pv);
-            var dense_arg: usize = 0;
-            var pruned_arg: usize = 0;
-            for (0..dv.len) |i| {
-                if (dv[i] > dv[dense_arg]) dense_arg = i;
-                if (pv[i] > pv[pruned_arg]) pruned_arg = i;
-            }
-            // The emitted token is the stock token, at the stock value (a
-            // candidate row is a bit-identical stock-gemv replica).
-            try tt.expectEqual(dense_arg, pruned_arg);
-            try tt.expectEqual(dv[dense_arg], pv[pruned_arg]);
-            // Certificate over the whole row: every slot is either the stock
-            // value (candidate) or strictly below the winner (coarse fill).
-            var coarse_writes: usize = 0;
-            for (0..dv.len) |i| {
-                if (pv[i] != dv[i]) {
-                    try tt.expect(pv[i] < dv[dense_arg]);
-                    coarse_writes += 1;
-                }
-            }
-            return coarse_writes;
-        }
-    }.f;
-
-    // Phase A — uniform random head: the certified bound (~2^-4.5·sum|x||w|)
-    // dwarfs the logit spread here, so EVERY row is a candidate and the whole
-    // vocabulary runs the exact replica. Pins the all-exact regime.
-    {
-        const w_shape = [_]c_int{ V, K };
-        const w = try attn256RandBf16(rnd, &w_shape, s);
-        defer _ = mlx.mlx_array_free(w);
-        const prune = (try buildLmHeadPruneCopy(s, w)) orelse return error.CopyDeclined;
-        defer _ = mlx.mlx_array_free(prune.codes);
-        defer _ = mlx.mlx_array_free(prune.scales);
-        for (0..3) |_| {
-            const x_shape = [_]c_int{ 1, 1, K };
-            const x = try attn256RandBf16(rnd, &x_shape, s);
-            defer _ = mlx.mlx_array_free(x);
-            _ = try checkRow(t, s, &prune, w, x);
-        }
-    }
-
-    // Phase B — a separated head (tiny rows + one large positive row against
-    // a positive activation): most rows fall OUT of the candidate set, so the
-    // coarse write path is exercised. Identical-everywhere output here would
-    // mean the exact pass silently ran the full head (a null prune).
-    {
-        const n: usize = @intCast(@as(c_int, V) * K);
-        const wd = try t.allocator.alloc(f32, n);
-        defer t.allocator.free(wd);
-        const kk: usize = @intCast(K);
-        for (0..@intCast(V)) |r| {
-            for (0..kk) |c| {
-                wd[r * kk + c] = if (r == 137)
-                    0.5 + 0.01 * (rnd.float(f32) - 0.5)
-                else
-                    0.01 * (rnd.float(f32) - 0.5);
-            }
-        }
-        const w_shape = [_]c_int{ V, K };
-        const wf = mlx.mlx_array_new_data(wd.ptr, &w_shape, 2, .float32);
-        defer _ = mlx.mlx_array_free(wf);
-        var w = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(w);
-        try mlx.check(mlx.mlx_astype(&w, wf, .bfloat16, s));
-        try mlx.check(mlx.mlx_array_eval(w));
-
-        const prune = (try buildLmHeadPruneCopy(s, w)) orelse return error.CopyDeclined;
-        defer _ = mlx.mlx_array_free(prune.codes);
-        defer _ = mlx.mlx_array_free(prune.scales);
-
-        var coarse_writes: usize = 0;
-        for (0..3) |_| {
-            const xd = try t.allocator.alloc(f32, kk);
-            defer t.allocator.free(xd);
-            for (xd) |*v| v.* = 0.5 * rnd.float(f32); // positive: row 137 wins for sure
-            const x_shape = [_]c_int{ 1, 1, K };
-            const xf = mlx.mlx_array_new_data(xd.ptr, &x_shape, 3, .float32);
-            defer _ = mlx.mlx_array_free(xf);
-            var x = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x);
-            try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
-            try mlx.check(mlx.mlx_array_eval(x));
-            coarse_writes += try checkRow(t, s, &prune, w, x);
-        }
-        try t.expect(coarse_writes > 0);
-    }
-}
-
-test "lm-head prune µbench: dense vs coarse vs full pipeline at Laguna XS geometry (MLX_SERVE_LMHEAD_UBENCH=1)" {
-    const raw = std.c.getenv("MLX_SERVE_LMHEAD_UBENCH") orelse return error.SkipZigTest;
-    if (!std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1")) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0xBE9C);
-    const rnd = prng.random();
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    const V: c_int = 100352;
-    const K: c_int = 2048;
-    const w_shape = [_]c_int{ V, K };
-    const w = try attn256RandBf16(rnd, &w_shape, s);
-    defer _ = mlx.mlx_array_free(w);
-    const prune = (try buildLmHeadPruneCopy(s, w)) orelse return error.CopyDeclined;
-    defer _ = mlx.mlx_array_free(prune.codes);
-    defer _ = mlx.mlx_array_free(prune.scales);
-    const x_shape = [_]c_int{ 1, 1, K };
-    const x = try attn256RandBf16(rnd, &x_shape, s);
-    defer _ = mlx.mlx_array_free(x);
-    var x_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_flat);
-    const flat_shape = [_]c_int{K};
-    try mlx.check(mlx.mlx_reshape(&x_flat, x, &flat_shape, 1, s));
-
-    // Separated head: tiny rows + one dominant row against a positive x —
-    // reproduces the LIVE candidate regime (median ~19/100352 measured via
-    // MLX_SERVE_LMHEAD_PRUNE_TRACE) instead of the all-candidate regime a
-    // uniform random head degenerates to.
-    // w_sep = 0.01·w everywhere except row 137 = |w| (positively aligned
-    // with the positive x below, so the winner is deterministic and the
-    // candidate set stays tiny — a random-sign winner row degenerates to the
-    // all-candidate regime on half the seeds).
-    const sep_scale_buf = try std.testing.allocator.alloc(f32, @intCast(V));
-    defer std.testing.allocator.free(sep_scale_buf);
-    for (sep_scale_buf, 0..) |*v, i| v.* = if (i == 137) 1.0 else 0.0;
-    const sc_shape = [_]c_int{ V, 1 };
-    const sep_mask = mlx.mlx_array_new_data(sep_scale_buf.ptr, &sc_shape, 2, .float32);
-    defer _ = mlx.mlx_array_free(sep_mask);
-    var w_sep_f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(w_sep_f);
-    {
-        var w_abs = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(w_abs);
-        try mlx.check(mlx.mlx_abs(&w_abs, w, s));
-        var big = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(big);
-        try mlx.check(mlx.mlx_multiply(&big, w_abs, sep_mask, s));
-        const small_scale = mlx.mlx_array_new_float(0.01);
-        defer _ = mlx.mlx_array_free(small_scale);
-        var small0 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(small0);
-        try mlx.check(mlx.mlx_multiply(&small0, w, small_scale, s));
-        const one_f = mlx.mlx_array_new_float(1.0);
-        defer _ = mlx.mlx_array_free(one_f);
-        var inv_mask = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inv_mask);
-        try mlx.check(mlx.mlx_subtract(&inv_mask, one_f, sep_mask, s));
-        var small = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(small);
-        try mlx.check(mlx.mlx_multiply(&small, small0, inv_mask, s));
-        var summed = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(summed);
-        try mlx.check(mlx.mlx_add(&summed, big, small, s));
-        _ = mlx.mlx_array_set(&w_sep_f, summed);
-    }
-    var w_sep = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(w_sep);
-    try mlx.check(mlx.mlx_astype(&w_sep, w_sep_f, .bfloat16, s));
-    try mlx.check(mlx.mlx_array_eval(w_sep));
-    const prune_sep = (try buildLmHeadPruneCopy(s, w_sep)) orelse return error.CopyDeclined;
-    defer _ = mlx.mlx_array_free(prune_sep.codes);
-    defer _ = mlx.mlx_array_free(prune_sep.scales);
-    var x_pos = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_pos);
-    try mlx.check(mlx.mlx_abs(&x_pos, x, s));
-    try mlx.check(mlx.mlx_array_eval(x_pos));
-
-    // Stage bisection: coarse + threshold chain (no select/exact), and
-    // coarse + threshold + select (no exact) — attribution for a slow tail.
-    const stageRun = struct {
-        fn f(s_: mlx.mlx_stream, prune_: *const LmHeadPrune, x_flat_: mlx.mlx_array, with_select: bool) !void {
-            const outs = try lmHeadPruneCoarse(s_, prune_, x_flat_);
-            const coarse = outs[0];
-            const delta = outs[1];
-            const coarse_bf = outs[2];
-            defer _ = mlx.mlx_array_free(coarse);
-            defer _ = mlx.mlx_array_free(delta);
-            defer _ = mlx.mlx_array_free(coarse_bf);
-            var lower = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(lower);
-            try mlx.check(mlx.mlx_subtract(&lower, coarse, delta, s_));
-            var l = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(l);
-            try mlx.check(mlx.mlx_max(&l, lower, false, s_));
-            var labs = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(labs);
-            try mlx.check(mlx.mlx_abs(&labs, l, s_));
-            const beta_scale = mlx.mlx_array_new_float(1.0 / 64.0);
-            defer _ = mlx.mlx_array_free(beta_scale);
-            var margin = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(margin);
-            try mlx.check(mlx.mlx_multiply(&margin, labs, beta_scale, s_));
-            var thr0 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(thr0);
-            try mlx.check(mlx.mlx_subtract(&thr0, l, margin, s_));
-            var thr = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(thr);
-            const one_shape = [_]c_int{1};
-            try mlx.check(mlx.mlx_reshape(&thr, thr0, &one_shape, 1, s_));
-            if (!with_select) {
-                _ = mlx.mlx_array_eval(thr);
-                return;
-            }
-            const select_kernel = try getLmHeadKernel(
-                &lmhead_select_kernel,
-                "mlxserve_lmhead_select",
-                &.{ "coarse", "delta", "thr" },
-                &.{"is_cand"},
-                LMHEAD_SELECT_SOURCE,
-                "",
-            );
-            var select_outs: [1]mlx.mlx_array = undefined;
-            const select_inputs = [_]mlx.mlx_array{ coarse, delta, thr };
-            try lmHeadApply(select_kernel, lmhead_select_cfg.?, &select_inputs, &select_outs, s_);
-            _ = mlx.mlx_array_eval(select_outs[0]);
-            _ = mlx.mlx_array_free(select_outs[0]);
-        }
-    }.f;
-
-    // Exact kernel in isolation against a pre-built mask: zero mask = pure
-    // early-out cost (launch + mask reads + coarse_bf copy), ones mask = the
-    // full replica gemv for comparison against stock.
-    const coarse_pre = try lmHeadPruneCoarse(s, &prune, x_flat);
-    defer for (coarse_pre) |o| {
-        _ = mlx.mlx_array_free(o);
-    };
-    for (coarse_pre) |o| _ = mlx.mlx_array_eval(o);
-    var mask_zero = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mask_zero);
-    var mask_ones = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mask_ones);
-    {
-        const zero8 = mlx.mlx_array_new_int(0);
-        defer _ = mlx.mlx_array_free(zero8);
-        const one8 = mlx.mlx_array_new_int(1);
-        defer _ = mlx.mlx_array_free(one8);
-        const vsh = [_]c_int{V};
-        var z32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(z32);
-        var o32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(o32);
-        try mlx.check(mlx.mlx_broadcast_to(&z32, zero8, &vsh, 1, s));
-        try mlx.check(mlx.mlx_broadcast_to(&o32, one8, &vsh, 1, s));
-        try mlx.check(mlx.mlx_astype(&mask_zero, z32, .uint8, s));
-        try mlx.check(mlx.mlx_astype(&mask_ones, o32, .uint8, s));
-        var mzc = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_contiguous(&mzc, mask_zero, false, s));
-        _ = mlx.mlx_array_free(mask_zero);
-        mask_zero = mzc;
-        var moc = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_contiguous(&moc, mask_ones, false, s));
-        _ = mlx.mlx_array_free(mask_ones);
-        mask_ones = moc;
-        _ = mlx.mlx_array_eval(mask_zero);
-        _ = mlx.mlx_array_eval(mask_ones);
-    }
-    const exactRun = struct {
-        fn f(s_: mlx.mlx_stream, w_: mlx.mlx_array, x_flat_: mlx.mlx_array, coarse_bf_: mlx.mlx_array, mask_: mlx.mlx_array) !void {
-            const exact_kernel = try getLmHeadKernel(
-                &lmhead_exact_kernel,
-                "mlxserve_lmhead_exact_block",
-                &.{ "coarse_bf", "lm_head", "x", "is_cand" },
-                &.{"assembled"},
-                LMHEAD_EXACT_SOURCE,
-                "",
-            );
-            var exact_outs: [1]mlx.mlx_array = undefined;
-            const exact_inputs = [_]mlx.mlx_array{ coarse_bf_, w_, x_flat_, mask_ };
-            try lmHeadApply(exact_kernel, lmhead_exact_cfg.?, &exact_inputs, &exact_outs, s_);
-            _ = mlx.mlx_array_eval(exact_outs[0]);
-            _ = mlx.mlx_array_free(exact_outs[0]);
-        }
-    }.f;
-
-    const iters: usize = 50;
-    const arms = [_][]const u8{ "dense gemv", "coarse only", "coarse+threshold", "coarse+thr+select", "exact only (zero mask)", "exact only (ones mask)", "full pipeline (all-candidate)", "full pipeline (live-like prune)" };
-    for (arms, 0..) |name, arm| {
-        // Warm.
-        for (0..5) |_| {
-            switch (arm) {
-                0 => {
-                    const r = try lmHeadDenseRef(s, w, x);
-                    _ = mlx.mlx_array_eval(r);
-                    _ = mlx.mlx_array_free(r);
-                },
-                1 => {
-                    const outs = try lmHeadPruneCoarse(s, &prune, x_flat);
-                    for (outs) |o| {
-                        _ = mlx.mlx_array_eval(o);
-                        _ = mlx.mlx_array_free(o);
-                    }
-                },
-                2 => try stageRun(s, &prune, x_flat, false),
-                3 => try stageRun(s, &prune, x_flat, true),
-                4 => try exactRun(s, w, x_flat, coarse_pre[2], mask_zero),
-                5 => try exactRun(s, w, x_flat, coarse_pre[2], mask_ones),
-                6 => {
-                    const r = try lmHeadPruneProject(s, &prune, w, x);
-                    _ = mlx.mlx_array_eval(r);
-                    _ = mlx.mlx_array_free(r);
-                },
-                else => {
-                    const r = try lmHeadPruneProject(s, &prune_sep, w_sep, x_pos);
-                    _ = mlx.mlx_array_eval(r);
-                    _ = mlx.mlx_array_free(r);
-                },
-            }
-        }
-        var sw = io_util.Stopwatch.init(io);
-        for (0..iters) |_| {
-            switch (arm) {
-                0 => {
-                    const r = try lmHeadDenseRef(s, w, x);
-                    _ = mlx.mlx_array_eval(r);
-                    _ = mlx.mlx_array_free(r);
-                },
-                1 => {
-                    const outs = try lmHeadPruneCoarse(s, &prune, x_flat);
-                    for (outs) |o| {
-                        _ = mlx.mlx_array_eval(o);
-                        _ = mlx.mlx_array_free(o);
-                    }
-                },
-                2 => try stageRun(s, &prune, x_flat, false),
-                3 => try stageRun(s, &prune, x_flat, true),
-                4 => try exactRun(s, w, x_flat, coarse_pre[2], mask_zero),
-                5 => try exactRun(s, w, x_flat, coarse_pre[2], mask_ones),
-                6 => {
-                    const r = try lmHeadPruneProject(s, &prune, w, x);
-                    _ = mlx.mlx_array_eval(r);
-                    _ = mlx.mlx_array_free(r);
-                },
-                else => {
-                    const r = try lmHeadPruneProject(s, &prune_sep, w_sep, x_pos);
-                    _ = mlx.mlx_array_eval(r);
-                    _ = mlx.mlx_array_free(r);
-                },
-            }
-        }
-        const ns = sw.read();
-        std.debug.print("[lmhead-ubench] {s}: {d:.3} ms/iter\n", .{ name, @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters)) / 1e6 });
-    }
 }
 
 /// Composed reference for the fused QK-norm+RoPE tests: the EXACT shipped

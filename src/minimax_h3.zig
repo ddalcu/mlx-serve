@@ -34,6 +34,8 @@ const mage_flow = @import("mage_flow.zig");
 /// Runtime LoRA adapters, shared with the image/LTX backends — ONE loader for
 /// every adapter format we accept, Turbo included.
 const lora_mod = @import("lora.zig");
+const w8a8 = @import("w8a8.zig");
+const int8_attn = @import("int8_attn.zig");
 const h3_glue = @import("h3_glue.zig");
 const add_norm = @import("add_norm.zig");
 const ane = @import("ane.zig");
@@ -1075,6 +1077,10 @@ const AttnW = struct {
             .out = try MfLinear.load(w, a, out_p, cfg.innerDim(), dt, s),
         };
         errdefer r.deinit();
+        if (!ane.media_offload.video) { // the ANE seam reads the packed weights
+            try r.qkv.toW8a8(s);
+            try r.out.toW8a8(s);
+        }
         return r;
     }
     fn deinit(self: *AttnW) void {
@@ -1101,6 +1107,10 @@ const MlpW = struct {
             .fc2 = try MfLinear.load(w, a, p2, cfg.ffn_hidden_size, dt, s),
         };
         errdefer r.deinit();
+        if (!ane.media_offload.video) {
+            try r.fc1.toW8a8(s);
+            try r.fc2.toW8a8(s);
+        }
         return r;
     }
     fn deinit(self: *MlpW) void {
@@ -1655,6 +1665,12 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     };
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
+    const dense = sparse == null or sparse.?.mode == .dense;
+    if (w8a8.enabled and dense and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
+        defer _ = mlx.mlx_array_free(flat8);
+        const out8 = try aw.out.forward(flat8, null, s);
+        return lora_mod.addSlot(out8, flat8, &aw.out_lora, s);
+    };
     var attn: mlx.mlx_array = undefined;
     if (ablate == .sdpa) {
         attn = try contig(t[2], s);
@@ -2249,7 +2265,7 @@ pub const Model = struct {
     ane_eng: ?*ane.AnePrefill = null,
     ane_rest: []AneRestMlp = &.{},
 
-    pub fn load(allocator: std.mem.Allocator, w: *const Weights, cfg: Config, dt: mlx.mlx_dtype, s: S) !Model {
+    pub fn load(allocator: std.mem.Allocator, w: *Weights, cfg: Config, dt: mlx.mlx_dtype, s: S) !Model {
         var m: Model = undefined;
         m.allocator = allocator;
         m.cfg = cfg;
@@ -2277,11 +2293,17 @@ pub const Model = struct {
         m.inv_freq = try ownWeightAs(w, allocator, "rope", ".inv_freq", f32t, s);
 
         m.refiner = try allocator.alloc(RefinerBlockW, cfg.token_refiner_num_layers);
-        for (m.refiner, 0..) |*b, i| b.* = try RefinerBlockW.load(w, allocator, @intCast(i), cfg, dt, s);
+        for (m.refiner, 0..) |*b, i| {
+            b.* = try RefinerBlockW.load(w, allocator, @intCast(i), cfg, dt, s);
+            if (w8a8.enabled) w.dropBlock("token_refiner.blocks.{d}.", i);
+        }
         m.refiner_final_norm = try ownWeightAs(w, allocator, "token_refiner.final_norm", ".weight", dt, s);
 
         m.blocks = try allocator.alloc(BlockW, cfg.num_layers);
-        for (m.blocks, 0..) |*b, i| b.* = try BlockW.load(w, allocator, @intCast(i), cfg, dt, s);
+        for (m.blocks, 0..) |*b, i| {
+            b.* = try BlockW.load(w, allocator, @intCast(i), cfg, dt, s);
+            if (w8a8.enabled) w.dropBlock("blocks.{d}.", i);
+        }
 
         m.final_norm = try ownWeightAs(w, allocator, "final_layer.norm", ".weight", dt, s);
         m.final_adaln = try AdalnW.load(w, allocator, "final_layer.adaln_proj", cfg, 2, 1, dt, s);
@@ -6332,6 +6354,53 @@ test "minimax h3 live: the SwiGLU fallback reads every row of a [S, 28672] fc1 o
     var same = false;
     try mlx.check(mlx.mlx_array_item_bool(&same, eq));
     try std.testing.expect(same);
+}
+
+test "minimax h3: DiT block linears under w8a8 stay within their bar of the packed block" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    // The same toy fixture as below; its qkv and fc1 take the route (K = 256), out and fc2 do not.
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    var w = model_mod.loadWeightsSingleFile(a, "src/fixtures/minimax_h3_dit.safetensors") catch return error.SkipZigTest;
+    defer w.deinit();
+    const cfg = Config{ .hidden_size = 256, .num_attention_heads = 4, .attention_head_dim = 32, .ffn_hidden_size = 128, .time_embed_dim = 32, .timestep_input_dim = 32, .rope_inv_freq_len = 4 };
+    const x = try ownWeight(&w, "x.attn_in");
+    defer _ = mlx.mlx_array_free(x);
+    const seq: c_int = @intCast(mlx.getShape(x)[0]);
+    const rc = try ownWeight(&w, "x.rope_cos");
+    defer _ = mlx.mlx_array_free(rc);
+    const rs = try ownWeight(&w, "x.rope_sin");
+    defer _ = mlx.mlx_array_free(rs);
+    const half: c_int = @intCast(cfg.rotDim() / 2);
+    var rope = RopeTables{ .cos = try reshape(rc, &[_]c_int{ 1, seq, 1, half }, s), .sin = try reshape(rs, &[_]c_int{ 1, seq, 1, half }, s) };
+    defer rope.deinit();
+
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    var outs: [2][2]mlx.mlx_array = undefined; // [arm][attn, mlp]
+    for (&outs, [_]bool{ false, true }) |*o, on| {
+        w8a8.enabled = on;
+        var attn = try AttnW.load(&w, a, "attn", cfg, .bfloat16, s);
+        defer attn.deinit();
+        var mlp_w = try MlpW.load(&w, a, "mlp", cfg, .bfloat16, s);
+        defer mlp_w.deinit();
+        try testing.expectEqual(on, attn.qkv.w8 != null and mlp_w.fc1.w8 != null);
+        try testing.expect(attn.out.w8 == null and mlp_w.fc2.w8 == null);
+        o[0] = try attnForward(&attn, x, cfg, rope, .none, null, s);
+        o[1] = try mlpForward(&mlp_w, x, s);
+        try mlx.check(mlx.mlx_array_eval(o[0]));
+        try mlx.check(mlx.mlx_array_eval(o[1]));
+    }
+    defer for (outs) |o| for (o) |t| {
+        _ = mlx.mlx_array_free(t);
+    };
+    inline for (.{ "attn", "mlp" }, 0..) |name, i| {
+        const g = try w8a8.agreement(outs[1][i], outs[0][i], s);
+        std.debug.print("[h3 {s} w8a8] cos={d:.6} rms_ratio={d:.6}\n", .{ name, g.cos, g.rms_ratio });
+        try testing.expect(g.cos < 0.99999); // the route engaged
+        try testing.expect(g.cos > 0.998);
+        try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.02);
+    }
 }
 
 test "minimax h3: DiT block matches the reference transcription" {

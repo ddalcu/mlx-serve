@@ -17,6 +17,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
+const w8a8 = @import("w8a8.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const qwen_image = @import("qwen_image.zig");
 const lora_mod = @import("lora.zig");
@@ -659,7 +660,7 @@ pub const ImageEngine = struct {
                 return self;
             }
             if (std.mem.startsWith(u8, mt, "qwen_image")) {
-                const staged = qwenImageStagesTextEncoder(estimateResidentBytes(io, model_dir), mlx.maxRecommendedWorkingSet());
+                const staged = qwenImageStagesTextEncoder(estimateResidentWeightBytes(io, model_dir, mt), mlx.maxRecommendedWorkingSet());
                 self.backend = .{ .qwen_image = try qwen_image.Engine.load(io, allocator, model_dir, staged) };
                 return self;
             }
@@ -1528,7 +1529,7 @@ pub fn h3ResidentFor(engine: *H3VideoEngine, io: std.Io, a: std.mem.Allocator, a
     const dir = engine.model_dir;
     const need = h3ResidentBytes(
         packFileBytes(io, a, dir, "text_encoder.safetensors"),
-        packFileBytes(io, a, dir, "transformer.safetensors"),
+        h3DitBytes(io, dir),
         packFileBytes(io, a, dir, "video_vae.safetensors") + packFileBytes(io, a, dir, "audio_vae.safetensors"),
         packFileBytes(io, a, dir, "turbo_lora.safetensors"),
         activations,
@@ -1747,7 +1748,7 @@ pub const LtxVideoEngine = struct {
 fn loadTransformerVariant(allocator: std.mem.Allocator, model_dir: []const u8, variant: TransformerVariant, load_s: mlx.mlx_stream) !ltx.Component {
     const tp = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, variant.fileName() }, 0);
     defer allocator.free(tp);
-    return ltx.loadComponent(allocator, tp, load_s);
+    return ltx.loadTransformer(allocator, tp, load_s, mlx.gpuStream());
 }
 
 /// Load the LTX VAE encoder (`vae_encoder.safetensors`, ~0.6 GB, MLX-layout
@@ -4060,7 +4061,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     const activations = h3ActivationBytes(rows, bcast_row);
     const plan = h3ResidentFor(engine, io, allocator, activations);
     if (plan == null) {
-        const dit = h3DitResidentBytes(packFileBytes(io, allocator, engine.model_dir, "transformer.safetensors"), minimax_h3.adalnPrecomputeOn()) +
+        const dit = h3DitResidentBytes(h3DitBytes(io, engine.model_dir), minimax_h3.adalnPrecomputeOn()) +
             (if (turbo) packFileBytes(io, allocator, engine.model_dir, "turbo_lora.safetensors") else 0);
         var active: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
@@ -4680,6 +4681,76 @@ pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
     return sumSafetensorsIn(io, dir);
 }
 
+/// `estimateResidentBytes` as the backend of `model_type` holds it resident.
+pub fn estimateResidentWeightBytes(io: std.Io, model_dir: []const u8, model_type: []const u8) u64 {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return 0; // openDirAbsolute UB class
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    return residentWeightBytes(io, dir, model_type);
+}
+
+/// Weights a media backend keeps resident: the pack's files, with a DiT that
+/// `--w8a8` converts re-billed at its int8 copy (4-bit packs grow, bf16 halves).
+fn residentWeightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 {
+    const sum = sumSafetensorsIn(io, dir);
+    if (!(convertsW8a8(model_type) orelse false) or aneKeepsPacked(model_type)) return sum;
+    return sum -| ditBytes(io, dir, false) + ditBytes(io, dir, true);
+}
+
+/// Whether a media type's DiT loaders convert under `--w8a8` (null: nobody classified it). The bill
+/// reads this, so a type that converts and is missing here would be under-billed into an uncatchable
+/// Metal OOM; the test below refuses an unclassified entry of `media_model_types`.
+fn convertsW8a8(model_type: []const u8) ?bool {
+    const converts = [_][]const u8{ "flux2", "krea", "mage_flow", "mageflow", "acestep", "AudioVideo", "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image" };
+    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization" };
+    for (converts) |p| if (std.mem.startsWith(u8, model_type, p)) return true;
+    for (packed_only) |p| if (std.mem.startsWith(u8, model_type, p)) return false;
+    return null;
+}
+
+/// The engines whose ANE seam reads the packed DiT weights, so `--ane-*` keeps them packed (the loaders
+/// skip the conversion) and the bill must not assume the int8 copy.
+fn aneKeepsPacked(model_type: []const u8) bool {
+    if (std.mem.startsWith(u8, model_type, "krea")) return ane.media_offload.image;
+    if (std.mem.eql(u8, model_type, "acestep")) return ane.media_offload.audio;
+    if (std.mem.eql(u8, model_type, "minimax_h3")) return ane.media_offload.video;
+    return false;
+}
+
+/// A top-level shard that holds a DiT: `transformer*` (Krea, H3, LTX, Music3), ACE-Step's `model` or
+/// Hunyuan3D's `dit`.
+fn isDitShardName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "transformer") or std.mem.eql(u8, name, "model.safetensors") or std.mem.eql(u8, name, "dit.safetensors");
+}
+
+/// A pack's DiT shards (`transformer/*.safetensors`, else the top-level ones `isDitShardName` names):
+/// their file bytes, or resident under `--w8a8`.
+fn ditBytes(io: std.Io, dir: std.Io.Dir, resident: bool) u64 {
+    var sub: ?std.Io.Dir = dir.openDir(io, "transformer", .{ .iterate = true }) catch null;
+    defer if (sub) |*d| d.close(io);
+    const d = sub orelse dir;
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file and e.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
+        if (sub == null and !isDitShardName(e.name)) continue;
+        const st = d.statFile(io, e.name, .{}) catch continue;
+        if (st.kind != .file) continue;
+        const size: u64 = @intCast(st.size);
+        total += if (resident) w8a8.residentBytes(io, d, e.name) orelse size else size;
+    }
+    return total;
+}
+
+/// H3's DiT as resident (`ditBytes`), from the model directory path.
+fn h3DitBytes(io: std.Io, model_dir: []const u8) u64 {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return 0; // openDirAbsolute UB class
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    return ditBytes(io, dir, true);
+}
+
 fn sumSafetensorsIn(io: std.Io, dir: std.Io.Dir) u64 {
     // Symlinked weights count (statFile follows) — an HF hub-cache snapshot
     // is ALL symlinks into ../../blobs; skipping them billed a pack at 0.
@@ -4994,7 +5065,7 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         // full size — billed whenever present, since the gate estimate is
         // per-model, not per-request.
         const dit = h3DitResidentBytes(
-            sz(io, dir, "transformer.safetensors"),
+            ditBytes(io, dir, !aneKeepsPacked(model_type)),
             minimax_h3.adalnPrecomputeOn(),
         ) + sz(io, dir, "turbo_lora.safetensors");
         return h3PeakBytes(
@@ -5005,10 +5076,10 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         );
     }
     if (std.mem.startsWith(u8, model_type, "qwen_image")) {
-        var te_dir = dir.openDir(io, "text_encoder", .{ .iterate = true }) catch return sumSafetensorsIn(io, dir);
+        var te_dir = dir.openDir(io, "text_encoder", .{ .iterate = true }) catch return residentWeightBytes(io, dir, model_type);
         defer te_dir.close(io);
         const te = sumSafetensorsIn(io, te_dir);
-        const rest = sumSafetensorsIn(io, dir) -| te;
+        const rest = residentWeightBytes(io, dir, model_type) -| te;
         // A tower in text_encoder/ means the pack edits — bill the heavier
         // edit transient (the tower's own bytes already ride `te`). Whatever
         // `towerPresentIn` answers, the engine's `has_tower` reads it too.
@@ -5021,7 +5092,7 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         // directory cannot see: the batch-2 KV cache (~4.1 GB at the 9000-frame
         // + 5000-token caps), the frame-hidden buffer (~0.6 GB bf16), and the
         // DiT/vocoder window transients.
-        const sum = sumSafetensorsIn(io, dir);
+        const sum = residentWeightBytes(io, dir, model_type);
         if (sum == 0) return 0; // unknown dir -> never block
         return sum + MUSIC3_GEN_BUFFER_BYTES;
     }
@@ -5034,12 +5105,12 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         // Both variants ship; only one is ever loaded. Subtract the smaller so
         // an asymmetric future pack still bills its larger one.
         const spare = @min(
-            sz(io, dir, "transformer-dev.safetensors"),
-            sz(io, dir, "transformer-distilled.safetensors"),
+            w8a8.residentBytes(io, dir, "transformer-dev.safetensors") orelse sz(io, dir, "transformer-dev.safetensors"),
+            w8a8.residentBytes(io, dir, "transformer-distilled.safetensors") orelse sz(io, dir, "transformer-distilled.safetensors"),
         );
-        return ltxPeakBytes(sumSafetensorsIn(io, dir), spare, 0);
+        return ltxPeakBytes(sumSafetensorsIn(io, dir) -| ditBytes(io, dir, false) + ditBytes(io, dir, true), spare, 0);
     }
-    return sumSafetensorsIn(io, dir);
+    return residentWeightBytes(io, dir, model_type);
 }
 
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
@@ -6895,6 +6966,100 @@ test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
     // Any other media type: the plain sum over the dir (the safe default —
     // a backend without a declared residency plan must not under-bill).
     try std.testing.expectEqual(@as(u64, 1950), estimatePeakResidentBytesIn(io, tmp.dir, "flux2"));
+}
+
+test "residency bill: a DiT that --w8a8 converts is billed at its int8 copy, not the pack's bytes" {
+    w8a8.nax_override = true; // only shard headers are read, so any machine can run this
+    defer w8a8.nax_override = null;
+    w8a8.enabled = true;
+    defer w8a8.enabled = false;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // One 4-bit g64 linear [N=128, K=256] (18432 B in the pack, 33280 B as int8) and one bf16
+    // linear [64, 256] (32768 B in the pack, 16640 B as int8).
+    const hdr =
+        \\{"blocks.0.attn.wq.weight":{"dtype":"U32","shape":[128,32],"data_offsets":[0,16384]},
+        \\"blocks.0.attn.wq.scales":{"dtype":"BF16","shape":[128,4],"data_offsets":[16384,17408]},
+        \\"blocks.0.attn.wq.biases":{"dtype":"BF16","shape":[128,4],"data_offsets":[17408,18432]},
+        \\"blocks.0.mlp.up.weight":{"dtype":"BF16","shape":[64,256],"data_offsets":[18432,51200]}}
+    ;
+    var buf: [8 + hdr.len + 51200]u8 = @splat(0);
+    std.mem.writeInt(u64, buf[0..8], hdr.len, .little);
+    @memcpy(buf[8..][0..hdr.len], hdr);
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer_mixed.safetensors", .data = &buf });
+    const other: [1000]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "vae.safetensors", .data = &other });
+    const file: u64 = buf.len;
+    // bill = vae + (file - pack bytes of the two linears) + their int8 copies
+    try std.testing.expectEqual(file + 1000 - 51200 + 33280 + 16640, estimatePeakResidentBytesIn(io, tmp.dir, "krea2_turbo"));
+    // a type the route does not convert keeps the plain sum
+    try std.testing.expectEqual(file + 1000, estimatePeakResidentBytesIn(io, tmp.dir, "stable_audio3"));
+    w8a8.enabled = false;
+    try std.testing.expectEqual(file + 1000, estimatePeakResidentBytesIn(io, tmp.dir, "krea2_turbo"));
+}
+
+test "residency bill: ACE-Step, Music3, Hunyuan3D and LTX DiT shards are billed at their int8 copy" {
+    w8a8.nax_override = true; // only shard headers are read, so any machine can run this
+    defer w8a8.nax_override = null;
+    w8a8.enabled = true;
+    defer w8a8.enabled = false;
+    const io = std.testing.io;
+    // One 4-bit g64 block linear [N=128, K=256]: 18432 B in the pack, 33280 B as int8.
+    const Pack = struct {
+        fn shard(dir: std.Io.Dir, name: []const u8, key: []const u8) !u64 {
+            var hb: [512]u8 = undefined;
+            const hdr = try std.fmt.bufPrint(&hb,
+                \\{{"{s}.weight":{{"dtype":"U32","shape":[128,32],"data_offsets":[0,16384]}},
+                \\"{s}.scales":{{"dtype":"BF16","shape":[128,4],"data_offsets":[16384,17408]}},
+                \\"{s}.biases":{{"dtype":"BF16","shape":[128,4],"data_offsets":[17408,18432]}}}}
+            , .{ key, key, key });
+            var buf: [8 + 512 + 18432]u8 = @splat(0);
+            std.mem.writeInt(u64, buf[0..8], hdr.len, .little);
+            @memcpy(buf[8..][0..hdr.len], hdr);
+            const n = 8 + hdr.len + 18432;
+            try dir.writeFile(io, .{ .sub_path = name, .data = buf[0..n] });
+            return n;
+        }
+    };
+    const cases = [_]struct { model_type: []const u8, shard: []const u8, key: []const u8 }{
+        .{ .model_type = "acestep", .shard = "model.safetensors", .key = "decoder.layers.0.self_attn.q_proj" },
+        .{ .model_type = "minimax_music3", .shard = "transformer.safetensors", .key = "transformer_blocks.0.ff_in" },
+        .{ .model_type = "hunyuan3d_2_1", .shard = "dit.safetensors", .key = "blocks.0.attn1.q" },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const file = try Pack.shard(tmp.dir, c.shard, c.key);
+        const extra: u64 = if (std.mem.eql(u8, c.model_type, "minimax_music3")) MUSIC3_GEN_BUFFER_BYTES else 0;
+        try std.testing.expectEqual(file - 18432 + 33280 + extra, estimatePeakResidentBytesIn(io, tmp.dir, c.model_type));
+    }
+    // The ANE seam reads the packed weights, so under `--ane-audio` ACE-Step is billed as the pack.
+    ane.media_offload.audio = true;
+    defer ane.media_offload.audio = false;
+    {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const file = try Pack.shard(tmp.dir, "model.safetensors", "decoder.layers.0.self_attn.q_proj");
+        try std.testing.expectEqual(file, estimatePeakResidentBytesIn(io, tmp.dir, "acestep"));
+    }
+    ane.media_offload.audio = false;
+    // LTX bills both variants' resident bytes, one of them spare (they never coexist).
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const f1 = try Pack.shard(tmp.dir, "transformer-dev.safetensors", "transformer.transformer_blocks.0.attn1.to_q");
+    _ = try Pack.shard(tmp.dir, "transformer-distilled.safetensors", "transformer.transformer_blocks.0.attn1.to_q");
+    try std.testing.expectEqual(f1 - 18432 + 33280, estimatePeakResidentBytesIn(io, tmp.dir, "AudioVideo"));
+}
+
+test "every media model type says whether --w8a8 converts it, so the bill cannot miss an engine" {
+    for (media_model_types) |mt| if (convertsW8a8(mt) == null) {
+        std.debug.print("media type '{s}' is not classified in convertsW8a8\n", .{mt});
+        return error.UnclassifiedMediaType;
+    };
+    try std.testing.expect(convertsW8a8("krea2_turbo").? and convertsW8a8("flux2_klein").? and convertsW8a8("AudioVideo").?);
+    try std.testing.expect(!convertsW8a8("kokoro").? and !convertsW8a8("stable_audio3").?);
+    try std.testing.expect(convertsW8a8("a_future_engine") == null);
 }
 
 test "media markers are per-TYPE, not per-modality" {

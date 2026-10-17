@@ -2554,10 +2554,7 @@ pub const Generator = struct {
         cancelled_checkpoint_sink: ?*CancelledCheckpointSink = null,
         /// Per-token logprobs count for this request (0 = disabled). Callers
         /// that set `Generator.logprobs_n` after init must ALSO pass it here:
-        /// init's split-prefill final-token forward is a single-row dispatch,
-        /// and the certified lm_head prune may only engage when the request
-        /// consumes nothing but the argmax — a logprobs request reads the
-        /// full logit row, which the pruned head does not produce.
+        /// init's split-prefill final-token forward reads it for the first token.
         logprobs_n: u32 = 0,
         /// `/v1/completions` echo: every prompt token after the first gets its
         /// `logprobs_n`-wide entry here. The prompt must be forwarded whole (no restore).
@@ -2761,18 +2758,6 @@ pub const Generator = struct {
         // `&ctx` to every forward call below; the cache/moe/ssm fields
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
-
-        // Certified lm_head prune gate: the pruned projection proves the
-        // ARGMAX, not the tail distribution, so it may engage only when this
-        // request consumes nothing else — greedy (or top-1) sampling with no
-        // logit-modifying penalties, no per-token logprobs and no grammar
-        // mask. Mirrors the `logprobs>0 + grammar disable spec` precedent:
-        // no request gets slower, some get faster.
-        ctx.argmax_only = (sampling.temperature < 0.01 or sampling.top_k == 1) and
-            sampling.repeat_penalty == 1.0 and
-            sampling.presence_penalty == 0.0 and
-            sampling.constraint == null and
-            options.logprobs_n == 0;
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);

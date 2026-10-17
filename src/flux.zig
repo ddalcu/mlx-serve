@@ -12,6 +12,8 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const sse = @import("gen_sse.zig");
 const lora_mod = @import("lora.zig");
+const w8a8 = @import("w8a8.zig");
+const int8_attn = @import("int8_attn.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -151,6 +153,8 @@ const QLinear = struct {
     // Fixed-capacity so attach/forward never allocate.
     lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
     lora_count: u8 = 0,
+    /// The int8 copy that REPLACES `w`/`scales`/`biases` (`--w8a8`), built by `toW8a8`.
+    w8: ?w8a8.Weight = null,
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8) !QLinear {
         const wk = try fmtKey(a, "{s}.weight", .{prefix});
@@ -173,6 +177,7 @@ const QLinear = struct {
         return ql;
     }
     fn deinit(self: *QLinear) void {
+        if (self.w8) |*q| q.deinit();
         _ = mlx.mlx_array_free(self.w);
         _ = mlx.mlx_array_free(self.scales);
         _ = mlx.mlx_array_free(self.biases);
@@ -180,7 +185,14 @@ const QLinear = struct {
     }
     fn forward(self: *const QLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
         var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
+        if (self.w8) |*q| {
+            _ = mlx.mlx_array_free(o);
+            const xb = try astype(x, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(xb);
+            o = try w8a8.forward(xb, q, s);
+        } else {
+            try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
+        }
         if (self.add_bias) |b| {
             const r = try addA(o, b, s);
             _ = mlx.mlx_array_free(o);
@@ -194,6 +206,11 @@ const QLinear = struct {
             o = r;
         }
         return o;
+    }
+
+    /// Replace the packed weights with their int8 copy when the route takes this shape.
+    fn toW8a8(self: *QLinear, s: S) !void {
+        self.w8 = try w8a8.takeLinear(&self.w, &self.scales, &self.biases, self.bits, self.group_size, s);
     }
 
     /// Install the stacked adapter Refs for this linear (from `Stack.findAll`).
@@ -857,6 +874,10 @@ pub const Dit = struct {
     fn attention(self: *Dit, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, seq: c_int, heads: c_int, hd: c_int, s: S) !mlx.mlx_array {
         _ = self;
         const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(hd)));
+        if (w8a8.enabled) if (try int8_attn.attention(q, k, v, scale, s)) |o| {
+            defer _ = mlx.mlx_array_free(o);
+            return reshape(o, &[_]c_int{ 1, seq, heads * hd }, s);
+        };
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
         const null_a = mlx.mlx_array{ .ctx = null };
@@ -1029,6 +1050,9 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     for (d.doubles, 0..) |*b, i| {
         const pfx = try fmtKey(allocator, "transformer_blocks.{d}", .{i}); defer allocator.free(pfx);
         b.* = try loadDouble(&w, allocator, pfx);
+        // The token-GEMM linears go int8 (`--w8a8`); modulation and embedders see one row or run once.
+        inline for (.{ "q", "k", "v", "o", "add_q", "add_k", "add_v", "add_o", "ff_in", "ff_out", "ffc_in", "ffc_out" }) |f| try @field(b, f).toW8a8(s);
+        if (w8a8.enabled) w.dropBlock("transformer_blocks.{d}.", i);
     }
     d.singles = try allocator.alloc(SingleBlock, d.cfg.single_layers);
     for (d.singles, 0..) |*b, i| {
@@ -1038,6 +1062,9 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
         const nq = try fmtKey(allocator, "{s}.attn.norm_q.weight", .{pfx}); defer allocator.free(nq);
         const nk = try fmtKey(allocator, "{s}.attn.norm_k.weight", .{pfx}); defer allocator.free(nk);
         b.* = .{ .qkv_mlp = try QLinear.load(&w, allocator, qp), .o = try QLinear.load(&w, allocator, op), .nq = try ownWeight(&w, nq), .nk = try ownWeight(&w, nk) };
+        try b.qkv_mlp.toW8a8(s);
+        try b.o.toW8a8(s);
+        if (w8a8.enabled) w.dropBlock("single_transformer_blocks.{d}.", i);
     }
     return d;
 }
@@ -2683,4 +2710,57 @@ test "flux QLinear with inferred sub-4-bit geometry matches the dequantized refe
         std.debug.print("[flux-qgeo] bits={d} cos={d:.6}\n", .{ bits, cos });
         try testing.expect(cos > 0.999);
     }
+}
+
+/// One DiT forward on seeded noise (32 x 32 latent tokens + 64 text rows), noise prediction as f32;
+/// `resident` receives the MLX bytes the loaded DiT holds.
+fn fluxProbe(io: std.Io, a: std.mem.Allocator, s: S, model_dir: []const u8, resident: *usize) !mlx.mlx_array {
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    var dit = try loadDit(io, a, s, model_dir);
+    defer dit.deinit();
+    const img = try w8a8.randn(&.{ 1, 1024, @intCast(dit.cfg.in_channels) }, 1, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(img);
+    const enc = try w8a8.randn(&.{ 1, 64, @intCast(dit.cfg.joint_dim) }, 2, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(enc);
+    const img_ids = try buildLatentIds(a, 32, 32);
+    defer a.free(img_ids);
+    const txt_ids = try buildTextIds(a, 64);
+    defer a.free(txt_ids);
+    const out = try dit.forward(img, enc, 0.5, img_ids, txt_ids);
+    defer _ = mlx.mlx_array_free(out);
+    const f = try astype(out, .float32, s);
+    try mlx.check(mlx.mlx_array_eval(f));
+    // Weights are lazy until the first forward has read them.
+    w8a8.dropMemo(); // job-end state: the last activation is not weights
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    resident.* = after -| before;
+    return f;
+}
+
+// The lossy int8 route against the same pack's packed forward. FLUX_TEST_MODEL.
+test "FLUX DiT: the w8a8 route stays within its bar of the packed forward" {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+    const model_dir = std.mem.span(std.c.getenv("FLUX_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const prev = w8a8.enabled;
+    defer w8a8.enabled = prev;
+    w8a8.enabled = false;
+    var packed_bytes: usize = 0;
+    const want = try fluxProbe(io, a, s, model_dir, &packed_bytes);
+    defer _ = mlx.mlx_array_free(want);
+    w8a8.enabled = true;
+    var int8_bytes: usize = 0;
+    const got = try fluxProbe(io, a, s, model_dir, &int8_bytes);
+    defer _ = mlx.mlx_array_free(got);
+    const g = try w8a8.agreement(got, want, s);
+    std.debug.print("[flux dit w8a8] cos={d:.6} rms_ratio={d:.6} resident packed={d} int8={d}\n", .{ g.cos, g.rms_ratio, packed_bytes, int8_bytes });
+    try testing.expect(g.cos < 0.99999); // the route engaged: a packed-numerics output would be identical
+    try testing.expect(g.cos > 0.998);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.02);
+    try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(io, model_dir, &.{ "transformer/0.safetensors", "transformer/1.safetensors" }));
 }

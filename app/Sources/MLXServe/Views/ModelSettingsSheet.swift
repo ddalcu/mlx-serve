@@ -29,6 +29,11 @@ enum ModelSettingsApply {
     static func offersNeuralEngine(modelType: String?) -> Bool {
         modelType == "qwen3_5" || modelType == "qwen3_5_text" || modelType == "qwen3"
     }
+
+    /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
+    static func hasInt8PrefillRoute(modelType: String?) -> Bool {
+        modelType == "prism_hadamard_qwen35"
+    }
 }
 
 struct ModelSettingsSheet: View {
@@ -94,9 +99,8 @@ struct ModelSettingsSheet: View {
         ModelSettingsApply.offersNeuralEngine(modelType: appState.localModels.first { $0.path == request.path }?.modelType)
     }
 
-    /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
     private var hasInt8PrefillRoute: Bool {
-        appState.localModels.first { $0.path == request.path }?.modelType == "prism_hadamard_qwen35"
+        ModelSettingsApply.hasInt8PrefillRoute(modelType: appState.localModels.first { $0.path == request.path }?.modelType)
     }
 
     private var rows: (mtp: Bool, acceptance: Bool) {
