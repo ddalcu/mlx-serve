@@ -180,6 +180,15 @@ enum CLISetupInstructions {
                 \(AgentConfigs.zcodeExports)
                 zcode
                 """),
+            // cmux opens the current folder as a workspace in its own window;
+            // no mlx-serve config is involved — agents INSIDE cmux get their
+            // model from MLX_SERVE_URL / their own settings.
+            Tab(id: "cmux",
+                title: "cmux",
+                installHint: "Requires cmux: download cmux.app from https://cmux.com",
+                command: """
+                cmux "$PWD"
+                """),
         ]
     }
 }

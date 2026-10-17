@@ -1,0 +1,46 @@
+name: Dev app binary (cmux launcher)
+
+# Built from the cmux-launcher fork branch: compiles ONLY the Swift app
+# (MLXCore) + its resource bundle and runs the launcher test pins. No Zig
+# engine, no mlx frameworks, no DMG — the artifact is meant to be dropped
+# into an existing MLX-Serve.app install on the maintainer's own Mac.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  MLXCore:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode (Swift 6.1+ required by MCP swift-sdk)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Metal Toolchain (SwiftTerm shaders)
+        run: |
+          xcrun -sdk macosx metal --version 2>/dev/null \
+            || sudo xcodebuild -downloadComponent MetalToolchain
+
+      - name: Resolve + patch dependencies
+        run: |
+          cd app
+          swift package resolve
+          bash ../scripts/patch-swatex-font-lookup.sh "$PWD/.build/checkouts/SwaTex"
+
+      - name: Launcher test pins
+        run: cd app && swift test --filter CLISetupInstructionsTests
+
+      - name: Build MLXCore (release)
+        run: cd app && swift build -c release
+
+      - name: Upload app binary + resource bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: MLXCore-cmux-launcher
+          path: |
+            app/.build/release/MLXCore
+            app/.build/release/SwaTex_SwaTexRender.bundle

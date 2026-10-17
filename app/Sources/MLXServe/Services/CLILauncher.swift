@@ -26,6 +26,7 @@ final class CLILauncher: ObservableObject {
         .fx,
         .grok,
         .zcode,
+        .cmux,
     ]
 
     /// Stable id list — pinned against the MAS instructions panel's tabs
@@ -681,6 +682,32 @@ extension LauncherCLI {
             export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
             \(cdLine)
             \(opencodeV2BinResolver) "$@"
+            """
+        }
+    )
+
+    /// cmux (https://cmux.com, manaflow-ai/cmux) — the GUI terminal
+    /// multiplexer for coding agents. A row here cds to the session's
+    /// workspace and asks cmux to open that folder as a new workspace (cmux
+    /// launches itself when it isn't running). cmux renders in its OWN
+    /// window — its terminals cannot be embedded in another app's pane — so
+    /// after opening the workspace the row execs an interactive zsh: the
+    /// session stays alive and doubles as a `cmux` CLI controller (open,
+    /// split, send keys, cookies…) for the workspace it just launched.
+    /// Needs no server, like the plain shell.
+    static let cmux = LauncherCLI(
+        id: "cmux",
+        displayName: "cmux",
+        binaryName: "cmux",
+        iconSystemName: "square.grid.2x2",
+        useClaudeIcon: false,
+        prepareConfig: nil,
+        requiresServer: false,
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            \(cdLine)
+            cmux "${PWD:-.}" || echo "cmux could not open a workspace for $PWD — is cmux.app installed?"
+            exec /bin/zsh -i
             """
         }
     )

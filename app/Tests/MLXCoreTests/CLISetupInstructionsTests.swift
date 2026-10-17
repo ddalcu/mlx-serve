@@ -163,7 +163,7 @@ final class CLISetupInstructionsTests: XCTestCase {
 
     func testTabsHaveStableIdsInLauncherOrder() {
         XCTAssertEqual(tabs.map(\.id),
-                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider", "fx", "grok", "zcode"],
+                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider", "fx", "grok", "zcode", "cmux"],
                        "same CLIs, same order as the DMG launcher dropdown")
         for tab in tabs {
             XCTAssertFalse(tab.command.isEmpty, tab.id)
@@ -185,6 +185,22 @@ final class CLISetupInstructionsTests: XCTestCase {
         // Without an exec the script would run to the end and the row would
         // close the moment it opened.
         XCTAssertTrue(script.contains("exec"), script)
+    }
+
+    /// cmux rides with the detected CLIs but opens its OWN window: the row
+    /// must still keep the session alive (exec zsh after handing the folder
+    /// to cmux), and it needs no server, like the plain shell.
+    func testCmuxRowOpensWorkspaceAndKeepsTheShellAlive() throws {
+        let cli = LauncherCLI.cmux
+        XCTAssertFalse(cli.requiresServer, "cmux opens without the server")
+        XCTAssertTrue(cli.fallbackPaths.isEmpty, cli.id)
+        let script = cli.scriptBody("http://localhost:11234", "m1", "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains("cd '/tmp'"), script)
+        XCTAssertTrue(script.contains("cmux"), script)
+        XCTAssertTrue(script.contains("exec /bin/zsh -i"), script)
+        let tab = try XCTUnwrap(tabs.first { $0.id == "cmux" })
+        XCTAssertFalse(tab.installHint.isEmpty)
+        XCTAssertFalse(tab.command.contains("exit"), tab.command)
     }
 
     /// The plain shell rides beside the detected CLIs but is not a candidate:
@@ -577,7 +593,7 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertEqual(LauncherCLI.codex.fallbackPaths.count, 4)
         XCTAssertTrue(LauncherCLI.codex.fallbackPaths.contains(
             "/Applications/ChatGPT.app/Contents/Resources/codex"))
-        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider, .fx, .grok, .zcode] {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider, .fx, .grok, .zcode, .cmux] {
             XCTAssertTrue(cli.fallbackPaths.isEmpty, cli.id)
         }
     }
