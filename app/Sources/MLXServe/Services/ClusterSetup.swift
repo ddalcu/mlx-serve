@@ -14,12 +14,13 @@ struct RdmaPort: Equatable {
 }
 
 /// How the two Macs of a Thunderbolt cluster find each other. Each port needs an
-/// IPv4 address for RDMA to carry traffic; by convention the host is 169.254.0.1
-/// and the worker 169.254.0.2 on the cable between them, and the worker dials the
-/// host there, so no LAN address or firewall rule is involved.
+/// IPv4 address for RDMA to carry traffic; the host is .1 and the worker .2 of a
+/// subnet of the cable's own, because the Thunderbolt Bridge already claims
+/// 169.254/16 and would route the worker's call to the host away from the cable.
 enum ClusterSetup {
     static let port = 32323
-    static func linkAddress(_ role: ClusterRole) -> String { role == .worker ? "169.254.0.2" : "169.254.0.1" }
+    static let linkSubnet = "10.254.77"
+    static func linkAddress(_ role: ClusterRole) -> String { "\(linkSubnet).\(role == .worker ? 2 : 1)" }
 
     /// `ibv_devinfo`'s ports, in its order.
     static func parsePorts(_ text: String) -> [RdmaPort] {
@@ -73,29 +74,39 @@ enum ClusterSetup {
         options.clusterDevice.isEmpty ? ports().first(where: \.active)?.device : options.clusterDevice
     }
 
-    static func coordinator(_ options: ServerOptions) -> String {
-        let typed = options.clusterCoordinator.trimmingCharacters(in: .whitespaces)
-        if typed.isEmpty { return "\(linkAddress(.host)):\(port)" }
-        return typed.contains(":") ? typed : "\(typed):\(port)"
+    /// Where the worker dials the host: the typed address, else the host's end of
+    /// the cable, read off this Mac's own port (a worker's x.y.z.2 → x.y.z.1).
+    static func coordinator(_ o: ServerOptions, ports: () -> [RdmaPort] = ClusterSetup.ports,
+                            address: (String) -> String? = ClusterSetup.ipv4(on:)) -> String {
+        let typed = o.clusterCoordinator.trimmingCharacters(in: .whitespaces)
+        if !typed.isEmpty { return typed.contains(":") ? typed : "\(typed):\(port)" }
+        var host = linkAddress(.host)
+        if let dev = device(o, ports: ports), let ip = address(RdmaPort(device: dev, active: true).interface) {
+            host = o.clusterRole == .worker ? ip.split(separator: ".").dropLast().joined(separator: ".") + ".1" : ip
+        }
+        return "\(host):\(port)"
     }
 
     /// The host's launch flags; none unless this Mac hosts and has a model and a port.
-    static func hostArgs(_ o: ServerOptions, ports: () -> [RdmaPort] = ClusterSetup.ports) -> [String] {
+    static func hostArgs(_ o: ServerOptions, ports: () -> [RdmaPort] = ClusterSetup.ports,
+                         address: (String) -> String? = ClusterSetup.ipv4(on:)) -> [String] {
         guard o.clusterRole == .host, !o.clusterModelPath.isEmpty, let dev = device(o, ports: ports) else { return [] }
-        return ["--dist", o.clusterMode.rawValue, "--dist-coordinator", coordinator(o),
+        return ["--dist", o.clusterMode.rawValue, "--dist-coordinator", coordinator(o, ports: { [RdmaPort(device: dev, active: true)] }, address: address),
                 "--dist-device", dev, "--dist-model", o.clusterModelPath]
     }
 
     /// `mlx-serve worker`'s arguments, or nil without a port.
-    static func workerArgs(_ o: ServerOptions, modelDirs: [String], ports: () -> [RdmaPort] = ClusterSetup.ports) -> [String]? {
+    static func workerArgs(_ o: ServerOptions, modelDirs: [String], ports: () -> [RdmaPort] = ClusterSetup.ports,
+                           address: (String) -> String? = ClusterSetup.ipv4(on:)) -> [String]? {
         guard let dev = device(o, ports: ports) else { return nil }
-        return ["worker", "--coordinator", coordinator(o), "--device", dev]
+        return ["worker", "--coordinator", coordinator(o, ports: { [RdmaPort(device: dev, active: true)] }, address: address),
+                "--device", dev]
             + ServerOptions.modelDirArgs(modelDirs)
     }
 
     /// The shell line that gives `interface` this Mac's cluster address (until restart).
     static func addressCommand(interface: String, role: ClusterRole) -> String {
-        "/sbin/ifconfig \(interface) inet \(linkAddress(role)) netmask 255.255.0.0 alias"
+        "/sbin/ifconfig \(interface) inet \(linkAddress(role)) netmask 255.255.255.0 alias"
     }
 
     /// Runs `addressCommand` behind the macOS admin prompt; the error text, or nil on success.

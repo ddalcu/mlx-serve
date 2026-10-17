@@ -1130,7 +1130,7 @@ private struct ThunderboltClusterSectionContent: View {
                 .labelsHidden().pickerStyle(.segmented).frame(width: 220)
             }
         }
-        SettingsRow(title: L10n.text("Status"), explainer: L10n.format("The worker joins at %@.", ClusterSetup.coordinator(options))) {
+        SettingsRow(title: L10n.text("Status"), explainer: L10n.format("The worker joins at %@.", ClusterSetup.coordinator(options, ports: { ports }))) {
             Text(verbatim: clusterStatus).font(.app(.caption)).foregroundStyle(.secondary)
         }
         if let c = server.cluster, c.planned, c.layers > 0 {
@@ -1151,7 +1151,7 @@ private struct ThunderboltClusterSectionContent: View {
         if let m = meta["clusterCoordinator"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterCoordinator)) {
                 TextField("", text: $appState.serverOptions.clusterCoordinator,
-                          prompt: Text(verbatim: ClusterSetup.coordinator(ServerOptions())))
+                          prompt: Text(verbatim: ClusterSetup.coordinator(options, ports: { ports })))
                     .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
                     .frame(width: 200).font(.app(.body))
             }

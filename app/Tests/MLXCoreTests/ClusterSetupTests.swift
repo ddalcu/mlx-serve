@@ -28,10 +28,21 @@ final class ClusterSetupTests: XCTestCase {
         XCTAssertEqual(ClusterSetup.hostArgs(o, ports: ports), [], "no model chosen")
         o.clusterModelPath = "/m/Flash"
         o.clusterMode = .tensor
-        XCTAssertEqual(ClusterSetup.hostArgs(o, ports: ports),
-                       ["--dist", "tensor", "--dist-coordinator", "169.254.0.1:32323",
+        XCTAssertEqual(ClusterSetup.hostArgs(o, ports: ports, address: { $0 == "en13" ? "10.254.77.1" : nil }),
+                       ["--dist", "tensor", "--dist-coordinator", "10.254.77.1:32323",
                         "--dist-device", "rdma_en13", "--dist-model", "/m/Flash"])
+        XCTAssertEqual(ClusterSetup.hostArgs(o, ports: ports, address: { _ in nil })[3], "10.254.77.1:32323",
+                       "a port with no address yet still names the cable's host end")
         XCTAssertEqual(ClusterSetup.hostArgs(o, ports: { [] }), [], "no port up")
+    }
+
+    /// A worker on x.y.z.2 dials the host at x.y.z.1 on the same cable.
+    func testWorkerDialsTheHostEndOfItsCable() {
+        var o = ServerOptions()
+        o.clusterRole = .worker
+        let args = ClusterSetup.workerArgs(o, modelDirs: [], ports: { ClusterSetup.parsePorts(self.devinfo) },
+                                           address: { _ in "10.254.77.2" })
+        XCTAssertEqual(args?[2], "10.254.77.1:32323")
     }
 
     /// The worker dials the typed host address, adding the port when it is missing.
