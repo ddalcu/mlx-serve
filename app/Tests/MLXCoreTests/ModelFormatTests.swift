@@ -32,12 +32,13 @@ final class ModelFormatTests: XCTestCase {
     /// verified pack gets a Download, any other one would fail at load.
     func testOnlyAVerifiedModelOptPackIsDownloadable() {
         XCTAssertNil(modelOpt("nvidia/Qwen3.8-Flash-Next-FP4-Local", modelType: "qwen4_exp").incompatibleReason)
+        XCTAssertNil(modelOpt("nvidia/GLM-5.3-Flash-FP4-Local", modelType: "glm5_next").incompatibleReason)
         XCTAssertNotNil(modelOpt("nvidia/Qwen3.8-Flash-Next-NVFP4", modelType: "qwen4_exp").incompatibleReason)
     }
 
     func testTheOtherTabListsOnlyPacksWeServe() {
-        let shown = HFSearchService.shown([modelOpt("nvidia/Qwen3.8-Flash-Next-FP4-Local", modelType: "qwen4_exp"), modelOpt("nvidia/Qwen3.8-Flash-Next-NVFP4", modelType: "qwen4_exp")], format: .other)
-        XCTAssertEqual(shown.map(\.id), ["nvidia/Qwen3.8-Flash-Next-FP4-Local"])
+        let shown = HFSearchService.shown([modelOpt("nvidia/Qwen3.8-Flash-Next-FP4-Local", modelType: "qwen4_exp"), modelOpt("nvidia/GLM-5.3-Flash-FP4-Local", modelType: "glm5_next"), modelOpt("nvidia/Qwen3.8-Flash-Next-NVFP4", modelType: "qwen4_exp")], format: .other)
+        XCTAssertEqual(shown.map(\.id), ["nvidia/Qwen3.8-Flash-Next-FP4-Local", "nvidia/GLM-5.3-Flash-FP4-Local"])
     }
 
     /// FP8 is one byte per element; a catch-all on "4" priced F8_E4M3 at half that.

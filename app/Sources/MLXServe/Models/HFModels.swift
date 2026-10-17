@@ -356,7 +356,10 @@ struct HFModel: Identifiable, Codable {
     /// ModelOpt packs verified to load. ModelOpt is a toolkit, not a layout: two packs of one
     /// model differ (csf vs dense scales, an NVFP4 vs FP8 n-gram table, MXFP8 vs NVFP4
     /// linears), so the model_type cannot tell a servable pack from one refused at load.
-    static let verifiedModelOptRepos: Set<String> = ["nvidia/Qwen3.8-Flash-Next-FP4-Local"]
+    static let verifiedModelOptRepos: Set<String> = [
+        "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+        "nvidia/GLM-5.3-Flash-FP4-Local",
+    ]
 
     /// Human-readable reason why this model isn't compatible. The row renders
     /// it verbatim, so the lookup runs here. `mlx-serve` is the repo's own name.
