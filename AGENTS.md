@@ -38,6 +38,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 | `lan.zig` | LAN sharing: Bonjour, `SharedSet` + `routeClass` allowlist, `<id>@<peer>` mirroring, streaming proxy. Pure transport |
 | `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `alias` (a request NAME, never a load setting), `ctx_size`, `kv_quant`, `mtp`/`mtp_acceptance`/`mtp_greedy_tail`, `int8_prefill` (LOSSY), `chat_template_kwargs`; read at every load site, stamped on `ModelConfig.*_override` + `ChatConfig.chat_template_kwargs`. Detail: reference.md "row detail" |
 | `providers.zig` | Upstream OpenAI-compatible chat providers (`~/.mlx-serve/providers.json`): background `/v1/models` probe, `<id>@<name>` rows (`models` = filter, or the list for a listless provider), curl-backed `/v1/chat/completions` proxy. `GET /v1/providers`, `POST /v1/providers/reload` |
+| `distributed.zig` / `h3_split.zig` | Two Macs over Thunderbolt RDMA: Flash Next by layers or experts, H3 by step rows (`chooseCut`). Detail: reference.md "Thunderbolt cluster" |
 | `metrics.zig` | Lock-free zero-when-off observability (`--metrics`): `vllm:`+`mlx_serve:` Prometheus + JSON |
 | `ollama.zig` | `/api/*` translation, SSE→NDJSON `Sink`, tags/show/ps, `resolveName` |
 | `gen.zig` | Unified media gen: modality-named engine slots, `detectModality`/`peekModelType`, per-request handlers, img2img/edit/LoRA, residency estimators |

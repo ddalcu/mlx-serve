@@ -8,6 +8,7 @@ const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const distributed = @import("distributed.zig");
 const h3 = @import("minimax_h3.zig");
+const gen = @import("gen.zig");
 
 const S = mlx.mlx_stream;
 
@@ -217,6 +218,7 @@ pub fn begin(pack_dir: []const u8, io: std.Io, model: *h3.Model, turbo: bool, us
     if (user_loras > 0) return alone("the request's LoRAs live on this Mac only", .{});
     const p = distributed.planRows(@intCast(model.cfg.hidden_size), @intCast(model.blocks.len)) catch |err| switch (err) {
         error.DistWorkerNotJoined => return alone("the worker Mac has not joined", .{}),
+        error.DistWorkerLoadFailed => return alone("the worker could not load {s}", .{name}),
         else => return err,
     };
     if (p.host_calib_us == 0) {
@@ -224,6 +226,11 @@ pub fn begin(pack_dir: []const u8, io: std.Io, model: *h3.Model, turbo: bool, us
         p.host_calib_us = try calibrate(model, io, s);
         log.info("[h3-split] this Mac: {d} us per {d}-row pass, the worker: {d} us; link {d:.1} GB/s each way\n", .{ p.host_calib_us, CALIB_ROWS, p.worker_calib_us, p.link_bytes_per_us / 1000 });
     }
+    // The worker reads every row's keys, so its step needs about what this Mac's would.
+    const bcast_row: u64 = if (bcast) @as(u64, model.blocks.len) * model.cfg.hidden_size * 2 else 0;
+    const need_mib = gen.h3ActivationBytes(rows, bcast_row) >> 20;
+    const free_mib = @as(u64, @intCast(@max(p.worker.avail_mib, 0))) -| p.worker_resident_mib;
+    if (need_mib > free_mib) return alone("{d}-row steps need {d} MiB on the worker, which has {d} MiB free", .{ rows, need_mib, free_mib });
     const kv_row: u64 = 2 * @as(u64, model.cfg.num_attention_heads) * model.cfg.attention_head_dim * 2;
     // Diagnostic: MLX_SERVE_H3_SPLIT_SHARE=<0..1> keeps that share of the rows here, paying or not.
     const forced: ?u32 = if (h3.envStr("MLX_SERVE_H3_SPLIT_SHARE")) |v| if (std.fmt.parseFloat(f64, v)) |f|

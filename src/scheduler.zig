@@ -1732,6 +1732,8 @@ pub const Scheduler = struct {
         self.queue_mu.unlock(self.io);
 
         if (self.inference_thread) |t| t.join();
+        // Past the join: the cluster's last message is this process's last MLX call on the link.
+        @import("distributed.zig").shutdown();
         // A build in flight still writes its entry and request.
         while (self.ane_builds.load(.acquire) > 0) std.Io.sleep(self.io, .fromMilliseconds(10), .real) catch {};
 

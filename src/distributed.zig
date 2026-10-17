@@ -335,6 +335,10 @@ pub const Peer = struct {
     shard: ?Shard = null,
     planned: bool = false,
     ready: bool = false,
+    /// The worker refused or failed its load: it has left, and nothing waits on it again.
+    failed: bool = false,
+    /// What the worker's load left resident (its READY message).
+    worker_resident_mib: u32 = 0,
     /// Exchanges with the worker since the group formed (`/props` cluster).
     exchanges: u64 = 0,
     /// Tokens the worker's caches hold. Every forward must continue them or start over at 0.
@@ -402,8 +406,10 @@ pub const Peer = struct {
     }
 
     fn awaitReady(self: *Peer) !void {
+        if (self.failed) return error.DistWorkerLoadFailed;
         const m = try recvMsg(&self.link, 1);
         if (m[0] != MAGIC or m[1] != 0) {
+            self.failed = true;
             switch (m[1]) {
                 NOT_FOUND => log.err("[dist] the worker has no model named {s} in its model folders\n", .{self.model}),
                 MISMATCH => log.err("[dist] the worker's copy of {s} has a different geometry\n", .{self.model}),
@@ -411,6 +417,7 @@ pub const Peer = struct {
             }
             return error.DistWorkerLoadFailed;
         }
+        self.worker_resident_mib = @intCast(@max(m[2], 0));
         switch (self.mode) {
             .pipeline => log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ self.span.end, self.span.total, m[2] }),
             .tensor => log.info("[dist] worker ready: its half of every expert resident, {d} MiB\n", .{m[2]}),
@@ -463,17 +470,19 @@ var joined_link: Link = undefined;
 pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     if (peer()) |p| return clusterJson(allocator, p);
     const g = group orelse return allocator.dupe(u8, "");
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"joined\":{},\"planned\":false,\"worker_ready\":false}}", .{
-        @tagName(g.mode), std.fs.path.basename(g.model), joined.load(.acquire),
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false}}", .{
+        @tagName(g.mode), std.json.fmt(std.fs.path.basename(g.model), .{}), joined.load(.acquire),
     });
 }
 
 fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     const sp = p.span;
+    while (!last_job_mu.tryLock()) std.atomic.spinLoopHint();
+    defer last_job_mu.unlock();
     // Rows mode: the worker's speed relative to this Mac and the link, once measured.
     const speed: f64 = if (p.worker_calib_us > 0 and p.host_calib_us > 0) @as(f64, @floatFromInt(p.host_calib_us)) / @as(f64, @floatFromInt(p.worker_calib_us)) else 0;
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}]}}", .{
-        @tagName(p.mode), std.fs.path.basename(p.model), p.planned, p.ready, sp.total, sp.start, sp.end,
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}]}}", .{
+        @tagName(p.mode), std.json.fmt(std.fs.path.basename(p.model), .{}), p.planned, p.ready, sp.total, sp.start, sp.end,
         if (p.mode == .pipeline) sp.end else 0, sp.total, if (p.shard) |sh| sh.size else 0,
         p.worker.avail_mib, p.worker.total_mib, p.exchanges, std.json.fmt(p.workerName(), .{}) , speed, p.link_bytes_per_us / 1000,
         std.json.fmt(last_job_buf[0..last_job_len], .{}), last_split[0], last_split[1],
@@ -483,10 +492,14 @@ fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
 var last_job_buf: [160]u8 = undefined;
 var last_job_len: usize = 0;
 var last_split: [2]u32 = .{ 0, 0 };
+/// The inference thread writes the note while `/props` reads it.
+var last_job_mu: std.atomic.Mutex = .unlocked;
 
 /// What the last video job did with the worker (`/props` cluster "last_job", and its rows
 /// on each Mac, zeros when it ran here alone).
 pub fn noteJob(split: [2]u32, comptime fmt: []const u8, args: anytype) void {
+    while (!last_job_mu.tryLock()) std.atomic.spinLoopHint();
+    defer last_job_mu.unlock();
     last_split = split;
     last_job_len = if (std.fmt.bufPrint(&last_job_buf, fmt, args)) |t| t.len else |_| 0;
 }

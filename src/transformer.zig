@@ -5,7 +5,7 @@ const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
-const distributed = @import("distributed.zig");
+const distributed_mod = @import("distributed.zig");
 const ple_gpu = @import("ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
@@ -15581,6 +15581,8 @@ pub const CaptureLayers = struct {
 
 pub const ForwardCtx = struct {
     cache: *KVCache,
+    /// A later pipeline rank's input: the previous rank's hyper-connection stream, in place of tokens.
+    stream_in: ?mlx.mlx_array = null,
     moe_seq_offset: *usize,
     ssm_entries: ?[]SSMCacheEntry,
     ssm_member_gen: u64 = 0,
@@ -17196,10 +17198,10 @@ pub const Transformer = struct {
     // read that replaces model.norm.
     qwen4: ?*qwen4_mod.Qwen4State = null,
     /// Pipeline rank 0: the worker holding the trunk's later layers (`distributed.Peer`).
-    dist_peer: ?*distributed.Peer = null,
+    dist_peer: ?*distributed_mod.Peer = null,
     /// Tensor-parallel rank 0: the worker holding the other slice of every expert. Its
     /// part is stateless, so nothing about scheduling or caching changes.
-    dist_tp: ?*distributed.Peer = null,
+    dist_tp: ?*distributed_mod.Peer = null,
     /// Run the qwen4 residual streams in f32 (QWEN4_STREAM_F32=1, or set by
     /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
     /// fixture is the tighter bar for the MATH.
@@ -18048,8 +18050,8 @@ pub const Transformer = struct {
             .emb_scale = emb_scale,
             .final_norm = final_norm,
             .qwen4 = qwen4_state,
-            .dist_peer = if (config.dist_span) |sp| if (sp.first()) distributed.peer() else null else null,
-            .dist_tp = if (config.dist_shard) |sh| if (sh.rank == 0) distributed.peer() else null else null,
+            .dist_peer = if (config.dist_span) |sp| if (sp.first()) distributed_mod.peer() else null else null,
+            .dist_tp = if (config.dist_shard) |sh| if (sh.rank == 0) distributed_mod.peer() else null else null,
             .qwen4_mixer = qwen4_mixer,
             .qwen4_mtp = qwen4_mtp,
             .lm_head_w = lm_head_w,
@@ -20492,7 +20494,7 @@ pub const Transformer = struct {
     /// pooled blocks), so slots interleave AND batch freely. The one
     /// module-owned piece on this arch is the MTP head's cache, and the
     /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
-    pub const module_shared_readonly_fields = [_][]const u8{"qwen4"};
+    pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "dist_tp" };
 
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         inline for (module_owned_state_fields) |f| {
@@ -25966,17 +25968,17 @@ pub const Transformer = struct {
     /// streams; every block reads a gated mix of the streams and writes back
     /// through per-stream scalar gates; the n-gram PLE adds to the streams
     /// before its layer; the final mixer replaces model.norm.
-    fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        return self.forwardQwen4Impl(ctx, token_ids, null);
-    }
 
     /// A later pipeline rank's forward: its layers over the `[B, L, hc*hidden]`
     /// stream the previous rank handed over, returning the stream for the next one.
     pub fn forwardQwen4Stream(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array) !mlx.mlx_array {
-        return self.forwardQwen4Impl(ctx, .{ .ctx = null }, stream);
+        ctx.stream_in = stream;
+        defer ctx.stream_in = null;
+        return self.forwardQwen4With(ctx, .{ .ctx = null });
     }
 
-    fn forwardQwen4Impl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, stream_in: ?mlx.mlx_array) !mlx.mlx_array {
+    fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const stream_in = ctx.stream_in;
         self.fwd_gen +%= 1; // per-forward QSA scratch key
         const ml = self.moe_layers.?;
         const cfg = &self.config;
@@ -33153,7 +33155,7 @@ pub const Transformer = struct {
 
     /// Tensor-parallel MoE: this rank's slice of every expert plus the worker's, both
     /// routed by the logits computed here so the two halves pick the same experts.
-    fn moeTensorParallel(self: *Transformer, tp: *distributed.Peer, x: mlx.mlx_array, mw: *const MoeMlpWeights, layer: u32) !mlx.mlx_array {
+    fn moeTensorParallel(self: *Transformer, tp: *distributed_mod.Peer, x: mlx.mlx_array, mw: *const MoeMlpWeights, layer: u32) !mlx.mlx_array {
         const logits = try self.moeRouterLogits(x, mw);
         defer _ = mlx.mlx_array_free(logits);
         try tp.sendMoe(x, logits, layer);
@@ -66013,6 +66015,8 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.dsv41 = null;
     t.mlx_stream_ext = null;
     t.qwen4 = null;
+    t.dist_peer = null;
+    t.dist_tp = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
     var fake_dsv4: dsv4_mod.Dsv4Model = undefined;
@@ -66025,6 +66029,10 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.dsv41 = null;
     var fake_ext: mlx_stream_mod.Model = undefined;
     t.mlx_stream_ext = &fake_ext;
+    try testing.expect(t.ownsModuleDecodeState());
+    t.mlx_stream_ext = null;
+    var fake_peer: distributed_mod.Peer = undefined;
+    t.dist_peer = &fake_peer;
     try testing.expect(t.ownsModuleDecodeState());
 }
 
