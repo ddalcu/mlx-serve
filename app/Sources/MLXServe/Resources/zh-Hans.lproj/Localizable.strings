@@ -2287,7 +2287,7 @@
 "Turbo already computes every step in full, so this changes nothing." = "Turbo 本来就会完整计算每一步，所以此项不起作用。";
 "Turns off the shortcut that reuses work between steps: slightly better detail and up to about 70% less peak memory, but about 2.5 times slower." = "关闭在步骤之间复用计算结果的捷径：细节略好，峰值内存最多减少约 70%，但速度慢约 2.5 倍。";
 "Reads the models from disk as they run: about 60% less peak memory, about 5% slower. Best on a fast SSD." = "运行时从磁盘读取模型：峰值内存减少约 60%，速度慢约 5%。在高速 SSD 上效果最好。";
-"Stores the attention cache in 8 bits: up to about 30% less peak memory, and about 1% slower. The video comes out slightly different." = "以 8 位存储注意力缓存：峰值内存最多减少约 30%，速度慢约 1%。生成的视频会略有不同。";
+"Stores the attention cache in 8 bits: up to about 30% less peak memory, about 1% slower, and a very slight quality loss." = "以 8 位存储注意力缓存：峰值内存最多减少约 30%，速度慢约 1%，画质略有下降。";
 "With every step computed in full, or Turbo on, there is no attention cache, so this changes nothing." = "每一步都完整计算或开启 Turbo 时没有注意力缓存，所以此项不起作用。";
 "Shows a rough still of each step while it runs, about 1% slower. The finished clip comes out sharper than the preview." = "运行时显示每一步的粗略静帧，速度约慢 1%。完成的片段比预览更清晰。";
 "Adapter files (.safetensors) that change the look or teach the model a subject. Up to 8 stack, each with its own strength." = "用于改变画面风格或教模型认识某个主体的适配器文件（.safetensors）。最多可叠加 8 个，各自设置强度。";

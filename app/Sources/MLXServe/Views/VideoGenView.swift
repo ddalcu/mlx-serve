@@ -102,8 +102,8 @@ struct VideoGenView: View {
     @State private var turbo: Bool = false
     /// H3 streams its weights from disk (server default); off holds them in memory.
     @State private var streamWeights: Bool = true
-    /// H3's fast-recipe attention cache stored 8-bit (less memory, slightly lossy).
-    @State private var attnCache8bit: Bool = false
+    /// H3's fast-recipe attention cache stored 8-bit (less memory, very slightly lossy; default on).
+    @State private var attnCache8bit: Bool = true
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -1932,10 +1932,10 @@ struct VideoGenView: View {
             if model.supportsFastRecipe {
                 Toggle("Quantize the attention cache", isOn: $attnCache8bit)
                     .font(.app(.caption))
-                    .help("Off (default): the fast recipe keeps its attention cache in bf16. On: the cache is stored 8-bit, for up to about 30% less peak memory. It is about 1% slower, and the video comes out slightly different from the bf16 cache's. Computing every step in full and Turbo keep no cache, so this does nothing there.")
+                    .help("On (default): the fast recipe stores its attention cache 8-bit, for up to about 30% less peak memory. It is about 1% slower, with a very slight quality loss. Off: the cache stays bf16. Computing every step in full and Turbo keep no cache, so this does nothing there.")
                     .disabled(!effectiveFast)
                 if effectiveFast {
-                    Text("Stores the attention cache in 8 bits: up to about 30% less peak memory, and about 1% slower. The video comes out slightly different.")
+                    Text("Stores the attention cache in 8 bits: up to about 30% less peak memory, about 1% slower, and a very slight quality loss.")
                         .font(.app(.caption2)).foregroundStyle(.secondary)
                 } else {
                     Text("With every step computed in full, or Turbo on, there is no attention cache, so this changes nothing.")

@@ -2275,7 +2275,7 @@
 "Turbo already computes every step in full, so this changes nothing." = "터보는 이미 모든 단계를 완전히 계산하므로 이 설정은 아무것도 바꾸지 않습니다.";
 "Turns off the shortcut that reuses work between steps: slightly better detail and up to about 70% less peak memory, but about 2.5 times slower." = "단계 사이에 작업을 재사용하는 지름길을 끕니다. 디테일이 약간 좋아지고 최대 메모리가 최대 약 70% 줄지만 약 2.5배 느립니다.";
 "Reads the models from disk as they run: about 60% less peak memory, about 5% slower. Best on a fast SSD." = "실행하면서 모델을 디스크에서 읽습니다. 최대 메모리는 약 60% 줄고 속도는 약 5% 느려집니다. 빠른 SSD에서 가장 좋습니다.";
-"Stores the attention cache in 8 bits: up to about 30% less peak memory, and about 1% slower. The video comes out slightly different." = "어텐션 캐시를 8비트로 저장합니다. 최대 메모리가 최대 약 30% 줄고, 속도는 약 1% 느려집니다. 영상이 약간 다르게 나옵니다.";
+"Stores the attention cache in 8 bits: up to about 30% less peak memory, about 1% slower, and a very slight quality loss." = "어텐션 캐시를 8비트로 저장합니다. 최대 메모리가 최대 약 30% 줄고, 속도는 약 1% 느려지며, 품질이 아주 약간 떨어집니다.";
 "With every step computed in full, or Turbo on, there is no attention cache, so this changes nothing." = "모든 단계를 완전히 계산하거나 터보를 켜면 어텐션 캐시가 없으므로 이 설정은 아무것도 바꾸지 않습니다.";
 "Shows a rough still of each step while it runs, about 1% slower. The finished clip comes out sharper than the preview." = "실행 중 각 단계의 대략적인 정지 이미지를 보여 주며 약 1% 느려집니다. 완성된 클립은 미리보기보다 선명합니다.";
 "Adapter files (.safetensors) that change the look or teach the model a subject. Up to 8 stack, each with its own strength." = "모습을 바꾸거나 모델에 대상을 가르치는 어댑터 파일(.safetensors)입니다. 최대 8개를 겹칠 수 있고 각각 강도를 따로 정합니다.";

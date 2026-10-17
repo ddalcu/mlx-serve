@@ -340,15 +340,17 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertLessThan(bill, 30.96 + 5)
     }
 
-    /// The 8-bit cache is opt-in and rides only a request that runs the fast recipe.
-    func testRequestBodySendsThe8BitCacheOnlyWhenAsked() {
+    /// The 8-bit cache is on by default and rides only a request that runs the fast recipe.
+    func testRequestBodySendsThe8BitCacheByDefault() {
         var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
                                   numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
         func body() -> [String: Any] { VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil) }
-        XCTAssertNil(body()["attn_cache_8bit"])
-        req.attnCache8bit = true
         XCTAssertEqual(body()["attn_cache_8bit"] as? Bool, true)
+        XCTAssertTrue(VideoGenSettings().attnCache8bit)
         req.bestQuality = true // no fast recipe, no cache to store
+        XCTAssertNil(body()["attn_cache_8bit"])
+        req.bestQuality = false
+        req.attnCache8bit = false
         XCTAssertNil(body()["attn_cache_8bit"])
     }
 
