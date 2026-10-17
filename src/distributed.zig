@@ -399,16 +399,26 @@ fn dependsOn(x: mlx.mlx_array, dep: mlx.mlx_array) !mlx.mlx_array {
 
 var peer_slot: ?Peer = null;
 
+/// The group this server leads (`--dist`): set at startup, while a thread waits
+/// for the worker to join; the handshake runs when the group's model loads.
+const Group = struct { mode: Mode, model: []const u8, split: ?u32 };
+var group: ?Group = null;
+var joined = std.atomic.Value(bool).init(false);
+var joined_link: Link = undefined;
+
 /// The `/props` "cluster" object (with its leading comma), empty when this server is
 /// not rank 0 of a group: what the app draws the split from.
 pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
-    const p = peer() orelse return allocator.dupe(u8, "");
-    return clusterJson(allocator, p);
+    if (peer()) |p| return clusterJson(allocator, p);
+    const g = group orelse return allocator.dupe(u8, "");
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"joined\":{},\"planned\":false,\"worker_ready\":false}}", .{
+        @tagName(g.mode), std.fs.path.basename(g.model), joined.load(.acquire),
+    });
 }
 
 fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     const sp = p.span;
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d}}}", .{
         @tagName(p.mode), std.fs.path.basename(p.model), p.planned, p.ready, sp.total, sp.start, sp.end,
         if (p.mode == .pipeline) sp.end else 0, sp.total, if (p.shard) |sh| sh.size else 0,
         p.worker.avail_mib, p.worker.total_mib, p.exchanges,
@@ -434,8 +444,18 @@ pub fn peer() ?*Peer {
 pub const Part = union(enum) { span: LayerSpan, shard: Shard };
 
 pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Part {
-    const p = peer() orelse return null;
-    if (!std.mem.eql(u8, std.fs.path.basename(p.model), std.fs.path.basename(model_dir))) return null;
+    const g = group orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(g.model), std.fs.path.basename(model_dir))) return null;
+    if (peer_slot == null) {
+        if (!joined.load(.acquire)) {
+            log.err("[dist] {s} is served with a worker: start `mlx-serve worker` on the other Mac first\n", .{std.fs.path.basename(g.model)});
+            return error.DistWorkerNotJoined;
+        }
+        const worker = try Hello.parse(try recvMsg(&joined_link, 1, .{ .ctx = null }));
+        log.info("[dist] worker: {d} MiB free of {d}\n", .{ worker.avail_mib, worker.total_mib });
+        peer_slot = .{ .link = joined_link, .mode = g.mode, .model = g.model, .split = g.split, .worker = worker };
+    }
+    const p = &peer_slot.?;
     if (!p.planned) try plan(p, config);
     return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
 }
@@ -483,14 +503,22 @@ fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
     @memcpy(out, (mlx.mlx_array_data_uint8(r) orelse return error.DistBadMessage)[0..out.len]);
 }
 
-/// Rank 0 at startup: joins the group and hears the worker's memory. The split waits
-/// for `model` to load (`planFor`).
+/// Rank 0 at startup: waits for the worker on a thread of its own, so the server
+/// serves meanwhile. Only the RDMA link opens there; every message runs on the
+/// inference thread, when `model` loads (`planFor`).
 pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32) !void {
-    var link = try Link.open(io, cfg);
-    errdefer link.deinit();
-    const worker = try Hello.parse(try recvMsg(&link, 1, .{ .ctx = null }));
-    log.info("[dist] worker joined: {d} MiB free of {d}; {s} mode for {s}\n", .{ worker.avail_mib, worker.total_mib, @tagName(mode), std.fs.path.basename(model) });
-    peer_slot = .{ .link = link, .mode = mode, .model = try allocator.dupe(u8, model), .split = split, .worker = worker };
+    group = .{ .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
+    const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
+    t.detach();
+}
+
+fn waitForWorker(io: std.Io, cfg: Config) void {
+    joined_link = Link.open(io, cfg) catch |err| {
+        log.err("[dist] the cluster link did not open: {s}\n", .{@errorName(err)});
+        return;
+    };
+    joined.store(true, .release);
+    log.info("[dist] worker joined; it loads its part with {s}\n", .{std.fs.path.basename(group.?.model)});
 }
 
 /// The folder named `name` in `roots` (`<root>/<name>` or `<root>/<org>/<name>`).
@@ -536,7 +564,15 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     try rest.appendSlice(allocator, &.{ "--rank", "1" });
     const cfg = try parseArgs(rest.items);
 
-    var link = try Link.open(io, cfg);
+    // The host listens only once its server is up: keep knocking until it is.
+    var link = while (true) break Link.open(io, cfg) catch |err| switch (err) {
+        error.RdmaInitFailed => {
+            log.info("[dist] worker: the host at {s} is not listening yet; retrying\n", .{cfg.coordinator});
+            std.Io.sleep(io, .fromSeconds(3), .real) catch {};
+            continue;
+        },
+        else => return err,
+    };
     defer link.deinit();
     const cs: mlx.mlx_stream = .{ .ctx = null };
     try sendMsg(&link, Hello.here().msg(), 0, cs);
@@ -804,5 +840,5 @@ test "clusterJson: a pipeline split names both ranks' layers" {
     var p: Peer = .{ .link = undefined, .mode = .pipeline, .model = "/m/org/Flash-FP4", .split = null, .worker = .{ .avail_mib = 100, .total_mib = 128 }, .span = .{ .start = 0, .end = 16, .total = 48 }, .planned = true, .ready = true, .exchanges = 3 };
     const j = try clusterJson(std.testing.allocator, &p);
     defer std.testing.allocator.free(j);
-    try std.testing.expectEqualStrings(",\"cluster\":{\"mode\":\"pipeline\",\"model\":\"Flash-FP4\",\"planned\":true,\"worker_ready\":true,\"layers\":48,\"here\":[0,16],\"worker\":[16,48],\"expert_shards\":0,\"worker_free_mib\":100,\"worker_total_mib\":128,\"exchanges\":3}", j);
+    try std.testing.expectEqualStrings(",\"cluster\":{\"mode\":\"pipeline\",\"model\":\"Flash-FP4\",\"joined\":true,\"planned\":true,\"worker_ready\":true,\"layers\":48,\"here\":[0,16],\"worker\":[16,48],\"expert_shards\":0,\"worker_free_mib\":100,\"worker_total_mib\":128,\"exchanges\":3}", j);
 }

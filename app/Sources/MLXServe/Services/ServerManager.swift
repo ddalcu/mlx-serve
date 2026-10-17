@@ -70,6 +70,8 @@ class ServerManager: ObservableObject {
     /// resident model. nil = the per-silicon tables applied.
     @Published var specCost: SpecCostInfo?
     @Published var batching: BatchingInfo?
+    /// The Thunderbolt cluster this server hosts, from `/props`; nil when it hosts none.
+    @Published var cluster: ClusterInfo?
     /// Live throughput, nil when the server runs without `--metrics`.
     @Published var throughput: ThroughputSnapshot?
     /// Live decode / prefill tok/s, derived from the gauge delta between the
@@ -232,14 +234,7 @@ class ServerManager: ObservableObject {
         proc.arguments = args
         lastLaunchedOptions = options
 
-        // Inherit environment + add framework paths for dylib loading
-        var env = ProcessInfo.processInfo.environment
-        if let frameworksPath = Bundle.main.privateFrameworksPath {
-            let existing = env["DYLD_LIBRARY_PATH"] ?? ""
-            env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"
-            env["MLX_METAL_PATH"] = frameworksPath
-        }
-        proc.environment = env
+        proc.environment = Self.launchEnvironment()
 
         // Echo the launch command at the top of the log (the buffer was just
         // cleared, so this lands above the server's own first line). Lets the
@@ -641,6 +636,7 @@ class ServerManager: ObservableObject {
             memoryInfo = memory
             specCost = props.specCost
             batching = props.batching
+            cluster = props.cluster
             let moved = Self.modelListMoved(seen: seenRegistryGeneration, reported: props.registryGeneration)
             seenRegistryGeneration = props.registryGeneration ?? seenRegistryGeneration
             if moved { await refreshModels() }
@@ -945,6 +941,17 @@ class ServerManager: ObservableObject {
     /// executable, else the dev `zig-out/bin/mlx-serve`, else the bare name.
     /// `nonisolated static` so version probing (`EngineVersions.probe`) can find
     /// it without touching `@MainActor` server state.
+    /// The app's environment plus the bundled frameworks the engine loads its dylibs from.
+    nonisolated static func launchEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        if let frameworksPath = Bundle.main.privateFrameworksPath {
+            let existing = env["DYLD_LIBRARY_PATH"] ?? ""
+            env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"
+            env["MLX_METAL_PATH"] = frameworksPath
+        }
+        return env
+    }
+
     nonisolated static func resolveBinaryPath() -> String {
         // 1. Bundled: Contents/MacOS/mlx-serve (same dir as the Swift binary)
         if let execURL = Bundle.main.executableURL {

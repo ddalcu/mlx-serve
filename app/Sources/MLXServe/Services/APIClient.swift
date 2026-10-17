@@ -416,6 +416,7 @@ class APIClient {
         /// tables applied), which the UI reads as "nothing to show".
         let specCost: SpecCostInfo?
         let batching: BatchingInfo?
+        let cluster: ClusterInfo?
         /// Moves whenever `/v1/models` would read differently; nil from older servers.
         let registryGeneration: UInt64?
     }
@@ -426,6 +427,7 @@ class APIClient {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
         return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json),
+                             cluster: ClusterInfo.parse(json),
                              registryGeneration: (json["registry_generation"] as? NSNumber)?.uint64Value)
     }
 

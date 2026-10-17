@@ -75,6 +75,18 @@ struct ServerOptions: Codable, Equatable {
     /// Name other Macs see for this one (`--lan-name`). Empty = hostname.
     var lanName: String = ""
 
+    // MARK: Thunderbolt cluster (RDMA)
+    /// Host: this server runs `clusterModelPath` across this Mac and a worker
+    /// (`--dist`). Worker: the app runs `mlx-serve worker` for another Mac's host.
+    var clusterRole: ClusterRole = .off
+    var clusterMode: ClusterMode = .pipeline
+    /// The model the two Macs serve together; the worker finds its own copy by folder name.
+    var clusterModelPath: String = ""
+    /// The RDMA port facing the other Mac (`rdma_enX`). Empty = the one that is up.
+    var clusterDevice: String = ""
+    /// The host's address the worker dials. Empty = the host's Thunderbolt address.
+    var clusterCoordinator: String = ""
+
     // Speculative decoding (server-launch flags)
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
     var pldDraftLen: Int = 5
@@ -508,6 +520,11 @@ struct ServerOptions: Codable, Equatable {
         lanSharedModels == other.lanSharedModels &&
         lanDiscoverEnabled == other.lanDiscoverEnabled &&
         lanName == other.lanName &&
+        clusterRole == other.clusterRole &&
+        clusterMode == other.clusterMode &&
+        clusterModelPath == other.clusterModelPath &&
+        clusterDevice == other.clusterDevice &&
+        clusterCoordinator == other.clusterCoordinator &&
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
@@ -658,6 +675,7 @@ struct ServerOptions: Codable, Equatable {
         if lanDiscoverEnabled {
             args += ["--lan-discover"]
         }
+        args += ClusterSetup.hostArgs(self)
         let trimmedLanName = lanName.trimmingCharacters(in: .whitespacesAndNewlines)
         if (lanShareEnabled || lanDiscoverEnabled) && !trimmedLanName.isEmpty {
             args += ["--lan-name", trimmedLanName]
@@ -886,6 +904,11 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent([String].self, forKey: .lanSharedModels) { lanSharedModels = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanDiscoverEnabled) { lanDiscoverEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lanName) { lanName = v }
+        if let v = try c.decodeIfPresent(ClusterRole.self, forKey: .clusterRole) { clusterRole = v }
+        if let v = try c.decodeIfPresent(ClusterMode.self, forKey: .clusterMode) { clusterMode = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterModelPath) { clusterModelPath = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterDevice) { clusterDevice = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterCoordinator) { clusterCoordinator = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .decodeAttnQuantChoice) {
             decodeAttnQuantChoice = v
@@ -1089,6 +1112,26 @@ extension ServerOptions {
         "lanName": .init(
             title: "Shown to others as",
             explainer: "The name other Macs see; leave blank to use this Mac's name.",
+            needsRestart: true),
+        "clusterRole": .init(
+            title: "This Mac in a Thunderbolt cluster",
+            explainer: "Host runs one model across this Mac and another over Thunderbolt; worker lends this Mac to another Mac's host.",
+            needsRestart: true),
+        "clusterMode": .init(
+            title: "Split",
+            explainer: "By layers: each Mac runs its own layers in turn, fast with little traffic. By experts: both Macs work on every layer at once.",
+            needsRestart: true),
+        "clusterModelPath": .init(
+            title: "Model",
+            explainer: "The model both Macs serve together; the other Mac needs the same model in its library.",
+            needsRestart: true),
+        "clusterDevice": .init(
+            title: "Thunderbolt port",
+            explainer: "The port the cable to the other Mac is in.",
+            needsRestart: true),
+        "clusterCoordinator": .init(
+            title: "Host address",
+            explainer: "Where the worker finds the host; leave blank to use the Thunderbolt link.",
             needsRestart: true),
         "lanDiscoverEnabled": .init(
             title: "Use models shared by other Macs",

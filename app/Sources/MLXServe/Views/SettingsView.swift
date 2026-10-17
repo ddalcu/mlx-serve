@@ -132,9 +132,10 @@ struct SettingsView: View {
         }
         SettingsSection(
             category: .lanSharing,
-            subtitle: "Share models with other Macs on your network and use theirs; restart the server to apply changes."
+            subtitle: "Share models with other machines on your network, use theirs, and run one model across two Macs over Thunderbolt; restart the server to apply changes."
         ) {
             LanSharingSectionContent()
+            ThunderboltClusterSectionContent()
         }
         SettingsSection(
             category: .providers,
@@ -1030,6 +1031,172 @@ private struct LanSharingSectionContent: View {
         }
         .padding(.leading, 8)
         .padding(.vertical, 2)
+    }
+}
+
+/// Settings ▸ Cluster, Thunderbolt half: one model across two Macs over RDMA.
+private struct ThunderboltClusterSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+    @State private var ports: [RdmaPort] = []
+    @State private var setupError: String?
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
+    }
+    private var options: ServerOptions { appState.serverOptions }
+    private var port: RdmaPort? {
+        let dev = ClusterSetup.device(options, ports: { ports })
+        return ports.first { $0.device == dev }
+    }
+
+    var body: some View {
+        SearchableRow(searchText: ["Thunderbolt", "RDMA", "cluster"], separatorGap: nil) {
+            Text("Thunderbolt cluster").font(.app(.headline)).padding(.top, 8)
+        }
+        if let m = meta["clusterRole"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterRole)) {
+                Picker("", selection: $appState.serverOptions.clusterRole) {
+                    Text("Off").tag(ClusterRole.off)
+                    Text("Host").tag(ClusterRole.host)
+                    Text("Worker").tag(ClusterRole.worker)
+                }
+                .labelsHidden().pickerStyle(.segmented).frame(width: 220)
+            }
+            .task { ports = await Task.detached { ClusterSetup.ports() }.value }
+        }
+        if options.clusterRole != .off {
+            linkRow
+            if let m = meta["clusterDevice"], ports.count > 1 {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterDevice)) {
+                    Picker("", selection: $appState.serverOptions.clusterDevice) {
+                        Text("Automatic").tag("")
+                        ForEach(ports, id: \.device) { p in
+                            Text(verbatim: "\(p.interface)\(p.active ? "" : " (no cable)")").tag(p.device)
+                        }
+                    }
+                    .labelsHidden().frame(width: 200)
+                }
+            }
+        }
+        if options.clusterRole == .host { hostRows }
+        if options.clusterRole == .worker { workerRows }
+    }
+
+    /// The cable and its address: RDMA carries nothing until the port has one.
+    @ViewBuilder private var linkRow: some View {
+        SettingsRow(title: L10n.text("Link"), explainer: L10n.text("A Thunderbolt 5 cable straight between the two Macs, with RDMA turned on.")) {
+            if let p = port, p.active {
+                if let ip = ClusterSetup.ipv4(on: p.interface) {
+                    Label(L10n.format("%@ connected · %@", p.interface, ip), systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green).font(.app(.caption))
+                } else {
+                    Button(L10n.format("Set up %@…", p.interface)) {
+                        setupError = ClusterSetup.assignAddress(interface: p.interface, role: options.clusterRole)
+                        ports = ClusterSetup.ports()
+                    }
+                    .help(L10n.text("Gives the port its cluster address (asks for your password); needed again after a restart."))
+                }
+            } else if ports.isEmpty {
+                Text("RDMA is off: run `rdma_ctl enable` in Recovery").font(.app(.caption)).foregroundStyle(.orange)
+            } else {
+                Text("No cable on a Thunderbolt 5 port").font(.app(.caption)).foregroundStyle(.orange)
+            }
+        }
+        if let setupError {
+            Text(verbatim: setupError).font(.app(.caption)).foregroundStyle(.red)
+        }
+    }
+
+    @ViewBuilder private var hostRows: some View {
+        if let m = meta["clusterModelPath"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterModelPath)) {
+                Picker("", selection: $appState.serverOptions.clusterModelPath) {
+                    Text("Choose…").tag("")
+                    ForEach(appState.localModels.filter { $0.modelType == "qwen4_exp" }, id: \.path) { m in
+                        Text(verbatim: m.name).tag(m.path)
+                    }
+                }
+                .labelsHidden().frame(width: 260)
+            }
+        }
+        if let m = meta["clusterMode"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterMode)) {
+                Picker("", selection: $appState.serverOptions.clusterMode) {
+                    Text("By layers").tag(ClusterMode.pipeline)
+                    Text("By experts").tag(ClusterMode.tensor)
+                }
+                .labelsHidden().pickerStyle(.segmented).frame(width: 220)
+            }
+        }
+        SettingsRow(title: L10n.text("Status"), explainer: L10n.format("The worker joins at %@.", ClusterSetup.coordinator(options))) {
+            Text(verbatim: clusterStatus).font(.app(.caption)).foregroundStyle(.secondary)
+        }
+        if let c = server.cluster, c.planned, c.layers > 0 {
+            ClusterSplitBar(cluster: c)
+        }
+    }
+
+    private var clusterStatus: String {
+        guard let c = server.cluster else {
+            return options.clusterModelPath.isEmpty ? L10n.text("Choose a model") : L10n.text("Starts with the server")
+        }
+        if !c.joined { return L10n.text("Waiting for the worker") }
+        if !c.planned { return L10n.format("Worker joined; it loads its part with %@", c.model) }
+        return c.workerReady ? L10n.format("Serving %@ on both Macs", c.model) : L10n.text("The worker is loading its part")
+    }
+
+    @ViewBuilder private var workerRows: some View {
+        if let m = meta["clusterCoordinator"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterCoordinator)) {
+                TextField("", text: $appState.serverOptions.clusterCoordinator,
+                          prompt: Text(verbatim: ClusterSetup.coordinator(ServerOptions())))
+                    .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
+                    .frame(width: 200).font(.app(.body))
+            }
+        }
+        WorkerStatusRow(worker: appState.clusterWorker)
+    }
+}
+
+private struct WorkerStatusRow: View {
+    @ObservedObject var worker: ClusterWorker
+
+    var body: some View {
+        SettingsRow(title: L10n.text("Status"), explainer: L10n.text("This Mac runs its part of the host's model; it needs the same model in its library.")) {
+            switch worker.state {
+            case .stopped: Text("Stopped").font(.app(.caption)).foregroundStyle(.secondary)
+            case .waiting: Text("Waiting for the host").font(.app(.caption)).foregroundStyle(.secondary)
+            case .loading(let what): Text(verbatim: L10n.format("Loading %@", what)).font(.app(.caption))
+            case .ready(let what): Label(L10n.format("Serving %@", what), systemImage: "checkmark.circle.fill")
+                .font(.app(.caption)).foregroundStyle(.green)
+            case .failed(let why): Text(verbatim: why).font(.app(.caption)).foregroundStyle(.red)
+            }
+        }
+    }
+}
+
+/// Which layers each Mac holds, as two bars in proportion.
+private struct ClusterSplitBar: View {
+    let cluster: ClusterInfo
+
+    var body: some View {
+        let here = cluster.mode == "tensor" ? 1.0 : Double(cluster.here) / Double(max(1, cluster.layers))
+        VStack(alignment: .leading, spacing: 4) {
+            GeometryReader { g in
+                HStack(spacing: 2) {
+                    RoundedRectangle(cornerRadius: 3).fill(Color.accentColor).frame(width: max(4, g.size.width * here - 1))
+                    RoundedRectangle(cornerRadius: 3).fill(Color.purple).frame(width: max(4, g.size.width * (1 - here) - 1))
+                }
+            }
+            .frame(height: 10)
+            Text(verbatim: cluster.mode == "tensor"
+                 ? L10n.text("Every layer on both Macs, each with half of every expert")
+                 : L10n.format("Layers 1–%lld here, %lld–%lld on the worker", Int64(cluster.here), Int64(cluster.here + 1), Int64(cluster.layers)))
+                .font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
     }
 }
 

@@ -57,6 +57,11 @@ struct VideoGenView: View {
     /// Storyboard mode: `prompt` is the story, and `shots` are what generates.
     @State private var storyboardMode: Bool = false
     @State private var shots: [StoryboardSegment] = []
+    /// Network machines the user switched off for this pane's storyboards.
+    @State private var clusterOff: Set<String> = []
+    /// "Draw last frames" in flight, and what it last had to say.
+    @State private var drawingFrames = false
+    @State private var drawNote: String? = nil
     @State private var seed: Int = 42
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
@@ -893,6 +898,9 @@ struct VideoGenView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            if appState.serverOptions.lanDiscoverEnabled, model.backend == .minimaxH3, lanModel == nil {
+                clusterStrip
+            }
             ForEach($shots) { $shot in
                 shotCard($shot, index: shots.firstIndex { $0.id == shot.id } ?? 0)
             }
@@ -904,6 +912,108 @@ struct VideoGenView: View {
             .buttonStyle(.borderless)
             Text("Each shot generates on its own, starting from the last frame of the one before, so describe the characters and place again in every shot. Enhance writes the shots from your story.")
                 .font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Network machines serving this exact pack: they render shots beside this Mac.
+    private var clusterPeers: [RenderDevice] {
+        guard storyboardOn, lanModel == nil, model.backend == .minimaxH3 else { return [] }
+        return StoryboardCluster.peers(of: model.repo, lanModels: server.lanModels(capability: "video"))
+    }
+
+    private var clusterReady: Bool {
+        StoryboardCluster.joinsAnchored(shots.map(\.endFramePath))
+    }
+
+    private var clusterStrip: some View {
+        let peers = clusterPeers
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                Text("Your cluster").font(.app(.caption).weight(.semibold))
+                Text("This Mac").font(.app(.caption)).padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                ForEach(peers) { p in
+                    let on = !clusterOff.contains(p.id)
+                    Button {
+                        if on { clusterOff.insert(p.id) } else { clusterOff.remove(p.id) }
+                    } label: {
+                        Label(StoryboardCluster.name(p), systemImage: on ? "checkmark.circle.fill" : "circle")
+                            .font(.app(.caption))
+                    }
+                    .buttonStyle(.borderless)
+                    .help(H3TimeEstimate.speedFactor(peer: p.peer).measured
+                          ? L10n.text("Renders shots for this storyboard. Click to leave it out.")
+                          : L10n.text("Renders shots for this storyboard; its speed is learned from its first shot. Click to leave it out."))
+                }
+            }
+            if peers.isEmpty {
+                Text(L10n.format("Other machines sharing %@ on your network render shots here too.",
+                                 (model.repo as NSString).lastPathComponent))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            } else if !clusterReady {
+                Text("Give every shot a last frame and the shots render on all these machines at once; without them each shot waits for the one before.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button(drawingFrames ? L10n.text("Drawing last frames…") : L10n.text("Draw last frames")) {
+                        drawLastFrames()
+                    }
+                    .disabled(drawingFrames || service.isRunning || shots.count < 2)
+                    .help("The Image model draws a picture for every shot that has none, each from the one before so the characters carry over. Replace any you don't like.")
+                    if drawingFrames { ProgressView().controlSize(.small) }
+                }
+            }
+            if let drawNote {
+                Text(drawNote).font(.app(.caption2)).foregroundStyle(.orange)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// Pictures for the joins that have none, from the Image pane's model at the
+    /// video's shape. A model that edits from a picture draws each from the one
+    /// before (the pane's first frame for the first), so the cast stays the same.
+    private func drawLastFrames() {
+        let settings = ImageGenSettings.load()
+        let imageModel = settings.resolvedModel(models: server.allModels)
+        let lanId = LanPick.lanId(settings.modelId)
+        guard lanId != nil || ServerManager.resolveModelDir(repo: imageModel.repo) != nil else {
+            drawNote = L10n.format("%@ isn't downloaded. Open the Image window to get it, or add the pictures yourself.", imageModel.name)
+            return
+        }
+        let size = MediaToolArgs.nearest(effectiveSize.width, effectiveSize.height, in: imageModel.resolutions)
+            ?? imageModel.defaultResolution
+        let steps = imageModel.stepsAreFixed ? imageModel.fixedSteps : imageModel.settings(settings.quality).steps
+        drawingFrames = true
+        drawNote = nil
+        Task {
+            defer { drawingFrames = false }
+            var previous = firstFrameImageURL?.path
+            for id in shots.dropLast().map(\.id) {
+                guard let i = shots.firstIndex(where: { $0.id == id }) else { continue }
+                if let picture = shots[i].endFramePath { previous = picture; continue }
+                var req = ImageGenRequest(model: imageModel, prompt: shots[i].prompt, seed: seed &+ i,
+                                          width: size.width, height: size.height, steps: steps,
+                                          keepResident: true, lanModelId: lanId)
+                if imageModel.supportsReferenceEdit, let previous {
+                    req.initImagePath = previous
+                    req.editMode = true
+                    req.prompt = "The same characters, look and place as this picture, now: " + shots[i].prompt
+                }
+                do {
+                    let path = try await appState.imageGen.generateForAgent(req, server: server)
+                    if let j = shots.firstIndex(where: { $0.id == id }) { shots[j].endFramePath = path }
+                    previous = path
+                } catch {
+                    drawNote = error.localizedDescription
+                    break
+                }
+            }
+            if lanId == nil, !settings.keepResident,
+               let dir = ServerManager.resolveModelDir(repo: imageModel.repo) {
+                try? await server.unloadModel(id: dir)
+            }
         }
     }
 
@@ -1062,6 +1172,17 @@ struct VideoGenView: View {
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         if storyboardOn, shots.isEmpty { return nil }
+        let peers = clusterPeers.filter { !clusterOff.contains($0.id) }
+        if !peers.isEmpty, clusterReady {
+            let costs = shotFrames.map {
+                H3TimeEstimate.seconds(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                       frames: $0, steps: steps, fast: effectiveFast, hardware: .anchor)
+            }
+            let factors = ([nil] + peers.map(\.peer)).map { H3TimeEstimate.speedFactor(peer: $0).factor }
+            let alone = StoryboardCluster.wallSeconds(costs: costs, factors: [factors[0]])
+            let cluster = StoryboardCluster.wallSeconds(costs: costs, factors: factors)
+            return StoryboardCluster.describe(alone: alone, cluster: cluster, machines: peers.count + 1)
+        }
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
             shotFrames: storyboardOn ? shotFrames : [numFrames], steps: steps, fast: effectiveFast
@@ -2507,7 +2628,7 @@ struct VideoGenView: View {
     private func run(_ req: VideoGenRequest) {
         guard storyboardOn else { return service.generate(req, server: server) }
         service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1, $0.endFramePath) },
-                                   server: server)
+                                   peers: clusterPeers.filter { !clusterOff.contains($0.id) }, server: server)
     }
 
     /// Whether this pane's current selection needs the Turbo adapter fetched.

@@ -1415,7 +1415,7 @@ pub fn main(init: std.process.Init) !void {
             log.err("--dist needs --dist-model DIR (or --model): the model the two Macs serve together\n", .{});
             std.process.exit(1);
         };
-        log.info("[dist] waiting for the worker at {s}...\n", .{coordinator});
+        log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
         try @import("distributed.zig").connect(io, allocator, .{ .rank = 0, .coordinator = coordinator, .device = device }, mode, group_model, dist_split);
     }
 

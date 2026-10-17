@@ -255,6 +255,8 @@ class AppState: ObservableObject {
     @Published var documentIndexes: [UUID: DocumentIndex] = [:]
     let testServer = TestServer()
     lazy var imageGen = ImageGenService()
+    /// `mlx-serve worker` while Settings ▸ Cluster makes this Mac a worker.
+    let clusterWorker = ClusterWorker()
     lazy var videoGen = VideoGenService()
     lazy var audioGen = AudioGenService()
     lazy var musicGen: MusicGenService = {
@@ -294,6 +296,7 @@ class AppState: ObservableObject {
     @Published var serverOptions: ServerOptions {
         didSet {
             serverOptions.save()
+            clusterWorker.reconcile(serverOptions)
             // Reconcile the Telegram bridge whenever options change (cheap no-op
             // unless the bot token / enabled flag actually moved).
             telegramBridge.reconcile()
@@ -605,6 +608,7 @@ class AppState: ObservableObject {
         self.defaultAgentId = UserDefaults.standard.string(forKey: "defaultAgentId")
             .flatMap(UUID.init(uuidString:))
         self.quickLauncherEnabled = UserDefaults.standard.bool(forKey: "quickLauncherEnabled")
+        clusterWorker.reconcile(opts)
         server.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
