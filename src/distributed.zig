@@ -9,12 +9,16 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const status = @import("status.zig");
 const transformer_mod = @import("transformer.zig");
+const h3_split = @import("h3_split.zig");
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
     pipeline,
     /// Every rank runs every layer on its slice of each MoE expert; one all_sum per MoE layer.
     tensor,
+    /// A video DiT whole on every rank, each step's rows split (`h3_split`); the group's
+    /// model decides it, never the flag.
+    rows,
 
     pub fn parse(s: []const u8) ?Mode {
         return std.meta.stringToEnum(Mode, s);
@@ -200,16 +204,48 @@ pub const Link = struct {
         try mlx.check(mlx.mlx_distributed_all_sum(&r, x, self.group, cs));
         return r;
     }
+
+    /// Every rank's `x` stacked on axis 0 in rank order; the shapes must match.
+    pub fn allGather(self: *const Link, x: mlx.mlx_array) !mlx.mlx_array {
+        const cs = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cs);
+        var r = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_distributed_all_gather(&r, x, self.group, cs));
+        return r;
+    }
 };
 
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
-const MAGIC: i32 = 0x4D4C5853; // "MLXS"
-const VERSION: i32 = 1;
-const Msg = [8]i32;
+pub const MAGIC: i32 = 0x4D4C5853; // "MLXS"
+const VERSION: i32 = 2;
+pub const Msg = [8]i32;
 const OP_FORWARD: i32 = 1;
-const OP_STOP: i32 = 2;
+pub const OP_STOP: i32 = 2;
 const OP_MOE: i32 = 3;
+pub const OP_H3_JOB: i32 = 4;
+pub const OP_H3_STEP: i32 = 5;
+pub const OP_H3_END: i32 = 6;
+
+/// A control message to the other rank of a two-Mac group.
+pub fn sendOp(link: *const Link, m: Msg) !void {
+    return sendMsg(link, m, 1 - link.rank);
+}
+
+pub fn recvOp(link: *const Link) !Msg {
+    return recvMsg(link, 1 - link.rank);
+}
+
+/// `x` sent and complete before this returns.
+pub fn sendNow(link: *const Link, x: mlx.mlx_array, dst: u32) !void {
+    const r = try link.send(x, dst);
+    defer _ = mlx.mlx_array_free(r);
+    try evalOne(r);
+}
+
+pub fn recvNow(link: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32) !mlx.mlx_array {
+    return queuedRecv(link, shape, dtype, src);
+}
 
 fn sendMsg(link: *const Link, m: Msg, dst: u32) !void {
     const shape = [_]c_int{8};
@@ -234,20 +270,22 @@ fn mib(b: u64) i32 {
     return @intCast(@min(b >> 20, std.math.maxInt(i32)));
 }
 
-/// What a worker reports on joining: its memory.
+/// What a worker reports on joining: its memory, then its host name (`name_len` bytes).
 const Hello = struct {
     avail_mib: i32,
     total_mib: i32,
+    name_len: i32 = 0,
 
-    fn here() Hello {
-        return .{ .avail_mib = mib(status.getAvailableMemBytes()), .total_mib = mib(status.getTotalMemBytes()) };
+    fn here(name_len: usize) Hello {
+        return .{ .avail_mib = mib(status.getAvailableMemBytes()), .total_mib = mib(status.getTotalMemBytes()), .name_len = @intCast(name_len) };
     }
     fn msg(h: Hello) Msg {
-        return .{ MAGIC, VERSION, h.avail_mib, h.total_mib, 0, 0, 0, 0 };
+        return .{ MAGIC, VERSION, h.avail_mib, h.total_mib, h.name_len, 0, 0, 0 };
     }
     fn parse(m: Msg) !Hello {
         if (m[0] != MAGIC or m[1] != VERSION) return error.DistProtocolMismatch;
-        return .{ .avail_mib = m[2], .total_mib = m[3] };
+        if (m[4] < 0 or m[4] > 64) return error.DistBadMessage;
+        return .{ .avail_mib = m[2], .total_mib = m[3], .name_len = m[4] };
     }
 };
 
@@ -301,6 +339,17 @@ pub const Peer = struct {
     exchanges: u64 = 0,
     /// Tokens the worker's caches hold. Every forward must continue them or start over at 0.
     peer_pos: usize = 0,
+    /// The worker's host name, as its LAN sharing names it.
+    worker_name_buf: [64]u8 = undefined,
+    worker_name_len: usize = 0,
+    /// Rows mode: each Mac's time for one calibration pass, and the link's measured rate.
+    host_calib_us: u64 = 0,
+    worker_calib_us: u64 = 0,
+    link_bytes_per_us: f64 = 0,
+
+    pub fn workerName(self: *const Peer) []const u8 {
+        return self.worker_name_buf[0..self.worker_name_len];
+    }
 
     /// Hands the stream to the worker and returns its output stream. Lazy: the sends are
     /// queued (async) ahead of the receive so the comm stream runs them in that order.
@@ -362,10 +411,14 @@ pub const Peer = struct {
             }
             return error.DistWorkerLoadFailed;
         }
-        if (self.mode == .pipeline)
-            log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ self.span.end, self.span.total, m[2] })
-        else
-            log.info("[dist] worker ready: its half of every expert resident, {d} MiB\n", .{m[2]});
+        switch (self.mode) {
+            .pipeline => log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ self.span.end, self.span.total, m[2] }),
+            .tensor => log.info("[dist] worker ready: its half of every expert resident, {d} MiB\n", .{m[2]}),
+            .rows => {
+                self.worker_calib_us = @intCast(m[3]);
+                log.info("[dist] worker ready: the whole DiT resident, {d} MiB\n", .{m[2]});
+            },
+        }
         self.ready = true;
     }
 };
@@ -417,11 +470,22 @@ pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
 
 fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     const sp = p.span;
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d}}}", .{
+    // Rows mode: the worker's speed relative to this Mac and the link, once measured.
+    const speed: f64 = if (p.worker_calib_us > 0 and p.host_calib_us > 0) @as(f64, @floatFromInt(p.host_calib_us)) / @as(f64, @floatFromInt(p.worker_calib_us)) else 0;
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":\"{s}\",\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":\"{f}\",\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":\"{f}\"}}", .{
         @tagName(p.mode), std.fs.path.basename(p.model), p.planned, p.ready, sp.total, sp.start, sp.end,
         if (p.mode == .pipeline) sp.end else 0, sp.total, if (p.shard) |sh| sh.size else 0,
-        p.worker.avail_mib, p.worker.total_mib, p.exchanges,
+        p.worker.avail_mib, p.worker.total_mib, p.exchanges, std.json.fmt(p.workerName(), .{}) , speed, p.link_bytes_per_us / 1000,
+        std.json.fmt(last_job_buf[0..last_job_len], .{}),
     });
+}
+
+var last_job_buf: [160]u8 = undefined;
+var last_job_len: usize = 0;
+
+/// What the last video job did with the worker (`/props` cluster "last_job").
+pub fn noteJob(comptime fmt: []const u8, args: anytype) void {
+    last_job_len = if (std.fmt.bufPrint(&last_job_buf, fmt, args)) |t| t.len else |_| 0;
 }
 
 /// Rank 0 at shutdown: releases the worker. A peer that vanishes mid-protocol crashes the
@@ -443,20 +507,49 @@ pub fn peer() ?*Peer {
 pub const Part = union(enum) { span: LayerSpan, shard: Shard };
 
 pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Part {
-    const g = group orelse return null;
-    if (!std.mem.eql(u8, std.fs.path.basename(g.model), std.fs.path.basename(model_dir))) return null;
+    if (!serves(model_dir)) return null;
+    const p = try join();
+    if (!p.planned) try plan(p, config);
+    return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
+}
+
+/// Whether `model_dir` is the model this server's group serves.
+pub fn serves(model_dir: []const u8) bool {
+    const g = group orelse return false;
+    return std.mem.eql(u8, std.fs.path.basename(g.model), std.fs.path.basename(model_dir));
+}
+
+/// Rows mode: the worker told to load the group's video model whole, and ready.
+pub fn planRows(hidden: i32, blocks: i32) !*Peer {
+    const p = try join();
+    if (!p.planned) {
+        p.mode = .rows;
+        const name = std.fs.path.basename(p.model);
+        const pl: Plan = .{ .mode = .rows, .span = .{ .start = 0, .end = @intCast(blocks), .total = @intCast(blocks) }, .hidden = hidden, .experts = 0 };
+        try sendMsg(&p.link, pl.msg(name.len), 1);
+        try sendBytes(&p.link, name, 1);
+        p.planned = true;
+    }
+    if (!p.ready) try p.awaitReady();
+    return p;
+}
+
+/// The worker's hello, read once.
+fn join() !*Peer {
     if (peer_slot == null) {
+        const g = group.?;
         if (!joined.load(.acquire)) {
             log.err("[dist] {s} is served with a worker: start `mlx-serve worker` on the other Mac first\n", .{std.fs.path.basename(g.model)});
             return error.DistWorkerNotJoined;
         }
         const worker = try Hello.parse(try recvMsg(&joined_link, 1));
-        log.info("[dist] worker: {d} MiB free of {d}\n", .{ worker.avail_mib, worker.total_mib });
-        peer_slot = .{ .link = joined_link, .mode = g.mode, .model = g.model, .split = g.split, .worker = worker };
+        var p: Peer = .{ .link = joined_link, .mode = g.mode, .model = g.model, .split = g.split, .worker = worker };
+        if (worker.name_len > 0) try recvBytes(&joined_link, p.worker_name_buf[0..@intCast(worker.name_len)], 1);
+        p.worker_name_len = @intCast(worker.name_len);
+        log.info("[dist] worker {s}: {d} MiB free of {d}\n", .{ p.workerName(), worker.avail_mib, worker.total_mib });
+        peer_slot = p;
     }
-    const p = &peer_slot.?;
-    if (!p.planned) try plan(p, config);
-    return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
+    return &peer_slot.?;
 }
 
 fn plan(self: *Peer, config: *const model_mod.ModelConfig) !void {
@@ -472,6 +565,7 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig) !void {
             self.shard = .{ .rank = 0, .size = 2 };
             log.info("[dist] tensor: each expert of {s} split across this Mac and the worker\n", .{std.fs.path.basename(self.model)});
         },
+        .rows => return error.DistArchUnsupported,
         .pipeline => {
             const mine: u64 = status.getAvailableMemBytes() >> 20;
             const k = self.split orelse chooseSplit(n, config.full_attention_interval, mine, @intCast(self.worker.avail_mib));
@@ -573,7 +667,11 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
         else => return err,
     };
     defer link.deinit();
-    try sendMsg(&link, Hello.here().msg(), 0);
+    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const host = std.posix.gethostname(&host_buf) catch "mac";
+    const short = host[0..@min(host.len, 64)];
+    try sendMsg(&link, Hello.here(short.len).msg(), 0);
+    if (short.len > 0) try sendBytes(&link, short, 0);
     log.info("[dist] worker: joined, waiting for the host to load a model\n", .{});
     const pmsg = try recvMsg(&link, 0);
     const pl = try Plan.parse(pmsg);
@@ -582,10 +680,11 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     if (name_len == 0 or name_len > name_buf.len) return error.DistBadMessage;
     try recvBytes(&link, name_buf[0..name_len], 0);
     const name = name_buf[0..name_len];
-    if (pl.mode == .pipeline)
-        log.info("[dist] worker: {s} layers {d}..{d} of {d} (pipeline)\n", .{ name, pl.span.start, pl.span.end, pl.span.total })
-    else
-        log.info("[dist] worker: {s}, half of every expert (tensor)\n", .{name});
+    switch (pl.mode) {
+        .pipeline => log.info("[dist] worker: {s} layers {d}..{d} of {d} (pipeline)\n", .{ name, pl.span.start, pl.span.end, pl.span.total }),
+        .tensor => log.info("[dist] worker: {s}, half of every expert (tensor)\n", .{name}),
+        .rows => log.info("[dist] worker: {s}, the whole DiT (video steps)\n", .{name}),
+    }
 
     const fail = struct {
         fn send(l: *const Link, code: i32) void {
@@ -598,6 +697,15 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
         return error.DistModelNotFound;
     };
     defer allocator.free(dir);
+    if (pl.mode == .rows) {
+        h3_split.serveWorker(allocator, io, &link, dir, pl.hidden, @intCast(pl.span.total)) catch |err| {
+            log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
+            fail.send(&link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
+            return err;
+        };
+        log.info("[dist] worker: stopped by rank 0\n", .{});
+        return;
+    }
     var config = try model_mod.parseConfig(io, allocator, dir);
     defer config.deinit(allocator);
     if (!pl.matches(&config)) {
@@ -687,6 +795,7 @@ fn load(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, config: *mode
     switch (mode) {
         .pipeline => try config.applyLayerSpan(span),
         .tensor => try config.applyShard(.{ .rank = 1, .size = 2 }),
+        .rows => return error.DistArchUnsupported,
     }
     var w = try model_mod.loadModelWeights(io, allocator, dir, config, false);
     errdefer w.deinit();

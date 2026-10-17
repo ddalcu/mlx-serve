@@ -37,6 +37,7 @@ const lora_mod = @import("lora.zig");
 const w8a8 = @import("w8a8.zig");
 const int8_attn = @import("int8_attn.zig");
 const h3_glue = @import("h3_glue.zig");
+const h3_split = @import("h3_split.zig");
 const add_norm = @import("add_norm.zig");
 const ane = @import("ane.zig");
 const gen_sse = @import("gen_sse.zig");
@@ -1651,7 +1652,7 @@ fn qkvHeadMajor(aw: *const AttnW, qkv: mlx.mlx_array, cfg: Config, rope: ?RopeTa
 ///
 /// `ablate` is `.none` everywhere except the profile ladder; `.sdpa` passes v
 /// through in place of the attention output (same shape, projections intact).
-fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?SparseSpec, s: S) !mlx.mlx_array {
+fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?SparseSpec, split: ?*const h3_split.RowSplit, s: S) !mlx.mlx_array {
     const n: c_int = @intCast(mlx.getShape(x)[0]);
     const h: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.attention_head_dim);
@@ -1663,6 +1664,13 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     defer for (&t) |*p| {
         _ = mlx.mlx_array_free(p.*);
     };
+    if (split) |sp| {
+        const all = try sp.gatherKv(t[1], t[2], s);
+        for (t[1..], all) |*mine, every| {
+            _ = mlx.mlx_array_free(mine.*);
+            mine.* = every;
+        }
+    }
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
     const dense = sparse == null or sparse.?.mode == .dense;
@@ -2231,6 +2239,8 @@ pub const Model = struct {
     /// Sparse-attention layer policy (`MINIMAX_H3_SPARSE_ATTN`); `.off` until
     /// `generate` opts in.
     sparse_policy: SparsePolicy,
+    /// Set for a job whose steps are split with a cluster worker (`h3_split`).
+    split: ?*const h3_split.RowSplit = null,
 
     video_patch_w: mlx.mlx_array, // fp32 island
     video_patch_b: mlx.mlx_array,
@@ -2613,6 +2623,13 @@ pub const Model = struct {
     /// Sinusoidal timestep embedding, fp32 throughout, COS BEFORE SIN.
     /// The concat order is not cosmetic: swapping the halves silently shifts
     /// every modulation the model produces.
+    /// `timeEmbed` in the model's dtype, as `forward` feeds the blocks.
+    pub fn timeEmbedAs(self: *const Model, t_vals: []const f64, s: S) !mlx.mlx_array {
+        const t32 = try self.timeEmbed(t_vals, s);
+        defer _ = mlx.mlx_array_free(t32);
+        return astype(t32, self.dtype, s);
+    }
+
     fn timeEmbed(self: *const Model, t_vals: []const f64, s: S) !mlx.mlx_array {
         const half = self.cfg.timestep_input_dim / 2;
         const m = t_vals.len;
@@ -2646,7 +2663,7 @@ pub const Model = struct {
         for (self.refiner) |*b| {
             const n1 = try rmsNormLast(h, b.norm1, self.cfg.norm_eps, s);
             defer _ = mlx.mlx_array_free(n1);
-            const at = try attnForward(&b.attn, n1, self.cfg, null, .none, null, s);
+            const at = try attnForward(&b.attn, n1, self.cfg, null, .none, null, null, s);
             defer _ = mlx.mlx_array_free(at);
             const h2 = try addA(h, at, s);
             _ = mlx.mlx_array_free(h);
@@ -2777,74 +2794,19 @@ pub const Model = struct {
             try mlx.check(mlx.mlx_zeros(&zero_mods, &[_]c_int{ zrows, @intCast(cfg.hidden_size) }, 2, self.dtype, s));
         }
 
-        // Each block ends in a gated add that the NEXT norm absorbs (`gateNormMod`), so a branch
-        // output rides in `pend` until then.
-        var pend: ?PendingGate = null;
-        defer if (pend) |*p| p.deinit();
-        const row_mod = if (h3_glue.enabled()) try buildRowMod(a, layout.seq_len, plan.runs) else mlx.mlx_array{ .ctx = null };
-        defer if (row_mod.ctx != null) {
-            _ = mlx.mlx_array_free(row_mod);
-        };
-        const eps_a = mlx.mlx_array_new_float(cfg.norm_eps);
-        defer _ = mlx.mlx_array_free(eps_a);
-        const fused: ?FusedMod = if (row_mod.ctx != null) .{ .row_mod = row_mod, .eps = eps_a } else null;
-
-        for (self.blocks, 0..) |*b, bi| {
-            var mods: [6]mlx.mlx_array = undefined;
-            var mods_owned = true;
-            if (self.ablate == .adaln) {
-                for (&mods) |*p| p.* = try contig(zero_mods, s);
-            } else if (self.adaln_tables) |tt| {
-                mods = tt.blocks[bi]; // borrowed from the table
-                mods_owned = false;
-            } else {
-                try b.adaln.?.forward(t_emb, cfg, true, &mods, s);
-            }
-            defer if (mods_owned) for (&mods) |*p| {
-                _ = mlx.mlx_array_free(p.*);
-            };
-            // 0..5 = shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-            //
-            // Attention branch: on a broadcast (non-refresh) step the whole
-            // branch — norm1, modulation, qkv, SDPA, out-proj — is replaced by
-            // the block's cached output from the last refresh; only the GATE
-            // is re-applied at the current timestep (PAB semantics). Profile
-            // arms bypass the cache so ablation stays honest.
-            var at: mlx.mlx_array = undefined;
-            var at_owned = true;
-            const cacheable = attn_bcast != null and self.ablate == .none;
-            if (cacheable and !attn_refresh and attn_bcast.?.blocks[bi].ctx != null) {
-                try applyPending(&h, &pend, plan.runs, a, s);
-                at = attn_bcast.?.blocks[bi];
-                at_owned = false;
-            } else {
-                const m1 = try gateNormMod(&h, &pend, b.norm1, mods[0], mods[1], fused, plan.runs, a, cfg.norm_eps, s);
-                defer _ = mlx.mlx_array_free(m1);
-                const smode = if (self.ablate == .none) sparseModeForLayer(bi, self.blocks.len, self.sparse_policy) else SparseMode.dense;
-                const spec: ?SparseSpec = if (smode == .dense) null else .{
-                    .mode = smode,
-                    .t = layout.latent_t,
-                    .f = (layout.latent_h / PATCH_H) * (layout.latent_w / PATCH_W),
-                    .video_start = layout.videoSegment().start,
-                };
-                at = if (self.ablate == .attn) try contig(m1, s) else try attnForward(&b.attn, m1, cfg, rope, self.ablate, spec, s);
-                if (cacheable) {
-                    if (attn_bcast.?.blocks[bi].ctx != null) _ = mlx.mlx_array_free(attn_bcast.?.blocks[bi]);
-                    attn_bcast.?.blocks[bi] = at;
-                    at_owned = false;
-                }
-            }
-            defer if (at_owned) {
-                _ = mlx.mlx_array_free(at);
-            };
-            pend = PendingGate.init(at, mods[2]);
-            const m2 = try gateNormMod(&h, &pend, b.norm2, mods[3], mods[4], fused, plan.runs, a, cfg.norm_eps, s);
-            defer _ = mlx.mlx_array_free(m2);
-            const mo = if (self.ablate == .mlp) try contig(m2, s) else try self.mlpMaybeAne(&b.mlp, m2, bi, s);
-            defer _ = mlx.mlx_array_free(mo);
-            pend = PendingGate.init(mo, mods[5]);
-        }
-        try applyPending(&h, &pend, plan.runs, a, s);
+        if (self.split) |sp| {
+            // Rank 0 of a row split: the worker runs the rows past the cut, this
+            // process the rows before it; both read every row's keys.
+            var mine = try sp.shareRows(h, t_emb, plan.runs, rope, attn_refresh, a, s);
+            defer mine.deinit(a);
+            _ = mlx.mlx_array_free(h);
+            h = mine.h;
+            mine.h = .{ .ctx = null };
+            try self.runBlocks(&h, t_emb, zero_mods, mine.runs, mine.rope, layout, attn_bcast, attn_refresh, s);
+            const whole = try sp.collectRows(h, s);
+            _ = mlx.mlx_array_free(h);
+            h = whole;
+        } else try self.runBlocks(&h, t_emb, zero_mods, plan.runs, rope, layout, attn_bcast, attn_refresh, s);
         defer _ = mlx.mlx_array_free(h);
 
         // Final layer: 1 modality, so the mod row is just the timestep row.
@@ -2883,6 +2845,83 @@ pub const Model = struct {
         defer _ = mlx.mlx_array_free(nega);
         const audio = try mulA(aout_raw, nega, s);
         return .{ .video = video, .audio = audio };
+    }
+
+    /// Every block over the rows in `h` (all of them, or one rank's run under a row split,
+    /// whose attention then gathers the other rank's keys): `h` is replaced by the output.
+    pub fn runBlocks(self: *const Model, h: *mlx.mlx_array, t_emb: mlx.mlx_array, zero_mods: mlx.mlx_array, runs: []const ModRun, rope: RopeTables, layout: ?*const PackedLayout, attn_bcast: ?*AttnBroadcast, attn_refresh: bool, s: S) !void {
+        const a = self.allocator;
+        const cfg = self.cfg;
+        // Each block ends in a gated add that the NEXT norm absorbs (`gateNormMod`), so a branch
+        // output rides in `pend` until then.
+        var pend: ?PendingGate = null;
+        defer if (pend) |*p| p.deinit();
+        const row_mod = if (h3_glue.enabled()) try buildRowMod(a, @intCast(mlx.getShape(h.*)[0]), runs) else mlx.mlx_array{ .ctx = null };
+        defer if (row_mod.ctx != null) {
+            _ = mlx.mlx_array_free(row_mod);
+        };
+        const eps_a = mlx.mlx_array_new_float(cfg.norm_eps);
+        defer _ = mlx.mlx_array_free(eps_a);
+        const fused: ?FusedMod = if (row_mod.ctx != null) .{ .row_mod = row_mod, .eps = eps_a } else null;
+
+        for (self.blocks, 0..) |*b, bi| {
+            var mods: [6]mlx.mlx_array = undefined;
+            var mods_owned = true;
+            if (self.ablate == .adaln) {
+                for (&mods) |*p| p.* = try contig(zero_mods, s);
+            } else if (self.adaln_tables) |tt| {
+                mods = tt.blocks[bi]; // borrowed from the table
+                mods_owned = false;
+            } else {
+                try b.adaln.?.forward(t_emb, cfg, true, &mods, s);
+            }
+            defer if (mods_owned) for (&mods) |*p| {
+                _ = mlx.mlx_array_free(p.*);
+            };
+            // 0..5 = shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+            //
+            // Attention branch: on a broadcast (non-refresh) step the whole
+            // branch — norm1, modulation, qkv, SDPA, out-proj — is replaced by
+            // the block's cached output from the last refresh; only the GATE
+            // is re-applied at the current timestep (PAB semantics). Profile
+            // arms bypass the cache so ablation stays honest.
+            var at: mlx.mlx_array = undefined;
+            var at_owned = true;
+            const cacheable = attn_bcast != null and self.ablate == .none;
+            if (cacheable and !attn_refresh and attn_bcast.?.blocks[bi].ctx != null) {
+                try applyPending(h, &pend, runs, a, s);
+                at = attn_bcast.?.blocks[bi];
+                at_owned = false;
+            } else {
+                const m1 = try gateNormMod(h, &pend, b.norm1, mods[0], mods[1], fused, runs, a, cfg.norm_eps, s);
+                defer _ = mlx.mlx_array_free(m1);
+                // A row split's attention reads gathered keys, so it stays dense.
+                const lay = if (self.split == null) layout else null;
+                const smode = if (self.ablate == .none and lay != null) sparseModeForLayer(bi, self.blocks.len, self.sparse_policy) else SparseMode.dense;
+                const spec: ?SparseSpec = if (smode == .dense) null else .{
+                    .mode = smode,
+                    .t = lay.?.latent_t,
+                    .f = (lay.?.latent_h / PATCH_H) * (lay.?.latent_w / PATCH_W),
+                    .video_start = lay.?.videoSegment().start,
+                };
+                at = if (self.ablate == .attn) try contig(m1, s) else try attnForward(&b.attn, m1, cfg, rope, self.ablate, spec, self.split, s);
+                if (cacheable) {
+                    if (attn_bcast.?.blocks[bi].ctx != null) _ = mlx.mlx_array_free(attn_bcast.?.blocks[bi]);
+                    attn_bcast.?.blocks[bi] = at;
+                    at_owned = false;
+                }
+            }
+            defer if (at_owned) {
+                _ = mlx.mlx_array_free(at);
+            };
+            pend = PendingGate.init(at, mods[2]);
+            const m2 = try gateNormMod(h, &pend, b.norm2, mods[3], mods[4], fused, runs, a, cfg.norm_eps, s);
+            defer _ = mlx.mlx_array_free(m2);
+            const mo = if (self.ablate == .mlp) try contig(m2, s) else try self.mlpMaybeAne(&b.mlp, m2, bi, s);
+            defer _ = mlx.mlx_array_free(mo);
+            pend = PendingGate.init(mo, mods[5]);
+        }
+        try applyPending(h, &pend, runs, a, s);
     }
 
     fn finalHead(self: *const Model, h: mlx.mlx_array, shift: mlx.mlx_array, scale: mlx.mlx_array, seg: Segment, row: u32, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -3939,7 +3978,7 @@ pub fn turboAttachComplete(attached: u32, shipped: usize) bool {
 /// Loads every wanted adapter into `stack` and binds it to `model`, holding each file to its own
 /// expectation: engagement is COUNTED and logged, because a rejected or half-matching adapter is
 /// otherwise a silent no-op that looks exactly like a working one.
-fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *Model, want_paths: []const []const u8, want_scales: []const f32, turbo: bool) !void {
+pub fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *Model, want_paths: []const []const u8, want_scales: []const f32, turbo: bool) !void {
     model.clearLoras();
     stack.deinit();
     for (want_paths, want_scales) |p, sc| {
@@ -3968,7 +4007,7 @@ fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *Model
 /// The DiT, with its weights map freed as soon as the model owns the arrays: a map that outlived
 /// `Model.load` would hold +1 refs on every raw file-backed array, so anything the model later
 /// frees (the 13 GB of AdaLN under precompute) would stay resident.
-fn loadDit(allocator: std.mem.Allocator, path: []const u8, dt: mlx.mlx_dtype, s: S) !Model {
+pub fn loadDit(allocator: std.mem.Allocator, path: []const u8, dt: mlx.mlx_dtype, s: S) !Model {
     var dw = try model_mod.loadWeightsSingleFile(allocator, path);
     defer dw.deinit();
     return Model.load(allocator, &dw, .{}, dt, s);
@@ -4425,6 +4464,12 @@ fn generateOne(
         const bcast_k: u32 = speed.bcast_k;
         var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
+
+        // A Thunderbolt cluster serving this pack splits each step's rows with its worker.
+        var job = try h3_split.begin(std.fs.path.dirname(paths.dit) orelse "", io, model, req.turbo, req.lora_paths.len, req.resident != null, layout.seq_len, bcast_k > 1, s);
+        defer if (job) |*j| j.end();
+        model.split = if (job) |*j| &j.split else null;
+        defer model.split = null;
         var bcast_reused: u32 = 0;
 
         // ── step cache (TeaCache-style velocity reuse, OPT-IN) ──
@@ -6386,7 +6431,7 @@ test "minimax h3: DiT block linears under w8a8 stay within their bar of the pack
         defer mlp_w.deinit();
         try testing.expectEqual(on, attn.qkv.w8 != null and mlp_w.fc1.w8 != null);
         try testing.expect(attn.out.w8 == null and mlp_w.fc2.w8 == null);
-        o[0] = try attnForward(&attn, x, cfg, rope, .none, null, s);
+        o[0] = try attnForward(&attn, x, cfg, rope, .none, null, null, s);
         o[1] = try mlpForward(&mlp_w, x, s);
         try mlx.check(mlx.mlx_array_eval(o[0]));
         try mlx.check(mlx.mlx_array_eval(o[1]));
@@ -6468,7 +6513,7 @@ test "minimax h3: DiT block matches the reference transcription" {
         defer _ = mlx.mlx_array_free(attn_in);
         const want = try ownWeight(&w, "x.attn_out");
         defer _ = mlx.mlx_array_free(want);
-        const got = try attnForward(&attn, attn_in, cfg, rope, .none, null, s);
+        const got = try attnForward(&attn, attn_in, cfg, rope, .none, null, null, s);
         defer _ = mlx.mlx_array_free(got);
         const cos_v = try cosineSim(got, want, s);
         try testing.expect(std.math.isFinite(cos_v));
@@ -6517,7 +6562,7 @@ test "minimax h3: DiT block matches the reference transcription" {
         defer _ = mlx.mlx_array_free(n1);
         const m1 = try modScaleShift(n1, mods[0], mods[1], runs, a, s);
         defer _ = mlx.mlx_array_free(m1);
-        const at = try attnForward(&attn, m1, cfg, rope, .none, null, s);
+        const at = try attnForward(&attn, m1, cfg, rope, .none, null, null, s);
         defer _ = mlx.mlx_array_free(at);
         const h1 = try modGate(h_in, mods[2], at, runs, a, s);
         defer _ = mlx.mlx_array_free(h1);
@@ -7273,12 +7318,12 @@ test "minimax h3: turbo lora — runtime bypass equals a W_eff-folded forward" {
 
     inline for (.{ "attn", "mlp" }) |which| {
         const got = if (comptime std.mem.eql(u8, which, "attn"))
-            try attnForward(&attn, x, cfg, null, .none, null, s)
+            try attnForward(&attn, x, cfg, null, .none, null, null, s)
         else
             try mlpForward(&mlp_l, x, s);
         defer _ = mlx.mlx_array_free(got);
         const want = if (comptime std.mem.eql(u8, which, "attn"))
-            try attnForward(&attn_folded, x, cfg, null, .none, null, s)
+            try attnForward(&attn_folded, x, cfg, null, .none, null, null, s)
         else
             try mlpForward(&mlp_folded, x, s);
         defer _ = mlx.mlx_array_free(want);
