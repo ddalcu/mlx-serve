@@ -3,6 +3,7 @@ const crt = @import("crt.zig");
 const win_io = @import("win_io.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
+const w8a8_mod = @import("w8a8.zig");
 const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -5698,6 +5699,8 @@ pub const PrefillRequestTerms = struct {
     mtp_head_kv_bytes: u64 = 0,
     /// Forward width from which the dequant+GEMM route fires (`prefillDqGemmMinRows`).
     dq_min_rows: u64 = transformer_mod.PREFILL_DQ_GEMM_MIN_M,
+    /// The per-call int8 copy `--w8a8-prefill` builds of the widest projection (`prefillW8a8CopyBytes`).
+    w8a8_copy_bytes: u64 = 0,
 };
 
 /// `glmDsaWith` reads the old indexer tail before append, then the new latent + indexer.
@@ -5731,8 +5734,9 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // 2048, +0.17-0.21 on the lfm2 2.6B, ~0 at chunk 8192 where the envelope
     // already dominates.
     const dq_weights: u64 = if (fwd >= req.dq_min_rows) dequant_weights else 0;
+    const w8a8_copy: u64 = if (fwd >= w8a8_mod.PREFILL_MIN_ROWS) req.w8a8_copy_bytes else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        req.grow_coexist_bytes + req.slot_fixed_kv_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
+        req.grow_coexist_bytes + req.slot_fixed_kv_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + w8a8_copy + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
     return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
@@ -5828,6 +5832,15 @@ fn prefillDequantWeightBytes(config: *const model_mod.ModelConfig) u64 {
     if (config.quant_bits == 0 or config.quant_mode != .affine) return 0;
     if (!transformer_mod.prefillDqGemmEnabled()) return 0;
     return 3 * prefillFfnWidth(config) * @as(u64, config.hidden_size) * 2;
+}
+
+/// The int8 copies `w8a8.prefillQmm` rebuilds of the widest projection (the MLP's) per call; zero
+/// unless `--w8a8-prefill` is on, on NAX, for a 4-bit g64 affine model. Two in flight: the measured
+/// peak rise reached 2.4 copies, which the bill's 5/4 covers.
+fn prefillW8a8CopyBytes(config: *const model_mod.ModelConfig) u64 {
+    if (config.quant_bits != 4 or config.quant_group_size != 64 or config.quant_mode != .affine) return 0;
+    if (!w8a8_mod.prefillRequested() or !w8a8_mod.nax()) return 0;
+    return 2 * w8a8_mod.prefillCopyBytes(prefillFfnWidth(config), config.hidden_size);
 }
 
 fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
@@ -5997,6 +6010,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
             .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
             .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk),
             .dq_min_rows = dq_min_rows,
+            .w8a8_copy_bytes = prefillW8a8CopyBytes(config),
         };
     }
     // `reservedTokens` returns 0 below its length threshold; floor the reserved length at `seq`.
@@ -6020,6 +6034,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk) +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dq_min_rows = dq_min_rows,
+        .w8a8_copy_bytes = prefillW8a8CopyBytes(config),
     };
 }
 
@@ -24795,6 +24810,42 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
     gdn.full_attention_interval = 4;
     try t.expectEqual(@as(u32, 10), gdn.attnCacheLayerCount());
     try t.expectEqual(@as(u64, 10 * 2 * 512 * 2), gdn.kvBytesPerToken());
+}
+
+test "prefillMemoryNeeded: the w8a8 prefill copy is billed only at forwards wide enough to take the route" {
+    const copy: u64 = 89 << 20;
+    const off = prefillMemoryNeeded(4096, 24, 4, 65536, 256, 256, 5120, 17408, 16, 512, 4096, 0, 0, .{});
+    const on = prefillMemoryNeeded(4096, 24, 4, 65536, 256, 256, 5120, 17408, 16, 512, 4096, 0, 0, .{ .w8a8_copy_bytes = copy });
+    try std.testing.expectEqual(off + copy * 5 / 4, on);
+    // A 16-token prompt is one 16-row forward: stock 4-bit, no copy.
+    try std.testing.expectEqual(
+        prefillMemoryNeeded(16, 24, 4, 65536, 256, 256, 5120, 17408, 16, 512, 16, 0, 0, .{}),
+        prefillMemoryNeeded(16, 24, 4, 65536, 256, 256, 5120, 17408, 16, 512, 16, 0, 0, .{ .w8a8_copy_bytes = copy }),
+    );
+}
+
+test "prefillRequestTerms: the w8a8 copy term follows the switch, the hardware and the pack" {
+    const prev_cli = w8a8_mod.prefill_cli;
+    const prev_nax = w8a8_mod.nax_override;
+    defer {
+        w8a8_mod.prefill_cli = prev_cli;
+        w8a8_mod.nax_override = prev_nax;
+    }
+    var cfg = model_mod.ModelConfig{};
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+    cfg.quant_bits = 4;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    w8a8_mod.nax_override = true;
+    w8a8_mod.prefill_cli = true;
+    try std.testing.expectEqual(2 * w8a8_mod.prefillCopyBytes(17408, 5120), prefillRequestTerms(&cfg, 4096, 64, 16, 512, .{}).w8a8_copy_bytes);
+    w8a8_mod.nax_override = false;
+    try std.testing.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, 4096, 64, 16, 512, .{}).w8a8_copy_bytes);
+    w8a8_mod.nax_override = true;
+    cfg.quant_bits = 8;
+    try std.testing.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, 4096, 64, 16, 512, .{}).w8a8_copy_bytes);
 }
 
 test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-width forward, not the chunk cap" {
