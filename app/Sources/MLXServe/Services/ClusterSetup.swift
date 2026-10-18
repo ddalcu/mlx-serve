@@ -20,7 +20,7 @@ struct RdmaPort: Equatable {
 enum ClusterSetup {
     static let port = 32323
     /// Model types a cluster serves: Flash Next by layers or experts, H3 by video steps.
-    static let servableTypes: Set<String> = ["qwen4_exp", "minimax_h3"]
+    static let servableTypes: Set<String> = ["qwen4_exp", "deepseek_v41", "minimax_h3"]
     static let linkSubnet = "10.254.77"
     static func linkAddress(_ role: ClusterRole) -> String { "\(linkSubnet).\(role == .worker ? 2 : 1)" }
 

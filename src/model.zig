@@ -342,6 +342,8 @@ pub const ModelConfig = struct {
     linear_attn_tail_from: u32 = 0,
     /// Pipeline-parallel rank: the trunk layers this process holds (`applyLayerSpan`).
     dist_span: ?distributed.LayerSpan = null,
+    /// DeepSeek-V4.1 on a two-Mac pair: the worker's layers, kept under their own numbers.
+    dist_dsv41: ?@import("deepseek_v41.zig").Pair = null,
     /// Tensor-parallel rank: its slice of each MoE expert (`applyShard`).
     dist_shard: ?distributed.Shard = null,
     partial_rotary_factor: f32 = 1.0,
@@ -5053,6 +5055,36 @@ const TensorWorker = struct {
 
 /// Keeps the tensors one rank holds, under the names `keep.remap` gives them
 /// (`LayerSpan`: its layers renumbered; `TensorWorker`: all but the head-only towers).
+/// DeepSeek-V4.1 on a pair: each Mac's trunk layers under their own numbers (the model reads
+/// sources and Engram layers by absolute index); the worker keeps nothing else, and neither
+/// keeps the DSpark stages, which stay off on a pair.
+const Dsv41Keep = struct {
+    pair: @import("deepseek_v41.zig").Pair,
+
+    pub fn remap(self: Dsv41Keep, key: []const u8, _: []u8) ?[]const u8 {
+        if (std.mem.startsWith(u8, key, "mtp.")) return null;
+        if (std.mem.startsWith(u8, key, "layers.")) {
+            const end = std.mem.indexOfScalarPos(u8, key, 7, '.') orelse return null;
+            const li = std.fmt.parseInt(usize, key[7..end], 10) catch return null;
+            return if (self.pair.holds(li)) key else null;
+        }
+        return if (self.pair.worker) null else key;
+    }
+};
+
+test "a DeepSeek-V4.1 pair keeps each Mac's layers under their own numbers" {
+    var buf: [512]u8 = undefined;
+    const worker: Dsv41Keep = .{ .pair = .{ .lo = 20, .hi = 40, .worker = true } };
+    const host: Dsv41Keep = .{ .pair = .{ .lo = 20, .hi = 40, .worker = false } };
+    try std.testing.expectEqualStrings("layers.20.attn.wkv.weight", worker.remap("layers.20.attn.wkv.weight", &buf).?);
+    try std.testing.expect(worker.remap("layers.19.attn.wkv.weight", &buf) == null);
+    try std.testing.expect(worker.remap("embed.weight", &buf) == null);
+    try std.testing.expect(host.remap("layers.25.ffn.gate.weight", &buf) == null);
+    try std.testing.expectEqualStrings("layers.1.engram.wkv.weight", host.remap("layers.1.engram.wkv.weight", &buf).?);
+    try std.testing.expectEqualStrings("head.weight", host.remap("head.weight", &buf).?);
+    try std.testing.expect(host.remap("mtp.0.main_proj.weight", &buf) == null);
+}
+
 fn retainPart(weights: *Weights, keep: anytype) !void {
     const a = weights.allocator;
     var kept = std.StringHashMap(mlx.mlx_array).init(a);
@@ -5115,14 +5147,16 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    if (config.dist_span == null and config.dist_shard == null) if (try distributed.planFor(model_dir, config)) |part| switch (part) {
+    if (config.dist_span == null and config.dist_shard == null and config.dist_dsv41 == null) if (try distributed.planFor(model_dir, config)) |part| switch (part) {
         .span => |sp| try config.applyLayerSpan(sp),
         .shard => |sh| try config.applyShard(sh),
+        .remote => |r| config.dist_dsv41 = .{ .lo = r.start, .hi = r.end, .worker = false },
     };
     var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainPart(&weights, sp);
+    if (config.dist_dsv41) |p| try retainPart(&weights, Dsv41Keep{ .pair = p });
     if (config.dist_shard) |sh| if (sh.rank != 0) try retainPart(&weights, TensorWorker{});
     if (config.modelopt) {
         const s = mlx.mlx_default_cpu_stream_new();
@@ -5130,7 +5164,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, s, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
     }
     if (config.dist_shard) |sh| try shardExperts(&weights, sh, config.modelopt);
-    if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
+    if (config.isDsv41() and !(if (config.dist_dsv41) |p| p.worker else false)) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
         defer reportF16Narrowing();
         resolveWeightPrefix(config, &weights);

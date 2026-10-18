@@ -12,6 +12,7 @@ const status = @import("status.zig");
 const transformer_mod = @import("transformer.zig");
 const h3_split = @import("h3_split.zig");
 const lan = @import("lan.zig");
+const dsv41_mod = @import("deepseek_v41.zig");
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
@@ -326,6 +327,7 @@ const OP_MOE: i32 = 3;
 pub const OP_H3_JOB: i32 = 4;
 pub const OP_H3_STEP: i32 = 5;
 pub const OP_H3_END: i32 = 6;
+const OP_DSV41: i32 = 7;
 
 /// A control message to the other rank of a two-Mac group.
 pub fn sendOp(link: *const Link, m: Msg) !void {
@@ -467,6 +469,8 @@ pub const Peer = struct {
     planned: bool = false,
     /// The `modelIdentity` of the copy the plan was made for.
     plan_id: u64 = 0,
+    /// DeepSeek-V4.1: the worker's layers in the middle or tail of the trunk.
+    remote: ?LayerSpan = null,
     ready: bool = false,
     /// The worker refused or failed its load: it has left, and nothing waits on it again.
     failed: bool = false,
@@ -612,6 +616,8 @@ var worker_copy = std.atomic.Value(i32).init(-1);
 /// The worker's bell connection closed: it left, and JACCL forms a group once per process,
 /// so this server must restart to pair again (the app does it, `/props` cluster "worker_gone").
 var worker_gone = std.atomic.Value(bool).init(false);
+/// The worker's free memory as it answered on joining (MiB), for the load bill.
+var worker_free_mib = std.atomic.Value(u32).init(0);
 var joined_link: Link = undefined;
 
 /// The `/props` "cluster" object (with its leading comma), empty when this server is
@@ -691,13 +697,40 @@ pub fn peer() ?*Peer {
 
 /// What this rank holds of `model_dir`'s model when it is the group's model: on the first
 /// load the split is chosen and the worker told to load its part; reloads reuse it.
-pub const Part = union(enum) { span: LayerSpan, shard: Shard };
+pub const Part = union(enum) { span: LayerSpan, shard: Shard, remote: LayerSpan };
 
 pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Part {
     if (!serves(model_dir)) return null;
     const p = try join();
     if (p.planned) try p.samePlannedCopy(model_dir) else try plan(p, config, model_dir);
+    if (p.remote) |r| return .{ .remote = r };
     return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
+}
+
+/// What this Mac holds of `whole` resident bytes of `model_dir` when its pair serves it: its run
+/// of layers, chosen as the plan chooses it (or the plan itself once made); `whole` otherwise.
+pub fn hostShare(model_dir: []const u8, config: *const model_mod.ModelConfig, whole: u64) u64 {
+    if (!holds(model_dir)) return whole;
+    const g = group.?;
+    const n: u64 = config.num_hidden_layers;
+    if (n == 0) return whole;
+    if (peer()) |p| if (p.planned) return if (p.mode == .tensor) whole / 2 + whole / 10 else whole * p.span.len() / n;
+    return shareFor(g, config, whole, status.getAvailableMemBytes() >> 20, worker_free_mib.load(.acquire));
+}
+
+fn shareFor(g: Group, config: *const model_mod.ModelConfig, whole: u64, mine: u64, theirs: u64) u64 {
+    const n: u64 = config.num_hidden_layers;
+    if (theirs == 0) return whole;
+    if (config.isDsv41()) {
+        const r = dsv41_mod.pairRange(config, mine, theirs) orelse return whole;
+        return whole * (n - (r[1] - r[0])) / n;
+    }
+    if (!config.isQwen4()) return whole;
+    return switch (g.mode) {
+        .tensor => whole / 2 + whole / 10,
+        .rows => whole,
+        .pipeline => whole * (g.split orelse chooseSplit(@intCast(n), config.full_attention_interval, mine, theirs)) / n,
+    };
 }
 
 /// Whether a Thunderbolt pair holds `model_dir`: the worker joined and holds its part of it,
@@ -753,6 +786,7 @@ fn join() !*Peer {
 }
 
 fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8) !void {
+    if (config.isDsv41()) return planDsv41(self, config, model_dir);
     if (!config.isQwen4()) {
         log.err("[dist] {s}: this architecture ({s}) has no multi-Mac path yet\n", .{ self.model, config.model_type });
         return error.DistArchUnsupported;
@@ -777,6 +811,84 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8
     }
     self.plan_id = try pl.send(&self.link, model_dir);
     self.planned = true;
+}
+
+/// DeepSeek-V4.1: the worker takes a run of layers its share of the memory holds, cut where
+/// no layer reads another Mac's state (`deepseek_v41.pairRange`); the stream and mix cross twice.
+fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8) !void {
+    if (self.mode != .pipeline) {
+        log.err("[dist] {s}: DeepSeek-V4.1 splits by layers only (--dist pipeline)\n", .{self.model});
+        return error.DistArchUnsupported;
+    }
+    const n = config.num_hidden_layers;
+    const mine: u64 = status.getAvailableMemBytes() >> 20;
+    const r = dsv41_mod.pairRange(config, mine, @intCast(self.worker.avail_mib)) orelse return error.DistSplitOffInterval;
+    self.remote = .{ .start = @intCast(r[0]), .end = @intCast(r[1]), .total = n };
+    self.span = .{ .start = 0, .end = @intCast(n - (r[1] - r[0])), .total = n };
+    log.info("[dist] pipeline: layers {d}..{d} of {s} on the worker ({d} MiB free of {d}), the other {d} here ({d} MiB free)\n", .{ r[0], r[1], std.fs.path.basename(self.model), self.worker.avail_mib, self.worker.total_mib, n - (r[1] - r[0]), mine });
+    const pl: Plan = .{ .mode = .pipeline, .span = self.remote.?, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts) };
+    self.plan_id = try pl.send(&self.link, model_dir);
+    self.planned = true;
+    dsv41_mod.pair_exchange = &dsv41Exchange;
+}
+
+/// Host, DeepSeek-V4.1: one step's stream and mix through the worker's layers and back.
+fn dsv41Exchange(x: mlx.mlx_array, pre: mlx.mlx_array, p0: usize, snap: bool) anyerror![2]mlx.mlx_array {
+    const self = peer() orelse return error.DistWorkerNotJoined;
+    if (!self.ready) try self.awaitReady();
+    const xs = mlx.getShape(x);
+    try self.sendOrdered(.{ OP_DSV41, xs[0], @intCast(p0 & 0x7fffffff), @intCast(p0 >> 31), @intFromBool(snap), xs[1], @intFromEnum(mlx.mlx_array_dtype(x)), @intFromEnum(mlx.mlx_array_dtype(pre)) }, &.{ x, pre });
+    self.exchanges += 1;
+    const xo = try queuedRecv(&self.link, xs, mlx.mlx_array_dtype(x), 1);
+    errdefer _ = mlx.mlx_array_free(xo);
+    return .{ xo, try queuedRecv(&self.link, mlx.getShape(pre), mlx.mlx_array_dtype(pre), 1) };
+}
+
+/// Worker, DeepSeek-V4.1: its run of layers (`pl.span`), then one step per OP_DSV41 until
+/// rank 0 stops it.
+fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: []const u8, config: *model_mod.ModelConfig, pl: Plan) !void {
+    config.dist_dsv41 = .{ .lo = pl.span.start, .hi = pl.span.end, .worker = true };
+    var w = model_mod.loadModelWeights(io, allocator, dir, config, false) catch |err| {
+        log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
+        sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
+        return err;
+    };
+    defer w.deinit();
+    const m = dsv41_mod.init(allocator, config, &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41 }) catch |err| {
+        log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
+        sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
+        return err;
+    };
+    defer m.deinit();
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
+    log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
+    const d: c_int = @intCast(config.hidden_size);
+    var steps: u64 = 0;
+    while (true) {
+        const msg = try recvMsg(link, 0);
+        switch (msg[0]) {
+            OP_STOP => break,
+            OP_DSV41 => {
+                const p0: usize = @as(usize, @intCast(msg[2])) | (@as(usize, @intCast(msg[3])) << 31);
+                const x = try queuedRecv(link, &.{ msg[1], msg[5], d }, @enumFromInt(msg[6]), 0);
+                defer _ = mlx.mlx_array_free(x);
+                const pre = try queuedRecv(link, &.{ msg[1], msg[5] }, @enumFromInt(msg[7]), 0);
+                defer _ = mlx.mlx_array_free(pre);
+                const out = try dsv41_mod.workerStep(m, allocator, x, pre, p0, msg[4] != 0);
+                defer for (out) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                try sendNow(link, out[0], 0);
+                try sendNow(link, out[1], 0);
+                steps += 1;
+                if (msg[1] > 1 or steps % 256 == 0) log.info("[dist] worker: step {d}: {d} rows at {d}\n", .{ steps, msg[1], p0 });
+            },
+            else => return error.DistBadMessage,
+        }
+    }
+    log.info("[dist] worker: stopped by rank 0 after {d} steps\n", .{steps});
 }
 
 fn sendBytes(link: *const Link, bytes: []const u8, dst: u32) !void {
@@ -848,13 +960,15 @@ fn askForModel(link: *const Link) !void {
     try link.bell.writeAll(name);
     var fds = [_]std.posix.pollfd{.{ .fd = link.bell.fd, .events = std.posix.POLL.IN, .revents = 0 }};
     if (try std.posix.poll(&fds, 30_000) == 0) return error.DistNoAnswer;
-    var reply: [1]u8 = undefined;
+    var reply: [5]u8 = undefined;
     try link.bell.readAll(&reply);
     worker_copy.store(reply[0], .release);
+    worker_free_mib.store(std.mem.readInt(u32, reply[1..5], .little), .release);
     if (reply[0] != 0) log.err("[dist] the worker does not have {s} ({s}): download the same model there, then join again\n", .{ name, workerCopyName() });
 }
 
-/// The worker's side of `askForModel`: looks the model up in its folders and answers.
+/// The worker's side of `askForModel`: looks the model up in its folders and answers with
+/// that and its free memory.
 fn answerModel(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots: []const []const u8) !bool {
     if (link.bell.fd < 0) return true;
     var head: [10]u8 = undefined;
@@ -864,21 +978,26 @@ fn answerModel(io: std.Io, allocator: std.mem.Allocator, link: *const Link, root
     if (len == 0 or len > name_buf.len) return error.DistBadMessage;
     const name = name_buf[0..len];
     try link.bell.readAll(name);
+    var reply: [5]u8 = undefined;
+    std.mem.writeInt(u32, reply[1..5], @intCast(@min(status.getAvailableMemBytes() >> 20, std.math.maxInt(u32))), .little);
     const found = findModel(io, allocator, roots, name, std.mem.readInt(u64, head[2..10], .little)) catch |err| switch (err) {
         error.DistModelMismatch => {
             log.err("[dist] worker: {s} here is not the host's copy (quantization or revision)\n", .{name});
-            try link.bell.writeAll(&.{@intCast(MISMATCH)});
+            reply[0] = @intCast(MISMATCH);
+            try link.bell.writeAll(&reply);
             return false;
         },
         else => return err,
     };
     if (found) |dir| {
         allocator.free(dir);
-        try link.bell.writeAll(&.{0});
+        reply[0] = 0;
+        try link.bell.writeAll(&reply);
         return true;
     }
     log.err("[dist] worker: no model named {s} in {s}\n", .{ name, roots[0] });
-    try link.bell.writeAll(&.{@intCast(NOT_FOUND)});
+    reply[0] = @intCast(NOT_FOUND);
+    try link.bell.writeAll(&reply);
     return false;
 }
 
@@ -1005,6 +1124,7 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
         fail.send(&link, MISMATCH);
         return error.DistModelMismatch;
     }
+    if (config.isDsv41()) return serveDsv41(io, allocator, &link, dir, &config, pl);
     var xfm = load(io, allocator, dir, &config, pl.mode, pl.span) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         fail.send(&link, LOAD_FAILED);
@@ -1487,4 +1607,19 @@ test "a paired model is never picked to unload while the worker is joined" {
     try std.testing.expect(!reg_mod.ModelRegistry.idleEvictable(flash, std.math.maxInt(i64), 0));
     joined.store(false, .release);
     try std.testing.expectEqualStrings("Flash", reg.pickLruEvictable("", false).?.id);
+}
+
+test "the leader bills only the layers it keeps of a model its pair splits" {
+    var c: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8 };
+    c.dsv4_compress_ratios[0..8].* = .{ 0, 0, 2, 2, 2, 1, 1, 1 };
+    c.dsv41_kv_sources = (1 << 2) | (1 << 5);
+    c.dsv41_index_sources = (1 << 2) | (1 << 5) | (1 << 7);
+    c.dsv41_candidate_source = 5;
+    c.dsv41_engram_layers[0..2].* = .{ 1, 2 };
+    c.dsv41_n_engram_layers = 2;
+    const g: Group = .{ .io = std.testing.io, .allocator = std.testing.allocator, .mode = .pipeline, .model = "/m/V41", .split = null };
+    // The worker's 40% holds layers 5..8: this Mac keeps 5 of 8.
+    try std.testing.expectEqual(@as(u64, 500), shareFor(g, &c, 800, 60, 40));
+    // A worker that has not said how much it has: the whole model.
+    try std.testing.expectEqual(@as(u64, 800), shareFor(g, &c, 800, 60, 0));
 }

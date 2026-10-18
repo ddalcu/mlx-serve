@@ -1112,7 +1112,7 @@ private struct ThunderboltClusterSectionContent: View {
         let models = appState.localModels.filter { ClusterSetup.servableTypes.contains($0.modelType) }
         let here = Int64(SystemMetrics.availableBytes())
         func needsPair(_ m: LocalModel) -> Bool {
-            m.modelType != "minimax_h3" && PairPlan.fit(bytes: m.sizeBytes, freeHere: here, freeThere: nil) != .alone
+            m.modelType != "minimax_h3" && PairPlan.fit(bytes: ResidentSize.bytes(of: m), freeHere: here, freeThere: nil) != .alone
         }
         return models.sorted { a, b in
             needsPair(a) != needsPair(b) ? needsPair(a) : a.name < b.name
@@ -1219,7 +1219,7 @@ private struct ThunderboltClusterSectionContent: View {
     @ViewBuilder private var leadControls: some View {
         let models = pairable
         if models.isEmpty {
-            Text("A pair runs MiniMax-H3 (video) or Qwen3.8-Flash-Next (chat). Download one on both Macs to use it.")
+            Text("A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it.")
                 .font(.app(.caption)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         } else {
             HStack(spacing: 8) {
@@ -1260,11 +1260,12 @@ private struct ThunderboltClusterSectionContent: View {
         let here = Int64(SystemMetrics.availableBytes())
         let other = PairLookup.otherMac(server.lanPeers, workerName: server.cluster?.workerName ?? "")
         let there = other.map { $0.peer.freeBytes }
-        let share = PairPlan.share(bytes: m.sizeBytes, video: video, mode: options.clusterMode, freeHere: here, freeThere: there ?? here)
+        let bytes = ResidentSize.bytes(of: m)
+        let share = PairPlan.share(bytes: bytes, video: video, mode: options.clusterMode, freeHere: here, freeThere: there ?? here)
         let otherName = other?.name ?? L10n.text("the other Mac")
         VStack(alignment: .leading, spacing: 2) {
             if !video {
-                switch PairPlan.fit(bytes: m.sizeBytes, freeHere: here, freeThere: there) {
+                switch PairPlan.fit(bytes: bytes, freeHere: here, freeThere: there) {
                 case .alone:
                     Text("Fits on this Mac alone. A pair runs it a little slower; pair it only to free memory here.")
                 case .needsBoth:

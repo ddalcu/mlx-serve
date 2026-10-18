@@ -347,6 +347,7 @@ pub const Dsv41Model = struct {
     /// Arrays made at load (casts, reshapes, stacks); freed in `deinit`.
     owned: std.ArrayList(A) = .empty,
     dec_state: ?State = null,
+    pair: ?Pair = null,
     /// Bumped whenever `dec_state` is replaced: a snapshot names the state it was taken of.
     state_gen: u64 = 0,
     /// The last prompt's state one token short of its end (`resumePrompt`).
@@ -383,6 +384,11 @@ pub const Dsv41Model = struct {
             return e;
         };
         return x;
+    }
+
+    fn held(self: *const Dsv41Model, li: usize) bool {
+        const p = self.pair orelse return true;
+        return p.holds(li);
     }
 
     fn isKvSource(self: *const Dsv41Model, l: usize) bool {
@@ -700,11 +706,81 @@ fn buildSplitKernel() !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
+/// A two-Mac pair's share of the trunk: the worker runs layers [lo, hi), the host every other one.
+/// A cut never splits what layers share (`pairCutOk`), and the worker holds no Engram layer.
+pub const Pair = struct {
+    lo: usize,
+    hi: usize,
+    worker: bool,
+
+    pub fn holds(p: Pair, li: usize) bool {
+        return (li >= p.lo and li < p.hi) == p.worker;
+    }
+};
+
+/// Host: hands one step's stream `[L, hc, dim]` and mix `[L, hc]` to the worker at `Pair.lo` and
+/// returns both as they stand after `Pair.hi` (caller frees); `snap`: the host snapshots when
+/// the step ends, so the worker does too. Set by distributed.zig.
+pub var pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool) anyerror![2]A = null;
+
+/// The highest set bit of `mask` at or below `l`, or -1.
+fn latestBit(mask: u64, l: usize) i64 {
+    var j: i64 = @intCast(l);
+    while (j >= 0) : (j -= 1) if ((mask >> @intCast(j)) & 1 != 0) return j;
+    return -1;
+}
+
+/// Whether a pair may cut the trunk before layer `x`: no compressed layer at or past it reads
+/// compressed rows, index picks or candidate blocks made below it.
+pub fn pairCutOk(c: *const ModelConfig, x: usize) bool {
+    const n = c.num_hidden_layers;
+    if (x == 0 or x == n) return true;
+    if (x > n) return false;
+    const cand = c.dsv41_candidate_source;
+    for (x..n) |l| {
+        if (c.dsv4_compress_ratios[l] == 0) continue;
+        if (latestBit(c.dsv41_kv_sources, l) < x or latestBit(c.dsv41_index_sources, l) < x) return false;
+        if (cand >= 0 and x > cand and l > cand and (c.dsv41_index_sources >> @intCast(l)) & 1 != 0) return false;
+    }
+    return true;
+}
+
+fn engramIn(c: *const ModelConfig, lo: usize, hi: usize) bool {
+    for (c.dsv41_engram_layers[0..c.dsv41_n_engram_layers]) |l| if (l >= lo and l < hi) return true;
+    return false;
+}
+
+/// The worker's layers: the longest valid run holding no Engram layer that stays within its
+/// share of the two Macs' free memory (`mine`, `theirs`, any unit), else the shortest one.
+pub fn pairRange(c: *const ModelConfig, mine: u64, theirs: u64) ?[2]usize {
+    const n = c.num_hidden_layers;
+    const share = @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(theirs)) / @as(f64, @floatFromInt(@max(mine + theirs, 1)));
+    var best: ?[2]usize = null;
+    for (0..n) |a| {
+        if (!pairCutOk(c, a)) continue;
+        for (a + 1..n + 1) |b| {
+            if (!pairCutOk(c, b) or engramIn(c, a, b)) continue;
+            const len: f64 = @floatFromInt(b - a);
+            const cur = best orelse {
+                best = .{ a, b };
+                continue;
+            };
+            const cur_len: f64 = @floatFromInt(cur[1] - cur[0]);
+            const fits = len <= share;
+            const cur_fits = cur_len <= share;
+            if ((fits and (!cur_fits or len > cur_len)) or (!fits and !cur_fits and len < cur_len)) best = .{ a, b };
+        }
+    }
+    return best;
+}
+
 pub const InitOpts = struct {
     /// The activation dtype; tests run f32 against the f32 reference.
     act: mlx.mlx_dtype = .bfloat16,
     /// Load the DSpark stages when the checkpoint ships them.
     dspark: bool = false,
+    /// This process's share of a two-Mac pair.
+    pair: ?Pair = null,
 };
 
 pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, s: S, opts: InitOpts) !*Dsv41Model {
@@ -731,6 +807,9 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         .split_kernel = try buildSplitKernel(),
     };
     m.cfg.pack_dir = null; // borrowed; the caller's config owns it
+    m.pair = opts.pair;
+    const worker = if (opts.pair) |p| p.worker else false;
+    if (opts.pair) |p| if (p.worker and engramIn(cfg, p.lo, p.hi)) return error.DsvPairEngram;
     errdefer {
         for (m.qat_fns) |f| if (f.ctx != null) {
             _ = mlx.mlx_closure_free(f);
@@ -745,12 +824,18 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         _ = mlx.mlx_fast_metal_kernel_free(m.split_kernel);
     }
     try compileQat(m);
-    m.embed = try getLin(w, cfg.hidden_size, "embed", .{});
-    m.head = try getLin(w, cfg.hidden_size, "head", .{});
-    m.norm = try ownCast(m, try getW(w, "norm.weight", .{}), m.act);
+    if (worker) {
+        m.embed = .{ .w = none };
+        m.head = .{ .w = none };
+        m.norm = none;
+    } else {
+        m.embed = try getLin(w, cfg.hidden_size, "embed", .{});
+        m.head = try getLin(w, cfg.hidden_size, "head", .{});
+        m.norm = try ownCast(m, try getW(w, "norm.weight", .{}), m.act);
+    }
     m.rope_plain = try buildRope(m, cfg.rope_theta, 0, 1, 0, 0);
     m.rope_yarn = try buildRope(m, cfg.dsv4_compress_rope_theta, if (cfg.rope_yarn) cfg.yarn_orig_max_pos else 0, cfg.yarn_factor, cfg.yarn_beta_fast, cfg.yarn_beta_slow);
-    for (0..n_layers) |li| m.layers[li] = try loadLayer(m, w, "layers", li, li);
+    for (0..n_layers) |li| m.layers[li] = if (m.held(li)) try loadLayer(m, w, "layers", li, li) else std.mem.zeroes(Layer);
     try compileRegions(m);
     if (n_stages > 0) {
         for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
@@ -768,7 +853,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         m.ds_block = cfg.dsv4_dspark_block_size;
         m.ds_conf_thr = dsv4.dsparkConfThreshold();
     }
-    if (cfg.pack_dir) |dir| try initEngram(m, w, dir);
+    if (!worker) if (cfg.pack_dir) |dir| try initEngram(m, w, dir);
     try evalWeights(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages\n", .{ n_layers, m.engrams.len, n_stages });
     return m;
@@ -843,6 +928,7 @@ pub fn prefillBytes(config: *const ModelConfig, seq: u64, chunk: u64, floor: u64
 /// The DSpark stages load when the pack ships them, unless `--no-mtp` or the model's `mtp` setting turn them off
 /// (`applyModelSettings` folds both into `mtp_override`); V4's `MLX_SERVE_DSV4_DSPARK` turns them on either way.
 pub fn dsparkWanted(cfg: *const ModelConfig) bool {
+    if (cfg.dist_dsv41 != null) return false; // a pair runs without DSpark for now
     const env = std.c.getenv("MLX_SERVE_DSV4_DSPARK");
     return (cfg.mtp_override orelse true) or (env != null and env.?[0] != '0');
 }
@@ -1782,30 +1868,13 @@ pub fn extend(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
     }
 
     const sp: Spans = .{ .xs = xs, .pres = pres, .topks = topks, .cands = cands, .mh = mh, .span = span, .L = L, .p0 = p0, .eng_ids = eng_ids, .ncols = ncols };
-    for (0..m.n_layers) |li| {
-        for (0..n_spans) |k| {
-            // A span's intermediates are dropped as soon as it is built, so the
-            // layer's evaluation frees each one when its consumers are done.
-            var sc = Scope.init(gpa, m.s);
-            defer sc.deinit();
-            var x = try spanIn(&sc, m, gpa, &sp, li, k);
-            var sh: Shared = .{ .topk = topks[k], .cand = cands[k] };
-            var pre = pres[k];
-            x = try block(&sc, m, st, li, x, &pre, p0 + k * span, &sh, null);
-            if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
-            hold(&xs[k], x);
-            hold(&pres[k], pre);
-            hold(&topks[k], sh.topk);
-            hold(&cands[k], sh.cand);
-        }
-        if (n_spans > 1) {
-            var ev: std.ArrayList(A) = .empty;
-            defer ev.deinit(gpa);
-            for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
-            try appendLayerState(gpa, &ev, &st.layers[li]);
-            try evalAll(ev.items);
-        }
+    var from: usize = 0;
+    if (m.pair) |p| {
+        try runLayers(m, gpa, st, &sp, held, 0, p.lo);
+        try exchange(m, gpa, &sp, p0, m.snap_at != null and m.snap_at.? == p0 + L);
+        from = p.hi;
     }
+    try runLayers(m, gpa, st, &sp, held, from, m.n_layers);
     st.n = p0 + L;
 
     var sc = Scope.init(gpa, m.s);
@@ -1842,6 +1911,104 @@ pub fn extend(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
     return sc.out(logits);
+}
+
+/// Layers [lo, hi) over every span of `sp`, one layer at a time; `held` is every array crossing
+/// layers, evaluated per layer when there are several spans.
+fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, held: []A, lo: usize, hi: usize) !void {
+    const n_spans = sp.xs.len;
+    for (lo..hi) |li| {
+        for (0..n_spans) |k| {
+            // A span's intermediates are dropped as soon as it is built, so the
+            // layer's evaluation frees each one when its consumers are done.
+            var sc = Scope.init(gpa, m.s);
+            defer sc.deinit();
+            var x = try spanIn(&sc, m, gpa, sp, li, k);
+            var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
+            var pre = sp.pres[k];
+            x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh, null);
+            if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
+            hold(&sp.xs[k], x);
+            hold(&sp.pres[k], pre);
+            hold(&sp.topks[k], sh.topk);
+            hold(&sp.cands[k], sh.cand);
+        }
+        if (n_spans > 1) {
+            var ev: std.ArrayList(A) = .empty;
+            defer ev.deinit(gpa);
+            for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
+            try appendLayerState(gpa, &ev, &st.layers[li]);
+            try evalAll(ev.items);
+        }
+    }
+}
+
+/// Host: every span's stream and mix to the worker, and back as they stand after its layers.
+/// The picks and candidates restart at the next source layer (a valid cut is one).
+fn exchange(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, p0: usize, snap: bool) !void {
+    const xchg = pair_exchange orelse return error.DsvPairNotJoined;
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const back = try xchg(try sc.concat(sp.xs, 0), try sc.concat(sp.pres, 0), p0, snap);
+    _ = try sc.keep(back[0]);
+    _ = try sc.keep(back[1]);
+    for (0..sp.xs.len) |k| {
+        const lo, const hi = sp.bounds(k);
+        hold(&sp.xs[k], try sc.slice(back[0], 0, lo, hi));
+        hold(&sp.pres[k], try sc.slice(back[1], 0, lo, hi));
+        hold(&sp.topks[k], none);
+        hold(&sp.cands[k], none);
+    }
+}
+
+/// Worker: its layers over one step the host handed over (`x` [L, hc, dim], `pre` [L, hc]),
+/// returning both as they stand after them (caller frees). The state follows the host's: a step
+/// at 0 starts a new one, a step behind it rewinds to the snapshot, and `snap` takes one after.
+pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usize, snap: bool) ![2]A {
+    const p = m.pair orelse return error.DsvNotPaired;
+    if (p0 == 0 or m.dec_state == null) {
+        if (m.dec_state) |*old| old.deinit();
+        m.dec_state = null;
+        m.state_gen += 1;
+        m.dec_state = try initState(m, gpa);
+    } else if (p0 != m.dec_state.?.n and !try restoreAt(m, p0)) return error.DistPeerDiverged;
+    const st = &m.dec_state.?;
+    const L = dim(x, 0);
+    const n_spans = (L + m.span - 1) / m.span;
+    const held = try gpa.alloc(A, n_spans * 4);
+    defer {
+        for (held) |h| if (h.ctx != null) {
+            _ = mlx.mlx_array_free(h);
+        };
+        gpa.free(held);
+    }
+    @memset(held, none);
+    const sp: Spans = .{ .xs = held[0..n_spans], .pres = held[n_spans .. 2 * n_spans], .topks = held[2 * n_spans .. 3 * n_spans], .cands = held[3 * n_spans ..], .mh = &.{}, .span = m.span, .L = L, .p0 = p0, .eng_ids = &.{}, .ncols = 0 };
+    {
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        for (0..n_spans) |k| {
+            const lo, const hi = sp.bounds(k);
+            hold(&sp.xs[k], try sc.slice(x, 0, lo, hi));
+            hold(&sp.pres[k], try sc.slice(pre, 0, lo, hi));
+        }
+    }
+    try runLayers(m, gpa, st, &sp, held, p.lo, p.hi);
+    st.n = p0 + L;
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const xo = try sc.concat(sp.xs, 0);
+    const po = try sc.concat(sp.pres, 0);
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    try ev.appendSlice(gpa, &.{ xo, po });
+    for (st.layers[p.lo..p.hi]) |*ls| try appendLayerState(gpa, &ev, ls);
+    try evalAll(ev.items);
+    if (snap) {
+        m.snap_at = st.n;
+        try snapshotIfDue(m);
+    }
+    return .{ sc.out(xo), sc.out(po) };
 }
 
 /// What crosses layers in `extend`: each span's stream and mix, the picks
@@ -2019,6 +2186,8 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32) !A {
 /// once), and append-only rows by their count.
 const Snap = struct {
     gen: u64,
+    /// The state's position: `ids.len` on the host; a worker keeps no ids.
+    n: usize,
     ids: []u32,
     layers: []LSnap,
     ds: []A,
@@ -2070,6 +2239,20 @@ fn restore(m: *Dsv41Model, prompt: []const u32) !usize {
     const sn = &(m.snap orelse return 0);
     const st = &(m.dec_state orelse return 0);
     if (sn.gen != m.state_gen or sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
+    try applySnap(st, sn);
+    return st.n;
+}
+
+/// Worker: rewinds to its snapshot at `n`, where the host restored its own.
+fn restoreAt(m: *Dsv41Model, n: usize) !bool {
+    const sn = &(m.snap orelse return false);
+    const st = &(m.dec_state orelse return false);
+    if (sn.gen != m.state_gen or sn.n != n) return false;
+    try applySnap(st, sn);
+    return true;
+}
+
+fn applySnap(st: *State, sn: *const Snap) !void {
     st.dropVerify();
     for (st.layers, sn.layers) |*l, s| {
         hold(&l.win.buf, s.win);
@@ -2082,8 +2265,7 @@ fn restore(m: *Dsv41Model, prompt: []const u32) !usize {
     hold(&st.mh, sn.mh);
     st.hist.clearRetainingCapacity();
     try st.hist.appendSlice(st.gpa, sn.hist);
-    st.n = sn.ids.len;
-    return st.n;
+    st.n = sn.n;
 }
 
 /// Takes the armed snapshot once the state stands at its position.
@@ -2107,7 +2289,7 @@ fn snapshotIfDue(m: *Dsv41Model) !void {
         .pend_gate = ref(l.pend_gate),
     };
     for (ds, st.ds) |*o, r| o.* = ref(r.buf);
-    m.snap = .{ .gen = m.state_gen, .ids = m.snap_ids, .layers = layers, .ds = ds, .mh = ref(st.mh), .hist = hist };
+    m.snap = .{ .gen = m.state_gen, .n = st.n, .ids = m.snap_ids, .layers = layers, .ds = ds, .mh = ref(st.mh), .hist = hist };
     m.snap_ids = &.{};
 }
 
@@ -2962,4 +3144,60 @@ test "dsv41 rows: growth keeps every appended row" {
     const got = try hostF32(v);
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(f32, want[0 .. at * 4], got);
+}
+
+test "dsv41 pair cuts: valid only where no layer past the cut reads what a layer below it made" {
+    var c: ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8 };
+    c.dsv4_compress_ratios[0..8].* = .{ 0, 0, 2, 2, 2, 1, 1, 1 };
+    c.dsv41_kv_sources = (1 << 2) | (1 << 5);
+    c.dsv41_index_sources = (1 << 2) | (1 << 5) | (1 << 7);
+    c.dsv41_candidate_source = 5;
+    c.dsv41_engram_layers[0..2].* = .{ 1, 2 };
+    c.dsv41_n_engram_layers = 2;
+    for (0..9) |x| try testing.expectEqual(x == 0 or x == 1 or x == 2 or x == 5 or x == 8, pairCutOk(&c, x));
+    // The worker's share of 40% of memory is 3.2 layers: the run within it, holding no Engram layer.
+    try testing.expectEqual([2]usize{ 5, 8 }, pairRange(&c, 60, 40).?);
+}
+
+test "dsv41 pair: a host and a worker split at a valid cut give the unsplit model's logits, resume included (DSV41_TINY)" {
+    const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    var t = try Tiny.open(root, "repack", "fixture.safetensors");
+    defer t.deinit();
+    const host = try init(gpa, &t.cfg, &t.w, mlx.gpuStream(), .{ .act = .float32, .pair = .{ .lo = 5, .hi = 8, .worker = false } });
+    defer host.deinit();
+    const worker = try init(gpa, &t.cfg, &t.w, mlx.gpuStream(), .{ .act = .float32, .pair = .{ .lo = 5, .hi = 8, .worker = true } });
+    defer worker.deinit();
+    const Xchg = struct {
+        var w: *Dsv41Model = undefined;
+        fn call(x: A, pre: A, p0: usize, snap: bool) anyerror![2]A {
+            return workerStep(w, testing.allocator, x, pre, p0, snap);
+        }
+    };
+    Xchg.w = worker;
+    pair_exchange = &Xchg.call;
+    defer pair_exchange = null;
+    // Several spans per chunk on both sides.
+    for ([_]*Dsv41Model{ t.m, host, worker }) |m| m.span = 4;
+
+    const a = try t.ids();
+    defer gpa.free(a);
+    const b = try gpa.alloc(u32, a.len + 6);
+    defer gpa.free(b);
+    @memcpy(b[0..a.len], a);
+    @memcpy(b[a.len..], &[_]u32{ 5, 9, 2, 7, 3, 11 });
+    // Turn 1 (prefill + three decode steps), then turn 2 resumed from the snapshot.
+    var got: [2][]f32 = undefined;
+    for ([_]*Dsv41Model{ t.m, host }, 0..) |m, which| {
+        _ = try resumePrompt(m, a);
+        _ = mlx.mlx_array_free(try prefill(m, gpa, a));
+        for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}));
+        const n = try resumePrompt(m, b);
+        try testing.expectEqual(a.len - 1, n);
+        const l = try extendResumable(m, gpa, b[n..]);
+        defer _ = mlx.mlx_array_free(l);
+        got[which] = try hostF32(l);
+    }
+    defer for (got) |g| gpa.free(g);
+    try expectRowsClose("pair vs whole", got[1], got[0], t.cfg.vocab_size);
 }

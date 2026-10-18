@@ -2286,7 +2286,6 @@
 "Reconnect" = "다시 연결";
 "Paired with %@ for %@." = "%@과(와) %@용으로 페어링됨.";
 "Waiting for the other Mac. On it, open Settings ▸ Cluster and click Join." = "다른 Mac을 기다리는 중입니다. 그 Mac에서 설정 ▸ 클러스터를 열고 참여를 클릭하세요.";
-"A pair runs MiniMax-H3 (video) or Qwen3.8-Flash-Next (chat). Download one on both Macs to use it." = "페어는 MiniMax-H3(영상) 또는 Qwen3.8-Flash-Next(채팅)를 실행합니다. 사용하려면 두 Mac 모두에 하나를 다운로드하세요.";
 "Use the pair for" = "페어 용도";
 "Pair" = "페어링";
 "Join the Mac that leads instead" = "대신 주도하는 Mac에 참여";
@@ -2345,3 +2344,4 @@
 "Too big for this Mac alone: the pair runs it across both Macs." = "이 Mac 하나로는 너무 큽니다. 페어가 두 Mac에 나눠 실행합니다.";
 "Too big even for both Macs together." = "두 Mac을 합쳐도 너무 큽니다.";
 "About %@ on this Mac and %@ on %@." = "이 Mac에 약 %@, %@ 정도는 %@에 놓입니다.";
+"A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it." = "페어는 MiniMax-H3(비디오) 또는 Qwen3.8-Flash-Next나 DeepSeek-V4.1(채팅)을 실행합니다. 두 Mac 모두에 하나를 다운로드하세요.";

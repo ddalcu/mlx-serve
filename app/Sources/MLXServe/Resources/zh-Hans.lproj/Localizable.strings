@@ -2298,7 +2298,6 @@
 "Reconnect" = "重新连接";
 "Paired with %@ for %@." = "已与 %@ 配对，用于 %@。";
 "Waiting for the other Mac. On it, open Settings ▸ Cluster and click Join." = "正在等待另一台 Mac。在那台 Mac 上打开“设置 ▸ 集群”，点按“加入”。";
-"A pair runs MiniMax-H3 (video) or Qwen3.8-Flash-Next (chat). Download one on both Macs to use it." = "配对可运行 MiniMax-H3（视频）或 Qwen3.8-Flash-Next（对话）。请在两台 Mac 上都下载其中一个。";
 "Use the pair for" = "配对用于";
 "Pair" = "配对";
 "Join the Mac that leads instead" = "改为加入主导的 Mac";
@@ -2357,3 +2356,4 @@
 "Too big for this Mac alone: the pair runs it across both Macs." = "这台 Mac 单独放不下：配对后由两台 Mac 一起运行。";
 "Too big even for both Macs together." = "两台 Mac 加起来也放不下。";
 "About %@ on this Mac and %@ on %@." = "本机约占用 %@，%@ 在 %@ 上。";
+"A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it." = "配对可运行 MiniMax-H3（视频），或 Qwen3.8-Flash-Next、DeepSeek-V4.1（聊天）。请在两台 Mac 上都下载其中一个。";

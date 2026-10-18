@@ -45617,7 +45617,7 @@ fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 /// DSpark stages load as `deepseek_v41.dsparkWanted` decides.
 fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
     if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
-    const mdl = try dsv41_mod.init(allocator, &config, weights, s, .{ .dspark = dsv41_mod.dsparkWanted(&config) });
+    const mdl = try dsv41_mod.init(allocator, &config, weights, s, .{ .dspark = dsv41_mod.dsparkWanted(&config), .pair = config.dist_dsv41 });
     errdefer mdl.deinit();
     var t = try moduleShell(allocator, config, s);
     t.dsv41 = mdl;
