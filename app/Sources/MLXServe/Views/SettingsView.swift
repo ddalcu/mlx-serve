@@ -1455,7 +1455,7 @@ private struct ClusterMapView: View {
     var body: some View {
         SearchableRow(searchText: ["Cluster", "machines", "Thunderbolt", "network"], separatorGap: nil) {
             VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .center, spacing: 20) {
+                HStack(alignment: .iconMiddle, spacing: 20) {
                     MachineTile(icon: MachineKind.thisMac.icon, name: thisMac, caption: L10n.text("This Mac"))
                     if let pair {
                         ThunderboltLink(model: pair.model)
@@ -1500,9 +1500,14 @@ private struct ClusterMapView: View {
         switch appState.serverOptions.clusterRole {
         case .host:
             guard let c = server.cluster, c.joined else { return nil }
+            let model = (c.model as NSString).lastPathComponent
+            // The worker names itself when the pair's model first loads; until then, the Mac
+            // the network reaches over the cable.
+            if let other = PairLookup.otherMac(server.lanPeers, workerName: c.workerName) {
+                return (other.name, other.peer.kind, model)
+            }
             let name = c.workerName.isEmpty ? L10n.text("The other Mac") : ClusterVideoAdvice.shortName(c.workerName)
-            let kind = server.lanPeers.first { StoryboardCluster.sameMachine($0.key, c.workerName) }?.value.kind ?? .mac
-            return (name, kind, (c.model as NSString).lastPathComponent)
+            return (name, .mac, model)
         case .worker:
             guard case .ready = worker.state else { return nil }
             // The leader reports its pair's model and that a Mac joined it.
@@ -1538,6 +1543,7 @@ private struct MachineTile: View {
     var body: some View {
         VStack(spacing: 2) {
             Image(nsImage: icon).resizable().interpolation(.high).frame(width: 64, height: 64)
+                .alignmentGuide(.iconMiddle) { $0[VerticalAlignment.center] }
             Text(verbatim: name).font(.app(.body)).lineLimit(1)
             Text(verbatim: caption).font(.app(.caption2)).foregroundStyle(.secondary)
         }
@@ -1556,13 +1562,21 @@ private struct ThunderboltLink: View {
                 Image(systemName: "bolt.fill").font(.system(size: 18, weight: .semibold)).foregroundStyle(Color.accentColor)
                 Rectangle().fill(Color.accentColor.opacity(0.6)).frame(width: 36, height: 2)
             }
+            .alignmentGuide(.iconMiddle) { $0[VerticalAlignment.center] }
             Text("Thunderbolt").font(.app(.caption2)).foregroundStyle(.secondary)
             if !model.isEmpty {
                 Text(verbatim: model).font(.app(.caption)).lineLimit(1).truncationMode(.middle).frame(maxWidth: 180)
             }
         }
-        .padding(.bottom, 30)
     }
+}
+
+extension VerticalAlignment {
+    /// The middle of the machine icons on the Cluster map, where the Thunderbolt line runs.
+    private enum IconMiddle: AlignmentID {
+        static func defaultValue(in d: ViewDimensions) -> CGFloat { d[VerticalAlignment.center] }
+    }
+    fileprivate static let iconMiddle = VerticalAlignment(IconMiddle.self)
 }
 
 /// Video steps: how fast the worker is against this Mac, what that means, and what the last
