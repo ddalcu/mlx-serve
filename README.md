@@ -142,6 +142,8 @@ It goes well beyond text-to-X: photo editing by instruction, image-to-image, ani
 
 ## MLX Core (macOS app)
 
+The model browser opens on **My Models**, with your local library first, followed by Recommended, Discover, Downloads and Media.
+
 Menu-bar app that wraps the server with a full UI:
 
 - **Chat + agent mode:** multi-session chat, PDFs and images, 10 built-in tools with per-tool approvals, an MCP marketplace, prompt-based skills, persistent memory, folder RAG.
