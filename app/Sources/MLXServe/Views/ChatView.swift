@@ -4224,6 +4224,7 @@ enum ContextMonitor {
 
 /// Animated indicator shown while the model is generating, with live GPU and memory stats.
 struct GeneratingIndicator: View {
+    @AppStorage(InterfacePrefKey.showActivityPhrases) var showActivityPhrases = true
     @State private var gpuPercent: Int = 0
     @State private var memPercent: Int = 0
     @State private var whimsy: String = Self.randomWhimsy()
@@ -4246,11 +4247,13 @@ struct GeneratingIndicator: View {
                 .foregroundStyle(.tertiary)
             Text(L10n.format("Mem %lld%%", memPercent))
                 .foregroundStyle(memColor)
-            Text("·")
-                .foregroundStyle(.tertiary)
-            Text(L10n.text(whimsy))
-                .foregroundStyle(.secondary)
-                .transition(.opacity)
+            if showActivityPhrases {
+                Text("·")
+                    .foregroundStyle(.tertiary)
+                Text(L10n.text(whimsy))
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
             Text("·")
                 .foregroundStyle(.tertiary)
             TimelineView(.periodic(from: startDate, by: 1)) { context in
@@ -4292,7 +4295,7 @@ struct GeneratingIndicator: View {
         gpuPercent = Int(SystemMetrics.gpuUtilization())
         memPercent = Int(SystemMetrics.memoryPressure())
         // Rotate whimsy every ~3 seconds
-        if Int(Date().timeIntervalSince(startDate)) % 3 == 0 {
+        if showActivityPhrases && Int(Date().timeIntervalSince(startDate)) % 3 == 0 {
             withAnimation(.easeInOut(duration: 0.3)) {
                 whimsy = Self.randomWhimsy()
             }
