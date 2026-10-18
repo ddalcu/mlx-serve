@@ -918,14 +918,11 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     try rest.appendSlice(allocator, &.{ "--rank", "1" });
     const cfg = try parseArgs(rest.items);
 
-    // The host listens only once its server is up: keep knocking until it is.
-    var link = while (true) break Link.open(io, cfg) catch |err| switch (err) {
-        error.RdmaInitFailed => {
-            log.info("[dist] worker: the host at {s} is not listening yet; retrying\n", .{cfg.coordinator});
-            std.Io.sleep(io, .fromSeconds(3), .real) catch {};
-            continue;
-        },
-        else => return err,
+    // A failed JACCL init leaks its socket, so a retry is a fresh process: the app restarts
+    // the worker a few seconds later (headless: run it under launchd or in a loop).
+    var link = Link.open(io, cfg) catch |err| {
+        if (err == error.RdmaInitFailed) log.info("[dist] worker: the host at {s} is not listening yet; retrying\n", .{cfg.coordinator});
+        return err;
     };
     defer link.deinit();
     var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
