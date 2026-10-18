@@ -184,6 +184,12 @@ enum ThunderboltAddressJob {
             + " && (/bin/launchctl bootout system/\(label) 2>/dev/null; /bin/launchctl bootstrap system '\(plistPath)')"
     }
 
+    /// Puts the role file back in step with the app's role, when the job is in and they differ.
+    static func sync(_ role: ClusterRole) {
+        guard installed, (try? String(contentsOfFile: roleFile, encoding: .utf8)) != role.rawValue else { return }
+        _ = apply(role)
+    }
+
     /// Sets this Mac's role on the cable: the role file once the job is in, else the one
     /// password prompt that installs it. The error text, or nil.
     static func apply(_ role: ClusterRole) -> String? {

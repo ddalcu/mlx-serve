@@ -1050,6 +1050,17 @@ private struct ThunderboltClusterSectionContent: View {
     @Environment(\.settingsSearchQuery) private var query
     @State private var ports: [RdmaPort] = []
     @State private var setupError: String?
+    /// A Pair, Join or Reconnect is waiting for the cable's address.
+    @State private var settingUp = false
+
+    private func pairing(_ action: @escaping @MainActor () async -> String?) {
+        settingUp = true
+        setupError = nil
+        Task {
+            setupError = await action()
+            settingUp = false
+        }
+    }
     /// A Mac on the network that leads a pair and waits for one to join.
     @State private var leader: String?
     @State private var leadInstead = false
@@ -1129,7 +1140,7 @@ private struct ThunderboltClusterSectionContent: View {
                 if let leader, !leadInstead {
                     status(L10n.format("%@ is waiting to pair with this Mac.", leader), "bolt.horizontal.circle", .accentColor)
                     HStack(spacing: 12) {
-                        Button { Task { setupError = await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
+                        Button { pairing { await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
                             Text(L10n.format("Join %@", leader)).font(.app(.body))
                         }
                         .buttonStyle(.borderedProminent)
@@ -1144,7 +1155,7 @@ private struct ThunderboltClusterSectionContent: View {
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             case .reconnect(let role):
                 status(L10n.text("Paired, but the cable needs setting up again after a restart."), "arrow.triangle.2.circlepath", .orange)
-                Button { Task { setupError = await ThunderboltPairing.reconnect(role, appState: appState, ports: ports) } } label: {
+                Button { pairing { await ThunderboltPairing.reconnect(role, appState: appState, ports: ports) } } label: {
                     Text("Reconnect").font(.app(.body))
                 }
                 .buttonStyle(.borderedProminent)
@@ -1159,7 +1170,7 @@ private struct ThunderboltClusterSectionContent: View {
                 } else if let other = server.lanPeers.filter(\.value.waitsForPartner).keys.sorted().first {
                     // Both Macs clicked Pair: one of them has to join the other.
                     status(L10n.format("%@ is also waiting for a Mac to join it.", other), "exclamationmark.triangle", .orange)
-                    Button { Task { setupError = await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
+                    Button { pairing { await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
                         Text(L10n.format("Join %@", other)).font(.app(.body))
                     }
                     .buttonStyle(.borderedProminent)
@@ -1171,10 +1182,16 @@ private struct ThunderboltClusterSectionContent: View {
                 HelperStatus(worker: appState.clusterWorker)
                 unpairButton
             }
-            if let setupError {
+            if settingUp {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Setting up the cable…").font(.app(.caption)).foregroundStyle(.secondary)
+                }
+            } else if let setupError {
                 Text(verbatim: setupError).font(.app(.caption)).foregroundStyle(.red)
             }
         }
+        .disabled(settingUp)
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
@@ -1198,12 +1215,12 @@ private struct ThunderboltClusterSectionContent: View {
             }
             .onAppear { if !models.contains(where: { $0.path == pairModel }) { pairModel = models[0].path } }
             HStack(spacing: 12) {
-                Button { Task { setupError = await ThunderboltPairing.lead(model: pairModel, appState: appState, ports: ports) } } label: {
+                Button { pairing { await ThunderboltPairing.lead(model: pairModel, appState: appState, ports: ports) } } label: {
                     Text("Pair").font(.app(.body))
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(pairModel.isEmpty)
-                Button { Task { setupError = await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
+                Button { pairing { await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
                     Text("Join the Mac that leads instead").font(.app(.caption))
                 }
                 .buttonStyle(.link)

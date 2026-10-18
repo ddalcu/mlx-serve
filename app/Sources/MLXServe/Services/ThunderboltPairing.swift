@@ -8,7 +8,7 @@ import AppKit
 enum ThunderboltPairing {
     /// This Mac leads a pair that runs `model` (a path from the library).
     static func lead(model: String, appState: AppState, ports: [RdmaPort]) async -> String? {
-        if let err = await giveAddress(.host, ports: ports) { return err }
+        if let err = await giveAddress(.host, ports: ports, appState: appState) { return err }
         var o = appState.serverOptions
         o.clusterRole = .host
         o.clusterDevice = ""
@@ -22,7 +22,7 @@ enum ThunderboltPairing {
     /// This Mac joins the Mac that leads at the other end of the cable; a Mac that led
     /// restarts its server without the pair.
     static func join(appState: AppState, ports: [RdmaPort]) async -> String? {
-        if let err = await giveAddress(.worker, ports: ports) { return err }
+        if let err = await giveAddress(.worker, ports: ports, appState: appState) { return err }
         let led = appState.serverOptions.clusterRole == .host
         var o = appState.serverOptions
         o.clusterRole = .worker
@@ -35,7 +35,7 @@ enum ThunderboltPairing {
 
     /// The address a restart took away, for the role this Mac already has.
     static func reconnect(_ role: ClusterRole, appState: AppState, ports: [RdmaPort]) async -> String? {
-        if let err = await giveAddress(role, ports: ports) { return err }
+        if let err = await giveAddress(role, ports: ports, appState: appState) { return err }
         if role == .host { restartServer(appState) }
         return nil
     }
@@ -48,15 +48,17 @@ enum ThunderboltPairing {
     }
 
     /// Sets the role on the cable and waits for the job to give the port its address: the
-    /// server listens on it as soon as it restarts.
-    private static func giveAddress(_ role: ClusterRole, ports: [RdmaPort]) async -> String? {
+    /// server listens on it as soon as it restarts. launchd runs the job at most every 10 s,
+    /// so this can take that long; on failure the cable goes back to the app's role.
+    private static func giveAddress(_ role: ClusterRole, ports: [RdmaPort], appState: AppState) async -> String? {
         guard ports.contains(where: \.active) else { return L10n.text("Connect the Thunderbolt cable first.") }
         if let err = ThunderboltAddressJob.apply(role) { return err }
-        for _ in 0..<40 {
+        for _ in 0..<120 {
             let up = await Task.detached { ClusterSetup.ports() }.value.first(where: \.active)
             if let up, ClusterSetup.ipv4(on: up.interface) == ClusterSetup.linkAddress(role) { return nil }
             try? await Task.sleep(for: .milliseconds(250))
         }
+        _ = ThunderboltAddressJob.apply(appState.serverOptions.clusterRole)
         return L10n.text("The cable did not get its address. Unplug it, plug it back into a Thunderbolt 5 port and try again.")
     }
 
@@ -90,6 +92,7 @@ final class PairInvites {
     }
 
     private func check(_ appState: AppState) async {
+        ThunderboltAddressJob.sync(appState.serverOptions.clusterRole)
         guard appState.serverOptions.clusterRole == .off else { asked.removeAll(); return }
         await appState.server.refreshModelsIfMoved()
         let waiting = Set(appState.server.lanPeers.filter(\.value.waitsForPartner).keys)
