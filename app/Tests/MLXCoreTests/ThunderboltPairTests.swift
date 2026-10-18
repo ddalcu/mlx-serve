@@ -87,4 +87,23 @@ final class ThunderboltPairTests: XCTestCase {
         XCTAssertNil(PairInvites.next(waiting: [], asked: &asked))
         XCTAssertEqual(PairInvites.next(waiting: ["Studio"], asked: &asked), "Studio")
     }
+
+    /// Layers follow free memory, experts split in half, a video model sits whole on both.
+    func testThePairPlanSharesTheModelTheWayTheServerSplitsIt() {
+        let gb: Int64 = 1 << 30
+        let layers = PairPlan.share(bytes: 300 * gb, video: false, mode: .pipeline, freeHere: 200 * gb, freeThere: 100 * gb)
+        XCTAssertEqual(layers.here, 200 * gb)
+        XCTAssertEqual(layers.there, 100 * gb)
+        XCTAssertEqual(PairPlan.share(bytes: 80 * gb, video: false, mode: .tensor, freeHere: 200 * gb, freeThere: 100 * gb).there, 40 * gb)
+        XCTAssertEqual(PairPlan.share(bytes: 30 * gb, video: true, mode: .pipeline, freeHere: 200 * gb, freeThere: 100 * gb).there, 30 * gb)
+        XCTAssertEqual(PairPlan.fit(bytes: 80 * gb, freeHere: 200 * gb, freeThere: nil), .alone)
+        XCTAssertEqual(PairPlan.fit(bytes: 250 * gb, freeHere: 200 * gb, freeThere: 100 * gb), .needsBoth)
+        XCTAssertEqual(PairPlan.fit(bytes: 290 * gb, freeHere: 200 * gb, freeThere: 50 * gb), .tooBig)
+    }
+
+    /// The leader reports whether the worker has the pair's model.
+    func testTheLeaderReportsWhetherTheWorkerHasTheModel() {
+        let c = ClusterInfo.parse(["cluster": ["mode": "pipeline", "model": "Flash", "joined": true, "worker_model": "missing"]])
+        XCTAssertEqual(c?.workerModel, "missing")
+    }
 }

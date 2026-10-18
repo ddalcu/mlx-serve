@@ -1893,7 +1893,8 @@ class DownloadManager: ObservableObject {
                     source: source,
                     kind: .base,
                     quantFile: primaryBase,
-                    quantLabel: quant.label
+                    quantLabel: quant.label,
+                    sizeBytes: Int64(size)
                 )
             }
         }
@@ -1934,6 +1935,7 @@ class DownloadManager: ObservableObject {
             numExperts: meta.numExperts,
             activeExperts: meta.activeExperts,
             hasMtpHead: dirHasMtpHead(atDir: resolved),
+            sizeBytes: Int64(size),
             defect: defect
         )]
     }

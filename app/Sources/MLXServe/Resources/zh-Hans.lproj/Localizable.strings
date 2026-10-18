@@ -2347,3 +2347,13 @@
 "Runs across the two Macs of a Thunderbolt pair." = "在 Thunderbolt 配对的两台 Mac 上一起运行。";
 "This Mac's part, for the Mac that leads" = "本机承担的部分，供主导的 Mac 使用";
 "This Mac's part (%@), for the Mac that leads" = "本机承担的部分（%@），供主导的 Mac 使用";
+"Runs across the two Macs of a Thunderbolt pair. Unpair in Settings ▸ Cluster to unload it." = "在 Thunderbolt 配对的两台 Mac 上一起运行。要卸载，请在“设置 ▸ 集群”中取消配对。";
+"It runs %@, which this Mac doesn't have. Download the same model here, then join from Settings ▸ Cluster." = "它运行的是 %@，本机没有这个模型。请先在本机下载同一个模型，然后在“设置 ▸ 集群”中加入。";
+"Join it, and the two Macs run %@ together." = "加入后，两台 Mac 将一起运行 %@。";
+"It runs %@, which this Mac doesn't have. Download the same model here to join." = "它运行的是 %@，本机没有这个模型。请先在本机下载同一个模型再加入。";
+"%@ doesn't have %@. Download the same model there, then join again." = "%@ 没有 %@。请在那台 Mac 上下载同一个模型，然后重新加入。";
+"%@ has another copy of %@ (a different quantization or revision). Download this one there, then join again." = "%@ 上的 %@ 是另一个版本（不同的量化或修订）。请在那台 Mac 上下载这个版本，然后重新加入。";
+"Fits on this Mac alone. A pair runs it a little slower; pair it only to free memory here." = "这台 Mac 单独就能运行它。配对运行会稍慢一些，只有想腾出本机内存时才需要配对。";
+"Too big for this Mac alone: the pair runs it across both Macs." = "这台 Mac 单独放不下：配对后由两台 Mac 一起运行。";
+"Too big even for both Macs together." = "两台 Mac 加起来也放不下。";
+"About %@ on this Mac and %@ on %@." = "本机约占用 %@，%@ 在 %@ 上。";

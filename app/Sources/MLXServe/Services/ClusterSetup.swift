@@ -229,6 +229,8 @@ struct ClusterInfo: Equatable {
     /// The last video's rows on each Mac; zeros when it ran here alone.
     var splitRows: [Int] = []
     var workerFreeMib: Int = 0
+    /// Whether the worker has the pair's model: "ok", "missing", "different" or "unknown".
+    var workerModel: String = "unknown"
 
     var lastSplit: Bool { splitRows.count == 2 && splitRows[1] > 0 }
 
@@ -249,7 +251,34 @@ struct ClusterInfo: Equatable {
                            linkGbps: (c["link_gbps"] as? NSNumber)?.doubleValue ?? 0,
                            lastJob: c["last_job"] as? String ?? "",
                            splitRows: c["split_rows"] as? [Int] ?? [],
-                           workerFreeMib: c["worker_free_mib"] as? Int ?? 0)
+                           workerFreeMib: c["worker_free_mib"] as? Int ?? 0,
+                           workerModel: c["worker_model"] as? String ?? "unknown")
+    }
+}
+
+/// What pairing a model would put on each Mac, split the way the server splits it: layers by
+/// free memory (`distributed.chooseSplit`), experts half each, a video model whole on both.
+enum PairPlan {
+    enum Fit: Equatable { case alone, needsBoth, tooBig }
+
+    static func share(bytes: Int64, video: Bool, mode: ClusterMode, freeHere: Int64, freeThere: Int64) -> (here: Int64, there: Int64) {
+        if video { return (bytes, bytes) }
+        switch mode {
+        case .tensor:
+            return (bytes / 2, bytes - bytes / 2)
+        case .pipeline:
+            let here = Int64(Double(bytes) * Double(freeHere) / Double(max(freeHere + freeThere, 1)))
+            return (here, bytes - here)
+        }
+    }
+
+    /// Whether the weights fit beside a tenth of headroom on this Mac, on both, or on neither
+    /// (`freeThere` nil: the other Mac's memory is not known yet).
+    static func fit(bytes: Int64, freeHere: Int64, freeThere: Int64?) -> Fit {
+        let need = Double(bytes) * 1.1
+        if need <= Double(freeHere) { return .alone }
+        if let freeThere, need > Double(freeHere + freeThere) { return .tooBig }
+        return .needsBoth
     }
 }
 

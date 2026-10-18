@@ -1057,6 +1057,9 @@ struct LocalModel: Identifiable, Hashable {
     /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
     var quantLabel: String? = nil
 
+    /// The files' size on disk, which `sizeFormatted` prints.
+    var sizeBytes: Int64 = 0
+
     /// Non-nil when this directory cannot serve as a model. See `ModelDefect`.
     /// A defective row is listed so you can see and remove it, and is excluded
     /// from every picker.

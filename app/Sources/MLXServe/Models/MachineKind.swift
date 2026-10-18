@@ -57,6 +57,9 @@ struct LanPeer: Equatable {
     /// The model of a Thunderbolt pair it leads; empty when it leads none.
     let leads: String
     let joined: Bool
+    var url: URL? = nil
+    /// Its free memory, as its server reports it (0 when it does not).
+    var freeBytes: Int64 = 0
 
     /// It leads a pair and waits for a Mac to join it.
     var waitsForPartner: Bool { !leads.isEmpty && !joined }

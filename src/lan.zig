@@ -297,6 +297,8 @@ pub const PeerMachine = struct {
     model: Text(32) = .{},
     leads: Text(128) = .{},
     joined: bool = false,
+    free_mib: u64 = 0,
+    total_mib: u64 = 0,
 
     fn Text(comptime n: usize) type {
         return struct {
@@ -313,6 +315,11 @@ pub const PeerMachine = struct {
         };
     }
 
+    fn mib(v: ?std.json.Value) u64 {
+        const x = v orelse return 0;
+        return if (x == .integer and x.integer > 0) @intCast(x.integer) else 0;
+    }
+
     pub fn parse(alloc: std.mem.Allocator, body: []const u8) PeerMachine {
         var out: PeerMachine = .{};
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return out;
@@ -324,16 +331,19 @@ pub const PeerMachine = struct {
         out.model.set(m.object.get("model"));
         out.leads.set(m.object.get("leads"));
         if (m.object.get("joined")) |j| out.joined = j == .bool and j.bool;
+        out.free_mib = mib(m.object.get("free_mib"));
+        out.total_mib = mib(m.object.get("total_mib"));
         return out;
     }
 };
 
 fn appendPeerAddress(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), display: []const u8, ip4: [4]u8, port: u16, m: *const PeerMachine) !void {
     if (buf.items.len > 0) try buf.append(alloc, ',');
-    try buf.print(alloc, "{{\"name\":{f},\"url\":\"http://{d}.{d}.{d}.{d}:{d}\",\"os\":{f},\"model\":{f},\"leads\":{f},\"joined\":{}}}", .{
+    try buf.print(alloc, "{{\"name\":{f},\"url\":\"http://{d}.{d}.{d}.{d}:{d}\",\"os\":{f},\"model\":{f},\"leads\":{f},\"joined\":{},\"free_mib\":{d},\"total_mib\":{d}}}", .{
         std.json.fmt(display, .{}),             ip4[0], ip4[1], ip4[2], ip4[3], port,
         std.json.fmt(m.os.get(), .{}),          std.json.fmt(m.model.get(), .{}),
         std.json.fmt(m.leads.get(), .{}),       m.joined,
+        m.free_mib,                             m.total_mib,
     });
 }
 
@@ -1667,7 +1677,7 @@ test "a peer that starts leading a pair moves the change count; a plain refetch 
 test "a peer's machine rides from its /v1/models into the app's peer list" {
     const a = std.testing.allocator;
     const m = PeerMachine.parse(a,
-        \\{"object":"list","data":[],"machine":{"os":"macos","model":"Mac16,5","leads":"MiniMax-H3","joined":false}}
+        \\{"object":"list","data":[],"machine":{"os":"macos","model":"Mac16,5","leads":"MiniMax-H3","joined":false,"free_mib":98205,"total_mib":131072}}
     );
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(a);
@@ -1681,5 +1691,6 @@ test "a peer's machine rides from its /v1/models into the app's peer list" {
     try std.testing.expectEqualStrings("http://192.168.137.3:11234", first.get("url").?.string);
     try std.testing.expectEqualStrings("Mac16,5", first.get("model").?.string);
     try std.testing.expectEqualStrings("MiniMax-H3", first.get("leads").?.string);
+    try std.testing.expectEqual(@as(i64, 98205), first.get("free_mib").?.integer);
     try std.testing.expectEqualStrings("", parsed.value.array.items[1].object.get("os").?.string);
 }

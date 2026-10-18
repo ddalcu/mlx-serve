@@ -68,6 +68,24 @@ enum ThunderboltPairing {
     }
 }
 
+/// Where a pair's model is and who the other Mac is, from what the app already knows.
+enum PairLookup {
+    /// Whether this Mac's library holds a model of that folder name (the pair finds it by name).
+    static func has(_ name: String, in models: [LocalModel]) -> Bool {
+        !name.isEmpty && models.contains { ($0.path as NSString).lastPathComponent == name }
+    }
+
+    /// The Mac on the other end of the cable, as the network lists it: the one reached over the
+    /// cable's subnet, else the paired worker by name, else the only other Mac that reports memory.
+    static func otherMac(_ peers: [String: LanPeer], workerName: String) -> (name: String, peer: LanPeer)? {
+        let subnet = ClusterSetup.linkAddress(.host).split(separator: ".").dropLast().joined(separator: ".") + "."
+        if let p = peers.first(where: { $0.value.url?.host?.hasPrefix(subnet) == true }) { return (p.key, p.value) }
+        if !workerName.isEmpty, let p = peers.first(where: { StoryboardCluster.sameMachine($0.key, workerName) }) { return (p.key, p.value) }
+        let macs = peers.filter { $0.value.kind.os == "macos" && $0.value.freeBytes > 0 }
+        return macs.count == 1 ? (macs.first!.key, macs.first!.value) : nil
+    }
+}
+
 /// While this Mac has no pair, watches for a Mac on the network that leads one and waits:
 /// with a Thunderbolt cable in, MLX Serve comes forward and asks to join it, once per leader.
 @MainActor
@@ -94,7 +112,7 @@ final class PairInvites {
     private func check(_ appState: AppState) async {
         ThunderboltAddressJob.sync(appState.serverOptions.clusterRole)
         guard appState.serverOptions.clusterRole == .off else { asked.removeAll(); return }
-        await appState.server.refreshModelsIfMoved()
+        await appState.server.refreshPairState()
         let waiting = Set(appState.server.lanPeers.filter(\.value.waitsForPartner).keys)
         guard let leader = Self.next(waiting: waiting, asked: &asked) else { return }
         let ports = await Task.detached { ClusterSetup.ports() }.value
@@ -102,9 +120,17 @@ final class PairInvites {
         asked.insert(leader)
 
         NSApplication.shared.activate(ignoringOtherApps: true)
+        let model = appState.server.lanPeers[leader]?.leads ?? ""
+        guard PairLookup.has(model, in: appState.localModels) else {
+            let missing = NSAlert()
+            missing.messageText = L10n.format("%@ wants to pair over Thunderbolt", leader)
+            missing.informativeText = L10n.format("It runs %@, which this Mac doesn't have. Download the same model here, then join from Settings ▸ Cluster.", model)
+            missing.runModal()
+            return
+        }
         let alert = NSAlert()
         alert.messageText = L10n.format("%@ wants to pair over Thunderbolt", leader)
-        alert.informativeText = L10n.text("Join it, and the two Macs work on the same jobs together.")
+        alert.informativeText = L10n.format("Join it, and the two Macs run %@ together.", model)
         alert.addButton(withTitle: L10n.text("Join"))
         alert.addButton(withTitle: L10n.text("Not now"))
         guard alert.runModal() == .alertFirstButtonReturn, appState.serverOptions.clusterRole == .off else { return }

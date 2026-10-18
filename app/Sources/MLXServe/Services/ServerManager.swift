@@ -659,10 +659,12 @@ class ServerManager: ObservableObject {
         if moved { await refreshModels() }
     }
 
-    /// Re-reads `/v1/models` only when `/props` says it moved (a load, or a network machine
-    /// coming, going or changing): cheap enough to run in the background.
-    func refreshModelsIfMoved() async {
+    /// The Thunderbolt pair's state from `/props`, and `/v1/models` only when it moved (a load,
+    /// or a network machine coming, going or changing): cheap enough to run in the background,
+    /// where the tray's `/props` ticker does not.
+    func refreshPairState() async {
         guard status == .running, let props = try? await api.fetchProps(port: port) else { return }
+        cluster = props.cluster
         await noteRegistryGeneration(props.registryGeneration)
     }
 

@@ -1107,17 +1107,23 @@ private struct ThunderboltClusterSectionContent: View {
     }
 
     /// The models a pair can run, video first.
+    /// Chat models too big for this Mac alone first (what a pair is for), then the rest.
     private var pairable: [LocalModel] {
         let models = appState.localModels.filter { ClusterSetup.servableTypes.contains($0.modelType) }
-        let video = models.filter { $0.modelType == "minimax_h3" }.sorted { $0.name < $1.name }
-        let chat = models.filter { $0.modelType != "minimax_h3" }.sorted { $0.name < $1.name }
-        return video + chat
+        let here = Int64(SystemMetrics.availableBytes())
+        func needsPair(_ m: LocalModel) -> Bool {
+            m.modelType != "minimax_h3" && PairPlan.fit(bytes: m.sizeBytes, freeHere: here, freeThere: nil) != .alone
+        }
+        return models.sorted { a, b in
+            needsPair(a) != needsPair(b) ? needsPair(a) : a.name < b.name
+        }
     }
 
     /// The cable comes and goes, and a Mac on the network may start leading: look again every few seconds.
     private func watch() async {
         while !Task.isCancelled {
             ports = await Task.detached { ClusterSetup.ports() }.value
+            await server.refreshPairState()
             if case .ready = pair {
                 leader = server.lanPeers.filter(\.value.waitsForPartner).keys.sorted().first
             } else {
@@ -1138,12 +1144,19 @@ private struct ThunderboltClusterSectionContent: View {
                 status(L10n.text("Connect the other Mac to this one with a Thunderbolt 5 cable."), "cable.connector", .secondary)
             case .ready(let leader):
                 if let leader, !leadInstead {
+                    let model = server.lanPeers[leader]?.leads ?? ""
+                    let haveIt = PairLookup.has(model, in: appState.localModels)
                     status(L10n.format("%@ is waiting to pair with this Mac.", leader), "bolt.horizontal.circle", .accentColor)
+                    if !haveIt {
+                        Text(L10n.format("It runs %@, which this Mac doesn't have. Download the same model here to join.", model))
+                            .font(.app(.caption)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
                     HStack(spacing: 12) {
                         Button { pairing { await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
                             Text(L10n.format("Join %@", leader)).font(.app(.body))
                         }
                         .buttonStyle(.borderedProminent)
+                        .disabled(!haveIt)
                         Button { leadInstead = true } label: { Text("Lead from this Mac instead").font(.app(.caption)) }
                             .buttonStyle(.link)
                     }
@@ -1160,7 +1173,12 @@ private struct ThunderboltClusterSectionContent: View {
                 }
                 .buttonStyle(.borderedProminent)
             case .leading(let partner):
-                if let partner {
+                if let partner, let c = server.cluster, c.workerModel == "missing" || c.workerModel == "different" {
+                    status(c.workerModel == "missing"
+                           ? L10n.format("%@ doesn't have %@. Download the same model there, then join again.", partner, c.model)
+                           : L10n.format("%@ has another copy of %@ (a different quantization or revision). Download this one there, then join again.", partner, c.model),
+                           "exclamationmark.triangle", .orange)
+                } else if let partner {
                     status(L10n.format("Paired with %@ for %@.", partner, server.cluster?.model ?? ""), "bolt.horizontal.fill", .green)
                     if let c = server.cluster, c.mode == "rows" {
                         VideoClusterAdviceRow(cluster: c)
@@ -1214,6 +1232,7 @@ private struct ThunderboltClusterSectionContent: View {
                 .labelsHidden().frame(maxWidth: 320)
             }
             .onAppear { if !models.contains(where: { $0.path == pairModel }) { pairModel = models[0].path } }
+            if let m = models.first(where: { $0.path == pairModel }) { pairEstimate(m) }
             HStack(spacing: 12) {
                 Button { pairing { await ThunderboltPairing.lead(model: pairModel, appState: appState, ports: ports) } } label: {
                     Text("Pair").font(.app(.body))
@@ -1232,7 +1251,32 @@ private struct ThunderboltClusterSectionContent: View {
 
     private func pairLabel(_ m: LocalModel) -> String {
         let use: String = m.modelType == "minimax_h3" ? L10n.text("video") : L10n.text("chat")
-        return "\(m.name) · \(use)"
+        return "\(m.name) · \(use) · \(m.sizeFormatted)"
+    }
+
+    /// Whether the model needs the pair at all, and about how much memory each Mac gives it.
+    @ViewBuilder private func pairEstimate(_ m: LocalModel) -> some View {
+        let video = m.modelType == "minimax_h3"
+        let here = Int64(SystemMetrics.availableBytes())
+        let other = PairLookup.otherMac(server.lanPeers, workerName: server.cluster?.workerName ?? "")
+        let there = other.map { $0.peer.freeBytes }
+        let share = PairPlan.share(bytes: m.sizeBytes, video: video, mode: options.clusterMode, freeHere: here, freeThere: there ?? here)
+        let otherName = other?.name ?? L10n.text("the other Mac")
+        VStack(alignment: .leading, spacing: 2) {
+            if !video {
+                switch PairPlan.fit(bytes: m.sizeBytes, freeHere: here, freeThere: there) {
+                case .alone:
+                    Text("Fits on this Mac alone. A pair runs it a little slower; pair it only to free memory here.")
+                case .needsBoth:
+                    Text("Too big for this Mac alone: the pair runs it across both Macs.")
+                case .tooBig:
+                    Text("Too big even for both Macs together.").foregroundStyle(.orange)
+                }
+            }
+            Text(L10n.format("About %@ on this Mac and %@ on %@.",
+                             MemoryInfo.format(share.here), MemoryInfo.format(share.there), otherName))
+        }
+        .font(.app(.caption2)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
 
     private var unpairButton: some View {

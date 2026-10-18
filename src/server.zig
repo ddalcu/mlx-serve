@@ -7615,13 +7615,16 @@ fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool
 }
 
 /// `/v1/models`' "machine" (behind the API key, unlike `/health`): the OS, the device model
-/// id the app draws its icon from, and the Thunderbolt pair this server leads, if any.
+/// id the app draws its icon from, its memory (the pair card's split estimate), and the
+/// Thunderbolt pair this server leads, if any.
 fn machineJson(allocator: std.mem.Allocator) ![]u8 {
     const pair = try @import("distributed.zig").pairFields(allocator);
     defer allocator.free(pair);
     var model_buf: [64]u8 = undefined;
-    return std.fmt.allocPrint(allocator, ",\"machine\":{{\"os\":\"{s}\",\"model\":{f}{s}}}", .{
-        @tagName(builtin.os.tag), std.json.fmt(machineModel(&model_buf), .{}), pair,
+    const status_mod = @import("status.zig");
+    return std.fmt.allocPrint(allocator, ",\"machine\":{{\"os\":\"{s}\",\"model\":{f},\"free_mib\":{d},\"total_mib\":{d}{s}}}", .{
+        @tagName(builtin.os.tag), std.json.fmt(machineModel(&model_buf), .{}),
+        status_mod.getAvailableMemBytes() >> 20, status_mod.getTotalMemBytes() >> 20, pair,
     });
 }
 
@@ -7649,6 +7652,7 @@ test "machineJson names the OS and the device model, as valid JSON" {
     const m = parsed.value.object.get("machine").?.object;
     try std.testing.expectEqualStrings(@tagName(builtin.os.tag), m.get("os").?.string);
     if (builtin.os.tag == .macos) try std.testing.expect(m.get("model").?.string.len > 0);
+    try std.testing.expect(m.get("total_mib").?.integer >= m.get("free_mib").?.integer);
 }
 
 /// A `/v1/models` row with its Model Settings `alias` as the first field; `id`
@@ -8384,6 +8388,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
         },
         error.Shutdown => {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+            return;
+        },
+        error.ModelHeldByPair => {
+            try sendErrorResponse(allocator, stream, "409 Conflict", "held_by_pair", "This model runs across a Thunderbolt pair; unpair to unload it", 409);
             return;
         },
         else => {

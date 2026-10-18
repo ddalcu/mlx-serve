@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const crt = @import("crt.zig");
+const distributed = @import("distributed.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -1301,6 +1302,7 @@ pub const ModelRegistry = struct {
             if (entry.refcount.load(.acquire) != 0) continue;
             if (std.mem.eql(u8, entry.id, exclude_id)) continue;
             if (slot_only and !takesSlot(entry)) continue;
+            if (distributed.holds(entry.path)) continue;
             if (entry.last_used_ns < best_used) {
                 best_used = entry.last_used_ns;
                 best = entry;
@@ -1315,6 +1317,7 @@ pub const ModelRegistry = struct {
     pub fn idleEvictable(entry: *LoadedModel, now_ms: i64, window_ms: i64) bool {
         if (entry.state != .ready) return false;
         if (entry.refcount.load(.acquire) != 0) return false;
+        if (distributed.holds(entry.path)) return false;
         // `now_ms - used` and not `used < deadline`: the boot clock's epoch
         // is arbitrary, so the subtraction is the only meaningful form.
         return now_ms - entry.last_used_ms.load(.acquire) >= window_ms;
@@ -1484,6 +1487,7 @@ pub const ModelRegistry = struct {
             const e = entry_ptr.*;
             if (e.state != .ready or e.refcount.load(.acquire) != 0 or std.mem.eql(u8, e.id, exclude_id)) continue;
             if (e.ds4_engine != null or e.llama_engine != null or n_idle == idle.len) continue;
+            if (distributed.holds(e.path)) continue;
             idle[n_idle] = e;
             n_idle += 1;
             reachable +|= e.bytes_resident;

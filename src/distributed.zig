@@ -268,6 +268,25 @@ const Bell = struct {
         return fd;
     }
 
+    fn writeAll(b: Bell, bytes: []const u8) !void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = std.c.write(b.fd, bytes.ptr + off, bytes.len - off);
+            if (n <= 0) return error.DistPeerGone;
+            off += @intCast(n);
+        }
+    }
+
+    fn readAll(b: Bell, out: []u8) !void {
+        var off: usize = 0;
+        while (off < out.len) {
+            const n = std.c.read(b.fd, out.ptr + off, out.len - off);
+            if (n < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+            if (n <= 0) return error.DistPeerGone;
+            off += @intCast(n);
+        }
+    }
+
     fn ring(b: Bell) !void {
         if (b.fd < 0) return;
         if (std.c.write(b.fd, &[_]u8{1}, 1) != 1) return error.DistPeerGone;
@@ -299,7 +318,7 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC: i32 = 0x4D4C5853; // "MLXS"
-const VERSION: i32 = 4;
+const VERSION: i32 = 5;
 pub const Msg = [8]i32;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP: i32 = 2;
@@ -587,6 +606,9 @@ var peer_slot: ?Peer = null;
 const Group = struct { io: std.Io, allocator: std.mem.Allocator, mode: Mode, model: []const u8, split: ?u32 };
 var group: ?Group = null;
 var joined = std.atomic.Value(bool).init(false);
+/// What the worker said about the group's model when it joined: 0 has it, else NOT_FOUND or
+/// MISMATCH (-1 = not asked: no bell connection).
+var worker_copy = std.atomic.Value(i32).init(-1);
 var joined_link: Link = undefined;
 
 /// The `/props` "cluster" object (with its leading comma), empty when this server is
@@ -594,8 +616,8 @@ var joined_link: Link = undefined;
 pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     if (peer()) |p| return clusterJson(allocator, p);
     const g = group orelse return allocator.dupe(u8, "");
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false}}", .{
-        @tagName(g.mode), std.json.fmt(std.fs.path.basename(g.model), .{}), joined.load(.acquire),
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false,\"worker_model\":\"{s}\"}}", .{
+        @tagName(g.mode), std.json.fmt(std.fs.path.basename(g.model), .{}), joined.load(.acquire), workerCopyName(),
     });
 }
 
@@ -617,12 +639,22 @@ fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     defer last_job_mu.unlock();
     // Rows mode: the worker's speed relative to this Mac and the link, once measured.
     const speed: f64 = if (p.worker_calib_us > 0 and p.host_calib_us > 0) @as(f64, @floatFromInt(p.host_calib_us)) / @as(f64, @floatFromInt(p.worker_calib_us)) else 0;
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}]}}", .{
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}],\"worker_model\":\"{s}\"}}", .{
         @tagName(p.mode), std.json.fmt(std.fs.path.basename(p.model), .{}), p.planned, p.ready, sp.total, sp.start, sp.end,
         if (p.mode == .pipeline) sp.end else 0, sp.total, if (p.shard) |sh| sh.size else 0,
         p.worker.avail_mib, p.worker.total_mib, p.exchanges, std.json.fmt(p.workerName(), .{}) , speed, p.link_bytes_per_us / 1000,
-        std.json.fmt(last_job_buf[0..last_job_len], .{}), last_split[0], last_split[1],
+        std.json.fmt(last_job_buf[0..last_job_len], .{}), last_split[0], last_split[1], workerCopyName(),
     });
+}
+
+/// `/props` cluster "worker_model": whether the worker has the group's model.
+fn workerCopyName() []const u8 {
+    return switch (worker_copy.load(.acquire)) {
+        0 => "ok",
+        NOT_FOUND => "missing",
+        MISMATCH => "different",
+        else => "unknown",
+    };
 }
 
 var last_job_buf: [160]u8 = undefined;
@@ -665,6 +697,12 @@ pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Pa
     return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
 }
 
+/// Whether a Thunderbolt pair holds `model_dir`: the worker joined and holds its part of it,
+/// so nothing here unloads it until the pair ends (Unpair restarts the server).
+pub fn holds(model_dir: []const u8) bool {
+    return joined.load(.acquire) and serves(model_dir);
+}
+
 /// Whether `model_dir` is the model this server's group serves.
 pub fn serves(model_dir: []const u8) bool {
     const g = group orelse return false;
@@ -692,6 +730,15 @@ fn join() !*Peer {
             log.err("[dist] {s} is served with a worker: start `mlx-serve worker` on the other Mac first\n", .{std.fs.path.basename(g.model)});
             return error.DistWorkerNotJoined;
         }
+        switch (worker_copy.load(.acquire)) {
+            NOT_FOUND, MISMATCH => {
+                log.err("[dist] the worker does not have {s}: download the same model there, then join again\n", .{std.fs.path.basename(g.model)});
+                return error.DistWorkerMissingModel;
+            },
+            else => {},
+        }
+        // The worker sends its hello only once rung: JACCL's send polls until this recv is posted.
+        try joined_link.bell.ring();
         const worker = try Hello.parse(try recvMsg(&joined_link, 1));
         var p: Peer = .{ .link = joined_link, .mode = g.mode, .model = g.model, .split = g.split, .worker = worker };
         if (worker.name_len > 0) try recvBytes(&joined_link, p.worker_name_buf[0..@intCast(worker.name_len)], 1);
@@ -758,8 +805,61 @@ fn waitForWorker(io: std.Io, cfg: Config) void {
         log.err("[dist] the cluster link did not open: {s}\n", .{@errorName(err)});
         return;
     };
+    // Asked before `joined`: the inference thread's first ring must not land inside the question.
+    askForModel(&joined_link) catch |err| {
+        log.err("[dist] the worker did not answer about the model ({s}); is it an older mlx-serve?\n", .{@errorName(err)});
+        return;
+    };
     joined.store(true, .release);
     log.info("[dist] worker joined; it loads its part with {s}\n", .{std.fs.path.basename(group.?.model)});
+}
+
+/// Right after the worker joins, over the bell connection (no MLX off the inference thread):
+/// the group's model by name and `modelIdentity`, answered with whether the worker has it.
+fn askForModel(link: *const Link) !void {
+    if (link.bell.fd < 0) return;
+    const g = group.?;
+    const name = std.fs.path.basename(g.model);
+    const id = try modelIdentity(g.io, g.allocator, g.model);
+    var head: [10]u8 = undefined;
+    std.mem.writeInt(u16, head[0..2], @intCast(name.len), .little);
+    std.mem.writeInt(u64, head[2..10], id, .little);
+    try link.bell.writeAll(&head);
+    try link.bell.writeAll(name);
+    var fds = [_]std.posix.pollfd{.{ .fd = link.bell.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    if (try std.posix.poll(&fds, 30_000) == 0) return error.DistNoAnswer;
+    var reply: [1]u8 = undefined;
+    try link.bell.readAll(&reply);
+    worker_copy.store(reply[0], .release);
+    if (reply[0] != 0) log.err("[dist] the worker does not have {s} ({s}): download the same model there, then join again\n", .{ name, workerCopyName() });
+}
+
+/// The worker's side of `askForModel`: looks the model up in its folders and answers.
+fn answerModel(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots: []const []const u8) !bool {
+    if (link.bell.fd < 0) return true;
+    var head: [10]u8 = undefined;
+    try link.bell.readAll(&head);
+    var name_buf: [256]u8 = undefined;
+    const len = std.mem.readInt(u16, head[0..2], .little);
+    if (len == 0 or len > name_buf.len) return error.DistBadMessage;
+    const name = name_buf[0..len];
+    try link.bell.readAll(name);
+    const found = findModel(io, allocator, roots, name, std.mem.readInt(u64, head[2..10], .little)) catch |err| switch (err) {
+        error.DistModelMismatch => {
+            log.err("[dist] worker: {s} here is not the host's copy (quantization or revision)\n", .{name});
+            try link.bell.writeAll(&.{@intCast(MISMATCH)});
+            return false;
+        },
+        else => return err,
+    };
+    if (found) |dir| {
+        allocator.free(dir);
+        try link.bell.writeAll(&.{0});
+        return true;
+    }
+    log.err("[dist] worker: no model named {s} in {s}\n", .{ name, roots[0] });
+    try link.bell.writeAll(&.{@intCast(NOT_FOUND)});
+    return false;
 }
 
 /// The folder named `name` in `roots` (`<root>/<name>` or `<root>/<org>/<name>`) whose
@@ -831,9 +931,15 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const host = std.posix.gethostname(&host_buf) catch "mac";
     const short = host[0..@min(host.len, 64)];
+    if (!try answerModel(io, allocator, &link, roots.items)) {
+        // The host refuses to use this worker; sleep until it leaves (unpair, restart).
+        while (true) try link.bell.wait();
+    }
+    log.info("[dist] worker: joined, waiting for the host to load a model\n", .{});
+    // The host rings when it reads the hello, which it does when it first loads the model.
+    try link.bell.wait();
     try sendMsg(&link, Hello.here(short.len).msg(), 0);
     if (short.len > 0) try sendBytes(&link, short, 0);
-    log.info("[dist] worker: joined, waiting for the host to load a model\n", .{});
     const pmsg = try recvMsg(&link, 0);
     const pl = try Plan.parse(pmsg);
     var name_buf: [256]u8 = undefined;
@@ -1296,4 +1402,72 @@ test "the bell wakes rank 1 once per ring and reports a host that left" {
     _ = std.c.close(host.fd);
     try std.testing.expectError(error.DistPeerGone, worker.wait());
     _ = std.c.close(worker.fd);
+}
+
+test "the worker answers whether it has the host's copy of the model when it joins" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "host/Flash", "worker/Flash", "other/Flash" }, [_][]const u8{ "4bit", "4bit", "8bit" }) |dir, q| {
+        try tmp.dir.createDirPath(io, dir);
+        const cfg = try std.fmt.allocPrint(allocator, "{s}/config.json", .{dir});
+        defer allocator.free(cfg);
+        try tmp.dir.writeFile(io, .{ .sub_path = cfg, .data = q });
+    }
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd)));
+    const base = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(base);
+    const host_model = try std.fmt.allocPrint(allocator, "{s}/host/Flash", .{base});
+    defer allocator.free(host_model);
+    group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = host_model, .split = null };
+    defer group = null;
+    defer worker_copy.store(-1, .release);
+
+    const Case = struct { root: []const u8, want: i32 };
+    for ([_]Case{ .{ .root = "worker", .want = 0 }, .{ .root = "other", .want = MISMATCH }, .{ .root = "nowhere", .want = NOT_FOUND } }) |c| {
+        const coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = 39421 };
+        const listener = Bell.listen(coord);
+        try std.testing.expect(listener >= 0);
+        defer _ = std.c.close(listener);
+        var worker: Link = .{ .group = undefined, .rank = 1, .size = 2, .bell = Bell.connect(coord) };
+        defer _ = std.c.close(worker.bell.fd);
+        var host: Link = .{ .group = undefined, .rank = 0, .size = 2, .bell = Bell.accept(listener) };
+        defer _ = std.c.close(host.bell.fd);
+        const asker = try std.Thread.spawn(.{}, askForModel, .{&host});
+        const root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, c.root });
+        defer allocator.free(root);
+        const has = try answerModel(io, allocator, &worker, &.{root});
+        asker.join();
+        try std.testing.expectEqual(c.want == 0, has);
+        try std.testing.expectEqual(c.want, worker_copy.load(.acquire));
+    }
+}
+
+test "a paired model is never picked to unload while the worker is joined" {
+    const reg_mod = @import("model_registry.zig");
+    var reg = try reg_mod.ModelRegistry.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const flash = try reg.registerStub("Flash", "Flash", 100);
+    const other = try reg.registerStub("other", "other", 100);
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(flash, 100);
+    reg.markReadyLocked(other, 100);
+    reg.mutex.unlock(reg.io);
+    _ = try reg.ensureLoaded("other");
+    reg.release(other); // `other` is now the newest; Flash the oldest
+
+    group = .{ .io = std.testing.io, .allocator = std.testing.allocator, .mode = .pipeline, .model = "/m/Flash", .split = null };
+    defer group = null;
+    joined.store(true, .release);
+    defer joined.store(false, .release);
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try std.testing.expectEqualStrings("other", reg.pickLruEvictable("", false).?.id);
+    try std.testing.expect(!reg_mod.ModelRegistry.idleEvictable(flash, std.math.maxInt(i64), 0));
+    joined.store(false, .release);
+    try std.testing.expectEqualStrings("Flash", reg.pickLruEvictable("", false).?.id);
 }

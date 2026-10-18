@@ -2335,3 +2335,13 @@
 "Runs across the two Macs of a Thunderbolt pair." = "Thunderbolt로 페어링된 두 Mac에서 함께 실행됩니다.";
 "This Mac's part, for the Mac that leads" = "주도하는 Mac을 위해 이 Mac이 맡은 부분";
 "This Mac's part (%@), for the Mac that leads" = "주도하는 Mac을 위해 이 Mac이 맡은 부분(%@)";
+"Runs across the two Macs of a Thunderbolt pair. Unpair in Settings ▸ Cluster to unload it." = "Thunderbolt로 페어링된 두 Mac에서 함께 실행됩니다. 언로드하려면 설정 ▸ 클러스터에서 페어링을 해제하세요.";
+"It runs %@, which this Mac doesn't have. Download the same model here, then join from Settings ▸ Cluster." = "%@을(를) 실행하지만 이 Mac에는 해당 모델이 없습니다. 같은 모델을 다운로드한 후 설정 ▸ 클러스터에서 참여하세요.";
+"Join it, and the two Macs run %@ together." = "참여하면 두 Mac이 %@을(를) 함께 실행합니다.";
+"It runs %@, which this Mac doesn't have. Download the same model here to join." = "%@을(를) 실행하지만 이 Mac에는 해당 모델이 없습니다. 참여하려면 같은 모델을 다운로드하세요.";
+"%@ doesn't have %@. Download the same model there, then join again." = "%@에 %@이(가) 없습니다. 그 Mac에서 같은 모델을 다운로드한 후 다시 참여하세요.";
+"%@ has another copy of %@ (a different quantization or revision). Download this one there, then join again." = "%@에 있는 %@은(는) 다른 버전입니다(양자화 또는 리비전이 다름). 그 Mac에서 이 버전을 다운로드한 후 다시 참여하세요.";
+"Fits on this Mac alone. A pair runs it a little slower; pair it only to free memory here." = "이 Mac 하나로 충분합니다. 페어로 실행하면 조금 느려지므로, 이 Mac의 메모리를 확보하려는 경우에만 페어링하세요.";
+"Too big for this Mac alone: the pair runs it across both Macs." = "이 Mac 하나로는 너무 큽니다. 페어가 두 Mac에 나눠 실행합니다.";
+"Too big even for both Macs together." = "두 Mac을 합쳐도 너무 큽니다.";
+"About %@ on this Mac and %@ on %@." = "이 Mac에 약 %@, %@ 정도는 %@에 놓입니다.";

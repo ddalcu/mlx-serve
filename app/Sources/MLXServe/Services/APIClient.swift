@@ -156,7 +156,9 @@ class APIClient {
         for p in json["lan_peers"] as? [[String: Any]] ?? [] {
             guard let name = p["name"] as? String else { continue }
             peers[name] = LanPeer(kind: MachineKind(os: p["os"] as? String ?? "", model: p["model"] as? String ?? ""),
-                                  leads: p["leads"] as? String ?? "", joined: p["joined"] as? Bool ?? false)
+                                  leads: p["leads"] as? String ?? "", joined: p["joined"] as? Bool ?? false,
+                                  url: (p["url"] as? String).flatMap(URL.init(string:)),
+                                  freeBytes: Int64(p["free_mib"] as? Int ?? 0) << 20)
         }
         return (dataArr.map { parseModelInfo($0) }, json["lan_needs_key"] as? [String] ?? [], peers)
     }

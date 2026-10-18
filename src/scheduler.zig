@@ -2375,7 +2375,13 @@ pub const Scheduler = struct {
                         self.registry.state_cond.waitUncancelable(self.io, &self.registry.mutex);
                         continue :wait;
                     },
-                    .ready => break :wait,
+                    .ready => {
+                        if (@import("distributed.zig").holds(entry.path)) {
+                            self.registry.mutex.unlock(self.io);
+                            return error.ModelHeldByPair;
+                        }
+                        break :wait;
+                    },
                 }
             }
             if (idle_window_ms) |window_ms| {
