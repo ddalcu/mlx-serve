@@ -87,6 +87,19 @@ final class AnePrefillSettingsTests: XCTestCase {
         XCTAssertTrue((field?.explainer ?? "").contains("4-bit"))
     }
 
+    /// `--int8-prefill` mirrors the server default (off): only an explicit on emits, apart from `w8a8`.
+    func testInt8PrefillDefaultsOffAndEmitsOnlyWhenOn() throws {
+        XCTAssertFalse(ServerOptions().int8Prefill)
+        XCTAssertFalse(args().contains("--int8-prefill"))
+        XCTAssertTrue(args { $0.int8Prefill = true }.contains("--int8-prefill"))
+        XCTAssertFalse(args { $0.w8a8 = true }.contains("--int8-prefill"), "the media switch never turns chat lossy")
+        let legacy = #"{"host":"0.0.0.0","port":11234,"w8a8":true}"#.data(using: .utf8)!
+        XCTAssertFalse(try JSONDecoder().decode(ServerOptions.self, from: legacy).int8Prefill)
+        let on = #"{"host":"0.0.0.0","port":11234,"int8Prefill":true}"#.data(using: .utf8)!
+        XCTAssertTrue(try JSONDecoder().decode(ServerOptions.self, from: on).int8Prefill)
+        XCTAssertTrue(ServerOptions.serverFlagFields["int8Prefill"]?.needsRestart ?? false)
+    }
+
     // ── Per-Mac advice (pure: chip brand string + RAM in) ──
 
     func testM4MaxWithEnoughRamGetsNoCaution() {
