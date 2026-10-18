@@ -557,6 +557,8 @@ class AppState: ObservableObject {
     /// Runs unattended scheduled/on-demand agent tasks (the "claw" spine). Lazily
     /// created so it only spins up the first time the Tasks window is opened.
     lazy var taskScheduler = TaskScheduler(appState: self)
+    /// Asks to join a Mac on the network that waits for a Thunderbolt pair.
+    let pairInvites = PairInvites()
 
     /// The persistent, window-independent voice assistant. Owned here (not in a
     /// view) so it survives chat-window open/close and runs from the menu-bar
@@ -640,6 +642,7 @@ class AppState: ObservableObject {
         // route back here to resume paused runs / deep-link into the Tasks window.
         TaskNotifier.shared.appState = self
         taskScheduler.start()
+        if Bundle.main.bundleURL.pathExtension == "app" { pairInvites.start(appState: self) }
         if ProcessInfo.processInfo.environment["TESTING_MODE"] != nil {
             testServer.start(appState: self)
         }

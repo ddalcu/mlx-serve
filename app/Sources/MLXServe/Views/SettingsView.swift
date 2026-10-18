@@ -1156,6 +1156,13 @@ private struct ThunderboltClusterSectionContent: View {
                     } else if let c = server.cluster, c.planned, c.layers > 0 {
                         ClusterSplitBar(cluster: c)
                     }
+                } else if let other = server.lanPeers.filter(\.value.waitsForPartner).keys.sorted().first {
+                    // Both Macs clicked Pair: one of them has to join the other.
+                    status(L10n.format("%@ is also waiting for a Mac to join it.", other), "exclamationmark.triangle", .orange)
+                    Button { Task { setupError = await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
+                        Text(L10n.format("Join %@", other)).font(.app(.body))
+                    }
+                    .buttonStyle(.borderedProminent)
                 } else {
                     status(L10n.text("Waiting for the other Mac. On it, open Settings ▸ Cluster and click Join."), "hourglass", .secondary)
                 }

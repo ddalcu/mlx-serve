@@ -337,6 +337,14 @@ fn appendPeerAddress(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), display:
     });
 }
 
+/// Whether a refetched peer shows the app the same thing it did.
+fn samePeerView(old: *const Peer, models: []const PeerModel, needs_key: bool, m: *const PeerMachine) bool {
+    if (old.models.len != models.len or old.needs_key != needs_key or old.machine.joined != m.joined) return false;
+    for (old.models, models) |a, b| if (!std.mem.eql(u8, a.id, b.id)) return false;
+    return std.mem.eql(u8, old.machine.leads.get(), m.leads.get()) and
+        std.mem.eql(u8, old.machine.os.get(), m.os.get()) and std.mem.eql(u8, old.machine.model.get(), m.model.get());
+}
+
 const Peer = struct {
     display: []u8, // sanitized instance name — also the hash key
     ip4: [4]u8,
@@ -410,6 +418,9 @@ pub const Lan = struct {
     /// micro critical section (same rationale as log.zig's sink_mutex).
     mu: os_mutex.Mutex = .{},
     peers: std.StringHashMap(Peer),
+    /// Moves whenever a peer comes, goes, or changes its models or machine: the app re-reads
+    /// `/v1/models` when `/props` "registry_generation" (which includes this) moves.
+    changes: std.atomic.Value(u64) = .init(0),
     /// Set by `pokeDiscovery` (conn threads); consumed by the browser loop.
     refresh_asap: std.atomic.Value(bool) = .init(false),
     // Browser-thread only (events + refresh both run there — no lock):
@@ -596,6 +607,7 @@ pub const Lan = struct {
         if (l.peers.fetchRemove(display)) |kv| {
             var p = kv.value;
             p.deinit(l.alloc);
+            _ = l.changes.fetchAdd(1, .monotonic);
         }
     }
 
@@ -606,10 +618,13 @@ pub const Lan = struct {
         };
         l.mu.lock();
         defer l.mu.unlock();
+        var moved = true;
         if (l.peers.fetchRemove(display)) |kv| {
             var old = kv.value;
+            moved = !samePeerView(&old, models, needs_key, &machine);
             old.deinit(l.alloc);
         }
+        if (moved) _ = l.changes.fetchAdd(1, .monotonic);
         const p = Peer{ .display = owned, .ip4 = ip4, .port = port, .models = models, .needs_key = needs_key, .machine = machine };
         l.peers.put(p.display, p) catch {
             var tmp = p;
@@ -1628,6 +1643,25 @@ test "lan: discovery sends the peer's key, and a keyed peer's 401 reads as Unaut
     defer freePeerModels(a, models);
     try t.expectEqual(@as(usize, 1), models.len);
     try t.expectEqualStrings("gemma", models[0].id);
+}
+
+test "a peer that starts leading a pair moves the change count; a plain refetch does not" {
+    const a = std.testing.allocator;
+    var l = Lan{ .alloc = a, .port = 0, .discover = true, .peers = .init(a), .known = .init(a) };
+    defer {
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| p.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+    l.installPeer("M4Max", .{ 127, 0, 0, 1 }, 1, &.{}, false, .{});
+    const first = l.changes.load(.monotonic);
+    l.installPeer("M4Max", .{ 127, 0, 0, 1 }, 1, &.{}, false, .{});
+    try std.testing.expectEqual(first, l.changes.load(.monotonic));
+    l.installPeer("M4Max", .{ 127, 0, 0, 1 }, 1, &.{}, false, PeerMachine.parse(a,
+        \\{"machine":{"os":"macos","leads":"Flash","joined":false}}
+    ));
+    try std.testing.expect(l.changes.load(.monotonic) > first);
 }
 
 test "a peer's machine rides from its /v1/models into the app's peer list" {

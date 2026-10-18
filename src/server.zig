@@ -8713,9 +8713,11 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
 
 /// `ModelRegistry.generation`: moves with every model added and every load state change (not with
 /// provider or LAN rows).
+/// Moves whenever `/v1/models` would list something else: the registry or a LAN peer.
 fn registryGeneration() u64 {
-    const reg = global_registry orelse return 0;
-    return reg.generation.load(.monotonic);
+    const reg: u64 = if (global_registry) |r| r.generation.load(.monotonic) else 0;
+    const lan: u64 = if (g_lan) |l| l.changes.load(.monotonic) else 0;
+    return reg +% lan;
 }
 
 /// The registry's residency bill: the weights of every ready model, media ones included.

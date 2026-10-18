@@ -2337,3 +2337,9 @@
 "Could not set up the cable." = "无法设置线缆。";
 "The first time, macOS asks for your password to set up the cable. It stays set up after restarts." = "第一次设置线缆时，macOS 会要求输入密码。重启后设置仍然保留。";
 "Gives the port its cluster address; the first time macOS asks for your password, and it stays set up after restarts." = "为端口设置集群地址；第一次 macOS 会要求输入密码，重启后设置仍然保留。";
+"%@ is also waiting for a Mac to join it." = "%@ 也在等待另一台 Mac 加入。";
+"%@ wants to pair over Thunderbolt" = "%@ 想通过 Thunderbolt 配对";
+"Join it, and the two Macs work on the same jobs together." = "加入后，两台 Mac 将一起处理同一个任务。";
+"Not now" = "以后再说";
+"Could not join" = "无法加入";
+"Join" = "加入";

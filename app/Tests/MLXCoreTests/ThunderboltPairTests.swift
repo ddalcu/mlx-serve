@@ -77,4 +77,14 @@ final class ThunderboltPairTests: XCTestCase {
         XCTAssertTrue(cmd.contains("launchctl bootstrap system"))
         XCTAssertTrue(cmd.contains("printf host"))
     }
+
+    /// One dialog per leader while it waits; a leader that stops waiting and waits again asks again.
+    func testEachWaitingLeaderIsAskedAboutOnce() {
+        var asked: Set<String> = []
+        XCTAssertEqual(PairInvites.next(waiting: ["Studio"], asked: &asked), "Studio")
+        asked.insert("Studio")
+        XCTAssertNil(PairInvites.next(waiting: ["Studio"], asked: &asked))
+        XCTAssertNil(PairInvites.next(waiting: [], asked: &asked))
+        XCTAssertEqual(PairInvites.next(waiting: ["Studio"], asked: &asked), "Studio")
+    }
 }

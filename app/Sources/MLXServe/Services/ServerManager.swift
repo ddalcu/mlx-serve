@@ -639,9 +639,7 @@ class ServerManager: ObservableObject {
             specCost = props.specCost
             batching = props.batching
             cluster = props.cluster
-            let moved = Self.modelListMoved(seen: seenRegistryGeneration, reported: props.registryGeneration)
-            seenRegistryGeneration = props.registryGeneration ?? seenRegistryGeneration
-            if moved { await refreshModels() }
+            await noteRegistryGeneration(props.registryGeneration)
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {
@@ -653,6 +651,19 @@ class ServerManager: ObservableObject {
         // `/v1/models` reads every model's config, so it is re-read only when
         // `registry_generation` says a load, unload or eviction (from any
         // client) has changed it.
+    }
+
+    private func noteRegistryGeneration(_ reported: UInt64?) async {
+        let moved = Self.modelListMoved(seen: seenRegistryGeneration, reported: reported)
+        seenRegistryGeneration = reported ?? seenRegistryGeneration
+        if moved { await refreshModels() }
+    }
+
+    /// Re-reads `/v1/models` only when `/props` says it moved (a load, or a network machine
+    /// coming, going or changing): cheap enough to run in the background.
+    func refreshModelsIfMoved() async {
+        guard status == .running, let props = try? await api.fetchProps(port: port) else { return }
+        await noteRegistryGeneration(props.registryGeneration)
     }
 
     /// Whether the registry changed since the last `/props`: the first reading only records it
