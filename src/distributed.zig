@@ -11,6 +11,7 @@ const model_mod = @import("model.zig");
 const status = @import("status.zig");
 const transformer_mod = @import("transformer.zig");
 const h3_split = @import("h3_split.zig");
+const lan = @import("lan.zig");
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
@@ -137,6 +138,7 @@ pub const Link = struct {
     group: mlx.mlx_distributed_group,
     rank: u32,
     size: u32,
+    bell: Bell = .{},
 
     /// Joins the group. Blocks until every rank has connected to the coordinator.
     pub fn open(io: std.Io, cfg: Config) !Link {
@@ -163,19 +165,28 @@ pub const Link = struct {
         crt.setEnv("MLX_JACCL_COORDINATOR", try std.fmt.bufPrintSentinel(&coord_buf, "{s}", .{cfg.coordinator}, 0));
         crt.setEnv("MLX_IBV_DEVICES", path);
         log.info("[dist] joining as rank {d}/{d} via {s}, coordinator {s}\n", .{ cfg.rank, cfg.size, cfg.device, cfg.coordinator });
+        // Rank 0 listens for the bell before the group forms, so rank 1 finds it once it does.
+        const coord = try parseCoordinator(cfg.coordinator);
+        const listener: std.c.fd_t = if (cfg.rank == 0) Bell.listen(coord) else -1;
+        defer if (listener >= 0) {
+            _ = std.c.close(listener);
+        };
         var g = mlx.mlx_distributed_group_new();
         mlx.check(mlx.mlx_distributed_init(&g, true, "jaccl")) catch {
             var eb: [512]u8 = undefined;
             log.err("[dist] JACCL init failed: {s}\n", .{mlx.takeError(&eb) orelse "unknown"});
             return error.RdmaInitFailed;
         };
-        const link: Link = .{ .group = g, .rank = @intCast(mlx.mlx_distributed_group_rank(g)), .size = @intCast(mlx.mlx_distributed_group_size(g)) };
+        var link: Link = .{ .group = g, .rank = @intCast(mlx.mlx_distributed_group_rank(g)), .size = @intCast(mlx.mlx_distributed_group_size(g)) };
         if (link.rank != cfg.rank or link.size != cfg.size) return error.RdmaGroupMismatch;
+        link.bell = if (link.rank == 0) Bell.accept(listener) else Bell.connect(coord);
+        if (link.bell.fd < 0) log.warn("[dist] no bell connection: the worker waits on the RDMA link, one core busy\n", .{});
         log.info("[dist] joined: rank {d} of {d}\n", .{ link.rank, link.size });
         return link;
     }
 
     pub fn deinit(self: *Link) void {
+        if (self.bell.fd >= 0) _ = std.c.close(self.bell.fd);
         _ = mlx.mlx_distributed_group_free(self.group);
     }
 
@@ -217,10 +228,78 @@ pub const Link = struct {
     }
 };
 
+/// A plain TCP connection beside the RDMA link, on the coordinator's port + 1. Rank 0 writes
+/// one byte before each control message and rank 1 sleeps on it before receiving one: JACCL
+/// waits by polling the link in a loop, which held a core at 100% while the worker idled.
+const Bell = struct {
+    fd: std.c.fd_t = -1,
+
+    fn listen(coord: Coordinator) std.c.fd_t {
+        const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (fd < 0) return -1;
+        const one: c_int = 1;
+        _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &one, @sizeOf(c_int));
+        var sa: std.posix.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, coord.port +% 1), .addr = @bitCast(coord.ip4) };
+        if (std.c.bind(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in)) != 0 or std.c.listen(fd, 1) != 0) {
+            _ = std.c.close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
+    /// Rank 1 connects right after the group forms; it waits up to 10 s.
+    fn accept(listener: std.c.fd_t) Bell {
+        if (listener < 0) return .{};
+        var fds = [_]std.posix.pollfd{.{ .fd = listener, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 10_000) catch return .{};
+        if (ready == 0) return .{};
+        const fd = std.c.accept(listener, null, null);
+        return .{ .fd = if (fd < 0) -1 else noDelay(fd) };
+    }
+
+    fn connect(coord: Coordinator) Bell {
+        const fd = lan.connectTimeout(coord.ip4, coord.port +% 1, 3000) catch return .{};
+        return .{ .fd = noDelay(fd) };
+    }
+
+    fn noDelay(fd: std.c.fd_t) std.c.fd_t {
+        const one: c_int = 1;
+        _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &one, @sizeOf(c_int));
+        return fd;
+    }
+
+    fn ring(b: Bell) !void {
+        if (b.fd < 0) return;
+        if (std.c.write(b.fd, &[_]u8{1}, 1) != 1) return error.DistPeerGone;
+    }
+
+    fn wait(b: Bell) !void {
+        if (b.fd < 0) return;
+        var x: [1]u8 = undefined;
+        while (true) {
+            const n = std.c.read(b.fd, &x, 1);
+            if (n == 1) return;
+            if (n < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+            return error.DistPeerGone;
+        }
+    }
+};
+
+const Coordinator = struct { ip4: [4]u8, port: u16 };
+
+fn parseCoordinator(text: []const u8) !Coordinator {
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.DistBadCoordinator;
+    var out: Coordinator = .{ .ip4 = undefined, .port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.DistBadCoordinator };
+    var it = std.mem.splitScalar(u8, text[0..colon], '.');
+    for (&out.ip4) |*b| b.* = std.fmt.parseInt(u8, it.next() orelse return error.DistBadCoordinator, 10) catch return error.DistBadCoordinator;
+    if (it.next() != null) return error.DistBadCoordinator;
+    return out;
+}
+
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC: i32 = 0x4D4C5853; // "MLXS"
-const VERSION: i32 = 3;
+const VERSION: i32 = 4;
 pub const Msg = [8]i32;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP: i32 = 2;
@@ -250,6 +329,7 @@ pub fn recvNow(link: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, sr
 }
 
 fn sendMsg(link: *const Link, m: Msg, dst: u32) !void {
+    if (link.rank == 0) try link.bell.ring();
     const shape = [_]c_int{8};
     const a = mlx.mlx_array_new_data(&m, &shape, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
@@ -259,6 +339,7 @@ fn sendMsg(link: *const Link, m: Msg, dst: u32) !void {
 }
 
 fn recvMsg(link: *const Link, src: u32) !Msg {
+    if (link.rank == 1) try link.bell.wait();
     const r = try link.recv(&.{8}, .int32, src);
     defer _ = mlx.mlx_array_free(r);
     try evalOne(r);
@@ -424,6 +505,7 @@ pub const Peer = struct {
         const shape = [_]c_int{8};
         const hdr = mlx.mlx_array_new_data(&hdr_host, &shape, 1, .int32);
         defer _ = mlx.mlx_array_free(hdr);
+        try self.link.bell.ring();
         var last = try self.link.send(hdr, 1);
         defer _ = mlx.mlx_array_free(last);
         for (payload) |p| {
@@ -1187,4 +1269,31 @@ test "a plan made for one copy refuses another folder of the same name" {
     p.plan_id = try modelIdentity(io, allocator, a);
     try p.samePlannedCopy(a);
     try std.testing.expectError(error.DistModelMismatch, p.samePlannedCopy(b));
+}
+
+test "parseCoordinator reads the host's address and port" {
+    const c = try parseCoordinator("10.254.77.1:32323");
+    try std.testing.expectEqual([4]u8{ 10, 254, 77, 1 }, c.ip4);
+    try std.testing.expectEqual(@as(u16, 32323), c.port);
+    try std.testing.expectError(error.DistBadCoordinator, parseCoordinator("10.254.77:32323"));
+    try std.testing.expectError(error.DistBadCoordinator, parseCoordinator("10.254.77.1"));
+}
+
+test "the bell wakes rank 1 once per ring and reports a host that left" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    const coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = 39411 };
+    const listener = Bell.listen(coord);
+    try std.testing.expect(listener >= 0);
+    defer _ = std.c.close(listener);
+    const worker = Bell.connect(coord);
+    try std.testing.expect(worker.fd >= 0);
+    const host = Bell.accept(listener);
+    try std.testing.expect(host.fd >= 0);
+    try host.ring();
+    try host.ring();
+    try worker.wait();
+    try worker.wait();
+    _ = std.c.close(host.fd);
+    try std.testing.expectError(error.DistPeerGone, worker.wait());
+    _ = std.c.close(worker.fd);
 }

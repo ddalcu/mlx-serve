@@ -1074,7 +1074,7 @@ const fd_t = std.c.fd_t;
 
 /// Non-blocking connect with a real deadline: a blocking connect to a
 /// powered-off host can hang for the kernel's full SYN-retry budget (~75 s).
-fn connectTimeout(ip4: [4]u8, port: u16, timeout_ms: i32) !fd_t {
+pub fn connectTimeout(ip4: [4]u8, port: u16, timeout_ms: i32) !fd_t {
     const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return error.PeerUnreachable;
     errdefer _ = std.c.close(fd);
