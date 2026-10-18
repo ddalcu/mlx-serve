@@ -2313,7 +2313,6 @@
 "Turn on finding network models below to see your other machines." = "在下方开启查找网络模型，即可看到你的其他机器。";
 "The other Mac" = "另一台 Mac";
 "The Mac that leads" = "主导的 Mac";
-"Together they run %@." = "它们一起运行 %@。";
 "This Mac + %@" = "这台 Mac + %@";
 "%@: shots %@" = "%@：镜头 %@";
 "Renders on %@, over your network." = "在 %@ 上渲染，通过你的网络。";
@@ -2343,3 +2342,4 @@
 "Not now" = "以后再说";
 "Could not join" = "无法加入";
 "Join" = "加入";
+"Paired" = "已配对";

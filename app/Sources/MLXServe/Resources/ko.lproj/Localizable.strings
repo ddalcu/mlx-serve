@@ -2301,7 +2301,6 @@
 "Turn on finding network models below to see your other machines." = "다른 컴퓨터를 보려면 아래에서 네트워크 모델 찾기를 켜세요.";
 "The other Mac" = "다른 Mac";
 "The Mac that leads" = "주도하는 Mac";
-"Together they run %@." = "둘이 함께 %@을(를) 실행합니다.";
 "This Mac + %@" = "이 Mac + %@";
 "%@: shots %@" = "%@: 샷 %@";
 "Renders on %@, over your network." = "네트워크를 통해 %@에서 렌더링합니다.";
@@ -2331,3 +2330,4 @@
 "Not now" = "나중에";
 "Could not join" = "참여할 수 없음";
 "Join" = "참여";
+"Paired" = "페어링됨";

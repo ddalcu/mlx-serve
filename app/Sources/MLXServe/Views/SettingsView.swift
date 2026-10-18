@@ -1395,9 +1395,9 @@ private struct ClusterMapView: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .center, spacing: 20) {
                     MachineTile(icon: MachineKind.thisMac.icon, name: thisMac, caption: L10n.text("This Mac"))
-                    if let partner {
-                        ThunderboltLink()
-                        MachineTile(icon: partnerKind.icon, name: partner, caption: L10n.text("Thunderbolt"))
+                    if let pair {
+                        ThunderboltLink(model: pair.model)
+                        MachineTile(icon: pair.kind.icon, name: pair.name, caption: L10n.text("Paired"))
                     }
                 }
                 if let together {
@@ -1433,30 +1433,28 @@ private struct ClusterMapView: View {
         return n.isEmpty ? (Host.current().localizedName ?? L10n.text("This Mac")) : n
     }
 
-    /// The Mac on the other end of the cable, once paired.
-    private var partner: String? {
+    /// The Mac on the other end of the cable once paired, and the model the two run.
+    private var pair: (name: String, kind: MachineKind, model: String)? {
         switch appState.serverOptions.clusterRole {
         case .host:
             guard let c = server.cluster, c.joined else { return nil }
-            return c.workerName.isEmpty ? L10n.text("The other Mac") : ClusterVideoAdvice.shortName(c.workerName)
+            let name = c.workerName.isEmpty ? L10n.text("The other Mac") : ClusterVideoAdvice.shortName(c.workerName)
+            let kind = server.lanPeers.first { StoryboardCluster.sameMachine($0.key, c.workerName) }?.value.kind ?? .mac
+            return (name, kind, (c.model as NSString).lastPathComponent)
         case .worker:
-            if case .ready = worker.state { return L10n.text("The Mac that leads") }
-            return nil
+            guard case .ready = worker.state else { return nil }
+            // The leader reports its pair's model and that a Mac joined it.
+            guard let (name, peer) = server.lanPeers.first(where: { !$0.value.leads.isEmpty && $0.value.joined })
+                .map({ ($0.key, $0.value) }) else { return (L10n.text("The Mac that leads"), .mac, "") }
+            return (name, peer.kind, peer.leads)
         case .off:
             return nil
         }
     }
 
-    /// The paired Mac's kind, when it also shows up on the network.
-    private var partnerKind: MachineKind {
-        guard let name = server.cluster?.workerName, !name.isEmpty else { return .mac }
-        return server.lanPeers.first { StoryboardCluster.sameMachine($0.key, name) }?.value.kind ?? .mac
-    }
-
     /// What the pair does for one video.
     private var together: String? {
-        guard let c = server.cluster, c.joined else { return nil }
-        guard c.mode == "rows" else { return L10n.format("Together they run %@.", c.model) }
+        guard let c = server.cluster, c.joined, c.mode == "rows" else { return nil }
         return ClusterVideoAdvice.of(c).text(worker: c.workerName)
     }
 
@@ -1464,7 +1462,7 @@ private struct ClusterMapView: View {
     private var networkMachines: [String] {
         var names = Set(server.lanPeers.keys)
         names.formUnion(server.allModels.compactMap(\.lanPeer))
-        if let c = server.cluster, c.joined { names = names.filter { !StoryboardCluster.sameMachine($0, c.workerName) } }
+        if let pair { names = names.filter { !StoryboardCluster.sameMachine($0, pair.name) } }
         return names.sorted()
     }
 }
@@ -1485,13 +1483,21 @@ private struct MachineTile: View {
     }
 }
 
-/// The cable between the two paired Macs.
+/// The cable between the two paired Macs, with the model they run together.
 private struct ThunderboltLink: View {
+    let model: String
+
     var body: some View {
-        HStack(spacing: 4) {
-            Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 28, height: 2)
-            Image(systemName: "bolt.fill").font(.app(.caption)).foregroundStyle(.secondary)
-            Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 28, height: 2)
+        VStack(spacing: 4) {
+            HStack(spacing: 6) {
+                Rectangle().fill(Color.accentColor.opacity(0.6)).frame(width: 36, height: 2)
+                Image(systemName: "bolt.fill").font(.system(size: 18, weight: .semibold)).foregroundStyle(Color.accentColor)
+                Rectangle().fill(Color.accentColor.opacity(0.6)).frame(width: 36, height: 2)
+            }
+            Text("Thunderbolt").font(.app(.caption2)).foregroundStyle(.secondary)
+            if !model.isEmpty {
+                Text(verbatim: model).font(.app(.caption)).lineLimit(1).truncationMode(.middle).frame(maxWidth: 180)
+            }
         }
         .padding(.bottom, 30)
     }
