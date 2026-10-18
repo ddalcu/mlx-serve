@@ -504,6 +504,12 @@ struct ServerOptions: Codable, Equatable {
 
     /// Compares only fields that affect the launched mlx-serve process, ignoring
     /// per-request defaults.
+    /// The cluster fields the server's flags read: a host's only (a worker is its own process).
+    private var hostCluster: [String]? {
+        guard clusterRole == .host else { return nil }
+        return [clusterMode.rawValue, clusterModelPath, clusterDevice, clusterCoordinator]
+    }
+
     func serverLaunchEquals(_ other: ServerOptions) -> Bool {
         host == other.host &&
         port == other.port &&
@@ -520,11 +526,7 @@ struct ServerOptions: Codable, Equatable {
         lanSharedModels == other.lanSharedModels &&
         lanDiscoverEnabled == other.lanDiscoverEnabled &&
         lanName == other.lanName &&
-        clusterRole == other.clusterRole &&
-        clusterMode == other.clusterMode &&
-        clusterModelPath == other.clusterModelPath &&
-        clusterDevice == other.clusterDevice &&
-        clusterCoordinator == other.clusterCoordinator &&
+        hostCluster == other.hostCluster &&
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&

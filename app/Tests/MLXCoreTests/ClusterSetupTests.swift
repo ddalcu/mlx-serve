@@ -66,6 +66,22 @@ final class ClusterSetupTests: XCTestCase {
         XCTAssertNil(ClusterSetup.workerArgs(o, modelDirs: [], ports: { [] }))
     }
 
+    /// Joining or leaving as the worker changes no server flag, so it asks for no restart;
+    /// becoming or changing the host does.
+    func testOnlyTheHostsClusterFieldsNeedARestart() {
+        let off = ServerOptions()
+        var worker = off
+        worker.clusterRole = .worker
+        worker.clusterCoordinator = "10.254.77.1"
+        XCTAssertTrue(off.serverLaunchEquals(worker))
+        var host = off
+        host.clusterRole = .host
+        XCTAssertFalse(off.serverLaunchEquals(host))
+        var other = host
+        other.clusterModelPath = "/m/Other"
+        XCTAssertFalse(host.serverLaunchEquals(other))
+    }
+
     /// The default launch carries no cluster flag.
     func testDefaultLaunchHasNoClusterFlags() {
         XCTAssertFalse(ServerOptions().toCLIArgs(modelDirs: []).contains("--dist"))
