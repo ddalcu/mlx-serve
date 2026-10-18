@@ -766,6 +766,7 @@ pub fn holds(model_dir: []const u8) bool {
 
 /// Whether `model_dir` is the model this server's group serves.
 pub fn serves(model_dir: []const u8) bool {
+    if (comptime builtin.os.tag != .macos) return false; // a cluster exists only on macOS
     const g = group orelse return false;
     return samePath(g.model, model_dir);
 }
