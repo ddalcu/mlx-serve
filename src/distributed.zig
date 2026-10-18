@@ -504,16 +504,15 @@ pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     });
 }
 
-/// `/health`, which any machine on the network may read: when this server leads a
-/// Thunderbolt pair, its model and whether the other Mac has joined, so that Mac's app
-/// can offer to join it.
-pub fn healthJson(allocator: std.mem.Allocator) ![]u8 {
-    const g = group orelse return allocator.dupe(u8, "{\"status\":\"ok\"}");
-    return pairHealthJson(allocator, std.fs.path.basename(g.model), joined.load(.acquire));
+/// `/health`'s Thunderbolt field (with its leading comma), empty unless this server leads a
+/// pair: its model and whether the other Mac has joined, so that Mac's app can offer to join.
+pub fn healthField(allocator: std.mem.Allocator) ![]u8 {
+    const g = group orelse return allocator.dupe(u8, "");
+    return pairHealthField(allocator, std.fs.path.basename(g.model), joined.load(.acquire));
 }
 
-fn pairHealthJson(allocator: std.mem.Allocator, model: []const u8, has_joined: bool) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"status\":\"ok\",\"thunderbolt\":{{\"leads\":{f},\"joined\":{}}}}}", .{
+fn pairHealthField(allocator: std.mem.Allocator, model: []const u8, has_joined: bool) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"thunderbolt\":{{\"leads\":{f},\"joined\":{}}}", .{
         std.json.fmt(model, .{}), has_joined,
     });
 }
@@ -1140,9 +1139,11 @@ test "findModel pairs the host's copy of a name, not another quantization of it"
     try std.testing.expect((try findModel(io, allocator, &.{root}, "Other", 42)) == null);
 }
 
-test "healthJson names the model a Thunderbolt pair leads, as valid JSON" {
+test "healthField names the model a Thunderbolt pair leads, as valid JSON" {
     const a = std.testing.allocator;
-    const j = try pairHealthJson(a, "MiniMax \"H3\"", false);
+    const f = try pairHealthField(a, "MiniMax \"H3\"", false);
+    defer a.free(f);
+    const j = try std.fmt.allocPrint(a, "{{\"status\":\"ok\"{s}}}", .{f});
     defer a.free(j);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
     defer parsed.deinit();

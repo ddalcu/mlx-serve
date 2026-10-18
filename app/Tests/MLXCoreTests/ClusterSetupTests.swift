@@ -45,6 +45,16 @@ final class ClusterSetupTests: XCTestCase {
         XCTAssertEqual(args?[2], "10.254.77.1:32323")
     }
 
+    /// A self-assigned 169.254 address is the Thunderbolt Bridge's, never the pair's: the
+    /// worker dials the pair's host address until the cable is set up.
+    func testWorkerIgnoresASelfAssignedAddress() {
+        var o = ServerOptions()
+        o.clusterRole = .worker
+        let args = ClusterSetup.workerArgs(o, modelDirs: [], ports: { ClusterSetup.parsePorts(self.devinfo) },
+                                           address: { _ in "169.254.0.2" })
+        XCTAssertEqual(args?[2], "10.254.77.1:32323")
+    }
+
     /// The worker dials the typed host address, adding the port when it is missing.
     func testWorkerArgsDialTheHost() {
         var o = ServerOptions()

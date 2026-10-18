@@ -84,13 +84,15 @@ enum ClusterSetup {
     }
 
     /// Where the worker dials the host: the typed address, else the host's end of
-    /// the cable, read off this Mac's own port (a worker's x.y.z.2 → x.y.z.1).
+    /// the cable, read off this Mac's own port (a worker's x.y.z.2 → x.y.z.1). A
+    /// self-assigned 169.254 address belongs to the Thunderbolt Bridge, not the pair.
     static func coordinator(_ o: ServerOptions, ports: () -> [RdmaPort] = ClusterSetup.ports,
                             address: (String) -> String? = ClusterSetup.ipv4(on:)) -> String {
         let typed = o.clusterCoordinator.trimmingCharacters(in: .whitespaces)
         if !typed.isEmpty { return typed.contains(":") ? typed : "\(typed):\(port)" }
         var host = linkAddress(.host)
-        if let dev = device(o, ports: ports), let ip = address(RdmaPort(device: dev, active: true).interface) {
+        if let dev = device(o, ports: ports), let ip = address(RdmaPort(device: dev, active: true).interface),
+           !ip.hasPrefix("169.254.") {
             host = o.clusterRole == .worker ? ip.split(separator: ".").dropLast().joined(separator: ".") + ".1" : ip
         }
         return "\(host):\(port)"
@@ -263,41 +265,5 @@ enum ThunderboltPair: Equatable {
               let tb = json["thunderbolt"] as? [String: Any],
               let model = tb["leads"] as? String, tb["joined"] as? Bool == false else { return nil }
         return model
-    }
-}
-
-/// The video the Cluster page times every machine on: the Video window's current one
-/// when it is an H3 video, else a 5-second 832×480 clip on the H3 pack.
-struct ReferenceClip: Equatable {
-    let model: VideoModelPreset
-    let width: Int
-    let height: Int
-    let frames: Int
-    let steps: Int
-    let fast: Bool
-
-    static func current(_ s: VideoGenSettings = .load()) -> ReferenceClip {
-        if let m = VideoModelPreset.all.first(where: { $0.id == s.modelId }), m.backend == .minimaxH3 {
-            let r = s.concreteResolution(for: m)
-            return ReferenceClip(model: m, width: r.width, height: r.height, frames: s.numFrames,
-                                 steps: s.steps, fast: !s.bestQuality && !(s.turbo && m.supportsTurbo))
-        }
-        let m = VideoModelPreset.minimaxH3Q4
-        return ReferenceClip(model: m, width: 832, height: 480, frames: 121,
-                             steps: m.settings(.good).steps, fast: true)
-    }
-
-    /// "a 10-second 800 × 640 video".
-    var label: String {
-        L10n.format("a %lld-second %lld × %lld video", Int64(max(1, Int((Double(frames) / 24).rounded()))),
-                    Int64(width), Int64(height))
-    }
-
-    /// Seconds on a machine (`peer` nil = this Mac), and whether that machine's speed was measured.
-    func seconds(peer: String?) -> (seconds: Double, measured: Bool) {
-        let anchor = H3TimeEstimate.seconds(model: model, width: width, height: height, frames: frames,
-                                            steps: steps, fast: fast, hardware: .anchor)
-        let f = H3TimeEstimate.speedFactor(peer: peer)
-        return (anchor * f.factor, f.measured)
     }
 }

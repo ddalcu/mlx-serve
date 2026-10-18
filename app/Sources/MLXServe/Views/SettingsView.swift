@@ -1377,38 +1377,31 @@ private struct HelperStatus: View {
 }
 
 /// The top of Settings ▸ Cluster: this Mac, the Mac paired with it by Thunderbolt, and the
-/// machines on the network, each with how long it takes for the same video.
+/// machines on the network, each drawn with the icon macOS uses for it.
 private struct ClusterMapView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @ObservedObject var worker: ClusterWorker
+    /// Each network machine's `/health`: what kind of machine it is.
+    @State private var kinds: [String: MachineKind] = [:]
 
     var body: some View {
-        let clip = ReferenceClip.current()
-        let mine = clip.seconds(peer: nil)
         SearchableRow(searchText: ["Cluster", "machines", "Thunderbolt", "network"], separatorGap: nil) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .center, spacing: 0) {
-                    MachineCard(name: thisMac, kind: L10n.text("This Mac"), symbol: "desktopcomputer",
-                                time: Self.time(mine.seconds, measured: mine.measured), tint: .accentColor)
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center, spacing: 20) {
+                    MachineTile(icon: MachineKind.thisMac.icon, name: thisMac, caption: L10n.text("This Mac"))
                     if let partner {
                         ThunderboltLink()
-                        MachineCard(name: partner, kind: L10n.text("Paired by Thunderbolt"), symbol: "laptopcomputer",
-                                    time: partnerTime(mine.seconds), tint: .purple)
+                        MachineTile(icon: partnerKind.icon, name: partner, caption: L10n.text("Thunderbolt"))
                     }
-                    Spacer(minLength: 0)
                 }
-                if let together = together(mine.seconds) {
-                    Label(together, systemImage: "bolt.horizontal.fill")
-                        .font(.app(.caption)).foregroundStyle(.purple)
+                if let together {
+                    Text(verbatim: together)
+                        .font(.app(.caption)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                HStack(spacing: 6) {
-                    Image(systemName: "network")
-                    Text("Over your network: each machine takes whole jobs")
-                    Rectangle().stroke(style: StrokeStyle(lineWidth: 1, dash: [4, 3])).frame(height: 1)
-                }
-                .font(.app(.caption)).foregroundStyle(.secondary)
+                Divider()
+                Text("On your network").font(.app(.caption).weight(.semibold)).foregroundStyle(.secondary)
                 let peers = networkMachines
                 if peers.isEmpty {
                     Text(appState.serverOptions.lanDiscoverEnabled
@@ -1417,19 +1410,25 @@ private struct ClusterMapView: View {
                         .font(.app(.caption)).foregroundStyle(.secondary)
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
+                        HStack(alignment: .top, spacing: 20) {
                             ForEach(peers, id: \.self) { name in
-                                MachineCard(name: name, kind: L10n.text("On your network"), symbol: "network",
-                                            time: peerTime(name, clip: clip), tint: .teal)
+                                let kind = kinds[name] ?? .unknown
+                                MachineTile(icon: kind.icon, name: name, caption: kind.label)
                             }
                         }
                     }
                 }
-                Text(L10n.format("Times are for %@, as set in the Video window.", clip.label))
-                    .font(.app(.caption2)).foregroundStyle(.tertiary)
             }
-            .padding(12)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.06)))
+            .padding(.vertical, 6)
+        }
+        .task(id: server.lanPeerURLs) { await readKinds() }
+    }
+
+    private func readKinds() async {
+        for (name, url) in server.lanPeerURLs where kinds[name] == nil {
+            var req = URLRequest(url: url.appendingPathComponent("health"))
+            req.timeoutInterval = 2
+            if let (data, _) = try? await URLSession.shared.data(for: req) { kinds[name] = MachineKind(health: data) }
         }
     }
 
@@ -1452,31 +1451,17 @@ private struct ClusterMapView: View {
         }
     }
 
-    private func partnerTime(_ mine: Double) -> String {
-        guard let c = server.cluster, c.workerSpeed > 0 else { return L10n.text("Measured with the first video") }
-        return L10n.format("%@ on its own", H3TimeEstimate.duration(mine / c.workerSpeed))
+    /// The paired Mac's kind, when it also shows up on the network.
+    private var partnerKind: MachineKind {
+        guard let name = server.cluster?.workerName, !name.isEmpty else { return .mac }
+        return kinds.first { StoryboardCluster.sameMachine($0.key, name) }?.value ?? .mac
     }
 
-    /// What the pair does for one video, in minutes.
-    private func together(_ mine: Double) -> String? {
+    /// What the pair does for one video.
+    private var together: String? {
         guard let c = server.cluster, c.joined else { return nil }
         guard c.mode == "rows" else { return L10n.format("Together they run %@.", c.model) }
-        let name = partner ?? L10n.text("The other Mac")
-        switch ClusterVideoAdvice.of(c) {
-        case .unmeasured:
-            return L10n.text("Together over Thunderbolt: the first video measures how much faster they are.")
-        case .tooSlow:
-            return L10n.format("%@ is too slow to make one video faster, so videos stay on this Mac. It can still take whole storyboard shots over your network.", name)
-        case .shares, .largeOnly:
-            let measured = H3TimeEstimate.speedFactor(peer: ClusterInfo.thunderboltPeer)
-            let clip = ReferenceClip.current()
-            let both = measured.measured ? clip.seconds(peer: ClusterInfo.thunderboltPeer).seconds : mine / ClusterVideoAdvice.stepSpeedup(c)
-            guard both < mine - 30 else {
-                return L10n.text("Together over Thunderbolt: about as fast as this Mac alone for this video; larger videos gain more.")
-            }
-            return L10n.format("Together over Thunderbolt: %@ for this video, %@ sooner than this Mac alone.",
-                               H3TimeEstimate.duration(both), H3TimeEstimate.duration(mine - both).replacingOccurrences(of: "about ", with: ""))
-        }
+        return ClusterVideoAdvice.of(c).text(worker: c.workerName)
     }
 
     /// Every machine on the network but the paired one.
@@ -1486,53 +1471,33 @@ private struct ClusterMapView: View {
         if let c = server.cluster, c.joined { names = names.filter { !StoryboardCluster.sameMachine($0, c.workerName) } }
         return names.sorted()
     }
-
-    private func peerTime(_ name: String, clip: ReferenceClip) -> String {
-        let serves = StoryboardCluster.peers(of: clip.model.repo, lanModels: server.lanModels(capability: "video"))
-            .contains { $0.peer == name }
-        guard serves else { return L10n.format("No %@", (clip.model.repo as NSString).lastPathComponent) }
-        let t = clip.seconds(peer: name)
-        return t.measured ? H3TimeEstimate.duration(t.seconds) : L10n.text("Measured with its first shot")
-    }
-
-    static func time(_ seconds: Double, measured: Bool) -> String {
-        measured ? H3TimeEstimate.duration(seconds) : L10n.format("%@ (estimate)", H3TimeEstimate.duration(seconds))
-    }
 }
 
-/// One machine on the Cluster map.
-private struct MachineCard: View {
+/// One machine on the Cluster map: its macOS icon, name and kind.
+private struct MachineTile: View {
+    let icon: NSImage
     let name: String
-    let kind: String
-    let symbol: String
-    let time: String
-    let tint: Color
+    let caption: String
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Label { Text(verbatim: name).font(.app(.body).weight(.semibold)).lineLimit(1) } icon: {
-                Image(systemName: symbol).foregroundStyle(tint)
-            }
-            Text(verbatim: kind).font(.app(.caption2)).foregroundStyle(.secondary)
-            Label { Text(verbatim: time).font(.app(.caption)) } icon: { Image(systemName: "film") }
-                .foregroundStyle(.secondary)
-        }
-        .padding(8)
-        .frame(width: 190, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 8).fill(tint.opacity(0.10)))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(tint.opacity(0.45), lineWidth: 1))
-    }
-}
-
-/// The cable between the two paired Macs: one job, both machines.
-private struct ThunderboltLink: View {
     var body: some View {
         VStack(spacing: 2) {
-            Image(systemName: "bolt.fill").foregroundStyle(.purple)
-            Rectangle().fill(Color.purple).frame(height: 3)
-            Text("Same job").font(.app(.caption2)).foregroundStyle(.purple)
+            Image(nsImage: icon).resizable().interpolation(.high).frame(width: 64, height: 64)
+            Text(verbatim: name).font(.app(.body)).lineLimit(1)
+            Text(verbatim: caption).font(.app(.caption2)).foregroundStyle(.secondary)
         }
-        .frame(width: 80)
+        .frame(width: 112)
+    }
+}
+
+/// The cable between the two paired Macs.
+private struct ThunderboltLink: View {
+    var body: some View {
+        HStack(spacing: 4) {
+            Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 28, height: 2)
+            Image(systemName: "bolt.fill").font(.app(.caption)).foregroundStyle(.secondary)
+            Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 28, height: 2)
+        }
+        .padding(.bottom, 30)
     }
 }
 

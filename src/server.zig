@@ -2588,7 +2588,7 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
-        const body = try @import("distributed.zig").healthJson(allocator);
+        const body = try healthBody(allocator);
         defer allocator.free(body);
         try sendResponse(stream, "200 OK", "application/json", body);
         return;
@@ -7611,6 +7611,41 @@ fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool
     return std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{s}]{s}}}
     , .{ entries_buf.items, extras.items });
+}
+
+/// `/health`: alive, the kind of machine (the app draws its icon from the Mac's model id),
+/// and, when this server leads one, its Thunderbolt pair.
+fn healthBody(allocator: std.mem.Allocator) ![]u8 {
+    const pair = try @import("distributed.zig").healthField(allocator);
+    defer allocator.free(pair);
+    var model_buf: [64]u8 = undefined;
+    return std.fmt.allocPrint(allocator, "{{\"status\":\"ok\",\"os\":\"{s}\",\"model\":{f}{s}}}", .{
+        @tagName(builtin.os.tag), std.json.fmt(machineModel(&model_buf), .{}), pair,
+    });
+}
+
+/// The device model id ("Mac16,5", "iPhone17,1"); empty off Apple platforms. iOS keeps it
+/// in `hw.machine`, where macOS has the CPU architecture.
+fn machineModel(buf: *[64]u8) []const u8 {
+    const key = switch (comptime builtin.os.tag) {
+        .macos => "hw.model",
+        .ios, .visionos => "hw.machine",
+        else => return "",
+    };
+    var len: usize = buf.len;
+    if (std.c.sysctlbyname(key, buf, &len, null, 0) != 0) return "";
+    return std.mem.sliceTo(buf[0..len], 0);
+}
+
+test "healthBody says the machine is alive and what kind it is, as valid JSON" {
+    const a = std.testing.allocator;
+    const j = try healthBody(a);
+    defer a.free(j);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("ok", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings(@tagName(builtin.os.tag), parsed.value.object.get("os").?.string);
+    if (builtin.os.tag == .macos) try std.testing.expect(std.mem.startsWith(u8, parsed.value.object.get("model").?.string, "Mac"));
 }
 
 /// A `/v1/models` row with its Model Settings `alias` as the first field; `id`
