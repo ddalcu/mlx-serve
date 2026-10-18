@@ -107,6 +107,20 @@ text-image instructions of `polish_prompt_en` in
 src/examples/tools/prompt_utils_2512.py.
 
 --------------------------------------------------------------------------------
+MOSS-Image
+https://github.com/OpenMOSS/MOSS-Image
+Copyright OpenMOSS
+Licensed under the Apache License, Version 2.0.
+
+src/moss_image.zig ports the MOSS-Image diffusers pipeline
+(pipeline_moss_image.py: the transformer, scheduler and sampling loop) to MLX.
+The image Enhance shape for MOSS-Image (`mossShape` in
+app/Sources/MLXServe/Services/PromptRewriter.swift) is condensed from
+skills/moss-image-prompt-enhancer/SKILL.md, and
+app/Sources/MLXServe/Services/MossLayout.swift ports its
+scripts/compile_prompt.py.
+
+--------------------------------------------------------------------------------
 laya-mlx
 https://github.com/mizorewww/laya-mlx
 Copyright laya-mlx contributors

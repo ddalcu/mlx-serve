@@ -561,6 +561,23 @@ extension MediaBundle {
         )
     }
 
+    /// MOSS-Image: the release's diffusers tree as published (model_index.json
+    /// names the pipeline; the tokenizer has its own subdir).
+    static func mossImage(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "mossimage:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, excludeSubstrings: ["assets/"]),
+                    readyMarkers: ["model_index.json", "transformer", "vae", "text_encoder", "tokenizer", "scheduler"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
     /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
     /// resolves the encoder from this exact path, so a rename here silently
@@ -588,6 +605,8 @@ extension ImageModelPreset {
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .qwenImage21, .qwenImage21Turbo:
             return .qwenImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .mossImage:
+            return .mossImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .flux2Klein9B, .flux2Klein9BBase:
             // The MLX conversions of klein 9B — distilled and base alike —
             // ship no root config.json.

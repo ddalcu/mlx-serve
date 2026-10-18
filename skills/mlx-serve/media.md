@@ -60,8 +60,14 @@ async function generate(base, path, body, onProgress) {
 | `mode` | `"variation"` (default when `image` is set: re-noise the source, `strength` 0-1, default 0.6) or `"edit"` (instruction edit: "make the sword glow") |
 | `ref_images` | edit mode: array of extra base64 references ("put the hat from image 2 on image 1") |
 | `transparent` | `true` for an RGBA PNG with alpha; Qwen-Image models only |
-| `guidance_scale`, `negative_prompt` | undistilled FLUX base and Qwen-Image only |
+| `guidance_scale`, `negative_prompt` | undistilled FLUX base, Qwen-Image and MOSS-Image only (MOSS-Image defaults to 3; its authors recommend the negative `nsfw, worst quality, bad anatomy, watermark, jpeg artifact`) |
 | `lora_paths`, `lora_scales` | absolute paths to `.safetensors` LoRAs (max 8), scales parallel |
+
+MOSS-Image (`moss_image`) also takes a layout as the prompt: one line of JSON,
+`{"summary":{"meta":["poster"],"canvas":"single","caption":"..."},"items":[{"label":"text","caption":"...","text":"EXPLORE","bbox":[y1,x1,y2,x2]}],"bbox_coord_space":"abs_centralized","bbox_format":"yxyx"}`,
+where each `bbox` is pixels from the CENTRE of the canvas (subtract W/2 from x
+and H/2 from y), y first; `label` is `object`, `character` or `text`. Keep the
+request's `size` the canvas the boxes were drawn on. It is text-to-image only.
 
 Response: `{"created":0,"data":[{"b64_json":"<base64 PNG>"}]}`
 

@@ -135,6 +135,7 @@ test {
     _ = @import("mage_flow.zig");
     _ = @import("qwen_image.zig");
     _ = @import("qwen_image_edit.zig");
+    _ = @import("moss_image.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");
     _ = @import("arch/ane_dflash.zig");

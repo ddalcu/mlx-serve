@@ -189,7 +189,7 @@ struct PromptRewriteSheet: View {
                     if case .content = event { text = progress.text }
                 }
                 if Task.isCancelled { return }
-                text = PromptRewriter.clean(text)
+                text = PromptRewriter.finish(text, request: req)
                 error = progress.emptyReason
             } catch is CancellationError {
             } catch {

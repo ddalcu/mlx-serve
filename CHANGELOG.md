@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **MOSS-Image.** OpenMOSS's 5B image model generates from long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese, at its authors' 50 steps and guidance 3; the app's Enhance writes a layout for you on the current canvas, and the Image pane starts from the recommended negative tags.
 - **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
 - **NVIDIA Nemotron 3.5 Bolt and Super.** The omni packs serve text, images and video (RADIO tower), and draft with their LiLiCorr DFlash drafter on every API.
 - **NVIDIA's Qwen3.8-Flash-Next FP4 pack runs as published.** `nvidia/Qwen3.8-Flash-Next-FP4-Local` loads straight from Hugging Face (NVFP4 experts with their compressed scales, MXFP8 linears, the NVFP4 n-gram table read from SSD) and decodes and prefills within about 1% of our own Flash Next pack, MTP drafts and images included.

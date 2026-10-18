@@ -20,6 +20,7 @@ const krea = @import("krea.zig");
 const w8a8 = @import("w8a8.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const qwen_image = @import("qwen_image.zig");
+const moss_image = @import("moss_image.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -115,7 +116,7 @@ pub const media_model_types = [_][]const u8{
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
     "laya",      "kev",        "clef",           "d1",
-    "stable_audio3", "yue2",      "nemotron_diarization",
+    "stable_audio3", "yue2",      "nemotron_diarization", "moss_image",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -123,6 +124,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
+    if (std.mem.eql(u8, model_type, "moss_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -218,6 +220,7 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // An mlx-community-style Qwen-Image-2.1 repo likewise: no root
     // config.json, model_index.json's `_class_name` the only marker.
     if (isQwenImage21Repo(io, allocator, model_dir)) return allocator.dupe(u8, "qwen_image21") catch null;
+    if (isMossImageRepo(io, allocator, model_dir)) return allocator.dupe(u8, "moss_image") catch null;
     // Stable Audio 3 as Stability publishes it: stable-audio-tools' model_config.json.
     if (isStableAudio3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "stable_audio3") catch null;
     return null;
@@ -261,6 +264,13 @@ fn isQwenImage21Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
     defer dir.close(io);
     return discovery.peekQwenImage21Index(io, allocator, dir);
+}
+
+/// Thin path→Dir wrapper over `model_discovery.peekMossImageIndex`.
+fn isMossImageRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekMossImageIndex(io, allocator, dir);
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -555,6 +565,7 @@ const ImageBackend = union(enum) {
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
     qwen_image: *qwen_image.Engine,
+    moss_image: *moss_image.Engine,
 };
 
 /// Most reference images one edit may carry (the primary 'image' plus
@@ -569,7 +580,7 @@ pub const MAX_EDIT_IMAGES_OTHER = 4;
 pub fn editRefCap(backend: ImageBackend) usize {
     return switch (backend) {
         .qwen_image => MAX_EDIT_IMAGES,
-        .flux, .krea, .mage_flow => MAX_EDIT_IMAGES_OTHER,
+        .flux, .krea, .mage_flow, .moss_image => MAX_EDIT_IMAGES_OTHER,
     };
 }
 
@@ -664,6 +675,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .qwen_image = try qwen_image.Engine.load(io, allocator, model_dir, staged) };
                 return self;
             }
+            if (std.mem.eql(u8, mt, "moss_image")) {
+                self.backend = .{ .moss_image = try moss_image.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -676,6 +691,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
             .qwen_image => |q| q.deinit(),
+            .moss_image => |m| m.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -686,6 +702,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
             .qwen_image => |q| q.s,
+            .moss_image => |m| m.s,
         };
     }
 
@@ -696,6 +713,7 @@ pub const ImageEngine = struct {
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
             .qwen_image => 0, // one final-norm hidden state, no layer taps
+            .moss_image => 0,
         };
     }
 
@@ -706,6 +724,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
             .qwen_image => true, // the VAE encoder loads on first use
+            .moss_image => false, // text-to-image only: the release has no edit or variation training
         };
     }
 
@@ -718,6 +737,7 @@ pub const ImageEngine = struct {
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
             .qwen_image => |q| q.supportsEdit(), // tower in the pack's text_encoder/
+            .moss_image => false,
         };
     }
 
@@ -735,7 +755,13 @@ pub const ImageEngine = struct {
     /// fields (1.0 is a no-op, matching mflux's basic guider); Krea/Mage-Flow
     /// have no negative-encode path.
     pub fn supportsGuidance(self: *const ImageEngine) bool {
-        return self.backend == .flux or self.backend == .qwen_image;
+        return self.backend == .flux or self.backend == .qwen_image or self.backend == .moss_image;
+    }
+
+    /// `guidance_scale` when the request omits it: MOSS-Image is undistilled and its
+    /// authors' default is CFG 3; everywhere else 1.0 (one forward per step).
+    pub fn defaultGuidance(self: *const ImageEngine) f32 {
+        return if (self.backend == .moss_image) moss_image.DEFAULT_GUIDANCE else 1.0;
     }
 
     /// Steps for a request: a checkpoint's own sampling grid, else the
@@ -745,6 +771,7 @@ pub const ImageEngine = struct {
     pub fn resolveSteps(self: *const ImageEngine, steps: u32) u32 {
         return switch (self.backend) {
             .qwen_image => |q| q.stepsFor(steps),
+            .moss_image => |m| m.stepsFor(steps),
             else => if (steps == 0) 4 else steps,
         };
     }
@@ -775,6 +802,8 @@ pub const ImageEngine = struct {
                 .krea => .krea2,
                 .mage_flow => .generic,
                 .qwen_image => .qwen_image21,
+                // Adapters name the checkpoint's own modules (`layers.N.proj.q`).
+                .moss_image => .generic,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -787,6 +816,7 @@ pub const ImageEngine = struct {
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
             .qwen_image => |q| q.dit.attachLora(&stack),
+            .moss_image => |m| m.dit.attachLora(&stack),
         };
         if (matched != 0 and matched != stack.entryCount())
             log.warn("[lora] attached {d} of {d} adapter module(s); the rest target modules this model does not have\n", .{ matched, stack.entryCount() });
@@ -804,6 +834,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
             .qwen_image => |q| q.dit.detachLora(),
+            .moss_image => |m| m.dit.detachLora(),
             .mage_flow => {}, // no LoRA attached
         }
         if (self.lora_stack) |*st| st.deinit();
@@ -858,6 +889,13 @@ pub const ImageEngine = struct {
                     .transparent = opts.transparent,
                 }, progress);
             },
+            .moss_image => |m| if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0 or opts.init_image != null)
+                error.EditUnsupported
+            else
+                m.generateImage(prompt, width, height, seed, steps, .{
+                    .guidance_scale = opts.guidance_scale,
+                    .negative_prompt = opts.negative_prompt,
+                }, progress),
         };
     }
 
@@ -879,6 +917,8 @@ pub const ImageEngine = struct {
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // Qwen-Image-2.1: one latent token per 16x16 tile.
             .qwen_image => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // One latent token per 16x16 tile; the card extrapolates 0.25 to 4 MP.
+            .moss_image => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
 
@@ -889,7 +929,7 @@ pub const ImageEngine = struct {
     pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
         return switch (kind) {
             .flux => 1536,
-            .krea, .mage_flow, .qwen_image => 2048,
+            .krea, .mage_flow, .qwen_image, .moss_image => 2048,
         };
     }
 
@@ -2540,7 +2580,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // standard CFG convention). 1.0 is a no-op, so distilled klein can
     // accept both fields harmlessly; only an ACTUALLY-requested CFG run
     // needs the capability.
-    var guidance_scale: f32 = 1.0;
+    var guidance_scale: f32 = engine.defaultGuidance();
     if (extractJsonFloat(body, "guidance_scale")) |g| {
         if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
         guidance_scale = @floatCast(g);
@@ -2553,7 +2593,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         negative_prompt = negative_prompt_owned.?;
     }
     if (guidance_scale != 1.0 and !engine.supportsGuidance())
-        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2 or Qwen-Image model");
+        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2, Qwen-Image or MOSS-Image model");
 
     // Qwen-Image edit: reference conditioning resolution (diffusers'
     // per-call `output_resolution` knob). Lower = fewer joint tokens per
@@ -2649,8 +2689,8 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
     // Text-to-image: a canvas past the default size the load reserved can run
     // past the working set, and that Metal OOM mid-denoise is uncatchable.
-    if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len == 0) {
-        const need = qwenImageGenTransientBytes(width, height);
+    if ((engine.backend == .qwen_image and gen_opts.edit_image_bytes.len == 0) or engine.backend == .moss_image) {
+        const need = if (engine.backend == .moss_image) mossImageGenTransientBytes(width, height) else qwenImageGenTransientBytes(width, height);
         const headroom = gpuHeadroomBytes();
         if (need > headroom) {
             log.info("[image] bill refused: {d}x{d} needs {d} MB, headroom {d} MB\n", .{ width, height, need >> 20, headroom >> 20 });
@@ -4652,7 +4692,7 @@ fn residentWeightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 
 /// Metal OOM; the test below refuses an unclassified entry of `media_model_types`.
 fn convertsW8a8(model_type: []const u8) ?bool {
     const converts = [_][]const u8{ "flux2", "krea", "mage_flow", "mageflow", "acestep", "AudioVideo", "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image" };
-    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization" };
+    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization", "moss_image" };
     for (converts) |p| if (std.mem.startsWith(u8, model_type, p)) return true;
     for (packed_only) |p| if (std.mem.startsWith(u8, model_type, p)) return false;
     return null;
@@ -4760,6 +4800,17 @@ pub fn qwenImageGenTransientBytes(width: u32, height: u32) u64 {
 
 /// The load plan reserves a default-size request.
 const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = qwenImageGenTransientBytes(1024, 1024);
+
+/// MOSS-Image's denoise holds one block's activations at a time (each block
+/// frees its own before the next) across the canvas plus a full 4096-token
+/// prompt; the f32 decode at 2048² stays below it.
+const MOSS_IMAGE_GEN_TOKEN_BYTES: u64 = 512 << 10;
+const MOSS_IMAGE_GEN_BASE_BYTES: u64 = 1 << 30;
+
+pub fn mossImageGenTransientBytes(width: u32, height: u32) u64 {
+    const latents: u64 = @as(u64, width / moss_image.VAE_DOWNSAMPLE) * (height / moss_image.VAE_DOWNSAMPLE);
+    return MOSS_IMAGE_GEN_BASE_BYTES + (latents + moss_image.MAX_PROMPT_TOKENS) * MOSS_IMAGE_GEN_TOKEN_BYTES;
+}
 
 /// What the GPU can still take: Metal's working set less live MLX memory.
 fn gpuHeadroomBytes() u64 {
@@ -5035,6 +5086,12 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         // `towerPresentIn` answers, the engine's `has_tower` reads it too.
         const tower = if (model_dir) |md| qwen_image.towerPresentIn(io, std.heap.page_allocator, md) else false;
         return if (tower) qwenImageEditPeakBytes(te, rest, mlx.maxRecommendedWorkingSet(), true) else qwenImagePeakBytes(te, rest, mlx.maxRecommendedWorkingSet());
+    }
+    if (std.mem.eql(u8, model_type, "moss_image")) {
+        // Everything stays resident (the Qwen3.5 encoder too), plus a default-size request.
+        const sum = residentWeightBytes(io, dir, model_type);
+        if (sum == 0) return 0; // unknown dir -> never block
+        return sum + mossImageGenTransientBytes(1024, 1024);
     }
     if (std.mem.eql(u8, model_type, "minimax_music3")) {
         // The whole engine is resident for its lifetime (no staging), so the
@@ -5928,6 +5985,31 @@ test "peekModelType classifies a model_index-only Qwen-Image-2.1 repo" {
     const dir20 = try std.fmt.allocPrint(a, "{s}/q20", .{root});
     defer a.free(dir20);
     try testing.expect(peekModelType(io, a, dir20) == null);
+}
+
+test "MOSS-Image: a model_index-only repo routes to the image slot with CFG 3 by default" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    const dir = try std.fmt.allocPrint(a, "{s}/m", .{root});
+    defer a.free(dir);
+    const mt = peekModelType(io, a, dir) orelse return error.TestUnexpectedResult;
+    defer a.free(mt);
+    try testing.expectEqualStrings("moss_image", mt);
+    try testing.expectEqual(Modality.image, modalityFromType(mt).?);
+
+    const eng = ImageEngine{ .allocator = a, .backend = .{ .moss_image = undefined } };
+    try testing.expectEqual(@as(f32, 3.0), eng.defaultGuidance());
+    try testing.expect(eng.supportsGuidance() and !eng.supportsEdit() and !eng.supportsImg2Img());
+    const flux_eng = ImageEngine{ .allocator = a, .backend = .{ .krea = undefined } };
+    try testing.expectEqual(@as(f32, 1.0), flux_eng.defaultGuidance());
+    // A 2048² canvas bills four times the 1024² latents.
+    try testing.expect(mossImageGenTransientBytes(2048, 2048) > mossImageGenTransientBytes(1024, 1024));
 }
 
 test "Modality.mesh advertises the 3d capability" {

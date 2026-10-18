@@ -163,6 +163,7 @@ enum FluxVariant: String, Hashable, Codable {
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
     case qwenImage21      // Qwen-Image-2.1 block-causal DiT — served by the qwen_image backend; undistilled (40 steps, optional real CFG)
     case qwenImage21Turbo // Qwen-Image-2.1-Turbo — same backend; its pack's 8-sigma grid sets the steps server-side
+    case mossImage        // OpenMOSS MOSS-Image 5B single-stream DiT — served by the moss_image backend; undistilled (50 steps, CFG 3)
 }
 
 struct ImageQualitySettings: Hashable {
@@ -564,6 +565,44 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Qwen-Image 2.1 Turbo quantized to 4-bit for smaller Macs — 8 steps at about half the memory, with some loss of fine detail. Qwen Research License (non-commercial)."
     )
 
+    /// MOSS-Image's card recommends 1, 1.5 or 2 MP at any aspect, multiples
+    /// of 16 (its Gradio grid: `gradio_presets.fit_size`).
+    private static let mossImageResolutions: [ResolutionOption] = [
+        .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        .init(width: 1248, height: 1248, label: "1248 × 1248 (square, 1.5 MP)"),
+        .init(width: 1456, height: 1456, label: "1456 × 1456 (square, 2 MP)"),
+        .init(width: 832,  height: 1248, label: "832 × 1248 (portrait 2:3)"),
+        .init(width: 1248, height: 832,  label: "1248 × 832 (landscape 3:2)"),
+        .init(width: 1360, height: 768,  label: "1360 × 768 (landscape 16:9)"),
+        .init(width: 768,  height: 1360, label: "768 × 1360 (portrait 9:16)"),
+        .init(width: 1936, height: 1088, label: "1936 × 1088 (landscape 16:9, 2 MP)"),
+        .init(width: 1088, height: 1936, label: "1088 × 1936 (portrait 9:16, 2 MP)"),
+        .init(width: 512,  height: 512,  label: "512 × 512 (fastest)"),
+    ]
+
+    /// OpenMOSS MOSS-Image SFT, bf16 (the mlx-community mirror of the release's
+    /// diffusers tree). The Qwen3.5-9B text encoder stays resident beside the
+    /// 5B DiT.
+    static let mossImageSFT_bf16 = ImageModelPreset(
+        id: "mlx-community/moss-image-sft-bf16",
+        name: "MOSS-Image SFT bf16 (~27 GB)",
+        variant: .mossImage,
+        configName: "moss_image",
+        repo: "mlx-community/MOSS-Image-SFT-bf16",
+        approxDownloadGB: 27,
+        approxRAMGB: 32,
+        resolutions: mossImageResolutions,
+        defaultResolution: mossImageResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 20),
+            .good:         .init(steps: 30),
+            .quality:      .init(steps: 40),
+            .superQuality: .init(steps: 50),
+        ],
+        defaultQuality: .superQuality,
+        description: "OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)."
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
@@ -576,6 +615,7 @@ struct ImageModelPreset: Identifiable, Hashable {
         .krea2Turbo,                                   // 15
         .qwenImage21_8bit,                             // 18
         .qwenImage21Turbo_8bit,                        // 18
+        .mossImageSFT_bf16,                            // 27
     ]
 }
 
@@ -2192,9 +2232,9 @@ struct ImageGenRequest {
     /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
     /// Empty = none. Rows with an empty `path` are dropped before sending.
     var loras: [LoraAdapter] = []
-    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only):
-    /// 1.0 = off, matching the server default.
-    var guidanceScale: Double = 1.0
+    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only);
+    /// nil = the backend's own default (`defaultGuidance`).
+    var guidanceScale: Double? = nil
     /// What to steer AWAY from — only meaningful alongside `guidanceScale`
     /// != 1.0. Empty = the server's own unconditioning (empty-string prompt).
     var negativePrompt: String = ""
@@ -2208,7 +2248,7 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo: return 0
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo, .mossImage: return 0
         default: return 3
         }
     }
@@ -2220,7 +2260,7 @@ extension ImageModelPreset {
         switch variant {
         // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
         // with a ×16 VAE downsample and shares the same clamp server-side.
-        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
+        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo, .mossImage:
             return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
         // widest preset edge.
@@ -2237,7 +2277,7 @@ extension ImageModelPreset {
         switch variant {
         case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
             return true
-        case .krea2Turbo, .mageFlowTurbo:
+        case .krea2Turbo, .mageFlowTurbo, .mossImage:
             return false
         }
     }
@@ -2260,7 +2300,17 @@ extension ImageModelPreset {
     /// Qwen-Image-2.1 is undistilled too: 1.0 (its recommended default) runs
     /// one forward per step, anything else two.
     var supportsGuidance: Bool {
-        variant == .flux2Klein9BBase || variant == .qwenImage21
+        variant == .flux2Klein9BBase || variant == .qwenImage21 || variant == .mossImage
+    }
+
+    /// The server's `guidance_scale` when the request omits it
+    /// (`gen.ImageEngine.defaultGuidance`): MOSS-Image's authors run CFG 3.
+    var defaultGuidance: Double { variant == .mossImage ? 3.0 : 1.0 }
+
+    /// The negative tags MOSS-Image's guide recommends; the pane pre-fills them
+    /// and chat generations send them.
+    var defaultNegativePrompt: String {
+        variant == .mossImage ? "nsfw, worst quality, bad anatomy, watermark, jpeg artifact" : ""
     }
 
     // ── Capability flags: what the Advanced panel is allowed to offer ──
@@ -2273,7 +2323,7 @@ extension ImageModelPreset {
     /// all: sending a source without `mode:"edit"` is a 400.
     var supportsImg2Img: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .mossImage: return false
         default: return true
         }
     }
@@ -2314,6 +2364,7 @@ extension ImageModelPreset {
     /// is to be shown the sentence that does it.
     func promptExamples(editing: Bool) -> [ImagePromptExampleGroup] {
         guard editing && supportsReferenceEdit else {
+            if variant == .mossImage { return ImagePromptExamples.textToImage + [ImagePromptExamples.mossImage] }
             return rendersDenseText ? ImagePromptExamples.textToImage + [ImagePromptExamples.infographics]
                                     : ImagePromptExamples.textToImage
         }
