@@ -25,6 +25,22 @@ final class ClusterWorker: ObservableObject {
         }
     }
 
+    /// The model the worker holds its part of, from its "worker: <model> <part> (<mode>)" line.
+    nonisolated static func part(of state: State) -> (model: String, detail: String, ready: Bool)? {
+        let (what, ready): (String, Bool) = switch state {
+        case .loading(let w): (w, false)
+        case .ready(let w): (w, true)
+        default: ("", false)
+        }
+        guard !what.isEmpty else { return nil }
+        var text = what
+        if let mode = text.range(of: " (", options: .backwards) { text = String(text[..<mode.lowerBound]) }
+        let cut = [text.range(of: ", "), text.range(of: " layers ")].compactMap { $0 }.min { $0.lowerBound < $1.lowerBound }
+        guard let cut else { return (text, "", ready) }
+        let detail = text[cut.lowerBound...].trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+        return (String(text[..<cut.lowerBound]), detail, ready)
+    }
+
     /// The worker's state after one of its log lines.
     nonisolated static func state(after line: String, current: State) -> State {
         if line.contains("[dist] worker ready") {

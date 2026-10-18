@@ -2344,3 +2344,6 @@
 "Join" = "加入";
 "Paired" = "已配对";
 "Setting up the cable…" = "正在设置线缆…";
+"Runs across the two Macs of a Thunderbolt pair." = "在 Thunderbolt 配对的两台 Mac 上一起运行。";
+"This Mac's part, for the Mac that leads" = "本机承担的部分，供主导的 Mac 使用";
+"This Mac's part (%@), for the Mac that leads" = "本机承担的部分（%@），供主导的 Mac 使用";

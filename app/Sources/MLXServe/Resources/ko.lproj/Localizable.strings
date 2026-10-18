@@ -2332,3 +2332,6 @@
 "Join" = "참여";
 "Paired" = "페어링됨";
 "Setting up the cable…" = "케이블 설정 중…";
+"Runs across the two Macs of a Thunderbolt pair." = "Thunderbolt로 페어링된 두 Mac에서 함께 실행됩니다.";
+"This Mac's part, for the Mac that leads" = "주도하는 Mac을 위해 이 Mac이 맡은 부분";
+"This Mac's part (%@), for the Mac that leads" = "주도하는 Mac을 위해 이 Mac이 맡은 부분(%@)";

@@ -82,6 +82,20 @@ final class ClusterSetupTests: XCTestCase {
         XCTAssertFalse(host.serverLaunchEquals(other))
     }
 
+    /// The tray names the model the worker holds its part of, and which part.
+    func testTheWorkersPartNamesItsModel() {
+        let pipeline = ClusterWorker.part(of: .ready("Qwen3.8-Flash-Next-FP4-Local layers 30..60 of 60 (pipeline)"))
+        XCTAssertEqual(pipeline?.model, "Qwen3.8-Flash-Next-FP4-Local")
+        XCTAssertEqual(pipeline?.detail, "layers 30..60 of 60")
+        XCTAssertEqual(pipeline?.ready, true)
+        let tensor = ClusterWorker.part(of: .loading("Qwen3.8-Flash-Next-FP4-Local, half of every expert (tensor)"))
+        XCTAssertEqual(tensor?.model, "Qwen3.8-Flash-Next-FP4-Local")
+        XCTAssertEqual(tensor?.detail, "half of every expert")
+        XCTAssertEqual(tensor?.ready, false)
+        XCTAssertNil(ClusterWorker.part(of: .waiting))
+        XCTAssertNil(ClusterWorker.part(of: .ready("")))
+    }
+
     /// The default launch carries no cluster flag.
     func testDefaultLaunchHasNoClusterFlags() {
         XCTAssertFalse(ServerOptions().toCLIArgs(modelDirs: []).contains("--dist"))
