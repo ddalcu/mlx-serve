@@ -2588,9 +2588,7 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
-        const body = try healthBody(allocator);
-        defer allocator.free(body);
-        try sendResponse(stream, "200 OK", "application/json", body);
+        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
         return;
     }
     // The console. It belongs here, above resolution, for the same reason
@@ -7595,10 +7593,13 @@ fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
     if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
 
-    // Keyed peers we hold no working key for, so the app can ask for one, and every
-    // peer's address, so the app can read its `/health`.
+    // What this machine is; keyed peers we hold no working key for, so the app can ask for
+    // one; and every peer with what it said about itself.
     var extras = std.ArrayList(u8).empty;
     defer extras.deinit(allocator);
+    const machine = try machineJson(allocator);
+    defer allocator.free(machine);
+    try extras.appendSlice(allocator, machine);
     if (!lan_filtered) if (g_lan) |l| {
         var list = std.ArrayList(u8).empty;
         defer list.deinit(allocator);
@@ -7613,13 +7614,13 @@ fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool
     , .{ entries_buf.items, extras.items });
 }
 
-/// `/health`: alive, the kind of machine (the app draws its icon from the Mac's model id),
-/// and, when this server leads one, its Thunderbolt pair.
-fn healthBody(allocator: std.mem.Allocator) ![]u8 {
-    const pair = try @import("distributed.zig").healthField(allocator);
+/// `/v1/models`' "machine" (behind the API key, unlike `/health`): the OS, the device model
+/// id the app draws its icon from, and the Thunderbolt pair this server leads, if any.
+fn machineJson(allocator: std.mem.Allocator) ![]u8 {
+    const pair = try @import("distributed.zig").pairFields(allocator);
     defer allocator.free(pair);
     var model_buf: [64]u8 = undefined;
-    return std.fmt.allocPrint(allocator, "{{\"status\":\"ok\",\"os\":\"{s}\",\"model\":{f}{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"machine\":{{\"os\":\"{s}\",\"model\":{f}{s}}}", .{
         @tagName(builtin.os.tag), std.json.fmt(machineModel(&model_buf), .{}), pair,
     });
 }
@@ -7637,15 +7638,17 @@ fn machineModel(buf: *[64]u8) []const u8 {
     return std.mem.sliceTo(buf[0..len], 0);
 }
 
-test "healthBody says the machine is alive and what kind it is, as valid JSON" {
+test "machineJson names the OS and the device model, as valid JSON" {
     const a = std.testing.allocator;
-    const j = try healthBody(a);
+    const field = try machineJson(a);
+    defer a.free(field);
+    const j = try std.fmt.allocPrint(a, "{{\"data\":[]{s}}}", .{field});
     defer a.free(j);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("ok", parsed.value.object.get("status").?.string);
-    try std.testing.expectEqualStrings(@tagName(builtin.os.tag), parsed.value.object.get("os").?.string);
-    if (builtin.os.tag == .macos) try std.testing.expect(std.mem.startsWith(u8, parsed.value.object.get("model").?.string, "Mac"));
+    const m = parsed.value.object.get("machine").?.object;
+    try std.testing.expectEqualStrings(@tagName(builtin.os.tag), m.get("os").?.string);
+    if (builtin.os.tag == .macos) try std.testing.expect(m.get("model").?.string.len > 0);
 }
 
 /// A `/v1/models` row with its Model Settings `alias` as the first field; `id`

@@ -42,19 +42,6 @@ enum ThunderboltPairing {
         if led { restartServer(appState) }
     }
 
-    /// A Mac on the network that leads a pair and waits for one to join: its name.
-    static func waitingLeader(among peers: [String: URL]) async -> String? {
-        for (name, url) in peers.sorted(by: { $0.key < $1.key }) {
-            var req = URLRequest(url: url.appendingPathComponent("health"))
-            req.timeoutInterval = 2
-            if let (data, _) = try? await URLSession.shared.data(for: req),
-               ThunderboltPair.waitingLeader(health: data) != nil {
-                return name
-            }
-        }
-        return nil
-    }
-
     private static func giveAddress(_ role: ClusterRole, ports: [RdmaPort]) -> String? {
         guard let p = ports.first(where: \.active) else { return L10n.text("Connect the Thunderbolt cable first.") }
         guard ClusterSetup.ipv4(on: p.interface) != ClusterSetup.linkAddress(role) else { return nil }

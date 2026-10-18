@@ -290,10 +290,50 @@ extern "c" fn DNSServiceRefDeallocate(ref: DNSServiceRef) void;
 
 pub const Remote = struct { ip4: [4]u8, port: u16 };
 
-fn appendPeerAddress(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), display: []const u8, ip4: [4]u8, port: u16) !void {
+/// What a peer says about itself in its `/v1/models` "machine" (behind its API key): its OS,
+/// device model id and, when it leads a Thunderbolt pair, that pair's model. Bounded copies.
+pub const PeerMachine = struct {
+    os: Text(16) = .{},
+    model: Text(32) = .{},
+    leads: Text(128) = .{},
+    joined: bool = false,
+
+    fn Text(comptime n: usize) type {
+        return struct {
+            buf: [n]u8 = undefined,
+            len: usize = 0,
+            fn set(self: *@This(), v: ?std.json.Value) void {
+                const str = if (v) |x| (if (x == .string) x.string else "") else "";
+                self.len = @min(str.len, n);
+                @memcpy(self.buf[0..self.len], str[0..self.len]);
+            }
+            fn get(self: *const @This()) []const u8 {
+                return self.buf[0..self.len];
+            }
+        };
+    }
+
+    pub fn parse(alloc: std.mem.Allocator, body: []const u8) PeerMachine {
+        var out: PeerMachine = .{};
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return out;
+        defer parsed.deinit();
+        if (parsed.value != .object) return out;
+        const m = parsed.value.object.get("machine") orelse return out;
+        if (m != .object) return out;
+        out.os.set(m.object.get("os"));
+        out.model.set(m.object.get("model"));
+        out.leads.set(m.object.get("leads"));
+        if (m.object.get("joined")) |j| out.joined = j == .bool and j.bool;
+        return out;
+    }
+};
+
+fn appendPeerAddress(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), display: []const u8, ip4: [4]u8, port: u16, m: *const PeerMachine) !void {
     if (buf.items.len > 0) try buf.append(alloc, ',');
-    try buf.print(alloc, "{{\"name\":{f},\"url\":\"http://{d}.{d}.{d}.{d}:{d}\"}}", .{
-        std.json.fmt(display, .{}), ip4[0], ip4[1], ip4[2], ip4[3], port,
+    try buf.print(alloc, "{{\"name\":{f},\"url\":\"http://{d}.{d}.{d}.{d}:{d}\",\"os\":{f},\"model\":{f},\"leads\":{f},\"joined\":{}}}", .{
+        std.json.fmt(display, .{}),             ip4[0], ip4[1], ip4[2], ip4[3], port,
+        std.json.fmt(m.os.get(), .{}),          std.json.fmt(m.model.get(), .{}),
+        std.json.fmt(m.leads.get(), .{}),       m.joined,
     });
 }
 
@@ -304,6 +344,7 @@ const Peer = struct {
     models: []PeerModel,
     /// The peer answered 401: it runs with --api-key and we hold no working key.
     needs_key: bool = false,
+    machine: PeerMachine = .{},
 
     fn deinit(p: *Peer, alloc: std.mem.Allocator) void {
         freePeerModels(alloc, p.models);
@@ -499,7 +540,7 @@ pub const Lan = struct {
         l.mu.lock();
         defer l.mu.unlock();
         var it = l.peers.valueIterator();
-        while (it.next()) |p| try appendPeerAddress(alloc, buf, p.display, p.ip4, p.port);
+        while (it.next()) |p| try appendPeerAddress(alloc, buf, p.display, p.ip4, p.port, &p.machine);
     }
 
     /// Ask the browser thread to re-attempt every known service NOW instead
@@ -558,7 +599,7 @@ pub const Lan = struct {
         }
     }
 
-    fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel, needs_key: bool) void {
+    fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel, needs_key: bool, machine: PeerMachine) void {
         const owned = l.alloc.dupe(u8, display) catch {
             freePeerModels(l.alloc, models);
             return;
@@ -569,7 +610,7 @@ pub const Lan = struct {
             var old = kv.value;
             old.deinit(l.alloc);
         }
-        const p = Peer{ .display = owned, .ip4 = ip4, .port = port, .models = models, .needs_key = needs_key };
+        const p = Peer{ .display = owned, .ip4 = ip4, .port = port, .models = models, .needs_key = needs_key, .machine = machine };
         l.peers.put(p.display, p) catch {
             var tmp = p;
             tmp.deinit(l.alloc);
@@ -616,12 +657,13 @@ pub const Lan = struct {
         const candidates = addr.ordered(&order_buf);
         var ip4: [4]u8 = candidates[0];
         var models: ?[]PeerModel = null;
+        var machine: PeerMachine = .{};
         var reachable = false;
         var needs_key = false;
         const key = l.peerKey(l.alloc, display);
         defer if (key) |k| l.alloc.free(k);
         for (candidates) |cand| {
-            models = fetchPeerModels(l.alloc, cand, res.port, display, &l.token_hex, key) catch |err| switch (err) {
+            models = fetchPeerModels(l.alloc, cand, res.port, display, &l.token_hex, key, &machine) catch |err| switch (err) {
                 error.PeerUnreachable => {
                     log.debug("[lan] \"{s}\" unreachable at {d}.{d}.{d}.{d}:{d}\n", .{ display, cand[0], cand[1], cand[2], cand[3], res.port });
                     continue;
@@ -648,7 +690,7 @@ pub const Lan = struct {
         }
         if (!reachable) return .failed;
         const fetched = models orelse {
-            l.installPeer(display, ip4, res.port, &.{}, needs_key);
+            l.installPeer(display, ip4, res.port, &.{}, needs_key, .{});
             return .installed;
         };
         const changed = blk: {
@@ -658,7 +700,7 @@ pub const Lan = struct {
             break :blk p.models.len != fetched.len;
         };
         const count = fetched.len;
-        l.installPeer(display, ip4, res.port, fetched, false);
+        l.installPeer(display, ip4, res.port, fetched, false, machine);
         if (changed)
             log.info("[lan] peer \"{s}\" at {d}.{d}.{d}.{d}:{d} shares {d} models\n", .{ display, ip4[0], ip4[1], ip4[2], ip4[3], res.port, count });
         return .installed;
@@ -1091,7 +1133,7 @@ pub fn headerValueCI(head: []const u8, name_lower: []const u8) ?[]const u8 {
 /// it — resolves back to this very server, and the loopback-first fetch
 /// would happily install our own models as a "peer" (live test_lan_share
 /// self-mirror after the peer-restart section, 2026-07-21).
-fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8, key: ?[]const u8) ![]PeerModel {
+fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8, key: ?[]const u8, machine: ?*PeerMachine) ![]PeerModel {
     const fd = try connectTimeout(ip4, port, 3000);
     defer _ = std.c.close(fd);
     const tv = std.c.timeval{ .sec = 5, .usec = 0 };
@@ -1115,6 +1157,7 @@ fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display
     if (headerValueCI(raw[0..header_end], "x-mlx-lan-token")) |tok| {
         if (std.mem.eql(u8, tok, own_token)) return error.SelfFetch;
     }
+    if (machine) |m| m.* = PeerMachine.parse(alloc, raw[header_end + 4 ..]);
     return parsePeerModels(alloc, raw[header_end + 4 ..], peer_display);
 }
 
@@ -1391,7 +1434,7 @@ test "lan: lookupRemote distinguishes found / unlisted / unknown" {
 
     const models = try a.alloc(PeerModel, 1);
     models[0] = .{ .id = try a.dupe(u8, "gemma"), .entry_json = try a.dupe(u8, "{}") };
-    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1234, models, false);
+    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1234, models, false, .{});
     try t.expect(l.lookupRemote("gemma@studio") == .found);
     // The peer answered recently and does NOT offer this model — definitive,
     // fail fast (probes/typos must not burn the wait).
@@ -1399,7 +1442,7 @@ test "lan: lookupRemote distinguishes found / unlisted / unknown" {
 
     // A mid-boot empty install (peer reachable, models not served yet)
     // counts as unknown so the wait covers it too.
-    l.installPeer("booting", .{ 127, 0, 0, 1 }, 1235, &.{}, false);
+    l.installPeer("booting", .{ 127, 0, 0, 1 }, 1235, &.{}, false, .{});
     try t.expect(l.lookupRemote("anything@booting") == .peer_unknown);
 }
 
@@ -1450,8 +1493,8 @@ test "lan: a peer that answered 401 is listed as needing a key" {
         l.peers.deinit();
         l.known.deinit();
     }
-    l.installPeer("open", .{ 127, 0, 0, 1 }, 1, &.{}, false);
-    l.installPeer("locked", .{ 127, 0, 0, 1 }, 2, &.{}, true);
+    l.installPeer("open", .{ 127, 0, 0, 1 }, 1, &.{}, false, .{});
+    l.installPeer("locked", .{ 127, 0, 0, 1 }, 2, &.{}, true, .{});
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
     try l.appendPeersNeedingKey(a, &buf);
@@ -1580,24 +1623,29 @@ test "lan: discovery sends the peer's key, and a keyed peer's 401 reads as Unaut
     const th = try std.Thread.spawn(.{}, KeyedPeer.run, .{lst});
     defer th.join();
 
-    try t.expectError(error.Unauthorized, fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", null));
-    const models = try fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", "s3cret");
+    try t.expectError(error.Unauthorized, fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", null, null));
+    const models = try fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", "s3cret", null);
     defer freePeerModels(a, models);
     try t.expectEqual(@as(usize, 1), models.len);
     try t.expectEqualStrings("gemma", models[0].id);
 }
 
-test "appendPeerAddress lists each peer's name and URL as JSON" {
+test "a peer's machine rides from its /v1/models into the app's peer list" {
     const a = std.testing.allocator;
+    const m = PeerMachine.parse(a,
+        \\{"object":"list","data":[],"machine":{"os":"macos","model":"Mac16,5","leads":"MiniMax-H3","joined":false}}
+    );
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(a);
-    try appendPeerAddress(a, &buf, "M4Max", .{ 192, 168, 137, 3 }, 11234);
-    try appendPeerAddress(a, &buf, "5060-linux", .{ 192, 168, 2, 76 }, 11400);
+    try appendPeerAddress(a, &buf, "M4Max", .{ 192, 168, 137, 3 }, 11234, &m);
+    try appendPeerAddress(a, &buf, "5060-linux", .{ 192, 168, 2, 76 }, 11400, &PeerMachine.parse(a, "{\"data\":[]}"));
     const j = try std.fmt.allocPrint(a, "[{s}]", .{buf.items});
     defer a.free(j);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
-    try std.testing.expectEqualStrings("http://192.168.137.3:11234", parsed.value.array.items[0].object.get("url").?.string);
-    try std.testing.expectEqualStrings("5060-linux", parsed.value.array.items[1].object.get("name").?.string);
+    const first = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings("http://192.168.137.3:11234", first.get("url").?.string);
+    try std.testing.expectEqualStrings("Mac16,5", first.get("model").?.string);
+    try std.testing.expectEqualStrings("MiniMax-H3", first.get("leads").?.string);
+    try std.testing.expectEqualStrings("", parsed.value.array.items[1].object.get("os").?.string);
 }

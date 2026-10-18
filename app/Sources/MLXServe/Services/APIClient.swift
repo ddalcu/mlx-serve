@@ -144,17 +144,19 @@ class APIClient {
 
     /// `/v1/models` whole: the rows, the LAN peers that refused us for want of a key, and
     /// every peer's address.
-    func fetchModelList(port: UInt16) async throws -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: URL]) {
+    func fetchModelList(port: UInt16) async throws -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: LanPeer]) {
         let (data, _) = try await session.data(from: serverURL(port: port, path: "/v1/models"))
         return Self.parseModelsBody(data)
     }
 
-    static func parseModelsBody(_ data: Data) -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: URL]) {
+    static func parseModelsBody(_ data: Data) -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: LanPeer]) {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let dataArr = json["data"] as? [[String: Any]] else { return ([], [], [:]) }
-        var peers: [String: URL] = [:]
+        var peers: [String: LanPeer] = [:]
         for p in json["lan_peers"] as? [[String: Any]] ?? [] {
-            if let name = p["name"] as? String, let url = (p["url"] as? String).flatMap(URL.init(string:)) { peers[name] = url }
+            guard let name = p["name"] as? String else { continue }
+            peers[name] = LanPeer(kind: MachineKind(os: p["os"] as? String ?? "", model: p["model"] as? String ?? ""),
+                                  leads: p["leads"] as? String ?? "", joined: p["joined"] as? Bool ?? false)
         }
         return (dataArr.map { parseModelInfo($0) }, json["lan_needs_key"] as? [String] ?? [], peers)
     }

@@ -1,7 +1,7 @@
 import AppKit
 import UniformTypeIdentifiers
 
-/// What kind of machine a cluster member is, from its `/health` ("os", "model"): the icon
+/// What kind of machine a cluster member is, from its `/v1/models` "machine": the icon
 /// macOS itself draws for it, and a word for it.
 struct MachineKind: Equatable {
     let os: String
@@ -15,11 +15,6 @@ struct MachineKind: Equatable {
     init(os: String, model: String) {
         self.os = os
         self.model = model
-    }
-
-    init(health: Data) {
-        let json = (try? JSONSerialization.jsonObject(with: health)) as? [String: Any]
-        self.init(os: json?["os"] as? String ?? "", model: json?["model"] as? String ?? "")
     }
 
     var label: String {
@@ -47,11 +42,22 @@ struct MachineKind: Equatable {
         return NSWorkspace.shared.icon(for: byModel ?? UTType(family) ?? .item)
     }
 
-    private static func sysctlString(_ name: String) -> String? {
+    fileprivate static func sysctlString(_ name: String) -> String? {
         var len = 0
         guard sysctlbyname(name, nil, &len, nil, 0) == 0, len > 0 else { return nil }
         var buf = [CChar](repeating: 0, count: len)
         guard sysctlbyname(name, &buf, &len, nil, 0) == 0 else { return nil }
         return String(cString: buf)
     }
+}
+
+/// A LAN peer as this Mac's server reports it in `/v1/models` "lan_peers".
+struct LanPeer: Equatable {
+    let kind: MachineKind
+    /// The model of a Thunderbolt pair it leads; empty when it leads none.
+    let leads: String
+    let joined: Bool
+
+    /// It leads a pair and waits for a Mac to join it.
+    var waitsForPartner: Bool { !leads.isEmpty && !joined }
 }

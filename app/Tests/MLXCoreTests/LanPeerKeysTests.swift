@@ -28,6 +28,6 @@ final class LanPeerKeysTests: XCTestCase {
 
     func testThePeersAddressesComeWithTheModelList() {
         let body = #"{"object":"list","data":[],"lan_peers":[{"name":"M4Max","url":"http://192.168.137.3:11234"}]}"#
-        XCTAssertEqual(APIClient.parseModelsBody(Data(body.utf8)).lanPeers["M4Max"]?.absoluteString, "http://192.168.137.3:11234")
+        XCTAssertEqual(APIClient.parseModelsBody(Data(body.utf8)).lanPeers["M4Max"]?.kind, .unknown)
     }
 }

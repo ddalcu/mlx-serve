@@ -309,13 +309,15 @@ const Plan = struct {
     fn matches(p: Plan, cfg: *const model_mod.ModelConfig) bool {
         return cfg.num_hidden_layers == p.span.total and cfg.hidden_size == p.hidden and cfg.num_experts == p.experts;
     }
-    fn send(p: Plan, link: *const Link, model_dir: []const u8) !void {
+    /// Sends the plan for `model_dir`; returns that copy's `modelIdentity`.
+    fn send(p: Plan, link: *const Link, model_dir: []const u8) !u64 {
         const g = group.?;
         const id = try modelIdentity(g.io, g.allocator, model_dir);
         const name = std.fs.path.basename(model_dir);
         try sendMsg(link, p.msg(name.len), 1);
         try sendBytes(link, name, 1);
         try sendMsg(link, .{ MAGIC, @bitCast(@as(u32, @truncate(id))), @bitCast(@as(u32, @truncate(id >> 32))), 0, 0, 0, 0, 0 }, 1);
+        return id;
     }
 };
 
@@ -363,6 +365,8 @@ pub const Peer = struct {
     span: LayerSpan = .{ .start = 0, .end = 0, .total = 0 },
     shard: ?Shard = null,
     planned: bool = false,
+    /// The `modelIdentity` of the copy the plan was made for.
+    plan_id: u64 = 0,
     ready: bool = false,
     /// The worker refused or failed its load: it has left, and nothing waits on it again.
     failed: bool = false,
@@ -432,6 +436,15 @@ pub const Peer = struct {
         const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{last}, 1);
         defer _ = mlx.mlx_vector_array_free(v);
         try mlx.check(mlx.mlx_async_eval(v));
+    }
+
+    /// The worker holds its part of the copy the plan was made for: another folder of the same
+    /// name (another quantization or revision) would pair this Mac's part with the wrong weights.
+    fn samePlannedCopy(self: *const Peer, model_dir: []const u8) !void {
+        const g = group.?;
+        if (try modelIdentity(g.io, g.allocator, model_dir) == self.plan_id) return;
+        log.err("[dist] {s} is not the copy the worker loaded; restart the server to pair with it\n", .{model_dir});
+        return error.DistModelMismatch;
     }
 
     fn awaitReady(self: *Peer) !void {
@@ -504,17 +517,16 @@ pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     });
 }
 
-/// `/health`'s Thunderbolt field (with its leading comma), empty unless this server leads a
-/// pair: its model and whether the other Mac has joined, so that Mac's app can offer to join.
-pub fn healthField(allocator: std.mem.Allocator) ![]u8 {
+/// The `/v1/models` "machine" fields of a Thunderbolt pair this server leads (with a leading
+/// comma), empty when it leads none: its model and whether the other Mac has joined, so that
+/// Mac's app can offer to join it.
+pub fn pairFields(allocator: std.mem.Allocator) ![]u8 {
     const g = group orelse return allocator.dupe(u8, "");
-    return pairHealthField(allocator, std.fs.path.basename(g.model), joined.load(.acquire));
+    return pairFieldsFor(allocator, std.fs.path.basename(g.model), joined.load(.acquire));
 }
 
-fn pairHealthField(allocator: std.mem.Allocator, model: []const u8, has_joined: bool) ![]u8 {
-    return std.fmt.allocPrint(allocator, ",\"thunderbolt\":{{\"leads\":{f},\"joined\":{}}}", .{
-        std.json.fmt(model, .{}), has_joined,
-    });
+fn pairFieldsFor(allocator: std.mem.Allocator, model: []const u8, has_joined: bool) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"leads\":{f},\"joined\":{}", .{ std.json.fmt(model, .{}), has_joined });
 }
 
 fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
@@ -567,7 +579,7 @@ pub const Part = union(enum) { span: LayerSpan, shard: Shard };
 pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Part {
     if (!serves(model_dir)) return null;
     const p = try join();
-    if (!p.planned) try plan(p, config, model_dir);
+    if (p.planned) try p.samePlannedCopy(model_dir) else try plan(p, config, model_dir);
     return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
 }
 
@@ -583,9 +595,9 @@ pub fn planRows(model_dir: []const u8, hidden: i32, blocks: i32) !*Peer {
     if (!p.planned) {
         p.mode = .rows;
         const pl: Plan = .{ .mode = .rows, .span = .{ .start = 0, .end = @intCast(blocks), .total = @intCast(blocks) }, .hidden = hidden, .experts = 0 };
-        try pl.send(&p.link, model_dir);
+        p.plan_id = try pl.send(&p.link, model_dir);
         p.planned = true;
-    }
+    } else try p.samePlannedCopy(model_dir);
     if (!p.ready) try p.awaitReady();
     return p;
 }
@@ -631,7 +643,7 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8
             log.info("[dist] pipeline: layers 0..{d} of {s} here ({d} MiB free), {d}..{d} on the worker ({d} MiB free of {d})\n", .{ k, std.fs.path.basename(self.model), mine, k, n, self.worker.avail_mib, self.worker.total_mib });
         },
     }
-    try pl.send(&self.link, model_dir);
+    self.plan_id = try pl.send(&self.link, model_dir);
     self.planned = true;
 }
 
@@ -1139,15 +1151,40 @@ test "findModel pairs the host's copy of a name, not another quantization of it"
     try std.testing.expect((try findModel(io, allocator, &.{root}, "Other", 42)) == null);
 }
 
-test "healthField names the model a Thunderbolt pair leads, as valid JSON" {
+test "pairFields names the model a Thunderbolt pair leads, as valid JSON" {
     const a = std.testing.allocator;
-    const f = try pairHealthField(a, "MiniMax \"H3\"", false);
+    const f = try pairFieldsFor(a, "MiniMax \"H3\"", false);
     defer a.free(f);
-    const j = try std.fmt.allocPrint(a, "{{\"status\":\"ok\"{s}}}", .{f});
+    const j = try std.fmt.allocPrint(a, "{{\"os\":\"macos\"{s}}}", .{f});
     defer a.free(j);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
     defer parsed.deinit();
-    const tb = parsed.value.object.get("thunderbolt").?.object;
-    try std.testing.expectEqualStrings("MiniMax \"H3\"", tb.get("leads").?.string);
-    try std.testing.expect(!tb.get("joined").?.bool);
+    try std.testing.expectEqualStrings("MiniMax \"H3\"", parsed.value.object.get("leads").?.string);
+    try std.testing.expect(!parsed.value.object.get("joined").?.bool);
+}
+
+test "a plan made for one copy refuses another folder of the same name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a/Flash", "b/Flash" }, [_][]const u8{ "4bit", "8bit" }) |dir, q| {
+        try tmp.dir.createDirPath(io, dir);
+        const cfg = try std.fmt.allocPrint(allocator, "{s}/config.json", .{dir});
+        defer allocator.free(cfg);
+        try tmp.dir.writeFile(io, .{ .sub_path = cfg, .data = q });
+    }
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd)));
+    const a = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/a/Flash", .{ cwd, tmp.sub_path });
+    defer allocator.free(a);
+    const b = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/b/Flash", .{ cwd, tmp.sub_path });
+    defer allocator.free(b);
+
+    group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = a, .split = null };
+    defer group = null;
+    var p: Peer = undefined;
+    p.plan_id = try modelIdentity(io, allocator, a);
+    try p.samePlannedCopy(a);
+    try std.testing.expectError(error.DistModelMismatch, p.samePlannedCopy(b));
 }

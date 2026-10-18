@@ -1107,8 +1107,8 @@ private struct ThunderboltClusterSectionContent: View {
     private func watch() async {
         while !Task.isCancelled {
             ports = await Task.detached { ClusterSetup.ports() }.value
-            if case .ready = pair, !server.lanPeerURLs.isEmpty {
-                leader = await ThunderboltPairing.waitingLeader(among: server.lanPeerURLs)
+            if case .ready = pair {
+                leader = server.lanPeers.filter(\.value.waitsForPartner).keys.sorted().first
             } else {
                 leader = nil
             }
@@ -1382,8 +1382,6 @@ private struct ClusterMapView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @ObservedObject var worker: ClusterWorker
-    /// Each network machine's `/health`: what kind of machine it is.
-    @State private var kinds: [String: MachineKind] = [:]
 
     var body: some View {
         SearchableRow(searchText: ["Cluster", "machines", "Thunderbolt", "network"], separatorGap: nil) {
@@ -1412,7 +1410,7 @@ private struct ClusterMapView: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(alignment: .top, spacing: 20) {
                             ForEach(peers, id: \.self) { name in
-                                let kind = kinds[name] ?? .unknown
+                                let kind = server.lanPeers[name]?.kind ?? .unknown
                                 MachineTile(icon: kind.icon, name: name, caption: kind.label)
                             }
                         }
@@ -1420,15 +1418,6 @@ private struct ClusterMapView: View {
                 }
             }
             .padding(.vertical, 6)
-        }
-        .task(id: server.lanPeerURLs) { await readKinds() }
-    }
-
-    private func readKinds() async {
-        for (name, url) in server.lanPeerURLs where kinds[name] == nil {
-            var req = URLRequest(url: url.appendingPathComponent("health"))
-            req.timeoutInterval = 2
-            if let (data, _) = try? await URLSession.shared.data(for: req) { kinds[name] = MachineKind(health: data) }
         }
     }
 
@@ -1454,7 +1443,7 @@ private struct ClusterMapView: View {
     /// The paired Mac's kind, when it also shows up on the network.
     private var partnerKind: MachineKind {
         guard let name = server.cluster?.workerName, !name.isEmpty else { return .mac }
-        return kinds.first { StoryboardCluster.sameMachine($0.key, name) }?.value ?? .mac
+        return server.lanPeers.first { StoryboardCluster.sameMachine($0.key, name) }?.value.kind ?? .mac
     }
 
     /// What the pair does for one video.
@@ -1466,7 +1455,7 @@ private struct ClusterMapView: View {
 
     /// Every machine on the network but the paired one.
     private var networkMachines: [String] {
-        var names = Set(server.lanPeerURLs.keys)
+        var names = Set(server.lanPeers.keys)
         names.formUnion(server.allModels.compactMap(\.lanPeer))
         if let c = server.cluster, c.joined { names = names.filter { !StoryboardCluster.sameMachine($0, c.workerName) } }
         return names.sorted()

@@ -258,12 +258,4 @@ enum ThunderboltPair: Equatable {
         case .worker: return .helping
         }
     }
-
-    /// A pair leader's `/health`: the model it leads with while no Mac has joined it.
-    static func waitingLeader(health: Data) -> String? {
-        guard let json = try? JSONSerialization.jsonObject(with: health) as? [String: Any],
-              let tb = json["thunderbolt"] as? [String: Any],
-              let model = tb["leads"] as? String, tb["joined"] as? Bool == false else { return nil }
-        return model
-    }
 }

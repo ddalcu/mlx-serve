@@ -36,11 +36,9 @@ final class ThunderboltPairTests: XCTestCase {
     }
 
     func testOnlyALeaderStillWaitingIsOffered() {
-        let waiting = Data(#"{"status":"ok","thunderbolt":{"leads":"MiniMax-H3","joined":false}}"#.utf8)
-        let taken = Data(#"{"status":"ok","thunderbolt":{"leads":"MiniMax-H3","joined":true}}"#.utf8)
-        XCTAssertEqual(ThunderboltPair.waitingLeader(health: waiting), "MiniMax-H3")
-        XCTAssertNil(ThunderboltPair.waitingLeader(health: taken))
-        XCTAssertNil(ThunderboltPair.waitingLeader(health: Data(#"{"status":"ok"}"#.utf8)))
+        let body = #"{"data":[],"lan_peers":[{"name":"Studio","os":"macos","model":"Mac17,15","leads":"MiniMax-H3","joined":false},{"name":"Taken","leads":"MiniMax-H3","joined":true},{"name":"Plain","leads":""}]}"#
+        let peers = APIClient.parseModelsBody(Data(body.utf8)).lanPeers
+        XCTAssertEqual(peers.filter(\.value.waitsForPartner).keys.sorted(), ["Studio"])
     }
 
     /// A Mac that led and now joins drops the leader's address before taking its own.
