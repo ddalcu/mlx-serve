@@ -1313,6 +1313,15 @@ let gemmaModelOptions: [GemmaModelOption] = [
         sizeEstimate: "~426 GB on disk (experts stream from SSD), needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
+    // GLM-5.3-Flash (glm5_next) on mlx-stream: FP8 residents load once, the EXL3 K=3
+    // experts stream from SSD, the pack's MTP head drafts; the full 1M context on a 128 GB Mac.
+    GemmaModelOption(
+        id: "glm53-flash-exl3",
+        displayName: "GLM-5.3-Flash (streaming repack, EXL3 3.05 bpw)",
+        repoId: "OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw",
+        sizeEstimate: "~131 GB on disk (experts stream from SSD), needs 128 GB RAM",
+        minHostRamBytes: 128 * (UInt64(1) << 30)
+    ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
     GemmaModelOption(
         id: "hy3-oq2e",
