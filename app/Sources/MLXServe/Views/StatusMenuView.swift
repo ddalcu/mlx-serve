@@ -516,8 +516,9 @@ struct StatusMenuView: View {
                     }
                     // Shared meter — the same bar the Recommended pane and
                     // welcome screen show.
+                    // A Thunderbolt worker's part lives in its own process, beside the server's.
                     MemoryMeter(
-                        gpuBytes: mem.activeBytes,
+                        gpuBytes: mem.activeBytes + appState.clusterWorker.residentBytes,
                         gpuLabel: mem.gpuMemoryLabel,
                         availableBytes: mem.availableBytes,
                         totalBytes: Int64(ProcessInfo.processInfo.physicalMemory),
@@ -741,7 +742,7 @@ struct StatusMenuView: View {
                 let paired = server.cluster.map { $0.joined && $0.serves(info.name) } ?? false
                 if paired {
                     ThunderboltBadge()
-                        .help(L10n.text("Runs across the two Macs of a Thunderbolt pair. Unpair in Settings ▸ Cluster to unload it."))
+                        .help(L10n.text("Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both."))
                 }
                 Spacer(minLength: 4)
                 // Copy the model's full name/id to the clipboard (paste into a curl,
@@ -760,9 +761,7 @@ struct StatusMenuView: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(copiedModelName == info.name ? .green : .secondary)
                 .help("Copy model name")
-                if paired {
-                    EmptyView()
-                } else if unloadingIds.contains(info.name) {
+                if unloadingIds.contains(info.name) {
                     ProgressView()
                         .controlSize(.mini)
                         .help("Unloading — waits for any running request to finish")
@@ -1437,6 +1436,9 @@ private struct WorkerPartRow: View {
                         .truncationMode(.middle)
                     ThunderboltBadge()
                     Spacer(minLength: 4)
+                    if worker.residentBytes > 0 {
+                        Text(verbatim: MemoryInfo.format(worker.residentBytes)).font(.app(.caption2)).foregroundStyle(.secondary)
+                    }
                     if !part.ready { ProgressView().controlSize(.mini) }
                 }
                 Text(part.detail.isEmpty

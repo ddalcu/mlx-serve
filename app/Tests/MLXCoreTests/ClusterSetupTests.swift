@@ -96,6 +96,13 @@ final class ClusterSetupTests: XCTestCase {
         XCTAssertNil(ClusterWorker.part(of: .ready("")))
     }
 
+    /// The tray counts the worker's part from its ready line.
+    func testTheWorkersResidentMemoryComesFromItsReadyLine() {
+        XCTAssertEqual(ClusterWorker.residentMiB(in: "[dist] worker ready (70179 MiB resident)"), 70179)
+        XCTAssertEqual(ClusterWorker.residentMiB(in: "[dist] worker ready (812 MiB resident, 9000 us per 64-row pass)"), 812)
+        XCTAssertNil(ClusterWorker.residentMiB(in: "[dist] worker ready: layers 2..14 resident, 70179 MiB"))
+    }
+
     /// The default launch carries no cluster flag.
     func testDefaultLaunchHasNoClusterFlags() {
         XCTAssertFalse(ServerOptions().toCLIArgs(modelDirs: []).contains("--dist"))

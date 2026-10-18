@@ -253,7 +253,7 @@ fn alone(comptime fmt: []const u8, args: anytype) ?Job {
 
 /// The worker's side: loads the whole DiT from `dir`, reports its speed, then runs its rows of
 /// every step until rank 0 stops it.
-pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distributed.Link, dir: []const u8, hidden: i32, blocks: i32) !void {
+pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distributed.Link, dir: []const u8, hidden: i32, blocks: i32) !bool {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const dit = try std.fs.path.join(allocator, &.{ dir, "transformer.safetensors" });
@@ -279,6 +279,7 @@ pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distri
         const m = try distributed.recvOp(link);
         switch (m[0]) {
             distributed.OP_STOP => break,
+            distributed.OP_RELEASE => return true,
             distributed.OP_H3_JOB => {
                 const turbo = m[1] != 0;
                 if (turbo != turbo_bound) {
@@ -330,6 +331,7 @@ pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distri
             else => return error.DistBadMessage,
         }
     }
+    return false;
 }
 
 fn cat(arrs: []const mlx.mlx_array, axis: c_int, s: S) !mlx.mlx_array {

@@ -26,6 +26,11 @@ pub fn nowMsMonotonic(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .boot).toMilliseconds();
 }
 
+/// `nowMsMonotonic` in microseconds.
+pub fn nowUsMonotonic(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .boot).toMicroseconds();
+}
+
 /// `nowMsMonotonic` as a value, for code that takes its clock as a parameter so a test can step it.
 pub const MonotonicClock = struct {
     io: std.Io,

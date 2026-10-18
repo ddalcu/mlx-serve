@@ -2346,7 +2346,6 @@
 "Runs across the two Macs of a Thunderbolt pair." = "在 Thunderbolt 配对的两台 Mac 上一起运行。";
 "This Mac's part, for the Mac that leads" = "本机承担的部分，供主导的 Mac 使用";
 "This Mac's part (%@), for the Mac that leads" = "本机承担的部分（%@），供主导的 Mac 使用";
-"Runs across the two Macs of a Thunderbolt pair. Unpair in Settings ▸ Cluster to unload it." = "在 Thunderbolt 配对的两台 Mac 上一起运行。要卸载，请在“设置 ▸ 集群”中取消配对。";
 "It runs %@, which this Mac doesn't have. Download the same model here, then join from Settings ▸ Cluster." = "它运行的是 %@，本机没有这个模型。请先在本机下载同一个模型，然后在“设置 ▸ 集群”中加入。";
 "Join it, and the two Macs run %@ together." = "加入后，两台 Mac 将一起运行 %@。";
 "It runs %@, which this Mac doesn't have. Download the same model here to join." = "它运行的是 %@，本机没有这个模型。请先在本机下载同一个模型再加入。";
@@ -2357,3 +2356,4 @@
 "Too big even for both Macs together." = "两台 Mac 加起来也放不下。";
 "About %@ on this Mac and %@ on %@." = "本机约占用 %@，%@ 在 %@ 上。";
 "A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it." = "配对可运行 MiniMax-H3（视频），或 Qwen3.8-Flash-Next、DeepSeek-V4.1（聊天）。请在两台 Mac 上都下载其中一个。";
+"Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both." = "在 Thunderbolt 配对的两台 Mac 上一起运行；卸载它会同时在两台 Mac 上释放。";

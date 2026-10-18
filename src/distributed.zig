@@ -328,6 +328,8 @@ pub const OP_H3_JOB: i32 = 4;
 pub const OP_H3_STEP: i32 = 5;
 pub const OP_H3_END: i32 = 6;
 const OP_DSV41: i32 = 7;
+/// The host unloaded the pair's model: the worker frees its part and waits for the next plan.
+pub const OP_RELEASE: i32 = 8;
 
 /// A control message to the other rank of a two-Mac group.
 pub fn sendOp(link: *const Link, m: Msg) !void {
@@ -566,7 +568,10 @@ pub const Peer = struct {
         }
         self.worker_resident_mib = @intCast(@max(m[2], 0));
         switch (self.mode) {
-            .pipeline => log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ self.span.end, self.span.total, m[2] }),
+            .pipeline => if (self.remote) |r|
+                log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ r.start, r.end, m[2] })
+            else
+                log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ self.span.end, self.span.total, m[2] }),
             .tensor => log.info("[dist] worker ready: its half of every expert resident, {d} MiB\n", .{m[2]}),
             .rows => {
                 self.worker_calib_us = @intCast(m[3]);
@@ -616,6 +621,12 @@ var worker_copy = std.atomic.Value(i32).init(-1);
 /// The worker's bell connection closed: it left, and JACCL forms a group once per process,
 /// so this server must restart to pair again (the app does it, `/props` cluster "worker_gone").
 var worker_gone = std.atomic.Value(bool).init(false);
+/// The worker's compute time for its last step (µs), sent over the bell after each one.
+var worker_us = std.atomic.Value(u32).init(0);
+/// Round trips since the last timing line, and their totals (µs): the whole exchange and the
+/// worker's share of it.
+var timing: struct { n: u32 = 0, round_us: u64 = 0, worker_us: u64 = 0 } = .{};
+
 /// The worker's free memory as it answered on joining (MiB), for the load bill.
 var worker_free_mib = std.atomic.Value(u32).init(0);
 var joined_link: Link = undefined;
@@ -690,6 +701,20 @@ pub fn shutdown() void {
     log.info("[dist] worker released\n", .{});
 }
 
+/// Rank 0, on the inference thread, when the pair's model unloads here: the worker frees its
+/// part too and waits for the next plan, which the model's next load sends.
+pub fn release() void {
+    const p = peer() orelse return;
+    if (!p.ready) return;
+    sendMsg(&p.link, .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 }, 1) catch return;
+    p.planned = false;
+    p.ready = false;
+    p.remote = null;
+    p.shard = null;
+    p.peer_pos = 0;
+    log.info("[dist] {s} unloaded: the worker released its part\n", .{std.fs.path.basename(p.model)});
+}
+
 /// Rank 0's peer, once `connect` has run.
 pub fn peer() ?*Peer {
     return if (peer_slot) |*p| p else null;
@@ -733,8 +758,8 @@ fn shareFor(g: Group, config: *const model_mod.ModelConfig, whole: u64, mine: u6
     };
 }
 
-/// Whether a Thunderbolt pair holds `model_dir`: the worker joined and holds its part of it,
-/// so nothing here unloads it until the pair ends (Unpair restarts the server).
+/// Whether a Thunderbolt pair holds `model_dir`: the worker joined, so no other load unloads it
+/// to make room (an explicit unload still does, on both Macs: `release`).
 pub fn holds(model_dir: []const u8) bool {
     return joined.load(.acquire) and serves(model_dir);
 }
@@ -837,6 +862,8 @@ fn dsv41Exchange(x: mlx.mlx_array, pre: mlx.mlx_array, p0: usize, snap: bool) an
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
     const xs = mlx.getShape(x);
+    const t0 = io_util.nowUsMonotonic(group.?.io);
+    defer noteRoundTrip(io_util.nowUsMonotonic(group.?.io) - t0);
     try self.sendOrdered(.{ OP_DSV41, xs[0], @intCast(p0 & 0x7fffffff), @intCast(p0 >> 31), @intFromBool(snap), xs[1], @intFromEnum(mlx.mlx_array_dtype(x)), @intFromEnum(mlx.mlx_array_dtype(pre)) }, &.{ x, pre });
     self.exchanges += 1;
     const xo = try queuedRecv(&self.link, xs, mlx.mlx_array_dtype(x), 1);
@@ -844,9 +871,23 @@ fn dsv41Exchange(x: mlx.mlx_array, pre: mlx.mlx_array, p0: usize, snap: bool) an
     return .{ xo, try queuedRecv(&self.link, mlx.getShape(pre), mlx.mlx_array_dtype(pre), 1) };
 }
 
+/// Every 64 round trips: what one took, and how much of it the worker computed (the rest is the
+/// link, both sends and the hand-off). The worker's time arrives over the bell, a step late.
+fn noteRoundTrip(us: i64) void {
+    timing.n += 1;
+    timing.round_us += @intCast(@max(us, 0));
+    timing.worker_us += worker_us.load(.acquire);
+    if (timing.n < 64) return;
+    const n: f64 = @floatFromInt(timing.n);
+    const round = @as(f64, @floatFromInt(timing.round_us)) / n / 1000;
+    const work = @as(f64, @floatFromInt(timing.worker_us)) / n / 1000;
+    log.info("[dist] timing over {d} steps: round trip {d:.2} ms = worker {d:.2} ms + link {d:.2} ms\n", .{ timing.n, round, work, round - work });
+    timing = .{};
+}
+
 /// Worker, DeepSeek-V4.1: its run of layers (`pl.span`), then one step per OP_DSV41 until
 /// rank 0 stops it.
-fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: []const u8, config: *model_mod.ModelConfig, pl: Plan) !void {
+fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: []const u8, config: *model_mod.ModelConfig, pl: Plan) !bool {
     config.dist_dsv41 = .{ .lo = pl.span.start, .hi = pl.span.end, .worker = true };
     var w = model_mod.loadModelWeights(io, allocator, dir, config, false) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
@@ -870,16 +911,21 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
         const msg = try recvMsg(link, 0);
         switch (msg[0]) {
             OP_STOP => break,
+            OP_RELEASE => return true,
             OP_DSV41 => {
                 const p0: usize = @as(usize, @intCast(msg[2])) | (@as(usize, @intCast(msg[3])) << 31);
                 const x = try queuedRecv(link, &.{ msg[1], msg[5], d }, @enumFromInt(msg[6]), 0);
                 defer _ = mlx.mlx_array_free(x);
                 const pre = try queuedRecv(link, &.{ msg[1], msg[5] }, @enumFromInt(msg[7]), 0);
                 defer _ = mlx.mlx_array_free(pre);
+                const t0 = io_util.nowUsMonotonic(io);
                 const out = try dsv41_mod.workerStep(m, allocator, x, pre, p0, msg[4] != 0);
                 defer for (out) |o| {
                     _ = mlx.mlx_array_free(o);
                 };
+                var took: [4]u8 = undefined;
+                std.mem.writeInt(u32, &took, @intCast(std.math.clamp(io_util.nowUsMonotonic(io) - t0, 0, std.math.maxInt(u32))), .little);
+                link.bell.writeAll(&took) catch {};
                 try sendNow(link, out[0], 0);
                 try sendNow(link, out[1], 0);
                 steps += 1;
@@ -889,6 +935,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
         }
     }
     log.info("[dist] worker: stopped by rank 0 after {d} steps\n", .{steps});
+    return false;
 }
 
 fn sendBytes(link: *const Link, bytes: []const u8, dst: u32) !void {
@@ -934,13 +981,11 @@ fn waitForWorker(io: std.Io, cfg: Config) void {
 /// returns only at its end.
 fn watchWorker(link: *const Link) void {
     if (link.bell.fd < 0) return;
-    var x: [1]u8 = undefined;
-    while (true) {
-        const n = std.c.read(link.bell.fd, &x, 1);
-        if (n < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
-        if (n > 0) continue;
-        break;
-    }
+    // After its answer the worker writes only each step's compute time (µs, u32).
+    var x: [4]u8 = undefined;
+    while (link.bell.readAll(&x)) |_| {
+        worker_us.store(std.mem.readInt(u32, &x, .little), .release);
+    } else |_| {}
     worker_gone.store(true, .release);
     joined.store(false, .release);
     log.warn("[dist] the worker left; this server restarts to pair again\n", .{});
@@ -1076,14 +1121,23 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     try link.bell.wait();
     try sendMsg(&link, Hello.here(short.len).msg(), 0);
     if (short.len > 0) try sendBytes(&link, short, 0);
-    const pmsg = try recvMsg(&link, 0);
+    while (true) {
+        const pmsg = try recvMsg(&link, 0);
+        if (pmsg[0] == OP_STOP or !try servePlan(io, allocator, &link, roots.items, pmsg)) break;
+        log.info("[dist] worker: released its part, waiting for the host to load a model\n", .{});
+    }
+}
+
+/// One plan: finds and loads this Mac's part, then serves until rank 0 stops it (false) or
+/// releases it (true: the host unloaded the model and may plan again).
+fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots: []const []const u8, pmsg: Msg) !bool {
     const pl = try Plan.parse(pmsg);
     var name_buf: [256]u8 = undefined;
     const name_len: usize = @intCast(pmsg[5]);
     if (name_len == 0 or name_len > name_buf.len) return error.DistBadMessage;
-    try recvBytes(&link, name_buf[0..name_len], 0);
+    try recvBytes(link, name_buf[0..name_len], 0);
     const name = name_buf[0..name_len];
-    const idm = try recvMsg(&link, 0);
+    const idm = try recvMsg(link, 0);
     if (idm[0] != MAGIC) return error.DistProtocolMismatch;
     const id = @as(u64, @as(u32, @bitCast(idm[1]))) | @as(u64, @as(u32, @bitCast(idm[2]))) << 32;
     switch (pl.mode) {
@@ -1097,53 +1151,54 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
             sendMsg(l, .{ MAGIC, code, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         }
     };
-    const found = findModel(io, allocator, roots.items, name, id) catch |err| {
+    const found = findModel(io, allocator, roots, name, id) catch |err| {
         if (err == error.DistModelMismatch) log.err("[dist] worker: {s} here is not the host's copy (quantization or revision)\n", .{name});
-        fail.send(&link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
+        fail.send(link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
         return err;
     };
     const dir = found orelse {
-        log.err("[dist] worker: no model named {s} in {s}\n", .{ name, roots.items[0] });
-        fail.send(&link, NOT_FOUND);
+        log.err("[dist] worker: no model named {s} in {s}\n", .{ name, roots[0] });
+        fail.send(link, NOT_FOUND);
         return error.DistModelNotFound;
     };
     defer allocator.free(dir);
     if (pl.mode == .rows) {
-        h3_split.serveWorker(allocator, io, &link, dir, pl.hidden, @intCast(pl.span.total)) catch |err| {
+        const released = h3_split.serveWorker(allocator, io, link, dir, pl.hidden, @intCast(pl.span.total)) catch |err| {
             log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
-            fail.send(&link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
+            fail.send(link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
             return err;
         };
-        log.info("[dist] worker: stopped by rank 0\n", .{});
-        return;
+        if (!released) log.info("[dist] worker: stopped by rank 0\n", .{});
+        return released;
     }
     var config = try model_mod.parseConfig(io, allocator, dir);
     defer config.deinit(allocator);
     if (!pl.matches(&config)) {
         log.err("[dist] worker: {s} here has a different geometry than the host's\n", .{dir});
-        fail.send(&link, MISMATCH);
+        fail.send(link, MISMATCH);
         return error.DistModelMismatch;
     }
-    if (config.isDsv41()) return serveDsv41(io, allocator, &link, dir, &config, pl);
+    if (config.isDsv41()) return serveDsv41(io, allocator, link, dir, &config, pl);
     var xfm = load(io, allocator, dir, &config, pl.mode, pl.span) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
-        fail.send(&link, LOAD_FAILED);
+        fail.send(link, LOAD_FAILED);
         return err;
     };
     defer xfm.t.deinit();
     defer xfm.w.deinit();
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
-    try sendMsg(&link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
+    try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
 
     const t = &xfm.t;
     var ctx = t.defaultCtx();
     var forwards: u64 = 0;
     while (true) {
-        const m = try recvMsg(&link, 0);
+        const m = try recvMsg(link, 0);
         switch (m[0]) {
             OP_STOP => break,
+            OP_RELEASE => return true,
             OP_FORWARD => {
                 const offset: usize = @as(usize, @intCast(m[3])) | (@as(usize, @intCast(m[4])) << 31);
                 if (offset == 0) {
@@ -1153,7 +1208,7 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
                     return error.DistPeerDiverged;
                 }
                 const shape = [_]c_int{ m[1], m[2], m[5] };
-                const h = try queuedRecv(&link, &shape, @enumFromInt(m[6]), 0);
+                const h = try queuedRecv(link, &shape, @enumFromInt(m[6]), 0);
                 defer _ = mlx.mlx_array_free(h);
                 const raw = try t.forwardQwen4Stream(&ctx, h);
                 defer _ = mlx.mlx_array_free(raw);
@@ -1174,9 +1229,9 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
                 if (m[1] * m[2] > 1 or forwards % 256 == 0) log.info("[dist] worker: forward {d}: {d}x{d} rows, now at {d} tokens\n", .{ forwards, m[1], m[2], t.moe_seq_offset });
             },
             OP_MOE => {
-                const x = try queuedRecv(&link, &.{ m[1], m[2], m[3] }, @enumFromInt(m[5]), 0);
+                const x = try queuedRecv(link, &.{ m[1], m[2], m[3] }, @enumFromInt(m[5]), 0);
                 defer _ = mlx.mlx_array_free(x);
-                const logits = try queuedRecv(&link, &.{ m[1], m[2], m[4] }, @enumFromInt(m[7]), 0);
+                const logits = try queuedRecv(link, &.{ m[1], m[2], m[4] }, @enumFromInt(m[7]), 0);
                 defer _ = mlx.mlx_array_free(logits);
                 const raw = try t.moeExpertsRouted(x, @intCast(m[6]), logits);
                 defer _ = mlx.mlx_array_free(raw);
@@ -1198,6 +1253,7 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
         }
     }
     log.info("[dist] worker: stopped by rank 0 after {d} forwards\n", .{forwards});
+    return false;
 }
 
 const Loaded = struct { w: model_mod.Weights, t: transformer_mod.Transformer };

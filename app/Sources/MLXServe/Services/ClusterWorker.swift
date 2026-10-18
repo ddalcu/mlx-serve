@@ -13,6 +13,10 @@ final class ClusterWorker: ObservableObject {
     }
 
     @Published private(set) var state: State = .stopped
+    /// What the worker's part holds in memory, from its "worker ready (N MiB resident)" line.
+    @Published private(set) var residentBytes: Int64 = 0
+    /// The worker's output, kept for a post-mortem beside the server's log.
+    nonisolated static let logPath = (NSHomeDirectory() as NSString).appendingPathComponent(".mlx-serve/logs/mlx-serve-worker.log")
     private var process: Process?
     private var wanted = false
     private var options = ServerOptions()
@@ -39,6 +43,21 @@ final class ClusterWorker: ObservableObject {
         guard let cut else { return (text, "", ready) }
         let detail = text[cut.lowerBound...].trimmingCharacters(in: CharacterSet(charactersIn: ", "))
         return (String(text[..<cut.lowerBound]), detail, ready)
+    }
+
+    /// The MiB a "[dist] worker ready (N MiB resident…)" line reports.
+    nonisolated static func residentMiB(in line: String) -> Int64? {
+        guard line.contains("[dist] worker ready ("), let open = line.range(of: "ready (") else { return nil }
+        return Int64(line[open.upperBound...].prefix { $0.isNumber })
+    }
+
+    nonisolated private static func appendToLog(_ data: Data) {
+        let url = URL(fileURLWithPath: logPath)
+        if !FileManager.default.fileExists(atPath: logPath) { FileManager.default.createFile(atPath: logPath, contents: nil) }
+        guard let f = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? f.close() }
+        _ = try? f.seekToEnd()
+        try? f.write(contentsOf: data)
     }
 
     /// The worker's state after one of its log lines.
@@ -92,13 +111,17 @@ final class ClusterWorker: ObservableObject {
         let err = Pipe()
         p.standardError = err
         err.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let text = String(decoding: h.availableData, as: UTF8.self)
+            let data = h.availableData
+            let text = String(decoding: data, as: UTF8.self)
             guard !text.isEmpty else { return }
+            Self.appendToLog(data)
             Task { @MainActor in
                 guard let self else { return }
                 for line in text.split(separator: "\n") {
                     self.state = Self.state(after: String(line), current: self.state)
+                    if let mib = Self.residentMiB(in: String(line)) { self.residentBytes = mib << 20 }
                 }
+                if case .ready = self.state {} else if case .loading = self.state {} else { self.residentBytes = 0 }
             }
         }
         // The worker exits when its host stops it; it waits for the next host.

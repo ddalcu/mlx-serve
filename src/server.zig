@@ -8390,10 +8390,6 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
             return;
         },
-        error.ModelHeldByPair => {
-            try sendErrorResponse(allocator, stream, "409 Conflict", "held_by_pair", "This model runs across a Thunderbolt pair; unpair to unload it", 409);
-            return;
-        },
         else => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_unload_failed", "Model unload failed", 500);
             return;

@@ -578,6 +578,8 @@ pub const LoadedModel = struct {
     /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
     /// mlx frees happen on the inference thread.
     pub fn unloadResident(self: *LoadedModel) void {
+        // A Thunderbolt pair's model unloads on both Macs; its next load plans again.
+        if (distributed.serves(self.path)) distributed.release();
         if (self.llama_ctx) |ctx| {
             ctx.free();
             self.llama_ctx = null;
