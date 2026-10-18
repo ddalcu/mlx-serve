@@ -54,7 +54,7 @@ boot() { # extra flags...
     SERVER_PID=$!
     echo "waiting for server (load takes minutes)..."
     for _ in $(seq 1 400); do
-        curl -s -m 2 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && break
+        curl -sf -m 2 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && break
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
         fi

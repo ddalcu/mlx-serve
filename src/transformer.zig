@@ -41555,7 +41555,7 @@ const GQMV_BODY_NVFP4 =
 // One packed unit of quantized values as a uint32: a word for 2/4/8-bit; at
 // 3-bit, mx.quantize packs 8 values into 3 bytes (value i at bit 3i), so the
 // unit is a byte triple and the body's `>> (i * BITS)` walk is unchanged.
-const GQMV_AFFINE_HEADER =
+pub const GQMV_AFFINE_HEADER =
     \\template <int B>
     \\inline uint32_t mlxserve_qpack(const device uint32_t* w, size_t wbase_words, int pack) {
     \\  if (B == 3) {
@@ -45652,13 +45652,18 @@ fn forwardMlxStream(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arr
 /// resumed one (`resumePrompt` set step) and every later call, prefill chunk
 /// or decode token alike, extends it. Returns the last position's logits `[1, 1, V]`.
 fn forwardDsv41WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, mdl: *dsv41_mod.Dsv41Model) !mlx.mlx_array {
-    const ids = try hostIds(self, token_ids);
-    defer self.allocator.free(ids);
-    const n = ids.len;
-    const logits = if (ctx.cache.step == 0 or mdl.dec_state == null)
-        try dsv41_mod.prefill(mdl, self.allocator, ids)
-    else
-        try dsv41_mod.extendResumable(mdl, self.allocator, ids);
+    const n = mlx.mlx_array_size(token_ids);
+    // A decode token stays on the GPU: the module reads it back once the layers before Engram are queued.
+    const logits = if (ctx.cache.step > 0 and mdl.dec_state != null and n == 1 and mdl.pair == null)
+        try dsv41_mod.extendResumableGpu(mdl, self.allocator, token_ids)
+    else blk: {
+        const ids = try hostIds(self, token_ids);
+        defer self.allocator.free(ids);
+        break :blk if (ctx.cache.step == 0 or mdl.dec_state == null)
+            try dsv41_mod.prefill(mdl, self.allocator, ids)
+        else
+            try dsv41_mod.extendResumable(mdl, self.allocator, ids);
+    };
     defer _ = mlx.mlx_array_free(logits);
     ctx.cache.step += n;
     var out = mlx.mlx_array_new();
@@ -45681,7 +45686,7 @@ fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 /// DSpark stages load as `deepseek_v41.dsparkWanted` decides.
 fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
     if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
-    const mdl = try dsv41_mod.init(allocator, &config, weights, s, .{ .dspark = dsv41_mod.dsparkWanted(&config), .pair = config.dist_dsv41 });
+    const mdl = try dsv41_mod.init(allocator, &config, weights, s, .{ .dspark = dsv41_mod.dsparkWanted(&config), .pair = config.dist_dsv41, .head_8bit = true });
     errdefer mdl.deinit();
     var t = try moduleShell(allocator, config, s);
     t.dsv41 = mdl;

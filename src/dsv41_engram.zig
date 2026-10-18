@@ -280,6 +280,7 @@ pub const Table = struct {
             }
             return error.EngramManifest;
         } else |_| {}
+        if (try openRawTable(a, dir, dir_path, layer, rows, head_dim)) |t| return t;
         // An MLX pack: the three tensors in one shard named by the index.
         const index_raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20)) catch return error.EngramTableMissing;
         const idx = std.json.parseFromSliceLeaky(std.json.Value, a, index_raw, .{}) catch return error.EngramTableMissing;
@@ -330,6 +331,42 @@ pub const Table = struct {
             .slen = @intCast(scols * 2),
             .b_off = base + regions[2].start,
         };
+    }
+
+    /// oMLX's lossless layout: `omlx_deepseek_v41.engram_tables` names the
+    /// release's own shard, its table e4m3 with one e8m0 scale per 32 (mxfp8).
+    fn openRawTable(a: std.mem.Allocator, dir: std.Io.Dir, dir_path: []const u8, layer: usize, rows: u64, head_dim: u32) !?Table {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const raw = dir.readFileAlloc(io, "config.json", a, .limited(64 << 20)) catch return null;
+        const Spec = struct { weight_file: []const u8, weight_key: []const u8, scale_file: ?[]const u8 = null, scale_key: ?[]const u8 = null, bits: ?u32 = null };
+        const cfg = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return null;
+        const fmt = (if (cfg == .object) cfg.object.get("omlx_deepseek_v41") else null) orelse return null;
+        const tables = (if (fmt == .object) fmt.object.get("engram_tables") else null) orelse return null;
+        if (tables != .object) return null;
+        const name = try std.fmt.allocPrint(a, "{s}layers.{d}.engram.embed", .{ model.dsv41_text_prefix, layer });
+        const v = tables.object.get(name) orelse return null;
+        const spec = std.json.parseFromValueLeaky(Spec, a, v, .{ .ignore_unknown_fields = true }) catch return error.EngramTableHeader;
+        if (spec.bits != null) return null; // a requantized table rides the index arm
+        const scale_key = spec.scale_key orelse return error.EngramTableHeader;
+        if (spec.scale_file) |sf| if (!std.mem.eql(u8, sf, spec.weight_file)) return error.EngramTableSplit;
+        if (std.mem.indexOf(u8, spec.weight_file, "..") != null or std.fs.path.isAbsolute(spec.weight_file)) return error.EngramTableMissing;
+        const fd = try openAt(a, dir_path, spec.weight_file);
+        errdefer crt.close(fd);
+        var hl: [8]u8 = undefined;
+        if (crt.pread(fd, &hl, 8, 0) != 8) return error.EngramTableHeader;
+        const hlen = std.mem.readInt(u64, &hl, .little);
+        if (hlen > 16 << 20) return error.EngramTableHeader;
+        const hbuf = try a.alloc(u8, @intCast(hlen));
+        if (crt.pread(fd, hbuf.ptr, hbuf.len, 8) != @as(isize, @intCast(hlen))) return error.EngramTableHeader;
+        const hdr = std.json.parseFromSliceLeaky(std.json.Value, a, hbuf, .{}) catch return error.EngramTableHeader;
+        if (hdr != .object) return error.EngramTableHeader;
+        const size: usize = @intCast(fileSize(fd));
+        const base = 8 + hlen;
+        const w = qwen4_ple.headerRegion(hdr.object, spec.weight_key, "F8_E4M3", 1, size, @intCast(base), .matrix) catch return error.EngramTableHeader;
+        const s = qwen4_ple.headerRegion(hdr.object, scale_key, "F8_E8M0", 1, size, @intCast(base), .matrix) catch return error.EngramTableHeader;
+        if (w.rows != rows or s.rows != rows) return error.EngramTableSize;
+        if (w.cols != head_dim or s.cols * 32 != head_dim) return error.EngramTableGeometry;
+        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols };
     }
 
     /// Rows `ids`, dequantized: f32 `[ids.len, head_dim]` (caller frees).
@@ -506,6 +543,43 @@ test "dsv41 engram: a table nested under language_model. (oMLX's packs) opens li
     var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
     defer t.close();
     try testing.expectEqual(@as(u64, 288), t.shardBytes());
+}
+
+test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from the shard its config names" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    const hdr = "{\"layers.1.engram.embed.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[4,64],\"data_offsets\":[0,256]}," ++
+        "\"layers.1.engram.embed.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[4,2],\"data_offsets\":[256,264]}}";
+    var shard: [8 + hdr.len + 264]u8 = undefined;
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    const data = shard[8 + hdr.len ..];
+    @memset(data[0..256], 0x38); // e4m3 1.0
+    for (0..4) |r| {
+        data[256 + 2 * r] = @intCast(127 + r); // 2^r for the first 32 columns
+        data[256 + 2 * r + 1] = 126; // 0.5 for the rest
+    }
+    try td.dir.createDirPath(io, "engram");
+    try td.dir.writeFile(io, .{ .sub_path = "engram/model-00002-of-00002.safetensors", .data = &shard });
+    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"omlx_deepseek_v41\":{\"version\":1,\"engram_tables\":{" ++
+        "\"language_model.layers.1.engram.embed\":{\"weight_key\":\"layers.1.engram.embed.weight\",\"weight_file\":\"engram/model-00002-of-00002.safetensors\"," ++
+        "\"scale_key\":\"layers.1.engram.embed.scale\",\"scale_file\":\"engram/model-00002-of-00002.safetensors\",\"bias_key\":null,\"bits\":null,\"group_size\":null}}}}" });
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{}}" });
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+    defer t.close();
+    try testing.expectEqual(@as(u64, 0), t.shardBytes());
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const rows = try t.gather(testing.allocator, &.{ 3, 0 }, s);
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_array_eval(rows));
+    const v = mlx.mlx_array_data_float32(rows).?;
+    try testing.expectEqual(@as(f32, 8), v[0]);
+    try testing.expectEqual(@as(f32, 0.5), v[63]);
+    try testing.expectEqual(@as(f32, 1), v[64]);
+    try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
 }
 
 test "dsv41 engram: a pack with no token map (oMLX's) gets V4.1's own tokenizer's" {
