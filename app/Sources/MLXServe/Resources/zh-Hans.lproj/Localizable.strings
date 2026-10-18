@@ -2364,6 +2364,7 @@
 "1936 × 1088 (landscape 16:9, 2 MP)" = "1936 × 1088（横版 16:9，200 万像素）";
 "1088 × 1936 (portrait 9:16, 2 MP)" = "1088 × 1936（竖版 9:16，200 万像素）";
 "OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)." = "OpenMOSS 的 5B 图像模型——支持长提示词、标签序列，或用 JSON 布局摆放每个物体和每行文字，图中文字支持中英文。未蒸馏：默认 50 步并使用引导，速度较慢。开源（Apache-2.0）。";
+"MOSS-Image quantized to 8-bit for smaller Macs: the same 50-step model at about half the memory, with renders matching bf16. Open (Apache-2.0)." = "为小内存 Mac 量化为 8-bit 的 MOSS-Image：同样是 50 步模型，内存占用约为一半，出图与 bf16 一致。开源（Apache-2.0）。";
 "Handwritten note (Chinese text)" = "手写便签（中文）";
 "Whiteboard (Chinese text)" = "玻璃白板（中文）";
 "Layout poster (1024 × 1024)" = "布局海报（1024 × 1024）";

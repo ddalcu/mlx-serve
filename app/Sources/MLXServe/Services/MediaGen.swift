@@ -580,6 +580,30 @@ struct ImageModelPreset: Identifiable, Hashable {
         .init(width: 512,  height: 512,  label: "512 × 512 (fastest)"),
     ]
 
+    private static let mossImageQuality: [QualityPreset: ImageQualitySettings] = [
+        .fast:         .init(steps: 20),
+        .good:         .init(steps: 30),
+        .quality:      .init(steps: 40),
+        .superQuality: .init(steps: 50),
+    ]
+
+    /// MOSS-Image SFT, 8-bit (`tests/convert_moss_image_weights.py`): the DiT
+    /// blocks and the text encoder quantized, renders matching bf16 at the same seed.
+    static let mossImageSFT_8bit = ImageModelPreset(
+        id: "ddalcu/moss-image-sft-8bit",
+        name: "MOSS-Image SFT 8-bit (~15 GB)",
+        variant: .mossImage,
+        configName: "moss_image",
+        repo: "ddalcu/MOSS-Image-SFT-MLX-Serve-8bit",
+        approxDownloadGB: 15,
+        approxRAMGB: 21,
+        resolutions: mossImageResolutions,
+        defaultResolution: mossImageResolutions[0],
+        qualityProfiles: mossImageQuality,
+        defaultQuality: .superQuality,
+        description: "MOSS-Image quantized to 8-bit for smaller Macs: the same 50-step model at about half the memory, with renders matching bf16. Open (Apache-2.0)."
+    )
+
     /// OpenMOSS MOSS-Image SFT, bf16 (the mlx-community mirror of the release's
     /// diffusers tree). The Qwen3.5-9B text encoder stays resident beside the
     /// 5B DiT.
@@ -590,15 +614,10 @@ struct ImageModelPreset: Identifiable, Hashable {
         configName: "moss_image",
         repo: "mlx-community/MOSS-Image-SFT-bf16",
         approxDownloadGB: 27,
-        approxRAMGB: 32,
+        approxRAMGB: 33,
         resolutions: mossImageResolutions,
         defaultResolution: mossImageResolutions[0],
-        qualityProfiles: [
-            .fast:         .init(steps: 20),
-            .good:         .init(steps: 30),
-            .quality:      .init(steps: 40),
-            .superQuality: .init(steps: 50),
-        ],
+        qualityProfiles: mossImageQuality,
         defaultQuality: .superQuality,
         description: "OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)."
     )
@@ -613,6 +632,7 @@ struct ImageModelPreset: Identifiable, Hashable {
         .qwenImage21_4bit,                             // 10
         .qwenImage21Turbo_4bit,                        // 11
         .krea2Turbo,                                   // 15
+        .mossImageSFT_8bit,                            // 15
         .qwenImage21_8bit,                             // 18
         .qwenImage21Turbo_8bit,                        // 18
         .mossImageSFT_bf16,                            // 27

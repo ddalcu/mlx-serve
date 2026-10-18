@@ -790,18 +790,21 @@ const Vae = struct {
         defer _ = mlx.mlx_array_free(x);
         try mlx.check(mlx.mlx_array_eval(x));
         for (0..self.n_up) |bi| {
-            var sc = Scope.init(a, s);
-            defer sc.deinit();
-            var h = x;
-            for (self.up[bi][0..self.up_res[bi]]) |*r| h = try resForward(&sc, r, h);
-            if (self.up_conv[bi]) |uc| {
-                var o1 = mlx.mlx_array_new();
-                const r1 = try sc.res(mlx.mlx_repeat_axis(&o1, h, 2, 1, s), &o1);
-                var o2 = mlx.mlx_array_new();
-                const r2 = try sc.res(mlx.mlx_repeat_axis(&o2, r1, 2, 2, s), &o2);
-                h = try convB(&sc, r2, uc[0], uc[1]);
-            }
-            const next = sc.out(h);
+            // The scope ends before the eval: a live handle would pin every full-resolution intermediate.
+            const next = blk: {
+                var sc = Scope.init(a, s);
+                defer sc.deinit();
+                var h = x;
+                for (self.up[bi][0..self.up_res[bi]]) |*r| h = try resForward(&sc, r, h);
+                if (self.up_conv[bi]) |uc| {
+                    var o1 = mlx.mlx_array_new();
+                    const r1 = try sc.res(mlx.mlx_repeat_axis(&o1, h, 2, 1, s), &o1);
+                    var o2 = mlx.mlx_array_new();
+                    const r2 = try sc.res(mlx.mlx_repeat_axis(&o2, r1, 2, 2, s), &o2);
+                    h = try convB(&sc, r2, uc[0], uc[1]);
+                }
+                break :blk sc.out(h);
+            };
             _ = mlx.mlx_array_free(x);
             x = next;
             try mlx.check(mlx.mlx_array_eval(x));

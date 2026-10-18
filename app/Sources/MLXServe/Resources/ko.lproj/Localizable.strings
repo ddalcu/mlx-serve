@@ -2352,6 +2352,7 @@
 "1936 × 1088 (landscape 16:9, 2 MP)" = "1936 × 1088 (가로 16:9, 200만 화소)";
 "1088 × 1936 (portrait 9:16, 2 MP)" = "1088 × 1936 (세로 9:16, 200만 화소)";
 "OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)." = "OpenMOSS의 5B 이미지 모델 — 긴 프롬프트, 태그 목록, 또는 각 물체와 글줄의 위치를 정하는 JSON 레이아웃을 받으며, 이미지 속 글자는 영어와 중국어를 지원합니다. 증류되지 않은 모델이라 가이던스와 함께 50단계로 실행되어 느립니다. 오픈 소스(Apache-2.0).";
+"MOSS-Image quantized to 8-bit for smaller Macs: the same 50-step model at about half the memory, with renders matching bf16. Open (Apache-2.0)." = "작은 Mac용으로 8비트 양자화한 MOSS-Image입니다. 같은 50단계 모델을 약 절반의 메모리로 실행하며, 결과는 bf16과 거의 같습니다. 공개 모델(Apache-2.0)입니다.";
 "Handwritten note (Chinese text)" = "손글씨 메모 (중국어)";
 "Whiteboard (Chinese text)" = "유리 보드 (중국어)";
 "Layout poster (1024 × 1024)" = "레이아웃 포스터 (1024 × 1024)";

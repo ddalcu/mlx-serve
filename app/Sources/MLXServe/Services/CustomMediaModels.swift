@@ -44,7 +44,7 @@ enum CustomMediaModels {
             return isEditDir(id) ? .mageFlowEditTurbo : .mageFlowTurbo
         }
         if arch.hasPrefix("qwen_image") { return .qwenImage21_8bit }
-        if arch == "moss_image" { return .mossImageSFT_bf16 }
+        if arch == "moss_image" { return .mossImageSFT_8bit }
         return nil
     }
 

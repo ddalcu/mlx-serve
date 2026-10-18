@@ -4801,15 +4801,15 @@ pub fn qwenImageGenTransientBytes(width: u32, height: u32) u64 {
 /// The load plan reserves a default-size request.
 const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = qwenImageGenTransientBytes(1024, 1024);
 
-/// MOSS-Image's denoise holds one block's activations at a time (each block
-/// frees its own before the next) across the canvas plus a full 4096-token
-/// prompt; the f32 decode at 2048² stays below it.
-const MOSS_IMAGE_GEN_TOKEN_BYTES: u64 = 512 << 10;
-const MOSS_IMAGE_GEN_BASE_BYTES: u64 = 1 << 30;
+/// MOSS-Image's peak is its f32 full-resolution VAE stage, linear in the canvas;
+/// a full 4096-token prompt peaks earlier and only wins on small canvases.
+const MOSS_IMAGE_GEN_TOKEN_BYTES: u64 = 1536 << 10;
+const MOSS_IMAGE_GEN_BASE_BYTES: u64 = 512 << 20;
+const MOSS_IMAGE_GEN_PROMPT_BYTES: u64 = 3 << 30;
 
 pub fn mossImageGenTransientBytes(width: u32, height: u32) u64 {
     const latents: u64 = @as(u64, width / moss_image.VAE_DOWNSAMPLE) * (height / moss_image.VAE_DOWNSAMPLE);
-    return MOSS_IMAGE_GEN_BASE_BYTES + (latents + moss_image.MAX_PROMPT_TOKENS) * MOSS_IMAGE_GEN_TOKEN_BYTES;
+    return @max(MOSS_IMAGE_GEN_PROMPT_BYTES, MOSS_IMAGE_GEN_BASE_BYTES + latents * MOSS_IMAGE_GEN_TOKEN_BYTES);
 }
 
 /// What the GPU can still take: Metal's working set less live MLX memory.
@@ -6010,6 +6010,22 @@ test "MOSS-Image: a model_index-only repo routes to the image slot with CFG 3 by
     try testing.expectEqual(@as(f32, 1.0), flux_eng.defaultGuidance());
     // A 2048² canvas bills four times the 1024² latents.
     try testing.expect(mossImageGenTransientBytes(2048, 2048) > mossImageGenTransientBytes(1024, 1024));
+}
+
+test "MOSS-Image text-to-image bill covers the measured peak at every canvas" {
+    const GiB: f64 = 1 << 30;
+    // Peaks above the bf16 weights (M4 Max): the VAE sets them, except a full-length prompt at 512².
+    const measured = [_]struct { w: u32, h: u32, peak: f64 }{
+        .{ .w = 512, .h = 512, .peak = 2.88 },
+        .{ .w = 1024, .h = 1024, .peak = 6.15 },
+        .{ .w = 1456, .h = 1456, .peak = 11.66 },
+        .{ .w = 1792, .h = 1792, .peak = 17.66 },
+    };
+    for (measured) |m| {
+        const bill = @as(f64, @floatFromInt(mossImageGenTransientBytes(m.w, m.h))) / GiB;
+        try testing.expect(bill >= m.peak);
+        try testing.expect(bill < m.peak * 1.1);
+    }
 }
 
 test "Modality.mesh advertises the 3d capability" {

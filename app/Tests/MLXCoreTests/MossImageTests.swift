@@ -11,23 +11,27 @@ final class MossImageTests: XCTestCase {
 
     // MARK: - Preset
 
-    func testPresetOffersOnlyWhatTheBackendHonors() {
-        XCTAssertTrue(preset.supportsGuidance, "undistilled, real CFG")
-        XCTAssertEqual(preset.defaultGuidance, 3.0, "the authors' default")
-        XCTAssertEqual(preset.defaultNegativePrompt, "nsfw, worst quality, bad anatomy, watermark, jpeg artifact")
-        XCTAssertTrue(preset.supportsLoRA, "block linears take stacked adapters (the DMD few-step LoRAs)")
-        XCTAssertFalse(preset.supportsImg2Img, "text-to-image only")
-        XCTAssertFalse(preset.supportsReferenceEdit)
-        XCTAssertFalse(preset.stepsAreFixed)
-        XCTAssertEqual(preset.condWeightCount, 0)
-        XCTAssertEqual(preset.settings(preset.defaultQuality).steps, 50, "the card: best at 50 steps or more")
-        XCTAssertEqual(preset.resolutionGrid.alignment, 16)
-        for r in preset.resolutions {
-            XCTAssertEqual(r.width % 16, 0)
-            XCTAssertEqual(r.height % 16, 0)
-            XCTAssertLessThanOrEqual(max(r.width, r.height), preset.resolutionGrid.maxDim)
+    func testPresetOffersOnlyWhatTheBackendHonors() throws {
+        for preset in [ImageModelPreset.mossImageSFT_8bit, .mossImageSFT_bf16] {
+            XCTAssertTrue(preset.supportsGuidance, "undistilled, real CFG")
+            XCTAssertEqual(preset.defaultGuidance, 3.0, "the authors' default")
+            XCTAssertEqual(preset.defaultNegativePrompt, "nsfw, worst quality, bad anatomy, watermark, jpeg artifact")
+            XCTAssertTrue(preset.supportsLoRA, "block linears take stacked adapters (the DMD few-step LoRAs)")
+            XCTAssertFalse(preset.supportsImg2Img, "text-to-image only")
+            XCTAssertFalse(preset.supportsReferenceEdit)
+            XCTAssertFalse(preset.stepsAreFixed)
+            XCTAssertEqual(preset.condWeightCount, 0)
+            XCTAssertEqual(preset.settings(preset.defaultQuality).steps, 50, "the card: best at 50 steps or more")
+            XCTAssertEqual(preset.resolutionGrid.alignment, 16)
+            for r in preset.resolutions {
+                XCTAssertEqual(r.width % 16, 0)
+                XCTAssertEqual(r.height % 16, 0)
+                XCTAssertLessThanOrEqual(max(r.width, r.height), preset.resolutionGrid.maxDim)
+            }
         }
-        XCTAssertTrue(ImageModelPreset.all.contains(preset))
+        // The quantized pack is the one offered first; bf16 stays as the quality reference.
+        let all = ImageModelPreset.all
+        XCTAssertLessThan(try XCTUnwrap(all.firstIndex(of: .mossImageSFT_8bit)), try XCTUnwrap(all.firstIndex(of: .mossImageSFT_bf16)))
         XCTAssertEqual(ImageModelPreset.flux2Klein9BBase_Q4.defaultGuidance, 1.0)
         XCTAssertEqual(ImageModelPreset.qwenImage21_8bit.defaultNegativePrompt, "")
     }
