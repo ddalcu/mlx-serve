@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
+- **GLM-5.3-Flash streams from SSD too.** `OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw` (EXL3 K=3 experts on mlx-stream, 131 GB on disk) serves GLM-5.3-Flash on a 128 GB Mac with the full 1M context: about 1,090 tok/s prefill and 33-37 tok/s decode on a 16K prompt with the MTP lane on. The experts decode left behind stay for the next prompt and the pack's usage profile seeds them at load, so a short request's time to first token falls from about 7 s to 2.4-2.6 s; the decode rows may go up to the layer's 288 experts.
 - **NVIDIA Nemotron 3.5 Bolt and Super.** The omni packs serve text, images and video (RADIO tower), and draft with their LiLiCorr DFlash drafter on every API.
 - **NVIDIA's Qwen3.8-Flash-Next FP4 pack runs as published.** `nvidia/Qwen3.8-Flash-Next-FP4-Local` loads straight from Hugging Face (NVFP4 experts with their compressed scales, MXFP8 linears, the NVFP4 n-gram table read from SSD) and decodes and prefills within about 1% of our own Flash Next pack, MTP drafts and images included.
 - **NVIDIA's GLM-5.3-Flash FP4 pack runs as published.** `nvidia/GLM-5.3-Flash-FP4-Local` loads from Hugging Face (NVFP4 experts with their compressed scales, MXFP8 attention) in about 175 GiB, so it needs a 256 GB Mac; chat, images and MTP drafts work.
