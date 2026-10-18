@@ -142,6 +142,8 @@ It goes well beyond text-to-X: photo editing by instruction, image-to-image, ani
 
 ## MLX Core (macOS app)
 
+Chat and Quick Launcher keep GPU and memory percentages in fixed three-digit fields, so the status line stays aligned.
+
 Menu-bar app that wraps the server with a full UI:
 
 - **Chat + agent mode:** multi-session chat, PDFs and images, 10 built-in tools with per-tool approvals, an MCP marketplace, prompt-based skills, persistent memory, folder RAG.

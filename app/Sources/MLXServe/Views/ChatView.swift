@@ -4240,11 +4240,11 @@ struct GeneratingIndicator: View {
                 .frame(width: 20, height: 20)
 
             // Stats + whimsy
-            Text(L10n.format("GPU %lld%%", gpuPercent))
+            Text(L10n.format("GPU %3lld%%", gpuPercent))
                 .foregroundStyle(gpuColor)
             Text("·")
                 .foregroundStyle(.tertiary)
-            Text(L10n.format("Mem %lld%%", memPercent))
+            Text(L10n.format("Mem %3lld%%", memPercent))
                 .foregroundStyle(memColor)
             Text("·")
                 .foregroundStyle(.tertiary)
