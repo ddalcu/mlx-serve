@@ -720,8 +720,9 @@ pub const Pair = struct {
 
 /// Host: hands one step's stream `[L, hc, dim]` and mix `[L, hc]` to the worker at `Pair.lo` and
 /// returns both as they stand after `Pair.hi` (caller frees); `snap`: the host snapshots when
-/// the step ends, so the worker does too. Set by distributed.zig.
-pub var pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool) anyerror![2]A = null;
+/// the step ends, so the worker does too; `verify`: a DSpark verify chunk, so the worker arms
+/// the same rollback anchors. Set by distributed.zig.
+pub var pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A = null;
 
 /// The highest set bit of `mask` at or below `l`, or -1.
 fn latestBit(mask: u64, l: usize) i64 {
@@ -928,7 +929,11 @@ pub fn prefillBytes(config: *const ModelConfig, seq: u64, chunk: u64, floor: u64
 /// The DSpark stages load when the pack ships them, unless `--no-mtp` or the model's `mtp` setting turn them off
 /// (`applyModelSettings` folds both into `mtp_override`); V4's `MLX_SERVE_DSV4_DSPARK` turns them on either way.
 pub fn dsparkWanted(cfg: *const ModelConfig) bool {
-    if (cfg.dist_dsv41 != null) return false; // a pair runs without DSpark for now
+    // On a pair DSpark drafts on the host, from the target layers' rows: they must be its own.
+    if (cfg.dist_dsv41) |p| {
+        if (p.worker) return false;
+        for (cfg.dsv4_dspark_target_layers[0..cfg.dsv4_n_dspark_target_layers]) |t| if (t >= p.lo and t < p.hi) return false;
+    }
     const env = std.c.getenv("MLX_SERVE_DSV4_DSPARK");
     return (cfg.mtp_override orelse true) or (env != null and env.?[0] != '0');
 }
@@ -1871,7 +1876,7 @@ pub fn extend(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
     var from: usize = 0;
     if (m.pair) |p| {
         try runLayers(m, gpa, st, &sp, held, 0, p.lo);
-        try exchange(m, gpa, &sp, p0, m.snap_at != null and m.snap_at.? == p0 + L);
+        try exchange(m, gpa, &sp, p0, m.snap_at != null and m.snap_at.? == p0 + L, if (st.verify) |v| v.n0 == p0 else false);
         from = p.hi;
     }
     try runLayers(m, gpa, st, &sp, held, from, m.n_layers);
@@ -1945,11 +1950,11 @@ fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
 
 /// Host: every span's stream and mix to the worker, and back as they stand after its layers.
 /// The picks and candidates restart at the next source layer (a valid cut is one).
-fn exchange(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, p0: usize, snap: bool) !void {
+fn exchange(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, p0: usize, snap: bool, verify: bool) !void {
     const xchg = pair_exchange orelse return error.DsvPairNotJoined;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const back = try xchg(try sc.concat(sp.xs, 0), try sc.concat(sp.pres, 0), p0, snap);
+    const back = try xchg(try sc.concat(sp.xs, 0), try sc.concat(sp.pres, 0), p0, snap, verify);
     _ = try sc.keep(back[0]);
     _ = try sc.keep(back[1]);
     for (0..sp.xs.len) |k| {
@@ -1964,8 +1969,14 @@ fn exchange(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, p0: usize,
 /// Worker: its layers over one step the host handed over (`x` [L, hc, dim], `pre` [L, hc]),
 /// returning both as they stand after them (caller frees). The state follows the host's: a step
 /// at 0 starts a new one, a step behind it rewinds to the snapshot, and `snap` takes one after.
-pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usize, snap: bool) ![2]A {
+/// A verify chunk arms the rollback anchors; the next step's position says how much of it the
+/// host kept.
+pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usize, snap: bool, verify: bool) ![2]A {
     const p = m.pair orelse return error.DsvNotPaired;
+    if (m.dec_state) |*prev| if (prev.verify) |v| {
+        if (p0 >= v.n0 and p0 < prev.n) try rollbackVerify(m, prev, p0 - v.n0);
+        prev.dropVerify();
+    };
     if (p0 == 0 or m.dec_state == null) {
         if (m.dec_state) |*old| old.deinit();
         m.dec_state = null;
@@ -1993,6 +2004,7 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
             hold(&sp.pres[k], try sc.slice(pre, 0, lo, hi));
         }
     }
+    if (verify) try armVerify(st, m.n_layers);
     try runLayers(m, gpa, st, &sp, held, p.lo, p.hi);
     st.n = p0 + L;
     var sc = Scope.init(gpa, m.s);
@@ -2442,7 +2454,19 @@ pub fn dsparkBegin(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) 
 /// the returned `vl_g` holds every position's logits, lazily.
 pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft) !DsparkPending {
     const b = d.len;
-    const nl = m.n_layers;
+    try armVerify(st, m.n_layers);
+    var ids: [16]u32 = undefined;
+    ids[0] = t1;
+    @memcpy(ids[1 .. b + 1], d.ids[1 .. b + 1]);
+    const vl = extend(m, gpa, st, ids[0 .. b + 1], .all) catch |e| {
+        st.dropVerify();
+        return e;
+    };
+    return .{ .vl_g = vl, .b = b, .verify = ids };
+}
+
+/// The rollback anchors a verify chunk restores to.
+fn armVerify(st: *State, nl: usize) !void {
     var v: Verify = .{
         .n0 = st.n,
         .comp_used = try st.gpa.alloc(usize, nl),
@@ -2457,14 +2481,31 @@ pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
         v.pend_gate[li] = none;
     }
     st.verify = v;
-    var ids: [16]u32 = undefined;
-    ids[0] = t1;
-    @memcpy(ids[1 .. b + 1], d.ids[1 .. b + 1]);
-    const vl = extend(m, gpa, st, ids[0 .. b + 1], .all) catch |e| {
-        st.dropVerify();
-        return e;
-    };
-    return .{ .vl_g = vl, .b = b, .verify = ids };
+}
+
+/// Back to `keep_n` positions past the verify chunk's start: offsets roll back and each pooling
+/// compressor's open group is re-cut from the chunk's rows.
+fn rollbackVerify(m: *Dsv41Model, st: *State, keep_n: usize) !void {
+    var sc = Scope.init(st.gpa, m.s);
+    defer sc.deinit();
+    const v = &st.verify.?;
+    const end = v.n0 + keep_n;
+    for (st.layers, 0..) |*ls, li| {
+        const r = m.ratio(li);
+        if (ls.comp) |*rows| rows.used = v.comp_used[li] + (end / r - v.n0 / r);
+        if (ls.idx_k) |*rows| rows.used = v.idx_used[li] + (end / r - v.n0 / r);
+        if (r > 1 and v.pend_kv[li].ctx != null) {
+            const first = v.n0 - v.n0 % r; // position of pend_kv[li] row 0
+            const lo = end - end % r - first;
+            const hi = end - first;
+            if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+            if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+            ls.pend_kv = if (hi > lo) sc.out(try sc.slice(v.pend_kv[li], 0, lo, hi)) else none;
+            ls.pend_gate = if (hi > lo) sc.out(try sc.slice(v.pend_gate[li], 0, lo, hi)) else none;
+        }
+    }
+    st.n = end;
+    if (st.hist.items.len > end) st.hist.shrinkRetainingCapacity(end);
 }
 
 /// Keep `accepted + 1` of the verify chunk's positions: offsets roll back,
@@ -2476,25 +2517,7 @@ pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending:
     defer st.dropVerify();
     const v = &st.verify.?;
     const keep_n = accepted + 1;
-    const end = v.n0 + keep_n;
-    if (keep_n < pending.b + 1) {
-        for (st.layers, 0..) |*ls, li| {
-            const r = m.ratio(li);
-            if (ls.comp) |*rows| rows.used = v.comp_used[li] + (end / r - v.n0 / r);
-            if (ls.idx_k) |*rows| rows.used = v.idx_used[li] + (end / r - v.n0 / r);
-            if (r > 1 and v.pend_kv[li].ctx != null) {
-                const first = v.n0 - v.n0 % r; // position of pend_kv[li] row 0
-                const lo = end - end % r - first;
-                const hi = end - first;
-                if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
-                if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
-                ls.pend_kv = if (hi > lo) sc.out(try sc.slice(v.pend_kv[li], 0, lo, hi)) else none;
-                ls.pend_gate = if (hi > lo) sc.out(try sc.slice(v.pend_gate[li], 0, lo, hi)) else none;
-            }
-        }
-        st.n = end;
-        st.hist.shrinkRetainingCapacity(end);
-    }
+    if (keep_n < pending.b + 1) try rollbackVerify(m, st, keep_n);
     if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
     const tokens = try gpa.alloc(u32, keep_n);
     @memcpy(tokens, pending.verify[0..keep_n]);
@@ -3146,6 +3169,75 @@ test "dsv41 rows: growth keeps every appended row" {
     try testing.expectEqualSlices(f32, want[0 .. at * 4], got);
 }
 
+test "dsv41 pair: DSpark on the host drafts what the whole model drafts, rollbacks included (DSV41_TINY)" {
+    const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    var t = try Tiny.open(root, "repack", "fixture.safetensors");
+    defer t.deinit();
+    // The fixture's only Engram-free worker run (5..8) holds its DSpark targets; move them below
+    // it, for the whole model and the pair alike.
+    var c = t.cfg;
+    c.dsv4_dspark_target_layers[0..3].* = .{ 2, 3, 4 };
+    const pair: Pair = .{ .lo = 5, .hi = 8, .worker = false };
+    var cp = c;
+    cp.dist_dsv41 = pair;
+    try testing.expect(dsparkWanted(&cp));
+    // A load moves the DSpark experts out of its weight map: the two DSpark models load their own.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try std.fmt.allocPrint(gpa, "{s}/repack", .{root});
+    defer gpa.free(dir);
+    var w_whole = try model.loadModelWeights(io, gpa, dir, &c, false);
+    defer w_whole.deinit();
+    var w_host = try model.loadModelWeights(io, gpa, dir, &c, false);
+    defer w_host.deinit();
+    const whole = try init(gpa, &c, &w_whole, mlx.gpuStream(), .{ .act = .float32, .dspark = true });
+    defer whole.deinit();
+    try testing.expect(whole.n_mtp > 0);
+    const host = try init(gpa, &c, &w_host, mlx.gpuStream(), .{ .act = .float32, .dspark = true, .pair = pair });
+    defer host.deinit();
+    var wp = pair;
+    wp.worker = true;
+    const worker = try init(gpa, &c, &t.w, mlx.gpuStream(), .{ .act = .float32, .pair = wp });
+    defer worker.deinit();
+    const Xchg = struct {
+        var w: *Dsv41Model = undefined;
+        fn call(x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A {
+            return workerStep(w, testing.allocator, x, pre, p0, snap, verify);
+        }
+    };
+    Xchg.w = worker;
+    pair_exchange = &Xchg.call;
+    defer pair_exchange = null;
+
+    const ids = try t.ids();
+    defer gpa.free(ids);
+    const prompt = ids[0..32];
+    const N = 24;
+    var emitted: [2][N + 16]u32 = undefined;
+    var partial: usize = 0;
+    var after: [2]u32 = undefined;
+    for ([_]*Dsv41Model{ whole, host }, 0..) |m, which| {
+        var st = try initState(m, gpa);
+        defer st.deinit();
+        const first = try logitsHost(m, &st, prompt, .last);
+        var tok = argmaxRow(first);
+        gpa.free(first);
+        var got: usize = 0;
+        while (got < N) {
+            var r = try dsparkRound(m, gpa, &st, tok, N - got - 1);
+            defer r.deinit(gpa);
+            @memcpy(emitted[which][got .. got + r.tokens.len], r.tokens);
+            got += r.tokens.len;
+            if (r.accepted < m.ds_block and got < N) partial += 1;
+            tok = r.next_token;
+        }
+        after[which] = tok;
+    }
+    try testing.expectEqualSlices(u32, emitted[0][0..N], emitted[1][0..N]);
+    try testing.expectEqual(after[0], after[1]);
+    try testing.expect(partial > 0); // the worker rolled back with the host
+}
+
 test "dsv41 pair cuts: valid only where no layer past the cut reads what a layer below it made" {
     var c: ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8 };
     c.dsv4_compress_ratios[0..8].* = .{ 0, 0, 2, 2, 2, 1, 1, 1 };
@@ -3170,8 +3262,8 @@ test "dsv41 pair: a host and a worker split at a valid cut give the unsplit mode
     defer worker.deinit();
     const Xchg = struct {
         var w: *Dsv41Model = undefined;
-        fn call(x: A, pre: A, p0: usize, snap: bool) anyerror![2]A {
-            return workerStep(w, testing.allocator, x, pre, p0, snap);
+        fn call(x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A {
+            return workerStep(w, testing.allocator, x, pre, p0, snap, verify);
         }
     };
     Xchg.w = worker;

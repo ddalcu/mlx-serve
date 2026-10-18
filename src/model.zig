@@ -5062,7 +5062,6 @@ const Dsv41Keep = struct {
     pair: @import("deepseek_v41.zig").Pair,
 
     pub fn remap(self: Dsv41Keep, key: []const u8, _: []u8) ?[]const u8 {
-        if (std.mem.startsWith(u8, key, "mtp.")) return null;
         if (std.mem.startsWith(u8, key, "layers.")) {
             const end = std.mem.indexOfScalarPos(u8, key, 7, '.') orelse return null;
             const li = std.fmt.parseInt(usize, key[7..end], 10) catch return null;
@@ -5082,7 +5081,9 @@ test "a DeepSeek-V4.1 pair keeps each Mac's layers under their own numbers" {
     try std.testing.expect(host.remap("layers.25.ffn.gate.weight", &buf) == null);
     try std.testing.expectEqualStrings("layers.1.engram.wkv.weight", host.remap("layers.1.engram.wkv.weight", &buf).?);
     try std.testing.expectEqualStrings("head.weight", host.remap("head.weight", &buf).?);
-    try std.testing.expect(host.remap("mtp.0.main_proj.weight", &buf) == null);
+    // DSpark drafts on the host.
+    try std.testing.expectEqualStrings("mtp.0.main_proj.weight", host.remap("mtp.0.main_proj.weight", &buf).?);
+    try std.testing.expect(worker.remap("mtp.0.main_proj.weight", &buf) == null);
 }
 
 fn retainPart(weights: *Weights, keep: anytype) !void {

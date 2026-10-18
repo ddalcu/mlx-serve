@@ -858,13 +858,13 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
 }
 
 /// Host, DeepSeek-V4.1: one step's stream and mix through the worker's layers and back.
-fn dsv41Exchange(x: mlx.mlx_array, pre: mlx.mlx_array, p0: usize, snap: bool) anyerror![2]mlx.mlx_array {
+fn dsv41Exchange(x: mlx.mlx_array, pre: mlx.mlx_array, p0: usize, snap: bool, verify: bool) anyerror![2]mlx.mlx_array {
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
     const xs = mlx.getShape(x);
     const t0 = io_util.nowUsMonotonic(group.?.io);
     defer noteRoundTrip(io_util.nowUsMonotonic(group.?.io) - t0);
-    try self.sendOrdered(.{ OP_DSV41, xs[0], @intCast(p0 & 0x7fffffff), @intCast(p0 >> 31), @intFromBool(snap), xs[1], @intFromEnum(mlx.mlx_array_dtype(x)), @intFromEnum(mlx.mlx_array_dtype(pre)) }, &.{ x, pre });
+    try self.sendOrdered(.{ OP_DSV41, xs[0], @intCast(p0 & 0x7fffffff), @intCast(p0 >> 31), @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(verify)) << 1, xs[1], @intFromEnum(mlx.mlx_array_dtype(x)), @intFromEnum(mlx.mlx_array_dtype(pre)) }, &.{ x, pre });
     self.exchanges += 1;
     const xo = try queuedRecv(&self.link, xs, mlx.mlx_array_dtype(x), 1);
     errdefer _ = mlx.mlx_array_free(xo);
@@ -919,7 +919,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 const pre = try queuedRecv(link, &.{ msg[1], msg[5] }, @enumFromInt(msg[7]), 0);
                 defer _ = mlx.mlx_array_free(pre);
                 const t0 = io_util.nowUsMonotonic(io);
-                const out = try dsv41_mod.workerStep(m, allocator, x, pre, p0, msg[4] != 0);
+                const out = try dsv41_mod.workerStep(m, allocator, x, pre, p0, msg[4] & 1 != 0, msg[4] & 2 != 0);
                 defer for (out) |o| {
                     _ = mlx.mlx_array_free(o);
                 };
