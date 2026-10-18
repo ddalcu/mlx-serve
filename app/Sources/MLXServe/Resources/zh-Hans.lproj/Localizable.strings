@@ -2294,7 +2294,6 @@
 "Join %@" = "加入 %@";
 "Lead from this Mac instead" = "改由这台 Mac 主导";
 "A Mac is connected to this one by Thunderbolt." = "有一台 Mac 通过 Thunderbolt 连接到了这台。";
-"macOS asks for your password once, to set up the cable." = "macOS 会要求你输入一次密码，用于设置线缆。";
 "Paired, but the cable needs setting up again after a restart." = "已配对，但重新启动后需要重新设置线缆。";
 "Reconnect" = "重新连接";
 "Paired with %@ for %@." = "已与 %@ 配对，用于 %@。";
@@ -2334,3 +2333,7 @@
 "Linux PC" = "Linux 电脑";
 "Windows PC" = "Windows 电脑";
 "Computer" = "电脑";
+"The cable did not get its address. Unplug it, plug it back into a Thunderbolt 5 port and try again." = "线缆没有获得地址。请拔下线缆，重新插入 Thunderbolt 5 端口后再试。";
+"Could not set up the cable." = "无法设置线缆。";
+"The first time, macOS asks for your password to set up the cable. It stays set up after restarts." = "第一次设置线缆时，macOS 会要求输入密码。重启后设置仍然保留。";
+"Gives the port its cluster address; the first time macOS asks for your password, and it stays set up after restarts." = "为端口设置集群地址；第一次 macOS 会要求输入密码，重启后设置仍然保留。";

@@ -41,10 +41,40 @@ final class ThunderboltPairTests: XCTestCase {
         XCTAssertEqual(peers.filter(\.value.waitsForPartner).keys.sorted(), ["Studio"])
     }
 
-    /// A Mac that led and now joins drops the leader's address before taking its own.
-    func testTheAddressCommandSwapsTheOtherRolesAddress() {
-        let cmd = ClusterSetup.addressCommand(interface: "en13", role: .worker)
-        XCTAssertTrue(cmd.hasPrefix("/sbin/ifconfig en13 inet 10.254.77.1 -alias"))
-        XCTAssertTrue(cmd.hasSuffix("/sbin/ifconfig en13 inet 10.254.77.2 netmask 255.255.255.0 alias"))
+    /// The address job is a shell script launchd runs as root: it must parse, read the role
+    /// file, and know both of the pair's addresses.
+    func testTheAddressScriptParsesAndKnowsBothRoles() throws {
+        let script = ThunderboltAddressJob.script
+        XCTAssertTrue(script.contains(ThunderboltAddressJob.roleFile))
+        XCTAssertTrue(script.contains("host) mine=10.254.77.1"))
+        XCTAssertTrue(script.contains("worker) mine=10.254.77.2"))
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("tb-address-\(UUID()).sh")
+        try script.write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let sh = Process()
+        sh.executableURL = URL(fileURLWithPath: "/bin/sh")
+        sh.arguments = ["-n", file.path]
+        try sh.run()
+        sh.waitUntilExit()
+        XCTAssertEqual(sh.terminationStatus, 0, "the script does not parse")
+    }
+
+    /// launchd runs it at boot, whenever the role file changes, and every 30 s (a cable moved).
+    func testTheJobRunsAtBootOnARoleChangeAndPeriodically() throws {
+        let plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(ThunderboltAddressJob.plist.utf8), format: nil) as? [String: Any])
+        XCTAssertEqual(plist["Label"] as? String, ThunderboltAddressJob.label)
+        XCTAssertEqual(plist["RunAtLoad"] as? Bool, true)
+        XCTAssertEqual(plist["StartInterval"] as? Int, 30)
+        XCTAssertEqual(plist["WatchPaths"] as? [String], [ThunderboltAddressJob.roleFile])
+        XCTAssertEqual(plist["ProgramArguments"] as? [String], ["/bin/sh", ThunderboltAddressJob.scriptPath])
+    }
+
+    /// The install line rides inside an AppleScript string: no double quote or backslash may break it.
+    func testTheInstallCommandIsSafeInsideAppleScript() {
+        let cmd = ThunderboltAddressJob.installCommand(role: .host)
+        XCTAssertFalse(cmd.contains("\""))
+        XCTAssertFalse(cmd.contains("\\"))
+        XCTAssertTrue(cmd.contains("launchctl bootstrap system"))
+        XCTAssertTrue(cmd.contains("printf host"))
     }
 }

@@ -1129,7 +1129,7 @@ private struct ThunderboltClusterSectionContent: View {
                 if let leader, !leadInstead {
                     status(L10n.format("%@ is waiting to pair with this Mac.", leader), "bolt.horizontal.circle", .accentColor)
                     HStack(spacing: 12) {
-                        Button { setupError = ThunderboltPairing.join(appState: appState, ports: ports) } label: {
+                        Button { Task { setupError = await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
                             Text(L10n.format("Join %@", leader)).font(.app(.body))
                         }
                         .buttonStyle(.borderedProminent)
@@ -1140,11 +1140,11 @@ private struct ThunderboltClusterSectionContent: View {
                     status(L10n.text("A Mac is connected to this one by Thunderbolt."), "bolt.horizontal.circle", .accentColor)
                     leadControls
                 }
-                Text("macOS asks for your password once, to set up the cable.")
+                Text("The first time, macOS asks for your password to set up the cable. It stays set up after restarts.")
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             case .reconnect(let role):
                 status(L10n.text("Paired, but the cable needs setting up again after a restart."), "arrow.triangle.2.circlepath", .orange)
-                Button { setupError = ThunderboltPairing.reconnect(role, appState: appState, ports: ports) } label: {
+                Button { Task { setupError = await ThunderboltPairing.reconnect(role, appState: appState, ports: ports) } } label: {
                     Text("Reconnect").font(.app(.body))
                 }
                 .buttonStyle(.borderedProminent)
@@ -1191,12 +1191,12 @@ private struct ThunderboltClusterSectionContent: View {
             }
             .onAppear { if !models.contains(where: { $0.path == pairModel }) { pairModel = models[0].path } }
             HStack(spacing: 12) {
-                Button { setupError = ThunderboltPairing.lead(model: pairModel, appState: appState, ports: ports) } label: {
+                Button { Task { setupError = await ThunderboltPairing.lead(model: pairModel, appState: appState, ports: ports) } } label: {
                     Text("Pair").font(.app(.body))
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(pairModel.isEmpty)
-                Button { setupError = ThunderboltPairing.join(appState: appState, ports: ports) } label: {
+                Button { Task { setupError = await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
                     Text("Join the Mac that leads instead").font(.app(.caption))
                 }
                 .buttonStyle(.link)
@@ -1260,10 +1260,10 @@ private struct ThunderboltClusterSectionContent: View {
                         .foregroundStyle(.green).font(.app(.caption))
                 } else {
                     Button(L10n.format("Set up %@…", p.interface)) {
-                        setupError = ClusterSetup.assignAddress(interface: p.interface, role: options.clusterRole)
+                        setupError = ThunderboltAddressJob.apply(options.clusterRole)
                         ports = ClusterSetup.ports()
                     }
-                    .help(L10n.text("Gives the port its cluster address (asks for your password); needed again after a restart."))
+                    .help(L10n.text("Gives the port its cluster address; the first time macOS asks for your password, and it stays set up after restarts."))
                 }
             } else if ports.isEmpty {
                 Text("RDMA is off: run `rdma_ctl enable` in Recovery").font(.app(.caption)).foregroundStyle(.orange)

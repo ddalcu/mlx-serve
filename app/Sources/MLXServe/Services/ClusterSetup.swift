@@ -114,21 +114,92 @@ enum ClusterSetup {
                 "--device", dev]
             + ServerOptions.modelDirArgs(modelDirs)
     }
+}
 
-    /// The shell line that gives `interface` this Mac's cluster address (until restart),
-    /// dropping the other role's first: a Mac that led and now joins would dial itself.
-    static func addressCommand(interface: String, role: ClusterRole) -> String {
-        let other = linkAddress(role == .worker ? .host : .worker)
-        return "/sbin/ifconfig \(interface) inet \(other) -alias 2>/dev/null; "
-            + "/sbin/ifconfig \(interface) inet \(linkAddress(role)) netmask 255.255.255.0 alias"
+/// What keeps the cable's address across restarts: a launchd job that runs as root and gives
+/// the Thunderbolt port with a cable this Mac's pair address (or takes it away), at boot, when
+/// the role file changes and every 30 s. One password prompt installs it; after that pairing
+/// only writes the role file, which holds nothing but host, worker or off.
+enum ThunderboltAddressJob {
+    static let label = "com.mlx-serve.thunderbolt-address"
+    static let dir = "/Library/Application Support/MLX-Serve"
+    static let roleFile = dir + "/thunderbolt-role"
+    static let scriptPath = dir + "/thunderbolt-address.sh"
+    static let plistPath = "/Library/LaunchDaemons/\(label).plist"
+
+    static var installed: Bool {
+        FileManager.default.fileExists(atPath: plistPath) && FileManager.default.isWritableFile(atPath: roleFile)
     }
 
-    /// Runs `addressCommand` behind the macOS admin prompt; the error text, or nil on success.
-    static func assignAddress(interface: String, role: ClusterRole) -> String? {
-        let script = "do shell script \"\(addressCommand(interface: interface, role: role))\" with administrator privileges"
+    static var script: String {
+        let host = ClusterSetup.linkAddress(.host), worker = ClusterSetup.linkAddress(.worker)
+        return """
+        #!/bin/sh
+        # Installed by MLX Serve: gives the Thunderbolt port with a cable this Mac's pair address.
+        case "$(/bin/cat '\(roleFile)' 2>/dev/null)" in
+          host) mine=\(host) ;;
+          worker) mine=\(worker) ;;
+          *) mine= ;;
+        esac
+        port=$(/usr/bin/ibv_devinfo 2>/dev/null | /usr/bin/awk '/hca_id:/ {d=$2} /PORT_ACTIVE/ {print substr(d, 6); exit}')
+        for ifc in $(/sbin/ifconfig -l); do
+          for a in \(host) \(worker); do
+            if [ "$ifc/$a" != "$port/$mine" ] && /sbin/ifconfig "$ifc" | /usr/bin/grep -qF "inet $a "; then
+              /sbin/ifconfig "$ifc" inet "$a" -alias
+            fi
+          done
+        done
+        if [ -n "$mine" ] && [ -n "$port" ] && ! /sbin/ifconfig "$port" | /usr/bin/grep -qF "inet $mine "; then
+          /sbin/ifconfig "$port" inet "$mine" netmask 255.255.255.0 alias
+        fi
+
+        """
+    }
+
+    static var plist: String {
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key><string>\(label)</string>
+            <key>ProgramArguments</key><array><string>/bin/sh</string><string>\(scriptPath)</string></array>
+            <key>RunAtLoad</key><true/>
+            <key>StartInterval</key><integer>30</integer>
+            <key>WatchPaths</key><array><string>\(roleFile)</string></array>
+        </dict>
+        </plist>
+
+        """
+    }
+
+    /// The root shell line that installs the job with `role`. The files ride in base64, so
+    /// nothing in it needs quoting inside AppleScript.
+    static func installCommand(role: ClusterRole) -> String {
+        let b64 = { (s: String) in Data(s.utf8).base64EncodedString() }
+        return "/bin/mkdir -p '\(dir)'"
+            + " && echo \(b64(script)) | /usr/bin/base64 -D > '\(scriptPath)' && /bin/chmod 755 '\(scriptPath)'"
+            + " && echo \(b64(plist)) | /usr/bin/base64 -D > '\(plistPath)' && /bin/chmod 644 '\(plistPath)'"
+            + " && printf \(role.rawValue) > '\(roleFile)' && /bin/chmod 666 '\(roleFile)'"
+            + " && (/bin/launchctl bootout system/\(label) 2>/dev/null; /bin/launchctl bootstrap system '\(plistPath)')"
+    }
+
+    /// Sets this Mac's role on the cable: the role file once the job is in, else the one
+    /// password prompt that installs it. The error text, or nil.
+    static func apply(_ role: ClusterRole) -> String? {
+        if installed {
+            do {
+                try role.rawValue.write(toFile: roleFile, atomically: false, encoding: .utf8)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        guard role != .off else { return nil }
+        let script = "do shell script \"\(installCommand(role: role))\" with administrator privileges"
         var error: NSDictionary?
         NSAppleScript(source: script)?.executeAndReturnError(&error)
-        return error.map { ($0[NSAppleScript.errorMessage] as? String) ?? "Could not set the address." }
+        return error.map { ($0[NSAppleScript.errorMessage] as? String) ?? L10n.text("Could not set up the cable.") }
     }
 }
 
