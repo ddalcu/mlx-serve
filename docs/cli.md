@@ -92,7 +92,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--lan-share <all\|id,...>` | off | Share the listed models (or all) with your local network over Bonjour — only inference is exposed, model management stays host-local |
 | `--lan-discover` | off | Discover models other Macs share: they appear in `/v1/models` as `model@peer` and requests proxy to that Mac |
 | `--lan-name NAME` | hostname | The Bonjour name other Macs see |
-| `--dist pipeline\|tensor` | off | Serve `--dist-model` across this Mac and a second one over Thunderbolt 5 RDMA (Qwen3.8-Flash-Next): `pipeline` gives each Mac a run of layers, `tensor` gives each half of every MoE expert. The other Mac runs `mlx-serve worker --coordinator IP:PORT --device rdma_enX` and finds the same model in its own library |
+| `--dist pipeline\|tensor` | off | Serve `--dist-model` across this Mac and a second one over Thunderbolt 5 RDMA: `pipeline` gives each Mac a run of layers (Qwen3.8-Flash-Next, DeepSeek-V4.1), `tensor` gives each half of every MoE expert (Flash Next); with a MiniMax-H3 pack each video step's rows are split instead, when that is faster. The other Mac runs `mlx-serve worker --coordinator IP:PORT --device rdma_enX` and finds the same model in its own library |
 | `--dist-model PATH` | `--model` | The model the two Macs serve together |
 | `--dist-coordinator IP:PORT` | none | This Mac's address the worker dials |
 | `--dist-device rdma_enX` | none | The RDMA port facing the worker (`ibv_devinfo`) |

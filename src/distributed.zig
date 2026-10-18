@@ -767,7 +767,25 @@ pub fn holds(model_dir: []const u8) bool {
 /// Whether `model_dir` is the model this server's group serves.
 pub fn serves(model_dir: []const u8) bool {
     const g = group orelse return false;
-    return std.mem.eql(u8, std.fs.path.basename(g.model), std.fs.path.basename(model_dir));
+    return samePath(g.model, model_dir);
+}
+
+/// One folder however it is spelled (symlinks, `..`, a trailing slash); a path that does not
+/// resolve matches only itself. A folder elsewhere with the same name is another copy.
+fn samePath(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    var za: [std.fs.max_path_bytes]u8 = undefined;
+    var zb: [std.fs.max_path_bytes]u8 = undefined;
+    var ra: [std.fs.max_path_bytes]u8 = undefined;
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    if (a.len >= za.len or b.len >= zb.len) return false;
+    @memcpy(za[0..a.len], a);
+    za[a.len] = 0;
+    @memcpy(zb[0..b.len], b);
+    zb[b.len] = 0;
+    const pa = std.c.realpath(@ptrCast(&za), &ra) orelse return false;
+    const pb = std.c.realpath(@ptrCast(&zb), &rb) orelse return false;
+    return std.mem.eql(u8, std.mem.span(pa), std.mem.span(pb));
 }
 
 /// Rows mode: the worker told to load the group's video model whole, and ready.
@@ -1570,6 +1588,36 @@ test "a plan made for one copy refuses another folder of the same name" {
     try std.testing.expectError(error.DistModelMismatch, p.samePlannedCopy(b));
 }
 
+test "the pair holds its own folder, not another one with the same name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a/Flash");
+    try tmp.dir.createDirPath(io, "b/Flash");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const a = try std.fmt.allocPrint(allocator, "{s}/a/Flash", .{root});
+    defer allocator.free(a);
+    const a_spelled = try std.fmt.allocPrint(allocator, "{s}/b/../a/Flash/", .{root});
+    defer allocator.free(a_spelled);
+    const b = try std.fmt.allocPrint(allocator, "{s}/b/Flash", .{root});
+    defer allocator.free(b);
+
+    group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = a, .split = null };
+    defer group = null;
+    joined.store(true, .release);
+    defer joined.store(false, .release);
+    try std.testing.expect(holds(a));
+    try std.testing.expect(holds(a_spelled));
+    try std.testing.expect(!holds(b));
+    // The other folder loads, and is billed, whole.
+    var c: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .num_hidden_layers = 8 };
+    worker_free_mib.store(40, .release);
+    defer worker_free_mib.store(0, .release);
+    try std.testing.expectEqual(@as(u64, 800), hostShare(b, &c, 800));
+}
+
 test "parseCoordinator reads the host's address and port" {
     const c = try parseCoordinator("10.254.77.1:32323");
     try std.testing.expectEqual([4]u8{ 10, 254, 77, 1 }, c.ip4);
@@ -1643,7 +1691,7 @@ test "a paired model is never picked to unload while the worker is joined" {
     const reg_mod = @import("model_registry.zig");
     var reg = try reg_mod.ModelRegistry.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
-    const flash = try reg.registerStub("Flash", "Flash", 100);
+    const flash = try reg.registerStub("Flash", "/m/Flash", 100);
     const other = try reg.registerStub("other", "other", 100);
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(flash, 100);
