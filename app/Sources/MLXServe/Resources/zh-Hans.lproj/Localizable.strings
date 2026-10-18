@@ -727,7 +727,7 @@
 "Serve GGUF files on MLX (experimental)" = "在 MLX 上运行 GGUF 文件（实验性）";
 "GGUF file-format version the engine reads." = "引擎读取的 GGUF 文件格式版本。";
 "GGUF format" = "GGUF 格式";
-"GPU %lld%%" = "GPU 占用 %lld%%";
+"GPU %3lld%%" = "GPU 占用 %3lld%%";
 "GPU cores" = "GPU 核心数";
 "GPU-safe max" = "GPU 安全上限";
 "Gemma 3 12B (4-bit)" = "Gemma 3 12B（4-bit）";
@@ -979,7 +979,7 @@
 "Media Generation" = "媒体生成";
 "Median decode tok/s per rung, per machine + model + settings. n = sessions behind each row. Double-click for detail." = "每档解码 tok/s 中位数，按机器 + 模型 + 设置分组。n = 每行对应的会话数。双击查看详情。";
 "Medium" = "中";
-"Mem %lld%%" = "内存占用 %lld%%";
+"Mem %3lld%%" = "内存占用 %3lld%%";
 "Memory" = "内存";
 "Memory & Tasks" = "记忆与任务";
 "Memory needed" = "所需内存";

@@ -111,7 +111,7 @@
 "Stop listening without ending voice" = "음성 모드를 끝내지 않고 듣기 중단";
 "Off (default): the plain convolutional decoder. On: LTX's own diffusion decoder — the one their published clips use. It denoises the frames instead of interpolating them, so fine texture and edges come out sharper. The decode itself takes about 21 s for a 97-frame clip at 768x512; measured end to end against the plain decoder in the same session the difference was inside run-to-run variance." = "끔(기본값): 일반 컨볼루션 디코더. 켬: LTX 자체 확산 디코더 — LTX가 공개한 클립에 사용된 디코더입니다. 프레임을 보간하는 대신 디노이징하므로 미세한 질감과 가장자리가 더 선명하게 나옵니다. 디코딩 자체는 768x512의 97프레임 클립 기준 약 21초가 걸립니다. 같은 세션에서 일반 디코더와 전체 과정을 비교 측정한 결과, 차이는 실행 간 편차 범위 안이었습니다.";
 "No agent selected" = "선택된 에이전트 없음";
-"GPU %lld%%" = "GPU %lld%%";
+"GPU %3lld%%" = "GPU %3lld%%";
 "Audio guidance" = "오디오 가이던스";
 "1344 × 768 (16:9 widescreen) — most detail, 2.9x slower" = "1344 × 768 (16:9 와이드스크린) — 가장 세밀함, 2.9배 느림";
 "Speculative Decoding (MLX only)" = "추측 디코딩(MLX 전용)";
@@ -1229,7 +1229,7 @@
 "Speaking… (tap the orb to interrupt)" = "말하는 중…(오브를 탭하여 중단)";
 "GPU-safe max" = "GPU 안전 최대값";
 "Demo unavailable in this build." = "이 빌드에서는 데모를 사용할 수 없습니다.";
-"Mem %lld%%" = "메모리 %lld%%";
+"Mem %3lld%%" = "메모리 %3lld%%";
 "Encoding mp4…" = "mp4 인코딩 중…";
 "No GGUF files found" = "GGUF 파일을 찾을 수 없음";
 "Force on" = "강제 켬";
