@@ -2357,3 +2357,9 @@
 "About %@ on this Mac and %@ on %@." = "本机约占用 %@，%@ 在 %@ 上。";
 "A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it." = "配对可运行 MiniMax-H3（视频），或 Qwen3.8-Flash-Next、DeepSeek-V4.1（聊天）。请在两台 Mac 上都下载其中一个。";
 "Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both." = "在 Thunderbolt 配对的两台 Mac 上一起运行；卸载它会同时在两台 Mac 上释放。";
+
+"Automatically Discover Models" = "自动发现模型";
+
+"Include LM Studio, the Hugging Face cache and other apps. Turn off to use only configured folders and previous MLX-Serve downloads. Restart the server to update its search folders." = "包含 LM Studio、Hugging Face 缓存及其他应用中的模型。关闭后仅使用已配置的文件夹和以前的 MLX-Serve 下载。重启服务器以更新搜索文件夹。";
+
+"Rescan enabled model folders" = "重新扫描已启用的模型文件夹";

@@ -133,6 +133,8 @@ brew bundle install --file=Brewfile   # cmake + webp
 
 ## MLX Core（macOS 应用）
 
+**设置 → 服务器 → 自动发现模型** 控制 LM Studio、Hugging Face 缓存及其他自动识别的来源，默认开启。关闭后仅显示已配置文件夹和以前的 MLX-Serve 下载中的模型。**我的模型 → 刷新** 重新扫描已启用的来源，同一文件不会重复显示。
+
 把服务器包装成完整界面的菜单栏应用：
 
 - **聊天 + Agent 模式：** 多会话聊天、PDF 与图像、10 个内置工具（可逐工具审批）、MCP 市场、基于提示词的技能、持久记忆、文件夹 RAG。

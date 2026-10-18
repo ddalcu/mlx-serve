@@ -71,7 +71,7 @@ struct ModelBrowserPane: View {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { break }
-                appState.refreshModels()
+                appState.refreshModels(isBackgroundPoll: true)
             }
         }
     }
@@ -772,6 +772,20 @@ private struct MyModelsPane: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary).font(.app(.body))
                 }
+                Button {
+                    appState.refreshModels(reloadExternalRoots: true)
+                } label: {
+                    HStack(spacing: 4) {
+                        if appState.isRefreshingModels {
+                            ProgressView().controlSize(.mini).frame(width: 12)
+                        } else {
+                            Image(systemName: "arrow.clockwise").frame(width: 12)
+                        }
+                        Text("Refresh").font(.app(.body))
+                    }
+                }
+                .disabled(appState.isRefreshingModels)
+                .help("Rescan enabled model folders")
             }
             .padding(8)
             .background(.quaternary.opacity(0.5))

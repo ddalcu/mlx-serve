@@ -112,6 +112,9 @@ class ServerManager: ObservableObject {
     /// Settings UI compares this against the current options to decide whether
     /// the restart banner should appear.
     @Published var lastLaunchedOptions: ServerOptions?
+    /// Configured discovery roots, independent of the selected model's extra parent.
+    var lastLaunchedDiscoveryRoots: [String]?
+    var lastLaunchedAutomaticDiscovery: Bool?
 
     var baseURL: String { "http://localhost:\(port)" }
 
@@ -132,7 +135,12 @@ class ServerManager: ObservableObject {
     /// apply on the next chat request. Always false for a stopped server.
     func needsRestartFor(_ current: ServerOptions) -> Bool {
         guard let last = liveLaunchedOptions else { return false }
-        return !last.serverLaunchEquals(current)
+        let roots = ModelRoots()
+        let automaticChanged = lastLaunchedAutomaticDiscovery.map { $0 != roots.automaticallyDiscoverModels } ?? false
+        let rootsChanged = lastLaunchedDiscoveryRoots.map {
+            $0 != roots.scanRoots(toolRoots: ToolModelRoots.detected())
+        } ?? false
+        return !last.serverLaunchEquals(current) || automaticChanged || rootsChanged
     }
 
     func start(modelPath: String, options: ServerOptions) {
@@ -235,6 +243,8 @@ class ServerManager: ObservableObject {
         proc.executableURL = URL(fileURLWithPath: binaryPath)
         proc.arguments = args
         lastLaunchedOptions = options
+        lastLaunchedDiscoveryRoots = ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
+        lastLaunchedAutomaticDiscovery = ModelRoots().automaticallyDiscoverModels
 
         proc.environment = Self.launchEnvironment()
 

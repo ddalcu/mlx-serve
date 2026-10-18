@@ -474,6 +474,7 @@ private struct ResetDefaultsFooter: View {
 private struct RestartBanner: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
 
     var body: some View {
         HStack(spacing: 12) {
@@ -494,11 +495,12 @@ private struct RestartBanner: View {
                 server.stop()
                 if !model.isEmpty {
                     server.start(modelPath: model, options: opts)
+                } else {
+                    server.startHeadless(modelsDir: downloads.modelsDir, options: opts)
                 }
             } label: { Text("Restart Now")
                 .font(.app(.body)) }
             .buttonStyle(.borderedProminent)
-            .disabled(appState.selectedModelPath.isEmpty)
 
             Button {
                 if let last = server.lastLaunchedOptions {
@@ -781,6 +783,7 @@ fileprivate struct ServerLaunchDirty {
 /// existing directory. Picking a folder triggers an immediate refresh so the
 /// menu-bar picker updates without a server restart.
 private struct ModelFoldersSectionContent: View {
+    @AppStorage(ModelRoots.automaticDiscoveryKey) private var automaticallyDiscoverModels = true
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var downloads: DownloadManager
 
@@ -794,6 +797,14 @@ private struct ModelFoldersSectionContent: View {
     var body: some View {
         if BuildFeatures.current.customModelFolders { defaultFolderRow }
         customFolderRow
+        SettingsRow(title: "Automatically Discover Models",
+                    explainer: "Include LM Studio, the Hugging Face cache and other apps. Turn off to use only configured folders and previous MLX-Serve downloads. Restart the server to update its search folders.") {
+            Toggle("Automatically Discover Models", isOn: $automaticallyDiscoverModels)
+                .labelsHidden().toggleStyle(.switch)
+                .onChange(of: automaticallyDiscoverModels) { _, _ in
+                    appState.refreshModels(reloadExternalRoots: true)
+                }
+        }
     }
 
     // MARK: - Default (download destination)

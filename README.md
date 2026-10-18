@@ -142,12 +142,14 @@ It goes well beyond text-to-X: photo editing by instruction, image-to-image, ani
 
 ## MLX Core (macOS app)
 
+**Settings → Server → Automatically Discover Models** controls LM Studio, Hugging Face cache and other detected sources (on by default). Turn it off to list only configured folders and previous MLX-Serve downloads. **My Models → Refresh** rescans enabled sources without duplicating the same files.
+
 Menu-bar app that wraps the server with a full UI:
 
 - **Chat + agent mode:** multi-session chat, PDFs and images, 10 built-in tools with per-tool approvals, an MCP marketplace, prompt-based skills, persistent memory, folder RAG.
 - **Agents:** named assistants with their own personality, voice, model, tools, workspace and wake phrase.
 - **Agent Sandbox:** one toggle and every agent shell command runs in an isolated Linux VM that boots in under a second. Your Mac stays untouched.
-- **Model browser:** resumable multi-connection downloads, finds your existing LM Studio models so nothing re-downloads.
+- **Model browser:** resumable multi-connection downloads, finds your existing LM Studio models when automatic discovery is enabled.
 - **Hands-free Voice Mode:** say "Hey Loki" and talk; replies in 54 Kokoro voices or a clone of your own.
 - **Reach it from anywhere:** ⌃Space Quick Launcher over any app, a Telegram bridge to your phone, scheduled tasks in plain English, LAN sharing between your Macs.
 - **Server management:** every launch flag in an engine-aware Settings window, live logs, start/stop.
