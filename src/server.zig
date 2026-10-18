@@ -4,6 +4,7 @@ const win_io = @import("win_io.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const w8a8_mod = @import("w8a8.zig");
+const int8_prefill = @import("int8_prefill.zig");
 const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -5699,7 +5700,7 @@ pub const PrefillRequestTerms = struct {
     mtp_head_kv_bytes: u64 = 0,
     /// Forward width from which the dequant+GEMM route fires (`prefillDqGemmMinRows`).
     dq_min_rows: u64 = transformer_mod.PREFILL_DQ_GEMM_MIN_M,
-    /// The per-call int8 copy `--w8a8-prefill` builds of the widest projection (`prefillW8a8CopyBytes`).
+    /// The per-call int8 copy `--int8-prefill` builds of the widest projection (`prefillW8a8CopyBytes`).
     w8a8_copy_bytes: u64 = 0,
 };
 
@@ -5835,11 +5836,11 @@ fn prefillDequantWeightBytes(config: *const model_mod.ModelConfig) u64 {
 }
 
 /// The int8 copies `w8a8.prefillQmm` rebuilds of the widest projection (the MLP's) per call; zero
-/// unless `--w8a8-prefill` is on, on NAX, for a 4-bit g64 affine model. Two in flight: the measured
-/// peak rise reached 2.4 copies, which the bill's 5/4 covers.
+/// unless `--int8-prefill` or the model's setting turns the route on, on NAX, for a 4-bit g64 affine
+/// model. Two in flight: the measured peak rise reached 2.4 copies, which the bill's 5/4 covers.
 fn prefillW8a8CopyBytes(config: *const model_mod.ModelConfig) u64 {
     if (config.quant_bits != 4 or config.quant_group_size != 64 or config.quant_mode != .affine) return 0;
-    if (!w8a8_mod.prefillRequested() or !w8a8_mod.nax()) return 0;
+    if (!int8_prefill.on(config.int8_prefill_override, .affine_4bit) or !w8a8_mod.nax()) return 0;
     return 2 * w8a8_mod.prefillCopyBytes(prefillFfnWidth(config), config.hidden_size);
 }
 
@@ -24824,11 +24825,11 @@ test "prefillMemoryNeeded: the w8a8 prefill copy is billed only at forwards wide
     );
 }
 
-test "prefillRequestTerms: the w8a8 copy term follows the switch, the hardware and the pack" {
-    const prev_cli = w8a8_mod.prefill_cli;
+test "prefillRequestTerms: the w8a8 copy term follows the switch, the model setting, the hardware and the pack" {
+    const prev_cli = int8_prefill.cli;
     const prev_nax = w8a8_mod.nax_override;
     defer {
-        w8a8_mod.prefill_cli = prev_cli;
+        int8_prefill.cli = prev_cli;
         w8a8_mod.nax_override = prev_nax;
     }
     var cfg = model_mod.ModelConfig{};
@@ -24839,8 +24840,14 @@ test "prefillRequestTerms: the w8a8 copy term follows the switch, the hardware a
     cfg.quant_group_size = 64;
     cfg.quant_mode = .affine;
     w8a8_mod.nax_override = true;
-    w8a8_mod.prefill_cli = true;
-    try std.testing.expectEqual(2 * w8a8_mod.prefillCopyBytes(17408, 5120), prefillRequestTerms(&cfg, 4096, 64, 16, 512, .{}).w8a8_copy_bytes);
+    int8_prefill.cli = true;
+    const copy = 2 * w8a8_mod.prefillCopyBytes(17408, 5120);
+    try std.testing.expectEqual(copy, prefillRequestTerms(&cfg, 4096, 64, 16, 512, .{}).w8a8_copy_bytes);
+    cfg.int8_prefill_override = false;
+    try std.testing.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, 4096, 64, 16, 512, .{}).w8a8_copy_bytes);
+    int8_prefill.cli = false;
+    cfg.int8_prefill_override = true;
+    try std.testing.expectEqual(copy, prefillRequestTerms(&cfg, 4096, 64, 16, 512, .{}).w8a8_copy_bytes);
     w8a8_mod.nax_override = false;
     try std.testing.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, 4096, 64, 16, 512, .{}).w8a8_copy_bytes);
     w8a8_mod.nax_override = true;

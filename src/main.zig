@@ -234,9 +234,6 @@ fn printUsage(io: std.Io) void {
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
         \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
-        \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
-        \\                        models with int8 Q/K (NAX GPUs, lossy, wins
-        \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
         \\  --lm-head-mxfp8 / --no-lm-head-mxfp8
         \\                      Quantize a dense bf16 lm_head to MXFP8 at load, vLLM's
         \\                        VLLM_MXFP8_LM_HEAD bytes (lossy; half the head's bytes
@@ -251,11 +248,13 @@ fn printUsage(io: std.Io) void {
         \\                        (default: 1). Slots share the weights; each adds
         \\                        its own KV and state (2 slots: ~1.75x the
         \\                        decode throughput on an M5 Ultra).
-        \\  --w8a8-prefill      Run prompt-width 4-bit affine LLM projections as
-        \\                        rotated int8 x int8 on the tensor units (NAX GPUs,
-        \\                        M5-class and later; ignored elsewhere). Lossy, off
-        \\                        by default; decode and spec verify stay 4-bit.
-        \\                        Also MLX_SERVE_W8A8_PREFILL=1.
+        \\  --int8-prefill      Faster prompt processing on NAX GPUs (M5-class and
+        \\                        later; ignored elsewhere): every int8 route that
+        \\                        applies to the model (4-bit affine projections,
+        \\                        hd-256 attention Q/K, 2-bit Prism projections).
+        \\                        Lossy, off by default; decode stays exact. A
+        \\                        model's "int8_prefill" setting wins. Also
+        \\                        MLX_SERVE_INT8_PREFILL=1.
         \\  --ane-image         Run a share of each image DiT block's MLP on the
         \\  --ane-video           Neural Engine beside the GPU (Krea / MiniMax-H3 /
         \\  --ane-audio           ACE-Step; int8/fp16, lossy; off by default). The
@@ -911,14 +910,12 @@ pub fn main(init: std.process.Init) !void {
             @import("w8a8.zig").enabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-w8a8")) {
             @import("w8a8.zig").enabled = false;
-        } else if (std.mem.eql(u8, args[i], "--int8-qk")) {
-            @import("nax_attention.zig").int8_qk_cli = true;
         } else if (std.mem.eql(u8, args[i], "--lm-head-mxfp8")) {
             @import("transformer.zig").lm_head_mxfp8_cli = true;
         } else if (std.mem.eql(u8, args[i], "--no-lm-head-mxfp8")) {
             @import("transformer.zig").lm_head_mxfp8_cli = false;
-        } else if (std.mem.eql(u8, args[i], "--w8a8-prefill")) {
-            @import("w8a8.zig").prefill_cli = true;
+        } else if (std.mem.eql(u8, args[i], "--int8-prefill")) {
+            @import("int8_prefill.zig").cli = true;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {

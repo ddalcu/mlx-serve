@@ -847,26 +847,13 @@ fn forwardImpl(x: mlx.mlx_array, w: *const Weight, swiglu: bool, s: mlx.mlx_stre
 
 // ── LLM prefill: 4-bit affine weights converted per call ──
 //
-// OPT-IN and LOSSY (`--w8a8-prefill`): prompt-width calls of 4-bit g64 affine LLM linears take the
+// OPT-IN and LOSSY (`--int8-prefill`): prompt-width calls of 4-bit g64 affine LLM linears take the
 // route above with the int8 copy rebuilt from the packed weight on every call, so nothing extra stays
 // resident. Forwards under PREFILL_MIN_ROWS (decode, spec verify) keep the exact 4-bit path.
 
 pub const PREFILL_MIN_ROWS: c_int = 64;
 /// Up to this many rows a whole number of 128-row tiles takes `gemm`; anything else takes `gemmLong`.
 pub const PREFILL_LONG_ROWS: c_int = 1536;
-
-/// Set by `--w8a8-prefill`.
-pub var prefill_cli: bool = false;
-var prefill_env: ?bool = null;
-
-/// `--w8a8-prefill` or `MLX_SERVE_W8A8_PREFILL=1`; off by default.
-pub fn prefillRequested() bool {
-    if (prefill_cli) return true;
-    if (prefill_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_W8A8_PREFILL");
-    prefill_env = raw != null and raw.?[0] == '1';
-    return prefill_env.?;
-}
 
 /// Bytes of the per-call int8 copy of an `[n, k]` weight.
 pub fn prefillCopyBytes(n: u64, k: u64) u64 {

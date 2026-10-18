@@ -29,6 +29,7 @@ const qmv_nax2 = @import("qmv_nax2.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const qmm_int8 = @import("qmm_int8.zig");
 const w8a8 = @import("w8a8.zig");
+const int8_prefill = @import("int8_prefill.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
@@ -3474,14 +3475,19 @@ pub fn fusedSdpa256Prefill(
     if (window > 0) {
         if (!fused256Enabled()) return null;
     } else {
-        // Opt-in int8 Q/K causal arm on NAX (lossy); null when off or ineligible.
-        if (try @import("nax_attention.zig").attention256Int8(s, q, k, v, scale)) |q8| return q8;
         if (fused256CausalMode() == .off) return null;
         // The band arm stays ours (mlx's NAX kernel takes no band); the
         // causal arm yields to the stock fused kernel on NAX.
         if (naxSdpaPreferred()) return null;
     }
     return fusedSdpa256Impl(s, q, k, v, scale, window, null, null);
+}
+
+/// `fusedSdpa256Prefill` with the model's LOSSY int8 Q/K route (`Transformer.int8_attn`)
+/// tried first on the causal arm; it declines off NAX and at verify widths.
+pub fn prefillSdpa256(s: mlx.mlx_stream, int8_qk: bool, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int) !?mlx.mlx_array {
+    if (int8_qk and window == 0) if (try @import("nax_attention.zig").attention256Int8(s, q, k, v, scale)) |q8| return q8;
+    return fusedSdpa256Prefill(s, q, k, v, scale, window);
 }
 
 /// The same kernel for the sink-attention arm (gpt_oss / MiMo): any of its head
@@ -17577,11 +17583,11 @@ pub const Transformer = struct {
     /// A 2-bit group-128 pack without rotations whose every matmul weight has
     /// biases == -scales (Prism's ternary codec): qmv2's ternary kernel applies.
     ternary_2bit: bool = false,
-    /// LOSSY int8-activation prefill (`qmm_int8`), per model: allocated when its
-    /// `int8_prefill` setting (else the process default) turns the route on.
+    /// The LOSSY int8 prefill routes (`int8_prefill.on`, per model): 2-bit Prism projections
+    /// (`qmm_int8`), 4-bit affine projections (`w8a8.prefillQmm`, NAX only) and hd-256 Q/K.
     int8_cache: ?*qmm_int8.Cache = null,
-    /// LOSSY rotated-int8 prefill (`w8a8.prefillQmm`, `--w8a8-prefill`): allocated only on a NAX GPU.
     w8a8_prefill: ?*w8a8.PrefillCache = null,
+    int8_attn: bool = false,
 
     // When non-null, the next forward pass captures the post-final-norm
     // hidden state at the last position into the pointed-to array
@@ -18317,7 +18323,7 @@ pub const Transformer = struct {
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         }
 
-        const int8_on = (config.int8_prefill_override orelse qmm_int8.enabled()) and mlx.metalKernelsAvailable();
+        const int8_on = int8_prefill.on(config.int8_prefill_override, .prism_2bit) and mlx.metalKernelsAvailable();
         var int8_cache: ?*qmm_int8.Cache = null;
         errdefer if (int8_cache) |c| allocator.destroy(c);
         if (int8_on) {
@@ -18326,13 +18332,13 @@ pub const Transformer = struct {
         }
         var w8a8_prefill: ?*w8a8.PrefillCache = null;
         errdefer if (w8a8_prefill) |c| allocator.destroy(c);
-        if (w8a8.prefillRequested()) {
+        if (int8_prefill.on(config.int8_prefill_override, .affine_4bit)) {
             if (naxAvailable() and mlx.metalKernelsAvailable()) {
                 w8a8_prefill = try allocator.create(w8a8.PrefillCache);
                 w8a8_prefill.?.* = .{};
-                log.info("[w8a8-prefill] on: prompt-width 4-bit affine projections run rotated int8 x int8 (lossy; decode and verify stay 4-bit)\n", .{});
+                log.info("[int8-prefill] on: prompt-width 4-bit affine projections run rotated int8 x int8 (lossy; decode and verify stay 4-bit)\n", .{});
             } else {
-                log.warn("[w8a8-prefill] requested but this GPU has no neural accelerators (NAX, M5-class): ignored, stock qmm\n", .{});
+                log.warn("[int8-prefill] requested but this GPU has no neural accelerators (NAX, M5-class): ignored, stock qmm\n", .{});
             }
         }
         var rht_registry: ?*rht.Registry = null;
@@ -18473,6 +18479,7 @@ pub const Transformer = struct {
             .ternary_2bit = ternary_2bit,
             .int8_cache = int8_cache,
             .w8a8_prefill = w8a8_prefill,
+            .int8_attn = int8_prefill.on(config.int8_prefill_override, .attn_qk),
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
@@ -22135,7 +22142,7 @@ pub const Transformer = struct {
             if (kv_fused_done) {
                 // packed kernel handled this layer
             } else if (std.mem.eql(u8, sel_mode, "causal")) {
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
@@ -22154,7 +22161,7 @@ pub const Transformer = struct {
                 // would band-mask a layer that has no band at all).
                 if (is_prefill and cfg.has_sliding_window and ctx.prefill_mask_add == null) {
                     // Sliding-window prefill: the band mask runs in-kernel.
-                    if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, @intCast(cfg.sliding_window))) |fused| {
+                    if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, @intCast(cfg.sliding_window))) |fused| {
                         _ = mlx.mlx_array_free(attn_out);
                         attn_out = fused;
                         fused_done = true;
@@ -23259,7 +23266,7 @@ pub const Transformer = struct {
                 out = try qkvAttnVerifyKernel(self.s, q_i, dv, attn_scale, mode);
             }
             if (out == null and seq_len > 1) {
-                out = try fusedSdpa256Prefill(self.s, q_i, dv.k, dv.v, attn_scale, 0);
+                out = try prefillSdpa256(self.s, self.int8_attn, q_i, dv.k, dv.v, attn_scale, 0);
                 if (out == null) out = try splitCausalSdpa(self.s, q_i, dv.k, dv.v, attn_scale);
             }
             if (out == null) {
@@ -28743,7 +28750,7 @@ pub const Transformer = struct {
             // sums in another order.
             try rowByRowSdpa(&attn_out, q_t, k_t, v_t, attn_scale, seq_len, self.s);
         } else if (is_prefill) {
-            if (try fusedSdpa256Prefill(self.s, q_t, k_t, v_t, attn_scale, 0)) |fused| {
+            if (try prefillSdpa256(self.s, self.int8_attn, q_t, k_t, v_t, attn_scale, 0)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else {
@@ -29787,7 +29794,7 @@ pub const Transformer = struct {
         } else if (self.config.rowExactDecode() and seq_len > 1 and seq_len <= rowqmv.MAX_ROWS and batch == 1) {
             try rowByRowSdpa(&attn_out, q_rope, full_k, full_v, attn_scale, seq_len, self.s);
         } else if (is_prefill) {
-            if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+            if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
@@ -31087,7 +31094,7 @@ pub const Transformer = struct {
         // precondition miss -> composed fallback, identical to before).
         if (!cfg.has_sliding_window) {
             if (is_prefill) {
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else {
@@ -31105,7 +31112,7 @@ pub const Transformer = struct {
                 // order the mlx-lm/mlx-vlm reference picks for short prompts,
                 // which keeps near-tie MoE router decisions from flipping vs
                 // the reference; DiffusionGemma parity).
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else {
@@ -31113,7 +31120,7 @@ pub const Transformer = struct {
                 }
             } else if (is_prefill) {
                 // Sliding-window prefill: band mask runs in-kernel when fused.
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, sw)) |fused| {
+                if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, sw)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else {

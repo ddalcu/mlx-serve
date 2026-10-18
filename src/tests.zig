@@ -79,6 +79,7 @@ test {
     _ = @import("qmv_nax2.zig");
     _ = @import("gather_qmm_nax.zig");
     _ = @import("qmm_int8.zig");
+    _ = @import("int8_prefill.zig");
     _ = @import("w8a8.zig");
     _ = @import("int8_attn.zig");
     _ = @import("mtp_graft.zig");

@@ -1,6 +1,6 @@
 //! OPT-IN, LOSSY int8-activation prefill route for 2-bit Prism packs on M5.
 //!
-//! Default OFF. `MLX_SERVE_BONSAI_INT8_PREFILL=1` turns it on. Unlike every
+//! Default OFF. `--int8-prefill` (`int8_prefill.zig`) turns it on. Unlike every
 //! other 2-bit route in this tree it is NOT lossless: the activation is
 //! quantized to int8 per 128-group, so committed tokens can differ from the
 //! stock path and greedy serial/speculative byte-equality no longer holds.
@@ -25,16 +25,6 @@ const log = std.log.scoped(.qmm_int8);
 
 pub const MIN_ROWS: c_int = 64;
 pub const GS: c_int = 128;
-
-var env_enabled: ?bool = null;
-/// The process default (a model's `int8_prefill` setting overrides it).
-/// DEFAULT OFF: this route changes numerics.
-pub fn enabled() bool {
-    if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_BONSAI_INT8_PREFILL");
-    env_enabled = raw != null and raw.?[0] != '0';
-    return env_enabled.?;
-}
 
 pub const HEADER =
     \\#include <metal_tensor>
