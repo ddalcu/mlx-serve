@@ -709,6 +709,8 @@ final class DownloadManagerLayoutTests: XCTestCase {
         let meta = DownloadManager.parseConfigMetadata(atPath: cfg)
         XCTAssertEqual(meta.modelType, "qwen3_moe")
         XCTAssertEqual(meta.quantBits, 8)
+        XCTAssertEqual(meta.quantGroupSize, 64)
+        XCTAssertNil(meta.quantMode)
         XCTAssertEqual(meta.contextLength, 262144)
         XCTAssertEqual(meta.numExperts, 128)
         XCTAssertEqual(meta.activeExperts, 8)
@@ -727,6 +729,20 @@ final class DownloadManagerLayoutTests: XCTestCase {
         let meta = DownloadManager.parseConfigMetadata(atPath: cfg)
         XCTAssertEqual(meta.quantBits, 4)
         XCTAssertTrue(meta.hasVision)
+    }
+
+    func testParseConfigMetadataReadsQuantMode() throws {
+        let dir = (tempRoot as NSString).appendingPathComponent("cfg-mxfp4")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try """
+        {"model_type":"gemma4","quantization":{"group_size":32,"bits":4,"mode":"mxfp4"}}
+        """.write(toFile: cfg, atomically: true, encoding: .utf8)
+
+        let meta = DownloadManager.parseConfigMetadata(atPath: cfg)
+        XCTAssertEqual(meta.quantBits, 4)
+        XCTAssertEqual(meta.quantGroupSize, 32)
+        XCTAssertEqual(meta.quantMode, "mxfp4")
     }
 
     func testParseConfigMetadataTextOnlyArchSuppressesVision() throws {

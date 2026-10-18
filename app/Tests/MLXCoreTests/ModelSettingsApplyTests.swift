@@ -73,6 +73,16 @@ final class ModelSettingsInt8PrefillRowTests: XCTestCase {
         XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "gguf", quantBits: 4))
         XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: nil, quantBits: 4))
     }
+
+    /// The 4-bit route takes affine g64 only (`prefillW8a8CopyBytes`, `w8a8.prefillQmm`).
+    func testOnlyAffineG64QualifiesForTheFourBitRoute() {
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "lfm2_moe", quantBits: 4, quantGroupSize: 64, quantMode: "affine"))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "lfm2_moe", quantBits: 4, quantGroupSize: 32))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "gemma4", quantBits: 4, quantGroupSize: 32, quantMode: "mxfp4"))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "gemma4", quantBits: 4, quantGroupSize: 16, quantMode: "nvfp4"))
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "qwen3_5", quantBits: 4, quantGroupSize: 32),
+                      "the hd-256 attention route still applies")
+    }
 }
 
 /// Mirrors the server's `mtp.dirAdvertisesMtp`: sidecar file, index marker, or qwen4's own head.

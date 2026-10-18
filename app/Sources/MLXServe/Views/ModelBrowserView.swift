@@ -2038,7 +2038,8 @@ private struct LocalModelRow: View {
         let socket = model.quantFile == nil
             ? DrafterGems.badge(override, modelDir: model.path, hasMtpHead: model.hasMtpHead, options: appState.serverOptions)
             : SocketBadge(stone: nil, skull: false)
-        settingBadges = ModelOverrideBadges.badges(override, modelType: model.modelType, quantBits: model.quantBits, socket: socket)
+        settingBadges = ModelOverrideBadges.badges(override, modelType: model.modelType, quantBits: model.quantBits,
+                                                   quantGroupSize: model.quantGroupSize, quantMode: model.quantMode, socket: socket)
     }
 
     private func revealInFinder() {

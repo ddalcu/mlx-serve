@@ -31,10 +31,12 @@ enum ModelSettingsApply {
     }
 
     /// Some int8 prefill route (`src/int8_prefill.zig`) applies: 2-bit Prism packs, the hd-256
-    /// attention of the Qwen 3.5 family, or the projections of a 4-bit chat model.
-    static func hasInt8PrefillRoute(modelType: String?, quantBits: Int?) -> Bool {
+    /// attention of the Qwen 3.5 family, or the projections of a 4-bit g64 affine chat model (the
+    /// shape `w8a8.prefillQmm` takes; nil group size / mode are MLX's defaults, 64 and affine).
+    static func hasInt8PrefillRoute(modelType: String?, quantBits: Int?, quantGroupSize: Int? = nil, quantMode: String? = nil) -> Bool {
         guard let modelType, modelType != "gguf", MediaModality(modelType: modelType) == nil else { return false }
-        return modelType == "prism_hadamard_qwen35" || modelType.hasPrefix("qwen3_5") || quantBits == 4
+        let affine4g64 = quantBits == 4 && (quantGroupSize ?? 64) == 64 && (quantMode ?? "affine") == "affine"
+        return modelType == "prism_hadamard_qwen35" || modelType.hasPrefix("qwen3_5") || affine4g64
     }
 }
 
@@ -103,7 +105,8 @@ struct ModelSettingsSheet: View {
 
     private var hasInt8PrefillRoute: Bool {
         let model = appState.localModels.first { $0.path == request.path }
-        return !isGguf && ModelSettingsApply.hasInt8PrefillRoute(modelType: model?.modelType, quantBits: model?.quantBits)
+        return !isGguf && ModelSettingsApply.hasInt8PrefillRoute(modelType: model?.modelType, quantBits: model?.quantBits,
+                                                                    quantGroupSize: model?.quantGroupSize, quantMode: model?.quantMode)
     }
 
     private var rows: (mtp: Bool, acceptance: Bool) {
