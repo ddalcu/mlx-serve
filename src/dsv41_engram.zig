@@ -2,6 +2,7 @@
 //! the on-disk tables it indexes, and the gated add into the residual stream.
 //! The tables (~100 GB a layer) are read from disk per lookup, never loaded.
 const std = @import("std");
+const builtin = @import("builtin");
 const crt = @import("crt.zig");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
@@ -369,15 +370,27 @@ pub const Table = struct {
         return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols };
     }
 
-    /// Rows `ids`, dequantized: f32 `[ids.len, head_dim]` (caller frees).
-    pub fn gather(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    /// Rows `ids` as they sit on disk (host only, any thread).
+    pub const Raw = struct {
+        w: []align(4) u8,
+        s: []align(4) u8,
+        b: []align(4) u8,
+
+        pub fn deinit(self: Raw, gpa: std.mem.Allocator) void {
+            gpa.free(self.w);
+            gpa.free(self.s);
+            gpa.free(self.b);
+        }
+    };
+
+    pub fn read(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
         const n = ids.len;
         const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
-        defer gpa.free(w);
+        errdefer gpa.free(w);
         const sc = try gpa.alignedAlloc(u8, .@"4", n * self.slen);
-        defer gpa.free(sc);
+        errdefer gpa.free(sc);
         const bi = try gpa.alignedAlloc(u8, .@"4", if (self.mode == .affine) n * self.slen else 0);
-        defer gpa.free(bi);
+        errdefer gpa.free(bi);
         const job: Job = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
         if (n >= PAR_MIN_ROWS) {
             var threads: [PAR_THREADS]?std.Thread = @splat(null);
@@ -388,15 +401,20 @@ pub const Table = struct {
             }
             if (failed or job.bad.load(.acquire)) return error.EngramRead;
         } else if (!job.run(0, 1)) return error.EngramRead;
+        return .{ .w = w, .s = sc, .b = bi };
+    }
+
+    /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (caller frees).
+    pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
         const wcols: c_int = @intCast(self.wlen / 4);
         const scols: c_int = @intCast(if (self.mode == .affine) self.slen / 2 else self.slen);
         const rows: c_int = @intCast(n);
-        const wa = mlx.mlx_array_new_data(w.ptr, &[_]c_int{ rows, wcols }, 2, .uint32);
+        const wa = mlx.mlx_array_new_data(raw.w.ptr, &[_]c_int{ rows, wcols }, 2, .uint32);
         defer _ = mlx.mlx_array_free(wa);
         const sdt: mlx.mlx_dtype = if (self.mode == .affine) .bfloat16 else .uint8;
-        const sa = mlx.mlx_array_new_data(sc.ptr, &[_]c_int{ rows, scols }, 2, sdt);
+        const sa = mlx.mlx_array_new_data(raw.s.ptr, &[_]c_int{ rows, scols }, 2, sdt);
         defer _ = mlx.mlx_array_free(sa);
-        const ba: mlx.mlx_array = if (self.mode == .affine) mlx.mlx_array_new_data(bi.ptr, &[_]c_int{ rows, scols }, 2, .bfloat16) else .{ .ctx = null };
+        const ba: mlx.mlx_array = if (self.mode == .affine) mlx.mlx_array_new_data(raw.b.ptr, &[_]c_int{ rows, scols }, 2, .bfloat16) else .{ .ctx = null };
         defer if (ba.ctx != null) {
             _ = mlx.mlx_array_free(ba);
         };
@@ -404,6 +422,13 @@ pub const Table = struct {
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_dequantize(&out, wa, sa, ba, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), self.mode.cstr(), .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
         return out;
+    }
+
+    /// Rows `ids`, dequantized: f32 `[ids.len, head_dim]` (caller frees).
+    pub fn gather(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
+        const raw = try self.read(gpa, ids);
+        defer raw.deinit(gpa);
+        return self.dequant(raw, ids.len, s);
     }
 
     const Job = struct {
@@ -439,6 +464,116 @@ pub const Table = struct {
     };
 };
 
+/// Engram rows read ahead on a thread of its own: per grid (a run of `len` tokens from position `at`),
+/// layer by layer and span by span, the order the forward asks for them, so the SSD reads hide behind
+/// the GPU work of the spans, layers and chunks before.
+pub const Prefetch = struct {
+    gpa: std.mem.Allocator,
+    tables: []const *const Table,
+    grids: []Grid,
+    span: usize,
+    nc: usize,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
+    pub const Spec = struct { at: usize, len: usize, ids: []const u32 };
+
+    const Grid = struct {
+        at: usize,
+        len: usize,
+        ids: []u32,
+        items: []Item,
+    };
+    const Item = struct {
+        raw: ?Table.Raw = null,
+        state: std.atomic.Value(u8) = .init(pending),
+    };
+    const pending = 0;
+    const done = 1;
+    const failed = 2;
+
+    /// Reads `specs` in order. Copies what it is given; the returned value must not move (the thread holds it).
+    pub fn start(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize) !*Prefetch {
+        const self = try gpa.create(Prefetch);
+        errdefer gpa.destroy(self);
+        const own_tables = try gpa.dupe(*const Table, tables);
+        errdefer gpa.free(own_tables);
+        const grids = try gpa.alloc(Grid, specs.len);
+        var made: usize = 0;
+        errdefer {
+            for (grids[0..made]) |g| freeGrid(gpa, g);
+            gpa.free(grids);
+        }
+        for (specs, grids) |sp, *g| {
+            const ids = try gpa.dupe(u32, sp.ids);
+            errdefer gpa.free(ids);
+            const items = try gpa.alloc(Item, tables.len * ((sp.len + span - 1) / span));
+            @memset(items, .{});
+            g.* = .{ .at = sp.at, .len = sp.len, .ids = ids, .items = items };
+            made += 1;
+        }
+        self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc };
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    fn freeGrid(gpa: std.mem.Allocator, g: Grid) void {
+        for (g.items) |*item| if (item.raw) |r| r.deinit(gpa);
+        gpa.free(g.items);
+        gpa.free(g.ids);
+    }
+
+    fn run(self: *Prefetch) void {
+        for (self.grids) |*g| {
+            const n_spans = g.items.len / self.tables.len;
+            for (self.tables, 0..) |table, layer| for (0..n_spans) |k| {
+                if (self.stop.load(.acquire)) return;
+                const item = &g.items[layer * n_spans + k];
+                item.raw = self.readSpan(g, table, layer, k) catch null;
+                item.state.store(if (item.raw != null) done else failed, .release);
+            };
+        }
+    }
+
+    fn readSpan(self: *Prefetch, g: *const Grid, table: *const Table, layer: usize, k: usize) !Table.Raw {
+        const lo = k * self.span;
+        const hi = @min(g.len, lo + self.span);
+        const mine = try self.gpa.alloc(u32, (hi - lo) * self.nc);
+        defer self.gpa.free(mine);
+        for (lo..hi) |t| @memcpy(mine[(t - lo) * self.nc ..][0..self.nc], g.ids[(t * self.tables.len + layer) * self.nc ..][0..self.nc]);
+        return table.read(self.gpa, mine);
+    }
+
+    /// Does a grid start at `at` and cover `len` tokens?
+    pub fn covers(self: *const Prefetch, at: usize, len: usize) bool {
+        for (self.grids) |g| if (g.at == at and g.len >= len) return true;
+        return false;
+    }
+
+    /// The rows of `layer`'s span `k` of the grid at `at`, once read (the caller frees them).
+    pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !Table.Raw {
+        for (self.grids) |*g| if (g.at == at) {
+            const item = &g.items[layer * (g.items.len / self.tables.len) + k];
+            while (item.state.load(.acquire) == pending) std.Thread.yield() catch {};
+            const raw = item.raw orelse return error.EngramRead;
+            item.raw = null;
+            return raw;
+        };
+        return error.EngramRead;
+    }
+
+    /// Stops the thread, frees what was never taken and the prefetch itself.
+    pub fn finish(self: *Prefetch) void {
+        self.stop.store(true, .release);
+        if (self.thread) |t| t.join();
+        for (self.grids) |g| freeGrid(self.gpa, g);
+        self.gpa.free(self.grids);
+        self.gpa.free(self.tables);
+        self.gpa.destroy(self);
+    }
+};
+
 const PAR_MIN_ROWS = 512;
 const PAR_THREADS = 16;
 
@@ -454,6 +589,8 @@ fn openAt(a: std.mem.Allocator, dir_path: []const u8, name: []const u8) !c_int {
     const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir_path, name }, 0);
     const fd = crt.openRead(path);
     if (fd < 0) return error.FileNotFound;
+    // Rows are read at random: read-ahead would pull their neighbours in.
+    if (comptime builtin.os.tag.isDarwin()) _ = std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0));
     return fd;
 }
 
@@ -545,10 +682,8 @@ test "dsv41 engram: a table nested under language_model. (oMLX's packs) opens li
     try testing.expectEqual(@as(u64, 288), t.shardBytes());
 }
 
-test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from the shard its config names" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var td = testing.tmpDir(.{});
-    defer td.cleanup();
+/// oMLX's lossless layout: 4 rows of head_dim 64 as raw e4m3 codes (1.0) with row r's first scale 2^r, its second 0.5.
+fn writeRawFp8Fixture(io: std.Io, dir: std.Io.Dir) !void {
     const hdr = "{\"layers.1.engram.embed.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[4,64],\"data_offsets\":[0,256]}," ++
         "\"layers.1.engram.embed.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[4,2],\"data_offsets\":[256,264]}}";
     var shard: [8 + hdr.len + 264]u8 = undefined;
@@ -560,12 +695,19 @@ test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from 
         data[256 + 2 * r] = @intCast(127 + r); // 2^r for the first 32 columns
         data[256 + 2 * r + 1] = 126; // 0.5 for the rest
     }
-    try td.dir.createDirPath(io, "engram");
-    try td.dir.writeFile(io, .{ .sub_path = "engram/model-00002-of-00002.safetensors", .data = &shard });
-    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"omlx_deepseek_v41\":{\"version\":1,\"engram_tables\":{" ++
+    try dir.createDirPath(io, "engram");
+    try dir.writeFile(io, .{ .sub_path = "engram/model-00002-of-00002.safetensors", .data = &shard });
+    try dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"omlx_deepseek_v41\":{\"version\":1,\"engram_tables\":{" ++
         "\"language_model.layers.1.engram.embed\":{\"weight_key\":\"layers.1.engram.embed.weight\",\"weight_file\":\"engram/model-00002-of-00002.safetensors\"," ++
         "\"scale_key\":\"layers.1.engram.embed.scale\",\"scale_file\":\"engram/model-00002-of-00002.safetensors\",\"bias_key\":null,\"bits\":null,\"group_size\":null}}}}" });
-    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{}}" });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{}}" });
+}
+
+test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from the shard its config names" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFp8Fixture(io, td.dir);
     var buf: [512]u8 = undefined;
     var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
     defer t.close();
@@ -580,6 +722,54 @@ test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from 
     try testing.expectEqual(@as(f32, 0.5), v[63]);
     try testing.expectEqual(@as(f32, 1), v[64]);
     try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
+}
+
+test "dsv41 engram: a prefetch hands each span's rows as a gather of the same ids would" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFp8Fixture(io, td.dir);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+    defer t.close();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // 5 tokens, 2 layers, 2 columns: ids [(token * 2 + layer) * 2 + column]; spans of 2 leave a ragged last one.
+    var ids: [5 * 2 * 2]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast((i * 3 + 1) % 4);
+    const tables = [_]*const Table{ &t, &t };
+    // The second grid starts at token 5 and reads ids[0..8] again: a lookahead behind the first.
+    var pf = try Prefetch.start(testing.allocator, &tables, &.{ .{ .at = 0, .len = 5, .ids = &ids }, .{ .at = 5, .len = 2, .ids = ids[0..8] } }, 2, 2);
+    defer pf.finish();
+    try testing.expect(pf.covers(5, 2) and pf.covers(0, 3) and !pf.covers(0, 6) and !pf.covers(4, 1));
+    for (0..2) |layer| for (0..3) |k| {
+        const lo = k * 2;
+        const hi = @min(5, lo + 2);
+        var mine: [4]u32 = undefined;
+        for (lo..hi) |tok| @memcpy(mine[(tok - lo) * 2 ..][0..2], ids[(tok * 2 + layer) * 2 ..][0..2]);
+        const want = try t.gather(testing.allocator, mine[0 .. (hi - lo) * 2], s);
+        defer _ = mlx.mlx_array_free(want);
+        const raw = try pf.take(0, layer, k);
+        defer raw.deinit(testing.allocator);
+        const got = try t.dequant(raw, (hi - lo) * 2, s);
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_array_eval(want));
+        try mlx.check(mlx.mlx_array_eval(got));
+        const n = (hi - lo) * 2 * 64;
+        try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(want).?[0..n], mlx.mlx_array_data_float32(got).?[0..n]);
+    };
+    // The lookahead grid is the same rows as a gather of its ids; the grid that was not asked for is freed unread.
+    const ahead = try pf.take(5, 1, 0);
+    defer ahead.deinit(testing.allocator);
+    var mine: [4]u32 = undefined;
+    for (0..2) |tok| @memcpy(mine[tok * 2 ..][0..2], ids[(tok * 2 + 1) * 2 ..][0..2]);
+    const want = try t.gather(testing.allocator, &mine, s);
+    defer _ = mlx.mlx_array_free(want);
+    const got = try t.dequant(ahead, 4, s);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(want).?[0 .. 4 * 64], mlx.mlx_array_data_float32(got).?[0 .. 4 * 64]);
 }
 
 test "dsv41 engram: a pack with no token map (oMLX's) gets V4.1's own tokenizer's" {

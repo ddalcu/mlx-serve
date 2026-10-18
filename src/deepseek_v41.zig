@@ -27,6 +27,12 @@ const none: A = .{ .ctx = null };
 /// Rows one attention span handles: the compressed rows each query gathers
 /// are its largest transient ([span, index_topk, head_dim] f32).
 pub const SPAN: usize = 256;
+
+/// Threads in a hyper-connection threadgroup before `probeHcThreads` finds what the GPU grants.
+const HC_TG: usize = 1024;
+
+/// Rows one MoE call handles: a layer's expert banks stream once per call.
+const MOE_ROWS: usize = 2048;
 /// Window rows kept past the window, so a verify chunk can write its rows
 /// and still roll back to any prefix.
 const RING_SLACK: usize = 16;
@@ -335,6 +341,10 @@ pub const Dsv41Model = struct {
     ds_block: usize = 0,
     /// Rows per attention span (tests narrow it to drive several spans).
     span: usize = SPAN,
+    /// Rows per MoE call: spans whose rows fit are routed and run together.
+    moe_rows: usize = MOE_ROWS,
+    /// Threads per threadgroup of the hc kernels, all four alike so the wide and decode-width stages sum in one order.
+    hc_tg: usize = HC_TG,
     /// Bytes per indexer score block (tests narrow it to drive several).
     /// Test-only: named intermediates of a one-span forward.
     trace: ?*Trace = null,
@@ -344,6 +354,9 @@ pub const Dsv41Model = struct {
     hash: ?engram.Hash = null,
     token_map: []u32 = &.{},
     engrams: []EngramLayer = &.{},
+    /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
+    prompt: []u32 = &.{},
+    ahead: ?*engram.Prefetch = null,
     rope_plain: Rope,
     rope_yarn: Rope,
     attn_dec_kernel: mlx.mlx_fast_metal_kernel,
@@ -386,10 +399,17 @@ pub const Dsv41Model = struct {
     ds_prof_head_ns: u64 = 0,
     ds_prof_comp_sync_ns: u64 = 0,
 
+    fn dropAhead(self: *Dsv41Model) void {
+        if (self.ahead) |a| a.finish();
+        self.ahead = null;
+    }
+
     pub fn deinit(self: *Dsv41Model) void {
         if (self.dec_state) |*st| st.deinit();
         if (self.snap) |*sn| sn.deinit(self.gpa);
         self.gpa.free(self.snap_ids);
+        self.dropAhead();
+        self.gpa.free(self.prompt);
         for (self.engrams) |*e| e.table.close();
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -1714,6 +1734,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
     m.rope_plain = try buildRope(m, cfg.rope_theta, 0, 1, 0, 0);
     m.rope_yarn = try buildRope(m, cfg.dsv4_compress_rope_theta, if (cfg.rope_yarn) cfg.yarn_orig_max_pos else 0, cfg.yarn_factor, cfg.yarn_beta_fast, cfg.yarn_beta_slow);
     for (0..n_layers) |li| m.layers[li] = if (m.held(li)) try loadLayer(m, w, "layers", li, li) else std.mem.zeroes(Layer);
+    try probeHcThreads(gpa, m);
     try compileRegions(m);
     if (n_stages > 0) {
         for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
@@ -1793,7 +1814,7 @@ fn collectArrays(gpa: std.mem.Allocator, xs: *std.ArrayList(A), v: anytype) !voi
 /// The prompt pass's working set over `floor`: a chunk runs one layer at a time over spans; the whole
 /// chunk's stream (in and out), the picks layers hand down and the DSpark rows
 /// stay live across layers, and one span at a time adds its gathered
-/// compressed rows, attention scores, an indexer score block and its MoE.
+/// compressed rows, attention scores and an indexer score block, one MoE call its transients.
 /// State is the compressed caches per token plus the windows per layer.
 pub fn prefillBytes(config: *const ModelConfig, seq: u64, chunk: u64, floor: u64) u64 {
     const c: u64 = @min(chunk, @max(seq, 1));
@@ -1807,7 +1828,7 @@ pub fn prefillBytes(config: *const ModelConfig, seq: u64, chunk: u64, floor: u64
     const held = c * (2 * config.dsv4_hc_mult * d * 2 + topk * 4 + seq / cand_block + config.dsv4_n_dspark_target_layers * d * 2);
     const attn = span * topk * hd * 4 * 2 + span * config.num_attention_heads * ((window + topk) * 4 * 2 + hd * 4 * 2);
     const idx_bytes = span * seq * 4 * 3;
-    const moe_bytes = span * config.num_experts_per_tok * (2 * config.moe_intermediate_size + d) * 4;
+    const moe_bytes = @min(c, MOE_ROWS) * config.num_experts_per_tok * (2 * config.moe_intermediate_size + d) * 4;
     return (state + held + attn + idx_bytes + moe_bytes + floor) * 5 / 4;
 }
 
@@ -2172,7 +2193,7 @@ fn hcPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, nor
 fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A) !Normed {
     const L = dim(x, 0);
     const mix = dim(hc.fn_w, 0);
-    const tg: usize = 1024;
+    const tg = m.hc_tg;
     const eps = try hcEps(sc, m);
     var zv = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(zv);
@@ -2192,6 +2213,38 @@ fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc,
     return hcNorm(sc, m, z, x, cpre, norm_w, eps);
 }
 
+/// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1/M2): launches every hc kernel once at
+/// `m.hc_tg` threads and halves it until they run.
+fn probeHcThreads(gpa: std.mem.Allocator, m: *Dsv41Model) !void {
+    while (true) {
+        probeHcOnce(gpa, m) catch |e| {
+            if (e != error.MlxError or m.hc_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            m.hc_tg /= 2;
+            log.info("[dsv41] hc kernels: {d} threads per threadgroup on this GPU\n", .{m.hc_tg});
+            continue;
+        };
+        return;
+    }
+}
+
+fn probeHcOnce(gpa: std.mem.Allocator, m: *const Dsv41Model) !void {
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const D = ci(m.cfg.hidden_size);
+    const nh = ci(m.cfg.dsv4_hc_mult);
+    const mix = (2 + nh) * nh;
+    const x = try sc.zeros(&.{ 1, nh, D }, m.act);
+    const y = try sc.zeros(&.{ 1, D }, m.act);
+    const w = try sc.zeros(&.{D}, m.act);
+    const cpre = try sc.zeros(&.{ 1, nh }, .float32);
+    const hc: Hc = .{ .fn_w = try sc.zeros(&.{ mix, nh * D }, .float32), .scale = try sc.zeros(&.{mix}, .float32), .base = try sc.zeros(&.{mix}, .float32) };
+    const sp: Split = .{ .pre = none, .post = try sc.zeros(&.{ 1, nh }, .float32), .comb = try sc.zeros(&.{ 1, nh, nh }, .float32) };
+    const wide = try hcPreNormWide(&sc, m, x, cpre, &hc, w);
+    const plain = try hcStage(&sc, m, x, null, cpre, &hc, w);
+    const expand = try hcStage(&sc, m, x, .{ .y = y, .sp = &sp }, cpre, &hc, w);
+    try evalAll(&.{ wide.h, wide.sp.comb, plain.h, plain.sp.comb, expand.h, expand.x1, expand.sp.comb });
+}
+
 fn hcEps(sc: *Scope, m: *const Dsv41Model) !A {
     return sc.keep(mlx.mlx_array_new_data(&[_]f32{ m.cfg.rms_norm_eps, m.cfg.dsv4_hc_eps }, &[_]c_int{2}, 1, .float32));
 }
@@ -2202,7 +2255,7 @@ const Expand = struct { y: A, sp: *const Split };
 /// `hcPreNorm` (with `ex`: `hcExpandPreNorm`, the stream being `hcExpand(x, y, ex.sp)`) as
 /// `HC_STAGE_SOURCE` and `HC_SPLIT_SOURCE`.
 fn hcStage(sc: *Scope, m: *const Dsv41Model, x: A, ex: ?Expand, cpre: A, hc: *const Hc, norm_w: A) !Staged {
-    const tg: usize = 1024;
+    const tg = m.hc_tg;
     const L = dim(x, 0);
     const D = dim(x, 2);
     const nh = m.cfg.dsv4_hc_mult;
@@ -2275,7 +2328,7 @@ fn hcNorm(sc: *Scope, m: *const Dsv41Model, z: A, x: A, cpre: A, norm_w: A, eps:
     const L = dim(x, 0);
     const D = dim(x, 2);
     const nh = m.cfg.dsv4_hc_mult;
-    const tg: usize = 1024;
+    const tg = m.hc_tg;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(nh) }, 2, .float32));
@@ -3018,6 +3071,41 @@ fn engramIds(m: *const Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []co
     return out;
 }
 
+/// The Engram rows of `ids` (the chunk at `st.n - ids.len`, whose hash is `rows`) as a prefetch: the one the
+/// previous chunk started for it, or a new one; either way the prompt's next chunk is read behind. `m.ahead`
+/// keeps a prefetch that still has a chunk to hand over; the caller finishes the other.
+fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []const *const engram.Table, ids: []const u32, rows: []const u32, span: usize) !*engram.Prefetch {
+    const hs = &m.hash.?;
+    const p0 = st.n;
+    const L = ids.len;
+    const p1 = p0 + L;
+    const mine = p1 <= m.prompt.len and std.mem.eql(u32, ids, m.prompt[p0..p1]);
+    const adopted: ?*engram.Prefetch = if (m.ahead) |a| if (mine and a.covers(p0, L)) a else null else null;
+    errdefer if (adopted) |a| a.finish();
+    if (m.ahead != null and adopted == null) m.dropAhead();
+    m.ahead = null;
+
+    // The next chunk is expected as wide as this one; hist already holds this chunk.
+    const w = if (mine) @min(m.prompt.len - p1, L) else 0;
+    const next = try gpa.alloc(u32, if (w > region_rows) w * hs.n_layers * hs.cols() else 0);
+    defer gpa.free(next);
+    if (next.len > 0) {
+        const comp = try gpa.alloc(u32, w);
+        defer gpa.free(comp);
+        for (m.prompt[p1..][0..w], comp) |t, *o| o.* = if (t < m.token_map.len) m.token_map[t] else 0;
+        hs.rows(st.hist.items, comp, next);
+    }
+    const ahead_spec: engram.Prefetch.Spec = .{ .at = p1, .len = w, .ids = next };
+    if (adopted) |a| {
+        if (next.len > 0) m.ahead = try engram.Prefetch.start(gpa, tables, &.{ahead_spec}, hs.cols(), span);
+        return a;
+    }
+    const cur_spec: engram.Prefetch.Spec = .{ .at = p0, .len = L, .ids = rows };
+    const pf = try engram.Prefetch.start(gpa, tables, if (next.len > 0) &.{ cur_spec, ahead_spec } else &.{cur_spec}, hs.cols(), span);
+    if (next.len > 0) m.ahead = pf;
+    return pf;
+}
+
 /// `extend` over `ids`. A GPU token goes out as its own batch and the layers
 /// before the first Engram layer are queued on it before the host reads it
 /// back for the hash: the GPU never waits on that round trip.
@@ -3078,7 +3166,17 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         }
     }
 
-    var sp: Spans = .{ .xs = xs, .pres = pres, .topks = topks, .cands = cands, .mh = mh, .span = span, .L = L, .p0 = p0, .eng_ids = eng_ids, .ncols = ncols };
+    // The chunk's Engram rows come off the SSD while the layers before them run, and the prompt's next
+    // chunk is read behind them: the previous call already did the same for this one.
+    const eng_on = ids == .host and L > region_rows and m.pair == null and m.engrams.len > 0;
+    const eng_tables = try gpa.alloc(*const engram.Table, if (eng_on) m.engrams.len else 0);
+    defer gpa.free(eng_tables);
+    for (eng_tables, m.engrams[0..eng_tables.len]) |*t, *e| t.* = &e.table;
+    var prefetch: ?*engram.Prefetch = null;
+    defer if (prefetch) |pf| if (m.ahead != pf) pf.finish();
+    if (eng_on) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span);
+
+    var sp: Spans = .{ .xs = xs, .pres = pres, .topks = topks, .cands = cands, .mh = mh, .span = span, .L = L, .p0 = p0, .eng_ids = eng_ids, .ncols = ncols, .prefetch = prefetch };
     var from: usize = 0;
     if (ids == .gpu and m.engrams.len > 0) {
         var first = m.n_layers;
@@ -3144,6 +3242,16 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
 /// layers, evaluated per layer when there are several spans.
 fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, held: []A, lo: usize, hi: usize) !void {
     const n_spans = sp.xs.len;
+    // Wide spans split each block at its FFN: attention runs per span, the MoE over `moe_rows` of them at once.
+    const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
+    const mids = try gpa.alloc(A, if (wide) n_spans * mid_len else 0);
+    defer {
+        for (mids) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        gpa.free(mids);
+    }
+    @memset(mids, none);
     for (lo..hi) |li| {
         for (0..n_spans) |k| {
             // A span's intermediates are dropped as soon as it is built, so the
@@ -3153,13 +3261,21 @@ fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             var x = try spanIn(&sc, m, gpa, sp, li, k);
             var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
             var pre = sp.pres[k];
-            x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh, null);
-            if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
-            hold(&sp.xs[k], x);
-            hold(&sp.pres[k], pre);
+            if (wide) {
+                const mid = try blockAttn(&sc, m, st, li, x, pre, sp.p0 + k * sp.span, &sh, null);
+                const slots = mids[k * mid_len ..][0..mid_len];
+                for (slots, [mid_len]A{ mid.x1, mid.sf.pre, mid.sf.post, mid.sf.comb, mid.h }) |*slot, v| hold(slot, v);
+                hold(&sp.pres[k], mid.sf.pre);
+            } else {
+                x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh, null);
+                if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
+                hold(&sp.xs[k], x);
+                hold(&sp.pres[k], pre);
+            }
             hold(&sp.topks[k], sh.topk);
             hold(&sp.cands[k], sh.cand);
         }
+        if (wide) try moeBlocks(m, gpa, sp, mids, li);
         const decode = n_spans == 1 and sp.L <= region_rows;
         if (n_spans > 1 or (decode and li + 1 < hi)) {
             var ev: std.ArrayList(A) = .empty;
@@ -3252,6 +3368,35 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
     return .{ sc.out(xo), sc.out(po) };
 }
 
+/// A block held between its attention half and its MoE: the stream after attention, the FFN's mix
+/// (pre, post, comb) and the normed FFN input.
+const mid_len = 5;
+
+/// Layer `li`'s MoE over the spans in `mids`, `moe_rows` of them per call; their new streams land in `sp.xs`.
+fn moeBlocks(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, mids: []A, li: usize) !void {
+    const n_spans = sp.xs.len;
+    const group = @max(1, m.moe_rows / sp.span);
+    var k0: usize = 0;
+    while (k0 < n_spans) : (k0 += group) {
+        const k1 = @min(n_spans, k0 + group);
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const hs = try gpa.alloc(A, k1 - k0);
+        defer gpa.free(hs);
+        for (hs, k0..) |*h, k| h.* = mids[k * mid_len + 4];
+        const y = try moe(&sc, m, li, if (hs.len == 1) hs[0] else try sc.concat(hs, 0));
+        var row: usize = 0;
+        for (k0..k1) |k| {
+            const mid = mids[k * mid_len ..][0..mid_len];
+            const rows = dim(mid[0], 0);
+            const split: Split = .{ .pre = mid[1], .post = mid[2], .comb = mid[3] };
+            hold(&sp.xs[k], try hcExpand(&sc, mid[0], try sc.slice(y, 0, row, row + rows), &split));
+            row += rows;
+        }
+    }
+    for (mids) |*slot| hold(slot, none);
+}
+
 /// What crosses layers in `extend`: each span's stream and mix, the picks
 /// attention layers hand down, the DSpark main rows, and the Engram row ids.
 const Spans = struct {
@@ -3265,6 +3410,7 @@ const Spans = struct {
     p0: usize,
     eng_ids: []const u32,
     ncols: usize,
+    prefetch: ?*engram.Prefetch = null,
 
     fn bounds(sp: *const Spans, k: usize) [2]usize {
         const lo = k * sp.span;
@@ -3280,10 +3426,16 @@ fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, 
     for (m.engrams, 0..) |*e, ek| {
         if (e.layer != li) continue;
         const nc = sp.ncols;
-        const mine = try gpa.alloc(u32, (hi - lo) * nc);
-        defer gpa.free(mine);
-        for (lo..hi) |t| @memcpy(mine[(t - lo) * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
-        const rows = try sc.keep(try e.table.gather(gpa, mine, sc.s));
+        const rows = if (sp.prefetch) |pf| blk: {
+            const raw = try pf.take(sp.p0, ek, k);
+            defer raw.deinit(gpa);
+            break :blk try sc.keep(try e.table.dequant(raw, (hi - lo) * nc, sc.s));
+        } else blk: {
+            const mine = try gpa.alloc(u32, (hi - lo) * nc);
+            defer gpa.free(mine);
+            for (lo..hi) |t| @memcpy(mine[(t - lo) * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
+            break :blk try sc.keep(try e.table.gather(gpa, mine, sc.s));
+        };
         x = try engramApply(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }));
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
     }
@@ -3464,6 +3616,10 @@ fn ref(x: A) A {
 /// prefix of `prompt` and returns its length (0: a cold prompt). A restore
 /// always leaves a token to forward.
 pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32) !usize {
+    m.dropAhead();
+    m.gpa.free(m.prompt);
+    m.prompt = &.{};
+    m.prompt = try m.gpa.dupe(u32, prompt);
     const n = try restore(m, prompt);
     m.gpa.free(m.snap_ids);
     m.snap_ids = &.{};
@@ -3955,6 +4111,19 @@ test "dsv41 fixture: prefill, chunked prefill, spans and decode match DeepSeek's
         t.m.span = SPAN;
         defer gpa.free(spanned);
         try expectRowsClose(try std.fmt.bufPrint(&label, "{s} 7-row spans", .{pack}), spanned, full_ref, V);
+
+        // The MoE over several spans at once (9-row spans, two or all of them per call).
+        t.m.span = 9;
+        for ([_]usize{ 18, 4096 }) |moe_rows| {
+            t.m.moe_rows = moe_rows;
+            st = try initState(t.m, gpa);
+            const wide = try logitsHost(t.m, &st, ids, .all);
+            st.deinit();
+            defer gpa.free(wide);
+            try expectRowsClose(try std.fmt.bufPrint(&label, "{s} {d}-row MoE blocks", .{ pack, moe_rows }), wide, full_ref, V);
+        }
+        t.m.span = SPAN;
+        t.m.moe_rows = MOE_ROWS;
 
         st = try initState(t.m, gpa);
         defer st.deinit();
@@ -4615,19 +4784,8 @@ test "dsv41 bench: one hyper-connection stage as a dependent chain (DSV41_BENCH_
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
     var m: Dsv41Model = undefined;
-    m.cfg = .{};
-    m.cfg.dsv4_hc_mult = 4;
-    m.cfg.dsv4_hc_sinkhorn_iters = 20;
-    m.hc_mix_kernel = try buildKernel("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, HC_MIX_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_mix_kernel);
-    m.hc_norm_kernel = try buildKernel("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "pre", "post", "comb", "h_out" }, HC_NORM_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_norm_kernel);
-    m.hc_stage_kernel = try buildKernel("dsv41_hc_stage", &HC_STAGE_INS, &HC_STAGE_OUTS, HC_STAGE_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_stage_kernel);
-    m.hc_stage_x_kernel = try buildKernel("dsv41_hc_stage_x", &HC_STAGE_X_INS, &HC_STAGE_X_OUTS, HC_STAGE_X_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_stage_x_kernel);
-    m.hc_split_kernel = try buildKernel("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, HC_SPLIT_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_split_kernel);
+    try hcTestModel(&m);
+    defer hcTestModelFree(&m);
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_key(&key, 3));
@@ -4655,56 +4813,127 @@ test "dsv41 bench: one hyper-connection stage as a dependent chain (DSV41_BENCH_
     std.debug.print("[hc] {d} rows: expand+mix+norm+add chain {d:.1} us/call\n", .{ L, best });
 }
 
-test "dsv41 hc: a decode-width stage gives the wide path's mixes, split, norm and expanded stream bit for bit" {
+/// A model with only the hc kernels built, at the release's widths.
+fn hcTestModel(m: *Dsv41Model) !void {
+    m.cfg = .{};
+    m.cfg.hidden_size = 5120;
+    m.cfg.dsv4_hc_mult = 4;
+    m.cfg.dsv4_hc_sinkhorn_iters = 20;
+    m.s = mlx.gpuStream();
+    m.act = .bfloat16;
+    m.hc_tg = HC_TG;
+    m.hc_mix_kernel = try buildKernel("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, HC_MIX_SOURCE, "");
+    m.hc_norm_kernel = try buildKernel("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "pre", "post", "comb", "h_out" }, HC_NORM_SOURCE, "");
+    m.hc_stage_kernel = try buildKernel("dsv41_hc_stage", &HC_STAGE_INS, &HC_STAGE_OUTS, HC_STAGE_SOURCE, "");
+    m.hc_stage_x_kernel = try buildKernel("dsv41_hc_stage_x", &HC_STAGE_X_INS, &HC_STAGE_X_OUTS, HC_STAGE_X_SOURCE, "");
+    m.hc_split_kernel = try buildKernel("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, HC_SPLIT_SOURCE, "");
+}
+
+fn hcTestModelFree(m: *Dsv41Model) void {
+    for ([_]mlx.mlx_fast_metal_kernel{ m.hc_mix_kernel, m.hc_norm_kernel, m.hc_stage_kernel, m.hc_stage_x_kernel, m.hc_split_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+}
+
+test "dsv41 kv row: a head-width row launches and is normed by its own rms on this GPU" {
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
     var m: Dsv41Model = undefined;
     m.cfg = .{};
-    m.cfg.dsv4_hc_mult = 4;
-    m.cfg.dsv4_hc_sinkhorn_iters = 20;
-    m.hc_mix_kernel = try buildKernel("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, HC_MIX_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_mix_kernel);
-    m.hc_norm_kernel = try buildKernel("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "pre", "post", "comb", "h_out" }, HC_NORM_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_norm_kernel);
-    m.hc_stage_kernel = try buildKernel("dsv41_hc_stage", &HC_STAGE_INS, &HC_STAGE_OUTS, HC_STAGE_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_stage_kernel);
-    m.hc_stage_x_kernel = try buildKernel("dsv41_hc_stage_x", &HC_STAGE_X_INS, &HC_STAGE_X_OUTS, HC_STAGE_X_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_stage_x_kernel);
-    m.hc_split_kernel = try buildKernel("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, HC_SPLIT_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_split_kernel);
+    m.cfg.rms_norm_eps = 1e-6;
+    m.cfg.dsv4_rope_head_dim = 64;
+    m.qat_off = true;
+    m.kv_row_kernel = try buildKernel("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, KV_ROW_SOURCE, FP8_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.kv_row_kernel);
+    const L = 3;
+    const D = 512;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 11));
+    var xr = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&xr, &[_]c_int{ L, D }, 2, .bfloat16, 0, 1, key, sc.s));
+    const x = try sc.keep(xr);
+    var ly: Layer = undefined;
+    ly.kv_norm = try sc.keep(mlx.mlx_array_new_data(&@as([D]f32, @splat(1)), &[_]c_int{D}, 1, .float32));
+    ly.kv_norm = try sc.astype(ly.kv_norm, .bfloat16);
+    const periods = try sc.keep(mlx.mlx_array_new_data(&@as([32]f32, @splat(1)), &[_]c_int{32}, 1, .float32));
+    const got = try hostF32(try kvRow(&sc, &m, &ly, periods, x, try sc.i(0)));
+    defer gpa.free(got);
+    const xs = try hostF32(x);
+    defer gpa.free(xs);
+    // Columns before the rope tail are the row times 1/rms.
+    for (0..L) |l| {
+        var ss: f32 = 0;
+        for (xs[l * D ..][0..D]) |v| ss += v * v;
+        const inv = 1.0 / @sqrt(ss / D + 1e-6);
+        for (0..D - 64) |d| try testing.expectApproxEqAbs(xs[l * D + d] * inv, got[l * D + d], 1e-2 * @max(1.0, @abs(xs[l * D + d] * inv)));
+    }
+}
+
+test "dsv41 hc: a threadgroup the GPU refuses is halved until the kernels launch" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: Dsv41Model = undefined;
+    try hcTestModel(&m);
+    defer hcTestModelFree(&m);
+    m.hc_tg = 4 * HC_TG; // above any Metal cap
+    try probeHcThreads(testing.allocator, &m);
+    try testing.expect(m.hc_tg >= 32 and m.hc_tg <= HC_TG and m.hc_tg % 32 == 0);
+    const granted = m.hc_tg;
+    try probeHcThreads(testing.allocator, &m);
+    try testing.expectEqual(granted, m.hc_tg);
+}
+
+test "dsv41 hc: a decode-width stage gives the wide path's mixes, split, norm and expanded stream bit for bit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    try hcTestModel(&m);
+    defer hcTestModelFree(&m);
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_key(&key, 9));
-    for ([_]c_int{ 1, 5, 8, 17, 100, 300 }) |L| {
-        var t: [8]A = undefined;
-        for ([_][]const c_int{ &.{ L, 4, 5120 }, &.{ L, 5120 }, &.{ L, 4 }, &.{ L, 4, 4 }, &.{ 24, 20480 }, &.{24}, &.{5120}, &.{ L, 4 } }, &t, 0..) |sh, *o, i| {
-            var r = mlx.mlx_array_new();
-            const dt: mlx.mlx_dtype = if (i <= 1 or i == 6) .bfloat16 else .float32;
-            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, dt, 0, if (i == 4) 0.01 else 1, key, sc.s));
-            o.* = try sc.keep(r);
-        }
-        const hc: Hc = .{ .fn_w = t[4], .scale = t[5], .base = t[5] };
-        const sp: Split = .{ .pre = t[2], .post = t[2], .comb = t[3] };
-        const cpre = t[7];
-        const want_plain = try hcPreNormWide(&sc, &m, t[0], cpre, &hc, t[6]);
-        const x1 = try hcExpand(&sc, t[0], t[1], &sp);
-        const want_x = try hcPreNormWide(&sc, &m, x1, cpre, &hc, t[6]);
-        const got_plain = try hcStage(&sc, &m, t[0], null, cpre, &hc, t[6]);
-        const got_x = try hcStage(&sc, &m, t[0], .{ .y = t[1], .sp = &sp }, cpre, &hc, t[6]);
-        const pairs = [_][2]A{
-            .{ want_plain.h, got_plain.h },     .{ want_plain.sp.pre, got_plain.sp.pre }, .{ want_plain.sp.post, got_plain.sp.post }, .{ want_plain.sp.comb, got_plain.sp.comb },
-            .{ x1, got_x.x1 },                  .{ want_x.h, got_x.h },                   .{ want_x.sp.pre, got_x.sp.pre },           .{ want_x.sp.post, got_x.sp.post },
-            .{ want_x.sp.comb, got_x.sp.comb },
-        };
-        for (pairs) |pr| {
-            var eq = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(eq);
-            try mlx.check(mlx.mlx_array_equal(&eq, pr[0], pr[1], false, sc.s));
-            var same = false;
-            try mlx.check(mlx.mlx_array_eval(eq));
-            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
-            try testing.expect(same);
+    try probeHcThreads(gpa, &m);
+    // The width the GPU grants and a narrower one: the stage and the wide kernels agree at both.
+    const granted = m.hc_tg;
+    for ([_]usize{ granted, 256 }) |tg| {
+        m.hc_tg = tg;
+        for ([_]c_int{ 1, 5, 8, 17, 100, 300 }) |L| {
+            var t: [8]A = undefined;
+            for ([_][]const c_int{ &.{ L, 4, 5120 }, &.{ L, 5120 }, &.{ L, 4 }, &.{ L, 4, 4 }, &.{ 24, 20480 }, &.{24}, &.{5120}, &.{ L, 4 } }, &t, 0..) |sh, *o, i| {
+                var r = mlx.mlx_array_new();
+                const dt: mlx.mlx_dtype = if (i <= 1 or i == 6) .bfloat16 else .float32;
+                try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, dt, 0, if (i == 4) 0.01 else 1, key, sc.s));
+                o.* = try sc.keep(r);
+            }
+            const hc: Hc = .{ .fn_w = t[4], .scale = t[5], .base = t[5] };
+            const sp: Split = .{ .pre = t[2], .post = t[2], .comb = t[3] };
+            const cpre = t[7];
+            const want_plain = try hcPreNormWide(&sc, &m, t[0], cpre, &hc, t[6]);
+            const x1 = try hcExpand(&sc, t[0], t[1], &sp);
+            const want_x = try hcPreNormWide(&sc, &m, x1, cpre, &hc, t[6]);
+            const got_plain = try hcStage(&sc, &m, t[0], null, cpre, &hc, t[6]);
+            const got_x = try hcStage(&sc, &m, t[0], .{ .y = t[1], .sp = &sp }, cpre, &hc, t[6]);
+            const pairs = [_][2]A{
+                .{ want_plain.h, got_plain.h },     .{ want_plain.sp.pre, got_plain.sp.pre }, .{ want_plain.sp.post, got_plain.sp.post }, .{ want_plain.sp.comb, got_plain.sp.comb },
+                .{ x1, got_x.x1 },                  .{ want_x.h, got_x.h },                   .{ want_x.sp.pre, got_x.sp.pre },           .{ want_x.sp.post, got_x.sp.post },
+                .{ want_x.sp.comb, got_x.sp.comb },
+            };
+            for (pairs) |pr| {
+                var eq = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(eq);
+                try mlx.check(mlx.mlx_array_equal(&eq, pr[0], pr[1], false, sc.s));
+                var same = false;
+                mlx.check(mlx.mlx_array_eval(eq)) catch |e| {
+                    var msg: [512]u8 = undefined;
+                    std.debug.print("hc rows={d} tg={d}: {s}\n", .{ L, tg, mlx.takeError(&msg) orelse "no MLX message" });
+                    return e;
+                };
+                try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+                try testing.expect(same);
+            }
         }
     }
 }
@@ -4837,6 +5066,38 @@ test "dsv41 resume: a prompt that extends the last one resumes its state and mat
         defer gpa.free(cold);
         try testing.expectEqualSlices(f32, cold, warm);
     }
+}
+
+test "dsv41 engram: a chunk's rows are read behind the one before it and give the same logits (DSV41_TINY)" {
+    const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    var t = try Tiny.open(root, "repack", "fixture.safetensors");
+    defer t.deinit();
+    const ids = try t.ids();
+    defer gpa.free(ids);
+    const m = t.m;
+    const cuts = [_]usize{ 13, 27, ids.len };
+    try testing.expect(ids.len > 27 + region_rows);
+    var logits: [2][]f32 = undefined;
+    for (&logits, 0..) |*out, ahead| {
+        _ = try resumePrompt(m, ids);
+        if (ahead == 0) { // the prompt is unknown: every chunk reads its own rows
+            m.gpa.free(m.prompt);
+            m.prompt = &.{};
+        }
+        var lo: usize = 0;
+        for (cuts, 0..) |hi, c| {
+            const l = if (c == 0) try prefill(m, gpa, ids[lo..hi]) else try extendResumable(m, gpa, ids[lo..hi]);
+            defer _ = mlx.mlx_array_free(l);
+            if (c + 1 == cuts.len) out.* = try hostF32(l);
+            // After a chunk, the next one's rows are coming; after the last, nothing.
+            try testing.expectEqual(ahead == 1 and c + 1 < cuts.len, m.ahead != null);
+            if (m.ahead) |a| try testing.expect(a.covers(hi, @min(cuts[c + 1] - hi, hi - lo)));
+            lo = hi;
+        }
+    }
+    defer for (logits) |l| gpa.free(l);
+    try testing.expectEqualSlices(f32, logits[0], logits[1]);
 }
 
 test "dsv41 init: every weight the model reads is evaluated before a region traces it (DSV41_TINY)" {
