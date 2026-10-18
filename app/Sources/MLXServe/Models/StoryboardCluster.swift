@@ -153,8 +153,8 @@ struct ShotDispatcher {
         }
         guard pending.isEmpty else { return nil }
         // Nothing left to start: take over the shot that ends last, run once so far.
-        let costs = costs, mineFactor = factors[device]
-        let mine = { (s: Int) in costs[s] * mineFactor }
+        let shotCosts = costs, mineFactor = factors[device]
+        let mine = { (s: Int) in shotCosts[s] * mineFactor }
         let rerun = factors.indices
             .compactMap { j -> (shot: Int, end: Double)? in
                 guard let s = shot[j], pins[s] == nil, let e = end(j), shot.filter({ $0 == s }).count == 1 else { return nil }
