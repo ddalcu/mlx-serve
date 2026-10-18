@@ -62,6 +62,11 @@ enum ThunderboltPairing {
         return L10n.text("The cable did not get its address. Unplug it, plug it back into a Thunderbolt 5 port and try again.")
     }
 
+    /// The leader's server again, waiting for the worker to join.
+    static func restartLeader(_ appState: AppState) {
+        restartServer(appState)
+    }
+
     private static func restartServer(_ appState: AppState) {
         appState.server.stop()
         appState.startServer(loadingSelection: false)
@@ -111,6 +116,12 @@ final class PairInvites {
 
     private func check(_ appState: AppState) async {
         ThunderboltAddressJob.sync(appState.serverOptions.clusterRole)
+        if appState.serverOptions.clusterRole == .host {
+            await appState.server.refreshPairState()
+            // The worker left (its Mac restarted or unpaired): only a fresh server takes one again.
+            if appState.server.cluster?.workerGone == true { ThunderboltPairing.restartLeader(appState) }
+            return
+        }
         guard appState.serverOptions.clusterRole == .off else { asked.removeAll(); return }
         await appState.server.refreshPairState()
         let waiting = Set(appState.server.lanPeers.filter(\.value.waitsForPartner).keys)

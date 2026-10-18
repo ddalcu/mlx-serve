@@ -609,6 +609,9 @@ var joined = std.atomic.Value(bool).init(false);
 /// What the worker said about the group's model when it joined: 0 has it, else NOT_FOUND or
 /// MISMATCH (-1 = not asked: no bell connection).
 var worker_copy = std.atomic.Value(i32).init(-1);
+/// The worker's bell connection closed: it left, and JACCL forms a group once per process,
+/// so this server must restart to pair again (the app does it, `/props` cluster "worker_gone").
+var worker_gone = std.atomic.Value(bool).init(false);
 var joined_link: Link = undefined;
 
 /// The `/props` "cluster" object (with its leading comma), empty when this server is
@@ -616,8 +619,8 @@ var joined_link: Link = undefined;
 pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     if (peer()) |p| return clusterJson(allocator, p);
     const g = group orelse return allocator.dupe(u8, "");
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false,\"worker_model\":\"{s}\"}}", .{
-        @tagName(g.mode), std.json.fmt(std.fs.path.basename(g.model), .{}), joined.load(.acquire), workerCopyName(),
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false,\"worker_model\":\"{s}\",\"worker_gone\":{}}}", .{
+        @tagName(g.mode), std.json.fmt(std.fs.path.basename(g.model), .{}), joined.load(.acquire), workerCopyName(), worker_gone.load(.acquire),
     });
 }
 
@@ -639,11 +642,11 @@ fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     defer last_job_mu.unlock();
     // Rows mode: the worker's speed relative to this Mac and the link, once measured.
     const speed: f64 = if (p.worker_calib_us > 0 and p.host_calib_us > 0) @as(f64, @floatFromInt(p.host_calib_us)) / @as(f64, @floatFromInt(p.worker_calib_us)) else 0;
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":true,\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}],\"worker_model\":\"{s}\"}}", .{
-        @tagName(p.mode), std.json.fmt(std.fs.path.basename(p.model), .{}), p.planned, p.ready, sp.total, sp.start, sp.end,
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}],\"worker_model\":\"{s}\",\"worker_gone\":{}}}", .{
+        @tagName(p.mode), std.json.fmt(std.fs.path.basename(p.model), .{}), joined.load(.acquire), p.planned, p.ready, sp.total, sp.start, sp.end,
         if (p.mode == .pipeline) sp.end else 0, sp.total, if (p.shard) |sh| sh.size else 0,
         p.worker.avail_mib, p.worker.total_mib, p.exchanges, std.json.fmt(p.workerName(), .{}) , speed, p.link_bytes_per_us / 1000,
-        std.json.fmt(last_job_buf[0..last_job_len], .{}), last_split[0], last_split[1], workerCopyName(),
+        std.json.fmt(last_job_buf[0..last_job_len], .{}), last_split[0], last_split[1], workerCopyName(), worker_gone.load(.acquire),
     });
 }
 
@@ -812,6 +815,23 @@ fn waitForWorker(io: std.Io, cfg: Config) void {
     };
     joined.store(true, .release);
     log.info("[dist] worker joined; it loads its part with {s}\n", .{std.fs.path.basename(group.?.model)});
+    watchWorker(&joined_link);
+}
+
+/// Waits on the bell for the worker to leave: it never writes after its answer, so a read
+/// returns only at its end.
+fn watchWorker(link: *const Link) void {
+    if (link.bell.fd < 0) return;
+    var x: [1]u8 = undefined;
+    while (true) {
+        const n = std.c.read(link.bell.fd, &x, 1);
+        if (n < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+        if (n > 0) continue;
+        break;
+    }
+    worker_gone.store(true, .release);
+    joined.store(false, .release);
+    log.warn("[dist] the worker left; this server restarts to pair again\n", .{});
 }
 
 /// Right after the worker joins, over the bell connection (no MLX off the inference thread):

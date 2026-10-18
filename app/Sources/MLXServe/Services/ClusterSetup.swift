@@ -231,6 +231,8 @@ struct ClusterInfo: Equatable {
     var workerFreeMib: Int = 0
     /// Whether the worker has the pair's model: "ok", "missing", "different" or "unknown".
     var workerModel: String = "unknown"
+    /// The worker left; the server must restart to pair again.
+    var workerGone: Bool = false
 
     var lastSplit: Bool { splitRows.count == 2 && splitRows[1] > 0 }
 
@@ -252,7 +254,8 @@ struct ClusterInfo: Equatable {
                            lastJob: c["last_job"] as? String ?? "",
                            splitRows: c["split_rows"] as? [Int] ?? [],
                            workerFreeMib: c["worker_free_mib"] as? Int ?? 0,
-                           workerModel: c["worker_model"] as? String ?? "unknown")
+                           workerModel: c["worker_model"] as? String ?? "unknown",
+                           workerGone: c["worker_gone"] as? Bool ?? false)
     }
 }
 

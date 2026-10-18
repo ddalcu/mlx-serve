@@ -105,5 +105,6 @@ final class ThunderboltPairTests: XCTestCase {
     func testTheLeaderReportsWhetherTheWorkerHasTheModel() {
         let c = ClusterInfo.parse(["cluster": ["mode": "pipeline", "model": "Flash", "joined": true, "worker_model": "missing"]])
         XCTAssertEqual(c?.workerModel, "missing")
+        XCTAssertEqual(ClusterInfo.parse(["cluster": ["joined": false, "worker_gone": true]])?.workerGone, true)
     }
 }
