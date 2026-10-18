@@ -64,6 +64,10 @@ pub const WIDE_PREFILL_CHUNK: usize = 16384;
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 pub var prefill_chunk_explicit: bool = false;
 
+/// The widest chunk this machine runs without `--prefill-chunk` (`server.autoPrefillChunkCap`),
+/// set once by main.zig. Every auto width obeys it, the per-request and adaptive rungs included.
+pub var machine_prefill_chunk_cap: usize = std.math.maxInt(usize);
+
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
 pub fn explicitPrefillChunkU32() u32 {
     if (!prefill_chunk_explicit) return 0;
@@ -248,10 +252,12 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     // real KV budget. It NARROWS, never raises, and an explicit
     // `--prefill-chunk` outranks it — the operator asked for a width.
     const launch: usize = if (head_dim == 0 and !prefill_chunk_explicit) WIDE_PREFILL_CHUNK else prefill_chunk_override;
-    const base: usize = if (prefill_chunk_explicit or pinned_chunk == 0)
+    const base: usize = if (prefill_chunk_explicit)
         launch
+    else if (pinned_chunk == 0)
+        @min(launch, machine_prefill_chunk_cap)
     else
-        @min(launch, pinned_chunk);
+        @min(launch, pinned_chunk, machine_prefill_chunk_cap);
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
@@ -280,6 +286,26 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
     try std.testing.expectEqual(@as(usize, 8192), env);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
+}
+
+test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {
+    const saved_cap = machine_prefill_chunk_cap;
+    const saved_explicit = prefill_chunk_explicit;
+    const saved_override = prefill_chunk_override;
+    defer {
+        machine_prefill_chunk_cap = saved_cap;
+        prefill_chunk_explicit = saved_explicit;
+        prefill_chunk_override = saved_override;
+    }
+    machine_prefill_chunk_cap = 2048;
+    prefill_chunk_explicit = false;
+    prefill_chunk_override = WIDE_PREFILL_CHUNK;
+    // A per-request rung (8192) and an unpinned adaptive cap (0) both stop at the machine's cap.
+    try std.testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(256, 24, 16384, false, true, true, 8192));
+    try std.testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(256, 24, 16384, false, true, true, 0));
+    prefill_chunk_explicit = true;
+    prefill_chunk_override = 8192;
+    try std.testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(256, 24, 16384, false, true, true, 8192));
 }
 
 /// The `[spec-stats] mode=` word of an mlx-stream lane: the first word of the plugin's lane name.

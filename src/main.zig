@@ -250,8 +250,8 @@ fn printUsage(io: std.Io) void {
         \\                        GPU with 64 GiB of RAM; --w8a8 opts in below that.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
-        \\  --mtp               No-op: a loaded MTP head drafts by default,
-        \\                        dense or MoE (--no-mtp turns it off).
+        \\  --mtp               Draft with a loaded MTP head, dense or MoE. The default
+        \\                        on Metal and CUDA; Vulkan needs it (--no-mtp turns it off).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV).
@@ -1118,7 +1118,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
-    if (!server_mod.mtpAllowedByDefault(mtp_forced)) enable_mtp = false;
+    if (!server_mod.mtpAllowedByDefault(mtp_forced, mlx.metalKernelsAvailable(), mlx.cudaAvailable())) enable_mtp = false;
+    generate_mod.machine_prefill_chunk_cap = server_mod.autoPrefillChunkCap(mlx.cudaAvailable());
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.

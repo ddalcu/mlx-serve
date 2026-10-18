@@ -58,6 +58,13 @@ Cause: the arithmetic, not memory traffic. Staging x in shared memory did not he
 Fix: `qmv_cuda.zig` puts 16 weight rows x 8 x rows into one `mma.m16n8k16`, so 8 rows cost about one decode step. A lane owns 32 consecutive k of each 128-k block, so its packed words and its x slice load as 16-byte vectors. A and B take the same k permutation, which leaves the dot product unchanged. 16 warps split K over each 16-row tile.
 Guard: `qmv_cuda: no worse than stock quantized_matmul against f32 truth` (rows 2..8, bf16 + f16, groups 32/64/128).
 
+### Flash Next's 8192-row prefill failed in MLX's expert gather on a DGX Spark
+
+Defect: NVIDIA's Flash Next FP4 pack chose an 8192-row chunk on a GB10 and every prompt past it failed with `cuGraphAddKernelNode ... invalid argument`.
+Cause: MLX's `GatherQMM` runs `qmm_sm80` with one block per (token, expert) pair on grid z, capped at 65,535; 8192 rows x top-10 is 81,920. The 2048-row CUDA cap (`autoPrefillChunkCap`) bound only the load-time pin, and Flash Next picks its width per request and widens per chunk.
+Fix: `mlx-cuda-gather-qmm-rhs.patch` (upstream #4554) runs sorted fp4/fp8 gathers one group per expert, ~10x faster at a 2048-row chunk; `generate.machine_prefill_chunk_cap` bounds every auto width in `effectivePrefillChunk`. Affine banks and expert widths not a multiple of 128 keep the old gather and its limit.
+Guard: `gatherExpertMm: a sorted nvfp4 gather past 65,535 rows…`, `effectivePrefillChunk: the machine cap bounds every auto width…`, `chooseRequestPrefillChunk: the machine's chunk cap bounds…`.
+
 ## MLX patches and what could move into mlx-serve
 
 | Patch | What it changes | Could be a kernel we pass in? |
@@ -65,5 +72,6 @@ Guard: `qmv_cuda: no worse than stock quantized_matmul against f32 truth` (rows 
 | `mlx-cuda-qmv-rows.patch` | rows kernel inside `quantized_matmul` | Done on sm_120 (`qmv_cuda.zig`); GB10 keeps the patch until it is measured there |
 | `mlx-cuda-qmm-read-weights-once.patch` | folds `[B, M, K]` batches into rows | Yes: `qmv_cuda` flattens leading dims; the stock path could reshape before the call |
 | `mlx-cuda-sdpa-head-dim-256-512.patch` | fused attention at head dims 256 and 512 | Possible, as a custom attention kernel (as `msv_attn_p256` is on Metal) |
+| `mlx-cuda-gather-qmm-rhs.patch` | upstream #4554: sorted fp4/fp8 expert gather, one group per expert | No: drop it once the pin includes #4554 |
 | `mlx-cuda-lru-consecutive-misses.patch` | MLX's internal LRU cache | No: not a kernel |
 | `mlx-cuda-windows-toolkit-dirs.patch` | DLL search folders on Windows | No: not a kernel |

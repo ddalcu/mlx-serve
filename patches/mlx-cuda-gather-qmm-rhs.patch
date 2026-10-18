@@ -1,0 +1,351 @@
+Backport of ml-explore/mlx#4554 ("[CUDA] Add gather_qmm_rhs_sm80", merged
+2026-10-01): a sorted-rhs gather_qmm for fp modes (nvfp4, mxfp4, mxfp8) on
+sm_80+, the CUDA twin of Metal's gather_qmm_rhs.
+
+- GatherQMM ran qmm_sm80 with one block per (token, expert) pair on grid z:
+  each pair was a one-row tile, and past 65,535 pairs (an 8192-row chunk at
+  top-10) the launch failed with "invalid argument". The sorted kernel runs
+  each expert's rows as one group (grid z = 1).
+- It carries upstream's fix to qmm_sm80_mainloop issuing cp.async past the
+  last K tile.
+
+The quantized.cpp hunk is rebased onto mlx-cuda-qmm-read-weights-once.patch.
+Drop this file and its step in build-mlx-linux.sh once lib/mlx-src includes
+the upstream commit.
+
+--- a/mlx/backend/cuda/device/qmm_sm80.cuh
++++ b/mlx/backend/cuda/device/qmm_sm80.cuh
+@@ -267,6 +267,9 @@
+   for (int i = 0; i < size(tCrC_accu); i++) {
+     tCrC(i) = Element(tCrC_accu(i));
+   }
++  // The last prefetches may still be landing in the buffers C reuses.
++  cp_async_wait<0>();
++  __syncthreads();
+   copy(r2s_copy_c, r2s_tCrC, r2s_tCsC);
+   __syncthreads();
+   copy_if(s2g_copy_c, tCpC, s2g_tCsC, s2g_tCgC);
+@@ -355,4 +358,116 @@
+       thread_idx);
+ }
+ 
++template <int GroupSize,
++          typename Element,
++          typename Quant,
++          typename Scale,
++          typename CtaTiler>
++__global__
++__launch_bounds__(decltype(size(make_tiled_mma()))::value)
++void qmm_sm80_rhs_kernel(
++    const Element* A,
++    const Quant* B,
++    const Scale* S,
++    const Element* Z,
++    const uint32_t* rhs_indices,
++    Element* C,
++    int m,
++    int n,
++    int k,
++    int group_count) {
++  int thread_idx = int(threadIdx.x);
++  int m_coord = int(blockIdx.x);
++  int n_coord = int(blockIdx.y);
++
++  auto cta_tiler = CtaTiler{};
++  int tile_m = int(size<0>(cta_tiler));
++  int y_row = m_coord * tile_m;
++  int m_max_coord = m - y_row;
++  int tgp_bm = m_max_coord < tile_m ? m_max_coord : tile_m;
++
++  // Define layouts (mixed). All gathered rows form one matrix; each run of
++  // equal rhs_indices inside the row tile reuses one expert tile.
++  auto dA = make_stride(k, Int<1>{}, m * k); // (dM,dK,dL)
++  auto dB = make_stride(k, Int<1>{}, n * k); // (dN,dK,dL)
++  auto dC = make_stride(n, Int<1>{}, m * n); // (dM,dN,dL)
++  auto S_layout = make_scales_layout<GroupSize>(n, k, group_count);
++
++  Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        make_shape(m, k, 1), dA); // (M,K,L)
++  Tensor mB_nkl = make_tensor(make_gmem_ptr<Quant>(B), make_shape(n, k, group_count), dB); // (N,K,L)
++  Tensor mC_mnl = make_tensor(make_gmem_ptr(C),        make_shape(m, n, 1), dC); // (M,N,L)
++
++  Tensor mS_nkl = make_tensor(make_gmem_ptr(S), S_layout); // (N,(group_size,K/group_size),L)
++  Tensor mZ_nkl = make_tensor(make_gmem_ptr(Z), S_layout); // (N,(group_size,K/group_size),L)
++
++  Tensor mA = mA_mkl(_,_,0); // (M,K)
++  Tensor mC = mC_mnl(_,_,0); // (M,N)
++  uint32_t index_next = rhs_indices[y_row];
++  int offset_next = 0;
++  while (offset_next < tgp_bm) {
++    int offset = offset_next;
++    uint32_t b_batch = index_next;
++    offset_next = tgp_bm;
++    for (int row = offset + 1; row < tgp_bm; ++row) {
++      uint32_t index = rhs_indices[y_row + row];
++      if (index != b_batch) {
++        offset_next = row;
++        index_next = index;
++        break;
++      }
++    }
++
++    int run_rows = offset_next - offset;
++    Tensor mA_offset =
++        domain_offset(make_coord(y_row + offset, 0), mA);
++    Tensor mC_offset =
++        domain_offset(make_coord(y_row + offset, 0), mC);
++    Tensor mB = mB_nkl(_,_,b_batch); // (N,K)
++    Tensor mS = mS_nkl(_,_,b_batch); // (N,(group_size,K/group_size))
++    Tensor mZ = mZ_nkl(_,_,b_batch); // (N,(group_size,K/group_size))
++
++    auto run_qmm = [&](auto run_tiler) {
++      Tensor gA = local_tile(mA_offset, run_tiler, make_coord(0, n_coord, _), Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
++      Tensor gB = local_tile(mB, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
++      Tensor gC = local_tile(mC_offset, run_tiler, make_coord(0, n_coord, _), Step<_1,_1, X>{}); // (BLK_M,BLK_N)
++      Tensor gS = local_tile(mS, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
++      Tensor gZ = local_tile(mZ, run_tiler, make_coord(0, n_coord, _), Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
++
++      qmm_sm80_mainloop(
++          run_tiler,
++          gA,
++          gB,
++          gS,
++          gZ,
++          gC,
++          run_rows,
++          thread_idx);
++    };
++
++    constexpr int tile_rows = decltype(size<0>(cta_tiler))::value;
++    if constexpr (tile_rows > 32) {
++      if (run_rows <= 16) {
++        run_qmm(make_shape(
++            Int<16>{}, size<1>(cta_tiler), size<2>(cta_tiler)));
++      } else if (run_rows <= 32) {
++        run_qmm(make_shape(
++            Int<32>{}, size<1>(cta_tiler), size<2>(cta_tiler)));
++      } else {
++        run_qmm(cta_tiler);
++      }
++    } else if constexpr (tile_rows > 16) {
++      if (run_rows <= 16) {
++        run_qmm(make_shape(
++            Int<16>{}, size<1>(cta_tiler), size<2>(cta_tiler)));
++      } else {
++        run_qmm(cta_tiler);
++      }
++    } else {
++      run_qmm(cta_tiler);
++    }
++    // The next run's loads must not overwrite C while it is still being stored.
++    __syncthreads();
++  }
++}
++
+ } // namespace mlx::core::cu
+--- a/mlx/backend/cuda/quantized/qmm/qmm.h
++++ b/mlx/backend/cuda/quantized/qmm/qmm.h
+@@ -59,6 +59,30 @@
+     QuantizationMode mode,
+     cu::CommandEncoder& encoder);
+ 
++bool supports_gather_qmm_rhs_sm80(
++    const array& x,
++    const array& w,
++    const array& scales,
++    const std::optional<array>& biases,
++    const array& out,
++    bool transpose,
++    int bits,
++    int group_size,
++    QuantizationMode mode,
++    cu::Device& device);
++
++void gather_qmm_rhs_sm80(
++    const array& x,
++    const array& w,
++    const array& scales,
++    const std::optional<array>& biases,
++    const array& rhs_indices,
++    array& out,
++    int bits,
++    int group_size,
++    QuantizationMode mode,
++    cu::CommandEncoder& encoder);
++
+ bool supports_qmm_naive(
+     const array& x,
+     const array& w,
+--- a/mlx/backend/cuda/quantized/qmm/qmm_sm80.cu
++++ b/mlx/backend/cuda/quantized/qmm/qmm_sm80.cu
+@@ -21,6 +21,10 @@
+   return cute::make_shape(tile_m, tile_n, tile_k);
+ }
+ 
++inline int get_quantized_batch_count(const array& w) {
++  return w.ndim() > 2 ? w.size() / (w.shape(-1) * w.shape(-2)) : 1;
++}
++
+ } // namespace
+ 
+ void qmm_sm80(
+@@ -113,4 +117,125 @@
+       broadcast_b);
+ }
+ 
++bool supports_gather_qmm_rhs_sm80(
++    const array& x,
++    const array& w,
++    const array& scales,
++    const std::optional<array>& biases,
++    const array& out,
++    bool transpose,
++    int bits,
++    int group_size,
++    QuantizationMode mode,
++    cu::Device& device) {
++  int out_m = out.ndim() > 1 ? out.shape(-2) : 1;
++  if (out_m != 1) {
++    return false;
++  }
++  if (!supports_qmm_sm80(
++          x,
++          w,
++          scales,
++          biases,
++          out,
++          transpose,
++          bits,
++          group_size,
++          mode,
++          device)) {
++    return false;
++  }
++
++  int rows = out.size() / out.shape(-1);
++  int input_rows = x.size() / x.shape(-1);
++  int group_count = get_quantized_batch_count(w);
++  return input_rows == rows && rows >= 16 && group_count > 0 &&
++      rows / group_count >= 4;
++}
++
++void gather_qmm_rhs_sm80(
++    const array& x,
++    const array& w,
++    const array& scales,
++    const std::optional<array>& biases,
++    const array& rhs_indices,
++    array& out,
++    int bits,
++    int group_size,
++    QuantizationMode mode,
++    cu::CommandEncoder& encoder) {
++  int m = x.size() / x.shape(-1);
++  int n = out.shape(-1);
++  int k = x.shape(-1);
++  int group_count = get_quantized_batch_count(w);
++  auto cta_tiler = make_cta_tiler(m, group_size);
++
++  std::string module_name = fmt::format(
++      "gather_qmm_rhs_sm80_tn_{}_m{}_b{}_g{}_{}",
++      dtype_to_string(x.dtype()),
++      cute::size<0>(cta_tiler),
++      bits,
++      group_size,
++      quantization_mode_to_string(mode));
++
++  auto [ctype_x, ctype_q, ctype_s] = get_qmm_cutlass_types(x, bits, mode);
++  std::string kernel_name = fmt::format(
++      "mlx::core::cu::qmm_sm80_rhs_kernel<{}, {}, {}, {}, {}>",
++      group_size,
++      ctype_x,
++      ctype_q,
++      ctype_s,
++      cta_tiler_to_string(cta_tiler));
++
++  cu::JitModule& mod = cu::get_jit_module(encoder.device(), module_name, [&]() {
++    return std::make_tuple(
++        false, jit_source_qmm_sm80, std::vector{kernel_name});
++  });
++
++  encoder.set_input_array(x);
++  encoder.set_input_array(w);
++  encoder.set_input_array(scales);
++  if (biases) {
++    encoder.set_input_array(*biases);
++  }
++  encoder.set_input_array(rhs_indices);
++  encoder.set_output_array(out);
++
++  dim3 num_blocks{
++      uint32_t(cute::ceil_div(m, cute::size<0>(cta_tiler))),
++      uint32_t(cute::ceil_div(n, cute::size<1>(cta_tiler))),
++      1};
++  dim3 block_dims{uint32_t(cute::size(cu::make_tiled_mma()))};
++
++  auto [sA_layout, sB_layout, sC_layout] = cu::make_smem_layouts(cta_tiler);
++  size_t smem_bytes = std::max(
++      cute::cosize(sA_layout) * x.itemsize() +
++          cute::cosize(sB_layout) * bits / 8,
++      cute::cosize(sC_layout) * x.itemsize());
++
++  auto kernel = mod.get_kernel(kernel_name, [&](CUfunction kernel) {
++    if (smem_bytes > 48000) {
++      cuFuncSetAttribute(
++          kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_bytes);
++    }
++  });
++
++  encoder.add_kernel_node_ex(
++      kernel,
++      num_blocks,
++      block_dims,
++      {},
++      smem_bytes,
++      gpu_ptr<void>(x),
++      gpu_ptr<void>(w),
++      gpu_ptr<void>(scales),
++      biases ? gpu_ptr<void>(*biases) : nullptr,
++      gpu_ptr<void>(rhs_indices),
++      gpu_ptr<void>(out),
++      m,
++      n,
++      k,
++      group_count);
++}
++
+ } // namespace mlx::core
+--- a/mlx/backend/cuda/quantized/quantized.cpp
++++ b/mlx/backend/cuda/quantized/quantized.cpp
+@@ -201,6 +201,9 @@
+   // naive kernel until it does.
+   bool can_use_qmm_sm80 =
+       !global_scale.has_value() && supports(supports_qmm_sm80);
++  bool can_use_gather_qmm_rhs_sm80 = mode_ != QuantizationMode::Affine &&
++      right_sorted_ && !global_scale.has_value() &&
++      supports(supports_gather_qmm_rhs_sm80);
+   bool can_use_qmm_naive = supports(supports_qmm_naive);
+   bool can_use_qmv = supports(supports_qmv);
+ 
+@@ -253,6 +256,22 @@
+         encoder);
+   };
+ 
++  if (can_use_gather_qmm_rhs_sm80) {
++    out.set_data(cu::malloc_async(out.nbytes(), encoder));
++    gather_qmm_rhs_sm80(
++        x,
++        w,
++        scales,
++        biases,
++        rhs_indices,
++        out,
++        bits_,
++        group_size_,
++        mode_,
++        encoder);
++    return;
++  }
++
+   if (can_use_qmm_sm80) {
+     if (can_use_qmv && (M * B < 8)) {
+       call_qmv();

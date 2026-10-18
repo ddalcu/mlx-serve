@@ -666,10 +666,10 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
     return mtp_loaded or dsv4_stages;
 }
 
-/// MTP verify rounds cost more than they save without the Metal verify
-/// kernels: plain decode is faster on CUDA and Vulkan unless `--mtp` asks for it.
-pub fn mtpAllowedByDefault(mtp_forced: bool) bool {
-    return mtp_forced or mlx.metalKernelsAvailable();
+/// Where an MTP head drafts without `--mtp`. CUDA's multi-row matmuls make a verify round pay;
+/// Vulkan has none and decodes plain.
+pub fn mtpAllowedByDefault(mtp_forced: bool, metal: bool, cuda: bool) bool {
+    return mtp_forced or metal or cuda;
 }
 
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
@@ -5178,6 +5178,20 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     const ceiling: u64 = 26_000 * 1024 * 1024;
     try t.expect(old_needed > ceiling);
     try t.expect(new_needed <= ceiling);
+}
+
+test "chooseRequestPrefillChunk: the machine's chunk cap bounds the per-request width" {
+    // Flash Next on CUDA chose 8192 past the 2048 cap and MLX's expert gather failed at that width.
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const saved = generate_mod.machine_prefill_chunk_cap;
+    defer generate_mod.machine_prefill_chunk_cap = saved;
+    generate_mod.machine_prefill_chunk_cap = autoPrefillChunkCap(true);
+    const cfg = qwen4RequestTestConfig();
+    const available: u64 = 28_909 << 20;
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 8192, .{}));
 }
 
 test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M session cannot" {
@@ -25486,9 +25500,11 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
     try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
 }
 
-test "MTP is off by default where the Metal verify kernels cannot run" {
-    try std.testing.expectEqual(mlx.metalKernelsAvailable(), mtpAllowedByDefault(false));
-    try std.testing.expect(mtpAllowedByDefault(true));
+test "MTP drafts by default on Metal and CUDA, and only when asked elsewhere" {
+    try std.testing.expect(mtpAllowedByDefault(false, true, false));
+    try std.testing.expect(mtpAllowedByDefault(false, false, true));
+    try std.testing.expect(!mtpAllowedByDefault(false, false, false));
+    try std.testing.expect(mtpAllowedByDefault(true, false, false));
 }
 
 test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {

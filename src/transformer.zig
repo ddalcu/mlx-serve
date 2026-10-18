@@ -43160,6 +43160,68 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
     }
 }
 
+test "gatherExpertMm: a sorted nvfp4 gather past 65,535 rows matches the dequantized experts" {
+    // A Flash Next chunk of 8192 rows routes 81,920 rows; MLX's CUDA gather put one block per row on
+    // grid z (at most 65,535) and the launch failed. Bar: bf16 rounding of an fp32 dequant reference.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var sc = @import("mlx_scope.zig").Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    var prng = std.Random.DefaultPrng.init(0x65536);
+    const E: c_int = 4;
+    const N: c_int = 128; // qmm_sm80's tile: narrower falls to MLX's naive gather, same limit
+    const K: c_int = 64;
+    const R: c_int = 65_600;
+    const wb = try testRandWeightBf16(prng.random(), &[_]c_int{ E, N, K }, s);
+    defer _ = mlx.mlx_array_free(wb);
+    var pair = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(pair);
+    try mlx.check(mlx.mlx_quantize(&pair, wb, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+    var wq = mlx.mlx_array_new();
+    var wsc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wq);
+    defer _ = mlx.mlx_array_free(wsc);
+    try mlx.check(mlx.mlx_vector_array_get(&wq, pair, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&wsc, pair, 1));
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, wq, wsc, .{ .ctx = null }, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+
+    const xs = try testRandWeightBf16(prng.random(), &[_]c_int{ R, 1, K }, s);
+    defer _ = mlx.mlx_array_free(xs);
+    const ids = try testing.allocator.alloc(i32, @intCast(R));
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*v, i| v.* = @intCast(i * @as(usize, @intCast(E)) / @as(usize, @intCast(R)));
+    const rhs = try sc.astype(try sc.fromI32(ids, &.{R}), .uint32);
+
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try gatherExpertMm(&out, xs, wq, wsc, .{ .ctx = null }, .{ .ctx = null }, rhs, 4, 16, .nvfp4, true, s);
+
+    // Reference: each expert's contiguous rows against its fp32 weights.
+    const x2 = try sc.astype(try sc.reshape(xs, &.{ R, K }), .float32);
+    var parts: [4]mlx.mlx_array = undefined;
+    for (0..4) |e| {
+        const lo: c_int = @intCast(e * @as(usize, @intCast(R)) / 4);
+        const hi: c_int = @intCast((e + 1) * @as(usize, @intCast(R)) / 4);
+        const w_e = try sc.reshape(try sc.slice(deq, 0, @intCast(e), @intCast(e + 1)), &.{ N, K });
+        parts[e] = try sc.matmul(try sc.slice(x2, 0, lo, hi), try sc.transpose(w_e, &.{ 1, 0 }));
+    }
+    const ref = try sc.concat(&parts, 0);
+    const got = try sc.astype(try sc.reshape(out, &.{ R, N }), .float32);
+    const d = try sc.sub(got, ref);
+    const err = try sc.sumAxis(try sc.sumAxis(try sc.mul(d, d), 1), 0);
+    const nrm = try sc.sumAxis(try sc.sumAxis(try sc.mul(ref, ref), 1), 0);
+    const both = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ err, nrm }, 2);
+    defer _ = mlx.mlx_vector_array_free(both);
+    try mlx.check(mlx.mlx_eval(both));
+    var e2: f32 = 0;
+    var n2: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&e2, err));
+    try mlx.check(mlx.mlx_array_item_float32(&n2, nrm));
+    try testing.expect(n2 > 0 and @sqrt(e2 / n2) < 0.01);
+}
+
 /// DiffusionGemma packs each expert's gate and up projections in one tensor
 /// `experts.gate_up_proj` of shape [E, 2*M, X], gate rows first (HF chunks
 /// the projected output in halves: gate = [..., :M], up = [..., M:]).
