@@ -1590,6 +1590,7 @@ test "a plan made for one copy refuses another folder of the same name" {
 }
 
 test "the pair holds its own folder, not another one with the same name" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // a cluster exists only on macOS
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1689,6 +1690,7 @@ test "the worker answers whether it has the host's copy of the model when it joi
 }
 
 test "a paired model is never picked to unload while the worker is joined" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // a cluster exists only on macOS
     const reg_mod = @import("model_registry.zig");
     var reg = try reg_mod.ModelRegistry.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
