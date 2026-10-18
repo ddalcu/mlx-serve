@@ -98,6 +98,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
     // YuE2: the upstream repo has no decoder; only a pack with the folded-in VAE can run.
     if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
+    // MOSS-Image: no root config.json, so model_index.json lands first; every pack names its VAE weights so.
+    if (std.mem.eql(u8, model_type, "moss_image")) return "vae/diffusion_pytorch_model.safetensors";
     return null;
 }
 
@@ -1796,6 +1798,12 @@ test "discoverModels finds a MOSS-Image repo by its model_index.json alone" {
     try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/transformer");
     try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    // A pull still in progress stays invisible until its VAE weights land.
+    try tmp.dir.createDirPath(io, "me/MOSS-Image-half/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
 
     var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
     defer result.deinit();

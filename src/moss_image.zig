@@ -43,6 +43,8 @@ pub const MAX_PROMPT_TOKENS: usize = 4096;
 pub const VAE_DOWNSAMPLE: u32 = 16;
 const TRAIN_STEPS: usize = 1000;
 const EPS: f32 = 1e-6;
+/// Four RoPE axes of `head_dim / 8` bands each, built on the stack.
+const MAX_HEAD_DIM: u32 = 512;
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
 
 const PROMPT_PREFIX = "<|im_start|>user\n";
@@ -59,6 +61,14 @@ fn readJson(io: std.Io, a: std.mem.Allocator, path: []const u8) !std.json.Parsed
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch return error.MossImageConfigMissing;
     defer a.free(bytes);
     return std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+}
+
+/// A size from the config: absent is null, anything but an integer that fits a u32 is an error.
+fn jsonU32(v: std.json.Value, key: []const u8) !?u32 {
+    if (v != .object) return null;
+    const x = v.object.get(key) orelse return null;
+    if (x != .integer) return error.MossImageBadConfig;
+    return std.math.cast(u32, x.integer) orelse error.MossImageBadConfig;
 }
 
 fn jsonNum(v: std.json.Value, key: []const u8) ?f64 {
@@ -93,10 +103,9 @@ pub const DitConfig = struct {
             var parsed = try readJson(io, a, path);
             defer parsed.deinit();
             const v = parsed.value;
-            inline for (.{ "dim", "ffn_dim", "layers", "text_dim", "latent_channels" }, .{ "dim", "ffn_dim", "num_layers", "text_dim", "latent_channels" }) |field, key| {
-                if (jsonNum(v, key)) |n| @field(c, field) = @intFromFloat(n);
+            inline for (.{ "dim", "ffn_dim", "layers", "text_dim", "latent_channels", "heads" }, .{ "dim", "ffn_dim", "num_layers", "text_dim", "latent_channels", "num_heads" }) |field, key| {
+                if (try jsonU32(v, key)) |n| @field(c, field) = n;
             }
-            if (jsonNum(v, "num_heads")) |n| c.heads = @intFromFloat(n);
             if (jsonNum(v, "rope_base")) |n| c.rope_base = @floatCast(n);
         }
         // The scheduler config is optional: the release defaults are the class defaults.
@@ -108,7 +117,7 @@ pub const DitConfig = struct {
             if (jsonNum(parsed.value, "shift")) |n| c.shift = @floatCast(n);
             if (jsonNum(parsed.value, "training_shift")) |n| c.training_shift = @floatCast(n);
         } else |_| {}
-        if (c.heads == 0 or c.dim % c.heads != 0 or c.headDim() % 8 != 0 or c.latent_channels != 128 or !(c.shift > 0) or !(c.training_shift > 0))
+        if (c.heads == 0 or c.dim % c.heads != 0 or c.headDim() % 8 != 0 or c.headDim() > MAX_HEAD_DIM or c.latent_channels != 128 or !(c.shift > 0) or !(c.training_shift > 0))
             return error.MossImageBadConfig;
         return c;
     }
@@ -339,7 +348,7 @@ pub const Rope = struct {
         defer a.free(cos_buf);
         const sin_buf = try a.alloc(f32, n * half);
         defer a.free(sin_buf);
-        var band: [64]f32 = undefined;
+        var band: [MAX_HEAD_DIM / 8]f32 = undefined;
         for (band[0..bands], 0..) |*b, j| {
             const e: f32 = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(bands));
             b.* = 1.0 / std.math.pow(f32, cfg.rope_base, e);
@@ -994,6 +1003,27 @@ pub const Engine = struct {
 // ── tests ──
 
 const testing = std.testing;
+
+test "MOSS-Image: a transformer config outside what the engine can hold is a named error" {
+    const io = std.testing.io;
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "transformer");
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    for ([_][]const u8{
+        "{\"dim\": 12288, \"num_heads\": 16}",
+        "{\"dim\": -3072}",
+        "{\"num_layers\": 1e12}",
+        "{\"num_heads\": 4294967296}",
+    }) |cfg| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "transformer/config.json", .data = cfg });
+        try testing.expectError(error.MossImageBadConfig, DitConfig.parse(io, a, root));
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer/config.json", .data = "{\"dim\": 3072, \"num_heads\": 24, \"num_layers\": 42}" });
+    try testing.expectEqual(@as(u32, 128), (try DitConfig.parse(io, a, root)).headDim());
+}
 
 test "MOSS-Image: the schedule is the release scheduler's, snapped to the training grid" {
     const want8 = [_]f32{ 1.0, 0.967999995, 0.925999999, 0.870999992, 0.791000009, 0.671000004, 0.463000029, 0.0240000002, 0.0 };

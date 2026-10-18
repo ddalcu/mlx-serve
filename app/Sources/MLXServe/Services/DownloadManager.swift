@@ -367,6 +367,7 @@ class DownloadManager: ObservableObject {
         case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
+        case "moss_image": return "vae/diffusion_pytorch_model.safetensors"
         default: return nil
         }
     }
