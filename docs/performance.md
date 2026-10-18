@@ -43,6 +43,16 @@ Pass `--int8-prefill` (or set `MLX_SERVE_INT8_PREFILL=1`) for faster prompt proc
 
 A model's `int8_prefill` setting in `model-settings.json` (the app's per-model settings sheet) wins over the switch in both directions. To compare one route against the others, `=0` on its own variable turns just that route off: `MLX_SERVE_W8A8_PREFILL=0` (4-bit projections), `MLX_SERVE_INT8_QK=0` (Q/K attention), `MLX_SERVE_BONSAI_INT8_PREFILL=0` (2-bit projections). Those variables never turn a route on. Other Macs log a warning and keep the stock path.
 
+With every route on, the loss does not add up. Qwen3.8-27B 4-bit + DFlash on an M6, greedy requests, next-token KL (top-20 logprobs, 128 tokens) against the switch off:
+
+| Prompt tokens | 3K | 11.7K | 22.7K |
+|---|---|---|---|
+| All routes (`--int8-prefill`) | 0.0008 | 0.0005 | 0.0005 |
+| 4-bit projections only (`MLX_SERVE_INT8_QK=0`) | 0.0008 | 0.0009 | 0.0004 |
+| Q/K attention only (`MLX_SERVE_W8A8_PREFILL=0`) | 0.0006 | 0.0004 | 0.0003 |
+
+Two runs of the same arm differ by 0, and the stock path moves by 0.0003–0.0006 between prefill chunk sizes.
+
 ### 4-bit projections
 
 Prompt-width projections (64 rows or more) run on the `--w8a8` kernels: the 4-bit weight is converted on each call to int8 behind the same block-256 Hadamard rotation (nothing extra stays resident), the activations are rotated and quantized per token, and the int8 x int8 product runs on the tensor units. The lm_head and weights with Hadamard signs keep the 4-bit path. The server logs `[int8-prefill] on` at load and `[w8a8-prefill] engaged` on the first call.
