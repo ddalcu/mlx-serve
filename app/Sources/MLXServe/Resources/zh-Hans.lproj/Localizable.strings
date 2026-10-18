@@ -2357,3 +2357,6 @@
 "About %@ on this Mac and %@ on %@." = "本机约占用 %@，%@ 在 %@ 上。";
 "A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it." = "配对可运行 MiniMax-H3（视频），或 Qwen3.8-Flash-Next、DeepSeek-V4.1（聊天）。请在两台 Mac 上都下载其中一个。";
 "Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both." = "在 Thunderbolt 配对的两台 Mac 上一起运行；卸载它会同时在两台 Mac 上释放。";
+
+"Show Activity Phrases" = "显示活动短语";
+"Show rotating activity text while generating. GPU, memory and elapsed time remain visible." = "生成时显示轮换的活动文字。GPU、内存和已用时间始终可见。";
