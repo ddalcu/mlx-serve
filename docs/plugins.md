@@ -142,7 +142,8 @@ share code: each serves a different arch, and their kernels are tuned to it.
 [mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`; the pin, 7d29eaa, is on the `main` branch of davidtai/mlx-stream) serves
 DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
 prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`) and, as its third,
-GLM-5.3 (`glm_moe_dsa`, the trunk beside an `experts.bin` bank). It owns the model: the arch, its Metal
+GLM-5.3 (`glm_moe_dsa`, the trunk beside an `experts.bin` bank), GLM-5.3-Flash's NVFP4 pack and Beam 1.0's NVFP4 pack
+(`glm5_next` and `beam`, each config declaring `expert_streaming`). It owns the model: the arch, its Metal
 kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
 resume of one conversation, its weight loading past the page cache and its memory bill. Its `sdk` module (`sdk/`)
 holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepseek_v41.zig`).
@@ -150,9 +151,12 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
 - **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`), a
   `mimo_v2` config that declares `expert_streaming` (`ModelConfig.mimo_stream`) and a `glm_moe_dsa` directory with
   `experts.bin` (`ModelConfig.glm_stream`; without the bank it is refused by name, `GlmMoeDsaNeedsExpertBank`: no
-  in-tree arch serves it); `ModelConfig.mlxStream()` is any of them, and `loadModelWeights` loads nothing for it. The
-  glue holds one arch per model (`plugin.arch` for V4.1, `plugin.mimo.arch` for MiMo, `plugin.glm.arch` for GLM-5.3)
-  and leaves out at comptime the entry points an arch does not declare.
+  in-tree arch serves it), a `glm5_next` config that declares `expert_streaming` (`ModelConfig.glm5_stream`) and a
+  `beam` config that declares it (`ModelConfig.beam_stream`; without the block it is refused by name,
+  `BeamNeedsStreamPack`: no in-tree arch serves it); `ModelConfig.mlxStream()` is any of them, and `loadModelWeights`
+  loads nothing for it. The glue holds one arch per model (`plugin.arch` for V4.1, `plugin.mimo.arch` for MiMo,
+  `plugin.glm.arch` for GLM-5.3, `plugin.glm5_next.arch` for GLM-5.3-Flash, `plugin.beam.arch` for Beam) and leaves
+  out at comptime the entry points an arch does not declare.
 - **Glue** (`src/arch/mlx_stream.zig`):
   - settings (GLM-5.3): after the parse, the arch's `applySettings` receives the model's `model-settings.json` entry
     (`.null` without one), then the manual context (`ctx_size`, else `--ctx-size`), which wins;

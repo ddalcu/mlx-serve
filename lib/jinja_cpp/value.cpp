@@ -1101,6 +1101,16 @@ const func_builtins & value_object_t::get_builtins() const {
         return no_builtins;
     }
 
+    // `keys` and `list` (Jinja2's list(mapping)): the keys in insertion order.
+    static const func_handler keys = [](const func_args & args) -> value {
+        args.ensure_vals<value_object>();
+        const auto & obj = args.get_pos(0)->as_ordered_object();
+        auto result = mk_val<value_array>();
+        for (const auto & pair : obj) {
+            result->push_back(pair.first);
+        }
+        return result;
+    };
     static const func_builtins builtins = {
         // {"default", default_value}, // cause issue with gpt-oss
         {"get", [](const func_args & args) -> value {
@@ -1119,15 +1129,8 @@ const func_builtins & value_object_t::get_builtins() const {
             const value key = args.get_pos(1);
             return obj->at(key, default_val);
         }},
-        {"keys", [](const func_args & args) -> value {
-            args.ensure_vals<value_object>();
-            const auto & obj = args.get_pos(0)->as_ordered_object();
-            auto result = mk_val<value_array>();
-            for (const auto & pair : obj) {
-                result->push_back(pair.first);
-            }
-            return result;
-        }},
+        {"keys", keys},
+        {"list", keys},
         {"values", [](const func_args & args) -> value {
             args.ensure_vals<value_object>();
             const auto & obj = args.get_pos(0)->as_ordered_object();

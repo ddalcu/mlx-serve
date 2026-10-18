@@ -1,0 +1,7 @@
+<|start|>system<|message|>You are Beam, an AI assistant trained by Reflection.
+
+Reasoning effort: 512
+
+# Valid channels: analysis, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions
+
+Be brief.<|end|><|start|>user<|message|>What is 2+2?<|end|><|start|>assistant<|channel|>analysis<|message|>Add two and two.<|end|><|start|>assistant<|channel|>final<|message|>4<|return|><|start|>user<|message|>And 3+3?<|end|><|start|>assistant

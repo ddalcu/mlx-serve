@@ -1727,6 +1727,66 @@ const corpus = [_]Expect{
         .content_contains = "atem:function_calls block",
     },
 
+    // ── Beam 1.0 (beam, Harmony with xml calls) ─────────────────────────────
+    // After the prompt's bare `<|start|>assistant`: `<|channel|>analysis<|message|>R<|end|>`, then a final segment or
+    // `<|start|>assistant to=NAME<|channel|>analysis <|constrain|>xml<|message|>` + `rfl:parameter` values (text).
+    .{
+        .family = "beam",
+        .name = "analysis + final answer",
+        .raw = "<|channel|>analysis<|message|>2+2 is 4.<|end|><|start|>assistant<|channel|>final<|message|>4<|return|>",
+        .thinking = true,
+        .content_exact = "4",
+        .reasoning_contains = "2+2 is 4",
+    },
+    .{
+        // A bool spelled as text; the schema coercion types it.
+        .family = "beam",
+        .name = "xml call on the analysis channel after thinking",
+        .raw = "<|channel|>analysis<|message|>Need the weather; call get_weather.<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"city\">\nParis\n</rfl:parameter>\n<rfl:parameter name=\"celsius\">\ntrue\n</rfl:parameter><|call|>",
+        .thinking = true,
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+        .reasoning_contains = "call get_weather",
+    },
+    .{
+        .family = "beam",
+        .name = "parallel xml calls, <|end|> between, <|call|> on the last",
+        .raw = "<|channel|>analysis<|message|>Two files.<|end|><|start|>assistant to=read<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"path\">\na.txt\n</rfl:parameter><|end|><|start|>assistant to=read<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"path\">\nb.txt\n</rfl:parameter><|call|>",
+        .thinking = true,
+        .tools_json = write_read_tools_schema,
+        .tool_name = "read",
+        .tool_count = 2,
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .last_tool_arg_value = "b.txt",
+    },
+    .{
+        // The call opens the turn: no analysis segment.
+        .family = "beam",
+        .name = "xml call with no analysis before it",
+        .raw = " to=shell<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"command\">\npwd\n</rfl:parameter><|call|>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+    },
+    .{
+        // Truncation inside a VALUE: NAME + completed params only.
+        .family = "beam",
+        .name = "truncated xml value salvages the name, drops the fragment",
+        .raw = "<|channel|>analysis<|message|>Write it.<|end|><|start|>assistant to=write<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"path\">\nnovel.txt\n</rfl:parameter>\n<rfl:parameter name=\"content\">\nChapter 1. It was a dark and",
+        .thinking = true,
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "novel.txt",
+        .tool_arg_absent = "content",
+    },
+
     // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
     .{
         .family = "minicpm5",
@@ -1935,6 +1995,8 @@ const leak_tags = [_][]const u8{
     // Muse-Glimmer channel markers (each a single special token). The
     // `assistant to=` header TEXT between them is covered by the split tests.
     "<|start|>",            "<|message|>",     "<|eom|>",           "<|eot|>",
+    // Harmony (gpt_oss, Beam) markers and Beam's call body.
+    "<|channel|>",          "<|constrain|>",   "<rfl:",
 };
 
 /// Tool-call wrapper openers that must never appear in reasoning_content
@@ -1947,6 +2009,7 @@ const reasoning_leak_tags = [_][]const u8{
     "<tool_calls:",
     "<|content_invoke_tool_json|>",
     "<atem:",
+    "<rfl:",
 };
 
 fn fail(entry: Expect, comptime what: []const u8, got: []const u8) !void {
@@ -2194,6 +2257,13 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
                     if (best == null or e < best.?) best = e;
                 }
             }
+            // Harmony: an analysis segment closes at <|end|>.
+            if (chat.harmonyAnalysisHeaderLen(entry.raw) != null) {
+                if (std.mem.indexOf(u8, entry.raw, "<|end|>")) |p| {
+                    const e = p + "<|end|>".len;
+                    if (best == null or e < best.?) best = e;
+                }
+            }
             // Muse: a to=self segment closes at <|eom|>; a resolved non-self
             // header IS the close (immediate split, empty reasoning).
             switch (chat.museThinkOpenerAt(entry.raw)) {
@@ -2426,6 +2496,53 @@ test "format corpus: streaming tool buffer never flushes Inkling call text" {
     }
 }
 
+test "format corpus: a Beam call never streams, as content or as reasoning" {
+    // The server's has_tools order (tool hold, then the think gate; a split clears the buffer), `<|…|>` markers
+    // whole. Bar: no flush or split covers a byte of the call, no streamed reasoning carries call text, and the
+    // end flush parses the call from what is left.
+    const allocator = testing.allocator;
+    var checked: usize = 0;
+    for (corpus) |entry| {
+        if (!std.mem.eql(u8, entry.family, "beam") or entry.tool_name == null) continue;
+        const raw = entry.raw;
+        const constrain = std.mem.indexOf(u8, raw, "<|constrain|>xml").?;
+        const call_start = std.mem.lastIndexOf(u8, raw[0..constrain], "<|start|>") orelse 0;
+        var start: usize = 0;
+        var think_closed = false;
+        var i: usize = 0;
+        while (i < raw.len) {
+            i += specialMarkerLenAt(raw[i..]) orelse 1;
+            const buf = raw[start..i];
+            if (chat.streamShouldBufferForTools(buf)) continue;
+            switch (chat.streamThinkGate(buf, true, think_closed)) {
+                .hold_thinking => if (chat.splitThinkBlock(buf, true, false).reasoning_content) |r| {
+                    if (std.mem.indexOf(u8, r, "rfl:") != null or std.mem.indexOf(u8, r, "to=") != null)
+                        try fail(entry, "call text streamed as reasoning", r);
+                },
+                .split_think => {
+                    if (i > call_start) try fail(entry, "think split covered call text", buf);
+                    think_closed = true;
+                    start = i;
+                },
+                .flush_text => if (i > call_start) try fail(entry, "call text flushed as content", buf),
+            }
+        }
+        const rest = raw[start..];
+        const calls = (try chat.parseToolCalls(allocator, rest)) orelse return fail(entry, "end flush parsed no call", rest);
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        if (!std.mem.eql(u8, calls[0].name, entry.tool_name.?)) try fail(entry, "end flush named another call", calls[0].name);
+        if (chat.splitThinkBlock(rest, true, false).reasoning_content) |r| try fail(entry, "end flush delivered call text as reasoning", r);
+        checked += 1;
+    }
+    try testing.expect(checked > 0);
+}
+
 test "format corpus: no flush boundary lands inside a tool-call opener, any family" {
     // UNIVERSAL class guard. streamShouldBufferForTools is the only thing
     // standing between a mid-marker token boundary and the wire, and the part
@@ -2469,7 +2586,7 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     const gate_split_markers = [_][]const u8{
         "<tool_call", "<|tool_call", "<atem:",
         "<｜DSML｜",
-        "<function",
+        "<function",  "<rfl:parameter",
     };
     var checked: usize = 0;
     for (corpus) |entry| {
@@ -2651,6 +2768,14 @@ const dialects = [_]Dialect{
         .key = "path",
         .value = "a.txt",
     },
+    .{
+        .family = "beam",
+        .dialect = "harmony xml call, rfl:parameter body",
+        .raw = "<|start|>assistant to=write_file<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"path\">\na.txt\n</rfl:parameter>\n<rfl:parameter name=\"content\">\nhi\n</rfl:parameter><|call|>",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
+    },
 };
 
 fn firstCallArg(allocator: std.mem.Allocator, raw: []const u8, key: []const u8) !?struct { name: []const u8, value: ?[]const u8 } {
@@ -2721,6 +2846,7 @@ test "format corpus: a parameter VALUE never decides the call" {
     const shapes = [_]Shape{
         .{ .pre = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n", .post = "\n</parameter>\n</function>\n</tool_call>" },
         .{ .pre = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n", .post = "\n</parameter>\n</function>" },
+        .{ .pre = "<|start|>assistant to=write_file<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"path\">\na.txt\n</rfl:parameter>\n<rfl:parameter name=\"content\">\n", .post = "\n</rfl:parameter><|call|>" },
     };
 
     for (shapes) |shape| {

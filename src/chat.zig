@@ -1422,6 +1422,23 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     return "xhigh";
 }
 
+/// Beam's Harmony template: the one family whose tool calls carry `rfl:parameter` bodies.
+fn isBeamEffortTemplate(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "rfl:parameter") != null;
+}
+
+/// OpenAI's effort vocabulary -> Beam's minimal|low|medium|high|xhigh|max (the template's default is max; it raises
+/// on any other string). Harmony has no thinking-off: off is the smallest effort the model was trained on.
+fn beamEffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
+    if (!enable_thinking) return "minimal";
+    const e = effort orelse return "max";
+    if (std.mem.eql(u8, e, "none")) return "minimal";
+    for ([_][]const u8{ "minimal", "low", "medium", "high", "xhigh" }) |w| {
+        if (std.mem.eql(u8, e, w)) return w;
+    }
+    return "max";
+}
+
 /// K2-Horizon reads `reasoning_effort` as high|medium|low (default high) and
 /// raises on anything else; each word picks a different think opener.
 fn k2EffortFor(effort: ?[]const u8) []const u8 {
@@ -1555,6 +1572,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     } else if (isKolibriEffortTemplate(chat_config.chat_template)) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, kolibriEffortFor(effort, enable_thinking));
+        try buf.append(allocator, '"');
+    } else if (isBeamEffortTemplate(chat_config.chat_template)) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, beamEffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
@@ -2057,6 +2078,13 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
             is_inkling = false;
         }
     }
+    // Beam: an xml call segment from its header on (the name sits before the `rfl:parameter` body).
+    if (harmonyXmlCallCut(text)) |p| {
+        if (p < cut) {
+            cut = p;
+            is_inkling = false;
+        }
+    }
     if (cut == text.len) return text;
     // Inkling puts the tool NAME immediately BEFORE its invoke marker, so the
     // cut takes the trailing identifier run with it — otherwise the bare name
@@ -2224,8 +2252,30 @@ const HARMONY_MSG_TAG = "<|message|>";
 const HARMONY_END_TAG = "<|end|>";
 const HARMONY_RETURN_TAG = "<|return|>";
 const HARMONY_CALL_TAG = "<|call|>";
+// Beam (`harmony_xml`): `to=NAME<|channel|>analysis <|constrain|>xml<|message|>`, an `rfl:parameter` body. The tool is
+// the bare recipient (no `functions.`) and the call rides the analysis channel, so the xml constraint marks it.
+const HARMONY_XML_CONSTRAIN = "<|constrain|>xml";
+const RFL_PARAM_TAG = "<rfl:parameter";
+const RFL_PARAM_CLOSE = "</rfl:parameter>";
 
-const HarmonySegment = struct { channel: []const u8, recipient: []const u8, body: []const u8 };
+const HarmonySegment = struct { channel: []const u8, recipient: []const u8, body: []const u8, xml_call: bool };
+
+/// The tool a resolved Beam call header names, or null when the header is not an xml call.
+fn harmonyXmlCallName(header: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, header, HARMONY_XML_CONSTRAIN) == null) return null;
+    const t = std.mem.indexOf(u8, header, "to=") orelse return null;
+    const r = header[t + 3 ..];
+    var m: usize = 0;
+    while (m < r.len and museIsRecipientChar(r[m])) m += 1;
+    return if (m > 0) r[0..m] else null;
+}
+
+/// Start of the first Beam call segment in `text` (its `<|start|>`, or 0 when the text opens with the header), or null.
+fn harmonyXmlCallCut(text: []const u8) ?usize {
+    const c = std.mem.indexOf(u8, text, HARMONY_XML_CONSTRAIN) orelse return null;
+    const seg = std.mem.lastIndexOf(u8, text[0..c], HARMONY_START_TAG) orelse 0;
+    return if (harmonyXmlCallName(text[seg .. c + HARMONY_XML_CONSTRAIN.len]) != null) seg else null;
+}
 
 /// Channel, recipient and body of the segment in text[seg_start..seg_end].
 /// null when the header never resolved — a header still streaming in is never
@@ -2258,7 +2308,7 @@ fn harmonySegmentAt(text: []const u8, seg_start: usize, seg_end: usize) ?Harmony
     for ([_][]const u8{ HARMONY_END_TAG, HARMONY_RETURN_TAG, HARMONY_CALL_TAG }) |tag| {
         if (std.mem.indexOf(u8, body, tag)) |e| body = body[0..e];
     }
-    return .{ .channel = channel, .recipient = recipient, .body = body };
+    return .{ .channel = channel, .recipient = recipient, .body = body, .xml_call = harmonyXmlCallName(header) != null };
 }
 
 /// gpt_oss channel split. Claims the text only when `<|channel|>` is present.
@@ -2279,7 +2329,10 @@ fn splitHarmonyChannels(text: []const u8) ?ThinkSplit {
         const seg_end = next orelse text.len;
         if (harmonySegmentAt(text, seg_start, seg_end)) |s| {
             routed = true;
-            if (std.mem.startsWith(u8, s.recipient, "functions.")) {
+            if (s.xml_call) {
+                // A Beam call: the raw segments from its header on, so a KeepingMarkup caller can still parse the name.
+                if (tool_body == null) tool_body = text[seg_start..];
+            } else if (std.mem.startsWith(u8, s.recipient, "functions.")) {
                 // A tool call, whatever channel it rode in on.
                 if (tool_body == null) tool_body = s.body;
             } else if (std.mem.eql(u8, s.channel, "analysis")) {
@@ -2410,7 +2463,7 @@ fn harmonyStreamVerdict(buf: []const u8) ?StreamThinkGate {
 
     // Tool payload: the tools path buffers before this gate is consulted;
     // hold defensively on a no-tools request rather than leak raw arguments.
-    if (std.mem.startsWith(u8, recipient, "functions.")) return .hold_thinking;
+    if (std.mem.startsWith(u8, recipient, "functions.") or harmonyXmlCallName(header) != null) return .hold_thinking;
     if (std.mem.eql(u8, channel, "analysis")) {
         const closed = std.mem.indexOf(u8, seg, HARMONY_END_TAG) != null or
             std.mem.indexOf(u8, seg, HARMONY_RETURN_TAG) != null;
@@ -2419,18 +2472,20 @@ fn harmonyStreamVerdict(buf: []const u8) ?StreamThinkGate {
     return .split_think;
 }
 
-/// gpt_oss streaming tool hold: true while a segment header is unresolved
+/// gpt_oss / Beam streaming tool hold: true while a segment header is unresolved
 /// (the next token decides whether it names a tool) or already resolved to a
-/// `functions.` recipient (the body is call arguments — parsed on the end
-/// flush, never streamed).
+/// `functions.` recipient or a Beam xml call (the body is call arguments —
+/// parsed on the end flush, never streamed).
 fn harmonyHeaderHoldsForTools(buf: []const u8) bool {
     const chan = std.mem.lastIndexOf(u8, buf, HARMONY_CHANNEL_TAG) orelse return false;
     // Header runs from the segment's `<|start|>` (the `to=` may sit on either
     // side of the channel marker) to `<|message|>`. No `<|message|>` yet means
     // the header is still growing — hold, the next token may name a tool.
     const msg_rel = std.mem.indexOfPos(u8, buf, chan, HARMONY_MSG_TAG) orelse return true;
-    const seg_start = std.mem.lastIndexOf(u8, buf, HARMONY_START_TAG) orelse 0;
-    return std.mem.indexOf(u8, buf[seg_start..msg_rel], "to=functions.") != null;
+    // The `<|start|>` before that `<|message|>`: Beam's parallel calls put the next one's `<|start|>` after it.
+    const seg_start = std.mem.lastIndexOf(u8, buf[0..msg_rel], HARMONY_START_TAG) orelse 0;
+    const header = buf[seg_start..msg_rel];
+    return std.mem.indexOf(u8, header, "to=functions.") != null or harmonyXmlCallName(header) != null;
 }
 
 fn museIsRecipientChar(c: u8) bool {
@@ -5408,6 +5463,15 @@ const ATEM_PARAM_TAG = "<atem:parameter";
 const ATEM_PARAM_CLOSE = "</atem:parameter>";
 const ATEM_INVOKE_CLOSE = "</atem:invoke>";
 
+/// The body of a segment whose `<|message|>` sits at `msg_rel`, up to its terminator.
+fn harmonyBodyAt(seg: []const u8, msg_rel: usize) []const u8 {
+    var body = seg[msg_rel + HARMONY_MSG_TAG.len ..];
+    for ([_][]const u8{ HARMONY_CALL_TAG, HARMONY_END_TAG, HARMONY_RETURN_TAG }) |tag| {
+        if (std.mem.indexOf(u8, body, tag)) |e| body = body[0..e];
+    }
+    return body;
+}
+
 /// gpt_oss / harmony tool calls. Structurally unlike every other family here:
 /// the function NAME is not in the payload at all, it is the segment header's
 /// recipient (`to=functions.NAME`), and the body is already a JSON arguments
@@ -5419,7 +5483,8 @@ const ATEM_INVOKE_CLOSE = "</atem:invoke>";
 /// Keyed on `to=functions.` sitting in a resolved channel header, a shape no
 /// other family emits. A body that is not a COMPLETE balanced JSON object is
 /// a truncated call: ship the name with `{}` rather than a fragment, per the
-/// same rule the ATEM and DSML parsers follow.
+/// same rule the ATEM and DSML parsers follow. Beam's xml call (`to=NAME`,
+/// `<|constrain|>xml`) carries `rfl:parameter` values instead.
 fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     if (std.mem.indexOf(u8, text, HARMONY_CHANNEL_TAG) == null) return;
     var seg_start: usize = 0;
@@ -5437,6 +5502,14 @@ fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
         };
         const header = seg[0..msg_rel];
         const fn_at = std.mem.indexOf(u8, header, "to=functions.") orelse {
+            if (harmonyXmlCallName(header)) |xml_name| {
+                const body = harmonyBodyAt(seg, msg_rel);
+                const name = try allocator.dupe(u8, xml_name);
+                errdefer allocator.free(name);
+                const arguments = (try xmlParamsToJson(allocator, body, RFL_PARAMS)) orelse try allocator.dupe(u8, "{}");
+                errdefer allocator.free(arguments);
+                try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
+            }
             if (next == null) break;
             continue;
         };
@@ -5450,11 +5523,7 @@ fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
             continue;
         }
 
-        var body = seg[msg_rel + HARMONY_MSG_TAG.len ..];
-        for ([_][]const u8{ HARMONY_CALL_TAG, HARMONY_END_TAG, HARMONY_RETURN_TAG }) |tag| {
-            if (std.mem.indexOf(u8, body, tag)) |e| body = body[0..e];
-        }
-        const args_src = balancedJsonObject(std.mem.trim(u8, body, " \n\t\r")) orelse "{}";
+        const args_src = balancedJsonObject(std.mem.trim(u8, harmonyBodyAt(seg, msg_rel), " \n\t\r")) orelse "{}";
 
         const name = try allocator.dupe(u8, name_slice);
         errdefer allocator.free(name);
@@ -5491,7 +5560,7 @@ fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
         if (std.mem.indexOfScalar(u8, seg, '>')) |te| {
             const body_all = seg[te + 1 ..];
             const body_end = std.mem.indexOf(u8, body_all, ATEM_INVOKE_CLOSE) orelse body_all.len;
-            args_json = try atemParamsToJson(allocator, body_all[0..body_end]);
+            args_json = try xmlParamsToJson(allocator, body_all[0..body_end], ATEM_PARAMS);
             pos = if (body_end < body_all.len)
                 after_tag + te + 1 + body_end + ATEM_INVOKE_CLOSE.len
             else
@@ -5507,20 +5576,33 @@ fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
     }
 }
 
-/// Assemble `<atem:parameter name="k">v</atem:parameter>` runs into a JSON
-/// object string. A value that parses as COMPLETE JSON keeps its spelled type;
-/// everything else is a raw string, exact bytes. Keys are escaped + deduped
-/// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
-/// JSON. Returns null when no complete parameter was found.
-fn atemParamsToJson(allocator: std.mem.Allocator, body: []const u8) !?[]const u8 {
+/// The parameter tags of an xml call body.
+const XmlParams = struct {
+    open: []const u8,
+    close: []const u8,
+    /// Beam's grammar (its tokenizer_config `response_template`): a value sits between newlines
+    /// (`>\nVALUE\n</rfl:parameter>`), may end at the next opener with no close, and is text, every one.
+    beam: bool,
+};
+const ATEM_PARAMS = XmlParams{ .open = ATEM_PARAM_TAG, .close = ATEM_PARAM_CLOSE, .beam = false };
+const RFL_PARAMS = XmlParams{ .open = RFL_PARAM_TAG, .close = RFL_PARAM_CLOSE, .beam = true };
+
+/// Assemble `<atem:parameter name="k">v</atem:parameter>` (or Beam's
+/// `rfl:parameter`) runs into a JSON object string. An ATEM value that parses
+/// as COMPLETE JSON keeps its spelled type; everything else is a raw string,
+/// exact bytes (the schema coercion chokepoint types a declared parameter).
+/// Keys are escaped + deduped (last wins) via ObjectMap+Stringify, so emitted
+/// arguments are ALWAYS valid JSON. Returns null when no complete parameter
+/// was found.
+fn xmlParamsToJson(allocator: std.mem.Allocator, body: []const u8, tags: XmlParams) !?[]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
     var map: std.json.ObjectMap = .empty;
     var pos: usize = 0;
     var found = false;
-    while (std.mem.indexOfPos(u8, body, pos, ATEM_PARAM_TAG)) |p| {
-        const after = p + ATEM_PARAM_TAG.len;
+    while (std.mem.indexOfPos(u8, body, pos, tags.open)) |p| {
+        const after = p + tags.open.len;
         const seg = body[after..];
         const te = std.mem.indexOfScalar(u8, seg, '>') orelse break; // truncated open tag
         const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
@@ -5531,13 +5613,27 @@ fn atemParamsToJson(allocator: std.mem.Allocator, body: []const u8) !?[]const u8
         // The value runs to the CONFIRMED closing tag — rich values with
         // newlines/quotes/`<` survive; no close by end of text = fragment,
         // dropped.
-        const vend_rel = std.mem.indexOf(u8, body[vstart..], ATEM_PARAM_CLOSE) orelse break;
-        const raw = body[vstart .. vstart + vend_rel];
-        const v: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
+        var vend_rel = std.mem.indexOf(u8, body[vstart..], tags.close);
+        var close_len = tags.close.len;
+        if (tags.beam) {
+            if (std.mem.indexOf(u8, body[vstart..], tags.open)) |n| {
+                if (vend_rel == null or n < vend_rel.?) {
+                    vend_rel = n;
+                    close_len = 0;
+                }
+            }
+        }
+        const vend = vend_rel orelse break;
+        var raw = body[vstart .. vstart + vend];
+        if (tags.beam) {
+            if (std.mem.startsWith(u8, raw, "\n")) raw = raw[1..];
+            if (std.mem.endsWith(u8, raw, "\n")) raw = raw[0 .. raw.len - 1];
+        }
+        const v: std.json.Value = if (tags.beam) .{ .string = raw } else std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
             std.json.Value{ .string = raw };
         try map.put(aa, pname, v);
         found = true;
-        pos = vstart + vend_rel + ATEM_PARAM_CLOSE.len;
+        pos = vstart + vend + close_len;
     }
     if (!found) return null;
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = map }, .{});
@@ -10095,6 +10191,18 @@ test "renderChatTemplate: |min picks the smaller element, |max the larger" {
     try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
 }
 
+test "renderChatTemplate: `string * int` repeats as Python does, and `mapping | list` is its keys in order" {
+    const allocator = testing.allocator;
+    const tpl =
+        \\[{{ "ab" * 3 }}|{{ 2 * "-" }}|{{ "x" * 0 }}|{{ "x" * -1 }}|{{ {"b": 1, "a": 2} | list | join(",") }}|{{ ({"k": 1} | list) == ["k"] }}]
+    ;
+    var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings("[ababab|--|||b,a|True]", rendered);
+}
+
 test "renderChatTemplate: a namespace attribute named like a dict method is the attribute" {
     // `ns.items` resolved to dict.items(), `+` raised, and the render fell back to the generic format.
     const allocator = testing.allocator;
@@ -10579,6 +10687,66 @@ test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
         var want: [64]u8 = undefined;
         try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
     }
+}
+
+test "serializeExtraContext: beam maps effort onto its six labels, default max, thinking-off minimal" {
+    const allocator = testing.allocator;
+    var beam = ChatConfig{ .chat_template = @embedFile("fixtures/beam_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    const cases = [_]struct { in: ?[]const u8, thinking: bool, out: []const u8 }{
+        .{ .in = null, .thinking = true, .out = "max" },
+        .{ .in = "banana", .thinking = true, .out = "max" },
+        .{ .in = "none", .thinking = true, .out = "minimal" },
+        .{ .in = "minimal", .thinking = true, .out = "minimal" },
+        .{ .in = "low", .thinking = true, .out = "low" },
+        .{ .in = "medium", .thinking = true, .out = "medium" },
+        .{ .in = "high", .thinking = true, .out = "high" },
+        .{ .in = "xhigh", .thinking = true, .out = "xhigh" },
+        .{ .in = "max", .thinking = true, .out = "max" },
+        .{ .in = "high", .thinking = false, .out = "minimal" },
+    };
+    for (cases) |c| {
+        const r = try serializeExtraContext(allocator, &beam, c.thinking, c.in);
+        defer allocator.free(r);
+        var want: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
+    }
+}
+
+test "renderChatTemplate: beam's shipped template renders two turns byte-identical to transformers" {
+    // The reference is transformers' render of the same messages with the kwargs the host passes.
+    const allocator = testing.allocator;
+    var config = ChatConfig{ .chat_template = @embedFile("fixtures/beam_chat_template.jinja"), .bos_token = null, .eos_token = "<|return|>", .add_bos_token = false, .allocator = allocator };
+    const two_turn = [_]Message{
+        .{ .role = "system", .content = "Be brief." },
+        .{ .role = "user", .content = "What is 2+2?" },
+        .{ .role = "assistant", .content = "4", .reasoning_content = "Add two and two." },
+        .{ .role = "user", .content = "And 3+3?" },
+    };
+    const plain = try renderChatTemplate(allocator, &two_turn, &config, null, null, true, null, false);
+    defer allocator.free(plain);
+    try testing.expectEqualStrings(@embedFile("fixtures/beam_render_reference.txt"), plain);
+}
+
+test "renderChatTemplate: beam's shipped template renders a two-tool parallel round trip byte-identical to transformers" {
+    // A trained-shape `bash` (system block, `mapping | list`) beside a tool with a nested object (`" " * indent`).
+    const allocator = testing.allocator;
+    var config = ChatConfig{ .chat_template = @embedFile("fixtures/beam_chat_template.jinja"), .bos_token = null, .eos_token = "<|return|>", .add_bos_token = false, .allocator = allocator };
+    const tools_json =
+        \\[{"type": "function", "function": {"name": "bash", "description": "Run a shell command", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command"}}, "required": ["command"]}}}, {"type": "function", "function": {"name": "get_weather", "description": "Get the weather", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"}, "days": {"type": "integer"}, "options": {"type": "object", "description": "Display options", "properties": {"unit": {"type": "string", "enum": ["c", "f"]}, "hourly": {"type": "boolean"}}}}, "required": ["city"]}}}]
+    ;
+    const tc = [_]ToolCall{
+        .{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\": \"Paris\", \"days\": 2, \"options\": {\"unit\": \"c\", \"hourly\": false}}" },
+        .{ .id = "call_2", .name = "bash", .arguments = "{\"command\": \"ls -la\"}" },
+    };
+    const tool_turn = [_]Message{
+        .{ .role = "user", .content = "Weather in Paris, and list the files?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need both tools." },
+        .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
+        .{ .role = "tool", .content = "a.txt", .tool_call_id = "call_2" },
+    };
+    const rendered = try renderChatTemplate(allocator, &tool_turn, &config, tools_json, null, true, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings(@embedFile("fixtures/beam_tools_render_reference.txt"), rendered);
 }
 
 test "kolibriEffortFor: thinking-off is the word 'none', never hy3's no_think" {
@@ -13906,6 +14074,92 @@ test "parseHarmonyToolCalls: two tool segments both parse" {
     try std.testing.expectEqual(@as(usize, 2), calls.items.len);
     try std.testing.expectEqualStrings("a", calls.items[0].name);
     try std.testing.expectEqualStrings("b", calls.items[1].name);
+}
+
+// Beam's tool turn after the prompt's `<|start|>assistant`, as its template renders one.
+const beam_weather_call = "<|channel|>analysis<|message|>Need the weather.<|end|>" ++
+    "<|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|>" ++
+    "<rfl:parameter name=\"city\">\nParis\n</rfl:parameter>\n<rfl:parameter name=\"days\">\n2\n</rfl:parameter><|call|>";
+
+fn expectHarmonyCalls(text: []const u8, want: []const [2][]const u8) !void {
+    var calls: std.ArrayList(ParsedToolCall) = .empty;
+    defer {
+        for (calls.items) |tc| {
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        calls.deinit(std.testing.allocator);
+    }
+    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
+    try std.testing.expectEqual(want.len, calls.items.len);
+    for (want, calls.items) |w, c| {
+        try std.testing.expectEqualStrings(w[0], c.name);
+        try std.testing.expectEqualStrings(w[1], c.arguments);
+        try std.testing.expect(!c.inferred);
+    }
+}
+
+test "parseHarmonyToolCalls: a Beam call names the bare recipient; its rfl:parameter values are text" {
+    // Beam's grammar types nothing: the schema coercion chokepoint makes `days` a number.
+    try expectHarmonyCalls(beam_weather_call, &.{.{ "get_weather", "{\"city\":\"Paris\",\"days\":\"2\"}" }});
+    // The call may open the turn, with no analysis segment before it.
+    try expectHarmonyCalls(" to=bash<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"command\">\nls -la\n</rfl:parameter>", &.{.{ "bash", "{\"command\":\"ls -la\"}" }});
+}
+
+test "parseHarmonyToolCalls: Beam's parallel calls, multi-line and empty values, a value closed by the next opener" {
+    const text = "<|channel|>analysis<|message|>Both.<|end|>" ++
+        "<|start|>assistant to=write<|channel|>analysis <|constrain|>xml<|message|>" ++
+        "<rfl:parameter name=\"path\">\na.txt\n<rfl:parameter name=\"content\">\nline 1\n\nline 3\n\n</rfl:parameter>\n<rfl:parameter name=\"mode\">\n\n</rfl:parameter><|end|>" ++
+        "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name=\"command\">\n{\"a\": 1}\n</rfl:parameter><|call|>";
+    try expectHarmonyCalls(text, &.{
+        .{ "write", "{\"path\":\"a.txt\",\"content\":\"line 1\\n\\nline 3\\n\",\"mode\":\"\"}" },
+        .{ "bash", "{\"command\":\"{\\\"a\\\": 1}\"}" },
+    });
+}
+
+test "parseHarmonyToolCalls: a truncated Beam value ships the name and the completed values only" {
+    const text = "<|start|>assistant to=write<|channel|>analysis <|constrain|>xml<|message|>" ++
+        "<rfl:parameter name=\"path\">\na.txt\n</rfl:parameter>\n<rfl:parameter name=\"content\">\nChapter 1. It was";
+    try expectHarmonyCalls(text, &.{.{ "write", "{\"path\":\"a.txt\"}" }});
+    // A header with no parameter yet: the name with `{}`.
+    try expectHarmonyCalls("<|start|>assistant to=ping<|channel|>analysis <|constrain|>xml<|message|>", &.{.{ "ping", "{}" }});
+}
+
+test "splitThinkBlock: a Beam call is neither reasoning nor content; the markup split keeps it for the parser" {
+    const split = splitThinkBlock(beam_weather_call, true, false);
+    try std.testing.expectEqualStrings("Need the weather.", split.reasoning_content.?);
+    try std.testing.expectEqualStrings("", split.content);
+    // The /v1/messages path parses the markup split's content: the header must still be there to name the call.
+    const kept = splitThinkBlockKeepingMarkup(beam_weather_call, true, false);
+    try std.testing.expectEqualStrings("Need the weather.", kept.reasoning_content.?);
+    const calls = (try parseToolCalls(std.testing.allocator, kept.content)).?;
+    defer {
+        for (calls) |tc| {
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        std.testing.allocator.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("get_weather", calls[0].name);
+    // A Beam answer still splits as Harmony.
+    const answer = splitThinkBlock("<|channel|>analysis<|message|>Add.<|end|><|start|>assistant<|channel|>final<|message|>4<|return|>", true, false);
+    try std.testing.expectEqualStrings("Add.", answer.reasoning_content.?);
+    try std.testing.expectEqualStrings("4", answer.content);
+}
+
+test "streamShouldBufferForTools: a Beam call holds from its header through the next parallel call" {
+    const head = "<|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|>";
+    const body = "<rfl:parameter name=\"city\">\nParis\n</rfl:parameter>";
+    try std.testing.expect(streamShouldBufferForTools("<|start|>assistant to=get_weather"));
+    try std.testing.expect(streamShouldBufferForTools(head));
+    try std.testing.expect(streamShouldBufferForTools(head ++ body));
+    try std.testing.expect(streamShouldBufferForTools(head ++ body ++ "<|end|><|start|>"));
+    try std.testing.expect(streamShouldBufferForTools(head ++ body ++ "<|end|><|start|>assistant to=bash"));
+    // On a no-tools request the gate holds the call rather than stream it as reasoning.
+    try std.testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(head ++ body ++ "<|end|>", true, true, false));
+    // The analysis channel itself still streams.
+    try std.testing.expect(!streamShouldBufferForTools("<|channel|>analysis<|message|>Need the"));
 }
 
 test "parseAtemToolCalls: canonical block — raw strings, spelled types, schema untouched" {

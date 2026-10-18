@@ -40,9 +40,9 @@ private let supportedArchitectureTagPrefixes: [String] = [
 /// MLX-format DeepSeek-V4 is intentionally NOT in this set — DSV4 is served
 /// by the embedded ds4 engine, which loads the GGUF checkpoint directly.
 /// Served model types the Hugging Face search does not offer: the server loads them only
-/// from an mlx-stream pack (the trunk beside an `experts.bin` bank), and an ordinary
+/// from an mlx-stream pack (the trunk beside its expert bank), and an ordinary
 /// checkpoint with the same model_type does not load. A local pack still lists and picks.
-let streamOnlyModelTypes: Set<String> = ["glm_moe_dsa"]
+let streamOnlyModelTypes: Set<String> = ["glm_moe_dsa", "beam"]
 
 let supportedModelTypes: Set<String> = [
     "gemma3", "gemma3_text", "gemma4", "gemma4_text",
@@ -61,6 +61,7 @@ let supportedModelTypes: Set<String> = [
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
     "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE): an mlx-stream pack (the trunk beside an experts.bin bank)
+    "beam", // Reflection Beam 1.0 (501B-A23B MoE): an mlx-stream pack (the trunk beside its NVFP4 expert bank)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)

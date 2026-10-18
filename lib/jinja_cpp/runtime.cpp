@@ -241,6 +241,19 @@ value binary_expression::execute_impl(context & ctx) {
         }
     }
 
+    // String repetition, as Python: "ab" * 3 and 3 * "ab"; a count below 1 gives "".
+    if (op.value == "*" && ((is_val<value_string>(left_val) && is_val<value_int>(right_val)) ||
+                            (is_val<value_int>(left_val) && is_val<value_string>(right_val)))) {
+        const bool str_left = is_val<value_string>(left_val);
+        const string unit = (str_left ? left_val : right_val)->as_string();
+        const int64_t count = (str_left ? right_val : left_val)->as_int();
+        auto res = mk_val<value_string>();
+        for (int64_t i = 0; i < count; ++i) {
+            res->val_str.append(unit);
+        }
+        return res;
+    }
+
     // String concatenation with ~ and +
     if ((is_val<value_string>(left_val) || is_val<value_string>(right_val)) &&
             (op.value == "~" || op.value == "+")) {

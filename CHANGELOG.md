@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Beam 1.0.** Reflection's 501B-A23B MoE runs from an mlx-stream pack on a 256 GB Mac, with its NVFP4 experts streamed from SSD; text, thinking (with `reasoning_effort` from minimal to max) and tool calls, parallel ones included.
 - **MOSS-Image.** OpenMOSS's 5B image model generates from long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese, at its authors' 50 steps and guidance 3; the app's Enhance writes a layout for you on the current canvas, and the Image pane starts from the recommended negative tags. The app offers our 8-bit pack (14 GB, about 21 GB of memory at 1024x1024) beside mlx-community's bf16.
 - **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
 - **NVIDIA Nemotron 3.5 Bolt and Super.** The omni packs serve text, images and video (RADIO tower), and draft with their LiLiCorr DFlash drafter on every API.
@@ -16,7 +17,7 @@
 - **Faster VAEs.** Krea and Qwen-Image decode their pictures in half precision.
 - **Faster MoE prefill on NVIDIA GPUs, and MTP by default.** FP4 and FP8 expert packs prefill their experts about ten times faster on CUDA, long prompts on NVIDIA's Flash Next pack no longer fail past 6,500 tokens a chunk, and a loaded MTP head drafts by default on CUDA as it does on Macs.
 - **Model Browser.** My Models shows what each model overrides (engine, speculation, KV cache, sampling, template kwargs) in a Settings column, and Discover offers Use on decision models and, for a repo with one build on disk, a Use button beside its quant menu.
-- **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs. A download, in the app and with `mlx-serve pull`, now fetches every file a model's shard index names, so OptiQ packs that keep weights in a subfolder no longer show "Missing shards".
+- **Fixes.** Nemotron-H packs that spell `time_step_limit` as `{"__float__": "Infinity"}` no longer clamp the Mamba step to zero, and `/v1/messages` now drafts with a loaded DFlash drafter by default like the other APIs. A download, in the app and with `mlx-serve pull`, now fetches every file a model's shard index names, so OptiQ packs that keep weights in a subfolder no longer show "Missing shards". A chat template that repeats a string (`" " * n`) or lists a mapping's keys (`mapping | list`) now renders as written instead of falling back to a generic prompt format.
 
 ## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
 

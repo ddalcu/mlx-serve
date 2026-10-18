@@ -1,0 +1,37 @@
+<|start|>system<|message|>You are Beam, an AI assistant trained by Reflection.
+
+Reasoning effort: 512
+
+# Tools
+
+// Execute a bash command. The output contains the command's stdout and stderr.
+// Commands time out after 10 minutes. You can set a shorter timeout within the bash command.
+type bash = (_: {
+// The command to execute
+command: string,
+}) => any;
+
+# Valid channels: analysis, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Tools
+
+// Get the weather
+type get_weather = (_: {
+// City name
+city: string,
+days?: number,
+// Display options
+options?:     // Display options
+{
+    unit?: "c" | "f",
+    hourly?: boolean,
+    },
+}) => any;<|end|><|start|>user<|message|>Weather in Paris, and list the files?<|end|><|start|>assistant<|channel|>analysis<|message|>Need both tools.<|end|><|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="city">
+Paris
+</rfl:parameter>
+<rfl:parameter name="days">
+2
+</rfl:parameter>
+<rfl:parameter name="options">
+{"unit": "c", "hourly": false}
+</rfl:parameter><|end|><|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="command">
+ls -la
+</rfl:parameter><|call|><|start|>get_weather to=assistant<|channel|>analysis<|message|>{"temp": 21}<|end|><|start|>bash to=assistant<|channel|>analysis<|message|>a.txt<|end|><|start|>assistant

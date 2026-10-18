@@ -12329,7 +12329,7 @@ fn handleStreamingGeneration(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-    const gated_stream = has_tools or (sampling.constraint == null and std.mem.eql(u8, config.model_type, "gpt_oss"));
+    const gated_stream = has_tools or (sampling.constraint == null and config.harmonyChannels());
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to
@@ -18057,7 +18057,7 @@ fn handleAnthropicStreaming(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-    const gated_stream = has_tools or (sampling.constraint == null and std.mem.eql(u8, config.model_type, "gpt_oss"));
+    const gated_stream = has_tools or (sampling.constraint == null and config.harmonyChannels());
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to

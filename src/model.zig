@@ -384,7 +384,7 @@ pub const ModelConfig = struct {
     ngram_table_path: ?[]const u8 = null,
     /// The pack's directory: deepseek_v41's Engram tables sit beside the
     /// weights, and an mlx-stream pack (DeepSeek-V4.1, `mimo_stream`,
-    /// `glm_stream` or `glm5_stream`) loads from it. Set by `parseConfig`.
+    /// `glm_stream`, `glm5_stream` or `beam_stream`) loads from it. Set by `parseConfig`.
     pack_dir: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
@@ -536,6 +536,9 @@ pub const ModelConfig = struct {
     /// bank): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its weights; a `glm5_next` config without the
     /// block is the host's resident arch. Set by `parseConfig`.
     glm5_stream: bool = false,
+    /// A Beam pack prepared for mlx-stream (`beam`, its config declares `expert_streaming`: the NVFP4 bank):
+    /// mlx-stream serves it (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
+    beam_stream: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -1257,10 +1260,20 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "glm_moe_dsa");
     }
 
-    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3
-    /// pack.
+    pub fn isBeam(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "beam");
+    }
+
+    /// The model speaks Harmony (gpt_oss, Beam): every turn opens `<|channel|>analysis`, so it always thinks and its
+    /// stream goes through the channel gate.
+    pub fn harmonyChannels(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "gpt_oss") or self.isBeam();
+    }
+
+    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo, GLM-5.3, GLM-5.3-Flash
+    /// or Beam stream pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
-        return self.dsv41_stream or self.mimo_stream or self.glm_stream or self.glm5_stream;
+        return self.dsv41_stream or self.mimo_stream or self.glm_stream or self.glm5_stream or self.beam_stream;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1553,7 +1566,7 @@ pub const ModelConfig = struct {
         // delivered rather than paid-and-dropped). A plain chat request
         // defaults to the prompt-committed to=user channel instead
         // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
-        // gpt_oss: UNCONDITIONALLY on. Harmony has no thinking-off mode — the
+        // gpt_oss and beam: UNCONDITIONALLY on. Harmony has no thinking-off mode — the
         // template's `Reasoning: low|medium|high` sets depth, not presence, and
         // the model opens `<|channel|>analysis<|message|>` on every turn no
         // matter what we ask. Defaulting a silent request to off did not stop
@@ -1562,7 +1575,7 @@ pub const ModelConfig = struct {
         // the reasoning itself into visible content (live 2026-08-12).
         // Thinking-off here would have to be enforced in the PROMPT, and
         // harmony offers no way to do it.
-        if (std.mem.eql(u8, self.model_type, "gpt_oss")) return true;
+        if (self.harmonyChannels()) return true;
         if (has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer")) return true;
         // bailing_hybrid (Ling 3.0): thinking-on with or without tools. The
         // checkpoint's own template normalizes an undefined `enable_thinking`
@@ -1792,6 +1805,15 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         };
         config.pack_dir = try allocator.dupe(u8, model_dir);
         config.glm_stream = true;
+    }
+    if (config.isBeam()) {
+        // No in-tree arch serves Beam: only an mlx-stream pack (its config declares the expert bank) loads.
+        if (!declaresExpertStreaming(allocator, content)) {
+            log.err("beam: {s} declares no expert_streaming; Beam runs only from an mlx-stream pack (the trunk beside its NVFP4 expert bank)\n", .{model_dir});
+            return error.BeamNeedsStreamPack;
+        }
+        config.pack_dir = try allocator.dupe(u8, model_dir);
+        config.beam_stream = true;
     }
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
@@ -4236,6 +4258,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (jsonField(cfg_obj, "n_routed_experts")) |v| {
             if (v == .integer) config.num_experts = try jsonU32(v);
         }
+    } else if (std.mem.eql(u8, model_type, "beam")) {
+        // Reflection Beam 1.0, served only by mlx-stream (`parseConfig`). The host reads the shell fields the common
+        // block parsed: vocab, hidden, layers, context, untied head; its eos ids ride generation_config.json.
+        config.model_type = "beam";
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
         config.weight_prefix = "model";
@@ -7855,6 +7881,64 @@ test "parseConfig: a glm_moe_dsa pack with an experts.bin bank is mlx-stream's; 
     defer pack.deinit(testing.allocator);
     try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.dsv41_stream and !pack.mimo_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
+    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 0), w.count());
+}
+
+const beam_config =
+    \\{"architectures": ["BeamForCausalLM"], "model_type": "beam", "vocab_size": 151936, "hidden_size": 5120,
+    \\ "num_hidden_layers": 52, "num_attention_heads": 48, "num_key_value_heads": 8, "head_dim": 128,
+    \\ "max_position_embeddings": 1048576, "tie_word_embeddings": false, "num_experts": 256, "bos_token_id": null,
+    \\ "eos_token_id": null, "final_logit_softcapping": 30.0, "sliding_window": 512,
+    \\ "rope_parameters": {"sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}, "full_attention": null},
+    \\ "quantization_config": {"quant_algo": "NVFP4", "quant_method": "modelopt"}}
+;
+
+test "parseConfigFromJson beam: the shell fields the host reads, thinking on" {
+    const config = try parseConfigFromJson(testing.allocator, beam_config);
+    try testing.expectEqualStrings("beam", config.model_type);
+    try testing.expectEqual(@as(u32, 151936), config.vocab_size);
+    try testing.expectEqual(@as(u32, 5120), config.hidden_size);
+    try testing.expectEqual(@as(u32, 52), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 1048576), config.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expect(!config.tie_word_embeddings and !config.has_vision);
+    try testing.expect(config.defaultEnableThinking(false) and config.defaultEnableThinking(true));
+}
+
+test "parseConfig: a beam release config (ModelOpt, no expert_streaming) is refused by name, never loaded resident" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = beam_config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = "{\"eos_token_id\": [151674, 151675], \"pad_token_id\": 151643}" });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    try testing.expect((try parseConfigFromJson(testing.allocator, beam_config)).modelopt);
+    try testing.expectError(error.BeamNeedsStreamPack, parseConfig(io, testing.allocator, dir));
+}
+
+test "parseConfig: a beam pack that declares expert_streaming is mlx-stream's, its eos ids from its config.json" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    // The converter's config: the block added, eos filled from generation_config.json, quantization_config removed.
+    const with_block = try std.mem.replaceOwned(u8, testing.allocator, beam_config, "\"model_type\": \"beam\",", "\"model_type\": \"beam\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-nvfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
+    defer testing.allocator.free(with_block);
+    const with_eos = try std.mem.replaceOwned(u8, testing.allocator, with_block, "\"eos_token_id\": null,", "\"eos_token_id\": [151674, 151675], \"pad_token_id\": 151643,");
+    defer testing.allocator.free(with_eos);
+    const pack_json = try std.mem.replaceOwned(u8, testing.allocator, with_eos, ",\n \"quantization_config\": {\"quant_algo\": \"NVFP4\", \"quant_method\": \"modelopt\"}", "");
+    defer testing.allocator.free(pack_json);
+    try testing.expect(std.mem.indexOf(u8, pack_json, "expert_streaming") != null and std.mem.indexOf(u8, pack_json, "151675") != null and std.mem.indexOf(u8, pack_json, "modelopt") == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = pack_json });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var pack = try parseConfig(io, testing.allocator, dir);
+    defer pack.deinit(testing.allocator);
+    try testing.expect(pack.isBeam() and pack.beam_stream and pack.mlxStream() and !pack.modelopt and !pack.glm5_stream and !pack.mimo_stream);
+    try testing.expectEqualStrings(dir, pack.pack_dir.?);
+    try testing.expectEqualSlices(u32, &.{ 151674, 151675 }, pack.eos_token_ids[0..pack.num_eos_tokens]);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
     try testing.expectEqual(@as(u32, 0), w.count());
