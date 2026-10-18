@@ -2345,3 +2345,9 @@
 "About %@ on this Mac and %@ on %@." = "이 Mac에 약 %@, %@ 정도는 %@에 놓입니다.";
 "A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it." = "페어는 MiniMax-H3(비디오) 또는 Qwen3.8-Flash-Next나 DeepSeek-V4.1(채팅)을 실행합니다. 두 Mac 모두에 하나를 다운로드하세요.";
 "Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both." = "Thunderbolt로 페어링된 두 Mac에서 함께 실행됩니다. 언로드하면 두 Mac 모두에서 해제됩니다.";
+
+"Automatically Discover Models" = "모델 자동 검색";
+
+"Include LM Studio, the Hugging Face cache and other apps. Turn off to use only configured folders and previous MLX-Serve downloads. Restart the server to update its search folders." = "LM Studio, Hugging Face 캐시 및 다른 앱의 모델을 포함합니다. 끄면 설정한 폴더와 기존 MLX-Serve 다운로드만 사용합니다. 검색 폴더를 적용하려면 서버를 다시 시작하세요.";
+
+"Rescan enabled model folders" = "활성화된 모델 폴더 다시 검색";

@@ -2,9 +2,11 @@
 
 # MLX Core (macOS app)
 
+In **Settings → Server**, **Automatically Discover Models** is on by default. Turning it off limits discovery to the download folder, previous MLX-Serve downloads and the optional custom folder. Turning it on also scans LM Studio, the Hugging Face cache and other supported apps. **My Models → Refresh** reloads enabled sources and their current folder settings in the background; new downloads refresh automatically. Shared files appear once, including symbolic links, with configured folders preferred. The app list updates immediately; restart a running server to apply its changed search folders. No models are moved or deleted.
+
 Menu-bar app that wraps the server with a full UI. [Download the latest release](https://github.com/ddalcu/mlx-serve/releases/latest) or `brew install --cask mlx-serve`. Since v26.8.4 it is one window with a sidebar, content and detail column: Models, Tasks, Settings and the media generators are modes of the chat window rather than separate windows.
 
-- **Model browser** — download from HuggingFace with resumable multi-connection transfers (up to 16 connections per file), auto-discovers LM Studio's existing model folder (`~/.lmstudio/settings.json`) and your Hugging Face cache (wherever `HF_HOME` / `HF_HUB_CACHE` point) so you don't re-download what's on disk, GGUF rows show a min–max RAM-estimate range. Multi-variant repos let you pick your quant, and **Settings ▸ Model Folders** chooses where downloads land.
+- **Model browser** — download from HuggingFace with resumable multi-connection transfers (up to 16 connections per file), when automatic discovery is enabled, finds LM Studio's existing model folder (`~/.lmstudio/settings.json`) and your Hugging Face cache (wherever `HF_HOME` / `HF_HUB_CACHE` point) so you don't re-download what's on disk, GGUF rows show a min–max RAM-estimate range. Multi-variant repos let you pick your quant, and **Settings ▸ Model Folders** chooses where downloads land.
 - **Model switching without a restart** — picking a chat model loads it into the running server and makes it the default (`POST /v1/load-model` with `"default": true` over the API).
 - **Chat interface** — multi-session chat with markdown rendering. Drop in PDFs (PDFKit-extracted) or images alongside text.
 - **Agent mode** — 10 built-in tools (shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory) with automatic tool calling loop and a per-tool approval dialog (**Allow** / **Deny** / **Always allow this session**).

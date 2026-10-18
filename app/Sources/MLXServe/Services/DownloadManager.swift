@@ -600,21 +600,15 @@ class DownloadManager: ObservableObject {
         where URL(fileURLWithPath: owned).standardizedFileURL.path == standardized {
             return nil
         }
-        if let lm = lmStudioRoot,
-           URL(fileURLWithPath: lm).standardizedFileURL.path == standardized {
-            return nil
-        }
-        if let hf = huggingFaceRoot,
-           URL(fileURLWithPath: hf).standardizedFileURL.path == standardized {
-            return nil
-        }
         return standardized
     }
 
-    /// LM Studio's downloads root, resolved once at app launch.
+    /// Re-read LM Studio settings so a moved folder is picked up by Refresh.
     /// Reads `~/.lmstudio/settings.json`'s `downloadsFolder` field; falls back to
     /// `~/.lmstudio/models`. nil if LM Studio isn't installed or the folder is unreachable.
-    let lmStudioRoot: String? = DownloadManager.lmStudioRootPath()
+    var lmStudioRoot: String? {
+        ModelRoots().automaticallyDiscoverModels ? Self.lmStudioRootPath() : nil
+    }
 
     /// The same resolution, reachable from `nonisolated` code — the launch-flag
     /// builder needs it and cannot touch this `@MainActor` instance.
@@ -646,7 +640,11 @@ class DownloadManager: ObservableObject {
     /// A `var` because the cache is MOVABLE by environment and a Finder-
     /// launched bundle cannot see the environment that moved it — the login
     /// shell is asked off-main at launch (`refreshHuggingFaceRootFromLoginShell`).
-    var huggingFaceRoot: String? = DownloadManager.huggingFaceRootPath()
+    private var detectedHuggingFaceRoot: String? = DownloadManager.huggingFaceRootPath()
+
+    var huggingFaceRoot: String? {
+        ModelRoots().automaticallyDiscoverModels ? detectedHuggingFaceRoot : nil
+    }
 
     /// Resolve the hub cache the way `huggingface_hub` itself does:
     /// `HF_HUB_CACHE` > `$HF_HOME/hub` > `$XDG_CACHE_HOME/huggingface/hub` >
@@ -686,11 +684,12 @@ class DownloadManager: ObservableObject {
 
     /// Adopt the login shell's answer. True when the root changed.
     func refreshHuggingFaceRootFromLoginShell() async -> Bool {
+        guard ModelRoots().automaticallyDiscoverModels else { return false }
         let resolved = await Task.detached(priority: .utility) {
             DownloadManager.loginShellHuggingFaceRoot()
         }.value
-        guard resolved != huggingFaceRoot else { return false }
-        huggingFaceRoot = resolved
+        guard resolved != detectedHuggingFaceRoot else { return false }
+        detectedHuggingFaceRoot = resolved
         return true
     }
 
@@ -2100,8 +2099,10 @@ class DownloadManager: ObservableObject {
             lmStudioRoot: lmStudioRoot,
             huggingFaceRoot: huggingFaceRoot,
             customRoot: resolvedCustomRoot(),
-            toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).orderedWithSource
-                .map { LocalScanInputs.ToolRoot(path: $0.path, source: $0.source) },
+            toolRoots: ModelRoots().automaticallyDiscoverModels
+                ? ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).orderedWithSource
+                    .map { LocalScanInputs.ToolRoot(path: $0.path, source: $0.source) }
+                : [],
             inFlightDirs: Set(downloads.filter { $0.value.status == .downloading }
                 .map { (newLayoutDir(for: $0.key) as NSString).standardizingPath })
         )
@@ -2119,6 +2120,10 @@ class DownloadManager: ObservableObject {
         // The owned roots — download destination + `~/.mlx-serve/models` after
         // the destination moves — so the pre-move library stays in the picker.
         out.append(contentsOf: Self.mlxServeModels(inRoots: inputs.ownedRoots))
+
+        if let root = inputs.customRoot {
+            out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
+        }
 
         // LM Studio — two levels deep: <root>/<publisher>/<repo>/
         if let root = inputs.lmStudioRoot,
@@ -2152,15 +2157,11 @@ class DownloadManager: ObservableObject {
                 atRoot: tool.path, idPrefix: "tool:", source: tool.source))
         }
 
-        // User-configured custom root — same dual-layout scan as the owned
-        // roots. resolvedCustomRoot() handles tilde expansion, existence check,
-        // and dedup against the default roots so a user pointing it at
-        // `~/.mlx-serve/models` doesn't produce duplicate picker entries.
-        if let root = inputs.customRoot {
-            out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
+        var seen = Set<String>()
+        let unique = out.filter {
+            seen.insert(URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL.path).inserted
         }
-
-        return Self.markingInFlight(out, activeDirs: inputs.inFlightDirs)
+        return Self.markingInFlight(unique, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.
