@@ -8155,6 +8155,9 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     if (ic.ticks == 0) {
         log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
     }
+    // Decode ticks keep the CUDA graphs a prefill dropped.
+    const graphs_were = mlx.setCudaGraphs(true);
+    defer _ = mlx.setCudaGraphs(graphs_were);
     const chunk_ns = ic.chunk_sw.read();
     const share = prefillDecodeShare();
     // Small pending requests first, so the ticks below include them; their time is hosted time. A
@@ -8597,6 +8600,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
     if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
+    const graphs_were = mlx.setCudaGraphs(mlx.prefillKeepsCudaGraphs());
+    defer _ = mlx.setCudaGraphs(graphs_were);
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,

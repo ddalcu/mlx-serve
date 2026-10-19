@@ -533,6 +533,7 @@ pub fn main(init: std.process.Init) !void {
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
     mlx.exportCudaHome();
+    mlx.exportPtxCacheDir(@import("mlx_stamp").bytes);
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
     @import("prefix_cache.zig").warmEnvCaches();

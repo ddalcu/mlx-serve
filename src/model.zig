@@ -5159,11 +5159,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     if (config.dist_span) |sp| try retainPart(&weights, sp);
     if (config.dist_dsv41) |p| try retainPart(&weights, Dsv41Keep{ .pair = p });
     if (config.dist_shard) |sh| if (sh.rank != 0) try retainPart(&weights, TensorWorker{});
-    if (config.modelopt) {
-        const s = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(s);
-        try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, s, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
-    }
+    if (config.modelopt) try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
     if (config.dist_shard) |sh| try shardExperts(&weights, sh, config.modelopt);
     if (config.isDsv41() and !(if (config.dist_dsv41) |p| p.worker else false)) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {

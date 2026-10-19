@@ -140,24 +140,87 @@ pub fn exportCudaHome() void {
     if (cudaHomeDefault(env_set, has.headers("/usr/local/cuda"), has.headers("/opt/cuda"))) |home| crt.setEnv("CUDA_HOME", home);
 }
 
+/// The CUDA kernel cache for one staged MLX build. MLX keys its PTX cache by module name under
+/// its version alone, so a patched kernel kept running the build cached before the patch.
+pub fn ptxCacheDir(buf: []u8, tmp: []const u8, stamp_id: []const u8) ?[:0]const u8 {
+    if (stamp_id.len == 0) return null;
+    const sep = std.fs.path.sep_str;
+    return std.fmt.bufPrintSentinel(buf, "{s}" ++ sep ++ "mlx-serve-ptx" ++ sep ++ "{s}", .{ tmp, stamp_id }, 0) catch null;
+}
+
+/// A short id of a staged MLX build's stamp (`lib/mlx/.version`); "" for an unstamped build.
+pub fn stampId(buf: *[16]u8, stamp: []const u8) []const u8 {
+    const s = std.mem.trim(u8, stamp, " \t\r\n");
+    if (s.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{x:0>16}", .{std.hash.Wyhash.hash(0, s)}) catch "";
+}
+
+/// Export MLX_PTX_CACHE_DIR (see ptxCacheDir) for the staged MLX build's stamp before MLX
+/// compiles its first kernel, unless set.
+pub fn exportPtxCacheDir(stamp: []const u8) void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .windows) return;
+    if (std.c.getenv("MLX_PTX_CACHE_DIR") != null) return;
+    const tmp_env = if (comptime builtin.os.tag == .windows) std.c.getenv("TEMP") else std.c.getenv("TMPDIR");
+    const tmp = if (tmp_env) |t| std.mem.span(t) else "/tmp";
+    var id_buf: [16]u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    if (ptxCacheDir(&buf, tmp, stampId(&id_buf, stamp))) |dir| crt.setEnv("MLX_PTX_CACHE_DIR", dir.ptr);
+}
+
 var cuda_cache: ?bool = null;
 
-/// The stream weight files load on. A CPU-stream load allocates host memory: on native Linux
-/// that is CUDA managed memory and migrates to the GPU, but where NVIDIA's unified memory is
-/// "limited" (Windows, WSL) it is pinned host memory that every kernel reads over PCIe, so
-/// there CUDA loads on the GPU stream. Metal has no GPU `Load`.
+/// The stream weight files load on. A CPU-stream load allocates host memory: on a discrete
+/// Linux GPU that is CUDA managed memory and migrates to VRAM. Where NVIDIA's unified memory is
+/// "limited" (Windows, WSL) it is pinned host memory that every kernel reads over PCIe, and on an
+/// integrated GPU (DGX Spark) the GPU reads managed pages at two thirds of its own pool's
+/// bandwidth, so there CUDA loads on the GPU stream. Metal has no GPU `Load`.
 pub fn weightLoadStream() mlx_stream {
-    return if (weightsInDeviceMemory()) mlx_default_gpu_stream_new() else mlx_default_cpu_stream_new();
+    return if (weightsInGpuPool()) mlx_default_gpu_stream_new() else mlx_default_cpu_stream_new();
 }
 
-/// Whether loaded weights live in device memory (see `weightLoadStream`).
+/// Whether loaded weights live in a discrete GPU's VRAM (memory accounting reads this).
 pub fn weightsInDeviceMemory() bool {
     if (limited_unified_memory == null) limited_unified_memory = limitedUnifiedMemory();
-    return weightLoadOnGpu(cudaAvailable(), limited_unified_memory.?);
+    return weightLoadOnGpu(cudaAvailable(), limited_unified_memory.?, false);
 }
 
-pub fn weightLoadOnGpu(cuda: bool, limited_um: bool) bool {
-    return cuda and limited_um;
+/// Whether loaded weights go to the GPU's own allocation pool (see `weightLoadStream`).
+pub fn weightsInGpuPool() bool {
+    if (limited_unified_memory == null) limited_unified_memory = limitedUnifiedMemory();
+    return weightLoadOnGpu(cudaAvailable(), limited_unified_memory.?, cudaIntegrated());
+}
+
+pub fn weightLoadOnGpu(cuda: bool, limited_um: bool, integrated: bool) bool {
+    return cuda and (limited_um or integrated);
+}
+
+var cuda_integrated_cache: ?bool = null;
+
+/// The default CUDA device shares the host's memory (DGX Spark, Jetson).
+pub fn cudaIntegrated() bool {
+    if (cuda_integrated_cache == null) cuda_integrated_cache = cudaAvailable() and defaultDeviceInfoSize("integrated") == 1;
+    return cuda_integrated_cache.?;
+}
+
+/// `arr` copied into the GPU's pool where weights live there (`weightsInGpuPool`), else `arr`
+/// itself. Takes `arr`'s reference either way: an array built from host data
+/// (`mlx_array_new_data`) is CUDA managed memory.
+pub fn toGpuPool(arr: mlx_array) !mlx_array {
+    if (!weightsInGpuPool()) return arr;
+    defer _ = mlx_array_free(arr);
+    const s = mlx_default_gpu_stream_new();
+    defer _ = mlx_stream_free(s);
+    // A kernel's output is allocated in the pool; `arr` stays referenced, so it is not donated.
+    const one_i = mlx_array_new_int(1);
+    defer _ = mlx_array_free(one_i);
+    var one = mlx_array_new();
+    defer _ = mlx_array_free(one);
+    try check(mlx_astype(&one, one_i, mlx_array_dtype(arr), s));
+    var out = mlx_array_new();
+    errdefer _ = mlx_array_free(out);
+    try check(mlx_multiply(&out, arr, one, s));
+    try check(mlx_array_eval(out));
+    return out;
 }
 
 var limited_unified_memory: ?bool = null;
@@ -179,6 +242,34 @@ pub fn kernelReleaseIsWsl(release: []const u8) bool {
 }
 
 /// MLX runs on its CUDA backend (NVIDIA): `mlx_fast_cuda_kernel` instead of Metal.
+/// Whether prefill keeps MLX's CUDA graphs. On an integrated GPU (GB10) prefill kernels ran up to
+/// 2.3x slower inside them at every prompt length measured; decode keeps them either way.
+pub fn prefillKeepsCudaGraphs() bool {
+    return !cudaIntegrated();
+}
+
+var cuda_graphs_on = true;
+var cuda_graphs_fn: ?*const fn (bool) callconv(.c) void = null;
+var cuda_graphs_looked = false;
+
+/// Turns MLX's CUDA graphs on or off (`mlx_cuda_set_graphs` in the patched libmlx; a libmlx
+/// without it keeps them on) and returns the previous state. Inference thread only.
+pub fn setCudaGraphs(on: bool) bool {
+    const was = cuda_graphs_on;
+    if (comptime builtin.os.tag != .linux) return was;
+    if (on == was) return was;
+    if (!cuda_graphs_looked) {
+        cuda_graphs_looked = true;
+        if (std.c.dlopen(null, .{ .LAZY = true })) |self| {
+            if (std.c.dlsym(self, "mlx_cuda_set_graphs")) |f| cuda_graphs_fn = @ptrCast(@alignCast(f));
+        }
+    }
+    const f = cuda_graphs_fn orelse return was;
+    f(on);
+    cuda_graphs_on = on;
+    return was;
+}
+
 pub fn cudaAvailable() bool {
     if (cuda_cache == null) {
         var cuda = false;
@@ -979,10 +1070,120 @@ test "cudaHomeDefault: export /opt/cuda only when nothing else names a toolkit" 
     try std.testing.expect(cudaHomeDefault(false, false, false) == null);
 }
 
-test "weight loads go to the GPU on CUDA only where host memory never migrates there" {
-    try std.testing.expect(weightLoadOnGpu(true, true));
-    try std.testing.expect(!weightLoadOnGpu(true, false)); // native Linux: managed memory migrates
-    try std.testing.expect(!weightLoadOnGpu(false, true)); // Metal/CPU: no GPU `Load`
+test "ptxCacheDir: each staged MLX build compiles into its own kernel cache" {
+    var a: [256]u8 = undefined;
+    var b: [256]u8 = undefined;
+    const one = ptxCacheDir(&a, "/tmp", "1f2e3d4c5b6a7980").?;
+    try std.testing.expectEqualStrings("/tmp" ++ std.fs.path.sep_str ++ "mlx-serve-ptx" ++ std.fs.path.sep_str ++ "1f2e3d4c5b6a7980", one);
+    try std.testing.expect(!std.mem.eql(u8, one, ptxCacheDir(&b, "/tmp", "0000000000000001").?));
+    try std.testing.expect(ptxCacheDir(&a, "/tmp", "") == null); // unstamped build: MLX's own default
+    try std.testing.expect(ptxCacheDir(a[0..8], "/tmp", "1f2e3d4c5b6a7980") == null);
+}
+
+test "stampId: a rebuilt MLX gets a cache of its own, an unstamped build none" {
+    var a: [16]u8 = undefined;
+    var b: [16]u8 = undefined;
+    const one = stampId(&a, "mlx=64ea011cb65f backend=cuda cuda_arch=121 inputs=a83be3e5e701\n");
+    try std.testing.expectEqual(@as(usize, 16), one.len);
+    try std.testing.expectEqualStrings(one, stampId(&b, "mlx=64ea011cb65f backend=cuda cuda_arch=121 inputs=a83be3e5e701"));
+    try std.testing.expect(!std.mem.eql(u8, one, stampId(&b, "mlx=64ea011cb65f backend=cuda cuda_arch=121 inputs=f6a0d900c02d")));
+    try std.testing.expectEqualStrings("", stampId(&a, " \n"));
+}
+
+test "a custom CUDA kernel is written to MLX's kernel cache, so the next process loads it instead of compiling it" {
+    if (!cudaAvailable()) return error.SkipZigTest;
+    const io = std.testing.io;
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "msv_test_ptx_cache_{x}", .{crt.monotonicMs()}, 0);
+    const ins = [_][*:0]const u8{"x"};
+    const in_vec = mlx_vector_string_new_data(&ins, 1);
+    defer _ = mlx_vector_string_free(in_vec);
+    const outs = [_][*:0]const u8{"y"};
+    const out_vec = mlx_vector_string_new_data(&outs, 1);
+    defer _ = mlx_vector_string_free(out_vec);
+    const k = mlx_fast_cuda_kernel_new(name, in_vec, out_vec, "y[0] = x[0] + 1.0f;", "", false, 0);
+    defer mlx_fast_cuda_kernel_free(k);
+    const c = mlx_fast_cuda_kernel_config_new();
+    defer mlx_fast_cuda_kernel_config_free(c);
+    try check(mlx_fast_cuda_kernel_config_add_output_arg(c, &[_]c_int{1}, 1, .float32));
+    try check(mlx_fast_cuda_kernel_config_set_grid(c, 1, 1, 1));
+    try check(mlx_fast_cuda_kernel_config_set_thread_group(c, 1, 1, 1));
+    const x = mlx_array_new_float(1.0);
+    defer _ = mlx_array_free(x);
+    const v = mlx_vector_array_new_data(&[_]mlx_array{x}, 1);
+    defer _ = mlx_vector_array_free(v);
+    var o = mlx_vector_array_new();
+    defer _ = mlx_vector_array_free(o);
+    try check(mlx_fast_cuda_kernel_apply(&o, k, v, c, gpuStream()));
+    var y = mlx_array_new();
+    defer _ = mlx_array_free(y);
+    try check(mlx_vector_array_get(&y, o, 0));
+    try check(mlx_array_eval(y));
+
+    // MLX's cache: MLX_PTX_CACHE_DIR, else <tmp>/mlx/<version>/ptx.
+    var ver = mlx_string_new();
+    defer _ = mlx_string_free(ver);
+    try check(mlx_version(&ver));
+    var dir_buf: [1024]u8 = undefined;
+    const dir_path = if (std.c.getenv("MLX_PTX_CACHE_DIR")) |d| std.mem.span(d) else try std.fmt.bufPrint(&dir_buf, "{s}/mlx/{s}/ptx", .{
+        if (std.c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp", std.mem.span(mlx_string_data(ver)),
+    });
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var prefix_buf: [96]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "custom_kernel_{s}_", .{name});
+    var written: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |e| if (std.mem.startsWith(u8, e.name, prefix)) {
+        written += 1;
+        dir.deleteFile(io, e.name) catch {};
+    };
+    try std.testing.expect(written > 0);
+}
+
+test "setCudaGraphs: work evaluated with the graphs off, on and off again is bit-identical" {
+    if (!cudaAvailable()) return error.SkipZigTest;
+    const s = gpuStream();
+    var key = mlx_array_new();
+    defer _ = mlx_array_free(key);
+    try check(mlx_random_key(&key, 3));
+    var a = mlx_array_new();
+    defer _ = mlx_array_free(a);
+    try check(mlx_random_normal(&a, &[_]c_int{ 256, 512 }, 2, .bfloat16, 0, 1, key, s));
+    var outs: [3]mlx_array = .{ mlx_array_new(), mlx_array_new(), mlx_array_new() };
+    defer for (outs) |o| {
+        _ = mlx_array_free(o);
+    };
+    const states = [_]bool{ false, true, false };
+    for (states, &outs) |on, *o| {
+        _ = setCudaGraphs(on);
+        var t = mlx_array_new();
+        defer _ = mlx_array_free(t);
+        try check(mlx_transpose(&t, a, s));
+        var m = mlx_array_new();
+        defer _ = mlx_array_free(m);
+        try check(mlx_matmul(&m, a, t, s));
+        try check(mlx_add(o, m, m, s));
+        try check(mlx_array_eval(o.*));
+    }
+    try std.testing.expect(!setCudaGraphs(true)); // returns the state it replaced
+    try std.testing.expect(setCudaGraphs(true));
+    for (outs[1..]) |o| {
+        var eq = mlx_array_new();
+        defer _ = mlx_array_free(eq);
+        try check(mlx_array_equal(&eq, outs[0], o, false, s));
+        try check(mlx_array_eval(eq));
+        var same = false;
+        try check(mlx_array_item_bool(&same, eq));
+        try std.testing.expect(same);
+    }
+}
+
+test "weight loads go to the GPU's pool on CUDA where managed memory reads slow or never migrates" {
+    try std.testing.expect(weightLoadOnGpu(true, true, false));
+    try std.testing.expect(weightLoadOnGpu(true, false, true)); // DGX Spark: managed pages read at 2/3 speed
+    try std.testing.expect(!weightLoadOnGpu(true, false, false)); // discrete Linux: managed memory migrates
+    try std.testing.expect(!weightLoadOnGpu(false, true, true)); // Metal/CPU: no GPU `Load`
     try std.testing.expect(kernelReleaseIsWsl("6.18.54.1-microsoft-standard-WSL2"));
     try std.testing.expect(!kernelReleaseIsWsl("7.2.9-2-cachyos"));
 }

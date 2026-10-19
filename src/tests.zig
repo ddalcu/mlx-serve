@@ -50,6 +50,10 @@ test {
     _ = @import("moe_gather_ubench.zig");
     _ = @import("moe_affine4.zig");
     _ = @import("hc_decode2.zig");
+    _ = @import("hc_cuda.zig");
+    _ = @import("moe_cuda.zig");
+    _ = @import("moe_prefill_cuda.zig");
+    _ = @import("qsa_decode_cuda.zig");
     _ = @import("qsa_mask.zig");
     _ = @import("qsa_decode.zig");
     _ = @import("rowqmv.zig");

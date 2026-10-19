@@ -315,6 +315,7 @@ Loading + residency:
 - **Embedded engines**: one ds4 session per model, one llama.cpp sequence per request (`llama_ctx`, `session_claims`); ds4 in-checkpoint MTP only when the GGUF declares `nextn_predict_layers` on an arch ds4 embeds it for (`ds4_embedded_mtp_archs`; DSV4 ships its head apart); the `Tokenizer` is a STUB — count via `server.encodeText`, stop on the ENGINE's set (`isEog`/`isStop`, #667); embeddings refuse by NAME; a llama trim is FALLIBLE (cold-prefill on refusal). Guard: `tests/test_ds4_serve.sh`.
 - **An embedding SUB-BATCH is its own forward** (cache reset per sub-batch). Guard: `tests/test_embeddings.sh` [4c].
 - **A READY model never advertises LESS than its stub** (`readyHasChat`). Default bind 0.0.0.0 WARNS (`shouldWarnOpenBind`).
+- **On an integrated CUDA GPU (DGX Spark) managed memory reads at 2/3 bandwidth**: weights load on the GPU stream (`mlx.weightsInGpuPool`), arrays built from host bytes go through `mlx.toGpuPool`, and load-time passes run on `mlx.weightLoadStream()`: a CPU-stream op over a GPU load moves it to managed memory for good. Story: `docs/CUDA.md`.
 - **One port, one server** (`listenExclusive`): std's `reuse_address` also sets SO_REUSEPORT (a second instance stole the port); macOS clears it after bind, Linux (which joins the reuseport group AT bind) never sets it (`listenExclusiveLinux`).
 
 Memory bills + admission:
@@ -495,6 +496,9 @@ Kernels + numerics:
 - **Memory**: RSS is blind to Metal (`/props` `active_bytes`); a live handle pins its buffer through the eval, so free a step's intermediates BEFORE evaluating it; a weights MAP outliving the model pins every buffer; `iterator_next` hands a +1; `mlx_array_new_data` COPIES shape-worth of bytes; Metal at the working-set edge returns ZEROS before it aborts.
 - **Tokenizer**: special-token splitting only in `Tokenizer.encode` (first-byte buckets); any per-position loop over a vocab-derived collection needs an index.
 - **Upgrades**: mlx-c → diff `lib/mlxc-src/mlx/c/*.h` vs `src/mlx.zig`; ds4 → re-sync `ds4_ffi.zig` EngineOptions + CORE_OBJS; NAX presence asserted, never assumed.
+- **A CUDA kernel claiming MLX's bits reproduces what production RUNS**: MLX's DISPATCH (the sorted fp gather is `qmm_sm80` only from 16 rows and 4 per expert, `moe_prefill_cuda.mlxTakesExpertPath`) and the `mlx_compile`d closure, whose NVRTC bf16 `Add` differs from the op's (`hc prefill on CUDA`).
+- **On GB10 prefill runs without CUDA graphs** (`mlx.setCudaGraphs`, patched libmlx: kernels ran up to 2.3x slower inside them; decode keeps them), and MLX's SDPA gets an ADDITIVE mask (`qsaMaskArm`: a bool one becomes three `[B, H, S, kv]` arrays). Story: `docs/CUDA.md`.
+- **MLX caches its CUDA kernels by module NAME**: a patched `qmm_sm80` kept running from the cache (run-to-run drift); `mlx.exportPtxCacheDir` keys it by the staged `lib/mlx/.version`, passed through the build graph (`mlx_stamp`: a configure-time read is cached); after a hand edit to `lib/mlx-src` clear `<tmp>/mlx-serve-ptx`. Our `cuda_kernel`s are cached too (patched): uncached, NVRTC recompiled each per process.
 - **Kokoro**: safetensors READ on CPU stream; depthwise `ConvTranspose1d` transposes `{0,2,1}`; `AdaIN1d` is pure instance norm; `Vocab.encode` DROPS unknowns; reproducing an upstream NO-OP means NOT doing it (SineGen).
 - **ANE prefill (opt-in, M4-and-below, LOSSY)**: rules in `docs/reference.md` "ANE prefill rules"; parity = per-program cos/rms + perceived-content equivalence; `ready: N/M` under-count = silent partial coverage. Guard: `tests/test_ane_prefill.sh`.
 
