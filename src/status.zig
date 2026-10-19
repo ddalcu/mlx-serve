@@ -126,6 +126,23 @@ pub fn getAppMemFootprintMb() u32 {
     return @intCast(info.phys_footprint / (1024 * 1024));
 }
 
+extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *anyopaque) c_int;
+extern "c" fn proc_reset_footprint_interval(pid: c_int) c_int;
+
+/// The kernel's highest phys_footprint since the last `resetFootprintPeak` (rusage_info_v4's
+/// `ri_interval_max_phys_footprint`, byte offset 280): an exact peak, no sampling. 0 off macOS.
+pub fn footprintPeakBytes() u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return 0;
+    var ri: [37]u64 = @splat(0); // sizeof(rusage_info_v4) == 296
+    if (proc_pid_rusage(std.c.getpid(), 4, &ri) != 0) return 0; // RUSAGE_INFO_V4
+    return ri[280 / 8];
+}
+
+pub fn resetFootprintPeak() void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    _ = proc_reset_footprint_interval(std.c.getpid());
+}
+
 /// Bytes the OS will grant a new wiring: free (less speculative — free_count
 /// already contains them and `external` carries them back) plus file-backed,
 /// capped by the RAM outside wired + compressor. 0 on a failed query.

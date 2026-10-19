@@ -97,19 +97,24 @@ final class H3PlanningTests: XCTestCase {
     }
 
     /// The VAE stage is billed per canvas, mirroring the server's `h3VaeStageBytes`: measured
-    /// process peaks of the capped video decode (8-bit pack), 5.71 GiB at 512x288 x 56 to
-    /// 10.42 at 1120x640 x 192.
+    /// process peaks of the video decode (8-bit pack), 2.00 to 2.91 GiB streamed and 6.41 to
+    /// 7.29 GiB with the decoder held.
     func testVaeStageCoversTheMeasuredDecodePeaks() {
         let gib = 1024.0 * 1024.0 * 1024.0
-        for c in [(512, 288, 56, 5.71), (1120, 640, 56, 7.05), (512, 288, 192, 6.52),
-                  (768, 448, 124, 6.93), (1120, 640, 192, 10.42)] {
-            let bill = Double(H3Plan.vaeStageBytes(width: c.0, height: c.1, frames: c.2)) / gib
-            XCTAssertGreaterThanOrEqual(bill, c.3)
-            XCTAssertLessThan(bill, c.3 + 1.0)
+        for c in [(512, 288, 56, 2.00, 6.41), (640, 352, 107, 2.29, 6.68), (1120, 640, 56, 2.32, 6.68),
+                  (512, 288, 192, 2.34, 6.71), (768, 448, 124, 2.37, 6.77), (1120, 640, 192, 2.85, 7.24),
+                  (1344, 768, 124, 2.91, 7.29)] {
+            let streamed = Double(H3Plan.vaeStageBytes(width: c.0, height: c.1, frames: c.2)) / gib
+            XCTAssertGreaterThanOrEqual(streamed, c.3)
+            XCTAssertLessThan(streamed, c.3 + 1.0)
+            let held = Double(H3Plan.vaeStageBytes(width: c.0, height: c.1, frames: c.2,
+                                                   streamWeights: false)) / gib
+            XCTAssertGreaterThanOrEqual(held, c.4)
+            XCTAssertLessThan(held, c.4 + 1.5)
         }
-        // Without the fast recipe's cache, decoding 1120x640 x 192 holds more than sampling it.
-        XCTAssertEqual(H3Plan.peakBytes(model: h3, width: 1120, height: 640, frames: 192, fast: false),
-                       H3Plan.vaeStageBytes(width: 1120, height: 640, frames: 192))
+        // Streamed, decoding 1120x640 x 192 holds less than sampling it, even without the cache.
+        XCTAssertGreaterThan(H3Plan.peakBytes(model: h3, width: 1120, height: 640, frames: 192, fast: false),
+                             H3Plan.vaeStageBytes(width: 1120, height: 640, frames: 192))
     }
 
     /// Turning the fast recipe OFF removes the cache entirely (`bcast_k = 1`

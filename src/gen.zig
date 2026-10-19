@@ -4071,7 +4071,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         _ = mlx.mlx_get_active_memory(&active);
         const bill = h3CanvasBill(dit, activations, metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active, mlx.cudaAvailable());
         const held = minimax_h3.chainDeliveredFrames(chain_windows, shape.frame_count) - shape.frame_count;
-        const vae = h3VaeStageBytes(packFileBytes(io, allocator, engine.model_dir, "video_vae.safetensors"), width, height, shape.frame_count, held);
+        const vae = h3VaeStageBytes(packFileBytes(io, allocator, engine.model_dir, "video_vae.safetensors"), stream_weights, width, height, shape.frame_count, held);
         const te = h3TeResidentBytes(packFileBytes(io, allocator, engine.model_dir, "text_encoder.safetensors"), stream_weights);
         const gb = 1024.0 * 1024.0 * 1024.0;
         const avail_gb = @as(f64, @floatFromInt(bill.avail)) / gb;
@@ -5002,21 +5002,20 @@ pub fn h3DitResidentBytes(dit_file: u64, precompute: bool, stream: bool) u64 {
 /// see). The text encoder is one forward over a few hundred prompt rows and carries none.
 pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64) u64 {
     if (te == 0 and dit_resident == 0 and video_vae == 0) return 0; // unknown dir → never block
-    return stagedPeakBytes(0, &.{ te, dit_resident + H3_REQUEST_BASE_BYTES, h3VaeStageBytes(video_vae, 0, 0, 0, 0) });
+    return stagedPeakBytes(0, &.{ te, dit_resident + H3_REQUEST_BASE_BYTES, h3VaeStageBytes(video_vae, true, 0, 0, 0, 0) });
 }
 
-/// The VAE stage of one window, measured (process footprint, 8-bit pack, 8M-138M decoded pixels):
-/// the video decoder, a base, and what the capped decode holds per decoded pixel
-/// (`minimax_h3.VAE_DECODE_KEEP_PER_PX` plus the decoded chunks), plus the f32 pixels of the
-/// `held_frames` earlier chain windows keep. The audio decode, the RGB conversion and the send
-/// come after the decoder is freed and hold less.
-pub const H3_VAE_BASE_BYTES: u64 = 800 << 20;
-pub const H3_VAE_PIXEL_BYTES: u64 = 40;
+/// The VAE stage of one window, measured (process footprint, 8-bit pack): the tile batch in
+/// flight (`minimax_h3_vae.TILE_BATCH_ROWS`) with its streamed block, plus 3 B (u8 RGB) per
+/// delivered pixel, earlier chain windows' frames included. A held decoder adds its file. The
+/// audio decode, the conversion and the send come after the decoder is freed and hold less.
+pub const H3_VAE_BASE_BYTES: u64 = 2816 << 20;
+pub const H3_VAE_PIXEL_BYTES: u64 = 3;
 
-pub fn h3VaeStageBytes(video_vae: u64, width: u32, height: u32, frames: u32, held_frames: u32) u64 {
+pub fn h3VaeStageBytes(video_vae: u64, stream: bool, width: u32, height: u32, frames: u32, held_frames: u32) u64 {
     if (video_vae == 0) return 0;
     const frame_px = @as(u64, width) * height;
-    return video_vae + H3_VAE_BASE_BYTES + frame_px * (@as(u64, frames) * H3_VAE_PIXEL_BYTES + @as(u64, held_frames) * 12);
+    return (if (stream) 0 else video_vae) + H3_VAE_BASE_BYTES + frame_px * (@as(u64, frames) + held_frames) * H3_VAE_PIXEL_BYTES;
 }
 
 /// Sequence rows one window puts through the DiT: video latents on the 32-pixel grid, stereo
@@ -6913,7 +6912,8 @@ test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint 
     // video VAE, the video decoder before the audio one. Billing any two together
     // refuses a Mac that would work — the VAEs used to be added to the DiT term.
     try std.testing.expectEqual(35 * GB + act, h3PeakBytes(28 * GB, 35 * GB, 5 * GB));
-    try std.testing.expectEqual(h3VaeStageBytes(9 * GB, 0, 0, 0, 0), h3PeakBytes(4 * GB, 3 * GB, 9 * GB));
+    // The decoder streams in the request default, so its file is no stage of its own.
+    try std.testing.expectEqual(3 * GB + act, h3PeakBytes(2 * GB, 3 * GB, 9 * GB));
     // The TE stage carries no generation transients — one forward over a few
     // hundred prompt rows. Adding them to it is what refused the 8-bit pack.
     try std.testing.expectEqual(48 * GB, h3PeakBytes(48 * GB, 35 * GB, 5 * GB));
@@ -6938,26 +6938,29 @@ test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint 
 }
 
 test "h3 VAE stage covers the measured decode peaks without billing a canvas twice" {
-    const MiB: f64 = 1024 * 1024;
+    const GiB: f64 = 1024 * 1024 * 1024;
     const video_vae: u64 = 5_207_808_496; // the 8-bit pack's video_vae.safetensors
-    // Process-footprint peaks of the video decode, 8-bit FL2VA pack, MiB.
-    const Case = struct { w: u32, h: u32, f: u32, peak: f64 };
+    // Process-footprint peaks of the video decode, 8-bit FL2VA pack, GiB: streamed, then held.
+    const Case = struct { w: u32, h: u32, f: u32, streamed: f64, held: f64 };
     const cases = [_]Case{
-        .{ .w = 512, .h = 288, .f = 56, .peak = 5.71 * 1024 },
-        .{ .w = 1120, .h = 640, .f = 56, .peak = 7.05 * 1024 },
-        .{ .w = 512, .h = 288, .f = 192, .peak = 6.52 * 1024 },
-        .{ .w = 768, .h = 448, .f = 124, .peak = 6.93 * 1024 },
-        .{ .w = 1120, .h = 640, .f = 192, .peak = 10.42 * 1024 },
+        .{ .w = 512, .h = 288, .f = 56, .streamed = 2.00, .held = 6.41 },
+        .{ .w = 640, .h = 352, .f = 107, .streamed = 2.29, .held = 6.68 },
+        .{ .w = 1120, .h = 640, .f = 56, .streamed = 2.32, .held = 6.68 },
+        .{ .w = 512, .h = 288, .f = 192, .streamed = 2.34, .held = 6.71 },
+        .{ .w = 768, .h = 448, .f = 124, .streamed = 2.37, .held = 6.77 },
+        .{ .w = 1120, .h = 640, .f = 192, .streamed = 2.85, .held = 7.24 },
+        .{ .w = 1344, .h = 768, .f = 124, .streamed = 2.91, .held = 7.29 },
     };
     for (cases) |c| {
-        const bill = @as(f64, @floatFromInt(h3VaeStageBytes(video_vae, c.w, c.h, c.f, 0))) / MiB;
-        try std.testing.expect(bill >= c.peak);
-        try std.testing.expect(bill < c.peak + 1024);
+        const streamed = @as(f64, @floatFromInt(h3VaeStageBytes(video_vae, true, c.w, c.h, c.f, 0))) / GiB;
+        try std.testing.expect(streamed >= c.streamed and streamed < c.streamed + 1);
+        const held = @as(f64, @floatFromInt(h3VaeStageBytes(video_vae, false, c.w, c.h, c.f, 0))) / GiB;
+        try std.testing.expect(held >= c.held and held < c.held + 1.5);
     }
-    // A chained window also holds the earlier windows' f32 pixels.
-    try std.testing.expectEqual(h3VaeStageBytes(video_vae, 512, 288, 192, 0) + 512 * 288 * 191 * 12, h3VaeStageBytes(video_vae, 512, 288, 192, 191));
-    // The per-model gate bills the smallest request: the decoder and the base, no canvas.
-    try std.testing.expectEqual(h3VaeStageBytes(video_vae, 0, 0, 0, 0), h3PeakBytes(2 << 30, 1 << 30, video_vae));
+    // A chained window also holds the earlier windows' frames, as u8 RGB.
+    try std.testing.expectEqual(h3VaeStageBytes(video_vae, true, 512, 288, 192, 0) + 512 * 288 * 191 * 3, h3VaeStageBytes(video_vae, true, 512, 288, 192, 191));
+    // The per-model gate bills the smallest streamed request: the base, no canvas.
+    try std.testing.expectEqual(h3VaeStageBytes(video_vae, true, 0, 0, 0, 0), h3PeakBytes(1 << 30, 0, video_vae));
 }
 
 test "h3 request rows: latent frames on the 32-pixel grid, stereo audio, one frame of rows per keyframe" {
@@ -7070,9 +7073,9 @@ test "h3 streamed text encoder bills what stays resident and still covers the me
     const vision_peak: u64 = 2_930 * 1024 * 1024;
     try std.testing.expect(te >= vision_peak and te < vision_peak + 2 * GiB);
     try std.testing.expectEqual(@as(u64, 300), h3TeResidentBytes(300, true)); // never above the file
-    // Streamed, the 8-bit pack's staged peak is the VAE stage, not the encoder.
+    // Streamed, the 8-bit pack's video decode is no longer its biggest stage.
     const MB: u64 = 1024 * 1024;
-    try std.testing.expectEqual(h3VaeStageBytes(4_966 * MB, 0, 0, 0, 0), h3PeakBytes(te, h3DitResidentBytes(35_248_980_296, true, true) + 747 * MB, 4_966 * MB));
+    try std.testing.expect(h3VaeStageBytes(4_966 * MB, true, 0, 0, 0, 0) < h3PeakBytes(te, h3DitResidentBytes(35_248_980_296, true, true) + 747 * MB, 4_966 * MB));
 }
 
 test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
@@ -7104,7 +7107,7 @@ test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
 
     // H3: max(TE 300, DiT term of 500 + activations, the video VAE stage); streamed, the DiT term is 25.
     const dit = h3DitResidentBytes(500, minimax_h3.adalnPrecomputeOn(), minimax_h3.ditStreamOn(true));
-    const vae = h3VaeStageBytes(120, 0, 0, 0, 0);
+    const vae = h3VaeStageBytes(120, true, 0, 0, 0, 0);
     try std.testing.expectEqual(@max(dit + H3_REQUEST_BASE_BYTES, vae), estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
 
     // A pack shipping the Turbo LoRA bills it on the DiT term (it is resident

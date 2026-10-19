@@ -62,17 +62,18 @@ enum H3Plan {
     /// on disk, rounded up — the server bills the real file the same way).
     static let turboLoraBytes: UInt64 = 800 * 1024 * 1024
 
-    /// The video decode stage, mirroring the server's `h3VaeStageBytes`: the
-    /// decoder file, a base, and what the capped decode holds per delivered
-    /// pixel; frames held from earlier chained windows add their f32 pixels.
+    /// The video decode stage, mirroring the server's `h3VaeStageBytes`: the tile batch in
+    /// flight with its streamed block, plus u8 RGB for every delivered pixel, frames held from
+    /// earlier chained windows included. A decoder that does not stream adds its file.
     /// The VAEs are shared by every H3 pack, so the file size is one constant.
     static let videoVaeBytes: UInt64 = 5_207_808_496
-    static let vaeBaseBytes: UInt64 = 800 << 20
-    static let vaePixelBytes: UInt64 = 40
-    static func vaeStageBytes(width: Int, height: Int, frames: Int, heldFrames: Int = 0) -> UInt64 {
+    static let vaeBaseBytes: UInt64 = 2816 << 20
+    static let vaePixelBytes: UInt64 = 3
+    static func vaeStageBytes(width: Int, height: Int, frames: Int, heldFrames: Int = 0,
+                              streamWeights: Bool = true) -> UInt64 {
         let px = UInt64(max(0, width)) * UInt64(max(0, height))
-        return videoVaeBytes + vaeBaseBytes
-            + px * (UInt64(max(0, frames)) * vaePixelBytes + UInt64(max(0, heldFrames)) * 12)
+        return (streamWeights ? 0 : videoVaeBytes) + vaeBaseBytes
+            + px * (UInt64(max(0, frames)) + UInt64(max(0, heldFrames))) * vaePixelBytes
     }
 
     /// Peak unified memory for one generation, in bytes.
@@ -99,7 +100,8 @@ enum H3Plan {
             + (fast ? pabCacheBytes(rows: r, cache8bit: cache8bit) : 0)
             + (turbo ? turboLoraBytes : 0)
             + requestBaseBytes + UInt64(r) * activationBytesPerRow
-        return max(loadPeak, sampling, vaeStageBytes(width: width, height: height, frames: frames))
+        return max(loadPeak, sampling, vaeStageBytes(width: width, height: height, frames: frames,
+                                                    streamWeights: !held))
     }
 
     /// "12 GB peak memory usage": the plan `fits` checks, for the longest shot of a run.

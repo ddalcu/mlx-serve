@@ -40,6 +40,7 @@ const h3_glue = @import("h3_glue.zig");
 const add_norm = @import("add_norm.zig");
 const ane = @import("ane.zig");
 const gen_sse = @import("gen_sse.zig");
+const status = @import("status.zig");
 /// Vision presentation math (grids, adaLN tags, mRoPE), pinned against
 /// ComfyUI's own output by `fixtures/minimax_h3_vision.json`.
 pub const h3v = @import("minimax_h3_vision.zig");
@@ -3964,8 +3965,10 @@ pub const GenPaths = struct {
 };
 
 pub const GenResult = struct {
-    /// [1, 3, frames, H, W] in [-1, 1].
-    pixels: mlx.mlx_array,
+    /// [frames, H, W, 3] u8.
+    rgb: mlx.mlx_array,
+    /// The last frame [1, 3, 1, H, W] f32 in [-1, 1]: the next chained window's keyframe.
+    last_frame: mlx.mlx_array,
     /// Final audio latent [1, 32, 2, audio_t], still in latent space.
     audio_latent: mlx.mlx_array,
     /// Decoded stereo waveform [2, L] at 32 kHz, when an audio VAE was given.
@@ -3975,9 +3978,41 @@ pub const GenResult = struct {
     height: u32,
 
     pub fn deinit(self: *GenResult) void {
-        _ = mlx.mlx_array_free(self.pixels);
+        _ = mlx.mlx_array_free(self.rgb);
+        _ = mlx.mlx_array_free(self.last_frame);
         _ = mlx.mlx_array_free(self.audio_latent);
         if (self.audio) |a| _ = mlx.mlx_array_free(a);
+    }
+};
+
+/// The process-footprint and MLX peaks of each phase of one run, one `[h3-mem]` line per phase.
+/// The footprint peak is the kernel's own (`status.footprintPeakBytes`), so no spike is missed.
+const MemPhases = struct {
+    name: []const u8,
+    clock: LapClock,
+
+    fn begin(io: std.Io, name: []const u8) MemPhases {
+        status.resetFootprintPeak();
+        _ = mlx.mlx_reset_peak_memory();
+        return .{ .name = name, .clock = LapClock.init(io) };
+    }
+
+    /// Logs the phase that ends here and starts `next_name`.
+    fn next(self: *MemPhases, next_name: []const u8) void {
+        var peak: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&peak);
+        var active: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        const g: f64 = 1024.0 * 1024.0 * 1024.0;
+        log.info("[h3-mem] {s}: footprint peak {d:.2} GiB, mlx peak {d:.2} GiB, {d} ms\n", .{
+            self.name,
+            @as(f64, @floatFromInt(status.footprintPeakBytes())) / g,
+            @as(f64, @floatFromInt(@max(peak, active))) / g,
+            self.clock.lapMs(),
+        });
+        status.resetFootprintPeak();
+        _ = mlx.mlx_reset_peak_memory();
+        self.name = next_name;
     }
 };
 
@@ -4241,6 +4276,7 @@ fn generateOne(
     });
 
     var phase_timer = LapClock.init(io);
+    var mem = MemPhases.begin(io, "prepare");
 
     // H3's DiT runs EVERY forward at prefill width (~9K rows at 480p), where
     // the wide-M dequant+GEMM route measured −13%/step on the 8-bit pack
@@ -4522,6 +4558,7 @@ fn generateOne(
     try present.append(allocator, .{ .text = ids });
 
     // ── 3. text encoder, then FREE it before the DiT loads (kept when resident) ──
+    mem.next("text encoder");
     var te_active: usize = 0;
     var enc: EncodedPrompt = blk: {
         const needs_vision = for (present.items) |it| {
@@ -4578,6 +4615,7 @@ fn generateOne(
     });
 
     // ── 4. DiT sampling ──
+    mem.next("dit load");
     var layout = try PackedLayout.initFull(allocator, te_len, shape.latent_t, lat_h, lat_w, shape.audio_t, anchors, shape.frame_count, ref_blocks);
     defer layout.deinit();
     // BORROWED from `enc`, which outlives the layout. Empty for a pure t2va
@@ -4668,6 +4706,7 @@ fn generateOne(
         defer rope.deinit();
         try mlx.check(mlx.mlx_array_eval(refined));
         log.info("[minimax-h3] dit loaded in {d} ms, text refined in {d} ms\n", .{ load_ms, phase_timer.lapMs() });
+        mem.next("denoise");
 
         // ── sparse attention (OPT-IN) ──
         model.sparse_policy = sparsePolicyFrom(envStr("MINIMAX_H3_SPARSE_ATTN"));
@@ -4879,6 +4918,7 @@ fn generateOne(
     log.info("[minimax-h3] sampling done in {d} ms, DiT released\n", .{phase_timer.lapMs()});
 
     // ── 4. VAE decode ──
+    mem.next("video vae");
     // Unpatchify the video rows back to a latent volume: rows are
     // (t, h/2, w/2) major with C*2*2 per row.
     const zlat = try unpatchifyVideoRows(video_x, shape.latent_t, lat_h, lat_w, s);
@@ -4886,13 +4926,15 @@ fn generateOne(
 
     if (progress) |p| p.emit("Decoding video", req.steps, req.steps);
     _ = phase_timer.lapMs();
-    // Scoped: the video decoder is freed before the audio VAE loads.
-    const pixels = blk: {
-        var dec = try vae_mod.Decoder.loadFile(allocator, paths.vae, .{}, dt, s);
+    // Scoped: the video decoder is freed before the audio VAE loads. It streams its blocks like the DiT.
+    const stream_vae = req.stream_weights and req.resident == null;
+    var video = blk: {
+        var dec = try vae_mod.Decoder.loadFile(allocator, paths.vae, .{}, dt, s, stream_vae);
         defer dec.deinit();
-        break :blk try decodeVideo(&dec, zlat, allocator, s);
+        if (stream_vae) log.info("[minimax-h3] video decoder: block weights stream from disk once per tile batch\n", .{});
+        break :blk try vae_mod.decode(&dec, zlat, allocator, s);
     };
-    errdefer _ = mlx.mlx_array_free(pixels);
+    errdefer video.deinit();
     _ = mlx.mlx_clear_cache();
     log.info("[minimax-h3] video decoded in {d} ms (load+decode)\n", .{phase_timer.lapMs()});
 
@@ -4900,6 +4942,7 @@ fn generateOne(
     errdefer _ = mlx.mlx_array_free(audio_latent);
 
     // ── 5. audio VAE (optional) ──
+    mem.next("audio vae");
     var audio_wave: ?mlx.mlx_array = null;
     if (paths.audio_vae) |apath| {
         if (progress) |p| p.emit("Decoding audio", req.steps, req.steps);
@@ -4919,34 +4962,17 @@ fn generateOne(
         log.info("[minimax-h3] audio decoded: {d} samples/ch at {d} Hz ({d} ms)\n", .{ mlx.getShape(wave)[1], audio_mod.SAMPLE_RATE, phase_timer.lapMs() });
     }
 
-    const pshape = mlx.getShape(pixels);
+    mem.next("");
+    const pshape = mlx.getShape(video.rgb);
     return .{
-        .pixels = pixels,
+        .rgb = video.rgb,
+        .last_frame = video.last,
         .audio_latent = audio_latent,
         .audio = audio_wave,
-        .frame_count = @intCast(pshape[2]),
-        .height = @intCast(pshape[3]),
-        .width = @intCast(pshape[4]),
+        .frame_count = @intCast(pshape[0]),
+        .height = @intCast(pshape[1]),
+        .width = @intCast(pshape[2]),
     };
-}
-
-/// What the video decode keeps beyond its weights, per decoded pixel: the bf16 chunks and their
-/// concat, then the denormalize chain's f32 input and output.
-pub const VAE_DECODE_KEEP_PER_PX: usize = 36;
-
-/// The decode ends in six full-video f32 ops; encoded ahead, MLX holds every one of them.
-fn decodeVideo(dec: *const @import("minimax_h3_vae.zig").Decoder, z: mlx.mlx_array, allocator: std.mem.Allocator, s: S) !mlx.mlx_array {
-    const vae = @import("minimax_h3_vae.zig");
-    const shp = mlx.getShape(z);
-    const frames: usize = vae.planTemporal(@intCast(shp[2])).output_frames;
-    const px = frames * @as(usize, @intCast(shp[3] * shp[4])) * vae.VAE_RATIO * vae.VAE_RATIO;
-    const cap = DenoiseMemCap.begin();
-    defer cap.end();
-    cap.step(px * VAE_DECODE_KEEP_PER_PX);
-    const out = try vae.decode(dec, z, allocator, s);
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_array_eval(out));
-    return out;
 }
 
 // ── Chained windows ─────────────────────────────────────────────────────────
@@ -4959,20 +4985,6 @@ pub fn chainDeliveredFrames(windows: u32, window_frames: u32) u32 {
 
 /// One video frame of audio — the cross-fade width at each seam.
 pub const CHAIN_OVERLAP_SAMPLES: usize = audio_mod.SAMPLE_RATE / FPS;
-
-/// [1,3,F,H,W] -> [1,3,hi-lo,H,W]. The frame slice is never row-contiguous
-/// (channel planes are strided across it), so `contig` materializes a REAL
-/// copy and the window's 0.7 GB pixel buffer is not pinned by a view.
-fn sliceFrames(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
-    const shp = mlx.getShape(x);
-    const start = [_]c_int{ 0, 0, lo, 0, 0 };
-    const stop = [_]c_int{ shp[0], shp[1], hi, shp[3], shp[4] };
-    const step = [_]c_int{ 1, 1, 1, 1, 1 };
-    var o = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(o);
-    try mlx.check(mlx.mlx_slice(&o, x, &start, 5, &stop, 5, &step, 5, s));
-    return contig(o, s);
-}
 
 /// Equal-power cross-fade join of mono sample runs: `out` is seg0, then each
 /// later segment fades in over `overlap` samples of what was already written
@@ -5181,10 +5193,13 @@ fn generateChain(
         const rframes: c_int = @intCast(res.frame_count);
         out_w = res.width;
         out_h = res.height;
-        var rp: ?mlx.mlx_array = res.pixels;
+        var rp: ?mlx.mlx_array = res.rgb;
         errdefer if (rp) |x| {
             _ = mlx.mlx_array_free(x);
         };
+        // The last frame is the next window's keyframe, and the clip's own after the final window.
+        if (prev_last) |x| _ = mlx.mlx_array_free(x);
+        prev_last = res.last_frame;
         if (res.audio) |wave| {
             waves.append(allocator, wave) catch |e| {
                 _ = mlx.mlx_array_free(wave);
@@ -5198,11 +5213,6 @@ fn generateChain(
             _ = mlx.mlx_array_free(res.audio_latent);
         }
 
-        if (w + 1 < n) {
-            if (prev_last) |x| _ = mlx.mlx_array_free(x);
-            prev_last = try sliceFrames(rp.?, rframes - 1, rframes, s);
-            try mlx.check(mlx.mlx_array_eval(prev_last.?));
-        }
         // Drop the duplicate join frame: window w>0's frame 0 reproduces the
         // keyframe that conditioned it, which the previous window already
         // delivered as its last frame.
@@ -5211,7 +5221,7 @@ fn generateChain(
             rp = null;
             break :blk p;
         } else blk: {
-            const sl = try sliceFrames(rp.?, 1, rframes, s);
+            const sl = try sliceAxis0(rp.?, 1, rframes, s);
             errdefer _ = mlx.mlx_array_free(sl);
             try mlx.check(mlx.mlx_array_eval(sl));
             _ = mlx.mlx_array_free(rp.?);
@@ -5232,11 +5242,13 @@ fn generateChain(
         for (pixel_segs.items) |p| _ = mlx.mlx_vector_array_append_value(vec, p);
         var o = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(o);
-        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 2, s));
+        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 0, s));
         try mlx.check(mlx.mlx_array_eval(o));
         break :blk o;
     };
     errdefer _ = mlx.mlx_array_free(joined);
+    for (pixel_segs.items) |x| _ = mlx.mlx_array_free(x);
+    pixel_segs.clearRetainingCapacity();
 
     var audio_joined: ?mlx.mlx_array = null;
     if (have_audio and waves.items.len == n) {
@@ -5248,12 +5260,16 @@ fn generateChain(
     _ = mlx.mlx_clear_cache();
 
     const pshape = mlx.getShape(joined);
-    log.info("[minimax-h3] chain joined: {d} windows -> {d} frames, audio {s}\n", .{ n, pshape[2], if (audio_joined != null) "cross-faded" else "absent" });
+    log.info("[minimax-h3] chain joined: {d} windows -> {d} frames, audio {s}\n", .{ n, pshape[0], if (audio_joined != null) "cross-faded" else "absent" });
+    const last_frame = prev_last orelse return error.ChainNoWindows;
+    const audio_latent = final_latent orelse return error.ChainNoWindows;
+    prev_last = null;
     return .{
-        .pixels = joined,
-        .audio_latent = final_latent orelse return error.ChainNoWindows,
+        .rgb = joined,
+        .last_frame = last_frame,
+        .audio_latent = audio_latent,
         .audio = audio_joined,
-        .frame_count = @intCast(pshape[2]),
+        .frame_count = @intCast(pshape[0]),
         .height = out_h,
         .width = out_w,
     };
@@ -5261,23 +5277,18 @@ fn generateChain(
 
 // ── Output conversion ───────────────────────────────────────────────────────
 
-/// [1,3,F,H,W] in [-1,1] -> tightly packed [F,H,W,3] u8. Caller owns.
+/// The frames as tightly packed [F,H,W,3] u8 bytes. Caller owns.
 pub fn pixelsToRgb8(allocator: std.mem.Allocator, res: *const GenResult, s: S) ![]u8 {
-    const out = blk: {
-        const u8a = try rgb8Lazy(res.pixels, s);
-        defer _ = mlx.mlx_array_free(u8a);
-        try mlx.check(mlx.mlx_array_eval(u8a));
-        const n: usize = @intCast(mlx.mlx_array_size(u8a));
-        const raw = mlx.mlx_array_data_uint8(u8a) orelse return error.NoPixelData;
-        break :blk try allocator.dupe(u8, raw[0..n]);
-    };
-    _ = mlx.mlx_clear_cache();
-    return out;
+    _ = s;
+    try mlx.check(mlx.mlx_array_eval(res.rgb));
+    const n: usize = @intCast(mlx.mlx_array_size(res.rgb));
+    const raw = mlx.mlx_array_data_uint8(res.rgb) orelse return error.NoPixelData;
+    return allocator.dupe(u8, raw[0..n]);
 }
 
-/// The chain's handles are freed BEFORE the eval: a live handle pins its buffer through it, and
-/// then every full-video f32 step is held at once instead of donated in place.
-fn rgb8Lazy(pixels: mlx.mlx_array, s: S) !mlx.mlx_array {
+/// [1,3,F,H,W] in [-1,1] -> [F,H,W,3] u8. The chain's handles are freed BEFORE the eval: a live
+/// handle pins its buffer through it, and then every f32 step is held at once instead of donated.
+pub fn rgb8Lazy(pixels: mlx.mlx_array, s: S) !mlx.mlx_array {
     const p = try transpose(pixels, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
     defer _ = mlx.mlx_array_free(p);
     const pc = try contig(p, s);
@@ -5420,7 +5431,7 @@ test "minimax h3 live: generates a clip" {
 
     // The pipeline can produce a plausible-looking tensor full of NaN; a
     // finiteness check has to come BEFORE anything that inspects values.
-    const finite = try allFinite(res.pixels, s);
+    const finite = try allFinite(res.last_frame, s);
     try testing.expect(finite);
     try testing.expectEqual(alignFrameCount(@max(5, frames)), res.frame_count);
     try testing.expectEqual(envU32("MINIMAX_H3_WIDTH", size), res.width);
@@ -5486,30 +5497,13 @@ fn allFinite(x: mlx.mlx_array, s: S) !bool {
     return b;
 }
 
-/// [-1,1] pixels -> 8-bit RGB frames on disk (raw + PNG).
+/// The frames on disk (raw + PNG).
 fn writeFrames(a: std.mem.Allocator, io: std.Io, res: *const GenResult, out_dir: []const u8, s: S) !void {
+    _ = s;
     const png = @import("png.zig");
-    // [1,3,F,H,W] -> [F,H,W,3] u8
-    const p = try transpose(res.pixels, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
-    defer _ = mlx.mlx_array_free(p);
-    const pc = try contig(p, s);
-    defer _ = mlx.mlx_array_free(pc);
-    const half = try scalarLike(0.5, pc, s);
-    defer _ = mlx.mlx_array_free(half);
-    const shifted = try addA(pc, try oneLike(pc, s), s);
-    defer _ = mlx.mlx_array_free(shifted);
-    const unit = try mulA(shifted, half, s);
-    defer _ = mlx.mlx_array_free(unit);
-    const c255 = try scalarLike(255.0, unit, s);
-    defer _ = mlx.mlx_array_free(c255);
-    const scaled = try mulA(unit, c255, s);
-    defer _ = mlx.mlx_array_free(scaled);
-    const u8a = try astype(scaled, mlx.mlx_dtype.uint8, s);
-    defer _ = mlx.mlx_array_free(u8a);
-    try mlx.check(mlx.mlx_array_eval(u8a));
-
+    try mlx.check(mlx.mlx_array_eval(res.rgb));
     const n = res.frame_count * res.height * res.width * 3;
-    const raw = mlx.mlx_array_data_uint8(u8a) orelse return error.NoPixelData;
+    const raw = mlx.mlx_array_data_uint8(res.rgb) orelse return error.NoPixelData;
 
     std.Io.Dir.cwd().createDirPath(io, out_dir) catch {};
     var d = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
@@ -7727,7 +7721,7 @@ test "minimax h3: a video decoder loaded from its file holds one copy of its wei
     _ = mlx.mlx_clear_cache();
     var before: usize = 0;
     _ = mlx.mlx_get_active_memory(&before);
-    var dec = try vae.Decoder.loadFile(a, path, cfg, .bfloat16, s);
+    var dec = try vae.Decoder.loadFile(a, path, cfg, .bfloat16, s, false);
     defer dec.deinit();
     _ = mlx.mlx_synchronize(s);
     var after: usize = 0;
@@ -7743,35 +7737,79 @@ test "minimax h3: a video decoder loaded from its file holds one copy of its wei
     defer ref.deinit();
     const z = try toyRand(&.{ 1, @intCast(cfg.in_channels), 2, 2, 2 }, 7, s);
     defer _ = mlx.mlx_array_free(z);
-    const want = try vae.decode(&ref, z, a, s);
-    defer _ = mlx.mlx_array_free(want);
-    const got = try vae.decode(&dec, z, a, s);
-    defer _ = mlx.mlx_array_free(got);
-    try mlx.check(mlx.mlx_array_eval(want));
-    try mlx.check(mlx.mlx_array_eval(got));
-    try expectBitEqual(got, want, "file-loaded video decoder", s);
+    var want = try vae.decode(&ref, z, a, s);
+    defer want.deinit();
+    var got = try vae.decode(&dec, z, a, s);
+    defer got.deinit();
+    try expectBitEqual(got.rgb, want.rgb, "file-loaded video decoder frames", s);
+    try expectBitEqual(got.last, want.last, "file-loaded video decoder last frame", s);
+}
+
+test "minimax h3: a streamed video decoder holds only its head and decodes the resident decoder's bytes" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const vae = @import("minimax_h3_vae.zig");
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/video_vae.safetensors", .{pbuf[0..root_len]}, 0);
+    defer a.free(path);
+    const cfg = vae.DecCfg{ .layers = 3, .heads = 4, .head_dim = 32 };
+    try writeToyVideoVae(path, cfg, 1024, s);
+
+    var held = try vae.Decoder.loadFile(a, path, cfg, .bfloat16, s, false);
+    defer held.deinit();
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    var streamed = try vae.Decoder.loadFile(a, path, cfg, .bfloat16, s, true);
+    defer streamed.deinit();
+    _ = mlx.mlx_synchronize(s);
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    // The bar: streaming holds the embedder and head only, under a third of the whole decoder.
+    try testing.expect(after -| before <= held.weightBytes() / 3);
+
+    // 20x20 latents tile 2x2 at 320 px, and 8 latent frames make several temporal clips.
+    const z = try toyRand(&.{ 1, @intCast(cfg.in_channels), 8, 20, 20 }, 9, s);
+    defer _ = mlx.mlx_array_free(z);
+    var want = try vae.decodeBatched(&held, z, 1, a, s);
+    defer want.deinit();
+    var got = try vae.decode(&streamed, z, a, s);
+    defer got.deinit();
+    try expectBitEqual(got.rgb, want.rgb, "streamed video decoder frames", s);
+    try expectBitEqual(got.last, want.last, "streamed video decoder last frame", s);
+    _ = mlx.mlx_synchronize(s);
+    var end: usize = 0;
+    _ = mlx.mlx_get_active_memory(&end);
+    // No block weight stays behind: what is left beyond the head is the two decodes' outputs.
+    const outputs = 2 * (mlx.mlx_array_size(got.rgb) + 4 * mlx.mlx_array_size(got.last));
+    try testing.expect(end -| after <= outputs + (1 << 20));
 }
 
 test "minimax h3: the rgb conversion holds the f32 copy and the bytes, not every step of its chain" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const a = testing.allocator;
     const s = mlx.gpuStream();
     const shape = [_]c_int{ 1, 3, 8, 256, 512 };
-    var res = GenResult{ .pixels = try toyRand(&shape, 3, s), .audio_latent = mlx.mlx_array_new(), .frame_count = 8, .width = 512, .height = 256 };
-    defer res.deinit();
-    try mlx.check(mlx.mlx_array_eval(res.pixels));
-    const values: usize = mlx.mlx_array_size(res.pixels);
+    const px = try toyRand(&shape, 3, s);
+    defer _ = mlx.mlx_array_free(px);
+    try mlx.check(mlx.mlx_array_eval(px));
+    const values: usize = mlx.mlx_array_size(px);
     _ = mlx.mlx_clear_cache();
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     _ = mlx.mlx_reset_peak_memory();
-    const rgb = try pixelsToRgb8(a, &res, s);
-    defer a.free(rgb);
+    const rgb = try rgb8Lazy(px, s);
+    defer _ = mlx.mlx_array_free(rgb);
+    try mlx.check(mlx.mlx_array_eval(rgb));
     var peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak);
     // The bar: the transposed f32 copy (4 B a value) and the u8 result (1), with slack for one more byte.
     try testing.expect(peak -| active <= values * 6);
-    try testing.expectEqual(values, rgb.len);
+    try testing.expectEqual(values, @as(usize, @intCast(mlx.mlx_array_size(rgb))));
 }
 
 test "minimax h3: the measured >=30-step schedules are unchanged" {

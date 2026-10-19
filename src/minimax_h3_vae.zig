@@ -379,6 +379,39 @@ const DecBlockW = struct {
     }
 };
 
+fn loadBlock(w: *const Weights, a: std.mem.Allocator, i: usize, dt: mlx.mlx_dtype, s: S) !DecBlockW {
+    const p = try std.fmt.allocPrint(a, "decoder.transformer_blocks.{d}", .{i});
+    defer a.free(p);
+    const attn_p = try std.fmt.allocPrint(a, "{s}.attn.to_qkv", .{p});
+    defer a.free(attn_p);
+    const out_p = try std.fmt.allocPrint(a, "{s}.attn.to_out", .{p});
+    defer a.free(out_p);
+    const w1_p = try std.fmt.allocPrint(a, "{s}.ff.w1", .{p});
+    defer a.free(w1_p);
+    const w2_p = try std.fmt.allocPrint(a, "{s}.ff.w2", .{p});
+    defer a.free(w2_p);
+    var arrs: [12]mlx.mlx_array = undefined;
+    var n: usize = 0;
+    errdefer for (arrs[0..n]) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    inline for (.{ .{ p, ".norm1.weight" }, .{ p, ".norm2.weight" }, .{ p, ".scale1" }, .{ p, ".scale2" } }) |k| {
+        arrs[n] = try ownAs(w, a, k[0], k[1], dt, s);
+        n += 1;
+    }
+    for ([_][]const u8{ attn_p, out_p, w1_p, w2_p }) |lp| {
+        arrs[n] = try loadLinT(w, a, lp, dt, s);
+        n += 1;
+        arrs[n] = try ownAs(w, a, lp, ".bias", dt, s);
+        n += 1;
+    }
+    return .{
+        .norm1 = arrs[0], .norm2 = arrs[1], .scale1 = arrs[2], .scale2 = arrs[3],
+        .qkv_w = arrs[4], .qkv_b = arrs[5], .out_w = arrs[6], .out_b = arrs[7],
+        .w1 = arrs[8], .w1_b = arrs[9], .w2 = arrs[10], .w2_b = arrs[11],
+    };
+}
+
 fn evalArrays(xs: []const mlx.mlx_array) !void {
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);
@@ -402,12 +435,31 @@ pub const Decoder = struct {
     pq_b: mlx.mlx_array,
     latents_mean: mlx.mlx_array,
     latents_std: mlx.mlx_array,
+    /// Set when the blocks stream: `blocks` is empty and each decode pass reads block i from this
+    /// file once for every tile of the pass (`decodeTiles`).
+    stream_path: ?[]u8 = null,
 
     pub fn load(allocator: std.mem.Allocator, w: *const Weights, cfg: DecCfg, dt: mlx.mlx_dtype, s: S) !Decoder {
+        var self = try loadHead(allocator, w, cfg, dt, s);
+        errdefer self.deinit();
+        allocator.free(self.blocks);
+        self.blocks = try allocator.alloc(DecBlockW, cfg.layers);
+        for (self.blocks, 0..) |*b, i| b.* = loadBlock(w, allocator, i, dt, s) catch |e| {
+            for (self.blocks[0..i]) |*d| d.deinit();
+            allocator.free(self.blocks);
+            self.blocks = &.{};
+            return e;
+        };
+        return self;
+    }
+
+    fn loadHead(allocator: std.mem.Allocator, w: *const Weights, cfg: DecCfg, dt: mlx.mlx_dtype, s: S) !Decoder {
         var self: Decoder = undefined;
         self.allocator = allocator;
         self.cfg = cfg;
         self.dtype = dt;
+        self.stream_path = null;
+        self.blocks = &.{};
         const a = allocator;
 
         self.x_embed_w = try loadLinT(w, a, "decoder.x_embedder", dt, s);
@@ -433,47 +485,21 @@ pub const Decoder = struct {
         // checkpoint stores them as plain per-channel tables.
         self.latents_mean = try ownAs(w, a, "latents_mean", "", mlx.mlx_dtype.float32, s);
         self.latents_std = try ownAs(w, a, "latents_std", "", mlx.mlx_dtype.float32, s);
-
-        self.blocks = try a.alloc(DecBlockW, cfg.layers);
-        for (self.blocks, 0..) |*b, i| {
-            const p = try std.fmt.allocPrint(a, "decoder.transformer_blocks.{d}", .{i});
-            defer a.free(p);
-            const attn_p = try std.fmt.allocPrint(a, "{s}.attn.to_qkv", .{p});
-            defer a.free(attn_p);
-            const out_p = try std.fmt.allocPrint(a, "{s}.attn.to_out", .{p});
-            defer a.free(out_p);
-            const w1_p = try std.fmt.allocPrint(a, "{s}.ff.w1", .{p});
-            defer a.free(w1_p);
-            const w2_p = try std.fmt.allocPrint(a, "{s}.ff.w2", .{p});
-            defer a.free(w2_p);
-            b.* = .{
-                .norm1 = try ownAs(w, a, p, ".norm1.weight", dt, s),
-                .norm2 = try ownAs(w, a, p, ".norm2.weight", dt, s),
-                .scale1 = try ownAs(w, a, p, ".scale1", dt, s),
-                .scale2 = try ownAs(w, a, p, ".scale2", dt, s),
-                .qkv_w = try loadLinT(w, a, attn_p, dt, s),
-                .qkv_b = try ownAs(w, a, attn_p, ".bias", dt, s),
-                .out_w = try loadLinT(w, a, out_p, dt, s),
-                .out_b = try ownAs(w, a, out_p, ".bias", dt, s),
-                .w1 = try loadLinT(w, a, w1_p, dt, s),
-                .w1_b = try ownAs(w, a, w1_p, ".bias", dt, s),
-                .w2 = try loadLinT(w, a, w2_p, dt, s),
-                .w2_b = try ownAs(w, a, w2_p, ".bias", dt, s),
-            };
-        }
         return self;
     }
 
     /// The decoder holds converted (bf16, transposed) copies of the f16 file: the map is dropped
     /// BEFORE the first eval, so each original is freed once its copy is built instead of pinned.
-    pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, cfg: DecCfg, dt: mlx.mlx_dtype, s: S) !Decoder {
+    /// `stream` keeps only the embedder and head; the blocks are read per decode pass.
+    pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, cfg: DecCfg, dt: mlx.mlx_dtype, s: S, stream: bool) !Decoder {
         var w = try model_mod.loadWeightsSingleFile(allocator, path);
-        var self = Decoder.load(allocator, &w, cfg, dt, s) catch |e| {
+        var self = (if (stream) loadHead(allocator, &w, cfg, dt, s) else load(allocator, &w, cfg, dt, s)) catch |e| {
             w.deinit();
             return e;
         };
         w.deinit();
         errdefer self.deinit();
+        if (stream) self.stream_path = try allocator.dupe(u8, path);
         try self.evalWeights();
         return self;
     }
@@ -502,6 +528,7 @@ pub const Decoder = struct {
             _ = mlx.mlx_array_free(f);
         for (self.blocks) |*b| b.deinit();
         self.allocator.free(self.blocks);
+        if (self.stream_path) |p| self.allocator.free(p);
     }
 
     /// Normalized coordinates for one (T,H,W) extent, plus zeros for the
@@ -653,8 +680,34 @@ pub const Decoder = struct {
         return out;
     }
 
-    /// One untiled ViT pass: latent [1, C, t, h, w] -> pixels [1, 3, t*4, h*16, w*16].
+    /// One untiled ViT pass: latent [1, C, t, h, w] -> pixels [1, 3, t*4, h*16, w*16]. Needs the
+    /// blocks held (`stream_path == null`).
     pub fn decodePixels(self: *const Decoder, z: mlx.mlx_array, s: S) !mlx.mlx_array {
+        var st = try self.embedTile(z, s);
+        defer st.deinit();
+        for (self.blocks) |*b| {
+            const nh = try self.blockForward(b, st.h, st.rope, s);
+            _ = mlx.mlx_array_free(st.h);
+            st.h = nh;
+        }
+        return self.finishTile(&st, s);
+    }
+
+    /// One tile between the embedder and the head: its hidden rows and their rope.
+    const TileState = struct {
+        h: mlx.mlx_array,
+        rope: h3.RopeTables,
+        t: u32,
+        hh: u32,
+        ww: u32,
+
+        fn deinit(self: *TileState) void {
+            _ = mlx.mlx_array_free(self.h);
+            self.rope.deinit();
+        }
+    };
+
+    fn embedTile(self: *const Decoder, z: mlx.mlx_array, s: S) !TileState {
         const cfg = self.cfg;
         const shp = mlx.getShape(z);
         const t: u32 = @intCast(shp[2]);
@@ -681,23 +734,22 @@ pub const Decoder = struct {
         var zeros = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(zeros);
         try mlx.check(mlx.mlx_zeros(&zeros, &zero_shape, 3, self.dtype, s));
-        var h = try concat(&[_]mlx.mlx_array{ h0, self.register_tokens, zeros }, 1, s);
+        const h = try concat(&[_]mlx.mlx_array{ h0, self.register_tokens, zeros }, 1, s);
         errdefer _ = mlx.mlx_array_free(h);
 
         const n_rows: usize = @as(usize, @intCast(n_patches)) + n_suffix;
         const ids = try self.tokenIds(t, hh, ww, n_suffix);
         defer self.allocator.free(ids);
-        var rope = try self.buildRope(ids, n_rows, s);
-        defer rope.deinit();
+        return .{ .h = h, .rope = try self.buildRope(ids, n_rows, s), .t = t, .hh = hh, .ww = ww };
+    }
 
-        for (self.blocks) |*b| {
-            const nh = try self.blockForward(b, h, rope, s);
-            _ = mlx.mlx_array_free(h);
-            h = nh;
-        }
-
-        const no = try layerNormLast(h, self.norm_out_w, self.norm_out_b, cfg.eps, s);
-        _ = mlx.mlx_array_free(h);
+    fn finishTile(self: *const Decoder, st: *const TileState, s: S) !mlx.mlx_array {
+        const cfg = self.cfg;
+        const t = st.t;
+        const hh = st.hh;
+        const ww = st.ww;
+        const n_patches: c_int = @intCast(t * hh * ww);
+        const no = try layerNormLast(st.h, self.norm_out_w, self.norm_out_b, cfg.eps, s);
         defer _ = mlx.mlx_array_free(no);
         const po = try linT(no, self.proj_out_w, self.proj_out_b, s);
         defer _ = mlx.mlx_array_free(po);
@@ -759,135 +811,337 @@ fn blendAxis(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, extent: u32, axis: usiz
     return concat(&[_]mlx.mlx_array{ mixed, rest }, @intCast(axis), s);
 }
 
-/// One latent chunk -> pixels, spatially TILED when the canvas exceeds the
-/// 256-px tile extent.
-///
-/// Tiles are decoded independently (each renormalizes its own rope coordinates,
-/// which is why this is not equivalent to one big pass), cross-faded into their
-/// up/left neighbours over the planned overlap, then trimmed so the kept extents
-/// tile the canvas exactly. Row-major assembly by concatenation rather than
-/// writes into a mutable canvas.
-fn decodeSpatial(dec: *const Decoder, z: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
-    const shp = mlx.getShape(z);
-    const lat_h: u32 = @intCast(shp[3]);
-    const lat_w: u32 = @intCast(shp[4]);
-    const px_h = lat_h * VAE_RATIO;
-    const px_w = lat_w * VAE_RATIO;
-    if (fitsSingleTile(px_h) and fitsSingleTile(px_w)) return dec.decodePixels(z, s);
+/// How each latent clip splits into spatial tiles: one untiled pass when the canvas fits a tile.
+const SpatialPlan = struct {
+    yp: ?TilePlan,
+    xp: ?TilePlan,
 
-    var yp = try splitTiles(alloc, px_h);
-    defer yp.deinit();
-    var xp = try splitTiles(alloc, px_w);
-    defer xp.deinit();
+    fn init(alloc: std.mem.Allocator, px_h: u32, px_w: u32) !SpatialPlan {
+        if (fitsSingleTile(px_h) and fitsSingleTile(px_w)) return .{ .yp = null, .xp = null };
+        var yp = try splitTiles(alloc, px_h);
+        errdefer yp.deinit();
+        return .{ .yp = yp, .xp = try splitTiles(alloc, px_w) };
+    }
+    fn deinit(self: *SpatialPlan) void {
+        if (self.yp) |*p| p.deinit();
+        if (self.xp) |*p| p.deinit();
+    }
+    fn count(self: *const SpatialPlan) usize {
+        return if (self.yp) |yp| yp.count() * self.xp.?.count() else 1;
+    }
 
-    // Bottom strips of the previous row, one per column, captured BEFORE that
-    // row's tiles were blended (matching the reference's clone order).
-    var row_tails = try alloc.alloc(?mlx.mlx_array, xp.count());
-    defer alloc.free(row_tails);
-    @memset(row_tails, null);
-    defer for (row_tails) |t| if (t) |v| {
-        _ = mlx.mlx_array_free(v);
-    };
-
-    var rows = try alloc.alloc(mlx.mlx_array, yp.count());
-    defer alloc.free(rows);
-    var rows_built: usize = 0;
-    errdefer for (rows[0..rows_built]) |r| {
-        _ = mlx.mlx_array_free(r);
-    };
-
-    for (yp.starts, 0..) |y0, i| {
-        const zi = y0 / VAE_RATIO;
-        const zl = yp.len / VAE_RATIO;
-        var new_tails = try alloc.alloc(?mlx.mlx_array, xp.count());
-        defer alloc.free(new_tails);
-        @memset(new_tails, null);
-
-        var cols = try alloc.alloc(mlx.mlx_array, xp.count());
-        defer alloc.free(cols);
-        var cols_built: usize = 0;
-        errdefer for (cols[0..cols_built]) |c| {
-            _ = mlx.mlx_array_free(c);
+    /// The clip's tile latents in row-major order, appended to `out`.
+    fn subs(self: *const SpatialPlan, z: mlx.mlx_array, out: *std.ArrayList(mlx.mlx_array), alloc: std.mem.Allocator, s: S) !void {
+        const yp = self.yp orelse {
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&o, z));
+            try appendOwned(out, alloc, o);
+            return;
         };
-        var left_tail: ?mlx.mlx_array = null;
-        defer if (left_tail) |v| {
+        const xp = self.xp.?;
+        for (yp.starts) |y0| for (xp.starts) |x0| {
+            const zi = y0 / VAE_RATIO;
+            const zj = x0 / VAE_RATIO;
+            const sub_h = try sliceAxis(z, 3, @intCast(zi), @intCast(zi + yp.len / VAE_RATIO), s);
+            defer _ = mlx.mlx_array_free(sub_h);
+            try appendOwned(out, alloc, try sliceAxis(sub_h, 4, @intCast(zj), @intCast(zj + xp.len / VAE_RATIO), s));
+        };
+    }
+
+    /// One clip's decoded tiles (row-major, consumed) -> its pixels [1,3,f,H,W].
+    ///
+    /// Each tile renormalizes its own rope coordinates, which is why this is not one big pass:
+    /// tiles are cross-faded into their up/left neighbours over the planned overlap, then trimmed
+    /// so the kept extents tile the canvas exactly.
+    fn assemble(self: *const SpatialPlan, tiles: []mlx.mlx_array, alloc: std.mem.Allocator, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
+        const yp = self.yp orelse {
+            const t = tiles[0];
+            tiles[0] = .{ .ctx = null };
+            return t;
+        };
+        const xp = self.xp.?;
+
+        // Bottom strips of the previous row, one per column, captured BEFORE that
+        // row's tiles were blended (matching the reference's clone order).
+        var row_tails = try alloc.alloc(?mlx.mlx_array, xp.count());
+        defer alloc.free(row_tails);
+        @memset(row_tails, null);
+        defer for (row_tails) |t| if (t) |v| {
             _ = mlx.mlx_array_free(v);
         };
 
-        for (xp.starts, 0..) |x0, j| {
-            const zj = x0 / VAE_RATIO;
-            const zw = xp.len / VAE_RATIO;
-            const sub_h = try sliceAxis(z, 3, @intCast(zi), @intCast(zi + zl), s);
-            defer _ = mlx.mlx_array_free(sub_h);
-            const sub = try sliceAxis(sub_h, 4, @intCast(zj), @intCast(zj + zw), s);
-            defer _ = mlx.mlx_array_free(sub);
-            var tile = try dec.decodePixels(sub, s);
-            errdefer _ = mlx.mlx_array_free(tile);
+        var rows = try alloc.alloc(mlx.mlx_array, yp.count());
+        defer alloc.free(rows);
+        var rows_built: usize = 0;
+        defer for (rows[0..rows_built]) |r| {
+            _ = mlx.mlx_array_free(r);
+        };
 
-            // Capture the strips the NEXT row/column will blend against, taken
-            // from the unblended tile.
-            const th: u32 = @intCast(mlx.getShape(tile)[3]);
-            const tw: u32 = @intCast(mlx.getShape(tile)[4]);
-            if (i + 1 < yp.count()) {
-                new_tails[j] = try sliceAxis(tile, 3, @intCast(th - yp.overlaps[i]), @intCast(th), s);
-            }
-            var next_left: ?mlx.mlx_array = null;
-            if (j + 1 < xp.count()) {
-                next_left = try sliceAxis(tile, 4, @intCast(tw - xp.overlaps[j]), @intCast(tw), s);
-            }
+        for (0..yp.count()) |i| {
+            var new_tails = try alloc.alloc(?mlx.mlx_array, xp.count());
+            defer alloc.free(new_tails);
+            @memset(new_tails, null);
+            defer for (new_tails) |t| if (t) |v| {
+                _ = mlx.mlx_array_free(v);
+            };
 
-            if (i > 0) {
-                if (row_tails[j]) |prev| {
-                    const b = try blendAxis(prev, tile, yp.overlaps[i - 1], 3, alloc, dec.dtype, s);
-                    _ = mlx.mlx_array_free(tile);
-                    tile = b;
+            var cols = try alloc.alloc(mlx.mlx_array, xp.count());
+            defer alloc.free(cols);
+            var cols_built: usize = 0;
+            defer for (cols[0..cols_built]) |c| {
+                _ = mlx.mlx_array_free(c);
+            };
+            var left_tail: ?mlx.mlx_array = null;
+            defer if (left_tail) |v| {
+                _ = mlx.mlx_array_free(v);
+            };
+
+            for (0..xp.count()) |j| {
+                var tile = tiles[i * xp.count() + j];
+                tiles[i * xp.count() + j] = .{ .ctx = null };
+                errdefer _ = mlx.mlx_array_free(tile);
+
+                // Capture the strips the NEXT row/column will blend against, taken
+                // from the unblended tile.
+                const th: u32 = @intCast(mlx.getShape(tile)[3]);
+                const tw: u32 = @intCast(mlx.getShape(tile)[4]);
+                if (i + 1 < yp.count()) {
+                    new_tails[j] = try sliceAxis(tile, 3, @intCast(th - yp.overlaps[i]), @intCast(th), s);
                 }
-            }
-            if (j > 0) {
-                if (left_tail) |prev| {
-                    const b = try blendAxis(prev, tile, xp.overlaps[j - 1], 4, alloc, dec.dtype, s);
-                    _ = mlx.mlx_array_free(tile);
-                    tile = b;
+                var next_left: ?mlx.mlx_array = null;
+                if (j + 1 < xp.count()) {
+                    next_left = try sliceAxis(tile, 4, @intCast(tw - xp.overlaps[j]), @intCast(tw), s);
                 }
-            }
-            if (left_tail) |v| _ = mlx.mlx_array_free(v);
-            left_tail = next_left;
 
-            // Trim the overlap that the next tile will own.
-            if (i + 1 < yp.count()) {
-                const h2: u32 = @intCast(mlx.getShape(tile)[3]);
-                const t2 = try sliceAxis(tile, 3, 0, @intCast(h2 - yp.overlaps[i]), s);
-                _ = mlx.mlx_array_free(tile);
-                tile = t2;
-            }
-            if (j + 1 < xp.count()) {
-                const w2: u32 = @intCast(mlx.getShape(tile)[4]);
-                const t2 = try sliceAxis(tile, 4, 0, @intCast(w2 - xp.overlaps[j]), s);
-                _ = mlx.mlx_array_free(tile);
-                tile = t2;
-            }
-            cols[j] = tile;
-            cols_built += 1;
-        }
-        rows[i] = try concat(cols, 4, s);
-        rows_built += 1;
-        for (cols) |c| _ = mlx.mlx_array_free(c);
+                if (i > 0) {
+                    if (row_tails[j]) |prev| {
+                        const b = try blendAxis(prev, tile, yp.overlaps[i - 1], 3, alloc, dt, s);
+                        _ = mlx.mlx_array_free(tile);
+                        tile = b;
+                    }
+                }
+                if (j > 0) {
+                    if (left_tail) |prev| {
+                        const b = try blendAxis(prev, tile, xp.overlaps[j - 1], 4, alloc, dt, s);
+                        _ = mlx.mlx_array_free(tile);
+                        tile = b;
+                    }
+                }
+                if (left_tail) |v| _ = mlx.mlx_array_free(v);
+                left_tail = next_left;
 
-        for (row_tails, 0..) |t, k| {
-            if (t) |v| _ = mlx.mlx_array_free(v);
-            row_tails[k] = new_tails[k];
-            new_tails[k] = null;
+                // Trim the overlap that the next tile will own.
+                if (i + 1 < yp.count()) {
+                    const h2: u32 = @intCast(mlx.getShape(tile)[3]);
+                    const t2 = try sliceAxis(tile, 3, 0, @intCast(h2 - yp.overlaps[i]), s);
+                    _ = mlx.mlx_array_free(tile);
+                    tile = t2;
+                }
+                if (j + 1 < xp.count()) {
+                    const w2: u32 = @intCast(mlx.getShape(tile)[4]);
+                    const t2 = try sliceAxis(tile, 4, 0, @intCast(w2 - xp.overlaps[j]), s);
+                    _ = mlx.mlx_array_free(tile);
+                    tile = t2;
+                }
+                cols[j] = tile;
+                cols_built += 1;
+            }
+            rows[i] = try concat(cols, 4, s);
+            rows_built += 1;
+
+            for (row_tails, 0..) |t, k| {
+                if (t) |v| _ = mlx.mlx_array_free(v);
+                row_tails[k] = new_tails[k];
+                new_tails[k] = null;
+            }
         }
+        return concat(rows, 3, s);
     }
-    const outp = try concat(rows, 3, s);
-    for (rows) |r| _ = mlx.mlx_array_free(r);
-    rows_built = 0;
-    return outp;
+};
+
+fn appendOwned(list: *std.ArrayList(mlx.mlx_array), alloc: std.mem.Allocator, x: mlx.mlx_array) !void {
+    list.append(alloc, x) catch |e| {
+        _ = mlx.mlx_array_free(x);
+        return e;
+    };
 }
 
-/// Full decode: normalized latents [1,24,T,H,W] -> pixels [1,3,frames,H*16,W*16]
-/// in [-1, 1].
-pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+/// Runs every tile through the decoder BLOCK-MAJOR: each block, held or read from the file once
+/// (`stream_path`), takes every tile before the next block, so a streamed pass reads the weights
+/// once however many tiles it has. `out[k]` is tile k's pixels, lazy.
+fn decodeTiles(dec: *const Decoder, subs: []const mlx.mlx_array, out: []mlx.mlx_array, cap: h3.DenoiseMemCap, alloc: std.mem.Allocator, s: S) !void {
+    const states = try alloc.alloc(Decoder.TileState, subs.len);
+    defer alloc.free(states);
+    var built: usize = 0;
+    defer for (states[0..built]) |*st| st.deinit();
+    var hidden_bytes: usize = 0;
+    for (subs, 0..) |z, k| {
+        states[k] = try dec.embedTile(z, s);
+        built += 1;
+        hidden_bytes += mlx.mlx_array_size(states[k].h) * mlx.mlx_array_itemsize(states[k].h);
+    }
+    const hs = try alloc.alloc(mlx.mlx_array, subs.len);
+    defer alloc.free(hs);
+    for (0..dec.cfg.layers) |bi| {
+        var streamed: ?DecBlockW = null;
+        defer if (streamed) |*b| b.deinit();
+        const bw: *const DecBlockW = if (dec.stream_path) |p| blk: {
+            var w = try model_mod.loadWeightsSingleFile(alloc, p);
+            defer w.deinit();
+            streamed = try loadBlock(&w, alloc, bi, dec.dtype, s);
+            break :blk &streamed.?;
+        } else &dec.blocks[bi];
+        for (states, hs) |*st, *h| {
+            const nh = try dec.blockForward(bw, st.h, st.rope, s);
+            _ = mlx.mlx_array_free(st.h);
+            st.h = nh;
+            h.* = nh;
+        }
+        cap.step(hidden_bytes);
+        try evalArrays(hs);
+    }
+    for (states, 0..) |*st, k| out[k] = try dec.finishTile(st, s);
+}
+
+/// A decoded video: [frames, H, W, 3] u8, and its last frame [1, 3, 1, H, W] f32 in [-1, 1] (a
+/// chained window's next keyframe).
+pub const Decoded = struct {
+    rgb: mlx.mlx_array,
+    last: mlx.mlx_array,
+
+    pub fn deinit(self: *Decoded) void {
+        _ = mlx.mlx_array_free(self.rgb);
+        _ = mlx.mlx_array_free(self.last);
+    }
+};
+
+/// Pixel denormalization of decoder output: ImageNet stats, clamp to [0,1], then to [-1,1], in f32.
+fn denormPixels(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const df = try astype(x, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(df);
+    const pshape = [_]c_int{ 1, 3, 1, 1, 1 };
+    const pm_arr = mlx.mlx_array_new_data(&IMAGENET_MEAN, &pshape, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pm_arr);
+    const ps_arr = mlx.mlx_array_new_data(&IMAGENET_STD, &pshape, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(ps_arr);
+    const m1 = try mulA(df, ps_arr, s);
+    defer _ = mlx.mlx_array_free(m1);
+    const a1 = try addA(m1, pm_arr, s);
+    defer _ = mlx.mlx_array_free(a1);
+    const lo = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(hi);
+    var cl = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cl);
+    try mlx.check(mlx.mlx_clip(&cl, a1, lo, hi, s));
+    const two = mlx.mlx_array_new_float(2.0);
+    defer _ = mlx.mlx_array_free(two);
+    const scaled2 = try mulA(cl, two, s);
+    defer _ = mlx.mlx_array_free(scaled2);
+    const one2 = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one2);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_subtract(&out, scaled2, one2, s));
+    return out;
+}
+
+/// Decoder output [1,3,f,H,W] -> [f,H,W,3] u8, through the same per-pixel f32 chain as a whole clip.
+fn partRgb8(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const px = try denormPixels(x, s);
+    defer _ = mlx.mlx_array_free(px);
+    const u = try h3.rgb8Lazy(px, s);
+    defer _ = mlx.mlx_array_free(u);
+    const shp = mlx.getShape(u);
+    return reshape(u, &[_]c_int{ shp[1], shp[2], shp[3], shp[4] }, s);
+}
+
+/// The temporal seam logic, fed one decoded clip at a time; every finished piece leaves as u8.
+const Frames = struct {
+    output_frames: u32,
+    delivered: u32 = 0,
+    overlap: ?mlx.mlx_array = null,
+    parts: std.ArrayList(mlx.mlx_array) = .empty,
+    last: ?mlx.mlx_array = null,
+
+    fn deinit(self: *Frames, alloc: std.mem.Allocator) void {
+        if (self.overlap) |o| _ = mlx.mlx_array_free(o);
+        if (self.last) |l| _ = mlx.mlx_array_free(l);
+        for (self.parts.items) |p| _ = mlx.mlx_array_free(p);
+        self.parts.deinit(alloc);
+    }
+
+    /// Clip `i` of the plan, decoded [1,3,f,H,W] (consumed).
+    fn addClip(self: *Frames, clip_dec: mlx.mlx_array, i: usize, num_chunks: u32, cap: h3.DenoiseMemCap, alloc: std.mem.Allocator, dt: mlx.mlx_dtype, s: S) !void {
+        defer _ = mlx.mlx_array_free(clip_dec);
+        const chunk_dec = TOKENS_CHUNK_SIZE * VAE_RATIO_T;
+        const split_count: u32 = @as(u32, @intFromBool(TOKEN_DROP > 0)) + 1;
+        const clip_frames: u32 = @intCast(mlx.getShape(clip_dec)[2]);
+        for (0..split_count) |j| {
+            const f_start = @as(u32, @intCast(j)) * chunk_dec;
+            if (f_start >= clip_frames) continue;
+            const f_end = @min(f_start + chunk_dec, clip_frames);
+            if (f_end - f_start <= FRAME_PRE_PADDING) continue;
+            // Every decoded chunk drops `frame_pre_padding` frames off the
+            // FRONT — the VAE's clip length is not a multiple of its temporal
+            // ratio, so those frames are the previous clip's tail.
+            const piece = try sliceAxis(clip_dec, 2, @intCast(f_start + FRAME_PRE_PADDING), @intCast(f_end), s);
+            if (j == 0) {
+                if (self.overlap) |o| {
+                    defer _ = mlx.mlx_array_free(o);
+                    defer _ = mlx.mlx_array_free(piece);
+                    self.overlap = null;
+                    try self.emit(try blendAxis(o, piece, FRAME_OVERLAP, 2, alloc, dt, s), cap, alloc, s);
+                } else {
+                    try self.emit(piece, cap, alloc, s);
+                }
+            } else {
+                if (self.overlap) |o| _ = mlx.mlx_array_free(o);
+                self.overlap = piece;
+            }
+        }
+        if (i == num_chunks - 1) {
+            if (self.overlap) |o| {
+                self.overlap = null;
+                try self.emit(o, cap, alloc, s);
+            }
+        }
+    }
+
+    /// Converts a finished piece (consumed) to u8, cut at the plan's frame count.
+    fn emit(self: *Frames, piece: mlx.mlx_array, cap: h3.DenoiseMemCap, alloc: std.mem.Allocator, s: S) !void {
+        defer _ = mlx.mlx_array_free(piece);
+        const n: u32 = @intCast(mlx.getShape(piece)[2]);
+        const keep = @min(n, self.output_frames -| self.delivered);
+        if (keep == 0) return;
+        const kept = try sliceAxis(piece, 2, 0, @intCast(keep), s);
+        defer _ = mlx.mlx_array_free(kept);
+        const u = try partRgb8(kept, s);
+        errdefer _ = mlx.mlx_array_free(u);
+        const tail = try sliceAxis(kept, 2, @intCast(keep - 1), @intCast(keep), s);
+        defer _ = mlx.mlx_array_free(tail);
+        const last = try denormPixels(tail, s);
+        errdefer _ = mlx.mlx_array_free(last);
+        cap.step(0);
+        try evalArrays(&.{ u, last });
+        try appendOwned(&self.parts, alloc, u);
+        if (self.last) |l| _ = mlx.mlx_array_free(l);
+        self.last = last;
+        self.delivered += keep;
+    }
+};
+
+/// Latent rows one weight pass decodes at most: whole clips are batched up to it (at least one),
+/// and each batch reads a streamed decoder once. bf16 hidden at dim 2048: 256 MB.
+pub const TILE_BATCH_ROWS: usize = 65536;
+
+/// Full decode: normalized latents [1,24,T,H,W] -> u8 frames [frames,H*16,W*16,3].
+pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !Decoded {
+    return decodeBatched(dec, z_norm, TILE_BATCH_ROWS, alloc, s);
+}
+
+/// `decode` with its batch budget as a parameter (tests pin that the grouping never moves a byte).
+pub fn decodeBatched(dec: *const Decoder, z_norm: mlx.mlx_array, batch_rows: usize, alloc: std.mem.Allocator, s: S) !Decoded {
     const shp = mlx.getShape(z_norm);
     const latent_t: u32 = @intCast(shp[2]);
     const lat_h: u32 = @intCast(shp[3]);
@@ -938,106 +1192,126 @@ pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocat
         _ = mlx.mlx_array_free(z);
         z = padded;
     }
+    try mlx.check(mlx.mlx_array_eval(z));
 
-    const chunk_dec = TOKENS_CHUNK_SIZE * VAE_RATIO_T;
-    const split_count: u32 = @as(u32, @intFromBool(TOKEN_DROP > 0)) + 1;
-    var parts = std.ArrayList(mlx.mlx_array).empty;
-    defer {
-        for (parts.items) |p| _ = mlx.mlx_array_free(p);
-        parts.deinit(alloc);
-    }
-    var overlap: ?mlx.mlx_array = null;
-    errdefer if (overlap) |o| {
-        _ = mlx.mlx_array_free(o);
-    };
+    var sp = try SpatialPlan.init(alloc, lat_h * VAE_RATIO, lat_w * VAE_RATIO);
+    defer sp.deinit();
+    const per_clip = sp.count();
+    const cap = h3.DenoiseMemCap.begin();
+    defer cap.end();
 
-    const z_len = plan.padded_len;
+    // The plan's clips: chunk index and token span.
+    const Clip = struct { i: usize, lo: u32, hi: u32 };
+    var clips = std.ArrayList(Clip).empty;
+    defer clips.deinit(alloc);
     for (0..plan.num_chunks) |i| {
         const t_start = @as(u32, @intCast(i)) * TOKENS_CHUNK_SIZE;
-        const t_end = @min(t_start + TOKENS_CHUNK_SIZE + TOKEN_OVERLAP, z_len);
-        if (t_start >= t_end) continue;
-        const clip_z = try sliceAxis(z, 2, @intCast(t_start), @intCast(t_end), s);
-        defer _ = mlx.mlx_array_free(clip_z);
-        const clip_dec = try decodeSpatial(dec, clip_z, alloc, s);
-        defer _ = mlx.mlx_array_free(clip_dec);
-        const clip_frames: u32 = @intCast(mlx.getShape(clip_dec)[2]);
-
-        for (0..split_count) |j| {
-            const f_start = @as(u32, @intCast(j)) * chunk_dec;
-            if (f_start >= clip_frames) continue;
-            const f_end = @min(f_start + chunk_dec, clip_frames);
-            if (f_end - f_start <= FRAME_PRE_PADDING) continue;
-            // Every decoded chunk drops `frame_pre_padding` frames off the
-            // FRONT — the VAE's clip length is not a multiple of its temporal
-            // ratio, so those frames are the previous clip's tail.
-            const piece = try sliceAxis(clip_dec, 2, @intCast(f_start + FRAME_PRE_PADDING), @intCast(f_end), s);
-            if (j == 0) {
-                if (overlap) |o| {
-                    defer _ = mlx.mlx_array_free(o);
-                    defer _ = mlx.mlx_array_free(piece);
-                    overlap = null;
-                    const blended = try blendAxis(o, piece, FRAME_OVERLAP, 2, alloc, dec.dtype, s);
-                    try parts.append(alloc, blended);
-                } else {
-                    try parts.append(alloc, piece);
-                }
-            } else {
-                if (overlap) |o| _ = mlx.mlx_array_free(o);
-                overlap = piece;
-            }
-        }
-        if (i == plan.num_chunks - 1) {
-            if (overlap) |o| {
-                try parts.append(alloc, o);
-                overlap = null;
-            }
-        }
+        const t_end = @min(t_start + TOKENS_CHUNK_SIZE + TOKEN_OVERLAP, plan.padded_len);
+        if (t_start < t_end) try clips.append(alloc, .{ .i = i, .lo = t_start, .hi = t_end });
     }
-    if (parts.items.len == 0) return error.EmptyDecode;
+    const tile_tokens: usize = if (sp.yp) |yp| @as(usize, yp.len / VAE_RATIO) * (sp.xp.?.len / VAE_RATIO) else @as(usize, lat_h) * lat_w;
 
-    var dec_all = try concat(parts.items, 2, s);
-    errdefer _ = mlx.mlx_array_free(dec_all);
-    const have: u32 = @intCast(mlx.getShape(dec_all)[2]);
-    if (have > plan.output_frames) {
-        const trimmed = try sliceAxis(dec_all, 2, 0, @intCast(plan.output_frames), s);
-        _ = mlx.mlx_array_free(dec_all);
-        dec_all = trimmed;
+    var frames: Frames = .{ .output_frames = plan.output_frames };
+    defer frames.deinit(alloc);
+    var subs = std.ArrayList(mlx.mlx_array).empty;
+    defer subs.deinit(alloc);
+    var c0: usize = 0;
+    while (c0 < clips.items.len) {
+        var c1 = c0;
+        var rows: usize = 0;
+        while (c1 < clips.items.len) : (c1 += 1) {
+            const r = per_clip * tile_tokens * (clips.items[c1].hi - clips.items[c1].lo);
+            if (c1 > c0 and rows + r > batch_rows) break;
+            rows += r;
+        }
+        defer {
+            for (subs.items) |x| _ = mlx.mlx_array_free(x);
+            subs.clearRetainingCapacity();
+        }
+        for (clips.items[c0..c1]) |c| {
+            const clip_z = try sliceAxis(z, 2, @intCast(c.lo), @intCast(c.hi), s);
+            defer _ = mlx.mlx_array_free(clip_z);
+            try sp.subs(clip_z, &subs, alloc, s);
+        }
+        const tiles = try alloc.alloc(mlx.mlx_array, subs.items.len);
+        defer alloc.free(tiles);
+        @memset(tiles, .{ .ctx = null });
+        defer for (tiles) |t| if (t.ctx != null) {
+            _ = mlx.mlx_array_free(t);
+        };
+        try decodeTiles(dec, subs.items, tiles, cap, alloc, s);
+        for (clips.items[c0..c1], 0..) |c, k| {
+            const clip_dec = try sp.assemble(tiles[k * per_clip ..][0..per_clip], alloc, dec.dtype, s);
+            try frames.addClip(clip_dec, c.i, plan.num_chunks, cap, alloc, dec.dtype, s);
+        }
+        c0 = c1;
     }
+    if (frames.parts.items.len == 0) return error.EmptyDecode;
 
-    // Pixel denormalization: ImageNet stats, clamp to [0,1], then to [-1,1].
-    const df = try astype(dec_all, mlx.mlx_dtype.float32, s);
-    _ = mlx.mlx_array_free(dec_all);
-    defer _ = mlx.mlx_array_free(df);
-    const pshape = [_]c_int{ 1, 3, 1, 1, 1 };
-    const pm_arr = mlx.mlx_array_new_data(&IMAGENET_MEAN, &pshape, 5, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(pm_arr);
-    const ps_arr = mlx.mlx_array_new_data(&IMAGENET_STD, &pshape, 5, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(ps_arr);
-    const m1 = try mulA(df, ps_arr, s);
-    defer _ = mlx.mlx_array_free(m1);
-    const a1 = try addA(m1, pm_arr, s);
-    defer _ = mlx.mlx_array_free(a1);
-    const lo = mlx.mlx_array_new_float(0.0);
-    defer _ = mlx.mlx_array_free(lo);
-    const hi = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(hi);
-    var cl = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(cl);
-    try mlx.check(mlx.mlx_clip(&cl, a1, lo, hi, s));
-    const two = mlx.mlx_array_new_float(2.0);
-    defer _ = mlx.mlx_array_free(two);
-    const scaled2 = try mulA(cl, two, s);
-    defer _ = mlx.mlx_array_free(scaled2);
-    const one2 = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one2);
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_subtract(&out, scaled2, one2, s));
-    return out;
+    const rgb = try concat(frames.parts.items, 0, s);
+    errdefer _ = mlx.mlx_array_free(rgb);
+    try mlx.check(mlx.mlx_array_eval(rgb));
+    const last = frames.last.?;
+    frames.last = null;
+    return .{ .rgb = rgb, .last = last };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// A decode's u8 frames as [1,3,F,H,W] f32 in [-1,1], for the live tests' pixel checks.
+fn decodedF32(d: Decoded, s: S) !mlx.mlx_array {
+    const t = try transpose(d.rgb, &[_]c_int{ 3, 0, 1, 2 }, s);
+    defer _ = mlx.mlx_array_free(t);
+    const shp = mlx.getShape(t);
+    const r = try reshape(t, &[_]c_int{ 1, shp[0], shp[1], shp[2], shp[3] }, s);
+    defer _ = mlx.mlx_array_free(r);
+    const f = try astype(r, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(f);
+    const k = mlx.mlx_array_new_float(1.0 / 127.5);
+    defer _ = mlx.mlx_array_free(k);
+    const sc = try mulA(f, k, s);
+    defer _ = mlx.mlx_array_free(sc);
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_subtract(&o, sc, one, s));
+    return o;
+}
+
+test "minimax h3 vae: a clip converted piece by piece gives the bytes of the whole clip" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var parts: [2]mlx.mlx_array = undefined;
+    for (&parts, 0..) |*p, i| {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 40 + i));
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        const shape = [_]c_int{ 1, 3, @intCast(3 + i), 16, 24 };
+        try mlx.check(mlx.mlx_random_normal(&x, &shape, 5, .float32, 0, 1.5, key, s));
+        p.* = try astype(x, .bfloat16, s);
+    }
+    defer for (parts) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    const whole = try concat(&parts, 2, s);
+    defer _ = mlx.mlx_array_free(whole);
+    const want = try partRgb8(whole, s);
+    defer _ = mlx.mlx_array_free(want);
+    const a8 = try partRgb8(parts[0], s);
+    defer _ = mlx.mlx_array_free(a8);
+    const b8 = try partRgb8(parts[1], s);
+    defer _ = mlx.mlx_array_free(b8);
+    const got = try concat(&.{ a8, b8 }, 0, s);
+    defer _ = mlx.mlx_array_free(got);
+    try evalArrays(&.{ want, got });
+    const n: usize = @intCast(mlx.mlx_array_size(want));
+    try testing.expectEqual(n, @as(usize, @intCast(mlx.mlx_array_size(got))));
+    try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..n], mlx.mlx_array_data_uint8(got).?[0..n]);
+}
 
 test "minimax h3 vae: temporal constants follow from the clip length" {
     // These are derived, not typed in: a future clip_length change must move
@@ -1189,9 +1463,9 @@ test "minimax h3 vae live: tiled decode seam energy stays at ambient level" {
     const z = mlx.mlx_array_new_data(buf.ptr, &zshape, 5, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(z);
 
-    const pixels = try decode(&dec, z, a, s);
-    defer _ = mlx.mlx_array_free(pixels);
-    const pf = try astype(pixels, mlx.mlx_dtype.float32, s);
+    var dd = try decode(&dec, z, a, s);
+    defer dd.deinit();
+    const pf = try decodedF32(dd, s);
     defer _ = mlx.mlx_array_free(pf);
     try mlx.check(mlx.mlx_array_eval(pf));
 
@@ -1970,9 +2244,9 @@ test "minimax h3 vae live: encode->decode round trip preserves orientation" {
 
     const lat = try enc.encodeImage(img, a, s);
     defer _ = mlx.mlx_array_free(lat);
-    const pixels = try decode(&dec, lat, a, s);
-    defer _ = mlx.mlx_array_free(pixels);
-    const pf = try astype(pixels, mlx.mlx_dtype.float32, s);
+    var dd = try decode(&dec, lat, a, s);
+    defer dd.deinit();
+    const pf = try decodedF32(dd, s);
     defer _ = mlx.mlx_array_free(pf);
     try mlx.check(mlx.mlx_array_eval(pf));
 
@@ -2075,9 +2349,9 @@ test "minimax h3 vae live: the Latent2RGB preview resembles the decoded frame" {
     preview.latentSliceToRgb(ctrl_map, lat_host, lt, lh, lw, 0, ctrl);
 
     // What the user eventually gets: the same latent through the real decoder.
-    const pixels = try decode(&dec, lat, a, s);
-    defer _ = mlx.mlx_array_free(pixels);
-    const pf = try astype(pixels, mlx.mlx_dtype.float32, s);
+    var dd = try decode(&dec, lat, a, s);
+    defer dd.deinit();
+    const pf = try decodedF32(dd, s);
     defer _ = mlx.mlx_array_free(pf);
     try mlx.check(mlx.mlx_array_eval(pf));
     const pshp = mlx.getShape(pf);
