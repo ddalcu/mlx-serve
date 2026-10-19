@@ -5153,7 +5153,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         .shard => |sh| try config.applyShard(sh),
         .remote => |r| config.dist_dsv41 = .{ .lo = r.start, .hi = r.end, .worker = false },
     };
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainPart(&weights, sp);

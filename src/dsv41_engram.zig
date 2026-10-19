@@ -392,12 +392,14 @@ pub const Table = struct {
         const bi = try gpa.alignedAlloc(u8, .@"4", if (self.mode == .affine) n * self.slen else 0);
         errdefer gpa.free(bi);
         const job: Job = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
-        if (n >= PAR_MIN_ROWS) {
+        // A DSpark verify's 6 x 24 rows wait at the first Engram layer: 16 rows per thread, this one included.
+        const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
+        if (parts > 1) {
             var threads: [PAR_THREADS]?std.Thread = @splat(null);
-            for (&threads, 0..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, PAR_THREADS }) catch null;
-            var failed = false;
-            for (threads, 0..) |t, k| {
-                if (t) |th| th.join() else failed = failed or !job.run(k, PAR_THREADS);
+            for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, parts }) catch null;
+            var failed = !job.run(0, parts);
+            for (threads[1..parts], 1..) |t, k| {
+                if (t) |th| th.join() else failed = !job.run(k, parts) or failed;
             }
             if (failed or job.bad.load(.acquire)) return error.EngramRead;
         } else if (!job.run(0, 1)) return error.EngramRead;
@@ -431,6 +433,22 @@ pub const Table = struct {
         return self.dequant(raw, ids.len, s);
     }
 
+    /// Asks the kernel to read every `stride`-th of `ids` from `first` into the page cache now
+    /// (`F_RDADVISE`: asynchronous, no copy), so the preads behind it find the rows cached or in
+    /// flight and a batch of random rows costs about one SSD latency, not one per row. An
+    /// out-of-range id is left for `read` to refuse.
+    fn advise(self: *const Table, ids: []const u32, first: usize, stride: usize) void {
+        if (comptime !builtin.os.tag.isDarwin()) return;
+        var i = first;
+        while (i < ids.len) : (i += stride) {
+            const r: u64 = ids[i];
+            if (r >= self.rows) continue;
+            rdadvise(self.fd, self.w_off + r * self.w_stride, self.wlen);
+            rdadvise(self.fd, self.s_off + r * self.s_stride, self.slen);
+            if (self.mode == .affine) rdadvise(self.fd, self.b_off + r * self.s_stride, self.slen);
+        }
+    }
+
     const Job = struct {
         t: *const Table,
         ids: []const u32,
@@ -443,10 +461,11 @@ pub const Table = struct {
             _ = self.run(first, stride);
         }
 
-        /// Every `stride`-th row from `first`: preads run in parallel where
+        /// Every `stride`-th row from `first`, asked of the kernel first: preads run in parallel where
         /// faults on one mapping would serialize.
         fn run(self: *const Job, first: usize, stride: usize) bool {
             const t = self.t;
+            t.advise(self.ids, first, stride);
             var i = first;
             while (i < self.ids.len) : (i += stride) {
                 const r: u64 = self.ids[i];
@@ -574,11 +593,19 @@ pub const Prefetch = struct {
     }
 };
 
-const PAR_MIN_ROWS = 512;
+const PAR_ROWS_PER_THREAD = 16;
 const PAR_THREADS = 16;
 
 fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
     return crt.pread(fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
+}
+
+/// macOS `struct radvisory`.
+const Radvisory = extern struct { ra_offset: i64, ra_count: c_int };
+
+fn rdadvise(fd: c_int, off: u64, len: usize) void {
+    var ra: Radvisory = .{ .ra_offset = @intCast(off), .ra_count = @intCast(len) };
+    _ = std.c.fcntl(fd, std.c.F.RDADVISE, &ra);
 }
 
 fn fileSize(fd: c_int) u64 {
@@ -722,6 +749,51 @@ test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from 
     try testing.expectEqual(@as(f32, 0.5), v[63]);
     try testing.expectEqual(@as(f32, 1), v[64]);
     try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
+}
+
+test "dsv41 engram: rows asked of the kernel ahead read as a plain gather does; an out-of-range id is skipped there and refused by the read" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFp8Fixture(io, td.dir);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+    defer t.close();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const ids = [_]u32{ 3, 1, 3, 0, 7 };
+    t.advise(&ids, 0, 1);
+    try testing.expectError(error.EngramRead, t.read(testing.allocator, &ids));
+    const rows = try t.gather(testing.allocator, ids[0..4], s);
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_array_eval(rows));
+    const v = mlx.mlx_array_data_float32(rows).?;
+    for (ids[0..4], 0..) |id, i| {
+        try testing.expectEqual(@as(f32, @floatFromInt(@as(u32, 1) << @intCast(id))), v[i * 64]);
+        try testing.expectEqual(@as(f32, 0.5), v[i * 64 + 63]);
+    }
+}
+
+test "dsv41 engram: a read split over threads lands every row where one thread puts it, and still refuses a bad id" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFp8Fixture(io, td.dir);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+    defer t.close();
+    // A 6-row verify's 144 rows of one table.
+    var ids: [144]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast((i * 7 + i / 5) % 4);
+    const raw = try t.read(testing.allocator, &ids);
+    defer raw.deinit(testing.allocator);
+    for (ids, 0..) |id, i| {
+        try testing.expectEqual(@as(u8, @intCast(127 + id)), raw.s[2 * i]);
+        try testing.expectEqual(@as(u8, 126), raw.s[2 * i + 1]);
+        try testing.expect(std.mem.allEqual(u8, raw.w[64 * i ..][0..64], 0x38));
+    }
+    ids[100] = 7;
+    try testing.expectError(error.EngramRead, t.read(testing.allocator, &ids));
 }
 
 test "dsv41 engram: a prefetch hands each span's rows as a gather of the same ids would" {

@@ -38,9 +38,12 @@ pub fn nax() bool {
 /// Whether this linear can take the route: NAX present, K a multiple of the
 /// rotation block, N a multiple of the store tile's width.
 pub fn eligible(k: u32, n: u32) bool {
-    if (!enabled) return false;
-    if (k % @as(u32, @intCast(BLOCK)) != 0 or n % 64 != 0) return false;
-    return nax();
+    return enabled and fits(k, n) and nax();
+}
+
+/// The shape rule alone, for routes with their own switch (the DSV4.1 trunk).
+pub fn fits(k: u32, n: u32) bool {
+    return k % @as(u32, @intCast(BLOCK)) == 0 and n % 64 == 0;
 }
 
 /// Group size read for quantized weights when billing: every shipped media pack is g64

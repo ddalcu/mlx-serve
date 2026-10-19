@@ -1408,7 +1408,9 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // The model card's window, not the trunk's 262144 (model.zig EMBEDDING_GEMMA2_WINDOW).
     const embedding_gemma2_window: u32 = 8192;
     if (embedding_gemma2) meta.max_position_embeddings = if (meta.max_position_embeddings == 0) embedding_gemma2_window else @min(meta.max_position_embeddings, embedding_gemma2_window);
-    meta.has_chat = has_chat_template and !meta.is_encoder;
+    // Their packs ship no template; the loader embeds ours (chat.loadChatConfig).
+    const embeds_template = std.mem.eql(u8, mt, "deepseek_v4") or std.mem.eql(u8, mt, "deepseek_v41");
+    meta.has_chat = (has_chat_template or embeds_template) and !meta.is_encoder;
     meta.has_embedding = meta.is_encoder;
     if (root.get("pooling_mode")) |v| {
         if (v == .string) meta.has_embedding = true;
@@ -2427,6 +2429,12 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         try testing.expect(m.is_encoder);
         try testing.expect(!m.has_chat);
         try testing.expectEqual(@as(u32, 768), m.hidden_size);
+    }
+    // DeepSeek V4/V4.1 packs ship no chat template: the loader embeds ours, so the stub is still chat.
+    for ([_][]const u8{ "deepseek_v4", "deepseek_v41" }) |mt| {
+        var buf: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf, "{{\"model_type\":\"{s}\",\"hidden_size\":5120}}", .{mt});
+        try testing.expect(parseStubMeta(a, json, false).has_chat);
     }
     // A chat gemma3_text WITHOUT the flag stays a chat model.
     {
