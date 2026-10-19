@@ -410,6 +410,11 @@ pub const Dsv41Model = struct {
     /// Where this prompt's snapshot is taken (`armSnapshot`), and its tokens.
     snap_at: ?usize = null,
     snap_ids: []u32 = &.{},
+    /// Other conversations' states with their snapshots, kept for a later resume (`swapInBest`).
+    parked: std.ArrayList(Parked) = .empty,
+    /// The last `state_gen` handed out: a parked state keeps its own, so a new one never reuses it.
+    gen_seq: u64 = 0,
+    park_tick: u64 = 0,
     ds_conf_thr: f32 = -std.math.inf(f32),
     /// The adaptive verify policy reads each draft's confidence; otherwise only a finite `ds_conf_thr` does.
     ds_want_conf: bool = false,
@@ -425,6 +430,8 @@ pub const Dsv41Model = struct {
     pub fn deinit(self: *Dsv41Model) void {
         if (self.dec_state) |*st| st.deinit();
         if (self.snap) |*sn| sn.deinit(self.gpa);
+        for (self.parked.items) |*p| p.deinit(self.gpa);
+        self.parked.deinit(self.gpa);
         self.gpa.free(self.snap_ids);
         self.dropAhead();
         self.gpa.free(self.prompt);
@@ -4151,12 +4158,92 @@ fn appendLayerState(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LS
 pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32) !A {
     if (m.dec_state) |*st| st.deinit();
     m.dec_state = null;
-    m.state_gen += 1;
+    m.gen_seq = @max(m.gen_seq, m.state_gen) + 1;
+    m.state_gen = m.gen_seq;
     m.dec_state = try initState(m, gpa);
     return extendResumable(m, gpa, ids);
 }
 
-// ── prefix resume: one conversation ──────────────────────────────────────
+// ── prefix resume: one conversation, plus parked ones ────────────────────
+
+/// Another conversation's state and its snapshot, set aside while a different prompt runs.
+const Parked = struct {
+    st: State,
+    snap: Snap,
+    gen: u64,
+    tick: u64,
+
+    fn deinit(self: *Parked, gpa: std.mem.Allocator) void {
+        self.st.deinit();
+        self.snap.deinit(gpa);
+    }
+};
+
+/// How many conversations keep a resumable state: `MLX_SERVE_DSV41_STATES`, default 1 (only the last one,
+/// as before). Each kept state holds its conversation's KV rows (about 890 bytes a token in the pack's dtype).
+fn maxStates(m: *const Dsv41Model) usize {
+    if (m.pair != null) return 1; // a pair's worker keeps one state, mirrored by `restoreAt`
+    const env = std.c.getenv("MLX_SERVE_DSV41_STATES") orelse return 1;
+    const n = std.fmt.parseInt(usize, std.mem.span(env), 10) catch return 1;
+    return @max(n, 1);
+}
+
+/// How far `sn` resumes `prompt`: its length when it is a proper prefix, else 0.
+fn resumeLen(sn: *const Snap, prompt: []const u32) usize {
+    if (sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
+    return sn.ids.len;
+}
+
+/// Moves the current state and its snapshot to the parked list, evicting the least recently used when full.
+/// A state with no valid snapshot cannot resume anything and is left for `prefill` to drop.
+fn park(m: *Dsv41Model, cap: usize) !void {
+    const sn = m.snap orelse return;
+    const st = m.dec_state orelse return;
+    if (sn.gen != m.state_gen) return;
+    while (m.parked.items.len + 1 >= cap and m.parked.items.len > 0) {
+        var lru: usize = 0;
+        for (m.parked.items, 0..) |p, i| if (p.tick < m.parked.items[lru].tick) {
+            lru = i;
+        };
+        var old = m.parked.swapRemove(lru);
+        old.deinit(m.gpa);
+    }
+    if (cap <= 1) return;
+    m.park_tick += 1;
+    try m.parked.append(m.gpa, .{ .st = st, .snap = sn, .gen = m.state_gen, .tick = m.park_tick });
+    m.dec_state = null;
+    m.snap = null;
+}
+
+/// Makes the state that resumes `prompt` furthest the current one: the current state when it does, else a
+/// parked one, parking the current state in its place. When nothing resumes, the current state is parked so
+/// the coming `prefill` starts fresh without losing it. Requests are serial, so no step holds a state here.
+fn swapInBest(m: *Dsv41Model, prompt: []const u32) !void {
+    const cap = maxStates(m);
+    if (cap <= 1) return;
+    const cur: usize = if (m.snap) |*sn| (if (sn.gen == m.state_gen and m.dec_state != null) resumeLen(sn, prompt) else 0) else 0;
+    var best: ?usize = null;
+    var best_len = cur;
+    for (m.parked.items, 0..) |*p, i| {
+        const l = resumeLen(&p.snap, prompt);
+        if (l > best_len) {
+            best = i;
+            best_len = l;
+        }
+    }
+    if (best) |i| {
+        const e = m.parked.swapRemove(i);
+        park(m, cap + 1) catch |err| {
+            m.parked.append(m.gpa, e) catch {};
+            return err;
+        };
+        if (m.dec_state) |*st| st.deinit();
+        if (m.snap) |*sn| sn.deinit(m.gpa);
+        m.dec_state = e.st;
+        m.snap = e.snap;
+        m.state_gen = e.gen;
+    } else if (cur == 0) try park(m, cap);
+}
 
 /// What a resume restores: every buffer a later step replaces rather than
 /// appends to is held by reference (a ring's first write after copies it
@@ -4205,6 +4292,7 @@ pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32) !usize {
     m.gpa.free(m.prompt);
     m.prompt = &.{};
     m.prompt = try m.gpa.dupe(u32, prompt);
+    try swapInBest(m, prompt);
     const n = try restore(m, prompt);
     m.gpa.free(m.snap_ids);
     m.snap_ids = &.{};
@@ -6486,6 +6574,46 @@ test "dsv41 engram: a chunk's rows are read behind the one before it and give th
     }
     defer for (logits) |l| gpa.free(l);
     try testing.expectEqualSlices(f32, logits[0], logits[1]);
+}
+
+test "dsv41 resume: two conversations taking turns both resume, and match a cold prefill (DSV41_TINY)" {
+    const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    _ = setenv("MLX_SERVE_DSV41_STATES", "2", 1);
+    defer _ = setenv("MLX_SERVE_DSV41_STATES", "1", 1);
+    const gpa = testing.allocator;
+    var t = try Tiny.open(root, "repack", "fixture.safetensors");
+    defer t.deinit();
+    const a = try t.ids();
+    defer gpa.free(a);
+    const m = t.m;
+    const c = a[1..]; // a second conversation: no common prefix with `a`
+    const tail = [_]u32{ 5, 9, 2, 7, 3, 11 };
+    // Turn 1 of each: A, then B (which parks A).
+    for ([_][]const u32{ a, c }) |p| {
+        try testing.expectEqual(@as(usize, 0), try resumePrompt(m, p));
+        _ = mlx.mlx_array_free(try prefill(m, gpa, p));
+        for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}));
+    }
+    // Turn 2 of each: A resumes from its parked state, then B from its own.
+    for ([_][]const u32{ a, c }) |p| {
+        const q = try gpa.alloc(u32, p.len + tail.len);
+        defer gpa.free(q);
+        @memcpy(q[0..p.len], p);
+        @memcpy(q[p.len..], &tail);
+        const n = try resumePrompt(m, q);
+        try testing.expectEqual(p.len - 1, n);
+        const wl = try extendResumable(m, gpa, q[n..]);
+        defer _ = mlx.mlx_array_free(wl);
+        const warm = try hostF32(wl);
+        defer gpa.free(warm);
+        var st = try initState(m, gpa);
+        defer st.deinit();
+        const cl = try extend(m, gpa, &st, q, .last);
+        defer _ = mlx.mlx_array_free(cl);
+        const cold = try hostF32(cl);
+        defer gpa.free(cold);
+        try testing.expectEqualSlices(f32, cold, warm);
+    }
 }
 
 test "dsv41 init: every weight the model reads is evaluated before a region traces it (DSV41_TINY)" {
