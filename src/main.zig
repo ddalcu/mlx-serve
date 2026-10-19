@@ -146,7 +146,7 @@ fn printUsage(io: std.Io) void {
         \\                      <ip:port> --device <rdma_enX> [--soak N]
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
-        \\                      hermes, aider, zcode); starts the MLX Core app if the
+        \\                      hermes, aider, zcode); starts the MLX-Serve app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
         \\

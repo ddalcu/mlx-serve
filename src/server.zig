@@ -3067,7 +3067,7 @@ fn handleOllamaEarly(allocator: std.mem.Allocator, stream: *Conn, method: []cons
     for (unsupported) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) {
             log.warn("{s} {s} -> 501 (unsupported ollama endpoint)\n", .{ method, path });
-            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX Core app");
+            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX-Serve app");
             return true;
         }
     }

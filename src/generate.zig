@@ -3619,6 +3619,9 @@ pub const Generator = struct {
             return gen;
         }
 
+        if (dspark_active) if (xfm.dsv41) |m41| {
+            m41.ds_want_conf = dsparkPolicyEnabled();
+        };
         // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
         // pre-forward the sampled token. The first nextDrafter / nextPld /
         // nextMtp call needs the cache at exactly prompt_len (last prompt
@@ -22244,7 +22247,7 @@ test "dsparkVerifyDrafts: a sure head verifies the block, an unsure one t1 alone
 }
 
 test "dspark drafting backoff: prose rounds that lose to the plain step are skipped, copy-like rounds are not" {
-    // M5 Ultra, V4.1 3.0bpw: a 6-row prose round commits 3.2 tokens in ~66 ms; a plain step is 17.6 ms.
+    // A round that commits few tokens for its cost loses to the plain step (costs in ms).
     var prose = dflash_policy.Drafting{};
     try testing.expect(prose.shouldDraft());
     prose.record(3.2 * 17.6, 66);
