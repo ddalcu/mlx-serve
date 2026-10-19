@@ -6714,6 +6714,13 @@ pub fn qsaSlotAttn(
         // dequant -> dense SDPA over K'<<kv. Declines to the mask arm.
         if (try qsaDecodeGatherAttn(s, q_rope, kv_view, blocks, ratio, attn_scale)) |g| return qsaSlotGathered(arms, seq_len, g, 2);
     }
+    if (qsa_ok and verify_w and !kv_view.has_quant_triple) {
+        // CUDA: each verify row attends its own picks and tail; the mask arm read the whole cache.
+        if (try @import("qsa_decode_cuda.zig").attend(s, q_rope, kv_view.k, kv_view.v, blocks, ratio, attn_scale)) |g| {
+            if (qsa_dec_engaged_bits.take(1)) log.info("[qsa-dec] verify rows engaged (S={d} kv={d}) (MLX_SERVE_QSA_DEC_KERNEL=0 restores the gather / mask arms)\n", .{ seq_len, mlx.getShape(kv_view.k)[2] });
+            return qsaSlotGathered(arms, seq_len, g, 4);
+        }
+    }
     if (qsa_ok and verify_w) {
         // Verify widths 2..15: the union of the block's rows' selections + tail. The
         // fused kernel's fallback for any width it declines.
