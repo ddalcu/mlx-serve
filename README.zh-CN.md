@@ -133,6 +133,8 @@ brew bundle install --file=Brewfile   # cmake + webp
 
 ## MLX Core（macOS 应用）
 
+模型浏览器默认打开“我的模型”，后面依次为推荐、发现、下载和媒体。
+
 把服务器包装成完整界面的菜单栏应用：
 
 - **聊天 + Agent 模式：** 多会话聊天、PDF 与图像、10 个内置工具（可逐工具审批）、MCP 市场、基于提示词的技能、持久记忆、文件夹 RAG。

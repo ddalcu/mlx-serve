@@ -2,6 +2,8 @@
 
 # MLX Core (macOS app)
 
+The Models page opens on **My Models**. Its sections are ordered My Models, Recommended, Discover, Downloads and Media. Links to a specific section still open that section.
+
 Menu-bar app that wraps the server with a full UI. [Download the latest release](https://github.com/ddalcu/mlx-serve/releases/latest) or `brew install --cask mlx-serve`. Since v26.8.4 it is one window with a sidebar, content and detail column: Models, Tasks, Settings and the media generators are modes of the chat window rather than separate windows.
 
 - **Model browser** — download from HuggingFace with resumable multi-connection transfers (up to 16 connections per file), auto-discovers LM Studio's existing model folder (`~/.lmstudio/settings.json`) and your Hugging Face cache (wherever `HF_HOME` / `HF_HUB_CACHE` point) so you don't re-download what's on disk, GGUF rows show a min–max RAM-estimate range. Multi-variant repos let you pick your quant, and **Settings ▸ Model Folders** chooses where downloads land.

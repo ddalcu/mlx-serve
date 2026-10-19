@@ -12,6 +12,14 @@ final class ModelBrowserSectionTests: XCTestCase {
 
     // MARK: - Sections
 
+    func testMyModelsIsFirstAndTheDefaultWithoutChangingExplicitDestinations() {
+        XCTAssertEqual(ModelBrowserSection.allCases, [.myModels, .recommended, .discover, .downloads, .media])
+        XCTAssertEqual(ModelBrowserSection.defaultSection, .myModels)
+        for section in ModelBrowserSection.allCases {
+            XCTAssertEqual(ChatWorkspace.models(section).section, section)
+        }
+    }
+
     func testEverySectionHasADistinctTitleAndIcon() {
         let titles = ModelBrowserSection.allCases.map(\.title)
         let icons = ModelBrowserSection.allCases.map(\.systemImage)

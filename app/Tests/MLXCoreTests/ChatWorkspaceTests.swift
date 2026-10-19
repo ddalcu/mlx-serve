@@ -47,8 +47,8 @@ final class ChatWorkspaceTests: XCTestCase {
             "Cancel still wins — it is the sheet's one door")
     }
 
-    func testEntryLandsOnTheRecommendedSection() {
-        XCTAssertEqual(ChatWorkspace.defaultEntry, .models(.recommended))
+    func testEntryLandsOnMyModels() {
+        XCTAssertEqual(ChatWorkspace.defaultEntry, .models(.myModels))
         XCTAssertTrue(ChatWorkspace.defaultEntry.isModels)
         XCTAssertEqual(ChatWorkspace.conversation.section, nil)
     }

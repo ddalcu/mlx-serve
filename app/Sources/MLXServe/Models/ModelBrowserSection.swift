@@ -2,19 +2,18 @@ import Foundation
 
 /// The Model Browser's sidebar destinations.
 enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
-    /// Every curated Gemma 4 / Qwen 3.5-3.6 checkpoint, grouped by family and
-    /// explained in plain English — the friendly front door for someone who
-    /// has never picked a local model before. Lands first; Discover is the
-    /// power-user HuggingFace search.
+    /// Everything on this Mac that the tray picker can offer, grouped by source.
+    case myModels
+    /// Curated checkpoints grouped by family, with recommendations for this Mac.
     case recommended
     /// Search HuggingFace. On-disk models stay listed here, marked, never hidden.
     case discover
-    /// Everything on this Mac that the tray picker can offer, grouped by source.
-    case myModels
     /// The transfer queue: in-flight and failed downloads.
     case downloads
     /// Media-gen model catalog (image/audio/video/music), grouped by modality.
     case media
+
+    static let defaultSection: ModelBrowserSection = .myModels
 
     var id: String { rawValue }
 
