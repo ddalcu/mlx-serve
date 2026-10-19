@@ -1,10 +1,18 @@
+Below 4 rows per expert, the sorted fp expert gather's mat-vec (row_dot_sorted_kernel) loads each
+expert's weight row once per run of sorted rows on that expert instead of once per row. Each
+output keeps row_dot's per-row arithmetic at the threads per row the per-row launch picks, so it
+is bit-identical to the per-row mat-vec.
+
+Retires with mlx-cuda-row-dot-matvec.patch, or when upstream's gather mat-vec shares weight loads
+across sorted rows. Not reported upstream yet.
+
 diff --git a/mlx/backend/cuda/gemms/row_dot.cuh b/mlx/backend/cuda/gemms/row_dot.cuh
-index 826d31ca4..15ce50141 100644
+index 5d25dcb10..c0803addc 100644
 --- a/mlx/backend/cuda/gemms/row_dot.cuh
 +++ b/mlx/backend/cuda/gemms/row_dot.cuh
-@@ -169,6 +169,69 @@ __device__ __forceinline__ void row_dot_chunk(
-   }
- }
+@@ -22,6 +22,69 @@ namespace mlx::core::cu {
+ 
+ constexpr int row_dot_threads = 256;
  
 +// row_dot_chunk over rows of x at their own addresses, the same arithmetic per row.
 +template <int FMT, int ROWS, typename T>
@@ -72,7 +80,7 @@ index 826d31ca4..15ce50141 100644
  // out[l, m, n] = x[lhs[l], m, :] . W[rhs[l], n, :]; lhs/rhs null = batch 0.
  // Grid: x = row groups, y = groups of ROWS x rows, z = batch.
  template <int FMT, int ROWS, typename T>
-@@ -274,6 +337,119 @@ __global__ void __launch_bounds__(row_dot_threads) row_dot_kernel(
+@@ -117,6 +180,119 @@ __global__ void __launch_bounds__(row_dot_threads) row_dot_kernel(
    }
  }
  
@@ -192,7 +200,7 @@ index 826d31ca4..15ce50141 100644
  // Threads per row: fit short rows, then widen until the grid fills the GPU.
  // `rows` counts every output row of the launch, batches included.
  inline int row_dot_tpr(int chunks, int64_t rows, int num_sms) {
-@@ -318,7 +494,8 @@ void launch_row_dot(
+@@ -161,7 +337,8 @@ void launch_row_dot(
      const uint32_t* lhs_indices,
      const uint32_t* rhs_indices,
      int64_t w_batch_bytes,
@@ -202,7 +210,7 @@ index 826d31ca4..15ce50141 100644
    int bits = fmt == kRowDotDense ? 8 * sizeof(T) : fmt == kRowDotMxfp8 ? 8 : 4;
    int chunks = static_cast<int>(static_cast<int64_t>(k) * bits / 128);
    int rows_cap = m <= 1 ? 1 : m <= 2 ? 2 : m <= 4 ? 4 : 8;
-@@ -332,6 +509,36 @@ void launch_row_dot(
+@@ -175,6 +352,36 @@ void launch_row_dot(
        (n + rows_per_block - 1) / rows_per_block, row_groups, batch);
    auto wp = static_cast<const uint8_t*>(w);
    auto sp = static_cast<const uint8_t*>(scales);

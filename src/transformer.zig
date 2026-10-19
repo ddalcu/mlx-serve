@@ -34090,7 +34090,7 @@ pub const Transformer = struct {
             mw.switch_up_bias.ctx != null or
             mw.switch_down_bias.ctx != null;
         const has_gate_scale = mw.gate_expert_scale.ctx != null;
-        const do_sort = moeSortsExperts(B * S, total_inds, has_expert_bias);
+        const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias or has_gate_scale;
         const no_idx = mlx.mlx_array{ .ctx = null };
 
         var down_out = mlx.mlx_array_new();
@@ -34365,7 +34365,7 @@ pub const Transformer = struct {
                 const bskh_shape = [_]c_int{ B, S, K, hidden };
                 try mlx.check(mlx.mlx_reshape(&down_out, down_unsorted, &bskh_shape, 4, self.s));
             }
-        } else if (B * S == 1 and !has_gate_scale and useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
+        } else if (B * S == 1 and useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
             try self.moeDecodeGatherQmv(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
             // ── Decode fast path: in-place gather-qmv kernel ──
@@ -34375,7 +34375,7 @@ pub const Transformer = struct {
             // gather_qmm 349). Everything is done inside the predicate; a null
             // return (unsupported quant mode or width) falls through to the
             // batched take path below with no behaviour change.
-        } else if (B * S == 1 and !has_gate_scale and useBatchedExpertDecode(self) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null) {
+        } else if (B * S == 1 and useBatchedExpertDecode(self) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null) {
             // ── Decode fast path: take experts + batched quantized_matmul ──
             // Dodges our libmlx's serialized decode gather_qmm. A per-arch
             // VALIDATED opt-in (laguna by default) — NOT default-on-for-all-MoE:
@@ -34423,7 +34423,6 @@ pub const Transformer = struct {
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
-            try self.scaleExperts(&gate_out, mw.gate_expert_scale, inds);
 
             var up_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_5d);
@@ -34431,12 +34430,8 @@ pub const Transformer = struct {
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
-            try self.scaleExperts(&up_out, mw.up_expert_scale, inds);
 
-            const expert_act = if (cfg.swiglu_limit > 0.0)
-                try self.computeGptOssSwiGLU(gate_out, up_out)
-            else
-                try self.computeGeglu(gate_out, up_out);
+            const expert_act = try self.computeGeglu(gate_out, up_out);
             defer _ = mlx.mlx_array_free(expert_act);
 
             var act_exp = mlx.mlx_array_new();
@@ -42577,13 +42572,6 @@ fn moeCudaFormat(rows: c_int, gate: QuantMode, up: QuantMode, down: QuantMode, s
         .mxfp8 => .mxfp8,
         else => null,
     };
-}
-
-/// Whether the composed MoE chain sorts the expert assignments: several tokens, many
-/// assignments, or per-expert biases (added in sorted order). Per-expert scales do not sort:
-/// one token's gather applies them in place.
-fn moeSortsExperts(tokens: c_int, total_inds: c_int, has_expert_bias: bool) bool {
-    return tokens > 1 or total_inds >= 64 or has_expert_bias;
 }
 
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
@@ -52588,13 +52576,6 @@ test "moe decode: the CUDA fused arm takes fp banks with plain SiLU, and decline
     try std.testing.expect(moeCudaFormat(1, .nvfp4, .nvfp4, .nvfp4, true, true, false, false) == null);
     try std.testing.expect(moeCudaFormat(1, .nvfp4, .nvfp4, .nvfp4, true, false, true, false) == null);
     try std.testing.expect(moeCudaFormat(1, .nvfp4, .nvfp4, .nvfp4, true, false, false, true) == null);
-}
-
-test "moe decode: per-expert scales alone keep one token off the sorted chain" {
-    try std.testing.expect(!moeSortsExperts(1, 10, false));
-    try std.testing.expect(moeSortsExperts(2, 20, false));
-    try std.testing.expect(moeSortsExperts(1, 64, false));
-    try std.testing.expect(moeSortsExperts(1, 10, true));
 }
 
 test "moe dispatch: a clamped SwiGLU declines the rows arm, at batched decode and at verify widths" {

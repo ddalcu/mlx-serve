@@ -1,3 +1,10 @@
+The sorted fp expert gather (qmm_sm80 over sorted rhs indices, from ml-explore/mlx#4554) runs
+CTAs per (N tile, expert): a 64-row tile over sorted rows spanned 2-3 experts at Flash Next's
+~40 rows each, one serial K-loop per expert run. A popular expert's M tiles split over up to 8
+CTAs, and the grid stays near 16k CTAs.
+
+Retires when upstream's sorted-rhs gather schedules per expert. Not reported upstream yet.
+
 diff --git a/mlx/backend/cuda/device/qmm_sm80.cuh b/mlx/backend/cuda/device/qmm_sm80.cuh
 index 476c2339c..6ee6315b3 100644
 --- a/mlx/backend/cuda/device/qmm_sm80.cuh

@@ -1,79 +1,31 @@
-diff --git a/mlx/backend/cuda/device_info.cpp b/mlx/backend/cuda/device_info.cpp
-index a4a15e285..e58d92649 100644
---- a/mlx/backend/cuda/device_info.cpp
-+++ b/mlx/backend/cuda/device_info.cpp
-@@ -150,6 +150,7 @@ device_info_impl(int device_index) {
-       // Compute capability as size_t (to match Metal's variant type)
-       dev.info["compute_capability_major"] = static_cast<size_t>(prop.major);
-       dev.info["compute_capability_minor"] = static_cast<size_t>(prop.minor);
-+      dev.info["integrated"] = static_cast<size_t>(prop.integrated);
- 
-       devices.push_back(std::move(dev));
-     }
-diff --git a/mlx/backend/cuda/gemms/gemv.cu b/mlx/backend/cuda/gemms/gemv.cu
-index e48317daa..4573a04a3 100644
---- a/mlx/backend/cuda/gemms/gemv.cu
-+++ b/mlx/backend/cuda/gemms/gemv.cu
-@@ -1,6 +1,7 @@
- // Copyright © 2025 Apple Inc.
- 
- #include "mlx/backend/cuda/gemms/gemv.h"
-+#include "mlx/backend/cuda/gemms/row_dot.cuh"
- #include "mlx/backend/cuda/kernel_utils.cuh"
- #include "mlx/dtype_utils.h"
- 
-@@ -238,6 +239,27 @@ void gemv(
-       vec = gpu_ptr<DataType>(b);
-       rows = M;
-     }
-+    if constexpr (sizeof(DataType) == 2) {
-+      if (batch_count == 1 && K % 8 == 0 && row_dot_aligned(mat) &&
-+          row_dot_aligned(vec)) {
-+        launch_row_dot<DataType>(
-+            encoder,
-+            kRowDotDense,
-+            mat,
-+            nullptr,
-+            vec,
-+            gpu_ptr<DataType>(out),
-+            rows,
-+            K,
-+            1,
-+            1,
-+            nullptr,
-+            nullptr,
-+            0,
-+            0);
-+        return;
-+      }
-+    }
-     uint32_t num_blocks_x = (rows + rows_per_block - 1) / rows_per_block;
-     int n_per_t;
-     if (K % 128 == 0 && is_aligned<4>(mat) && is_aligned<4>(vec)) {
-diff --git a/mlx/backend/cuda/gemms/row_dot.cuh b/mlx/backend/cuda/gemms/row_dot.cuh
+CUDA decode mat-vecs read 16 bytes per load (row_dot): bf16 gemv, mxfp8/mxfp4/nvfp4
+quantized_matmul and the fp expert gather with fewer than 8 rows per expert. Short-N rows split
+over up to 256 threads, and each weight load is shared by up to 8 rows of x. device_info reports
+`integrated`. The arithmetic is in mlx/backend/cuda/device/row_dot_ops.cuh, a JIT header, so a
+cuda_kernel that must match it bit for bit (mlx-serve's moe_cuda.zig) includes the same code.
+
+Retires when upstream MLX's CUDA gemv and quantized mat-vecs read 16-byte vectors for these
+formats at decode widths. Not reported upstream yet.
+
+diff --git a/mlx/backend/cuda/device/row_dot_ops.cuh b/mlx/backend/cuda/device/row_dot_ops.cuh
 new file mode 100644
-index 000000000..826d31ca4
+index 000000000..8648d173a
 --- /dev/null
-+++ b/mlx/backend/cuda/gemms/row_dot.cuh
-@@ -0,0 +1,385 @@
-+// Copyright © 2026 Apple Inc.
++++ b/mlx/backend/cuda/device/row_dot_ops.cuh
+@@ -0,0 +1,189 @@
++// Copyright © 2025 Apple Inc.
 +
-+// Mat-vec over 16-bit, mxfp8, mxfp4 and nvfp4 weight rows with 16-byte loads.
-+// A row is split over 8..256 threads, and up to ROWS rows of x share each load.
++// row_dot's arithmetic, shared by its kernels and by JIT kernels that must
++// reproduce it bit for bit.
 +
 +#pragma once
 +
-+#include "mlx/backend/cuda/device.h"
-+#include "mlx/backend/cuda/device/config.h"
 +#include "mlx/backend/cuda/device/utils.cuh"
 +
 +#include <cuda_bf16.h>
 +#include <cuda_fp16.h>
 +#include <cuda_fp4.h>
 +#include <cuda_fp8.h>
-+
-+#include <algorithm>
-+#include <cstdint>
 +
 +namespace mlx::core::cu {
 +
@@ -83,8 +35,6 @@ index 000000000..826d31ca4
 +  kRowDotMxfp4 = 2, // e2m1, one ue8m0 scale per 32
 +  kRowDotNvfp4 = 3, // e2m1, one e4m3 scale per 16
 +};
-+
-+constexpr int row_dot_threads = 256;
 +
 +__device__ __forceinline__ float2 row_dot_pair(uint32_t v, __nv_bfloat16) {
 +  return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&v));
@@ -227,6 +177,113 @@ index 000000000..826d31ca4
 +  }
 +}
 +
++// One thread's share of a weight row: chunks lane, lane + tpr, ..., two loads in flight.
++template <int FMT, int ROWS, typename T>
++__device__ __forceinline__ void row_dot_lane(
++    const uint4* wp,
++    const uint8_t* s_row,
++    const T* x,
++    int64_t k,
++    int rows,
++    int chunks,
++    int lane,
++    int tpr,
++    float* acc) {
++  int c = lane;
++  for (; c + tpr < chunks; c += 2 * tpr) {
++    uint4 a = wp[c];
++    uint4 b = wp[c + tpr];
++    row_dot_chunk<FMT, ROWS>(a, s_row, c, x, k, rows, acc);
++    row_dot_chunk<FMT, ROWS>(b, s_row, c + tpr, x, k, rows, acc);
++  }
++  if (c < chunks) {
++    row_dot_chunk<FMT, ROWS>(wp[c], s_row, c, x, k, rows, acc);
++  }
++}
++
++} // namespace mlx::core::cu
+diff --git a/mlx/backend/cuda/device_info.cpp b/mlx/backend/cuda/device_info.cpp
+index a4a15e285..e58d92649 100644
+--- a/mlx/backend/cuda/device_info.cpp
++++ b/mlx/backend/cuda/device_info.cpp
+@@ -150,6 +150,7 @@ device_info_impl(int device_index) {
+       // Compute capability as size_t (to match Metal's variant type)
+       dev.info["compute_capability_major"] = static_cast<size_t>(prop.major);
+       dev.info["compute_capability_minor"] = static_cast<size_t>(prop.minor);
++      dev.info["integrated"] = static_cast<size_t>(prop.integrated);
+ 
+       devices.push_back(std::move(dev));
+     }
+diff --git a/mlx/backend/cuda/gemms/gemv.cu b/mlx/backend/cuda/gemms/gemv.cu
+index e48317daa..4573a04a3 100644
+--- a/mlx/backend/cuda/gemms/gemv.cu
++++ b/mlx/backend/cuda/gemms/gemv.cu
+@@ -1,6 +1,7 @@
+ // Copyright © 2025 Apple Inc.
+ 
+ #include "mlx/backend/cuda/gemms/gemv.h"
++#include "mlx/backend/cuda/gemms/row_dot.cuh"
+ #include "mlx/backend/cuda/kernel_utils.cuh"
+ #include "mlx/dtype_utils.h"
+ 
+@@ -238,6 +239,27 @@ void gemv(
+       vec = gpu_ptr<DataType>(b);
+       rows = M;
+     }
++    if constexpr (sizeof(DataType) == 2) {
++      if (batch_count == 1 && K % 8 == 0 && row_dot_aligned(mat) &&
++          row_dot_aligned(vec)) {
++        launch_row_dot<DataType>(
++            encoder,
++            kRowDotDense,
++            mat,
++            nullptr,
++            vec,
++            gpu_ptr<DataType>(out),
++            rows,
++            K,
++            1,
++            1,
++            nullptr,
++            nullptr,
++            0,
++            0);
++        return;
++      }
++    }
+     uint32_t num_blocks_x = (rows + rows_per_block - 1) / rows_per_block;
+     int n_per_t;
+     if (K % 128 == 0 && is_aligned<4>(mat) && is_aligned<4>(vec)) {
+diff --git a/mlx/backend/cuda/gemms/row_dot.cuh b/mlx/backend/cuda/gemms/row_dot.cuh
+new file mode 100644
+index 000000000..5d25dcb10
+--- /dev/null
++++ b/mlx/backend/cuda/gemms/row_dot.cuh
+@@ -0,0 +1,228 @@
++// Copyright © 2026 Apple Inc.
++
++// Mat-vec over 16-bit, mxfp8, mxfp4 and nvfp4 weight rows with 16-byte loads.
++// A row is split over 8..256 threads, and up to ROWS rows of x share each load.
++
++#pragma once
++
++#include "mlx/backend/cuda/device.h"
++#include "mlx/backend/cuda/device/config.h"
++#include "mlx/backend/cuda/device/row_dot_ops.cuh"
++#include "mlx/backend/cuda/device/utils.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_fp4.h>
++#include <cuda_fp8.h>
++
++#include <algorithm>
++#include <cstdint>
++
++namespace mlx::core::cu {
++
++constexpr int row_dot_threads = 256;
++
 +// out[l, m, n] = x[lhs[l], m, :] . W[rhs[l], n, :]; lhs/rhs null = batch 0.
 +// Grid: x = row groups, y = groups of ROWS x rows, z = batch.
 +template <int FMT, int ROWS, typename T>
@@ -278,17 +335,7 @@ index 000000000..826d31ca4
 +          static_cast<int64_t>(row) * (k / group);
 +    }
 +    const uint4* wp = reinterpret_cast<const uint4*>(w_row);
-+    // Two loads in flight per thread.
-+    int c = lane;
-+    for (; c + tpr < chunks; c += 2 * tpr) {
-+      uint4 a = wp[c];
-+      uint4 b = wp[c + tpr];
-+      row_dot_chunk<FMT, ROWS>(a, s_row, c, x, k, rows, acc);
-+      row_dot_chunk<FMT, ROWS>(b, s_row, c + tpr, x, k, rows, acc);
-+    }
-+    if (c < chunks) {
-+      row_dot_chunk<FMT, ROWS>(wp[c], s_row, c, x, k, rows, acc);
-+    }
++    row_dot_lane<FMT, ROWS>(wp, s_row, x, k, rows, chunks, lane, tpr, acc);
 +  }
 +
 +  // Reduce in the warp, then across the warps of one row.
@@ -441,6 +488,26 @@ index 000000000..826d31ca4
 +}
 +
 +} // namespace mlx::core::cu
+diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
+index 0d107a8e1..9c1d98a83 100644
+--- a/mlx/backend/cuda/jit_module.cpp
++++ b/mlx/backend/cuda/jit_module.cpp
+@@ -274,6 +274,7 @@ constexpr const char* g_include_names[] = {
+     INCLUDE_PREFIX "qmm_naive.cuh",
+     INCLUDE_PREFIX "qmm_sm80.cuh",
+     INCLUDE_PREFIX "qmm_sm90.cuh",
++    INCLUDE_PREFIX "row_dot_ops.cuh",
+     INCLUDE_PREFIX "scatter_ops.cuh",
+     INCLUDE_PREFIX "unary_ops.cuh",
+     INCLUDE_PREFIX "ternary_ops.cuh",
+@@ -296,6 +297,7 @@ constexpr const char* g_headers[] = {
+     jit_source_qmm_naive,
+     jit_source_qmm_sm80,
+     jit_source_qmm_sm90,
++    jit_source_row_dot_ops,
+     jit_source_scatter_ops,
+     jit_source_unary_ops,
+     jit_source_ternary_ops,
 diff --git a/mlx/backend/cuda/quantized/qmm/fp_qmv.cu b/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
 index 41de03e85..d2bdd3842 100644
 --- a/mlx/backend/cuda/quantized/qmm/fp_qmv.cu

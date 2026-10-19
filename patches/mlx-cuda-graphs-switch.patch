@@ -1,3 +1,11 @@
+mlx_cuda_set_graphs: CUDA graphs on or off at runtime, committing pending nodes first. On a GB10
+(sm_121) prefill kernels ran up to 2.3x slower inside MLX's CUDA graphs than alone (MLX commits a
+graph per 20 ops or 25 MB there); the cause was not found. mlx-serve runs prefill without graphs
+on integrated GPUs and keeps them for decode.
+
+Retires when MLX's CUDA graphs run prefill at standalone kernel speed on GB10 (the measurements
+are in mlx-serve's docs/CUDA.md). Not reported upstream yet.
+
 diff --git a/mlx/backend/cuda/device.cpp b/mlx/backend/cuda/device.cpp
 index 6e40b3403..798dd83b1 100644
 --- a/mlx/backend/cuda/device.cpp

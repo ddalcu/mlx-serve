@@ -15,96 +15,9 @@ pub const Bank = struct { w: mlx.mlx_array, s: mlx.mlx_array };
 const HEADER =
     \\#include "mlx/backend/cuda/device/binary_ops.cuh"
     \\#include "mlx/backend/cuda/device/unary_ops.cuh"
-    \\#include <cuda_bf16.h>
-    \\#include <cuda_fp16.h>
-    \\#include <cuda_fp4.h>
-    \\#include <cuda_fp8.h>
-    \\// A copy of row_dot's device code: the same arithmetic in the same order.
-    \\__device__ __forceinline__ float2 msv_pair(uint32_t v, __nv_bfloat16) { return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&v)); }
-    \\__device__ __forceinline__ float2 msv_pair(uint32_t v, __half) { return __half22float2(*reinterpret_cast<__half2*>(&v)); }
-    \\__device__ __forceinline__ float2 msv_e4m3x2(uint32_t v16) {
-    \\  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(v16 & 0xffff), __NV_E4M3);
-    \\  return __half22float2(*reinterpret_cast<__half2*>(&h));
-    \\}
-    \\__device__ __forceinline__ float2 msv_e2m1x2(uint32_t v8) {
-    \\  __half2_raw h = __nv_cvt_fp4x2_to_halfraw2(static_cast<__nv_fp4x2_storage_t>(v8 & 0xff), __NV_E2M1);
-    \\  return __half22float2(*reinterpret_cast<__half2*>(&h));
-    \\}
-    \\__device__ __forceinline__ float msv_ue8m0(uint32_t s) { return s == 0 ? __int_as_float(0x00400000) : __int_as_float(s << 23); }
-    \\__device__ __forceinline__ float msv_e4m3(uint32_t s) {
-    \\  __half_raw h = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(s & 0xff), __NV_E4M3);
-    \\  return __half2float(*reinterpret_cast<__half*>(&h));
-    \\}
-    \\template <typename T>
-    \\__device__ __forceinline__ float msv_dot_x(const T* x, const float* w, int n_uint4) {
-    \\  float a = 0.f, b = 0.f;
-    \\#pragma unroll 4
-    \\  for (int i = 0; i < n_uint4; ++i) {
-    \\    uint4 xv = reinterpret_cast<const uint4*>(x)[i];
-    \\    float2 x0 = msv_pair(xv.x, T{});
-    \\    float2 x1 = msv_pair(xv.y, T{});
-    \\    float2 x2 = msv_pair(xv.z, T{});
-    \\    float2 x3 = msv_pair(xv.w, T{});
-    \\    const float* wi = w + 8 * i;
-    \\    a = fmaf(x0.x, wi[0], a);
-    \\    b = fmaf(x0.y, wi[1], b);
-    \\    a = fmaf(x1.x, wi[2], a);
-    \\    b = fmaf(x1.y, wi[3], b);
-    \\    a = fmaf(x2.x, wi[4], a);
-    \\    b = fmaf(x2.y, wi[5], b);
-    \\    a = fmaf(x3.x, wi[6], a);
-    \\    b = fmaf(x3.y, wi[7], b);
-    \\  }
-    \\  return a + b;
-    \\}
-    \\// Chunk c (16 bytes) of a weight row against one row of x, added to acc.
-    \\template <int FMT, typename T>
-    \\__device__ __forceinline__ void msv_chunk(uint4 wv, const uint8_t* s_row, int c, const T* x, float& acc) {
-    \\  constexpr int E = FMT == 1 ? 16 : 32;
-    \\  const T* xc = x + (long)c * E;
-    \\  uint32_t wu[4] = {wv.x, wv.y, wv.z, wv.w};
-    \\  if constexpr (FMT == 1) {
-    \\    float scale = msv_ue8m0(s_row[c >> 1]);
-    \\    float w[16];
-    \\    for (int i = 0; i < 4; ++i) {
-    \\      float2 lo = msv_e4m3x2(wu[i]);
-    \\      float2 hi = msv_e4m3x2(wu[i] >> 16);
-    \\      w[4 * i] = lo.x; w[4 * i + 1] = lo.y; w[4 * i + 2] = hi.x; w[4 * i + 3] = hi.y;
-    \\    }
-    \\    acc += scale * msv_dot_x(xc, w, 2);
-    \\  } else {
-    \\    float w[32];
-    \\    for (int i = 0; i < 4; ++i) {
-    \\      for (int j = 0; j < 4; ++j) {
-    \\        float2 p = msv_e2m1x2(wu[i] >> (8 * j));
-    \\        w[8 * i + 2 * j] = p.x; w[8 * i + 2 * j + 1] = p.y;
-    \\      }
-    \\    }
-    \\    if constexpr (FMT == 2) {
-    \\      float scale = msv_ue8m0(s_row[c]);
-    \\      acc += scale * msv_dot_x(xc, w, 4);
-    \\    } else {
-    \\      uint32_t s2 = *reinterpret_cast<const uint16_t*>(s_row + 2 * c);
-    \\      float s0 = msv_e4m3(s2);
-    \\      float s1 = msv_e4m3(s2 >> 8);
-    \\      acc += s0 * msv_dot_x(xc, w, 2) + s1 * msv_dot_x(xc + 16, w + 16, 2);
-    \\    }
-    \\  }
-    \\}
-    \\// One weight row's dot with x over `tpr` lanes, row_dot's two-loads-in-flight order.
-    \\template <int FMT, typename T>
-    \\__device__ __forceinline__ float msv_row(const uint4* wp, const uint8_t* s_row, const T* x, int chunks, int lane, int tpr) {
-    \\  float acc = 0.f;
-    \\  int c = lane;
-    \\  for (; c + tpr < chunks; c += 2 * tpr) {
-    \\    uint4 a = wp[c];
-    \\    uint4 b = wp[c + tpr];
-    \\    msv_chunk<FMT>(a, s_row, c, x, acc);
-    \\    msv_chunk<FMT>(b, s_row, c + tpr, x, acc);
-    \\  }
-    \\  if (c < chunks) msv_chunk<FMT>(wp[c], s_row, c, x, acc);
-    \\  return acc;
-    \\}
+    \\// row_dot's arithmetic, which the decode rows must match bit for bit.
+    \\#include "mlx/backend/cuda/device/row_dot_ops.cuh"
+    \\
 ;
 
 // Grid (I/8 blocks, B*TOPK): one warp per intermediate row, gate and up rows of one expert.
@@ -122,8 +35,9 @@ const GU_SOURCE =
     \\const long row = (long)e * I + n;
     \\const uint4* gp = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(gw) + row * (D * BITS / 8));
     \\const uint4* upw = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(uw) + row * (D * BITS / 8));
-    \\float ag = msv_row<FMT>(gp, gs + row * (D / GROUP), xr, CH, lane, 32);
-    \\float au = msv_row<FMT>(upw, us + row * (D / GROUP), xr, CH, lane, 32);
+    \\float ag = 0.f, au = 0.f;
+    \\row_dot_lane<FMT, 1>(gp, gs + row * (D / GROUP), xr, 0, 1, CH, lane, 32, &ag);
+    \\row_dot_lane<FMT, 1>(upw, us + row * (D / GROUP), xr, 0, 1, CH, lane, 32, &au);
     \\for (int off = 16; off > 0; off /= 2) {
     \\  ag += __shfl_xor_sync(0xffffffff, ag, off);
     \\  au += __shfl_xor_sync(0xffffffff, au, off);
@@ -156,7 +70,7 @@ const DR_SOURCE =
     \\  const uint32_t e = inds[b * TOPK + k];
     \\  const long row = (long)e * D + d;
     \\  const uint4* wp = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(dw) + row * (I * BITS / 8));
-    \\  acc = msv_row<FMT>(wp, ds + row * (I / GROUP), act + (long)(b * TOPK + k) * I, CH, l, 8);
+    \\  row_dot_lane<FMT, 1>(wp, ds + row * (I / GROUP), act + (long)(b * TOPK + k) * I, 0, 1, CH, l, 8, &acc);
     \\}
     \\for (int off = 4; off > 0; off /= 2) acc += __shfl_xor_sync(0xffffffff, acc, off);
     \\__shared__ T part[32];

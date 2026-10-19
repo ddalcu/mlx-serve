@@ -1,3 +1,10 @@
+cuda_kernel modules go to the disk kernel cache like MLX's own JIT kernels (MLX passed
+use_disk_cache = false for them), so NVRTC compiles each once per machine instead of once per
+process. The module name hashes the generated source, and mlx-serve keys the cache directory by
+its MLX build stamp, so a cached module never outlives its source or its headers.
+
+Retires when upstream caches custom kernels on disk. Not reported upstream yet.
+
 diff --git a/mlx/backend/cuda/custom_kernel.cpp b/mlx/backend/cuda/custom_kernel.cpp
 index c230656d8..35f725c25 100644
 --- a/mlx/backend/cuda/custom_kernel.cpp
