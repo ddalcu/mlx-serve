@@ -369,7 +369,28 @@ pub fn promiseMaterialized(completion_tokens: usize) bool {
     return completion_tokens >= PROMISE_MATERIALIZED_TOKENS;
 }
 
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool = null;
+pub const HotCacheAdmissionSnapshot = struct {
+    resident: u64 = 0,
+    eviction_base: u64 = 0,
+    checked_out: u64 = 0,
+    reclaimable: u64 = 0,
+    live_slots: usize = 0,
+    /// What the live slots hold: the most their finishing can ever hand back.
+    live_kv_bytes: u64 = 0,
+};
+
+pub const PrefillAdmissionNumbers = struct {
+    needed: u64,
+    available: u64,
+    chunk: u32,
+    cache: HotCacheAdmissionSnapshot = .{},
+
+    pub fn fits(self: PrefillAdmissionNumbers) bool {
+        return self.needed <= self.available;
+    }
+};
+
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) PrefillAdmissionNumbers = null;
 
 /// The prefill width this request should run at, chosen against live post-eviction memory
 /// (`server.requestPrefillChunkNow`). Null keeps the model's load-time pin.
@@ -426,8 +447,8 @@ pub var prefill_chunk_widen_ok: ?*const fn (
     u64,
 ) bool = null;
 
-/// Logs the numbers the estimator compared on a refusal and returns them, {needed, available} bytes.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) [2]u64 = null;
+/// Logs the numbers the estimator compared on a refusal; returns {needed, available} for the client.
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, PrefillAdmissionNumbers) [2]u64 = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
@@ -555,6 +576,11 @@ pub const Slot = struct {
     logprobs_n: u32,
     serial_reason_logged: bool = false,
     memory_hold_logged: bool = false,
+    memory_hold_live_count: usize = 0,
+    /// Nanoseconds from `request_start_ts` when the warm-hold loop's OWN wait expires:
+    /// stamped when the bill parks this slot, cleared when its company drains.
+    /// 0 = not held. `--timeout` is a stall timeout, so arrival never starts this clock.
+    memory_hold_deadline_ns: u64 = 0,
     memory_promised: u64 = 0,
     /// This tick decodes plain (batched) although the slot's MTP head is armed: the
     /// batched forward captures its hidden so the next solo tick can resume speculating.
@@ -1470,8 +1496,6 @@ pub const Scheduler = struct {
     cached_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
     cached_session_count: usize = 0,
 
-    /// The part of the above an eviction can prove it will return (residency minus the largest entry).
-    reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
@@ -1492,6 +1516,9 @@ pub const Scheduler = struct {
     hot_cache_digests: []prefix_cache_mod.HotPrefixCache.EntryDigest = &.{},
     /// The residency the digests describe, published in the same critical section.
     digest_residency: u64 = 0,
+    digest_eviction_base: u64 = 0,
+    digest_checked_out: u64 = 0,
+    digest_reclaimable: u64 = 0,
     digest_mu: std.Io.Mutex = .init,
 
     max_concurrent: u32,
@@ -1831,13 +1858,32 @@ pub const Scheduler = struct {
         self.hot_prefix_cache = null;
         self.resident_hot_cache_bytes.store(0, .monotonic);
         if (hot_cache_budget_invalidate) |f| f();
-        self.reclaimable_hot_cache_bytes.store(0, .monotonic);
         if (self.load_error_name) |n| self.allocator.free(n);
 
         self.allocator.destroy(self);
     }
 
-    /// Decoders a tick would advance now; finished slots linger in `decoding` until the cull.
+    /// Put `batch` (the tail of the admitted prefill list, starting at list position
+    /// `first_index`) back at the head of `pending`, in order: release promises, unlist
+    /// from `prefilling` for `cancelAllInFlight`, never revive a slot `complete` removed.
+    fn requeuePrefillBatch(sch: *Scheduler, batch: []const *Slot, first_index: usize) void {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        sch.n_prefilling = first_index; // back in `pending`, which `cancelAllInFlight` walks
+        var r = batch.len;
+        while (r > 0) {
+            r -= 1;
+            const slot = batch[r];
+            sch.promise_ledger.release(slot.memory_promised);
+            slot.memory_promised = 0;
+            if (!slot.cancelled.load(.acquire) and !slot.finished and slot.error_code == null) {
+                sch.pending.insert(sch.allocator, 0, slot) catch slot.markError("OutOfMemory");
+            }
+            if (r > 0) _ = batch[r].in_pass.fetchSub(1, .acq_rel);
+        }
+    }
+
+    /// Decoders a tick would advance now; finished slots linger until the cull.
     fn liveDecodingCount(self: *Scheduler) usize {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
@@ -2772,6 +2818,11 @@ fn liveDecodingCount(sch: *Scheduler) usize {
 
 /// Cold bill against live memory; the gated arch runs its own warm pass inside `runPrefill`.
 fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
+    if (slot.memory_hold_live_count > 0) {
+        if (liveDecodingCount(sch) >= slot.memory_hold_live_count) return true;
+        slot.memory_hold_live_count = 0;
+        slot.memory_hold_deadline_ns = 0;
+    }
     const cfg = slot.model.config orelse return false;
     if (cfg.longCtxGated()) return false;
     if (slot.model.transformer == null) return false;
@@ -5496,8 +5547,6 @@ fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
     const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
-    const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
-    sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
     publishHotCacheDigests(sch);
     if (sch.metrics != null) publishCachedSessions(sch);
 }
@@ -5529,34 +5578,40 @@ fn publishCachedSessions(sch: *Scheduler) void {
     sch.cached_session_count = n;
 }
 
-/// Swap in a fresh digest snapshot and free the one it supersedes (inference thread only).
-/// An allocation failure keeps the previous snapshot: a stale digest is a hint, an empty one
-/// credits bytes that exist.
+/// Publish cache classifications together; an incomplete snapshot grants no eviction credit.
 fn publishHotCacheDigests(sch: *Scheduler) void {
-    const fresh: []prefix_cache_mod.HotPrefixCache.EntryDigest = if (sch.hot_prefix_cache) |hc|
-        (hc.digestsAlloc(sch.allocator) catch return)
-    else
-        &.{};
-    const residency: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    const hc = sch.hot_prefix_cache;
+    const snapshot = if (hc) |cache| cache.digestSnapshotAlloc(sch.allocator) catch null else null;
+    const resident = if (snapshot) |v| v.resident_bytes else if (hc) |cache| cache.residentBytes() else 0;
+    const checked_out = if (snapshot) |v| v.checked_out_bytes else if (hc) |cache| resident -| cache.evictionBaseBytes() else 0;
     sch.digest_mu.lockUncancelable(sch.io);
     const old = sch.hot_cache_digests;
-    sch.hot_cache_digests = fresh;
-    // Published under the same lock as the digests it describes.
-    sch.digest_residency = residency;
+    sch.hot_cache_digests = if (snapshot) |v| v.digests else &.{};
+    sch.digest_residency = resident;
+    sch.digest_eviction_base = if (snapshot) |v| v.eviction_base else 0;
+    sch.digest_checked_out = checked_out;
+    sch.digest_reclaimable = if (snapshot != null) (if (hc) |cache| cache.reclaimableBytes() else 0) else 0;
     sch.digest_mu.unlock(sch.io);
     if (old.len > 0) sch.allocator.free(old);
 }
 
-/// Connection-thread entry point: what an eviction pass can prove it will get back for this prompt.
-pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) u64 {
-    const fp = prefix_cache_mod.HotPrefixCache.prefixFingerprint(prompt_tokens);
+pub fn hotCacheAdmissionSnapshotFor(sch: *Scheduler, prompt_tokens: ?[]const u32) HotCacheAdmissionSnapshot {
     sch.digest_mu.lockUncancelable(sch.io);
-    defer sch.digest_mu.unlock(sch.io);
-    return prefix_cache_mod.HotPrefixCache.reclaimableFromDigests(
-        sch.hot_cache_digests,
-        sch.digest_residency,
-        fp,
-    );
+    const fp = if (prompt_tokens) |tokens| prefix_cache_mod.HotPrefixCache.prefixFingerprint(tokens) else null;
+    const reclaimable = if (prompt_tokens != null)
+        prefix_cache_mod.HotPrefixCache.reclaimableFromDigests(sch.hot_cache_digests, sch.digest_eviction_base, fp)
+    else
+        @min(sch.digest_eviction_base, sch.digest_reclaimable);
+    var result = HotCacheAdmissionSnapshot{
+        .resident = sch.digest_residency,
+        .eviction_base = sch.digest_eviction_base,
+        .checked_out = sch.digest_checked_out,
+        .reclaimable = reclaimable,
+    };
+    sch.digest_mu.unlock(sch.io);
+    result.live_slots = liveDecodingCount(sch);
+    result.live_kv_bytes = sch.resident_live_kv_bytes.load(.monotonic);
+    return result;
 }
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.
@@ -5815,6 +5870,8 @@ fn drainSideQueues(sch: *Scheduler) bool {
         if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
         s.deinit();
     }
+    // Cleanup freed cache entries; conn threads must not bill the dead bytes again.
+    if (cleanup_n > 0) publishHotCacheResidency(sch);
     for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
     for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
     return cleanup_n + vision_n + embed_n > 0;
@@ -5847,11 +5904,17 @@ fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
         finishSlot(sch, slot, "cancelled");
         return .finished;
     }
+    if (finishExpiredPrefill(sch, slot)) return .errored;
     if (slotHoldsForMemory(sch, slot)) return .held;
     var prefill_sw = io_util.Stopwatch.init(sch.io);
     var qsa_gap_retried = false;
     prefill: while (true) {
         runPrefill(sch, slot) catch |err| {
+            if (err == error.PrefillHeld) {
+                // The warm bill failed beside a live decoder: the restore was
+                // returned intact, so wait for one to finish and try again.
+                return .held;
+            }
             if (err == error.Cancelled) {
                 log.info("[scheduler] prefill aborted: client disconnected\n", .{});
                 finishSlot(sch, slot, "cancelled");
@@ -6022,18 +6085,10 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
             switch (prefillAdmitted(sch, slot)) {
                 .held => {
-                    // Back to the head of `pending`, in order; the decode tick below runs first.
-                    sch.queue_mu.lockUncancelable(sch.io);
-                    defer sch.queue_mu.unlock(sch.io);
-                    sch.n_prefilling = pi; // back in `pending`, which `cancelAllInFlight` walks
-                    var r = n_prefill;
-                    while (r > pi) {
-                        r -= 1;
-                        sch.pending.insert(sch.allocator, 0, to_prefill[r]) catch {
-                            to_prefill[r].markError("OutOfMemory");
-                        };
-                        if (r > pi) _ = to_prefill[r].in_pass.fetchSub(1, .acq_rel);
-                    }
+                    // Back to the head of `pending`, in order; the decode tick below runs
+                    // first. Requeues release the promise ledger and never revive a slot
+                    // `complete` has already removed.
+                    Scheduler.requeuePrefillBatch(sch, to_prefill[pi..n_prefill], pi);
                     break;
                 },
                 .decoding, .finished, .errored, .tail_too_large => ran = true,
@@ -7878,8 +7933,8 @@ pub fn orderByTail(tails: []const usize, order: []usize) void {
 
 /// Undo a hot-cache restore the slot has not started on: hand the checkout back and empty the
 /// slot's cache, so the request can wait in `pending` and restore again when its turn comes.
-fn resetRestoredSlot(slot: *Slot) void {
-    if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), "tail over the boundary limit");
+fn resetRestoredSlot(slot: *Slot, reason: []const u8) void {
+    if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
     emptySlotCache(slot);
     slot.restored_entry = 0;
 }
@@ -8220,6 +8275,18 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     return tick_ns;
 }
 
+fn finishExpiredPrefill(sch: *Scheduler, slot: *Slot) bool {
+    // Bounds the warm-hold loop ONLY: the deadline runs from the hold, never from
+    // arrival (`--timeout` is a stall timeout; queue depth alone must not finish a
+    // queued request empty); a slot whose company drained is refused by name, not killed.
+    if (slot.memory_hold_deadline_ns == 0 or liveDecodingCount(sch) == 0) return false;
+    if (slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds < slot.memory_hold_deadline_ns) return false;
+    // No forward ever ran: an empty "length" would read as the model running out
+    // of tokens. This is the memory refusal the bill named, and it answers as one.
+    slot.markError("PrefillDoesNotFit");
+    return true;
+}
+
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
@@ -8443,7 +8510,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // own: the restore covered less than the pre-filter peeked (SSD tier, lien, QSA gap, a checkout
     // taken meanwhile). Nothing has been forwarded yet, so hand the entry back and let it wait.
     if (slot.boundary_max_tail) |max_tail| if (prefill_tokens.len > max_tail) {
-        resetRestoredSlot(slot);
+        resetRestoredSlot(slot, "tail over the boundary limit");
         return error.BoundaryTailTooLarge;
     };
 
@@ -8467,6 +8534,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         if (slot.model.config) |cfg| {
             // Bills the request's own kv-quant scheme and vision chunking, not the process defaults.
             const Probe = struct {
+                sch: *Scheduler,
                 cfg: *const model_mod.ModelConfig,
                 seq: usize,
                 max_tokens: u32,
@@ -8479,13 +8547,17 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 /// Only a checked-out restore is credited: a refcount share is copied by the first append.
                 warm_will_donate: bool,
                 enable_mtp: bool,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) PrefillAdmissionNumbers,
+                numbers: PrefillAdmissionNumbers = .{ .needed = 0, .available = 0, .chunk = 0 },
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
+                    publishHotCacheResidency(self.sch);
+                    self.numbers = self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
+                    return self.numbers.fits();
                 }
             };
             var probe = Probe{
+                .sch = sch,
                 .cfg = cfg,
                 .seq = slot.full_prompt.len,
                 .max_tokens = slot.max_tokens,
@@ -8533,9 +8605,34 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 // What the allocator returned, not what the cache was billed for.
                 evicted_live_bytes = report.bytes;
                 if (!report.admitted) {
-                    log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
+                    const live = liveDecodingCount(sch);
+                    // A hold pays only while the shortfall is at most what the live slots can
+                    // hand back. This is the POST-eviction bill (the eviction pass's final probe
+                    // re-read live memory): never subtract `evicted_live_bytes` again here.
+                    const shortfall = probe.numbers.needed -| probe.numbers.available;
+                    if (live > 0 and shortfall <= sch.resident_live_kv_bytes.load(.monotonic)) {
+                        slot.memory_hold_live_count = live;
+                        if (slot.timeout_ns != 0 and slot.memory_hold_deadline_ns == 0) {
+                            const held_at: u64 = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+                            slot.memory_hold_deadline_ns = held_at +| slot.timeout_ns;
+                        }
+                        // Quote THIS bill if the hold itself expires: no later bill will ever run.
+                        if (prefill_admission_refused_log) |report_fn| {
+                            slot.refused_bill = report_fn(cfg, slot.full_prompt.len, probe.numbers);
+                        }
+                        // One sanctioned undo of the restore (checkout, KV/SSM rows, module-side
+                        // qwen4 state), with the truncate's failure swallowed like the helper's other users.
+                        resetRestoredSlot(slot, "prefill held");
+                        publishHotCacheResidency(sch);
+                        if (!slot.memory_hold_logged) {
+                            log.info("[admission] held: {d} tokens do not fit beside live requests; waiting for one to finish\n", .{slot.full_prompt.len});
+                            slot.memory_hold_logged = true;
+                        }
+                        return error.PrefillHeld;
+                    }
+                    log.warn("[scheduler] prefill refused: {d} tokens do not fit after reclaiming evictable entries\n", .{slot.full_prompt.len});
                     if (prefill_admission_refused_log) |report_fn| {
-                        slot.refused_bill = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                        slot.refused_bill = report_fn(cfg, slot.full_prompt.len, probe.numbers);
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.
@@ -8597,6 +8694,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
     if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
+    publishHotCacheResidency(sch);
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -12927,7 +13025,6 @@ test "hot-cache view: a revise that follows an unload raises a budget but never 
     sch.hot_cache_digests = &.{};
     sch.digest_residency = 0;
     sch.resident_hot_cache_bytes = std.atomic.Value(u64).init(0);
-    sch.reclaimable_hot_cache_bytes = std.atomic.Value(u64).init(0);
 
     hc.max_kv_bytes = 600 << 20;
     reviseHotCacheBudgets(&sch, true);
@@ -12941,3 +13038,350 @@ test "hot-cache view: a revise that follows an unload raises a budget but never 
     try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
 }
 
+test "warm prefill waits beside a live sibling and refuses alone" {
+    const Hook = struct {
+        fn fits(_: *const model_mod.ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: bool, _: u64, _: u64, _: bool, _: bool) PrefillAdmissionNumbers {
+            return .{ .needed = 2, .available = 1, .chunk = 512 };
+        }
+    };
+    const saved = prefill_admission_fits;
+    prefill_admission_fits = &Hook.fits;
+    defer prefill_admission_fits = saved;
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_type = "qwen4_exp";
+    // Zeroed, not `undefined`: `runPrefill` reads every pointer field the
+    // admission path probes, and garbage there is a wild read.
+    var xfm: Transformer = undefined;
+    @memset(@as([*]u8, @ptrCast(&xfm))[0..@sizeOf(Transformer)], 0);
+    xfm.config = cfg;
+    var lm: LoadedModel = undefined;
+    @memset(@as([*]u8, @ptrCast(&lm))[0..@sizeOf(LoadedModel)], 0);
+    lm.ds4_engine = null;
+    lm.llama_engine = null;
+    lm.prefix_cache = null;
+    lm.vision_encoder = null;
+    lm.ssm_checkpoint_stride = 0;
+    lm.ssm_checkpoint_max = 0;
+    lm.config = &cfg;
+    lm.transformer = &xfm;
+    const slot = try Slot.init(testing.allocator, testing.io, &cfg, .{
+        .prompt_ids = &.{ 1, 2 },
+        .sampling = .{},
+        .eos_token_ids = &.{},
+        .max_tokens = 1,
+        .model = &lm,
+    }, transformer_mod.KVQuantConfig.dense);
+    defer slot.deinit();
+    var sibling: Slot = undefined;
+    sibling.cancelled = .init(false);
+    sibling.finished = false;
+    sibling.error_code = null;
+    var sch: Scheduler = undefined;
+    sch.metrics = null;
+    sch.hot_prefix_cache = null;
+    sch.hot_cache_digests = &.{};
+    sch.resident_hot_cache_bytes = .init(0);
+    sch.resident_live_kv_bytes = .init(8);
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.digest_mu = .init;
+    sch.decoding = .empty;
+    defer sch.decoding.deinit(testing.allocator);
+    // Queue depth is not death: the timeout is a stall timeout, so a slot the
+    // warm bill never held keeps waiting even past it.
+    slot.timeout_ns = 1;
+    try testing.expect(!finishExpiredPrefill(&sch, slot));
+    try testing.expectEqual(SlotState.pending_prefill, slot.state);
+    // Beside a live decoder the warm bill holds: the restore comes back intact,
+    // and the hold stamps its OWN deadline, not one measured from arrival.
+    try sch.decoding.append(testing.allocator, &sibling);
+    try testing.expectError(error.PrefillHeld, runPrefill(&sch, slot));
+    try testing.expectEqual(SlotState.pending_prefill, slot.state);
+    try testing.expectEqual(@as(usize, 0), slot.cache.step);
+    try testing.expect(slot.memory_hold_deadline_ns > 0);
+    try testing.expect(slotHoldsForMemory(&sch, slot));
+    sch.decoding.clearRetainingCapacity();
+    // The company drained: a past-deadline slot that is about to retry is not
+    // killed; the next pass answers it by name.
+    try testing.expect(!finishExpiredPrefill(&sch, slot));
+    try testing.expect(!slotHoldsForMemory(&sch, slot));
+    try testing.expectEqual(@as(u64, 0), slot.memory_hold_deadline_ns);
+    // Alone, what does not fit is refused by name, not killed by the deadline.
+    try testing.expectError(error.PrefillDoesNotFit, runPrefill(&sch, slot));
+    // A live sibling that cannot hand back the shortfall never earns a hold: a
+    // prompt that can never run must not park the queue behind it for the deadline.
+    try sch.decoding.append(testing.allocator, &sibling);
+    sch.resident_live_kv_bytes.store(0, .monotonic);
+    try testing.expectError(error.PrefillDoesNotFit, runPrefill(&sch, slot));
+    sch.resident_live_kv_bytes.store(8, .monotonic);
+    // Expired WHILE HELD, the hold loop is bounded — and the answer is the named
+    // refusal with its bill, not an empty "length" turn read as a spent budget.
+    try testing.expectError(error.PrefillHeld, runPrefill(&sch, slot));
+    slot.memory_hold_deadline_ns = 1; // the hold's own deadline, already spent
+    try testing.expect(finishExpiredPrefill(&sch, slot));
+    try testing.expect(slot.errorNameIs("PrefillDoesNotFit"));
+    try testing.expectEqual(SlotState.errored, slot.state);
+}
+
+test "the hold reads the post-eviction bill: freed bytes are not subtracted twice" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const Hook = struct {
+        fn fits(_: *const model_mod.ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: bool, _: u64, _: u64, _: bool, _: bool) PrefillAdmissionNumbers {
+            // Post-eviction, `available` already prices what the eviction pass freed.
+            return .{ .needed = 100, .available = 95, .chunk = 512 };
+        }
+    };
+    const saved = prefill_admission_fits;
+    prefill_admission_fits = &Hook.fits;
+    defer prefill_admission_fits = saved;
+    var entry_toks: [600]u32 = undefined;
+    for (&entry_toks, 0..) |*id, i| id.* = @intCast(i + 7);
+
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_type = "qwen4_exp";
+    var xfm: Transformer = undefined;
+    @memset(@as([*]u8, @ptrCast(&xfm))[0..@sizeOf(Transformer)], 0);
+    xfm.config = cfg;
+    xfm.s = s;
+    var lm: LoadedModel = undefined;
+    @memset(@as([*]u8, @ptrCast(&lm))[0..@sizeOf(LoadedModel)], 0);
+    lm.ds4_engine = null;
+    lm.llama_engine = null;
+    lm.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    defer lm.prefix_cache.?.deinit();
+    const hc = &lm.prefix_cache.?;
+    // The donor dies right after the commit: only an entry whose buffers the allocator
+    // got back returns REAL bytes when the eviction pass takes it.
+    {
+        var donor = try KVCache.init(testing.allocator, 1);
+        try admissionTestFillKv(&donor, s, 600);
+        for (donor.entries) |*e| {
+            if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
+            if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+        }
+        _ = try hc.commit(&donor, &entry_toks, false);
+        donor.deinit();
+    }
+    lm.vision_encoder = null;
+    lm.ssm_checkpoint_stride = 0;
+    lm.ssm_checkpoint_max = 0;
+    lm.config = &cfg;
+    lm.transformer = &xfm;
+    // The prompt misses the entry, so the eviction pass is free to take it.
+    const slot = try Slot.init(testing.allocator, testing.io, &cfg, .{
+        .prompt_ids = &.{ 1, 2 },
+        .sampling = .{},
+        .eos_token_ids = &.{},
+        .max_tokens = 1,
+        .model = &lm,
+    }, transformer_mod.KVQuantConfig.dense);
+    defer slot.deinit();
+    var sibling: Slot = undefined;
+    sibling.cancelled = .init(false);
+    sibling.finished = false;
+    sibling.error_code = null;
+    var sch = admissionTestScheduler(hc);
+    defer sch.decoding.deinit(testing.allocator);
+    defer if (sch.hot_cache_digests.len > 0) testing.allocator.free(sch.hot_cache_digests);
+    try sch.decoding.append(testing.allocator, &sibling);
+    // The live sibling holds 2 bytes; the post-eviction shortfall is 5, so this can
+    // never run and is refused now. Subtracting the eviction's freed bytes AGAIN
+    // (they are already inside `available`) would read 5-5=0 <= 2 and hold it.
+    sch.resident_live_kv_bytes.store(2, .monotonic);
+    try testing.expectError(error.PrefillDoesNotFit, runPrefill(&sch, slot));
+    // Non-vacuous: the eviction pass really gave the entry's bytes back.
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+}
+
+test "prefill requeue preserves FIFO without reviving cancelled slots or promises" {
+    var slots: [4]Slot = undefined;
+    var batch: [4]*Slot = undefined;
+    for (&slots, &batch) |*slot, *ptr| {
+        slot.cancelled = .init(false);
+        slot.finished = false;
+        slot.error_code = null;
+        slot.in_pass = .init(1);
+        slot.memory_promised = 10;
+        ptr.* = slot;
+    }
+    slots[0].cancelled.store(true, .release);
+    slots[2].cancelled.store(true, .release);
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.promise_ledger = .{ .promised = 40 };
+    defer sch.pending.deinit(testing.allocator);
+    Scheduler.requeuePrefillBatch(&sch, &batch, 0);
+    try testing.expectEqualSlices(*Slot, &.{ &slots[1], &slots[3] }, sch.pending.items);
+    try testing.expectEqual(@as(u64, 0), sch.promise_ledger.promised);
+    for (&slots, 0..) |*slot, i| {
+        try testing.expectEqual(@as(u32, if (i == 0) 1 else 0), slot.in_pass.load(.acquire));
+        try testing.expectEqual(@as(u64, 0), slot.memory_promised);
+    }
+}
+
+fn admissionTestFillKv(cache: *KVCache, s: mlx.mlx_stream, rows: u32) !void {
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_arange(&flat, 0, @floatFromInt(rows * 8), 1, .float32, s));
+    var values = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(values);
+    const shape = [_]c_int{ 1, 1, @intCast(rows), 8 };
+    try mlx.check(mlx.mlx_reshape(&values, flat, &shape, 4, s));
+    var view = try cache.update(0, values, values, s, 0);
+    view.deinit();
+    cache.step = rows;
+}
+
+fn admissionTestScheduler(hc: *prefix_cache_mod.HotPrefixCache) Scheduler {
+    var sch: Scheduler = undefined;
+    sch.metrics = null;
+    sch.hot_prefix_cache = hc;
+    sch.hot_cache_digests = &.{};
+    sch.resident_hot_cache_bytes = .init(0);
+    sch.resident_live_kv_bytes = .init(8);
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.digest_mu = .init;
+    sch.decoding = .empty;
+    return sch;
+}
+
+test "held restored prefill returns real KV and SSM checkout intact" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const Hook = struct {
+        var saw_checkout = false;
+        fn fits(_: *const ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: bool, warm: u64, _: u64, donated: bool, _: bool) PrefillAdmissionNumbers {
+            if (warm == 600 and donated) saw_checkout = true;
+            return .{ .needed = 2, .available = 1, .chunk = 512 };
+        }
+    };
+    Hook.saw_checkout = false;
+    const saved = prefill_admission_fits;
+    prefill_admission_fits = &Hook.fits;
+    defer prefill_admission_fits = saved;
+    const saved_move = prefix_cache_mod.restore_move_override;
+    prefix_cache_mod.restore_move_override = true;
+    defer prefix_cache_mod.restore_move_override = saved_move;
+
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast(i + 7);
+    var donor = try KVCache.init(testing.allocator, 1);
+    defer donor.deinit();
+    try admissionTestFillKv(&donor, s, 600);
+    var live: [1]SSMCacheEntry = .{.{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = true,
+    }};
+    defer {
+        _ = mlx.mlx_array_free(live[0].conv_state);
+        _ = mlx.mlx_array_free(live[0].ssm_state);
+        transformer_mod.ssmFreeQsaState(&live[0]);
+    }
+    const state_shape = [_]c_int{1};
+    const state = [_]f32{42};
+    _ = mlx.mlx_array_free(live[0].conv_state);
+    _ = mlx.mlx_array_free(live[0].ssm_state);
+    live[0].conv_state = mlx.mlx_array_new_data(&state, &state_shape, 1, .float32);
+    live[0].ssm_state = mlx.mlx_array_new_data(&state, &state_shape, 1, .float32);
+
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_type = "qwen4_exp";
+    cfg.num_hidden_layers = 1;
+    cfg.has_hybrid_layers = true;
+    var xfm: Transformer = undefined;
+    @memset(@as([*]u8, @ptrCast(&xfm))[0..@sizeOf(Transformer)], 0);
+    xfm.config = cfg;
+    xfm.s = s;
+    var lm: LoadedModel = undefined;
+    @memset(@as([*]u8, @ptrCast(&lm))[0..@sizeOf(LoadedModel)], 0);
+    lm.ssm_checkpoint_stride = 600;
+    lm.ssm_checkpoint_max = 1;
+    lm.config = &cfg;
+    lm.transformer = &xfm;
+    lm.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    defer lm.prefix_cache.?.deinit();
+    const hc = &lm.prefix_cache.?;
+    hc.ssd_first = true;
+    const cps = try testing.allocator.alloc(transformer_mod.SSMCheckpoint, 1);
+    cps[0] = transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 600, s) catch |err| {
+        testing.allocator.free(cps);
+        return err;
+    };
+    // commit consumes cps on every outcome, including error.
+    _ = try hc.commitWithState(&donor, prompt[0..600], false, &.{}, cps, null, null);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    const before = hc.residentBytes();
+
+    const slot = try Slot.init(testing.allocator, testing.io, &cfg, .{
+        .prompt_ids = &prompt,
+        .sampling = .{},
+        .eos_token_ids = &.{},
+        .max_tokens = 1,
+        .model = &lm,
+    }, transformer_mod.KVQuantConfig.dense);
+    defer slot.deinit();
+    var sibling: Slot = undefined;
+    sibling.cancelled = .init(false);
+    sibling.finished = false;
+    sibling.error_code = null;
+    var sch = admissionTestScheduler(hc);
+    defer sch.decoding.deinit(testing.allocator);
+    defer if (sch.hot_cache_digests.len > 0) testing.allocator.free(sch.hot_cache_digests);
+    try sch.decoding.append(testing.allocator, &sibling);
+    try testing.expectError(error.PrefillHeld, runPrefill(&sch, slot));
+    try testing.expect(Hook.saw_checkout);
+    try testing.expectEqual(@as(usize, 0), slot.cache.step);
+    try testing.expect(!slot.cache.entries[0].initialized);
+    try testing.expect(!slot.ssm_entries.?[0].initialized);
+    try testing.expectEqual(@as(usize, 0), slot.moe_seq_offset);
+    try testing.expectEqual(@as(u64, 0), slot.restored_entry);
+    try testing.expectEqual(@as(u32, 0), slot.cached_tokens);
+    try testing.expectEqual(SlotState.pending_prefill, slot.state);
+    try testing.expectEqual(before, hc.residentBytes());
+    try testing.expectEqual(@as(?usize, null), hc.entries.items[0].checked_out_by);
+    try testing.expect(!hc.entries.items[0].checkout_donated);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
+    try testing.expect(hc.entries.items[0].ssm_checkpoints.?[0].layers[0].initialized);
+    // Retry restores and returns the same entry again, without retaining slot state.
+    Hook.saw_checkout = false;
+    try testing.expectError(error.PrefillHeld, runPrefill(&sch, slot));
+    try testing.expect(Hook.saw_checkout);
+    try testing.expectEqual(before, hc.residentBytes());
+    try testing.expectEqual(@as(?usize, null), hc.entries.items[0].checked_out_by);
+}
+
+test "failed digest publication grants no eviction credit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*id, i| id.* = @intCast(i + 7);
+    var donor = try KVCache.init(testing.allocator, 1);
+    defer donor.deinit();
+    try admissionTestFillKv(&donor, s, 600);
+    var hc = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    _ = try hc.commit(&donor, &tokens, false);
+    var sch = admissionTestScheduler(&hc);
+    defer sch.decoding.deinit(testing.allocator);
+    // First publish a valid snapshot, then force replacement allocation to fail.
+    publishHotCacheResidency(&sch);
+    try testing.expect(sch.digest_eviction_base > 0);
+    var fail = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    sch.allocator = fail.allocator();
+    publishHotCacheResidency(&sch);
+    try testing.expect(fail.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), sch.hot_cache_digests.len);
+    try testing.expect(sch.digest_residency > 0);
+    try testing.expectEqual(@as(u64, 0), sch.digest_eviction_base);
+    const snapshot = hotCacheAdmissionSnapshotFor(&sch, null);
+    try testing.expectEqual(@as(u64, 0), snapshot.reclaimable);
+    try testing.expectEqual(@as(u64, 0), hotCacheAdmissionSnapshotFor(&sch, &tokens).reclaimable);
+}
