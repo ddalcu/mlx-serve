@@ -43,7 +43,7 @@ const ND_SOURCE =
     \\constexpr int PR = R + HC;
     \\constexpr int NDG = R / 8;
     \\constexpr unsigned MASK = (1u << BITS) - 1u;
-    \\__shared__ T xs[H];
+    \\__shared__ __align__(16) T xs[H];
     \\__shared__ float npart[8];
     \\__shared__ float tgi[8 * HC];
     \\const int base = s * H;
@@ -111,7 +111,10 @@ const ND_SOURCE =
     \\    if (slot < NSLOT) {
     \\      float xr[16];
     \\      float xsum = 0.0f;
-    \\      for (int e = 0; e < 16; ++e) { xr[e] = static_cast<float>(xs[slot * 16 + e]); xsum += xr[e]; }
+    \\      // Two 16-byte loads: one bf16 at a time, lanes 32 bytes apart conflict 8 ways.
+    \\      uint4 xq[2] = {reinterpret_cast<const uint4*>(xs + slot * 16)[0], reinterpret_cast<const uint4*>(xs + slot * 16)[1]};
+    \\      const T* xe = reinterpret_cast<const T*>(xq);
+    \\      for (int e = 0; e < 16; ++e) { xr[e] = static_cast<float>(xe[e]); xsum += xr[e]; }
     \\      float d = 0.0f;
     \\      for (int w = 0; w < WPL; ++w) {
     \\        for (int j = 0; j < VPW; ++j) d += xr[w * VPW + j] * hc_val<DENSE>((pw[i][w] >> (j * BITS)) & MASK);
