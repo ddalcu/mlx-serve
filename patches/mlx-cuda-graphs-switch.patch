@@ -23,7 +23,7 @@ index 6e40b3403..798dd83b1 100644
  namespace {
  
 +std::atomic<bool>& cuda_graphs_on() {
-+  static std::atomic<bool> on{env::get_var("MLX_USE_CUDA_GRAPHS", true)};
++  static std::atomic<bool> on{env::get_var("MLX_USE_CUDA_GRAPHS", true) != 0};
 +  return on;
 +}
 +
