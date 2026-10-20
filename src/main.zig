@@ -237,6 +237,12 @@ fn printUsage(io: std.Io) void {
         \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
         \\                        models with int8 Q/K (NAX GPUs, lossy, wins
         \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
+        \\  --lm-head-mxfp8 / --no-lm-head-mxfp8
+        \\                      Quantize a dense bf16 lm_head to MXFP8 at load, vLLM's
+        \\                        VLLM_MXFP8_LM_HEAD bytes (lossy; half the head's bytes
+        \\                        per token). On by default for quantized packs on an
+        \\                        integrated NVIDIA GPU (DGX Spark).
+        \\                        A model's "lm_head_mxfp8" setting wins.
         \\  --ane               Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine
         \\                        instead of the GPU (a model's "ane" setting in
         \\                        model-settings.json wins). The first load on a
@@ -902,6 +908,10 @@ pub fn main(init: std.process.Init) !void {
             @import("w8a8.zig").enabled = false;
         } else if (std.mem.eql(u8, args[i], "--int8-qk")) {
             @import("nax_attention.zig").int8_qk_cli = true;
+        } else if (std.mem.eql(u8, args[i], "--lm-head-mxfp8")) {
+            @import("transformer.zig").lm_head_mxfp8_cli = true;
+        } else if (std.mem.eql(u8, args[i], "--no-lm-head-mxfp8")) {
+            @import("transformer.zig").lm_head_mxfp8_cli = false;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {

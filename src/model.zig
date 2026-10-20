@@ -585,6 +585,8 @@ pub const ModelConfig = struct {
     mtp_greedy_tail_override: ?bool = null,
     /// null = the process default (`MLX_SERVE_BONSAI_INT8_PREFILL`).
     int8_prefill_override: ?bool = null,
+    /// LOSSY MXFP8 copy of a dense head; null = `--lm-head-mxfp8`, else the integrated-CUDA default.
+    lm_head_mxfp8_override: ?bool = null,
     /// The model's `ane` setting: serve it on the Neural Engine; null follows `--ane`.
     ane_override: ?bool = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
@@ -4954,6 +4956,14 @@ pub const Weights = struct {
     pub fn dropBlock(self: *Weights, comptime fmt: []const u8, idx: usize) void {
         var buf: [128]u8 = undefined;
         self.dropPrefix(std.fmt.bufPrint(&buf, fmt, .{idx}) catch return);
+    }
+
+    /// Hand the map `arr` under `name` (the key is copied), freeing an array it held there.
+    pub fn put(self: *Weights, name: []const u8, arr: mlx.mlx_array) !void {
+        if (self.map.contains(name)) return self.replace(name, arr);
+        const key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key);
+        try self.map.put(key, arr);
     }
 
     /// Drop `name` and free its array (a loader that copied it elsewhere lets the original go).

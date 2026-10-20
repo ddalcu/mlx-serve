@@ -17766,6 +17766,9 @@ pub const Transformer = struct {
         var lm_head_s: mlx.mlx_array = undefined;
         var lm_head_b: mlx.mlx_array = undefined;
         var owns_lm_head = false;
+        // The head's own map name, when it has one (not the embedding's).
+        var head_key_buf: [160]u8 = undefined;
+        var head_key: ?[]const u8 = null;
 
         {
             // A nested decoder's head is a sibling of model/backbone.
@@ -17802,8 +17805,10 @@ pub const Transformer = struct {
                 else
                     getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix) orelse mlx.mlx_array_new();
                 owns_lm_head = !config.tie_word_embeddings;
+                head_key = std.fmt.bufPrint(&head_key_buf, "{s}.{s}.weight", .{ lm_prefix, if (is_inkling) "unembed" else "lm_head" }) catch null;
             } else if (weights.get("lm_head.weight")) |w| {
                 lm_head_w = w;
+                head_key = "lm_head.weight";
                 lm_head_s = weights.get("lm_head.scales") orelse emb_s_arr;
                 lm_head_b = weights.get("lm_head.biases") orelse emb_b_arr;
                 owns_lm_head = !config.tie_word_embeddings;
@@ -17815,6 +17820,15 @@ pub const Transformer = struct {
                 log.err("MISSING WEIGHT: lm_head.weight\n", .{});
                 return error.MissingWeight;
             }
+        }
+        if (lmHeadMxfp8On(config.lm_head_mxfp8_override, lm_head_mxfp8_cli, mlx.cudaIntegrated(), config.quant_bits)) {
+            if (head_key != null and lm_head_s.ctx == null) {
+                lm_head_s = try quantizeHeadMxfp8(weights, head_key.?, lm_head_w, s);
+                lm_head_w = weights.get(head_key.?).?;
+                const shape = mlx.getShape(lm_head_s);
+                log.info("[lm-head] mxfp8 (lossy): the {d}x{d} bf16 head quantized at load\n", .{ shape[0], shape[1] * 32 });
+            } else if ((config.lm_head_mxfp8_override orelse lm_head_mxfp8_cli) != null)
+                log.info("[lm-head] mxfp8 declined: the head is {s}\n", .{if (lm_head_s.ctx != null) "already quantized" else "the embedding"});
         }
 
         // EmbeddingGemma sentence-transformers projection head: folded into
@@ -34840,6 +34854,35 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
     return .{ .layers = layers, .owned_bf16 = try owned_bf16.toOwnedSlice(allocator) };
 }
 
+/// `--lm-head-mxfp8` / `--no-lm-head-mxfp8`; null = the default below.
+pub var lm_head_mxfp8_cli: ?bool = null;
+
+/// LOSSY, so on by default only where it was measured: an integrated CUDA GPU (DGX Spark),
+/// for a quantized pack whose head ships dense. A bf16 pack keeps its reference head.
+pub fn lmHeadMxfp8On(setting: ?bool, cli: ?bool, cuda_integrated: bool, quant_bits: u32) bool {
+    return setting orelse cli orelse (cuda_integrated and quant_bits > 0);
+}
+
+/// Quantize the dense head `w` (the map's `key`) to MXFP8 g32, the bytes vLLM serves under
+/// `VLLM_MXFP8_LM_HEAD`, and hand the map the packed weight and its scales in place of the
+/// bf16 copy, which is freed. Returns the scales, borrowed from the map.
+fn quantizeHeadMxfp8(weights: *Weights, key: []const u8, w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var pair = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(pair);
+    try mlx.check(mlx.mlx_quantize(&pair, w, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{}, s));
+    try mlx.check(mlx.mlx_eval(pair)); // before the bf16 copy goes
+    var qw = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(qw);
+    var qs = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(qs);
+    try mlx.check(mlx.mlx_vector_array_get(&qw, pair, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&qs, pair, 1));
+    var name: [176]u8 = undefined;
+    try weights.put(try std.fmt.bufPrint(&name, "{s}.scales", .{key[0 .. key.len - ".weight".len]}), qs);
+    weights.replace(key, qw);
+    return qs;
+}
+
 /// Pre-transpose a plain-BF16 weight stored as `[out, in]` to `[in, out]` so
 /// `mlx_matmul(x, w_t)` lands the contraction over the input axis. Used by
 /// Unsloth Dynamic checkpoints that leave linear-attention projections
@@ -48808,6 +48851,98 @@ test "nemotron_h: Super checkpoint dense and affine language layouts load and fo
             if (flat_logits) |flat| try t.expectEqualSlices(f32, flat, values) else flat_logits = try allocator.dupe(f32, values);
         }
     }
+}
+
+// Bar: the default is on only where measured (integrated CUDA, quantized pack); a flag beats it, a model setting beats both.
+test "lm_head mxfp8: on by default for quantized packs on integrated CUDA, settings and flags win" {
+    const t = std.testing;
+    try t.expect(lmHeadMxfp8On(null, null, true, 4));
+    try t.expect(!lmHeadMxfp8On(null, null, true, 0));
+    try t.expect(!lmHeadMxfp8On(null, null, false, 4));
+    try t.expect(!lmHeadMxfp8On(null, false, true, 4));
+    try t.expect(lmHeadMxfp8On(null, true, false, 0));
+    try t.expect(lmHeadMxfp8On(true, false, false, 0));
+    try t.expect(!lmHeadMxfp8On(false, true, true, 4));
+}
+
+// Bar: vLLM's MXFP8 bytes (scale 2^ceil(log2(amax/448)), e4m3 nearest-even), the map holds them in place of the bf16 head, logits within 5% RMS.
+test "lm_head mxfp8: a dense head loads as vLLM's MXFP8 bytes in place of the bf16 copy" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const allocator = t.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    const Fix = @import("dflash.zig").TinyFix;
+    const V = Fix.VOCAB;
+    const H = Fix.HIDDEN;
+    const E4m3 = struct {
+        fn nearestEven(x: f32) f32 {
+            const a = @abs(x);
+            if (a == 0) return 0;
+            const step = std.math.exp2(@max(@floor(std.math.log2(a)), -6) - 3);
+            const r = @floor(a / step);
+            const up = a / step - r > 0.5 or (a / step - r == 0.5 and @mod(r, 2) == 1);
+            return std.math.copysign((if (up) r + 1 else r) * step, x);
+        }
+    };
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try Fix.writeTrunk(io, tmp.dir, dir, s);
+    const ids = mlx.mlx_array_new_data(&[_]i32{ 1, 4, 7 }, &[_]c_int{ 1, 3 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    var logits: [2][]f32 = .{ &.{}, &.{} };
+    defer for (logits) |l| allocator.free(l);
+    for ([_]bool{ false, true }, &logits) |mxfp8, *out| {
+        var config = try model_mod.parseConfig(io, allocator, dir);
+        defer config.deinit(allocator);
+        config.tie_word_embeddings = false;
+        config.lm_head_mxfp8_override = mxfp8;
+        var weights = try model_mod.loadWeights(io, allocator, dir);
+        defer weights.deinit();
+        model_mod.resolveWeightPrefix(&config, &weights);
+        try weights.put("lm_head.weight", try Fix.bf16Arr(V, H, 99, s));
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        const head = weights.get("lm_head.weight").?;
+        try t.expectEqual(head.ctx, xfm.lm_head_w.ctx);
+        try t.expectEqual(mxfp8, xfm.lm_head_s.ctx != null);
+        if (mxfp8) {
+            try t.expect(mlx.mlx_array_dtype(xfm.lm_head_s) == .uint8);
+            try t.expectEqualSlices(c_int, &.{ V, H / 32 }, mlx.getShape(xfm.lm_head_s));
+            try t.expectEqual(xfm.lm_head_s.ctx, weights.get("lm_head.scales").?.ctx);
+            const ref = try Fix.bf16Arr(V, H, 99, s);
+            defer _ = mlx.mlx_array_free(ref);
+            const w = try Fix.readF32(ref, allocator, s);
+            defer allocator.free(w);
+            var deq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(deq);
+            try mlx.check(mlx.mlx_dequantize(&deq, head, xfm.lm_head_s, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+            const got = try Fix.readF32(deq, allocator, s);
+            defer allocator.free(got);
+            try mlx.check(mlx.mlx_array_eval(xfm.lm_head_s));
+            const bytes = mlx.mlx_array_data_uint8(xfm.lm_head_s).?;
+            for (0..V * H / 32) |g| {
+                var amax: f32 = 0;
+                for (w[g * 32 ..][0..32]) |x| amax = @max(amax, @abs(x));
+                const e = @ceil(std.math.log2(amax / 448.0));
+                try t.expectEqual(@as(u8, @intFromFloat(e + 127)), bytes[g]);
+                for (w[g * 32 ..][0..32], got[g * 32 ..][0..32]) |x, y|
+                    try t.expectEqual(E4m3.nearestEven(x / std.math.exp2(e)) * std.math.exp2(e), y);
+            }
+        }
+        const l = try xfm.forward(ids);
+        defer _ = mlx.mlx_array_free(l);
+        out.* = try Fix.readF32(l, allocator, s);
+    }
+    var err: f64 = 0;
+    var ref: f64 = 0;
+    for (logits[0], logits[1]) |a, b| {
+        err += (b - a) * (b - a);
+        ref += a * a;
+    }
+    try t.expect(err > 0 and @sqrt(err / ref) < 0.05);
 }
 
 // Bar: a decode step through the fused residual+norm path (plain arm on the
