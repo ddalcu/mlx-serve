@@ -44,10 +44,19 @@ const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_st
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
 
+/// How long after an unload its memory may still be reaching the OS.
+pub const UNLOAD_SETTLE_MS: i64 = 10_000;
+
 /// The last unload: when (monotonic ms) and how many resident bytes it freed. Inference thread only.
 pub const UnloadMark = struct {
     at_ms: i64 = 0,
     bytes: u64 = 0,
+
+    /// `bytes` were just freed. Models freed within one settle window are one release still reaching the OS.
+    pub fn record(self: *UnloadMark, now_ms: i64, bytes: u64) void {
+        self.bytes = if (now_ms - self.at_ms <= UNLOAD_SETTLE_MS) self.bytes +| bytes else bytes;
+        self.at_ms = now_ms;
+    }
 
     /// A load committed into the freed room: those bytes are no longer coming back.
     pub fn consume(self: *UnloadMark, bytes: u64) void {
@@ -678,7 +687,7 @@ pub const LoadedModel = struct {
             self.drafter_path = "";
         }
         self.drafter_block_size = 0;
-        if (self.bytes_resident > 0) last_unload = .{ .at_ms = monotonicMs(), .bytes = self.bytes_resident };
+        if (self.bytes_resident > 0) last_unload.record(monotonicMs(), self.bytes_resident);
         self.bytes_resident = 0;
         // The prefill-chunk pin was resolved from LIVE memory at load, so it
         // can be stale-narrow (pinned while a since-evicted model was
@@ -2643,4 +2652,13 @@ test "ModelRegistry: a second stream pack that reads the foreign bytes unloads a
     try testing.expectEqual(LoadState.evicting, dsv41.state);
     reg.unmarkEvictingLocked(dsv41);
     reg.markUnloadedLocked(glm);
+}
+
+test "UnloadMark: models unloaded together count as one pending release" {
+    var m: UnloadMark = .{};
+    m.record(1_000, 70);
+    m.record(1_200, 17);
+    try testing.expectEqual(@as(u64, 87), m.bytes);
+    m.record(1_200 + UNLOAD_SETTLE_MS + 1, 5);
+    try testing.expectEqual(@as(u64, 5), m.bytes);
 }

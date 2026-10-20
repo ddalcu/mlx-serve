@@ -4182,8 +4182,7 @@ fn availForLoad(io: std.Io, need: u64) u64 {
     return settledAvail(need, avail, io, loadAvail, pauseLoadAvail);
 }
 
-/// How long after an unload its memory may still be reaching the OS.
-const UNLOAD_SETTLE_MS: i64 = 10_000;
+const UNLOAD_SETTLE_MS = model_registry_mod.UNLOAD_SETTLE_MS;
 
 /// Whether a load refused at `avail` waits for memory still coming back: only right after an
 /// unload whose bytes could close the gap. Any other refusal is instant, since the wait stalls every stream.
@@ -12941,3 +12940,11 @@ test "hot-cache view: a revise that follows an unload raises a budget but never 
     try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
 }
 
+
+test "a refusal right after a two-model eviction waits for the memory to come back" {
+    const GiB: u64 = 1024 * 1024 * 1024;
+    var mark: model_registry_mod.UnloadMark = .{};
+    mark.record(1_000, 100 * GiB);
+    mark.record(1_100, 17 * GiB);
+    try std.testing.expect(waitForUnload(211 * GiB, 108 * GiB, mark, 1_200));
+}
