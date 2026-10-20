@@ -2197,7 +2197,13 @@ pub const Scheduler = struct {
                 // idle server the cause is always the static cap (#126), and
                 // the flag that moves it is not otherwise discoverable.
                 const gb = 1024.0 * 1024.0 * 1024.0;
-                log.err("Refusing to load {s}: needs ~{d:.2} GB with {d:.2} GB resident across {d} model(s), none evictable, against --max-resident-models {d} and --max-resident-mem {d:.2} GB (0 = off). Unload a model or raise a cap.\n", .{
+                if (loadExceedsMemCap(estimated, self.registry.max_resident_mem)) {
+                    log.err("Refusing to load {s}: needs ~{d:.2} GB, more than --max-resident-mem {d:.2} GB on its own, so unloading other models cannot help. Raise the cap.\n", .{
+                        entry.id,
+                        @as(f64, @floatFromInt(estimated)) / gb,
+                        @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
+                    });
+                } else log.err("Refusing to load {s}: needs ~{d:.2} GB with {d:.2} GB resident across {d} model(s), none evictable, against --max-resident-models {d} and --max-resident-mem {d:.2} GB (0 = off). Unload a model or raise a cap.\n", .{
                     entry.id,
                     @as(f64, @floatFromInt(estimated)) / gb,
                     @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
@@ -3587,6 +3593,13 @@ fn endAneSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     publishSlotTerminator(slot, reason, null);
 }
 
+/// A load whose own bill exceeds the memory cap is refused whatever else is resident.
+fn loadExceedsMemCap(estimated: u64, max_resident_mem: u64) bool {
+    return max_resident_mem != 0 and estimated > max_resident_mem;
+}
+
+const TEXT_GATE_MARGIN_CAP_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+
 /// The post-load residency bill the eviction gate reserves, in bytes.
 ///
 /// A media entry is billed by its BACKEND: a staged-residency model
@@ -3599,7 +3612,8 @@ fn endAneSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
 ///
 /// `media_peak == 0` means "not a media model, or a directory we could not
 /// read" and keeps the original ladder byte-for-byte: a text bill is weights
-/// only, so it takes 10% headroom for KV / vision / drafter overhead.
+/// only, so it takes 10% headroom for KV / vision / drafter overhead, up to
+/// `TEXT_GATE_MARGIN_CAP_BYTES`: that overhead does not grow with the weights.
 ///
 /// A media peak takes NONE. Those are text-model concepts — a media engine has
 /// no KV cache and no drafter — and `gen.estimatePeakResidentBytes` already
@@ -3614,7 +3628,7 @@ pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers
         b
     else
         @as(u64, num_hidden_layers) * @as(u64, hidden_size) * 4 * 4;
-    return base + base / 10;
+    return base + @min(base / 10, TEXT_GATE_MARGIN_CAP_BYTES);
 }
 
 /// Where a media peak lives. Unified memory holds it in one pool. CUDA keeps file-loaded
@@ -3882,6 +3896,22 @@ test "GGUF and unavailable media peak retain discovery bytes at the eviction gat
     try std.testing.expectEqual(@as(?u64, 100 * GB), residentGateBytes(0, 100 * GB, true));
     try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(0, null, true));
     try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(null, 0, false));
+}
+
+test "a text pack's gate margin stops growing with its weights" {
+    const GiB: u64 = 1024 * 1024 * 1024;
+    // DeepSeek-V4.1 oQ2.5e: 203.83 GiB of resident weights must fit a 222.72 GiB cap with nothing else loaded.
+    const ds: u64 = 218_858_232_429;
+    try std.testing.expect(gateEstimateBytes(0, ds, 43, 4096) < 222 * GiB);
+    // Up to 100 GiB the margin is still 10%.
+    try std.testing.expectEqual(@as(u64, 66 * GiB), gateEstimateBytes(0, 60 * GiB, 48, 2560));
+}
+
+test "a load over the memory cap on its own is named as such, not as a busy registry" {
+    const GiB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expect(loadExceedsMemCap(225 * GiB, 222 * GiB));
+    try std.testing.expect(!loadExceedsMemCap(200 * GiB, 222 * GiB));
+    try std.testing.expect(!loadExceedsMemCap(225 * GiB, 0));
 }
 
 fn committedTextBytes(model_bytes: u64, config: *const model_mod.ModelConfig) u64 {
