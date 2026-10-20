@@ -6,10 +6,26 @@ cuda_kernel that must match it bit for bit (mlx-serve's moe_cuda.zig) includes t
 The one-row fp quantized_matmul arm runs on integrated GPUs only: on a discrete RTX 5060 Ti the
 stock kernel is faster. fp4 decodes through the cvt instruction where the target has it
 (sm_120a, sm_121a) and through an exact byte-permute table elsewhere (plain sm_120 emulated it).
+The fp modes take the mat-vec through 8 rows on GB10, where one weight read beats the
+tiled kernel (MLX_CUDA_QMV_MAX_ROWS still decides).
 
 Retires when upstream MLX's CUDA gemv and quantized mat-vecs read 16-byte vectors for these
 formats at decode widths. Not reported upstream yet.
 
+diff --git a/docs/src/usage/environment_variables.rst b/docs/src/usage/environment_variables.rst
+index c2012d530..abb05dd42 100644
+--- a/docs/src/usage/environment_variables.rst
++++ b/docs/src/usage/environment_variables.rst
+@@ -180,7 +180,8 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
+    Rows of one batch (``1`` to ``8``) that a CUDA quantized matmul runs through
+    the mat-vec kernel, reading the weights once for all of them. A speculative
+    verify and a batched decode both arrive as those rows. Unset, a GB10
+-   (compute capability 12.1) uses ``6`` and every other GPU uses ``1``.
++   (compute capability 12.1) uses ``8`` for the fp modes and ``6`` for affine,
++   and every other GPU uses ``1``.
+ 
+ .. envvar:: MLX_ENABLE_CACHE_THRASHING_CHECK
+ 
 diff --git a/mlx/backend/cuda/device/row_dot_ops.cuh b/mlx/backend/cuda/device/row_dot_ops.cuh
 new file mode 100644
 index 0000000..afd818a
@@ -643,10 +659,54 @@ index 728db42..fa2bdb0 100644
      dispatch_quant_types<T>(
          bits,
 diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
-index 8ed9b72..437448a 100644
+index 8ed9b72bd..d998e9197 100644
 --- a/mlx/backend/cuda/quantized/quantized.cpp
 +++ b/mlx/backend/cuda/quantized/quantized.cpp
-@@ -272,8 +272,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -13,6 +13,20 @@
+ 
+ namespace mlx::core {
+ 
++// The fp modes run row_dot, which shares one weight read across up to 8 rows: on
++// GB10 that beats the tiled kernel through 8 rows. A set MLX_CUDA_QMV_MAX_ROWS
++// still decides.
++int fp_qmv_max_rows(const cu::Device& device) {
++  static const int cap = [&] {
++    const char* env = std::getenv("MLX_CUDA_QMV_MAX_ROWS");
++    bool gb10 = device.compute_capability_major() == 12 &&
++        device.compute_capability_minor() == 1;
++    return (env == nullptr || env[0] == '\0') && gb10 ? 8
++                                                      : qmv_max_rows(device);
++  }();
++  return cap;
++}
++
+ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
+   auto& s = stream();
+@@ -118,9 +132,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+     return;
+   }
+ 
++  const int qmv_rows = mode_ == QuantizationMode::Affine
++      ? qmv_max_rows(encoder.device())
++      : fp_qmv_max_rows(encoder.device());
+   if (can_use_qmm_sm80) {
+-    if (can_use_qmv &&
+-        (M * B == 1 || (B == 1 && M <= qmv_max_rows(encoder.device())))) {
++    if (can_use_qmv && (M * B == 1 || (B == 1 && M <= qmv_rows))) {
+       call_qmv();
+     } else {
+       call_qmm_sm80();
+@@ -129,7 +145,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   }
+ 
+   if (can_use_qmm_naive) {
+-    if (can_use_qmv && (M * B < 8)) {
++    if (can_use_qmv && (M * B < 8 || (B == 1 && M <= qmv_rows))) {
+       call_qmv();
+     } else {
+       call_qmm_naive();
+@@ -272,8 +288,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
      return;
    }
  
@@ -659,7 +719,7 @@ index 8ed9b72..437448a 100644
        call_qmv();
      } else {
        call_qmm_sm80();
-@@ -282,7 +285,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -282,7 +301,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
    }
  
    if (can_use_qmm_naive) {

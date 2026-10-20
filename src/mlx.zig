@@ -1554,3 +1554,89 @@ test "a sticky CUDA error marks the GPU context lost; any other error does not" 
     try t.expectError(error.MlxFailure, checkError());
     try t.expect(gpuContextLost()); // consuming the latch does not bring the context back
 }
+
+test "fp quantized matmul on GB10: 8 rows equal each row alone, bit for bit, and no worse than the tiled kernel against f64 truth" {
+    if (!cudaAvailable() or std.c.getenv("MLX_CUDA_QMV_MAX_ROWS") != null) return error.SkipZigTest;
+    if (cudaComputeCapability(.major) != 12 or cudaComputeCapability(.minor) != 1) return error.SkipZigTest;
+    const s = gpuStream();
+    const a = std.testing.allocator;
+    var sse_rows: f64 = 0;
+    var sse_tiled: f64 = 0;
+    for ([_][:0]const u8{ "mxfp8", "nvfp4" }) |mode| for ([_][2]c_int{ .{ 2560, 2560 }, .{ 640, 6144 }, .{ 12288, 2560 } }, 0..) |nk, case| {
+        const bits: c_int = if (std.mem.eql(u8, mode, "mxfp8")) 8 else 4;
+        const gs: c_int = if (bits == 8) 32 else 16;
+        var key = mlx_array_new();
+        defer _ = mlx_array_free(key);
+        try check(mlx_random_key(&key, 40 + case));
+        var wf = mlx_array_new();
+        defer _ = mlx_array_free(wf);
+        try check(mlx_random_normal(&wf, &[_]c_int{ nk[0], nk[1] }, 2, .bfloat16, 0, 0.05, key, s));
+        var qv = mlx_vector_array_new();
+        defer _ = mlx_vector_array_free(qv);
+        try check(mlx_quantize(&qv, wf, mlx_optional_int.some(gs), mlx_optional_int.some(bits), mode, .{ .ctx = null }, s));
+        var w = mlx_array_new();
+        defer _ = mlx_array_free(w);
+        var sc = mlx_array_new();
+        defer _ = mlx_array_free(sc);
+        try check(mlx_vector_array_get(&w, qv, 0));
+        try check(mlx_vector_array_get(&sc, qv, 1));
+        // Nine rows take the tiled kernel; their first eight are the eight-row call's input.
+        var x9 = mlx_array_new();
+        defer _ = mlx_array_free(x9);
+        try check(mlx_random_normal(&x9, &[_]c_int{ 9, nk[1] }, 2, .bfloat16, 0, 1, key, s));
+        var x8 = mlx_array_new();
+        defer _ = mlx_array_free(x8);
+        try check(mlx_slice(&x8, x9, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 8, nk[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        const Q = struct {
+            fn mm(st: mlx_stream, x: mlx_array, ww: mlx_array, scl: mlx_array, g: c_int, b: c_int, m: [*:0]const u8) !mlx_array {
+                var o = mlx_array_new();
+                try check(mlx_quantized_matmul(&o, x, ww, scl, .{ .ctx = null }, true, mlx_optional_int.some(g), mlx_optional_int.some(b), m, st));
+                var f = mlx_array_new();
+                try check(mlx_astype(&f, o, .float32, st));
+                _ = mlx_array_free(o);
+                try check(mlx_array_eval(f));
+                return f;
+            }
+        };
+        const y8 = try Q.mm(s, x8, w, sc, gs, bits, mode);
+        defer _ = mlx_array_free(y8);
+        const y9 = try Q.mm(s, x9, w, sc, gs, bits, mode);
+        defer _ = mlx_array_free(y9);
+        const n: usize = @intCast(nk[0]);
+        const r8 = mlx_array_data_float32(y8).?[0 .. 8 * n];
+        const r9 = mlx_array_data_float32(y9).?[0 .. 8 * n];
+        for (0..8) |r| {
+            var xr = mlx_array_new();
+            defer _ = mlx_array_free(xr);
+            try check(mlx_slice(&xr, x8, &[_]c_int{ @intCast(r), 0 }, 2, &[_]c_int{ @intCast(r + 1), nk[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            const y1 = try Q.mm(s, xr, w, sc, gs, bits, mode);
+            defer _ = mlx_array_free(y1);
+            try std.testing.expectEqualSlices(f32, mlx_array_data_float32(y1).?[0..n], r8[r * n ..][0..n]);
+        }
+        // f64 truth over the dequantized weights.
+        var wd = mlx_array_new();
+        defer _ = mlx_array_free(wd);
+        try check(mlx_dequantize(&wd, w, sc, .{ .ctx = null }, mlx_optional_int.some(gs), mlx_optional_int.some(bits), mode, .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        try check(mlx_array_eval(wd));
+        var xf = mlx_array_new();
+        defer _ = mlx_array_free(xf);
+        try check(mlx_astype(&xf, x8, .float32, s));
+        try check(mlx_array_eval(xf));
+        const wdat = mlx_array_data_float32(wd).?;
+        const xdat = mlx_array_data_float32(xf).?;
+        const k: usize = @intCast(nk[1]);
+        const truth = try a.alloc(f64, 8 * n);
+        defer a.free(truth);
+        for (0..8) |r| for (0..n) |j| {
+            var acc: f64 = 0;
+            for (0..k) |i| acc += @as(f64, xdat[r * k + i]) * @as(f64, wdat[j * k + i]);
+            truth[r * n + j] = acc;
+        };
+        for (truth, r8, r9) |t, p8, p9| {
+            sse_rows += (@as(f64, p8) - t) * (@as(f64, p8) - t);
+            sse_tiled += (@as(f64, p9) - t) * (@as(f64, p9) - t);
+        }
+    };
+    std.debug.print("[fp qmv 8 rows] rms err rows/tiled = {d:.4}\n", .{@sqrt(sse_rows / sse_tiled)});
+    try std.testing.expect(sse_rows <= sse_tiled);
+}

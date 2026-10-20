@@ -280,10 +280,10 @@ index fa2bdb0..503684a 100644
      if (out.dtype() == bfloat16) {
        launch.template operator()<__nv_bfloat16>();
 diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
-index 437448a..03b2fa3 100644
+index d998e9197..e4b0a5f8d 100644
 --- a/mlx/backend/cuda/quantized/quantized.cpp
 +++ b/mlx/backend/cuda/quantized/quantized.cpp
-@@ -253,7 +253,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -269,7 +269,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
          bits_,
          group_size_,
          mode_,
