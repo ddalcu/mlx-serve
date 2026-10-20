@@ -1,0 +1,109 @@
+[
+  {
+    "id": "kolibri1-attn",
+    "shard": [
+      "docs/reference.md"
+    ],
+    "prompt": "I am about to change how the kolibri1 architecture is served. What sliding-window size and layer split does it use, and how does it select experts? Answer from this repo's docs.",
+    "answer": [
+      "513",
+      "sigmoid"
+    ]
+  },
+  {
+    "id": "d1-answer",
+    "shard": [
+      "docs/reference.md"
+    ],
+    "prompt": "I want to touch the d1 decision-pack code. How does it turn the model's output into an answer? Answer from this repo's docs.",
+    "answer": [
+      "softmax",
+      "token group"
+    ]
+  },
+  {
+    "id": "sushi-mimo-qkv",
+    "shard": [
+      "docs/reference.md"
+    ],
+    "prompt": "I am editing sushi_pack.zig. How are MiMo's QKV weights stored and read there? Answer from this repo's docs.",
+    "answer": [
+      "e4m3",
+      "(one|1) scale row"
+    ]
+  },
+  {
+    "id": "aligner-units",
+    "shard": [
+      "docs/reference.md"
+    ],
+    "prompt": "I am changing forced_align.zig. What word unit does it use for Japanese and Korean, and what time step does its head classify timestamps into? Answer from this repo's docs.",
+    "answer": [
+      "one character",
+      "80 ?ms"
+    ]
+  },
+  {
+    "id": "launch-remote",
+    "shard": [
+      "docs/reference.md"
+    ],
+    "prompt": "I am editing launch.zig. What does `GET /launch?agent=` serve, and what is the Swift twin of the launcher? Answer from this repo's docs.",
+    "answer": [
+      "curl",
+      "CLILauncher"
+    ]
+  },
+  {
+    "id": "ds4-mtp",
+    "shard": [
+      "docs/gotchas/"
+    ],
+    "prompt": "I am changing the embedded ds4 engine glue. Under what condition is an in-checkpoint MTP head used with ds4, and which symbol lists the archs? Answer from this repo's docs.",
+    "answer": [
+      "nextn_predict_layers",
+      "ds4_embedded_mtp_archs"
+    ]
+  },
+  {
+    "id": "ssd-spill",
+    "shard": [
+      "docs/gotchas/"
+    ],
+    "prompt": "I am changing the SSD prefix-cache tier. What is the floor applied when a RAM decline spills to disk, and what function does the spilling? Answer from this repo's docs.",
+    "answer": [
+      "4 ?GB",
+      "spillDeclinedToDisk"
+    ]
+  },
+  {
+    "id": "tok-isolated",
+    "shard": [
+      "docs/gotchas/"
+    ],
+    "prompt": "I am changing the tokenizer's pretokenizer Split handling. What name does the code use for a Split entry of its own, such as DeepSeek's digits or CJK, that cuts the text first? Answer from this repo's docs.",
+    "answer": [
+      "isolated_runs"
+    ]
+  },
+  {
+    "id": "ctl-zig",
+    "control": true,
+    "shard": [],
+    "prompt": "Which Zig version does this repo pin, and which optimize flag must every build use? Answer from this repo's docs.",
+    "answer": [
+      "0\\.17",
+      "ReleaseFast"
+    ]
+  },
+  {
+    "id": "ctl-mlx-thread",
+    "control": true,
+    "shard": [],
+    "prompt": "Which thread is allowed to call MLX in the server, according to this repo's docs?",
+    "answer": [
+      "inference thread",
+      "sole|only"
+    ]
+  }
+]

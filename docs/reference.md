@@ -821,3 +821,219 @@ The full rows and rules AGENTS.md compresses (verbatim as of 2026-10-03).
 - **An f32 SCALAR promotes every bf16 operand** — scalars via `scalarOf(v, dtype)`; a load-time const table in the wrong dtype widens every read (`constTableAs`); a chain that returns f32 by design makes the CALLER own the dtype (Mamba2's f32 SSM `y` too: cast back like mlx-lm's `ssm_attn`, else the whole residual runs f32); a quantized KV cache returns the dtype it was FED (bf16 scales widened f16 Bonsai under `--kv-quant`). Tell: `[dtype-trace] residual widened`.
 
 - **A model can open its OWN think block when the template did not** (Gemma 4 `<|channel>`+`thought`, a bare `<think>` token on LFM2.5-8B-A1B, muse's ` to=self<|message|>` header at position 0): the plain arm latches via `chat.modelThinkOpener` (checked BEFORE the marker skip, which swallows `<think>`) and `promptOpensMuseHeader` arms the header skip at stream start. Bar = the stream/non-stream split invariant on a template that opens nothing; `tests/test_smoke_matrix.sh` runs it per arch.
+
+### `launch.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider/fx/grok/zcode): reads `/v1/models` (ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, links the `skills/mlx-serve` skill, starts the app if the server is down. `GET /launch?agent=` serves the same files as a `curl … | sh` script for another machine (the console's Code Launcher, `remoteScript`). Swift twin: `CLILauncher` + `AgentConfigs`. Detail: reference.md "row detail" |
+
+### `server.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `server.zig` | All HTTP: `/v1/*` (chat/completions/messages/responses/embeddings/load/unload/load-progress/models), media endpoints, `/metrics(.json)`, WS, Ollama glue, `--api-key`, console at `GET /` (embedded `src/html/index.html`, renders with NO model). Embeddings: BERT + EmbeddingGemma, per-checkpoint pooling, `--embedding-max-length` |
+
+### `model_settings.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `alias` (a request NAME, never a load setting), `ctx_size`, `kv_quant`, `mtp`/`mtp_acceptance`/`mtp_greedy_tail`, `int8_prefill` (LOSSY), `chat_template_kwargs`; read at every load site, stamped on `ModelConfig.*_override` + `ChatConfig.chat_template_kwargs`. Detail: reference.md "row detail" |
+
+### `providers.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `providers.zig` | Upstream OpenAI-compatible chat providers (`~/.mlx-serve/providers.json`): background `/v1/models` probe, `<id>@<name>` rows (`models` = filter, or the list for a listless provider), curl-backed `/v1/chat/completions` proxy. `GET /v1/providers`, `POST /v1/providers/reload` |
+
+### `qwen_image.zig` / `qwen_image_edit.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `qwen_image.zig` / `qwen_image_edit.zig` | Qwen-Image-2.1 (`qwen_image21`): block-causal single-stream DiT, 64-ch /16 VAE, 8B `mage_flow.TextEncoder`; 40 steps, real CFG, img2img; text encoder STAGED where the pack crowds the GPU (`gen.qwenImageStagesTextEncoder`); edit = `mode:"edit"` (cap `gen.editRefCap`, tower gate `towerPresentIn`). Detail: reference.md "row detail" |
+
+### `qwen_audio.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `qwen_audio.zig` / `transcription.zig` / `forced_align.zig` | Qwen3-ASR audio tower (Whisper log-mel, chunked convs, windowed encoder; a `VisionEncoder` arm) / `/v1/audio/transcriptions` form, languages, the reference prompt, the official 180 s cuts, verbose_json/srt/vtt/diarized_json, each word's speaker (`Activity`) / Qwen3-ForcedAligner word times: the official units (Japanese and Korean one character each), ONE trunk pass whose head classifies every `<timestamp>` into 80 ms steps, the official monotonic repair |
+
+### `nemotron_diarization.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `nemotron_diarization.zig` | Nemotron 3 Diarization: NeMo log-mels eight to a row into a 31-layer RoPE encoder, speaker probabilities every 10 ms for up to 8 speakers in order of first speech; 27.2 s chunks attend to a FIFO and the Arrival-Order Speaker Cache, whose compression (`aoscKeep`) runs on the host |
+
+### `w8a8.zig` / `int8_attn.zig` / `dit_kernels.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `w8a8.zig` / `int8_attn.zig` / `dit_kernels.zig` | Media DiTs on NAX GPUs (LOSSY; ON by default only with NAX + 64 GiB RAM, `--w8a8` / `--no-w8a8`): rotated per-row int8 x int8 GEMM whose int8 copy REPLACES the packed weights (`w8a8.residentBytes` bills it), Sage-style int8 attention (hd 128), fused qkv norm+RoPE. Detail: `docs/reference.md` "Int8 media DiTs" |
+
+### `yue2.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `yue2.zig` | YuE2-3B songs (`/v1/audio/music-generations`): ONE Qwen3-shaped trunk with AR and NAR weight sets per layer — ABC score → semantic ids (host sampler, CFG) → flow-matching latents → tiled Oobleck decoder, 48 kHz. Pack = ahmadw/YuE2-3B-MLX's layout (`qwen.tiktoken` via `tokenizer.loadTiktoken`) |
+
+### `preview.zig` / `latent_rgb.zig` / `jpeg.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `preview.zig` / `latent_rgb.zig` / `jpeg.zig` | Opt-in per-step video previews (#208): published latent→RGB map per backend (GENERATED — `tests/dump_latent_rgb_factors.py`), temporal pick + filmstrip, bilinear resize, baseline JPEG. Zero MLX; `zig build preview-test` is the Linux-runnable graph |
+
+### `qwen4_exp.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `qwen4_exp.zig` | Qwen3.8-Flash-Next (`qwen4_exp`) host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped 4-bit `ngram_table.bin` row gather. `ple_gpu.zig` = the same hash + gather as one Metal kernel over a no-copy wrap of the whole mapping (serial forwards). Trunk forward = `transformer.forwardQwen4With` (hyper-connections, PLE, QSA mask over `gatedFullAttnWith`) |
+
+### `arch/ane_lm.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `arch/ane_lm.zig` + `ane_qwen35.zig` + `ane_dflash.zig` + `ane_prefix.zig` (+ `ane_mil.zig`, `ane_pack.zig`, `ane_rt.zig`) | Dense qwen3_5 + Qwen3 MLX packs on the Neural Engine (`--ane` / per-model `"ane"`, private API, `lib/ane`): MIL programs (int8 rows, compile cache), split across an Ultra's two engines, DFlash2, KV to 64K, checkpoints. Detail: `docs/reference.md` "Neural Engine engine" |
+
+### `ane.zig` + `lib/ane/`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `ane.zig` + `lib/ane/` | ANE prefill offload (`--ane-prefill`, opt-in, LOSSY int8/fp16, M4-and-below): SwiGLU-MLP + fused GDN in-proj MIL programs on the private AppleNeuralEngine framework (`msv_ane_*`, attribution in NOTICE), `/props` `"ane"` + `mlx_serve:ane_*`. Rules: `docs/reference.md` "ANE prefill rules" |
+
+### `rht.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `rht.zig` / `qmv2.zig` / `gdn_decode.zig` / `mtp_graft.zig` | Prism Hadamard packs (`prism_hadamard_qwen35`): `<linear>.signs` on weight handles, `qmatmul` reads `H_block(signs*x)`, the embedding gather the inverse; exact 2-bit GEMVs (`qmv2`, M 1..8, per-GPU `planFor`, also `ternary_2bit`); 2-dispatch GDN decode; MTP head grafted from Qwen3.8-27B |
+
+### `moe_affine4.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `moe_affine4.zig` / `hc_decode2.zig` / `qsa_decode.zig` / `qsa_mask.zig` | qwen4_exp one-token decode kernels, each with a kill switch + engagement line: affine-4 MoE gate+up and down+reduce over one-expert bank views, the two-launch hyper-connection read, QSA split+merge attention over the indexer's picks, the one-launch QSA row mask. Stories: `docs/gotchas/engine-mlx.md` |
+
+### `sushi_pack.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `sushi_pack.zig` | Sushi GLM/MiMo packs (`expert_quant`, EXL3 experts through `sushi_exl3`) in their source layout: GLM hyper-connection names + `kv_b_proj` split into `embed_q`/`unembed_out` (dense bf16); MiMo QKV kept e4m3 with one scale row per code row (`fp8Linear`: an e4m3 GEMV up to 8 rows, wider inputs decoded per projection inside `qmatmul`), layer-0 MLP decoded to bf16; the resident bill (`residentBytes`) reads shard headers, skipping unserved tensors and shards the index does not own |
+
+### `modelopt_pack.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `modelopt_pack.zig` / `mxfp8_qmv.zig` | NVIDIA ModelOpt packs as published (`quant_method: modelopt`, NVIDIA's Flash Next FP4): names mapped to mlx-lm's, MXFP8 bytes reinterpreted in place, NVFP4 routed experts read off disk into banks (csf scales decoded) with each expert's `weight_scale_2` as a gate scale (before the SiLU) and an up x down scale (on the routing weight); MXFP8 GEMV for 1..8 rows |
+
+### `embedding_gemma2` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `embedding_gemma2` | EmbeddingGemma 2: Gemma 4 trunk trained bidirectional (`forwardEmbeddingGemma2With`), projection-only PLE, INCLUSIVE band, head in the dense0 slot; images (Gemma 4 SigLIP tower, budgeted size) and video FRAMES ride `messages` on `/v1/embeddings`; no audio. Story: `docs/gotchas/models-media.md` |
+
+### `qwen3_5`, `qwen3_5_moe(_text)` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `qwen3_5`, `qwen3_5_moe(_text)` | GatedDeltaNet + optional MoE, shared expert; Qwen3-VL vision. Qwen3.8 packs serve on this arch, and MiniCPM-V 4.7 (`minicpmv4_7`, mlx-vlm layout; SigLIP2 tower + canvas M-RoPE in `minicpm_vision.zig`/`minicpm_canvas.zig`, a pack without the tower serves text) |
+
+### `nemotron_h` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `nemotron_h` | Hybrid transformer + Mamba2 (`backbone` prefix; nested trunks probed); pattern from `hybrid_override_pattern` OR `layers_block_type`; sigmoid/ReLU² MoE + shared expert, including latent full-hidden routing; attention is NoPE (`layer_no_rope`). Puzzle/omni aliases, RADIO image/video and LiLiCorr via DFlash. MTP = a bare-key `mtp_head.safetensors` (`mtp.Layout.nemotron`), depth 2. Detail: reference.md "Nemotron 3.5 Bolt and Super" |
+
+### `lfm2`, `lfm2_moe`, `lfm2_vl` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `lfm2`, `lfm2_moe`, `lfm2_vl` | Hybrid gated conv + attention; `lfm2_moe` = sparse MoE past `num_dense_layers` (sigmoid routing, selection-only `expert_bias`, no shared expert); dense MLP `w1/w3/w2` OR `gate/up/down_proj` (probed); `lfm2_vl` = siglip2 tower + projector, NaFlex 64-256 merged tokens, tiling past `max_image_tokens x 2.0` into 512px tiles + thumbnail (`<|img_row_R_col_C|>`/`<|img_thumbnail|>`) |
+
+### `kolibri1` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `kolibri1` | Aleph Alpha Kolibri-1 (78B-A3.5B, 384 experts top-6): 40 sliding(513) + 10 NoPE full layers on laguna's attention arm, sandwich norms, UNGATED shared expert; top-k on logits + `expert_bias`, weights sigmoid(logits), router in fp32 (`moe_logit_select`, fused `logit_bias` kernel). Serial |
+
+### `mimo_v2`, `mimo_v2_flash` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `mimo_v2`, `mimo_v2_flash` | Xiaomi MiMo-V2.6-Flash (309B-A15B), mlx-lm's layout (release refused by name): gpt_oss's sink arm with PER-LAYER geometry (global / sliding-128 ring, K192/V128), laguna's MoE binding. Serial. MTP = 3 heads (`mimo_mtp.zig`). A pack whose config declares `expert_streaming` (residents + `experts.bin`) is `lib/mlx-stream`'s (`ModelConfig.mimo_stream`). Detail: `docs/reference.md` |
+
+### `muse_glimmer` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `muse_glimmer` | Muse-Glimmer-30B (dense VL, GQA 32/2 hd128): sandwich norms, qk-norm folded into `attnScale()`, sigmoid out-gate, NoPE every 4th layer, softcap 20. Harmony channels + ATEM tools; thinking ON with tools / OFF without (`defaultEnableThinking`). CASED Llama-3 pretokenizer (`.llama3`). Vision `muse_vision.zig`; DFlash via `-assistant` sidecar. Detail: reference.md "row detail" |
+
+### `spark2_5` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `spark2_5` | XHToken Spark-X2.5 (1.7B/4B dense, hd 256): 3 sliding(512)+1 full layers with PER-TYPE RoPE, PER-HEAD sigmoid out-gate, fused `q_k_v_proj` split at load, tied head. DeepSeek-style template, GLM `<arg_key>` tools; per-digit tokenizer. Packs `abenzerps/Spark-X2.5-4B-MLX-{4,8}bit`. Detail: reference.md "row detail" |
+
+### `k2_horizon` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `k2_horizon` | IFM K2-Horizon dense (7B: 36 layers, hd 128, 512k ctx): Llama trunk + GROUPED RMS norms (`groupedRmsNorm`). `<ifm|…>` markers decode to `<think>`/GLM tags (`installMarkerAliases`); the template RAISES on a thinking-less assistant turn and on any other effort word (`k2EffortFor`). Thinking default ON; MoVA not served. Detail: reference.md "row detail" |
+
+### `deepseek_v4`, `deepseek_v41` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `deepseek_v4`, `deepseek_v41` | DeepSeek-V4/V4.1 Flash, 1M ctx. Serial, spec off but DSpark, single-flight; DSML tools, OUR byte-pinned templates. V4: prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resumes one conversation (keyed on the image rows too); EXL3 repack on `lib/mlx-stream`. V4.1 images: every span position carries `image_token_id` (the template renders `<｜deepseek_image｜>` into STRING content), the module splices the rows itself, image rows route by `gate.bias_vl` and get no Engram write (`Hash.DEAD`) |
+
+### `qwen4_exp` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `qwen4_exp` | Qwen3.8-Flash-Next (125B-A6B + 51B n-gram + 4B MTP): qwen3_5 GDN+MoE trunk in 4 hyper-connection streams, n-gram PLE at layer 1 (`ngram_table.bin`; `--ple-gpu` opt-in), QSA sparse attention past 2048 tokens. Module state READ-ONLY: text slots BATCH-decode, only the MTP slot is exclusive (`slotExclusiveDecode`), prefix cache ON. MTP = the checkpoint's own layer over the PRE-mixer stream (`Qwen4Mtp`, on by default). Vision = Qwen3-VL tower + M-RoPE, serial. Packs, oracle: `docs/reference.md` |
+
+### `bailing_hybrid` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `bailing_hybrid` | Ling 3.0 (BailingMoeV3): KDA + MLA hybrid MoE, `layer_group_size` → `full_attention_interval`; KDA = GDN with PER-CHANNEL gate (`_vec` kernel), BOUNDED-SIGMOID gate (`kda_lower_bound` REPLACES softplus), sigmoid out-gate; MLA = naive DeepSeek-V3 (ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` ok); `noaux_tc` routing. Thinking ON; GLM tool tags. Mirror `rapid-mlx/Ling-3.0-tiny-MLX-4bit` |
+
+### `glm5_next` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `glm5_next` | GLM-5.3-Flash: KDA (f32 state) + DSA (absorbed NoPE MLA, indexer past position 2051) inside mHC, 288-expert MoE. Thinking ON. Batches decode (`forwardGlmBatchedDecode`); MTP = its `mtp.0` layer. Vision = `glm_vision.zig`, rows spliced at `<|image|>` on 1-D positions. Detail: `docs/reference.md` |
+
+### `laya` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `laya` | Laya typed-decision checkpoints (no root config.json: classified from `encoder/config.json` + `rl_agent_config.json` by `model_discovery.peekLayaCheckpoint`, app twin `DownloadManager.markerModelType`): ModernBERT encoder + 2 head layers + marker scorer + act head, fp16 |
+
+### `kev` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `kev` | Kev typed-decision packs: qwen3_5 trunk + pointer head; `kev_config.json` wins over the trunk's config.json (`model_discovery.peekKevPack`, app twin `DownloadManager.markerModelType`); the state runs once, each question from a KV/SSM snapshot (`kev.zig`) |
+
+### `d1` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `d1` | LiquidAI D1-3B decision packs (bf16, the card's own layout): LFM2-VL trunk whose root config.json `auto_map` names `modeling_d1.D1Model` (`model_discovery.isD1Root`, app twin `DownloadManager.markerModelType`); the answer is a softmax over each option's token group at the LM head, no new weights (`d1.zig`, state runs once via `kev.scoreBranches`); text only, torchao int8 refused by name. Oracle: `tests/dump_d1_fixtures.py` |
+
+### `qwen3_asr` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `qwen3_asr` | Qwen3-ASR (mlx-audio layout, `thinker_config` nesting): a plain `qwen3` trunk + audio tower whose rows splice at `<|audio_pad|>`; serves `/v1/audio/transcriptions` only (no chat template, not chat-pickable). Its forced aligner shares the root `model_type`; the thinker's `qwen3_forced_aligner` is the tell (arch hint of that name, capability `alignment`, loaded when a request asks for times, never a route of its own). Oracles: `tests/dump_qwen3_asr_fixtures.py`, `tests/dump_qwen3_aligner_fixtures.py` |
+
+### `nemotron_diarization` (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `nemotron_diarization` | NVIDIA Nemotron 3 Diarization (mlx-audio layout, mlx-community bf16 + 8-bit packs): the `.diarization` engine slot, capability `diarization`, no route of its own; `diarized_json` loads it and runs it ONCE over the whole clip, so a voice keeps its letter across the 180 s pieces. Oracle: `tests/dump_nemotron_diarization_fixtures.py` (mlx-audio and transformers' official model) |
+
+### media types (arch)
+
+Why this exists: without it an agent edits this arch blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| media types | `flux2*`/`krea*`/`mage_flow*`/`qwen_image*` (unified t2i+edit)/`moss_image`/`qwen3_tts`/`acestep`/`minimax_music3`/`stable_audio3`/`yue2`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow`, `moss_image` + the mlx-community qwen21 spelling have NO root config.json — classified from `model_index.json`, `stable_audio3` from `model_config.json`, by `gen.peekModelType` + `model_discovery`, kept in sync) |
