@@ -105,6 +105,8 @@ pub const Tokenizer = struct {
     fuse_unk: bool = false,
     /// HF BPE `ignore_merges`: a word the vocab holds whole is that one token, before any merge.
     ignore_merges: bool = false,
+    /// HF WordPiece `max_input_chars_per_word`: a longer word is one `[UNK]` (the greedy match is cubic in its length).
+    wordpiece_max_chars: usize = 100,
     unk_id: ?u32 = null,
     /// tokenizer.json decoder carries `ByteFallback`: runs of `<0xNN>`
     /// tokens decode as the bytes they spell (U+FFFD per byte when the run
@@ -639,6 +641,10 @@ pub const Tokenizer = struct {
 
         // WordPiece: greedy longest-match with ## prefix
         for (words.items) |word| {
+            if ((std.unicode.utf8CountCodepoints(word) catch word.len) > self.wordpiece_max_chars) {
+                try result.append(allocator, unk_id);
+                continue;
+            }
             var pos: usize = 0;
             while (pos < word.len) {
                 var end: usize = word.len;
@@ -1720,6 +1726,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .metaspace_split = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).split else false,
         .byte_fallback = if (model_obj.get("byte_fallback")) |v| v == .bool and v.bool else false,
         .ignore_merges = if (model_obj.get("ignore_merges")) |v| v == .bool and v.bool else false,
+        .wordpiece_max_chars = if (model_obj.get("max_input_chars_per_word")) |v| (if (v == .integer and v.integer > 0) @intCast(v.integer) else 100) else 100,
         .fuse_unk = if (model_obj.get("fuse_unk")) |v| v == .bool and v.bool else false,
         .unk_id = if (model_obj.get("unk_token")) |v| (if (v == .string) vocab.get(v.string) else null) else null,
         .byte_fallback_decode = if (root.get("decoder")) |d| decoderHasByteFallback(d) else false,
@@ -2233,6 +2240,23 @@ test "WordPiece encode unknown word falls back to UNK" {
     try testing.expectEqual(@as(usize, 2), ids.len);
     try testing.expectEqual(@as(u32, 10), ids[0]);
     try testing.expectEqual(@as(u32, 0), ids[1]);
+}
+
+test "WordPiece: a word past max_input_chars_per_word is one [UNK] (HF), never a greedy split" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .wordpiece);
+    defer tok.deinit();
+    for ([_][]const u8{ "[UNK]", "x", "##x" }, 0..) |t, i| try tok.vocab.put(try allocator.dupe(u8, t), @intCast(i));
+
+    const x100: [100]u8 = @splat('x');
+    const at_cap = try tok.encode(allocator, &x100);
+    defer allocator.free(at_cap);
+    try testing.expectEqual(@as(usize, 100), at_cap.len);
+
+    const x101: [101]u8 = @splat('x');
+    const past_cap = try tok.encode(allocator, "y " ++ x101);
+    defer allocator.free(past_cap);
+    try testing.expectEqualSlices(u32, &.{ 0, 0 }, past_cap);
 }
 
 test "WordPiece encode handles punctuation splitting" {

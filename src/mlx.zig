@@ -1253,11 +1253,44 @@ pub fn mlxErrorIsMemory(msg: []const u8) bool {
     return false;
 }
 
+/// CUDA's sticky errors: once one is raised, every later call in the context fails the same
+/// way, so the process can serve nothing until it restarts.
+pub fn mlxErrorIsContextLost(msg: []const u8) bool {
+    const needles = [_][]const u8{
+        "an illegal memory access was encountered",
+        "an illegal instruction was encountered",
+        "misaligned address",
+        "unspecified launch failure",
+        "the launch timed out and was terminated",
+        "uncorrectable ECC error encountered",
+        "context is destroyed",
+    };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, msg, n) != null) return true;
+    }
+    return false;
+}
+
+var gpu_context_lost = std.atomic.Value(bool).init(false);
+
+/// True once the latch has seen a sticky CUDA error: requests are refused, /health says so.
+pub fn gpuContextLost() bool {
+    return gpu_context_lost.load(.acquire);
+}
+
+pub fn resetGpuContextLostForTest() void {
+    gpu_context_lost.store(false, .release);
+}
+
 fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
     _ = data;
     const span = std.mem.span(msg);
     lockErrBuf();
     defer unlockErrBuf();
+    if (!gpu_context_lost.load(.acquire) and mlxErrorIsContextLost(span)) {
+        gpu_context_lost.store(true, .release);
+        log.err("[mlx] GPU context lost: every request is refused until the server restarts\n", .{});
+    }
     // First error wins: follow-on noise from a poisoned stream must not hide the cause.
     if (!mlx_error_latched.load(.acquire)) {
         const n = @min(span.len, mlx_error_buf.len);
@@ -1333,6 +1366,8 @@ pub fn dropLatchedErrorUnless(had_error: bool) void {
 /// OOM at the n-th `checkError` of the process, then disarms (`tests/test_mlx_error_recovery.sh`).
 const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_CHUNK). at transforms.cpp:15";
 const FAULT_STEP_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_STEP). at transforms.cpp:15";
+/// `MLX_SERVE_MLX_FAULT_KIND=cuda_lost` injects a sticky CUDA error instead of the OOM.
+const FAULT_CUDA_LOST_MSG = "cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered (injected by MLX_SERVE_MLX_FAULT_KIND). at array.cpp:352";
 
 /// One armed, self-disarming injector; prefill and decode checkpoints count separately.
 const FaultSite = struct {
@@ -1358,7 +1393,8 @@ const FaultSite = struct {
         self.seen += 1;
         if (self.seen != t) return;
         self.at = 0;
-        latchErrorForTest(self.msg);
+        const kind: []const u8 = if (std.c.getenv("MLX_SERVE_MLX_FAULT_KIND")) |p| std.mem.span(p) else "";
+        latchErrorForTest(if (std.mem.eql(u8, kind, "cuda_lost")) FAULT_CUDA_LOST_MSG else self.msg);
     }
 
     fn reset(self: *FaultSite) void {
@@ -1496,4 +1532,25 @@ test "a DECODE-time MLX failure is attributed to the decoding request, not the n
     try checkError();
     try checkErrorDecode();
     try t.expect(!errorPending());
+}
+
+test "a sticky CUDA error marks the GPU context lost; any other error does not" {
+    const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = takeError(&stale);
+    defer resetGpuContextLostForTest();
+
+    try t.expect(mlxErrorIsContextLost("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered at array.cpp:352"));
+    try t.expect(mlxErrorIsContextLost("cuLaunchKernelEx(&config, func, params, nullptr) failed: unspecified launch failure"));
+    try t.expect(!mlxErrorIsContextLost("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15"));
+    try t.expect(!mlxErrorIsContextLost("cudaMallocAsync(&data, size, stream) failed: out of memory"));
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(!gpuContextLost());
+
+    latchErrorForTest("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered at array.cpp:352");
+    try t.expect(gpuContextLost());
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(gpuContextLost()); // consuming the latch does not bring the context back
 }

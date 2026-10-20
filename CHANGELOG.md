@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.10.2 — New Models, Transcripts, RDMA, Faster
+## v26.10.3 — New Models, Transcripts, RDMA, Faster
 
 ### Highlights
 
@@ -16,7 +16,7 @@
 
 - **Images, video, music and 3D up to twice as fast on M5 Macs.** On an M5 Mac with 64 GB or more, the image, video, music and 3D models run on the Neural Accelerators, 1.2x to 2x faster from start to finish on an M5 Ultra: a 1024x1024 Krea picture takes 5.4 seconds instead of 10.7, a Qwen-Image one 3.9 instead of 7.3. You get the same picture, sound or mesh, give or take small details; 4-bit models hold 2 to 8 GB more memory while loaded, and Settings > Neural Accelerator int8 turns it on or off. On every Mac, Krea and Qwen-Image also finish each picture a little sooner.
 
-- **New models.** MOSS-Image draws from long prompts, tag lists or a scene layout, with English and Chinese text inside the picture, and Enhance writes the layout for you. MiniCPM-V 4.7 reads images down to the small print (thanks @beamivalice). NVIDIA's Nemotron 3.5 Bolt and Super understand text, images and video and draft ahead with their own drafter (thanks @thelogicalgate). NVIDIA's own FP4 builds of Qwen3.8-Flash-Next and GLM-5.3-Flash load straight from Hugging Face, the GLM one on a 256 GB Mac.
+- **New models.** MOSS-Image draws from long prompts, tag lists or a scene layout, with English and Chinese text inside the picture, and Enhance writes the layout for you. MiniCPM-V 4.7 reads images down to the small print (thanks @beamivalice). NVIDIA's Nemotron 3.5 Bolt and Super understand text, images and video and draft ahead with their own drafter (thanks @thelogicalgate). NVIDIA's own FP4 builds of Qwen3.8-Flash-Next and GLM-5.3-Flash load straight from Hugging Face, the GLM one on a 256 GB Mac. DeepSeek-V4.1-Flash now reads images too.
 
 - **Agents make films.** The mlx-serve skill takes a coding agent from a brief to a finished music video, trailer or release film: it writes and sings the song, times every word and beat, renders the shots on your Mac and cuts them to the music. Storyboard shots can now end on a picture you choose, and every join fades (thanks @lojza3d).
 
@@ -28,9 +28,9 @@
 
 - **Saved conversations stay saved.** Conversations with images pick up from the SSD cache even after they leave memory (thanks @GGGBB). Every long session is saved to the SSD, not just the newest, and quitting the server stops a long prompt right away and takes up to 45 seconds to finish saving (thanks @STRML, @Dankpaws). A failed save no longer throws away what was already saved (thanks @kmahara).
 - **Models load.** Homebrew's command-line server starts again (thanks @yGuy), DeepSeek-V4-Flash GGUFs open with default settings (thanks @nothinglimited), a model you download shows up in the server right away (thanks @Salingo), downloads fetch every file a model lists so OptiQ packs no longer show "Missing shards", Bonsai 2 2B, 4B and 9B load, and LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 are no longer marked unsupported.
-- **Answers come out right.** Loading an embedding model no longer makes the next chat turn fail (thanks @alexborhani), GLM-5.3 answers as it should when several chats share it or it drafts ahead, Nemotron-H packs that write their step limit as infinity answer properly, a picture sent as a plain image URL reaches the model instead of being dropped, Claude Code gets the same drafting speed-up as other clients, and DeepSeek-V4.1-Flash keeps answering while an image model is loaded beside it.
+- **Answers come out right.** Loading an embedding model no longer makes the next chat turn fail (thanks @alexborhani), GLM-5.3 answers as it should when several chats share it or it drafts ahead, Nemotron-H packs that write their step limit as infinity answer properly, a picture sent as a plain image URL reaches the model instead of being dropped, Claude Code gets the same drafting speed-up as other clients, DeepSeek-V4.1-Flash keeps answering while an image model is loaded beside it, and a 3D job that fails on the GPU says so instead of returning a broken mesh.
 - **NVIDIA, Linux and Windows.** Models paired with a drafter no longer stop after the first word on NVIDIA GPUs (thanks @Weschera), long prompts to NVIDIA's Flash Next pack no longer fail past 6,500 tokens at a time, image and video jobs on Windows respect the memory limit (thanks @alexborhani), Linux machines on MLX's Vulkan backend answer instead of failing every request, and on NVIDIA GPUs the same request no longer gets a different answer from run to run after an update, which came from an old cached copy of a fixed kernel.
-- **A smoother app.** Agents started from the web console's Code Launcher no longer quit on launch, the downloaded app ships the mlx-serve agent skill and the OpenCode 2 plugin again, Agent > Update System Prompt and Skills to Latest… works again, the "/" menu opens above the text field, pickers no longer flicker and placeholder text no longer runs under the scroll bar while a pane scrolls (thanks @lborloz), and a damaged LAN key file no longer stops your Mac from finding the others.
+- **A smoother app.** Agents started from the web console's Code Launcher no longer quit on launch, the downloaded app ships the mlx-serve agent skill and the OpenCode 2 plugin again, Agent > Update System Prompt and Skills to Latest… works again, the "/" menu opens above the text field, pickers no longer flicker and placeholder text no longer runs under the scroll bar while a pane scrolls (thanks @lborloz), a damaged LAN key file no longer stops your Mac from finding the others, the model memory cap gains a 224 GB step, and the agent skill loads one media model at a time and waits for its assets instead of generating beside your chat.
 
 ### Also new
 

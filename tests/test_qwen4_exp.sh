@@ -43,7 +43,7 @@ check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo
 "$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --max-concurrent 4 --prefix-cache-entries 0 > "$LOG" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
-for _ in $(seq 1 600); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
+for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
 U="http://127.0.0.1:$PORT"
 echo "[1] architecture + n-gram table"
 arch=$(curl -s "$U/v1/models" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['meta'].get('architecture',''))")
@@ -203,7 +203,7 @@ LOG11="$LOG.novision"
 sleep 20
 "$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --no-vision > "$LOG11" 2>&1 &
 SPID=$!
-for _ in $(seq 1 600); do curl -s "$U/health" >/dev/null 2>&1 && grep -q "Model ready" "$LOG11" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG11"; exit 1; }; sleep 2; done
+for _ in $(seq 1 600); do curl -sf "$U/health" >/dev/null 2>&1 && grep -q "Model ready" "$LOG11" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG11"; exit 1; }; sleep 2; done
 check "vision encoder load line absent" "$(grep -c 'Vision encoder: Qwen3-VL ViT' "$LOG11")" "0"
 check "capabilities drop vision" "$(curl -s "$U/v1/models" | python3 -c "import sys,json; print(1 if 'vision' in json.load(sys.stdin)['data'][0].get('capabilities',[]) else 0)")" "0"
 nv_bytes=$(curl -s "$U/props" | python3 -c "import sys,json; print(json.load(sys.stdin)['memory']['active_bytes'])")

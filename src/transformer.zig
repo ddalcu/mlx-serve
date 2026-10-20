@@ -8867,7 +8867,7 @@ pub const KVCache = struct {
         return n_chunks * chunk_step;
     }
 
-    fn nextCapacity(current_cap: usize, needed: usize) usize {
+    pub fn nextCapacity(current_cap: usize, needed: usize) usize {
         return nextCapacityPolicy(current_cap, needed, kvGrowLinear());
     }
 
@@ -45333,6 +45333,7 @@ test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row ker
 }
 
 test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it stays stock" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const n: c_int = 2048;
     const k: c_int = 512;
@@ -46067,10 +46068,12 @@ fn forwardDsv41WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     else blk: {
         const ids = try hostIds(self, token_ids);
         defer self.allocator.free(ids);
+        // The module splices the image rows itself (its embedding never leaves it).
+        const vision: ?dsv41_mod.VisionRows = if (ctx.vision_embeddings) |ve| .{ .rows = ve, .offset = ctx.vision_splice_offset } else null;
         break :blk if (ctx.cache.step == 0 or mdl.dec_state == null)
-            try dsv41_mod.prefill(mdl, self.allocator, ids)
+            try dsv41_mod.prefill(mdl, self.allocator, ids, vision)
         else
-            try dsv41_mod.extendResumable(mdl, self.allocator, ids);
+            try dsv41_mod.extendResumable(mdl, self.allocator, ids, vision);
     };
     defer _ = mlx.mlx_array_free(logits);
     ctx.cache.step += n;
@@ -46855,6 +46858,7 @@ fn qkvDecParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usiz
 }
 
 test "qkv decode kernel parity: GQA ratios x bits x head dims (strided views)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // T_k = 37+1 — not a multiple of NSG(4), exercises uneven simdgroup trip
     // counts; the second update leaves capacity slack so views are strided.
     try qkvDecParityCase(8, 2, 64, 8, 37, false);
@@ -46866,11 +46870,13 @@ test "qkv decode kernel parity: GQA ratios x bits x head dims (strided views)" {
 }
 
 test "qkv decode kernel parity: additive mask row (sliding decode shape)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     try qkvDecParityCase(8, 2, 128, 8, 37, true);
     try qkvDecParityCase(8, 2, 128, 4, 37, true);
 }
 
 test "qkv decode kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // g=4/DK=64 → BLOCK 512, so 700+1 rows exercises the two-block partial
     // merge (m/l/O carry through the mlx-op reduction); the masked case
     // additionally crosses a block boundary with -inf rows.
@@ -46982,6 +46988,7 @@ fn qkvVerParityCaseWith(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: 
 }
 
 test "qkv verify kernel parity: TQ 2..8 x bits x GQA (strided views, causal tail)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // Mutation-checked: dropping the in-kernel causal tail (gpos < lim) or
     // mis-ordering the (head, tq) row layout fails the Tq>=2 cases — the
     // reference is end-aligned SDPA over the SAME dequantized view, so the
@@ -47036,6 +47043,7 @@ test "qkv verify kernel defaults off on G17 but an explicit env value wins" {
 }
 
 test "qkv verify kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // GQA 4 x TQ 2 → BLOCK 256; 700+2 rows exercises the multi-block carry,
     // including a final block whose tail rows are causally -inf for tq 0.
     try qkvVerParityCase(8, 2, 64, 8, 700, 2);
@@ -47195,6 +47203,7 @@ fn composedStridedCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_pre: usize
 }
 
 test "composed quantAttention is correct on STRIDED cache views" {
+    mlx.installErrorHandler(); // MLX CUDA has no quantized_matmul for some multi-row shapes: fail, never abort
     // Class guard (splitPackedGateUp rule): slice-born views into
     // mlx_quantized_matmul must compute correctly — the cache's packed views
     // are non-contiguous whenever buffer capacity > logical length. Covers
@@ -50927,6 +50936,7 @@ test "fused MoE router reproduces the kolibri1 logit+bias routing chain" {
 }
 
 test "fused attention output gate is bit-identical to the softplus op chain" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // Same bar as the router: the kernel replaces four dispatches, so it has
     // to replace their arithmetic exactly or it is a different model. Covers
     // the negative/positive/extreme branches of MLX's LogAddExp.
@@ -56001,6 +56011,7 @@ fn gdnTestRun(comptime seq: bool, comptime vec: bool, q: mlx.mlx_array, k: mlx.m
 }
 
 test "GDN seq-kernel final state matches single-state kernel (PLD capture parity)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const B: c_int = 1;
     const T: c_int = 4;
@@ -56155,6 +56166,7 @@ test "joinableCols: a KDA q/k/v trio joins only when all three are quantized ali
 }
 
 test "GDN vectorized-gate kernel: a per-channel gate that is UNIFORM per head equals the scalar kernel" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // KDA gates each state element by its own key channel. The invariant that
     // pins the indexing: broadcast a per-head decay across that head's Dk
     // channels and the `_vec` kernel must reproduce the scalar kernel BIT FOR
@@ -56636,6 +56648,7 @@ test "GDN pipelined route: each model type gets its own verdict in one process" 
 }
 
 test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground truth (T/GQA/Dv/TB sweep)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     // T deliberately hits non-multiples of every supported TB (16/32/48);
     // Hk<Hv exercises GQA head mapping; Dv 32..128 exercises 1..4 DB blocks.
@@ -56662,10 +56675,12 @@ test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground t
 }
 
 test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full run)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     try gdnChunkContinuity(.blocked);
 }
 
 test "GDN pipelined kernel: chunk-boundary state continuity (split run == full run)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     try gdnChunkContinuity(.pipelined);
 }
 

@@ -353,7 +353,7 @@ fn printUsage(io: std.Io) void {
         \\                      Target fraction of wall time (0..0.9) the
         \\                        decoding streams keep while another request
         \\                        prefills; also narrows that prefill's chunks.
-        \\                        Default 0 (env MLX_SERVE_PREFILL_DECODE_SHARE).
+        \\                        Default 0.25; 0 = the old schedule (env MLX_SERVE_PREFILL_DECODE_SHARE).
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
@@ -577,7 +577,8 @@ pub fn main(init: std.process.Init) !void {
             try cli_mod.cmdPull(allocator, io, args[2]);
             return;
         } else if (std.mem.eql(u8, cmd, "list")) {
-            try cli_mod.cmdList(allocator, io);
+            // `mlx-serve list | head`: the reader hanging up on stdout is not an error.
+            cli_mod.cmdList(allocator, io) catch |e| if (e != error.WriteFailed) return e;
             return;
         } else if (std.mem.eql(u8, cmd, "run")) {
             if (args.len < 3) {

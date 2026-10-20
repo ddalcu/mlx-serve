@@ -7,8 +7,10 @@ agents shipped. Generate assets with `gen.mjs` next to this file (`node gen.mjs 
 
 Write every asset as a job in one `assets.json`, run `node <skill dir>/gen.mjs batch assets.json`,
 and load files through the `manifest.json` it writes. Jobs run one at a time (the server has one
-GPU), unchanged jobs are skipped, and the media models are unloaded at the end so your chat model
-keeps its memory. Never write your own SSE client for this.
+GPU, shared with the chat model you run on), unchanged jobs are skipped, a media model is unloaded
+before the next kind loads, and the last one at the end so your chat model keeps its memory. Run
+the batch and wait for it; do not keep working against the server while it runs. Never write your
+own SSE client for this.
 
 - Textures that repeat: `"tile": true` (seamless) and `"maps": true` (normal, roughness and AO maps
   beside the colour map). Prompt "seamless tileable texture of ..., top-down, flat even lighting".

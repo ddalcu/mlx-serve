@@ -4938,9 +4938,9 @@ pub const Generator = struct {
                 if (!full_accept) {
                     const onehot = try pldOneHotRow(draft[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
+                    break :blk try sampleResidual(probs, onehot, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 const lazy = self.sampleLazy(correction_logits);
@@ -5107,6 +5107,15 @@ pub const Generator = struct {
     ///      cache lands at exactly `+j+1`. Sample correction from the
     ///      *original* verify_logits[j] (the model's prediction at the
     ///      rejected position).
+    /// The sampling for a verify round's correction token (the bonus or the residual
+    /// draw after `accepted` drafts): keyed at that token's output position, so a
+    /// seeded request replays under every drafter and no two positions share a key.
+    fn correctionDraw(self: *const Generator, accepted: u32) SamplingParams {
+        var sp = self.sampling;
+        sp.draw = self.generated_ids.items.len + accepted + 2;
+        return sp;
+    }
+
     pub fn nextDrafter(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done) return null;
         std.debug.assert(self.drafter != null);
@@ -5406,9 +5415,9 @@ pub const Generator = struct {
                 if (accepted < m) {
                     const onehot = try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
+                    break :blk try sampleResidual(probs, onehot, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 // Greedy: reuse the bulk-read argmax row. Already eval'd in
@@ -6148,9 +6157,9 @@ pub const Generator = struct {
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
-                    break :blk try sampleResidual(probs, q_row, s);
+                    break :blk try sampleResidual(probs, q_row, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 const argmax_data = try verify_argmax.ids(1 + m);
@@ -6374,7 +6383,7 @@ pub const Generator = struct {
                 const probs = try probsAtLastPos(logits, self.sampling, s);
                 defer _ = mlx.mlx_array_free(probs);
                 try mlx.check(mlx.mlx_async_eval(eval_vec));
-                break :blk try sampleFromProbs(probs, s);
+                break :blk try sampleFromProbs(probs, self.correctionDraw(0), s);
             }
             picked = if (serial) try self.verifySerialSamples(logits, 1) else try verifyArgmax(logits, self.sampling.suppress_mask, s);
             _ = mlx.mlx_vector_array_append_value(eval_vec, picked.lazy());
@@ -13555,20 +13564,21 @@ fn probAt(probs: mlx.mlx_array, token_id: u32, s: mlx.mlx_stream) !f32 {
     return v;
 }
 
-/// Sample one token from probability distribution `probs` (shape `[B, V]`).
+/// Sample one token from probability distribution `probs` (shape `[B, V]`) with
+/// the request's key (`seedKey`: a seeded request replays, `draw` = the position).
 /// Returns a u32 token id (caller can append directly).
-fn sampleFromProbs(probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+fn sampleFromProbs(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !u32 {
     // mlx_random_categorical takes logits and applies softmax. Feed log(probs)
     // so the categorical's softmax recovers the original distribution.
     var log_probs = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(log_probs);
     try mlx.check(mlx.mlx_log(&log_probs, probs, s));
 
-    const null_key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(null_key);
+    const key = seedKey(sampling);
+    defer _ = mlx.mlx_array_free(key);
     var sampled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sampled);
-    try mlx.check(mlx.mlx_random_categorical(&sampled, log_probs, -1, null_key, s));
+    try mlx.check(mlx.mlx_random_categorical(&sampled, log_probs, -1, key, s));
     try mlx.check(mlx.mlx_array_eval(sampled));
     var v: i32 = 0;
     try mlx.check(mlx.mlx_array_item_int32(&v, sampled));
@@ -13842,7 +13852,7 @@ fn lazyOneHotRow(id: mlx.mlx_array, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_ar
 /// renormalized. Used on stochastic-verify reject so the corrected token
 /// preserves the target distribution (per Leviathan et al. speculative
 /// decoding paper).
-fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !u32 {
     var diff = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(diff);
     try mlx.check(mlx.mlx_subtract(&diff, target_probs, draft_probs, s));
@@ -13853,7 +13863,7 @@ fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: ml
     defer _ = mlx.mlx_array_free(residual);
     try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
 
-    return sampleFromProbs(residual, s);
+    return sampleFromProbs(residual, sampling, s);
 }
 
 /// Lazy categorical sample from an already-filtered probability row
@@ -23705,6 +23715,37 @@ test "shortlist top-p equals the whole row's ranking, ties and 248320-wide rows"
     }
 }
 
+test "a seeded correction draw replays: same seed and position, same token; positions differ" {
+    // Bar: the bonus/residual draw of a verify round is keyed like every other draw.
+    const s = mlx.gpuStream();
+    const v: c_int = 64;
+    var vals: [64]f32 = undefined;
+    var sum: f32 = 0;
+    for (&vals, 0..) |*x, i| {
+        x.* = 1.0 / @as(f32, @floatFromInt(i + 1));
+        sum += x.*;
+    }
+    for (&vals) |*x| x.* /= sum;
+    const shape = [_]c_int{ 1, v };
+    const probs = mlx.mlx_array_new_data(&vals, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const onehot = try pldOneHotRow(0, v, s);
+    defer _ = mlx.mlx_array_free(onehot);
+
+    var distinct = false;
+    var prev: ?u32 = null;
+    for (0..16) |d| {
+        const sp: SamplingParams = .{ .seed = 11, .draw = d };
+        const a = try sampleFromProbs(probs, sp, s);
+        try testing.expectEqual(a, try sampleFromProbs(probs, sp, s));
+        try testing.expectEqual(try sampleResidual(probs, onehot, sp, s), try sampleResidual(probs, onehot, sp, s));
+        try testing.expect(try sampleResidual(probs, onehot, sp, s) != 0); // the rejected draft is never redrawn
+        if (prev) |q| distinct = distinct or q != a;
+        prev = a;
+    }
+    try testing.expect(distinct);
+}
+
 test "shortlist top-p holds on rank-3 [B, L, V] blocks" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -24022,6 +24063,7 @@ test "repeat penalty shapes every sampling path, not only the logprobs one" {
 }
 
 test "keyed sampling draws the softmax distribution" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const probs = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
     var logv: [4]f32 = undefined;

@@ -48,7 +48,8 @@ batch file:
     {"type": "video", "id": "storm", "prompt": "...", "first_frame": "storm.png", "width": 1312, "height": 736, "num_frames": 124, "turbo": true}]}
   Paths in jobs (source, first_frame, image_file) are relative to where gen.mjs runs. Jobs run one at a time. Other job fields go to the endpoint as is (steps, voice, lyrics, ...).
   Writes <out>/<id>.png|wav|glb plus <out>/manifest.json; a job whose spec and model did not
-  change is skipped (--force regenerates). Media models are unloaded at the end (--keep-loaded).`;
+  change is skipped (--force regenerates). One media model is loaded at a time: the previous one is
+  unloaded before the next kind loads, and the last one at the end (--keep-loaded keeps it).`;
 
 // ---------- server ----------
 
@@ -241,6 +242,15 @@ function payload(kind, ev) {
   return Buffer.from(b64, "base64");
 }
 
+// One GPU shared with the chat model the agent runs on: a second media model resident beside the
+// first and a big chat model pushed Metal past its limit mid-job, so one media model at a time.
+let resident = null;
+async function use(model) {
+  if (resident && resident !== model) await unload(resident);
+  resident = model;
+  return model;
+}
+
 export async function unload(model) {
   await fetch(BASE + "/v1/unload-model", {
     method: "POST",
@@ -258,11 +268,10 @@ const LOCAL = new Set(["type", "id", "file", "model", "tile", "maps", "cutout", 
 
 const REF_SUFFIX = ", a single object, centered, whole object in frame, three-quarter view, plain white background, soft even studio light";
 
-async function runJob(job, out, used) {
+async function runJob(job, out) {
   const kind = job.type;
   if (!ENDPOINT[kind]) throw new Error(`job ${job.id}: unknown type "${kind}" (image, speech, music, sound, 3d, video)`);
   const model = await pickModel(kind, job.model);
-  used.add(model);
   const ext = { image: ".png", speech: ".wav", music: ".wav", sound: ".wav", "3d": ".glb", video: ".mp4" }[kind];
   const file = job.file || join(out, job.id + ext);
   mkdirSync(dirname(file), { recursive: true });
@@ -274,8 +283,7 @@ async function runJob(job, out, used) {
   if (kind === "3d") {
     let ref = job.image_file;
     if (!ref) {
-      const imageModel = await pickModel("image");
-      used.add(imageModel);
+      const imageModel = await use(await pickModel("image"));
       ref = file.replace(/\.glb$/, "") + "_ref.png";
       const ev = await generate("image", { model: imageModel, prompt: (job.ref_prompt || job.prompt) + REF_SUFFIX, seed: job.seed ?? 42 });
       writeFileSync(ref, payload("image", ev));
@@ -284,12 +292,14 @@ async function runJob(job, out, used) {
     delete body.prompt;
     body.image = readFileSync(ref).toString("base64");
     body.texture ??= true;
+    await use(model);
     let glb = payload("3d", await generate("3d", body));
     if (job.height_m || job.size_m || job.max_tris) glb = fixGlb(glb, { height: job.height_m, size: job.size_m, maxTris: job.max_tris });
     writeFileSync(file, glb);
     return { model, files };
   }
 
+  await use(model);
   if (kind === "video") {
     // the server's defaults are tiny test sizes; a film wants 16:9 and about five seconds (MiniMax-H3's 17k+5 ladder)
     body.width ??= 1312;
@@ -325,7 +335,6 @@ async function runBatch(specFile, opts) {
   const manifestFile = join(out, "manifest.json");
   const manifest = existsSync(manifestFile) ? JSON.parse(readFileSync(manifestFile, "utf8")) : { assets: {} };
   manifest.generated_by = "mlx-serve gen.mjs";
-  const used = new Set();
   let failed = 0;
   for (const job of spec.jobs || []) {
     if (!job.id || !job.type) throw new Error(`every job needs "id" and "type": ${JSON.stringify(job)}`);
@@ -337,7 +346,7 @@ async function runBatch(specFile, opts) {
       continue;
     }
     try {
-      const r = await runJob({ ...job, model }, out, used);
+      const r = await runJob({ ...job, model }, out);
       const files = Object.fromEntries(Object.entries(r.files).map(([k, f]) => [k, f.startsWith(out) ? f.slice(out.length + 1) : f]));
       manifest.assets[job.id] = { type: job.type, files, model: r.model, prompt: job.prompt ?? job.input, seed: job.seed, hash };
       writeFileSync(manifestFile, JSON.stringify(manifest, null, 2) + "\n");
@@ -346,7 +355,7 @@ async function runBatch(specFile, opts) {
       console.error(`  FAILED ${job.id}: ${e.message}`);
     }
   }
-  if (!opts.keepLoaded) for (const m of used) await unload(m);
+  if (!opts.keepLoaded && resident) await unload(resident);
   console.error(`${(spec.jobs || []).length - failed}/${(spec.jobs || []).length} jobs ok; manifest: ${manifestFile}`);
   if (failed) process.exitCode = 1;
 }
@@ -770,7 +779,7 @@ async function main() {
         first_frame: opt["first-frame"], last_frame: opt["last-frame"], width, height, num_frames: num(opt.frames),
         steps: num(opt.steps), turbo: opt.turbo, seed: num(opt.seed) };
       for (const k of Object.keys(job)) if (job[k] === undefined) delete job[k];
-      const r = await runJob(job, ".", new Set());
+      const r = await runJob(job, ".");
       console.log(r.files.main);
       return;
     }
@@ -787,7 +796,7 @@ async function main() {
       Object.assign(job, { tile: opt.tile, maps: opt.maps, cutout: opt.cutout, trim: opt.trim, holes: opt.holes, height_m: num(opt.height), size_m: num(opt.size_m), max_tris: num(opt["max-tris"]) });
       job.file ||= { image: "image.png", "3d": "model.glb" }[cmd] || cmd + ".wav";
       for (const k of Object.keys(job)) if (job[k] === undefined) delete job[k];
-      const r = await runJob(job, ".", new Set());
+      const r = await runJob(job, ".");
       console.log(Object.values(r.files).join("\n"));
       return;
     }

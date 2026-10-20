@@ -1084,6 +1084,8 @@ extension ServerOptionsTests {
         }
         // Unknown RAM must still produce a usable ladder, not just [Auto].
         XCTAssertGreaterThan(ServerOptions.residentMemPresets(physicalMemoryBytes: 0).count, 1)
+        // A 256 GB Mac holding a 208 GB model needs a step that refuses a second model beside it.
+        XCTAssertTrue(ServerOptions.residentMemPresets(physicalMemoryBytes: 256 * Self.GiB).contains(224))
     }
 
     /// Bar: the flag reaches the server when set, and 0 emits nothing (0 is

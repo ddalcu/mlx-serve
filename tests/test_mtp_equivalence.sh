@@ -124,7 +124,7 @@ start_server() { # $1 = extra flags
     "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 --log-level info $1 >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do
-        curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
         sleep 1
     done
     # /health answers as soon as the socket binds — the model is still
@@ -369,7 +369,7 @@ sleep 1
 MLX_SERVE_MTP_ADAPTIVE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --log-level info >"$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 120); do
-    curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
     sleep 1
 done
 # Same readiness rule as start_server: /health is up before the load ends.
