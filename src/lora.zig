@@ -425,6 +425,13 @@ pub fn delta(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     return scaled;
 }
 
+/// Does any attached adapter contribute (a nonzero scale)? A stack of strength-0 adapters leaves
+/// the base forward exactly as it was, fused kernels included.
+pub fn anyActive(refs: []const Ref) bool {
+    for (refs) |r| if (r.scale != 0) return true;
+    return false;
+}
+
 /// `y + Σ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ` in y's dtype, `y` borrowed, the result always a NEW handle. The
 /// rank-r activation is tiny, so each adapter is one skinny GEMM and an `addmm` whose epilogue adds
 /// onto y: no delta tensor, no scalar pass. An adapter at scale 0 is skipped: MLX's `addmm` does
@@ -494,6 +501,11 @@ pub const Slot = struct {
     }
     pub fn active(self: *const Slot) []const Ref {
         return self.refs[0..self.count];
+    }
+    /// Does the slot change the forward (an adapter at a nonzero scale)? A fused route keyed on
+    /// this keeps its bytes under a strength-0 stack.
+    pub fn isActive(self: *const Slot) bool {
+        return anyActive(self.active());
     }
 };
 
@@ -957,6 +969,23 @@ test "delta computes scale·(x@Aᵀ)@Bᵀ" {
     const dd = mlx.mlx_array_data_float32(d) orelse return error.NoData;
     try testing.expectApproxEqAbs(@as(f32, 110), dd[0], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 132), dd[1], 1e-4);
+}
+
+test "anyActive: a stack is active only through a nonzero scale" {
+    const z = std.mem.zeroes(Ref);
+    var on = z;
+    on.scale = 0.5;
+    var neg = z;
+    neg.scale = -1.0;
+    try std.testing.expect(!anyActive(&.{}));
+    try std.testing.expect(!anyActive(&.{ z, z }));
+    try std.testing.expect(anyActive(&.{ z, on }));
+    try std.testing.expect(anyActive(&.{neg}));
+    var slot: Slot = .{};
+    slot.set(&.{ z, z });
+    try std.testing.expect(!slot.isActive());
+    slot.set(&.{ z, on });
+    try std.testing.expect(slot.isActive());
 }
 
 test "deltaSum adds every attached adapter's delta — the whole point of stacking" {

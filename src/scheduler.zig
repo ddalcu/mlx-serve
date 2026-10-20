@@ -2069,6 +2069,8 @@ pub const Scheduler = struct {
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
+        // A lost GPU context fails every MLX call: nothing is loaded or served until a restart.
+        if (mlx.gpuContextLost()) return error.GpuContextLost;
         // Fast path: ready entries. registry.ensureLoaded handles waiting
         // out .loading / .evicting transitions by other callers.
         const fast_result = self.registry.ensureLoaded(id_or_empty);
@@ -2197,7 +2199,13 @@ pub const Scheduler = struct {
                 // idle server the cause is always the static cap (#126), and
                 // the flag that moves it is not otherwise discoverable.
                 const gb = 1024.0 * 1024.0 * 1024.0;
-                log.err("Refusing to load {s}: needs ~{d:.2} GB with {d:.2} GB resident across {d} model(s), none evictable, against --max-resident-models {d} and --max-resident-mem {d:.2} GB (0 = off). Unload a model or raise a cap.\n", .{
+                if (loadExceedsMemCap(estimated, self.registry.max_resident_mem)) {
+                    log.err("Refusing to load {s}: needs ~{d:.2} GB, more than --max-resident-mem {d:.2} GB on its own, so unloading other models cannot help. Raise the cap.\n", .{
+                        entry.id,
+                        @as(f64, @floatFromInt(estimated)) / gb,
+                        @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
+                    });
+                } else log.err("Refusing to load {s}: needs ~{d:.2} GB with {d:.2} GB resident across {d} model(s), none evictable, against --max-resident-models {d} and --max-resident-mem {d:.2} GB (0 = off). Unload a model or raise a cap.\n", .{
                     entry.id,
                     @as(f64, @floatFromInt(estimated)) / gb,
                     @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
@@ -3587,6 +3595,13 @@ fn endAneSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     publishSlotTerminator(slot, reason, null);
 }
 
+/// A load whose own bill exceeds the memory cap is refused whatever else is resident.
+fn loadExceedsMemCap(estimated: u64, max_resident_mem: u64) bool {
+    return max_resident_mem != 0 and estimated > max_resident_mem;
+}
+
+const TEXT_GATE_MARGIN_CAP_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+
 /// The post-load residency bill the eviction gate reserves, in bytes.
 ///
 /// A media entry is billed by its BACKEND: a staged-residency model
@@ -3599,7 +3614,8 @@ fn endAneSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
 ///
 /// `media_peak == 0` means "not a media model, or a directory we could not
 /// read" and keeps the original ladder byte-for-byte: a text bill is weights
-/// only, so it takes 10% headroom for KV / vision / drafter overhead.
+/// only, so it takes 10% headroom for KV / vision / drafter overhead, up to
+/// `TEXT_GATE_MARGIN_CAP_BYTES`: that overhead does not grow with the weights.
 ///
 /// A media peak takes NONE. Those are text-model concepts — a media engine has
 /// no KV cache and no drafter — and `gen.estimatePeakResidentBytes` already
@@ -3614,7 +3630,7 @@ pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers
         b
     else
         @as(u64, num_hidden_layers) * @as(u64, hidden_size) * 4 * 4;
-    return base + base / 10;
+    return base + @min(base / 10, TEXT_GATE_MARGIN_CAP_BYTES);
 }
 
 /// Where a media peak lives. Unified memory holds it in one pool. CUDA keeps file-loaded
@@ -3882,6 +3898,22 @@ test "GGUF and unavailable media peak retain discovery bytes at the eviction gat
     try std.testing.expectEqual(@as(?u64, 100 * GB), residentGateBytes(0, 100 * GB, true));
     try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(0, null, true));
     try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(null, 0, false));
+}
+
+test "a text pack's gate margin stops growing with its weights" {
+    const GiB: u64 = 1024 * 1024 * 1024;
+    // DeepSeek-V4.1 oQ2.5e: 203.83 GiB of resident weights must fit a 222.72 GiB cap with nothing else loaded.
+    const ds: u64 = 218_858_232_429;
+    try std.testing.expect(gateEstimateBytes(0, ds, 43, 4096) < 222 * GiB);
+    // Up to 100 GiB the margin is still 10%.
+    try std.testing.expectEqual(@as(u64, 66 * GiB), gateEstimateBytes(0, 60 * GiB, 48, 2560));
+}
+
+test "a load over the memory cap on its own is named as such, not as a busy registry" {
+    const GiB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expect(loadExceedsMemCap(225 * GiB, 222 * GiB));
+    try std.testing.expect(!loadExceedsMemCap(200 * GiB, 222 * GiB));
+    try std.testing.expect(!loadExceedsMemCap(225 * GiB, 0));
 }
 
 fn committedTextBytes(model_bytes: u64, config: *const model_mod.ModelConfig) u64 {
@@ -5474,6 +5506,25 @@ fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
     publishHotCacheResidency(sch);
 }
 
+/// What the module-owned archs retain between requests: DeepSeek-V4.1 keeps one conversation's decode
+/// state (window rings, compressed rows) in the module, outside every KVCache, so the KV figures would
+/// read 0 with 200 GB of weights resident. Inference thread only (the module replaces those buffers).
+fn moduleStateBytes(sch: *Scheduler) u64 {
+    var bytes: u64 = 0;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        const t = entry.transformer orelse continue;
+        if (t.dsv41) |m| if (m.dec_state) |*st| {
+            bytes += dsv41_mod.stateBytes(st);
+        };
+    }
+    return bytes;
+}
+
 /// The view must not outlive its cache: before `leaving`'s cache is freed, hand the view to
 /// another resident chat model's, the default's when it has one, or to none.
 fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
@@ -5493,7 +5544,8 @@ fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
-    const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    var bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    bytes += moduleStateBytes(sch);
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
@@ -6583,6 +6635,20 @@ const GenYield = struct {
     }
 };
 
+/// Chat interleaves with a running media job (GenYield) except on CUDA: there a decode that ran
+/// inside one image job left state the next job's first step faulted on once that chat model
+/// was evicted (an illegal memory access). Set at boot by `server.serve`.
+pub var gen_yield_enabled = true;
+
+/// `MLX_SERVE_GEN_YIELD=1` forces interleaving on, `=0` off; otherwise on except on CUDA.
+pub fn genYieldEnabled(cuda: bool, env: ?[]const u8) bool {
+    if (env) |e| {
+        if (std.mem.eql(u8, e, "1")) return true;
+        if (std.mem.eql(u8, e, "0")) return false;
+    }
+    return !cuda;
+}
+
 /// Run one media-generation job on the inference thread. The job body
 /// (`req.run`) does all mlx work + writes the HTTP/SSE response to the parked
 /// connection. We bracket it with the model's `gen_busy` flag for visibility
@@ -6593,7 +6659,7 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     req.model.gen_busy = true;
     var gy = GenYield{ .sch = sch, .step_sw = io_util.Stopwatch.init(sch.io) };
     const hook = gen_sse.Yield{ .ctx = &gy, .step = GenYield.step, .serve_until = GenYield.serveUntil, .wake = GenYield.wake };
-    gen_sse.gen_yield = &hook;
+    if (gen_yield_enabled) gen_sse.gen_yield = &hook;
     // The whole estimated peak, though live memory already holds part of it: the side that
     // cannot OOM.
     sch.gen_reserve_bytes = sch.mediaPeakFor(req.model);
@@ -7767,8 +7833,13 @@ pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
 }
 
 /// The flag's text if given, else the env's, else 0.
+/// The decode share a server runs with when nothing names one: the boundary admission and the
+/// smallest-tail-first batch only engage under a share, and without it a quick question waited
+/// 90-120 s behind a 90k prefill (26.10.3 validation). `--prefill-decode-share 0` restores the old schedule.
+pub const DEFAULT_DECODE_SHARE: f32 = 0.25;
+
 pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
-    const text = flag orelse env orelse return 0;
+    const text = flag orelse env orelse return DEFAULT_DECODE_SHARE;
     return parseDecodeShare(text);
 }
 
@@ -8154,6 +8225,9 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     if (ic.ticks == 0) {
         log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
     }
+    // Decode ticks keep the CUDA graphs a prefill dropped.
+    const graphs_were = mlx.setCudaGraphs(true);
+    defer _ = mlx.setCudaGraphs(graphs_were);
     const chunk_ns = ic.chunk_sw.read();
     const share = prefillDecodeShare();
     // Small pending requests first, so the ticks below include them; their time is hosted time. A
@@ -8348,7 +8422,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
     const resumed: u64 = if (xfm_ptr.dsv41) |mdl|
-        try dsv41_mod.resumePrompt(mdl, slot.full_prompt)
+        try dsv41_mod.resumePrompt(mdl, slot.full_prompt, slot.vision_embeddings)
     else if (xfm_ptr.mlx_stream_ext) |m|
         try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
     else
@@ -8596,6 +8670,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
     if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
+    const graphs_were = mlx.setCudaGraphs(mlx.prefillKeepsCudaGraphs());
+    defer _ = mlx.setCudaGraphs(graphs_were);
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -12593,7 +12669,8 @@ test "decode share: parse clamps above 0.9 and rejects anything that is not a sh
     // The flag outranks the env; neither set is 0; a bad env is an error, not 0.
     try testing.expectEqual(@as(f32, 0.3), try resolveDecodeShare("0.3", "0.5"));
     try testing.expectEqual(@as(f32, 0.5), try resolveDecodeShare(null, "0.5"));
-    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare(null, null));
+    try testing.expectEqual(DEFAULT_DECODE_SHARE, try resolveDecodeShare(null, null));
+    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare("0", null));
     try testing.expectError(error.InvalidDecodeShare, resolveDecodeShare(null, "abc"));
 }
 
@@ -12940,6 +13017,13 @@ test "hot-cache view: a revise that follows an unload raises a budget but never 
     try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
 }
 
+test "genYieldEnabled: off on CUDA unless asked for, on elsewhere" {
+    try std.testing.expect(!genYieldEnabled(true, null));
+    try std.testing.expect(genYieldEnabled(true, "1"));
+    try std.testing.expect(genYieldEnabled(false, null));
+    try std.testing.expect(!genYieldEnabled(false, "0"));
+    try std.testing.expect(!genYieldEnabled(true, ""));
+}
 
 test "a refusal right after a two-model eviction waits for the memory to come back" {
     const GiB: u64 = 1024 * 1024 * 1024;

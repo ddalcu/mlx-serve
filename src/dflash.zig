@@ -1192,6 +1192,12 @@ fn loadLinear(
     const scales_key = try std.fmt.bufPrint(&key_buf, "{s}.scales", .{prefix});
     if (w.get(scales_key)) |_| {
         var kb: [256]u8 = undefined;
+        // An fp4/fp8 pack ships scales and a global scale, no biases (EigenLabs' NVFP4 Nemotron drafter):
+        // the sidecar loader serves affine quantization only, so refuse by name instead of "MISSING WEIGHT".
+        if (w.get(try std.fmt.bufPrint(&kb, "{s}.biases", .{prefix})) == null) {
+            log.err("[dflash] {s} is quantized without biases (an fp4/fp8 pack): DFlash sidecars load affine quantization only; pass --no-drafter to serve the model without it\n", .{prefix});
+            return error.UnsupportedDflashQuant;
+        }
         var out = DflashLinear{
             .w = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix})),
             .scales = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.scales", .{prefix})),

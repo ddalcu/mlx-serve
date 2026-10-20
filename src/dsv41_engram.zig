@@ -104,6 +104,10 @@ fn isPrime(n: u64) bool {
 /// The per-layer hash constants: one odd multiplier per lookback, one prime
 /// bucket per (n-gram size, head), and each bucket's first row.
 pub const Hash = struct {
+    /// The compressed id of a token that takes no part in an n-gram (an image span's): every n-gram
+    /// reaching back to or past it hashes as all-pad, as the release's `engram_hash` blocks them.
+    pub const DEAD: u32 = std.math.maxInt(u32);
+
     n_layers: u32,
     max_ngram: u32,
     heads: u32,
@@ -150,8 +154,11 @@ pub const Hash = struct {
         for (ids, 0..) |_, i| {
             const pos = hist.len + i;
             var toks: [MAX_NGRAM]u64 = undefined;
+            var blocked = false;
             for (0..self.max_ngram) |s| {
-                toks[s] = if (pos < s) self.pad else if (pos - s >= hist.len) ids[pos - s - hist.len] else hist[pos - s];
+                const t: u32 = if (pos < s) self.pad else if (pos - s >= hist.len) ids[pos - s - hist.len] else hist[pos - s];
+                blocked = blocked or t == DEAD;
+                toks[s] = if (blocked) self.pad else t;
             }
             for (0..self.n_layers) |l| {
                 const dst = out[(i * self.n_layers + l) * nc ..][0..nc];
@@ -679,6 +686,23 @@ test "dsv41 engram: row ids match DeepSeek's NgramHashState across prefill and d
     h.rows(&.{}, prompt[0..2], split[0 .. 2 * 48]);
     h.rows(prompt[0..2], prompt[2..], split[2 * 48 ..]);
     try testing.expectEqualSlices(u32, &pre, &split);
+}
+
+test "dsv41 engram: a dead token (an image span's) makes every n-gram across it the all-pad one" {
+    const cfg = releaseConfig();
+    const h = try Hash.init(&cfg, 2);
+    // ... 3 [image] 77: the image's own row and 77's shifts past it read pad.
+    const ids = [_]u32{ 3, Hash.DEAD, 77 };
+    var got: [3 * 2 * 24]u32 = undefined;
+    h.rows(&.{}, &ids, &got);
+    var want: [3 * 2 * 24]u32 = undefined;
+    h.rows(&.{}, &.{2}, want[48..96]); // the image's own row: every slot pad
+    try testing.expectEqualSlices(u32, want[48..96], got[48..96]);
+    h.rows(&.{ 2, 2 }, &.{77}, want[96..]); // 77 with only pad behind it
+    try testing.expectEqualSlices(u32, want[96..], got[96..]);
+    // The token before the image hashes as if nothing followed it (no look-ahead).
+    h.rows(&.{}, &.{3}, want[0..48]);
+    try testing.expectEqualSlices(u32, want[0..48], got[0..48]);
 }
 
 /// An MLX pack's layer-1 table in one shard: 4 rows, head_dim 64, 8-bit g32

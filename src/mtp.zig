@@ -3913,12 +3913,33 @@ fn getTop32Final() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+/// `draftTop32` through MLX's argpartition (CUDA, where the Metal kernels do not run): the same
+/// set of ids, in no promised order or tie break. Proposal side only, so neither changes output.
+fn draftTop32Partition(s: mlx.mlx_stream, row: mlx.mlx_array) !mlx.mlx_array {
+    var neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg);
+    try mlx.check(mlx.mlx_negative(&neg, row, s));
+    var part = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(part);
+    try mlx.check(mlx.mlx_argpartition_axis(&part, neg, TOP32_K - 1, 0, s));
+    var head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head);
+    try mlx.check(mlx.mlx_slice(&head, part, &[_]c_int{0}, 1, &[_]c_int{TOP32_K}, 1, &[_]c_int{1}, 1, s));
+    var ids = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(ids);
+    try mlx.check(mlx.mlx_astype(&ids, head, .uint32, s));
+    return ids;
+}
+
 /// Exact top-32 ids of `row` ([rows], any float dtype) as a lazy [32] uint32
 /// array, ascending by (value, index) — ties break toward the higher index,
 /// NaN above every number. `rows` rides as a template int (stable per model,
 /// so MLX caches one specialization per vocab width).
 pub fn draftTop32(s: mlx.mlx_stream, row: mlx.mlx_array, rows: c_int) !mlx.mlx_array {
-    if (!mlx.streamIsGpu(s)) return error.MetalKernelNeedsGpuStream;
+    if (!mlx.streamIsGpu(s)) {
+        if (mlx.cudaAvailable()) return draftTop32Partition(s, row);
+        return error.MetalKernelNeedsGpuStream;
+    }
     if (rows < TOP32_MIN_ROWS) return error.UnsupportedTop32Shape;
     const per_thread = @divTrunc(rows + TOP32_TILES * TOP32_TG - 1, TOP32_TILES * TOP32_TG);
     if (per_thread > 32) return error.UnsupportedTop32Shape;
@@ -3969,6 +3990,35 @@ pub fn draftTop32(s: mlx.mlx_stream, row: mlx.mlx_array, rows: c_int) !mlx.mlx_a
 // ── Tests ──
 
 const testing = std.testing;
+
+test "draftTop32 on CUDA: the 32 largest ids of a vocab row, as a set" {
+    if (!mlx.cudaAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const rows: usize = 248320;
+    const data = try testing.allocator.alloc(f32, rows);
+    defer testing.allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(32);
+    for (data) |*x| x.* = prng.random().float(f32) * 10.0;
+    var want: [TOP32_K]u32 = undefined;
+    for (&want, 0..) |*w, i| {
+        w.* = @intCast((i * 7919 + 13) % rows);
+        data[w.*] = 20.0 + @as(f32, @floatFromInt(i));
+    }
+    const host = mlx.mlx_array_new_data(data.ptr, &[_]c_int{@intCast(rows)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(host);
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_astype(&row, host, .bfloat16, s));
+    const ids = try draftTop32(s, row, @intCast(rows));
+    defer _ = mlx.mlx_array_free(ids);
+    try mlx.check(mlx.mlx_array_eval(ids));
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(ids));
+    var got: [TOP32_K]u32 = undefined;
+    @memcpy(&got, mlx.mlx_array_data_uint32(ids).?[0..TOP32_K]);
+    std.mem.sort(u32, &got, {}, std.sort.asc(u32));
+    std.mem.sort(u32, &want, {}, std.sort.asc(u32));
+    try testing.expectEqualSlices(u32, &want, &got);
+}
 
 test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoid MoE)" {
     // Hy3 (hy_v3) checkpoints ship the MTP block in `model-mtp.safetensors`

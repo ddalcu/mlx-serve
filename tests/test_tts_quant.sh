@@ -16,7 +16,7 @@ LOG=/tmp/test_tts_quant_server.log
 "$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
 for i in $(seq 1 120); do
-  curl -s --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+  curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
   kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server exited during boot"; cat "$LOG"; exit 1; }
   sleep 1
 done

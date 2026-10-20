@@ -301,7 +301,8 @@ const Layer = struct {
     comp: ?Comp,
     idx: ?Idx,
     gate_w: A, // [E, dim], read in f32 by `GATE_SOURCE`
-    gate_bias: A, // f32 [E]
+    gate_bias: A, // f32 [1, E]
+    gate_bias_vl: ?A = null, // f32 [1, E]: the bias an image span's rows pick experts by (`noaux_tc_for_vl`)
     top_k: usize,
     shared: [3]Lin, // w1 (gate), w3 (up), w2 (down)
     shared_gu: ?Lin = null, // w1 and w3 as one linear; then shared[0..2] are unset
@@ -410,6 +411,9 @@ pub const Dsv41Model = struct {
     /// Where this prompt's snapshot is taken (`armSnapshot`), and its tokens.
     snap_at: ?usize = null,
     snap_ids: []u32 = &.{},
+    /// The image rows inside the snapshot's ids (`visionKey`): a prefix of the same ids with other pixels never resumes,
+    /// and an image added AFTER the prefix does not stop it.
+    snap_vision_key: u64 = 0,
     ds_conf_thr: f32 = -std.math.inf(f32),
     /// The adaptive verify policy reads each draft's confidence; otherwise only a finite `ds_conf_thr` does.
     ds_want_conf: bool = false,
@@ -466,6 +470,17 @@ pub const Dsv41Model = struct {
             return e;
         };
         return x;
+    }
+
+    /// How many of `ids` are image span positions.
+    fn imageRows(self: *const Dsv41Model, ids: []const u32) usize {
+        return if (self.cfg.image_token_id == 0) 0 else std.mem.count(u32, ids, &.{self.cfg.image_token_id});
+    }
+
+    /// A token's Engram id; an image span's positions take no part in an n-gram.
+    fn compressedId(self: *const Dsv41Model, t: u32) u32 {
+        if (self.cfg.image_token_id != 0 and t == self.cfg.image_token_id) return engram.Hash.DEAD;
+        return if (t < self.token_map.len) self.token_map[t] else 0;
     }
 
     fn held(self: *const Dsv41Model, li: usize) bool {
@@ -887,7 +902,7 @@ fn loadLayer(m: *Dsv41Model, w: *model.Weights, comptime pfx: []const u8, li: us
             .k_norm = if (is_kv) try ownCast(m, try getW(w, pfx ++ ".{d}.attn.indexer.k_norm.weight", .{li}), m.act) else none,
         } else null,
         .gate_w = try getW(w, pfx ++ ".{d}.ffn.gate.weight", .{li}),
-        .gate_bias = try ownCast(m, try getW(w, pfx ++ ".{d}.ffn.gate.bias", .{li}), .float32),
+        .gate_bias = try ownReshape(m, try ownCast(m, try getW(w, pfx ++ ".{d}.ffn.gate.bias", .{li}), .float32), &.{ 1, ci(n_experts) }),
         .top_k = if (trunk_li == null) c.dsv41_dspark_top_k else c.num_experts_per_tok,
         .shared = .{
             try getLin(w, d, pfx ++ ".{d}.ffn.shared_experts.w1", .{li}),
@@ -895,6 +910,9 @@ fn loadLayer(m: *Dsv41Model, w: *model.Weights, comptime pfx: []const u8, li: us
             try getLin(w, c.moe_intermediate_size, pfx ++ ".{d}.ffn.shared_experts.w2", .{li}),
         },
         .experts = try fuseExperts(m, w, try loadExperts(m, w, pfx, li, n_experts)),
+    };
+    if (trunk_li != null) if (getOpt(w, pfx ++ ".{d}.ffn.gate.bias_vl", .{li})) |b| {
+        ly.gate_bias_vl = try ownReshape(m, try ownCast(m, b, .float32), &.{ 1, ci(n_experts) });
     };
     if (try fuseRows(m, w, ly.shared[0], ly.shared[1], 0)) |f| {
         ly.shared_gu = f;
@@ -1221,7 +1239,7 @@ const ROUTE_SOURCE =
     \\  const float y = metal::exp(-metal::abs(z));
     \\  const float lp = y < 1e-4f ? y * (1.0f - y * (0.5f - y / 3.0f)) : metal::log(1.0f + y);
     \\  s = metal::sqrt(metal::max(z, 0.0f) + lp);
-    \\  v = s + bias[e];
+    \\  v = s + bias[(bias_shape[0] == 1 ? 0 : l) * E + e];
     \\  t_s[e] = s;
     \\}
     \\for (int r = 0; r < K; ++r) {
@@ -2099,10 +2117,10 @@ pub fn dsparkWanted(cfg: *const ModelConfig) bool {
 }
 
 /// What a load holds of the pack: its safetensors bytes less the Engram tables it preads and the tensors it
-/// drops (the vision tower; the DSpark stages when they do not load; a tensor's copy in a shard the index does not
-/// name for it).
+/// drops (the vision tower on a text load; the DSpark stages when they do not load; a tensor's copy in a shard the
+/// index does not name for it).
 pub fn residentDiskBytes(gpa: std.mem.Allocator, dir: []const u8, cfg: *const ModelConfig, shards: u64) !u64 {
-    var total = shards -| try droppedBytes(gpa, dir, dsparkWanted(cfg));
+    var total = shards -| try droppedBytes(gpa, dir, dsparkWanted(cfg), cfg.has_vision);
     for (cfg.dsv41_engram_layers[0..cfg.dsv41_n_engram_layers], 0..) |l, k| {
         var t = try engram.Table.open(gpa, dir, k, l, cfg.dsv41_engram_rows[k], cfg.dsv41_engram_head_dim);
         defer t.close();
@@ -2111,7 +2129,7 @@ pub fn residentDiskBytes(gpa: std.mem.Allocator, dir: []const u8, cfg: *const Mo
     return total;
 }
 
-fn droppedBytes(gpa: std.mem.Allocator, dir_path: []const u8, dspark: bool) !u64 {
+fn droppedBytes(gpa: std.mem.Allocator, dir_path: []const u8, dspark: bool, vision: bool) !u64 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2142,7 +2160,7 @@ fn droppedBytes(gpa: std.mem.Allocator, dir_path: []const u8, dspark: bool) !u64
             const bare = if (std.mem.startsWith(u8, key, model.dsv41_text_prefix)) key[model.dsv41_text_prefix.len..] else key;
             const owner = wm.object.get(key);
             const foreign = owner != null and owner.? == .string and !std.mem.eql(u8, owner.?.string, name);
-            if (!foreign and !model.dsv41VisionKey(bare) and (dspark or !std.mem.startsWith(u8, bare, "mtp."))) continue;
+            if (!foreign and (vision or !model.dsv41VisionKey(bare)) and (dspark or !std.mem.startsWith(u8, bare, "mtp."))) continue;
             const off = (if (e.value_ptr.* == .object) e.value_ptr.object.get("data_offsets") else null) orelse continue;
             if (off != .array or off.array.items.len != 2 or off.array.items[0] != .integer or off.array.items[1] != .integer) continue;
             total += @intCast(@max(off.array.items[1].integer - off.array.items[0].integer, 0));
@@ -2361,6 +2379,25 @@ pub const State = struct {
         self.verify = null;
     }
 };
+
+fn arrayBytes(a: A) u64 {
+    if (a.ctx == null) return 0;
+    return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
+}
+
+/// The decode state's resident bytes: every layer's window ring, compressed and indexer rows (their
+/// capacity, as allocated), open pooling group, and the DSpark windows. What `kv_cache_bytes` reports for
+/// this module, whose state lives outside the KVCache.
+pub fn stateBytes(st: *const State) u64 {
+    var bytes: u64 = 0;
+    for (st.layers) |*l| {
+        bytes += arrayBytes(l.win.buf) + arrayBytes(l.pend_kv) + arrayBytes(l.pend_gate);
+        if (l.comp) |r| bytes += arrayBytes(r.buf);
+        if (l.idx_k) |r| bytes += arrayBytes(r.buf);
+    }
+    for (st.ds) |r| bytes += arrayBytes(r.buf);
+    return bytes + arrayBytes(st.mh);
+}
 
 pub fn initState(m: *const Dsv41Model, gpa: std.mem.Allocator) !State {
     const layers = try gpa.alloc(LState, m.n_layers);
@@ -2649,6 +2686,7 @@ fn clampedSwiglu(sc: *Scope, gate: A, up: A, limit: f32) !A {
 const Shared = struct {
     topk: A = none, // [L, k] compressed indices, -1 = none
     cand: A = none, // [L, n_blocks] candidate blocks
+    img: A = none, // [L] bool: the rows inside an image span (`Spans.img` for this span)
     /// A replay tail's first position: the window band stops there, the decode-width graphs are skipped and no
     /// compressor runs (the split layer's read the whole chunk).
     floor: ?usize = null,
@@ -3339,11 +3377,13 @@ fn gateLogits(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     return sc.res(mlx.mlx_vector_array_get(&logits, lo, 0), &logits);
 }
 
-fn route(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Routes {
+/// `img` (`[L]` bool, or none) names the rows inside an image span, which pick their experts by `gate_bias_vl`.
+fn route(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, img: A) !Routes {
     const L = dim(x, 0);
     const E = dim(ly.gate_w, 0);
     const K = ly.top_k;
     const logits = try gateLogits(sc, m, ly, x);
+    const bias = if (img.ctx != null and ly.gate_bias_vl != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl.?, ly.gate_bias) else ly.gate_bias;
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -3354,7 +3394,7 @@ fn route(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Routes {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", ci(K)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "NORM", m.cfg.moe_route_norm and K > 1));
-    const iv = mlx.mlx_vector_array_new_data(&[_]A{ logits, ly.gate_bias, scal }, 3);
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ logits, bias, scal }, 3);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
@@ -3383,9 +3423,9 @@ fn addShared(sc: *Scope, m: *const Dsv41Model, y: A, sy: A) !A {
     return sc.astype(try sc.add(y, try sc.astype(sy, .float32)), m.act);
 }
 
-fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A) !A {
+fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     const ly = &m.layers[li];
-    const r = try route(sc, m, ly, x);
+    const r = try route(sc, m, ly, x, img);
     if (dim(x, 0) > region_rows) return moePrefill(sc, m, ly, x, r.idx, r.wts, try shared(sc, m, ly, x));
     return withShared(sc, m, ly, x, try routed(sc, m, ly, x, r.idx, r.wts));
 }
@@ -3523,7 +3563,7 @@ const Want = enum { last, all };
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
 /// mix, which the next layer's attention collapses with.
 fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared, ds_main: ?A) !A {
-    if (ds_main == null and sh.floor == null and li < m.regions.len and compiledAt(m, dim(x, 0))) {
+    if (ds_main == null and sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0))) {
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
         try runRegion(sc, m, li, .attn_in, &.{ x, pre.* }, &a);
         const ao = try attention(sc, m, st, li, a[3], p0, sh, null);
@@ -3533,7 +3573,7 @@ fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: u
         return o[0];
     }
     const mid = try blockAttn(sc, m, st, li, x, pre.*, p0, sh, ds_main);
-    const y = try moe(sc, m, li, mid.h);
+    const y = try moe(sc, m, li, mid.h, sh.img);
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
     pre.* = mid.sf.pre;
     return hcExpand(sc, mid.x1, y, &mid.sf);
@@ -3586,7 +3626,7 @@ fn evalAll(xs: []const A) !void {
 /// position or `[L, V]` for every one; caller frees). Chunks wider than one
 /// span run a layer at a time over all spans, evaluating per layer.
 pub fn extend(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, want: Want) !A {
-    return extendIds(m, gpa, st, .{ .host = ids }, want);
+    return extendIds(m, gpa, st, .{ .host = ids }, want, null);
 }
 
 /// A chunk's tokens: on the host, or one decode token still on the GPU (a
@@ -3598,7 +3638,7 @@ fn engramIds(m: *const Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []co
     const hs = &(m.hash orelse return &.{});
     const comp_ids = try gpa.alloc(u32, ids.len);
     defer gpa.free(comp_ids);
-    for (ids, comp_ids) |t, *o| o.* = if (t < m.token_map.len) m.token_map[t] else 0;
+    for (ids, comp_ids) |t, *o| o.* = m.compressedId(t);
     const out = try gpa.alloc(u32, ids.len * hs.n_layers * hs.cols());
     errdefer gpa.free(out);
     hs.rows(st.hist.items, comp_ids, out);
@@ -3627,7 +3667,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
     if (next.len > 0) {
         const comp = try gpa.alloc(u32, w);
         defer gpa.free(comp);
-        for (m.prompt[p1..][0..w], comp) |t, *o| o.* = if (t < m.token_map.len) m.token_map[t] else 0;
+        for (m.prompt[p1..][0..w], comp) |t, *o| o.* = m.compressedId(t);
         hs.rows(st.hist.items, comp, next);
     }
     const ahead_spec: engram.Prefetch.Spec = .{ .at = p1, .len = w, .ids = next };
@@ -3644,7 +3684,11 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
 /// `extend` over `ids`. A GPU token goes out as its own batch and the layers
 /// before the first Engram layer are queued on it before the host reads it
 /// back for the hash: the GPU never waits on that round trip.
-fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want: Want) !A {
+/// An image's rows for the chunk's `image_token_id` positions: `rows` is the request's `[1, N, dim]` (or
+/// `[N, dim]`) soft tokens in prompt order, `offset` the rows earlier chunks consumed.
+pub const VisionRows = struct { rows: A, offset: usize };
+
+fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want: Want, vision: ?VisionRows) !A {
     const c = &m.cfg;
     const L = switch (ids) {
         .host => |h| h.len,
@@ -3685,6 +3729,10 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     var sp = spansOf(held, n_spans, targets, span, L, p0);
     sp.eng_ids = eng_ids;
     sp.ncols = ncols;
+    var img_mask: A = none;
+    defer if (img_mask.ctx != null) {
+        _ = mlx.mlx_array_free(img_mask);
+    };
     {
         var sc = Scope.init(gpa, m.s);
         defer sc.deinit();
@@ -3692,7 +3740,25 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
             .host => |h| try sc.ints(@ptrCast(h), &.{ci(L)}),
             .gpu => |t| try sc.reshape(t, &.{1}),
         };
-        const emb = try m.embed.rows(&sc, id_arr, m.act);
+        var emb = try m.embed.rows(&sc, id_arr, m.act);
+        if (ids == .host and c.image_token_id != 0 and std.mem.indexOfScalar(u32, ids.host, c.image_token_id) != null) {
+            // The span's positions take the encoder's rows (delimiters included) in order, and are marked
+            // for the VL routing bias and the Engram pass-through.
+            const vr = vision orelse return error.Dsv41VisionRowsMissing;
+            const idx = try gpa.alloc(i32, L);
+            defer gpa.free(idx);
+            var k = vr.offset;
+            for (ids.host, idx) |t, *o| {
+                o.* = if (t == c.image_token_id) ci(k) else 0;
+                k += @intFromBool(t == c.image_token_id);
+            }
+            if (k * d > mlx.mlx_array_size(vr.rows)) return error.Dsv41VisionRowsShort;
+            const tok = try sc.i(@intCast(c.image_token_id));
+            try mlx.check(mlx.mlx_equal(&img_mask, id_arr, tok, m.s));
+            sp.img = img_mask;
+            const picked = try sc.astype(try sc.take(try sc.reshape(vr.rows, &.{ -1, ci(d) }), try sc.ints(idx, &.{ci(L)}), 0), m.act);
+            emb = try sc.where(try sc.expand(img_mask, -1), picked, emb);
+        }
         for (0..n_spans) |k| {
             const lo, const hi = sp.bounds(k);
             hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, lo, hi), 1), &.{ ci(hi - lo), ci(hc), ci(d) }));
@@ -3799,7 +3865,8 @@ fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             var sc = Scope.init(gpa, m.s);
             defer sc.deinit();
             var x = try spanIn(&sc, m, gpa, sp, li, k);
-            var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor };
+            const a, const b = sp.bounds(k);
+            var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .img = try sp.imgSlice(&sc, a, b) };
             var pre = sp.pres[k];
             x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh, null);
             if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
@@ -3938,7 +4005,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         const hi = sp.bounds(k1 - 1)[1];
         var gsc = Scope.init(gpa, m.s);
         defer gsc.deinit();
-        const yg = try moe(&gsc, m, li, try gsc.slice(pf.h, 0, lo, hi));
+        const yg = try moe(&gsc, m, li, try gsc.slice(pf.h, 0, lo, hi), try sp.imgSlice(&gsc, lo, hi));
         const sf: Split = .{ .pre = try gsc.slice(pf.sp.pre, 0, lo, hi), .post = try gsc.slice(pf.sp.post, 0, lo, hi), .comb = try gsc.slice(pf.sp.comb, 0, lo, hi) };
         const xg = try hcExpand(&gsc, try gsc.slice(pf.x1, 0, lo, hi), yg, &sf);
         for (k0..k1) |k| {
@@ -3965,10 +4032,17 @@ const Spans = struct {
     prefetch: ?*engram.Prefetch = null,
     /// A replay tail's first position (`Shared.floor`).
     floor: ?usize = null,
+    /// `[L]` bool, the chunk's rows inside an image span (none for text): they route by the VL bias and
+    /// Engram leaves them untouched.
+    img: A = none,
 
     fn bounds(sp: *const Spans, k: usize) [2]usize {
         const lo = k * sp.span;
         return .{ lo, @min(sp.L, lo + sp.span) };
+    }
+
+    fn imgSlice(sp: *const Spans, sc: *Scope, lo: usize, hi: usize) !A {
+        return if (sp.img.ctx != null) try sc.slice(sp.img, 0, lo, hi) else none;
     }
 };
 
@@ -4021,7 +4095,9 @@ fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, 
             for (lo..hi) |t| @memcpy(mine[(t - lo) * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
             break :blk try sc.keep(try e.table.gather(gpa, mine, sc.s));
         };
-        x = try engramApply(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }));
+        const y = try engramApply(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }));
+        // An image span's rows get no Engram write (the reference shuts their gate).
+        x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
     }
     if (m.n_mtp > 0) if (m.dsparkTarget(li)) |t| {
@@ -4118,7 +4194,7 @@ fn RegionBody(comptime kind: Region) type {
                     const sa: Split = .{ .pre = a[2], .post = a[3], .comb = a[4] };
                     const pf = try hcExpandPreNorm(&sc, m, a[0], a[1], &sa, a[2], &ly.hc_ffn, ly.ffn_norm);
                     const x1 = pf.x1;
-                    const r = try route(&sc, m, ly, pf.h);
+                    const r = try route(&sc, m, ly, pf.h, none);
                     const y = try ffnDecode(&sc, m, ly, pf.h, r.idx, r.wts, x1, &pf.sp) orelse try hcExpand(&sc, x1, try withShared(&sc, m, ly, pf.h, try routed(&sc, m, ly, pf.h, r.idx, r.wts)), &pf.sp);
                     res.* = mlx.mlx_vector_array_new_data(&.{ y, pf.sp.pre }, 2);
                 },
@@ -4148,12 +4224,12 @@ fn appendLayerState(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LS
 }
 
 /// A fresh request: drop the old state and prefill `ids`.
-pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32) !A {
+pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision: ?VisionRows) !A {
     if (m.dec_state) |*st| st.deinit();
     m.dec_state = null;
     m.state_gen += 1;
     m.dec_state = try initState(m, gpa);
-    return extendResumable(m, gpa, ids);
+    return extendResumable(m, gpa, ids, vision);
 }
 
 // ── prefix resume: one conversation ──────────────────────────────────────
@@ -4163,6 +4239,7 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32) !A {
 /// once), and append-only rows by their count.
 const Snap = struct {
     gen: u64,
+    vision_key: u64,
     /// The state's position: `ids.len` on the host; a worker keeps no ids.
     n: usize,
     ids: []u32,
@@ -4200,26 +4277,46 @@ fn ref(x: A) A {
 /// the next request (`snapshotIfDue`); restores the last one when it is a
 /// prefix of `prompt` and returns its length (0: a cold prompt). A restore
 /// always leaves a token to forward.
-pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32) !usize {
+pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
     m.dropAhead();
     m.gpa.free(m.prompt);
     m.prompt = &.{};
     m.prompt = try m.gpa.dupe(u32, prompt);
-    const n = try restore(m, prompt);
+    const n = try restore(m, prompt, vision_rows);
     m.gpa.free(m.snap_ids);
     m.snap_ids = &.{};
     m.snap_at = null;
+    m.snap_vision_key = 0;
     if (prompt.len >= 2) {
         m.snap_ids = try m.gpa.dupe(u32, prompt[0 .. prompt.len - 1]);
         m.snap_at = prompt.len - 1;
+        m.snap_vision_key = try visionKey(vision_rows, m.imageRows(m.snap_ids));
     }
     return n;
 }
 
-fn restore(m: *Dsv41Model, prompt: []const u32) !usize {
+/// What a snapshot keys its images by: a hash of the first `n` soft-token rows (0 for none), `n` being the image
+/// positions inside the ids it covers, so the rows of an image after them do not enter.
+pub fn visionKey(rows: ?A, n: usize) !u64 {
+    if (n == 0) return 0;
+    const r = rows orelse return error.Dsv41VisionRowsMissing;
+    const d = mlx.getShape(r)[mlx.getShape(r).len - 1];
+    if (n * @as(usize, @intCast(d)) > mlx.mlx_array_size(r)) return error.Dsv41VisionRowsShort;
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_reshape(&f, r, &[_]c_int{ -1, d }, 2, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_slice(&f, f, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(n), d }, 2, &[_]c_int{ 1, 1 }, 2, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_astype(&f, f, .float32, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(f));
+    const data = mlx.mlx_array_data_float32(f) orelse return error.NoData;
+    return std.hash.Wyhash.hash(0x5e1f, std.mem.sliceAsBytes(data[0..mlx.mlx_array_size(f)]));
+}
+
+fn restore(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
     const sn = &(m.snap orelse return 0);
     const st = &(m.dec_state orelse return 0);
     if (sn.gen != m.state_gen or sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
+    if (sn.vision_key != try visionKey(vision_rows, m.imageRows(sn.ids))) return 0;
     try applySnap(st, sn);
     return st.n;
 }
@@ -4270,7 +4367,7 @@ fn snapshotIfDue(m: *Dsv41Model) !void {
         .pend_gate = ref(l.pend_gate),
     };
     for (ds, st.ds) |*o, r| o.* = ref(r.buf);
-    m.snap = .{ .gen = m.state_gen, .n = st.n, .ids = m.snap_ids, .layers = layers, .ds = ds, .mh = ref(st.mh), .hist = hist };
+    m.snap = .{ .gen = m.state_gen, .vision_key = m.snap_vision_key, .n = st.n, .ids = m.snap_ids, .layers = layers, .ds = ds, .mh = ref(st.mh), .hist = hist };
     m.snap_ids = &.{};
 }
 
@@ -4279,22 +4376,25 @@ fn snapshotIfDue(m: *Dsv41Model) !void {
 /// One decode token still on the GPU (`Ids.gpu`), where `extendResumable` takes host ids.
 pub fn extendResumableGpu(m: *Dsv41Model, gpa: std.mem.Allocator, tok: A) !A {
     try snapshotIfDue(m);
-    const out = try extendIds(m, gpa, &m.dec_state.?, .{ .gpu = tok }, .last);
+    const out = try extendIds(m, gpa, &m.dec_state.?, .{ .gpu = tok }, .last, null);
     try snapshotIfDue(m);
     return out;
 }
 
-pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32) !A {
+pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision: ?VisionRows) !A {
     try snapshotIfDue(m);
     const st = &m.dec_state.?;
     if (m.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
         const k = at - st.n;
-        const head = try extend(m, gpa, st, ids[0..k], .last);
+        const head = try extendIds(m, gpa, st, .{ .host = ids[0..k] }, .last, vision);
         _ = mlx.mlx_array_free(head);
         try snapshotIfDue(m);
-        return extend(m, gpa, st, ids[k..], .last);
+        // The tail's rows follow the head's.
+        var rest = vision;
+        if (rest) |*v| v.offset += std.mem.count(u32, ids[0..k], &.{m.cfg.image_token_id});
+        return extendIds(m, gpa, st, .{ .host = ids[k..] }, .last, rest);
     };
-    const out = try extend(m, gpa, st, ids, .last);
+    const out = try extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
     try snapshotIfDue(m);
     return out;
 }
@@ -4851,7 +4951,7 @@ test "dsv41 decode: a token still on the GPU decodes as its host id does, Engram
         var g = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(g);
         try mlx.check(mlx.mlx_argmax_axis(&g, lg, -1, false, mlx.gpuStream()));
-        const ng = try extendIds(t.m, gpa, &gpu_st, .{ .gpu = g }, .last);
+        const ng = try extendIds(t.m, gpa, &gpu_st, .{ .gpu = g }, .last, null);
         _ = mlx.mlx_array_free(lg);
         lg = ng;
         const a = try hostF32(lh);
@@ -5035,7 +5135,7 @@ test "dsv41 fixture: verifies cut to any prefix, plain steps between rounds, emi
             const v: i32 = @intCast(tok);
             const g = mlx.mlx_array_new_data(&v, &[_]c_int{1}, 1, .int32);
             defer _ = mlx.mlx_array_free(g);
-            const l = try extendIds(m, gpa, &st_d, .{ .gpu = g }, .last);
+            const l = try extendIds(m, gpa, &st_d, .{ .gpu = g }, .last, null);
             defer _ = mlx.mlx_array_free(l);
             const row = try hostF32(l);
             defer gpa.free(row);
@@ -5502,7 +5602,9 @@ test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores
         const ws: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(ihd * ih)));
         const want_a = try indexScoresScalar(&sc, &m, q, t[1], t[2], ws, p0, ratio);
         const got_a = try indexScoresTiled(&sc, &m, q, t[1], t[2], ws, p0, ratio);
-        // The folded weight scale is the product the indexer used to make first, bit for bit.
+        // The folded weight scale is the product the indexer used to make first. Not bit for bit:
+        // whether the kernel contracts `float(w) * scale * q` into an FMA is the Metal compiler's
+        // call per GPU (bit-equal on M5, one rounding apart on the macos-26 CI runner).
         const wb = try sc.astype(t[2], .bfloat16);
         for ([2]bool{ false, true }) |tiled| {
             const f = if (tiled) &indexScoresTiled else &indexScoresScalar;
@@ -5510,7 +5612,9 @@ test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores
             defer gpa.free(pre);
             const fold = try hostF32(try f(&sc, &m, q, t[1], wb, ws, p0, ratio));
             defer gpa.free(fold);
-            for (pre, fold) |a, b| try testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+            for (pre, fold) |a, b| {
+                if (std.math.isInf(a)) try testing.expectEqual(a, b) else try testing.expectApproxEqAbs(a, b, 1e-5 * @max(1.0, @abs(a)));
+            }
         }
         const want = try hostF32(want_a);
         defer gpa.free(want);
@@ -5855,6 +5959,23 @@ fn hcTestModelFree(m: *Dsv41Model) void {
     for ([_]mlx.mlx_fast_metal_kernel{ m.hc_mix_kernel, m.hc_norm_kernel, m.hc_stage_kernel, m.hc_stage_x_kernel, m.hc_split_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
 }
 
+test "dsv41 state bytes: the window rings and the compressed rows as allocated" {
+    const gpa = testing.allocator;
+    const s = mlx.gpuStream();
+    const layers = try gpa.alloc(LState, 2);
+    defer gpa.free(layers);
+    layers[0] = .{ .win = try Ring.init(144, 512, .bfloat16, s) };
+    layers[1] = .{ .win = try Ring.init(144, 512, .bfloat16, s), .comp = .{ .width = 512, .dtype = .bfloat16 } };
+    var st: State = .{ .gpa = gpa, .layers = layers };
+    defer for (layers) |*l| l.deinit();
+    try testing.expectEqual(@as(u64, 2 * 144 * 512 * 2), stateBytes(&st));
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_zeros(&row, &[_]c_int{ 1, 512 }, 2, .bfloat16, s));
+    try layers[1].comp.?.append(row, s); // the first append allocates 64 rows of capacity
+    try testing.expectEqual(@as(u64, 2 * 144 * 512 * 2 + 64 * 512 * 2), stateBytes(&st));
+}
+
 test "dsv41 router: the wide f32 matmul gives the logits the decode kernel gives" {
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
@@ -5893,6 +6014,7 @@ test "dsv41 router: the wide f32 matmul gives the logits the decode kernel gives
 }
 
 test "dsv41 kv row: a head-width row launches and is normed by its own rms on this GPU" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
@@ -6065,7 +6187,7 @@ test "dsv41 decode step: serial one-token steps as the server pipelines them (DS
     defer _ = mlx.mlx_array_free(g);
     for (0..n) |k| {
         const t0 = iou.nowUsMonotonic(io);
-        const l = try extendIds(m, gpa, &st, .{ .gpu = g }, .last);
+        const l = try extendIds(m, gpa, &st, .{ .gpu = g }, .last, null);
         var o = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_argmax_axis(&o, l, -1, false, mlx.gpuStream()));
         _ = mlx.mlx_array_free(g);
@@ -6221,19 +6343,19 @@ test "dsv41 resume: a prompt that extends the last one resumes its state and mat
     @memcpy(b[a.len..], &[_]u32{ 5, 9, 2, 7, 3, 11 });
     for ([_][]const u32{ b, a }) |p| {
         // Turn 1: the prompt, then three decode steps.
-        try testing.expectEqual(@as(usize, 0), try resumePrompt(m, a));
-        _ = mlx.mlx_array_free(try prefill(m, gpa, a));
-        for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}));
-        const n = try resumePrompt(m, p);
+        try testing.expectEqual(@as(usize, 0), try resumePrompt(m, a, null));
+        _ = mlx.mlx_array_free(try prefill(m, gpa, a, null));
+        for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}, null));
+        const n = try resumePrompt(m, p, null);
         try testing.expectEqual(a.len - 1, n);
-        const wl = try extendResumable(m, gpa, p[n..]);
+        const wl = try extendResumable(m, gpa, p[n..], null);
         defer _ = mlx.mlx_array_free(wl);
         const warm = try hostF32(wl);
         defer gpa.free(warm);
         m.snap.?.deinit(gpa);
         m.snap = null;
-        try testing.expectEqual(@as(usize, 0), try resumePrompt(m, p));
-        const cl = try prefill(m, gpa, p);
+        try testing.expectEqual(@as(usize, 0), try resumePrompt(m, p, null));
+        const cl = try prefill(m, gpa, p, null);
         defer _ = mlx.mlx_array_free(cl);
         const cold = try hostF32(cl);
         defer gpa.free(cold);
@@ -6427,20 +6549,20 @@ test "dsv41 CED resume: a prompt that extends the last one replays the tail a co
     for (0..2) |warm| {
         if (warm == 1) {
             // Turn 1: prompt `a`, then three decode steps.
-            try testing.expectEqual(@as(usize, 0), try resumePrompt(m, a));
-            _ = mlx.mlx_array_free(try prefill(m, gpa, a));
-            for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}));
+            try testing.expectEqual(@as(usize, 0), try resumePrompt(m, a, null));
+            _ = mlx.mlx_array_free(try prefill(m, gpa, a, null));
+            for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}, null));
         } else if (m.snap) |*sn| {
             sn.deinit(gpa);
             m.snap = null;
         }
-        const n = try resumePrompt(m, b);
+        const n = try resumePrompt(m, b, null);
         try testing.expectEqual(if (warm == 1) a.len - 1 else 0, n);
         const before = m.ced_stats.chunks;
-        const l = if (warm == 1) try extendResumable(m, gpa, b[n..]) else try prefill(m, gpa, b);
+        const l = if (warm == 1) try extendResumable(m, gpa, b[n..], null) else try prefill(m, gpa, b, null);
         defer _ = mlx.mlx_array_free(l);
         try testing.expectEqual(before + 1, m.ced_stats.chunks);
-        const d = try extendResumable(m, gpa, &.{7});
+        const d = try extendResumable(m, gpa, &.{7}, null);
         defer _ = mlx.mlx_array_free(d);
         got[warm] = try hostF32(d);
         var dr = try draftRows(m, gpa, &m.dec_state.?, 11, true);
@@ -6468,14 +6590,14 @@ test "dsv41 engram: a chunk's rows are read behind the one before it and give th
     for (ids, 0..) |*id, k| id.* = base[k % base.len];
     var logits: [2][]f32 = undefined;
     for (&logits, 0..) |*out, ahead| {
-        _ = try resumePrompt(m, ids);
+        _ = try resumePrompt(m, ids, null);
         if (ahead == 0) { // the prompt is unknown: every chunk reads its own rows
             m.gpa.free(m.prompt);
             m.prompt = &.{};
         }
         var lo: usize = 0;
         for (cuts, 0..) |hi, c| {
-            const l = if (c == 0) try prefill(m, gpa, ids[lo..hi]) else try extendResumable(m, gpa, ids[lo..hi]);
+            const l = if (c == 0) try prefill(m, gpa, ids[lo..hi], null) else try extendResumable(m, gpa, ids[lo..hi], null);
             defer _ = mlx.mlx_array_free(l);
             if (c + 1 == cuts.len) out.* = try hostF32(l);
             // After a chunk, the next one's rows are coming; after the last, nothing.
@@ -6513,7 +6635,7 @@ test "dsv41 per-expert packs: banks stacked at load serve as the stacked pack, t
     defer t.deinit();
     const ids = try t.ids();
     defer gpa.free(ids);
-    const sl = try prefill(t.m, gpa, ids);
+    const sl = try prefill(t.m, gpa, ids, null);
     defer _ = mlx.mlx_array_free(sl);
     const stacked = try hostF32(sl);
     defer gpa.free(stacked);
@@ -6550,7 +6672,7 @@ test "dsv41 per-expert packs: banks stacked at load serve as the stacked pack, t
 
     const m = try init(gpa, &t.cfg, &w, s, .{ .act = .float32, .dspark = true });
     defer m.deinit();
-    const pl = try prefill(m, gpa, ids);
+    const pl = try prefill(m, gpa, ids, null);
     defer _ = mlx.mlx_array_free(pl);
     const per_expert = try hostF32(pl);
     defer gpa.free(per_expert);
@@ -6600,7 +6722,7 @@ test "dsv41 bill: a tensor's copy in a shard the index does not name for it is n
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"language_model.x\":\"b.safetensors\",\"language_model.y\":\"a.safetensors\"}}" });
     var pbuf: [1024]u8 = undefined;
     const dir = pbuf[0..try tmp.dir.realPath(io, &pbuf)];
-    try testing.expectEqual(@as(u64, 16), try droppedBytes(testing.allocator, dir, true));
+    try testing.expectEqual(@as(u64, 16), try droppedBytes(testing.allocator, dir, true, false));
 }
 
 test "dsv41 rows: growth keeps every appended row" {
@@ -6746,12 +6868,12 @@ test "dsv41 pair: a host and a worker split at a valid cut give the unsplit mode
     // Turn 1 (prefill + three decode steps), then turn 2 resumed from the snapshot.
     var got: [2][]f32 = undefined;
     for ([_]*Dsv41Model{ t.m, host }, 0..) |m, which| {
-        _ = try resumePrompt(m, a);
-        _ = mlx.mlx_array_free(try prefill(m, gpa, a));
-        for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}));
-        const n = try resumePrompt(m, b);
+        _ = try resumePrompt(m, a, null);
+        _ = mlx.mlx_array_free(try prefill(m, gpa, a, null));
+        for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}, null));
+        const n = try resumePrompt(m, b, null);
         try testing.expectEqual(a.len - 1, n);
-        const l = try extendResumable(m, gpa, b[n..]);
+        const l = try extendResumable(m, gpa, b[n..], null);
         defer _ = mlx.mlx_array_free(l);
         got[which] = try hostF32(l);
     }

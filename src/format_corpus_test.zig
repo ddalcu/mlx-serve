@@ -323,6 +323,17 @@ const corpus = [_]Expect{
         .content_exact = "17 × 23 = 391.",
     },
     .{
+        // LIVE 2026-10-19 (Qwen3.8-27B 4bit, MTP, temp 1.0, agent turn beside media jobs, m4max):
+        // the `<` of `<function=` was sampled as the `<|im_start|>` special, the JSON shapes
+        // failed and the agent got an empty `stop`. One mangled delimiter, name and args intact.
+        .family = "qwen",
+        .name = "function-tag call whose opener `<` came out as a special token",
+        .raw = "<tool_call>\n<|im_start|>function=read_file>\n<parameter=path>\nsrc/game.js\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "src/game.js",
+    },
+    .{
         // Raw JSON tool call with no wrapper tags (Qwen emits this when the
         // template's <tool_call> markers get sampled away).
         .family = "qwen",

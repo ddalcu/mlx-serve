@@ -22,7 +22,8 @@ HY3D="${HY3D_MODEL:-$M/ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit}"
 
 TMP=$(mktemp -d)
 LOG="$TMP/server.log"
-"$BIN" --serve --port "$PORT" --log-level debug >"$LOG" 2>&1 &
+# Interleaving is opt-in on CUDA (off by default there); this script tests the feature itself.
+MLX_SERVE_GEN_YIELD=1 "$BIN" --serve --port "$PORT" --log-level debug >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null' EXIT
 for i in $(seq 1 60); do

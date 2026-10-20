@@ -57,8 +57,11 @@ pub fn mlxName(a: std.mem.Allocator, key: []const u8, mtp_layer: ?u32) ![]u8 {
 /// Renames every loaded tensor to the mlx-lm layout, reinterprets fp weight bytes as the u32
 /// words MLX packs, dequantizes the vision tower's linears to bf16 (its encoder runs dense),
 /// then adds the routed-expert banks read from `model_dir`.
-pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, s: mlx.mlx_stream, clamped: bool, span: ?distributed.LayerSpan, shard: ?distributed.Shard) !void {
+pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, clamped: bool, span: ?distributed.LayerSpan, shard: ?distributed.Shard) !void {
     const a = weights.allocator;
+    // The loads' own stream: a CPU-stream view of a GPU load moves its buffer to managed memory.
+    const s = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(s);
     var old = weights.map;
     weights.map = std.StringHashMap(mlx.mlx_array).init(a);
     defer {
@@ -352,11 +355,11 @@ fn pageFree(m: []align(std.heap.page_size_min) u8) void {
 }
 
 /// `data` copied into an MLX array: MLX's allocator wires its memory, which the pageable scratch
-/// it came from is not.
+/// it came from is not. Lands in the GPU's pool where weights live there.
 fn putCopy(weights: *Weights, data: []const u8, shape: []const c_int, dtype: mlx.mlx_dtype, comptime fmt: []const u8, args: anytype) !void {
     const arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), dtype);
     if (arr.ctx == null) return error.ModelOptAlloc;
-    try putArray(weights, arr, fmt, args);
+    try putArray(weights, try mlx.toGpuPool(arr), fmt, args);
 }
 
 /// Stores `arr` under a formatted key; on failure frees both.
@@ -854,6 +857,76 @@ fn expectMiniBanks(weights: *const Weights, layers: usize, experts: usize) !void
             }
         }
     }
+}
+
+/// The device address `arr`'s data sits at, read by a kernel: asking MLX for the pointer would move
+/// a GPU buffer to managed memory first.
+fn deviceAddress(arr: mlx.mlx_array) !usize {
+    const ins = [_][*:0]const u8{"w"};
+    const in_vec = mlx.mlx_vector_string_new_data(&ins, 1);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const outs = [_][*:0]const u8{"addr"};
+    const out_vec = mlx.mlx_vector_string_new_data(&outs, 1);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const src = "unsigned long long p = reinterpret_cast<unsigned long long>(w); addr[0] = (uint32_t)p; addr[1] = (uint32_t)(p >> 32);";
+    const k = mlx.mlx_fast_cuda_kernel_new("msv_test_device_address", in_vec, out_vec, src, "", false, 0);
+    defer mlx.mlx_fast_cuda_kernel_free(k);
+    const c = mlx.mlx_fast_cuda_kernel_config_new();
+    defer mlx.mlx_fast_cuda_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_output_arg(c, &[_]c_int{2}, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_set_grid(c, 1, 1, 1));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_set_thread_group(c, 1, 1, 1));
+    const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{arr}, 1);
+    defer _ = mlx.mlx_vector_array_free(v);
+    var o = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o);
+    try mlx.check(mlx.mlx_fast_cuda_kernel_apply(&o, k, v, c, mlx.gpuStream()));
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, o, 0));
+    try mlx.check(mlx.mlx_array_eval(out));
+    const words = mlx.mlx_array_data_uint32(out).?;
+    return @as(usize, words[1]) << 32 | words[0];
+}
+
+/// Whether the CUDA driver reports `addr` as managed (host-visible) memory.
+fn isManaged(addr: usize) !bool {
+    const lib = std.c.dlopen("libcuda.so.1", .{ .LAZY = true }) orelse return error.NoCudaDriver;
+    const Get = *const fn (*c_uint, c_int, usize) callconv(.c) c_int;
+    const get: Get = @ptrCast(@alignCast(std.c.dlsym(lib, "cuPointerGetAttribute") orelse return error.NoCudaDriver));
+    var v: c_uint = 0;
+    if (get(&v, 8, addr) != 0) return error.PointerQueryFailed; // CU_POINTER_ATTRIBUTE_IS_MANAGED
+    return v != 0;
+}
+
+test "ModelOpt: an FP8 linear loaded into the GPU's pool stays there" {
+    if (!mlx.cudaAvailable() or !mlx.weightsInGpuPool()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeMiniPack(a, std.testing.io, tmp.dir, .{ .layers = 1, .experts = 1 });
+    const path = try tmpPath(a, &tmp);
+    defer a.free(path);
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    // As the loader leaves an MXFP8 linear: e4m3 codes and ue8m0 scales, still lazy on the weight stream.
+    _ = mlx.mlx_clear_cache();
+    const ls = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(ls);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 5));
+    var codes = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_bits(&codes, &[_]c_int{ 256, 128 }, 2, 1, key, ls));
+    try weights.map.put(try a.dupe(u8, "model.language_model.layers.0.self_attn.o_proj.weight"), codes);
+    var scales = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_bits(&scales, &[_]c_int{ 256, 4 }, 2, 1, key, ls));
+    try weights.map.put(try a.dupe(u8, "model.language_model.layers.0.self_attn.o_proj.weight_scale"), scales);
+
+    try adapt(&weights, path, null, false, null, null);
+    const w = weights.get("language_model.model.layers.0.self_attn.o_proj.weight") orelse return error.MissingWeight;
+    try mlx.check(mlx.mlx_array_eval(w));
+    try std.testing.expect(!try isManaged(try deviceAddress(w)));
 }
 
 test "ModelOpt banks: every expert's bytes and global scales land in its layer's banks" {

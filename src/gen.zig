@@ -2711,16 +2711,12 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             log.info("[image] generation cancelled — client disconnected\n", .{});
             return;
         }
-        log.err("[image] generation failed: {}\n", .{err});
-        if (want_stream) {
-            sse.sendError(conn, "generation failed");
-            return;
-        }
-        return sendError(conn, jobFailureStatus(err), "generation failed");
+        return imageJobFailed(conn, want_stream, err);
     };
     defer _ = mlx.mlx_array_free(img);
 
-    const png_bytes = try engine.toPng(allocator, img);
+    // The returned image is lazy: the denoise runs here, so a Metal OOM surfaces here too.
+    const png_bytes = engine.toPng(allocator, img) catch |err| return imageJobFailed(conn, want_stream, err);
     defer allocator.free(png_bytes);
 
     const b64_len = std.base64.standard.Encoder.calcSize(png_bytes.len);
@@ -2889,7 +2885,7 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
             sse.sendError(conn, msg);
             return;
         }
-        return sendError(conn, if (err == error.EmptyKokoroInput) 400 else 500, msg);
+        return sendError(conn, if (err == error.EmptyKokoroInput) 400 else jobFailureStatus(err), msg);
     };
     defer allocator.free(out);
     log.info("[kokoro] -> {d} WAV bytes\n", .{out.len});
@@ -4477,6 +4473,7 @@ fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u
     const paint_dir = engine.paint_dir orelse return error.PaintUnavailable; // guarded at parse
     var mesh = try engine.engine.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
     defer mesh.deinit(allocator);
+    try latchedJobFailure(); // a failed shape stage is not worth minutes of paint
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const paint = try hy3d_paint.PaintEngine.load(io, allocator, paint_dir);
@@ -4487,6 +4484,27 @@ fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u
         if (ts >= 1 and ts <= 100) popts.steps = @intCast(ts);
     }
     return paint.paintMeshToGlb(allocator, &mesh, rgba, w, h, popts, prog);
+}
+
+/// The whole 3D job, then the latch: the shape and paint stages read their results on the host,
+/// so a Metal failure inside them hands back bytes (zeros) with no error to catch.
+fn meshJobGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u8, w: u32, h: u32, opts: hy3d.MeshOpts, body: []const u8, prog: ?sse.Progress, textured: bool) ![]u8 {
+    // Texture path: shape → raw mesh → paint stage (loaded per request, freed after — the paint
+    // UNet+DINO+VAE ride ~4.6 GB beside the 3.5 GB shape engine only for the duration of this request).
+    const glb = if (textured)
+        try paintedGlb(allocator, engine, rgba, w, h, opts, body, prog)
+    else
+        try engine.engine.generateGlb(allocator, rgba, w, h, opts, prog);
+    errdefer allocator.free(glb);
+    try latchedJobFailure();
+    return glb;
+}
+
+/// `error.OutOfMemory` or `error.MlxFailure` for a latched MLX error, left latched so
+/// `jobFailureStatus` still sees its class.
+fn latchedJobFailure() !void {
+    const name = mlx.peekErrorName() orelse return;
+    return if (std.mem.eql(u8, name, "OutOfMemory")) error.OutOfMemory else error.MlxFailure;
 }
 
 /// POST /v1/3d/generations — base64 GLB (or SSE progress + complete).
@@ -4530,15 +4548,7 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
     if (want_stream) try conn.writeAll(sse.headers);
 
     const opts = hy3d.MeshOpts{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res };
-    const glb_bytes = blk: {
-        if (!want_texture) {
-            break :blk engine.engine.generateGlb(allocator, img.pix, img.w, img.h, opts, prog);
-        }
-        // Texture path: shape → raw mesh → paint stage (loaded per request,
-        // freed after — the paint UNet+DINO+VAE ride ~4.6 GB beside the
-        // 3.5 GB shape engine only for the duration of this request).
-        break :blk paintedGlb(allocator, engine, img.pix, img.w, img.h, opts, body, prog);
-    } catch |err| {
+    const glb_bytes = meshJobGlb(allocator, engine, img.pix, img.w, img.h, opts, body, prog, want_texture) catch |err| {
         if (err == error.Cancelled) {
             // Client hung up mid-generation (progress write failed) — nothing
             // to write, the socket is dead.
@@ -5208,9 +5218,18 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     try conn.writeAll(body);
 }
 
+fn imageJobFailed(conn: *Conn, want_stream: bool, err: anyerror) !void {
+    log.err("[image] generation failed: {}\n", .{err});
+    if (want_stream) {
+        sse.sendError(conn, "generation failed");
+        return;
+    }
+    return sendError(conn, jobFailureStatus(err), "generation failed");
+}
+
 /// A media or decision job that ran out of memory hit the machine's capacity, not a server fault: 503, like chat.
 fn jobFailureStatus(err: anyerror) u16 {
-    if (err == error.OutOfMemory) return 503;
+    if (err == error.OutOfMemory or mlx.gpuContextLost()) return 503;
     const latched = mlx.peekErrorName() orelse return 500;
     return if (std.mem.eql(u8, latched, "OutOfMemory")) 503 else 500;
 }
@@ -7316,6 +7335,47 @@ test "a base64 WebP reference reaches the media backends as a PNG with the same 
     const same = try imageB64Alloc(a, std.base64.standard.Encoder.encode(&b64_png, png_bytes));
     defer a.free(same);
     try std.testing.expectEqualSlices(u8, png_bytes, same);
+}
+
+test "a failed image job answers by name, never a closed socket" {
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    conn.init(.{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
+    defer _ = std.c.close(sv[0]);
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at array.cpp:352");
+    try imageJobFailed(&conn, false, error.MlxError);
+    _ = mlx.takeError(&stale);
+    var got: [256]u8 = undefined;
+    const n = std.c.recv(sv[1], &got, got.len, 0);
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.startsWith(u8, got[0..@intCast(n)], "HTTP/1.1 503"));
+}
+
+test "jobFailureStatus: after a lost GPU context every failure is a 503" {
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    defer mlx.resetGpuContextLostForTest();
+    mlx.latchErrorForTest("cuLaunchKernelEx(&config, func, params, nullptr) failed: an illegal memory access was encountered");
+    _ = mlx.takeError(&buf);
+    try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.MlxError));
+}
+
+test "a latched Metal failure fails the 3D job by class and stays visible to the status" {
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    try latchedJobFailure();
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Invalid Resource (00000009:kIOGPUCommandBufferCallbackErrorInvalidResource). at array.cpp:352");
+    try std.testing.expectError(error.MlxFailure, latchedJobFailure());
+    try std.testing.expectEqual(@as(u16, 500), jobFailureStatus(error.MlxFailure));
+    _ = mlx.takeError(&stale);
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at array.cpp:352");
+    try std.testing.expectError(error.OutOfMemory, latchedJobFailure());
+    try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.OutOfMemory));
+    _ = mlx.takeError(&stale);
 }
 
 test "jobFailureStatus: a memory failure is a 503, any other failure a 500" {
