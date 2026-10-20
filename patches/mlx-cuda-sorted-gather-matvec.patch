@@ -7,10 +7,10 @@ Retires with mlx-cuda-row-dot-matvec.patch, or when upstream's gather mat-vec sh
 across sorted rows. Not reported upstream yet.
 
 diff --git a/mlx/backend/cuda/gemms/row_dot.cuh b/mlx/backend/cuda/gemms/row_dot.cuh
-index 5d25dcb10..c0803addc 100644
+index d7dbfd6..acd9eb7 100644
 --- a/mlx/backend/cuda/gemms/row_dot.cuh
 +++ b/mlx/backend/cuda/gemms/row_dot.cuh
-@@ -22,6 +22,69 @@ namespace mlx::core::cu {
+@@ -22,6 +22,64 @@ namespace mlx::core::cu {
  
  constexpr int row_dot_threads = 256;
  
@@ -47,12 +47,7 @@ index 5d25dcb10..c0803addc 100644
 +    float w[32];
 +#pragma unroll
 +    for (int i = 0; i < 4; ++i) {
-+#pragma unroll
-+      for (int j = 0; j < 4; ++j) {
-+        float2 p = e2m1x2(wu[i] >> (8 * j));
-+        w[8 * i + 2 * j] = p.x;
-+        w[8 * i + 2 * j + 1] = p.y;
-+      }
++      e2m1x8(wu[i], w + 8 * i);
 +    }
 +    if constexpr (FMT == kRowDotMxfp4) {
 +      float scale = ue8m0_scale(s_row[c]);
@@ -80,7 +75,7 @@ index 5d25dcb10..c0803addc 100644
  // out[l, m, n] = x[lhs[l], m, :] . W[rhs[l], n, :]; lhs/rhs null = batch 0.
  // Grid: x = row groups, y = groups of ROWS x rows, z = batch.
  template <int FMT, int ROWS, typename T>
-@@ -117,6 +180,119 @@ __global__ void __launch_bounds__(row_dot_threads) row_dot_kernel(
+@@ -117,6 +175,119 @@ __global__ void __launch_bounds__(row_dot_threads) row_dot_kernel(
    }
  }
  
@@ -200,7 +195,7 @@ index 5d25dcb10..c0803addc 100644
  // Threads per row: fit short rows, then widen until the grid fills the GPU.
  // `rows` counts every output row of the launch, batches included.
  inline int row_dot_tpr(int chunks, int64_t rows, int num_sms) {
-@@ -161,7 +337,8 @@ void launch_row_dot(
+@@ -170,7 +341,8 @@ void launch_row_dot(
      const uint32_t* lhs_indices,
      const uint32_t* rhs_indices,
      int64_t w_batch_bytes,
@@ -210,7 +205,7 @@ index 5d25dcb10..c0803addc 100644
    int bits = fmt == kRowDotDense ? 8 * sizeof(T) : fmt == kRowDotMxfp8 ? 8 : 4;
    int chunks = static_cast<int>(static_cast<int64_t>(k) * bits / 128);
    int rows_cap = m <= 1 ? 1 : m <= 2 ? 2 : m <= 4 ? 4 : 8;
-@@ -175,6 +352,36 @@ void launch_row_dot(
+@@ -184,6 +356,36 @@ void launch_row_dot(
        (n + rows_per_block - 1) / rows_per_block, row_groups, batch);
    auto wp = static_cast<const uint8_t*>(w);
    auto sp = static_cast<const uint8_t*>(scales);
@@ -248,7 +243,7 @@ index 5d25dcb10..c0803addc 100644
      auto go = [&]<int ROWS>() {
        encoder.add_kernel_node(
 diff --git a/mlx/backend/cuda/quantized/qmm/qmm.h b/mlx/backend/cuda/quantized/qmm/qmm.h
-index ca873fca0..8ce5d097d 100644
+index ca873fc..8ce5d09 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmm.h
 +++ b/mlx/backend/cuda/quantized/qmm/qmm.h
 @@ -183,6 +183,7 @@ void gather_qmv(
@@ -261,7 +256,7 @@ index ca873fca0..8ce5d097d 100644
  
  } // namespace mlx::core
 diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
-index fa2bdb041..503684a48 100644
+index fa2bdb0..503684a 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmv.cu
 +++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
 @@ -644,7 +644,8 @@ void gather_qmv(
@@ -285,7 +280,7 @@ index fa2bdb041..503684a48 100644
      if (out.dtype() == bfloat16) {
        launch.template operator()<__nv_bfloat16>();
 diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
-index 437448a8f..03b2fa3ef 100644
+index 437448a..03b2fa3 100644
 --- a/mlx/backend/cuda/quantized/quantized.cpp
 +++ b/mlx/backend/cuda/quantized/quantized.cpp
 @@ -253,7 +253,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {

@@ -3,16 +3,19 @@ quantized_matmul and the fp expert gather with fewer than 8 rows per expert. Sho
 over up to 256 threads, and each weight load is shared by up to 8 rows of x. device_info reports
 `integrated`. The arithmetic is in mlx/backend/cuda/device/row_dot_ops.cuh, a JIT header, so a
 cuda_kernel that must match it bit for bit (mlx-serve's moe_cuda.zig) includes the same code.
+The one-row fp quantized_matmul arm runs on integrated GPUs only: on a discrete RTX 5060 Ti the
+stock kernel is faster. fp4 decodes through the cvt instruction where the target has it
+(sm_120a, sm_121a) and through an exact byte-permute table elsewhere (plain sm_120 emulated it).
 
 Retires when upstream MLX's CUDA gemv and quantized mat-vecs read 16-byte vectors for these
 formats at decode widths. Not reported upstream yet.
 
 diff --git a/mlx/backend/cuda/device/row_dot_ops.cuh b/mlx/backend/cuda/device/row_dot_ops.cuh
 new file mode 100644
-index 000000000..8648d173a
+index 0000000..afd818a
 --- /dev/null
 +++ b/mlx/backend/cuda/device/row_dot_ops.cuh
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,205 @@
 +// Copyright © 2025 Apple Inc.
 +
 +// row_dot's arithmetic, shared by its kernels and by JIT kernels that must
@@ -49,10 +52,31 @@ index 000000000..8648d173a
 +  return __half22float2(*reinterpret_cast<__half2*>(&h));
 +}
 +
-+__device__ __forceinline__ float2 e2m1x2(uint32_t v8) {
-+  __half2_raw h = __nv_cvt_fp4x2_to_halfraw2(
-+      static_cast<__nv_fp4x2_storage_t>(v8 & 0xff), __NV_E2M1);
-+  return __half22float2(*reinterpret_cast<__half2*>(&h));
++// 8 e2m1 codes (byte i holds codes 2i, 2i + 1 in its low, high nibble). The
++// fp4 cvt is one instruction only on arch-specific targets (sm_120a, sm_121a);
++// on plain sm_120 cuda_fp4.h emulates it, so there a byte-permute table builds
++// the same fp16 bits: magnitudes from the 8 values' high bytes, sign bits from
++// each code's top bit.
++__device__ __forceinline__ void e2m1x8(uint32_t v, float* out) {
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++#if __CUDA_FP8_INTERNAL_CAN_RELY_ON_PTX_FOR_SHORTTYPESCVT__
++    __half2_raw h = __nv_cvt_fp4x2_to_halfraw2(
++        static_cast<__nv_fp4x2_storage_t>((v >> (8 * i)) & 0xff), __NV_E2M1);
++#else
++    uint32_t mag = __byte_perm(
++        0x3e3c3800, 0x46444240, i < 2 ? v & 0x7777 : (v >> 16) & 0x7777);
++    uint32_t m = __byte_perm(mag, 0, (i & 1) ? 0x3424 : 0x1404);
++    uint32_t s; // prmt selector bit 3 replicates the chosen byte's msb
++    asm("prmt.b32 %0, %1, %2, %3;"
++        : "=r"(s)
++        : "r"(v << 4), "r"(v), "r"(((8 | i) << 4) | ((12 + i) << 12)));
++    uint32_t h = m | (s & 0x80008000);
++#endif
++    float2 f = __half22float2(*reinterpret_cast<__half2*>(&h));
++    out[2 * i] = f.x;
++    out[2 * i + 1] = f.y;
++  }
 +}
 +
 +__device__ __forceinline__ float ue8m0_scale(uint32_t s) {
@@ -147,12 +171,7 @@ index 000000000..8648d173a
 +    float w[32];
 +#pragma unroll
 +    for (int i = 0; i < 4; ++i) {
-+#pragma unroll
-+      for (int j = 0; j < 4; ++j) {
-+        float2 p = e2m1x2(wu[i] >> (8 * j));
-+        w[8 * i + 2 * j] = p.x;
-+        w[8 * i + 2 * j + 1] = p.y;
-+      }
++      e2m1x8(wu[i], w + 8 * i);
 +    }
 +    if constexpr (FMT == kRowDotMxfp4) {
 +      float scale = ue8m0_scale(s_row[c]);
@@ -203,7 +222,7 @@ index 000000000..8648d173a
 +
 +} // namespace mlx::core::cu
 diff --git a/mlx/backend/cuda/device_info.cpp b/mlx/backend/cuda/device_info.cpp
-index a4a15e285..e58d92649 100644
+index a4a15e2..e58d926 100644
 --- a/mlx/backend/cuda/device_info.cpp
 +++ b/mlx/backend/cuda/device_info.cpp
 @@ -150,6 +150,7 @@ device_info_impl(int device_index) {
@@ -215,7 +234,7 @@ index a4a15e285..e58d92649 100644
        devices.push_back(std::move(dev));
      }
 diff --git a/mlx/backend/cuda/gemms/gemv.cu b/mlx/backend/cuda/gemms/gemv.cu
-index e48317daa..4573a04a3 100644
+index e48317d..4573a04 100644
 --- a/mlx/backend/cuda/gemms/gemv.cu
 +++ b/mlx/backend/cuda/gemms/gemv.cu
 @@ -1,6 +1,7 @@
@@ -256,10 +275,10 @@ index e48317daa..4573a04a3 100644
      if (K % 128 == 0 && is_aligned<4>(mat) && is_aligned<4>(vec)) {
 diff --git a/mlx/backend/cuda/gemms/row_dot.cuh b/mlx/backend/cuda/gemms/row_dot.cuh
 new file mode 100644
-index 000000000..5d25dcb10
+index 0000000..d7dbfd6
 --- /dev/null
 +++ b/mlx/backend/cuda/gemms/row_dot.cuh
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,237 @@
 +// Copyright © 2026 Apple Inc.
 +
 +// Mat-vec over 16-bit, mxfp8, mxfp4 and nvfp4 weight rows with 16-byte loads.
@@ -406,6 +425,15 @@ index 000000000..5d25dcb10
 +  return sms;
 +}
 +
++inline bool row_dot_integrated(int device) {
++  static bool integrated = [device] {
++    int v = 0;
++    cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, device);
++    return v != 0;
++  }();
++  return integrated;
++}
++
 +// Needs 16-byte aligned rows of w and x: k * bits a multiple of 128, and
 +// k / group even for nvfp4.
 +template <typename T>
@@ -489,7 +517,7 @@ index 000000000..5d25dcb10
 +
 +} // namespace mlx::core::cu
 diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
-index 0d107a8e1..9c1d98a83 100644
+index 0d107a8..9c1d98a 100644
 --- a/mlx/backend/cuda/jit_module.cpp
 +++ b/mlx/backend/cuda/jit_module.cpp
 @@ -274,6 +274,7 @@ constexpr const char* g_include_names[] = {
@@ -509,7 +537,7 @@ index 0d107a8e1..9c1d98a83 100644
      jit_source_unary_ops,
      jit_source_ternary_ops,
 diff --git a/mlx/backend/cuda/quantized/qmm/fp_qmv.cu b/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
-index 41de03e85..d2bdd3842 100644
+index 41de03e..f19c049 100644
 --- a/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
 +++ b/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
 @@ -2,6 +2,7 @@
@@ -520,13 +548,16 @@ index 41de03e85..d2bdd3842 100644
  #include "mlx/backend/cuda/kernel_utils.cuh"
  #include "mlx/backend/cuda/quantized/qmm/qmm.h"
  #include "mlx/backend/cuda/quantized/quantized_utils.h"
-@@ -270,6 +271,30 @@ void fp_qmv(
+@@ -270,6 +271,33 @@ void fp_qmv(
             cu::is_aligned<2>(vec_ptr))) {
          n = 2;
        }
 +      if constexpr (sizeof(T) == 2) {
-+        if (B == 1 && K % 32 == 0 && cu::row_dot_aligned(mat_ptr) &&
-+            cu::row_dot_aligned(vec_ptr)) {
++        // row_dot pays here on an integrated GPU (GB10); on a discrete card
++        // the stock kernel below is faster, most at small N.
++        if (B == 1 && K % 32 == 0 &&
++            cu::row_dot_integrated(encoder.device().cuda_device()) &&
++            cu::row_dot_aligned(mat_ptr) && cu::row_dot_aligned(vec_ptr)) {
 +          int fmt = bits == 8   ? cu::kRowDotMxfp8
 +              : group_size == 16 ? cu::kRowDotNvfp4
 +                                 : cu::kRowDotMxfp4;
@@ -552,7 +583,7 @@ index 41de03e85..d2bdd3842 100644
          if (B == 1) {
            auto kernel =
 diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
-index 728db4225..fa2bdb041 100644
+index 728db42..fa2bdb0 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmv.cu
 +++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
 @@ -1,6 +1,7 @@
@@ -612,7 +643,7 @@ index 728db4225..fa2bdb041 100644
      dispatch_quant_types<T>(
          bits,
 diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
-index 8ed9b72bd..437448a8f 100644
+index 8ed9b72..437448a 100644
 --- a/mlx/backend/cuda/quantized/quantized.cpp
 +++ b/mlx/backend/cuda/quantized/quantized.cpp
 @@ -272,8 +272,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
