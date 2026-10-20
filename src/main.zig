@@ -240,8 +240,8 @@ fn printUsage(io: std.Io) void {
         \\  --lm-head-mxfp8 / --no-lm-head-mxfp8
         \\                      Quantize a dense bf16 lm_head to MXFP8 at load, vLLM's
         \\                        VLLM_MXFP8_LM_HEAD bytes (lossy; half the head's bytes
-        \\                        per token). On by default for quantized packs on an
-        \\                        integrated NVIDIA GPU (DGX Spark).
+        \\                        per token). On by default for quantized Flash Next
+        \\                        packs on an integrated NVIDIA GPU (DGX Spark).
         \\                        A model's "lm_head_mxfp8" setting wins.
         \\  --ane               Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine
         \\                        instead of the GPU (a model's "ane" setting in

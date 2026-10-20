@@ -17821,7 +17821,7 @@ pub const Transformer = struct {
                 return error.MissingWeight;
             }
         }
-        if (lmHeadMxfp8On(config.lm_head_mxfp8_override, lm_head_mxfp8_cli, mlx.cudaIntegrated(), config.quant_bits)) {
+        if (lmHeadMxfp8On(config.lm_head_mxfp8_override, lm_head_mxfp8_cli, mlx.cudaIntegrated(), config.isQwen4(), config.quant_bits)) {
             if (head_key != null and lm_head_s.ctx == null) {
                 lm_head_s = try quantizeHeadMxfp8(weights, head_key.?, lm_head_w, s);
                 lm_head_w = weights.get(head_key.?).?;
@@ -34857,10 +34857,10 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
 /// `--lm-head-mxfp8` / `--no-lm-head-mxfp8`; null = the default below.
 pub var lm_head_mxfp8_cli: ?bool = null;
 
-/// LOSSY, so on by default only where it was measured: an integrated CUDA GPU (DGX Spark),
-/// for a quantized pack whose head ships dense. A bf16 pack keeps its reference head.
-pub fn lmHeadMxfp8On(setting: ?bool, cli: ?bool, cuda_integrated: bool, quant_bits: u32) bool {
-    return setting orelse cli orelse (cuda_integrated and quant_bits > 0);
+/// LOSSY, so on by default only where it was measured: Flash Next (`qwen4`) on an integrated
+/// CUDA GPU (DGX Spark), for a quantized pack whose head ships dense. A bf16 pack keeps its reference head.
+pub fn lmHeadMxfp8On(setting: ?bool, cli: ?bool, cuda_integrated: bool, qwen4: bool, quant_bits: u32) bool {
+    return setting orelse cli orelse (cuda_integrated and qwen4 and quant_bits > 0);
 }
 
 /// Quantize the dense head `w` (the map's `key`) to MXFP8 g32, the bytes vLLM serves under
@@ -48853,16 +48853,17 @@ test "nemotron_h: Super checkpoint dense and affine language layouts load and fo
     }
 }
 
-// Bar: the default is on only where measured (integrated CUDA, quantized pack); a flag beats it, a model setting beats both.
-test "lm_head mxfp8: on by default for quantized packs on integrated CUDA, settings and flags win" {
+// Bar: the default is on only where measured (Flash Next, quantized pack, integrated CUDA); a flag beats it, a model setting beats both.
+test "lm_head mxfp8: on by default for quantized Flash Next packs on integrated CUDA, settings and flags win" {
     const t = std.testing;
-    try t.expect(lmHeadMxfp8On(null, null, true, 4));
-    try t.expect(!lmHeadMxfp8On(null, null, true, 0));
-    try t.expect(!lmHeadMxfp8On(null, null, false, 4));
-    try t.expect(!lmHeadMxfp8On(null, false, true, 4));
-    try t.expect(lmHeadMxfp8On(null, true, false, 0));
-    try t.expect(lmHeadMxfp8On(true, false, false, 0));
-    try t.expect(!lmHeadMxfp8On(false, true, true, 4));
+    try t.expect(lmHeadMxfp8On(null, null, true, true, 4));
+    try t.expect(!lmHeadMxfp8On(null, null, true, false, 4));
+    try t.expect(!lmHeadMxfp8On(null, null, true, true, 0));
+    try t.expect(!lmHeadMxfp8On(null, null, false, true, 4));
+    try t.expect(!lmHeadMxfp8On(null, false, true, true, 4));
+    try t.expect(lmHeadMxfp8On(null, true, false, false, 0));
+    try t.expect(lmHeadMxfp8On(true, false, false, false, 0));
+    try t.expect(!lmHeadMxfp8On(false, true, true, true, 4));
 }
 
 // Bar: vLLM's MXFP8 bytes (scale 2^ceil(log2(amax/448)), e4m3 nearest-even), the map holds them in place of the bf16 head, logits within 5% RMS.
