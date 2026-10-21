@@ -82,7 +82,7 @@ final class LocalMtpHeadProbeTests: XCTestCase {
         XCTAssertTrue(DownloadManager.dirHasMtpHead(atDir: d))
     }
     func testIndexMarkers() throws {
-        for key in ["language_model.mtp.fc.weight", "mtp.eh_proj.weight", "language_model.mtp.fc_hidden.weight"] {
+        for key in ["language_model.mtp.fc.weight", "mtp.eh_proj.weight", "language_model.mtp.fc_hidden.weight", "mtp.fc_hidden.weight"] {
             let d = try dir("idx")
             try #"{"weight_map":{"\#(key)":"a.safetensors"}}"#
                 .write(toFile: d + "/model.safetensors.index.json", atomically: true, encoding: .utf8)

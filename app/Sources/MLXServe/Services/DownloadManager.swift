@@ -2056,7 +2056,7 @@ class DownloadManager: ObservableObject {
         guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("model.safetensors.index.json")),
               let text = String(data: data, encoding: .utf8) else { return false }
         return ["\"mtp.fc.weight\"", "\"language_model.mtp.fc.weight\"", "\"mtp.eh_proj.weight\"",
-                "\"language_model.mtp.eh_proj.weight\"", "\"language_model.mtp.fc_hidden.weight\""]
+                "\"language_model.mtp.eh_proj.weight\"", "\"language_model.mtp.fc_hidden.weight\"", "\"mtp.fc_hidden.weight\""]
             .contains { text.contains($0) }
     }
 
