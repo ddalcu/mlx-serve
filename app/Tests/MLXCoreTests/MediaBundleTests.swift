@@ -154,6 +154,26 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
+    /// Qwen-Image-2.1 as Qwen publishes it (and as mlx-community mirrors it): no root
+    /// `config.json`, which the server classifies by `model_index.json` alone.
+    func testQwenImageOfficialLayoutReadyWithoutRootConfig() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "qwenimagetest-\(UUID().uuidString)"
+        let comp = ImageModelPreset.qwenImage21_8bit.asCustom(id: "Qwen-Image-2.1-Turbo").bundle.components[0]
+        let modelDir = (root as NSString).appendingPathComponent(comp.repo)
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("model_index.json"),
+                      contents: Data(#"{"_class_name":"QwenImage21Pipeline"}"#.utf8))
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        for sub in ["transformer", "vae", "text_encoder", "processor", "scheduler"] {
+            try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("transformer/diffusion_pytorch_model.safetensors"), contents: Data([0, 1, 2]))
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
     // MARK: - Bundle mappings
 
     func testLtxBundleBundlesGemmaDependency() {

@@ -43,7 +43,9 @@ enum CustomMediaModels {
         if arch.hasPrefix("mage_flow") || arch == "mageflow" {
             return isEditDir(id) ? .mageFlowEditTurbo : .mageFlowTurbo
         }
-        if arch.hasPrefix("qwen_image") { return .qwenImage21_8bit }
+        if arch.hasPrefix("qwen_image") {
+            return id.range(of: "turbo", options: .caseInsensitive) != nil ? .qwenImage21Turbo_8bit : .qwenImage21_8bit
+        }
         if arch == "moss_image" { return .mossImageSFT_8bit }
         return nil
     }

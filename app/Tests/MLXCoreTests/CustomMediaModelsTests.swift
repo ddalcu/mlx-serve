@@ -122,6 +122,18 @@ final class CustomMediaModelsTests: XCTestCase {
         XCTAssertEqual(presets.first { $0.id == "me/mage-flow-plain" }?.variant, .mageFlowTurbo)
     }
 
+    /// `/v1/models` cannot tell Qwen-Image-2.1 from its Turbo (the server reads the
+    /// pack's `sample_sigmas`), so the dir name picks the family, as for Mage-Flow Edit.
+    func testQwenImageTurboIsKeyedOnTheDirName() {
+        let models = [
+            info("Qwen-Image-2.1-Turbo", arch: "qwen_image21", caps: ["image"]),
+            info("Qwen-Image-2.1", arch: "qwen_image21", caps: ["image"]),
+        ]
+        let presets = CustomMediaModels.imagePresets(from: models)
+        XCTAssertEqual(presets.first { $0.id == "Qwen-Image-2.1-Turbo" }?.variant, .qwenImage21Turbo)
+        XCTAssertEqual(presets.first { $0.id == "Qwen-Image-2.1" }?.variant, .qwenImage21)
+    }
+
     // MARK: - What gets a row
 
     /// Catalog repos never duplicate into custom rows (they're already preset

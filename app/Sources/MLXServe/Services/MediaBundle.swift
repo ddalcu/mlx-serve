@@ -583,8 +583,9 @@ extension MediaBundle {
         )
     }
 
-    /// Qwen-Image-2.1 (mlx-serve pack): the diffusers layout plus the root
-    /// `config.json` our converter writes LAST, which is what names the backend.
+    /// Qwen-Image-2.1: the diffusers layout. Our packs add a root `config.json`;
+    /// the official and mlx-community trees have only `model_index.json`, which
+    /// every pack carries and the server classifies them by.
     static func qwenImage(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
         MediaBundle(
             id: "qwenimage:\(repo)",
@@ -593,7 +594,7 @@ extension MediaBundle {
                 MediaComponent(
                     repo: repo,
                     selection: FileSelection(recursive: true),
-                    readyMarkers: ["config.json", "transformer", "vae", "text_encoder", "processor"]
+                    readyMarkers: ["model_index.json", "transformer", "vae", "text_encoder", "processor"]
                 ),
             ],
             sizeEstimateGB: sizeGB
