@@ -30,9 +30,13 @@ enum ModelSettingsApply {
         modelType == "qwen3_5" || modelType == "qwen3_5_text" || modelType == "qwen3"
     }
 
-    /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
-    static func hasInt8PrefillRoute(modelType: String?) -> Bool {
-        modelType == "prism_hadamard_qwen35"
+    /// Some int8 prefill route (`src/int8_prefill.zig`) applies: 2-bit Prism packs, the hd-256
+    /// attention of the Qwen 3.5 family, or the projections of a 4-bit g64 affine chat model (the
+    /// shape `w8a8.prefillQmm` takes; nil group size / mode are MLX's defaults, 64 and affine).
+    static func hasInt8PrefillRoute(modelType: String?, quantBits: Int?, quantGroupSize: Int? = nil, quantMode: String? = nil) -> Bool {
+        guard let modelType, modelType != "gguf", MediaModality(modelType: modelType) == nil else { return false }
+        let affine4g64 = quantBits == 4 && (quantGroupSize ?? 64) == 64 && (quantMode ?? "affine") == "affine"
+        return modelType == "prism_hadamard_qwen35" || modelType.hasPrefix("qwen3_5") || affine4g64
     }
 }
 
@@ -100,7 +104,9 @@ struct ModelSettingsSheet: View {
     }
 
     private var hasInt8PrefillRoute: Bool {
-        ModelSettingsApply.hasInt8PrefillRoute(modelType: appState.localModels.first { $0.path == request.path }?.modelType)
+        let model = appState.localModels.first { $0.path == request.path }
+        return !isGguf && ModelSettingsApply.hasInt8PrefillRoute(modelType: model?.modelType, quantBits: model?.quantBits,
+                                                                    quantGroupSize: model?.quantGroupSize, quantMode: model?.quantMode)
     }
 
     private var rows: (mtp: Bool, acceptance: Bool) {
@@ -251,7 +257,7 @@ struct ModelSettingsSheet: View {
                     Text("On").font(.app(.body)).tag(1)
                     Text("Off").font(.app(.body)).tag(0)
                 }
-                .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU.")
+                .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU. Default follows Settings ▸ Neural Engine.")
                 }
                 if offersNeuralEngine {
                 Picker("Neural Engine", selection: Binding(

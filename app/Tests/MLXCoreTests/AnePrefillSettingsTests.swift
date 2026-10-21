@@ -87,6 +87,19 @@ final class AnePrefillSettingsTests: XCTestCase {
         XCTAssertTrue((field?.explainer ?? "").contains("4-bit"))
     }
 
+    /// `--int8-prefill` mirrors the server default (off): only an explicit on emits, apart from `w8a8`.
+    func testInt8PrefillDefaultsOffAndEmitsOnlyWhenOn() throws {
+        XCTAssertFalse(ServerOptions().int8Prefill)
+        XCTAssertFalse(args().contains("--int8-prefill"))
+        XCTAssertTrue(args { $0.int8Prefill = true }.contains("--int8-prefill"))
+        XCTAssertFalse(args { $0.w8a8 = true }.contains("--int8-prefill"), "the media switch never turns chat lossy")
+        let legacy = #"{"host":"0.0.0.0","port":11234,"w8a8":true}"#.data(using: .utf8)!
+        XCTAssertFalse(try JSONDecoder().decode(ServerOptions.self, from: legacy).int8Prefill)
+        let on = #"{"host":"0.0.0.0","port":11234,"int8Prefill":true}"#.data(using: .utf8)!
+        XCTAssertTrue(try JSONDecoder().decode(ServerOptions.self, from: on).int8Prefill)
+        XCTAssertTrue(ServerOptions.serverFlagFields["int8Prefill"]?.needsRestart ?? false)
+    }
+
     // ── Per-Mac advice (pure: chip brand string + RAM in) ──
 
     func testM4MaxWithEnoughRamGetsNoCaution() {
@@ -117,7 +130,7 @@ final class AnePrefillSettingsTests: XCTestCase {
     /// nothing — the advice says "not recommended" rather than hiding the
     /// switch, because it is a measured-per-machine lever, not a hard gate.
     func testM5FamilyGetsTheNotRecommendedCaution() {
-        for brand in ["Apple M5 Max", "Apple M5 Pro", "Apple M5 Ultra", "Apple M5"] {
+        for brand in ["Apple M5 Max", "Apple M5 Pro", "Apple M5 Ultra", "Apple M5", "Apple M6"] {
             let text = AnePrefillAdvice.caution(
                 chipBrand: brand,
                 physicalMemoryBytes: 128 << 30)
@@ -126,12 +139,16 @@ final class AnePrefillSettingsTests: XCTestCase {
         }
     }
 
-    /// M4 vs M5 is a PREFIX decision on the family token, not a substring
-    /// scan — "M5" appears inside no M4-era brand, but the check must not
-    /// fire on some future "M45" either.
+    /// The family is the "M<n>" token's number (M5 and later carry NAX), never a substring scan.
     func testFamilyDetectionIsTokenExact() {
+        XCTAssertTrue(AnePrefillAdvice.isM5Family("Apple M6"))
+        XCTAssertTrue(AnePrefillAdvice.isM5Family("Apple M6 Max"))
+        XCTAssertFalse(AnePrefillAdvice.isM5Family("Apple M4 Max"))
+        XCTAssertFalse(AnePrefillAdvice.isM5Family("Apple M1"))
+        XCTAssertFalse(AnePrefillAdvice.isM5Family("Apple XM5 Hypothetical"))
+        XCTAssertFalse(AnePrefillAdvice.isM5Family(nil))
         XCTAssertNil(AnePrefillAdvice.caution(
-            chipBrand: "Apple M45 Hypothetical",
+            chipBrand: "Apple XM5 Hypothetical",
             physicalMemoryBytes: 128 << 30))
     }
 

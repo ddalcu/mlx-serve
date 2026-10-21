@@ -111,6 +111,7 @@ enum SettingsReset {
                 f("aneVideo") { $0.aneVideo = $1.aneVideo },
                 f("aneAudio") { $0.aneAudio = $1.aneAudio },
                 f("w8a8") { $0.w8a8 = $1.w8a8 },
+                f("int8Prefill") { $0.int8Prefill = $1.int8Prefill },
                 f("aneSlots") { $0.aneSlots = $1.aneSlots },
             ]
 

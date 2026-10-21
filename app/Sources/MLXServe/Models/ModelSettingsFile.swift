@@ -47,7 +47,7 @@ struct ModelOverride: Equatable {
     var mtpGreedyTail: Bool?
     /// `drafter`: "off", "auto" or a drafter dir (the speculation socket, `DrafterSocket`).
     var drafter: String?
-    /// `int8_prefill`: LOSSY int8-activation prefill (2-bit Prism packs only).
+    /// `int8_prefill`: LOSSY int8 prefill routes; overrides `--int8-prefill` either way.
     var int8Prefill: Bool?
     /// `ane`: serve the model on the Neural Engine instead of the GPU.
     var ane: Bool?

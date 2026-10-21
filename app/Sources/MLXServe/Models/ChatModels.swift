@@ -1039,6 +1039,10 @@ struct LocalModel: Identifiable, Hashable {
     var hasVision: Bool = false
     /// Quantization bit-width from `config.json`'s `quantization.bits`.
     var quantBits: Int? = nil
+    /// `quantization.group_size` (nil = MLX's default, 64).
+    var quantGroupSize: Int? = nil
+    /// `quantization.mode` (nil = affine; `nvfp4`, `mxfp4`, `mxfp8`).
+    var quantMode: String? = nil
     /// `max_position_embeddings`.
     var contextLength: Int? = nil
     /// Total MoE experts (`num_experts` / `num_local_experts` / `n_routed_experts`).

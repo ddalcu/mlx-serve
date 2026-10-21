@@ -56,6 +56,35 @@ final class ModelSettingsNeuralEngineRowTests: XCTestCase {
     }
 }
 
+/// Mirrors `src/int8_prefill.zig`: Prism packs, the Qwen 3.5 family's hd-256 attention, 4-bit chat models.
+final class ModelSettingsInt8PrefillRowTests: XCTestCase {
+    func testEveryChatModelARouteAppliesToOffersInt8Prefill() {
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "prism_hadamard_qwen35", quantBits: 2))
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "qwen3_5", quantBits: 8))
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "qwen3_5_moe", quantBits: nil))
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "lfm2_moe", quantBits: 4))
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "gemma4", quantBits: 4))
+    }
+
+    func testModelsNoRouteAppliesToDoNot() {
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "llama", quantBits: 8))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "gemma4", quantBits: nil))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "krea2", quantBits: 4), "media DiTs have --w8a8")
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "gguf", quantBits: 4))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: nil, quantBits: 4))
+    }
+
+    /// The 4-bit route takes affine g64 only (`prefillW8a8CopyBytes`, `w8a8.prefillQmm`).
+    func testOnlyAffineG64QualifiesForTheFourBitRoute() {
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "lfm2_moe", quantBits: 4, quantGroupSize: 64, quantMode: "affine"))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "lfm2_moe", quantBits: 4, quantGroupSize: 32))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "gemma4", quantBits: 4, quantGroupSize: 32, quantMode: "mxfp4"))
+        XCTAssertFalse(ModelSettingsApply.hasInt8PrefillRoute(modelType: "gemma4", quantBits: 4, quantGroupSize: 16, quantMode: "nvfp4"))
+        XCTAssertTrue(ModelSettingsApply.hasInt8PrefillRoute(modelType: "qwen3_5", quantBits: 4, quantGroupSize: 32),
+                      "the hd-256 attention route still applies")
+    }
+}
+
 /// Mirrors the server's `mtp.dirAdvertisesMtp`: sidecar file, index marker, or qwen4's own head.
 final class LocalMtpHeadProbeTests: XCTestCase {
     private func dir(_ name: String) throws -> String {

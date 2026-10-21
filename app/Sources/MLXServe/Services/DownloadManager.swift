@@ -1958,6 +1958,8 @@ class DownloadManager: ObservableObject {
             kind: kind,
             hasVision: meta.hasVision,
             quantBits: meta.quantBits,
+            quantGroupSize: meta.quantGroupSize,
+            quantMode: meta.quantMode,
             contextLength: meta.contextLength,
             numExperts: meta.numExperts,
             activeExperts: meta.activeExperts,
@@ -2066,6 +2068,8 @@ class DownloadManager: ObservableObject {
         var modelType = "unknown"
         var hasVision = false
         var quantBits: Int? = nil
+        var quantGroupSize: Int? = nil
+        var quantMode: String? = nil
         var contextLength: Int? = nil
         var numExperts: Int? = nil
         var activeExperts: Int? = nil
@@ -2091,6 +2095,8 @@ class DownloadManager: ObservableObject {
         // Quant: MLX writes `quantization`/`quantization_config` with `bits`.
         if let q = (cfg["quantization"] ?? cfg["quantization_config"]) as? [String: Any] {
             meta.quantBits = q["bits"] as? Int
+            meta.quantGroupSize = q["group_size"] as? Int
+            meta.quantMode = q["mode"] as? String
         }
         meta.contextLength = cfg["max_position_embeddings"] as? Int
         // MoE: total experts under one of several arch-specific keys; active

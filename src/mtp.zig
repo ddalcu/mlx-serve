@@ -3464,7 +3464,7 @@ pub fn forwardWithMrope(
     // flash kernel first — same dispatch the trunk's prefill uses.
     var fused_done = false;
     if (seq_len > 1) {
-        if (try transformer_mod.fusedSdpa256Prefill(s, q_rope, kv_view.k, kv_view.v, attn_scale, 0)) |fused| {
+        if (try transformer_mod.prefillSdpa256(s, target.int8_attn, q_rope, kv_view.k, kv_view.v, attn_scale, 0)) |fused| {
             _ = mlx.mlx_array_free(attn_out);
             attn_out = fused;
             fused_done = true;

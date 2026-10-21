@@ -144,6 +144,9 @@ struct ServerOptions: Codable, Equatable {
     static func defaultW8a8(physicalMemoryBytes: UInt64, isM5Family: Bool) -> Bool {
         isM5Family && physicalMemoryBytes >= 64 * 1_073_741_824
     }
+    /// `--int8-prefill`: chat models' prompt processing through every int8 route that applies (lossy).
+    /// Off, like the server; its own row because `w8a8` is on by default at 64 GB+ and chat must opt in.
+    var int8Prefill: Bool = false
     /// `--ane-slots`: requests each Neural Engine model runs at once. Slots share the weights and
     /// the engines, so they split one stream's speed; each adds its own KV and state.
     var aneSlots: Int = 1
@@ -538,6 +541,7 @@ struct ServerOptions: Codable, Equatable {
         aneVideo == other.aneVideo &&
         aneAudio == other.aneAudio &&
         w8a8 == other.w8a8 &&
+        int8Prefill == other.int8Prefill &&
         aneSlots == other.aneSlots &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
@@ -714,6 +718,7 @@ struct ServerOptions: Codable, Equatable {
         if aneVideo { args += ["--ane-video"] }
         if aneAudio { args += ["--ane-audio"] }
         args += [w8a8 ? "--w8a8" : "--no-w8a8"]
+        if int8Prefill { args += ["--int8-prefill"] }
         if aneSlots > 1 { args += ["--ane-slots", "\(aneSlots)"] }
         // Decode attention requant: tri-state — undecided emits NOTHING (the
         // server default keeps laguna on and dsv4's comp_in dense); an
@@ -937,6 +942,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneVideo) { aneVideo = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .w8a8) { w8a8 = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .int8Prefill) { int8Prefill = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .aneSlots) { aneSlots = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
@@ -1182,6 +1188,10 @@ extension ServerOptions {
         "w8a8": .init(
             title: "Neural Accelerator int8 (M5)",
             explainer: "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models.",
+            needsRestart: true),
+        "int8Prefill": .init(
+            title: "Neural Accelerator int8 prefill (M5)",
+            explainer: "Faster prompt processing for chat models on M5 Macs, slightly lossy; a model's own setting wins.",
             needsRestart: true),
         "aneSlots": .init(
             title: "Neural Engine requests at once",

@@ -84,6 +84,8 @@ Decode speed in v26.10.2 on an M5 Ultra with 256 GB, on a code prompt, with spec
 
 On an M4 Max, the same models decode 9% to 56% faster than they did in v26.8. Every release is measured the same way in [benchmarks.md](benchmarks.md); speculative decoding and tuning are in [docs/performance.md](docs/performance.md).
 
+On Macs with neural accelerators (M5 and later), `--int8-prefill` (or Settings → Neural Engine → "Neural Accelerator int8 prefill (M5)") reads prompts faster with int8 math, at a small loss: +22% to +34% on Qwen3.8 27B 4-bit on an M6, and up to +14% more at 128K tokens on an M5 Ultra. Decode is unchanged. [Details](docs/performance.md#int8-prefill-nax-gpus)
+
 ## Docs
 
 - [Integrations](docs/integrations.md): Claude Code, Codex, OpenCode, pi, Zed and more

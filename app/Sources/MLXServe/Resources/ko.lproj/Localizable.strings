@@ -2257,6 +2257,8 @@
 "The model finished loading." = "모델 로드를 마쳤습니다.";
 "Neural Accelerator int8 (M5)" = "Neural Accelerator int8 (M5)";
 "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models." = "M5 Mac에서 이미지와 영상을 더 빨리 만들며 약간의 손실이 있습니다. 끄면 4비트 모델이 메모리를 덜 씁니다.";
+"Neural Accelerator int8 prefill (M5)" = "Neural Accelerator int8 프리필 (M5)";
+"Faster prompt processing for chat models on M5 Macs, slightly lossy; a model's own setting wins." = "M5 Mac에서 채팅 모델의 프롬프트를 더 빨리 처리하며 약간의 손실이 있습니다. 모델별 설정이 우선합니다.";
 "Spec" = "추측";
 "Spec off" = "추측 꺼짐";
 "Sizes this model ships with." = "이 모델이 제공하는 크기입니다.";

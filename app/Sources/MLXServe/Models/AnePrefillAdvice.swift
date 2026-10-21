@@ -31,12 +31,14 @@ enum AnePrefillAdvice {
         return nil
     }
 
-    /// "Apple M5", "Apple M5 Pro/Max/Ultra" — a token-exact family check,
-    /// never a substring scan (an "M45" must not match). An unreadable brand
+    /// M5 or later ("Apple M5 Max", "Apple M6"): the GPUs with NAX. A token-exact
+    /// check on the "M<n>" token, never a substring scan. An unreadable brand
     /// string is no information, not a warning.
     static func isM5Family(_ brand: String?) -> Bool {
         guard let brand else { return false }
-        return brand.split(separator: " ").contains("M5")
+        return brand.split(separator: " ").contains { token in
+            token.first == "M" && (Int(token.dropFirst()) ?? 0) >= 5
+        }
     }
 
     /// Whether this Mac is M5-family (the NAX hardware), computed once like `liveCaution`.

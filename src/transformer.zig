@@ -28,6 +28,8 @@ const sushi_pack = @import("sushi_pack.zig");
 const qmv_nax2 = @import("qmv_nax2.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const qmm_int8 = @import("qmm_int8.zig");
+const w8a8 = @import("w8a8.zig");
+const int8_prefill = @import("int8_prefill.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
@@ -3473,14 +3475,19 @@ pub fn fusedSdpa256Prefill(
     if (window > 0) {
         if (!fused256Enabled()) return null;
     } else {
-        // Opt-in int8 Q/K causal arm on NAX (lossy); null when off or ineligible.
-        if (try @import("nax_attention.zig").attention256Int8(s, q, k, v, scale)) |q8| return q8;
         if (fused256CausalMode() == .off) return null;
         // The band arm stays ours (mlx's NAX kernel takes no band); the
         // causal arm yields to the stock fused kernel on NAX.
         if (naxSdpaPreferred()) return null;
     }
     return fusedSdpa256Impl(s, q, k, v, scale, window, null, null);
+}
+
+/// `fusedSdpa256Prefill` with the model's LOSSY int8 Q/K route (`Transformer.int8_attn`)
+/// tried first on the causal arm; it declines off NAX and at verify widths.
+pub fn prefillSdpa256(s: mlx.mlx_stream, int8_qk: bool, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int) !?mlx.mlx_array {
+    if (int8_qk and window == 0) if (try @import("nax_attention.zig").attention256Int8(s, q, k, v, scale)) |q8| return q8;
+    return fusedSdpa256Prefill(s, q, k, v, scale, window);
 }
 
 /// The same kernel for the sink-attention arm (gpt_oss / MiMo): any of its head
@@ -17576,9 +17583,11 @@ pub const Transformer = struct {
     /// A 2-bit group-128 pack without rotations whose every matmul weight has
     /// biases == -scales (Prism's ternary codec): qmv2's ternary kernel applies.
     ternary_2bit: bool = false,
-    /// LOSSY int8-activation prefill (`qmm_int8`), per model: allocated when its
-    /// `int8_prefill` setting (else the process default) turns the route on.
+    /// The LOSSY int8 prefill routes (`int8_prefill.on`, per model): 2-bit Prism projections
+    /// (`qmm_int8`), 4-bit affine projections (`w8a8.prefillQmm`, NAX only) and hd-256 Q/K.
     int8_cache: ?*qmm_int8.Cache = null,
+    w8a8_prefill: ?*w8a8.PrefillCache = null,
+    int8_attn: bool = false,
 
     // When non-null, the next forward pass captures the post-final-norm
     // hidden state at the last position into the pointed-to array
@@ -18314,12 +18323,23 @@ pub const Transformer = struct {
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         }
 
-        const int8_on = (config.int8_prefill_override orelse qmm_int8.enabled()) and mlx.metalKernelsAvailable();
+        const int8_on = int8_prefill.on(config.int8_prefill_override, .prism_2bit) and mlx.metalKernelsAvailable();
         var int8_cache: ?*qmm_int8.Cache = null;
         errdefer if (int8_cache) |c| allocator.destroy(c);
         if (int8_on) {
             int8_cache = try allocator.create(qmm_int8.Cache);
             int8_cache.?.* = .{};
+        }
+        var w8a8_prefill: ?*w8a8.PrefillCache = null;
+        errdefer if (w8a8_prefill) |c| allocator.destroy(c);
+        if (int8_prefill.on(config.int8_prefill_override, .affine_4bit)) {
+            if (naxAvailable() and mlx.metalKernelsAvailable()) {
+                w8a8_prefill = try allocator.create(w8a8.PrefillCache);
+                w8a8_prefill.?.* = .{};
+                log.info("[int8-prefill] on: prompt-width 4-bit affine projections run rotated int8 x int8 (lossy; decode and verify stay 4-bit)\n", .{});
+            } else {
+                log.warn("[int8-prefill] requested but this GPU has no neural accelerators (NAX, M5-class): ignored, stock qmm\n", .{});
+            }
         }
         var rht_registry: ?*rht.Registry = null;
         errdefer if (rht_registry) |reg| {
@@ -18458,6 +18478,8 @@ pub const Transformer = struct {
             .rht = rht_registry,
             .ternary_2bit = ternary_2bit,
             .int8_cache = int8_cache,
+            .w8a8_prefill = w8a8_prefill,
+            .int8_attn = int8_prefill.on(config.int8_prefill_override, .attn_qk),
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
@@ -19185,6 +19207,11 @@ pub const Transformer = struct {
             self.allocator.destroy(c);
             self.int8_cache = null;
         }
+        if (self.w8a8_prefill) |c| {
+            c.deinit();
+            self.allocator.destroy(c);
+            self.w8a8_prefill = null;
+        }
         if (self.compiled_forward) |cf| _ = mlx.mlx_closure_free(cf);
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
@@ -19316,6 +19343,11 @@ pub const Transformer = struct {
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
         // first touch — x's inner dim pins (bits, group_size) exactly.
         const qp = self.quantParamsHinted(w, sc, lastDim(x));
+        // OPT-IN and LOSSY: prompt-width 4-bit affine calls through rotated int8; declines below
+        // w8a8.PREFILL_MIN_ROWS rows (decode, spec verify) and outside its shapes. The lm_head stays
+        // exact (its logits are the model's distribution), and so does a weight with Hadamard signs.
+        if (self.w8a8_prefill) |pc| if (qp.mode == .affine and w.ctx != self.lm_head_w.ctx and !self.hasRhtSigns(w))
+            if (try w8a8.prefillQmm(pc, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
         // The 2-bit kernels (qmv2.zig) serve Prism packs: Hadamard ones, and
         // ternary ones without rotations. Every other 2-bit pack keeps stock qmm.
         if (self.rht) |reg| {
@@ -19344,6 +19376,11 @@ pub const Transformer = struct {
             if (try rowExactQmm(&self.config, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
         }
         return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
+    }
+
+    inline fn hasRhtSigns(self: *const Transformer, w: mlx.mlx_array) bool {
+        const reg = self.rht orelse return false;
+        return reg.get(w) != null;
     }
 
     /// Final logits projection. For dense bf16 the lm_head weight is [vocab, hidden]
@@ -22105,7 +22142,7 @@ pub const Transformer = struct {
             if (kv_fused_done) {
                 // packed kernel handled this layer
             } else if (std.mem.eql(u8, sel_mode, "causal")) {
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
@@ -22124,7 +22161,7 @@ pub const Transformer = struct {
                 // would band-mask a layer that has no band at all).
                 if (is_prefill and cfg.has_sliding_window and ctx.prefill_mask_add == null) {
                     // Sliding-window prefill: the band mask runs in-kernel.
-                    if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, @intCast(cfg.sliding_window))) |fused| {
+                    if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, @intCast(cfg.sliding_window))) |fused| {
                         _ = mlx.mlx_array_free(attn_out);
                         attn_out = fused;
                         fused_done = true;
@@ -23229,7 +23266,7 @@ pub const Transformer = struct {
                 out = try qkvAttnVerifyKernel(self.s, q_i, dv, attn_scale, mode);
             }
             if (out == null and seq_len > 1) {
-                out = try fusedSdpa256Prefill(self.s, q_i, dv.k, dv.v, attn_scale, 0);
+                out = try prefillSdpa256(self.s, self.int8_attn, q_i, dv.k, dv.v, attn_scale, 0);
                 if (out == null) out = try splitCausalSdpa(self.s, q_i, dv.k, dv.v, attn_scale);
             }
             if (out == null) {
@@ -28713,7 +28750,7 @@ pub const Transformer = struct {
             // sums in another order.
             try rowByRowSdpa(&attn_out, q_t, k_t, v_t, attn_scale, seq_len, self.s);
         } else if (is_prefill) {
-            if (try fusedSdpa256Prefill(self.s, q_t, k_t, v_t, attn_scale, 0)) |fused| {
+            if (try prefillSdpa256(self.s, self.int8_attn, q_t, k_t, v_t, attn_scale, 0)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else {
@@ -29757,7 +29794,7 @@ pub const Transformer = struct {
         } else if (self.config.rowExactDecode() and seq_len > 1 and seq_len <= rowqmv.MAX_ROWS and batch == 1) {
             try rowByRowSdpa(&attn_out, q_rope, full_k, full_v, attn_scale, seq_len, self.s);
         } else if (is_prefill) {
-            if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+            if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
@@ -31057,7 +31094,7 @@ pub const Transformer = struct {
         // precondition miss -> composed fallback, identical to before).
         if (!cfg.has_sliding_window) {
             if (is_prefill) {
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else {
@@ -31075,7 +31112,7 @@ pub const Transformer = struct {
                 // order the mlx-lm/mlx-vlm reference picks for short prompts,
                 // which keeps near-tie MoE router decisions from flipping vs
                 // the reference; DiffusionGemma parity).
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else {
@@ -31083,7 +31120,7 @@ pub const Transformer = struct {
                 }
             } else if (is_prefill) {
                 // Sliding-window prefill: band mask runs in-kernel when fused.
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, sw)) |fused| {
+                if (try prefillSdpa256(self.s, self.int8_attn, q_rope, full_k, full_v, attn_scale, sw)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else {
@@ -75424,4 +75461,118 @@ test "Metal-only kernels decline on a stream without them, so the MLX-op path ru
     const rotated = try rht.transform(a, signs, 1024, false, s);
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_array_eval(rotated));
+}
+
+/// MLX-packed 4-bit g64 affine [n, k] weight from seeded normal values.
+fn w8a8TestPacked(n: c_int, k: c_int, seed: u64, s: mlx.mlx_stream) ![3]mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ n, k }, 2, .bfloat16, 0.0, 0.02, key, s));
+    var v = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_quantize(&v, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var out: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    for (&out, 0..) |*a, i| {
+        try mlx.check(mlx.mlx_vector_array_get(a, v, i));
+        try mlx.check(mlx.mlx_array_eval(a.*));
+    }
+    return out;
+}
+
+fn w8a8TestInput(m: c_int, k: c_int, seed: u64, s: mlx.mlx_stream) !mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ m, k }, 2, .bfloat16, 0.0, 1.0, key, s));
+    return x;
+}
+
+fn w8a8BitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var v: bool = false;
+    _ = mlx.mlx_array_item_bool(&v, eq);
+    return v;
+}
+
+test "w8a8 prefill: a 64-row lm_head projection stays stock qmm bit for bit while a projection takes the route" {
+    if (!naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const head = try w8a8TestPacked(256, 1024, 41, s);
+    defer for (head) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const x = try w8a8TestInput(64, 1024, 42, s);
+    defer _ = mlx.mlx_array_free(x);
+    var pc: w8a8.PrefillCache = .{};
+    defer pc.deinit();
+    var t: Transformer = undefined;
+    t.config = .{};
+    t.bits_cache = .{};
+    t.rht = null;
+    t.int8_cache = null;
+    t.ternary_2bit = false;
+    t.w8a8_prefill = &pc;
+    t.s = s;
+    t.lm_head_w = head[0];
+    t.lm_head_s = head[1];
+    t.lm_head_b = head[2];
+    var stock = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stock);
+    try mlx.check(mlx.mlx_quantized_matmul(&stock, x, head[0], head[1], head[2], true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    const logits = try t.lmHeadProject(x);
+    defer _ = mlx.mlx_array_free(logits);
+    try std.testing.expect(try w8a8BitEqual(logits, stock, s));
+    // The same weight as an ordinary projection does take the route (int8 output differs).
+    const proj = try w8a8TestPacked(256, 1024, 41, s);
+    defer for (proj) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const y = try t.qmatmul(x, proj[0], proj[1], proj[2]);
+    defer _ = mlx.mlx_array_free(y);
+    try std.testing.expect(!try w8a8BitEqual(y, stock, s));
+}
+
+test "w8a8 prefill: a weight with Hadamard signs declines the route" {
+    if (!naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const k: c_int = 1024;
+    const pw = try w8a8TestPacked(256, k, 43, s);
+    defer for (pw) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const x = try w8a8TestInput(64, k, 44, s);
+    defer _ = mlx.mlx_array_free(x);
+    var sg: [1024]f32 = undefined;
+    for (&sg, 0..) |*v, i| v.* = if (i % 3 == 0) -1.0 else 1.0;
+    const signs = mlx.mlx_array_new_data(&sg, &[_]c_int{k}, 1, .float32);
+    defer _ = mlx.mlx_array_free(signs);
+    var reg = rht.Registry.init(std.testing.allocator, 1024);
+    defer reg.deinit();
+    try reg.register(pw[0], signs, signs);
+    var pc: w8a8.PrefillCache = .{};
+    defer pc.deinit();
+    var t: Transformer = undefined;
+    t.config = .{};
+    t.bits_cache = .{};
+    t.rht = &reg;
+    t.int8_cache = null;
+    t.ternary_2bit = false;
+    t.s = s;
+    t.lm_head_w = .{ .ctx = null };
+    t.w8a8_prefill = null;
+    const off = try t.qmatmul(x, pw[0], pw[1], pw[2]);
+    defer _ = mlx.mlx_array_free(off);
+    try mlx.check(mlx.mlx_array_eval(off));
+    reg.dropMemo();
+    t.w8a8_prefill = &pc;
+    const on = try t.qmatmul(x, pw[0], pw[1], pw[2]);
+    defer _ = mlx.mlx_array_free(on);
+    try std.testing.expect(try w8a8BitEqual(on, off, s));
 }

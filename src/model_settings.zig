@@ -15,7 +15,7 @@ pub const Override = struct {
     mtp: ?bool = null,
     mtp_acceptance: ?mtp_acceptance.Mode = null,
     mtp_greedy_tail: ?bool = null,
-    /// LOSSY int8-activation prefill for 2-bit Prism packs (`qmm_int8`).
+    /// LOSSY int8 prefill routes (`int8_prefill.zig`); null follows `--int8-prefill`.
     int8_prefill: ?bool = null,
     /// LOSSY: a dense bf16 head quantized to MXFP8 at load (`--lm-head-mxfp8`, on by default on integrated CUDA).
     lm_head_mxfp8: ?bool = null,

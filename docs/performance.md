@@ -31,11 +31,46 @@ Since v26.8.6, sliding-window models trim every attention read to their window: 
 
 The gain grows with the conversation; below roughly 8k there is nothing to trim yet.
 
-## Int8 Q/K prefill attention (NAX GPUs)
+## Int8 prefill (NAX GPUs)
 
-Pass `--int8-qk` (or set `MLX_SERVE_INT8_QK=1`) to run the causal prefill attention of dense Qwen 3.5/3.6/3.8 models with int8 Q and K. The option is **off by default** and **lossy**. It needs a GPU with neural accelerators (M5-class and later).
+Pass `--int8-prefill` (or set `MLX_SERVE_INT8_PREFILL=1`) for faster prompt processing on GPUs with neural accelerators (M5-class and later). It is **off by default** and **lossy**: it turns on every int8 route that applies to the loaded model, and each one quantizes activations at prompt width only. Decode and speculative verify keep the exact path; only the prompt's KV/SSM state differs slightly. Treat it like `--ane-prefill`: a speed-for-exactness trade you turn on knowingly. In the app it is Settings → Neural Engine → "Neural Accelerator int8 prefill (M5)".
 
-The route quantizes Q per 64 rows and K per 32 keys, after it removes each head's mean key, and multiplies them in int8. P and V stay in half precision. Decode and prompt widths under 64 rows keep the stock kernels. A model whose prefill does not use the head-dim-256 causal path does not take the route: Flash-Next (`qwen4_exp`) switches to its own sparse attention past 2,048 tokens. Gemma and Spark take it when the variable is set, but quality was measured on the Qwen3.8 27B only.
+| Route | Applies to | Gains most |
+|---|---|---|
+| 4-bit projections | affine 4-bit, group-64 checkpoints | short and mid prompts: +22% to +34% up to 16k |
+| Q/K attention | the causal head-dim-256 prefill attention (dense Qwen 3.5/3.6/3.8) | long prompts: nil at 8k, +14% at 128k |
+| 2-bit projections | 2-bit Prism Hadamard packs (`prism_hadamard_qwen35`) | prompt-width projections |
+
+A model's `int8_prefill` setting in `model-settings.json` (the app's per-model settings sheet) wins over the switch in both directions. To compare one route against the others, `=0` on its own variable turns just that route off: `MLX_SERVE_W8A8_PREFILL=0` (4-bit projections), `MLX_SERVE_INT8_QK=0` (Q/K attention), `MLX_SERVE_BONSAI_INT8_PREFILL=0` (2-bit projections). Those variables never turn a route on. Other Macs log a warning and keep the stock path.
+
+With every route on, the loss does not add up. Qwen3.8-27B 4-bit + DFlash on an M6, greedy requests, next-token KL (top-20 logprobs, 128 tokens) against the switch off:
+
+| Prompt tokens | 3K | 11.7K | 22.7K |
+|---|---|---|---|
+| All routes (`--int8-prefill`) | 0.0008 | 0.0005 | 0.0005 |
+| 4-bit projections only (`MLX_SERVE_INT8_QK=0`) | 0.0008 | 0.0009 | 0.0004 |
+| Q/K attention only (`MLX_SERVE_W8A8_PREFILL=0`) | 0.0006 | 0.0004 | 0.0003 |
+
+Two runs of the same arm differ by 0, and the stock path moves by 0.0003–0.0006 between prefill chunk sizes.
+
+### 4-bit projections
+
+Prompt-width projections (64 rows or more) run on the `--w8a8` kernels: the 4-bit weight is converted on each call to int8 behind the same block-256 Hadamard rotation (nothing extra stays resident), the activations are rotated and quantized per token, and the int8 x int8 product runs on the tensor units. The lm_head and weights with Hadamard signs keep the 4-bit path. The server logs `[int8-prefill] on` at load and `[w8a8-prefill] engaged` on the first call.
+
+Measured on an M6 (32 GB), `tests/bench.sh` against the same binary with the route off, median of two runs per point:
+
+| Prompt tokens | 512 | 4K | 8K | 16K |
+|---|---|---|---|---|
+| Qwen3.8-27B 4-bit + DFlash, prefill | **+22%** | **+34%** | **+32%** | **+32%** |
+| Qwen3.5-9B 4-bit, prefill | **+28%** | **+53%** | **+54%** | **+52%** |
+
+The 9B rows ran both arms with `MLX_SERVE_PREFILL_DQ_GEMM=0`: its 4096-row chunks otherwise take the dequant+GEMM route, which is slower than qmm on the M6.
+
+Decode is unchanged within run-to-run noise. On greedy requests the next-token KL divergence against the route off is 0.0004–0.0009 (27B) and 0.001–0.004 (9B); two runs of the stock path differ by 0, and the stock path itself moves by 0.0003–0.0006 (27B) and 0.0006–0.0013 (9B) between prefill chunk sizes or a cold and a warm prefix cache.
+
+### Q/K attention
+
+The route quantizes Q per 64 rows and K per 32 keys, after it removes each head's mean key, and multiplies them in int8. P and V stay in half precision. Decode and prompt widths under 64 rows keep the stock kernels. A model whose prefill does not use the head-dim-256 causal path does not take the route: Flash-Next (`qwen4_exp`) switches to its own sparse attention past 2,048 tokens. Gemma and Spark take it when the switch is on, but quality was measured on the Qwen3.8 27B only.
 
 Qwen3.8-27B 4-bit on an M5 Ultra (256 GB), one request per cell, `--no-mtp --max-concurrent 1`, prefill tok/s, two boots per arm (A B B A):
 
@@ -50,7 +85,7 @@ Attention is a larger share of a longer prefill, so the gain grows with context 
 
 Against the route off, a 23,311-token echo NLL (measured on an M5 Max, 128 GB) moves by +0.001 nats and teacher-forced top-1 agreement is 98.3%. On a 113,784-token text the NLL moves by +0.0003 nats with no drift from 0 to 114k tokens. Greedy 64-token continuations after three prompts of 10k to 17k tokens match the stock path on two and diverge at token 48 on the third.
 
-When the route runs, the server logs `[attn] int8 QK hd-256 prefill attention engaged (MLX_SERVE_INT8_QK; lossy)` once.
+When the route runs, the server logs `[attn] int8 QK hd-256 prefill attention engaged (--int8-prefill; lossy)` once.
 
 ## Tuning
 

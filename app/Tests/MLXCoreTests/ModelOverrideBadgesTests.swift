@@ -25,12 +25,13 @@ final class ModelOverrideBadgesTests: XCTestCase {
         XCTAssertEqual(badges(o, type: "qwen3_5"), [])
     }
 
-    func testInt8PrefillIsLossyAndOnlyOnPrismPacks() {
+    func testInt8PrefillIsLossyAndOnlyWhereARouteApplies() {
         var o = ModelOverride()
         o.int8Prefill = true
         let b = badges(o, type: "prism_hadamard_qwen35")
         XCTAssertEqual(b.map(\.text), ["Int8"])
         XCTAssertTrue(b[0].lossy)
+        XCTAssertEqual(ModelOverrideBadges.badges(o, modelType: "qwen3", quantBits: 4, socket: none).map(\.text), ["Int8"])
         XCTAssertEqual(badges(o, type: "qwen3"), [])
     }
 

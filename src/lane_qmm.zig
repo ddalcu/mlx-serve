@@ -487,6 +487,14 @@ fn dropPacked(sc: mlx.mlx_array, bi: mlx.mlx_array) void {
     }
 }
 
+/// The tiled layout behind `w` (base handles, first row, tile width), or null for a weight in
+/// MLX's layout. For other prompt-width readers of a tiled weight (`w8a8.prefillQmm`).
+pub const TiledInfo = struct { w: mlx.mlx_array, st: mlx.mlx_array, bt: mlx.mlx_array, ntot: c_int, r0: c_int, nt: c_int, bits: c_int };
+pub fn tiledInfo(w: mlx.mlx_array) !?TiledInfo {
+    const t = (try tiledEntry(w)) orelse return null;
+    return .{ .w = t.w, .st = t.st, .bt = t.bt, .ntot = t.ntot, .r0 = t.r0, .nt = t.nt, .bits = t.bits };
+}
+
 fn tiledEntry(w: mlx.mlx_array) !?Tiled {
     if (tiled.count() == 0 or mlx.mlx_array_dtype(w) != .uint32) return null;
     const sh = mlx.getShape(w);

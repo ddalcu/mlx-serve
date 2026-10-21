@@ -2803,6 +2803,11 @@ private struct NeuralEngineSectionContent: View {
                 Toggle("", isOn: opts.w8a8).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }
         }
+        if let m = meta["int8Prefill"], AnePrefillAdvice.liveIsM5Family {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.int8Prefill)) {
+                Toggle("", isOn: opts.int8Prefill).labelsHidden().toggleStyle(.switch).font(.app(.body))
+            }
+        }
         if let m = meta["aneImage"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneImage),
                         cost: m.cost, costActive: appState.serverOptions.aneImage) {
