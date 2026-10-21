@@ -450,8 +450,8 @@ pub fn writeFixture(td: *std.testing.TmpDir, variant: FixtureVariant) !void {
     try writeSafetensors(td, "b.safetensors", header_b, &data_b);
 }
 
-/// One affine shard of two rows at dim 32, group 32, packed at `bits`: row 0 all zero codes, row 1
-/// all ones, scale 1.0, bias 0.
+/// One affine shard of two rows at dim 32, group 32, packed at `bits`: row 0 mixed codes (values
+/// straddle words at 3/5/6 bits), row 1 all ones, scale 1.0, bias 0.
 pub fn writeAffineFixture(td: *std.testing.TmpDir, bits: u32) !void {
     const a = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -463,8 +463,9 @@ pub fn writeAffineFixture(td: *std.testing.TmpDir, bits: u32) !void {
     defer a.free(header);
     const data = try a.alloc(u8, wbytes + 8);
     defer a.free(data);
-    @memset(data, 0);
+    for (data[0 .. wbytes / 2], 0..) |*b, i| b.* = @truncate(i *% 0x9d +% 0x35);
     @memset(data[wbytes / 2 .. wbytes], 0xff);
+    @memset(data[wbytes..], 0);
     for (0..2) |r| std.mem.writeInt(u16, data[wbytes + r * 2 ..][0..2], 0x3f80, .little);
     try writeSafetensors(td, "a.safetensors", header, data);
 }
