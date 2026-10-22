@@ -528,6 +528,44 @@ enum AgentConfigs {
         if [ -z "$CODEX_BIN" ]; then echo "codex is not installed: npm install -g @openai/codex, or install the ChatGPT app"; exit 127; fi
         """
 
+    /// Local models lack registry instructions: ship the current base_instructions
+    /// instead of codex's stale fallback; MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off|0
+    /// drops the override. A function, not a split variable: zsh never word-splits.
+    static func codexLaunchGate(args: String) -> String {
+        let off = "[ \"${MLX_SERVE_CODEX_MODEL_INSTRUCTIONS:-}\" = off ] || [ \"${MLX_SERVE_CODEX_MODEL_INSTRUCTIONS:-}\" = 0 ]"
+        let file = "$HOME/.mlx-serve/codex/model-instructions.md"
+        return """
+            if \(off); then
+            codex_launch() { "$CODEX_BIN" \(args) "$@"; }
+            else
+            codex_launch() { if [ -f "\(file)" ]; then "$CODEX_BIN" \(args) -c "model_instructions_file=\"\(file)\"" "$@"; else "$CODEX_BIN" \(args) "$@"; fi; }
+            fi
+            """
+    }
+
+    /// The app bundle's copy (app/build.sh), else the repo's `src/assets/` in
+    /// dev and tests (the AgentSkills.sourceDir resolution trick).
+    static func codexInstructionsText() -> String? {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("src/assets/codex_model_instructions.md")
+        return [Bundle.main.resourceURL?.appendingPathComponent("codex/model-instructions.md"), repo]
+            .compactMap { $0 }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+    }
+
+    /// A shell block that lands the instructions file for a pasted script that
+    /// has no bundle to read; nil when the resource is missing.
+    static func codexInstructionsSetup() -> String? {
+        guard let text = codexInstructionsText() else { return nil }
+        return "mkdir -p ~/.mlx-serve/codex\ncat > ~/.mlx-serve/codex/model-instructions.md <<'MLX_CODEX_PROMPT_EOF'\n\(text)\nMLX_CODEX_PROMPT_EOF\n"
+    }
+
     /// aider model metadata (litellm's registry format) — tells aider the
     /// real context window of every `openai/<id>` model so its budgeting and
     /// warnings work; without it unknown models get litellm defaults. One

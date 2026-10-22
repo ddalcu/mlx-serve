@@ -471,7 +471,14 @@ extension LauncherCLI {
         binaryName: "codex",
         iconSystemName: "chevron.left.forwardslash.chevron.right",
         useClaudeIcon: false,
-        prepareConfig: nil,
+        prepareConfig: { _, _, _, _ in
+            let dir = NSString(string: "~/.mlx-serve/codex").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            if let text = AgentConfigs.codexInstructionsText() {
+                try? text.write(toFile: (dir as NSString).appendingPathComponent("model-instructions.md"),
+                                atomically: true, encoding: .utf8)
+            }
+        },
         fallbackPaths: [
             "/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
@@ -480,10 +487,12 @@ extension LauncherCLI {
         ],
         resumeArgs: "resume --last",
         scriptBody: { baseURL, model, cdLine, budget, _ in
-            """
+            let args = AgentConfigs.codexConfigArgs(baseURL: baseURL, model: model, budget: budget)
+            return """
             \(AgentConfigs.codexBinResolver)
             \(cdLine)
-            "$CODEX_BIN" \(AgentConfigs.codexConfigArgs(baseURL: baseURL, model: model, budget: budget)) "$@"
+            \(AgentConfigs.codexLaunchGate(args: args))
+            codex_launch "$@"
             """
         }
     )

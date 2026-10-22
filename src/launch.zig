@@ -419,6 +419,12 @@ pub fn codexConfigOverrides(allocator: std.mem.Allocator, base_url: []const u8, 
     return out.toOwnedSlice(allocator);
 }
 
+/// codex's built-in fallback names tools the current binary no longer
+/// declares, so local models get this in-repo file instead. Retire both
+/// when codex ships instructions for registry-less models.
+const codex_model_instructions = @embedFile("assets/codex_model_instructions.md");
+const codex_instructions_path = ".mlx-serve/codex/model-instructions.md";
+
 /// grok `config.toml` under a dedicated GROK_HOME. A dummy XAI_API_KEY fails
 /// grok's key probe against xAI, so the credential is each model's `api_key`.
 /// Helper calls (titles, image descriptions, suggestions) default to xAI model
@@ -844,7 +850,11 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             );
             const overrides = try codexConfigOverrides(allocator, base_url, model, budget);
             defer allocator.free(overrides);
-            try out.print(allocator, "\n\"$CODEX_BIN\" {s}", .{overrides});
+            // The gate is evaluated at exec time so `launch --print` stays switchable.
+            // A function, not a word-split variable (zsh passes an unquoted expansion
+            // as ONE argument); the file test skips an override whose file is missing.
+            const off = "[ \"${MLX_SERVE_CODEX_MODEL_INSTRUCTIONS:-}\" = off ] || [ \"${MLX_SERVE_CODEX_MODEL_INSTRUCTIONS:-}\" = 0 ]";
+            try out.print(allocator, "\nif {s}; then\ncodex_launch() {{ \"$CODEX_BIN\" {s} \"$@\"; }}\nelse\ncodex_launch() {{ if [ -f \"$HOME/{s}\" ]; then \"$CODEX_BIN\" {s} -c \"model_instructions_file=\\\"$HOME/{s}\\\"\" \"$@\"; else \"$CODEX_BIN\" {s} \"$@\"; fi; }}\nfi\ncodex_launch", .{ off, overrides, codex_instructions_path, overrides, codex_instructions_path, overrides });
         },
         .hermes => {
             try out.appendSlice(allocator,
@@ -1062,9 +1072,8 @@ const claude_plugin_json_path = claude_plugin_dir ++ "/.claude-plugin/plugin.jso
 const claude_plugin_json = "{\"name\": \"mlx-serve\", \"description\": \"Skills for the local mlx-serve server\"}\n";
 
 /// Where each agent discovers skills inside its dedicated config dir; opencode
-/// reads `skills.paths` from its inline config instead, aider has no skills.
-/// Codex gets none: it has no dedicated dir and no `-c` key for a skills root,
-/// and a link in the user's own home would reach every codex session.
+/// reads `skills.paths` from its inline config instead. Codex gets none: no
+/// `-c` key for a skills root, and a home link would reach every codex session.
 fn agentSkillLink(kind: AgentKind) ?[]const u8 {
     return switch (kind) {
         .pi => "pi/skills/" ++ agent_skills.name,
@@ -1129,11 +1138,13 @@ fn existingOrEmpty(a: std.mem.Allocator, io: ?std.Io, rel_or_abs: []const u8) ![
 }
 
 /// The agent's config files (the app's prepareConfig twin), allocated in `a`
-/// (an arena). opencode carries its config inline, codex on the launch line.
+/// (an arena). opencode carries its config inline; codex settings ride the
+/// launch line and only the instructions file is written.
 fn configFiles(a: std.mem.Allocator, io: ?std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) ![]ConfigFile {
     var files = std.ArrayList(ConfigFile).empty;
     switch (kind) {
-        .claude, .opencode, .codex => {},
+        .claude, .opencode => {},
+        .codex => try files.append(a, .{ .path = codex_instructions_path, .data = codex_model_instructions }),
         .opencode2 => {
             const existing = try existingOrEmpty(a, io, try userOpencodeCliPath(a));
             try files.append(a, .{ .path = ".mlx-serve/opencode2/opencode/cli.json", .data = try mergeOpencode2CliJson(a, existing, base_url, null) });
@@ -1552,7 +1563,35 @@ test "codex overrides escape a model id for TOML, then for the shell" {
     try t.expect(std.mem.startsWith(u8, ov, "-c 'model=\"o'\\''ne\\\"il\\\\m\"' -c 'model_provider=\"mlx\"'"));
 }
 
-test "codex gets no skill link and no dedicated dir" {
+test "codex launch ships the current-contract instructions file under its dedicated dir" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const files = try configFiles(arena.allocator(), null, .codex, "http://x:1", "m1", .{ .context = 0, .output = 0 }, &.{});
+    var shipped: ?[]const u8 = null;
+    for (files) |f| {
+        if (std.mem.eql(u8, f.path, ".mlx-serve/codex/model-instructions.md")) shipped = f.data;
+    }
+    const data = shipped orelse return error.MissingInstructionsFile;
+    try t.expectEqualStrings(codex_model_instructions, data);
+    // The shipped text must teach the current contract: the editing path is
+    // exec_command, no stale tool or rule, no vendor identity for the model.
+    try t.expect(std.mem.indexOf(u8, data, "apply_patch") == null);
+    try t.expect(std.mem.indexOf(u8, data, "Preamble") == null);
+    try t.expect(std.mem.indexOf(u8, data, "GPT") == null);
+    try t.expect(std.mem.indexOf(u8, data, "exec_command") != null);
+}
+
+test "codex script gates the instructions override on MLX_SERVE_CODEX_MODEL_INSTRUCTIONS" {
+    const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "if [ \"${MLX_SERVE_CODEX_MODEL_INSTRUCTIONS:-}\" = off ] || [ \"${MLX_SERVE_CODEX_MODEL_INSTRUCTIONS:-}\" = 0 ]; then") != null);
+    try t.expect(std.mem.indexOf(u8, script, "codex_launch() { \"$CODEX_BIN\" -c 'model=\"m1\"' -c 'model_provider=\"mlx\"' -c model_context_window=4096 -c 'model_providers.mlx.name=\"MLX Serve (local)\"' -c 'model_providers.mlx.base_url=\"http://x:1/v1\"' -c 'model_providers.mlx.wire_api=\"responses\"' \"$@\"; }") != null);
+    try t.expect(std.mem.indexOf(u8, script, "if [ -f \"$HOME/.mlx-serve/codex/model-instructions.md\" ]; then") != null);
+    try t.expect(std.mem.indexOf(u8, script, "-c \"model_instructions_file=\\\"$HOME/.mlx-serve/codex/model-instructions.md\\\"\" \"$@\"; else \"$CODEX_BIN\"") != null);
+    try t.expect(std.mem.endsWith(u8, script, "codex_launch\n"));
+}
+
+test "codex gets no skill link" {
     try t.expect(agentSkillLink(.codex) == null);
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
@@ -1783,7 +1822,7 @@ test "script assembly: extras are shell-quoted onto the invocation line" {
     const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{ "resume", "it's" });
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" -c 'model=\"m1\"'") != null);
-    try t.expect(std.mem.indexOf(u8, script, "-c 'model_providers.mlx.wire_api=\"responses\"' 'resume' 'it'\\''s'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "codex_launch 'resume' 'it'\\''s'") != null);
     try t.expect(std.mem.indexOf(u8, script, "CODEX_HOME") == null);
 }
 
@@ -1796,7 +1835,7 @@ test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebr
     try t.expect(std.mem.indexOf(u8, script, "Contents/Resources/codex") != null);
     // Never exec an empty resolution — refuse with the install hint.
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
-    try t.expect(std.mem.indexOf(u8, script, "\n\"$CODEX_BIN\"") != null);
+    try t.expect(std.mem.indexOf(u8, script, "\ncodex_launch() { \"$CODEX_BIN\"") != null);
 }
 
 test "AgentKind.fromName recognizes opencode2" {

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Codex prompts that fit a local model.** `mlx-serve launch codex` and the app's Codex tab hand codex a current base-instructions file instead of its stale built-in fallback, which names tools the binary no longer declares; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override.
+
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 
 ### Highlights

@@ -392,6 +392,10 @@ fi
 mkdir -p "$CONTENTS/Resources/agent-skills"
 cp -R "$PROJECT_ROOT/skills/mlx-serve" "$CONTENTS/Resources/agent-skills/"
 
+# The codex current-contract instructions (AgentConfigs.codexInstructionsText); the CLI embeds the same file.
+mkdir -p "$CONTENTS/Resources/codex"
+cp "$PROJECT_ROOT/src/assets/codex_model_instructions.md" "$CONTENTS/Resources/codex/model-instructions.md"
+
 # SwiftPM does not embed resource bundles when we assemble the .app by hand.
 # SwaTex loads its KaTeX fonts from this bundle at runtime.
 cp -R "$SWATEX_RESOURCE_BUNDLE" "$CONTENTS/Resources/"

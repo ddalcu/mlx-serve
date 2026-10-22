@@ -515,18 +515,19 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertTrue(yml.contains("efforts: [minimal, low, medium, high, xhigh]"), yml)
     }
 
-    /// The tab and the launcher carry the SAME override builder and write nothing.
-    func testCodexTabAndLauncherShareTheOverridesAndWriteNothing() throws {
+    /// Tab and launcher share the overrides and the instructions gate; neither writes into ~/.codex.
+    func testCodexTabAndLauncherShareTheOverridesAndGate() throws {
         let tab = try XCTUnwrap(tabs.first { $0.id == "codex" })
         let args = AgentConfigs.codexConfigArgs(baseURL: "http://localhost:11234",
                                                 model: "gemma-4-e4b-it-4bit", budget: budget)
         let script = LauncherCLI.codex.scriptBody("http://localhost:11234",
                                                   "gemma-4-e4b-it-4bit", "", budget, [])
         for surface in [tab.command, script] {
-            XCTAssertTrue(surface.contains("\"$CODEX_BIN\" \(args)"), surface)
-            XCTAssertFalse(surface.contains("CODEX_HOME"), surface)
-            XCTAssertFalse(surface.contains("mkdir"), surface)
-            XCTAssertFalse(surface.contains("cat >"), surface)
+            XCTAssertTrue(surface.contains(AgentConfigs.codexLaunchGate(args: args)), surface)
+            XCTAssertTrue(surface.contains("codex_launch"), surface)
+            XCTAssertFalse(surface.contains("export CODEX_HOME"), surface)
+            XCTAssertFalse(surface.contains("> ~/.codex"), "nothing writes into the user's Codex home")
+            XCTAssertFalse(surface.contains("mkdir -p ~/.codex"), surface)
         }
     }
 
