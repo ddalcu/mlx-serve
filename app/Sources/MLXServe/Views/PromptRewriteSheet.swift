@@ -61,6 +61,7 @@ struct PromptRewriteSheet: View {
     @State private var progress = RewriteProgress()
     /// Set when there is a first frame the chat model cannot see.
     @State private var blindToFirstFrame = false
+    @State private var blindToReferences = false
     @State private var startedAt = Date()
     @State private var error: String? = nil
     @State private var job: Task<Void, Never>? = nil
@@ -114,6 +115,9 @@ struct PromptRewriteSheet: View {
                 Text(error).font(.app(.caption)).foregroundStyle(.red)
             } else if blindToFirstFrame {
                 Text("Your chat model can't see images, so this was written without your first frame and the video may cut away from it. A vision chat model fixes that.")
+                    .font(.app(.caption)).foregroundStyle(.orange)
+            } else if blindToReferences {
+                Text("Your chat model can't see images, so this was written without your reference pictures and may describe them differently. A vision chat model fixes that.")
                     .font(.app(.caption)).foregroundStyle(.orange)
             } else {
                 Text("Edit the result, then Apply to replace your text.")
@@ -178,11 +182,12 @@ struct PromptRewriteSheet: View {
             defer { isWriting = false }
             writtenSeconds = clipSeconds
             let req = request(clipSeconds)
-            let sees = req.firstFrame != nil && AgentComposer.seesImages(appState: appState)
+            let sees = !req.images.isEmpty && AgentComposer.seesImages(appState: appState)
             blindToFirstFrame = req.firstFrame != nil && !sees
+            blindToReferences = !req.references.isEmpty && !sees
             do {
                 for try await event in AgentComposer.events(userText: req.user(seeingImage: sees), systemPrompt: req.system,
-                                                            image: sees ? req.firstFrame : nil,
+                                                            images: sees ? req.images : [],
                                                             appState: appState, maxTokens: req.maxTokens) {
                     if Task.isCancelled { return }
                     progress.apply(event)

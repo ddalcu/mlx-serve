@@ -36,6 +36,18 @@ The joint schema head, input encoding and SystemOne response mapping in
 src/clef.zig are adapted from joint_schema_model.py and clef_mlx.py.
 
 --------------------------------------------------------------------------------
+FastVideo
+https://github.com/hao-ai-lab/FastVideo
+Copyright FastVideo contributors
+Licensed under the Apache License, Version 2.0.
+
+The VSA-H3 sparse attention in src/h3_vsa.zig (tile geometry, routing, the
+gate branch and the SIMD-group block-sparse Metal kernel) is ported from
+`fastvideo/mlx_runtime/minimax_h3_vsa.py` and `minimax_h3_vsa_simd.py`, and
+the PDD sampler in src/minimax_h3.zig follows `fastvideo/layers/pdd.py`.
+tests/dump_h3_vsa_fixtures.py executes the reference to validate the port.
+
+--------------------------------------------------------------------------------
 SageAttention
 https://github.com/thu-ml/SageAttention
 Licensed under the Apache License, Version 2.0.
@@ -189,6 +201,8 @@ Used in mlx-serve (`src/transformer.zig`):
     and `omlx/custom_kernels/nax_tiles.py` at 5dcfe243. Both are MLX's own
     steel NAX attention and tile code (Copyright (c) 2024-25 Apple Inc., MIT);
     the sliding-window bound is ours.
+  * The block-sparse VSA attention (`src/kernels/h3_vsa_nax.metal`): that
+    attention kernel's loop walking each query tile's selected key tiles.
 
 Used in mlx-serve for GLM-5-Next (`src/glm5_next.zig`, `src/dsa_nax.zig`,
 `src/kda_recurrence.zig`, `src/kernels/kda_*.metal`, `src/kernels/glm5_*.metal`),

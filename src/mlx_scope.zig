@@ -241,6 +241,30 @@ pub const Scope = struct {
         var o = mlx.mlx_array_new();
         return sc.res(mlx.mlx_take_axis(&o, table, ids, 0, sc.s), &o);
     }
+    pub fn takeAxis(sc: *Scope, table: A, ids: A, axis: c_int) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_take_axis(&o, table, ids, axis, sc.s), &o);
+    }
+    pub fn neg(sc: *Scope, x: A) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_negative(&o, x, sc.s), &o);
+    }
+    pub fn softmax(sc: *Scope, x: A, axis: c_int) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_softmax_axis(&o, x, axis, false, sc.s), &o);
+    }
+    pub fn argpartition(sc: *Scope, x: A, kth: c_int, axis: c_int) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_argpartition_axis(&o, x, kth, axis, sc.s), &o);
+    }
+    pub fn less(sc: *Scope, x: A, y: A) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_less(&o, x, y, sc.s), &o);
+    }
+    pub fn arange(sc: *Scope, start: c_int, stop: c_int, step: c_int) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_arange(&o, @floatFromInt(start), @floatFromInt(stop), @floatFromInt(step), .int32, sc.s), &o);
+    }
     /// `lo`/`hi` zero rows added on one axis.
     pub fn padAxis(sc: *Scope, x: A, axis: c_int, lo: c_int, hi: c_int) !A {
         var o = mlx.mlx_array_new();

@@ -12,6 +12,9 @@ The nucleus keeps a rank while the mass STRICTLY above it is `< top_p`. Rank 0 s
 ### A penalty applied only on the logprobs path was silently ignored everywhere else (#564)
 `repeat_penalty` / `frequency_penalty` / `presence_penalty` reached `applyRepeatPenalty` only through `sampleToken`, which the decode loop calls only when logprobs are requested. The pipelined fast path, the grammar path, spec verify (PLD/MTP/DFlash) and batched decode all sampled raw logits: "apple ×40" gave 120 apples at `repeat_penalty 2.0` and 3 with `logprobs: true`, and `json_schema` replies were byte-identical at any penalty. Fix: `Generator.sampleLazy` penalizes over the realized `generated_ids`; `SamplingParams.penalized()` keeps a request off `next`'s fast path (its pending token is not realized yet), off spec (`requestSpecModes` `shaped_logits`) and off batched decode (`BatchVerdict.penalty`). Guard: `repeat penalty shapes every sampling path` (generate.zig, `LOGPROBS_TEST_MODEL`) + `tests/test_repeat_penalty.sh` (engagement counts for PLD and batching).
 
+### OpenAI's `frequency_penalty` was read as a `repeat_penalty` multiplier and broke tool calls (#912)
+Crush sends `frequency_penalty: 1`, which the server read as `repeat_penalty` 1 + x = 2.0: every positive logit of every token already generated was halved. Once #564 applied penalties on every path (26.10.2), the newlines and markup a tool call needs had all appeared in the reasoning, so Qwen3.8-27B wrote the call as prose (`<tool_call> write tool with content 'print("Hell…`) and the agent stopped. Fix: `frequency_penalty` is its own field, subtracted once per occurrence (OpenAI's definition, as vLLM and llama.cpp read it); `repeat_penalty` stays the explicit multiplier. Guard: `OpenAI frequency_penalty is its own additive penalty…` (server.zig), `frequency_penalty subtracts per occurrence…` (generate.zig).
+
 ### Every sampled token ranked the whole vocabulary; a shortlist is exact only if it ranks the way the row does
 `applyTopP` argsorted 248,320 logits per sampled token and `applyTopK` paid a second pass through `mlx_argpartition`. On Metal `Partition::eval_gpu` and `ArgPartition::eval_gpu` "direct partition to sort for now", so `mlx_topk` and `mlx_argpartition` ARE the multi-block merge sort and buy nothing. Qwen3.8-Flash-Next on M4 Max, MTP off: 65.0 tok/s greedy vs 60.5 at temperature 1 / top_p 0.95 / top_k 20.
 
@@ -22,6 +25,9 @@ Under the rank contract (bdcf5a1: ties cut by rank, never value) the shortlist m
 The nucleus is the mass STRICTLY above each rank (exclusive scan, rank 0 sees zero so the argmax is always kept) over an f32 softmax of the ranked values (the row's finite entries, so the row's normalizer), and the scan runs in f32: mlx instantiates cumsum at the INPUT dtype and logits off a quantized `lm_head` are bf16, which dropped 148 of 3720 nucleus columns on one of six probe rows and made the sum depend on how many entries the scan walked.
 
 Guard: the shortlist route and the full-row route produce byte-identical filtered logits and draw the same token under the same key over `[m, V]` and `[B, L, V]` blocks at V 8192 and 248,320, six `(top_p, top_k)` settings, a 0.25-quantized row and an all-equal row; `applyTopK` keeps exactly k; the f64 nucleus reference may differ by one boundary column (its probability ~1e-5 against ~1e-7 of f32 scan error).
+
+### A ubench without the server's buffer-pool cap priced FastH3 VSA too cheap
+FastH3 Omni's sparse attention beat int8 dense attention in a test ubench, yet the real step ran slower than dense. Inside the server every stage that made a multi-GB temporary (tiled copies, f32 pooling buffers, the f32 gate product) ran several times slower: the server caps MLX's buffer pool at 8 GB (`applyMlxCacheLimit`), the MLP's own buffers churn it, and each block paid fresh multi-GB allocations. The test binary never set the cap; raising the server's cap made the gap vanish. Fix: fused pooling and assembly kernels with no f32 temporaries (`h3_vsa.poolKernel`, `assembleKernel`). Guard: the `H3_VSA_UBENCH` ubench runs under the server's 8 GB cap; the bar for a media-DiT change is still the server's per-step log.
 
 ### A short restore kept the long donor's KV capacity (#492)
 A restored cache SHARES the donor entry's buffer; the first append copied the WHOLE buffer, so a "hi" chat that matched only the system prompt of an 80k omp session kept 80k of capacity (27B: 1.9 GB). The byte budget then evicted the long session to hold the short one, and its next turn re-read the whole context.
@@ -5719,3 +5725,10 @@ Defect: `dsv41 index scores: the matrix kernel …` failed on every CI run since
 Cause: `IDX_TILE_SOURCE` reduces each 8x8 accumulator tile through per-simdgroup scratch (`simdgroup_store`, then every lane reads other lanes' entries) with only `simdgroup_barrier(mem_threadgroup)` between. On M1 that does not order the scratch: ~1% of scores (odd tile columns, the second element of each lane's pair) read a stale value, so the indexer's block picks moved between runs. The test blamed FMA contraction.
 Fix: both barriers in that loop are `threadgroup_barrier` (the loop is uniform across the threadgroup).
 Guard: the same test, red on M1 without the fix.
+
+## Flint prefilled slower on wide chunks: an array-masked SDPA walks every key block (2026-10-21)
+
+Defect: Flint's prefill slowed as prompts grew past one chunk, and `--prefill-chunk 2048` beat the machine's 8192.
+Cause: its 35 sliding layers (window 513) ran MLX's fused SDPA with an `[chunk, chunk + 513]` array mask. The kernel computes every key block and masks after, so at a wide chunk a sliding layer pays the whole chunk instead of its band. `msv_attn_p256` skips out-of-band blocks, but only at hd 256; Flint is 128.
+Fix: `nax_attention`'s kernel takes q/k 128 as well as 192 (the `DK` template) and serves Flint's sliding prefill with its sinks. Its full layers keep MLX's causal kernel, which was faster there.
+Guards: `nax attention q/k 192 (MiMo) or 128 (Flint), v 128` (fp32 truth, incl. a 32/4-head window-513 case); `flint fixture` runs the arm against rec_mlx's model.

@@ -15,12 +15,20 @@ enum PromptRewriter {
         var firstFrame: Data? = nil
         /// What the model must do with the picture; said only when it is sent.
         var firstFrameRule = ""
+        /// Reference pictures (`<Picture 1>`, `<Picture 2>`, …), in order, after any first frame.
+        var references: [Data] = []
+        /// Everything a chat model that can see is shown, in order.
+        var images: [Data] { (firstFrame.map { [$0] } ?? []) + references }
         /// MOSS-Image: the canvas a layout draft in the reply compiles to (`finish`).
         var layoutCanvas: MossLayout.Canvas? = nil
 
-        /// The user message, with the picture's rule when the picture goes along.
+        /// The user message, with each picture's rule when the pictures go along.
         func user(seeingImage: Bool) -> String {
-            seeingImage && firstFrame != nil ? user + "\n\n" + firstFrameRule : user
+            guard seeingImage else { return user }
+            var out = user
+            if firstFrame != nil { out += "\n\n" + firstFrameRule }
+            if !references.isEmpty { out += "\n\n" + PromptRewriter.referencesRule(count: references.count, afterFirstFrame: firstFrame != nil) }
+            return out
         }
     }
 
@@ -32,6 +40,14 @@ enum PromptRewriter {
         and continue the action from there. Never contradict it: a prompt that describes a different look \
         makes the video cut away from the picture.
         """
+
+    /// A reference model follows its pictures, so a prompt that describes a subject differently
+    /// fights them.
+    static func referencesRule(count: Int, afterFirstFrame: Bool) -> String {
+        let names = count == 1 ? "is <Picture 1>" : "are <Picture 1> to <Picture \(count)>"
+        return "The attached reference pictures \(names), in the order attached" + (afterFirstFrame ? " after the first frame" : "")
+            + ". Describe each subject as its picture shows it (face, hair, clothing, setting) and never contradict a picture: the video follows the references."
+    }
 
     /// `denseText`: the model renders whole layouts of text (`rendersDenseText`),
     /// so a picture with text is written as Qwen's own prompt enhancer writes it.
@@ -102,7 +118,8 @@ enum PromptRewriter {
         """
     }
 
-    static func video(text: String, format: VideoPromptFormat, seconds: Int, firstFrame: Data? = nil) -> Request {
+    static func video(text: String, format: VideoPromptFormat, seconds: Int, firstFrame: Data? = nil,
+                      references: [Data] = []) -> Request {
         let labels = H3PromptExamples.sections(for: format)
         let shape = labels.isEmpty
             ? "Write ONE paragraph of 4-8 sentences like the examples: subject, action, camera movement, lighting, setting, sound. Keep spoken dialogue in double quotes."
@@ -112,6 +129,7 @@ enum PromptRewriter {
                         note: "The clip is \(seconds) seconds long. Describe only what happens in that time: no more action than fits.")
         r.firstFrame = firstFrame
         r.firstFrameRule = firstFrameRule
+        r.references = references
         return r
     }
 

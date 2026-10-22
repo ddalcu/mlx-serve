@@ -286,7 +286,7 @@
       <details id="video-advanced" bind:open={ws.d.advanced}>
         <summary>{t("Advanced options")}</summary>
         <div class="video-advanced">
-          {@render slider("steps", t("Steps"), 4, maxSteps(ws.model, d))}
+          {#if !p?.steps}{@render slider("steps", t("Steps"), 4, maxSteps(ws.model, d))}{/if}
           {#if stepsAdvice(ws.model, d)}<p class="field-note" id="video-steps-advice">{stepsAdvice(ws.model, d)}</p>{/if}
           {#if p?.audio}
             {@render slider("cfg", t("CFG scale"), 1, 10, 0.5, working || lockedAudio)}
@@ -316,7 +316,7 @@
             <p class="field-note">{t("Requires the Turbo adapter on the server hosting this model.")}</p>
           {/if}
           {#if p?.decoder}{@render toggle("decoder", t("Diffusion decoder (sharper, slower)"))}{/if}
-          {#if p?.h3}{@render toggle("best", t("Max quality (slower)"))}{/if}
+          {#if p?.fast}{@render toggle("best", t("Max quality (slower)"))}{/if}
           {@render toggle("preview", t("Show live preview while generating (~1% slower)"))}
         </div>
       </details>

@@ -775,6 +775,9 @@ including on an empty list whose own cap has room.
 
 
 
+## H3's two fast levers compounded into stale attention and garbled speech
+The fast recipe pairs a step cache (reuse the last velocity when the step barely moves) with attention broadcast (recompute attention every k-th step, reuse it between). The broadcast schedule went by step index, so when the cache skipped the steps that would have recomputed, the next real forward reused attention from three steps back and the cache then reused that forward's velocity for two more: attention fresh about every sixth step. Each lever alone kept a spoken line intact; together a 10 s REF2VA clip said "deepseek ddeepiki emeng minimax". Fix: a forward right after a cached step always recomputes (`attnBroadcastRefresh(…, after_skip)`); the broadcast now engages 2-3 times instead of 7, about 8% slower. Guard: `a forward after a step-cache skip recomputes attention`; the bar was word errors of the spoken line over six seeds against the full render.
+
 ## `chat_template` has two legal shapes, and reading the wrong one is a PANIC (2026-08-07)
 
 Found during 26.8.3 pre-release validation, on a family nobody had exercised
@@ -2034,6 +2037,10 @@ Guard: `parseConfigFromJson rejects invalid field types and ranges`, `preserves 
 ## The plain Llama-3 pre-tokenizer was served with Muse's cased grammar
 
 Defect: GLM-5.3, Llama-3.2, LFM2.5 and K2 split camelCase (`UserDefaults` -> `User`+`Defaults`, `.indexOf` -> `.index`+`Of`) and `//!\n`, +0.3% tokens on code, every agent prompt off-distribution; LFM2.5 also split vocab words its merges never build (`_tokens`). Cause: the style detector keyed on the contraction group + `\p{N}{1,3}`, which the plain regex shares with Muse's cased one, and BPE `ignore_merges` was never read; `isDigit` was ASCII-only, so `4²` split. Fix: the cased grammar needs `\p{Lu}` in the regex (the plain one is `.gpt2` with 3-digit groups), `ignore_merges` emits a whole vocab word, `\p{N}` is a generated table. Guard: `tests/test_tokenizer_hf_parity.sh` (zero diff vs HF on code, per family).
+
+## Flint's cased pre-tokenizer was served as the gpt2 grammar (2026-10-21)
+
+Defect: tokens differed from HF on code (`Python's` split into `Python`+`'s`, `can't` into `can`+`'t`). Cause: the cased-grammar detector also required a `\p{N}{1,3}` branch in the same regex; Flint isolates digits (and CJK) in Split entries of their own, as DeepSeek does, so it fell to `.gpt2`, and the isolated runs only ever fed the gpt2 grammar. Flint's regex also differs from Muse's in its punctuation branch: `[\p{P}\p{S}]+[\r\n]*` keeps `/` out of the newline tail and leaves a format character (U+200B) unmatched, which HF keeps whole. Fix: the cased signature is `\p{Lu}` + attached contractions; `.cased` is Flint's punctuation branch; isolated runs feed either grammar. Guard: the Flint pre-tokenizer test in `tokenizer.zig` (HF's own pieces) and `tests/test_tokenizer_hf_parity.sh` (Flint now a default pack).
 
 ## Hunyuan3D paint unwrapped the raw marching-cubes mesh (2026-10-03)
 

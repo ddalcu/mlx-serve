@@ -36,6 +36,7 @@ const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const minimax_h3 = @import("minimax_h3.zig");
+const h3_vsa = @import("h3_vsa.zig");
 const ane = @import("ane.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
@@ -1502,33 +1503,31 @@ pub const VideoEngine = struct {
     }
 };
 
-/// `h3ConfigDeclaresRef2va` over a model dir's own `config.json`.
-fn h3DirDeclaresRef2va(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
-    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+/// A model dir's own `config.json` (caller owns), or null when unreadable.
+fn h3ReadConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return null;
     defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer file.close(io);
     var rb: [4096]u8 = undefined;
     var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    return h3ConfigDeclaresRef2va(allocator, content);
+    return rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch null;
 }
 
-/// True when a MiniMax-H3 `config.json` declares the `ref2va` task. The two
-/// partitions share the text encoder, both VAEs and every geometry number, so
-/// nothing about the files themselves tells them apart — only the converter's
-/// declared task list does, and an FL2VA pack handed references would generate
-/// while silently ignoring them.
-fn h3ConfigDeclaresRef2va(allocator: std.mem.Allocator, config_json: []const u8) bool {
+/// True when a MiniMax-H3 `config.json` declares `task`. The two partitions
+/// share the text encoder, both VAEs and every geometry number, so nothing
+/// about the files themselves tells them apart — only the converter's declared
+/// task list does, and an FL2VA pack handed references would generate while
+/// silently ignoring them.
+fn h3ConfigDeclaresTask(allocator: std.mem.Allocator, config_json: []const u8, task: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const tasks = parsed.value.object.get("tasks") orelse return false;
     if (tasks != .array) return false;
     for (tasks.array.items) |t| {
-        if (t == .string and std.mem.eql(u8, t.string, "ref2va")) return true;
+        if (t == .string and std.mem.eql(u8, t.string, task)) return true;
     }
     return false;
 }
@@ -1542,17 +1541,32 @@ pub const H3VideoEngine = struct {
     /// Whether this pack is the REF2VA partition (read from its config's task
     /// list at load — the file layout is identical either way).
     supports_refs: bool = false,
+    /// A pack declaring ref2va without t2va (FastH3 Omni) needs an image or a
+    /// video reference on every request.
+    supports_t2va: bool = false,
+    /// A FastH3 PDD student's sampling contract.
+    pdd: ?minimax_h3.Pdd = null,
+    /// Its trained sparse attention.
+    vsa: ?h3_vsa.Contract = null,
 
     /// The text encoder and DiT kept loaded between requests while memory allows.
     resident: minimax_h3.Resident,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
+        const config = h3ReadConfig(io, allocator, model_dir);
+        defer if (config) |c| allocator.free(c);
+        const c = config orelse "{}";
+        const pdd = try minimax_h3.Pdd.fromConfig(allocator, c);
+        const vsa = try h3_vsa.Contract.fromConfig(allocator, c);
         const self = try allocator.create(H3VideoEngine);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .model_dir = try allocator.dupe(u8, model_dir),
-            .supports_refs = h3DirDeclaresRef2va(io, allocator, model_dir),
+            .supports_refs = h3ConfigDeclaresTask(allocator, c, "ref2va"),
+            .supports_t2va = h3ConfigDeclaresTask(allocator, c, "t2va"),
+            .pdd = pdd,
+            .vsa = vsa,
             .resident = minimax_h3.Resident.init(allocator),
         };
         minimax_h3.registerResident(&self.resident);
@@ -3948,12 +3962,18 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // from ckpt500, which needed the extra steps to firm up. 30 stays the
     // non-turbo default.
     const turbo = sse.bodyWantsTrue(body, "turbo");
+    const pdd_steps: ?u32 = if (engine.pdd) |p| p.steps() else null;
+    if (turbo and pdd_steps != null)
+        return sendError(conn, 400, "'turbo' is the base model's few-step adapter — this pack is already a distilled student and runs its own trained steps");
     if (turbo and !engine.hasTurboLora(io, allocator))
         return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
     const width: u32 = extractJsonU32(body, "width") orelse 256;
     const height: u32 = extractJsonU32(body, "height") orelse 256;
-    const steps = stepsRequest(extractJsonInt(body, "steps"), if (turbo) 4 else 30, 1, 100) catch
+    const steps = if (pdd_steps) |n| stepsRequest(extractJsonInt(body, "steps"), n, n, n) catch {
+        var buf: [128]u8 = undefined;
+        return sendError(conn, 400, std.fmt.bufPrint(&buf, "this pack is a distilled student that runs exactly {d} steps — omit 'steps' or send {d}", .{ n, n }) catch "this pack runs a fixed step count — omit 'steps'");
+    } else stepsRequest(extractJsonInt(body, "steps"), if (turbo) 4 else 30, 1, 100) catch
         return sendError(conn, 400, "'steps' must be in [1,100]");
     const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
     const requested_frames: u32 = extractJsonU32(body, "num_frames") orelse 56;
@@ -4064,6 +4084,12 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             });
         }
     }
+    if (engine.supports_refs and !engine.supports_t2va) {
+        const visual = for (refs.items) |m| {
+            if (m.ref.kind != .audio) break true;
+        } else false;
+        if (!visual) return sendError(conn, 400, "this pack generates from references — attach at least one image or video ('ref_images' / 'ref_videos')");
+    }
 
     // Generations here run for MINUTES, so a silent socket is indistinguishable
     // from a wedged server; the client drives its meter off these events. The
@@ -4076,7 +4102,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // The load gate bills the model, not the request: the request's own activations price the
     // resident plan, and when that does not fit, the staged DiT stage is checked here, before
     // any stage loads, since the Metal OOM mid-step is uncatchable.
-    const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo, minimax_h3.envStr("MINIMAX_H3_STEP_CACHE"), minimax_h3.envStr("MINIMAX_H3_ATTN_BCAST"));
+    const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo or pdd_steps != null, minimax_h3.envStr("MINIMAX_H3_STEP_CACHE"), minimax_h3.envStr("MINIMAX_H3_ATTN_BCAST"));
     const cfg = minimax_h3.Config{};
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, cfg.num_layers) * cfg.hidden_size * 2 else 0;
     const rows = h3RequestRows(width, height, shape.frame_count, @intCast(n_kf));
@@ -4131,6 +4157,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .seed = seed,
         .speed = speed,
         .turbo = turbo,
+        .pdd = engine.pdd,
+        .vsa = engine.vsa,
         .lora_paths = lora_paths[0..lora_n],
         .lora_scales = lora_scales[0..lora_n],
         .chain_windows = chain_windows,
@@ -5558,6 +5586,10 @@ test "stepsRequest: omitted takes the default, the range is checked before the c
     try std.testing.expectError(error.StepsOutOfRange, stepsRequest(0, 30, 1, 100));
     try std.testing.expectError(error.StepsOutOfRange, stepsRequest(101, 30, 1, 100));
     try std.testing.expectError(error.StepsOutOfRange, stepsRequest(5_000_000_000, 30, 1, 100));
+    // A PDD student's range is its trained count alone.
+    try std.testing.expectEqual(@as(u32, 8), try stepsRequest(null, 8, 8, 8));
+    try std.testing.expectEqual(@as(u32, 8), try stepsRequest(8, 8, 8, 8));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(4, 8, 8, 8));
 }
 
 /// `key` is in the body with a value other than `null` (clients send null for an unset field).
@@ -7185,22 +7217,25 @@ test "reference audio arrives as 32 kHz stereo in the encoder's planar shape" {
     try testing.expectApproxEqAbs(pcm[200], pcm[201], 1e-6);
 }
 
-test "h3ConfigDeclaresRef2va reads the pack's own task list" {
+test "h3ConfigDeclaresTask reads the pack's own task list" {
     const a = testing.allocator;
     // The converter writes the partition's task list; ref2va and fl2va share
     // every geometry number, so the DiT file is the ONLY thing that differs and
     // this is the only way to tell an FL2VA pack from a REF2VA one.
-    try testing.expect(h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"ref2va\"]}"));
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+    try testing.expect(h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"ref2va\"]}", "ref2va"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}", "ref2va"));
+    // FastH3 Omni generates from references only: no t2va.
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"ref2va\"]}", "t2va"));
+    try testing.expect(h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}", "t2va"));
     // Absent / malformed / wrong-typed → NOT ref2va. A pack that cannot say it
     // supports references must not be handed them: it would generate happily
     // and ignore every one of them.
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\"}"));
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"tasks\":\"ref2va\"}"));
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "not json"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\"}", "ref2va"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"tasks\":\"ref2va\"}", "ref2va"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "not json", "ref2va"));
     // A substring match on the whole file would pass on the README-ish text a
     // config can legally carry; only the task LIST counts.
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}", "ref2va"));
 }
 
 test "iterJsonObjectArray walks ref_videos entries" {

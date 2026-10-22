@@ -156,6 +156,7 @@ test {
     _ = @import("ltx_diffvae_forward.zig");
     _ = @import("ltx_audio.zig");
     _ = @import("minimax_h3.zig");
+    _ = @import("h3_vsa.zig");
     _ = @import("h3_split.zig");
     _ = @import("distributed.zig");
     _ = @import("minimax_h3_vision.zig");
