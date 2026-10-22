@@ -1403,6 +1403,8 @@ pub const ModelConfig = struct {
         // GLM-5-Next: a batched tick's tokens ride as rows of one window; each slot's KDA state and
         // DSA cache are advanced by its own call (`Transformer.forwardGlmBatchedDecode`).
         if (self.isGlm5()) return true;
+        // Flint: MiMo's shape (sinks, sliding + full attention, row-generic MoE), per-slot views in `lagunaAttnWith`.
+        if (std.mem.eql(u8, self.model_type, "flint")) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
@@ -3997,6 +3999,30 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (config.has_explicit_layer_types) {
             for (0..@min(config.num_hidden_layers, 128)) |i| config.layer_no_rope[i] = config.layer_is_global[i];
         }
+    } else if (std.mem.eql(u8, model_type, "flint")) {
+        // Recursive Flint: the laguna attention arm without the output gate, plus learned
+        // per-head sinks (`self_attn.softmax_offset`); laguna's MoE (sigmoid top-k, renormed,
+        // ungated shared expert, dense `mlp_only_layers`). Reference: recursive-oss/rec rec_mlx/model.py.
+        config.model_type = "flint";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_attn_sinks = true;
+        config.moe_sigmoid_router = true;
+        config.moe_route_norm = true;
+        config.router_scaling_factor = 1.0;
+        config.rope_scaling_factor = 1.0;
+        config.query_pre_attn_scalar = config.head_dim;
+        config.rope_local_base_freq = config.rope_theta;
+        if (jsonField(cfg_obj, "no_rope_layer_indices")) |v| {
+            if (v == .array) for (v.array.items) |item| {
+                const i = try jsonU32(item);
+                if (i < 128) config.layer_no_rope[i] = true;
+            };
+        }
     } else if (std.mem.eql(u8, model_type, "inkling_mm_model")) {
         // Thinking Machines Inkling Small (276B-A12B MoE, natively multimodal;
         // REAP builds prune n_routed_experts). NO RoPE anywhere: position =
@@ -5351,9 +5377,33 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         return error.NoWeightFiles;
     }
 
+    try viewByteAffineWeights(&weights, s);
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
     if (!opts.defer_qwen4_norms) reportF16Narrowing();
     return weights;
+}
+
+/// An affine weight (`.scales` AND `.biases` beside it) stored as uint8 is MLX's packed
+/// uint32 words written byte-wise (Recursive's Flint export); MLX's quantized kernels read
+/// uint32 only. NVFP4/MXFP8/FP8 bytes carry no `.biases` and keep their dtype.
+fn viewByteAffineWeights(weights: *Weights, s: mlx.mlx_stream) !void {
+    var buf: [512]u8 = undefined;
+    var it = weights.map.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        if (!std.mem.endsWith(u8, key, ".weight") or mlx.mlx_array_dtype(e.value_ptr.*) != .uint8) continue;
+        const shape = mlx.getShape(e.value_ptr.*);
+        if (shape.len == 0 or @rem(shape[shape.len - 1], 4) != 0) continue;
+        const base = key[0 .. key.len - ".weight".len];
+        const scales = std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch continue;
+        if (weights.map.get(scales) == null) continue;
+        const biases = std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch continue;
+        if (weights.map.get(biases) == null) continue;
+        var words = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_view(&words, e.value_ptr.*, .uint32, s));
+        _ = mlx.mlx_array_free(e.value_ptr.*);
+        e.value_ptr.* = words;
+    }
 }
 
 /// Whether a just-loaded f16 tensor must be narrowed to the engine's bf16
@@ -6000,6 +6050,54 @@ test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-pa
     // quant side tensors force the mixed-dtype qmm path).
     try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.up_proj.weight").?));
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.down_proj.scales").?));
+}
+
+test "loadWeights reads an affine weight packed as uint8 (Flint's export) as MLX's uint32 words" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        var bytes: [16]u8 = undefined;
+        for (&bytes, 0..) |*b, i| b.* = @intCast(i);
+        const packed_u8 = mlx.mlx_array_new_data(&bytes, &[_]c_int{ 2, 8 }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(packed_u8);
+        const side_data: [2]f32 = .{ 1, 2 };
+        const side_f32 = mlx.mlx_array_new_data(&side_data, &[_]c_int{ 2, 1 }, 2, .float32);
+        defer _ = mlx.mlx_array_free(side_f32);
+        var side = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(side);
+        try mlx.check(mlx.mlx_astype(&side, side_f32, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(side));
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.self_attn.q_proj.weight", packed_u8);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.self_attn.q_proj.scales", side);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.self_attn.q_proj.biases", side);
+        // No biases: a byte format of its own (NVFP4, FP8), never reinterpreted.
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.up_proj.weight", packed_u8);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.up_proj.scales", side);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+    var weights = try loadWeights(io, allocator, dir_path);
+    defer weights.deinit();
+
+    const w = weights.get("model.layers.0.self_attn.q_proj.weight").?;
+    try mlx.check(mlx.mlx_array_eval(w));
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(w));
+    try testing.expectEqualSlices(c_int, &.{ 2, 2 }, mlx.getShape(w));
+    const words = mlx.mlx_array_data_uint32(w).?[0..4];
+    try testing.expectEqual(@as(u32, 0x03020100), words[0]);
+    try testing.expectEqual(@as(u32, 0x0f0e0d0c), words[3]);
+    try testing.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.up_proj.weight").?));
 }
 
 test "loadWeights on a weightless dir (incomplete download) errors clearly, not empty map" {
@@ -6794,6 +6892,53 @@ test "ModelConfig parses kolibri1: logit-bias routing, NoPE on full layers, sand
     try testing.expect(config.isGlobalLayer(3) and !config.isGlobalLayer(0));
     try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 1e-3);
     try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
+}
+
+test "ModelConfig parses flint: sinks, NoPE from no_rope_layer_indices, sigmoid MoE with renorm" {
+    // Trimmed copy of RecursiveSI/flint-int4's config.json: 6 layers keep both dense layers and the full/sliding mix.
+    const json =
+        \\{
+        \\  "model_type": "flint",
+        \\  "hidden_size": 2048,
+        \\  "intermediate_size": 6144,
+        \\  "moe_intermediate_size": 512,
+        \\  "shared_expert_intermediate_size": 1024,
+        \\  "num_hidden_layers": 6,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 4,
+        \\  "head_dim": 128,
+        \\  "num_experts": 256,
+        \\  "num_experts_per_tok": 6,
+        \\  "norm_topk_prob": true,
+        \\  "vocab_size": 150144,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "rope_theta": 10000.0,
+        \\  "sliding_window": 513,
+        \\  "use_sliding_window": true,
+        \\  "layer_types": ["full_attention", "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\  "no_rope_layer_indices": [0, 1, 5],
+        \\  "mlp_only_layers": [0, 1],
+        \\  "router_score_function": "sigmoid",
+        \\  "softmax_type": "learnable",
+        \\  "eos_token_id": [150001, 150003, 150005, 150018],
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"group_size": 64, "bits": 4}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("flint", config.model_type);
+    try testing.expect(config.has_attn_sinks and config.has_qk_norm and !config.laguna_attn_gate);
+    try testing.expect(config.moe_sigmoid_router and !config.moe_logit_select and config.moe_route_norm);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.router_scaling_factor, 1e-6);
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expectEqual(@as(u32, 1024), config.shared_expert_intermediate_size);
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 513), config.sliding_window);
+    try testing.expect(config.isGlobalLayer(0) and !config.isGlobalLayer(2) and config.isGlobalLayer(5));
+    try testing.expect(config.layerSkipsRope(0) and config.layerSkipsRope(5) and !config.layerSkipsRope(2));
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 1e-3);
+    try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
+    try testing.expectEqual(@as(u32, 4), config.num_eos_tokens);
 }
 
 test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softplus gate, YaRN, sigmoid MoE" {

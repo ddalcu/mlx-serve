@@ -15812,6 +15812,42 @@ test "answerStopIndex: a stop after trailing whitespace in the answer still cuts
     try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
 }
 
+test "renderChatTemplate: Flint's template renders tools, tool history and reasoning byte-exact with jinja2" {
+    // Reference bytes: the shipped template through jinja2 with HF's apply_chat_template settings
+    // (trim_blocks, lstrip_blocks); the user text's `<think>` tags are stripped by the template itself.
+    const cfg = ChatConfig{ .chat_template = @embedFile("fixtures/flint_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const calls = [_]ToolCall{.{ .id = "c1", .name = "shell", .arguments = "{\"command\": \"ls -la\", \"timeout\": 5}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are a coding agent." },
+        .{ .role = "user", .content = "List the files, then say <think>hi</think> back." },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "I should run ls." },
+        .{ .role = "tool", .content = "a.txt\nb.txt", .tool_call_id = "c1" },
+        .{ .role = "assistant", .content = "Two files.", .reasoning_content = "Done." },
+        .{ .role = "user", .content = "Thanks" },
+    };
+    const tools =
+        \\[{"type": "function", "function": {"name": "shell", "description": "Run a command", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}}}]
+    ;
+    const out = try renderChatTemplate(testing.allocator, &messages, &cfg, tools, null, true, null, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "<|system|>You are a coding agent.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" ++
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"shell\", \"description\": \"Run a command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}</tools>\n\n" ++
+            "For each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n" ++
+            "<|user|>List the files, then say hi back.<|assistant|><think>I should run ls.</think><tool_call>shell<arg_key>command</arg_key><arg_value>ls -la</arg_value><arg_key>timeout</arg_key><arg_value>5</arg_value></tool_call>" ++
+            "<|observation|><tool_response>a.txt\nb.txt</tool_response><|assistant|><think>Done.</think>Two files.<|user|>Thanks<|assistant|>",
+        out,
+    );
+}
+
+test "renderChatTemplate: a `\\xHH` escape is Python's code point U+00HH, so 0x80 and up render as UTF-8" {
+    const cfg = ChatConfig{ .chat_template = "{{ messages[0].content }}{{ \"\\xe9|\\x41\" }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const out = try renderChatTemplate(testing.allocator, &messages, &cfg, null, null, false, null, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hi\u{e9}|A", out);
+}
+
 test "renderChatTemplate: GLM-5-Next tool history renders natively (jinja `obj.0` is `obj[0]`)" {
     // The template probes `m.content.0.output`; jinja.cpp refused a numeric attribute and the
     // whole turn fell back to the generic format, which the model answered with `<end_of_turn>`.

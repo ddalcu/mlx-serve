@@ -1,4 +1,4 @@
-//! Tensor-unit (NAX) prefill attention at q/k 192, v 128 (MiMo-V2): MLX's own
+//! Tensor-unit (NAX) prefill attention at q/k 192 or 128, v 128 (MiMo-V2, Flint): MLX's own
 //! NAX flash-attention kernel with a separate value head dim, ported from oMLX
 //! (`omlx/utils/nax_attention.py`, kernels in `kernels/nax_attention.metal`).
 //! Causal, optionally banded to a sliding window, with learned sinks. Long key
@@ -19,7 +19,7 @@ const MAX_PASSES = 64;
 const SOURCE =
     \\  threadgroup float xchg[WN == 2 ? WM * 2 * 16 * 32 : 1];
     \\  omlx_nax::attention_nax_bdv<
-    \\      T, 16 * WM, 32, 192, 128, WM, WN,
+    \\      T, 16 * WM, 32, DK, 128, WM, WN,
     \\      ALIGN_Q, ALIGN_K, true, WINDOW, HAS_SINKS,
     \\      FIRST, LAST, float>(
     \\      q, k, v, out,
@@ -44,7 +44,7 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const header = @embedFile("kernels/nax_tiles.metal") ++ @embedFile("kernels/nax_attention.metal");
     // Q/K/V are read through their strides (cache views, transposed projections).
-    const k = mlx.mlx_fast_metal_kernel_new("msv_nax_attn_192_128", in_vec, out_vec, SOURCE, header, false, false);
+    const k = mlx.mlx_fast_metal_kernel_new("msv_nax_attn_dk_128", in_vec, out_vec, SOURCE, header, false, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     kernel = k;
     return k;
@@ -62,7 +62,7 @@ fn passEdges(out: *[MAX_PASSES + 1]c_int, groups: c_int, nk: c_int, window: c_in
 }
 
 /// Causal (bottom-right) attention, banded to the last `window` keys when > 0,
-/// for q [B, H, L, 192] over k [B, Hk, S, 192], v [B, Hk, S, 128] (any strides
+/// for q [B, H, L, DK] over k [B, Hk, S, DK], v [B, Hk, S, 128] with DK 192 or 128 (any strides
 /// with a contiguous head dim), `sinks` [H] or null: [B, H, L, 128] in q's dtype.
 /// Null off NAX and outside this shape.
 pub fn attention(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int, sinks: ?mlx.mlx_array) !?mlx.mlx_array {
@@ -71,7 +71,7 @@ pub fn attention(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.m
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     const vs = mlx.getShape(v);
-    if (qs[3] != 192 or ks[3] != 192 or vs[3] != 128) return null;
+    if ((qs[3] != 192 and qs[3] != 128) or ks[3] != qs[3] or vs[3] != 128) return null;
     if (ks[0] != qs[0] or vs[0] != qs[0] or vs[1] != ks[1] or vs[2] != ks[2]) return null;
     if (ks[1] == 0 or @rem(qs[1], ks[1]) != 0 or qs[2] <= 8 or ks[2] < qs[2]) return null;
     const dt = mlx.mlx_array_dtype(q);
@@ -84,7 +84,7 @@ pub fn attention(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.m
     const out = try dispatch(s, q, k, v, scale, window, sinks, edges, if (edges.len > 2) 2 else 1);
     if (!engaged) {
         engaged = true;
-        @import("log.zig").info("[attn] NAX 192/128 prefill attention engaged (window={d}, passes={d})\n", .{ window, edges.len - 1 });
+        @import("log.zig").info("[attn] NAX {d}/128 prefill attention engaged (window={d}, passes={d})\n", .{ qs[3], window, edges.len - 1 });
     }
     return out;
 }
@@ -125,7 +125,7 @@ fn dispatch(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_ar
         const first = i == 0;
         const last = i == edges.len - 2;
         // omlx_nax::AttnParams: B H D qL kL gqa scale NQ NK NQ_aligned NK_aligned qL_rem kL_rem qL_off kb_begin kb_end.
-        const pdata = [16]i32{ b, h, 192, ql, kl, @divExact(h, ks[1]), @bitCast(scale), nq, nk, nq_aligned, nk_aligned, ql - nq_aligned * bq, kl - nk_aligned * BK, kl - ql, kb_begin, kb_end };
+        const pdata = [16]i32{ b, h, qs[3], ql, kl, @divExact(h, ks[1]), @bitCast(scale), nq, nk, nq_aligned, nk_aligned, ql - nq_aligned * bq, kl - nk_aligned * BK, kl - ql, kb_begin, kb_end };
         const params = mlx.mlx_array_new_data(&pdata, &[_]c_int{16}, 1, .int32);
         defer _ = mlx.mlx_array_free(params);
 
@@ -144,6 +144,7 @@ fn dispatch(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_ar
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "WM", wm));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "WN", wn));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "WINDOW", window));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "DK", qs[3]));
         for ([_]struct { [*:0]const u8, bool }{
             .{ "ALIGN_Q", @rem(ql, bq) == 0 }, .{ "ALIGN_K", @rem(kl, BK) == 0 }, .{ "HAS_SINKS", sinks != null },
             .{ "FIRST", first },               .{ "LAST", last },
@@ -371,7 +372,7 @@ fn truth(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, windo
     return out;
 }
 
-test "nax attention 192/128: causal, windowed and sunk prefill track fp32 attention" {
+test "nax attention q/k 192 (MiMo) or 128 (Flint), v 128: causal, windowed and sunk prefill track fp32 attention" {
     if (mlx.noGpuBackend() or !@import("transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(192128);
@@ -383,11 +384,12 @@ test "nax attention 192/128: causal, windowed and sunk prefill track fp32 attent
         .{ .h = 8, .hk = 2, .ql = 200, .kl = 333, .window = 128, .sinks = true },
         .{ .h = 4, .hk = 4, .ql = 64, .kl = 64, .window = 16, .sinks = false },
         .{ .h = 4, .hk = 4, .ql = 40, .kl = 40, .window = 8, .sinks = true },
+        .{ .h = 32, .hk = 4, .ql = 700, .kl = 1300, .window = 513, .sinks = true },
     };
-    for (cases) |cs| {
-        const q = try randBf16(rnd, &.{ 1, cs.h, cs.ql, 192 }, s);
+    for ([_]c_int{ 192, 128 }) |dk| for (cases) |cs| {
+        const q = try randBf16(rnd, &.{ 1, cs.h, cs.ql, dk }, s);
         defer _ = mlx.mlx_array_free(q);
-        const k = try randBf16(rnd, &.{ 1, cs.hk, cs.kl, 192 }, s);
+        const k = try randBf16(rnd, &.{ 1, cs.hk, cs.kl, dk }, s);
         defer _ = mlx.mlx_array_free(k);
         const v = try randBf16(rnd, &.{ 1, cs.hk, cs.kl, 128 }, s);
         defer _ = mlx.mlx_array_free(v);
@@ -395,7 +397,7 @@ test "nax attention 192/128: causal, windowed and sunk prefill track fp32 attent
         defer if (sk) |a| {
             _ = mlx.mlx_array_free(a);
         };
-        const scale: f32 = 1.0 / @sqrt(192.0);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dk)));
         const ours = (try attention(s, q, k, v, scale, cs.window, sk)) orelse return error.TestUnexpectedDecline;
         defer _ = mlx.mlx_array_free(ours);
         const ref = try truth(q, k, v, scale, cs.window, sk, s);
@@ -403,10 +405,10 @@ test "nax attention 192/128: causal, windowed and sunk prefill track fp32 attent
         // bf16 output of an fp32-accumulated kernel: a few bf16 ulps at |O| < 2.
         const err = try maxAbsDiff(ours, ref, s);
         if (err > 2e-2) {
-            std.debug.print("nax attention {any}: max |d| {d} vs fp32\n", .{ cs, err });
+            std.debug.print("nax attention dk={d} {any}: max |d| {d} vs fp32\n", .{ dk, cs, err });
             return error.TestExpectedEqual;
         }
-    }
+    };
 }
 
 test "nax attention 192/128: key-range passes reproduce one dispatch bit for bit" {

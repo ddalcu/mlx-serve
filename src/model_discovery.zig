@@ -53,6 +53,7 @@ const supported_model_types = [_][]const u8{
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
+    "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
@@ -2367,6 +2368,7 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("minicpmv4_7"));
     try testing.expect(isSupportedModelType("qwen3_asr"));
     try testing.expect(isSupportedModelType("kolibri1"));
+    try testing.expect(isSupportedModelType("flint"));
     try testing.expect(isSupportedModelType("lfm2_moe"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));

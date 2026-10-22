@@ -23,7 +23,8 @@ const DOT16 =
     \\}
 ;
 
-// grid (32, N/ROWS, TOPK), threadgroup (32, SGS, 1): one token, slot e = its e-th expert.
+// grid (32, N/ROWS, TOPK + SE), threadgroup (32, SGS, 1): one token, slot e = its e-th expert;
+// slots past TOPK are N-row slices of the ungated shared expert (`sg_*`/`su_*`, SE = its rows / N).
 // GS >= 16 and 16 | GS, so a lane's 16 values share one scale and bias.
 const GATEUP_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
@@ -31,9 +32,14 @@ const GATEUP_SOURCE =
     \\const uint e = thread_position_in_grid.z;
     \\constexpr int KW2 = K / 16;
     \\constexpr int KG = K / GS;
-    \\const size_t row = size_t(inds[e]) * N + row0;
-    \\const device uint2* gw = (const device uint2*)wg_q + row * KW2 + lane;
-    \\const device uint2* uw = (const device uint2*)wu_q + row * KW2 + lane;
+    \\const bool sh = int(e) >= TOPK;
+    \\const size_t row = sh ? size_t(int(e) - TOPK) * N + row0 : size_t(inds[e]) * N + row0;
+    \\const device uint2* gw = (const device uint2*)(sh ? sg_q : wg_q) + row * KW2 + lane;
+    \\const device uint2* uw = (const device uint2*)(sh ? su_q : wu_q) + row * KW2 + lane;
+    \\const device T* gsc = sh ? sg_scales : g_scales;
+    \\const device T* gbi = sh ? sg_biases : g_biases;
+    \\const device T* usc = sh ? su_scales : u_scales;
+    \\const device T* ubi = sh ? su_biases : u_biases;
     \\float ag[ROWS] = {0.0f};
     \\float au[ROWS] = {0.0f};
     \\for (int k = 0; k < K; k += 512) {
@@ -45,8 +51,8 @@ const GATEUP_SOURCE =
     \\    const int gi = kk / GS;
     \\    for (int r = 0; r < ROWS; ++r) {
     \\      const size_t sg = (row + r) * KG + gi;
-    \\      ag[r] += float(g_scales[sg]) * mlxserve_a4_dot16(gw[r * KW2 + k / 16], xr) + float(g_biases[sg]) * xs;
-    \\      au[r] += float(u_scales[sg]) * mlxserve_a4_dot16(uw[r * KW2 + k / 16], xr) + float(u_biases[sg]) * xs;
+    \\      ag[r] += float(gsc[sg]) * mlxserve_a4_dot16(gw[r * KW2 + k / 16], xr) + float(gbi[sg]) * xs;
+    \\      au[r] += float(usc[sg]) * mlxserve_a4_dot16(uw[r * KW2 + k / 16], xr) + float(ubi[sg]) * xs;
     \\    }
     \\  }
     \\}
@@ -62,7 +68,8 @@ const GATEUP_SOURCE =
 
 // grid (32, H/ROWS, 1), threadgroup (32, SGS, 1): every expert's down row, weighted by its
 // routing score, accumulated in the same registers. SHARED: the gated shared expert's output
-// (`sdown`, gate logit `glog`) is added in the epilogue.
+// (`sdown`, gate logit `glog`) is added in the epilogue. SI > 0: the ungated shared expert's
+// down row (`sd_*`, SI inputs after the routed activations) joins the sum at weight 1.
 const DOWNRED_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const int row0 = int(thread_position_in_grid.y) * ROWS;
@@ -83,6 +90,24 @@ const DOWNRED_SOURCE =
     \\      for (int r = 0; r < ROWS; ++r) {
     \\        const size_t sg = (row + r) * KG + gi;
     \\        acc[r] += sc * (float(d_scales[sg]) * mlxserve_a4_dot16(dw[r * KW2 + k / 16], xr) + float(d_biases[sg]) * xs);
+    \\      }
+    \\    }
+    \\  }
+    \\}
+    \\if (SI > 0) {
+    \\  constexpr int SW2 = SI / 16;
+    \\  constexpr int SG = SI / GS;
+    \\  const device uint2* sw = (const device uint2*)sd_q + size_t(row0) * SW2 + lane;
+    \\  for (int k = 0; k < SI; k += 512) {
+    \\    const int kk = k + int(lane) * 16;
+    \\    if (kk < SI) {
+    \\      float xr[16];
+    \\      float xs = 0.0f;
+    \\      for (int i = 0; i < 16; ++i) { xr[i] = float(act[size_t(TOPK) * I + kk + i]); xs += xr[i]; }
+    \\      const int gi = kk / GS;
+    \\      for (int r = 0; r < ROWS; ++r) {
+    \\        const size_t sg = size_t(row0 + r) * SG + gi;
+    \\        acc[r] += float(sd_scales[sg]) * mlxserve_a4_dot16(sw[r * SW2 + k / 16], xr) + float(sd_biases[sg]) * xs;
     \\      }
     \\    }
     \\  }
@@ -196,11 +221,15 @@ pub fn bindViews(gate: Bank, up: Bank, down: Bank, owned: *std.ArrayList(mlx.mlx
 /// kernel adds `sigmoid(logit) * down` to the routed sum.
 pub const Shared = struct { down: mlx.mlx_array, logit: mlx.mlx_array };
 
+/// An UNGATED shared expert (Flint): 2-D affine-4 weights at the routed banks' group size, run
+/// as extra gate+up slices and joined to the down sum at weight 1. Its rows are a multiple of N.
+pub const Ungated = struct { gate: Bank, up: Bank, down: Bank };
+
 /// y [hidden] = sum_k scores[k] * down_k(silu(gate_k(x)) * up_k(x)) for ONE token. `x` [hidden]
 /// bf16/f16, banks [E, out, in/8] u32 with scales and biases [E, out, in/GS] in x's dtype,
 /// `inds` [TOPK] u32, `scores` [TOPK] in x's dtype, `sigtab` the SwiGLU table. Null outside
 /// the kernels' set (caller keeps its path). `views` (of the same banks) are what the kernels bind.
-pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, views: ?Views, shared: ?Shared, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, group_size: u32) !?mlx.mlx_array {
+pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, views: ?Views, shared: ?Shared, ungated: ?Ungated, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, group_size: u32) !?mlx.mlx_array {
     if (!enabled() or !mlx.streamIsGpu(s)) return null;
     if (group_size < 16 or group_size % 16 != 0) return null;
     const dt = mlx.mlx_array_dtype(x);
@@ -227,24 +256,41 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
         if (mlx.mlx_array_dtype(sh.down) != dt or mlx.mlx_array_dtype(sh.logit) != dt or mlx.mlx_array_size(sh.logit) != 1) return null;
         if (mlx.mlx_array_size(sh.down) != @as(usize, @intCast(hidden))) return null;
     }
+    var si: c_int = 0;
+    if (ungated) |u| {
+        if (shared != null) return null;
+        inline for (.{ u.gate, u.up, u.down }) |bk| {
+            if (bk.s.ctx == null or bk.b.ctx == null or mlx.mlx_array_dtype(bk.s) != dt or mlx.mlx_array_dtype(bk.b) != dt or mlx.mlx_array_dtype(bk.w) != .uint32) return null;
+        }
+        const ush = mlx.getShape(u.gate.w);
+        const udsh = mlx.getShape(u.down.w);
+        if (ush.len != 2 or udsh.len != 2 or !std.mem.eql(c_int, ush, mlx.getShape(u.up.w))) return null;
+        si = ush[0];
+        if (ush[1] * 8 != hidden or udsh[0] != hidden or udsh[1] * 8 != si) return null;
+        if (@rem(si, inter) != 0 or @rem(si, gs) != 0) return null;
+        // One group size for the whole layer: the scales' width says it.
+        if (mlx.getShape(u.gate.s)[1] * gs != hidden or mlx.getShape(u.down.s)[1] * gs != si) return null;
+    }
 
     if (gateup_kernel == null) {
-        const ins = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab" };
+        const ins = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "sg_q", "sg_scales", "sg_biases", "su_q", "su_scales", "su_biases" };
         gateup_kernel = try makeKernel("mlxserve_moe_a4_gateup", &ins, GATEUP_SOURCE);
     }
     if (downred_kernel == null) {
-        const ins = [_][*:0]const u8{ "act", "wd_q", "d_scales", "d_biases", "inds", "scores", "sdown", "glog" };
+        const ins = [_][*:0]const u8{ "act", "wd_q", "d_scales", "d_biases", "inds", "scores", "sdown", "glog", "sd_q", "sd_scales", "sd_biases" };
         downred_kernel = try makeKernel("mlxserve_moe_a4_downred", &ins, DOWNRED_SOURCE);
     }
     const bound = views orelse Views{ .gate = gate, .up = up, .down = down };
-    const act = try apply(gateup_kernel.?, &.{ x, bound.gate.w, bound.gate.s, bound.gate.b, bound.up.w, bound.up.s, bound.up.b, inds, sigtab }, &.{ topk, inter }, dt, .{ 32, @divExact(inter, ROWS), topk }, &.{ .{ "K", hidden }, .{ "N", inter }, .{ "GS", gs } }, s);
+    // Without a shared expert its operands are never read; any array of the right type binds.
+    const ug = ungated orelse Ungated{ .gate = bound.gate, .up = bound.up, .down = bound.down };
+    const se = @divExact(si, inter);
+    const act = try apply(gateup_kernel.?, &.{ x, bound.gate.w, bound.gate.s, bound.gate.b, bound.up.w, bound.up.s, bound.up.b, inds, sigtab, ug.gate.w, ug.gate.s, ug.gate.b, ug.up.w, ug.up.s, ug.up.b }, &.{ topk + se, inter }, dt, .{ 32, @divExact(inter, ROWS), topk + se }, &.{ .{ "K", hidden }, .{ "N", inter }, .{ "GS", gs }, .{ "TOPK", topk } }, s);
     defer _ = mlx.mlx_array_free(act);
-    // Without a shared expert the two operands are never read; any array of the right type binds.
     const sh = shared orelse Shared{ .down = scores, .logit = scores };
-    const y = try apply(downred_kernel.?, &.{ act, bound.down.w, bound.down.s, bound.down.b, inds, scores, sh.down, sh.logit }, &.{hidden}, dt, .{ 32, @divExact(hidden, ROWS), 1 }, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "SHARED", @intFromBool(shared != null) } }, s);
+    const y = try apply(downred_kernel.?, &.{ act, bound.down.w, bound.down.s, bound.down.b, inds, scores, sh.down, sh.logit, ug.down.w, ug.down.s, ug.down.b }, &.{hidden}, dt, .{ 32, @divExact(hidden, ROWS), 1 }, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "SHARED", @intFromBool(shared != null) }, .{ "SI", si } }, s);
     if (!engaged) {
         engaged = true;
-        log.info("[moe] affine-4 decode kernels engaged: topk={d} inter={d} hidden={d} gs={d} (MLX_SERVE_MOE_AFFINE4=0 restores the per-slot gather kernels)\n", .{ topk, inter, hidden, gs });
+        log.info("[moe] affine-4 decode kernels engaged: topk={d} inter={d} hidden={d} gs={d} ungated_shared={d} (MLX_SERVE_MOE_AFFINE4=0 restores the per-slot gather kernels)\n", .{ topk, inter, hidden, gs, si });
     }
     return y;
 }
@@ -344,7 +390,7 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
     try mlx.check(mlx.mlx_astype(&scores, sc32, .bfloat16, s));
     const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
 
-    const ours = (try decode(s, x, g.b, u.b, d.b, null, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    const ours = (try decode(s, x, g.b, u.b, d.b, null, null, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(ours);
     // The shipped per-slot kernels on the same inputs.
     const act = (try xfm.gatherQmvGateUp(s, x, g.b.w, g.b.s, g.b.b, u.b.w, u.b.s, u.b.b, inds, 4, 64, .affine, 0)) orelse return error.GatherDeclined;
@@ -406,7 +452,7 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
     defer _ = mlx.mlx_array_free(sd);
     const logit = try randBf16(rnd, &.{1}, 4.0, s);
     defer _ = mlx.mlx_array_free(logit);
-    const joined = (try decode(s, x, g.b, u.b, d.b, null, .{ .down = sd, .logit = logit }, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    const joined = (try decode(s, x, g.b, u.b, d.b, null, .{ .down = sd, .logit = logit }, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(joined);
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
@@ -439,9 +485,139 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
             try testing.expectEqual(@intFromPtr(mlx.mlx_array_data_uint32(bank)), @intFromPtr(mlx.mlx_array_data_uint32(v)));
         }
     }
-    const viewed = (try decode(s, x, g.b, u.b, d.b, views, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    const viewed = (try decode(s, x, g.b, u.b, d.b, views, null, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(viewed);
     const hv = try readF32(viewed, s);
     defer testing.allocator.free(hv);
     try testing.expectEqualSlices(f32, ho, hv);
+}
+
+test "moe affine-4 decode: an ungated shared expert folded into both kernels is no worse than the separate chain against the f32 truth (Flint, Kolibri-1, Hunyuan 3 geometries)" {
+    override = true;
+    defer override = null;
+    try ungatedFoldCase(2048, 512, 1024, 6);
+    try ungatedFoldCase(2560, 512, 512, 6);
+    try ungatedFoldCase(4096, 1536, 1536, 8);
+}
+
+fn ungatedFoldCase(comptime H: c_int, comptime I: c_int, comptime SI: c_int, comptime TOPK: c_int) !void {
+    const s = mlx.gpuStream();
+    const xfm = @import("transformer.zig");
+    var prng = std.Random.DefaultPrng.init(0xF117 + @as(u64, @intCast(H)));
+    const rnd = prng.random();
+    const E: c_int = TOPK + 2;
+    const Q = struct { b: Bank, deq: mlx.mlx_array };
+    var banks: [3]Q = undefined;
+    var shared: [3]Q = undefined;
+    for (&banks, [_][3]c_int{ .{ E, I, H }, .{ E, I, H }, .{ E, H, I } }) |*bk, sh| {
+        const w = try randBf16(rnd, &sh, 0.05, s);
+        defer _ = mlx.mlx_array_free(w);
+        const q = try quant(w, s);
+        bk.* = .{ .b = q.b, .deq = q.deq };
+    }
+    for (&shared, [_][2]c_int{ .{ SI, H }, .{ SI, H }, .{ H, SI } }) |*bk, sh| {
+        const w = try randBf16(rnd, &sh, 0.05, s);
+        defer _ = mlx.mlx_array_free(w);
+        const q = try quant(w, s);
+        bk.* = .{ .b = q.b, .deq = q.deq };
+    }
+    defer for (banks ++ shared) |bk| {
+        freeBank(bk.b);
+        _ = mlx.mlx_array_free(bk.deq);
+    };
+    const x = try randBf16(rnd, &.{H}, 1.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    // The top-k experts, out of order, and scores summing to 1.
+    var idx: [TOPK]u32 = undefined;
+    var scf: [TOPK]f32 = undefined;
+    for (&idx, &scf, 0..) |*e, *w, i| {
+        e.* = @intCast((i * 3 + 1) % @as(usize, @intCast(E)));
+        w.* = @as(f32, @floatFromInt(TOPK - i)) / @as(f32, @floatFromInt(TOPK * (TOPK + 1) / 2));
+    }
+    const inds = mlx.mlx_array_new_data(&idx, &[_]c_int{TOPK}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(inds);
+    const sc32 = mlx.mlx_array_new_data(&scf, &[_]c_int{TOPK}, 1, .float32);
+    defer _ = mlx.mlx_array_free(sc32);
+    var scores = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores);
+    try mlx.check(mlx.mlx_astype(&scores, sc32, .bfloat16, s));
+    const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+
+    const folded = (try decode(s, x, banks[0].b, banks[1].b, banks[2].b, null, null, .{ .gate = shared[0].b, .up = shared[1].b, .down = shared[2].b }, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    defer _ = mlx.mlx_array_free(folded);
+    // Today's arm: the routed kernels, then the shared expert as MLX's quantized matmuls in bf16.
+    const routed = (try decode(s, x, banks[0].b, banks[1].b, banks[2].b, null, null, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    defer _ = mlx.mlx_array_free(routed);
+    var gu: [2]mlx.mlx_array = undefined;
+    for (&gu, shared[0..2]) |*o, bk| {
+        o.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(o, x, bk.b.w, bk.b.s, bk.b.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    }
+    defer for (gu) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, gu[0], s));
+    var silu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(silu);
+    try mlx.check(mlx.mlx_multiply(&silu, gu[0], sig, s));
+    var act = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(act);
+    try mlx.check(mlx.mlx_multiply(&act, silu, gu[1], s));
+    var sdown = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sdown);
+    try mlx.check(mlx.mlx_quantized_matmul(&sdown, act, shared[2].b.w, shared[2].b.s, shared[2].b.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    var chain = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chain);
+    try mlx.check(mlx.mlx_add(&chain, routed, sdown, s));
+
+    // f32 truth over the dequantized weights: routed experts weighted by score, plus the shared one.
+    const xh = try readF32(x, s);
+    defer testing.allocator.free(xh);
+    const truth = try testing.allocator.alloc(f64, @intCast(H));
+    defer testing.allocator.free(truth);
+    @memset(truth, 0);
+    const Mlp = struct {
+        fn add(out: []f64, xv: []const f32, g: []const f32, u: []const f32, d: []const f32, e: usize, n_in: usize, n_mid: usize, w: f64) !void {
+            const a = try testing.allocator.alloc(f64, n_mid);
+            defer testing.allocator.free(a);
+            for (0..n_mid) |n| {
+                var gs: f64 = 0;
+                var us: f64 = 0;
+                const base = (e * n_mid + n) * n_in;
+                for (0..n_in) |k| {
+                    gs += @as(f64, g[base + k]) * xv[k];
+                    us += @as(f64, u[base + k]) * xv[k];
+                }
+                a[n] = gs / (1.0 + @exp(-gs)) * us;
+            }
+            for (0..n_in) |h| {
+                var acc: f64 = 0;
+                for (0..n_mid) |n| acc += @as(f64, d[(e * n_in + h) * n_mid + n]) * a[n];
+                out[h] += w * acc;
+            }
+        }
+    };
+    var deq: [6][]f32 = undefined;
+    for (&deq, banks ++ shared) |*o, bk| o.* = try readF32(bk.deq, s);
+    defer for (deq) |d| testing.allocator.free(d);
+    for (idx, scf) |e, w| try Mlp.add(truth, xh, deq[0], deq[1], deq[2], e, @intCast(H), @intCast(I), w);
+    try Mlp.add(truth, xh, deq[3], deq[4], deq[5], 0, @intCast(H), @intCast(SI), 1.0);
+
+    const hf = try readF32(folded, s);
+    defer testing.allocator.free(hf);
+    const hc = try readF32(chain, s);
+    defer testing.allocator.free(hc);
+    var se_f: f64 = 0;
+    var se_c: f64 = 0;
+    for (hf, hc, truth) |f, c, t| {
+        try testing.expect(std.math.isFinite(f));
+        se_f += (f - t) * (f - t);
+        se_c += (c - t) * (c - t);
+    }
+    const rms_f = @sqrt(se_f / @as(f64, @floatFromInt(H)));
+    const rms_c = @sqrt(se_c / @as(f64, @floatFromInt(H)));
+    std.debug.print("\n[moe-a4 ungated shared] H={d} I={d} SI={d}: folded_rms={e:.4} chain_rms={e:.4}\n", .{ H, I, SI, rms_f, rms_c });
+    try testing.expect(rms_f <= rms_c * 1.15 + 1e-6);
 }

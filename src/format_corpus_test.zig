@@ -1251,6 +1251,48 @@ const corpus = [_]Expect{
         .raw = "17 x 24 = **408**.",
         .content_contains = "408",
     },
+    // ── Recursive Flint ─────────────────────────────────────────────────
+    // GLM's bare-opener pairs with NO newlines, straight after the preamble. The
+    // model opens its own `<think>`; its thinking is buffered apart, so these are
+    // the answer side as captured live (RecursiveSI/flint-int4, temp 0).
+    .{
+        .family = "flint",
+        .name = "preamble then a call, pairs with no newlines, string→bool coercion",
+        .raw = "I'll get the current weather in Tokyo for you.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call>",
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
+    .{
+        .family = "flint",
+        .name = "two calls back to back keep their own arguments",
+        .raw = "I'll get the current weather for both cities for you.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Berlin</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call>",
+        .tools_json = weather_tool_schema,
+        .tool_count = 2,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .last_tool_arg_value = "Berlin",
+    },
+    .{
+        .family = "flint",
+        .name = "a call that repeats its pairs at the same values still parses once",
+        .raw = "I'll think through this briefly: the task is simple \u{2014} create a Python file that prints \"hello world\". The standard implementation is just a single `print` statement.\n\n" ++
+            "Now I'll write the file using the write tool.<tool_call>write<arg_key>path</arg_key><arg_value>hello.py</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>print(\"hello world\")\n</arg_value><arg_key>path</arg_key><arg_value>hello.py</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>print(\"hello world\")\n</arg_value></tool_call>\n",
+        .tools_json = write_read_tools_schema,
+        .tool_count = 1,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "hello.py",
+    },
     // ── K2-Horizon (IFM) ────────────────────────────────────────────────
     // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
     // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form

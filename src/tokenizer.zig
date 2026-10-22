@@ -64,7 +64,8 @@ pub fn reservedOutputIds(
 
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
 /// `.llama3` is Muse-Glimmer's CASED Llama-3 variant; the plain Llama-3 regex is `.gpt2`.
-pub const PretokStyle = enum { gpt2, llama3 };
+/// `.cased` is Flint's: the same word branches, a punctuation tail of newlines only (no `/`).
+pub const PretokStyle = enum { gpt2, llama3, cased };
 
 /// Runs that a tokenizer.json Split entry of their own isolates before the main regex runs (DeepSeek-V4,
 /// Hunyuan, Spark-X2.5): `digits` = `\p{N}{1,3}`, `cjk` = their CJK class, U+4E00-9FA5 and U+3040-30FF.
@@ -532,10 +533,7 @@ pub const Tokenizer = struct {
             for (words.items) |w| allocator.free(w);
             words.deinit(allocator);
         }
-        switch (self.pretok_style) {
-            .gpt2 => try isolatedRunsPreTokenize(allocator, text, self.digit_group, self.isolated_runs, &words),
-            .llama3 => try llama3PreTokenize(allocator, text, &words),
-        }
+        try isolatedRunsPreTokenize(allocator, text, self.pretok_style, self.digit_group, self.isolated_runs, &words);
 
         // For each word: map bytes to unicode chars, then BPE merge, then look up vocab
         var all_ids = std.ArrayList(u32).empty;
@@ -860,8 +858,8 @@ pub const Tokenizer = struct {
 
 /// HF applies the isolating Splits first and the main regex to each piece alone, so no
 /// pre-token crosses a run's edge: `"x  1"` keeps `"  "`, which Llama-3's combined regex splits.
-fn isolatedRunsPreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: u8, runs: IsolatedRuns, words: *std.ArrayList([]const u8)) !void {
-    if (!runs.digits and !runs.cjk) return gpt2PreTokenize(allocator, text, digit_group, words);
+fn isolatedRunsPreTokenize(allocator: std.mem.Allocator, text: []const u8, style: PretokStyle, digit_group: u8, runs: IsolatedRuns, words: *std.ArrayList([]const u8)) !void {
+    if (!runs.digits and !runs.cjk) return styledPreTokenize(allocator, text, style, digit_group, words);
     var start: usize = 0;
     var prev: u2 = 0;
     var i: usize = 0;
@@ -869,12 +867,20 @@ fn isolatedRunsPreTokenize(allocator: std.mem.Allocator, text: []const u8, digit
         const cjk = (c.cp >= 0x4E00 and c.cp <= 0x9FA5) or (c.cp >= 0x3040 and c.cp <= 0x30FF);
         const kind: u2 = if (runs.digits and isDigit(c.cp)) 1 else if (runs.cjk and cjk) 2 else 0;
         if (kind != prev and i > start) {
-            try gpt2PreTokenize(allocator, text[start..i], digit_group, words);
+            try styledPreTokenize(allocator, text[start..i], style, digit_group, words);
             start = i;
         }
         prev = kind;
     }
-    if (start < text.len) try gpt2PreTokenize(allocator, text[start..], digit_group, words);
+    if (start < text.len) try styledPreTokenize(allocator, text[start..], style, digit_group, words);
+}
+
+fn styledPreTokenize(allocator: std.mem.Allocator, text: []const u8, style: PretokStyle, digit_group: u8, words: *std.ArrayList([]const u8)) !void {
+    return switch (style) {
+        .gpt2 => gpt2PreTokenize(allocator, text, digit_group, words),
+        .llama3 => llama3PreTokenize(allocator, text, false, words),
+        .cased => llama3PreTokenize(allocator, text, true, words),
+    };
 }
 
 /// GPT-2 pre-tokenization: splits text following the Qwen / Llama-3 / GPT-2
@@ -1011,7 +1017,9 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: 
 /// are treated caseless, so a mid-word case transition there doesn't split —
 /// same text, off-reference boundary; revisit with real Lu/Ll tables if a
 /// checkpoint's traffic warrants it.
-fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.ArrayList([]const u8)) !void {
+/// `strict_punct` (`.cased`): branch 4 is ` ?[\p{P}\p{S}]+[\r\n]*`, and a `\p{C}` run no branch takes
+/// is one piece, as HF keeps an unmatched span.
+fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, strict_punct: bool, words: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
     while (i < text.len) {
         const start = i;
@@ -1040,7 +1048,7 @@ fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std
 
         // ── Branch 4: ` ?[^\s\p{L}\p{N}]+[\r\n/]*` (marks ride with punct,
         // and `/` joins the newline tail) ──
-        if (llama3MatchPunct(text, i)) |new_i| {
+        if (llama3MatchPunct(text, i, strict_punct)) |new_i| {
             i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
@@ -1063,9 +1071,31 @@ fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std
             continue;
         }
 
-        i += 1;
+        if (strict_punct) {
+            while (decodeCodepoint(text, i)) |c| {
+                if (i > start and !isOtherCp(c.cp)) break;
+                i += c.len;
+            }
+        } else i += 1;
         try words.append(allocator, try allocator.dupe(u8, text[start..i]));
     }
+}
+
+/// `[^\s\p{L}\p{N}]`, or `[\p{P}\p{S}]` when strict (which leaves out marks and `\p{C}`).
+fn isPunctClass(cp: u21, strict: bool) bool {
+    if (isWhitespaceCp(cp) or isLetter(cp) or isDigit(cp)) return false;
+    return !strict or !(isMark(cp) or isOtherCp(cp));
+}
+
+/// Approximate `\p{C}`: controls, the common format characters, private use.
+fn isOtherCp(cp: u21) bool {
+    if (cp < 0x20 or (cp >= 0x7F and cp <= 0x9F)) return true;
+    return switch (cp) {
+        0xAD, 0x061C, 0x06DD, 0x070F, 0x180E, 0xFEFF => true,
+        0x0600...0x0605, 0x200B...0x200F, 0x202A...0x202E, 0x2060...0x2064, 0x2066...0x206F, 0xFFF9...0xFFFB => true,
+        0xE000...0xF8FF, 0xF0000...0x10FFFF => true,
+        else => false,
+    };
 }
 
 /// UPPER class: \p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M} — ASCII exact, non-ASCII
@@ -1121,22 +1151,22 @@ fn llama3MatchWord(text: []const u8, start: usize) ?usize {
 
 /// Branch 4: ` ?[^\s\p{L}\p{N}]+[\r\n/]*`. Unlike the gpt2 pattern, marks
 /// belong to the punct class and `/` joins the trailing run.
-fn llama3MatchPunct(text: []const u8, start: usize) ?usize {
+fn llama3MatchPunct(text: []const u8, start: usize, strict: bool) ?usize {
     if (start >= text.len) return null;
     var p_start: usize = start;
     if (text[start] == ' ') p_start = start + 1;
 
     if (p_start >= text.len) return null;
     const first_cp = decodeCodepoint(text, p_start) orelse return null;
-    if (isWhitespaceCp(first_cp.cp) or isLetter(first_cp.cp) or isDigit(first_cp.cp)) return null;
+    if (!isPunctClass(first_cp.cp, strict)) return null;
 
     var i: usize = p_start + first_cp.len;
     while (i < text.len) {
         const c = decodeCodepoint(text, i) orelse break;
-        if (isWhitespaceCp(c.cp) or isLetter(c.cp) or isDigit(c.cp)) break;
+        if (!isPunctClass(c.cp, strict)) break;
         i += c.len;
     }
-    while (i < text.len and (text[i] == '\r' or text[i] == '\n' or text[i] == '/')) i += 1;
+    while (i < text.len and (text[i] == '\r' or text[i] == '\n' or (!strict and text[i] == '/'))) i += 1;
     return i;
 }
 
@@ -1782,11 +1812,12 @@ fn isIndividualDigitsRule(node: std.json.Value) bool {
 /// echoed "8 4" — the DSV4 echo-precision class on a new spelling).
 fn pretokStyleFromPreTokenizer(pt: std.json.Value) PretokStyle {
     if (pt != .object) return .gpt2;
-    if (splitRegexIsLlama3(pt)) return .llama3;
+    if (casedStyleOf(pt)) |style| return style;
     if (pt.object.get("pretokenizers")) |list| {
         if (list == .array) {
             for (list.array.items) |sub| {
-                if (sub == .object and splitRegexIsLlama3(sub)) return .llama3;
+                if (sub != .object) continue;
+                if (casedStyleOf(sub)) |style| return style;
             }
         }
     }
@@ -1809,16 +1840,16 @@ fn isolatedRunsFromPreTokenizer(pt: std.json.Value) IsolatedRuns {
     return runs;
 }
 
-fn splitRegexIsLlama3(node: std.json.Value) bool {
-    const rx = splitRegexOf(node) orelse return false;
-    return llama3StyleFromSplitRegex(rx);
+fn casedStyleOf(node: std.json.Value) ?PretokStyle {
+    const rx = splitRegexOf(node) orelse return null;
+    if (!llama3StyleFromSplitRegex(rx)) return null;
+    return if (std.mem.indexOf(u8, rx, "[\\r\\n/]") != null) .llama3 else .cased;
 }
 
-/// Muse's cased grammar only: the plain Llama-3 regex (`\p{L}+`, no case classes) is the gpt2
-/// grammar with 3-digit groups.
+/// The cased grammar (Muse; Flint, whose digits are a Split of their own): the plain Llama-3
+/// regex (`\p{L}+`, no case classes) is the gpt2 grammar with 3-digit groups.
 fn llama3StyleFromSplitRegex(rx: []const u8) bool {
     return std.mem.indexOf(u8, rx, "'s|'t|'re|'ve|'m|'ll|'d") != null and
-        std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null and
         std.mem.indexOf(u8, rx, "\\p{Lu}") != null;
 }
 
@@ -2421,7 +2452,7 @@ fn expectPreTokensL3(allocator: std.mem.Allocator, input: []const u8, expected: 
         for (words.items) |w| allocator.free(w);
         words.deinit(allocator);
     }
-    try llama3PreTokenize(allocator, input, &words);
+    try llama3PreTokenize(allocator, input, false, &words);
     if (words.items.len != expected.len) {
         std.debug.print("\n  llama3 pre-tokenize on {s}: got {d} words, expected {d}\n", .{
             input, words.items.len, expected.len,
@@ -2515,6 +2546,37 @@ test "llama3 style detection: muse's combined Split regex selects it, others kee
     // Qwen/GPT-2-style and the DSV4 standalone digit rule stay gpt2.
     try testing.expect(!llama3StyleFromSplitRegex("\\p{N}{1,3}"));
     try testing.expect(!llama3StyleFromSplitRegex("[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}"));
+}
+
+test "Flint's pre-tokenizer: the cased grammar over isolated digit and CJK runs, as HF splits it" {
+    // RecursiveSI/flint's tokenizer.json: digits and CJK isolated first, then the cased regex
+    // (contractions attached, no `/` in the punctuation tail). Want = HF `pre_tokenize_str`.
+    const pre =
+        \\{"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": "\\p{N}{1,3}"}, "behavior": "Isolated", "invert": false}, {"type": "Split", "pattern": {"Regex": "[一-龥぀-ゟ゠-ヿ]+"}, "behavior": "Isolated", "invert": false}, {"type": "Split", "pattern": {"Regex": "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?| ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false}, {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, pre, .{});
+    defer parsed.deinit();
+    const style = pretokStyleFromPreTokenizer(parsed.value);
+    const runs = isolatedRunsFromPreTokenizer(parsed.value);
+    try testing.expectEqual(PretokStyle.cased, style);
+    try testing.expect(runs.digits and runs.cjk);
+    var words: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (words.items) |w| testing.allocator.free(w);
+        words.deinit(testing.allocator);
+    }
+    try isolatedRunsPreTokenize(testing.allocator, "Python's server can't 12345 你好世界 x.indexOf(UserDefaults)\n//! DON'T", style, digitGroupFromPreTokenizer(parsed.value), runs, &words);
+    const want = [_][]const u8{ "Python's", " server", " can't", " ", "123", "45", " ", "你好世界", " x", ".index", "Of", "(User", "Defaults", ")\n", "//!", " DON'T" };
+    try testing.expectEqual(want.len, words.items.len);
+    for (want, words.items) |w, got| try testing.expectEqualStrings(w, got);
+    // A format character (U+200B) is neither punctuation nor symbol: no branch takes it, and HF
+    // keeps the unmatched character whole as its own piece (fixture fuzz_049).
+    for (words.items) |w| testing.allocator.free(w);
+    words.clearRetainingCapacity();
+    try isolatedRunsPreTokenize(testing.allocator, "  \u{2028}\u{2003}\u{200b}(don't:}?]Z\u{2028}\u{1680}:\u{2003}", style, 3, runs, &words);
+    const fuzz = [_][]const u8{ "  \u{2028}", "\u{2003}", "\u{200b}", "(don't", ":}?]", "Z", "\u{2028}", "\u{1680}", ":", "\u{2003}" };
+    try testing.expectEqual(fuzz.len, words.items.len);
+    for (fuzz, words.items) |w, got| try testing.expectEqualStrings(w, got);
 }
 
 test "the plain Llama-3 regex is the gpt2 grammar with 3-digit groups, never the cased one" {
@@ -2682,7 +2744,7 @@ test "pre-tokenize: DeepSeek's digit and CJK Splits run first, so a whitespace r
             for (words.items) |w| a.free(w);
             words.deinit(a);
         }
-        try isolatedRunsPreTokenize(a, c[0], 3, runs, &words);
+        try isolatedRunsPreTokenize(a, c[0], .gpt2, 3, runs, &words);
         try testing.expectEqual(c[1].len, words.items.len);
         for (c[1], words.items) |want, got| try testing.expectEqualStrings(want, got);
     }

@@ -905,6 +905,13 @@ GLM-5.3-Flash's template renders tool-call history through `tc.arguments.items()
 Fix: `parser.cpp` marks a member access whose property is an integer literal as computed, so `x.0` indexes like `x[0]`.
 Guard: the GLM tool-history render test in `chat.zig` (native `<tool_call>` turns, no fallback markers) and `tests/test_glm5_next.sh` [4].
 
+## jinja.cpp did not lex `\x00`, and every Flint turn fell back (2026-10-21)
+
+Recursive Flint's template strips NUL bytes from user text with `replace("\x00", "")`. jinja.cpp's lexer knew no `\x` escape, so the template raised at LEX time and every request rendered `fallbackFormatChat`: Gemma turn markers, no `<|assistant|>` header, the wrong stop tokens. Nothing in the log looked arch-specific.
+
+Fix: `lexer.cpp` reads `\xHH` as Python does: code point U+00HH, emitted as UTF-8.
+Guard: the Flint render test in `chat.zig` (byte-exact against jinja2 with HF's settings) and `tests/test_flint.sh` [4].
+
 ## `tool_choice: "required"` was a request, not a constraint (2026-10-04)
 
 tool-eval-bench TC-45 sent `tool_choice: "required"` with "What is 7 times 8?" to Qwen3.8 Flash Next and got text. Its probe ("Reply with the single word OK. Do not call any tools.") then showed why a fix in the prompt is not enough: with the instruction line delivered, the model obeyed the user and the bench excluded the scenario as unenforced.
