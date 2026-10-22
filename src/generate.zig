@@ -2130,12 +2130,24 @@ pub const Generator = struct {
     }
 
     /// The round policy (`dflash_policy.zig`) drives DFlash on a sparse target whose verify rows cost
-    /// (GLM-5.3); every other arch keeps the fixed block until it is A/B'd on its own.
+    /// (GLM-5.3, and Qwen3.8-Flash-Next: both route every extra verify row to more distinct experts); every
+    /// other arch keeps the fixed block until it is A/B'd on its own.
     /// `MLX_SERVE_DFLASH_POLICY=0` restores the fixed block and the sticky yield gate.
     pub fn dflashPolicyFor(config: *const model_mod.ModelConfig) bool {
-        if (!config.isGlm5()) return false;
-        const raw = std.c.getenv("MLX_SERVE_DFLASH_POLICY") orelse return true;
-        return !std.mem.eql(u8, std.mem.span(raw), "0");
+        return dflashPolicyWanted(config.isGlm5() or config.isQwen4(), if (std.c.getenv("MLX_SERVE_DFLASH_POLICY")) |raw| std.mem.span(raw) else null);
+    }
+
+    pub fn dflashPolicyWanted(sparse_target: bool, raw: ?[]const u8) bool {
+        if (!sparse_target) return false;
+        const r = raw orelse return true;
+        return !std.mem.eql(u8, r, "0");
+    }
+
+    test "dflashPolicyWanted: the round policy drives the sparse targets (GLM-5.3, Flash-Next) unless MLX_SERVE_DFLASH_POLICY=0; dense targets keep the fixed block" {
+        try std.testing.expect(dflashPolicyWanted(true, null));
+        try std.testing.expect(dflashPolicyWanted(true, "1"));
+        try std.testing.expect(!dflashPolicyWanted(true, "0"));
+        try std.testing.expect(!dflashPolicyWanted(false, null));
     }
 
     pub fn dflashGateWarmup() u64 {
@@ -2999,7 +3011,7 @@ pub const Generator = struct {
         var dfl_cl: transformer_mod.CaptureLayers = undefined;
         if (dflash_active) {
             dfl_out_buf = try allocator.alloc(mlx.mlx_array, options.dflash.?.config.target_layer_ids.len);
-            dfl_cl = .{ .ids = options.dflash.?.config.captureIds(), .out = dfl_out_buf };
+            dfl_cl = .{ .ids = options.dflash.?.config.captureIds(), .out = dfl_out_buf, .hc_mean = true };
         }
 
         // Start of the final (logits) forward's token span. Without SSM
@@ -6022,15 +6034,16 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out, .hc_mean = true };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         // Per-position SSM capture on a GDN trunk so partial accept can roll
         // back the recurrent state without re-forwarding (mirrors nextMtp).
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
-        var verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        // Built as the MTP verify and the tree round build theirs (`verifyForwardDeferred`): the tree round
+        // measured 52.8 -> 50.3 ms a round from the pipelining alone.
+        var verify_logits = try self.verifyForwardDeferred(verify_input, null, null);
         errdefer _ = mlx.mlx_array_free(verify_logits);
-        self.ctx.capture_ssm_seq = false;
         defer if (self.ctx.ssm_entries) |entries| {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
         };
@@ -6364,7 +6377,7 @@ pub const Generator = struct {
             allocator.free(caps);
         }
         for (caps) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps, .hc_mean = true };
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = false; // one row never rolls back
         const forward = xfm.forwardWith(&self.ctx, t1_arr);
@@ -6434,7 +6447,7 @@ pub const Generator = struct {
             allocator.free(caps);
         }
         for (caps) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps, .hc_mean = true };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         self.ctx.capture_ssm_seq = false; // one row never rolls back
@@ -6484,6 +6497,49 @@ pub const Generator = struct {
             .stopped => return null,
             .already_clean, .stay_disabled => return error.PipelineHalfState,
         }
+    }
+
+    /// A verify forward built the way every speculative verify builds it: the graph goes to the GPU every
+    /// VERIFY_PIPELINE_LAYERS layers while the host builds the rest (`pipeline_build`), and on qwen4_exp
+    /// the n-gram PLE gather at layer 1 is deferred (`ple_defer`) so the build does not stop at the layer-1
+    /// host read. The deferred leaf is filled HERE, once, after the build: that must precede the first eval
+    /// of anything downstream of the leaf and any `rollbackSsmFromCapture`, which is why the fill is part
+    /// of this call and not the caller's. The GPU PLE arm has no leaf to fill (its history settles from
+    /// the draft read). The caller owns `capture_*` and `tree` on the ctx; this sets and clears only the two
+    /// build flags. `MLX_SERVE_VERIFY_PIPELINE=0` (and `verify_pipeline_override`) builds eagerly for a
+    /// characterization run; the ops are the same either way, only their submission differs.
+    fn verifyForwardDeferred(self: *Generator, input: mlx.mlx_array, capture_hidden: ?*mlx.mlx_array, capture_hidden_all: ?*mlx.mlx_array) !mlx.mlx_array {
+        const xfm = self.xfm;
+        const pipelined = verifyPipelineEnabled();
+        self.ctx.ple_defer = pipelined;
+        self.ctx.pipeline_build = if (pipelined) VERIFY_PIPELINE_LAYERS else 0;
+        defer self.ctx.pipeline_build = 0;
+        const logits = (if (capture_hidden) |ch|
+            xfm.forwardWithCaptureAll(&self.ctx, input, ch, capture_hidden_all.?)
+        else
+            xfm.forwardWith(&self.ctx, input)) catch |e| {
+            self.ctx.ple_defer = false;
+            self.ctx.capture_ssm_seq = false;
+            xfm.discardDeferredPle(&self.ctx);
+            return e;
+        };
+        errdefer _ = mlx.mlx_array_free(logits);
+        self.ctx.ple_defer = false;
+        self.ctx.capture_ssm_seq = false;
+        errdefer xfm.discardDeferredPle(&self.ctx);
+        if (!Transformer.deferredPleOnGpu(&self.ctx)) try xfm.flushDeferredPle(&self.ctx);
+        return logits;
+    }
+
+    pub var verify_pipeline_override: ?bool = null;
+    var verify_pipeline_env: ?bool = null;
+    fn verifyPipelineEnabled() bool {
+        if (verify_pipeline_override) |v| return v;
+        if (verify_pipeline_env) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_VERIFY_PIPELINE");
+        const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        verify_pipeline_env = on;
+        return on;
     }
 
     /// Append the plain rounds' parked captures to the assistant context as one block.
@@ -6682,17 +6738,13 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out, .hc_mean = true };
         self.ctx.capture_layers = &cl;
+        defer self.ctx.capture_layers = null;
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         self.ctx.tree = &spec_tree;
-        self.ctx.pipeline_build = VERIFY_PIPELINE_LAYERS;
-        const verify_logits = xfm.forwardWith(&self.ctx, verify_input);
-        self.ctx.capture_layers = null;
-        self.ctx.capture_ssm_seq = false;
-        self.ctx.tree = null;
-        self.ctx.pipeline_build = 0;
-        const logits = try verify_logits;
+        defer self.ctx.tree = null;
+        const logits = try self.verifyForwardDeferred(verify_input, null, null);
         defer if (self.ctx.ssm_entries) |entries| {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
         };
@@ -9196,40 +9248,27 @@ pub const Generator = struct {
         // finishing on the GPU. Defer the leaf so the graph builds while the
         // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
         // 4 evaluates anything. Other arches never set `ple_pending`.
-        self.ctx.ple_defer = true;
-        self.ctx.pipeline_build = if (self.mtp_serial_accept) VERIFY_PIPELINE_LAYERS else 0;
-        defer self.ctx.pipeline_build = 0;
+        // The pipelined width here is gated on the serial accept (the batched arm keeps its own schedule);
+        // `verifyForwardDeferred` sets the leaf deferral, runs the forward and fills the leaf before anything
+        // downstream (Phase 4) or `ssmRollbackFromCapture` (Phase 5) can see it. The GPU arm has no leaf: its
+        // history settles from the draft read in the finish, still before Phase 5, so this round reads no ids.
         self.ctx.spec_verify = true;
         defer self.ctx.spec_verify = false;
-        const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
-            self.ctx.ple_defer = false;
-            self.ctx.capture_ssm_seq = false;
-            xfm.discardDeferredPle(&self.ctx);
-            return e;
-        };
-        errdefer _ = mlx.mlx_array_free(verify_logits);
-        self.ctx.ple_defer = false;
-        self.ctx.capture_ssm_seq = false;
         xfm.verify_laps.ple_sync_ns = 0;
+        const saved_override = verify_pipeline_override;
+        if (!self.mtp_serial_accept) verify_pipeline_override = false;
+        defer verify_pipeline_override = saved_override;
+        const ple_lap = SubLap.start(tracing, self.timer.io);
+        const verify_logits = try self.verifyForwardDeferred(st.verify_input, &new_hidden, &verify_hidden_all);
+        errdefer _ = mlx.mlx_array_free(verify_logits);
         if (tracing) {
             const build_ns = st.ph.read();
             self.mtp_trace.add(.verify, build_ns);
             self.mtp_trace.addSub(.build, build_ns);
             st.ph.reset();
-        }
-        const ple_lap = SubLap.start(tracing, self.timer.io);
-        defer if (tracing) {
             ple_lap.stop(&self.mtp_trace, .ple);
             self.mtp_trace.addSub(.ple_sync, xfm.verify_laps.ple_sync_ns);
-        };
-        // Fill the deferred PLE leaf: the one host read of the verify ids, and
-        // the point at which the entry's n-gram history + `spec_ple_tokens`
-        // advance. Must precede BOTH the first eval of anything downstream of
-        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5). The GPU
-        // arm has no leaf: its history settles from the draft read in the
-        // finish, still before Phase 5, so this round reads no ids here.
-        errdefer xfm.discardDeferredPle(&self.ctx);
-        if (!Transformer.deferredPleOnGpu(&self.ctx)) try xfm.flushDeferredPle(&self.ctx);
+        }
         st.verify_logits = verify_logits;
         st.new_hidden = new_hidden;
         st.verify_hidden_all = verify_hidden_all;
@@ -22647,7 +22686,8 @@ const LazyRig = struct {
         const rig = try a.create(LazyRig);
         errdefer a.destroy(rig);
         rig.config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
-        rig.weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
+        // The server's loader: it honours MLX_SERVE_NOCACHE_LOAD, which a 107 GB pack beside a memory guard needs.
+        rig.weights = try model_mod.loadModelWeights(io, a, std.mem.span(model_dir), &rig.config, false);
         model_mod.resolveWeightPrefix(&rig.config, &rig.weights);
         rig.xfm = try Transformer.init(io, a, rig.config, &rig.weights);
         rig.xfm.compileQwen4Hc();
@@ -22694,6 +22734,100 @@ const LazyRig = struct {
         return .{ .ids = try ids.toOwnedSlice(a), .built = g.mtp_lazy_built, .kept = g.mtp_lazy_kept, .lookup_rounds = g.mtp_lookup_rounds, .completion = g.completion_tokens, .residue = residue };
     }
 };
+
+/// A qwen4 generator with the DFlash2 drafter bound, for characterization against the real pack.
+const DflashChainTestSlot = struct {
+    cache: KVCache,
+    off: usize = 0,
+    entries: []transformer_mod.SSMCacheEntry,
+    gen: ?Generator = null,
+
+    fn init(a: std.mem.Allocator, io: std.Io, xfm: *Transformer, tok: *Tokenizer, drafter: *DflashModel, prompt: []const u32, block: u32, policy: bool) !*@This() {
+        const slot = try a.create(@This());
+        errdefer a.destroy(slot);
+        var cache = try KVCache.init(a, xfm.config.num_hidden_layers);
+        errdefer cache.deinit();
+        const entries = try a.alloc(transformer_mod.SSMCacheEntry, xfm.config.num_hidden_layers);
+        slot.* = .{ .cache = cache, .entries = entries };
+        for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        errdefer {
+            for (entries) |*e| {
+                _ = mlx.mlx_array_free(e.conv_state);
+                _ = mlx.mlx_array_free(e.ssm_state);
+                transformer_mod.ssmFreeQsaState(e);
+            }
+            a.free(entries);
+        }
+        const ctx: ForwardCtx = .{ .cache = &slot.cache, .moe_seq_offset = &slot.off, .ssm_entries = entries, .capture_hidden = null, .vision_embeddings = null };
+        slot.gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, 256, .{ .temperature = 0 }, &.{}, .{
+            .ctx = ctx,
+            .dflash_enabled = true,
+            .dflash = drafter,
+            .dflash_block_size = block,
+            .dflash_policy = policy,
+            .skip_lazy_preforward = true,
+        });
+        return slot;
+    }
+
+    fn deinit(slot: *@This(), a: std.mem.Allocator) void {
+        if (slot.gen) |*g| g.deinit(a);
+        for (slot.entries) |*e| {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+            transformer_mod.ssmFreeQsaState(e);
+        }
+        a.free(slot.entries);
+        slot.cache.deinit();
+        a.destroy(slot);
+    }
+
+    const Run = struct { ids: []u32, rounds: u64, accepted: u64 };
+
+    /// Greedy DFlash decode to `max_tokens`, the verify pipelined or built eagerly.
+    fn run(a: std.mem.Allocator, io: std.Io, xfm: *Transformer, tok: *Tokenizer, drafter: *DflashModel, prompt: []const u32, block: u32, pipelined: bool, max_tokens: u32) !Run {
+        Generator.verify_pipeline_override = pipelined;
+        defer Generator.verify_pipeline_override = null;
+        const slot = try DflashChainTestSlot.init(a, io, xfm, tok, drafter, prompt, block, false);
+        defer slot.deinit(a);
+        const g = &slot.gen.?;
+        g.max_tokens = max_tokens;
+        var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(a);
+        while (!g.done and g.completion_tokens < max_tokens) {
+            const r = (try g.nextDflash(a)) orelse break;
+            defer a.free(r.tokens);
+            try ids.appendSlice(a, r.tokens);
+        }
+        var accepted: u64 = 0;
+        for (g.dflash_stats.accepted) |n| accepted += n;
+        return .{ .ids = try ids.toOwnedSlice(a), .rounds = g.dflash_attempted, .accepted = accepted };
+    }
+};
+
+test "dflash chain verify: the pipelined, leaf-deferred build emits the eager build's tokens, round for round (QWEN4_TEST_MODEL, QWEN4_DFLASH)" {
+    // Characterization for `verifyForwardDeferred` on the chain verify: the same ops submitted earlier must give the
+    // same logits, so greedy DFlash decode must emit byte-identical ids with the same accepted count per round.
+    // Fixed block 4 (the policy's widths depend on timing); the prompt repeats so the drafter has something to draft.
+    const drafter_dir = std.c.getenv("QWEN4_DFLASH") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const rig = try LazyRig.load(a, io); // QWEN4_TEST_MODEL, GPU only
+    defer rig.deinit(a);
+    var drafter = try dflash_mod.loadDflash(io, a, mlx.gpuStream(), std.mem.span(drafter_dir));
+    defer drafter.deinit();
+    var buf: [192]u32 = undefined;
+    const prompt = LazyRig.prompt(&buf);
+    const eager = try DflashChainTestSlot.run(a, io, &rig.xfm, &rig.tok, &drafter, prompt, 4, false, 96);
+    defer a.free(eager.ids);
+    const piped = try DflashChainTestSlot.run(a, io, &rig.xfm, &rig.tok, &drafter, prompt, 4, true, 96);
+    defer a.free(piped.ids);
+    std.debug.print("[dflash pipelined-verify] eager: {d} ids, {d} rounds, {d} accepted; pipelined: {d} ids, {d} rounds, {d} accepted\n", .{ eager.ids.len, eager.rounds, eager.accepted, piped.ids.len, piped.rounds, piped.accepted });
+    try testing.expect(eager.rounds >= 4 and eager.accepted >= 1);
+    try testing.expectEqualSlices(u32, eager.ids, piped.ids);
+    try testing.expectEqual(eager.rounds, piped.rounds);
+    try testing.expectEqual(eager.accepted, piped.accepted);
+}
 
 test "lazy predraft: greedy tokens equal the eager padded path, lookup off and on, to and short of max_tokens (QWEN4_TEST_MODEL)" {
     // Bar: byte-identical ids; the lazy arm built and kept chains; the final rounds leave what the eager path leaves.

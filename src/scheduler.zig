@@ -9043,21 +9043,25 @@ pub fn specInitWiring(
     has_dflash: bool,
     enable_pld: bool,
 ) SpecInitWiring {
-    if (owns_module_state) return .{
-        // A module-owned arch that CAN rewind its state across a verify runs
-        // its own MTP head like any other target. PLD and the drafters
-        // stay off regardless: the drafters need a bound sidecar (DflashModel
-        // .bind refuses these archs anyway), and PLD's win case is
-        // echo-shaped traffic the n-gram gate rarely opens on a
-        // head this cheap — neither has been measured on this family, and an
-        // unmeasured spec mode is worse than none. Image requests ride the
-        // head too: `qwen4MtpForward` takes the slot's M-RoPE table.
-        .use_mtp = module_spec_rollback and enable_mtp and has_mtp,
-        .use_drafter = false,
-        .use_dflash = false,
-        .use_pld = false,
-        .native_intent = has_native_draft and enable_mtp,
-    };
+    if (owns_module_state) {
+        // A module-class arch that CAN rewind its state across a verify runs its own MTP head like any
+        // other target, and a bound DFlash sidecar too: the DFlash block verify rolls the trunk back
+        // through the same per-position capture (`rollbackSsmFromCapture`, qwen4_exp's GDN pair + PLE
+        // window + QSA key history) the head's verify uses, and `DflashModel.bind` already refuses the
+        // archs with no capture seam (dsv4, dsv41, mlx-stream). Flash-Next (qwen4_exp) is the first
+        // module-class target with a published DFlash2 drafter; GLM-5.3 reaches the same lane below as a
+        // shell-owned arch. The gemma drafter and PLD stay off here: neither has been measured on this
+        // family, and an unmeasured spec mode is worse than none. Image requests ride the head: the
+        // request gate (`assistantSidecarEnabledForRequest`) turns the drafter switch off for them.
+        const module_dflash = module_spec_rollback and enable_drafter and has_dflash;
+        return .{
+            .use_mtp = !module_dflash and module_spec_rollback and enable_mtp and has_mtp,
+            .use_drafter = false,
+            .use_dflash = module_dflash,
+            .use_pld = false,
+            .native_intent = has_native_draft and enable_mtp,
+        };
+    }
     // enable_drafter is the request-level "assistant sidecar" switch for BOTH
     // sidecar kinds; the loader guarantees at most one of drafter/dflash is
     // loaded per model. Priority: dflash > MTP > gemma drafter > PLD — a
@@ -12061,26 +12065,45 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
 
-    // Module-owned WITH rollback: its own MTP head arms; the shell
-    // spec modes stay off because none has been measured on this family.
+    // Module-owned WITH rollback: a bound DFlash sidecar outranks its own MTP head (the same
+    // priority as a shell-owned arch); without one, the head arms; the gemma drafter and PLD stay off.
     {
         const w = specInitWiring(true, true, false, true, true, true, true, true, true);
+        try testing.expect(w.use_dflash and !w.use_mtp and !w.use_drafter and !w.use_pld and !w.native_intent);
+    }
+    {
+        const w = specInitWiring(true, true, false, true, true, true, true, false, true);
         try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
-    // Rollback capability alone never arms a head that is not loaded.
+    // `--no-drafter` / enable_drafter:false hands the round back to the head.
+    {
+        const w = specInitWiring(true, true, false, true, true, false, false, true, true);
+        try testing.expect(w.use_mtp and !w.use_dflash);
+    }
+    // No rollback: a loaded DFlash sidecar still never arms on a module-class arch.
+    {
+        const w = specInitWiring(true, false, false, true, true, true, false, true, true);
+        try testing.expect(!w.use_dflash and !w.use_mtp);
+    }
+    // Rollback capability alone never arms a head that is not loaded; the bound sidecar still runs.
     {
         const w = specInitWiring(true, true, false, true, false, true, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+        try testing.expect(!w.use_mtp and !w.use_drafter and w.use_dflash and !w.use_pld);
+    }
+    // No head and no sidecar: nothing arms, and no intent bit.
+    {
+        const w = specInitWiring(true, true, false, true, false, true, true, false, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
     }
     // ...nor one the request opted out of.
     {
         const w = specInitWiring(true, true, false, false, true, true, true, false, true);
         try testing.expect(!w.use_mtp);
     }
-    // An image request keeps the head (the qwen4 head takes the slot's
-    // M-RoPE table); the drafters stay off.
+    // An image request keeps the head (the qwen4 head takes the slot's M-RoPE table): the request
+    // gate hands this function enable_drafter=false for it, so the drafters stay off.
     {
-        const w = specInitWiring(true, true, false, true, true, true, true, true, true);
+        const w = specInitWiring(true, true, false, true, true, false, true, true, true);
         try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
 

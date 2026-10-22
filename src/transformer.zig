@@ -15906,6 +15906,13 @@ pub const CaptureLayers = struct {
     /// `[B, L, H]`, refcount-shared with the live graph. Caller owns the
     /// handles (init with `mlx_array_new`, free after use).
     out: []mlx.mlx_array,
+    /// On a hyper-connection trunk (qwen4_exp) the layer output is the flat
+    /// `[B, L, hc*H]` stream. The parity oracles read that raw stream; a
+    /// DFlash drafter asks for the per-token MEAN over the hc streams,
+    /// `[B, L, H]` (incoai's DFlash2 for Flash-Next is trained on it: its
+    /// SGLang capture patch averages the four streams; GLM-5.3's tap is the
+    /// same mean, unconditionally, and its oracle expects it).
+    hc_mean: bool = false,
 };
 
 pub const ForwardCtx = struct {
@@ -23504,6 +23511,39 @@ pub const Transformer = struct {
         h.* = try self.hcWrite(h.*, out, inj, batch, seq_len);
     }
 
+    /// The mean over the `hc` hyper-connection streams of a flat `[batch, seq, hc*hidden]` stream: `[batch, seq, hidden]`.
+    /// The DFlash capture's view of a Flash-Next layer (SGLang's `hc_contract`: `unflatten(-1, (hc, hidden)).mean(-2)`).
+    pub fn hcStreamMean(out: *mlx.mlx_array, stream: mlx.mlx_array, batch: c_int, seq_len: c_int, hc: c_int, hidden: c_int, s: mlx.mlx_stream) !void {
+        const shape4 = [_]c_int{ batch, seq_len, hc, hidden };
+        var stream4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(stream4);
+        try mlx.check(mlx.mlx_reshape(&stream4, stream, &shape4, 4, s));
+        try mlx.check(mlx.mlx_mean_axis(out, stream4, 2, false, s));
+    }
+
+    test "hcStreamMean: the DFlash tap of a flat hyper-connection stream is the per-token mean over its hc streams" {
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        // batch 1, 2 tokens, hc 4, hidden 3: stream k of token t holds (t*100 + k*10 + d).
+        var vals: [2 * 4 * 3]f32 = undefined;
+        for (0..2) |t| for (0..4) |k| for (0..3) |d| {
+            vals[t * 12 + k * 3 + d] = @floatFromInt(t * 100 + k * 10 + d);
+        };
+        const flat = mlx.mlx_array_new_data(&vals, &[_]c_int{ 1, 2, 12 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(flat);
+        var mean = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mean);
+        try hcStreamMean(&mean, flat, 1, 2, 4, 3, cpu);
+        try mlx.check(mlx.mlx_array_eval(mean));
+        const shape = mlx.getShape(mean);
+        try std.testing.expectEqualSlices(c_int, &.{ 1, 2, 3 }, shape);
+        const got = mlx.mlx_array_data_float32(mean) orelse return error.MlxArrayDataNull;
+        // mean over k of (t*100 + k*10 + d) = t*100 + 15 + d
+        for (0..2) |t| for (0..3) |d| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(t * 100 + 15 + d)), got[t * 3 + d], 1e-5);
+        };
+    }
+
     fn hcFlush(self: *Transformer, h: *mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
         if (pending.*) |*pd| {
             defer pending.* = null;
@@ -26463,11 +26503,21 @@ pub const Transformer = struct {
                 if (!ladder_blocked) ladderStepMulti(&.{ h, mlp_out }, ladder, layer_idx, seq_len);
             }
 
+            // The capture slot is the raw `[B, L, hc*H]` stream (the parity oracles compare it to the
+            // reference's `stream_i`) unless the caller asked for the hyper-connection MEAN, `[B, L, H]`:
+            // what a DFlash drafter is trained on (`CaptureLayers.hc_mean`).
             if (ctx.capture_layers) |cl| {
                 for (cl.ids, cl.out) |cid, *slot| {
                     if (cid == li) {
                         try self.hcFlush(&h, batch, seq_len, &pending);
-                        _ = mlx.mlx_array_set(slot, h);
+                        if (cl.hc_mean) {
+                            var mean = mlx.mlx_array_new();
+                            defer _ = mlx.mlx_array_free(mean);
+                            try hcStreamMean(&mean, h, batch, seq_len, hc, @intCast(cfg.hidden_size), self.s);
+                            _ = mlx.mlx_array_set(slot, mean);
+                        } else {
+                            _ = mlx.mlx_array_set(slot, h);
+                        }
                     }
                 }
             }
@@ -75139,6 +75189,112 @@ test "glm5_next DFlash capture: the tapped layers' hyper-connection mean tracks 
             try Bar.check(try std.fmt.bufPrint(&label_buf, "decode row {d} layer {d}", .{ t, id }), got, want[@as(usize, @intCast(t)) * h ..], 1, h);
         }
     }
+}
+
+test "qwen4_exp DFlash capture: the slot DFlash binds is [B, L, hidden] and equals the stream mean; the oracle slot is the raw stream (QWEN4_TEST_MODEL)" {
+    // The qwen4 parity oracles read the capture slot as the flat `[B, L, hc*H]` stream (they compare it to the
+    // reference's `stream_i`); a DFlash drafter asks for the hyper-connection MEAN through `CaptureLayers.hc_mean`
+    // and must see `[B, L, H]` that is exactly the mean over the raw slot's hc streams. Both shapes from one
+    // layer on the real pack, prefill width and the one-token path, so a capture-site edit that drops the
+    // flag, or means unconditionally, fails here rather than in a drafter's shape mismatch.
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.supportsLayerCapture());
+    const hc: usize = @intCast(config.hc_count);
+    const h: usize = @intCast(config.hidden_size);
+    try testing.expect(hc > 1);
+    const tap = [_]u32{ @intCast(config.num_hidden_layers / 2) };
+
+    const Slot = struct { data: []f32, shape: [3]c_int };
+    const Run = struct {
+        /// One forward of `ids` with the capture armed; the slot on the host plus its shape.
+        fn slot(x: *Transformer, a: std.mem.Allocator, ids: mlx.mlx_array, tapped: []const u32, want_mean: bool, st: mlx.mlx_stream) !Slot {
+            var out = [_]mlx.mlx_array{mlx.mlx_array_new()};
+            defer _ = mlx.mlx_array_free(out[0]);
+            var cl = CaptureLayers{ .ids = tapped, .out = &out, .hc_mean = want_mean };
+            var ctx = x.defaultCtx();
+            ctx.capture_layers = &cl;
+            const logits = try x.forwardWith(&ctx, ids);
+            _ = mlx.mlx_array_free(logits);
+            if (out[0].ctx == null) return error.DflashCaptureMissing;
+            const shape = mlx.getShape(out[0]);
+            if (shape.len != 3) return error.DflashCaptureRank;
+            return .{ .data = try qwen4ReadF32(a, out[0], st), .shape = .{ shape[0], shape[1], shape[2] } };
+        }
+    };
+    const Check = struct {
+        fn both(x: *Transformer, a: std.mem.Allocator, ids: mlx.mlx_array, tapped: []const u32, n_tok: usize, hc_n: usize, hid: usize, st: mlx.mlx_stream, label: []const u8) !void {
+            const raw = try Run.slot(x, a, ids, tapped, false, st);
+            defer a.free(raw.data);
+            try x.resetCache();
+            const mean = try Run.slot(x, a, ids, tapped, true, st);
+            defer a.free(mean.data);
+            try testing.expectEqualSlices(c_int, &.{ 1, @intCast(n_tok), @intCast(hc_n * hid) }, &raw.shape);
+            try testing.expectEqualSlices(c_int, &.{ 1, @intCast(n_tok), @intCast(hid) }, &mean.shape);
+            var max_err: f32 = 0;
+            var max_abs: f32 = 0;
+            for (0..n_tok) |t| for (0..hid) |d| {
+                var acc: f32 = 0;
+                for (0..hc_n) |k| acc += raw.data[(t * hc_n + k) * hid + d];
+                const want = acc / @as(f32, @floatFromInt(hc_n));
+                max_err = @max(max_err, @abs(mean.data[t * hid + d] - want));
+                max_abs = @max(max_abs, @abs(want));
+            };
+            std.debug.print("[qwen4 dflash capture] {s}: max |mean - mean(raw)| {e:.3} (max |mean| {e:.3})\n", .{ label, max_err, max_abs });
+            // Same forward, same deterministic kernels: the only slack is bf16 rounding of the mean itself.
+            try testing.expect(max_err <= 1e-2 * @max(max_abs, 1.0));
+        }
+    };
+
+    // Prefill width: 8 tokens in one forward.
+    const T: usize = 8;
+    var tok_vals: [T]i32 = undefined;
+    for (&tok_vals, 0..) |*v, i| v.* = @intCast(1000 + 37 * i);
+    const ids = mlx.mlx_array_new_data(&tok_vals, &[_]c_int{ 1, T }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    try Check.both(&xfm, allocator, ids, &tap, T, hc, h, s, "prefill 8 tokens");
+
+    // The one-token path (the layer's expand is deferred into the next sublayer's read) after that prefix.
+    const one_val = [_]i32{2048};
+    const one = mlx.mlx_array_new_data(&one_val, &[_]c_int{ 1, 1 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(one);
+    const Decode = struct {
+        fn after(x: *Transformer, a: std.mem.Allocator, prefix: mlx.mlx_array, next: mlx.mlx_array, tapped: []const u32, want_mean: bool, st: mlx.mlx_stream) !Slot {
+            try x.resetCache();
+            var ctx = x.defaultCtx();
+            const pre_logits = try x.forwardWith(&ctx, prefix);
+            _ = mlx.mlx_array_free(pre_logits);
+            return Run.slot(x, a, next, tapped, want_mean, st);
+        }
+    };
+    const raw1 = try Decode.after(&xfm, allocator, ids, one, &tap, false, s);
+    defer allocator.free(raw1.data);
+    const mean1 = try Decode.after(&xfm, allocator, ids, one, &tap, true, s);
+    defer allocator.free(mean1.data);
+    try testing.expectEqualSlices(c_int, &.{ 1, 1, @intCast(hc * h) }, &raw1.shape);
+    try testing.expectEqualSlices(c_int, &.{ 1, 1, @intCast(h) }, &mean1.shape);
+    var max_err: f32 = 0;
+    var max_abs: f32 = 0;
+    for (0..h) |d| {
+        var acc: f32 = 0;
+        for (0..hc) |k| acc += raw1.data[k * h + d];
+        const want = acc / @as(f32, @floatFromInt(hc));
+        max_err = @max(max_err, @abs(mean1.data[d] - want));
+        max_abs = @max(max_abs, @abs(want));
+    }
+    std.debug.print("[qwen4 dflash capture] decode step: max |mean - mean(raw)| {e:.3} (max |mean| {e:.3})\n", .{ max_err, max_abs });
+    try testing.expect(max_err <= 1e-2 * @max(max_abs, 1.0));
 }
 
 test "glm5_next verify windows of 2..16 rows track the same rows decoded one at a time (GLM5_REAL_MODEL)" {
