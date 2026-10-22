@@ -624,7 +624,7 @@ pub const ServerConfig = struct {
     default_max_tokens: u32 = 0,
 };
 
-const Sampling = struct { temperature: f32, top_p: f32, top_k: u32, min_p: ?f32, repeat_penalty: f32, presence_penalty: f32 };
+const Sampling = struct { temperature: f32, top_p: f32, top_k: u32, min_p: ?f32, repeat_penalty: f32, presence_penalty: f32, frequency_penalty: f32 };
 
 /// Sampling for one request: a forced generation-defaults rule > request body > rule >
 /// CLI launch flag > model generation_config.json > hardcoded fallback. An explicit request
@@ -637,6 +637,7 @@ fn resolveSampling(gen: generation_settings.Profile, root: std.json.ObjectMap, c
         .min_p = gen.resolveOpt(f32, .min_p, parseJsonFloatOpt(root, "min_p", 0.0, 1.0), config.gen_min_p),
         .repeat_penalty = requestRepeatPenalty(root, gen),
         .presence_penalty = gen.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0.0),
+        .frequency_penalty = gen.resolve(f32, .frequency_penalty, parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0), 0.0),
     };
 }
 
@@ -10427,6 +10428,7 @@ fn handleChatCompletions(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -10700,6 +10702,7 @@ fn handleCompletions(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -15350,20 +15353,13 @@ fn formatLogprobsObject(
     return try std.fmt.allocPrint(allocator, "{{\"content\":{s}}}", .{content_buf.items});
 }
 
-/// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
-/// OpenAI's `frequency_penalty` (0-2) is read as `repeat_penalty` 1 + x; an explicit
-/// `repeat_penalty` wins.
-/// Forced generation-defaults rules outrank both; unforced ones fill the request's silence.
+/// The multiplicative `repeat_penalty` (llama.cpp's); a value <= 0 is an omission.
 fn requestRepeatPenalty(root: std.json.ObjectMap, gen: generation_settings.Profile) f32 {
-    if (gen.forced(.repeat_penalty)) return gen.value(f32, .repeat_penalty).?;
-    if (gen.forced(.frequency_penalty)) return 1.0 + gen.value(f32, .frequency_penalty).?;
     const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-    if (repeat > 0) return repeat;
-    if (parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0)) |frequency| return 1.0 + frequency;
-    if (gen.value(f32, .repeat_penalty)) |r| if (r != 1.0) return r;
-    return 1.0 + (gen.value(f32, .frequency_penalty) orelse 0.0);
+    return gen.resolve(f32, .repeat_penalty, if (repeat > 0) repeat else null, 1.0);
 }
 
+/// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
     const raw = if (root.get(key)) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
@@ -17797,6 +17793,7 @@ fn handleAnthropicMessages(
         .min_p = min_p,
         .repeat_penalty = sampled.repeat_penalty,
         .presence_penalty = sampled.presence_penalty,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -19324,7 +19321,7 @@ fn handleResponsesInner(
     const top_p = sampled.top_p;
     const top_k = sampled.top_k;
     const min_p = sampled.min_p;
-    const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    const frequency_penalty = sampled.frequency_penalty;
     const repeat_penalty = sampled.repeat_penalty;
     const presence_penalty = sampled.presence_penalty;
 
@@ -19599,6 +19596,7 @@ fn handleResponsesInner(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
+        .frequency_penalty = frequency_penalty,
         .seed = seed,
     };
     var sc: generate_mod.SchemaConstraint = undefined;
@@ -24540,12 +24538,24 @@ test "resolveSampling: forced rule > request > rule > generation_config > fallba
     try std.testing.expectEqual(@as(f32, 0.0), got.temperature);
     try std.testing.expectEqual(@as(u32, 0), got.top_k);
     try std.testing.expectEqual(@as(?f32, 0.05), got.min_p);
-    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 1.5), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 0.0), got.frequency_penalty);
     gen.set(.repeat_penalty, .{ .number = 1.0 }, false);
     gen.set(.frequency_penalty, .{ .number = 0.5 }, false);
-    try std.testing.expectEqual(@as(f32, 1.5), resolveSampling(gen, .empty, &config).repeat_penalty);
+    got = resolveSampling(gen, .empty, &config);
+    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 0.5), got.frequency_penalty);
     gen.set(.repeat_penalty, .{ .number = 1.2 }, true);
     try std.testing.expectEqual(@as(f32, 1.2), resolveSampling(gen, zeros.value.object, &config).repeat_penalty);
+}
+
+test "OpenAI frequency_penalty is its own additive penalty, never a repeat_penalty multiplier (#912)" {
+    const a = std.testing.allocator;
+    const body = try std.json.parseFromSlice(std.json.Value, a, "{\"frequency_penalty\":1,\"presence_penalty\":0}", .{});
+    defer body.deinit();
+    const got = resolveSampling(.{}, body.value.object, &.{});
+    try std.testing.expectEqual(@as(f32, 1.0), got.frequency_penalty);
+    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
 }
 
 test "generationMaxTokens: an auto request (0, negative, omitted) takes the rule, a forced rule takes everything" {

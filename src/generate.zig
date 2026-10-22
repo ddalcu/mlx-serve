@@ -956,6 +956,8 @@ pub const SamplingParams = struct {
     min_p: ?f32 = null,
     repeat_penalty: f32 = 1.0,
     presence_penalty: f32 = 0.0, // 0.0 = disabled
+    /// OpenAI's: subtracted once per earlier occurrence of a token (0.0 = disabled).
+    frequency_penalty: f32 = 0.0,
     seed: ?u64 = null,
     /// Draw index under `seed`: every sample takes a fresh key.
     draw: u64 = 0,
@@ -991,7 +993,7 @@ pub const SamplingParams = struct {
     /// Penalties read the realized history, so they keep a request off the
     /// pipelined fast path, spec verify and batched decode.
     pub fn penalized(self: SamplingParams) bool {
-        return self.repeat_penalty != 1.0 or self.presence_penalty != 0.0;
+        return self.repeat_penalty != 1.0 or self.presence_penalty != 0.0 or self.frequency_penalty != 0.0;
     }
 
     /// A grammar or a penalty reshapes the logits spec verify compares against.
@@ -2694,8 +2696,7 @@ pub const Generator = struct {
     /// MLX_SERVE_DSV4_DSPARK_STOCH=0 kill switch, which restores greedy-only
     /// gating.
     pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32, stoch_enabled: bool) DsparkArm {
-        const clean = sampling.repeat_penalty == 1.0 and
-            sampling.presence_penalty == 0.0 and
+        const clean = !sampling.penalized() and
             sampling.constraint == null and
             logprobs_n == 0;
         if (!clean) return .off;
@@ -4149,7 +4150,7 @@ pub const Generator = struct {
         if (self.sampling.penalized() and self.generated_ids.items.len > 0) {
             var pen = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(pen);
-            if (applyRepeatPenalty(&pen, logits, self.generated_ids.items, self.sampling.repeat_penalty, self.sampling.presence_penalty, self.xfm.s)) |_| {
+            if (applyPenalties(&pen, logits, self.generated_ids.items, self.sampling, self.xfm.s)) |_| {
                 return sampleTokenLazy(pen, self.sampling, self.xfm.s);
             } else |err| log.warn("[sampling] repeat penalty failed ({s}); this draw is unpenalized\n", .{@errorName(err)});
         }
@@ -15302,11 +15303,10 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         _ = mlx.mlx_array_free(penalized);
     };
 
-    const needs_penalty = (sampling.repeat_penalty != 1.0 or sampling.presence_penalty != 0.0);
-    if (needs_penalty) {
+    if (sampling.penalized()) {
         if (generated_ids) |ids| {
             if (ids.len > 0) {
-                try applyRepeatPenalty(&penalized, current, ids, sampling.repeat_penalty, sampling.presence_penalty, s);
+                try applyPenalties(&penalized, current, ids, sampling, s);
                 current = penalized;
                 penalized_owned = true;
             }
@@ -15879,102 +15879,64 @@ fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, nucleus_bou
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
 }
 
-/// Apply repeat penalty to already-generated tokens.
-/// Uses pure MLX GPU ops — no CPU readback, preserves lazy evaluation graph.
-fn applyRepeatPenalty(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
+/// Penalties over the tokens generated so far: `repeat_penalty` divides a positive logit and
+/// multiplies a negative one; `presence_penalty` is subtracted once per seen id and
+/// `frequency_penalty` once per occurrence (OpenAI's definition).
+fn applyPenalties(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, sampling: SamplingParams, s: mlx.mlx_stream) !void {
     const shape = mlx.getShape(logits);
     const vocab_size: usize = @intCast(shape[shape.len - 1]);
-
-    // Collect unique token ids
-    var seen_set = std.AutoHashMap(u32, void).init(std.heap.page_allocator);
-    defer seen_set.deinit();
-    for (generated_ids) |id| {
-        if (id < vocab_size) {
-            seen_set.put(id, {}) catch continue;
-        }
-    }
-
-    if (seen_set.count() == 0) return;
-
-    // Build boolean mask: true at positions of seen tokens
-    const mask_data = try std.heap.page_allocator.alloc(u8, vocab_size);
-    defer std.heap.page_allocator.free(mask_data);
-    @memset(mask_data, 0);
-
-    var it = seen_set.keyIterator();
-    while (it.next()) |id_ptr| {
-        mask_data[id_ptr.*] = 1;
-    }
-
     const arr_shape = [_]c_int{ 1, @intCast(vocab_size) };
-    const mask_arr = mlx.mlx_array_new_data(mask_data.ptr, &arr_shape, 2, .bool_);
-    defer _ = mlx.mlx_array_free(mask_arr);
 
-    var current = logits;
-
-    // Repeat penalty: multiply seen tokens by 1/penalty (positive) or penalty (negative)
-    // This is equivalent to: where(mask & logits > 0, logits / penalty, where(mask, logits * penalty, logits))
-    // Simplified: where(mask, where(logits > 0, logits / penalty, logits * penalty), logits)
-    var penalized = mlx.mlx_array_new();
-    var penalized_owned = false;
-    defer if (penalized_owned) {
-        _ = mlx.mlx_array_free(penalized);
+    // Occurrences per id; reused below for what each id loses.
+    const table = try std.heap.page_allocator.alloc(f32, vocab_size);
+    defer std.heap.page_allocator.free(table);
+    @memset(table, 0);
+    for (generated_ids) |id| if (id < vocab_size) {
+        table[id] += 1;
     };
 
-    if (repeat_penalty != 1.0) {
-        const rp = mlx.mlx_array_new_float(repeat_penalty);
+    var current = logits;
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    if (sampling.repeat_penalty != 1.0) {
+        const counts = mlx.mlx_array_new_data(table.ptr, &arr_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(counts);
+        const rp = mlx.mlx_array_new_float(sampling.repeat_penalty);
         defer _ = mlx.mlx_array_free(rp);
-        const inv_rp = mlx.mlx_array_new_float(1.0 / repeat_penalty);
+        const inv_rp = mlx.mlx_array_new_float(1.0 / sampling.repeat_penalty);
         defer _ = mlx.mlx_array_free(inv_rp);
         const zero = mlx.mlx_array_new_float(0.0);
         defer _ = mlx.mlx_array_free(zero);
 
-        // positive_mask = logits > 0
-        var positive_mask = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(positive_mask);
-        try mlx.check(mlx.mlx_greater(&positive_mask, current, zero, s));
-
-        // penalized_positive = logits * (1/penalty)
+        var seen = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(seen);
+        try mlx.check(mlx.mlx_greater(&seen, counts, zero, s));
+        var positive = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(positive);
+        try mlx.check(mlx.mlx_greater(&positive, logits, zero, s));
         var pen_pos = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pen_pos);
-        try mlx.check(mlx.mlx_multiply(&pen_pos, current, inv_rp, s));
-
-        // penalized_negative = logits * penalty
+        try mlx.check(mlx.mlx_multiply(&pen_pos, logits, inv_rp, s));
         var pen_neg = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pen_neg);
-        try mlx.check(mlx.mlx_multiply(&pen_neg, current, rp, s));
-
-        // sign_selected = where(positive, logits/penalty, logits*penalty)
+        try mlx.check(mlx.mlx_multiply(&pen_neg, logits, rp, s));
         var sign_selected = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sign_selected);
-        try mlx.check(mlx.mlx_where(&sign_selected, positive_mask, pen_pos, pen_neg, s));
-
-        // result = where(mask, sign_selected, logits)
-        try mlx.check(mlx.mlx_where(&penalized, mask_arr, sign_selected, current, s));
-        current = penalized;
-        penalized_owned = true;
+        try mlx.check(mlx.mlx_where(&sign_selected, positive, pen_pos, pen_neg, s));
+        try mlx.check(mlx.mlx_where(&scaled, seen, sign_selected, logits, s));
+        current = scaled;
     }
 
-    // Presence penalty: subtract from seen tokens
-    if (presence_penalty != 0.0) {
-        const pp = mlx.mlx_array_new_float(presence_penalty);
-        defer _ = mlx.mlx_array_free(pp);
-
-        // Cast mask to float for arithmetic
-        var mask_float = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mask_float);
-        try mlx.check(mlx.mlx_astype(&mask_float, mask_arr, .float16, s));
-
-        // subtract = mask * presence_penalty
-        var subtract = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(subtract);
-        try mlx.check(mlx.mlx_multiply(&subtract, mask_float, pp, s));
-
-        // result = current - subtract
-        try mlx.check(mlx.mlx_subtract(res, current, subtract, s));
-    } else {
+    if (sampling.presence_penalty == 0.0 and sampling.frequency_penalty == 0.0) {
         try mlx.check(mlx.mlx_copy(res, current, s));
+        return;
     }
+    for (table) |*v| if (v.* > 0) {
+        v.* = sampling.presence_penalty + sampling.frequency_penalty * v.*;
+    };
+    const subtract = mlx.mlx_array_new_data(table.ptr, &arr_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(subtract);
+    try mlx.check(mlx.mlx_subtract(res, current, subtract, s));
 }
 
 /// Greedy argmax over the last axis.
@@ -16017,6 +15979,20 @@ test "SamplingParams custom values" {
     try testing.expectApproxEqAbs(@as(f32, 0.9), params.top_p, 0.001);
     try testing.expectEqual(@as(u32, 40), params.top_k);
     try testing.expectEqual(@as(u64, 42), params.seed.?);
+}
+
+test "frequency_penalty subtracts per occurrence, presence_penalty once, and neither scales a logit" {
+    const s = mlx.gpuStream();
+    var data = [_]f32{ 2, 2, 2, 2, 2, -2, 2, 2 };
+    const logits = mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 8 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try applyPenalties(&out, logits, &.{ 3, 3, 5 }, .{ .frequency_penalty = 0.5, .presence_penalty = 0.25 }, s);
+    try mlx.check(mlx.mlx_array_eval(out));
+    const got = mlx.mlx_array_data_float32(out).?[0..8];
+    try testing.expectEqualSlices(f32, &.{ 2, 2, 2, 0.75, 2, -2.75, 2, 2 }, got);
+    try testing.expect((SamplingParams{ .frequency_penalty = 0.5 }).penalized());
 }
 
 test "specDecodeUnsupported: release-enforced guard for spec + constraint/logprobs (issue #97)" {
@@ -16123,7 +16099,7 @@ test "argmax with negative values" {
     try testing.expectEqual(@as(u32, 3), result); // index 3 has value -0.5 (highest)
 }
 
-test "applyRepeatPenalty reduces seen token logits" {
+test "applyPenalties reduces seen token logits" {
     const s = mlx.gpuStream();
     // logits: [1.0, 2.0, 3.0, 4.0, 5.0]
     const data = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0 };
@@ -16136,7 +16112,7 @@ test "applyRepeatPenalty reduces seen token logits" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 0.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat_penalty = 2.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -16152,7 +16128,7 @@ test "applyRepeatPenalty reduces seen token logits" {
     try testing.expectApproxEqAbs(@as(f32, 5.0), res_data[4], 0.01);
 }
 
-test "applyRepeatPenalty with negative logits" {
+test "applyPenalties with negative logits" {
     const s = mlx.gpuStream();
     // Mix of positive and negative logits
     const data = [_]f32{ -2.0, 3.0, -1.0, 4.0 };
@@ -16165,7 +16141,7 @@ test "applyRepeatPenalty with negative logits" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 0.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat_penalty = 2.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -16179,7 +16155,7 @@ test "applyRepeatPenalty with negative logits" {
     try testing.expectApproxEqAbs(@as(f32, 2.0), res_data[3], 0.01);
 }
 
-test "applyRepeatPenalty presence penalty" {
+test "applyPenalties presence penalty" {
     const s = mlx.gpuStream();
     const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const shape = [_]c_int{ 1, 4 };
@@ -16190,7 +16166,7 @@ test "applyRepeatPenalty presence penalty" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 1.0, 0.5, s);
+    try applyPenalties(&res, logits, &generated, .{ .presence_penalty = 0.5 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -16204,7 +16180,7 @@ test "applyRepeatPenalty presence penalty" {
     try testing.expectApproxEqAbs(@as(f32, 4.0), res_data[3], 0.01);
 }
 
-test "applyRepeatPenalty combined penalties" {
+test "applyPenalties combined penalties" {
     const s = mlx.gpuStream();
     const data = [_]f32{ 2.0, -1.0, 3.0 };
     const shape = [_]c_int{ 1, 3 };
@@ -16215,7 +16191,7 @@ test "applyRepeatPenalty combined penalties" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 1.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat_penalty = 2.0, .presence_penalty = 1.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;

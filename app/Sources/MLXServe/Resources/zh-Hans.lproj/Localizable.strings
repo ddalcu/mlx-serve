@@ -2226,7 +2226,7 @@
 "How many requests llama.cpp answers at once, each with its own memory." = "llama.cpp 同时回答的请求数，每个请求单独占用内存。";
 "How many tokens to guess ahead for GGUF models with an MTP head; 0 turns it off." = "对带 MTP 头的 GGUF 模型提前预测的 token 数，0 表示关闭。";
 "How much of a prompt llama.cpp reads at a time; larger is faster but uses more memory." = "llama.cpp 每次读取的提示词量，越大越快，但占用更多内存。";
-"Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory." = "从磁盘读取 DeepSeek-V4-Flash，让内存较少的 Mac 也能运行，速度稍慢。";
+"Read a DeepSeek-V4 GGUF from disk so it runs, a bit slower, on Macs with less memory. MLX packs always load fully into memory." = "从磁盘读取 DeepSeek-V4 GGUF，让内存较少的 Mac 也能运行，速度稍慢。MLX 包始终完整载入内存。";
 "Remember recent prompts so repeats start faster; 0 turns it off." = "记住最近的提示词，重复时更快开始，0 表示关闭。";
 "What's new in each version." = "每个版本的新内容。";
 "A star helps other people find mlx-serve." = "点个星标能帮助更多人发现 mlx-serve。";

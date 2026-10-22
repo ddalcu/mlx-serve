@@ -2202,7 +2202,7 @@
 "How many requests llama.cpp answers at once, each with its own memory." = "llama.cpp가 동시에 답하는 요청 수이며, 요청마다 메모리를 따로 씁니다.";
 "How many tokens to guess ahead for GGUF models with an MTP head; 0 turns it off." = "MTP 헤드가 있는 GGUF 모델에서 미리 추측할 토큰 수이며, 0이면 끕니다.";
 "How much of a prompt llama.cpp reads at a time; larger is faster but uses more memory." = "llama.cpp가 프롬프트를 한 번에 읽는 양으로, 클수록 빠르지만 메모리를 더 씁니다.";
-"Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory." = "DeepSeek-V4-Flash를 디스크에서 읽어 메모리가 적은 Mac에서도 조금 느리게 실행합니다.";
+"Read a DeepSeek-V4 GGUF from disk so it runs, a bit slower, on Macs with less memory. MLX packs always load fully into memory." = "DeepSeek-V4 GGUF를 디스크에서 읽어 메모리가 적은 Mac에서도 조금 느리게 실행합니다. MLX 패키지는 항상 전부 메모리에 로드됩니다.";
 "Remember recent prompts so repeats start faster; 0 turns it off." = "최근 프롬프트를 기억해 반복될 때 더 빨리 시작하며, 0이면 끕니다.";
 "What's new in each version." = "각 버전의 새로운 점입니다.";
 "A star helps other people find mlx-serve." = "별을 누르면 다른 사람이 mlx-serve를 찾는 데 도움이 됩니다.";

@@ -1278,7 +1278,7 @@ extension ServerOptions {
             needsRestart: true),
         "ssdStreaming": .init(
             title: "SSD weight streaming",
-            explainer: "Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory.",
+            explainer: "Read a DeepSeek-V4 GGUF from disk so it runs, a bit slower, on Macs with less memory. MLX packs always load fully into memory.",
             needsRestart: true),
         "tokenizeCacheEntries": .init(
             title: "Tokenize cache entries",
