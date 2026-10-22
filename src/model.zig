@@ -5089,7 +5089,30 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// `dsv41` also reads past the page cache (`nocache_reader`): its weights all load at init, and a pack near the
 /// RAM size would have them compressed under the file cache.
 /// `index_owners`: a tensor two shards carry loads from the shard the index names.
-pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null, nocache: bool = false };
+
+/// Weights read past the page cache (`nocache_reader.zig`, Darwin): on for DeepSeek-V4.1 packs, and for every other
+/// pack on `MLX_SERVE_NOCACHE_LOAD=1`. MLX's own reader leaves each shard's pages cached beside the array buffers, so a
+/// load of a pack near the RAM size (Qwen3.8-Flash-Next's 4-bit, 76 GB of weights beside a 32 GB n-gram table on a
+/// 128 GB Mac) peaks at twice its weights in physical memory until the kernel evicts the cache; a memory guard that
+/// counts the page cache kills it there. `MLX_SERVE_NOCACHE_LOAD=0` keeps MLX's reader for every pack.
+pub fn nocacheLoadWanted(dsv41: bool, raw: ?[]const u8) bool {
+    if (raw) |v| return std.mem.eql(u8, v, "1");
+    return dsv41;
+}
+
+fn nocacheLoadEnabled(dsv41: bool) bool {
+    const raw = std.c.getenv("MLX_SERVE_NOCACHE_LOAD");
+    return nocacheLoadWanted(dsv41, if (raw) |r| std.mem.sliceTo(r, 0) else null);
+}
+
+test "nocacheLoadWanted: DeepSeek-V4.1 packs read past the page cache by default; the env turns it on or off for any pack" {
+    try std.testing.expect(nocacheLoadWanted(true, null));
+    try std.testing.expect(!nocacheLoadWanted(false, null));
+    try std.testing.expect(nocacheLoadWanted(false, "1"));
+    try std.testing.expect(!nocacheLoadWanted(true, "0"));
+    try std.testing.expect(!nocacheLoadWanted(false, "yes"));
+}
 
 pub const Owners = std.StringHashMapUnmanaged([]const u8);
 
@@ -5226,7 +5249,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         .shard => |sh| try config.applyShard(sh),
         .remote => |r| config.dist_dsv41 = .{ .lo = r.start, .hi = r.end, .worker = false },
     };
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt, .nocache = nocacheLoadEnabled(config.isDsv41()) });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainPart(&weights, sp);
@@ -5544,7 +5567,7 @@ pub fn loadSafetensorsFile(
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
 
-    if (opts.dsv41 and comptime builtin.os.tag.isDarwin())
+    if ((opts.nocache or opts.dsv41) and comptime builtin.os.tag.isDarwin())
         try @import("nocache_reader.zig").loadSafetensors(&tensor_map, &meta_map, path, s)
     else
         try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));

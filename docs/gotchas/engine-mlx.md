@@ -2,6 +2,15 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### A pack near the RAM size loads at twice its weights in physical memory (2026-10-21)
+
+MLX's safetensors reader is a plain open + pread, so every shard's pages stay in the page cache beside the array buffers
+until the kernel evicts them: Qwen3.8-Flash-Next's 4-bit pack (76 GB of weights beside its 32 GB n-gram table) peaked at
+125.7 GiB physical used on a 128 GB Mac during the load, and a memory guard that counts the page cache killed it. The
+DeepSeek-V4.1 loader already reads past the cache (`nocache_reader.zig`, F_NOCACHE + read-ahead off); `LoadOpts.nocache`
+takes the same reader for any pack, on `MLX_SERVE_NOCACHE_LOAD=1` (`=0` keeps MLX's reader for every pack, DeepSeek's too).
+Decode is unchanged: the n-gram table's gathers go through their own `pread` path either way.
+
 ### A restored LiLiCorr context had no correlation anchor
 
 Defect: a request restored from the prefix cache failed under LiLiCorr. Cause: snapshots keep the drafter K/V but not the latest target feature. Fix: take one plain round to capture it, then resume speculation; layout unchanged. Guard: `lilicorr missing restored anchor takes a plain round and recovers it`.
