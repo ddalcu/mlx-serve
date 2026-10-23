@@ -482,6 +482,8 @@ pub const Slot = struct {
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
+    /// `[prefix-wait]` logged once per request.
+    prefix_wait_logged: bool = false,
     /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
     /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
     boundary_max_tail: ?usize = null,
@@ -2920,7 +2922,52 @@ test "a running media job's reserve is billed: a prefill that fits live memory a
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
 /// admission needs: an opaque model identity + the exclusive-decode bit.
-pub const AdmitCand = struct { model: usize, exclusive: bool };
+pub const AdmitCand = struct {
+    model: usize,
+    exclusive: bool,
+    /// Shared-prefix wait (`MLX_SERVE_PREFIX_WAIT`): the candidate's leading prompt tokens would be
+    /// prefilled again by this tick, so it waits one pass and restores them from the cache instead.
+    defer_for_prefix: bool = false,
+};
+
+/// Cache-aware admission (SGLang-style): the minimum shared prefix, in tokens, for a pending request
+/// to wait on a request that will prefill the same prefix this tick.
+pub const PREFIX_WAIT_MIN_TOKENS: usize = 4096;
+
+pub var prefix_wait_override: ?bool = null;
+var prefix_wait_cached: ?bool = null;
+/// `MLX_SERVE_PREFIX_WAIT=1`: a pending request whose prompt shares >= `PREFIX_WAIT_MIN_TOKENS`
+/// leading tokens with an earlier request admitted in the same tick, and that the hot cache cannot
+/// already serve, waits for that request's commit instead of prefilling the shared prefix cold
+/// beside it. Default off.
+pub fn prefixWaitEnabled() bool {
+    if (prefix_wait_override) |v| return v;
+    if (prefix_wait_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFIX_WAIT");
+    const on = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+    prefix_wait_cached = on;
+    return on;
+}
+
+/// Leading tokens `a` and `b` share.
+pub fn sharedPrefixLen(a: []const u32, b: []const u32) usize {
+    const n = @min(a.len, b.len);
+    return std.mem.indexOfDiff(u32, a[0..n], b[0..n]) orelse n;
+}
+
+/// The longest a request waits on a shared-prefix leader before it prefills on its own. The prefix
+/// is committed when the leader's request ends, so a leader with a long reply could otherwise hold
+/// the waiter past the cold prefill it was meant to save.
+pub const PREFIX_WAIT_MAX_NS: u64 = 30 * std.time.ns_per_s;
+
+/// Should pending prompt `p` wait for an earlier prompt `leader` of the same model? Only when they
+/// share a long prefix, the cache would not already give `p` that prefix (`p_cached`), and `p` has
+/// not waited `PREFIX_WAIT_MAX_NS` yet: then `p` restores the prefix from the leader's commit.
+pub fn prefixWaitFor(p: []const u32, leader: []const u32, p_cached: usize, waited_ns: u64) bool {
+    if (waited_ns >= PREFIX_WAIT_MAX_NS) return false;
+    const shared = sharedPrefixLen(p, leader);
+    return shared >= PREFIX_WAIT_MIN_TOKENS and p_cached + PREFIX_WAIT_MIN_TOKENS <= shared;
+}
 
 /// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
 /// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
@@ -2935,6 +2982,7 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
     var n: usize = 0;
     outer: for (cands, 0..) |c, i| {
         if (n >= out.len) break;
+        if (c.defer_for_prefix) continue;
         if (c.exclusive) {
             for (active) |a| if (a.exclusive and a.model == c.model) continue :outer;
             for (out[0..n]) |j| {
@@ -2945,6 +2993,40 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
         n += 1;
     }
     return n;
+}
+
+/// `MLX_SERVE_PREFIX_WAIT`: mark each pending candidate that should wait for a leader sharing its
+/// long prefix: an EARLIER candidate of this tick (it is never marked, so it admits now), or a live
+/// request already prefilled or decoding. The waiter's later pass restores the prefix from the
+/// leader's commit. Called under `queue_mu`; the cache peek is the read-only one the boundary gate uses.
+fn markPrefixWaiters(sch: *Scheduler, pending: []const *Slot, cands: []AdmitCand) void {
+    for (pending, 0..) |s, i| {
+        if (s.skip_prefix_cache or s.media.len > 0 or s.model.prefix_cache == null) continue;
+        const cached = s.full_prompt.len - slotUncachedTail(s);
+        const waited: u64 = @intCast(s.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+        var leader: ?*Slot = null;
+        for (pending[0..i], 0..) |lead, j| {
+            if (cands[j].defer_for_prefix or lead.model != s.model) continue;
+            if (prefixWaitFor(s.full_prompt, lead.full_prompt, cached, waited)) {
+                leader = lead;
+                break;
+            }
+        }
+        if (leader == null) for (sch.decoding.items) |lead| {
+            if (lead.cancelled.load(.acquire) or lead.finished or lead.error_code != null or lead.model != s.model) continue;
+            if (prefixWaitFor(s.full_prompt, lead.full_prompt, cached, waited)) {
+                leader = lead;
+                break;
+            }
+        };
+        if (leader) |lead| {
+            cands[i].defer_for_prefix = true;
+            if (!s.prefix_wait_logged) {
+                s.prefix_wait_logged = true;
+                log.info("[prefix-wait] a {d}-token request waits for a live request sharing {d} prefix tokens\n", .{ s.full_prompt.len, sharedPrefixLen(s.full_prompt, lead.full_prompt) });
+            }
+        }
+    }
 }
 
 const ThreadCtx = struct {
@@ -6014,6 +6096,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         for (sch.pending.items[0..n_cands], 0..) |s, i| {
             cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
         }
+        if (prefixWaitEnabled()) markPrefixWaiters(sch, sch.pending.items[0..n_cands], cand_buf[0..n_cands]);
         var admit_idx: [to_prefill.len]usize = undefined;
         const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
         for (admit_idx[0..n_admit]) |idx| {
@@ -11564,6 +11647,47 @@ test "admitPendingTick: per-slot exclusivity (qwen4 MTP slot) blocks only its ow
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
         try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
     }
+}
+
+test "prefixWaitFor: wait only for a long shared prefix the cache cannot serve, and never past the cap" {
+    var a: [9000]u32 = undefined;
+    for (&a, 0..) |*t, i| t.* = @intCast(i);
+    var b = a;
+    b[6000] = 99999; // shares 6000 leading tokens with `a`
+    try testing.expectEqual(@as(usize, 6000), sharedPrefixLen(&a, &b));
+    try testing.expectEqual(@as(usize, 9000), sharedPrefixLen(&a, &a));
+    try testing.expectEqual(@as(usize, 0), sharedPrefixLen(&a, &.{}));
+    try testing.expect(prefixWaitFor(&b, &a, 0, 0));
+    // The cache already serves most of the shared prefix: nothing left worth waiting for.
+    try testing.expect(!prefixWaitFor(&b, &a, 5000, 0));
+    try testing.expect(prefixWaitFor(&b, &a, 6000 - PREFIX_WAIT_MIN_TOKENS, 0));
+    // A short shared prefix is cheaper to prefill than to wait for.
+    var c = a;
+    c[PREFIX_WAIT_MIN_TOKENS - 1] = 88888;
+    try testing.expect(!prefixWaitFor(&c, &a, 0, 0));
+    // The wait is bounded.
+    try testing.expect(!prefixWaitFor(&b, &a, 0, PREFIX_WAIT_MAX_NS));
+    try testing.expect(prefixWaitFor(&b, &a, 0, PREFIX_WAIT_MAX_NS - 1));
+}
+
+test "admitPendingTick: a prefix waiter stays pending and does not block the requests behind it" {
+    var out: [4]usize = undefined;
+    const cands = [_]AdmitCand{
+        .{ .model = 1, .exclusive = false },
+        .{ .model = 1, .exclusive = false, .defer_for_prefix = true },
+        .{ .model = 1, .exclusive = false },
+    };
+    try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &out));
+    try testing.expectEqual(@as(usize, 0), out[0]);
+    try testing.expectEqual(@as(usize, 2), out[1]);
+}
+
+test "prefixWaitEnabled: off by default" {
+    prefix_wait_override = null;
+    if (std.c.getenv("MLX_SERVE_PREFIX_WAIT") == null) try testing.expect(!prefixWaitEnabled());
+    prefix_wait_override = true;
+    defer prefix_wait_override = null;
+    try testing.expect(prefixWaitEnabled());
 }
 
 test "admitPendingTick: exclusive single-flight FIFO contract" {
