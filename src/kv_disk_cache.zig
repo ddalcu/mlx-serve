@@ -689,6 +689,13 @@ pub const DiskTier = struct {
         return false;
     }
 
+    fn indexOfId(self: *const DiskTier, id: u64) ?usize {
+        for (self.entries.items, 0..) |e, i| {
+            if (e.id == id) return i;
+        }
+        return null;
+    }
+
     /// Is entry `id` poisoned, or gone?
     pub fn entryPoisoned(self: *const DiskTier, id: u64) bool {
         for (self.entries.items) |*e| {
@@ -1466,9 +1473,14 @@ pub const DiskTier = struct {
         }
         // Re-derive the budget from free space before every store, and only a store: the
         // purgeable-space query is slow and the idle spill reaches this point once per idle entry.
+        // Its eviction swap-removes, so the target crosses it by id; an evicted target is a fresh store.
+        const extend_id: ?u64 = if (extend_idx) |i| self.entries.items[i].id else null;
+        const ssm_only_id: ?u64 = if (ssm_only_idx) |i| self.entries.items[i].id else null;
         if (self.ssd_first) self.refreshDiskBudget();
         // The refresh gates THIS store, not merely the next one.
         if (self.store_declined) return .skipped;
+        extend_idx = if (extend_id) |x| self.indexOfId(x) else null;
+        ssm_only_idx = if (ssm_only_id) |x| self.indexOfId(x) else null;
         if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, dflash_snap, mtp_snap, s);
 
         const sw = io_util.Stopwatch.init(self.io);
@@ -6748,6 +6760,112 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     try testing.expect(!tier.store_declined);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
+}
+
+/// Commits A and B (in the order `a_first` asks), then shrinks the volume so the next SSD-first
+/// refresh evicts the LRU one: A itself, or B, whose swap-remove moves A.
+fn commitPairThenShrink(tier: *DiskTier, cache_a: *KVCache, tokens_a: []const u32, cache_b: *KVCache, tokens_b: []const u32, a_first: bool, s: mlx.mlx_stream) !void {
+    if (a_first) _ = try tier.appendCommit(cache_a.entries, cache_a.step, cache_a.config, tokens_a, false, null, s);
+    _ = try tier.appendCommit(cache_b.entries, cache_b.step, cache_b.config, tokens_b, false, null, s);
+    if (!a_first) _ = try tier.appendCommit(cache_a.entries, cache_a.step, cache_a.config, tokens_a, false, null, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const gib: u64 = 1024 * 1024 * 1024;
+    tier.total_bytes += 4 * gib;
+    tier.armTestSpace(63 * gib, 2048 * gib);
+}
+
+test "DiskTier: an extend commit across an SSD-first refresh that evicts lands on its own entry or a fresh one" {
+    // Bar: every entry restores the rows of its own tokens.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    for ([_]bool{ true, false }) |a_first| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-evict-ext", 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+        var cache_a = try KVCache.init(testing.allocator, 1);
+        defer cache_a.deinit();
+        try fillCache(&cache_a, s, 1, 520, 8, 0.0, .float32);
+        var cache_b = try KVCache.init(testing.allocator, 1);
+        defer cache_b.deinit();
+        try fillCache(&cache_b, s, 1, 520, 8, 9000.0, .float32);
+        var tokens_a: [900]u32 = undefined;
+        for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+        var tokens_b: [520]u32 = undefined;
+        for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
+
+        try commitPairThenShrink(&tier, &cache_a, tokens_a[0..520], &cache_b, &tokens_b, a_first, s);
+        try fillCache(&cache_a, s, 1, 380, 8, 4800.0, .float32);
+        _ = try tier.appendCommit(cache_a.entries, cache_a.step, cache_a.config, &tokens_a, false, null, s);
+
+        var found_a = false;
+        for (tier.entries.items, 0..) |e, idx| {
+            const is_a = std.mem.eql(u32, e.tokens, &tokens_a);
+            try testing.expect(is_a or std.mem.eql(u32, e.tokens, &tokens_b));
+            const src = if (is_a) &cache_a else &cache_b;
+            var got = try KVCache.init(testing.allocator, 1);
+            defer got.deinit();
+            try testing.expectEqual(e.kv_len, try tier.restoreInto(&got, idx, s));
+            for ([_]u32{ 5, e.kv_len - 1 }) |pos| {
+                try testing.expectEqual(try cacheValueAt(src, 0, pos, 5, s), try cacheValueAt(&got, 0, pos, 5, s));
+            }
+            if (is_a) {
+                found_a = true;
+                try testing.expectEqual(@as(u32, 900), e.kv_len);
+            }
+        }
+        try testing.expect(found_a);
+    }
+}
+
+test "DiskTier: a checkpoint-only append across an SSD-first refresh that evicts lands on its own entry or a fresh one" {
+    // Bar: A's checkpoint is filed under A, never under B.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    for ([_]bool{ true, false }) |a_first| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-evict-ssm", 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try fillCache(&cache, s, 2, 520, 8, 0.0, .float32);
+        var tokens_a: [520]u32 = undefined;
+        for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+        var tokens_b: [520]u32 = undefined;
+        for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
+
+        var src = buildHybridEntries(s, 11.0, 22.0);
+        defer freeHybridEntries(&src);
+        var cps = [_]transformer_mod.SSMCheckpoint{
+            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+        };
+        defer for (&cps) |*cp| cp.deinit(testing.allocator);
+        try commitPairThenShrink(&tier, &cache, &tokens_a, &cache, &tokens_b, a_first, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_a, false, &cps, s);
+
+        var found_a = false;
+        for (tier.entries.items) |e| {
+            if (std.mem.eql(u32, e.tokens, &tokens_b)) {
+                try testing.expectEqual(@as(usize, 0), e.ssm_positions.len);
+            } else {
+                try testing.expectEqualSlices(u32, &tokens_a, e.tokens);
+                try testing.expectEqualSlices(u32, &[_]u32{512}, e.ssm_positions);
+                found_a = true;
+            }
+        }
+        try testing.expect(found_a);
+    }
 }
 
 test "DiskTier: the shutdown drain fences what is still queued at its deadline, and deinit writes none of it" {

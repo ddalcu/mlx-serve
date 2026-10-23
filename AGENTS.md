@@ -367,6 +367,7 @@ Prefix cache (RAM + SSD):
 - **SSD-first** (qwen4 + disk tier, or `--no-prefix-cache-ram` + disk): SSD-only retains no idle RAM KV; writes ride `kv_disk_writer.zig`; a checkout is a PROMISE until append donates (`donateCheckout`/`releaseCheckout`).
 - **The batched pad-waste cap reads `KVCache.kvLenForBatching`**, never `cache.step`.
 - **An in-place SSD commit bills by MEASURE** (`nonChunkBytes` after − before, #573): the per-term delta in `appendSsmOnly` under-billed whole checkpoint lists in ReleaseFast builds and the tier outgrew its cap. Its guard is red only under `zig build test -Doptimize=ReleaseFast`.
+- **An index into `DiskTier.entries` does not survive a call that can evict** (`refreshDiskBudget`, `gcToBudget`, `dropPoisonedEntries` swap-remove): carry the entry's id across it (`indexOfId`, #947). A stale index freed another entry's arrays (SIGABRT) or served its rows.
 
 MLX errors + threads:
 - **Chat does not interleave with a media job on CUDA** (`scheduler.genYieldEnabled`, `MLX_SERVE_GEN_YIELD=1` re-enables; Metal unchanged): a decode run inside one image job left state the next job's first step faulted on once that model was evicted (3 of 4 stress runs; 0 with the hook off). Guard: `genYieldEnabled` test + the stress shape.

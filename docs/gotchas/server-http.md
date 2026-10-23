@@ -1624,6 +1624,13 @@ First live run on qwen4_exp: `[hot-cache] hybrid miss (no checkpoint <= 514 of 5
 **Fix.** `appendSsmOnly` bills by measure, `nonChunkBytes` after minus before; `persistQsaHistory` returns the held file when nothing new is written.
 **Guard.** `DiskTier: in-place commits keep an entry's bytes equal to the files it owns`, red only under `zig build test -Doptimize=ReleaseFast`, so run it in the mode that ships.
 
+## An SSD-first commit freed another entry's arrays (SIGABRT "pointer being freed was not allocated", #947)
+
+**Defect.** A Flash-Next server with `--prefix-cache-disk` aborted in `appendCommitWithSpecBounded` (prefill write-through) and, on another day, in `freeIndexEntryOwned` during an unload.
+**Cause.** The commit picks the entry it extends (or appends checkpoints to) by INDEX, then calls `refreshDiskBudget`. When free space put the budget below the cap, the refresh ran `gcToBudget`, whose `swapRemove` moved or removed that entry. A target that moved past `len` was read from the stale slot in ReleaseFast: its live arrays were freed and the new entry was written past the list, so the next eviction or unload freed them again. A target that was evicted took over the entry swapped into its slot, so the next restore served another prompt's rows.
+**Fix.** The targets cross the refresh by id (`indexOfId`); an evicted target is a fresh store.
+**Guard.** The two `across an SSD-first refresh that evicts` tests, each in both orders (target evicted, target moved).
+
 ## The SSD tier refused a volume with 117 GB usable (2026-09-14)
 
 `kv_disk_cache.volumeSpace` read `statfs.f_bavail`, which is what `df` prints and which excludes the purgeable space macOS frees on demand. The release box showed 36 GB free by df and 117 GB by Finder, so the tier declined every persist under its 64 GiB reserve and the Flash-Next SSD-first soak restored nothing after a restart. Fix: one ObjC probe, `msv_volume_free_for_use(path)`, returns `volumeAvailableCapacityForImportantUsage`; `volumeSpace` reports that as `free` (statfs stays the fallback and the total) and the ANE compile-cache cap reads the same probe. Guard: `test "volumeSpace: free is what the OS grants"` (red on this box: 117 GB expected, 36 GB found).
