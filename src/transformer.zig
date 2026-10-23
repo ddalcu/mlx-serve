@@ -21366,7 +21366,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&flat_ids, token_ids, &flat_shape, 1, self.s));
 
         // Word embeddings
-        const word_emb = try self.dequantTake(self.emb_w, self.emb_s, self.emb_b, flat_ids);
+        const word_emb = try self.dequantTake(self.emb_w, self.emb_s, self.emb_b, flat_ids, self.config.hidden_size);
         defer _ = mlx.mlx_array_free(word_emb);
 
         // Reshape word embeddings to [B, S, H] up front: position / token-type
@@ -21383,7 +21383,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(pos_ids);
         try mlx.check(mlx.mlx_arange(&pos_ids, 0, @as(f64, @floatFromInt(seq_len)), 1, .int32, self.s));
 
-        const pos_emb = try self.dequantTake(self.bert_pos_w, self.bert_pos_s, self.bert_pos_b, pos_ids);
+        const pos_emb = try self.dequantTake(self.bert_pos_w, self.bert_pos_s, self.bert_pos_b, pos_ids, self.config.hidden_size);
         defer _ = mlx.mlx_array_free(pos_emb);
 
         // Token type IDs: all zeros (one row per position, broadcast over B)
@@ -21392,7 +21392,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(toktype_ids);
         try mlx.check(mlx.mlx_zeros(&toktype_ids, &seq_shape, 1, .int32, self.s));
 
-        const toktype_emb = try self.dequantTake(self.bert_toktype_w, self.bert_toktype_s, self.bert_toktype_b, toktype_ids);
+        const toktype_emb = try self.dequantTake(self.bert_toktype_w, self.bert_toktype_s, self.bert_toktype_b, toktype_ids, self.config.hidden_size);
         defer _ = mlx.mlx_array_free(toktype_emb);
 
         const bcast_shape = [_]c_int{ 1, seq_len, @intCast(self.config.hidden_size) };
@@ -21415,7 +21415,8 @@ pub const Transformer = struct {
         return self.layerNorm(sum, self.bert_emb_norm_w, self.bert_emb_norm_b);
     }
 
-    fn dequantTake(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, ids: mlx.mlx_array) !mlx.mlx_array {
+    /// `row_width` is the table's dequantized row width: a per-tensor quant override is solved from it.
+    fn dequantTake(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, ids: mlx.mlx_array, row_width: u32) !mlx.mlx_array {
         var tw = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(tw);
         try mlx.check(mlx.mlx_take_axis(&tw, w, ids, 0, self.s));
@@ -21436,7 +21437,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_take_axis(&tb, bi, ids, 0, self.s));
         }
         var result = mlx.mlx_array_new();
-        const qp = self.quantParamsFor(w, sc);
+        const qp = self.quantParamsHinted(w, sc, row_width);
         try mlx.check(mlx.mlx_dequantize(
             &result,
             tw,
@@ -21577,7 +21578,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(flat_ids);
         try mlx.check(mlx.mlx_reshape(&flat_ids, token_ids, &flat_shape, 1, self.s));
 
-        const ple_emb_raw = try self.dequantTake(self.ple_emb_w, self.ple_emb_s, self.ple_emb_b, flat_ids);
+        const ple_emb_raw = try self.dequantTake(self.ple_emb_w, self.ple_emb_s, self.ple_emb_b, flat_ids, @intCast(total_ple));
         defer _ = mlx.mlx_array_free(ple_emb_raw);
 
         // Reshape to [B, S, n_layers, ple_dim] and scale by sqrt(ple_dim)
@@ -53780,6 +53781,65 @@ test "gatherQuantizedRows is BIT-identical to dequantizing the whole table and t
     defer _ = mlx.mlx_array_free(wf);
     try mlx.check(mlx.mlx_reshape(&wf, want, &flat, 1, s));
     try testing.expectEqual(@as(f32, 0.0), try maxAbsDiffF32(gf, wf, s));
+}
+
+test "dequantTake reads a table at its own group size inside a model with another one" {
+    // Bar: a gs-64 table (Gemma 4 E4B `embed_tokens_per_layer`) in a gs-32 pack gathers full-width rows.
+    const s = mlx.gpuStream();
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    const V = 8;
+    const IN = 512;
+    const gs = 64;
+    const bits = 4;
+
+    var host: [V * IN]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 97)) - 48)) * 0.011;
+    const sh = [_]c_int{ V, IN };
+    const w_f32 = mlx.mlx_array_new_data(&host, &sh, 2, .float32);
+    defer _ = mlx.mlx_array_free(w_f32);
+    var w_bf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_bf);
+    try mlx.check(mlx.mlx_astype(&w_bf, w_f32, .bfloat16, s));
+    var qvec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_quantize(&qvec, w_bf, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&q, qvec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, qvec, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, qvec, 2));
+
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.bits_cache = .{};
+    xfm.config = .{};
+    xfm.config.quant_bits = 4;
+    xfm.config.quant_group_size = 32;
+    xfm.config.quant_mode = .affine;
+
+    const ids_host = [_]i32{ 5, 0, 7 };
+    const ids_sh = [_]c_int{3};
+    const ids = mlx.mlx_array_new_data(&ids_host, &ids_sh, 1, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    const got = try xfm.dequantTake(q, sc, bi, ids, IN);
+    defer _ = mlx.mlx_array_free(got);
+
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, q, sc, bi, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_take_axis(&want, deq, ids, 0, s));
+
+    const shape_got = mlx.getShape(got);
+    try testing.expectEqual(@as(usize, 2), shape_got.len);
+    try testing.expectEqual(@as(c_int, IN), shape_got[1]);
+    try testing.expectEqual(@as(f32, 0.0), try maxAbsDiffF32(got, want, s));
 }
 
 test "splitPackedGateUp slices DiffusionGemma experts.gate_up_proj into gate/up halves" {

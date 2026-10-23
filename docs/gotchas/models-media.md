@@ -2,6 +2,10 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### A table gather and the Gemma vision projection ignored a per-tensor group size (Gemma 4 E4B mixed 4/6-bit)
+
+`zecanard/gemma-4-E4B-it-ultra-uncensored-heretic-MLX-4bit-mixed_4_6` declares gs 32 model-wide but stores every language-model tensor and both media projections at gs 64. Warmup died with `Cannot reshape array of size 5376 into shape (1,1,42,256)`, and every image turn 500'd. Cause: `dequantTake` (the per-layer embedding table, BERT's tables) and the Gemma `VisionEncoder` projections resolved quant without the input width, so they fell back to the config gs (6-bit gs 64 read as gs 32 gives half-width rows; the 4-bit projection read as 8-bit gs 32). Fix: `dequantTake` takes the row width; `quantLinear` solves each weight from its input width (`quantParamsFromGeometry`), like the other towers. Guards: `dequantTake reads a table at its own group size…` and `quantLinear reads a projection at its own group size…`.
+
 ### ModelOpt's NVFP4 global scale is not MLX's (NVIDIA Flash Next FP4)
 
 NVIDIA's pack loaded and chatted, but every image read as "a blank white canvas". The vision tower's NVFP4 linears were dequantized with `weight_scale_2` passed as MLX's `global_scale`. ModelOpt stores `weight_scale_2 = amax / (448 x 6)`; MLX's kernels divide its `global_scale` by 448 x 6 themselves, so every weight came out 2688x too small. Fix: `modelopt_pack.dequantDense` multiplies by 448 x 6 first. Guard: `ModelOpt NVFP4 dense dequant` checks code x e4m3 x `weight_scale_2` exactly. The routed experts never meet MLX's convention: their per-expert scales ride the gate and the routing weight.

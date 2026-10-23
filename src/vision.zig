@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
+const transformer = @import("transformer.zig");
 const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
@@ -65,7 +66,6 @@ const UnifiedWeights = struct {
     patch_dense_s: mlx.mlx_array,
     patch_dense_b: mlx.mlx_array,
     patch_dense_bias: mlx.mlx_array, // [mm_embed_dim] additive bias
-    patch_dense_bits: u32,
     patch_ln2_w: mlx.mlx_array, // [mm_embed_dim]
     patch_ln2_b: mlx.mlx_array,
     pos_embedding: mlx.mlx_array, // [posemb_size, 2, mm_embed_dim]
@@ -75,13 +75,11 @@ const UnifiedWeights = struct {
     ev_w: mlx.mlx_array,
     ev_s: mlx.mlx_array,
     ev_b: mlx.mlx_array,
-    ev_bits: u32,
     // embed_audio projection (RMSNorm-noscale → Linear, no bias). Optional —
     // present only when the checkpoint ships audio weights and --no-vision off.
     ea_w: ?mlx.mlx_array,
     ea_s: mlx.mlx_array,
     ea_b: mlx.mlx_array,
-    ea_bits: u32,
     model_patch_size: c_int, // 48
 };
 
@@ -180,8 +178,6 @@ pub const VisionEncoder = struct {
     proj_w: mlx.mlx_array,
     proj_s: mlx.mlx_array,
     proj_b: mlx.mlx_array,
-    proj_quant_bits: u32,
-    proj_quant_group_size: u32,
 
     // Gemma-4 26B/31B: learned pre-encoder standardization (scale * h + bias on last dim).
     // null for E4B which uses clipped linears and no standardization.
@@ -287,8 +283,6 @@ pub const VisionEncoder = struct {
         const proj_b = getWeight(weights, &name_buf, "embed_vision.embedding_projection.biases") orelse
             getWeight(weights, &name_buf, "multi_modal_projector.biases") orelse mlx.mlx_array_new();
 
-        const proj_bits = detectProjBits(proj_w, proj_s, config.quant_group_size);
-
         // Gemma-4 26B/31B learned standardization (per-channel scale + bias).
         // Applied once after patch + position embedding, before the transformer stack.
         const std_scale_opt = getWeight(weights, &name_buf, "vision_tower.std_scale");
@@ -343,8 +337,6 @@ pub const VisionEncoder = struct {
             .proj_w = proj_w,
             .proj_s = proj_s,
             .proj_b = proj_b,
-            .proj_quant_bits = proj_bits,
-            .proj_quant_group_size = config.quant_group_size,
             .std_scale = std_scale_opt,
             .std_bias = std_bias_opt,
             .rms_eps = 1e-6,
@@ -405,7 +397,6 @@ pub const VisionEncoder = struct {
         const ea_s = getWeight(weights, &nb, "embed_audio.embedding_projection.scales") orelse mlx.mlx_array_new();
         const ea_b = getWeight(weights, &nb, "embed_audio.embedding_projection.biases") orelse mlx.mlx_array_new();
 
-        const gs = config.quant_group_size;
         const unified = UnifiedWeights{
             .patch_ln1_w = getWeight(weights, &nb, "vision_embedder.patch_ln1.weight").?,
             .patch_ln1_b = getWeight(weights, &nb, "vision_embedder.patch_ln1.bias").?,
@@ -413,7 +404,6 @@ pub const VisionEncoder = struct {
             .patch_dense_s = dense_s,
             .patch_dense_b = dense_b,
             .patch_dense_bias = getWeight(weights, &nb, "vision_embedder.patch_dense.bias").?,
-            .patch_dense_bits = detectProjBits(dense_w, dense_s, gs),
             .patch_ln2_w = getWeight(weights, &nb, "vision_embedder.patch_ln2.weight").?,
             .patch_ln2_b = getWeight(weights, &nb, "vision_embedder.patch_ln2.bias").?,
             .pos_embedding = getWeight(weights, &nb, "vision_embedder.pos_embedding").?,
@@ -422,11 +412,9 @@ pub const VisionEncoder = struct {
             .ev_w = ev_w,
             .ev_s = ev_s,
             .ev_b = ev_b,
-            .ev_bits = detectProjBits(ev_w, ev_s, gs),
             .ea_w = ea_w,
             .ea_s = ea_s,
             .ea_b = ea_b,
-            .ea_bits = if (ea_w) |w| detectProjBits(w, ea_s, gs) else 4,
             .model_patch_size = @intCast(if (config.vision_model_patch_size > 0) config.vision_model_patch_size else 48),
         };
 
@@ -445,8 +433,6 @@ pub const VisionEncoder = struct {
             .proj_w = mlx.mlx_array_new(),
             .proj_s = mlx.mlx_array_new(),
             .proj_b = mlx.mlx_array_new(),
-            .proj_quant_bits = 4,
-            .proj_quant_group_size = gs,
             .std_scale = null,
             .std_bias = null,
             .rms_eps = 1e-6, // embed_{vision,audio} pre-projection RMSNorm eps
@@ -470,8 +456,6 @@ pub const VisionEncoder = struct {
             .proj_w = mlx.mlx_array_new(),
             .proj_s = mlx.mlx_array_new(),
             .proj_b = mlx.mlx_array_new(),
-            .proj_quant_bits = 4,
-            .proj_quant_group_size = config.quant_group_size,
             .std_scale = null,
             .std_bias = null,
             .rms_eps = 1e-6,
@@ -595,16 +579,22 @@ pub const VisionEncoder = struct {
 
     /// Apply a quantized (or dense) Linear y = x · Wᵀ (+ optional bias). `sc`
     /// non-empty (ndim>0) selects the quantized path; otherwise a plain matmul.
-    fn quantLinear(self: *VisionEncoder, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, qb: mlx.mlx_array, bits: u32, bias: ?mlx.mlx_array) !mlx.mlx_array {
+    fn quantLinear(self: *VisionEncoder, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, qb: mlx.mlx_array, bias: ?mlx.mlx_array) !mlx.mlx_array {
         var out = mlx.mlx_array_new();
         // Quantized weight has scales (non-null ctx); dense bf16 weight ships a
         // null-ctx `mlx_array_new()` placeholder. Gate on .ctx, not ndim, because
         // mlx_array_ndim throws on a null handle.
         if (sc.ctx != null) {
+            // Solved per weight from the input width: a pack can override one projection's group size.
+            const x_shape = mlx.getShape(x);
+            const in_dim: u32 = @intCast(x_shape[x_shape.len - 1]);
+            const gs = self.config.quant_group_size;
+            const qp = transformer.quantParamsFromGeometry(w, sc, qb.ctx != null, in_dim) orelse
+                transformer.QuantParams{ .bits = detectProjBits(w, sc, gs), .group_size = gs, .mode = self.config.quant_mode };
             try mlx.check(mlx.mlx_quantized_matmul(
                 &out, x, w, sc, qb, true,
-                mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
-                mlx.mlx_optional_int.some(@intCast(bits)), self.config.quant_mode.cstr(), self.s,
+                mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+                mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), self.s,
             ));
         } else {
             var wt = mlx.mlx_array_new();
@@ -654,7 +644,7 @@ pub const VisionEncoder = struct {
             h = t;
         }
         {
-            const t = try self.quantLinear(h, u.patch_dense_w, u.patch_dense_s, u.patch_dense_b, u.patch_dense_bits, u.patch_dense_bias);
+            const t = try self.quantLinear(h, u.patch_dense_w, u.patch_dense_s, u.patch_dense_b, u.patch_dense_bias);
             _ = mlx.mlx_array_free(h);
             h = t;
         }
@@ -685,7 +675,7 @@ pub const VisionEncoder = struct {
             const normed = try self.rmsNormNoScale(h);
             _ = mlx.mlx_array_free(h);
             defer _ = mlx.mlx_array_free(normed);
-            h = try self.quantLinear(normed, u.ev_w, u.ev_s, u.ev_b, u.ev_bits, null);
+            h = try self.quantLinear(normed, u.ev_w, u.ev_s, u.ev_b, null);
         }
         _ = L;
         return h;
@@ -764,7 +754,7 @@ pub const VisionEncoder = struct {
         const normed = try self.rmsNormNoScale(h);
         _ = mlx.mlx_array_free(h);
         defer _ = mlx.mlx_array_free(normed);
-        return self.quantLinear(normed, ea_w, u.ea_s, u.ea_b, u.ea_bits, null);
+        return self.quantLinear(normed, ea_w, u.ea_s, u.ea_b, null);
     }
 
     /// Forward pass: pixel data [B, 3, H, W] float32 → vision embeddings [B, N_out, text_hidden_size].
@@ -935,22 +925,7 @@ pub const VisionEncoder = struct {
         const pre_proj_normed = try self.rmsNormNoScale(post_std);
         _ = mlx.mlx_array_free(post_std);
 
-        var post_normed: mlx.mlx_array = undefined;
-        // .ctx (not ndim) — dense bf16 projector's proj_s is a null-ctx handle.
-        if (self.proj_s.ctx != null) {
-            post_normed = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_quantized_matmul(
-                &post_normed, pre_proj_normed, self.proj_w, self.proj_s, self.proj_b,
-                true, mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
-                mlx.mlx_optional_int.some(@intCast(self.proj_quant_bits)), self.config.quant_mode.cstr(), self.s,
-            ));
-        } else {
-            var proj_wt = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(proj_wt);
-            try mlx.check(mlx.mlx_transpose(&proj_wt, self.proj_w, self.s));
-            post_normed = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_matmul(&post_normed, pre_proj_normed, proj_wt, self.s));
-        }
+        const post_normed = try self.quantLinear(pre_proj_normed, self.proj_w, self.proj_s, self.proj_b, null);
         _ = mlx.mlx_array_free(pre_proj_normed);
 
         // Output: [B, n_pooled, text_hidden]
@@ -1879,6 +1854,66 @@ test "detectProjBits returns dense default for null-ctx scales" {
     try testing.expectEqual(@as(u32, 4), detectProjBits(w, dense_scales, 64));
 }
 
+test "quantLinear reads a projection at its own group size inside a model with another one" {
+    // Bar: a 4-bit gs-64 `embed_vision.embedding_projection` in a gs-32 pack equals x @ dequant(W)ᵀ.
+    const s = mlx.gpuStream();
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    const OUT = 8;
+    const IN = 256;
+    const gs = 64;
+    const bits = 4;
+
+    var w_host: [OUT * IN]f32 = undefined;
+    for (&w_host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 53)) - 26)) * 0.02;
+    const w_sh = [_]c_int{ OUT, IN };
+    const w_f32 = mlx.mlx_array_new_data(&w_host, &w_sh, 2, .float32);
+    defer _ = mlx.mlx_array_free(w_f32);
+    var w_bf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_bf);
+    try mlx.check(mlx.mlx_astype(&w_bf, w_f32, .bfloat16, s));
+    var qvec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_quantize(&qvec, w_bf, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&q, qvec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, qvec, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, qvec, 2));
+
+    var x_host: [IN]f32 = undefined;
+    for (&x_host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.1;
+    const x_sh = [_]c_int{ 1, IN };
+    const x_f32 = mlx.mlx_array_new_data(&x_host, &x_sh, 2, .float32);
+    defer _ = mlx.mlx_array_free(x_f32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x_f32, .bfloat16, s));
+
+    var enc: VisionEncoder = undefined;
+    enc.s = s;
+    enc.config = .{};
+    enc.config.quant_bits = 4;
+    enc.config.quant_group_size = 32;
+    enc.config.quant_mode = .affine;
+    const got = try enc.quantLinear(x, q, sc, bi, null);
+    defer _ = mlx.mlx_array_free(got);
+
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_quantized_matmul(&want, x, q, sc, bi, true, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", s));
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, got, want, false, s));
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+    try testing.expect(ok);
+}
+
 test "quantLinear dense fallback computes x @ Wᵀ for a bf16 projector" {
     // The dense projector path (scales absent) must transpose the [out, in]
     // weight and matmul — identical x @ Wᵀ semantics to the quantized
@@ -1887,7 +1922,6 @@ test "quantLinear dense fallback computes x @ Wᵀ for a bf16 projector" {
     var enc: VisionEncoder = undefined;
     enc.s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(enc.s);
-    enc.proj_quant_group_size = 64; // unused on the dense branch
 
     var x_buf = [_]f32{ 1.0, 2.0 };
     const x_shape = [_]c_int{ 1, 2 };
@@ -1900,7 +1934,7 @@ test "quantLinear dense fallback computes x @ Wᵀ for a bf16 projector" {
     const w = mlx.mlx_array_new_data(&w_buf, &w_shape, 2, .float32);
     defer _ = mlx.mlx_array_free(w);
 
-    const out = try enc.quantLinear(x, w, mlx.mlx_array_new(), mlx.mlx_array_new(), 4, null);
+    const out = try enc.quantLinear(x, w, mlx.mlx_array_new(), mlx.mlx_array_new(), null);
     defer _ = mlx.mlx_array_free(out);
 
     const oshape = mlx.getShape(out);
