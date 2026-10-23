@@ -851,6 +851,109 @@ pub const SchemaConstraint = struct {
     }
 };
 
+test "batchedConstrainedKind: only a single simple reason is batchable, and a protocol grammar only in its JSON body" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}},\"required\":[\"a\"]}", .{});
+    defer parsed.deinit();
+    var schema = try json_schema.parse(std.testing.allocator, parsed.value);
+    defer schema.deinit();
+    var grammar = try json_grammar.Grammar.init(std.testing.allocator, &schema);
+    defer grammar.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const a = arena.allocator();
+    // The vocab shape the token-mask tests use; `TokenBytes.deinit` frees the arena it owns.
+    const vocab: [5]?[]const u8 = .{
+        try a.dupe(u8, "{"),
+        try a.dupe(u8, "["),
+        try a.dupe(u8, "\"hello\""),
+        try a.dupe(u8, " "),
+        null,
+    };
+    var tb = try token_mask.TokenBytes.init(arena, &vocab, 4);
+    defer tb.deinit();
+    const mask = try std.testing.allocator.alloc(bool, 5);
+    defer std.testing.allocator.free(mask);
+    var constraint: Constraint = .{ .grammar = &grammar, .token_bytes = &tb, .mask_buf = mask };
+    const plain: SamplingParams = .{};
+
+    // No reason at all, and each reason alone.
+    try std.testing.expectEqual(ConstrainedKind.plain, batchedConstrainedKind(null, 0, plain));
+    try std.testing.expectEqual(ConstrainedKind.grammar, batchedConstrainedKind(&constraint, 0, plain));
+    try std.testing.expectEqual(ConstrainedKind.logprobs, batchedConstrainedKind(null, 3, plain));
+    try std.testing.expectEqual(ConstrainedKind.penalty, batchedConstrainedKind(null, 0, .{ .frequency_penalty = 0.2 }));
+    // Two reasons at once stay serial.
+    try std.testing.expectEqual(ConstrainedKind.mixed, batchedConstrainedKind(&constraint, 3, plain));
+    try std.testing.expectEqual(ConstrainedKind.mixed, batchedConstrainedKind(&constraint, 0, .{ .repeat_penalty = 1.2 }));
+    // A protocol in its JSON body is batchable; its other phases emit forced tokens.
+    const proto: rp_mod.Protocol = undefined;
+    var with_proto = constraint;
+    with_proto.proto = &proto;
+    with_proto.pstate.phase = .json_body;
+    try std.testing.expectEqual(ConstrainedKind.grammar, batchedConstrainedKind(&with_proto, 0, plain));
+    for ([_]rp_mod.Phase{ .choice, .header, .reasoning }) |ph| {
+        with_proto.pstate.phase = ph;
+        try std.testing.expectEqual(ConstrainedKind.mixed, batchedConstrainedKind(&with_proto, 0, plain));
+    }
+    // A recovery drain and a dead grammar also stay serial.
+    var recovering = constraint;
+    recovering.pstate.recovering = true;
+    try std.testing.expectEqual(ConstrainedKind.mixed, batchedConstrainedKind(&recovering, 0, plain));
+    var dead = constraint;
+    dead.grammar.dead = true;
+    try std.testing.expectEqual(ConstrainedKind.mixed, batchedConstrainedKind(&dead, 0, plain));
+
+    try std.testing.expect(constrainedRowBatchable(.grammar));
+    try std.testing.expect(constrainedRowBatchable(.logprobs));
+    try std.testing.expect(constrainedRowBatchable(.penalty));
+    try std.testing.expect(!constrainedRowBatchable(.mixed));
+    try std.testing.expect(!constrainedRowBatchable(.plain));
+}
+
+test "sampleConstrainedRow: a grammar row draws a schema-valid token and advances the grammar" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    // Schema: {"a": <integer>}. Vocab: 0 = `{`, 1 = `"a":`, 2 = `7`, 3 = `}`, 4 = EOS.
+    var value = try std.json.parseFromSlice(std.json.Value, t.allocator, "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}},\"required\":[\"a\"]}", .{});
+    defer value.deinit();
+    var sc: SchemaConstraint = undefined;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    const a = arena.allocator();
+    // `TokenBytes.deinit` frees the arena it owns.
+    const vocab: [5]?[]const u8 = .{
+        try a.dupe(u8, "{"),
+        try a.dupe(u8, "\"a\":"),
+        try a.dupe(u8, "7"),
+        try a.dupe(u8, "}"),
+        null,
+    };
+    var tb = try token_mask.TokenBytes.init(arena, &vocab, 4);
+    defer tb.deinit();
+    try sc.initFromValue(t.allocator, value.value, &tb);
+    defer sc.deinit();
+
+    const sampling: SamplingParams = .{ .constraint = &sc.constraint, .temperature = 0, .suppress_mask = null };
+    const eos = [_]u32{4};
+    // Flat logits favour an illegal token (EOS at index 4 is high): the grammar mask must win.
+    var host: [5]f32 = .{ 1.0, 1.0, 1.0, 1.0, 9.0 };
+    var out_ids: [3]u32 = undefined;
+    for (&out_ids, 0..) |*id, step| {
+        const logits = mlx.mlx_array_new_data(&host, &[_]c_int{ 1, 1, 5 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(logits);
+        const row = try sampleConstrainedRow(t.allocator, logits, sampling, 0, &eos, &.{}, s);
+        id.* = @intCast(row.id);
+        if (step == 0) try t.expectEqual(@as(u32, 0), id.*); // only `{` opens the object
+        // Later steps follow the grammar's own allowed set, not the logits' EOS peak.
+        try t.expect(row.id != 4);
+    }
+    // The grammar advanced: after `{` the accepted prefix is no longer the empty start.
+    try t.expect(!sc.grammar.isComplete());
+
+    // A row with two reasons is refused, not silently sampled without one of them.
+    const mixed_logits = mlx.mlx_array_new_data(&host, &[_]c_int{ 1, 1, 5 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(mixed_logits);
+    try t.expectError(error.NotBatchable, sampleConstrainedRow(t.allocator, mixed_logits, sampling, 3, &eos, &.{}, s));
+}
+
 test "forced recovery leaves room for the whole transition and one answer token" {
     try std.testing.expect(forcedBoundaryCanContinue(0, 2, 1));
     try std.testing.expect(forcedBoundaryCanContinue(8, 10, 1));
@@ -1688,6 +1791,9 @@ pub const Generator = struct {
     // Deferred token: lazy array from async pipeline, eval'd at start of next iteration
     pending_token: mlx.mlx_array = .{},
     has_pending_token: bool = false,
+    /// A batched grammar row: `next_token_id` is drawn (the grammar has advanced on it) but
+    /// neither emitted nor forwarded, and no logits are pending.
+    constrained_parked: bool = false,
 
     // ── Spec-decode shared state (PLD + drafter) ──
     // Post-final-norm hidden state at the last produced token's position.
@@ -4131,14 +4237,51 @@ pub const Generator = struct {
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
+        // As in the serial slow path: the emitted token's entry moves to `last_logprob`,
+        // and the new token's entry, from the raw logits, waits in `pending_logprob`.
         const lazy = self.sampleLazy(step_logits);
-        _ = mlx.mlx_array_free(step_logits);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
         _ = mlx.mlx_array_free(lazy);
         self.next_token_id = @intCast(val);
+        if (self.logprobs_n > 0) {
+            if (self.last_logprob) |*old_lp| allocator.free(old_lp.top_logprobs);
+            self.last_logprob = self.pending_logprob;
+            self.pending_logprob = try computeLogprobs(allocator, step_logits, @intCast(val), self.logprobs_n, self.xfm.s);
+        }
+        _ = mlx.mlx_array_free(step_logits);
         return token;
+    }
+
+    pub const ConstrainedJoin = enum { ready, stop };
+
+    /// Join a grammar slot to the batched tick. Its serial arm has no lookahead to emit, so the
+    /// next token is drawn from `pending_logits` through the grammar and parked, not forwarded.
+    pub fn drainConstrainedForBatch(self: *Generator, allocator: std.mem.Allocator) !ConstrainedJoin {
+        try self.xfm.flushDeferredPle(&self.ctx);
+        if (self.has_pending_token) return error.UnexpectedPendingToken;
+        if (!self.has_pending_logits) return error.MissingPendingLogits;
+        if (self.step >= self.max_tokens) {
+            _ = mlx.mlx_array_free(self.pending_logits);
+            self.has_pending_logits = false;
+            self.done = true;
+            self.finish_reason = "length";
+            return .stop;
+        }
+        const step_logits = self.pending_logits;
+        self.has_pending_logits = false;
+        defer _ = mlx.mlx_array_free(step_logits);
+        const row = try sampleConstrainedRow(allocator, step_logits, self.sampling, self.logprobs_n, self.eos_token_ids, self.generated_ids.items, self.xfm.s);
+        self.sampling.draw +%= 1;
+        self.next_token_id = @intCast(row.id);
+        for (self.eos_token_ids) |eos_id| if (self.next_token_id == eos_id) {
+            self.done = true;
+            self.finish_reason = "stop";
+            return .stop;
+        };
+        self.constrained_parked = true;
+        return .ready;
     }
 
     /// Resolve the deferred pending token: eval the lazy array and extract the u32 value.
@@ -13036,7 +13179,40 @@ pub const Generator = struct {
         return token;
     }
 
+    /// Batched to serial for a grammar row: emit the parked token, forward it, and leave its
+    /// successor's logits pending, which is the serial constrained arm's shape.
+    fn emitParkedConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        self.constrained_parked = false;
+        // The batched tick already ran the EOS and pad-run checks on this token.
+        if (self.step >= self.max_tokens or self.stall.expired(self.timer.read(), self.generated_ids.items.len, self.timeout_ns)) {
+            self.done = true;
+            self.finish_reason = "length";
+            return null;
+        }
+        const token = self.next_token_id;
+        self.advanceStep(1);
+        try self.generated_ids.append(allocator, token);
+        if (self.step < self.max_tokens) {
+            const tok_i32: i32 = @intCast(token);
+            const tok_shape = [_]c_int{ 1, 1 };
+            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(tok_input);
+            const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
+            const arr = [_]mlx.mlx_array{nl};
+            const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+            _ = mlx.mlx_async_eval(vec);
+            _ = mlx.mlx_vector_array_free(vec);
+            self.pending_logits = nl;
+            self.has_pending_logits = true;
+        } else {
+            self.done = true;
+            self.finish_reason = "length";
+        }
+        return token;
+    }
+
     fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        if (self.constrained_parked and !self.has_pending_logits) return self.emitParkedConstrained(allocator);
         if (!self.has_pending_logits) {
             self.done = true;
             return null;
@@ -15405,6 +15581,126 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
 /// `chosen` is the id the lazy sampler actually drew, so the reported
 /// `token_logprob` belongs to the token that was really emitted (re-sampling
 /// here would disagree with it at any temperature above 0).
+/// The constraint a decode row carries. `.mixed` is more than one of them, or a grammar state
+/// the batched arm does not drive; those rows stay serial.
+pub const ConstrainedKind = enum { plain, grammar, logprobs, penalty, mixed };
+
+/// A protocol's choice, header and reasoning phases and a recovery drain emit forced tokens, so
+/// a grammar row is batchable only in the JSON body, where it samples like a plain grammar step.
+pub fn batchedConstrainedKind(constraint: ?*Constraint, logprobs_n: u32, sampling: SamplingParams) ConstrainedKind {
+    const has_g = constraint != null;
+    const has_l = logprobs_n > 0;
+    const has_p = sampling.penalized();
+    const count = @as(u8, @intFromBool(has_g)) + @as(u8, @intFromBool(has_l)) + @as(u8, @intFromBool(has_p));
+    if (count == 0) return .plain;
+    if (count > 1) return .mixed;
+    if (has_g) {
+        const c = constraint.?;
+        if (c.pstate.phase != .json_body or c.pstate.recovering) return .mixed;
+        if (c.grammar.dead) return .mixed;
+        return .grammar;
+    }
+    return if (has_l) .logprobs else .penalty;
+}
+
+/// May a row of this kind ride the batched tick when the switch is on?
+pub fn constrainedRowBatchable(kind: ConstrainedKind) bool {
+    return switch (kind) {
+        .grammar, .logprobs, .penalty => true,
+        .plain, .mixed => false,
+    };
+}
+
+pub const RowSample = struct {
+    id: i32,
+    lp: ?LogprobResult = null,
+};
+
+/// Sample one constrained row of a batched tick: grammar mask, penalties, the serial sampler,
+/// then the grammar advances; logprobs report the raw-logits distribution.
+pub fn sampleConstrainedRow(
+    allocator: std.mem.Allocator,
+    logits: mlx.mlx_array,
+    sampling: SamplingParams,
+    logprobs_n: u32,
+    eos_ids: []const u32,
+    generated_ids: []const u32,
+    s: mlx.mlx_stream,
+) !RowSample {
+    const kind = batchedConstrainedKind(sampling.constraint, logprobs_n, sampling);
+    if (!constrainedRowBatchable(kind)) return error.NotBatchable;
+
+    var filtered = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(filtered);
+    var use_filtered = false;
+
+    switch (kind) {
+        .grammar => {
+            const c = sampling.constraint.?;
+            var allowed = (try token_mask.buildMask(c.grammar, c.token_bytes, c.mask_buf)).allowed;
+            // The tokenizer's EOS is not necessarily the model's only stop id (serial arm).
+            if (c.grammar.isComplete()) {
+                for (eos_ids) |eos_id| {
+                    if (eos_id < c.mask_buf.len and !c.mask_buf[eos_id]) {
+                        c.mask_buf[eos_id] = true;
+                        allowed += 1;
+                    }
+                }
+            }
+            if (allowed == 0) {
+                log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
+                c.grammar.dead = true;
+                @memset(c.mask_buf, true);
+            }
+            try applyGrammarMask(allocator, &filtered, logits, c.mask_buf, s);
+            use_filtered = true;
+        },
+        .penalty => {
+            if (generated_ids.len > 0) {
+                if (applyPenalties(&filtered, logits, generated_ids, sampling, s)) |_| {
+                    use_filtered = true;
+                } else |err| {
+                    log.warn("[sampling] repeat penalty failed ({s}); this draw is unpenalized\n", .{@errorName(err)});
+                }
+            }
+        },
+        else => {},
+    }
+
+    const lazy = sampleTokenLazy(if (use_filtered) filtered else logits, sampling, s);
+    defer _ = mlx.mlx_array_free(lazy);
+    try mlx.check(mlx.mlx_array_eval(lazy));
+    var val: i32 = 0;
+    try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
+    const token: u32 = @intCast(val);
+
+    var out: RowSample = .{ .id = val };
+    if (kind == .logprobs) {
+        out.lp = try computeLogprobs(allocator, logits, token, logprobs_n, s);
+    }
+    // EOS does not advance the grammar; the caller stops the slot.
+    if (kind == .grammar) {
+        const c = sampling.constraint.?;
+        var is_eos = false;
+        for (eos_ids) |eos_id| if (token == eos_id) {
+            is_eos = true;
+        };
+        if (!is_eos and token < c.token_bytes.bytes.len) {
+            if (c.token_bytes.bytes[token]) |bytes| {
+                for (bytes) |b| {
+                    const ok = try c.grammar.acceptByte(b);
+                    if (!ok) {
+                        log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
+                        c.grammar.dead = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
 fn firstTokenLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen: u32, logprobs_n: u32, s: mlx.mlx_stream) !?LogprobResult {
     if (logprobs_n == 0) return null;
     const shape = mlx.getShape(logits);

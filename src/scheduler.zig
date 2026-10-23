@@ -2509,6 +2509,13 @@ pub const Scheduler = struct {
         return gen.spec_disabled_runtime or slotSpecMode(slot, gen) == .regular;
     }
 
+    /// Can the batched arm drive this slot's constraint? Reads the Generator's copy.
+    fn batchedConstrainedRowOk(slot: *const Slot) bool {
+        const gen = if (slot.legacy_gen) |*g| g else return false;
+        const kind = generate_mod.batchedConstrainedKind(gen.sampling.constraint, slot.logprobs_n, gen.sampling);
+        return generate_mod.constrainedRowBatchable(kind);
+    }
+
     /// Does this slot owe a module-head release? One single-slot tick lands it.
     fn slotReleasePending(slot: *const Slot) bool {
         const gen = if (slot.legacy_gen) |*g| g else return false;
@@ -2533,9 +2540,8 @@ pub const Scheduler = struct {
         if (!slotTicksRegular(slot)) return .spec_active;
         // A slot whose module-head release is armed but not landed still holds the head.
         if (slotReleasePending(slot)) return .head_release_pending;
-        if (slot.sampling.constraint != null) return .grammar;
-        if (slot.logprobs_n > 0) return .logprobs;
-        if (slot.sampling.penalized()) return .penalty;
+        const batched_ok = batchedConstrainedEnabled() and batchedConstrainedRowOk(slot);
+        if (constrainedVerdict(slot.sampling.constraint != null, slot.logprobs_n > 0, slot.sampling.penalized(), batched_ok)) |v| return v;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
         // always fall through to the per-slot decode path (which dispatches
         // into the engine).
@@ -2552,6 +2558,29 @@ pub const Scheduler = struct {
 
 /// Slots one batched forward can carry; the tail decodes serial this tick.
 pub const MAX_BATCH_GROUP = 32;
+
+/// A slot with a JSON-body grammar, logprobs or a penalty rides the batched forward; only its
+/// row is sampled on its own. `MLX_SERVE_BATCH_CONSTRAINED=0` keeps such slots serial.
+/// The serial reason for a slot with a grammar, logprobs or a penalty, or null when it has none
+/// or the batched arm can drive it.
+fn constrainedVerdict(grammar: bool, logprobs: bool, penalty: bool, batched_ok: bool) ?BatchVerdict {
+    if (!grammar and !logprobs and !penalty) return null;
+    if (batched_ok) return null;
+    if (grammar) return .grammar;
+    if (logprobs) return .logprobs;
+    return .penalty;
+}
+
+pub var batch_constrained_override: ?bool = null;
+var batch_constrained_cached: ?bool = null;
+pub fn batchedConstrainedEnabled() bool {
+    if (batch_constrained_override) |v| return v;
+    if (batch_constrained_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_BATCH_CONSTRAINED");
+    const on = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else true;
+    batch_constrained_cached = on;
+    return on;
+}
 
 pub const BatchVerdict = enum {
     ok,
@@ -2808,6 +2837,22 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
         log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> 20 });
     }
     return true;
+}
+
+test "constrainedVerdict: a batchable constrained slot falls through to the other checks; the rest keep their reason" {
+    try testing.expectEqual(@as(?BatchVerdict, null), constrainedVerdict(false, false, false, false));
+    try testing.expectEqual(@as(?BatchVerdict, null), constrainedVerdict(true, false, false, true));
+    try testing.expectEqual(@as(?BatchVerdict, .grammar), constrainedVerdict(true, true, false, false));
+    try testing.expectEqual(@as(?BatchVerdict, .logprobs), constrainedVerdict(false, true, true, false));
+    try testing.expectEqual(@as(?BatchVerdict, .penalty), constrainedVerdict(false, false, true, false));
+}
+
+test "batchedConstrainedEnabled: on by default, off with MLX_SERVE_BATCH_CONSTRAINED=0" {
+    batch_constrained_override = null;
+    defer batch_constrained_override = null;
+    if (std.c.getenv("MLX_SERVE_BATCH_CONSTRAINED") == null) try testing.expect(batchedConstrainedEnabled());
+    batch_constrained_override = false;
+    try testing.expect(!batchedConstrainedEnabled());
 }
 
 test "boundaryEligible: a small plain request is admitted only under a share, never nested, never beside an exclusive model" {
@@ -10849,13 +10894,30 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             slot.markError("no_generator");
             continue;
         };
-        if (gen.has_pending_logits or gen.has_pending_token) {
+        if (gen.sampling.constraint != null and (gen.has_pending_logits or gen.has_pending_token)) {
+            // A grammar row has no lookahead to emit: draw through the grammar and park.
+            const join = gen.drainConstrainedForBatch(slot.allocator) catch |err| {
+                slot.markError(@errorName(err));
+                continue;
+            };
+            if (join == .stop) {
+                slot.completion_tokens = gen.completion_tokens;
+                finishSlot(sch, slot, gen.finish_reason);
+                continue;
+            }
+        } else if (gen.has_pending_logits or gen.has_pending_token) {
             const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
                 slot.markError(@errorName(err));
                 continue;
             };
             if (emitted) |tok| {
-                slot.pushToken(tok);
+                // The drained token's entry is in `last_logprob`; the new token's waits in `pending_logprob`.
+                var drain_lp: ?generate_mod.LogprobResult = null;
+                if (slot.logprobs_n > 0) if (gen.last_logprob) |lp| {
+                    drain_lp = lp;
+                    gen.last_logprob = null;
+                };
+                slot.pushTokenWithLogprob(tok, drain_lp);
                 if (Planner.enabled() and gen.mtp_planner_owned) {
                     gen.mtp_planner_plain_ticks += 1;
                     plannerOutputClock(slot, gen);
@@ -10961,18 +11023,41 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // the initWithOptions chokepoint and carries the model's
     // reserved-token suppression mask; the slot's copy is the raw
     // request params.
-    var sample_params: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
-    var sample_rows: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
     var sample_ids: [MAX_BATCH_GROUP]i32 = undefined;
+    // Logprob of the token this tick SAMPLES, held until the tick that emits it.
+    var sample_lp: [MAX_BATCH_GROUP]?generate_mod.LogprobResult = @splat(null);
     std.debug.assert(live_n == logits_arr.len);
-    std.debug.assert(live_n <= sample_params.len);
-    for (batch, 0..) |slot, i| {
-        sample_params[i] = slot.legacy_gen.?.sampling;
-        sample_rows[i] = logits_arr[i];
-    }
-    if (live_n > 0) {
-        try generate_mod.sampleRows(sample_ids[0..live_n], sample_rows[0..live_n], sample_params[0..live_n], xfm_ptr.s);
-        for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
+    std.debug.assert(live_n <= sample_ids.len);
+    {
+        // Plain rows share one stacked draw; a constrained row is filtered and drawn on its own.
+        var plain_src: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+        var plain_par: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
+        var plain_at: [MAX_BATCH_GROUP]usize = undefined;
+        var plain_ids: [MAX_BATCH_GROUP]i32 = undefined;
+        var plain_n: usize = 0;
+        for (batch, 0..) |slot, i| {
+            const gen = &slot.legacy_gen.?;
+            const kind = generate_mod.batchedConstrainedKind(gen.sampling.constraint, slot.logprobs_n, gen.sampling);
+            if (generate_mod.constrainedRowBatchable(kind)) {
+                // These logits follow `next_token_id`, which joins the history only in the emit loop.
+                try gen.generated_ids.append(slot.allocator, gen.next_token_id);
+                defer _ = gen.generated_ids.pop();
+                const row = try generate_mod.sampleConstrainedRow(allocator, logits_arr[i], gen.sampling, slot.logprobs_n, slot.eos_token_ids, gen.generated_ids.items, xfm_ptr.s);
+                gen.sampling.draw +%= 1;
+                sample_ids[i] = row.id;
+                sample_lp[i] = row.lp;
+            } else {
+                plain_src[plain_n] = logits_arr[i];
+                plain_par[plain_n] = gen.sampling;
+                plain_at[plain_n] = i;
+                plain_n += 1;
+            }
+        }
+        if (plain_n > 0) {
+            try generate_mod.sampleRows(plain_ids[0..plain_n], plain_src[0..plain_n], plain_par[0..plain_n], xfm_ptr.s);
+            for (plain_at[0..plain_n], plain_ids[0..plain_n]) |i, id| sample_ids[i] = id;
+            for (plain_at[0..plain_n], 0..) |i, k| batch[i].legacy_gen.?.sampling.draw = plain_par[k].draw;
+        }
     }
 
     // Sample per slot, emit prev id, set new next_token_id.
@@ -10982,14 +11067,31 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         const sampled: ?i32 = if (act.publish) sample_ids[i] else null;
 
         const emit = gen.next_token_id;
+        // As in the serial arm, a protocol's payload span is published before its token.
+        if (gen.takeConstraintSpan()) |span| slot.publishConstraintSpan(span.token_index, span.byte_offset);
+        // `emit`'s entry was parked in `pending_logprob` when it was sampled, as in the serial arm.
+        var lp_take: ?generate_mod.LogprobResult = null;
+        if (slot.logprobs_n > 0) if (gen.pending_logprob) |lp| {
+            lp_take = lp;
+            gen.pending_logprob = null;
+        };
         gen.generated_ids.append(slot.allocator, emit) catch |err| {
             slot.markError(@errorName(err));
             continue;
         };
         gen.advanceStep(1);
         if (emit != 0) slot.was_pad_only = false;
-        const val = sampled orelse continue;
+        const val = sampled orelse {
+            if (sample_lp[i]) |lp| slot.allocator.free(lp.top_logprobs);
+            sample_lp[i] = null;
+            continue;
+        };
         gen.next_token_id = @intCast(val);
+        if (sample_lp[i]) |lp| {
+            if (gen.pending_logprob) |old| slot.allocator.free(old.top_logprobs);
+            gen.pending_logprob = lp;
+            sample_lp[i] = null;
+        }
         if (Planner.enabled()) plannerOutputClock(slot, gen);
 
         // Stop checks (mirrors Generator.checkStop).
@@ -11000,11 +11102,11 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             // NEXT token (it's checked before emit). To preserve that
             // behavior we emit and then mark finished if `next_token_id` is
             // EOS (i.e. STOP is the next sampled token, ignored).
-            slot.pushToken(emit);
+            slot.pushTokenWithLogprob(emit, lp_take);
             slot.completion_tokens = gen.completion_tokens;
             // not finished yet; next tick's checkStop on next_token_id ends it
         } else {
-            slot.pushToken(emit);
+            slot.pushTokenWithLogprob(emit, lp_take);
             slot.completion_tokens = gen.completion_tokens;
         }
 
