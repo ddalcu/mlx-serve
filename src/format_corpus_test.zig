@@ -41,6 +41,22 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
+test "format corpus: declared stream backends never advertise image or video input" {
+    const discovery = @import("model_discovery.zig");
+    for ([_][]const u8{ "mimo_v2", "mimo_v2_flash", "glm5_next", "glm5_next_text", "qwen3_vl" }) |mt| {
+        for ([_][]const u8{ "{}", "null", "true", "[]" }) |marker| {
+            const json = try std.fmt.allocPrint(testing.allocator, "{{\"model_type\":\"{s}\",\"vision_config\":{{}},\"video_token_id\":42,\"expert_streaming\":{s}}}", .{ mt, marker });
+            defer testing.allocator.free(json);
+            const meta = discovery.parseStubMeta(testing.allocator, json, true);
+            const resident = std.mem.eql(u8, mt, "qwen3_vl") or !std.mem.eql(u8, marker, "{}");
+            const vision = resident and !std.mem.endsWith(u8, mt, "_text");
+            try testing.expect(meta.found and meta.has_chat);
+            try testing.expectEqual(vision, meta.has_vision);
+            try testing.expectEqual(vision, meta.has_video);
+        }
+    }
+}
+
 test "format corpus: video atoms come only from media parts and preserve text" {
     const clips = [_]chat.VideoData{.{ .pixels = "", .grid_t = 128, .grid_h = 32, .grid_w = 32 }};
     for ([_][]const u8{ "system", "user", "assistant", "tool" }) |role| {

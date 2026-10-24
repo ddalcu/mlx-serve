@@ -1385,6 +1385,10 @@ pub fn hasRadioVision(root: std.json.ObjectMap) bool {
 /// (chat-template presence ⇒ chat/tool_use/streaming/json_schema). Returns
 /// `.found=false` on any parse failure.
 pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_chat_template: bool) StubMeta {
+    return parseStubMetaWithBank(allocator, config_json, has_chat_template, false);
+}
+
+fn parseStubMetaWithBank(allocator: std.mem.Allocator, config_json: []const u8, has_chat_template: bool, has_expert_bank: bool) StubMeta {
     var meta: StubMeta = .{};
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return meta;
     defer parsed.deinit();
@@ -1447,6 +1451,16 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     const radio = nemotron and hasRadioVision(root);
     if (nemotron) meta.has_vision = radio;
     meta.has_video = (meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0) or radio;
+    // Mirror parseConfig's backend selection, not just its architecture: the
+    // resident variants can serve vision, but mlx-stream cannot yet.
+    const declared_stream = if (root.get("expert_streaming")) |v| v == .object else false;
+    const bank_stream = has_expert_bank and (std.mem.eql(u8, mt, "deepseek_v41") or std.mem.eql(u8, mt, "glm_moe_dsa"));
+    const marked_stream = declared_stream and (std.mem.eql(u8, mt, "mimo_v2") or std.mem.eql(u8, mt, "mimo_v2_flash") or
+        std.mem.eql(u8, mt, "glm5_next") or std.mem.eql(u8, mt, "glm5_next_text"));
+    if (bank_stream or marked_stream) {
+        meta.has_vision = false;
+        meta.has_video = false;
+    }
     meta.is_aligner = isForcedAligner(root);
     meta.has_transcription = std.mem.eql(u8, mt, "qwen3_asr") and !meta.is_aligner;
     const bidirectional = blk: {
@@ -1502,7 +1516,8 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     defer allocator.free(bytes);
 
     const sniff = sniffChatTemplate(io, allocator, dir);
-    var meta = parseStubMeta(allocator, bytes, sniff.present);
+    const has_expert_bank = if (dir.access(io, "experts.bin", .{})) |_| true else |_| false;
+    var meta = parseStubMetaWithBank(allocator, bytes, sniff.present, has_expert_bank);
     meta.has_thinking = meta.has_chat and sniff.thinking;
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
     // A sentence-transformers pooling sidecar marks embedding capability even
@@ -2684,6 +2699,40 @@ test "probeModelDir refuses an incomplete media pack by name" {
     defer allocator.free(dir);
 
     try testing.expectError(error.IncompleteMediaPack, probeModelDir(io, allocator, dir));
+}
+
+test "readStubMeta: stream packs suppress vision and video without hiding resident capabilities" {
+    const io = testing.io;
+    const a = testing.allocator;
+    const cases = [_]struct { model_type: []const u8, bank: bool = false, marker: []const u8 = "null", vision: bool }{
+        .{ .model_type = "deepseek_v41", .bank = true, .vision = false },
+        .{ .model_type = "deepseek_v41", .vision = true },
+        .{ .model_type = "deepseek_v41", .marker = "{}", .vision = true },
+        .{ .model_type = "glm_moe_dsa", .bank = true, .vision = false },
+        .{ .model_type = "mimo_v2", .marker = "{}", .vision = false },
+        .{ .model_type = "mimo_v2_flash", .marker = "{}", .vision = false },
+        .{ .model_type = "mimo_v2_flash", .bank = true, .vision = true },
+        .{ .model_type = "mimo_v2", .marker = "true", .vision = true },
+        .{ .model_type = "glm5_next", .marker = "{}", .vision = false },
+        .{ .model_type = "glm5_next", .bank = true, .vision = true },
+        .{ .model_type = "glm5_next", .marker = "[]", .vision = true },
+        .{ .model_type = "qwen3_vl", .bank = true, .marker = "{}", .vision = true },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const json = try std.fmt.allocPrint(a, "{{\"model_type\":\"{s}\",\"vision_config\":{{}},\"video_token_id\":42,\"expert_streaming\":{s}}}", .{ case.model_type, case.marker });
+        defer a.free(json);
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+        try tmp.dir.writeFile(io, .{ .sub_path = "chat_template.jinja", .data = "{{ messages }}" });
+        if (case.bank) try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try tmp.dir.realPath(io, &path_buf);
+        const meta = readStubMeta(io, a, path_buf[0..path_len]);
+        try testing.expect(meta.found and meta.has_chat);
+        try testing.expectEqual(case.vision, meta.has_vision);
+        try testing.expectEqual(case.vision, meta.has_video);
+    }
 }
 
 test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
