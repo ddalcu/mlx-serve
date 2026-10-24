@@ -108,14 +108,6 @@ if boot --metrics; then
         "$([ "$STATUS" = "200" ] && cmp -s "$BODY" src/html/index.html && echo 1 || echo 0)"
     check "GET /metrics.json with --metrics → 200 (got $METRICS_STATUS)" \
         "$([ "$METRICS_STATUS" = "200" ] && echo 1 || echo 0)"
-    curl -sf "http://localhost":"$PORT/metrics.json" > "$BODY"
-    check "JSON latency histograms retain old bounds and cover ten minutes" \
-        "$(jq -e '[.histograms | .time_to_first_token_seconds, .e2e_request_latency_seconds, .prefill_time_seconds, .decode_time_seconds] | all((.bounds | map(. * 1000000 | round / 1000000)) == [0.01,0.025,0.05,0.1,0.25,0.5,1,2.5,5,10,30,60,120,300,600] and (.bucket_counts | length) == 16)' "$BODY" >/dev/null && echo 1 || echo 0)"
-    curl -sf "http://localhost":"$PORT/metrics" > "$BODY"
-    for metric in time_to_first_token_seconds e2e_request_latency_seconds request_prefill_time_seconds request_decode_time_seconds; do
-        check "Prometheus $metric exposes a finite ten-minute bucket" \
-            "$(grep -qx "vllm:${metric}_bucket{le=\"600\"} 0" "$BODY" && echo 1 || echo 0)"
-    done
     stop
 else
     check "boot with --metrics" 0

@@ -109,6 +109,10 @@ check "# TYPE vllm:time_to_first_token_seconds histogram" \
     "$(echo "$BODY" | grep -q "# TYPE vllm:time_to_first_token_seconds histogram" && echo 1 || echo 0)"
 check "TTFT +Inf bucket present" \
     "$(echo "$BODY" | grep -q 'vllm:time_to_first_token_seconds_bucket{le="+Inf"}' && echo 1 || echo 0)"
+for metric in time_to_first_token_seconds e2e_request_latency_seconds request_prefill_time_seconds request_decode_time_seconds; do
+    check "Prometheus $metric exposes a finite ten-minute bucket" \
+        "$(echo "$BODY" | grep -qx "vllm:${metric}_bucket{le=\"600\"} 0" && echo 1 || echo 0)"
+done
 check "vllm:num_requests_running gauge present" \
     "$(echo "$BODY" | grep -q "# TYPE vllm:num_requests_running gauge" && echo 1 || echo 0)"
 check "mlx_serve:gpu_utilization_pct gauge present" \
@@ -136,6 +140,8 @@ check "/metrics.json has 'histograms' key" "$(echo "$JBODY" | grep -q '"histogra
 check "/metrics.json has 'generation_tokens_live'" \
     "$(echo "$JBODY" | grep -q '"generation_tokens_live"' && echo 1 || echo 0)"
 check "/metrics.json has 'bucket_counts'"  "$(echo "$JBODY" | grep -q '"bucket_counts"' && echo 1 || echo 0)"
+check "JSON latency histograms retain old bounds and cover ten minutes" \
+    "$(echo "$JBODY" | jq -e '[.histograms | .time_to_first_token_seconds, .e2e_request_latency_seconds, .prefill_time_seconds, .decode_time_seconds] | all((.bounds | map(. * 1000000 | round / 1000000)) == [0.01,0.025,0.05,0.1,0.25,0.5,1,2.5,5,10,30,60,120,300,600] and (.bucket_counts | length) == 16)' >/dev/null && echo 1 || echo 0)"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 3: After one chat request, counters are non-zero
