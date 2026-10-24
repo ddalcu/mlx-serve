@@ -1451,13 +1451,9 @@ fn parseStubMetaWithBank(allocator: std.mem.Allocator, config_json: []const u8, 
     const radio = nemotron and hasRadioVision(root);
     if (nemotron) meta.has_vision = radio;
     meta.has_video = (meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0) or radio;
-    // Mirror parseConfig's backend selection, not just its architecture: the
-    // resident variants can serve vision, but mlx-stream cannot yet.
-    const declared_stream = if (root.get("expert_streaming")) |v| v == .object else false;
-    const bank_stream = has_expert_bank and (std.mem.eql(u8, mt, "deepseek_v41") or std.mem.eql(u8, mt, "glm_moe_dsa"));
-    const marked_stream = declared_stream and (std.mem.eql(u8, mt, "mimo_v2") or std.mem.eql(u8, mt, "mimo_v2_flash") or
-        std.mem.eql(u8, mt, "glm5_next") or std.mem.eql(u8, mt, "glm5_next_text"));
-    if (bank_stream or marked_stream) {
+    // Stream packs may retain a vision tower that their selected backend cannot serve.
+    const model = @import("model.zig");
+    if (model.usesExpertStreaming(model.canonicalStreamModelType(mt), model.declaresExpertStreaming(root), has_expert_bank)) {
         meta.has_vision = false;
         meta.has_video = false;
     }

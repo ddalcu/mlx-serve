@@ -4,7 +4,7 @@ Full histories: live failures, measurements, diagnosis ladders, dead ends. The d
 
 ### Stream-pack metadata advertised a vision tower the backend cannot serve
 
-An unloaded mlx-stream pack could advertise `vision` and image input because its config and shards retain a vision tower, while loading selects a text-only backend and image requests return 400. Discovery must match the loader's selection: `experts.bin` for DeepSeek-V4.1/GLM-MoE-DSA, an object-valued `expert_streaming` declaration for MiMo/GLM5-Next. Suppress both vision and video for those packs, not the whole architecture. Guards: filesystem `readStubMeta` stream/resident cases and the declared-stream format corpus.
+An unloaded mlx-stream pack could advertise `vision` and image input because its config and shards retain a vision tower, while loading selects a text-only backend and image requests return 400. Discovery and loading share `model.usesExpertStreaming`: `experts.bin` for DeepSeek-V4.1/GLM-MoE-DSA, an object-valued `expert_streaming` declaration for MiMo/GLM5-Next, with shared alias normalization. Suppress both vision and video for those packs, not the whole architecture. Guards: filesystem `readStubMeta` stream/resident cases and the `parseConfig` selection matrix.
 
 ### Literal HTML became a RADIO video attachment
 
