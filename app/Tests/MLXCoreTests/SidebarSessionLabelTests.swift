@@ -22,6 +22,8 @@ final class SidebarSessionLabelTests: XCTestCase {
                 Text("Status").foregroundStyle(.blue)
             }.frame(width: 240, alignment: .leading).background(.white)
         )
+        // Single-line comparisons isolate dark title pixels from the plain chat's gray icon.
+        let darkness: CGFloat = subject == nil ? 0.3 : 0.85
         // Grayscale pixels belong to text, not the red symbols or blue status.
         var lines: [CGRect] = []
         var current: CGRect?
@@ -29,7 +31,7 @@ final class SidebarSessionLabelTests: XCTestCase {
             var row: CGRect?
             for x in 0..<image.pixelsWide {
                 let color = try XCTUnwrap(image.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
-                if color.redComponent < 0.85,
+                if color.redComponent < darkness,
                    abs(color.redComponent - color.greenComponent) < 0.02,
                    abs(color.greenComponent - color.blueComponent) < 0.02 {
                     let pixel = CGRect(x: x, y: y, width: 1, height: 1)
@@ -44,6 +46,9 @@ final class SidebarSessionLabelTests: XCTestCase {
             }
         }
         if let current { lines.append(current) }
+        if subject == nil, let first = lines.first {
+            lines = [lines.dropFirst().reduce(first) { $0.union($1) }]
+        }
         let scale = CGFloat(image.pixelsWide) / 240
         return lines.map { CGRect(x: $0.minX / scale, y: $0.minY / scale,
                                   width: $0.width / scale, height: $0.height / scale) }
@@ -51,8 +56,8 @@ final class SidebarSessionLabelTests: XCTestCase {
 
     @MainActor
     func testAgentTitlesIgnoreSymbolWidthAndSubjectsAlignWithTitles() throws {
+        var leading: CGFloat?
         for bridge in [false, true] {
-            var leading: CGFloat?
             for symbol in ["pencil", "brain.head.profile", "sparkles", "ellipsis"] {
                 let lines = try textLines(symbol: symbol, bridge: bridge)
                 XCTAssertEqual(lines.count, 2)
@@ -74,28 +79,16 @@ final class SidebarSessionLabelTests: XCTestCase {
     }
 
     @MainActor
-    func testSidebarSnapshot() throws {
-        let symbols = ["pencil", "brain.head.profile", "sparkles", "ellipsis"]
-        let view = VStack(alignment: .leading, spacing: 8) {
-            ForEach(symbols, id: \.self) { symbol in
-                SidebarSessionLabel(title: "Agent \(symbol)", subject: "Conversation summary",
-                                    agentSymbol: symbol, isExternalBridge: false, isSelected: false) {
-                    EmptyView()
-                }
+    func testPlainAgentAndBridgeTitlesShareOneLeadingEdge() throws {
+        var leading: CGFloat?
+        for bridge in [false, true] {
+            for symbol in ["pencil", "brain.head.profile", "sparkles", "ellipsis", nil] as [String?] {
+                let lines = try textLines(symbol: symbol, bridge: bridge, subject: nil)
+                XCTAssertEqual(lines.count, 1)
+                let title = try XCTUnwrap(lines.first)
+                if let leading { XCTAssertEqual(title.minX, leading, accuracy: 0.5) }
+                leading = title.minX
             }
-            SidebarSessionLabel(title: "Telegram agent", subject: "Bridge conversation summary",
-                                agentSymbol: "paperplane", isExternalBridge: true, isSelected: false) {
-                Image(systemName: "checkmark.circle.fill")
-            }
-            SidebarSessionLabel(title: "New Chat", subject: nil, agentSymbol: nil,
-                                isExternalBridge: false, isSelected: false) { EmptyView() }
-        }.padding(12).frame(width: 280, alignment: .leading)
-            .background(Color(nsColor: .windowBackgroundColor))
-        let image = try bitmap(view)
-        XCTAssertGreaterThan(image.pixelsHigh, 0)
-        if let path = ProcessInfo.processInfo.environment["SIDEBAR_UI_SNAPSHOT"] {
-            let png = try XCTUnwrap(image.representation(using: .png, properties: [:]))
-            try png.write(to: URL(fileURLWithPath: path))
         }
     }
 }

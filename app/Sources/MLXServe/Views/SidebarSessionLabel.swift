@@ -11,7 +11,7 @@ struct SidebarSessionLabel<Status: View>: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 4) {
-            Group {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
                 if isExternalBridge {
                     Image(systemName: "paperplane.fill")
                         .font(.app(.caption2))
@@ -28,8 +28,8 @@ struct SidebarSessionLabel<Status: View>: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            // SF Symbols have different intrinsic widths; text gets one stable column.
-            .frame(width: 16)
+            // One slot contains both bridge and agent symbols without shifting the text.
+            .frame(width: 32)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(title)
