@@ -835,14 +835,7 @@ fn loadExperts(m: *Dsv41Model, w: *model.Weights, comptime pfx: []const u8, li: 
             var bank: Bank = .{ .w = undefined, .qp = first.qp };
             inline for (.{ .{ "w", "weight" }, .{ "s", "scales" }, .{ "b", "biases" } }, 0..) |f, p| {
                 if (parts[p].items.len > 0) {
-                    // The loads first: a GPU stack waiting on hundreds of queued disk reads times out.
-                    try evalAll(parts[p].items);
-                    const vec = mlx.mlx_vector_array_new_data(parts[p].items.ptr, parts[p].items.len);
-                    defer _ = mlx.mlx_vector_array_free(vec);
-                    var o = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_stack_axis(&o, vec, 0, m.s));
-                    @field(bank, f[0]) = try m.own(o);
-                    try mlx.check(mlx.mlx_array_eval(o));
+                    @field(bank, f[0]) = try m.own(try mlx.stackEvaluated(parts[p].items, m.s));
                     // The stack holds the experts now: the map's copies go, or the bank is resident twice.
                     for (0..n_experts) |e| {
                         var buf: NameBuf = undefined;

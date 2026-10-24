@@ -1025,6 +1025,19 @@ pub fn evalFields(value: anytype) !void {
     try check(mlx_eval(vec));
 }
 
+/// `parts` stacked on a new leading axis (a per-expert bank), the result evaluated; caller frees.
+/// The parts evaluate first: a GPU stack waiting on hundreds of queued disk reads times out.
+pub fn stackEvaluated(parts: []const mlx_array, s: mlx_stream) !mlx_array {
+    const vec = mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx_vector_array_free(vec);
+    try check(mlx_eval(vec));
+    var out = mlx_array_new();
+    errdefer _ = mlx_array_free(out);
+    try check(mlx_stack_axis(&out, vec, 0, s));
+    try check(mlx_array_eval(out));
+    return out;
+}
+
 fn appendFields(vec: mlx_vector_array, value: anytype) void {
     const T = @TypeOf(value);
     if (T == mlx_array) {
