@@ -315,6 +315,24 @@ pub const Reporter = struct {
     }
 };
 
+const default_hub = "https://huggingface.co";
+
+/// The hub base URL from an `HF_ENDPOINT` value: a mirror (hf-mirror.com) keeps the hub's
+/// `api/models/...` and `resolve/main/...` layout. Unset or blank = huggingface.co.
+pub fn hubBase(raw: ?[]const u8) error{InvalidHfEndpoint}![]const u8 {
+    const v = std.mem.trim(u8, raw orelse return default_hub, " \t\r\n");
+    if (v.len == 0) return default_hub;
+    const base = std.mem.trimEnd(u8, v, "/");
+    for ([_][]const u8{ "https://", "http://" }) |scheme| {
+        if (std.ascii.startsWithIgnoreCase(base, scheme) and base.len > scheme.len) return base;
+    }
+    return error.InvalidHfEndpoint;
+}
+
+pub fn envHubBase() error{InvalidHfEndpoint}![]const u8 {
+    return hubBase(if (std.c.getenv("HF_ENDPOINT")) |p| std.mem.span(p) else null);
+}
+
 /// Appends the shared curl argv prefix; returns the owned Authorization
 /// header string when HF_TOKEN is set (caller frees).
 fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !?[]u8 {
@@ -447,7 +465,11 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         return error.PullUnavailable;
     }
     reporter.say("pulling manifest for {s}", .{resolved.repo});
-    const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
+    const hub = envHubBase() catch {
+        reporter.say("error: HF_ENDPOINT must be an http(s) URL such as https://hf-mirror.com", .{});
+        return error.PullFailed;
+    };
+    const tree_url = try std.fmt.allocPrint(allocator, "{s}/api/models/{s}/tree/main?recursive=true", .{ hub, resolved.repo });
     defer allocator.free(tree_url);
     const tree_json = curlFetch(allocator, io, tree_url) catch {
         reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
@@ -460,10 +482,10 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
-    const config_json = try fetchListed(allocator, io, resolved.repo, files, "config.json");
+    const config_json = try fetchListed(allocator, io, hub, resolved.repo, files, "config.json");
     defer if (config_json) |c| allocator.free(c);
     const media = isMediaListing(allocator, files, config_json);
-    const index_json = try fetchListed(allocator, io, resolved.repo, files, "model.safetensors.index.json");
+    const index_json = try fetchListed(allocator, io, hub, resolved.repo, files, "model.safetensors.index.json");
     defer if (index_json) |j| allocator.free(j);
     const index = if (index_json) |j| std.json.parseFromSlice(std.json.Value, allocator, j, .{}) catch null else null;
     defer if (index) |p| p.deinit();
@@ -504,7 +526,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
             }
         }
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
+        const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub, resolved.repo, f.path });
         defer allocator.free(url);
         curlDownload(allocator, io, url, dest_path, show_progress) catch {
             reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
@@ -534,10 +556,10 @@ fn indexNames(weight_map: ?std.json.Value, path: []const u8) bool {
 }
 
 /// The body of `name` from the repo's `main`, when the listing has it and it can be fetched.
-fn fetchListed(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, files: []const RepoFile, name: []const u8) !?[]u8 {
+fn fetchListed(allocator: std.mem.Allocator, io: std.Io, hub: []const u8, repo: []const u8, files: []const RepoFile, name: []const u8) !?[]u8 {
     for (files) |f| {
         if (!std.mem.eql(u8, f.path, name)) continue;
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ repo, name });
+        const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub, repo, name });
         defer allocator.free(url);
         return curlFetch(allocator, io, url) catch null;
     }
@@ -1035,6 +1057,18 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Unknown alias-shaped name → null.
     try testing.expect(resolveShortName("doesnotexist") == null);
     try testing.expect(resolveShortName("gemma4:nosuchtag") == null);
+}
+
+test "hubBase: HF_ENDPOINT picks the hub, unset or blank is huggingface.co, a value without a scheme is refused" {
+    try testing.expectEqualStrings("https://huggingface.co", try hubBase(null));
+    try testing.expectEqualStrings("https://huggingface.co", try hubBase(" \n"));
+    try testing.expectEqualStrings("https://hf-mirror.com", try hubBase("https://hf-mirror.com"));
+    try testing.expectEqualStrings("https://hf-mirror.com", try hubBase(" https://hf-mirror.com//\n"));
+    try testing.expectEqualStrings("http://127.0.0.1:8080/hub", try hubBase("http://127.0.0.1:8080/hub/"));
+    try testing.expectEqualStrings("HTTPS://hf-mirror.com", try hubBase("HTTPS://hf-mirror.com"));
+    try testing.expectError(error.InvalidHfEndpoint, hubBase("hf-mirror.com"));
+    try testing.expectError(error.InvalidHfEndpoint, hubBase("https://"));
+    try testing.expectError(error.InvalidHfEndpoint, hubBase("ftp://hf-mirror.com"));
 }
 
 test "cli: modelDestPath layout" {

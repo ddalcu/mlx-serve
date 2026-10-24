@@ -810,7 +810,7 @@ class DownloadManager: ObservableObject {
             // returns `mtp` as a bare directory entry and the file filter skips
             // it, silently dropping the sidecar (and the model's spec-decode
             // speedup). `selectNeededFiles` keeps top-level files + mtp/ only.
-            let listURL = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true")!
+            let listURL = URL(string: "\(Self.hfEndpoint())/api/models/\(repoId)/tree/main?recursive=true")!
             let (listData, _) = try await DownloadSession.shared.data(for: Self.hfApiRequest(listURL))
             guard let files = try JSONSerialization.jsonObject(with: listData) as? [[String: Any]] else {
                 throw URLError(.cannotParseResponse)
@@ -821,7 +821,7 @@ class DownloadManager: ObservableObject {
             // Unreadable = the old allowlist alone.
             var indexed: Set<String> = []
             if files.contains(where: { ($0["path"] as? String) == "model.safetensors.index.json" }),
-               let indexURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/model.safetensors.index.json"),
+               let indexURL = URL(string: "\(Self.hfEndpoint())/\(repoId)/resolve/main/model.safetensors.index.json"),
                let (indexData, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(indexURL)) {
                 indexed = Self.indexedShardNames(fromIndexData: indexData) ?? []
             }
@@ -878,7 +878,7 @@ class DownloadManager: ObservableObject {
                 downloads[repoId]?.bytesPerSecond = 0
                 downloads[repoId]?.statusText = "\(filePath) (\(sizeStr))"
 
-                let fileURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(filePath)")!
+                let fileURL = URL(string: "\(Self.hfEndpoint())/\(repoId)/resolve/main/\(filePath)")!
                 let maxRetries = 20
 
                 for attempt in 0..<maxRetries {
@@ -954,7 +954,7 @@ class DownloadManager: ObservableObject {
     /// download path reassembles a sharded quant from its ordered shard list.
     /// Sidecars (mmproj/tokenizer) are dropped. Empty on error.
     func listGgufFiles(repoId: String) async -> [String] {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true") else { return [] }
+        guard let url = URL(string: "\(Self.hfEndpoint())/api/models/\(repoId)/tree/main?recursive=true") else { return [] }
         guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let files = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
@@ -1434,7 +1434,7 @@ class DownloadManager: ObservableObject {
     /// Fetch the repo's full tree (NO sidecar filter — the MTP head is filtered
     /// out of the selectable-quant lists) and return the MTP draft-head path.
     private func repoMtpSidecar(repoId: String) async -> String? {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true") else { return nil }
+        guard let url = URL(string: "\(Self.hfEndpoint())/api/models/\(repoId)/tree/main?recursive=true") else { return nil }
         guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
@@ -1792,7 +1792,7 @@ class DownloadManager: ObservableObject {
             .split(separator: "/", omittingEmptySubsequences: false)
             .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
             .joined(separator: "/")
-        return URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(encoded)")!
+        return URL(string: "\(Self.hfEndpoint())/\(repoId)/resolve/main/\(encoded)")!
     }
 
     private func presentFailureAlert(repoId: String, message: String) {
@@ -2478,6 +2478,24 @@ class DownloadManager: ObservableObject {
     /// accounting an HF snapshot relies on.
     nonisolated static func directorySizeForTesting(_ path: String) -> UInt64 {
         directorySize(path)
+    }
+
+    // MARK: - Hugging Face endpoint
+
+    /// The hub base URL. `HF_ENDPOINT` mirrors the Zig CLI (`cli.hubBase`): a mirror such as
+    /// hf-mirror.com keeps the hub's `api/models/...` and `resolve/main/...` paths. Unset,
+    /// blank or not an http(s) URL is huggingface.co.
+    nonisolated static func hfEndpoint(environment: [String: String] = LoginShellEnv.huggingFaceEnvironment()) -> String {
+        let fallback = "https://huggingface.co"
+        guard var raw = environment["HF_ENDPOINT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return fallback }
+        while raw.hasSuffix("/") { raw.removeLast() }
+        guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http", url.host?.isEmpty == false else {
+            NSLog("HF_ENDPOINT %@ is not an http(s) URL; using %@", raw, fallback)
+            return fallback
+        }
+        return raw
     }
 
     // MARK: - Hugging Face auth

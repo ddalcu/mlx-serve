@@ -76,8 +76,8 @@ enum LoginShellEnv {
 
     // MARK: - Hugging Face
 
-    /// Everything that can move the HF cache or carry its token.
-    static let huggingFaceNames = ["HF_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME", "HF_TOKEN"]
+    /// Everything that can move the HF cache, carry its token or point at a mirror.
+    static let huggingFaceNames = ["HF_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME", "HF_TOKEN", "HF_ENDPOINT"]
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var cachedHF: [String: String] = [:]

@@ -8,8 +8,8 @@ enum ModelCard {
         URL(string: "https://huggingface.co/\(repoId)")
     }
 
-    static func readmeURL(repoId: String) -> URL? {
-        URL(string: "https://huggingface.co/\(repoId)/resolve/main/README.md")
+    static func readmeURL(repoId: String, endpoint: String = DownloadManager.hfEndpoint()) -> URL? {
+        URL(string: "\(endpoint)/\(repoId)/resolve/main/README.md")
     }
 
     /// `org/repo` as-is; MTPLX's flat `Org--Name` folded back; a bare folder

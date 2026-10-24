@@ -16,6 +16,8 @@ mlx-serve launch claude     # 配置并启动一个针对本地服务器的编�
 
 短名称、`org/repo` 形式的 HuggingFace id 以及 `name:tag` 都可用。模型会落进一个共享的 `~/.mlx-serve/models` 存储目录，MLX-Serve 应用用的也是它。
 
+如果 Hugging Face 访问缓慢或无法访问，把 `HF_ENDPOINT` 设为镜像（`export HF_ENDPOINT=https://hf-mirror.com`）：`pull`、`run`、从该 shell 启动的服务器上的 `/api/pull`，以及应用里的下载都会从镜像获取。`HF_TOKEN` 也会发送到该地址。
+
 ## 直接驱动服务器
 
 脚本、launchd 或无图形界面的 Mac 需要的方式：

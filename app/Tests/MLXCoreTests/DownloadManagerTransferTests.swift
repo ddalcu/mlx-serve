@@ -62,6 +62,25 @@ final class DownloadManagerTransferTests: XCTestCase {
         XCTAssertTrue(manager.isReady(repoId))
     }
 
+    func testHfEndpointMovesTheWholeDownloadToTheMirror() async throws {
+        let saved = getenv("HF_ENDPOINT").map { String(cString: $0) }
+        setenv("HF_ENDPOINT", "https://hf-mirror.test/", 1)
+        defer { if let saved { setenv("HF_ENDPOINT", saved, 1) } else { unsetenv("HF_ENDPOINT") } }
+        // Its own repo id: requests other tests leave in flight on the shared stub are not this download's.
+        let repo = "acme/mirror-fixture"
+        HuggingFaceStubProtocol.serve(repo: repo, files: Self.fixtureFiles())
+        HuggingFaceStubProtocol.answer(host: "hf-mirror.test")
+        let manager = DownloadManager(modelsRoot: tempRoot)
+
+        await manager.download(repoId: repo)
+
+        XCTAssertEqual(manager.downloads[repo]?.status, .completed,
+                       "error: \(manager.downloads[repo]?.error ?? "-")")
+        let mine = HuggingFaceStubProtocol.requests.filter { $0.path.contains(repo) }
+        XCTAssertTrue(mine.contains { $0.path == "/\(repo)/resolve/main/model.safetensors" })
+        XCTAssertEqual(Set(mine.compactMap(\.host)), ["hf-mirror.test"], "every hub request goes to the mirror")
+    }
+
     func testTheProgressBarOnlyEverMovesForward() async throws {
         // Every bar in the app used to render the CURRENT FILE's fraction, so a
         // repo of N files ran 0→100% N times and people read the resets as a
@@ -243,7 +262,8 @@ final class DownloadManagerTransferTests: XCTestCase {
         // two above the fetch, so a line-level check passes vacuously.
         for case let url as URL in walker where url.pathExtension == "swift" {
             let text = try String(contentsOf: url, encoding: .utf8)
-            guard text.contains("huggingface.co"), text.contains("URLSession.shared") else { continue }
+            guard text.contains("huggingface.co") || text.contains("hfEndpoint("),
+                  text.contains("URLSession.shared") else { continue }
             offenders.append(url.lastPathComponent)
         }
         XCTAssertTrue(offenders.isEmpty,
@@ -309,7 +329,7 @@ final class DownloadManagerTransferTests: XCTestCase {
 /// Answers the two endpoints the download loop speaks: the recursive tree
 /// listing and `resolve/main/<path>` with real Range semantics.
 final class HuggingFaceStubProtocol: URLProtocol {
-    struct Recorded { let path: String; let range: String? }
+    struct Recorded { let path: String; let range: String?; var host: String? = nil }
 
     private static let lock = NSLock()
     private static var repos: [String: [(String, Data)]] = [:]
@@ -336,7 +356,14 @@ final class HuggingFaceStubProtocol: URLProtocol {
         self.recorded = []
     }
 
-    static func reset() { serve(repo: "", files: []) }
+    static func reset() {
+        serve(repo: "", files: [])
+        answer(host: "huggingface.co")
+    }
+
+    /// A second origin the stub answers for beside huggingface.co (a mirror a test names).
+    private static var host = "huggingface.co"
+    static func answer(host: String) { lock.withLock { self.host = host } }
 
     static func clearRequests() {
         lock.lock(); defer { lock.unlock() }
@@ -348,7 +375,12 @@ final class HuggingFaceStubProtocol: URLProtocol {
         return recorded
     }
 
-    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "huggingface.co" }
+    override class func canInit(with request: URLRequest) -> Bool {
+        // The developer's own HF_ENDPOINT too, or every stubbed download goes to their mirror.
+        let host = request.url?.host
+        return host == "huggingface.co" || host == lock.withLock { Self.host }
+            || host == URL(string: DownloadManager.hfEndpoint())?.host
+    }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     private var stopped = false
@@ -359,7 +391,7 @@ final class HuggingFaceStubProtocol: URLProtocol {
         let path = url.path
         let range = request.value(forHTTPHeaderField: "Range")
         Self.lock.lock()
-        Self.recorded.append(Recorded(path: path, range: range))
+        Self.recorded.append(Recorded(path: path, range: range, host: url.host))
         let repos = Self.repos
         let throttle = Self.throttle
         Self.lock.unlock()

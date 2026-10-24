@@ -16,6 +16,8 @@ mlx-serve launch claude     # configure + launch a coding agent CLI against the 
 
 Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Models land in a shared `~/.mlx-serve/models` store the MLX-Serve app uses too.
 
+Where Hugging Face is slow or blocked, set `HF_ENDPOINT` to a mirror (`export HF_ENDPOINT=https://hf-mirror.com`): `pull`, `run`, `/api/pull` on a server started from that shell, and the app's downloads all fetch from it. `HF_TOKEN` is sent to that endpoint too.
+
 ## Driving the server directly
 
 What you want for scripts, launchd, or a headless Mac:

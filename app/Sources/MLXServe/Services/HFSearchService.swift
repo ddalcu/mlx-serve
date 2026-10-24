@@ -191,7 +191,7 @@ class HFSearchService: ObservableObject {
 
     /// Build the HF API query URL for the given page parameters. Exposed for tests.
     nonisolated static func searchURL(query: String, filter: String, skip: Int, limit: Int) -> URL? {
-        var components = URLComponents(string: "https://huggingface.co/api/models")!
+        var components = URLComponents(string: "\(DownloadManager.hfEndpoint())/api/models")!
         var items: [URLQueryItem] = [
             URLQueryItem(name: "filter", value: filter),
             URLQueryItem(name: "sort", value: "downloads"),
@@ -222,7 +222,7 @@ class HFSearchService: ObservableObject {
                     // `?recursive=true` so a sharded GGUF's nested shards are
                     // listed — `parseFallbackSize` sums each quant's shards, so
                     // a subfoldered repo reports a real size instead of "—".
-                    guard let url = URL(string: "https://huggingface.co/api/models/\(model.id)/tree/main?recursive=true") else { return nil }
+                    guard let url = URL(string: "\(DownloadManager.hfEndpoint())/api/models/\(model.id)/tree/main?recursive=true") else { return nil }
                     guard let (data, response) = try? await DownloadSession.shared.data(for: DownloadManager.hfApiRequest(url)),
                           let http = response as? HTTPURLResponse, http.statusCode == 200,
                           let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
