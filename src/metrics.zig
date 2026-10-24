@@ -22,9 +22,9 @@ const std = @import("std");
 // Histogram bounds (comptime constants shared by Metrics.init)
 // ---------------------------------------------------------------------------
 
-/// 10 latency buckets spanning 10 ms → 10 s, stored in nanoseconds.
-/// The Prometheus renderer divides by 1e9 before emitting `le="X.XXX"`.
-const LATENCY_BOUNDS_NS: [10]u64 = .{
+/// Latency buckets spanning 10 ms to 10 min, stored in nanoseconds.
+/// The Prometheus renderer converts bounds to seconds.
+const LATENCY_BOUNDS_NS = [_]u64{
     10_000_000, // 10 ms
     25_000_000, // 25 ms
     50_000_000, // 50 ms
@@ -35,6 +35,11 @@ const LATENCY_BOUNDS_NS: [10]u64 = .{
     2_500_000_000, // 2.5 s
     5_000_000_000, // 5 s
     10_000_000_000, // 10 s
+    30_000_000_000, // 30 s
+    60_000_000_000, // 1 min
+    120_000_000_000, // 2 min
+    300_000_000_000, // 5 min
+    600_000_000_000, // 10 min
 };
 
 /// 8 token-count buckets: 32 → 8 192 (raw integers, no scaling).
@@ -51,10 +56,10 @@ pub const Outcome = enum { success, cancelled, failed };
 /// Zero-allocation after init; every field is a lock-free primitive.
 pub const Metrics = struct {
     // Latency histograms (observe in nanoseconds; rendered as seconds)
-    ttft_ns: Histogram(10), // time to first token
-    e2e_latency_ns: Histogram(10), // end-to-end request latency
-    prefill_time_ns: Histogram(10), // prefill phase
-    decode_time_ns: Histogram(10), // decode phase
+    ttft_ns: Histogram(LATENCY_BOUNDS_NS.len), // time to first token
+    e2e_latency_ns: Histogram(LATENCY_BOUNDS_NS.len), // end-to-end request latency
+    prefill_time_ns: Histogram(LATENCY_BOUNDS_NS.len), // prefill phase
+    decode_time_ns: Histogram(LATENCY_BOUNDS_NS.len), // decode phase
 
     // Per-request token histograms (raw counts)
     prompt_tokens_hist: Histogram(8),
@@ -133,10 +138,10 @@ pub const Metrics = struct {
 
     pub fn init() Metrics {
         return .{
-            .ttft_ns = Histogram(10).init(LATENCY_BOUNDS_NS),
-            .e2e_latency_ns = Histogram(10).init(LATENCY_BOUNDS_NS),
-            .prefill_time_ns = Histogram(10).init(LATENCY_BOUNDS_NS),
-            .decode_time_ns = Histogram(10).init(LATENCY_BOUNDS_NS),
+            .ttft_ns = Histogram(LATENCY_BOUNDS_NS.len).init(LATENCY_BOUNDS_NS),
+            .e2e_latency_ns = Histogram(LATENCY_BOUNDS_NS.len).init(LATENCY_BOUNDS_NS),
+            .prefill_time_ns = Histogram(LATENCY_BOUNDS_NS.len).init(LATENCY_BOUNDS_NS),
+            .decode_time_ns = Histogram(LATENCY_BOUNDS_NS.len).init(LATENCY_BOUNDS_NS),
             .prompt_tokens_hist = Histogram(8).init(TOKEN_BOUNDS),
             .output_tokens_hist = Histogram(8).init(TOKEN_BOUNDS),
             .prompt_tokens_total = Counter.init(),
@@ -800,6 +805,48 @@ test "renderPrometheus emits well-formed Prometheus text" {
     try testing.expect(std.mem.indexOf(u8, out, "vllm:time_to_first_token_seconds_bucket{le=\"+Inf\"}") != null);
     try testing.expect(std.mem.indexOf(u8, out, "vllm:time_to_first_token_seconds_sum ") != null);
     try testing.expect(std.mem.indexOf(u8, out, "vllm:time_to_first_token_seconds_count 1") != null);
+}
+
+test "long-context latency buckets preserve old bounds and render finite multi-minute observations" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRequest(.success, 120_000_000_000, 60_000_000_000, 180_000_000_000, 200_000, 1, 0);
+    m.recordRequest(.success, 601_000_000_000, 601_000_000_000, 601_000_000_000, 200_000, 1, 0);
+
+    var pbuf: [64 * 1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try renderPrometheus(&m, &pw);
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &.{}, &jw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jbuf[0..jw.end], .{});
+    defer parsed.deinit();
+
+    inline for (.{
+        .{ "time_to_first_token_seconds", "time_to_first_token_seconds", 721.0 },
+        .{ "e2e_request_latency_seconds", "e2e_request_latency_seconds", 1502.0 },
+        .{ "request_prefill_time_seconds", "prefill_time_seconds", 661.0 },
+        .{ "request_decode_time_seconds", "decode_time_seconds", 781.0 },
+    }) |metric| {
+        try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "vllm:" ++ metric[0] ++ "_bucket{le=\"600\"} 1\n") != null);
+        try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "vllm:" ++ metric[0] ++ "_bucket{le=\"+Inf\"} 2\n") != null);
+        const hist = parsed.value.object.get("histograms").?.object.get(metric[1]).?.object;
+        const bounds = hist.get("bounds").?.array.items;
+        const expected = [_]f64{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600 };
+        try testing.expectEqual(expected.len, bounds.len);
+        for (bounds, expected) |bound, seconds| {
+            const actual: f64 = if (bound == .integer) @floatFromInt(bound.integer) else bound.float;
+            try testing.expectApproxEqAbs(seconds, actual, 0.000001);
+        }
+        const counts = hist.get("bucket_counts").?.array.items;
+        try testing.expectEqual(bounds.len + 1, counts.len);
+        try testing.expectEqual(@as(i64, 0), counts[9].integer);
+        try testing.expectEqual(@as(i64, 1), counts[bounds.len - 1].integer);
+        try testing.expectEqual(@as(i64, 2), counts[bounds.len].integer);
+        try testing.expectEqual(@as(i64, 2), hist.get("count").?.integer);
+        const sum = hist.get("sum").?;
+        try testing.expectApproxEqAbs(metric[2], if (sum == .integer) @as(f64, @floatFromInt(sum.integer)) else sum.float, 0.000001);
+    }
 }
 
 test "Counter concurrent writes are not lost" {
