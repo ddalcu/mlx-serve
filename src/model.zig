@@ -1788,9 +1788,11 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
-    defer parsed.deinit();
-    const declared = parsed.value == .object and declaresExpertStreaming(parsed.value.object);
+    const declared = if (config.isMimo() or config.isGlm5()) blk: {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+        defer parsed.deinit();
+        break :blk parsed.value == .object and declaresExpertStreaming(parsed.value.object);
+    } else false;
     const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
     defer allocator.free(bank);
     const has_bank = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
@@ -4827,9 +4829,9 @@ fn parseQwenAudioConfig(root: std.json.ObjectMap) !QwenAudioConfig {
     const ac = jsonField(root, "audio_config") orelse return qa;
     const o = try jsonValue(.object, ac);
     inline for (.{
-        .{ "d_model", "d_model" },     .{ "encoder_layers", "layers" },         .{ "encoder_attention_heads", "heads" },
-        .{ "encoder_ffn_dim", "ffn" }, .{ "num_mel_bins", "mel_bins" },         .{ "downsample_hidden_size", "downsample" },
-        .{ "n_window", "n_window" },   .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
+        .{ "d_model", "d_model" },             .{ "encoder_layers", "layers" },     .{ "encoder_attention_heads", "heads" },
+        .{ "encoder_ffn_dim", "ffn" },         .{ "num_mel_bins", "mel_bins" },     .{ "downsample_hidden_size", "downsample" },
+        .{ "n_window", "n_window" },           .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
     }) |kv| {
         if (jsonField(o, kv[0])) |v| @field(qa, kv[1]) = try jsonU32(v);
     }
