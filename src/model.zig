@@ -1754,14 +1754,22 @@ pub const ModelConfig = struct {
     }
 };
 
-/// A MiMo pack prepared for mlx-stream declares its expert bank (`"expert_streaming": {...}`); the plugin's own parse
-/// checks the declaration at load. An upstream MiMo checkpoint declares none and stays on the resident arch.
-fn declaresExpertStreaming(allocator: std.mem.Allocator, content: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const v = parsed.value.object.get("expert_streaming") orelse return false;
+pub fn canonicalStreamModelType(model_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, model_type, "mimo_v2_flash")) return "mimo_v2";
+    if (std.mem.eql(u8, model_type, "glm5_next_text")) return "glm5_next";
+    return model_type;
+}
+
+pub fn declaresExpertStreaming(root: std.json.ObjectMap) bool {
+    const v = root.get("expert_streaming") orelse return false;
     return v == .object;
+}
+
+/// Backend ownership is shared by config loading and unloaded capability discovery.
+pub fn usesExpertStreaming(model_type: []const u8, declared: bool, has_bank: bool) bool {
+    if (std.mem.eql(u8, model_type, "deepseek_v41") or std.mem.eql(u8, model_type, "glm_moe_dsa")) return has_bank;
+    if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "glm5_next")) return declared;
+    return false;
 }
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
@@ -1780,31 +1788,22 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
-    if (config.isDsv41()) {
-        config.pack_dir = try allocator.dupe(u8, model_dir);
-        const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
-        defer allocator.free(bank);
-        config.dsv41_stream = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    const declared = parsed.value == .object and declaresExpertStreaming(parsed.value.object);
+    const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
+    defer allocator.free(bank);
+    const has_bank = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
+    const streamed = usesExpertStreaming(config.model_type, declared, has_bank);
+    config.dsv41_stream = streamed and config.isDsv41();
+    config.mimo_stream = streamed and config.isMimo();
+    config.glm5_stream = streamed and config.isGlm5();
+    config.glm_stream = streamed and config.isGlmMoeDsa();
+    if (config.isGlmMoeDsa() and !streamed) {
+        log.err("glm_moe_dsa: {s} has no experts.bin; GLM-5.3 runs only from an mlx-stream pack (the trunk beside an experts.bin bank)\n", .{model_dir});
+        return error.GlmMoeDsaNeedsExpertBank;
     }
-    if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
-        config.pack_dir = try allocator.dupe(u8, model_dir);
-        config.mimo_stream = true;
-    }
-    if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
-        config.pack_dir = try allocator.dupe(u8, model_dir);
-        config.glm5_stream = true;
-    }
-    if (config.isGlmMoeDsa()) {
-        // No in-tree arch serves the 744B: only an mlx-stream pack (the trunk beside an experts.bin bank) loads.
-        const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
-        defer allocator.free(bank);
-        std.Io.Dir.accessAbsolute(io, bank, .{}) catch {
-            log.err("glm_moe_dsa: {s} has no experts.bin; GLM-5.3 runs only from an mlx-stream pack (the trunk beside an experts.bin bank)\n", .{model_dir});
-            return error.GlmMoeDsaNeedsExpertBank;
-        };
-        config.pack_dir = try allocator.dupe(u8, model_dir);
-        config.glm_stream = true;
-    }
+    if (streamed or config.isDsv41()) config.pack_dir = try allocator.dupe(u8, model_dir);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
@@ -3374,7 +3373,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
         }
         config.ensureGptOssTerminators();
-    } else if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5_next_text")) {
+    } else if (std.mem.eql(u8, canonicalStreamModelType(model_type), "glm5_next")) {
         // Z.ai GLM-5.3-Flash (Glm5NextForConditionalGeneration) in mlx-vlm's glm5_next layout
         // (TensorFold's MLX packs). Three Kimi-Delta-Attention layers per DeepSeek sparse
         // attention layer, every sublayer inside DeepSeek-V4's 4-stream Sinkhorn
@@ -3519,7 +3518,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 config.qv_out_hidden != config.hidden_size) return error.InvalidConfigField;
         }
         try parseSushiExperts(root, &config);
-    } else if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "mimo_v2_flash")) {
+    } else if (std.mem.eql(u8, canonicalStreamModelType(model_type), "mimo_v2")) {
         // Xiaomi MiMo-V2.6-Flash (309B-A15B) in the mlx-lm layout (tests/convert_mimo_v2.py,
         // the community packs); `mimo_v2_flash` is MiMo-V2-Flash and TensorFold's V2.6 label.
         // gpt_oss-shaped attention (learned sinks, 128-token sliding window) with
@@ -4828,9 +4827,9 @@ fn parseQwenAudioConfig(root: std.json.ObjectMap) !QwenAudioConfig {
     const ac = jsonField(root, "audio_config") orelse return qa;
     const o = try jsonValue(.object, ac);
     inline for (.{
-        .{ "d_model", "d_model" },             .{ "encoder_layers", "layers" },     .{ "encoder_attention_heads", "heads" },
-        .{ "encoder_ffn_dim", "ffn" },         .{ "num_mel_bins", "mel_bins" },     .{ "downsample_hidden_size", "downsample" },
-        .{ "n_window", "n_window" },           .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
+        .{ "d_model", "d_model" },     .{ "encoder_layers", "layers" },         .{ "encoder_attention_heads", "heads" },
+        .{ "encoder_ffn_dim", "ffn" }, .{ "num_mel_bins", "mel_bins" },         .{ "downsample_hidden_size", "downsample" },
+        .{ "n_window", "n_window" },   .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
     }) |kv| {
         if (jsonField(o, kv[0])) |v| @field(qa, kv[1]) = try jsonU32(v);
     }
@@ -7956,6 +7955,52 @@ test "deepseek_v41 bills its compressed caches per token, the window per slot" {
     // Every layer reads its 128-token window plus top-512 compressed entries.
     try testing.expectEqual(@as(u64, 128 + 512 + 1), config.prefillAttnKeys(1 << 20));
     try testing.expectEqual(@as(u64, 32), config.prefillAttnKeys(32));
+}
+
+test "parseConfig: stream selection preserves aliases, invalid markers and resident controls" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const mimo_alias = try std.mem.replaceOwned(u8, a, mimo_v2_pack_json, "\"mimo_v2\"", "\"mimo_v2_flash\"");
+    defer a.free(mimo_alias);
+    const glm_alias = try std.mem.replaceOwned(u8, a, glm5_next_pack_json, "\"glm5_next\"", "\"glm5_next_text\"");
+    defer a.free(glm_alias);
+    const cases = [_]struct { json: []const u8, canonical: []const u8, bank_selected: bool = false, marker_selected: bool = false }{
+        .{ .json = dsv41_release_config, .canonical = "deepseek_v41", .bank_selected = true },
+        .{ .json = glm_moe_dsa_config, .canonical = "glm_moe_dsa", .bank_selected = true },
+        .{ .json = mimo_v2_pack_json, .canonical = "mimo_v2", .marker_selected = true },
+        .{ .json = mimo_alias, .canonical = "mimo_v2", .marker_selected = true },
+        .{ .json = glm5_next_pack_json, .canonical = "glm5_next", .marker_selected = true },
+        .{ .json = glm_alias, .canonical = "glm5_next", .marker_selected = true },
+        .{ .json = "{\"model_type\":\"qwen3\"}", .canonical = "qwen3" },
+    };
+    for (cases) |case| {
+        for ([_][]const u8{ "{}", "null", "true", "[]" }) |marker| {
+            for ([_]bool{ false, true }) |bank| {
+                var tmp = testing.tmpDir(.{});
+                defer tmp.cleanup();
+                const json = try std.fmt.allocPrint(a, "{{\"expert_streaming\":{s},{s}", .{ marker, case.json[1..] });
+                defer a.free(json);
+                try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+                if (bank) try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
+                var buf: [512]u8 = undefined;
+                const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+                if (std.mem.eql(u8, case.canonical, "glm_moe_dsa") and !bank) {
+                    try testing.expectError(error.GlmMoeDsaNeedsExpertBank, parseConfig(io, a, dir));
+                    continue;
+                }
+                var config = try parseConfig(io, a, dir);
+                defer config.deinit(a);
+                const streamed = (case.bank_selected and bank) or (case.marker_selected and std.mem.eql(u8, marker, "{}"));
+                try testing.expectEqualStrings(case.canonical, config.model_type);
+                try testing.expectEqual(streamed, config.mlxStream());
+                try testing.expectEqual(streamed or config.isDsv41(), config.pack_dir != null);
+                if (streamed) {
+                    const meta = model_discovery.readStubMeta(io, a, dir);
+                    try testing.expect(meta.found and !meta.has_vision and !meta.has_video);
+                }
+            }
+        }
+    }
 }
 
 test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; an upstream MiMo checkpoint is not" {
