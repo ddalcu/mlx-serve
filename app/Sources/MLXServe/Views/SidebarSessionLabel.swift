@@ -12,24 +12,32 @@ struct SidebarSessionLabel<Status: View>: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                if isExternalBridge {
-                    Image(systemName: "paperplane.fill")
-                        .font(.app(.caption2))
-                        .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
-                        .help("Telegram conversation (view only)")
-                }
                 if let agentSymbol {
                     Image(systemName: agentSymbol)
                         .font(.app(.caption2))
                         .foregroundStyle(Color.accentColor)
-                } else if !isExternalBridge {
+                } else if isExternalBridge {
+                    Image(systemName: "paperplane.fill")
+                        .font(.app(.caption2))
+                        .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
+                        .help("Telegram conversation (view only)")
+                } else {
                     Image(systemName: "bubble.left")
                         .font(.app(.subheadline, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
             }
-            // One slot contains both bridge and agent symbols without shifting the text.
-            .frame(width: 32)
+            .frame(width: 16)
+            .overlay(alignment: .bottomTrailing) {
+                if isExternalBridge && agentSymbol != nil {
+                    Image(systemName: "paperplane.circle.fill")
+                        .font(.app(.caption2))
+                        .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
+                        .scaleEffect(0.7, anchor: .bottomTrailing)
+                        .offset(x: 2, y: 3)
+                        .help("Telegram conversation (view only)")
+                }
+            }
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(title)

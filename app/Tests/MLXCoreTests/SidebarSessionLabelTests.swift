@@ -86,6 +86,7 @@ final class SidebarSessionLabelTests: XCTestCase {
                 let lines = try textLines(symbol: symbol, bridge: bridge, subject: nil)
                 XCTAssertEqual(lines.count, 1)
                 let title = try XCTUnwrap(lines.first)
+                XCTAssertLessThan(title.minX, 24, "One glyph slot must not reserve space for a second icon")
                 if let leading { XCTAssertEqual(title.minX, leading, accuracy: 0.5) }
                 leading = title.minX
             }
