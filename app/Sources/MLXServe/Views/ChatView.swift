@@ -1610,48 +1610,16 @@ struct ChatSidebar: View {
             // to, so that answer belongs on the first line rather than in a
             // caption under a title derived from whatever you typed first.
             let agent = appState.agents.agent(id: session.agentId)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    if session.isExternalBridge {
-                        Image(systemName: "paperplane.fill")
-                            .font(.app(.caption2))
-                            .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
-                            .help("Telegram conversation (view only)")
-                    }
-                    if let agent {
-                        Image(systemName: agent.symbol)
-                            .font(.app(.caption2))
-                            .foregroundStyle(Color.accentColor)
-                    } else if !session.isExternalBridge {
-                        // Every row in this column carries a glyph saying what
-                        // it is — a terminal, an agent, a plain conversation.
-                        Image(systemName: "bubble.left")
-                            .font(.app(.subheadline, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    let displayTitle = ChatSessionTitle.display(title: session.title,
-                                                                agentName: agent?.name)
-                    Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
-                        .font(.app(.rowTitle))
-                        .lineLimit(1)
-                        .foregroundStyle(.primary)
-                    if let dot = activity.dot(for: session.id, isSelected: isSelected) {
-                        activityDot(for: dot)
-                    }
-                }
-                // What this particular conversation is about, displaced from
-                // the title line by the agent's name. It is also the only
-                // thing telling a second thread with the same agent apart
-                // from the first — without it the sidebar draws two identical
-                // rows. Absent until the thread has said something, so a new
-                // one is a single line exactly like a destination row.
-                if let subject = ChatSessionTitle.subject(title: session.title,
-                                                          agentName: agent?.name) {
-                    Text(L10n.text(subject))
-                        .font(.app(.caption2))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .foregroundStyle(.secondary)
+            let displayTitle = ChatSessionTitle.display(title: session.title, agentName: agent?.name)
+            SidebarSessionLabel(
+                title: displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle,
+                subject: ChatSessionTitle.subject(title: session.title, agentName: agent?.name).map { subject in L10n.text(subject) },
+                agentSymbol: agent?.symbol,
+                isExternalBridge: session.isExternalBridge,
+                isSelected: isSelected
+            ) {
+                if let dot = activity.dot(for: session.id, isSelected: isSelected) {
+                    activityDot(for: dot)
                 }
             }
             // Room kept for the delete button at ALL times, not only while
