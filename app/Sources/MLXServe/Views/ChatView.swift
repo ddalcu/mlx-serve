@@ -4224,7 +4224,15 @@ enum ContextMonitor {
 
 /// Animated indicator shown while the model is generating, with live GPU and memory stats.
 struct GeneratingIndicator: View {
-    @AppStorage(InterfacePrefKey.showActivityPhrases) var showActivityPhrases = true
+    enum StatusSegment: Equatable {
+        case gpu, memory, activityPhrase(String), elapsed
+    }
+
+    static func statusSegments(showActivityPhrases: Bool, phrase: String) -> [StatusSegment] {
+        [.gpu, .memory] + (showActivityPhrases ? [.activityPhrase(phrase)] : []) + [.elapsed]
+    }
+
+    @AppStorage(InterfacePrefKey.showActivityPhrases) private var showActivityPhrases = true
     @State private var gpuPercent: Int = 0
     @State private var memPercent: Int = 0
     @State private var whimsy: String = Self.randomWhimsy()
@@ -4240,26 +4248,30 @@ struct GeneratingIndicator: View {
                           outerColor: gpuNSColor, innerColor: memNSColor)
                 .frame(width: 20, height: 20)
 
-            // Stats + whimsy
-            Text(L10n.format("GPU %lld%%", gpuPercent))
-                .foregroundStyle(gpuColor)
-            Text("·")
-                .foregroundStyle(.tertiary)
-            Text(L10n.format("Mem %lld%%", memPercent))
-                .foregroundStyle(memColor)
-            if showActivityPhrases {
-                Text("·")
-                    .foregroundStyle(.tertiary)
-                Text(L10n.text(whimsy))
-                    .foregroundStyle(.secondary)
-                    .transition(.opacity)
-            }
-            Text("·")
-                .foregroundStyle(.tertiary)
-            TimelineView(.periodic(from: startDate, by: 1)) { context in
-                Text(Self.formatElapsed(context.date.timeIntervalSince(startDate)))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+            ForEach(Array(Self.statusSegments(showActivityPhrases: showActivityPhrases,
+                                             phrase: whimsy).enumerated()), id: \.offset) { index, segment in
+                if index > 0 {
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                }
+                switch segment {
+                case .gpu:
+                    Text(L10n.format("GPU %lld%%", gpuPercent))
+                        .foregroundStyle(gpuColor)
+                case .memory:
+                    Text(L10n.format("Mem %lld%%", memPercent))
+                        .foregroundStyle(memColor)
+                case .activityPhrase(let phrase):
+                    Text(L10n.text(phrase))
+                        .foregroundStyle(.secondary)
+                        .transition(.opacity)
+                case .elapsed:
+                    TimelineView(.periodic(from: startDate, by: 1)) { context in
+                        Text(Self.formatElapsed(context.date.timeIntervalSince(startDate)))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
             }
         }
         .font(.app(.caption2, weight: .medium, design: .monospaced))

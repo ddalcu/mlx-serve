@@ -2,13 +2,11 @@
 
 # MLX Core（macOS 应用）
 
-在 **设置 → 界面** 中关闭 **显示活动短语**，即可隐藏聊天和快速启动器中轮换的生成状态文字。GPU、内存和已用时间仍然可见。此设置默认开启，立即生效，并在重启后保留。也可通过 **显示 → 界面** 菜单切换。
-
 菜单栏应用，用完整的 UI 包住服务器。[下载最新版本](https://github.com/ddalcu/mlx-serve/releases/latest)或执行 `brew install --cask mlx-serve`。自 v26.8.4 起，它是一个窗口，含侧边栏、内容列与详情栏：模型、任务、设置以及媒体生成器都是聊天窗口的模式，而不再是独立窗口。
 
 - **模型浏览器** —— 从 HuggingFace 下载，支持断点续传的多连接传输（每个文件最多 16 个连接），自动发现 LM Studio 已有的模型文件夹（`~/.lmstudio/settings.json`）和你的 Hugging Face 缓存（`HF_HOME` / `HF_HUB_CACHE` 指向哪里就找哪里），这样磁盘上已有的内容不会再下载一遍，GGUF 行会显示一个 RAM 估算的最小–最大区间。多版本仓库让你自己挑量化版本，**设置 ▸ 模型文件夹**决定下载落到哪里。
 - **无需重启即可切换模型** —— 选中一个聊天模型会把它加载进正在运行的服务器并设为默认（通过 API 调用 `POST /v1/load-model`，带上 `"default": true`）。
-- **聊天界面** —— 多会话聊天，带 markdown 渲染。可以随文本一起放入 PDF（由 PDFKit 提取）或图像。
+- **聊天界面** —— 多会话聊天，带 markdown 渲染。可以随文本一起放入 PDF（由 PDFKit 提取）或图像。 在 **设置 → 界面** 中关闭 **显示活动短语**，即可隐藏聊天和快速启动器中轮换的生成状态文字。GPU、内存和已用时间仍然可见。此设置默认开启，立即生效，并在重启后保留。也可通过 **显示 → 界面** 菜单切换。
 - **Agent 模式** —— 10 个内置工具（shell、cwd、readFile、writeFile、editFile、searchFiles、listFiles、browse、webSearch、saveMemory），带自动工具调用循环和逐工具审批对话框（**允许** / **拒绝** / **本次会话始终允许**）。
 - **Agents** —— 具名助手，各自拥有性格、音色、模型、工具、工作区和唤醒词，以及各自固定的采样参数（temperature、top-p、top-k、惩罚项、推理预算）。应用会替你写好人设提示词，而且每一种发起对话的方式都能以某个 Agent 运行：聊天标签页、免手操作语音、定时任务、Telegram、快速启动器。
 - **MCP 客户端** —— 精选的 stdio + HTTP MCP 服务器市场（GitHub、Azure DevOps、DBHub、Docker、Kubernetes、Playwright、Slack、Notion、Filesystem、Shell），另外你还可以通过 `~/.mlx-serve/mcp.json` 添加自己的服务器。
