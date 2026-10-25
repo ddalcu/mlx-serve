@@ -61,6 +61,7 @@
 "%@ free" = "%@ 可用";
 "%@ has no download yet — convert the weights on-device with the matching script in the repo (see its README). They install to ~/.mlx-serve/models/local/." = "%@ 目前还没有可下载版本 —— 请用仓库中匹配的脚本在本机转换权重（见其 README）。转换后的权重会安装到 ~/.mlx-serve/models/local/。";
 "%@ in Sandbox" = "在沙盒中 %@";
+"%@ is empty, binary, or larger than %@." = "%@ 为空、为二进制文件，或大于 %@。";
 "%@ is empty, encrypted, or contains only scanned images (no extractable text)." = "%@ 为空、已加密，或仅包含扫描图片（无法提取文字）。";
 "%@ is taken by another app — kept %@." = "%@ 已被其他应用占用 —— 已保留 %@。";
 "%@ isn't on the network right now — the peer sharing it is offline or LAN discovery is off." = "%@ 目前不在网络上 —— 共享它的对等端已离线，或局域网发现已关闭。";
@@ -496,6 +497,7 @@
 "Couldn't convert the reference audio to 24 kHz mono." = "无法将参考音频转换为 24 kHz 单声道。";
 "Couldn't read PDF" = "无法读取 PDF";
 "Couldn't read audio" = "无法读取音频";
+"Couldn't read text file" = "无法读取文本文件";
 "Couldn't read video" = "无法读取视频";
 "Couldn't read the picture %@." = "无法读取图片 %@。";
 "Cover" = "翻唱";
@@ -1644,6 +1646,7 @@
 "Terminal" = "终端";
 "Terminal Background" = "终端背景";
 "Terminal Theme" = "终端主题";
+"Text · %lld chars" = "文本 · %lld 字符";
 "Text Size" = "文字大小";
 "Text on a sign" = "招牌上的文字";
 "Infographics" = "信息图";

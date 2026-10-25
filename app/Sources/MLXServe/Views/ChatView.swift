@@ -152,12 +152,12 @@ struct ToolApprovalSheet: View {
     }
 }
 
-/// Horizontal strip of pending attachment chips (images, PDFs, audio) shown
+/// Horizontal strip of pending attachment chips (images, documents, audio) shown
 /// above the message input. Extracted from `ChatDetailView` so its body stays
 /// within the Swift type-checker's complexity budget.
 private struct AttachmentPreviewRow: View {
     @Binding var images: [PendingImage]
-    @Binding var pdfs: [(name: String, text: String)]
+    @Binding var docs: [PendingTextDoc]
     @Binding var videos: [ChatVideo]
     @Binding var audio: [ChatAudio]
 
@@ -170,9 +170,10 @@ private struct AttachmentPreviewRow: View {
                 // Each `detail` is localized by its producer, not by `fileChip`:
                 // a format key has to be completed BEFORE the catalog lookup, or
                 // the lookup keys on the finished sentence and can never match.
-                ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
-                    fileChip(idx: idx, name: pdf.name, detail: L10n.format("PDF · %lld chars", pdf.text.count),
-                             icon: "doc.text.fill", tint: .red) { pdfs.remove(at: idx) }
+                ForEach(Array(docs.enumerated()), id: \.offset) { idx, doc in
+                    fileChip(idx: idx, name: doc.name, detail: detail(doc),
+                             icon: doc.kind == .pdf ? "doc.text.fill" : "doc.plaintext.fill",
+                             tint: doc.kind == .pdf ? .red : .blue) { docs.remove(at: idx) }
                 }
                 ForEach(Array(videos.enumerated()), id: \.offset) { idx, vid in
                     fileChip(idx: idx, name: vid.name, detail: L10n.format("Video · %lld frames", vid.frameCount),
@@ -185,6 +186,12 @@ private struct AttachmentPreviewRow: View {
             }
         }
         .frame(height: 64)
+    }
+
+    private func detail(_ doc: PendingTextDoc) -> String {
+        doc.kind == .pdf
+            ? L10n.format("PDF · %lld chars", doc.text.count)
+            : L10n.format("Text · %lld chars", doc.text.count)
     }
 
     @ViewBuilder
@@ -397,12 +404,21 @@ private struct MicButton: View {
 /// A top-level (non-`@MainActor`) type so the routing is unit-testable without
 /// the rendered view — it mirrors the attach button's dispatch (see ChatPasteTests).
 enum PasteFileKind: String, Equatable {
-    case folder, pdf, audio, video, image, unhandled
+    case folder, pdf, text, audio, video, image, unhandled
+
+    /// Extensions attached as plain text, read off disk verbatim.
+    ///
+    /// The indexer's own list minus its markup formats: HTML and RTF are tagged
+    /// text but their raw bytes are markup, which is not what a person means to
+    /// attach, and PDF has its own case because it is extracted, not read.
+    static let plainTextExtensions: Set<String> =
+        DocumentChunker.indexableExtensions.subtracting(["pdf", "html", "htm", "rtf"])
 
     static func classify(ext: String, isDirectory: Bool, audioSupported: Bool, videoSupported: Bool = false) -> PasteFileKind {
         if isDirectory { return .folder }
         let e = ext.lowercased()
         if e == "pdf" { return .pdf }
+        if plainTextExtensions.contains(e) { return .text }
         if let ut = UTType(filenameExtension: e) {
             if ut.conforms(to: .audio) { return audioSupported ? .audio : .unhandled }
             if ut.conforms(to: .movie) { return videoSupported ? .video : .unhandled }
@@ -410,6 +426,24 @@ enum PasteFileKind: String, Equatable {
         }
         return .unhandled
     }
+}
+
+/// One attachment the composer sends as text in the prompt rather than as
+/// media: a PDF's extracted text, or a plain-text file read off disk. `kind`
+/// picks the chip's label and the tag the model sees, so a pasted log is not
+/// announced as a PDF.
+struct PendingTextDoc: Equatable {
+    enum Kind: Equatable {
+        case pdf, text
+    }
+
+    let name: String
+    let text: String
+    let kind: Kind
+
+    /// The tag the prompt preamble puts in front of the file name. Plain English
+    /// in the prompt, like the rest of the preamble — the model reads it.
+    var preambleTag: String { kind == .pdf ? "PDF" : "Text" }
 }
 
 struct ChatView: View {
@@ -2064,7 +2098,7 @@ struct ChatDetailView: View {
     @State private var scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
     @State private var pasteMonitor: Any?
     @State private var pendingImages: [PendingImage] = []
-    @State private var pendingPDFs: [(name: String, text: String)] = []
+    @State private var pendingDocs: [PendingTextDoc] = []
     @State private var pendingVideos: [ChatVideo] = []
     @State private var pendingAudio: [ChatAudio] = []
     @StateObject private var recorder = AudioRecorder()
@@ -2873,9 +2907,9 @@ struct ChatDetailView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
               } else {
-                // Pending attachment thumbnails (images + PDFs + videos + audio)
-                if !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingVideos.isEmpty || !pendingAudio.isEmpty {
-                    AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, videos: $pendingVideos, audio: $pendingAudio)
+                // Pending attachment thumbnails (images + documents + videos + audio)
+                if !pendingImages.isEmpty || !pendingDocs.isEmpty || !pendingVideos.isEmpty || !pendingAudio.isEmpty {
+                    AttachmentPreviewRow(images: $pendingImages, docs: $pendingDocs, videos: $pendingVideos, audio: $pendingAudio)
                 }
 
                 // Attached document folder (mini RAG) — indexing progress / ready chip
@@ -2968,7 +3002,7 @@ struct ChatDetailView: View {
                         let name = url.lastPathComponent
                         if let text = Self.extractPDFText(from: url) {
                             DispatchQueue.main.async {
-                                pendingPDFs.append((name: name, text: text))
+                                pendingDocs.append(PendingTextDoc(name: name, text: text, kind: .pdf))
                             }
                         } else {
                             DispatchQueue.main.async { showPDFError(name) }
@@ -3363,7 +3397,7 @@ struct ChatDetailView: View {
         .disabled(!canAnswer
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
+                      && pendingImages.isEmpty && pendingDocs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
         }
     }
 
@@ -3467,9 +3501,15 @@ struct ChatDetailView: View {
             attachDocumentFolder(url)
         case .pdf:
             if let text = Self.extractPDFText(from: url) {
-                pendingPDFs.append((name: url.lastPathComponent, text: text))
+                pendingDocs.append(PendingTextDoc(name: url.lastPathComponent, text: text, kind: .pdf))
             } else {
                 showPDFError(url.lastPathComponent)
+            }
+        case .text:
+            if let text = Self.extractPlainTextFile(from: url) {
+                pendingDocs.append(PendingTextDoc(name: url.lastPathComponent, text: text, kind: .text))
+            } else {
+                showTextFileError(url.lastPathComponent)
             }
         case .audio:
             addAudioAttachment(url)
@@ -3490,8 +3530,9 @@ struct ChatDetailView: View {
 
     private func pickAttachment() {
         let panel = OpenPanel.make()
-        // Only offer audio/video on models that can use them.
-        var types: [UTType] = [.image, .pdf]
+        // Only offer audio/video on models that can use them. Text is always
+        // offered: every model reads it, because it rides in the prompt.
+        var types: [UTType] = [.image, .pdf, .plainText]
         if videoSupported { types.append(.movie) }
         if audioSupported { types.append(.audio) }
         panel.allowedContentTypes = types
@@ -3502,9 +3543,15 @@ struct ChatDetailView: View {
             for url in panel.urls {
                 if url.pathExtension.lowercased() == "pdf" {
                     if let text = Self.extractPDFText(from: url) {
-                        pendingPDFs.append((name: url.lastPathComponent, text: text))
+                        pendingDocs.append(PendingTextDoc(name: url.lastPathComponent, text: text, kind: .pdf))
                     } else {
                         showPDFError(url.lastPathComponent)
+                    }
+                } else if PasteFileKind.plainTextExtensions.contains(url.pathExtension.lowercased()) {
+                    if let text = Self.extractPlainTextFile(from: url) {
+                        pendingDocs.append(PendingTextDoc(name: url.lastPathComponent, text: text, kind: .text))
+                    } else {
+                        showTextFileError(url.lastPathComponent)
                     }
                 } else if let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .audio) {
                     addAudioAttachment(url)
@@ -3637,6 +3684,21 @@ struct ChatDetailView: View {
         return text
     }
 
+    /// Read a plain-text file the way its extension promises: UTF-8, then
+    /// Latin-1 for the older 8-bit encodings.
+    ///
+    /// Returns nil when the bytes are binary (a NUL early in the file), when the
+    /// file is larger than the indexer's per-file cap, or when nothing is left
+    /// after trimming — the same "nothing to send" test `extractPDFText` applies.
+    static func extractPlainTextFile(from url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              data.count <= DocumentIndex.maxFileBytes,
+              !data.prefix(1024).contains(0) else { return nil }
+        guard let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return text
+    }
+
     private func showPDFError(_ name: String) {
         let alert = NSAlert()
         alert.messageText = L10n.text("Couldn't read PDF")
@@ -3645,12 +3707,23 @@ struct ChatDetailView: View {
         alert.runModal()
     }
 
-    /// Build a preamble string that joins all pending PDFs and clears the list.
-    /// Returns "" when nothing is pending.
-    private func consumePendingPDFsAsText() -> String {
-        guard !pendingPDFs.isEmpty else { return "" }
-        let combined = pendingPDFs.map { "[PDF: \($0.name)]\n\($0.text)" }.joined(separator: "\n\n")
-        pendingPDFs = []
+    private func showTextFileError(_ name: String) {
+        let alert = NSAlert()
+        alert.messageText = L10n.text("Couldn't read text file")
+        alert.informativeText = L10n.format("%@ is empty, binary, or larger than %@.",
+                                            name,
+                                            ByteCountFormatter.string(fromByteCount: Int64(DocumentIndex.maxFileBytes),
+                                                                      countStyle: .file))
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
+    /// Build a preamble string that joins all pending text documents and clears
+    /// the list. Returns "" when nothing is pending.
+    private func consumePendingDocsAsText() -> String {
+        guard !pendingDocs.isEmpty else { return "" }
+        let combined = pendingDocs.map { "[\($0.preambleTag): \($0.name)]\n\($0.text)" }.joined(separator: "\n\n")
+        pendingDocs = []
         return combined
     }
 
@@ -4040,12 +4113,12 @@ struct ChatDetailView: View {
         let attachedImages = consumePendingImages()
         let attachedVideos = consumePendingVideos()
         let attachedAudio = consumePendingAudio()
-        let pdfText = consumePendingPDFsAsText()
-        guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty,
+        let docText = consumePendingDocsAsText()
+        guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !docText.isEmpty,
               composerState != .generatingHere, canAnswer else { return }
         inputText = ""
-        if !pdfText.isEmpty {
-            text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
+        if !docText.isEmpty {
+            text = text.isEmpty ? docText : docText + "\n\n" + text
         }
 
         chatEngine.runTurn(sessionId: sessionId, userText: text,
