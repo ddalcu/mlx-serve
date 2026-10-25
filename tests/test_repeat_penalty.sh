@@ -3,7 +3,7 @@
 #
 # Bar: at temp 0, repeat/frequency/presence penalties change a looping reply
 # without logprobs, the same bytes as with them, streamed or not, and under a
-# json_schema; frequency_penalty x is repeat_penalty 1+x on chat and /v1/completions; a
+# json_schema; frequency_penalty is read on chat and /v1/completions; a
 # penalized request never runs a PLD round (verify reads raw logits).
 #
 #   PENALTY_TEST_MODEL=<dir> ./tests/test_repeat_penalty.sh [port]
@@ -96,11 +96,10 @@ def completion(**extra):
     with urllib.request.urlopen(req, timeout=300) as r:
         return json.load(r)["choices"][0]["text"]
 
-# frequency_penalty x is read as repeat_penalty 1 + x on every surface.
+# frequency_penalty is read on every surface; its arithmetic is pinned by the unit tests (#912).
 for name, call in (("chat", chat), ("completions", completion)):
-    freq, rep = call(frequency_penalty=1.5), call(repeat_penalty=2.5)
-    ck(f"{name}: frequency_penalty 1.5 == repeat_penalty 2.5, and penalized", freq == rep and rep != call(),
-       f"freq={freq[:60]!r} rep={rep[:60]!r}")
+    freq = call(frequency_penalty=1.5)
+    ck(f"{name}: frequency_penalty changes the reply", freq != call(), f"freq={freq[:60]!r}")
 
 pj = "Write the word apple 40 times. Return JSON with a words array."
 j1 = chat(pj, response_format=SCHEMA, repeat_penalty=1.0)

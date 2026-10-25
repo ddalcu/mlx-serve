@@ -72,8 +72,9 @@ enum ChatWorkspace: Equatable {
         return nil
     }
 
-    /// The destination for a model-browser request without an explicit section.
-    static let defaultEntry: ChatWorkspace = .models(.defaultSection)
+    static func modelBrowserEntry(section: ModelBrowserSection? = nil, localModels: [LocalModel]) -> ChatWorkspace {
+        .models(section ?? .defaultSection(hasLocalModels: !localModels.isEmpty))
+    }
 
     /// Whether the "you need a model to chat" gate may cover the window.
     ///

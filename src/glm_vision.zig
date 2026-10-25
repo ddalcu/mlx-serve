@@ -463,7 +463,7 @@ pub fn linear(x: mlx.mlx_array, l: Lin, s: mlx.mlx_stream) !mlx.mlx_array {
 }
 
 /// `x*cos + rotate_half(x)*sin` in f32, back in `x`'s dtype. `x` is `[N, heads, hd]`, tables `[N, 1, hd]`.
-fn rope2d(x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn rope2d(x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const shape = mlx.getShape(x);
     const half = @divExact(shape[2], 2);
     var x32 = mlx.mlx_array_new();

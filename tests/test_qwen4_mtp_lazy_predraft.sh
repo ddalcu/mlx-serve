@@ -58,7 +58,7 @@ run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_LAZY_PREDRAFT, $3 = MLX_SERVE_MT
   MLX_SERVE_MTP_LAZY_PREDRAFT="$2" MLX_SERVE_MTP_LOOKUP="$3" MLX_SERVE_MTP_TRACE=1 \
     "$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --mtp --prefix-cache-entries 0 > "$log" 2>&1 &
   SPID=$!
-  for _ in $(seq 1 600); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$log" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$log"; exit 1; }; sleep 2; done
+  for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$log" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$log"; exit 1; }; sleep 2; done
   for p in $PROMPTS; do ask "$name" "$p" 0; done
   ask "$name" sampled-prose 0.8
   stop_srv

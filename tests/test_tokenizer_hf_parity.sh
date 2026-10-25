@@ -28,7 +28,7 @@ BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 if [[ ${#PACKS[@]} -eq 0 ]]; then
     for rel in TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP mlx-community/Llama-3.2-3B-Instruct-4bit \
                LiquidAI/LFM2.5-2.6B-MLX-mxfp4 ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit \
-               mlx-community/Qwen3.5-0.8B-MLX-4bit mlx-community/gemma-4-e4b-it-8bit; do
+               mlx-community/Qwen3.5-0.8B-MLX-4bit mlx-community/gemma-4-e4b-it-8bit RecursiveSI/flint-int4; do
         p=$(find_model "$rel") && PACKS+=("$p") || echo "SKIP: $rel not on this box"
     done
 fi

@@ -94,6 +94,23 @@ check("pull_request" in str(linux.get("if", "")) and "dry_run" in str(linux.get(
 check("gh run download" in linux_text and "gh release upload" in linux_text,
       "linux-assets downloads linux.yml's artifacts and uploads them")
 check("build-linux.sh" not in linux_text, "linux-assets never rebuilds")
+
+# MLX JIT-compiles its CUDA kernels against the headers beside libmlx (lib/mlx/include,
+# CCCL included): a tarball without them fails every custom kernel on a user's machine.
+lwf = yaml.safe_load(open(".github/workflows/linux.yml"))
+pkg = [st.get("run", "") for j in lwf["jobs"].values() for st in j.get("steps", []) if st.get("name") == "Package"]
+check(len(pkg) == 1 and "lib/mlx/include" in pkg[0], "the Linux tarball carries lib/mlx/include")
+
+# The Windows zip is windows.yml's build of the same commit, attached the same way.
+win = wf["jobs"].get("windows-assets", {})
+win_text = str(win)
+check(win.get("needs") == "build", "windows-assets runs after the draft exists")
+check("pull_request" in str(win.get("if", "")) and "dry_run" in str(win.get("if", "")),
+      "windows-assets gated off for pull_request and dry_run")
+check("gh run download" in win_text and "gh release upload" in win_text,
+      "windows-assets downloads windows.yml's artifact and uploads it")
+check("windows.yml" in win_text and "build-windows" not in win_text,
+      "windows-assets reads windows.yml's run and never rebuilds")
 check("steps.version.outputs.tag" in str(job.get("outputs", {}).get("tag", "")),
       "build job exports the release tag")
 

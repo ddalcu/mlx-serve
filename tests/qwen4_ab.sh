@@ -18,7 +18,7 @@ for i in $(seq 1 60); do lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1 || br
 flags=(--max-concurrent 4 --prefix-cache-entries 0 --log-level info)
 [[ $mode == mtp ]] && flags+=(--mtp)
 nohup $BIN --model $PACK --serve --host 127.0.0.1 --port $PORT $flags "$@" > $LOG 2>&1 &
-for i in $(seq 1 200); do curl -s -m 2 localhost:$PORT/health >/dev/null && grep -q "Model ready" $LOG && break; sleep 3; done
+for i in $(seq 1 200); do curl -sf -m 2 localhost:$PORT/health >/dev/null && grep -q "Model ready" $LOG && break; sleep 3; done
 one() { echo "$1" | curl -s -m 1800 localhost:$PORT/v1/chat/completions -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); t=d['timings']; print(f\"{t['predicted_per_second']:.1f}/{d['usage']['completion_tokens']}\")"; }
 agg() { python3 -c "
 import sys,time; t0=float(sys.argv[1]); toks=sum(int(x.split('/')[1]) for x in sys.stdin.read().split()); print(f'wall_agg={toks/(time.time()-t0):.1f} tok/s')" "$1"; }

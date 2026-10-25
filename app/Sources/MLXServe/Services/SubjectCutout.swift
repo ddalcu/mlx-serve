@@ -29,7 +29,35 @@ enum SubjectCutout {
         return png
     }
 
+    /// Cut the subject and keep the alpha, for a backend that reads transparency as the subject. A photo
+    /// that already has real transparency is the user's own cutout and passes through untouched; when
+    /// Vision finds no subject the original goes as is (the whole frame is then the subject).
+    static func cutoutKeepingAlpha(imageData: Data) -> Data {
+        guard let source = decodeCGImage(imageData), !hasTransparency(source),
+              let subject = maskedForeground(source), let png = pngData(from: subject) else { return imageData }
+        return png
+    }
+
     // MARK: - Pure helpers (testable)
+
+    /// Whether any pixel is not fully opaque.
+    static func hasTransparency(_ source: CGImage) -> Bool {
+        switch source.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return false
+        default: break
+        }
+        let w = source.width, h = source.height
+        guard w > 0, h > 0 else { return false }
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = pixels.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(
+                data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(source, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        return drawn && stride(from: 3, to: pixels.count, by: 4).contains { pixels[$0] < 255 }
+    }
 
     /// Composite `source` (which may carry an alpha channel) over opaque white,
     /// returning an alpha-free image the same size. Pure + testable.

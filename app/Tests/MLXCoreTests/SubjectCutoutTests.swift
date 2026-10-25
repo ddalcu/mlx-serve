@@ -45,6 +45,29 @@ final class SubjectCutoutTests: XCTestCase {
         XCTAssertEqual(SubjectCutout.cutoutOnWhite(imageData: junk), junk)
     }
 
+    func testATransparentCutoutIsNotFlattenedForTrellis2() throws {
+        // TRELLIS.2 reads the alpha as the subject, so a cutout the user already made must reach it untouched.
+        let half = try makeImage(width: 8, height: 8) { ctx, w, h in
+            ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.setFillColor(CGColor(colorSpace: CGColorSpaceCreateDeviceRGB(), components: [1, 0, 0, 1])!)
+            ctx.fill(CGRect(x: 0, y: 0, width: w / 2, height: h))
+        }
+        XCTAssertTrue(SubjectCutout.hasTransparency(half))
+        let data = try XCTUnwrap(SubjectCutout.pngData(from: half))
+        XCTAssertEqual(SubjectCutout.cutoutKeepingAlpha(imageData: data), data)
+
+        let opaque = try makeImage(width: 8, height: 8) { ctx, w, h in
+            ctx.setFillColor(CGColor(colorSpace: CGColorSpaceCreateDeviceRGB(), components: [0, 0, 1, 1])!)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        XCTAssertFalse(SubjectCutout.hasTransparency(opaque))
+    }
+
+    func testKeepingAlphaFallsBackToOriginalOnGarbage() {
+        let junk = Data("not an image".utf8)
+        XCTAssertEqual(SubjectCutout.cutoutKeepingAlpha(imageData: junk), junk)
+    }
+
     // MARK: - Helpers
 
     private func makeImage(width: Int, height: Int, draw: (CGContext, Int, Int) -> Void) throws -> CGImage {

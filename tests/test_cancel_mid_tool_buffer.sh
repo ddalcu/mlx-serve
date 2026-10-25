@@ -45,13 +45,14 @@ mem_bytes() { curl -sf -m 10 "$BASE/props" 2>/dev/null \
 
 # A request whose answer is ONE big tool call: the server buffers the whole
 # thing for detection, so a disconnect lands mid-buffer with high probability.
+# It must outlast the 3 s drop on the fastest box (an eight-paragraph page finished in 2.9 s on an M5).
 REQ=$(python3 <<'PY'
 import json
 print(json.dumps({"model": "mlx-serve",
  "messages": [{"role": "user", "content":
    "Use write_file RIGHT NOW to create a complete standalone HTML page saved as "
    "mars.html about Mars: full <!DOCTYPE html>, a <head> with a <title>, an "
-   "embedded <style> block, an <h1>, and at least eight <p> paragraphs. Call the "
+   "embedded <style> block, an <h1>, and forty <p> paragraphs of five sentences each. Call the "
    "tool now; do not ask questions."}],
  "tools": [{"type": "function", "function": {
    "name": "write_file", "description": "Write a file",

@@ -254,7 +254,8 @@ struct VideoGenView: View {
                         ? PromptRewriter.storyboard(idea: prompt, format: model.promptFormat, totalSeconds: seconds,
                                                     shotSeconds: Storyboard.plannedRange(shotSeconds), firstFrame: firstFrame)
                         : PromptRewriter.video(text: prompt, format: model.promptFormat, seconds: seconds,
-                                               firstFrame: firstFrame)
+                                               firstFrame: firstFrame,
+                                               references: model.supportsReferences ? refImageURLs.compactMap { try? Data(contentsOf: $0) } : [])
                 },
                 onApplyClip: { seconds in
                     guard !plansStoryboard(seconds) else { return }
@@ -2018,9 +2019,12 @@ struct VideoGenView: View {
 
     private var advancedBody: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Steps — more steps = more detail/smoother motion, but slower.
-            intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
-                         help: "Denoising steps. More = more detail and smoother motion, but slower.")
+            // Steps — more steps = more detail/smoother motion, but slower. A distilled student
+            // takes one count, which a slider pinned at it would only pretend to offer.
+            if model.fixedSteps == nil {
+                intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
+                             help: "Denoising steps. More = more detail and smoother motion, but slower.")
+            }
             Text(L10n.text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp))
                 .font(.app(.caption2)).foregroundStyle(.secondary)
             // The low end is REACHABLE and only advised against, so the pane

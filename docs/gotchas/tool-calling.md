@@ -905,6 +905,13 @@ GLM-5.3-Flash's template renders tool-call history through `tc.arguments.items()
 Fix: `parser.cpp` marks a member access whose property is an integer literal as computed, so `x.0` indexes like `x[0]`.
 Guard: the GLM tool-history render test in `chat.zig` (native `<tool_call>` turns, no fallback markers) and `tests/test_glm5_next.sh` [4].
 
+## jinja.cpp did not lex `\x00`, and every Flint turn fell back (2026-10-21)
+
+Recursive Flint's template strips NUL bytes from user text with `replace("\x00", "")`. jinja.cpp's lexer knew no `\x` escape, so the template raised at LEX time and every request rendered `fallbackFormatChat`: Gemma turn markers, no `<|assistant|>` header, the wrong stop tokens. Nothing in the log looked arch-specific.
+
+Fix: `lexer.cpp` reads `\xHH` as Python does: code point U+00HH, emitted as UTF-8.
+Guard: the Flint render test in `chat.zig` (byte-exact against jinja2 with HF's settings) and `tests/test_flint.sh` [4].
+
 ## `tool_choice: "required"` was a request, not a constraint (2026-10-04)
 
 tool-eval-bench TC-45 sent `tool_choice: "required"` with "What is 7 times 8?" to Qwen3.8 Flash Next and got text. Its probe ("Reply with the single word OK. Do not call any tools.") then showed why a fix in the prompt is not enough: with the instruction line delivered, the model obeyed the user and the bench excluded the scenario as unenforced.
@@ -921,3 +928,17 @@ Defect: DeepSeek's `chat_template.jinja` failed on every request in jinja.cpp (`
 Cause: it builds tool schemas with `dict(schema.d, **{k: v})`; jinja.cpp has no `**` unpacking, and `dict(d, key=v)` and chained comparisons also fail there. It also drops a newline right after a block tag where jinja2 keeps it.
 Fix: V4.1 always renders OUR transcription of `encoding/encoding.py` (`src/fixtures/dsv41_chat_template.jinja`), newlines after tags spelled out; V4.1 also spaces its DSML tag names (`<｜DSML｜ invoke`), so the parser accepts both spellings.
 Guard: `tests/dsv41_template_ab.py` (byte-exact vs the encoder) dumps the cases `chat: the embedded V4.1 template renders through jinja.cpp byte-exact` replays; corpus family `dsv41-dsml`.
+
+## Qwen3.8 Flash Next wrote Claude's tool markup, and the agent's turn ended (#928)
+
+Defect: in long pi sessions the iQ-MLX-4.7bpw pack sometimes answered with a complete `<invoke name="bash"><parameter name="command">…</parameter></invoke>` block as plain content, `finish_reason: "stop"`, no `tool_calls`. The agent took it as a final answer and stopped.
+Cause: the checkpoint has seen Claude transcripts and samples their dialect in place of its own `<tool_call>`. No parser knew a bare `<invoke` (only ATEM's `<atem:invoke` and DSML's), and neither the stream gate nor the scrubber held or cut it.
+Fix: `BARE_INVOKE` is ATEM's grammar without the namespace, parsed when no other family matched, as `.inferred` so an undeclared name stays prose; `invokeOpenerHoldsForTools` holds `<function_calls>` and `<invoke …` with every growing prefix; `bareInvokeMarkupCut` cuts it only beside a `<parameter ` or `</invoke>`.
+Guard: corpus family `qwen4_exp` (call, undeclared name, prose), `parseToolCalls: Anthropic-style bare <invoke> markup…`, `…a bare <invoke> in prose or inside another dialect's value is not a call` (it once ran before the `<tool` scan, so an echoed `<invoke>` inside a native call's value replaced the call) and the derived-prefix gate test in `chat.zig`.
+
+## Flint doubled its key opener, and Claude Code saw the key `<arg_key>file_path` (2026-10-22)
+
+Defect: in a Claude Code session on Flint (release agent run) an `Edit` call arrived with the argument key `<arg_key>file_path`; Claude Code rejected it as an unexpected parameter and the agent spent a turn retrying.
+Cause: the GLM pair loop takes the key as everything between the `<arg_key>` opener and the next close, so a doubled opener (`<arg_key><arg_key>file_path</arg_key>`) kept the inner opener in the key.
+Fix: the key starts after the LAST opener before its close (`parseHy3ToolCalls`).
+Guard: corpus family `flint`, "a doubled <arg_key> opener keeps the key", and the universal invariant that no parsed argument KEY carries a line break or markup.

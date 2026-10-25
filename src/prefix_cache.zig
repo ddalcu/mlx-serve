@@ -3764,6 +3764,44 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
     }
 }
 
+test "HotPrefixCache: a disk restore leaves room for the token it re-forwards" {
+    // A grow is not in place: an exact-size restore made the first append copy the whole
+    // cache, and the prefill guard refused a restored 38k prompt on a 16 GB Mac for it.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const Grows = &transformer_mod.KVCache.kv_cap_buf_grows;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-room", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        _ = try hc.commit(&cache, &tokens, false);
+        hc.flushPendingDisk(s);
+    }
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-room", 0, 128);
+    defer hc2.deinit();
+    var slot = try KVCache.init(testing.allocator, 2);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&slot, &moe_off, null, s, &tokens, false, &.{}, null, null);
+    try testing.expect(res.full_match and res.slot_owned);
+    try testing.expect(slot.residentCapacityTokens() > res.matched);
+    const g = Grows.*;
+    try testFillCache(&slot, s, 2, 1); // the re-forwarded last token
+    try testing.expectEqual(@as(usize, 0), Grows.* - g);
+}
+
 test "HotPrefixCache: budget decline reports a status, not a silent success" {
     // Live 2026-09-07: every oversized decline from a cancelled prefill
     // logged "[hot-cache] committed N/M" at the scheduler because the

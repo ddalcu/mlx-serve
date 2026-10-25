@@ -13,7 +13,9 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
     /// Media-gen model catalog (image/audio/video/music), grouped by modality.
     case media
 
-    static let defaultSection: ModelBrowserSection = .myModels
+    static func defaultSection(hasLocalModels: Bool) -> ModelBrowserSection {
+        hasLocalModels ? .myModels : .recommended
+    }
 
     var id: String { rawValue }
 

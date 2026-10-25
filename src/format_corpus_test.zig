@@ -323,6 +323,17 @@ const corpus = [_]Expect{
         .content_exact = "17 × 23 = 391.",
     },
     .{
+        // LIVE 2026-10-19 (Qwen3.8-27B 4bit, MTP, temp 1.0, agent turn beside media jobs, m4max):
+        // the `<` of `<function=` was sampled as the `<|im_start|>` special, the JSON shapes
+        // failed and the agent got an empty `stop`. One mangled delimiter, name and args intact.
+        .family = "qwen",
+        .name = "function-tag call whose opener `<` came out as a special token",
+        .raw = "<tool_call>\n<|im_start|>function=read_file>\n<parameter=path>\nsrc/game.js\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "src/game.js",
+    },
+    .{
         // Raw JSON tool call with no wrapper tags (Qwen emits this when the
         // template's <tool_call> markers get sampled away).
         .family = "qwen",
@@ -1240,6 +1251,59 @@ const corpus = [_]Expect{
         .raw = "17 x 24 = **408**.",
         .content_contains = "408",
     },
+    // ── Recursive Flint ─────────────────────────────────────────────────
+    // GLM's bare-opener pairs with NO newlines, straight after the preamble. The
+    // model opens its own `<think>`; its thinking is buffered apart, so these are
+    // the answer side as captured live (RecursiveSI/flint-int4, temp 0).
+    .{
+        .family = "flint",
+        .name = "preamble then a call, pairs with no newlines, string→bool coercion",
+        .raw = "I'll get the current weather in Tokyo for you.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call>",
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
+    .{
+        .family = "flint",
+        .name = "two calls back to back keep their own arguments",
+        .raw = "I'll get the current weather for both cities for you.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Berlin</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call>",
+        .tools_json = weather_tool_schema,
+        .tool_count = 2,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .last_tool_arg_value = "Berlin",
+    },
+    .{
+        .family = "flint",
+        .name = "a call that repeats its pairs at the same values still parses once",
+        .raw = "I'll think through this briefly: the task is simple \u{2014} create a Python file that prints \"hello world\". The standard implementation is just a single `print` statement.\n\n" ++
+            "Now I'll write the file using the write tool.<tool_call>write<arg_key>path</arg_key><arg_value>hello.py</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>print(\"hello world\")\n</arg_value><arg_key>path</arg_key><arg_value>hello.py</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>print(\"hello world\")\n</arg_value></tool_call>\n",
+        .tools_json = write_read_tools_schema,
+        .tool_count = 1,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "hello.py",
+    },
+    .{
+        // Claude Code on Flint: a doubled key opener reached the client as the key `<arg_key>file_path`.
+        .family = "flint",
+        .name = "a doubled <arg_key> opener keeps the key",
+        .raw = "<tool_call>write<arg_key><arg_key>path</arg_key><arg_value>snake.html</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value><canvas></canvas></arg_value></tool_call>",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "snake.html",
+    },
     // ── K2-Horizon (IFM) ────────────────────────────────────────────────
     // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
     // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form
@@ -1727,6 +1791,47 @@ const corpus = [_]Expect{
         .content_contains = "atem:function_calls block",
     },
 
+    // ── Anthropic-style `<function_calls><invoke>` in place of the model's own dialect (#928) ──
+    .{
+        // LIVE shape (qwen4_exp, pi session): the whole call arrived as content with finish stop.
+        .family = "qwen4_exp",
+        .name = "Anthropic invoke markup after thinking is a call",
+        .raw = "List the folder first.</think>\n\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x/wiki && ls -la && wc -l *.md | tail -1</parameter>\n</invoke>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_key = "command",
+        .tool_arg_value = "cd /x/wiki && ls -la && wc -l *.md | tail -1",
+        .reasoning_contains = "List the folder",
+    },
+    .{
+        // Not the model's dialect, so an undeclared name is a data block, not a call.
+        .family = "qwen4_exp",
+        .name = "Anthropic invoke naming an undeclared tool is not a call",
+        .raw = "<function_calls>\n<invoke name=\"teleport\">\n<parameter name=\"to\">mars</parameter>\n</invoke>\n</function_calls>",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "qwen4_exp",
+        .name = "prose naming the invoke tag is not a call",
+        .raw = "Claude's format wraps each call in <invoke name=\"bash\"> tags.",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+        .content_contains = "<invoke name=\"bash\"> tags",
+    },
+    .{
+        // The native call wins: invoke markup inside its parameter value is payload.
+        .family = "qwen3_5",
+        .name = "invoke markup inside a Hermes parameter value is payload",
+        .raw = "<tool_call>\n<function=bash>\n<parameter=command>\necho '<invoke name=\"bash\"><parameter name=\"command\">rm -rf /</parameter></invoke>'\n</parameter>\n</function>\n</tool_call>",
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_key = "command",
+        .tool_arg_value = "echo '<invoke name=\"bash\"><parameter name=\"command\">rm -rf /</parameter></invoke>'",
+    },
+
     // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
     .{
         .family = "minicpm5",
@@ -2032,6 +2137,11 @@ test "format corpus: recorded model outputs across families" {
                 };
                 defer parsed.deinit();
                 if (parsed.value != .object) try fail(entry, "tool arguments are not a JSON object", tc.arguments);
+                // An argument KEY never carries a dialect tag or a line break: a doubled
+                // `<arg_key>` opener reached Claude Code as the key `<arg_key>file_path`.
+                if (parsed.value == .object) for (parsed.value.object.keys()) |k| {
+                    if (k.len == 0 or std.mem.indexOfAny(u8, k, "\n\r<>") != null) try fail(entry, "argument KEY is empty or carries a line break or markup", k);
+                };
 
                 // Universal declared-type invariant: every argument whose type
                 // the tool declares must actually carry that JSON type. This is
@@ -2469,7 +2579,7 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     const gate_split_markers = [_][]const u8{
         "<tool_call", "<|tool_call", "<atem:",
         "<｜DSML｜",
-        "<function",
+        "<function",  "<invoke",
     };
     var checked: usize = 0;
     for (corpus) |entry| {

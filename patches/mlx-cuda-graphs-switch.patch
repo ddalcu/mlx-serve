@@ -1,0 +1,58 @@
+mlx_cuda_set_graphs: CUDA graphs on or off at runtime, committing pending nodes first. On a GB10
+(sm_121) prefill kernels ran up to 2.3x slower inside MLX's CUDA graphs than alone (MLX commits a
+graph per 20 ops or 25 MB there); the cause was not found. mlx-serve runs prefill without graphs
+on integrated GPUs and keeps them for decode.
+
+Retires when MLX's CUDA graphs run prefill at standalone kernel speed on GB10 (the measurements
+are in mlx-serve's docs/CUDA.md). Not reported upstream yet.
+
+diff --git a/mlx/backend/cuda/device.cpp b/mlx/backend/cuda/device.cpp
+index 6e40b3403..798dd83b1 100644
+--- a/mlx/backend/cuda/device.cpp
++++ b/mlx/backend/cuda/device.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <fmt/format.h>
+ #include <nvtx3/nvtx3.hpp>
++#include <atomic>
+ #include <future>
+ #include <unordered_set>
+ 
+@@ -14,9 +15,13 @@ namespace mlx::core::cu {
+ 
+ namespace {
+ 
++std::atomic<bool>& cuda_graphs_on() {
++  static std::atomic<bool> on{env::get_var("MLX_USE_CUDA_GRAPHS", true) != 0};
++  return on;
++}
++
+ bool use_cuda_graphs() {
+-  static bool use_graphs = env::get_var("MLX_USE_CUDA_GRAPHS", true);
+-  return use_graphs;
++  return cuda_graphs_on().load(std::memory_order_relaxed);
+ }
+ 
+ const char* save_cuda_graphs_dot_file() {
+@@ -632,4 +637,21 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
+   return *encoders;
+ }
+ 
++void set_cuda_graphs(bool enabled) {
++  static const bool allowed = env::get_var("MLX_USE_CUDA_GRAPHS", true);
++  enabled = enabled && allowed;
++  if (cuda_graphs_on().load(std::memory_order_relaxed) == enabled) {
++    return;
++  }
++  // Pending nodes launch in the mode they were recorded in.
++  for (auto& [_, encoder] : get_command_encoders()) {
++    encoder.commit();
++  }
++  cuda_graphs_on().store(enabled, std::memory_order_relaxed);
++}
++
+ } // namespace mlx::core::cu
++
++extern "C" MLX_API void mlx_cuda_set_graphs(bool enabled) {
++  mlx::core::cu::set_cuda_graphs(enabled);
++}

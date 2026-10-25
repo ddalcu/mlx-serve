@@ -54,10 +54,16 @@ download one in the MLX Core app (Models). Do not invent an id.
   `POST /v1/unload-model {"model": "<id>"}` frees it. While a load runs,
   `GET /v1/load-progress` lists each loading model's `phase`, `done`/`total`
   and `eta_s`.
-- All models share one GPU memory budget. A 503 `out_of_memory` means unload
-  something first (typically the media model when you are done with it).
-- Generation runs on one inference thread: a 3-minute video render stalls chat
-  replies for 3 minutes. Decisions and embeddings are milliseconds.
+- Everything runs on ONE machine and ONE GPU: the chat model you are running on,
+  the image, 3D and sound models all share its memory. A 503 `out_of_memory`
+  means unload something first. Not every overfill is refused: three models
+  packed to the edge make Metal fail mid-job instead, so keep ONE media model
+  loaded at a time and unload it before loading another kind (gen.mjs does).
+- Generation runs on one inference thread and chat shares the GPU with it: a
+  3-minute video render stalls chat replies for 3 minutes, and chatting while
+  media renders squeezes both. Run asset generation as its own step and wait
+  for it, never alongside your own coding turns. Decisions and embeddings are
+  milliseconds.
 
 ## Films and music videos
 
@@ -70,8 +76,9 @@ to the sung words and renders it.
 - Building a 3D game or scene? Read games.md first: movement, foliage and lighting rules,
   and `gen.mjs` (next to this file, Node 18+), which generates and post-processes every
   asset from one `assets.json` (`node gen.mjs help`).
-- Generate media AHEAD of time or in the background, never on the frame or
-  input path. Cache results on disk keyed by model + prompt + seed + size, and
+- Generate media AHEAD of time, as a step you wait for (one GPU, shared with
+  the chat model you run on; never in parallel with your own work), never on
+  the frame or input path. Cache results on disk keyed by model + prompt + seed + size, and
   ship the cache (or regenerate lazily) instead of calling on every run.
 - Rough cost on Apple Silicon: image 5-60 s, speech about real time or faster,
   sound effects about a second, music 30 s to minutes, 3D 1-5 min, video minutes. Set client timeouts to

@@ -1,7 +1,8 @@
 #!/bin/bash
 # An MLX error costs ONE REQUEST, never the server (#353). mlx-c's default handler was
 # exit(-1). `MLX_SERVE_MLX_FAULT_CHUNK=<n>` / `_STEP=<n>` latch a synthetic Metal OOM at the
-# n-th prefill-chunk / decode-step checkpoint and disarm, so one boot exercises the failure
+# n-th prefill-chunk / decode-step checkpoint and disarm (`MLX_SERVE_MLX_FAULT_KIND=cuda_lost`: a sticky CUDA
+# error instead, which refuses everything after it), so one boot exercises the failure
 # (a 503 with a body, `[mlx]` in the log) and the recovery (200 on the next request).
 #
 # Usage: ./tests/test_mlx_error_recovery.sh [model_dir] [port]
@@ -143,6 +144,30 @@ else
   bad "omitted max_tokens refused with $CODE6: $(head -c 240 /tmp/mlxerr_body.json)"
 fi
 fi
+
+# A sticky CUDA error poisons the context for good: refuse by name and say so on /health, never crash.
+echo "[7] a lost GPU context: every request is a named 503, /health says so, the process stays up"
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+LOG7=$(mktemp -t mlxerr7.XXXXXX).log
+MLX_SERVE_MLX_FAULT_STEP=2 MLX_SERVE_MLX_FAULT_KIND=cuda_lost ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+  --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG7" 2>&1 &
+SRV=$!
+trap 'kill $SRV 2>/dev/null' EXIT
+for _ in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+CODE8=$(req "Write one sentence about the sea.")
+[ "$CODE8" = "503" ] && grep -q 'GPU context was lost' /tmp/mlxerr_body.json &&
+  ok "the faulting request answered the named 503" ||
+  bad "faulting request status $CODE8: $(head -c 200 /tmp/mlxerr_body.json)"
+CODE9=$(req "Say hello.")
+[ "$CODE9" = "503" ] && grep -q 'gpu_context_lost' /tmp/mlxerr_body.json &&
+  ok "the next request is refused by name" ||
+  bad "post-loss request status $CODE9: $(head -c 200 /tmp/mlxerr_body.json)"
+HEALTH=$(curl -s -m 5 -w ' %{http_code}' "$BASE/health")
+[ "$HEALTH" = '{"status":"cuda context lost"} 503' ] && ok "/health answers 503 cuda context lost" ||
+  bad "/health after the loss: $HEALTH"
+kill -0 $SRV 2>/dev/null && ok "the process is still up" || bad "the process died"
+N=$(grep -c 'GPU context lost' "$LOG7")
+[ "$N" = "1" ] && ok "the loss is logged once" || bad "the loss is logged $N times"
 
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 echo "---- $PASS passed, $FAIL failed ----"

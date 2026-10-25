@@ -42,6 +42,118 @@ final class Model3DGenServiceTests: XCTestCase {
         XCTAssertEqual(json["seed"] as? Int, 9)
     }
 
+    func testTrellis2RequestCarriesItsOwnFieldsAndNoneOfHunyuans() {
+        var req = Model3DGenRequest(model: .trellis2Family, photoPath: "/tmp/car.png")
+        req.trellisResolution = 1536
+        req.decimationTarget = 150_000
+        req.textureSize = 1024
+        let json = Model3DGenService.requestJson(for: req, modelName: "TRELLIS.2-4B", imageB64: "QUJD", seed: 7)
+        XCTAssertEqual(json["model"] as? String, "TRELLIS.2-4B")
+        XCTAssertEqual(json["image"] as? String, "QUJD")
+        XCTAssertEqual(json["seed"] as? Int, 7)
+        XCTAssertEqual(json["resolution"] as? Int, 1536)
+        XCTAssertEqual(json["decimation_target"] as? Int, 150_000)
+        XCTAssertEqual(json["texture_size"] as? Int, 1024)
+        // Omitted steps keep the published 12; Hunyuan's knobs mean nothing here.
+        for key in ["steps", "guidance_scale", "octree_resolution", "texture"] {
+            XCTAssertNil(json[key], key)
+        }
+    }
+
+    func testPixal3DRequestSharesTheCascadeFieldsAndKeepsTheAlpha() {
+        var req = Model3DGenRequest(model: .pixal3d_8bit, photoPath: "/tmp/car.png")
+        req.trellisResolution = 1536
+        req.decimationTarget = 600_000
+        req.textureSize = 4096
+        let json = Model3DGenService.requestJson(for: req, modelName: "ddalcu/Pixal3D-MLX-Serve-8bit", imageB64: "QUJD", seed: 3)
+        XCTAssertEqual(json["resolution"] as? Int, 1536)
+        XCTAssertEqual(json["decimation_target"] as? Int, 600_000)
+        XCTAssertEqual(json["texture_size"] as? Int, 4096)
+        // One photo, the server's own camera: no steps, guidance, paint toggle, views, cameras or FOV.
+        for key in ["steps", "guidance_scale", "octree_resolution", "texture", "images", "cameras", "fov"] {
+            XCTAssertNil(json[key], key)
+        }
+        XCTAssertTrue(Model3DFamily.pixal3d.cutoutKeepsAlpha)
+        XCTAssertFalse(Model3DFamily.pixal3d.hasPaintStage)
+        XCTAssertEqual(Model3DModelPreset.pixal3d_8bit.approxRAMGB(trellisResolution: 1024), 22)
+        XCTAssertEqual(Model3DModelPreset.pixal3d_8bit.approxRAMGB(trellisResolution: 1536), 35)
+    }
+
+    func testHunyuanRequestCarriesNoTrellis2Fields() {
+        let req = Model3DGenRequest(model: .hunyuan3d21_8bit, photoPath: "/tmp/x.png")
+        let json = Model3DGenService.requestJson(for: req, modelName: "m", imageB64: "QUJD", seed: 1)
+        for key in ["resolution", "decimation_target", "texture_size"] {
+            XCTAssertNil(json[key], key)
+        }
+    }
+
+    func testFinishRidesTheCascadeRequestAndTheModelsOwnLeavesItOut() {
+        var req = Model3DGenRequest(model: .trellis2Family, photoPath: "/tmp/car.png")
+        // As generated sends nothing: the server keeps what the model predicted.
+        var json = Model3DGenService.requestJson(for: req, modelName: "m", imageB64: "QUJD", seed: 1)
+        XCTAssertNil(json["roughness_scale"])
+        XCTAssertNil(json["clearcoat"])
+        req.finish = .carPaint
+        json = Model3DGenService.requestJson(for: req, modelName: "m", imageB64: "QUJD", seed: 1)
+        XCTAssertEqual(json["roughness_scale"] as? Double, Model3DFinish.carPaint.roughnessScale)
+        XCTAssertEqual(json["clearcoat"] as? Double, Model3DFinish.carPaint.clearcoat)
+        var px = Model3DGenRequest(model: .pixal3d_8bit, photoPath: "/tmp/car.png")
+        px.finish = .glossy
+        XCTAssertEqual(Model3DGenService.requestJson(for: px, modelName: "m", imageB64: "QUJD", seed: 1)["clearcoat"] as? Double,
+                       Model3DFinish.glossy.clearcoat)
+        // Hunyuan3D's paint has no such knob and the server refuses the field by name.
+        var hy = Model3DGenRequest(model: .hunyuan3d21_8bit, photoPath: "/tmp/x.png")
+        hy.finish = .carPaint
+        let hyJson = Model3DGenService.requestJson(for: hy, modelName: "m", imageB64: "QUJD", seed: 1)
+        XCTAssertNil(hyJson["roughness_scale"])
+        XCTAssertNil(hyJson["clearcoat"])
+    }
+
+    func testFinishPresetsGetGlossierAndStayInsideTheServersBounds() {
+        XCTAssertEqual(Model3DFinish.model.roughnessScale, 1)
+        XCTAssertEqual(Model3DFinish.model.clearcoat, 0)
+        for (a, b) in zip(Model3DFinish.allCases, Model3DFinish.allCases.dropFirst()) {
+            XCTAssertLessThanOrEqual(b.roughnessScale, a.roughnessScale, "\(b) is no glossier than \(a)")
+            XCTAssertGreaterThanOrEqual(b.clearcoat, a.clearcoat, "\(b) has less coat than \(a)")
+        }
+        for f in Model3DFinish.allCases {
+            XCTAssertTrue((0.05...2).contains(f.roughnessScale), "\(f)")
+            XCTAssertTrue((0...1).contains(f.clearcoat), "\(f)")
+        }
+    }
+
+    func testFinishPersistsAndOldSettingsKeepTheModelsOwn() throws {
+        var s = Model3DGenSettings()
+        XCTAssertEqual(s.finish, .model)
+        s.finish = .carPaint
+        let decoded = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONEncoder().encode(s))
+        XCTAssertEqual(decoded.finish, .carPaint)
+        let legacy = try JSONDecoder().decode(Model3DGenSettings.self, from: Data("{}".utf8))
+        XCTAssertEqual(legacy.finish, .model)
+    }
+
+    func testAStoredFaceCountThatIsNoLongerAnOptionSnapsToTheNearest() throws {
+        XCTAssertEqual(Model3DGenSettings.faceOptions.last, 2_000_000)
+        let old = try JSONDecoder().decode(Model3DGenSettings.self, from: Data(#"{"decimationTarget":150000}"#.utf8))
+        XCTAssertEqual(old.decimationTarget, 100_000)
+        let big = try JSONDecoder().decode(Model3DGenSettings.self, from: Data(#"{"decimationTarget":1500000}"#.utf8))
+        XCTAssertTrue(Model3DGenSettings.faceOptions.contains(big.decimationTarget))
+        for o in Model3DGenSettings.faceOptions {
+            let kept = try JSONDecoder().decode(Model3DGenSettings.self, from: Data(#"{"decimationTarget":\#(o)}"#.utf8))
+            XCTAssertEqual(kept.decimationTarget, o)
+        }
+    }
+
+    func testOnlyTrellis2KeepsTheCutoutsAlpha() {
+        XCTAssertTrue(Model3DFamily.trellis2.cutoutKeepsAlpha)
+        XCTAssertFalse(Model3DFamily.hunyuan3d.cutoutKeepsAlpha)
+        XCTAssertTrue(Model3DFamily.hunyuan3d.hasPaintStage)
+        XCTAssertFalse(Model3DFamily.trellis2.hasPaintStage)
+        XCTAssertEqual(Model3DModelPreset.trellis2Family.approxRAMGB(trellisResolution: 1024), 22)
+        XCTAssertEqual(Model3DModelPreset.trellis2Family.approxRAMGB(trellisResolution: 1536), 35)
+        XCTAssertEqual(Model3DModelPreset.hunyuan3d21_8bit.approxRAMGB(trellisResolution: 1536), 5)
+    }
+
     // MARK: - Response decode (the /v1/3d/generations RESPONSE contract)
 
     func testDecodeGlbExtractsBytes() throws {

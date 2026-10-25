@@ -2019,7 +2019,7 @@
 "The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here." = "저장된 생성 정책에 잘못되었거나 지원하지 않는 필드가 있습니다. 내용은 그대로 보존됩니다. 여기서 편집하기 전에 model-settings.json을 수정하세요.";
 "Keeps only the k most likely next tokens. Lower values narrow choices; 0 disables this filter." = "다음에 올 가능성이 가장 높은 k개의 토큰만 남깁니다. 값이 낮을수록 선택 폭이 좁아지며, 0이면 이 필터를 끕니다.";
 "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding." = "1이면 반복 페널티를 끕니다. 중립값이 아닌 페널티는 추측 디코딩과 배치 디코딩을 비활성화할 수 있습니다.";
-"Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control." = "이 엔진의 기존 빈도 페널티 매핑을 사용합니다. 반복 페널티와 빈도 페널티는 하나의 샘플러 설정을 공유합니다.";
+"Discourage tokens in proportion to how often they already appeared. 0 disables the penalty." = "이미 등장한 횟수에 비례해 토큰을 덜 고르게 합니다. 0이면 페널티를 끕니다.";
 "0 uses remaining context. Context and memory limits still apply." = "0이면 남은 컨텍스트를 사용합니다. 컨텍스트와 메모리 한도는 그대로 적용됩니다.";
 "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. Effort words map against this budget." = "API: reasoning_budget_tokens. -1은 무제한, 0은 생각을 즉시 끝냅니다. 추론 강도 단어는 이 예산을 기준으로 환산됩니다.";
 "Explicit client thinking or effort wins unless locked." = "잠그지 않으면 클라이언트가 명시한 생각 또는 추론 강도가 우선합니다.";
@@ -2202,7 +2202,7 @@
 "How many requests llama.cpp answers at once, each with its own memory." = "llama.cpp가 동시에 답하는 요청 수이며, 요청마다 메모리를 따로 씁니다.";
 "How many tokens to guess ahead for GGUF models with an MTP head; 0 turns it off." = "MTP 헤드가 있는 GGUF 모델에서 미리 추측할 토큰 수이며, 0이면 끕니다.";
 "How much of a prompt llama.cpp reads at a time; larger is faster but uses more memory." = "llama.cpp가 프롬프트를 한 번에 읽는 양으로, 클수록 빠르지만 메모리를 더 씁니다.";
-"Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory." = "DeepSeek-V4-Flash를 디스크에서 읽어 메모리가 적은 Mac에서도 조금 느리게 실행합니다.";
+"Read a DeepSeek-V4 GGUF from disk so it runs, a bit slower, on Macs with less memory. MLX packs always load fully into memory." = "DeepSeek-V4 GGUF를 디스크에서 읽어 메모리가 적은 Mac에서도 조금 느리게 실행합니다. MLX 패키지는 항상 전부 메모리에 로드됩니다.";
 "Remember recent prompts so repeats start faster; 0 turns it off." = "최근 프롬프트를 기억해 반복될 때 더 빨리 시작하며, 0이면 끕니다.";
 "What's new in each version." = "각 버전의 새로운 점입니다.";
 "A star helps other people find mlx-serve." = "별을 누르면 다른 사람이 mlx-serve를 찾는 데 도움이 됩니다.";
@@ -2345,3 +2345,14 @@
 "About %@ on this Mac and %@ on %@." = "이 Mac에 약 %@, %@ 정도는 %@에 놓입니다.";
 "A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it." = "페어는 MiniMax-H3(비디오) 또는 Qwen3.8-Flash-Next나 DeepSeek-V4.1(채팅)을 실행합니다. 두 Mac 모두에 하나를 다운로드하세요.";
 "Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both." = "Thunderbolt로 페어링된 두 Mac에서 함께 실행됩니다. 언로드하면 두 Mac 모두에서 해제됩니다.";
+"1248 × 1248 (square, 1.5 MP)" = "1248 × 1248 (정사각형, 150만 화소)";
+"1456 × 1456 (square, 2 MP)" = "1456 × 1456 (정사각형, 200만 화소)";
+"1360 × 768 (landscape 16:9)" = "1360 × 768 (가로 16:9)";
+"768 × 1360 (portrait 9:16)" = "768 × 1360 (세로 9:16)";
+"1936 × 1088 (landscape 16:9, 2 MP)" = "1936 × 1088 (가로 16:9, 200만 화소)";
+"1088 × 1936 (portrait 9:16, 2 MP)" = "1088 × 1936 (세로 9:16, 200만 화소)";
+"OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)." = "OpenMOSS의 5B 이미지 모델 — 긴 프롬프트, 태그 목록, 또는 각 물체와 글줄의 위치를 정하는 JSON 레이아웃을 받으며, 이미지 속 글자는 영어와 중국어를 지원합니다. 증류되지 않은 모델이라 가이던스와 함께 50단계로 실행되어 느립니다. 오픈 소스(Apache-2.0).";
+"MOSS-Image quantized to 8-bit for smaller Macs: the same 50-step model at about half the memory, with renders matching bf16. Open (Apache-2.0)." = "작은 Mac용으로 8비트 양자화한 MOSS-Image입니다. 같은 50단계 모델을 약 절반의 메모리로 실행하며, 결과는 bf16과 거의 같습니다. 공개 모델(Apache-2.0)입니다.";
+"Handwritten note (Chinese text)" = "손글씨 메모 (중국어)";
+"Whiteboard (Chinese text)" = "유리 보드 (중국어)";
+"Layout poster (1024 × 1024)" = "레이아웃 포스터 (1024 × 1024)";

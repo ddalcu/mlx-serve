@@ -22,8 +22,8 @@ SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 240); do curl -s "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-if ! curl -s "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; tail -20 "$LOG"; exit 1; fi
+for i in $(seq 1 240); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+if ! curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; tail -20 "$LOG"; exit 1; fi
 
 B_HOUSE=$(base64 -i "$HOUSE"); B_ROBOT=$(base64 -i "$ROBOT")
 FAIL=0
@@ -90,7 +90,7 @@ kill "$SRV" 2>/dev/null; sleep 2
 echo "== --no-vision drops the tower =="
 ./zig-out/bin/mlx-serve --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --no-vision --log-level info > "$NVLOG" 2>&1 &
 SRV=$!
-for i in $(seq 1 240); do curl -s "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+for i in $(seq 1 240); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
 if grep -q "Muse-Glimmer ViT" "$NVLOG"; then echo "  FAIL: tower loaded under --no-vision"; FAIL=1; else echo "  OK: tower not loaded"; fi
 curl -s "localhost:$PORT/v1/models" | grep -q '"vision"' \
   && { echo "  FAIL: vision still advertised"; FAIL=1; } || echo "  OK: vision not advertised"

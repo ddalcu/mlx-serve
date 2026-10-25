@@ -22,6 +22,7 @@ const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const glm_vision = @import("glm_vision.zig");
+const dsv41_vision = @import("dsv41_vision.zig");
 const radio_vision = @import("radio_vision.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const minicpm_canvas = @import("minicpm_canvas.zig");
@@ -623,7 +624,7 @@ pub const ServerConfig = struct {
     default_max_tokens: u32 = 0,
 };
 
-const Sampling = struct { temperature: f32, top_p: f32, top_k: u32, min_p: ?f32, repeat_penalty: f32, presence_penalty: f32 };
+const Sampling = struct { temperature: f32, top_p: f32, top_k: u32, min_p: ?f32, repeat_penalty: f32, presence_penalty: f32, frequency_penalty: f32 };
 
 /// Sampling for one request: a forced generation-defaults rule > request body > rule >
 /// CLI launch flag > model generation_config.json > hardcoded fallback. An explicit request
@@ -636,6 +637,7 @@ fn resolveSampling(gen: generation_settings.Profile, root: std.json.ObjectMap, c
         .min_p = gen.resolveOpt(f32, .min_p, parseJsonFloatOpt(root, "min_p", 0.0, 1.0), config.gen_min_p),
         .repeat_penalty = requestRepeatPenalty(root, gen),
         .presence_penalty = gen.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0.0),
+        .frequency_penalty = gen.resolve(f32, .frequency_penalty, parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0), 0.0),
     };
 }
 
@@ -872,16 +874,17 @@ fn routeExists(path: []const u8) bool {
     return false;
 }
 
-pub const max_request_bytes: usize = 64 * 1024 * 1024;
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+/// A coding agent keeps its screenshots in the history, as base64: chat takes what media takes.
+pub const max_request_bytes: usize = max_media_request_bytes;
 /// A decision prompt keeps at most `max_len` state tokens, so a larger body only
 /// buys tokenizer work on the inference thread.
 pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 
 /// Per-route request-body cap. Media bodies are base64 payloads — a single
 /// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
-/// reference images approach 500 MB (issue #151) — while no JSON chat body
-/// has any business near 64 MB.
+/// reference images approach 500 MB (issue #151) — and a vision agent's chat
+/// history carries its screenshots the same way. Only a decision prompt is small.
 pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
@@ -957,15 +960,24 @@ fn queryModel(buf: []u8, raw_path: []const u8) ?[]const u8 {
 /// A non-empty query parameter, percent-decoded into `buf`.
 fn queryDecoded(buf: []u8, raw_path: []const u8, name: []const u8) ?[]const u8 {
     const q = raw_path[(std.mem.indexOfScalar(u8, raw_path, '?') orelse return null) + 1 ..];
-    var it = std.mem.splitScalar(u8, q, '&');
-    while (it.next()) |kv| {
+    return percentDecoded(buf, pairValue(q, '&', name) orelse return null);
+}
+
+/// The raw value of `name=` in a `sep`-separated list: a query string, a form body, a Cookie header.
+fn pairValue(list: []const u8, sep: u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, list, sep);
+    while (it.next()) |raw| {
+        const kv = std.mem.trim(u8, raw, " ");
         if (kv.len <= name.len + 1 or !std.mem.startsWith(u8, kv, name) or kv[name.len] != '=') continue;
-        const v = kv[name.len + 1 ..];
-        if (v.len > buf.len) return null;
-        @memcpy(buf[0..v.len], v);
-        return std.Uri.percentDecodeInPlace(buf[0..v.len]);
+        return kv[name.len + 1 ..];
     }
     return null;
+}
+
+fn percentDecoded(buf: []u8, v: []const u8) ?[]const u8 {
+    if (v.len > buf.len) return null;
+    @memcpy(buf[0..v.len], v);
+    return std.Uri.percentDecodeInPlace(buf[0..v.len]);
 }
 
 pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]const u8 {
@@ -2119,6 +2131,10 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
+    const gen_yield_env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_GEN_YIELD")) |p| std.mem.span(p) else null;
+    scheduler_mod.gen_yield_enabled = scheduler_mod.genYieldEnabled(mlx.cudaAvailable(), gen_yield_env);
+    if (!scheduler_mod.gen_yield_enabled and mlx.cudaAvailable())
+        log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job (MLX_SERVE_GEN_YIELD=1 interleaves)\n", .{});
     // Install signal handlers for graceful shutdown (POSIX; on Windows Ctrl+C ends the process).
     if (comptime builtin.os.tag != .windows) {
         const sigact = std.posix.Sigaction{
@@ -2461,7 +2477,7 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
     if (total_size > max_request_size) {
         var msg_buf: [128]u8 = undefined;
         const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
-        log.warn("[http] 413 {s}: {s}\n", .{ req_path, msg });
+        log.warn("[http] 413 {s}: {s}\n", .{ logSafePath(req_path), msg });
         try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
         // Closing with body bytes unread resets the connection, and the client
         // can lose the 413 before reading it: read what is left, up to the chat cap.
@@ -2533,7 +2549,7 @@ fn handleConnection(
     // carries its model in a multipart FIELD, which only the content-type's
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
-    logHttpRequest(method, raw_path, request_body);
+    logHttpRequest(method, logSafePath(raw_path), logSafeBody(method, path, request_content_type, request_body));
     if (multipart.boundaryFromContentType(request_content_type) == null and jsonNestingDepth(request_body) > MAX_JSON_DEPTH) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request JSON nests deeper than 4096 levels", 400);
         return;
@@ -2551,15 +2567,27 @@ fn handleConnection(
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
     if (apiKeyGateApplies(g_api_key != null, g_api_key_strict, peerIsLoopback(stream)) and
         !std.mem.eql(u8, method, "OPTIONS") and
-        !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) and
-        !apiKeyAuthorized(request[0..header_end_pos], raw_path))
+        !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")))
     {
-        log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-        if (wantsLoginPage(method, path, request[0..header_end_pos]))
-            try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(request[0..header_end_pos], raw_path))
-        else
-            try sendUnauthorized(stream);
-        return;
+        const raw_headers = request[0..header_end_pos];
+        if (loginFormKey(method, path, request_content_type, request_body)) |k| {
+            if (encodedKeyMatches(k, g_api_key.?)) return sendKeyCookie(stream, k);
+            return sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPageHtml("<p class=err>That key was not accepted. Try again.</p>"));
+        }
+        if (!apiKeyAuthorized(raw_headers, raw_path)) {
+            log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
+            if (wantsLoginPage(method, path, raw_headers))
+                try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(raw_headers, raw_path))
+            else
+                try sendUnauthorized(stream);
+            return;
+        }
+        // A page opened with `?api_key=` trades it for the cookie, so the key leaves the address bar.
+        if (wantsLoginPage(method, path, raw_headers)) {
+            if (queryParamValue(raw_path, "api_key") orelse queryParamValue(raw_path, "key")) |k| {
+                if (cookieSafe(k) and encodedKeyMatches(k, g_api_key.?)) return sendKeyCookie(stream, k);
+            }
+        }
     }
 
     // ── LAN sharing gate. With sharing ON and no --api-key set, a non-loopback
@@ -2587,6 +2615,7 @@ fn handleConnection(
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
+        if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"cuda context lost\"}");
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
         return;
@@ -3067,7 +3096,7 @@ fn handleOllamaEarly(allocator: std.mem.Allocator, stream: *Conn, method: []cons
     for (unsupported) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) {
             log.warn("{s} {s} -> 501 (unsupported ollama endpoint)\n", .{ method, path });
-            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX Core app");
+            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX-Serve app");
             return true;
         }
     }
@@ -5940,7 +5969,10 @@ const GLM5_INDEXER_BYTES_PER_POOL: u64 = 12;
 /// two are a max, not a sum.
 pub fn glm5PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
     const ctx: u64 = getEffectiveContextLength(config);
-    const output = @min(max_tokens, if (ctx > 0) ctx -| seq else max_tokens);
+    // Generation growth is billed to the KV reserve's headroom, as the drafter term is: an omitted
+    // max_tokens is the rest of the window (1M here), and pricing that answer's KV refused a
+    // 431-token prompt at 43 GB beside 36 GB free.
+    const output = @min(max_tokens, transformer_mod.KVCache.RESERVE_GEN_HEADROOM, if (ctx > 0) ctx -| seq else max_tokens);
     const end = seq +| output;
     const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const view_tok: u64 = if (kv_bits < 16) glm5DequantWidth(config) else 0;
@@ -6071,6 +6103,14 @@ pub const GenErrorWire = struct {
 /// non-streaming arms; streaming arms wrote a bare `server_error` into an SSE frame, so agents
 /// never saw the actionable 400/503. The unknown arm keeps the error name at a mapped 500.
 pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+    // Whatever the request saw, a lost context is the cause and a restart the remedy.
+    if (mlx.gpuContextLost()) return .{
+        .status_line = "503 Service Unavailable",
+        .code = 503,
+        .openai_type = "server_error",
+        .anthropic_type = "api_error",
+        .message = gpu_context_lost_message,
+    };
     return switch (err) {
         // The MLX working-set latch (#353): a memory 503.
         error.GenerationOutOfMemory, error.OutOfMemory => .{
@@ -8291,6 +8331,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     }
     var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route, .decision = if (decision) |*d| d else null };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
+    if (lm.mesh_engine) |e| req.peak_bytes = media_mod.meshRequestPeakBytes(body, e.backend);
     if (decision) |*d| req.merge = .{
         .run_many = genJobRunMany,
         .weight = @max(1, d.count()),
@@ -8822,6 +8863,21 @@ test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
     try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
 }
 
+test "wrapEmbeddingIds: a last-token pooler appends its tokenizer's terminator, not config.json's eos (#909)" {
+    const a = testing.allocator;
+    // Qwen3-Embedding-4B: config eos <|im_end|> 151645, post-processor appends <|endoftext|> 151643.
+    var cfg = model_mod.ModelConfig{};
+    cfg.pooling_mode = .last_token;
+    cfg.addEosToken(151645);
+    const ids = try wrapEmbeddingIds(a, &cfg, 151643, try a.dupe(u32, &.{ 10, 11 }));
+    defer a.free(ids);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 151643 }, ids);
+    // No post-processor terminator: config eos.
+    const fallback = try wrapEmbeddingIds(a, &cfg, null, try a.dupe(u32, &.{ 10, 11 }));
+    defer a.free(fallback);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 151645 }, fallback);
+}
+
 fn handleEmbeddings(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -8919,7 +8975,7 @@ fn handleEmbeddings(
             return;
         }
         const raw_ids = try tok.encode(allocator, text);
-        const ids = try wrapEmbeddingIds(allocator, config, raw_ids);
+        const ids = try wrapEmbeddingIds(allocator, config, tok.appended_special, raw_ids);
         total_tokens += ids.len;
         try seqs.append(allocator, ids);
     }
@@ -8946,7 +9002,9 @@ fn handleEmbeddings(
 /// [CLS]/[SEP] come from WordPiece itself); a last-token pooler (Qwen3-Embedding) pools an APPENDED terminator,
 /// which its tokenizer's TemplateProcessing adds to every encode and the reference pools THAT position — without
 /// it we'd pool the final text token and quietly diverge from the model card. Frees `raw_ids`.
-fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, raw_ids: []u32) ![]u32 {
+/// `appended`: the tokenizer's post-processor terminator (`Tokenizer.appended_special`), which can differ from
+/// config.json's eos (Qwen3-Embedding-4B: `<|im_end|>` there, `<|endoftext|>` pooled).
+fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, appended: ?u32, raw_ids: []u32) ![]u32 {
     const eos: ?u32 = if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null;
     if (config.use_bidirectional_attention) {
         defer allocator.free(raw_ids);
@@ -8954,7 +9012,7 @@ fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.Model
     }
     if (config.effectivePooling() == .last_token) {
         defer allocator.free(raw_ids);
-        return wrapEncoderIds(allocator, raw_ids, null, eos);
+        return wrapEncoderIds(allocator, raw_ids, null, appended orelse eos);
     }
     return raw_ids;
 }
@@ -9106,7 +9164,7 @@ fn handleMessagesEmbedding(
     };
 
     // Wrapped, with the placeholders still one id each; the expansion below replaces them with the soft-token runs.
-    var ids = try wrapEmbeddingIds(allocator, config, try allocator.dupe(u32, prompt.ids));
+    var ids = try wrapEmbeddingIds(allocator, config, lm.tokenizer.?.appended_special, try allocator.dupe(u32, prompt.ids));
     defer allocator.free(ids);
     log.info("POST /v1/embeddings (messages: {d} media items)\n", .{prompt.items.len});
 
@@ -10370,6 +10428,7 @@ fn handleChatCompletions(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -10643,6 +10702,7 @@ fn handleCompletions(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -13415,6 +13475,68 @@ fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u
     if (responseBodyLogged(content_type)) logHttpBody("[http] response body", body);
 }
 
+/// The path as logged: a query carrying the API key is dropped.
+fn logSafePath(raw_path: []const u8) []const u8 {
+    if (queryParamValue(raw_path, "api_key") == null and queryParamValue(raw_path, "key") == null) return raw_path;
+    return raw_path[0 .. std.mem.indexOfScalar(u8, raw_path, '?') orelse raw_path.len];
+}
+
+/// The body as logged: the login form's POST carries the API key.
+fn logSafeBody(method: []const u8, path: []const u8, content_type: []const u8, body: []const u8) []const u8 {
+    return if (loginFormKey(method, path, content_type, body) != null) "" else body;
+}
+
+test "a logged request never carries the API key" {
+    try testing.expectEqualStrings("/metrics", logSafePath("/metrics?api_key=s3cret"));
+    try testing.expectEqualStrings("/v1/models", logSafePath("/v1/models?x=1&key=s3cret"));
+    try testing.expectEqualStrings("/v1/messages?beta=true", logSafePath("/v1/messages?beta=true"));
+    const ct = "application/x-www-form-urlencoded";
+    try testing.expectEqualStrings("", logSafeBody("POST", "/", ct, "api_key=s3cret"));
+    try testing.expectEqualStrings("{\"a\":1}", logSafeBody("POST", "/v1/chat/completions", "application/json", "{\"a\":1}"));
+}
+
+test "the default-level log lines never carry the API key either" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.Io.Threaded.global_single_threaded.io(), &root_buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s.log", .{root});
+    try log.openFile(path, 0);
+    defer log.closeFile();
+
+    // The 413 for an oversized body (warn).
+    var body_buf: [64]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    _ = try readRequestOver("POST /v1/chat/completions?api_key=s3cret HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n{}", &body_buf, &reply_buf);
+
+    // The LAN proxy line (info), to a peer that accepts nothing.
+    const a = testing.allocator;
+    var l = lan_mod.Lan{ .alloc = a, .port = 0, .discover = true, .peers = .init(a), .known = .init(a) };
+    defer {
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| p.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+    const models = try a.alloc(lan_mod.PeerModel, 1);
+    models[0] = .{ .id = try a.dupe(u8, "gemma"), .entry_json = try a.dupe(u8, "{}") };
+    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1, models, false, .{});
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    defer conn.close();
+    defer _ = std.c.close(sv[1]);
+    try handleLanProxy(a, &conn, &l, "POST", "/v1/chat/completions?key=s3cret", "{\"model\":\"gemma@studio\"}", null, "gemma@studio");
+
+    const logged = try tmp.dir.readFileAlloc(std.Io.Threaded.global_single_threaded.io(), "s.log", a, .limited(1 << 20));
+    defer a.free(logged);
+    try testing.expect(std.mem.indexOf(u8, logged, "[lan] proxy") != null); // both lines were written
+    try testing.expect(std.mem.indexOf(u8, logged, "413") != null);
+    try testing.expect(std.mem.indexOf(u8, logged, "s3cret") == null);
+}
+
 /// The console page is half a megabyte of our own HTML and says nothing about a request;
 /// API responses (JSON, text) are what a post-mortem reads.
 fn responseBodyLogged(content_type: []const u8) bool {
@@ -13486,20 +13608,74 @@ fn bodyPreview(out: []u8, body: []const u8) []const u8 {
     return out[0..n];
 }
 
+/// A run of base64 this long is an embedded image or clip, not text anyone reads out of a log.
+const LOG_BASE64_RUN: usize = 4096;
+
+fn isBase64Byte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '=' or c == '-' or c == '_';
+}
+
+/// `body` with every base64 run of `LOG_BASE64_RUN` bytes or more replaced by `<N base64 chars>`.
+fn elideLongBase64(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out = try std.ArrayList(u8).initCapacity(allocator, @min(body.len, 1 << 20));
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < body.len) {
+        var j = i;
+        while (j < body.len and isBase64Byte(body[j])) j += 1;
+        if (j - i >= LOG_BASE64_RUN) {
+            try out.print(allocator, "<{d} base64 chars>", .{j - i});
+        } else {
+            try out.appendSlice(allocator, body[i..j]);
+        }
+        if (j < body.len) {
+            try out.append(allocator, body[j]);
+            j += 1;
+        }
+        i = j;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn logHttpBody(label: []const u8, body: []const u8) void {
     if (body.len == 0) return;
     // Text bodies go out WHOLE — reading a full request body out of the debug
-    // log is the documented way to reproduce a tool-calling bug.
+    // log is the documented way to reproduce a tool-calling bug — minus embedded
+    // images: a vision agent's history is megabytes of base64 per request.
     if (bodyIsText(body)) {
+        if (body.len > LOG_BASE64_RUN) if (elideLongBase64(std.heap.page_allocator, body)) |shown| {
+            defer std.heap.page_allocator.free(shown);
+            log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, shown });
+            return;
+        } else |_| {};
         log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, body });
         return;
     }
     // Binary is a different story. `/v1/images/edits` is multipart, so one image
-    // upload wrote raw PNG bytes into the log, and a body near the 64 MB request
+    // upload wrote raw PNG bytes into the log, and a body near the request
     // cap blew through the 32 MB rotation — taking the post-mortem file with it.
     var buf: [BODY_LOG_LIMIT]u8 = undefined;
     const preview = bodyPreview(&buf, body);
     log.debug("{s} ({d}b binary, first {d} sanitized):\n{s}…\n", .{ label, body.len, preview.len, preview });
+}
+
+test "debug body log: an embedded image is elided and the text around it is kept whole" {
+    const gpa = std.testing.allocator;
+    var b64: [5000]u8 = undefined;
+    @memset(&b64, 'A');
+    const body = try std.fmt.allocPrint(gpa, "{{\"role\":\"user\",\"image\":\"data:image/png;base64,{s}\",\"text\":\"keep this\"}}", .{&b64});
+    defer gpa.free(body);
+    const out = try elideLongBase64(gpa, body);
+    defer gpa.free(out);
+    try std.testing.expect(out.len < 200);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<5000 base64 chars>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "keep this") != null);
+    // A short run (a token, a hash, a small id) is ordinary text.
+    const short = "{\"id\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}";
+    const kept = try elideLongBase64(gpa, short);
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings(short, kept);
 }
 
 const GaugeSamplerCtx = struct {
@@ -13827,7 +14003,7 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
     defer allocator.free(rewritten);
     const key = l.peerKey(allocator, rid.peer);
     defer if (key) |k| allocator.free(k);
-    log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, raw_path, rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
+    log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, logSafePath(raw_path), rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
     lan_mod.tunnel(remote, method, raw_path, rewritten, key, stream) catch {
         try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
     };
@@ -13947,12 +14123,48 @@ fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     if (findHeaderValueCI(raw_headers, "x-api-key")) |xk| {
         if (constTimeEql(xk, key)) return true;
     }
-    // Percent-decoded: the login form sends the key back URL-encoded.
+    if (findHeaderValueCI(raw_headers, "cookie")) |c| {
+        if (pairValue(c, ';', KEY_COOKIE)) |v| if (encodedKeyMatches(v, key)) return true;
+    }
     var qbuf: [512]u8 = undefined;
     inline for (.{ "api_key", "key" }) |name| {
         if (queryDecoded(&qbuf, raw_path, name)) |q| if (constTimeEql(q, key)) return true;
     }
     return false;
+}
+
+/// The console's login cookie: the key as the form percent-encoded it. HttpOnly, so page
+/// scripts never read it; the browser sends it on the page load and on the console's own calls.
+const KEY_COOKIE = "mlx_serve_key";
+
+fn encodedKeyMatches(encoded: []const u8, key: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    return constTimeEql(percentDecoded(&buf, encoded) orelse return false, key);
+}
+
+/// Form encoding's own alphabet: nothing that could end a header or a cookie.
+fn cookieSafe(v: []const u8) bool {
+    if (v.len == 0 or v.len > 512) return false;
+    for (v) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "%+-._*~", c) == null) return false;
+    return true;
+}
+
+/// The still-encoded `api_key` of the login form's POST, or null when this is not that POST.
+fn loginFormKey(method: []const u8, path: []const u8, content_type: []const u8, body: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, method, "POST") or !std.mem.eql(u8, path, "/")) return null;
+    if (!std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded")) return null;
+    const v = pairValue(body, '&', "api_key") orelse return null;
+    return if (cookieSafe(v)) v else null;
+}
+
+/// Trade an accepted key for the cookie and send the browser to the bare page, so the key
+/// never sits in the URL (`./` keeps a reverse proxy's path prefix).
+fn sendKeyCookie(stream: *Conn, encoded: []const u8) !void {
+    logHttpResponse("303 See Other", "", "");
+    var hdr_buf: [1024]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 303 See Other\r\nLocation: ./\r\nSet-Cookie: " ++ KEY_COOKIE ++ "={s}; Path=/; HttpOnly; SameSite=Strict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{encoded}) catch return error.Overflow;
+    try stream.writeAll(hdr);
+    stream.length_framed = true;
 }
 
 /// A browser opening the page (`GET /` that accepts HTML) without the key gets
@@ -13964,10 +14176,12 @@ fn wantsLoginPage(method: []const u8, path: []const u8, raw_headers: []const u8)
 }
 
 /// The login form, saying so when a key was offered and refused. Script-free:
-/// a GET form back to the same path sends `?api_key=`, which the page then keeps.
+/// it POSTs the key back to `/` (`loginFormKey`), which answers with the cookie.
 fn loginPage(raw_headers: []const u8, raw_path: []const u8) []const u8 {
+    const cookie_key = if (findHeaderValueCI(raw_headers, "cookie")) |c| pairValue(c, ';', KEY_COOKIE) else null;
     const tried = findHeaderValueCI(raw_headers, "authorization") != null or
         findHeaderValueCI(raw_headers, "x-api-key") != null or
+        cookie_key != null or
         queryParamValue(raw_path, "api_key") != null or
         queryParamValue(raw_path, "key") != null;
     return if (tried) loginPageHtml("<p class=err>That key was not accepted. Try again.</p>") else loginPageHtml("");
@@ -13994,7 +14208,7 @@ fn loginPageHtml(comptime note: []const u8) []const u8 {
     \\<p>This MLX Serve server requires an API key. Enter the key the server was started with.</p>
     \\
 ++ note ++
-    \\<form method="get">
+    \\<form method="post">
     \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
     \\<button type="submit">Continue</button>
     \\</form>
@@ -14058,12 +14272,27 @@ test "a browser opening the page without the key gets a login form; API clients 
 
     const first = loginPage("", "/");
     try std.testing.expect(std.mem.indexOf(u8, first, "name=\"api_key\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "method=\"get\"") != null);
+    // POST, so the key never lands in the URL, history or a Referer (#887).
+    try std.testing.expect(std.mem.indexOf(u8, first, "method=\"post\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "<script") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "not accepted") == null);
     // A key that was tried and failed says so, whichever way it came.
     try std.testing.expect(std.mem.indexOf(u8, loginPage("", "/?api_key=bad"), "not accepted") != null);
     try std.testing.expect(std.mem.indexOf(u8, loginPage("Authorization: Basic dTpi\r\n", "/"), "not accepted") != null);
+}
+
+test "the login form's key comes back as a cookie that authorizes the page and its API calls (#887)" {
+    const prev = g_api_key;
+    defer g_api_key = prev;
+    g_api_key = "a+b/c=";
+    // The form body is percent-encoded; its value is what the cookie stores.
+    try std.testing.expectEqualStrings("a%2Bb%2Fc%3D", loginFormKey("POST", "/", "application/x-www-form-urlencoded", "api_key=a%2Bb%2Fc%3D").?);
+    try std.testing.expect(loginFormKey("GET", "/", "application/x-www-form-urlencoded", "api_key=x") == null);
+    try std.testing.expect(loginFormKey("POST", "/v1/models", "application/x-www-form-urlencoded", "api_key=x") == null);
+    try std.testing.expect(loginFormKey("POST", "/", "application/json", "{}") == null);
+    try std.testing.expect(apiKeyAuthorized("Cookie: theme=dark; " ++ KEY_COOKIE ++ "=a%2Bb%2Fc%3D\r\n", "/v1/models"));
+    try std.testing.expect(!apiKeyAuthorized("Cookie: " ++ KEY_COOKIE ++ "=a%2Bb\r\n", "/v1/models"));
+    try std.testing.expect(!apiKeyAuthorized("Cookie: x" ++ KEY_COOKIE ++ "=a%2Bb%2Fc%3D\r\n", "/"));
 }
 
 test "resolveRequestModelId: an alias names its model; an id beats it; /api/ strips the tag" {
@@ -14599,6 +14828,9 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
+pub const gpu_context_lost_message =
+    "The GPU context was lost (a CUDA kernel faulted) and every GPU call now fails. Restart the server; the server log names the first error.";
+
 /// Body text for a context-overflow 400, in a caller-owned buffer.
 ///
 /// The COUNTS are the point. "Prompt exceeds maximum context length" tells a
@@ -14649,6 +14881,7 @@ fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *sc
         error.InsufficientMemory => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503),
         error.LoadFailed => try sendLoadFailedResponse(allocator, stream, sched, id),
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
+        error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
         error.ForeignBytesReaderBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another DeepSeek-V4.1 or GLM-5.3 stream pack is in use; retry when its request finishes", 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
@@ -15182,20 +15415,13 @@ fn formatLogprobsObject(
     return try std.fmt.allocPrint(allocator, "{{\"content\":{s}}}", .{content_buf.items});
 }
 
-/// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
-/// OpenAI's `frequency_penalty` (0-2) is read as `repeat_penalty` 1 + x; an explicit
-/// `repeat_penalty` wins.
-/// Forced generation-defaults rules outrank both; unforced ones fill the request's silence.
+/// The multiplicative `repeat_penalty` (llama.cpp's); a value <= 0 is an omission.
 fn requestRepeatPenalty(root: std.json.ObjectMap, gen: generation_settings.Profile) f32 {
-    if (gen.forced(.repeat_penalty)) return gen.value(f32, .repeat_penalty).?;
-    if (gen.forced(.frequency_penalty)) return 1.0 + gen.value(f32, .frequency_penalty).?;
     const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-    if (repeat > 0) return repeat;
-    if (parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0)) |frequency| return 1.0 + frequency;
-    if (gen.value(f32, .repeat_penalty)) |r| if (r != 1.0) return r;
-    return 1.0 + (gen.value(f32, .frequency_penalty) orelse 0.0);
+    return gen.resolve(f32, .repeat_penalty, if (repeat > 0) repeat else null, 1.0);
 }
 
+/// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
     const raw = if (root.get(key)) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
@@ -15823,6 +16049,14 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
         .patch = config.vision_patch_size,
         .max_slices = config.mcv_max_slice_nums,
     };
+    if (config.dsv41_vision) return .{
+        .mode = .dsv41,
+        .patch = config.vision_patch_size,
+        .merge = config.dv_downsample,
+        .max_tokens = config.dv_max_image_tokens,
+        .min_pixels = config.dv_min_pixels,
+        .max_wh_ratio = config.dv_max_wh_ratio,
+    };
     if (config.glm_vision) return .{
         .mode = .glm,
         .patch = config.qv_patch,
@@ -15928,7 +16162,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     try std.testing.expectEqual(@as(u32, 2), gemma.width);
     try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
 
-    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .glm }, .{ .mode = .minicpm }, .{ .mode = .gemma_budget } }) |vp| {
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .glm }, .{ .mode = .minicpm }, .{ .mode = .gemma_budget }, .{ .mode = .dsv41 } }) |vp| {
         try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
     }
 }
@@ -16165,7 +16399,7 @@ fn appendAnthropicImageBlock(allocator: std.mem.Allocator, list: *std.ArrayList(
     return appendImageUrlContent(allocator, list, url, vp);
 }
 
-const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL (data:image/jpeg|png|webp;base64,...) with a readable payload; remote URLs are not fetched";
+const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL (data:image/jpeg|png|webp|gif|bmp;base64,...) with a readable payload; remote URLs are not fetched";
 
 /// `Lfm2VlImageProcessor.resize_and_split`: a source inside the budget is one
 /// resized image; past it, the WHOLE image is resized onto a `cols`x`rows`
@@ -16340,11 +16574,25 @@ const DecodedRgb = struct {
     }
 };
 
+test "decodeRgbOwned reads a GIF's first frame and a BMP, the formats the Anthropic and OpenAI image blocks allow beside JPEG/PNG/WebP" {
+    // 2x2: red, green / blue, white (Pillow-written).
+    const gif = "\x47\x49\x46\x38\x37\x61\x02\x00\x02\x00\x81\x00\x00\xff\xff\xff\x00\xff\x00\xff\x00\x00\x00\x00\xff\x2c\x00\x00\x00\x00\x02\x00\x02\x00\x00\x08\x07\x00\x05\x04\x18\x00\x20\x20\x00\x3b";
+    const bmp = "\x42\x4d\x46\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x01\x00\x18\x00\x00\x00\x00\x00\x10\x00\x00\x00\xc4\x0e\x00\x00\xc4\x0e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\x00\x00\xff\xff\xff\x00\x00\x00\x00\xff\x00\xff\x00\x00\x00";
+    for ([_][]const u8{ gif, bmp }) |bytes| {
+        const d = decodeRgbOwned(std.testing.allocator, bytes, true) orelse return error.TestUnexpectedResult;
+        defer std.testing.allocator.free(d.rgb);
+        try std.testing.expectEqual(@as(u32, 2), d.w);
+        try std.testing.expectEqual(@as(u32, 2), d.h);
+        try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 }, d.rgb);
+    }
+    try std.testing.expect(decodeRgbOwned(std.testing.allocator, "II*\x00not a tiff we read", true) == null);
+}
+
 fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8, composite_alpha: bool) ?DecodedRgb {
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
-    // stb first (JPEG/PNG) — 4 channels so transparency composites onto white.
+    // stb first (JPEG/PNG/GIF first frame/BMP) — 4 channels so transparency composites onto white.
     if (stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4)) |rgba| {
         defer stb.stbi_image_free(rgba);
         const total_px: usize = @intCast(w * h);
@@ -16392,6 +16640,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
 
     // MiniCPM-V images are several pieces: `appendImageUrlContent` makes them.
     if (vp.mode == .minicpm) return null;
+
+    if (vp.mode == .dsv41) {
+        const pv = dsv41_vision.preprocess(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens, vp.min_pixels, vp.max_wh_ratio) catch return null;
+        log.info("  Decoded {d}x{d} image → deepseek grid {d}x{d} ({d} tokens, canvas {d}x{d})\n", .{ src_w, src_h, pv.grid_h, pv.grid_w, dsv41_vision.spanTokens((pv.grid_h + vp.merge - 1) / vp.merge, (pv.grid_w + vp.merge - 1) / vp.merge), pv.w, pv.h });
+        return .{ .pixels = pv.bytes, .width = pv.w, .height = pv.h, .grid_h = pv.grid_h, .grid_w = pv.grid_w };
+    }
 
     if (vp.mode == .glm) {
         const pv = glm_vision.preprocess(allocator, src.rgb, src_h, src_w, vp.patch, vp.tps, vp.merge, vp.min_tokens, vp.max_tokens) catch return null;
@@ -16557,7 +16811,7 @@ const EMBED_PART_REJECT = "content parts must be text, image_url or video_url ob
 const EMBED_NO_VISION_REJECT = "image and video parts need a model with a vision encoder: this one has none loaded (a text-only pack, or --no-vision)";
 const EMBED_AUDIO_REJECT = "audio parts are not served: this model's audio tower is not loaded";
 const EMBED_EMPTY_REJECT = "'messages' carry nothing to embed: add a text part, an image or a video";
-const VIDEO_DECODE_REJECT = "video could not be decoded: send 'frames', a non-empty array of base64 image data URLs (data:image/jpeg|png|webp;base64,...) with readable payloads; remote URLs are not fetched";
+const VIDEO_DECODE_REJECT = "video could not be decoded: send 'frames', a non-empty array of base64 image data URLs (data:image/jpeg|png|webp|gif|bmp;base64,...) with readable payloads; remote URLs are not fetched";
 
 /// `messages` the way the model's own chat template reads them for an embedding (EmbeddingGemma 2's is a bare
 /// concatenation): system turns first, then the rest in order; text parts verbatim, no separator invented; an
@@ -17601,6 +17855,7 @@ fn handleAnthropicMessages(
         .min_p = min_p,
         .repeat_penalty = sampled.repeat_penalty,
         .presence_penalty = sampled.presence_penalty,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -19128,7 +19383,7 @@ fn handleResponsesInner(
     const top_p = sampled.top_p;
     const top_k = sampled.top_k;
     const min_p = sampled.min_p;
-    const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    const frequency_penalty = sampled.frequency_penalty;
     const repeat_penalty = sampled.repeat_penalty;
     const presence_penalty = sampled.presence_penalty;
 
@@ -19403,6 +19658,7 @@ fn handleResponsesInner(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
+        .frequency_penalty = frequency_penalty,
         .seed = seed,
     };
     var sc: generate_mod.SchemaConstraint = undefined;
@@ -21529,7 +21785,7 @@ test "findContentLength returns null when missing" {
 test "debug body log bounds BINARY but never truncates text (multipart PNG class)" {
     // `/v1/images/edits` is the first binary body we serve. `logHttpBody` dumped
     // whatever it got verbatim, so at --log-level debug one image upload wrote
-    // raw PNG bytes into the log — and a body near the 64 MB request cap blew
+    // raw PNG bytes into the log — and a body near the request cap blew
     // straight through the 32 MB rotation, taking the post-mortem file with it.
     //
     // Text bodies must stay WHOLE: reading a full request body out of the debug
@@ -24344,12 +24600,24 @@ test "resolveSampling: forced rule > request > rule > generation_config > fallba
     try std.testing.expectEqual(@as(f32, 0.0), got.temperature);
     try std.testing.expectEqual(@as(u32, 0), got.top_k);
     try std.testing.expectEqual(@as(?f32, 0.05), got.min_p);
-    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 1.5), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 0.0), got.frequency_penalty);
     gen.set(.repeat_penalty, .{ .number = 1.0 }, false);
     gen.set(.frequency_penalty, .{ .number = 0.5 }, false);
-    try std.testing.expectEqual(@as(f32, 1.5), resolveSampling(gen, .empty, &config).repeat_penalty);
+    got = resolveSampling(gen, .empty, &config);
+    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 0.5), got.frequency_penalty);
     gen.set(.repeat_penalty, .{ .number = 1.2 }, true);
     try std.testing.expectEqual(@as(f32, 1.2), resolveSampling(gen, zeros.value.object, &config).repeat_penalty);
+}
+
+test "OpenAI frequency_penalty is its own additive penalty, never a repeat_penalty multiplier (#912)" {
+    const a = std.testing.allocator;
+    const body = try std.json.parseFromSlice(std.json.Value, a, "{\"frequency_penalty\":1,\"presence_penalty\":0}", .{});
+    defer body.deinit();
+    const got = resolveSampling(.{}, body.value.object, &.{});
+    try std.testing.expectEqual(@as(f32, 1.0), got.frequency_penalty);
+    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
 }
 
 test "generationMaxTokens: an auto request (0, negative, omitted) takes the rule, a forced rule takes everything" {
@@ -25754,6 +26022,20 @@ test "PrefillDoesNotFit quotes the figures the inference thread refused on, once
     try t.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
 }
 
+test "mapGenerationError: after a lost GPU context any failure is the named 503" {
+    const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    defer mlx.resetGpuContextLostForTest();
+    var buf: [192]u8 = undefined;
+    try t.expectEqual(@as(u32, 500), mapGenerationError(error.GenerationFailed, &buf).code);
+    mlx.latchErrorForTest("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered");
+    _ = mlx.takeError(&stale);
+    const w = mapGenerationError(error.GenerationFailed, &buf);
+    try t.expectEqual(@as(u32, 503), w.code);
+    try t.expectEqualStrings(gpu_context_lost_message, w.message);
+}
+
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {
     // The 400/503 mapping existed only on the non-streaming arms; streaming arms wrote a bare `server_error` frame.
     const t = std.testing;
@@ -26145,8 +26427,7 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
 
 test "request body cap is per route: media bodies are base64 frame payloads" {
     // Issue #151: ONE ref2va reference video is ~100 MB of base64 JPEG frames,
-    // three of them plus full-res ref images can approach 500 MB — while no
-    // JSON chat body has any business near 64 MB.
+    // three of them plus full-res ref images can approach 500 MB.
     for ([_][]const u8{
         "/v1/images/generations",
         "/v1/images/edits",
@@ -26159,6 +26440,14 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
     try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions"));
     try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions?x=1"));
+}
+
+test "the chat body cap admits an agent session that keeps its screenshots" {
+    // 100 screenshots at 4 MiB of base64 each.
+    const screenshots = 100;
+    const base64_png = 4 * 1024 * 1024;
+    for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/v1/responses" }) |p|
+        try std.testing.expect(maxRequestBytesFor(p) >= screenshots * base64_png);
 }
 
 test "the 413 names both counts it compared" {
@@ -27236,21 +27525,24 @@ test "GLM bill: f32 checkpoints and the live state are billed" {
     try t.expect(glm5PrefillMemoryNeeded(&glm, 1, 1, 8, 512, .{}) >= 4 * glm.ssmCheckpointBytes() * 5 / 4);
 }
 
-test "GLM bill: prefill scratch and decode growth are a max, not a sum" {
+test "GLM bill: decode growth is billed to the generation headroom, never the auto budget's whole window" {
     const t = std.testing;
     const saved = GlmBillGlobals.pin();
     defer saved.restore();
     var glm = glm5TestConfig();
-    glm.ctx_override = 1 << 23;
+    glm.ctx_override = 1 << 20;
+    const headroom = transformer_mod.KVCache.RESERVE_GEN_HEADROOM;
     const kv_tok = glm.kvBytesPerToken();
-    const base = glm5PrefillMemoryNeeded(&glm, 100_000, 64, 16, 4096, .{});
-    // Below the crossover the prefill scratch is the peak, and its prompt-only indexer does not move.
-    try t.expectEqual(base, glm5PrefillMemoryNeeded(&glm, 100_000, 20_000, 16, 4096, .{}));
-    // Above it decode growth is the peak: each output token adds its row and its old row.
-    const long = glm5PrefillMemoryNeeded(&glm, 100_000, 4_000_000, 16, 4096, .{});
-    const longer = glm5PrefillMemoryNeeded(&glm, 100_000, 4_100_000, 16, 4096, .{});
-    try t.expect(long > base);
-    try t.expectEqual(100_000 * 2 * kv_tok * 5 / 4, longer - long);
+    // A client that sets no max_tokens gets the rest of the window: that answer is billed like one of
+    // `headroom` tokens, so a short prompt's bill does not depend on the window it was pegged to.
+    const auto = glm5PrefillMemoryNeeded(&glm, 431, (1 << 20) - 431, 16, 4096, .{});
+    try t.expectEqual(glm5PrefillMemoryNeeded(&glm, 431, headroom, 16, 4096, .{}), auto);
+    try t.expectEqual(auto, glm5PrefillMemoryNeeded(&glm, 431, 4_000_000, 16, 4096, .{}));
+    // Below the headroom the growth term still prices each output token's row and its old row,
+    // and it stays a max against the prefill scratch, never a sum.
+    const short = glm5PrefillMemoryNeeded(&glm, 431, 64, 16, 4096, .{});
+    try t.expect(auto >= short);
+    try t.expect(auto - short <= headroom * 2 * kv_tok * 5 / 4);
 }
 
 test "GLM bill: a prompt token costs its KV, one layer's grow copy and its indexer pools" {

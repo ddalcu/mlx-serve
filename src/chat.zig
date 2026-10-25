@@ -46,7 +46,7 @@ pub const VisionPreproc = struct {
     /// `gemma_budget` (Gemma 4's own processor, as EmbeddingGemma 2 uses it: a CHW image of any
     /// aspect ratio sized to `max_tokens` soft tokens), or one of the patch-grid towers
     /// (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio, dsv41 } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -68,6 +68,8 @@ pub const VisionPreproc = struct {
     pixels_tolerance: f32 = 0,
     /// gemma_budget video: the most frames kept from a client's list.
     max_frames: u32 = 0,
+    /// dsv41: an image wider than this many heights is stretched into the capped canvas (0 = no cap).
+    max_wh_ratio: u32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -164,6 +166,9 @@ pub const ChatConfig = struct {
     renders_tool_turn: ?bool = null,
     /// A model-specific video atom emitted only for an attached media part.
     video_placeholder: ?[]const u8 = null,
+    /// A template that reads `content` as a STRING (DeepSeek-V4.1): each attached image becomes this
+    /// atom, joined to the text by blank lines, the way the release's encoder renders image blocks.
+    image_placeholder: ?[]const u8 = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
@@ -389,6 +394,7 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         .add_bos_token = add_bos_token,
         .allocator = allocator,
         .renders_tool_turn = renders_tool_turn,
+        .image_placeholder = if (dsv41) "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>" else null,
     };
 }
 
@@ -1148,7 +1154,7 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
 }
 
 pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null);
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null, null);
 }
 
 /// K2-Horizon's template raises on an assistant turn with NO thinking field,
@@ -1159,7 +1165,7 @@ fn templateRequiresReasoningField(tpl: []const u8) bool {
 }
 
 pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.video_placeholder);
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.video_placeholder, chat_config.image_placeholder);
 }
 
 pub fn messageHasMedia(msg: Message) bool {
@@ -1177,6 +1183,23 @@ pub fn isImageItemStart(img: ImageData) bool {
 /// Media as content parts, so the model's own template renders one
 /// placeholder per item where the message sits: images, videos, audio (the
 /// order the server encodes them), then the text.
+/// `content` as one string: an `atom` per image, then the text, all joined by blank lines (DeepSeek's
+/// `process_image_messages`). Video and audio have no atom on such a template.
+fn appendImageAtomsText(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message, atom: []const u8) !void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+    for (msg.images orelse &[_]ImageData{}) |img| {
+        if (!isImageItemStart(img)) continue;
+        if (text.items.len > 0) try text.appendSlice(allocator, "\n\n");
+        try text.appendSlice(allocator, atom);
+    }
+    if (msg.content.len > 0) {
+        if (text.items.len > 0) try text.appendSlice(allocator, "\n\n");
+        try text.appendSlice(allocator, msg.content);
+    }
+    try appendJsonString(allocator, buf, text.items);
+}
+
 fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message, video_placeholder: ?[]const u8) !void {
     try buf.append(allocator, '[');
     var first = true;
@@ -1208,7 +1231,7 @@ fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)
     try buf.append(allocator, ']');
 }
 
-fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, video_placeholder: ?[]const u8) ![]const u8 {
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, video_placeholder: ?[]const u8, image_placeholder: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -1220,7 +1243,7 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
 
         try buf.appendSlice(allocator, ",\"content\":");
         if (messageHasMedia(msg)) {
-            try appendMediaContentParts(allocator, &buf, msg, video_placeholder);
+            if (image_placeholder) |atom| try appendImageAtomsText(allocator, &buf, msg, atom) else try appendMediaContentParts(allocator, &buf, msg, video_placeholder);
         } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
         } else switch (empty_content) {
@@ -2003,6 +2026,40 @@ const tool_markup_openers = [_][]const u8{
     INKLING_INVOKE_TAG,
 };
 
+/// Earliest index of Anthropic-style `<function_calls>` / `<invoke …>` markup, or null. Like MiniCPM5's,
+/// the opener alone is prose ("wrap it in <invoke name=…>"): a `<parameter ` or `</invoke>` must be there too.
+fn bareInvokeMarkupCut(text: []const u8) ?usize {
+    if (std.mem.indexOf(u8, text, "<parameter ") == null and
+        std.mem.indexOf(u8, text, BARE_INVOKE.invoke_close) == null) return null;
+    var cut = std.mem.indexOf(u8, text, FUNCTION_CALLS_TAG);
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, text, scan, BARE_INVOKE.invoke)) |p| {
+        const after = p + BARE_INVOKE.invoke.len;
+        if (after >= text.len or std.ascii.isWhitespace(text[after])) {
+            if (cut == null or p < cut.?) cut = p;
+            break;
+        }
+        scan = after;
+    }
+    return cut;
+}
+
+/// True while `buf` holds, or ends in a growing prefix of, a `<function_calls>` / `<invoke …` opener.
+fn invokeOpenerHoldsForTools(buf: []const u8) bool {
+    if (std.mem.indexOf(u8, buf, FUNCTION_CALLS_TAG) != null) return true;
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, scan, BARE_INVOKE.invoke)) |p| {
+        const after = p + BARE_INVOKE.invoke.len;
+        if (after >= buf.len or std.ascii.isWhitespace(buf[after])) return true;
+        scan = after;
+    }
+    inline for (.{ FUNCTION_CALLS_TAG, BARE_INVOKE.invoke }) |marker| {
+        var k: usize = 2;
+        while (k < marker.len) : (k += 1) if (std.mem.endsWith(u8, buf, marker[0..k])) return true;
+    }
+    return false;
+}
+
 /// Earliest index of MiniCPM5 attribute-form tool markup, or null.
 /// Discriminated exactly as the streaming gate does it — `<function` followed
 /// by WHITESPACE, with a `name=` inside the opener region — so `<functional`,
@@ -2052,6 +2109,12 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     // dialect is `<function` + whitespace + a `name=` attribute, so prose words
     // beginning `<function…` are left alone.
     if (miniCpm5MarkupCut(text)) |p| {
+        if (p < cut) {
+            cut = p;
+            is_inkling = false;
+        }
+    }
+    if (bareInvokeMarkupCut(text)) |p| {
         if (p < cut) {
             cut = p;
             is_inkling = false;
@@ -3169,6 +3232,8 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 
     // `<function…` family: MiniCPM5's `<function name="…">`.
     if (functionOpenerHoldsForTools(buf)) return true;
+    // Anthropic-style `<function_calls>` / `<invoke name="…">`.
+    if (invokeOpenerHoldsForTools(buf)) return true;
 
     // Trailing partial prefixes — the next streamed token could complete any
     // of these into a real tool open. Order doesn't matter; first endsWith
@@ -3596,7 +3661,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // (the bytes after `<` are `atem`, not `tool`). Runs on the FULL text —
     // tool segments arrive wrapped in channel headers the think-strip above
     // would misjudge.
-    try parseAtemToolCalls(allocator, text, &calls);
+    try parseInvokeToolCalls(allocator, text, &calls, ATEM_INVOKE);
     // gpt_oss / harmony (`to=functions.NAME<|channel|>commentary…<|message|>`):
     // the name lives in the header, not the payload, so no generic scan can
     // recover it. Runs on the FULL text for the same reason ATEM does — the
@@ -3872,8 +3937,11 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         // "Tool voxel-pagoda-garden not found" and the model looped on it).
         // The JSON shapes below can never contain that opener, so this only
         // reorders the case that was being read wrong.
-        if (std.mem.indexOf(u8, content, "<function=") != null) {
-            if (parseHermesToolCall(allocator, content)) |tc| {
+        const repaired_opener = try hermesSpecialOpenerRepair(allocator, content);
+        defer if (repaired_opener) |r| allocator.free(r);
+        const body = repaired_opener orelse content;
+        if (std.mem.indexOf(u8, body, "<function=") != null) {
+            if (parseHermesToolCall(allocator, body)) |tc| {
                 try calls.append(allocator, tc);
                 parsed_ok = true;
             }
@@ -3988,6 +4056,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             try parseMiniCpm5ToolCalls(allocator, effective_text, &calls);
         }
     }
+
+    // Anthropic's `<invoke>` is another family's dialect, so it runs after every native one:
+    // inside one of their parameter values it is payload, never the call.
+    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
 
     // If no <tool_call> tags, try to find raw JSON tool call(s). Never on
     // text carrying the Inkling invoke marker: that format OWNED the parse,
@@ -5403,10 +5475,19 @@ fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
 // coercion chokepoint still gets the final word). The parser keys on the
 // INVOKE tag so a dropped wrapper still parses (delimiter-drop class), and
 // truncation salvages NAME + completed parameters — never fragment values.
-const ATEM_INVOKE_TAG = "<atem:invoke";
-const ATEM_PARAM_TAG = "<atem:parameter";
-const ATEM_PARAM_CLOSE = "</atem:parameter>";
-const ATEM_INVOKE_CLOSE = "</atem:invoke>";
+const InvokeDialect = struct {
+    invoke: []const u8,
+    param: []const u8,
+    param_close: []const u8,
+    invoke_close: []const u8,
+    /// Not the model's own dialect: kept only when it names a declared tool (`filterInferredBySchema`).
+    inferred: bool,
+};
+const ATEM_INVOKE: InvokeDialect = .{ .invoke = "<atem:invoke", .param = "<atem:parameter", .param_close = "</atem:parameter>", .invoke_close = "</atem:invoke>", .inferred = false };
+/// Anthropic's spelling of the same grammar (`<function_calls><invoke name="X"><parameter name="k">`),
+/// which models trained on Claude transcripts emit in place of their own (qwen4_exp, #928).
+const BARE_INVOKE: InvokeDialect = .{ .invoke = "<invoke", .param = "<parameter", .param_close = "</parameter>", .invoke_close = "</invoke>", .inferred = true };
+const FUNCTION_CALLS_TAG = "<function_calls>";
 
 /// gpt_oss / harmony tool calls. Structurally unlike every other family here:
 /// the function NAME is not in the payload at all, it is the segment header's
@@ -5465,11 +5546,16 @@ fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
     }
 }
 
-fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), comptime d: InvokeDialect) !void {
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, text, pos, ATEM_INVOKE_TAG)) |inv| {
-        const after_tag = inv + ATEM_INVOKE_TAG.len;
+    while (std.mem.indexOfPos(u8, text, pos, d.invoke)) |inv| {
+        const after_tag = inv + d.invoke.len;
         const seg = text[after_tag..];
+        // `<invoked>` is a word, not the tag.
+        if (seg.len > 0 and !std.ascii.isWhitespace(seg[0])) {
+            pos = after_tag;
+            continue;
+        }
         // Attribute scan bounded so a runaway unclosed quote can't eat the
         // rest of the output.
         const raw_name = dsmlAttr(seg[0..@min(seg.len, 512)], "name") orelse {
@@ -5490,20 +5576,26 @@ fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
         var args_json: ?[]const u8 = null;
         if (std.mem.indexOfScalar(u8, seg, '>')) |te| {
             const body_all = seg[te + 1 ..];
-            const body_end = std.mem.indexOf(u8, body_all, ATEM_INVOKE_CLOSE) orelse body_all.len;
-            args_json = try atemParamsToJson(allocator, body_all[0..body_end]);
+            const body_end = std.mem.indexOf(u8, body_all, d.invoke_close) orelse body_all.len;
+            // An inferred opener with no parameter and no close is prose, as `bareInvokeMarkupCut` reads it.
+            if (d.inferred and body_end == body_all.len and std.mem.indexOf(u8, body_all, d.param) == null) {
+                pos = after_tag;
+                continue;
+            }
+            args_json = try invokeParamsToJson(allocator, body_all[0..body_end], d);
             pos = if (body_end < body_all.len)
-                after_tag + te + 1 + body_end + ATEM_INVOKE_CLOSE.len
+                after_tag + te + 1 + body_end + d.invoke_close.len
             else
                 text.len; // truncated body — completed params already salvaged
         } else {
+            if (d.inferred) break; // an unclosed opener alone is prose
             pos = text.len; // truncated inside the opening tag: NAME + {}
         }
 
         const name = try allocator.dupe(u8, name_slice);
         errdefer allocator.free(name);
         const arguments = args_json orelse try allocator.dupe(u8, "{}");
-        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
+        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = d.inferred });
     }
 }
 
@@ -5512,15 +5604,15 @@ fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
 /// everything else is a raw string, exact bytes. Keys are escaped + deduped
 /// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
 /// JSON. Returns null when no complete parameter was found.
-fn atemParamsToJson(allocator: std.mem.Allocator, body: []const u8) !?[]const u8 {
+fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d: InvokeDialect) !?[]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
     var map: std.json.ObjectMap = .empty;
     var pos: usize = 0;
     var found = false;
-    while (std.mem.indexOfPos(u8, body, pos, ATEM_PARAM_TAG)) |p| {
-        const after = p + ATEM_PARAM_TAG.len;
+    while (std.mem.indexOfPos(u8, body, pos, d.param)) |p| {
+        const after = p + d.param.len;
         const seg = body[after..];
         const te = std.mem.indexOfScalar(u8, seg, '>') orelse break; // truncated open tag
         const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
@@ -5531,13 +5623,13 @@ fn atemParamsToJson(allocator: std.mem.Allocator, body: []const u8) !?[]const u8
         // The value runs to the CONFIRMED closing tag — rich values with
         // newlines/quotes/`<` survive; no close by end of text = fragment,
         // dropped.
-        const vend_rel = std.mem.indexOf(u8, body[vstart..], ATEM_PARAM_CLOSE) orelse break;
+        const vend_rel = std.mem.indexOf(u8, body[vstart..], d.param_close) orelse break;
         const raw = body[vstart .. vstart + vend_rel];
         const v: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
             std.json.Value{ .string = raw };
         try map.put(aa, pname, v);
         found = true;
-        pos = vstart + vend_rel + ATEM_PARAM_CLOSE.len;
+        pos = vstart + vend_rel + d.param_close.len;
     }
     if (!found) return null;
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = map }, .{});
@@ -5872,7 +5964,12 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
             const ak_close = earliestIndexOfAny(text, key_start, &.{ "</arg_key", "</arg_value" }) orelse break;
             const ak_close_len = suffixedTagLenAt(text[ak_close..], "</arg_key") orelse
                 suffixedTagLenAt(text[ak_close..], "</arg_value") orelse break;
-            const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
+            // A doubled opener (`<arg_key><arg_key>K`, Flint) keeps the key after the last one.
+            var key_from = key_start;
+            if (std.mem.lastIndexOf(u8, text[key_start..ak_close], "<arg_key")) |rel| {
+                if (suffixedTagLenAt(text[key_start + rel ..], "<arg_key")) |l| key_from = key_start + rel + l;
+            }
+            const key = std.mem.trim(u8, text[key_from..ak_close], " \t\n\r");
             i = ak_close + ak_close_len;
             while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
             const av_len = suffixedTagLenAt(text[i..], "<arg_value") orelse break;
@@ -6957,6 +7054,23 @@ fn hermesParamSpanEnclosing(body: []const u8, at: usize) ?usize {
     const end = hermesValueEnd(body, gt + 1) orelse return null;
     if (end <= at) return null;
     return end + "</parameter>".len;
+}
+
+/// A `<tool_call>` body whose `<function=` opener lost its `<` to a sampled special token
+/// (`<|im_start|>function=read_file>`, live on Qwen3.8-27B under MTP): one mangled delimiter,
+/// name and arguments intact. Returns the body with that special spelled as `<`, null when the
+/// body already has a `<function=` or no `<|…|>function=` run; the caller owns the copy.
+fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
+    if (std.mem.indexOf(u8, body, "<function=") != null) return null;
+    const fn_at = std.mem.indexOf(u8, body, "function=") orelse return null;
+    if (fn_at < 4 or !std.mem.endsWith(u8, body[0..fn_at], "|>")) return null;
+    const open = std.mem.lastIndexOf(u8, body[0..fn_at], "<|") orelse return null;
+    if (std.mem.indexOfAny(u8, body[open + 2 .. fn_at - 2], " \t\r\n<>") != null) return null;
+    const out = try allocator.alloc(u8, body.len - (fn_at - open) + 1);
+    @memcpy(out[0..open], body[0..open]);
+    out[open] = '<';
+    @memcpy(out[open + 1 ..], body[fn_at..]);
+    return out;
 }
 
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
@@ -10713,6 +10827,21 @@ test "serializeMessagesJson basic" {
     try testing.expectEqualStrings("Hello", parsed.value.array.items[0].object.get("content").?.string);
 }
 
+test "serializeMessagesJson: a string-content template gets each image as its atom before the text" {
+    const a = std.testing.allocator;
+    var imgs = [_]ImageData{ .{ .pixels = &.{}, .width = 1, .height = 1 }, .{ .pixels = &.{}, .width = 1, .height = 1 } };
+    const msgs = [_]Message{.{ .role = "user", .content = "What differs?", .images = &imgs }};
+    var cfg = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = "<IMG>" };
+    const json = try serializeMessagesJsonFor(a, &msgs, .null_literal, &cfg);
+    defer a.free(json);
+    try std.testing.expectEqualStrings("[{\"role\":\"user\",\"content\":\"<IMG>\\n\\n<IMG>\\n\\nWhat differs?\"}]", json);
+    // Without the atom the same message renders as content parts.
+    cfg.image_placeholder = null;
+    const parts = try serializeMessagesJsonFor(a, &msgs, .null_literal, &cfg);
+    defer a.free(parts);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "{\"type\":\"image\"}") != null);
+}
+
 test "serializeMessagesJson with tool_calls" {
     const allocator = testing.allocator;
     const tool_calls = [_]ToolCall{
@@ -14001,6 +14130,54 @@ test "parseAtemToolCalls: parallel invokes each parse; dropped wrapper still par
     try testing.expectEqualStrings("a.two", calls[1].name);
 }
 
+test "parseToolCalls: Anthropic-style bare <invoke> markup is an inferred call (#928)" {
+    const allocator = testing.allocator;
+    const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x && ls -la</parameter>\n<parameter name=\"timeout\">30</parameter>\n</invoke>\n</function_calls>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    // Not the model's own dialect: it must name a declared tool to survive.
+    try testing.expect(calls[0].inferred);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("cd /x && ls -la", parsed.value.object.get("command").?.string);
+    try testing.expectEqual(@as(i64, 30), parsed.value.object.get("timeout").?.integer);
+    // Prose words are not the tag.
+    try testing.expect((try parseToolCalls(allocator, "I <invoked> it with <parameters> set.")) == null);
+    // Nothing of an unparsed block reaches content; prose naming the tag stays.
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls"));
+    const prose = "Claude's format wraps each call in <invoke name=\"x\"> tags.";
+    try testing.expectEqualStrings(prose, trimLeakedToolMarkup(prose));
+}
+
+test "parseToolCalls: a bare <invoke> in prose or inside another dialect's value is not a call" {
+    const allocator = testing.allocator;
+    // The opener alone is prose, as the scrubber reads it.
+    try testing.expect((try parseToolCalls(allocator, "Claude's format wraps each call in <invoke name=\"bash\"> tags.")) == null);
+    // A Hermes parameter VALUE carrying invoke markup never decides the call.
+    const text = "<tool_call>\n<function=write>\n<parameter=content>\nrun <invoke name=\"bash\"><parameter name=\"command\">ls</parameter></invoke>\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    try testing.expect(!calls[0].inferred);
+}
+
+test "streamShouldBufferForTools: every prefix of a bare <invoke> call holds; prose releases" {
+    const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\n</function_calls>";
+    for ([_]usize{ 0, std.mem.indexOf(u8, text, "<invoke").? }) |start| {
+        var end = start + 2;
+        while (end <= text.len) : (end += 1) {
+            testing.expect(streamShouldBufferForTools(text[start..end])) catch |e| {
+                std.debug.print("gate flushed a prefix of an accepted call: '{s}'\n", .{text[start..end]});
+                return e;
+            };
+        }
+    }
+    try testing.expect(!streamShouldBufferForTools("I <invoked> the <function_callback> helper"));
+}
+
 test "muse streaming gate: headers hold, self holds then splits, user splits" {
     // Growing bare header — never flush the ` to=…` text. The sub-"to="
     // prefixes are the live 2026-08-10 leak (" to" shipped as a text delta
@@ -15662,6 +15839,42 @@ test "answerStopIndex: a stop after trailing whitespace in the answer still cuts
     try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
 }
 
+test "renderChatTemplate: Flint's template renders tools, tool history and reasoning byte-exact with jinja2" {
+    // Reference bytes: the shipped template through jinja2 with HF's apply_chat_template settings
+    // (trim_blocks, lstrip_blocks); the user text's `<think>` tags are stripped by the template itself.
+    const cfg = ChatConfig{ .chat_template = @embedFile("fixtures/flint_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const calls = [_]ToolCall{.{ .id = "c1", .name = "shell", .arguments = "{\"command\": \"ls -la\", \"timeout\": 5}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are a coding agent." },
+        .{ .role = "user", .content = "List the files, then say <think>hi</think> back." },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "I should run ls." },
+        .{ .role = "tool", .content = "a.txt\nb.txt", .tool_call_id = "c1" },
+        .{ .role = "assistant", .content = "Two files.", .reasoning_content = "Done." },
+        .{ .role = "user", .content = "Thanks" },
+    };
+    const tools =
+        \\[{"type": "function", "function": {"name": "shell", "description": "Run a command", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}}}]
+    ;
+    const out = try renderChatTemplate(testing.allocator, &messages, &cfg, tools, null, true, null, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "<|system|>You are a coding agent.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" ++
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"shell\", \"description\": \"Run a command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}</tools>\n\n" ++
+            "For each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n" ++
+            "<|user|>List the files, then say hi back.<|assistant|><think>I should run ls.</think><tool_call>shell<arg_key>command</arg_key><arg_value>ls -la</arg_value><arg_key>timeout</arg_key><arg_value>5</arg_value></tool_call>" ++
+            "<|observation|><tool_response>a.txt\nb.txt</tool_response><|assistant|><think>Done.</think>Two files.<|user|>Thanks<|assistant|>",
+        out,
+    );
+}
+
+test "renderChatTemplate: a `\\xHH` escape is Python's code point U+00HH, so 0x80 and up render as UTF-8" {
+    const cfg = ChatConfig{ .chat_template = "{{ messages[0].content }}{{ \"\\xe9|\\x41\" }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const out = try renderChatTemplate(testing.allocator, &messages, &cfg, null, null, false, null, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hi\u{e9}|A", out);
+}
+
 test "renderChatTemplate: GLM-5-Next tool history renders natively (jinja `obj.0` is `obj[0]`)" {
     // The template probes `m.content.0.output`; jinja.cpp refused a numeric attribute and the
     // whole turn fell back to the generic format, which the model answered with `<end_of_turn>`.
@@ -15746,4 +15959,23 @@ test "renderChatTemplate: REAL MiniCPM-V 4.7 chat_template.jinja renders without
     defer allocator.free(off);
     try testing.expect(std.mem.endsWith(u8, off, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     try testing.expect(!promptTailOpensThink(off));
+}
+
+test "a sampled special token where <function='s `<` belongs still names the call" {
+    const allocator = std.testing.allocator;
+    const raw = "<tool_call>\n<|im_start|>function=read_file>\n<parameter=path>\nsrc/game.js\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("read_file", calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"src/game.js\"}", calls[0].arguments);
+    // A body with its real opener is left alone; a special that is not glued to `function=` is not touched.
+    try std.testing.expect((try hermesSpecialOpenerRepair(allocator, "<function=x>\n</function>")) == null);
+    try std.testing.expect((try hermesSpecialOpenerRepair(allocator, "<|im_start|>\nfunction=x>")) == null);
 }

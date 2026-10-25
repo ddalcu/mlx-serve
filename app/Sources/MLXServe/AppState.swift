@@ -65,6 +65,8 @@ class AppState: ObservableObject {
                         // Register-by-path failed (unsupported arch, partial
                         // download) or the load 503'd (memory) — a full
                         // restart with only the new model is the net.
+                        // A later switch, or a remote pick since, owns the server now.
+                        guard self.modelSwitchGeneration == generation, mgr.lanChatModelId == nil else { return }
                         print("[AppState] hot-switch failed (\(error)) — falling back to restart")
                         mgr.stop()
                         mgr.start(modelPath: self.selectedModelPath, options: self.serverOptions)
@@ -414,8 +416,8 @@ class AppState: ObservableObject {
     }
 
     /// Show the model browser — the ONE way in.
-    func showModels(_ section: ModelBrowserSection = .defaultSection) {
-        chatWorkspace = .models(section)
+    func showModels(_ section: ModelBrowserSection? = nil) {
+        chatWorkspace = .modelBrowserEntry(section: section, localModels: localModels)
         pendingChatOpenTick += 1
     }
 
@@ -759,7 +761,7 @@ class AppState: ObservableObject {
     /// LAN), else headless over the models root. Launch passes its plan's choice.
     func ensureServerForLan(modelPath: String? = nil) {
         guard server.status != .running, server.status != .starting else { return }
-        let path = modelPath ?? selectedModelPath
+        let path = modelPath ?? server.localChatLoadPath(selectedPath: selectedModelPath) ?? ""
         if !path.isEmpty {
             server.start(modelPath: path, options: serverOptions)
         } else {
@@ -773,8 +775,7 @@ class AppState: ObservableObject {
     func startServer(loadingSelection: Bool) {
         guard server.status != .running, server.status != .starting else { return }
         server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
-        guard loadingSelection, !selectedModelPath.isEmpty else { return }
-        let path = selectedModelPath
+        guard loadingSelection, let path = server.localChatLoadPath(selectedPath: selectedModelPath) else { return }
         let mgr = server
         modelSwitchGeneration += 1
         let generation = modelSwitchGeneration

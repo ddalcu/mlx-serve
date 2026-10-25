@@ -1,25 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { apiPrefix, pageApiKey, pageServer } from "../src/lib/core/console";
+import { apiPrefix, pageServer } from "../src/lib/core/console";
 import { Connection } from "../src/lib/state/connection.svelte";
-
-describe("page API key", () => {
-  it("reads ?api_key= from the query string", () => {
-    expect(pageApiKey("?api_key=123")).toBe("123");
-    expect(pageApiKey("?x=1&api_key=a%20b")).toBe("a b");
-    expect(pageApiKey("")).toBeUndefined();
-    expect(pageApiKey("?api_key=")).toBeUndefined();
-  });
-
-  it("authenticates its own server, never another, and stays off disk", () => {
-    const saved = new Map<string, string>();
-    const storage = { getItem: (k: string) => saved.get(k) ?? null, setItem: (k: string, v: string) => void saved.set(k, v) };
-    const conn = new Connection("http://lan:11234", storage, {}, "123");
-    expect(conn.active.apiKey).toBe("123");
-    const other = conn.add({ url: "http://other:1" });
-    expect(conn.store.get(other)?.apiKey).toBeUndefined();
-    expect(saved.get("studio.servers")).not.toMatch(/apiKey/);
-  });
-});
 
 describe("mount prefix", () => {
   it("console and Monitoring share the same resolution, without query keys", () => {

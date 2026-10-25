@@ -38,6 +38,7 @@ const w8a8 = @import("w8a8.zig");
 const int8_attn = @import("int8_attn.zig");
 const h3_glue = @import("h3_glue.zig");
 const h3_split = @import("h3_split.zig");
+const h3_vsa = @import("h3_vsa.zig");
 const add_norm = @import("add_norm.zig");
 const ane = @import("ane.zig");
 const gen_sse = @import("gen_sse.zig");
@@ -526,7 +527,13 @@ pub const SegmentKind = enum {
     }
 };
 
-pub const Segment = struct { start: u32, end: u32, kind: SegmentKind };
+pub const Segment = struct {
+    start: u32,
+    end: u32,
+    kind: SegmentKind,
+    /// A video segment's token grid (t, h, w); zero for every other segment.
+    grid: [3]u32 = .{ 0, 0, 0 },
+};
 
 /// Where a keyframe is anchored in the SOURCE frame timeline. Only the first
 /// and last frames are anchorable — the reference raises on anything else, and
@@ -741,7 +748,7 @@ pub const PackedLayout = struct {
                         row += n;
                     }
                     const n_rows = b.latent_t * g.rows;
-                    try segments.append(allocator, .{ .start = row, .end = row + n_rows, .kind = .ref_img });
+                    try segments.append(allocator, .{ .start = row, .end = row + n_rows, .kind = .ref_img, .grid = .{ b.latent_t, @intCast(g.h_axis.len), @intCast(g.w_axis.len) } });
                     const rt_grid = try videoTGrid(allocator, b.latent_t, cursor);
                     defer allocator.free(rt_grid);
                     for (rt_grid, 0..) |tv, f| {
@@ -768,7 +775,7 @@ pub const PackedLayout = struct {
         }
         row += n_audio_rows;
 
-        try segments.append(allocator, .{ .start = row, .end = row + n_video_rows, .kind = .video });
+        try segments.append(allocator, .{ .start = row, .end = row + n_video_rows, .kind = .video, .grid = .{ latent_t, @intCast(h_axis.len), @intCast(w_axis.len) } });
         const t_grid = try videoTGrid(allocator, latent_t, cursor);
         defer allocator.free(t_grid);
         for (t_grid, 0..) |tv, f| {
@@ -815,6 +822,23 @@ pub const PackedLayout = struct {
     /// The target audio segment — second to last by construction.
     pub fn audioSegment(self: *const PackedLayout) Segment {
         return self.segments[self.segments.len - 2];
+    }
+
+    /// The packed order as VSA reads it: one dense run per segment (keyframe rows as one run, as
+    /// FastVideo packs them), each video segment as its grid. Caller frees.
+    pub fn vsaSegments(self: *const PackedLayout, a: std.mem.Allocator) ![]h3_vsa.Seg {
+        var out: std.ArrayList(h3_vsa.Seg) = .empty;
+        errdefer out.deinit(a);
+        for (self.segments, 0..) |seg, i| {
+            if (seg.grid[0] > 0) {
+                try out.append(a, .{ .grid = seg.grid });
+            } else if (seg.kind == .cond and i > 0 and self.segments[i - 1].kind == .cond and out.items.len > 0 and out.items[out.items.len - 1] == .dense) {
+                out.items[out.items.len - 1].dense += seg.end - seg.start;
+            } else if (seg.end > seg.start) {
+                try out.append(a, .{ .dense = seg.end - seg.start });
+            }
+        }
+        return out.toOwnedSlice(a);
     }
 };
 
@@ -1063,6 +1087,8 @@ const AttnW = struct {
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
     out: MfLinear,
+    /// VSA students' `to_gate_compress` projection (FastH3 Omni).
+    gate: ?MfLinear = null,
     qkv_lora: lora_mod.Slot = .{},
     out_lora: lora_mod.Slot = .{},
 
@@ -1078,9 +1104,15 @@ const AttnW = struct {
             .out = try MfLinear.load(w, a, out_p, cfg.innerDim(), dt, s),
         };
         errdefer r.deinit();
+        const gate_p = try std.fmt.allocPrint(a, "{s}.to_gate_compress", .{prefix});
+        defer a.free(gate_p);
+        const gate_w = try std.fmt.allocPrint(a, "{s}.weight", .{gate_p});
+        defer a.free(gate_w);
+        if (w.get(gate_w) != null) r.gate = try MfLinear.load(w, a, gate_p, cfg.hidden_size, dt, s);
         if (!ane.media_offload.video) { // the ANE seam reads the packed weights
             try r.qkv.toW8a8(s);
             try r.out.toW8a8(s);
+            if (r.gate) |*g| try g.toW8a8(s);
         }
         return r;
     }
@@ -1089,6 +1121,7 @@ const AttnW = struct {
         _ = mlx.mlx_array_free(self.q_norm);
         _ = mlx.mlx_array_free(self.k_norm);
         self.out.deinit();
+        if (self.gate) |*g| g.deinit();
     }
 };
 
@@ -1652,7 +1685,10 @@ fn qkvHeadMajor(aw: *const AttnW, qkv: mlx.mlx_array, cfg: Config, rope: ?RopeTa
 ///
 /// `ablate` is `.none` everywhere except the profile ladder; `.sdpa` passes v
 /// through in place of the attention output (same shape, projections intact).
-fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?SparseSpec, split: ?*const h3_split.RowSplit, s: S) !mlx.mlx_array {
+/// A non-dense attention arm: a training-free pattern, or a VSA student's trained one.
+const AttnSparsity = union(enum) { pattern: SparseSpec, vsa: *const h3_vsa.Plan };
+
+fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?AttnSparsity, split: ?*const h3_split.RowSplit, s: S) !mlx.mlx_array {
     const n: c_int = @intCast(mlx.getShape(x)[0]);
     const h: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.attention_head_dim);
@@ -1673,12 +1709,20 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     }
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
-    const dense = sparse == null or sparse.?.mode == .dense;
+    const dense = sparse == null or (sparse.? == .pattern and sparse.?.pattern.mode == .dense);
     if (w8a8.enabled and dense and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
         defer _ = mlx.mlx_array_free(flat8);
         const out8 = try aw.out.forward(flat8, null, s);
         return lora_mod.addSlot(out8, flat8, &aw.out_lora, s);
     };
+    if (sparse != null and sparse.? == .vsa) {
+        const g = try (aw.gate orelse return error.VsaGateMissing).forward(x, null, s);
+        defer _ = mlx.mlx_array_free(g);
+        const flat_v = try h3_vsa.attend(sparse.?.vsa, t[0], t[1], t[2], g, scale, s);
+        defer _ = mlx.mlx_array_free(flat_v);
+        const out_v = try aw.out.forward(flat_v, null, s);
+        return lora_mod.addSlot(out_v, flat_v, &aw.out_lora, s);
+    }
     var attn: mlx.mlx_array = undefined;
     if (ablate == .sdpa) {
         attn = try contig(t[2], s);
@@ -1690,8 +1734,8 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
         const third = try scalarLike(1.0 / 3.0, sum3, s);
         defer _ = mlx.mlx_array_free(third);
         attn = try mulA(sum3, third, s);
-    } else if (sparse != null and sparse.?.mode != .dense) {
-        attn = try sparseAttend(t[0], t[1], t[2], sparse.?, scale, s);
+    } else if (!dense) {
+        attn = try sparseAttend(t[0], t[1], t[2], sparse.?.pattern, scale, s);
     } else {
         var o = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(o);
@@ -1887,9 +1931,13 @@ pub const TimestepPlan = struct {
     }
 };
 
-pub const CondNoiseAug = struct {
+/// How a step's video sigma becomes row timesteps: condition rows ride at
+/// their augmentation timesteps, and `max_t` is the top of the sigma clock (a
+/// PDD student's grid ends at 0.999).
+pub const StepClock = struct {
     visual: f64 = VISUAL_COND_TIMESTEP,
     audio: f64 = AUDIO_COND_TIMESTEP,
+    max_t: f64 = 1.0,
 };
 
 pub fn buildTimestepPlan(
@@ -1898,10 +1946,10 @@ pub fn buildTimestepPlan(
     sigma_v: f64,
     shift_v: f64,
     shift_a: f64,
-    aug: CondNoiseAug,
+    aug: StepClock,
 ) !TimestepPlan {
     const t_v = 1.0 - sigma_v;
-    const t_a = 1.0 - timeShiftSigma(sigma_v, shift_v, shift_a);
+    const t_a = 1.0 - aug.max_t * timeShiftSigma(sigma_v / aug.max_t, shift_v, shift_a);
 
     var uniq: [MAX_UNIQUE_T]f64 = undefined;
     var n: usize = 0;
@@ -2038,7 +2086,7 @@ pub fn buildTimestepPlanGlobal(
     sigma_v: f64,
     shift_v: f64,
     shift_a: f64,
-    aug: CondNoiseAug,
+    aug: StepClock,
     global_ts: []const f64,
 ) !TimestepPlan {
     var p = try buildTimestepPlan(allocator, layout, sigma_v, shift_v, shift_a, aug);
@@ -2063,7 +2111,7 @@ pub fn collectScheduleTs(
     sigmas: []const f64,
     shift_v: f64,
     shift_a: f64,
-    aug: CondNoiseAug,
+    aug: StepClock,
 ) ![]f64 {
     var list: std.ArrayList(f64) = .empty;
     errdefer list.deinit(allocator);
@@ -2195,9 +2243,11 @@ pub fn stepCacheWarmup(steps: u32) usize {
 }
 
 /// Refresh schedule: k<=1 disables broadcast (always refresh); otherwise the
-/// warmup and tail steps always recompute, and every k-th step in between.
-pub fn attnBroadcastRefresh(i: usize, steps: u32, k: u32) bool {
-    if (k <= 1) return true;
+/// warmup and tail steps always recompute, and every k-th step in between. A
+/// forward after a step-cache skip recomputes: the attention it would reuse is
+/// already as old as the velocity the skip reused.
+pub fn attnBroadcastRefresh(i: usize, steps: u32, k: u32, after_skip: bool) bool {
+    if (k <= 1 or after_skip) return true;
     const warm = attnBroadcastWarmup(steps);
     if (i < warm) return true;
     if (i + attnBroadcastTail(steps) >= steps) return true;
@@ -2241,6 +2291,8 @@ pub const Model = struct {
     sparse_policy: SparsePolicy,
     /// Set for a job whose steps are split with a cluster worker (`h3_split`).
     split: ?*const h3_split.RowSplit = null,
+    /// A VSA student's tile plan for the current run (`h3_vsa`).
+    vsa: ?*const h3_vsa.Plan = null,
 
     video_patch_w: mlx.mlx_array, // fp32 island
     video_patch_b: mlx.mlx_array,
@@ -2433,6 +2485,12 @@ pub const Model = struct {
     /// load phase from any profile and makes the first step read as a
     /// regression. Explicit rather than reflective: a missed field here only
     /// shifts a few ms of attribution, never a budget (unlike the dsv4 case).
+    /// Every DiT block carries a VSA gate projection.
+    pub fn hasVsaGates(self: *const Model) bool {
+        for (self.blocks) |b| if (b.attn.gate == null) return false;
+        return self.blocks.len > 0;
+    }
+
     pub fn evalWeights(self: *const Model) !void {
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
@@ -2681,6 +2739,34 @@ pub const Model = struct {
         return out;
     }
 
+    /// The output projections a step reads: the DiT's own, or a PDD block's
+    /// fused heads (owned by the caller, `deinit`).
+    pub const Heads = struct {
+        video_w: mlx.mlx_array,
+        video_b: mlx.mlx_array,
+        audio_w: mlx.mlx_array,
+        audio_b: mlx.mlx_array,
+
+        pub fn deinit(self: *Heads) void {
+            for ([_]mlx.mlx_array{ self.video_w, self.video_b, self.audio_w, self.audio_b }) |x| _ = mlx.mlx_array_free(x);
+        }
+    };
+
+    pub fn ownHeads(self: *const Model) Heads {
+        return .{ .video_w = self.video_out_w, .video_b = self.video_out_b, .audio_w = self.audio_out_w, .audio_b = self.audio_out_b };
+    }
+
+    /// PDD block `k`'s heads, each modality weighted on its own clock.
+    pub fn pddHeads(self: *const Model, p: *const Pdd, k: u32, shift_v: f64, shift_a: f64, s: S) !Heads {
+        var buf: [Pdd.MAX_NODES]f32 = undefined;
+        const v = try fusePddHead(self.video_out_w, self.video_out_b, p.grid, p.nodes[k], p.blockWeights(k, shift_v, &buf), s);
+        errdefer for (v) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        const a = try fusePddHead(self.audio_out_w, self.audio_out_b, p.grid, p.nodes[k], p.blockWeights(k, shift_a, &buf), s);
+        return .{ .video_w = v[0], .video_b = v[1], .audio_w = a[0], .audio_b = a[1] };
+    }
+
     pub const Output = struct {
         /// Velocity for the video stream, [n_video_rows, videoPatchDim].
         video: mlx.mlx_array,
@@ -2721,9 +2807,9 @@ pub const Model = struct {
         video_rows: mlx.mlx_array, // [n_video_rows, videoPatchDim] f32
         audio_rows: mlx.mlx_array, // [n_audio_rows, audio_latents_dim] f32
         rope: RopeTables,
-        sigma_v: f64,
-        shift_v: f64,
-        shift_a: f64,
+        heads: Heads,
+        /// d(sigma_a)/d(sigma_v) at this step, folded into the audio output.
+        audio_slope: f64,
         attn_bcast: ?*AttnBroadcast,
         attn_refresh: bool,
         s: S,
@@ -2826,22 +2912,21 @@ pub const Model = struct {
         const v_row = plan.runs[layout.segments.len - 1].mod_row / 3;
         const a_row = plan.runs[layout.segments.len - 2].mod_row / 3;
 
-        const vout = try self.finalHead(h, fmods[0], fmods[1], vseg, v_row, self.video_out_w, self.video_out_b, s);
+        const vout = try self.finalHead(h, fmods[0], fmods[1], vseg, v_row, heads.video_w, heads.video_b, s);
         errdefer _ = mlx.mlx_array_free(vout);
-        const aout_raw = try self.finalHead(h, fmods[0], fmods[1], aseg, a_row, self.audio_out_w, self.audio_out_b, s);
+        const aout_raw = try self.finalHead(h, fmods[0], fmods[1], aseg, a_row, heads.audio_w, heads.audio_b, s);
         defer _ = mlx.mlx_array_free(aout_raw);
 
         // The sampler integrates a flat ODE on the VIDEO schedule. Scaling the
         // audio velocity by d(sigma_a)/d(sigma_v) makes that equal the audio
         // stream's true ODE on its own schedule. Both are negated: the model
         // predicts velocity, the sampler wants the denoise direction.
-        const slope = timeShiftSlope(sigma_v, shift_v, shift_a);
         const negv = try scalarLike(-1.0, vout, s);
         defer _ = mlx.mlx_array_free(negv);
         const video = try mulA(vout, negv, s);
         _ = mlx.mlx_array_free(vout);
         errdefer _ = mlx.mlx_array_free(video);
-        const nega = try scalarLike(@floatCast(-slope), aout_raw, s);
+        const nega = try scalarLike(@floatCast(-audio_slope), aout_raw, s);
         defer _ = mlx.mlx_array_free(nega);
         const audio = try mulA(aout_raw, nega, s);
         return .{ .video = video, .audio = audio };
@@ -2898,12 +2983,14 @@ pub const Model = struct {
                 // A row split's attention reads gathered keys, so it stays dense.
                 const lay = if (self.split == null) layout else null;
                 const smode = if (self.ablate == .none and lay != null) sparseModeForLayer(bi, self.blocks.len, self.sparse_policy) else SparseMode.dense;
-                const spec: ?SparseSpec = if (smode == .dense) null else .{
+                const spec: ?AttnSparsity = if (self.vsa != null and lay != null and self.ablate == .none)
+                    .{ .vsa = self.vsa.? }
+                else if (smode == .dense) null else .{ .pattern = .{
                     .mode = smode,
                     .t = lay.?.latent_t,
                     .f = (lay.?.latent_h / PATCH_H) * (lay.?.latent_w / PATCH_W),
                     .video_start = lay.?.videoSegment().start,
-                };
+                } };
                 at = if (self.ablate == .attn) try contig(m1, s) else try attnForward(&b.attn, m1, cfg, rope, self.ablate, spec, self.split, s);
                 if (cacheable) {
                     if (attn_bcast.?.blocks[bi].ctx != null) _ = mlx.mlx_array_free(attn_bcast.?.blocks[bi]);
@@ -3535,6 +3622,125 @@ pub fn sigmaSchedule(allocator: std.mem.Allocator, steps: u32, shift: f64) ![]f6
     return out;
 }
 
+/// A FastH3 PDD student (FastVideo `fastvideo/layers/pdd.py`): its output heads
+/// are `grid` stacked heads, one per interval of a fine grid on the base clock
+/// [0, max_t], and a step between two trained nodes runs their
+/// integration-weighted mean. Read from the pack's config under the release
+/// contract's own names (`pdd_steps`, `pdd_step_indices`, `grid_max_t`).
+pub const Pdd = struct {
+    grid: u32,
+    nodes: [MAX_NODES]u32,
+    n_nodes: u32,
+    max_t: f64,
+
+    pub const MAX_NODES = 65;
+
+    /// Transformer forwards per generation: one per trained block.
+    pub fn steps(self: *const Pdd) u32 {
+        return self.n_nodes - 1;
+    }
+
+    /// Noise level of fine-grid node `j` on a modality's clock:
+    /// `max_t * g_shift(1 - j/grid)`, the rational shift scaled to the grid top.
+    pub fn sigmaAt(self: *const Pdd, j: u32, shift: f64) f64 {
+        const base = 1.0 - @as(f64, @floatFromInt(j)) / @as(f64, @floatFromInt(self.grid));
+        return self.max_t * timeShiftSigma(base, 1.0, shift);
+    }
+
+    /// Sampler sigmas on one clock: the trained nodes, ending at 0. Caller owns.
+    pub fn sigmas(self: *const Pdd, allocator: std.mem.Allocator, shift: f64) ![]f64 {
+        const out = try allocator.alloc(f64, self.n_nodes);
+        for (out, self.nodes[0..self.n_nodes]) |*o, j| o.* = self.sigmaAt(j, shift);
+        return out;
+    }
+
+    /// Block `k`'s head weights on one clock, normalized to sum 1: each interval's
+    /// sigma delta over the block's. The Euler step over the block's nodes
+    /// supplies the total.
+    pub fn blockWeights(self: *const Pdd, k: u32, shift: f64, out: []f32) []f32 {
+        const lo = self.nodes[k];
+        const hi = self.nodes[k + 1];
+        const total = self.sigmaAt(hi, shift) - self.sigmaAt(lo, shift);
+        for (lo..hi) |j| {
+            const d = self.sigmaAt(@intCast(j + 1), shift) - self.sigmaAt(@intCast(j), shift);
+            out[j - lo] = @floatCast(d / total);
+        }
+        return out[0 .. hi - lo];
+    }
+
+    /// Null for a pack without `pdd_steps`; a contract that cannot be sampled
+    /// (indices not rising from 0 to the grid, a clock outside (0, 1]) is refused.
+    pub fn fromConfig(allocator: std.mem.Allocator, config_json: []const u8) !?Pdd {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return error.BadPddContract;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.BadPddContract;
+        const o = parsed.value.object;
+        const grid_v = o.get("pdd_steps") orelse return null;
+        const idx_v = o.get("pdd_step_indices") orelse return error.BadPddContract;
+        const max_v = o.get("grid_max_t") orelse return error.BadPddContract;
+        if (grid_v != .integer or idx_v != .array) return error.BadPddContract;
+        const max_t: f64 = switch (max_v) {
+            .float => |f| f,
+            .integer => |i| @floatFromInt(i),
+            else => return error.BadPddContract,
+        };
+        const items = idx_v.array.items;
+        if (grid_v.integer < 2 or grid_v.integer >= MAX_NODES or !(max_t > 0 and max_t <= 1)) return error.BadPddContract;
+        if (items.len < 2 or items.len > MAX_NODES) return error.BadPddContract;
+        var p = Pdd{ .grid = @intCast(grid_v.integer), .nodes = undefined, .n_nodes = @intCast(items.len), .max_t = max_t };
+        for (items, 0..) |v, i| {
+            if (v != .integer or v.integer < 0 or v.integer > p.grid) return error.BadPddContract;
+            if (i > 0 and v.integer <= p.nodes[i - 1]) return error.BadPddContract;
+            p.nodes[i] = @intCast(v.integer);
+        }
+        if (p.nodes[0] != 0 or p.nodes[p.n_nodes - 1] != p.grid) return error.BadPddContract;
+        return p;
+    }
+};
+
+/// A DiT's output heads against the pack's contract: widened heads need a PDD
+/// contract of the same grid, and a contract needs widened heads.
+pub fn checkPddHeads(video_rows: u32, audio_rows: u32, cfg: Config, pdd: ?*const Pdd) !void {
+    const gv = video_rows / cfg.videoPatchDim();
+    const ga = audio_rows / cfg.audio_latents_dim;
+    if (gv * cfg.videoPatchDim() != video_rows or ga * cfg.audio_latents_dim != audio_rows or gv != ga)
+        return error.PddGridMismatch;
+    if (pdd) |p| {
+        if (gv == 1) return error.PddContractWithoutHeads;
+        if (gv != p.grid) return error.PddGridMismatch;
+    } else if (gv != 1) return error.PddHeadsWithoutContract;
+}
+
+/// One modality's head for a PDD block: the `wts`-weighted sum of heads
+/// `[start, start + wts.len)` of a `[grid*out, in]` bank, in f32 like the
+/// reference. Returns the owned `{weight, bias}`.
+fn fusePddHead(w: mlx.mlx_array, b: mlx.mlx_array, grid: u32, start: u32, wts: []const f32, s: S) ![2]mlx.mlx_array {
+    const shp = mlx.getShape(w);
+    const g: c_int = @intCast(grid);
+    const out = @divExact(shp[0], g);
+    const n: c_int = @intCast(wts.len);
+    const lo: c_int = @intCast(start);
+    var wshape = [_]c_int{ 1, n };
+    const wv = mlx.mlx_array_new_data(wts.ptr, &wshape, 2, .float32);
+    defer _ = mlx.mlx_array_free(wv);
+    const fw = try fuseRows(w, wv, g, lo, n, &[_]c_int{ out, shp[1] }, s);
+    errdefer _ = mlx.mlx_array_free(fw);
+    return .{ fw, try fuseRows(b, wv, g, lo, n, &[_]c_int{out}, s) };
+}
+
+fn fuseRows(bank: mlx.mlx_array, wv: mlx.mlx_array, g: c_int, lo: c_int, n: c_int, shape: []const c_int, s: S) !mlx.mlx_array {
+    var row: c_int = 1;
+    for (shape) |d| row *= d;
+    const rows = try reshape(bank, &[_]c_int{ g, row }, s);
+    defer _ = mlx.mlx_array_free(rows);
+    const block = try sliceRows(rows, lo, lo + n, s);
+    defer _ = mlx.mlx_array_free(block);
+    var m = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m);
+    try mlx.check(mlx.mlx_matmul(&m, wv, block, s));
+    return reshape(m, shape, s);
+}
+
 /// A first/last-frame conditioning image for fl2va. `pixels` is
 /// [1, 3, 1, H, W] in [-1, 1] at the TARGET canvas (the caller resizes:
 /// stretch for `.first` — the geometry anchor — and center-cover for `.last`,
@@ -3602,6 +3808,11 @@ pub const GenRequest = struct {
     /// Loaded as the FIRST file of the same stack the user's adapters ride —
     /// it is a LoRA, so it gets no private code path.
     turbo: bool = false,
+    /// The pack's FastH3 PDD contract: `steps` must be its block count, and the
+    /// sampler runs its trained nodes and fused heads.
+    pdd: ?Pdd = null,
+    /// A VSA student's trained sparse-attention contract.
+    vsa: ?h3_vsa.Contract = null,
     /// Style LoRAs stacked on the DiT: absolute `.safetensors` paths and their
     /// strengths (parallel arrays; a missing scale is 1.0 at the caller). They
     /// sum with each other and with Turbo, never merge — order is irrelevant
@@ -3647,8 +3858,9 @@ pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
 /// velocity cache's slow-drift premise is false (every step is a giant leap)
 /// and the broadcast gates cover most of the schedule anyway, so `turbo`
 /// forces both off regardless of `fast` — env still wins for A/B harnesses.
-pub fn resolveSpeed(fast: ?bool, turbo: bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
-    const want_fast = !turbo and (fast orelse true);
+/// A PDD student is `distilled` the same way.
+pub fn resolveSpeed(fast: ?bool, distilled: bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
+    const want_fast = !distilled and (fast orelse true);
     var out = SpeedConfig{
         .step_cache = if (want_fast) 0.05 else 0,
         .bcast_k = if (want_fast) 2 else 0,
@@ -3676,6 +3888,23 @@ pub fn audioStepFactor(turbo: bool, sigma_cur: f64, sigma_next: f64, shift_v: f6
     const sa_c = timeShiftSigma(sigma_cur, shift_v, shift_a);
     const sa_n = timeShiftSigma(sigma_next, shift_v, shift_a);
     return (sa_n - sa_c) / timeShiftSlope(@max(sigma_cur, 1e-6), shift_v, shift_a);
+}
+
+/// The slope the step cache divides a forward's audio velocity by: the one that forward was scaled
+/// by, read on the unit clock.
+pub fn cachedAudioSlope(sigma: f64, max_t: f64, shift_v: f64, shift_a: f64) f64 {
+    return timeShiftSlope(sigma / max_t, shift_v, shift_a);
+}
+
+/// What a skipped step advances the cached (slope-scaled) audio velocity by: the distilled arms'
+/// exact mapped delta on the max_t clock, else the validated first-order form.
+pub fn cachedAudioAdvance(distilled: bool, stored_slope: f64, sigma: f64, sigma_next: f64, max_t: f64, shift_v: f64, shift_a: f64) f64 {
+    const unit = sigma / max_t;
+    const da = if (distilled)
+        max_t * (timeShiftSigma(sigma_next / max_t, shift_v, shift_a) - timeShiftSigma(unit, shift_v, shift_a))
+    else
+        (sigma_next - sigma) * timeShiftSlope(unit, shift_v, shift_a);
+    return da / stored_slope;
 }
 
 /// The text encoder and the whole DiT, kept loaded between requests while the engine stays loaded
@@ -4027,6 +4256,7 @@ fn generateOne(
     const vae_mod = @import("minimax_h3_vae.zig");
     const dt = mlx.mlx_dtype.bfloat16;
 
+    if (req.pdd) |p| if (req.steps != p.steps()) return error.PddStepsMismatch;
     const shape = temporalShape(req.frames);
     const lat_h = req.height / vae_mod.VAE_RATIO;
     const lat_w = req.width / vae_mod.VAE_RATIO;
@@ -4377,8 +4607,20 @@ fn generateOne(
     var audio_x = try randomNormal(&[_]c_int{ n_audio_rows, 32 }, req.seed +% 1, mlx.mlx_dtype.float32, s);
     defer _ = mlx.mlx_array_free(audio_x);
 
-    const sigmas = try sigmaSchedule(allocator, req.steps, req.shift_video);
+    const max_t: f64 = if (req.pdd) |p| p.max_t else 1.0;
+    const sigmas = if (req.pdd) |*p| try p.sigmas(allocator, req.shift_video) else try sigmaSchedule(allocator, req.steps, req.shift_video);
     defer allocator.free(sigmas);
+    if (req.pdd) |p| log.info("[minimax-h3] PDD student: {d} fused blocks over {d} heads, max_t {d}\n", .{ p.steps(), p.grid, p.max_t });
+    // A PDD student starts at its first node's noise level, max_t on both clocks.
+    if (req.pdd != null) {
+        for ([_]*mlx.mlx_array{ &video_x, &audio_x }) |x| {
+            const m = try scalarLike(@floatCast(max_t), x.*, s);
+            defer _ = mlx.mlx_array_free(m);
+            const scaled = try mulA(x.*, m, s);
+            _ = mlx.mlx_array_free(x.*);
+            x.* = scaled;
+        }
+    }
 
     // Profiling arms: never set by any server path; the live-test harness and
     // profile drivers own the env. A non-empty junk value is LOUDLY off.
@@ -4427,11 +4669,13 @@ fn generateOne(
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
         if (adalnPrecomputeOn() and req.resident == null) {
-            const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{});
+            const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{ .max_t = max_t });
             defer allocator.free(ts);
             try model.precomputeAdaln(ts, s);
             log.info("[minimax-h3] adaln precomputed for {d} timesteps; 13B modulation weights released\n", .{ts.len});
         }
+        try checkPddHeads(@intCast(mlx.getShape(model.video_out_w)[0]), @intCast(mlx.getShape(model.audio_out_w)[0]), model.cfg, if (req.pdd) |*p| p else null);
+        if (req.vsa != null and !model.hasVsaGates()) return error.VsaContractWithoutGates;
         try model.evalWeights();
         // ANE MLP offload for this run's row count (opt-in; declines under a
         // LoRA, so a Turbo run stays GPU-only).
@@ -4470,6 +4714,23 @@ fn generateOne(
         defer if (job) |*j| j.end();
         model.split = if (job) |*j| &j.split else null;
         defer model.split = null;
+
+        // A VSA student attends sparsely as trained; a row split's gathered keys stay dense.
+        var vsa_plan: ?h3_vsa.Plan = null;
+        defer if (vsa_plan) |*p| p.deinit();
+        if (req.vsa) |c| {
+            if (!h3_vsa.enabled()) {
+                log.info("[minimax-h3] VSA off (MINIMAX_H3_VSA=0): dense attention\n", .{});
+            } else if (model.split != null) {
+                log.warn("[minimax-h3] VSA off under a cluster row split: dense attention\n", .{});
+            } else {
+                const segs = try layout.vsaSegments(allocator);
+                defer allocator.free(segs);
+                vsa_plan = try h3_vsa.Plan.init(allocator, segs, c, s);
+            }
+        }
+        model.vsa = if (vsa_plan) |*p| p else null;
+        defer model.vsa = null;
         var bcast_reused: u32 = 0;
 
         // ── step cache (TeaCache-style velocity reuse, OPT-IN) ──
@@ -4486,8 +4747,9 @@ fn generateOne(
         defer if (sc_v_video) |x| {
             _ = mlx.mlx_array_free(x);
         };
-        var sc_a_raw: ?mlx.mlx_array = null; // audio velocity DIVIDED by its slope
-        defer if (sc_a_raw) |x| {
+        var sc_a: ?mlx.mlx_array = null; // the caching forward's slope-scaled audio velocity
+        var sc_a_slope: f64 = 1.0;
+        defer if (sc_a) |x| {
             _ = mlx.mlx_array_free(x);
         };
         var sc_acc: f64 = 0;
@@ -4533,18 +4795,10 @@ fn generateOne(
                 const nv = try addA(video_x, stepv, s);
                 _ = mlx.mlx_array_free(video_x);
                 video_x = nv;
-                // `sc_a_raw` is the RAW audio-clock velocity (already divided
-                // by its forward's slope), so its exact advance is the mapped
-                // Δσa itself; the non-turbo arm keeps the validated
-                // first-order form (this path is only reachable under turbo
-                // when the env forces the cache back on).
-                const askip = if (req.turbo)
-                    timeShiftSigma(sigmas[i + 1], req.shift_video, req.shift_audio) - timeShiftSigma(sigma, req.shift_video, req.shift_audio)
-                else
-                    dsigma * timeShiftSlope(sigma, req.shift_video, req.shift_audio);
-                const da = try scalarLike(@floatCast(askip), sc_a_raw.?, s);
+                const askip = cachedAudioAdvance(req.turbo or req.pdd != null, sc_a_slope, sigma, sigmas[i + 1], max_t, req.shift_video, req.shift_audio);
+                const da = try scalarLike(@floatCast(askip), sc_a.?, s);
                 defer _ = mlx.mlx_array_free(da);
-                const stepa = try mulA(sc_a_raw.?, da, s);
+                const stepa = try mulA(sc_a.?, da, s);
                 defer _ = mlx.mlx_array_free(stepa);
                 const na = try addA(audio_x, stepa, s);
                 _ = mlx.mlx_array_free(audio_x);
@@ -4561,9 +4815,9 @@ fn generateOne(
                 continue;
             }
             var plan = if (model.adaln_tables) |tt|
-                try buildTimestepPlanGlobal(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{}, tt.ts)
+                try buildTimestepPlanGlobal(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{ .max_t = max_t }, tt.ts)
             else
-                try buildTimestepPlan(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{});
+                try buildTimestepPlan(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{ .max_t = max_t });
             defer plan.deinit();
 
             // The forward consumes EVERY video-stream row in packed order:
@@ -4587,9 +4841,13 @@ fn generateOne(
                 _ = mlx.mlx_array_free(audio_in);
             };
 
-            const refresh = attnBroadcastRefresh(i, req.steps, bcast_k);
+            const refresh = attnBroadcastRefresh(i, req.steps, bcast_k, sc_consec > 0);
             if (attn_bcast != null and !refresh) bcast_reused += 1;
-            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, s);
+            var fused: ?Model.Heads = if (req.pdd) |*p| try model.pddHeads(p, @intCast(i), req.shift_video, req.shift_audio, s) else null;
+            defer if (fused) |*f| f.deinit();
+            // The shift maps read the unit clock; max_t scales the noise levels.
+            const unit = sigma / max_t;
+            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, fused orelse model.ownHeads(), timeShiftSlope(unit, req.shift_video, req.shift_audio), if (attn_bcast) |*ab| ab else null, refresh, s);
             defer out.deinit();
 
             // Per-step JPEG from predicted clean x0 = x - σ·v, using the
@@ -4614,7 +4872,7 @@ fn generateOne(
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
 
-            const da = try scalarLike(@floatCast(audioStepFactor(req.turbo, sigma, sigmas[i + 1], req.shift_video, req.shift_audio)), out.audio, s);
+            const da = try scalarLike(@floatCast(max_t * audioStepFactor(req.turbo or req.pdd != null, unit, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio)), out.audio, s);
             defer _ = mlx.mlx_array_free(da);
             const stepa = try mulA(out.audio, da, s);
             defer _ = mlx.mlx_array_free(stepa);
@@ -4623,14 +4881,13 @@ fn generateOne(
             audio_x = na;
 
             if (sc_thresh > 0) {
-                const slope_f = timeShiftSlope(sigma, req.shift_video, req.shift_audio);
+                const slope_f = cachedAudioSlope(sigma, max_t, req.shift_video, req.shift_audio);
                 if (slope_f > 1e-9) {
                     if (sc_v_video) |x| _ = mlx.mlx_array_free(x);
                     sc_v_video = try contig(out.video, s);
-                    const inv_slope = try scalarLike(@floatCast(1.0 / slope_f), out.audio, s);
-                    defer _ = mlx.mlx_array_free(inv_slope);
-                    if (sc_a_raw) |x| _ = mlx.mlx_array_free(x);
-                    sc_a_raw = try mulA(out.audio, inv_slope, s);
+                    if (sc_a) |x| _ = mlx.mlx_array_free(x);
+                    sc_a = try contig(out.audio, s);
+                    sc_a_slope = slope_f;
                 }
                 sc_acc = 0;
                 sc_consec = 0;
@@ -5583,6 +5840,140 @@ test "minimax h3: dual sigma schedule and velocity slope" {
     }
 }
 
+const OMNI_CONTRACT =
+    \\{"model_type":"minimax_h3","pdd_steps":32,"pdd_step_indices":[0,4,8,12,16,20,24,28,32],"grid_max_t":0.999}
+;
+
+test "minimax h3: a FastH3 PDD contract samples on FastVideo's own plan" {
+    // Bar: `build_pdd_sampling_plan` of FastVideo's MLX runtime on the release's
+    // `fastvideo_inference.json` (node sigmas and normalized block weights).
+    const p = (try Pdd.fromConfig(testing.allocator, OMNI_CONTRACT)).?;
+    try testing.expectEqual(@as(u32, 8), p.steps());
+    const sig = try p.sigmas(testing.allocator, SIGMA_SHIFT_VIDEO);
+    defer testing.allocator.free(sig);
+    const want_v = [_]f64{ 0.9989999999999998, 0.9872470588235293, 0.972, 0.9514285714285715, 0.9221538461538461, 0.8771707317073171, 0.7992, 0.6309473684210525, 0.0 };
+    const want_a = [_]f64{ 0.999, 0.9535909090909089, 0.8990999999999999, 0.8325, 0.74925, 0.6422142857142856, 0.49950000000000006, 0.2996999999999999, 0.0 };
+    for (want_v, sig, 0..) |w, g, k| {
+        try testing.expectApproxEqAbs(w, g, 1e-12);
+        try testing.expectApproxEqAbs(want_a[k], p.sigmaAt(p.nodes[k], SIGMA_SHIFT_AUDIO), 1e-12);
+    }
+    var buf: [Pdd.MAX_NODES]f32 = undefined;
+    const cases = [_]struct { k: u32, shift: f64, w: [4]f32 }{
+        .{ .k = 0, .shift = SIGMA_SHIFT_VIDEO, .w = .{ 0.22788203753351186, 0.24173122213499687, 0.25688246682721805, 0.27350427350427325 } },
+        .{ .k = 0, .shift = SIGMA_SHIFT_AUDIO, .w = .{ 0.23404255319148914, 0.24421831637372868, 0.2550724637681157, 0.26666666666666644 } },
+        .{ .k = 3, .shift = SIGMA_SHIFT_VIDEO, .w = .{ 0.21576763485477146, 0.23640627818870696, 0.26015485407980904, 0.2876712328767124 } },
+        .{ .k = 7, .shift = SIGMA_SHIFT_VIDEO, .w = .{ 0.12307692307692293, 0.17321937321937295, 0.2618432385874253, 0.4418604651162787 } },
+        .{ .k = 7, .shift = SIGMA_SHIFT_AUDIO, .w = .{ 0.2105263157894735, 0.23391812865497053, 0.2614379084967327, 0.29411764705882326 } },
+    };
+    for (cases) |c| {
+        const got = p.blockWeights(c.k, c.shift, &buf);
+        try testing.expectEqual(@as(usize, 4), got.len);
+        for (c.w, got) |w, g| try testing.expectApproxEqAbs(w, g, 1e-6);
+    }
+}
+
+test "minimax h3: a PDD contract that cannot be sampled is refused, a plain pack has none" {
+    const a = testing.allocator;
+    try testing.expectEqual(@as(?Pdd, null), try Pdd.fromConfig(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\"]}"));
+    for ([_][]const u8{
+        "{\"pdd_steps\":32}", // no partition
+        "{\"pdd_steps\":32,\"pdd_step_indices\":[0,4,32,28],\"grid_max_t\":0.999}", // not increasing
+        "{\"pdd_steps\":32,\"pdd_step_indices\":[4,8,32],\"grid_max_t\":0.999}", // does not start at 0
+        "{\"pdd_steps\":32,\"pdd_step_indices\":[0,8,16],\"grid_max_t\":0.999}", // does not end at the grid
+        "{\"pdd_steps\":1,\"pdd_step_indices\":[0,1],\"grid_max_t\":0.999}", // no block structure
+        "{\"pdd_steps\":32,\"pdd_step_indices\":[0,32],\"grid_max_t\":1.5}", // clock past 1
+    }) |cfg| try testing.expectError(error.BadPddContract, Pdd.fromConfig(a, cfg));
+}
+
+test "minimax h3: PDD heads and the pack's contract must agree" {
+    const p = (try Pdd.fromConfig(testing.allocator, OMNI_CONTRACT)).?;
+    const cfg = Config{};
+    try checkPddHeads(cfg.videoPatchDim(), cfg.audio_latents_dim, cfg, null);
+    try checkPddHeads(32 * cfg.videoPatchDim(), 32 * cfg.audio_latents_dim, cfg, &p);
+    try testing.expectError(error.PddHeadsWithoutContract, checkPddHeads(32 * cfg.videoPatchDim(), 32 * cfg.audio_latents_dim, cfg, null));
+    try testing.expectError(error.PddContractWithoutHeads, checkPddHeads(cfg.videoPatchDim(), cfg.audio_latents_dim, cfg, &p));
+    try testing.expectError(error.PddGridMismatch, checkPddHeads(16 * cfg.videoPatchDim(), 16 * cfg.audio_latents_dim, cfg, &p));
+    try testing.expectError(error.PddGridMismatch, checkPddHeads(32 * cfg.videoPatchDim(), 16 * cfg.audio_latents_dim, cfg, &p));
+}
+
+test "minimax h3: the timestep plan reads a PDD student's 0.999 clock" {
+    const a = testing.allocator;
+    const p = (try Pdd.fromConfig(a, OMNI_CONTRACT)).?;
+    var l = try PackedLayout.init(a, 8, 2, 4, 4, 8, &.{}, 5);
+    defer l.deinit();
+    const k: u32 = 3;
+    var plan = try buildTimestepPlan(a, &l, p.sigmaAt(p.nodes[k], SIGMA_SHIFT_VIDEO), SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .max_t = p.max_t });
+    defer plan.deinit();
+    const t_a = 1.0 - p.sigmaAt(p.nodes[k], SIGMA_SHIFT_AUDIO);
+    const found = for (plan.unique_t[0..plan.n_unique]) |t| {
+        if (@abs(t - t_a) < 1e-12) break true;
+    } else false;
+    try testing.expect(found);
+}
+
+test "minimax h3: fused PDD heads equal the weighted sum of the heads they replace" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const grid: u32 = 6;
+    const out: c_int = 5;
+    const in: c_int = 16;
+    const w16 = try glueRand(&[_]c_int{ @as(c_int, @intCast(grid)) * out, in }, 11, 1.0, s);
+    defer _ = mlx.mlx_array_free(w16);
+    const w = try astype(w16, .float32, s);
+    defer _ = mlx.mlx_array_free(w);
+    const b16 = try glueRand(&[_]c_int{@as(c_int, @intCast(grid)) * out}, 12, 1.0, s);
+    defer _ = mlx.mlx_array_free(b16);
+    const b = try astype(b16, .float32, s);
+    defer _ = mlx.mlx_array_free(b);
+    const x16 = try glueRand(&[_]c_int{ 7, in }, 13, 1.0, s);
+    defer _ = mlx.mlx_array_free(x16);
+    const x = try astype(x16, .float32, s);
+    defer _ = mlx.mlx_array_free(x);
+
+    const start: u32 = 2;
+    const wts = [_]f32{ 0.2, 0.3, 0.5 };
+    const fused = try fusePddHead(w, b, grid, start, &wts, s);
+    defer for (fused) |f| {
+        _ = mlx.mlx_array_free(f);
+    };
+    const got = try denseLinear(x, fused[0], fused[1], s);
+    defer _ = mlx.mlx_array_free(got);
+
+    var want = try scalarLike(0, got, s);
+    defer _ = mlx.mlx_array_free(want);
+    for (wts, 0..) |wj, j| {
+        const row: c_int = @intCast((start + j) * @as(u32, @intCast(out)));
+        const hw = try sliceRows(w, row, row + out, s);
+        defer _ = mlx.mlx_array_free(hw);
+        const hb = try sliceAxis0(b, row, row + out, s);
+        defer _ = mlx.mlx_array_free(hb);
+        const y = try denseLinear(x, hw, hb, s);
+        defer _ = mlx.mlx_array_free(y);
+        const sc = try scalarLike(wj, y, s);
+        defer _ = mlx.mlx_array_free(sc);
+        const term = try mulA(y, sc, s);
+        defer _ = mlx.mlx_array_free(term);
+        const next = try addA(want, term, s);
+        _ = mlx.mlx_array_free(want);
+        want = next;
+    }
+    try testing.expect(try cosineSim(got, want, s) > 0.999999);
+    // The forward itself runs TF32 matmuls (~1e-3); the fused weights below are held exact.
+    try testing.expectApproxEqAbs(@as(f32, 1.0), try rmsRatio(got, want, s), 1e-3);
+
+    // The fusion: an f32 weighted sum of each head's rows, as FastVideo's `fuse_block_params`.
+    try mlx.check(mlx.mlx_array_eval(w));
+    try mlx.check(mlx.mlx_array_eval(fused[0]));
+    const wd = mlx.mlx_array_data_float32(w).?;
+    const fd = mlx.mlx_array_data_float32(fused[0]).?;
+    const per_head: usize = @intCast(out * in);
+    for (0..per_head) |e| {
+        var acc: f64 = 0;
+        for (wts, 0..) |wj, j| acc += @as(f64, wj) * wd[(start + j) * per_head + e];
+        try testing.expectApproxEqAbs(acc, fd[e], 1e-5);
+    }
+}
+
 test "minimax h3: area-normalized frame position grid" {
     const a = testing.allocator;
     var parsed = try loadFixture(a);
@@ -6055,6 +6446,27 @@ test "minimax h3: the reference set has a TOTAL cap, not just per-type ones" {
     };
     defer ok.deinit();
     try testing.expectEqual(@as(usize, 12), ok.refs.len);
+}
+
+test "h3 vsa: the packed layout hands VSA every segment in order, video segments as grids" {
+    const a = testing.allocator;
+    const refs = [_]RefBlock{
+        .{ .kind = .image, .latent_h = 4, .latent_w = 4 },
+        .{ .kind = .video, .latent_h = 4, .latent_w = 8, .latent_t = 2, .audio_t = 3 },
+    };
+    var lay = try PackedLayout.initFull(a, 10, 3, 8, 12, 4, &.{}, 9, &refs);
+    defer lay.deinit();
+    const segs = try lay.vsaSegments(a);
+    defer a.free(segs);
+    const want = [_]h3_vsa.Seg{ .{ .dense = 10 }, .{ .dense = 4 }, .{ .dense = 6 }, .{ .grid = .{ 2, 2, 4 } }, .{ .dense = 8 }, .{ .grid = .{ 3, 4, 6 } } };
+    try testing.expectEqualSlices(h3_vsa.Seg, &want, segs);
+
+    // Keyframe rows are ONE dense run, as FastVideo packs `n_cond`.
+    var fl = try PackedLayout.init(a, 10, 3, 8, 12, 4, &.{ .first, .last }, 9);
+    defer fl.deinit();
+    const fsegs = try fl.vsaSegments(a);
+    defer a.free(fsegs);
+    try testing.expectEqualSlices(h3_vsa.Seg, &.{ .{ .dense = 10 }, .{ .dense = 48 }, .{ .dense = 8 }, .{ .grid = .{ 3, 4, 6 } } }, fsegs);
 }
 
 test "minimax h3: Qwen sees a reference video at 2 fps" {
@@ -6863,20 +7275,26 @@ test "minimax h3 live: projection gemm ubench" {
 
 test "minimax h3: attention-broadcast refresh schedule" {
     // k<=1 = off (every step refreshes).
-    for (0..10) |i| try testing.expect(attnBroadcastRefresh(i, 30, 0));
-    for (0..10) |i| try testing.expect(attnBroadcastRefresh(i, 30, 1));
+    for (0..10) |i| try testing.expect(attnBroadcastRefresh(i, 30, 0, false));
+    for (0..10) |i| try testing.expect(attnBroadcastRefresh(i, 30, 1, false));
     // k=2: warmup 0-3 and the last two steps always refresh; alternating between.
-    for (0..4) |i| try testing.expect(attnBroadcastRefresh(i, 30, 2));
-    try testing.expect(attnBroadcastRefresh(4, 30, 2));
-    try testing.expect(!attnBroadcastRefresh(5, 30, 2));
-    try testing.expect(attnBroadcastRefresh(6, 30, 2));
-    try testing.expect(attnBroadcastRefresh(28, 30, 2));
-    try testing.expect(attnBroadcastRefresh(29, 30, 2));
+    for (0..4) |i| try testing.expect(attnBroadcastRefresh(i, 30, 2, false));
+    try testing.expect(attnBroadcastRefresh(4, 30, 2, false));
+    try testing.expect(!attnBroadcastRefresh(5, 30, 2, false));
+    try testing.expect(attnBroadcastRefresh(6, 30, 2, false));
+    try testing.expect(attnBroadcastRefresh(28, 30, 2, false));
+    try testing.expect(attnBroadcastRefresh(29, 30, 2, false));
     // k=3 skips two of three mid-schedule steps.
-    try testing.expect(attnBroadcastRefresh(4, 30, 3));
-    try testing.expect(!attnBroadcastRefresh(5, 30, 3));
-    try testing.expect(!attnBroadcastRefresh(6, 30, 3));
-    try testing.expect(attnBroadcastRefresh(7, 30, 3));
+    try testing.expect(attnBroadcastRefresh(4, 30, 3, false));
+    try testing.expect(!attnBroadcastRefresh(5, 30, 3, false));
+    try testing.expect(!attnBroadcastRefresh(6, 30, 3, false));
+    try testing.expect(attnBroadcastRefresh(7, 30, 3, false));
+}
+
+test "minimax h3: a forward after a step-cache skip recomputes attention" {
+    // Step 5 reuses step 4's attention on the plain schedule; after a skipped step 4 it cannot.
+    try testing.expect(!attnBroadcastRefresh(5, 30, 2, false));
+    try testing.expect(attnBroadcastRefresh(5, 30, 2, true));
 }
 
 test "minimax h3: the broadcast schedule scales down to few-step runs" {
@@ -6888,19 +7306,19 @@ test "minimax h3: the broadcast schedule scales down to few-step runs" {
     // runHeadlessServe eating the PLD flags.
     var bcast4: usize = 0;
     for (0..4) |i| {
-        if (!attnBroadcastRefresh(i, 4, 2)) bcast4 += 1;
+        if (!attnBroadcastRefresh(i, 4, 2, false)) bcast4 += 1;
     }
     try testing.expect(bcast4 >= 1);
     var bcast8: usize = 0;
     for (0..8) |i| {
-        if (!attnBroadcastRefresh(i, 8, 2)) bcast8 += 1;
+        if (!attnBroadcastRefresh(i, 8, 2, false)) bcast8 += 1;
     }
     try testing.expect(bcast8 >= 3);
     // Two invariants no step count may break: step 0 has nothing cached to
     // reuse, and the last step is where detail lands.
     inline for (.{ 4, 8, 12, 16 }) |n| {
-        try testing.expect(attnBroadcastRefresh(0, n, 2));
-        try testing.expect(attnBroadcastRefresh(n - 1, n, 2));
+        try testing.expect(attnBroadcastRefresh(0, n, 2, false));
+        try testing.expect(attnBroadcastRefresh(n - 1, n, 2, false));
     }
 }
 
@@ -6910,13 +7328,13 @@ test "minimax h3: the measured >=30-step schedules are unchanged" {
     // a schedule anyone has already validated by eye.
     const bcast30 = [_]usize{ 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27 };
     for (0..30) |i| {
-        const is_bcast = !attnBroadcastRefresh(i, 30, 2);
+        const is_bcast = !attnBroadcastRefresh(i, 30, 2, false);
         try testing.expectEqual(std.mem.indexOfScalar(usize, &bcast30, i) != null, is_bcast);
     }
-    for (0..4) |i| try testing.expect(attnBroadcastRefresh(i, 50, 2));
-    try testing.expect(!attnBroadcastRefresh(5, 50, 2));
-    try testing.expect(attnBroadcastRefresh(48, 50, 2));
-    try testing.expect(attnBroadcastRefresh(49, 50, 2));
+    for (0..4) |i| try testing.expect(attnBroadcastRefresh(i, 50, 2, false));
+    try testing.expect(!attnBroadcastRefresh(5, 50, 2, false));
+    try testing.expect(attnBroadcastRefresh(48, 50, 2, false));
+    try testing.expect(attnBroadcastRefresh(49, 50, 2, false));
 }
 
 test "minimax h3: the step-cache warmup scales the same way" {
@@ -7048,6 +7466,18 @@ test "minimax h3: a Turbo file is held to the modules it ships, not to one expor
     try testing.expect(turboAttachComplete(Model.LORA_TARGETS, Model.LORA_TARGETS));
     try testing.expect(turboAttachComplete(208, 208)); // Lightx2v: no AdaLN projections
     try testing.expect(!turboAttachComplete(200, 208)); // ships modules this DiT does not have
+}
+
+test "minimax h3: a step-cache skip advances the cached audio as the forward that cached it would" {
+    // Bar: on every clock, a skip at the caching forward's own sigma equals that forward's advance.
+    const cases = [_]struct { distilled: bool, max_t: f64 }{ .{ .distilled = true, .max_t = 0.999 }, .{ .distilled = true, .max_t = 1.0 }, .{ .distilled = false, .max_t = 1.0 } };
+    for (cases) |c| for ([_]f64{ 0.999, 0.95, 0.8, 0.5, 0.2 }) |sigma| {
+        const next = sigma * 0.9;
+        const normal = c.max_t * audioStepFactor(c.distilled, sigma / c.max_t, next / c.max_t, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO);
+        const slope = cachedAudioSlope(sigma, c.max_t, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO);
+        const skip = cachedAudioAdvance(c.distilled, slope, sigma, next, c.max_t, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO);
+        try std.testing.expectApproxEqRel(normal, skip, 1e-12);
+    };
 }
 
 test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-order otherwise" {

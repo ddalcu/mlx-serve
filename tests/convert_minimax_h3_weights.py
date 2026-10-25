@@ -48,12 +48,21 @@ Usage:
         --src ~/claude-tmp/h3-build/src \
         --tokenizer ~/claude-tmp/h3-build/src_orig/REF2VA/processor \
         --out ~/.mlx-serve/models/ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit
+
+    # FastH3 Omni: FastVideo's 8-step PDD student of the REF2VA DiT, read from
+    # its diffusers release; everything else is cloned from an H3 pack
+    uv run --with mlx tests/convert_minimax_h3_weights.py --partition omni \
+        --src <FastVideo/FastVideo-FastH3-Omni-8-Step-V1 snapshot> \
+        --reuse-from ~/.mlx-serve/models/ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit \
+        --out ~/.mlx-serve/models/ddalcu/FastH3-Omni-MLX-Serve-8bit
 """
 
 import argparse
+import glob
 import json
 import os
 import shutil
+import subprocess
 import time
 
 import mlx.core as mx
@@ -103,6 +112,60 @@ DTYPE_NAME = {
 }
 
 
+# diffusers -> ComfyUI module roots, as FastVideo's own Comfy export renames them
+# (FastVideo/FastH3-Omni-Comfy `conversion/convert_omniref_comfy.py`).
+FASTVIDEO_ROOTS = {
+    "proj_in": "video_patch_proj", "audio_proj_in": "audio_patch_proj",
+    "context_embedder": "condition_proj", "proj_out": "final_layer.video_out",
+    "audio_proj_out": "final_layer.audio_out", "norm_out.linear": "final_layer.adaln_proj.linear",
+    "norm_out.norm": "final_layer.norm", "time_embedder.linear_1": "time_embedder.proj_in",
+    "time_embedder.linear_2": "time_embedder.proj_out",
+}
+
+
+def comfy_name(name):
+    for before in sorted(FASTVIDEO_ROOTS, key=len, reverse=True):
+        if name.startswith(before + "."):
+            return FASTVIDEO_ROOTS[before] + name[len(before):]
+    name = name.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.")
+    if name.startswith("transformer_blocks."):
+        name = "blocks." + name[len("transformer_blocks."):]
+    return (name.replace(".attn.norm_q.", ".attn.q_norm.").replace(".attn.norm_k.", ".attn.k_norm.")
+            .replace(".attn.to_out.0.", ".attn.out_proj.").replace(".ff.net.2.", ".mlp.fc2.")
+            .replace(".ff.net.0.proj.", ".mlp.fc1."))
+
+
+def fastvideo_dit(dit_dir):
+    """A FastVideo diffusers DiT as the lazy Comfy-named tensors this engine
+    reads: Q/K/V fused in that order, SwiGLU halves swapped from (value, gate)
+    to (gate, value) and RoPE inverse frequencies generated. Every other tensor
+    is consumed, the PDD head banks and the VSA `to_gate_compress` projections
+    included."""
+    cfg = json.load(open(os.path.join(dit_dir, "config.json")))
+    src = {}
+    for shard in sorted(glob.glob(os.path.join(dit_dir, "*.safetensors"))):
+        src.update(mx.load(shard))
+    out = {}
+    for k in sorted(src):
+        if ".attn.to_k." in k or ".attn.to_v." in k:
+            continue
+        if ".attn.to_q." in k:
+            qkv = [src[k.replace(".to_q.", f".to_{p}.")] for p in "qkv"]
+            out[comfy_name(k).replace(".attn.to_q.", ".attn.qkv_proj.")] = mx.concatenate(qkv, axis=0)
+        elif ".ff.net.0.proj." in k:
+            half = src[k].shape[0] // 2
+            out[comfy_name(k)] = mx.concatenate([src[k][half:], src[k][:half]], axis=0)
+        else:
+            out[comfy_name(k)] = src[k]
+    gates = sum(".to_gate_compress." in k for k in src)
+    fused_away = 2 * (cfg["num_layers"] + cfg["num_refiner_layers"])  # to_k, to_v
+    if gates != cfg["num_layers"] or len(src) != len(out) + fused_away:
+        raise SystemExit(f"unexpected FastVideo DiT key set ({len(src)} source, {len(out)} mapped)")
+    half = cfg["rope_freq_dim"]
+    out["rope.inv_freq"] = 1.0 / (cfg["rope_theta"] ** (mx.arange(0, 2 * half, 2, dtype=mx.float32) / (2 * half)))
+    return out
+
+
 def convert_file(src_path, dst_path, label):
     t0 = time.time()
     out = {}
@@ -112,7 +175,7 @@ def convert_file(src_path, dst_path, label):
     # RAM as a whole. (safetensors' numpy framework cannot represent bfloat16 at
     # all — `data type 'bfloat16' not understood` — so this is not just faster,
     # it is the only path that reads these files.)
-    src = mx.load(src_path)
+    src = fastvideo_dit(src_path) if os.path.isdir(src_path) else mx.load(src_path)
     keys = list(src.keys())
     for i, k in enumerate(keys):
         arr = src.pop(k)
@@ -175,6 +238,22 @@ PARTITIONS = {
         "blurb": ("Text-to-audio-video conditioned on reference images, videos "
                   "and audio, for character / style / scene continuity."),
     },
+    "omni": {
+        "dit_file": "transformer_ref",
+        "tasks": ["ref2va"],
+        "upstream": "FastVideo/FastVideo-FastH3-Omni-8-Step-V1",
+        "base_model": "FastVideo/FastVideo-FastH3-Omni-8-Step-V1",
+        "title": "FastH3 Omni",
+        "blurb": ("FastVideo's 8-step distillation of MiniMax-H3 REF2VA: video with "
+                  "a matching stereo soundtrack from a prompt and ordered image, "
+                  "video and audio references, in eight transformer forwards. It needs "
+                  "at least one image or video reference and runs exactly 8 steps."),
+        "tags": "- image-text-to-video",
+        "extra": ("* The DiT is read from FastVideo's diffusers release: modules "
+                  "renamed to ComfyUI's MiniMax-H3 names, Q/K/V fused and the SwiGLU "
+                  "input halves reordered to (gate, value). All 32 PDD output heads "
+                  "and the sparse-attention `to_gate_compress` projections are kept.\n"),
+    },
 }
 
 CONFIG = {
@@ -223,7 +302,7 @@ What changed:
 * The tokenizer files are byte-for-byte copies from `MiniMaxAI/MiniMax-H3`
   (`FL2VA/processor/`), relocated into this directory so the model is
   self-contained.
-* `config.json` is new, written by mlx-serve's converter to describe the
+{extra}* `config.json` is new, written by mlx-serve's converter to describe the
   layout above. It is not from the original release.
 
 No weights were retrained, distilled, pruned or otherwise altered beyond the
@@ -234,13 +313,12 @@ README = """---
 license: other
 license_name: minimax-h3-community-license-agreement
 license_link: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE
-base_model: MiniMaxAI/MiniMax-H3
+base_model: {base_model}
 base_model_relation: quantized
 library_name: mlx
 tags:
 - mlx-serve
-- text-to-video
-- image-text-to-video
+{tags}
 - audio-video-generation
 ---
 
@@ -290,8 +368,9 @@ def main():
                     help="affine bits for every quantized linear (default 8)")
     ap.add_argument("--cpu", action="store_true",
                     help="quantize on the CPU stream (lets a conversion run while the GPU is busy)")
-    ap.add_argument("--src", required=True, help="dir holding the Comfy-Org bf16 files")
-    ap.add_argument("--tokenizer", required=True, help="dir holding tokenizer.json")
+    ap.add_argument("--src", required=True, help="dir holding the Comfy-Org bf16 files (omni: the FastVideo snapshot)")
+    ap.add_argument("--tokenizer", help="dir holding tokenizer.json (default: --reuse-from)")
+    ap.add_argument("--reuse-from", help="an H3 pack to clone the text encoder, VAEs, tokenizer and LICENSE from")
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-existing", action="store_true", default=True)
     args = ap.parse_args()
@@ -308,9 +387,27 @@ def main():
     src = os.path.expanduser(args.src)
     out = os.path.expanduser(args.out)
     os.makedirs(out, exist_ok=True)
+    if args.reuse_from:
+        reuse = os.path.expanduser(args.reuse_from)
+        for fn in ("text_encoder.safetensors", "video_vae.safetensors", "audio_vae.safetensors"):
+            if not os.path.exists(os.path.join(out, fn)):
+                print(f"[{fn}] cloning from {reuse}", flush=True)
+                # APFS copy-on-write clone: instant, no space; a real copy elsewhere.
+                if subprocess.run(["cp", "-c", os.path.join(reuse, fn), os.path.join(out, fn)]).returncode != 0:
+                    shutil.copyfile(os.path.join(reuse, fn), os.path.join(out, fn))
+    if not (args.tokenizer or args.reuse_from):
+        raise SystemExit("--tokenizer or --reuse-from is required")
+    if args.partition == "omni":
+        contract = json.load(open(os.path.join(src, "fastvideo_inference.json")))
+        if (contract.get("video_scheduler_shift"), contract.get("audio_scheduler_shift")) != (12.0, 3.0):
+            raise SystemExit("contract shifts differ from H3's 12/3; the engine samples on those")
+        for key in ("pdd_steps", "pdd_step_indices", "grid_max_t", "attention_backend",
+                    "vsa_sparsity", "vsa_tile_size", "vsa_ref_policy", "vsa_ref_keep_rate"):
+            CONFIG[key] = contract[key]
 
     jobs = [
-        ("transformer", f"{src}/diffusion_models/{part['dit_file']}",
+        ("transformer", os.path.join(src, part["dit_file"]) if args.partition == "omni"
+         else f"{src}/diffusion_models/{part['dit_file']}",
          f"{out}/transformer.safetensors"),
         ("text_encoder", f"{src}/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
          f"{out}/text_encoder.safetensors"),
@@ -342,13 +439,14 @@ def main():
             shutil.copyfile(s, d)
         total += os.path.getsize(d) / 1e9
 
-    tok = os.path.expanduser(args.tokenizer)
+    tok = os.path.expanduser(args.tokenizer or args.reuse_from)
     for fn in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"):
         p = os.path.join(tok, fn)
         if os.path.exists(p):
             shutil.copyfile(p, os.path.join(out, fn))
-    lic_src = os.path.join(os.path.dirname(tok.rstrip("/")), "..", "LICENSE")
-    lic_src = os.path.normpath(lic_src)
+    lic_src = os.path.join(tok, "LICENSE")
+    if not os.path.exists(lic_src):
+        lic_src = os.path.normpath(os.path.join(os.path.dirname(tok.rstrip("/")), "..", "LICENSE"))
     if not os.path.exists(lic_src):
         lic_src = os.path.join(os.path.dirname(os.path.dirname(tok.rstrip("/"))), "LICENSE")
     if not os.path.exists(lic_src):
@@ -364,9 +462,12 @@ def main():
         f.write(NOTICE)
     def fill(t):
         return (t.replace("{bits}", str(BITS))
+                 .replace("{extra}", part.get("extra", ""))
+                 .replace("{base_model}", part.get("base_model", "MiniMaxAI/MiniMax-H3"))
                  .replace("{upstream}", part["upstream"])
                  .replace("{title}", part["title"])
-                 .replace("{blurb}", part["blurb"]))
+                 .replace("{blurb}", part["blurb"])
+                 .replace("{tags}", part.get("tags", "- text-to-video\n- image-text-to-video")))
 
     with open(os.path.join(out, "MODIFICATIONS.md"), "w") as f:
         f.write(fill(MODIFICATIONS))

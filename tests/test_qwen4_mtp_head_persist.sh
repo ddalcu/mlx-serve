@@ -81,7 +81,7 @@ run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_HEAD_PERSIST value
   MLX_SERVE_MTP_HEAD_PERSIST="$persist" "$BIN" --model "$MODEL" --serve --host 127.0.0.1 \
     --port "$PORT" --log-level info --mtp --prefix-cache-entries 4 > "$log" 2>&1 &
   SPID=$!
-  for _ in $(seq 1 600); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$log" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$log"; exit 1; }; sleep 2; done
+  for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$log" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$log"; exit 1; }; sleep 2; done
   b=$(body)
   # Turn 1 cold-prefills and COMMITS the head; turn 2 is the cache hit.
   curl -s -m 1800 "$u/v1/chat/completions" -H 'content-type: application/json' -d "$b" >/dev/null
