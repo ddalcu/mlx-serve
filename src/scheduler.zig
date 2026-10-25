@@ -5352,6 +5352,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // performance plan): with per-stride SSM checkpoints we can rewind both
     // KV and SSM to a snapshotted prefix; without them, divergence forces a
     // full reset, so we keep the legacy single-slot path for hybrid.
+    if (entry.transformer) |x| if (x.mlx_stream_ext) |m|
+        mlx_stream.configureDiskCache(m, sch.io, entry.path, params.prefix_cache_disk_bytes) catch |err| {
+            log.warn("[mlx-stream] disk prefix cache disabled: {s}\n", .{@errorName(err)});
+        };
     const enable_ssm_cps = params.ssm_checkpoint_stride > 0;
     const ram_prefix_cache = params.prefix_cache_ram_enabled;
     const disk_prefix_cache = params.prefix_cache_disk_bytes > 0;
@@ -7286,6 +7290,12 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
     recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+    if (latched == null and slot.error_code == null and !slot.cancelled.load(.acquire) and !std.mem.eql(u8, reason, "cancelled")) {
+        if (slot.legacy_gen) |*g| if (slot.model.transformer) |x| if (x.mlx_stream_ext) |m|
+            mlx_stream.completeRequest(m, slot.full_prompt, g.generated_ids.items) catch |err| {
+                log.warn("[mlx-stream] request checkpoint update failed: {s}\n", .{@errorName(err)});
+            };
+    }
     // mlx-stream: the arch's request end (GLM-5.3's decode line), before the terminator.
     if (slot.model.transformer) |x| if (x.mlx_stream_ext) |m| mlx_stream.end(m);
     publishSlotTerminator(slot, reason, latched);

@@ -139,6 +139,11 @@ share code: each serves a different arch, and their kernels are tuned to it.
 
 ## Example: mlx-stream (arch seam)
 
+With a plugin providing `saveRequest`/`loadRequest`, `--prefix-cache-disk` also persists streamed DeepSeek
+request boundaries. Successful responses save both their committed token prefix and the original prompt
+fallback. The next load restores a compatible prefix; incompatible or corrupt checkpoints are skipped.
+Requests remain single-flight, and caching is off by default.
+
 [mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`) serves
 DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
 prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`) and, as its third,

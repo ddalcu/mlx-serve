@@ -19,7 +19,10 @@ test {
     _ = @import("crt.zig");
     _ = @import("win_io.zig");
     _ = @import("arch/mlx_gguf.zig");
-    if (@import("build_options").mlx_stream) _ = @import("arch/mlx_stream.zig");
+    if (@import("build_options").mlx_stream) {
+        _ = @import("arch/mlx_stream.zig");
+        _ = @import("arch/stream_checkpoint_cache.zig");
+    }
     _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");

@@ -35,6 +35,8 @@ pub fn open(_: std.mem.Allocator, _: std.Io, _: mlx.mlx_stream, config: *const M
     return refuse(config);
 }
 
+pub fn configureDiskCache(_: *Model, _: std.Io, _: []const u8, _: u64) !void {}
+pub fn completeRequest(_: *Model, _: []const u32, _: []const u32) !void {}
 pub fn close(_: *Model) void {}
 pub fn begin(_: *Model, _: []const u32, _: u32, _: u64) !u64 {
     return 0;

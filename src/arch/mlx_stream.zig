@@ -18,6 +18,8 @@ const scheduler = @import("../scheduler.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const plugin = @import("mlx_stream");
 const sdk = plugin.sdk;
+const checkpoint_cache = @import("stream_checkpoint_cache.zig");
+const io_util = @import("../io_util.zig");
 
 pub const built = true;
 
@@ -63,6 +65,7 @@ pub const Model = struct {
     /// The draft lane is armed for this request (`arm`), under this sampling.
     drafting: bool = false,
     sampling: sdk.SamplingParams = .{},
+    disk: ?checkpoint_cache.Cache = null,
 };
 
 /// The context the load bills: the model's `ctx_size`, else the auto context this pack's preflight chose
@@ -130,6 +133,7 @@ fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const Mo
         return e;
     };
     errdefer A.freeConfig(gpa, c);
+    if (comptime @hasField(A.Config, "checkpoint_cache")) c.checkpoint_cache = server.prefix_cache_disk_bytes > 0;
     // Every arch that declares `applySettings` gets the model's model-settings.json entry (`.null` without one).
     if (comptime @hasDecl(A, "applySettings")) {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -265,6 +269,7 @@ fn openArch(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_str
 }
 
 pub fn close(m: *Model) void {
+    if (m.disk) |*disk| disk.deinit();
     switch (m.arch) {
         inline else => |b, k| {
             const A = Side(k).arch;
@@ -275,6 +280,62 @@ pub fn close(m: *Model) void {
         },
     }
     m.gpa.destroy(m);
+}
+
+pub fn configureDiskCache(m: *Model, io: std.Io, model_path: []const u8, budget: u64) !void {
+    if (budget == 0) return;
+    switch (m.arch) {
+        inline else => |b, k| if (comptime @hasDecl(Side(k).arch, "saveRequest")) {
+            const A = Side(k).arch;
+            const bound: u64 = if (comptime @hasDecl(A.Module, "maxContext")) b.module.maxContext() else if (comptime @hasField(A.Module, "max_context")) b.module.max_context else b.module.context_bound;
+            const layout = try std.fmt.allocPrint(m.gpa, "{s}-serial-checkpoints-v1-ctx{d}-draft{d}", .{ A.name, bound, blockSize(m) });
+            defer m.gpa.free(layout);
+            m.disk = try checkpoint_cache.Cache.init(m.gpa, io, model_path, layout, budget);
+        },
+    }
+}
+
+const CheckpointCall = struct {
+    model: *Model,
+    ids: []const u32 = &.{},
+
+    fn save(ctx: *anyopaque, dir: []const u8, identity: [32]u8) !void {
+        const self: *CheckpointCall = @ptrCast(@alignCast(ctx));
+        switch (self.model.arch) {
+            inline else => |b, k| if (comptime @hasDecl(Side(k).arch, "saveRequest")) {
+                try Side(k).arch.saveRequest(b.module, dir, identity, self.ids);
+            } else return error.CheckpointUnsupported,
+        }
+    }
+
+    fn load(ctx: *anyopaque, dir: []const u8, prefix: []const u32, identity: [32]u8) !u64 {
+        const self: *CheckpointCall = @ptrCast(@alignCast(ctx));
+        return switch (self.model.arch) {
+            inline else => |b, k| if (comptime @hasDecl(Side(k).arch, "loadRequest"))
+                Side(k).arch.loadRequest(b.module, dir, prefix, identity)
+            else
+                error.CheckpointUnsupported,
+        };
+    }
+};
+
+pub fn completeRequest(m: *Model, prompt: []const u32, generated: []const u32) !void {
+    if (m.disk == null) return;
+    switch (m.arch) {
+        inline else => |b, k| if (comptime @hasDecl(Side(k).arch, "saveRequest")) {
+            const ids = try m.gpa.alloc(u32, prompt.len + generated.len);
+            defer m.gpa.free(ids);
+            @memcpy(ids[0..prompt.len], prompt);
+            @memcpy(ids[prompt.len..], generated);
+            if (m.disk) |*disk| {
+                const keep: usize = @intCast(@min(ids.len, Side(k).arch.position(b.module)));
+                var call: CheckpointCall = .{ .model = m, .ids = ids };
+                const watch = io_util.Stopwatch.init(disk.io);
+                try disk.save(ids[0..keep], prompt, &call, CheckpointCall.save);
+                log.info("[mlx-stream-cache] saved tokens={d} bytes={d} elapsed_ms={d}\n", .{ keep, disk.last_saved_bytes, watch.read() / std.time.ns_per_ms });
+            }
+        },
+    }
 }
 
 /// A request's start: how many leading positions of `prompt` the module's kept state already holds (the rest, at
@@ -293,7 +354,17 @@ pub fn begin(m: *Model, prompt: []const u32, max_tokens: u32, context: u64) !u64
             m.prompt_due = true;
             m.handover_due = true;
             m.drafting = false;
-            return if (comptime @hasDecl(A, "restorePrefix")) A.restorePrefix(b.module, prompt[0..prompt.len -| 1]) else 0;
+            const prefix = prompt[0..prompt.len -| 1];
+            var resumed = if (comptime @hasDecl(A, "restorePrefix")) A.restorePrefix(b.module, prefix) else @as(u64, 0);
+            if (m.disk) |*disk| {
+                var call: CheckpointCall = .{ .model = m };
+                const watch = io_util.Stopwatch.init(disk.io);
+                if (try disk.restoreBest(prefix, resumed, &call, CheckpointCall.load)) |keep| {
+                    resumed = keep;
+                    log.info("[mlx-stream-cache] restored tokens={d} elapsed_ms={d}\n", .{ keep, watch.read() / std.time.ns_per_ms });
+                }
+            }
+            return resumed;
         },
     }
 }
