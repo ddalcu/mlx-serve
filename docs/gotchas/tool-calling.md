@@ -57,10 +57,13 @@ and historical positions. Only byte-pinned Qwen template revisions extend the
 strict system branch to emit later ChatML system turns; native tool, reasoning
 and media bytes are parity-tested. Unknown revisions keep their native contract.
 Templates that raise, drop or reorder notes consolidate; supported templates
-preserve order and system role.
+preserve order and system role. A consolidating template logs one warning
+(`lateFoldWarningId`): a Qwen-derived template outside the pinned revisions
+lost prefix reuse every tool round with nothing in the log saying why.
 Responses instruction replacement removes only leading instructions, retaining
 historical notes. Guards: `mid-system:` tests, the cross-family late-note corpus
-invariant, and `tests/test_mid_system_cache.sh` tool rounds plus disk restart.
+invariant, `tests/test_mid_system_cache.sh` tool rounds plus disk restart, and
+`tests/test_late_system_fold_warning.sh`.
 
 ### Tool-arg types must come from the SCHEMA, never from the value's spelling (strict-client rejection class)
 The tag tool formats carry no type information — `<parameter=replace_all>False</parameter>`, Gemma's `key:false` — so the parsers inferred the JSON type from the value's BYTES (`chat.isJsonLiteral`, used by `parseHermesToolCall` + `convertGemma4Value`; `parseXmlElementToolCall` was worse and typed *everything* as a string). That guess is wrong in **both** directions, and strict clients (Claude Code, pi, opencode) reject both:
