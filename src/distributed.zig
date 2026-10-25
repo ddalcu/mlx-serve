@@ -168,7 +168,7 @@ pub const Link = struct {
         log.info("[dist] joining as rank {d}/{d} via {s}, coordinator {s}\n", .{ cfg.rank, cfg.size, cfg.device, cfg.coordinator });
         // Rank 0 listens for the bell before the group forms, so rank 1 finds it once it does.
         const coord = try parseCoordinator(cfg.coordinator);
-        const listener: std.c.fd_t = if (cfg.rank == 0) Bell.listen(coord) else -1;
+        const listener: std.c.fd_t = if (cfg.rank == 0) Bell.listen(coord) else Bell.none;
         defer if (listener >= 0) {
             _ = std.c.close(listener);
         };
@@ -181,13 +181,13 @@ pub const Link = struct {
         var link: Link = .{ .group = g, .rank = @intCast(mlx.mlx_distributed_group_rank(g)), .size = @intCast(mlx.mlx_distributed_group_size(g)) };
         if (link.rank != cfg.rank or link.size != cfg.size) return error.RdmaGroupMismatch;
         link.bell = if (link.rank == 0) Bell.accept(listener) else Bell.connect(coord);
-        if (link.bell.fd < 0) log.warn("[dist] no bell connection: the worker waits on the RDMA link, one core busy\n", .{});
+        if (!link.bell.open()) log.warn("[dist] no bell connection: the worker waits on the RDMA link, one core busy\n", .{});
         log.info("[dist] joined: rank {d} of {d}\n", .{ link.rank, link.size });
         return link;
     }
 
     pub fn deinit(self: *Link) void {
-        if (self.bell.fd >= 0) _ = std.c.close(self.bell.fd);
+        if (self.bell.open()) _ = std.c.close(self.bell.fd);
         _ = mlx.mlx_distributed_group_free(self.group);
     }
 
@@ -233,29 +233,36 @@ pub const Link = struct {
 /// one byte before each control message and rank 1 sleeps on it before receiving one: JACCL
 /// waits by polling the link in a loop, which held a core at 100% while the worker idled.
 const Bell = struct {
-    fd: std.c.fd_t = -1,
+    fd: std.c.fd_t = none,
+
+    /// No connection. `fd_t` is a HANDLE on Windows, where a cluster never forms.
+    const none: std.c.fd_t = if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else -1;
+
+    fn open(b: Bell) bool {
+        return b.fd != none;
+    }
 
     fn listen(coord: Coordinator) std.c.fd_t {
         const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        if (fd < 0) return -1;
+        if (fd < 0) return none;
         const one: c_int = 1;
         _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &one, @sizeOf(c_int));
         var sa: std.posix.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, coord.port +% 1), .addr = @bitCast(coord.ip4) };
         if (std.c.bind(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in)) != 0 or std.c.listen(fd, 1) != 0) {
             _ = std.c.close(fd);
-            return -1;
+            return none;
         }
         return fd;
     }
 
     /// Rank 1 connects right after the group forms; it waits up to 10 s.
     fn accept(listener: std.c.fd_t) Bell {
-        if (listener < 0) return .{};
+        if (listener == none) return .{};
         var fds = [_]std.posix.pollfd{.{ .fd = listener, .events = std.posix.POLL.IN, .revents = 0 }};
         const ready = std.posix.poll(&fds, 10_000) catch return .{};
         if (ready == 0) return .{};
         const fd = std.c.accept(listener, null, null);
-        return .{ .fd = if (fd < 0) -1 else noDelay(fd) };
+        return .{ .fd = if (fd < 0) none else noDelay(fd) };
     }
 
     fn connect(coord: Coordinator) Bell {
@@ -289,12 +296,12 @@ const Bell = struct {
     }
 
     fn ring(b: Bell) !void {
-        if (b.fd < 0) return;
+        if (!b.open()) return;
         if (std.c.write(b.fd, &[_]u8{1}, 1) != 1) return error.DistPeerGone;
     }
 
     fn wait(b: Bell) !void {
-        if (b.fd < 0) return;
+        if (!b.open()) return;
         var x: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(b.fd, &x, 1);
@@ -697,7 +704,13 @@ pub fn noteJob(split: [2]u32, comptime fmt: []const u8, args: anytype) void {
 pub fn shutdown() void {
     const p = peer() orelse return;
     if (!p.ready) return;
-    sendMsg(&p.link, .{ OP_STOP, 0, 0, 0, 0, 0, 0, 0 }, 1) catch return;
+    // The stopped worker posts no more receives: a later message (the model's unload) would wait forever.
+    p.ready = false;
+    sendMsg(&p.link, .{ OP_STOP, 0, 0, 0, 0, 0, 0, 0 }, 1) catch |err| {
+        var eb: [512]u8 = undefined;
+        log.warn("[dist] the stop did not reach the worker ({s}: {s})\n", .{ @errorName(err), mlx.takeError(&eb) orelse "" });
+        return;
+    };
     log.info("[dist] worker released\n", .{});
 }
 
@@ -976,6 +989,7 @@ fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
 /// serves meanwhile. Only the RDMA link opens there; every message runs on the
 /// inference thread, when `model` loads (`planFor`).
 pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32) !void {
+    if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable; // a cluster exists only on macOS
     group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
     t.detach();
@@ -999,7 +1013,7 @@ fn waitForWorker(io: std.Io, cfg: Config) void {
 /// Waits on the bell for the worker to leave: it never writes after its answer, so a read
 /// returns only at its end.
 fn watchWorker(link: *const Link) void {
-    if (link.bell.fd < 0) return;
+    if (!link.bell.open()) return;
     // After its answer the worker writes only each step's compute time (µs, u32).
     var x: [4]u8 = undefined;
     while (link.bell.readAll(&x)) |_| {
@@ -1013,7 +1027,7 @@ fn watchWorker(link: *const Link) void {
 /// Right after the worker joins, over the bell connection (no MLX off the inference thread):
 /// the group's model by name and `modelIdentity`, answered with whether the worker has it.
 fn askForModel(link: *const Link) !void {
-    if (link.bell.fd < 0) return;
+    if (!link.bell.open()) return;
     const g = group.?;
     const name = std.fs.path.basename(g.model);
     const id = try modelIdentity(g.io, g.allocator, g.model);
@@ -1034,7 +1048,7 @@ fn askForModel(link: *const Link) !void {
 /// The worker's side of `askForModel`: looks the model up in its folders and answers with
 /// that and its free memory.
 fn answerModel(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots: []const []const u8) !bool {
-    if (link.bell.fd < 0) return true;
+    if (!link.bell.open()) return true;
     var head: [10]u8 = undefined;
     try link.bell.readAll(&head);
     var name_buf: [256]u8 = undefined;
@@ -1635,9 +1649,9 @@ test "the bell wakes rank 1 once per ring and reports a host that left" {
     try std.testing.expect(listener >= 0);
     defer _ = std.c.close(listener);
     const worker = Bell.connect(coord);
-    try std.testing.expect(worker.fd >= 0);
+    try std.testing.expect(worker.open());
     const host = Bell.accept(listener);
-    try std.testing.expect(host.fd >= 0);
+    try std.testing.expect(host.open());
     try host.ring();
     try host.ring();
     try worker.wait();
@@ -1729,4 +1743,15 @@ test "the leader bills only the layers it keeps of a model its pair splits" {
     try std.testing.expectEqual(@as(u64, 500), shareFor(g, &c, 800, 60, 40));
     // A worker that has not said how much it has: the whole model.
     try std.testing.expectEqual(@as(u64, 800), shareFor(g, &c, 800, 60, 0));
+}
+
+test "after the stop message rank 0 sends the worker nothing more" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // a cluster exists only on macOS
+    // A read-only bell fails to ring, so no message reaches the (absent) RDMA link.
+    const fd = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+    defer _ = std.c.close(fd);
+    peer_slot = .{ .link = .{ .group = undefined, .rank = 0, .size = 2, .bell = .{ .fd = fd } }, .mode = .pipeline, .model = "/m/H3", .split = null, .worker = undefined, .ready = true };
+    defer peer_slot = null;
+    shutdown();
+    try std.testing.expect(!peer().?.ready); // the model's unload at teardown must not message a stopped worker
 }

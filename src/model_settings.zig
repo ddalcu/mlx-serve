@@ -17,6 +17,8 @@ pub const Override = struct {
     mtp_greedy_tail: ?bool = null,
     /// LOSSY int8-activation prefill for 2-bit Prism packs (`qmm_int8`).
     int8_prefill: ?bool = null,
+    /// LOSSY: a dense bf16 head quantized to MXFP8 at load (`--lm-head-mxfp8`, on by default on integrated CUDA).
+    lm_head_mxfp8: ?bool = null,
     /// Serve this model on the Neural Engine (`arch/ane_lm.zig`) instead of the GPU.
     ane: ?bool = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
@@ -28,7 +30,7 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.ane == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.chat_template_kwargs == null and o.drafter == null;
     }
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
@@ -153,6 +155,10 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     };
     if (obj.get("int8_prefill")) |m| switch (m) {
         .bool => |b| o.int8_prefill = b,
+        else => {},
+    };
+    if (obj.get("lm_head_mxfp8")) |m| switch (m) {
+        .bool => |b| o.lm_head_mxfp8 = b,
         else => {},
     };
     if (obj.get("ane")) |m| switch (m) {
@@ -323,7 +329,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
             o.drafter = null;
         };
     };
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} ane={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} drafter={s} kwargs={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -331,6 +337,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
         if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
         if (o.int8_prefill) |b| (if (b) "on" else "off") else "default",
+        if (o.lm_head_mxfp8) |b| (if (b) "on" else "off") else "default",
         if (o.ane) |b| (if (b) "on" else "off") else "default",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
@@ -450,6 +457,18 @@ test "model_settings: int8_prefill is a boolean, anything else is unset" {
     const t = std.testing.allocator;
     try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").int8_prefill);
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").int8_prefill);
+    try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
+    try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: lm_head_mxfp8 is a boolean, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"lm_head_mxfp8": true}, "/m/b": {"lm_head_mxfp8": false}, "/m/c": {"lm_head_mxfp8": 1}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").lm_head_mxfp8);
+    try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").lm_head_mxfp8);
     try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
 }

@@ -55,6 +55,7 @@ final class Model3DGenService: ObservableObject {
 
         let outputPath = Self.makeOutputPath(photoPath: request.photoPath)
         let photoPath = request.photoPath
+        let keepsAlpha = request.model.family.cutoutKeepsAlpha
         let steps = request.steps
         // Send a concrete seed so "random" (-1) actually varies per run.
         let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
@@ -73,7 +74,8 @@ final class Model3DGenService: ObservableObject {
                 // alpha-on-white itself.
                 let imageB64: String? = await Task.detached(priority: .userInitiated) {
                     guard let raw = try? Data(contentsOf: URL(fileURLWithPath: photoPath)) else { return nil }
-                    return SubjectCutout.cutoutOnWhite(imageData: raw).base64EncodedString()
+                    let cut = keepsAlpha ? SubjectCutout.cutoutKeepingAlpha(imageData: raw) : SubjectCutout.cutoutOnWhite(imageData: raw)
+                    return cut.base64EncodedString()
                 }.value
                 guard let imageB64 else {
                     phase = .failed("Couldn't read the photo. Pick a PNG or JPEG.")
@@ -143,15 +145,34 @@ final class Model3DGenService: ObservableObject {
     /// so the file I/O + Vision stay off the main actor. `stream` is injected by
     /// `APIClient.streamGeneration`, not here (mirrors image/video/audio).
     static func requestJson(for request: Model3DGenRequest, modelName: String, imageB64: String, seed: Int) -> [String: Any] {
-        [
-            "model": modelName,
-            "image": imageB64,
-            "steps": request.steps,
-            "guidance_scale": request.guidanceScale,
-            "octree_resolution": request.octreeResolution,
-            "seed": seed,
-            "texture": request.texture,
-        ]
+        switch request.model.family {
+        case .hunyuan3d:
+            return [
+                "model": modelName,
+                "image": imageB64,
+                "steps": request.steps,
+                "guidance_scale": request.guidanceScale,
+                "octree_resolution": request.octreeResolution,
+                "seed": seed,
+                "texture": request.texture,
+            ]
+        case .trellis2, .pixal3d:
+            // `steps` is left out on purpose: omitted keeps the published recipe.
+            var body: [String: Any] = [
+                "model": modelName,
+                "image": imageB64,
+                "seed": seed,
+                "resolution": request.trellisResolution,
+                "decimation_target": request.decimationTarget,
+                "texture_size": request.textureSize,
+            ]
+            // The model's own finish sends nothing, so the server keeps what it predicted.
+            if request.finish != .model {
+                body["roughness_scale"] = request.finish.roughnessScale
+                body["clearcoat"] = request.finish.clearcoat
+            }
+            return body
+        }
     }
 
     /// Extract the base64 GLB from a `{format:"glb", data:…}` response body.

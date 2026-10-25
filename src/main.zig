@@ -146,7 +146,7 @@ fn printUsage(io: std.Io) void {
         \\                      <ip:port> --device <rdma_enX> [--soak N]
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
-        \\                      hermes, aider, zcode); starts the MLX Core app if the
+        \\                      hermes, aider, zcode); starts the MLX-Serve app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
         \\
@@ -237,6 +237,12 @@ fn printUsage(io: std.Io) void {
         \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
         \\                        models with int8 Q/K (NAX GPUs, lossy, wins
         \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
+        \\  --lm-head-mxfp8 / --no-lm-head-mxfp8
+        \\                      Quantize a dense bf16 lm_head to MXFP8 at load, vLLM's
+        \\                        VLLM_MXFP8_LM_HEAD bytes (lossy; half the head's bytes
+        \\                        per token). On by default for quantized Flash Next
+        \\                        packs on an integrated NVIDIA GPU (DGX Spark).
+        \\                        A model's "lm_head_mxfp8" setting wins.
         \\  --ane               Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine
         \\                        instead of the GPU (a model's "ane" setting in
         \\                        model-settings.json wins). The first load on a
@@ -353,7 +359,7 @@ fn printUsage(io: std.Io) void {
         \\                      Target fraction of wall time (0..0.9) the
         \\                        decoding streams keep while another request
         \\                        prefills; also narrows that prefill's chunks.
-        \\                        Default 0 (env MLX_SERVE_PREFILL_DECODE_SHARE).
+        \\                        Default 0.25; 0 = the old schedule (env MLX_SERVE_PREFILL_DECODE_SHARE).
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
@@ -533,6 +539,7 @@ pub fn main(init: std.process.Init) !void {
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
     mlx.exportCudaHome();
+    mlx.exportPtxCacheDir(@import("mlx_stamp").bytes);
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
     @import("prefix_cache.zig").warmEnvCaches();
@@ -576,7 +583,8 @@ pub fn main(init: std.process.Init) !void {
             try cli_mod.cmdPull(allocator, io, args[2]);
             return;
         } else if (std.mem.eql(u8, cmd, "list")) {
-            try cli_mod.cmdList(allocator, io);
+            // `mlx-serve list | head`: the reader hanging up on stdout is not an error.
+            cli_mod.cmdList(allocator, io) catch |e| if (e != error.WriteFailed) return e;
             return;
         } else if (std.mem.eql(u8, cmd, "run")) {
             if (args.len < 3) {
@@ -900,6 +908,10 @@ pub fn main(init: std.process.Init) !void {
             @import("w8a8.zig").enabled = false;
         } else if (std.mem.eql(u8, args[i], "--int8-qk")) {
             @import("nax_attention.zig").int8_qk_cli = true;
+        } else if (std.mem.eql(u8, args[i], "--lm-head-mxfp8")) {
+            @import("transformer.zig").lm_head_mxfp8_cli = true;
+        } else if (std.mem.eql(u8, args[i], "--no-lm-head-mxfp8")) {
+            @import("transformer.zig").lm_head_mxfp8_cli = false;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {

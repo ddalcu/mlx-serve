@@ -44,6 +44,47 @@ final class GLBMeshLoaderTests: XCTestCase {
             .appendingPathComponent("Fixtures/hy3d_textured_quad.glb")
     }
 
+    /// The fixture's material rewritten the way the server writes a finish: a roughness multiplier and a clearcoat.
+    private func fixtureWithFinish(roughness: Double, clearcoat: Double) throws -> URL {
+        let glb = try Data(contentsOf: texturedFixtureURL)
+        func le(_ v: UInt32) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+        let jsonLen = Int(glb.subdata(in: 12..<16).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) })
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: glb.subdata(in: 20..<(20 + jsonLen))) as? [String: Any])
+        var materials = try XCTUnwrap(json["materials"] as? [[String: Any]])
+        var pbr = try XCTUnwrap(materials[0]["pbrMetallicRoughness"] as? [String: Any])
+        pbr["roughnessFactor"] = roughness
+        materials[0]["pbrMetallicRoughness"] = pbr
+        materials[0]["extensions"] = ["KHR_materials_clearcoat": ["clearcoatFactor": clearcoat]]
+        json["materials"] = materials
+        var body = try JSONSerialization.data(withJSONObject: json)
+        while body.count % 4 != 0 { body.append(0x20) }
+        let rest = glb.subdata(in: (20 + jsonLen)..<glb.count)
+        var out = le(0x46546C67) + le(2) + le(UInt32(20 + body.count + rest.count))
+        out += le(UInt32(body.count)) + le(0x4E4F534A) + body + rest
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("finish-\(UUID().uuidString).glb")
+        try out.write(to: url)
+        return url
+    }
+
+    func testThePreviewShowsTheFinishTheGlbDeclares() throws {
+        guard FileManager.default.fileExists(atPath: texturedFixtureURL.path) else {
+            throw XCTSkip("hy3d_textured_quad.glb fixture not present yet (produced by the Zig writer)")
+        }
+        func material(_ url: URL) throws -> SCNMaterial {
+            let scene = try XCTUnwrap(GLBMeshLoader.loadScene(url: url))
+            return try XCTUnwrap(GLBMeshLoader.firstGeometryNode(in: scene)?.geometry?.firstMaterial)
+        }
+        // A GLB with no finish keeps the texture's roughness as it is.
+        let plain = try material(texturedFixtureURL)
+        XCTAssertEqual(plain.roughness.intensity, 1.0, accuracy: 1e-9)
+        // The multiplier scales the roughness texture and the coat shows as SceneKit's clear coat.
+        let url = try fixtureWithFinish(roughness: 0.4, clearcoat: 0.8)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let painted = try material(url)
+        XCTAssertEqual(painted.roughness.intensity, 0.4, accuracy: 1e-6)
+        XCTAssertEqual(painted.clearCoat.contents as? Double, 0.8)
+    }
+
     func testLoadsTexturedFixtureWithUVsAndDiffuseImage() throws {
         guard FileManager.default.fileExists(atPath: texturedFixtureURL.path) else {
             throw XCTSkip("hy3d_textured_quad.glb fixture not present yet (produced by the Zig writer)")

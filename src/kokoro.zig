@@ -831,7 +831,10 @@ fn albertForward(
     s: S,
 ) !mlx.mlx_array {
     var buf: [256]u8 = undefined;
-    const t_len = mlx.getShape(input_ids)[1];
+    // A lost GPU context hands back an empty array from `mlx_array_new_data`.
+    const ids_shape = mlx.getShape(input_ids);
+    if (ids_shape.len != 2) return error.MlxError;
+    const t_len = ids_shape[1];
 
     // ── embeddings: word + position + token_type(0) ──
     const word = try takeAxis(try need(comp, "bert.embeddings.word_embeddings.weight"), input_ids, 0, s);
@@ -2258,6 +2261,16 @@ fn hasSpeakable(phonemes: []const u8) bool {
         else => return true,
     };
     return false;
+}
+
+test "kokoro: empty input ids (a lost GPU context) are an MlxError, not a crash" {
+    mlx.installErrorHandler(); // reading an empty array's shape raises; the latch keeps the test alive
+    var stale: [512]u8 = undefined;
+    defer _ = mlx.takeError(&stale);
+    const empty = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(empty);
+    var comp: ltx.Component = undefined;
+    try std.testing.expectError(error.MlxError, albertForward(&comp, undefined, empty, mlx.gpuStream()));
 }
 
 test "kokoro: hasSpeakable is false for marks and spaces alone" {

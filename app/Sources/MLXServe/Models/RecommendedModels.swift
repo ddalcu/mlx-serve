@@ -433,31 +433,28 @@ extension RecommendedModelPick {
         ramOverrideGB: 78.0
     )
 
-    /// Qwen 3.8 Flash-Next in the Sushi project's packs (beamster): routed experts
+    /// Qwen 3.8 Flash-Next in the Sushi project's 2bpw pack (beamster): routed experts
     /// in EXL3, served through lib/sushi. Scores are Flash-Next's own (the bars
     /// describe the original weights), context is the checkpoint's YaRN 1M, and
-    /// the RAM gate is Sushi's README figure for a full 128k context (GiB).
-    static let sushi2bpw = sushi("2", sizeGB: 69.6, ramGB: 41.7, macGB: 48)
-    static let sushi3bpw = sushi("3", sizeGB: 85.0, ramGB: 56.1, macGB: 64)
-
-    private static func sushi(_ bpw: String, sizeGB: Double, ramGB: Double, macGB: Int) -> RecommendedModelPick {
-        RecommendedModelPick(
-            id: "sushi-\(bpw)bpw",
-            name: "Qwen Flash-Next Sushi \(bpw)bpw",
-            tagline: "EXL3 Variant for \(macGB) GB Macs",
-            blurb: "The same 125 billion parameter Qwen 3.8 Flash-Next, packed by the Sushi project to about \(bpw) bits per weight so it fits a Mac with \(macGB) GB of memory. Fewer bits means a smaller download and less memory, at a small cost in answer quality. Part of the download is a lookup table that stays on disk while it runs.",
-            repoId: "beamster/Qwen3.8-Flash-Next-Sushi-\(bpw)bpw",
-            sizeGB: sizeGB,
-            family: .largest,
-            intelligence: qwen38FlashNext.intelligence,
-            intelligenceIsEstimated: true,
-            speed: qwen38FlashNext.speed,
-            speedIsWithMtp: true,
-            contextTokens: 1_048_576,
-            activeParamsB: 6.0,
-            ramOverrideGB: ramGB
-        )
-    }
+    /// the RAM gate is Sushi's README figure for a full 128k context (GiB). Its
+    /// tier is a stock 64 GB Mac: on 48 GB it needs a raised `iogpu.wired_limit_mb`,
+    /// which the app cannot set, and the 3bpw pack does not fit a stock 64 GB Mac.
+    static let sushi2bpw = RecommendedModelPick(
+        id: "sushi-2bpw",
+        name: "Qwen Flash-Next Sushi 2bpw",
+        tagline: "EXL3 Variant for 64 GB Macs",
+        blurb: "The same 125 billion parameter Qwen 3.8 Flash-Next, packed by the Sushi project to about 2 bits per weight so it fits a Mac with 64 GB of memory. Fewer bits means a smaller download and less memory, at a small cost in answer quality. Part of the download is a lookup table that stays on disk while it runs.",
+        repoId: "beamster/Qwen3.8-Flash-Next-Sushi-2bpw",
+        sizeGB: 69.6,
+        family: .largest,
+        intelligence: qwen38FlashNext.intelligence,
+        intelligenceIsEstimated: true,
+        speed: qwen38FlashNext.speed,
+        speedIsWithMtp: true,
+        contextTokens: 1_048_576,
+        activeParamsB: 6.0,
+        ramOverrideGB: 41.7
+    )
 
 }
 
@@ -481,7 +478,7 @@ extension RecommendedModelPick {
     /// DeepSeek-V4-Flash (~130 GB). Grouped by "needs a very large Mac"
     /// rather than by vendor.
     static let largestCatalog: [RecommendedModelPick] = [
-        .sushi2bpw, .sushi3bpw, .qwen38FlashNext, .deepseekV4Flash,
+        .sushi2bpw, .qwen38FlashNext, .deepseekV4Flash,
     ]
 
     /// Every curated pick, across all three sections — the union the score

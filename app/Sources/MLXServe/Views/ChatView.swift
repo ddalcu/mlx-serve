@@ -2909,7 +2909,7 @@ struct ChatDetailView: View {
                 }
 
                 // The chat model loading: what it is doing and how long is left.
-                ModelLoadProgressRow()
+                ModelLoadProgressRow(chatTargetOnly: true)
 
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the

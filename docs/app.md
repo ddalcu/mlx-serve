@@ -1,6 +1,6 @@
 [English](app.md) · [简体中文](zh-CN/app.md)
 
-# MLX Core (macOS app)
+# MLX-Serve (macOS app)
 
 Menu-bar app that wraps the server with a full UI. [Download the latest release](https://github.com/ddalcu/mlx-serve/releases/latest) or `brew install --cask mlx-serve`. Since v26.8.4 it is one window with a sidebar, content and detail column: Models, Tasks, Settings and the media generators are modes of the chat window rather than separate windows.
 

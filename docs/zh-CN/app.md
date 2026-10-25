@@ -1,6 +1,6 @@
 [English](../app.md) · [简体中文](app.md)
 
-# MLX Core（macOS 应用）
+# MLX-Serve（macOS 应用）
 
 菜单栏应用，用完整的 UI 包住服务器。[下载最新版本](https://github.com/ddalcu/mlx-serve/releases/latest)或执行 `brew install --cask mlx-serve`。自 v26.8.4 起，它是一个窗口，含侧边栏、内容列与详情栏：模型、任务、设置以及媒体生成器都是聊天窗口的模式，而不再是独立窗口。
 

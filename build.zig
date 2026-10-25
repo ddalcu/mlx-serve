@@ -136,6 +136,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
 
+    const mlx_stamp = mlxStampModule(b, "lib/mlx/.version");
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
     // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
     // without traversing the project root.
@@ -167,6 +168,7 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "mlx_stamp", .module = mlx_stamp },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
             .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
@@ -265,6 +267,7 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "mlx_stamp", .module = mlx_stamp },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
             .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
@@ -345,6 +348,17 @@ pub fn build(b: *std.Build) void {
         const conf = b.addRunArtifact(addMlxStreamTests(b, target, optimize, null, macos_sdk_frameworks, "src/conformance.zig", "mlx-stream-conformance"));
         conf.setEnvironmentVariable("MLX_DEFAULT_DEVICE", "cpu");
         b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite (CPU lane, no device)").dependOn(&conf.step);
+    }
+
+    // `zig build check`: type-check the engine and its tests without generating
+    // code. The build system passes `-fno-emit-bin` when no step asks for the
+    // binary, so this is AstGen + Sema alone — the whole tree in seconds, where
+    // emitting it costs minutes (LLVM, single-threaded, ~4x more again at
+    // ReleaseFast). For the edit loop; a real build still gates every change.
+    {
+        const check = b.step("check", "Type-check everything, emitting no binary");
+        check.dependOn(&b.addExecutable(.{ .name = "mlx-serve", .root_module = mod }).step);
+        check.dependOn(&b.addTest(.{ .root_module = test_mod }).step);
     }
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
@@ -451,6 +465,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     });
 
     // The server and its unit tests (`zig build test`, root src/tests.zig) share one module setup.
+    const mlx_stamp = mlxStampModule(b, if (windows) "lib/mlx-win/.version" else "lib/mlx/.version");
     var mods: [2]*std.Build.Module = undefined;
     for (&mods, [_][]const u8{ "src/main.zig", "src/tests.zig" }) |*slot, root| {
         const mod = b.createModule(.{
@@ -460,6 +475,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             .link_libcpp = true,
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "mlx_stamp", .module = mlx_stamp },
                 .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
                 .{ .name = "opencode2_plugin", .module = opencode2_plugin },
                 .{ .name = "agent_skills", .module = agent_skills },
@@ -1134,6 +1150,18 @@ fn readDs4Commit(b: *std.Build) ?[]const u8 {
     const sha = std.mem.trim(u8, head, " \t\r\n");
     if (sha.len < 7 or std.mem.startsWith(u8, sha, "ref:")) return null;
     return b.dupe(sha[0..7]);
+}
+
+/// Module `mlx_stamp`: the staged MLX build's stamp (commits, patch inputs, CUDA arch) as
+/// `bytes`, keying the CUDA kernel cache (`mlx.exportPtxCacheDir`); "" when nothing is staged.
+/// Copied through the build graph: a configure-time read is cached, so a rebuilt MLX kept the old stamp.
+fn mlxStampModule(b: *std.Build, stamp_path: []const u8) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    const src = if (buildRootHandle(b).access(b.graph.io, stamp_path, .{})) |_| blk: {
+        _ = wf.addCopyFile(b.path(stamp_path), "version");
+        break :blk "pub const bytes = @embedFile(\"version\");\n";
+    } else |_| "pub const bytes = \"\";\n";
+    return b.createModule(.{ .root_source_file = wf.add("mlx_stamp.zig", src) });
 }
 
 fn readMlxcPin(b: *std.Build) ?[]const u8 {

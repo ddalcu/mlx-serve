@@ -425,33 +425,74 @@ pub fn delta(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     return scaled;
 }
 
+/// Does any attached adapter contribute (a nonzero scale)? A stack of strength-0 adapters leaves
+/// the base forward exactly as it was, fused kernels included.
+pub fn anyActive(refs: []const Ref) bool {
+    for (refs) |r| if (r.scale != 0) return true;
+    return false;
+}
+
 /// `y + Σ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ` in y's dtype, `y` borrowed, the result always a NEW handle. The
-/// rank-r activation is tiny, so each adapter is one skinny GEMM and an `addmm` whose epilogue adds
-/// onto y: no delta tensor, no scalar pass. An adapter at scale 0 is skipped: MLX's `addmm` does
-/// not return `beta*c` at `alpha == 0`. Caller must ensure `refs.len >= 1`.
+/// rank-r activation is tiny, so the adapters are one skinny GEMM and an `addmm` whose epilogue adds
+/// onto y: no delta tensor. A stack runs as ONE adapter over the concatenated ranks, so the deltas
+/// sum in the GEMM's accumulator and y rounds once. An adapter at scale 0 is skipped: MLX's
+/// `addmm` does not return `beta*c` at `alpha == 0`. Caller must ensure `refs.len >= 1`.
 pub fn addTo(y: mlx.mlx_array, x: mlx.mlx_array, refs: []const Ref, s: mlx.mlx_stream) !mlx.mlx_array {
-    var acc = y;
-    errdefer if (acc.ctx != y.ctx) {
-        _ = mlx.mlx_array_free(acc);
+    var live: [MAX_LORAS]Ref = undefined;
+    var n: usize = 0;
+    for (refs) |r| if (r.scale != 0) {
+        live[n] = r;
+        n += 1;
+    };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (n == 0) {
+        try mlx.check(mlx.mlx_array_set(&out, y));
+        return out;
+    }
+    const one = if (n == 1) live[0] else try stackRanks(live[0..n], s);
+    defer if (n > 1) {
+        _ = mlx.mlx_array_free(one.at);
+        _ = mlx.mlx_array_free(one.bt);
+    };
+    var xa = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xa);
+    try mlx.check(mlx.mlx_matmul(&xa, x, one.at, s));
+    try mlx.check(mlx.mlx_addmm(&out, y, xa, one.bt, one.scale, 1.0, s));
+    return out;
+}
+
+/// The adapters as one: ranks side by side, each `B` scaled in its own dtype (an f32 scalar would
+/// widen a bf16 adapter). The returned arrays are new handles.
+fn stackRanks(refs: []const Ref, s: mlx.mlx_stream) !Ref {
+    var ats: [MAX_LORAS]mlx.mlx_array = undefined;
+    var bts: [MAX_LORAS]mlx.mlx_array = undefined;
+    var n: usize = 0;
+    defer for (bts[0..n]) |b| {
+        _ = mlx.mlx_array_free(b);
     };
     for (refs) |r| {
-        if (r.scale == 0) continue;
-        var xa = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(xa);
-        try mlx.check(mlx.mlx_matmul(&xa, x, r.at, s));
-        var next = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(next);
-        try mlx.check(mlx.mlx_addmm(&next, acc, xa, r.bt, r.scale, 1.0, s));
-        if (acc.ctx != y.ctx) _ = mlx.mlx_array_free(acc);
-        acc = next;
+        ats[n] = r.at;
+        const f = mlx.mlx_array_new_float(r.scale);
+        defer _ = mlx.mlx_array_free(f);
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_astype(&sc, f, mlx.mlx_array_dtype(r.bt), s));
+        bts[n] = mlx.mlx_array_new();
+        n += 1;
+        try mlx.check(mlx.mlx_multiply(&bts[n - 1], r.bt, sc, s));
     }
-    if (acc.ctx == y.ctx) {
-        var same = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(same);
-        try mlx.check(mlx.mlx_array_set(&same, y));
-        return same;
-    }
-    return acc;
+    const va = mlx.mlx_vector_array_new_data(&ats, n);
+    defer _ = mlx.mlx_vector_array_free(va);
+    const vb = mlx.mlx_vector_array_new_data(&bts, n);
+    defer _ = mlx.mlx_vector_array_free(vb);
+    var at = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(at);
+    try mlx.check(mlx.mlx_concatenate_axis(&at, va, 1, s));
+    var bt = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(bt);
+    try mlx.check(mlx.mlx_concatenate_axis(&bt, vb, 0, s));
+    return .{ .at = at, .bt = bt, .scale = 1.0 };
 }
 
 /// Sum of `scale_i · (x @ Aᵀᵢ) @ Bᵀᵢ` over every attached adapter — the
@@ -494,6 +535,11 @@ pub const Slot = struct {
     }
     pub fn active(self: *const Slot) []const Ref {
         return self.refs[0..self.count];
+    }
+    /// Does the slot change the forward (an adapter at a nonzero scale)? A fused route keyed on
+    /// this keeps its bytes under a strength-0 stack.
+    pub fn isActive(self: *const Slot) bool {
+        return anyActive(self.active());
     }
 };
 
@@ -959,6 +1005,23 @@ test "delta computes scale·(x@Aᵀ)@Bᵀ" {
     try testing.expectApproxEqAbs(@as(f32, 132), dd[1], 1e-4);
 }
 
+test "anyActive: a stack is active only through a nonzero scale" {
+    const z = std.mem.zeroes(Ref);
+    var on = z;
+    on.scale = 0.5;
+    var neg = z;
+    neg.scale = -1.0;
+    try std.testing.expect(!anyActive(&.{}));
+    try std.testing.expect(!anyActive(&.{ z, z }));
+    try std.testing.expect(anyActive(&.{ z, on }));
+    try std.testing.expect(anyActive(&.{neg}));
+    var slot: Slot = .{};
+    slot.set(&.{ z, z });
+    try std.testing.expect(!slot.isActive());
+    slot.set(&.{ z, on });
+    try std.testing.expect(slot.isActive());
+}
+
 test "deltaSum adds every attached adapter's delta — the whole point of stacking" {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -1071,6 +1134,45 @@ test "addTo equals y + deltaSum in y's dtype, for one adapter and a stack" {
         try testing.expect(max_abs < 0.35);
     }
 }
+
+test "addTo rounds y once for a stack: two adapters at 1.0 equal one at 2.0" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const full = struct {
+        fn f(rows: c_int, cols: c_int, v: f32, sm: mlx.mlx_stream) !mlx.mlx_array {
+            const shape = [_]c_int{ rows, cols };
+            const val = mlx.mlx_array_new_float(v);
+            defer _ = mlx.mlx_array_free(val);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&out, &shape, 2, val, .bfloat16, sm));
+            return out;
+        }
+    }.f;
+    // Each adapter adds 0.75 to 256, under half of bf16's ulp of 2 there; their sum 1.5 is over it.
+    const x = try full(4, 8, 1.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const y = try full(4, 16, 256.0, s);
+    defer _ = mlx.mlx_array_free(y);
+    const at = try full(8, 2, 0.0625, s);
+    defer _ = mlx.mlx_array_free(at);
+    const bt = try full(2, 16, 0.75, s);
+    defer _ = mlx.mlx_array_free(bt);
+    const one = Ref{ .at = at, .bt = bt, .scale = 1.0 };
+    const two = Ref{ .at = at, .bt = bt, .scale = 2.0 };
+    const stacked = try addTo(y, x, &[_]Ref{ one, one }, s);
+    defer _ = mlx.mlx_array_free(stacked);
+    const single = try addTo(y, x, &[_]Ref{two}, s);
+    defer _ = mlx.mlx_array_free(single);
+    for ([_]mlx.mlx_array{ stacked, single }) |got| {
+        var g32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g32);
+        try mlx.check(mlx.mlx_astype(&g32, got, .float32, s));
+        _ = mlx.mlx_array_eval(g32);
+        const gp = mlx.mlx_array_data_float32(g32) orelse return error.NoData;
+        for (gp[0..64]) |v| try testing.expectEqual(@as(f32, 258), v);
+    }
+}
+
 
 fn testBf16Matrix(al: std.mem.Allocator, rows: usize, cols: usize, seed: f32, sm: mlx.mlx_stream) !mlx.mlx_array {
     const host = try al.alloc(f32, rows * cols);

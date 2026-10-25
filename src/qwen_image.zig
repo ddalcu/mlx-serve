@@ -1053,7 +1053,7 @@ pub const Dit = struct {
     /// the fused weight is absent or the call is outside it.
     fn fusedHeads(self: *const Dit, b: *const Block, x: A, geo: *const Geometry) !?dit_kernels.QkvHeads {
         const f = if (b.qkv) |*q| q else return null;
-        if (b.lora.q.count + b.lora.k.count + b.lora.v.count != 0 or self.cfg.head_dim != 128) return null;
+        if (b.lora.q.isActive() or b.lora.k.isActive() or b.lora.v.isActive() or self.cfg.head_dim != 128) return null;
         const sh = mlx.getShape(x);
         if (sh[0] != 1) return null;
         const xc = try astype(x, self.dtype, self.s);
@@ -1144,7 +1144,7 @@ pub const Dit = struct {
         if (b.gp) |*f| {
             const xc = try astype(x, self.dtype, s);
             defer free(xc);
-            if (b.lora.gate.count + b.lora.proj.count == 0) return w8a8.forwardSwiglu(xc, f, s);
+            if (!b.lora.gate.isActive() and !b.lora.proj.isActive()) return w8a8.forwardSwiglu(xc, f, s);
             const pair = try w8a8.forwardPair(xc, f, s);
             const g = try lora_mod.addSlot(pair.gate, xc, &b.lora.gate, s);
             const p = lora_mod.addSlot(pair.up, xc, &b.lora.proj, s) catch |e| {

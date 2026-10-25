@@ -60,8 +60,14 @@ async function generate(base, path, body, onProgress) {
 | `mode` | `"variation"` (default when `image` is set: re-noise the source, `strength` 0-1, default 0.6) or `"edit"` (instruction edit: "make the sword glow") |
 | `ref_images` | edit mode: array of extra base64 references ("put the hat from image 2 on image 1") |
 | `transparent` | `true` for an RGBA PNG with alpha; Qwen-Image models only |
-| `guidance_scale`, `negative_prompt` | undistilled FLUX base and Qwen-Image only |
+| `guidance_scale`, `negative_prompt` | undistilled FLUX base, Qwen-Image and MOSS-Image only (MOSS-Image defaults to 3; its authors recommend the negative `nsfw, worst quality, bad anatomy, watermark, jpeg artifact`) |
 | `lora_paths`, `lora_scales` | absolute paths to `.safetensors` LoRAs (max 8), scales parallel |
+
+MOSS-Image (`moss_image`) also takes a layout as the prompt: one line of JSON,
+`{"summary":{"meta":["poster"],"canvas":"single","caption":"..."},"items":[{"label":"text","caption":"...","text":"EXPLORE","bbox":[y1,x1,y2,x2]}],"bbox_coord_space":"abs_centralized","bbox_format":"yxyx"}`,
+where each `bbox` is pixels from the CENTRE of the canvas (subtract W/2 from x
+and H/2 from y), y first; `label` is `object`, `character` or `text`. Keep the
+request's `size` the canvas the boxes were drawn on. It is text-to-image only.
 
 Response: `{"created":0,"data":[{"b64_json":"<base64 PNG>"}]}`
 
@@ -189,10 +195,65 @@ minutes and hold a lot of memory: one at a time, unload the model after.
 
 | field | notes |
 |---|---|
-| `image` | required base64 PNG/JPEG of ONE object; transparent or plain background works best |
-| `texture` | `true` = paint PBR textures too (slower; 400 if the pack has no paint weights) |
-| `octree_resolution` | 64-512, default 256; higher = finer mesh, slower |
-| `steps`, `guidance_scale`, `seed`, `texture_steps` | |
+| `image` | base64 PNG/JPEG of ONE object; a cutout with real transparency works best (TRELLIS.2 and Pixal3D have no background remover: an opaque photo's whole frame becomes the subject) |
+| `images` | Pixal3D only, instead of `image`: 2-8 views of the same object, the first its front. Each is used as framed (never cropped), so the framing must match the cameras. 400 beside `image`, with one view, or on another model |
+| `cameras` | Pixal3D with `images`: one 4x4 camera-to-world matrix per view (Blender axes: Z up, the camera looks down its own -Z). Omitted = the reference's rig: 0/90/180/270 degrees around the object, level, so at most 4 views |
+| `fov` | Pixal3D: horizontal field of view of the picture(s) in degrees (1-120). For `image` that is the cutout as cropped to its subject; the reference estimates it with MoGe-2, which is not shipped, so the default is 49.1. With `images` the default is the rig's 20 |
+| `texture` | Hunyuan3D only: `true` = paint PBR textures too (slower; 400 if the pack has no paint weights). TRELLIS.2 and Pixal3D are always textured |
+| `octree_resolution` | Hunyuan3D: 64-512, default 256; higher = finer mesh, slower |
+| `resolution` | TRELLIS.2 and Pixal3D: 1024 (default, about 23 GB of free GPU memory) or 1536 (about 36 GB; a 400 names the shortfall); 512 only on packs that ship the 512 texture model (about 6 GB; `gen.mjs 3d --resolution 512`) |
+| `decimation_target`, `texture_size` | TRELLIS.2 and Pixal3D: faces kept (10000-2000000, default 300000) and texture side (512/1024/2048/4096, default 2048) |
+| `roughness_scale`, `clearcoat` | TRELLIS.2 and Pixal3D, the GLB's finish: `roughness_scale` (0.05-2) multiplies the model's roughness map, below 1 is glossier; `clearcoat` (0-1) adds a clear layer. Omitted = what the model predicted. Hunyuan3D refuses both by name |
+| `steps`, `guidance_scale`, `seed`, `texture_steps` | Hunyuan3D defaults 30 / 5.0 / 42 / 30; TRELLIS.2 and Pixal3D `steps` omitted = the published 12 |
+
+What each model needs: Hunyuan3D-2.1 one photo of the object; TRELLIS.2
+(`microsoft/TRELLIS.2-4B`) one cutout, its alpha the subject; Pixal3D
+(`TencentARC/Pixal3D`) one cutout the same way, or several posed views (the
+pack's `pipeline_mv.json` models). TRELLIS.2 and Pixal3D return a textured PBR
+GLB (base colour and metallic-roughness). Both are Y up, but TRELLIS.2's object
+stands axis-aligned facing +Z while Pixal3D's keeps the picture's viewing angle
+(a car from a three-quarter photo comes out turned about 30 degrees, nose near -Z):
+`gen.mjs 3d ... --vehicle` (or `"vehicle": true` in a batch job) turns a car so its
+length runs along Z with the nose at +Z (the nose is judged by the lower end, so check the first car).
+
+One car cutout, 1024, 2048 texture, 150000 faces, M5 Ultra (MLX peak = GPU memory):
+
+| model | GPU stages | whole request | MLX peak |
+|---|---|---|---|
+| TRELLIS.2 | 58 s | 91 s | 21.9 GiB |
+| Pixal3D, one view | 49 s | 79 s | 21.9 GiB |
+| Pixal3D at 1536 | 152 s | 186 s | 31.4 GiB |
+| Pixal3D, four views (the reference's example head, not the car) | 62 s | 81 s | 22.0 GiB |
+
+TRELLIS.2 at 1536 peaks at 34.1 GiB. On the same red sports-car photo Pixal3D kept
+what the picture shows (rear wing, exhausts, diffuser, glass that reads as glass,
+wheel spokes) with a mottled body texture and lumpy wheels; TRELLIS.2 gave a smoother,
+cleaner body and wheels but turned glass into black patches with white speckles and
+the rear window into a black blob. That red coupe was at 1024.
+
+Which to use: for a car or other hard-surface object from a MOSS photo, use TRELLIS.2 at `"resolution": 1536`
+(about 36 GB of free GPU memory; 1024 where less is free) and `"texture_size": 2048`. On a blue rally hatchback at those settings (same photo, same seed, M5 Ultra)
+TRELLIS.2 kept the spoked rims, round headlights, bumper vents, rear lights, mudflaps and roof scoop and took
+250-270 s; Pixal3D came out soft and mottled with flat wheels and took 360-420 s. Two cars is a small sample
+(the red coupe above went Pixal3D's way on glass and rear detail at 1024), so treat TRELLIS.2 as the default.
+Pixal3D is the choice for several posed views (`images`), the only mode TRELLIS.2 does not have.
+
+A model's roughness map is nearly flat (a car's paint, trim and wheels all come out near 0.58), so the finish is
+one setting for the whole object: a car wants `"roughness_scale": 0.4, "clearcoat": 1.0` (car paint), a satin
+`0.7, 0`. A glossy finish reflects every bump of the surface, and how lumpy a car comes out depends on the seed:
+try two or three. Tyres and glass share the paint's gloss; a viewer's environment map (three.js `RoomEnvironment`)
+is what makes either look real.
+
+For a game, cut the cost where the mesh is made. `decimation_target` (150000 for a hero car) decimates before
+the unwrap, so no UV seam stops it, and `texture_size` 2048 costs about 22 MB of GPU memory per texture where 4096
+costs 89 MB. Afterwards `gen.mjs glb --max-texture 2048 --quantize` costs nothing visible: textures shrink by area
+(colour in linear light), and `--quantize` stores positions and UVs as 16-bit and normals as 8-bit integers
+(`KHR_mesh_quantization`; three.js, Blender, Godot 4 and glTFast read it), halving the vertex data. Do not use
+`--max-tris` to cut a car: its UV seams stay fixed, so a 2M-face car asked down to 200k stopped at 766k and the
+hood came out crumpled. It is for small props.
+
+A studio photo's soft ground shadow is part of the subject to the 3D model: it comes out as a grey slab under
+the object. The `gen.mjs` cutout keeps it (it is darker than the white floor), and both models build it.
 
 Response: `{"created":0,"format":"glb","data":"<base64 GLB>"}`. Loads directly
 in three.js (`GLTFLoader`), Godot, Unity (glTFast) and Blender. Text-to-3D is

@@ -156,14 +156,6 @@ fn trace() bool {
     return trace_env.?;
 }
 
-/// Total physical RAM; 0 when unknown.
-fn totalMemBytes() u64 {
-    var mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    _ = std.c.sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
-    return mem;
-}
-
 // ── host math ──
 
 /// RoPE inverse frequencies: 1 / theta^(i / rot) for i = 0, 2, ..., rot - 2.
@@ -426,7 +418,7 @@ pub const Model = struct {
         // one in flight holds its weight blob, so RAM bounds how many.
         const cpus = @max(1, std.Thread.getCpuCount() catch 4);
         const biggest = @max(q35.MAX_PROGRAM_BYTES, @as(u64, arch.vocab) * arch.hidden / self.lanes);
-        const lanes: usize = @intCast(std.math.clamp(totalMemBytes() / 8 / @max(biggest, 1), 1, @min(8, cpus)));
+        const lanes: usize = @intCast(std.math.clamp(ane.totalMemBytes() / 8 / @max(biggest, 1), 1, @min(8, cpus)));
         const nunits = self.units.len;
         const B = Build{ .model = self, .io = io, .pfx = pfx, .starts = starts, .threads = @max(1, cpus / lanes), .n = nunits + self.lanes + @as(usize, if (self.dcfg != null) 2 else 1), .progress = opts.progress };
         if (opts.progress) |p| p.begin(.ane_programs, B.n, io_util.nowMsMonotonic(io));

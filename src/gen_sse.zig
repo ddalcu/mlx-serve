@@ -62,6 +62,20 @@ pub const Yield = struct {
 /// `Progress` (H3's chained windows, LTX's windows) keeps it.
 pub threadlocal var gen_yield: ?*const Yield = null;
 
+/// The streaming job's connection on this thread, set by `StreamCtx.progress` and cleared by the scheduler when
+/// the job ends: a CPU stage that runs for minutes (`offload`) keeps the socket alive through it.
+pub threadlocal var stream_conn: ?*Conn = null;
+
+/// Writes an SSE comment whenever the stream has been silent for the keepalive interval, until `done`. A client's
+/// idle-body timeout (Node's fetch: 300 s, then `TypeError: terminated`) otherwise cuts a job whose unwrap alone
+/// outlasts it. A failed write is left for the next progress event or probe to find.
+fn beatUntil(conn: *Conn, done: *const std.atomic.Value(bool)) void {
+    while (!done.load(.acquire)) {
+        if (conn.ws_mode == null and conn.keepaliveDue()) conn.writeAll(": keepalive\n\n") catch {};
+        std.Io.sleep(conn.io, .fromMilliseconds(100), .real) catch {};
+    }
+}
+
 fn ReturnOf(comptime func: anytype) type {
     return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
 }
@@ -69,22 +83,25 @@ fn ReturnOf(comptime func: anytype) type {
 /// Run a pure-CPU stage (zero MLX: it runs off the inference thread) on a worker
 /// thread while chat keeps the inference thread. Inline when no hook is installed.
 pub fn offload(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnOf(func) {
-    const y = gen_yield orelse return @call(.auto, func, args);
+    const conn = stream_conn;
+    if (gen_yield == null and conn == null) return @call(.auto, func, args);
     const Job = struct {
         args: @TypeOf(args),
-        y: *const Yield,
+        y: ?*const Yield,
         result: ReturnOf(func) = undefined,
         done: std.atomic.Value(bool) = .init(false),
         fn run(j: *@This()) void {
             j.result = @call(.auto, func, j.args);
             j.done.store(true, .release);
-            j.y.wake(j.y.ctx);
+            if (j.y) |y| y.wake(y.ctx);
         }
     };
-    var job = Job{ .args = args, .y = y };
+    var job = Job{ .args = args, .y = gen_yield };
     const t = std.Thread.spawn(.{}, Job.run, .{&job}) catch return @call(.auto, func, args);
-    y.serve_until(y.ctx, &job.done);
+    const beater = if (conn) |c| std.Thread.spawn(.{}, beatUntil, .{ c, &job.done }) catch null else null;
+    if (job.y) |y| y.serve_until(y.ctx, &job.done);
     t.join();
+    if (beater) |b| b.join();
     return job.result;
 }
 
@@ -156,6 +173,7 @@ pub const StreamCtx = struct {
         return false;
     }
     pub fn progress(self: *StreamCtx) Progress {
+        stream_conn = if (self.stream) self.conn else null;
         const opts = (preview.Opts{
             .enabled = self.preview,
             .frames = self.preview_frames,
@@ -375,6 +393,56 @@ test "offload runs a CPU stage on a worker while the hook serves, and returns it
     try std.testing.expect(r.tid != me);
     try std.testing.expectError(error.Odd, offload(H.work, .{ 1, 2 }));
     try std.testing.expectEqual(@as(u32, 2), h.served);
+}
+
+test "offload keeps a streaming job's socket alive through a long CPU stage, with or without a chat hook" {
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[0]);
+    defer _ = std.c.close(sv[1]);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, io);
+    // Silent since the epoch and due again every millisecond: any beat shows up on the wire.
+    conn.heartbeat = .{ .last_write_ms = 0, .interval_ms = 1 };
+    var sctx = StreamCtx{ .conn = &conn, .stream = true };
+    _ = sctx.progress();
+    defer stream_conn = null;
+    const H = struct {
+        fn work() u32 {
+            std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(250), .real) catch {};
+            return 7;
+        }
+        fn step(_: *anyopaque) void {}
+        fn serve(_: *anyopaque, done: *const std.atomic.Value(bool)) void {
+            while (!done.load(.acquire)) std.atomic.spinLoopHint();
+        }
+        fn wake(_: *anyopaque) void {}
+    };
+    var buf: [256]u8 = undefined;
+    // No hook: the stage still leaves the inference thread, which has nothing to serve.
+    try std.testing.expectEqual(@as(u32, 7), offload(H.work, .{}));
+    var n = std.c.recv(sv[1], &buf, buf.len, std.posix.MSG.DONTWAIT);
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.startsWith(u8, buf[0..@intCast(n)], ": keepalive"));
+    // With the scheduler's hook serving chat meanwhile.
+    var dummy: u8 = 0;
+    const y = Yield{ .ctx = &dummy, .step = H.step, .serve_until = H.serve, .wake = H.wake };
+    gen_yield = &y;
+    defer gen_yield = null;
+    conn.heartbeat = .{ .last_write_ms = 0, .interval_ms = 1 };
+    try std.testing.expectEqual(@as(u32, 7), offload(H.work, .{}));
+    n = std.c.recv(sv[1], &buf, buf.len, std.posix.MSG.DONTWAIT);
+    try std.testing.expect(n > 0);
+}
+
+test "a job that is not streaming registers no keepalive connection, and a stale one is dropped" {
+    var dummy: Conn = undefined;
+    stream_conn = &dummy;
+    defer stream_conn = null;
+    var quiet = StreamCtx{ .conn = &dummy, .stream = false };
+    _ = quiet.progress();
+    try std.testing.expect(stream_conn == null);
 }
 
 test "a NON-streaming job still gets a cancellation probe, and writes no SSE" {

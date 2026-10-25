@@ -20,6 +20,7 @@ const krea = @import("krea.zig");
 const w8a8 = @import("w8a8.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const qwen_image = @import("qwen_image.zig");
+const moss_image = @import("moss_image.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -35,9 +36,12 @@ const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const minimax_h3 = @import("minimax_h3.zig");
+const h3_vsa = @import("h3_vsa.zig");
 const ane = @import("ane.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
+const trellis2_pipeline = @import("trellis2_pipeline.zig");
+const pixal3d = @import("pixal3d.zig");
 const glb_mod = @import("glb.zig");
 const wav_mod = @import("wav.zig");
 const png_mod = @import("png.zig");
@@ -115,7 +119,8 @@ pub const media_model_types = [_][]const u8{
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
     "laya",      "kev",        "clef",           "d1",
-    "stable_audio3", "yue2",      "nemotron_diarization",
+    "stable_audio3", "yue2",      "nemotron_diarization", "moss_image",
+    "trellis2",  "pixal3d",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -123,6 +128,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
+    if (std.mem.eql(u8, model_type, "moss_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -131,7 +137,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
-    if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.startsWith(u8, model_type, "hunyuan3d") or std.mem.eql(u8, model_type, "trellis2") or std.mem.eql(u8, model_type, "pixal3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
     if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     return null;
@@ -218,6 +224,9 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // An mlx-community-style Qwen-Image-2.1 repo likewise: no root
     // config.json, model_index.json's `_class_name` the only marker.
     if (isQwenImage21Repo(io, allocator, model_dir)) return allocator.dupe(u8, "qwen_image21") catch null;
+    if (isMossImageRepo(io, allocator, model_dir)) return allocator.dupe(u8, "moss_image") catch null;
+    if (isPixal3dPack(io, allocator, model_dir)) return allocator.dupe(u8, "pixal3d") catch null;
+    if (isTrellis2Pack(io, allocator, model_dir)) return allocator.dupe(u8, "trellis2") catch null;
     // Stable Audio 3 as Stability publishes it: stable-audio-tools' model_config.json.
     if (isStableAudio3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "stable_audio3") catch null;
     return null;
@@ -261,6 +270,27 @@ fn isQwenImage21Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
     defer dir.close(io);
     return discovery.peekQwenImage21Index(io, allocator, dir);
+}
+
+/// Thin path→Dir wrapper over `model_discovery.peekTrellis2Pipeline`.
+fn isTrellis2Pack(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekTrellis2Pipeline(io, allocator, dir);
+}
+
+/// Thin path→Dir wrapper over `model_discovery.peekPixal3dPipeline`.
+fn isPixal3dPack(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekPixal3dPipeline(io, allocator, dir);
+}
+
+/// Thin path→Dir wrapper over `model_discovery.peekMossImageIndex`.
+fn isMossImageRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekMossImageIndex(io, allocator, dir);
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -555,6 +585,7 @@ const ImageBackend = union(enum) {
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
     qwen_image: *qwen_image.Engine,
+    moss_image: *moss_image.Engine,
 };
 
 /// Most reference images one edit may carry (the primary 'image' plus
@@ -569,7 +600,7 @@ pub const MAX_EDIT_IMAGES_OTHER = 4;
 pub fn editRefCap(backend: ImageBackend) usize {
     return switch (backend) {
         .qwen_image => MAX_EDIT_IMAGES,
-        .flux, .krea, .mage_flow => MAX_EDIT_IMAGES_OTHER,
+        .flux, .krea, .mage_flow, .moss_image => MAX_EDIT_IMAGES_OTHER,
     };
 }
 
@@ -664,6 +695,10 @@ pub const ImageEngine = struct {
                 self.backend = .{ .qwen_image = try qwen_image.Engine.load(io, allocator, model_dir, staged) };
                 return self;
             }
+            if (std.mem.eql(u8, mt, "moss_image")) {
+                self.backend = .{ .moss_image = try moss_image.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -676,6 +711,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
             .qwen_image => |q| q.deinit(),
+            .moss_image => |m| m.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -686,6 +722,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
             .qwen_image => |q| q.s,
+            .moss_image => |m| m.s,
         };
     }
 
@@ -696,6 +733,7 @@ pub const ImageEngine = struct {
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
             .qwen_image => 0, // one final-norm hidden state, no layer taps
+            .moss_image => 0,
         };
     }
 
@@ -706,6 +744,7 @@ pub const ImageEngine = struct {
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
             .qwen_image => true, // the VAE encoder loads on first use
+            .moss_image => false, // text-to-image only: the release has no edit or variation training
         };
     }
 
@@ -718,6 +757,7 @@ pub const ImageEngine = struct {
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
             .qwen_image => |q| q.supportsEdit(), // tower in the pack's text_encoder/
+            .moss_image => false,
         };
     }
 
@@ -735,7 +775,13 @@ pub const ImageEngine = struct {
     /// fields (1.0 is a no-op, matching mflux's basic guider); Krea/Mage-Flow
     /// have no negative-encode path.
     pub fn supportsGuidance(self: *const ImageEngine) bool {
-        return self.backend == .flux or self.backend == .qwen_image;
+        return self.backend == .flux or self.backend == .qwen_image or self.backend == .moss_image;
+    }
+
+    /// `guidance_scale` when the request omits it: MOSS-Image is undistilled and its
+    /// authors' default is CFG 3; everywhere else 1.0 (one forward per step).
+    pub fn defaultGuidance(self: *const ImageEngine) f32 {
+        return if (self.backend == .moss_image) moss_image.DEFAULT_GUIDANCE else 1.0;
     }
 
     /// Steps for a request: a checkpoint's own sampling grid, else the
@@ -745,6 +791,7 @@ pub const ImageEngine = struct {
     pub fn resolveSteps(self: *const ImageEngine, steps: u32) u32 {
         return switch (self.backend) {
             .qwen_image => |q| q.stepsFor(steps),
+            .moss_image => |m| m.stepsFor(steps),
             else => if (steps == 0) 4 else steps,
         };
     }
@@ -775,6 +822,8 @@ pub const ImageEngine = struct {
                 .krea => .krea2,
                 .mage_flow => .generic,
                 .qwen_image => .qwen_image21,
+                // Adapters name the checkpoint's own modules (`layers.N.proj.q`).
+                .moss_image => .generic,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -787,6 +836,7 @@ pub const ImageEngine = struct {
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
             .qwen_image => |q| q.dit.attachLora(&stack),
+            .moss_image => |m| m.dit.attachLora(&stack),
         };
         if (matched != 0 and matched != stack.entryCount())
             log.warn("[lora] attached {d} of {d} adapter module(s); the rest target modules this model does not have\n", .{ matched, stack.entryCount() });
@@ -804,6 +854,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
             .qwen_image => |q| q.dit.detachLora(),
+            .moss_image => |m| m.dit.detachLora(),
             .mage_flow => {}, // no LoRA attached
         }
         if (self.lora_stack) |*st| st.deinit();
@@ -858,6 +909,13 @@ pub const ImageEngine = struct {
                     .transparent = opts.transparent,
                 }, progress);
             },
+            .moss_image => |m| if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0 or opts.init_image != null)
+                error.EditUnsupported
+            else
+                m.generateImage(prompt, width, height, seed, steps, .{
+                    .guidance_scale = opts.guidance_scale,
+                    .negative_prompt = opts.negative_prompt,
+                }, progress),
         };
     }
 
@@ -879,6 +937,8 @@ pub const ImageEngine = struct {
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // Qwen-Image-2.1: one latent token per 16x16 tile.
             .qwen_image => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // One latent token per 16x16 tile; the card extrapolates 0.25 to 4 MP.
+            .moss_image => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
 
@@ -889,7 +949,7 @@ pub const ImageEngine = struct {
     pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
         return switch (kind) {
             .flux => 1536,
-            .krea, .mage_flow, .qwen_image => 2048,
+            .krea, .mage_flow, .qwen_image, .moss_image => 2048,
         };
     }
 
@@ -1250,14 +1310,13 @@ fn sendDecision(engine: *DecisionEngine, job: DecisionJob, result: anyerror![]u8
     try sendBytesJson(job.conn, job.allocator, out);
 }
 
-/// Mesh backend (currently Hunyuan3D-2.1 shape). Thin owner of the hunyuan3d
-/// engine — the DINO conditioner, DiT, and ShapeVAE decoder live in
-/// `src/hunyuan3d.zig` (mirrors `AudioEngine` over `tts.Synthesizer`). When a
-/// second 3D arch arrives this becomes an `ImageBackend`-style tagged union.
+/// Mesh backends: Hunyuan3D-2.1 (shape + optional paint stage), TRELLIS.2 (textured PBR in one pass) and Pixal3D
+/// (TRELLIS.2's cascade read pixel by pixel, one view or several). Each lives in its own file (`src/hunyuan3d.zig`,
+/// `src/trellis2_pipeline.zig`, `src/pixal3d.zig`); this is the engine slot.
 pub const MeshEngine = struct {
     allocator: std.mem.Allocator,
-    engine: *hy3d.Engine,
-    /// P2 paint (texture) stage dir, discovered lazily beside the shape model
+    backend: Backend,
+    /// Hunyuan P2 paint (texture) stage dir, discovered lazily beside the shape model
     /// (SIBLING dir `<models root>/local/hunyuan3d-2-1-paint-8bit` or the
     /// `HY3D_PAINT_DIR` override). Null → `"texture": true` requests get a 400.
     /// The paint engine itself loads per-request and frees after (memory
@@ -1265,12 +1324,26 @@ pub const MeshEngine = struct {
     /// the shape stage completes before the paint stage starts).
     paint_dir: ?[]u8 = null,
 
+    pub const Backend = union(enum) {
+        hunyuan: *hy3d.Engine,
+        trellis2: *trellis2_pipeline.Engine,
+        pixal3d: *pixal3d.Engine,
+    };
+
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*MeshEngine {
         const self = try allocator.create(MeshEngine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.paint_dir = null;
-        self.engine = try hy3d.Engine.load(io, allocator, model_dir);
+        if (isPixal3dPack(io, allocator, model_dir)) {
+            self.backend = .{ .pixal3d = try pixal3d.Engine.load(io, allocator, model_dir) };
+            return self;
+        }
+        if (isTrellis2Pack(io, allocator, model_dir)) {
+            self.backend = .{ .trellis2 = try trellis2_pipeline.Engine.load(io, allocator, model_dir) };
+            return self;
+        }
+        self.backend = .{ .hunyuan = try hy3d.Engine.load(io, allocator, model_dir) };
         self.paint_dir = findPaintDir(allocator, model_dir);
         if (self.paint_dir) |p| log.info("[mesh] paint (texture) weights available: {s}\n", .{p});
         log.info("[mesh] Hunyuan3D shape engine ready\n", .{});
@@ -1279,7 +1352,11 @@ pub const MeshEngine = struct {
 
     pub fn deinit(self: *MeshEngine) void {
         if (self.paint_dir) |p| self.allocator.free(p);
-        self.engine.deinit();
+        switch (self.backend) {
+            .hunyuan => |e| e.deinit(),
+            .trellis2 => |e| e.deinit(),
+            .pixal3d => |e| e.deinit(),
+        }
         self.allocator.destroy(self);
     }
 };
@@ -1426,33 +1503,31 @@ pub const VideoEngine = struct {
     }
 };
 
-/// `h3ConfigDeclaresRef2va` over a model dir's own `config.json`.
-fn h3DirDeclaresRef2va(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
-    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+/// A model dir's own `config.json` (caller owns), or null when unreadable.
+fn h3ReadConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return null;
     defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer file.close(io);
     var rb: [4096]u8 = undefined;
     var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    return h3ConfigDeclaresRef2va(allocator, content);
+    return rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch null;
 }
 
-/// True when a MiniMax-H3 `config.json` declares the `ref2va` task. The two
-/// partitions share the text encoder, both VAEs and every geometry number, so
-/// nothing about the files themselves tells them apart — only the converter's
-/// declared task list does, and an FL2VA pack handed references would generate
-/// while silently ignoring them.
-fn h3ConfigDeclaresRef2va(allocator: std.mem.Allocator, config_json: []const u8) bool {
+/// True when a MiniMax-H3 `config.json` declares `task`. The two partitions
+/// share the text encoder, both VAEs and every geometry number, so nothing
+/// about the files themselves tells them apart — only the converter's declared
+/// task list does, and an FL2VA pack handed references would generate while
+/// silently ignoring them.
+fn h3ConfigDeclaresTask(allocator: std.mem.Allocator, config_json: []const u8, task: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const tasks = parsed.value.object.get("tasks") orelse return false;
     if (tasks != .array) return false;
     for (tasks.array.items) |t| {
-        if (t == .string and std.mem.eql(u8, t.string, "ref2va")) return true;
+        if (t == .string and std.mem.eql(u8, t.string, task)) return true;
     }
     return false;
 }
@@ -1466,17 +1541,32 @@ pub const H3VideoEngine = struct {
     /// Whether this pack is the REF2VA partition (read from its config's task
     /// list at load — the file layout is identical either way).
     supports_refs: bool = false,
+    /// A pack declaring ref2va without t2va (FastH3 Omni) needs an image or a
+    /// video reference on every request.
+    supports_t2va: bool = false,
+    /// A FastH3 PDD student's sampling contract.
+    pdd: ?minimax_h3.Pdd = null,
+    /// Its trained sparse attention.
+    vsa: ?h3_vsa.Contract = null,
 
     /// The text encoder and DiT kept loaded between requests while memory allows.
     resident: minimax_h3.Resident,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
+        const config = h3ReadConfig(io, allocator, model_dir);
+        defer if (config) |c| allocator.free(c);
+        const c = config orelse "{}";
+        const pdd = try minimax_h3.Pdd.fromConfig(allocator, c);
+        const vsa = try h3_vsa.Contract.fromConfig(allocator, c);
         const self = try allocator.create(H3VideoEngine);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .model_dir = try allocator.dupe(u8, model_dir),
-            .supports_refs = h3DirDeclaresRef2va(io, allocator, model_dir),
+            .supports_refs = h3ConfigDeclaresTask(allocator, c, "ref2va"),
+            .supports_t2va = h3ConfigDeclaresTask(allocator, c, "t2va"),
+            .pdd = pdd,
+            .vsa = vsa,
             .resident = minimax_h3.Resident.init(allocator),
         };
         minimax_h3.registerResident(&self.resident);
@@ -2540,7 +2630,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // standard CFG convention). 1.0 is a no-op, so distilled klein can
     // accept both fields harmlessly; only an ACTUALLY-requested CFG run
     // needs the capability.
-    var guidance_scale: f32 = 1.0;
+    var guidance_scale: f32 = engine.defaultGuidance();
     if (extractJsonFloat(body, "guidance_scale")) |g| {
         if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
         guidance_scale = @floatCast(g);
@@ -2553,7 +2643,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         negative_prompt = negative_prompt_owned.?;
     }
     if (guidance_scale != 1.0 and !engine.supportsGuidance())
-        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2 or Qwen-Image model");
+        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2, Qwen-Image or MOSS-Image model");
 
     // Qwen-Image edit: reference conditioning resolution (diffusers'
     // per-call `output_resolution` knob). Lower = fewer joint tokens per
@@ -2649,8 +2739,8 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
     // Text-to-image: a canvas past the default size the load reserved can run
     // past the working set, and that Metal OOM mid-denoise is uncatchable.
-    if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len == 0) {
-        const need = qwenImageGenTransientBytes(width, height);
+    if ((engine.backend == .qwen_image and gen_opts.edit_image_bytes.len == 0) or engine.backend == .moss_image) {
+        const need = if (engine.backend == .moss_image) mossImageGenTransientBytes(width, height) else qwenImageGenTransientBytes(width, height);
         const headroom = gpuHeadroomBytes();
         if (need > headroom) {
             log.info("[image] bill refused: {d}x{d} needs {d} MB, headroom {d} MB\n", .{ width, height, need >> 20, headroom >> 20 });
@@ -2671,16 +2761,12 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             log.info("[image] generation cancelled — client disconnected\n", .{});
             return;
         }
-        log.err("[image] generation failed: {}\n", .{err});
-        if (want_stream) {
-            sse.sendError(conn, "generation failed");
-            return;
-        }
-        return sendError(conn, jobFailureStatus(err), "generation failed");
+        return imageJobFailed(conn, want_stream, err);
     };
     defer _ = mlx.mlx_array_free(img);
 
-    const png_bytes = try engine.toPng(allocator, img);
+    // The returned image is lazy: the denoise runs here, so a Metal OOM surfaces here too.
+    const png_bytes = engine.toPng(allocator, img) catch |err| return imageJobFailed(conn, want_stream, err);
     defer allocator.free(png_bytes);
 
     const b64_len = std.base64.standard.Encoder.calcSize(png_bytes.len);
@@ -2849,7 +2935,7 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
             sse.sendError(conn, msg);
             return;
         }
-        return sendError(conn, if (err == error.EmptyKokoroInput) 400 else 500, msg);
+        return sendError(conn, if (err == error.EmptyKokoroInput) 400 else jobFailureStatus(err), msg);
     };
     defer allocator.free(out);
     log.info("[kokoro] -> {d} WAV bytes\n", .{out.len});
@@ -3876,12 +3962,18 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // from ckpt500, which needed the extra steps to firm up. 30 stays the
     // non-turbo default.
     const turbo = sse.bodyWantsTrue(body, "turbo");
+    const pdd_steps: ?u32 = if (engine.pdd) |p| p.steps() else null;
+    if (turbo and pdd_steps != null)
+        return sendError(conn, 400, "'turbo' is the base model's few-step adapter — this pack is already a distilled student and runs its own trained steps");
     if (turbo and !engine.hasTurboLora(io, allocator))
         return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
     const width: u32 = extractJsonU32(body, "width") orelse 256;
     const height: u32 = extractJsonU32(body, "height") orelse 256;
-    const steps = stepsRequest(extractJsonInt(body, "steps"), if (turbo) 4 else 30, 1, 100) catch
+    const steps = if (pdd_steps) |n| stepsRequest(extractJsonInt(body, "steps"), n, n, n) catch {
+        var buf: [128]u8 = undefined;
+        return sendError(conn, 400, std.fmt.bufPrint(&buf, "this pack is a distilled student that runs exactly {d} steps — omit 'steps' or send {d}", .{ n, n }) catch "this pack runs a fixed step count — omit 'steps'");
+    } else stepsRequest(extractJsonInt(body, "steps"), if (turbo) 4 else 30, 1, 100) catch
         return sendError(conn, 400, "'steps' must be in [1,100]");
     const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
     const requested_frames: u32 = extractJsonU32(body, "num_frames") orelse 56;
@@ -3992,6 +4084,12 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             });
         }
     }
+    if (engine.supports_refs and !engine.supports_t2va) {
+        const visual = for (refs.items) |m| {
+            if (m.ref.kind != .audio) break true;
+        } else false;
+        if (!visual) return sendError(conn, 400, "this pack generates from references — attach at least one image or video ('ref_images' / 'ref_videos')");
+    }
 
     // Generations here run for MINUTES, so a silent socket is indistinguishable
     // from a wedged server; the client drives its meter off these events. The
@@ -4004,7 +4102,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // The load gate bills the model, not the request: the request's own activations price the
     // resident plan, and when that does not fit, the staged DiT stage is checked here, before
     // any stage loads, since the Metal OOM mid-step is uncatchable.
-    const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo, minimax_h3.envStr("MINIMAX_H3_STEP_CACHE"), minimax_h3.envStr("MINIMAX_H3_ATTN_BCAST"));
+    const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo or pdd_steps != null, minimax_h3.envStr("MINIMAX_H3_STEP_CACHE"), minimax_h3.envStr("MINIMAX_H3_ATTN_BCAST"));
     const cfg = minimax_h3.Config{};
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, cfg.num_layers) * cfg.hidden_size * 2 else 0;
     const rows = h3RequestRows(width, height, shape.frame_count, @intCast(n_kf));
@@ -4059,6 +4157,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .seed = seed,
         .speed = speed,
         .turbo = turbo,
+        .pdd = engine.pdd,
+        .vsa = engine.vsa,
         .lora_paths = lora_paths[0..lora_n],
         .lora_scales = lora_scales[0..lora_n],
         .chain_windows = chain_windows,
@@ -4435,8 +4535,9 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
 /// loads lazily per request and frees before returning.
 fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u8, w: u32, h: u32, shape_opts: hy3d.MeshOpts, body: []const u8, prog: ?sse.Progress) ![]u8 {
     const paint_dir = engine.paint_dir orelse return error.PaintUnavailable; // guarded at parse
-    var mesh = try engine.engine.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
+    var mesh = try engine.backend.hunyuan.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
     defer mesh.deinit(allocator);
+    try latchedJobFailure(); // a failed shape stage is not worth minutes of paint
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const paint = try hy3d_paint.PaintEngine.load(io, allocator, paint_dir);
@@ -4449,56 +4550,261 @@ fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u
     return paint.paintMeshToGlb(allocator, &mesh, rgba, w, h, popts, prog);
 }
 
+/// One validated 3D request, per backend.
+const MeshJob = union(enum) {
+    hunyuan: struct { opts: hy3d.MeshOpts, texture: bool },
+    trellis2: trellis2_pipeline.Opts,
+    /// `cameras` is owned (freed by `deinit`).
+    pixal3d: pixal3d.Opts,
+
+    fn deinit(self: MeshJob, allocator: std.mem.Allocator) void {
+        if (self == .pixal3d) allocator.free(self.pixal3d.cameras);
+    }
+};
+
+/// A decoded request photo: straight-alpha RGBA8.
+const MeshView = struct { pix: []u8, w: u32, h: u32 };
+
+fn freeViews(allocator: std.mem.Allocator, views: []MeshView) void {
+    for (views) |v| allocator.free(v.pix);
+    allocator.free(views);
+}
+
+const MeshViews = union(enum) { ok: []MeshView, bad: []const u8 };
+
+const BAD_IMAGES = "'images' must be an array of base64 PNG/JPEG views of one object";
+
+/// The request's photos: one `image`, or `images` (several posed views of one object, Pixal3D only), counted
+/// and refused by name before any of them decodes. Caller frees `ok` with `freeViews`.
+fn meshViews(allocator: std.mem.Allocator, body: []const u8, engine: *const MeshEngine) !MeshViews {
+    if (!jsonFieldSet(body, "images")) {
+        const raw = extractJsonString(body, "image") orelse return .{ .bad = "missing 'image' (base64 PNG/JPEG of the subject)" };
+        const one = try allocator.alloc(MeshView, 1);
+        errdefer allocator.free(one);
+        one[0] = switch (try decodeMeshView(allocator, raw, "'image'")) {
+            .ok => |v| v,
+            .bad => |m| {
+                allocator.free(one);
+                return .{ .bad = m };
+            },
+        };
+        return .{ .ok = one };
+    }
+    if (jsonFieldSet(body, "image")) return .{ .bad = "send 'image' or 'images', not both" };
+    if (engine.backend != .pixal3d) return .{ .bad = "'images' (several views of one object) is served by Pixal3D; this model takes one 'image'" };
+    var count: usize = 0;
+    {
+        var it = iterJsonStringArray(body, "images") orelse return .{ .bad = BAD_IMAGES };
+        while (it.next()) |_| count += 1;
+        if (it.bad) return .{ .bad = BAD_IMAGES };
+    }
+    if (count < 2) return .{ .bad = "'images' needs at least 2 views (send a single view as 'image')" };
+    if (count > pixal3d.MAX_VIEWS) return .{ .bad = std.fmt.comptimePrint("'images' takes at most {d} views", .{pixal3d.MAX_VIEWS}) };
+    const views = try allocator.alloc(MeshView, count);
+    var done: usize = 0;
+    errdefer {
+        for (views[0..done]) |v| allocator.free(v.pix);
+        allocator.free(views);
+    }
+    var it = iterJsonStringArray(body, "images").?;
+    while (it.next()) |raw| : (done += 1) {
+        views[done] = switch (try decodeMeshView(allocator, raw, "an 'images' entry")) {
+            .ok => |v| v,
+            .bad => |m| {
+                for (views[0..done]) |v| allocator.free(v.pix);
+                allocator.free(views);
+                return .{ .bad = m };
+            },
+        };
+    }
+    return .{ .ok = views };
+}
+
+const MeshViewDecode = union(enum) { ok: MeshView, bad: []const u8 };
+
+fn decodeMeshView(allocator: std.mem.Allocator, raw: []const u8, comptime what: []const u8) !MeshViewDecode {
+    const b64 = try jsonUnescape(allocator, raw); // handles \/ from Swift JSONSerialization
+    defer allocator.free(b64);
+    if (b64.len == 0) return .{ .bad = "empty " ++ what };
+    const bytes = imageB64Alloc(allocator, b64) catch return .{ .bad = "invalid base64 in " ++ what };
+    defer allocator.free(bytes);
+    const img = decodeImageRgba(allocator, bytes) orelse return .{ .bad = "could not decode " ++ what ++ " (PNG/JPEG supported)" };
+    return .{ .ok = .{ .pix = img.pix, .w = img.w, .h = img.h } };
+}
+
+/// The whole 3D job, then the latch: the shape and paint stages read their results on the host,
+/// so a Metal failure inside them hands back bytes (zeros) with no error to catch.
+fn meshJobGlb(allocator: std.mem.Allocator, engine: *MeshEngine, views: []const MeshView, job: MeshJob, body: []const u8, prog: ?sse.Progress) ![]u8 {
+    const rgba = views[0].pix;
+    const w = views[0].w;
+    const h = views[0].h;
+    const glb = switch (job) {
+        // Texture path: shape → raw mesh → paint stage (loaded per request, freed after — the paint
+        // UNet+DINO+VAE ride ~4.6 GB beside the 3.5 GB shape engine only for the duration of this request).
+        .hunyuan => |j| if (j.texture)
+            try paintedGlb(allocator, engine, rgba, w, h, j.opts, body, prog)
+        else
+            try engine.backend.hunyuan.generateGlb(allocator, rgba, w, h, j.opts, prog),
+        .trellis2 => |o| try engine.backend.trellis2.generateGlb(allocator, rgba, w, h, o, prog),
+        .pixal3d => |o| blk: {
+            var photos: [pixal3d.MAX_VIEWS]pixal3d.Photo = undefined;
+            for (views, 0..) |v, i| photos[i] = .{ .rgba = v.pix, .w = v.w, .h = v.h };
+            break :blk try engine.backend.pixal3d.generateGlb(allocator, photos[0..views.len], o, prog);
+        },
+    };
+    errdefer allocator.free(glb);
+    try latchedJobFailure();
+    return glb;
+}
+
+/// `error.OutOfMemory` or `error.MlxFailure` for a latched MLX error, left latched so
+/// `jobFailureStatus` still sees its class.
+fn latchedJobFailure() !void {
+    const name = mlx.peekErrorName() orelse return;
+    return if (std.mem.eql(u8, name, "OutOfMemory")) error.OutOfMemory else error.MlxFailure;
+}
+
+const MeshJobParse = union(enum) { ok: MeshJob, bad: []const u8 };
+
+/// The validated job for a request body over `views` photos, or the 400 message naming the field that is wrong.
+fn meshJobFromBody(allocator: std.mem.Allocator, body: []const u8, engine: *const MeshEngine, views: usize) !MeshJobParse {
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+    switch (engine.backend) {
+        .hunyuan => {
+            if (jsonFieldSet(body, "roughness_scale") or jsonFieldSet(body, "clearcoat"))
+                return .{ .bad = "'roughness_scale' and 'clearcoat' are TRELLIS.2 and Pixal3D fields (a Hunyuan3D texture's finish comes from its paint)" };
+            const steps = stepsRequest(extractJsonInt(body, "steps"), 30, 1, 100) catch
+                return .{ .bad = "'steps' must be in [1,100]" };
+            const res: u32 = extractJsonU32(body, "octree_resolution") orelse 256;
+            if (res < 64 or res > 512) return .{ .bad = "'octree_resolution' must be in [64,512]" };
+            var guidance: f32 = 5.0;
+            if (extractJsonFloat(body, "guidance_scale")) |g| {
+                if (!(g >= 0.0 and g <= 20.0)) return .{ .bad = "'guidance_scale' must be in [0,20]" };
+                guidance = @floatCast(g);
+            }
+            // P2 texture stage (opt-in): requires the converted paint weights. The
+            // 400 here is explicit — never a silent untextured downgrade (the a2vid
+            // precedent: the user asked for THIS output).
+            const want_texture = sse.bodyWantsTrue(body, "texture");
+            if (want_texture and engine.paint_dir == null)
+                return .{ .bad = "texture requested but the paint weights are not installed (run tests/convert_hunyuan3d_paint_weights.py, or set HY3D_PAINT_DIR)" };
+            return .{ .ok = .{ .hunyuan = .{ .opts = .{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res }, .texture = want_texture } } };
+        },
+        .trellis2 => |t| return switch (parseTrellis2Opts(body, t.hasResolution512())) {
+            .ok => |o| .{ .ok = .{ .trellis2 = o } },
+            .bad => |m| .{ .bad = m },
+        },
+        .pixal3d => |p| return switch (try parsePixal3dOpts(allocator, body, views, p.mv != null)) {
+            .ok => |o| .{ .ok = .{ .pixal3d = o } },
+            .bad => |m| .{ .bad = m },
+        },
+    }
+}
+
+const Pixal3dParse = union(enum) { ok: pixal3d.Opts, bad: []const u8 };
+
+/// Pixal3D request fields: TRELLIS.2's (no 512 pipeline), `fov` (horizontal, degrees, every view; the reference
+/// default when omitted) and, with `images`, `cameras` (one 4x4 camera-to-world per view; the shipped rig when
+/// omitted). `ok.cameras` is the caller's to free.
+fn parsePixal3dOpts(allocator: std.mem.Allocator, body: []const u8, views: usize, has_mv: bool) !Pixal3dParse {
+    var o = pixal3d.Opts{};
+    o.base = switch (parseTrellis2Opts(body, false)) {
+        .ok => |b| b,
+        .bad => |m| return .{ .bad = m },
+    };
+    o.base.pixal3d_axes = true;
+    if (extractJsonFloat(body, "fov")) |f| {
+        if (!(f >= 1 and f <= 120)) return .{ .bad = "'fov' is the horizontal field of view in degrees, in [1,120]" };
+        o.fov = std.math.degreesToRadians(@as(f32, @floatCast(f)));
+    }
+    if (jsonFieldSet(body, "cameras")) {
+        if (views < 2) return .{ .bad = "'cameras' goes with 'images' (several views)" };
+        const raw = extractJsonArrayRaw(body, "cameras") orelse return .{ .bad = pixal3d.BAD_CAMERAS };
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return .{ .bad = pixal3d.BAD_CAMERAS };
+        defer parsed.deinit();
+        o.cameras = switch (try pixal3d.parseCameras(allocator, parsed.value)) {
+            .ok => |c| c,
+            .bad => |m| return .{ .bad = m },
+        };
+    }
+    if (pixal3d.viewsRefusal(views, o.cameras.len, has_mv)) |m| {
+        allocator.free(o.cameras);
+        return .{ .bad = m };
+    }
+    return .{ .ok = o };
+}
+
+const Trellis2Parse = union(enum) { ok: trellis2_pipeline.Opts, bad: []const u8 };
+
+/// TRELLIS.2 request fields: `resolution` (512 only where the pack ships its 512 texture flow, else 1024 or 1536),
+/// `steps` (omitted keeps the published 12), `seed`, `decimation_target` (faces), `texture_size`, and the finish:
+/// `roughness_scale` and `clearcoat`.
+fn parseTrellis2Opts(body: []const u8, has_512: bool) Trellis2Parse {
+    var o = trellis2_pipeline.Opts{ .seed = extractJsonInt(body, "seed") orelse 42 };
+    if (extractJsonU32(body, "resolution")) |r| {
+        if (!trellis2_pipeline.resolutionServed(r, has_512)) return .{ .bad = if (has_512) "'resolution' must be 512, 1024 or 1536" else "'resolution' must be 1024 or 1536 (this pack has no 512 texture model)" };
+        o.resolution = r;
+    }
+    if (extractJsonInt(body, "steps")) |n| {
+        if (n < 1 or n > 50) return .{ .bad = "'steps' must be in [1,50]" };
+        o.steps = @intCast(n);
+    }
+    if (extractJsonU32(body, "decimation_target")) |f| {
+        if (f < 10_000 or f > 2_000_000) return .{ .bad = "'decimation_target' must be in [10000,2000000] faces" };
+        o.decimation_target = f;
+    }
+    if (extractJsonU32(body, "texture_size")) |t| {
+        if (t != 512 and t != 1024 and t != 2048 and t != 4096) return .{ .bad = "'texture_size' must be 512, 1024, 2048 or 4096" };
+        o.texture_size = t;
+    }
+    if (extractJsonFloat(body, "roughness_scale")) |r| {
+        if (!(r >= 0.05 and r <= 2)) return .{ .bad = "'roughness_scale' multiplies the model's roughness and must be in [0.05,2]" };
+        o.roughness_scale = @floatCast(r);
+    }
+    if (extractJsonFloat(body, "clearcoat")) |c| {
+        if (!(c >= 0 and c <= 1)) return .{ .bad = "'clearcoat' must be in [0,1]" };
+        o.clearcoat = @floatCast(c);
+    }
+    return .{ .ok = o };
+}
+
 /// POST /v1/3d/generations — base64 GLB (or SSE progress + complete).
 /// The engine takes straight-alpha RGBA8 (its preprocess recenters the subject
 /// via the alpha bbox and composites on white — so an app-side cutout with real
 /// alpha conditions best, and an opaque photo still works as a fallback).
 pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *MeshEngine) !void {
-    const raw_img = extractJsonString(body, "image") orelse return sendError(conn, 400, "missing 'image' (base64 PNG/JPEG of the subject)");
-    const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
-    defer allocator.free(b64);
-    if (b64.len == 0) return sendError(conn, 400, "empty 'image'");
-    const img_bytes = imageB64Alloc(allocator, b64) catch
-        return sendError(conn, 400, "invalid base64 in 'image'");
-    defer allocator.free(img_bytes);
-    const img = decodeImageRgba(allocator, img_bytes) orelse
-        return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
-    defer allocator.free(img.pix);
+    const views = switch (try meshViews(allocator, body, engine)) {
+        .ok => |v| v,
+        .bad => |msg| return sendError(conn, 400, msg),
+    };
+    defer freeViews(allocator, views);
+    const img = views[0];
 
-    const steps = stepsRequest(extractJsonInt(body, "steps"), 30, 1, 100) catch
-        return sendError(conn, 400, "'steps' must be in [1,100]");
-    const res: u32 = extractJsonU32(body, "octree_resolution") orelse 256;
-    if (res < 64 or res > 512) return sendError(conn, 400, "'octree_resolution' must be in [64,512]");
-    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    var guidance: f32 = 5.0;
-    if (extractJsonFloat(body, "guidance_scale")) |g| {
-        if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
-        guidance = @floatCast(g);
+    const job = switch (try meshJobFromBody(allocator, body, engine, views.len)) {
+        .ok => |j| j,
+        .bad => |msg| return sendError(conn, 400, msg),
+    };
+    defer job.deinit(allocator);
+    const cascade_res: ?u32 = switch (job) {
+        .trellis2 => |o| o.resolution,
+        .pixal3d => |o| o.base.resolution,
+        .hunyuan => null,
+    };
+    if (cascade_res) |r| {
+        var rbuf: [192]u8 = undefined;
+        if (trellis2Refusal(&rbuf, r, gpuHeadroomBytes())) |msg| return sendError(conn, 400, msg);
     }
-
-    // P2 texture stage (opt-in): requires the converted paint weights. The
-    // 400 here is explicit — never a silent untextured downgrade (the a2vid
-    // precedent: the user asked for THIS output).
-    const want_texture = sse.bodyWantsTrue(body, "texture");
-    if (want_texture and engine.paint_dir == null)
-        return sendError(conn, 400, "texture requested but the paint weights are not installed (run tests/convert_hunyuan3d_paint_weights.py, or set HY3D_PAINT_DIR)");
-
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ steps, res, guidance, seed, want_texture, want_stream, img.w, img.h });
+    switch (job) {
+        .hunyuan => |j| log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ j.opts.steps, j.opts.octree_resolution, j.opts.guidance, j.opts.seed, j.texture, want_stream, img.w, img.h }),
+        .trellis2 => |o| log.info("[mesh] generating TRELLIS.2 res={d} steps={d} faces={d} tex={d} seed={d} stream={} from {d}x{d} image\n", .{ o.resolution, o.steps, o.decimation_target, o.texture_size, o.seed, want_stream, img.w, img.h }),
+        .pixal3d => |o| log.info("[mesh] generating Pixal3D res={d} views={d} cameras={s} fov={d:.1}deg steps={d} faces={d} tex={d} seed={d} stream={}\n", .{ o.base.resolution, views.len, if (o.cameras.len > 0) "given" else "default", std.math.radiansToDegrees(o.fov orelse (if (views.len > 1) pixal3d.RIG_FOV else pixal3d.DEFAULT_FOV)), o.base.steps, o.base.decimation_target, o.base.texture_size, o.base.seed, want_stream }),
+    }
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
-    const opts = hy3d.MeshOpts{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res };
-    const glb_bytes = blk: {
-        if (!want_texture) {
-            break :blk engine.engine.generateGlb(allocator, img.pix, img.w, img.h, opts, prog);
-        }
-        // Texture path: shape → raw mesh → paint stage (loaded per request,
-        // freed after — the paint UNet+DINO+VAE ride ~4.6 GB beside the
-        // 3.5 GB shape engine only for the duration of this request).
-        break :blk paintedGlb(allocator, engine, img.pix, img.w, img.h, opts, body, prog);
-    } catch |err| {
+    const glb_bytes = meshJobGlb(allocator, engine, views, job, body, prog) catch |err| {
         if (err == error.Cancelled) {
             // Client hung up mid-generation (progress write failed) — nothing
             // to write, the socket is dead.
@@ -4506,6 +4812,13 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
             return;
         }
         log.err("[mesh] generation failed: {}\n", .{err});
+        if (meshJobRefusal(err)) |msg| {
+            if (want_stream) {
+                sse.sendError(conn, msg);
+                return;
+            }
+            return sendError(conn, 400, msg);
+        }
         if (want_stream) {
             sse.sendError(conn, "generation failed");
             return;
@@ -4652,7 +4965,7 @@ fn residentWeightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 
 /// Metal OOM; the test below refuses an unclassified entry of `media_model_types`.
 fn convertsW8a8(model_type: []const u8) ?bool {
     const converts = [_][]const u8{ "flux2", "krea", "mage_flow", "mageflow", "acestep", "AudioVideo", "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image" };
-    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization" };
+    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization", "moss_image", "trellis2", "pixal3d" };
     for (converts) |p| if (std.mem.startsWith(u8, model_type, p)) return true;
     for (packed_only) |p| if (std.mem.startsWith(u8, model_type, p)) return false;
     return null;
@@ -4760,6 +5073,55 @@ pub fn qwenImageGenTransientBytes(width: u32, height: u32) u64 {
 
 /// The load plan reserves a default-size request.
 const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = qwenImageGenTransientBytes(1024, 1024);
+
+/// MOSS-Image's peak is its f32 full-resolution VAE stage, linear in the canvas;
+/// a full 4096-token prompt peaks earlier and only wins on small canvases.
+const MOSS_IMAGE_GEN_TOKEN_BYTES: u64 = 1536 << 10;
+const MOSS_IMAGE_GEN_BASE_BYTES: u64 = 512 << 20;
+const MOSS_IMAGE_GEN_PROMPT_BYTES: u64 = 3 << 30;
+
+pub fn mossImageGenTransientBytes(width: u32, height: u32) u64 {
+    const latents: u64 = @as(u64, width / moss_image.VAE_DOWNSAMPLE) * (height / moss_image.VAE_DOWNSAMPLE);
+    return @max(MOSS_IMAGE_GEN_PROMPT_BYTES, MOSS_IMAGE_GEN_BASE_BYTES + latents * MOSS_IMAGE_GEN_TOKEN_BYTES);
+}
+
+/// TRELLIS.2's and Pixal3D's whole-request MLX peak at each served resolution, for a car-sized subject (the
+/// same cascade and decoders): 512 skips the 1024 cascade, and above that the decoders' per-voxel features grow
+/// with the surface.
+pub fn trellis2PeakBytes(resolution: u32) u64 {
+    const mib: u64 = switch (resolution) {
+        512 => 5800,
+        1024 => 23000,
+        else => 35800,
+    };
+    return mib << 20;
+}
+
+/// The load bill: the default request's peak, so a load evicts idle models for it; a GPU whose ceiling
+/// cannot pass that peak through the load preflight bills 512 when the pack serves it, and each request
+/// is still refused by name past its own peak.
+fn trellis2LoadBillBytes(serves512: bool, gpu_ceiling: u64) u64 {
+    const def = trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution);
+    return if (@import("scheduler.zig").loadRequirementBytes(def) > gpu_ceiling and serves512) trellis2PeakBytes(512) else def;
+}
+
+/// The MLX peak one mesh request reaches, for the scheduler's reserve: the cascade resolution moves it by
+/// 12 GB. 0 keeps the model's own resident estimate (Hunyuan). An unservable `resolution` bills the largest
+/// cascade; the handler's 400 follows.
+pub fn meshRequestPeakBytes(body: []const u8, backend: std.meta.Tag(MeshEngine.Backend)) u64 {
+    if (backend == .hunyuan) return 0;
+    return trellis2PeakBytes(extractJsonU32(body, "resolution") orelse (trellis2_pipeline.Opts{}).resolution);
+}
+
+/// The 400 text for a request whose peak exceeds what the GPU can still take, else null.
+fn trellis2Refusal(buf: []u8, resolution: u32, headroom: u64) ?[]const u8 {
+    const need = trellis2PeakBytes(resolution);
+    if (need <= headroom) return null;
+    const gb: f64 = 1 << 30;
+    return std.fmt.bufPrint(buf, "resolution {d} needs ~{d:.1} GB of free GPU memory but {d:.1} GB is free: send a lower 'resolution' (1024 needs ~{d:.0} GB)", .{
+        resolution, @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(headroom)) / gb, @as(f64, @floatFromInt(trellis2PeakBytes(1024))) / gb,
+    }) catch "this resolution needs more GPU memory than is free: send a lower 'resolution'";
+}
 
 /// What the GPU can still take: Metal's working set less live MLX memory.
 fn gpuHeadroomBytes() u64 {
@@ -5036,6 +5398,18 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         const tower = if (model_dir) |md| qwen_image.towerPresentIn(io, std.heap.page_allocator, md) else false;
         return if (tower) qwenImageEditPeakBytes(te, rest, mlx.maxRecommendedWorkingSet(), true) else qwenImagePeakBytes(te, rest, mlx.maxRecommendedWorkingSet());
     }
+    if (std.mem.eql(u8, model_type, "trellis2") or std.mem.eql(u8, model_type, "pixal3d")) {
+        // Every stage loads its own weights and frees them, so the bill is the smallest servable request's
+        // peak, not the dir sum; each request is refused by name past its own resolution's peak.
+        _ = dir.statFile(io, "pipeline.json", .{}) catch return 0; // unknown dir -> never block
+        return trellis2LoadBillBytes(trellis2_pipeline.packServes512(io, std.heap.page_allocator, dir), mlx.maxRecommendedWorkingSet());
+    }
+    if (std.mem.eql(u8, model_type, "moss_image")) {
+        // Everything stays resident (the Qwen3.5 encoder too), plus a default-size request.
+        const sum = residentWeightBytes(io, dir, model_type);
+        if (sum == 0) return 0; // unknown dir -> never block
+        return sum + mossImageGenTransientBytes(1024, 1024);
+    }
     if (std.mem.eql(u8, model_type, "minimax_music3")) {
         // The whole engine is resident for its lifetime (no staging), so the
         // sum is the right weight bill — plus the AR stage's working set the
@@ -5151,9 +5525,27 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     try conn.writeAll(body);
 }
 
+fn imageJobFailed(conn: *Conn, want_stream: bool, err: anyerror) !void {
+    log.err("[image] generation failed: {}\n", .{err});
+    if (want_stream) {
+        sse.sendError(conn, "generation failed");
+        return;
+    }
+    return sendError(conn, jobFailureStatus(err), "generation failed");
+}
+
+/// The 400 text for a mesh job that failed on the request itself, else null (a server fault stays a 500/503).
+fn meshJobRefusal(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.EmptySubject => "the image has no subject: its alpha channel is empty (send a cutout on a transparent background, or a photo whose background can be cut away)",
+        error.EmptyStructure => "no occupied voxels came out of this image: try another seed or a clearer, larger subject",
+        else => null,
+    };
+}
+
 /// A media or decision job that ran out of memory hit the machine's capacity, not a server fault: 503, like chat.
 fn jobFailureStatus(err: anyerror) u16 {
-    if (err == error.OutOfMemory) return 503;
+    if (err == error.OutOfMemory or mlx.gpuContextLost()) return 503;
     const latched = mlx.peekErrorName() orelse return 500;
     return if (std.mem.eql(u8, latched, "OutOfMemory")) 503 else 500;
 }
@@ -5203,6 +5595,10 @@ test "stepsRequest: omitted takes the default, the range is checked before the c
     try std.testing.expectError(error.StepsOutOfRange, stepsRequest(0, 30, 1, 100));
     try std.testing.expectError(error.StepsOutOfRange, stepsRequest(101, 30, 1, 100));
     try std.testing.expectError(error.StepsOutOfRange, stepsRequest(5_000_000_000, 30, 1, 100));
+    // A PDD student's range is its trained count alone.
+    try std.testing.expectEqual(@as(u32, 8), try stepsRequest(null, 8, 8, 8));
+    try std.testing.expectEqual(@as(u32, 8), try stepsRequest(8, 8, 8, 8));
+    try std.testing.expectError(error.StepsOutOfRange, stepsRequest(4, 8, 8, 8));
 }
 
 /// `key` is in the body with a value other than `null` (clients send null for an unset field).
@@ -5493,6 +5889,36 @@ fn iterJsonStringArray(body: []const u8, key: []const u8) ?JsonStringArrayIter {
     while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
     if (i >= body.len or body[i] != '[') return null;
     return .{ .rest = body[i + 1 ..] };
+}
+
+/// The raw `[...]` text of the `key` JSON array, bracket-balanced and string-aware, or null.
+fn extractJsonArrayRaw(body: []const u8, key: []const u8) ?[]const u8 {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) i += 1;
+    if (i >= body.len or body[i] != '[') return null;
+    const start = i;
+    var depth: usize = 0;
+    var in_str = false;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (in_str) {
+            if (c == '\\') i += 1 else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '[', '{' => depth += 1,
+            ']', '}' => {
+                depth -= 1;
+                if (depth == 0) return body[start .. i + 1];
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Base64-decode (standard alphabet) into an owned buffer.
@@ -5928,6 +6354,339 @@ test "peekModelType classifies a model_index-only Qwen-Image-2.1 repo" {
     const dir20 = try std.fmt.allocPrint(a, "{s}/q20", .{root});
     defer a.free(dir20);
     try testing.expect(peekModelType(io, a, dir20) == null);
+}
+
+test "TRELLIS.2: a pipeline.json-only pack routes to the mesh slot" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/pipeline.json", .data = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{}}" });
+    const dir = try std.fmt.allocPrint(a, "{s}/m", .{root});
+    defer a.free(dir);
+    const mt = peekModelType(io, a, dir) orelse return error.TestUnexpectedResult;
+    defer a.free(mt);
+    try testing.expectEqualStrings("trellis2", mt);
+    try testing.expectEqual(Modality.mesh, modalityFromType(mt).?);
+}
+
+test "Pixal3D: a TRELLIS.2-layout pack whose flows read proj routes to the mesh slot as pixal3d" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "m/ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/pipeline.json", .data = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{\"models\":{\"sparse_structure_flow_model\":\"ckpts/ss\"}}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/ckpts/ss.json", .data = "{\"args\":{\"image_attn_mode\":\"proj\"}}" });
+    const dir = try std.fmt.allocPrint(a, "{s}/m", .{root});
+    defer a.free(dir);
+    const mt = peekModelType(io, a, dir) orelse return error.TestUnexpectedResult;
+    defer a.free(mt);
+    try testing.expectEqualStrings("pixal3d", mt);
+    try testing.expectEqual(Modality.mesh, modalityFromType(mt).?);
+}
+
+test "Pixal3D request fields: FOV in degrees, a camera per view, and every bad value names its field" {
+    const a = testing.allocator;
+    const ok = struct {
+        fn of(body: []const u8, views: usize) !pixal3d.Opts {
+            return switch (try parsePixal3dOpts(testing.allocator, body, views, true)) {
+                .ok => |o| o,
+                .bad => error.TestUnexpectedResult,
+            };
+        }
+        fn bad(body: []const u8, views: usize, has_mv: bool) ![]const u8 {
+            return switch (try parsePixal3dOpts(testing.allocator, body, views, has_mv)) {
+                .ok => |o| blk: {
+                    testing.allocator.free(o.cameras);
+                    break :blk error.TestUnexpectedResult;
+                },
+                .bad => |m| m,
+            };
+        }
+    };
+    const d = try ok.of("{}", 1);
+    try testing.expectEqual(@as(u32, 1024), d.base.resolution);
+    try testing.expect(d.base.pixal3d_axes);
+    try testing.expect(d.fov == null);
+    try testing.expectEqual(@as(usize, 0), d.cameras.len);
+    const f = try ok.of("{\"fov\":30,\"resolution\":1536,\"seed\":3}", 1);
+    try testing.expectApproxEqAbs(std.math.degreesToRadians(@as(f32, 30)), f.fov.?, 1e-6);
+    try testing.expectEqual(@as(u32, 1536), f.base.resolution);
+    const cams = "{\"cameras\":[[[1,0,0,0],[0,0,-1,-3],[0,1,0,0],[0,0,0,1]],[[0,0,1,3],[1,0,0,0],[0,1,0,0],[0,0,0,1]]]}";
+    const c = try ok.of(cams, 2);
+    defer a.free(c.cameras);
+    try testing.expectEqual(@as(usize, 2), c.cameras.len);
+    try testing.expectEqual(@as(f32, 3), c.cameras[1][0][3]);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"fov\":0.4}", 1, true), "'fov'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"fov\":150}", 1, true), "'fov'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"resolution\":512}", 1, true), "'resolution'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad(cams, 1, true), "'cameras'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad(cams, 3, true), "'cameras'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"cameras\":[[1,2]]}", 2, true), "'cameras'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{}", 5, true), "'cameras'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{}", 2, false), "multi-view") != null);
+}
+
+test "mesh views: one 'image', or 'images' on Pixal3D only, counted before anything decodes" {
+    const a = testing.allocator;
+    var tr = MeshEngine{ .allocator = a, .backend = .{ .trellis2 = undefined } };
+    var px = MeshEngine{ .allocator = a, .backend = .{ .pixal3d = undefined } };
+    const cases = [_]struct { body: []const u8, engine: *MeshEngine, want: []const u8 }{
+        .{ .body = "{}", .engine = &tr, .want = "missing 'image'" },
+        .{ .body = "{\"image\":\"AAAA\",\"images\":[\"AAAA\",\"AAAA\"]}", .engine = &px, .want = "not both" },
+        .{ .body = "{\"images\":[\"AAAA\",\"AAAA\"]}", .engine = &tr, .want = "Pixal3D" },
+        .{ .body = "{\"images\":[\"AAAA\"]}", .engine = &px, .want = "at least 2" },
+        .{ .body = "{\"images\":[\"A\",\"A\",\"A\",\"A\",\"A\",\"A\",\"A\",\"A\",\"A\"]}", .engine = &px, .want = "at most 8" },
+        .{ .body = "{\"images\":\"AAAA\"}", .engine = &px, .want = "'images'" },
+        .{ .body = "{\"images\":[\"!!\",\"!!\"]}", .engine = &px, .want = "base64" },
+    };
+    for (cases) |cs| {
+        const r = try meshViews(a, cs.body, cs.engine);
+        switch (r) {
+            .ok => |v| {
+                freeViews(a, v);
+                return error.TestUnexpectedResult;
+            },
+            .bad => |m| if (std.mem.indexOf(u8, m, cs.want) == null) {
+                std.debug.print("{s}: {s}\n", .{ cs.body, m });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "TRELLIS.2 request fields: defaults, and every bad value names its field" {
+    const ok = struct {
+        fn of(body: []const u8, has_512: bool) !trellis2_pipeline.Opts {
+            return switch (parseTrellis2Opts(body, has_512)) {
+                .ok => |o| o,
+                .bad => error.TestUnexpectedResult,
+            };
+        }
+        fn bad(body: []const u8, has_512: bool) ![]const u8 {
+            return switch (parseTrellis2Opts(body, has_512)) {
+                .ok => error.TestUnexpectedResult,
+                .bad => |m| m,
+            };
+        }
+    };
+    const d = try ok.of("{}", true);
+    try testing.expectEqual(@as(u32, 1024), d.resolution);
+    try testing.expectEqual(@as(u32, 0), d.steps); // the published 12
+    try testing.expectEqual(@as(u64, 42), d.seed);
+    const o = try ok.of("{\"resolution\":1536,\"steps\":8,\"seed\":7,\"decimation_target\":50000,\"texture_size\":4096}", false);
+    try testing.expectEqual(@as(u32, 1536), o.resolution);
+    try testing.expectEqual(@as(u32, 8), o.steps);
+    try testing.expectEqual(@as(u32, 50000), o.decimation_target);
+    try testing.expectEqual(@as(u32, 4096), o.texture_size);
+    try testing.expectEqual(@as(u32, 512), (try ok.of("{\"resolution\":512}", true)).resolution);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"resolution\":512}", false), "no 512 texture model") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"resolution\":768}", true), "'resolution'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"steps\":0}", true), "'steps'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"steps\":51}", true), "'steps'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"decimation_target\":10}", true), "'decimation_target'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"texture_size\":1000}", true), "'texture_size'") != null);
+}
+
+test "3D request finish: roughness_scale and clearcoat default to the model's own, bound, and reach Pixal3D" {
+    const a = testing.allocator;
+    const parse = struct {
+        fn of(body: []const u8) !trellis2_pipeline.Opts {
+            return switch (parseTrellis2Opts(body, false)) {
+                .ok => |o| o,
+                .bad => error.TestUnexpectedResult,
+            };
+        }
+        fn bad(body: []const u8) ![]const u8 {
+            return switch (parseTrellis2Opts(body, false)) {
+                .ok => error.TestUnexpectedResult,
+                .bad => |m| m,
+            };
+        }
+    };
+    const d = try parse.of("{}");
+    try testing.expectEqual(@as(f32, 1.0), d.roughness_scale);
+    try testing.expectEqual(@as(f32, 0.0), d.clearcoat);
+    const o = try parse.of("{\"roughness_scale\":0.4,\"clearcoat\":1}");
+    try testing.expectApproxEqAbs(@as(f32, 0.4), o.roughness_scale, 1e-6);
+    try testing.expectEqual(@as(f32, 1.0), o.clearcoat);
+    try testing.expect(std.mem.indexOf(u8, try parse.bad("{\"roughness_scale\":0}"), "'roughness_scale'") != null);
+    try testing.expect(std.mem.indexOf(u8, try parse.bad("{\"roughness_scale\":2.5}"), "'roughness_scale'") != null);
+    try testing.expect(std.mem.indexOf(u8, try parse.bad("{\"clearcoat\":1.5}"), "'clearcoat'") != null);
+    try testing.expect(std.mem.indexOf(u8, try parse.bad("{\"clearcoat\":-0.1}"), "'clearcoat'") != null);
+
+    const px = switch (try parsePixal3dOpts(a, "{\"roughness_scale\":0.5,\"clearcoat\":0.6}", 1, false)) {
+        .ok => |p| p,
+        .bad => return error.TestUnexpectedResult,
+    };
+    defer a.free(px.cameras);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), px.base.roughness_scale, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), px.base.clearcoat, 1e-6);
+
+    // Hunyuan3D's paint has no such knob: the field is refused by name, never dropped.
+    const hy = MeshEngine{ .allocator = a, .backend = .{ .hunyuan = undefined } };
+    const r = try meshJobFromBody(a, "{\"clearcoat\":1}", &hy, 1);
+    switch (r) {
+        .ok => return error.TestUnexpectedResult,
+        .bad => |m| try testing.expect(std.mem.indexOf(u8, m, "'clearcoat'") != null),
+    }
+}
+
+test "MOSS-Image: a model_index-only repo routes to the image slot with CFG 3 by default" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    const dir = try std.fmt.allocPrint(a, "{s}/m", .{root});
+    defer a.free(dir);
+    const mt = peekModelType(io, a, dir) orelse return error.TestUnexpectedResult;
+    defer a.free(mt);
+    try testing.expectEqualStrings("moss_image", mt);
+    try testing.expectEqual(Modality.image, modalityFromType(mt).?);
+
+    const eng = ImageEngine{ .allocator = a, .backend = .{ .moss_image = undefined } };
+    try testing.expectEqual(@as(f32, 3.0), eng.defaultGuidance());
+    try testing.expect(eng.supportsGuidance() and !eng.supportsEdit() and !eng.supportsImg2Img());
+    const flux_eng = ImageEngine{ .allocator = a, .backend = .{ .krea = undefined } };
+    try testing.expectEqual(@as(f32, 1.0), flux_eng.defaultGuidance());
+    // A 2048² canvas bills four times the 1024² latents.
+    try testing.expect(mossImageGenTransientBytes(2048, 2048) > mossImageGenTransientBytes(1024, 1024));
+}
+
+test "MOSS-Image text-to-image bill covers the measured peak at every canvas" {
+    const GiB: f64 = 1 << 30;
+    // Peaks above the bf16 weights (M4 Max): the VAE sets them, except a full-length prompt at 512².
+    const measured = [_]struct { w: u32, h: u32, peak: f64 }{
+        .{ .w = 512, .h = 512, .peak = 2.88 },
+        .{ .w = 1024, .h = 1024, .peak = 6.15 },
+        .{ .w = 1456, .h = 1456, .peak = 11.66 },
+        .{ .w = 1792, .h = 1792, .peak = 17.66 },
+    };
+    for (measured) |m| {
+        const bill = @as(f64, @floatFromInt(mossImageGenTransientBytes(m.w, m.h))) / GiB;
+        try testing.expect(bill >= m.peak);
+        try testing.expect(bill < m.peak * 1.1);
+    }
+}
+
+test "TRELLIS.2 and Pixal3D bill covers the measured peak at every resolution" {
+    const MiB: u64 = 1 << 20;
+    // MLX peaks of one car cutout (M5 Ultra): 1.3M, 5.1M and 11.8M decoded voxels.
+    const measured = [_]struct { res: u32, peak_mib: u64 }{
+        .{ .res = 512, .peak_mib = 5654 },
+        .{ .res = 1024, .peak_mib = 21557 },
+        .{ .res = 1536, .peak_mib = 34903 },
+        // Pixal3D on the same cutout: the same cascade and decoders, 4.9M and 10.9M voxels.
+        .{ .res = 1024, .peak_mib = 22414 },
+        .{ .res = 1536, .peak_mib = 32145 },
+    };
+    for (measured) |m| {
+        var worst: u64 = 0;
+        for (measured) |o| if (o.res == m.res) {
+            worst = @max(worst, o.peak_mib);
+        };
+        try testing.expect(trellis2PeakBytes(m.res) >= m.peak_mib * MiB);
+        try testing.expect(trellis2PeakBytes(m.res) < worst * MiB * 11 / 10);
+    }
+    try testing.expect(trellis2PeakBytes(512) < trellis2PeakBytes(1024));
+}
+
+test "TRELLIS.2 load estimate reads whether the pack serves 512 and an unreadable dir never blocks" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
+    const pj = "{\"args\":{\"models\":{\"tex_slat_flow_model_512\":\"ckpts/tex512\"}}}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "pipeline.json", .data = pj });
+    try testing.expectEqual(trellis2PeakBytes(1024), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
+    try tmp.dir.createDirPath(io, "ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ckpts/tex512.safetensors", .data = "x" });
+    const served = trellis2LoadBillBytes(true, mlx.maxRecommendedWorkingSet());
+    try testing.expectEqual(served, estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
+    try testing.expectEqual(served, estimatePeakResidentBytesIn(io, tmp.dir, "pixal3d"));
+}
+
+test "TRELLIS.2 load bill is the default request's peak wherever the GPU can take it" {
+    const def = trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution);
+    // A big GPU keeps billing the default request, so the load evicts idle models for it.
+    try testing.expectEqual(def, trellis2LoadBillBytes(true, 128 << 30));
+    // A GPU short of it, warmup headroom included, loads the pack for 512 requests when the pack serves them.
+    try testing.expectEqual(trellis2PeakBytes(512), trellis2LoadBillBytes(true, 16 << 30));
+    try testing.expectEqual(trellis2PeakBytes(512), trellis2LoadBillBytes(true, 25 << 30));
+    try testing.expectEqual(def, trellis2LoadBillBytes(false, 16 << 30));
+}
+
+test "TRELLIS.2 request is refused by name when its peak does not fit the free GPU memory" {
+    const GiB: u64 = 1 << 30;
+    var buf: [192]u8 = undefined;
+    try testing.expect(trellis2Refusal(&buf, 1536, 80 * GiB) == null);
+    const msg = trellis2Refusal(&buf, 1536, 20 * GiB) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, msg, "resolution") != null);
+    // An agent told to unload "another model" unloads its own chat model.
+    try testing.expect(std.mem.indexOf(u8, msg, "unload") == null);
+}
+
+test "meshViews: an allocation failing after the first view decoded frees every allocation exactly once" {
+    const gpa = testing.allocator;
+    var rgb: [2 * 2 * 3]u8 = undefined;
+    @memset(&rgb, 128);
+    const png_bytes = try @import("png.zig").encodeRgb(gpa, &rgb, 2, 2);
+    defer gpa.free(png_bytes);
+    const b64 = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(png_bytes.len));
+    defer gpa.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, png_bytes);
+    const body = try std.fmt.allocPrint(gpa, "{{\"images\":[\"{s}\",\"{s}\"]}}", .{ b64, b64 });
+    defer gpa.free(body);
+    var engine = MeshEngine{ .allocator = gpa, .backend = .{ .pixal3d = undefined } };
+    var fail_at: usize = 0;
+    while (fail_at < 64) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        const got = meshViews(failing.allocator(), body, &engine) catch continue;
+        switch (got) {
+            .ok => |views| {
+                try testing.expectEqual(@as(usize, 2), views.len);
+                freeViews(failing.allocator(), views);
+                return;
+            },
+            .bad => continue, // the decoder names a failed allocation as a refusal; the bar is no leak and no wrong-sized free
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "mesh job failures a client can fix are named 400s, not a generic 500" {
+    const empty = meshJobRefusal(error.EmptySubject) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, empty, "alpha") != null);
+    try testing.expect(meshJobRefusal(error.EmptyStructure) != null);
+    try testing.expect(meshJobRefusal(error.OutOfMemory) == null);
+    try testing.expect(meshJobRefusal(error.MlxFailure) == null);
+}
+
+test "a mesh request is billed at its own resolution's peak, not the model's default" {
+    const peak = struct {
+        fn of(body: []const u8, backend: std.meta.Tag(MeshEngine.Backend)) u64 {
+            return meshRequestPeakBytes(body, backend);
+        }
+    }.of;
+    try testing.expectEqual(trellis2PeakBytes(1536), peak("{\"resolution\":1536}", .trellis2));
+    try testing.expectEqual(trellis2PeakBytes(1536), peak("{\"resolution\":1536,\"images\":[]}", .pixal3d));
+    try testing.expectEqual(trellis2PeakBytes(512), peak("{\"resolution\":512}", .trellis2));
+    try testing.expectEqual(trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution), peak("{}", .trellis2));
+    // An unservable value is billed as the largest cascade; the handler's 400 follows.
+    try testing.expectEqual(trellis2PeakBytes(1536), peak("{\"resolution\":9999}", .trellis2));
+    // Hunyuan keeps the model's resident estimate.
+    try testing.expectEqual(@as(u64, 0), peak("{\"resolution\":1536}", .hunyuan));
+    try testing.expect(trellis2PeakBytes(1536) > trellis2PeakBytes(1024));
 }
 
 test "Modality.mesh advertises the 3d capability" {
@@ -6482,22 +7241,25 @@ test "reference audio arrives as 32 kHz stereo in the encoder's planar shape" {
     try testing.expectApproxEqAbs(pcm[200], pcm[201], 1e-6);
 }
 
-test "h3ConfigDeclaresRef2va reads the pack's own task list" {
+test "h3ConfigDeclaresTask reads the pack's own task list" {
     const a = testing.allocator;
     // The converter writes the partition's task list; ref2va and fl2va share
     // every geometry number, so the DiT file is the ONLY thing that differs and
     // this is the only way to tell an FL2VA pack from a REF2VA one.
-    try testing.expect(h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"ref2va\"]}"));
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+    try testing.expect(h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"ref2va\"]}", "ref2va"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}", "ref2va"));
+    // FastH3 Omni generates from references only: no t2va.
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"ref2va\"]}", "t2va"));
+    try testing.expect(h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}", "t2va"));
     // Absent / malformed / wrong-typed → NOT ref2va. A pack that cannot say it
     // supports references must not be handed them: it would generate happily
     // and ignore every one of them.
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\"}"));
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"tasks\":\"ref2va\"}"));
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "not json"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"model_type\":\"minimax_h3\"}", "ref2va"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"tasks\":\"ref2va\"}", "ref2va"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "not json", "ref2va"));
     // A substring match on the whole file would pass on the README-ish text a
     // config can legally carry; only the task LIST counts.
-    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+    try testing.expect(!h3ConfigDeclaresTask(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}", "ref2va"));
 }
 
 test "iterJsonObjectArray walks ref_videos entries" {
@@ -7218,6 +7980,47 @@ test "a base64 WebP reference reaches the media backends as a PNG with the same 
     const same = try imageB64Alloc(a, std.base64.standard.Encoder.encode(&b64_png, png_bytes));
     defer a.free(same);
     try std.testing.expectEqualSlices(u8, png_bytes, same);
+}
+
+test "a failed image job answers by name, never a closed socket" {
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    conn.init(.{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
+    defer _ = std.c.close(sv[0]);
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at array.cpp:352");
+    try imageJobFailed(&conn, false, error.MlxError);
+    _ = mlx.takeError(&stale);
+    var got: [256]u8 = undefined;
+    const n = std.c.recv(sv[1], &got, got.len, 0);
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.startsWith(u8, got[0..@intCast(n)], "HTTP/1.1 503"));
+}
+
+test "jobFailureStatus: after a lost GPU context every failure is a 503" {
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    defer mlx.resetGpuContextLostForTest();
+    mlx.latchErrorForTest("cuLaunchKernelEx(&config, func, params, nullptr) failed: an illegal memory access was encountered");
+    _ = mlx.takeError(&buf);
+    try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.MlxError));
+}
+
+test "a latched Metal failure fails the 3D job by class and stays visible to the status" {
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    try latchedJobFailure();
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Invalid Resource (00000009:kIOGPUCommandBufferCallbackErrorInvalidResource). at array.cpp:352");
+    try std.testing.expectError(error.MlxFailure, latchedJobFailure());
+    try std.testing.expectEqual(@as(u16, 500), jobFailureStatus(error.MlxFailure));
+    _ = mlx.takeError(&stale);
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at array.cpp:352");
+    try std.testing.expectError(error.OutOfMemory, latchedJobFailure());
+    try std.testing.expectEqual(@as(u16, 503), jobFailureStatus(error.OutOfMemory));
+    _ = mlx.takeError(&stale);
 }
 
 test "jobFailureStatus: a memory failure is a 503, any other failure a 500" {

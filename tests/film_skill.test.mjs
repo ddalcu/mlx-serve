@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import { decodePng, encodePng, fixGlb, parseGlb, readAccessor, writeGlb } from "../skills/mlx-serve/gen.mjs";
+
 import {
   abcTempo, alignLyrics, beatsBetween, dynamics, envelopeDb, estimateTempo, onsetEnvelope, parseLyrics,
   readWav, scoreTake, trackBeats, transcriptWords, validateTimeline,
@@ -380,6 +382,276 @@ test("gen.mjs video reports the server's error and leaves no partial frames on d
 });
 
 // ---------- init ----------
+
+// ---------- gen.mjs 3d ----------
+
+const MOSS_AND_TRELLIS = [{ id: "org/moss", capabilities: ["image"], state: "ready" }, { id: "org/trellis", capabilities: ["3d"], state: "ready" }];
+
+async function threeDRun({ ref, input = "a red car", args = [], glb = Buffer.from("glb"), models = MOSS_AND_TRELLIS }) {
+  const srv = await mockServer(
+    models,
+    {
+      "/v1/images/generations": (req, res) => sse(res, { type: "complete", data: [{ b64_json: ref.toString("base64") }] }),
+      "/v1/3d/generations": (req, res) => sse(res, { type: "complete", format: "glb", data: glb.toString("base64") }),
+    },
+  );
+  try {
+    const dir = tmp(), out = join(dir, "car.glb");
+    await run("node", [join(SKILL, "gen.mjs"), "3d", input, "-o", out, ...args], { env: { ...process.env, MLX_SERVE_URL: srv.url } });
+    const body = JSON.parse(srv.calls.find((c) => c.url === "/v1/3d/generations").body);
+    let sent;
+    try { sent = decodePng(Buffer.from(body.image, "base64")); } catch { /* a reference sent as it was may be a PNG this decoder refuses */ }
+    return { sent, raw: body.image, body, dir, out };
+  } finally {
+    await srv.close();
+  }
+}
+
+const pixelAt = ({ w, data }, x, y) => Array.from(data.subarray((y * w + x) * 4, (y * w + x) * 4 + 4));
+
+test("gen.mjs 3d sends the finish only when asked, so the model keeps its own roughness otherwise", async () => {
+  const png = encodePng({ w: 8, h: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+  const plain = await threeDRun({ ref: png });
+  assert.equal(plain.body.roughness_scale, undefined);
+  assert.equal(plain.body.clearcoat, undefined);
+  const painted = await threeDRun({ ref: png, args: ["--roughness-scale", "0.4", "--clearcoat", "1"] });
+  assert.equal(painted.body.roughness_scale, 0.4);
+  assert.equal(painted.body.clearcoat, 1);
+});
+
+test("gen.mjs 3d sends --resolution, so a GPU short of the 1024 peak can ask for 512", async () => {
+  const png = encodePng({ w: 8, h: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+  assert.equal((await threeDRun({ ref: png })).body.resolution, undefined);
+  assert.equal((await threeDRun({ ref: png, args: ["--resolution", "512"] })).body.resolution, 512);
+});
+
+test("gen.mjs 3d cuts the plain background off the reference image, because TRELLIS.2 and Pixal3D read the alpha as the subject", async () => {
+  const w = 32, h = 32, data = new Uint8Array(w * h * 4).fill(255);
+  for (let y = 12; y < 20; y++) for (let x = 12; x < 20; x++) data.set([200, 30, 30, 255], (y * w + x) * 4);
+  const r = await threeDRun({ ref: encodePng({ w, h, data }) });
+  assert.equal(pixelAt(r.sent, 1, 1)[3], 0, "the white background is transparent");
+  assert.deepEqual(pixelAt(r.sent, 16, 16), [200, 30, 30, 255], "the object keeps its colour and is opaque");
+  assert.equal(r.body.model, "org/trellis");
+});
+
+test("gen.mjs 3d sends a reference it cannot decode (16-bit PNG) as it is instead of failing the job", async () => {
+  const png = encodePng({ w: 8, h: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+  png[24] = 16; // IHDR bit depth: the decoder here takes 8-bit only
+  const r = await threeDRun({ ref: png });
+  assert.equal(r.raw, png.toString("base64"));
+});
+
+test("gen.mjs 3d sends a reference as it is when the cutout would erase the whole subject (white on white)", async () => {
+  const png = encodePng({ w: 32, h: 32, data: new Uint8Array(32 * 32 * 4).fill(255) });
+  const r = await threeDRun({ ref: png });
+  assert.equal(r.raw, png.toString("base64"));
+});
+
+test("gen.mjs 3d leaves a reference that already has transparency alone", async () => {
+  const w = 16, h = 16, data = new Uint8Array(w * h * 4); // all transparent black, one dark opaque object
+  for (let y = 6; y < 10; y++) for (let x = 6; x < 10; x++) data.set([10, 10, 10, 255], (y * w + x) * 4);
+  const png = encodePng({ w, h, data });
+  const dir = tmp(), file = join(dir, "own.png");
+  writeFileSync(file, png);
+  const r = await threeDRun({ ref: png, input: file });
+  assert.deepEqual(pixelAt(r.sent, 7, 7), [10, 10, 10, 255], "a dark object is not mistaken for background");
+  assert.equal(pixelAt(r.sent, 0, 0)[3], 0);
+});
+
+/** A car-ish wedge, 1.8 wide and 4 long, nose (lower, 0.9 high) at local +z, tail 1.4 high, turned `yawDeg` about Y. */
+function wedgeGlb(yawDeg) {
+  const a = (yawDeg * Math.PI) / 180, turn = ([x, y, z]) => [x * Math.cos(a) + z * Math.sin(a), y, -x * Math.sin(a) + z * Math.cos(a)];
+  const pos = [], nrm = [];
+  for (const z of [-2, 2]) for (const x of [-0.9, 0.9]) for (const top of [0, 1]) {
+    pos.push(...turn([x, top ? (z > 0 ? 0.9 : 1.4) : 0, z]));
+    nrm.push(...turn([0, 0, 1]));
+  }
+  const idx = [0, 1, 2, 2, 1, 3, 4, 6, 5, 5, 6, 7];
+  const f = new Float32Array([...pos, ...nrm]), u = new Uint16Array(idx);
+  const bin = Buffer.concat([Buffer.from(f.buffer), Buffer.from(u.buffer)]);
+  const xs = [0, 1, 2].map((c) => pos.filter((_, i) => i % 3 === c));
+  const json = {
+    asset: { version: "2.0" }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1 }, indices: 2 }] }],
+    buffers: [{ byteLength: bin.length }],
+    bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: pos.length * 4 }, { buffer: 0, byteOffset: pos.length * 4, byteLength: nrm.length * 4 }, { buffer: 0, byteOffset: pos.length * 8, byteLength: u.byteLength }],
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: 8, type: "VEC3", min: xs.map((v) => Math.min(...v)), max: xs.map((v) => Math.max(...v)) },
+      { bufferView: 1, componentType: 5126, count: 8, type: "VEC3" },
+      { bufferView: 2, componentType: 5123, count: 12, type: "SCALAR" },
+    ],
+  };
+  return writeGlb(json, bin);
+}
+
+test("gen.mjs glb --vehicle turns a yawed car so its length runs along Z with the nose on +Z, normals and bounds following", () => {
+  for (const yaw of [0, 33, 147, 270]) {
+    const out = parseGlb(fixGlb(wedgeGlb(yaw), { vehicle: true }));
+    const P = readAccessor(out.json, out.bin, 0), N = readAccessor(out.json, out.bin, 1);
+    const lo = [0, 1, 2].map((c) => Math.min(...Array.from({ length: 8 }, (_, i) => P[i * 3 + c])));
+    const hi = [0, 1, 2].map((c) => Math.max(...Array.from({ length: 8 }, (_, i) => P[i * 3 + c])));
+    assert.ok(Math.abs(hi[0] - lo[0] - 1.8) < 1e-3 && Math.abs(hi[2] - lo[2] - 4) < 1e-3, `yaw ${yaw}: extent ${hi.map((h, c) => (h - lo[c]).toFixed(3))}`);
+    for (let i = 0; i < 8; i++) if (P[i * 3 + 2] > 0) assert.ok(Math.max(P[i * 3 + 1], 0) <= 0.9 + 1e-3, `yaw ${yaw}: the +Z end is the low nose`);
+    assert.ok(Array.from({ length: 8 }, (_, i) => N[i * 3 + 2]).every((z) => Math.abs(z - 1) < 1e-3), `yaw ${yaw}: normals turned with the mesh`);
+    assert.deepEqual(out.json.accessors[0].min.map((v) => +v.toFixed(3)), lo.map((v) => +v.toFixed(3)), "accessor bounds follow the vertices");
+  }
+});
+
+test("gen.mjs glb --vehicle with --height keeps the pivot at the base centre of the straightened car", () => {
+  const out = parseGlb(fixGlb(wedgeGlb(33), { vehicle: true, height: 1.2 }));
+  const node = out.json.nodes[out.json.scenes[0].nodes[0]], s = node.scale[0], P = readAccessor(out.json, out.bin, 0);
+  const lo = [0, 1, 2].map((c) => Math.min(...Array.from({ length: 8 }, (_, i) => P[i * 3 + c])));
+  const hi = [0, 1, 2].map((c) => Math.max(...Array.from({ length: 8 }, (_, i) => P[i * 3 + c])));
+  assert.ok(Math.abs(node.translation[0] + ((lo[0] + hi[0]) / 2) * s) < 1e-4 && Math.abs(node.translation[2] + ((lo[2] + hi[2]) / 2) * s) < 1e-4, "centred on the car, not on its old yawed box");
+  assert.ok(Math.abs((hi[1] - lo[1]) * s - 1.2) < 1e-4 && Math.abs(hi[2] - lo[2] - 4) < 1e-3, "straightened, scaled to the asked height");
+});
+
+/** A textured plane of n x n quads (uint32 indices, UVs 0..uvScale) with two `side`-pixel checkerboard PNGs
+ *  (base colour, metallic-roughness) and `orphans` vertices no triangle uses. */
+function texturedGlb({ n = 24, side = 64, orphans = 0, uvScale = 1, node = {} } = {}) {
+  const pos = [], nrm = [], uv = [], idx = [];
+  for (let y = 0; y <= n; y++) for (let x = 0; x <= n; x++) {
+    pos.push(x * 0.1, y * 0.1, 0.03 * Math.sin(x * 0.7) * Math.cos(y * 0.5));
+    nrm.push(0, 0, 1);
+    uv.push((x / n) * uvScale, (y / n) * uvScale);
+  }
+  for (let o = 0; o < orphans; o++) { pos.push(50 + o, 50, 50); nrm.push(0, 0, 1); uv.push(0.5, 0.5); }
+  const v = (x, y) => y * (n + 1) + x;
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) idx.push(v(x, y), v(x + 1, y), v(x + 1, y + 1), v(x, y), v(x + 1, y + 1), v(x, y + 1));
+  const checker = () => { const d = new Uint8Array(side * side * 4); for (let i = 0; i < side * side; i++) { const on = ((i % side) + Math.floor(i / side)) % 2 ? 255 : 0; d.set([on, on, on, 255], i * 4); } return encodePng({ w: side, h: side, data: d }); };
+  const parts = [Buffer.from(new Float32Array(pos).buffer), Buffer.from(new Float32Array(nrm).buffer), Buffer.from(new Float32Array(uv).buffer), Buffer.from(new Uint32Array(idx).buffer), checker(), checker()];
+  const views = [], accessors = [];
+  let off = 0;
+  parts.forEach((b, i) => { views.push({ buffer: 0, byteOffset: off, byteLength: b.length }); off += b.length + ((4 - (b.length % 4)) % 4); });
+  const bin = Buffer.concat(parts.map((b) => Buffer.concat([b, Buffer.alloc((4 - (b.length % 4)) % 4)])));
+  const cnt = pos.length / 3, mm = [0, 1, 2].map((c) => pos.filter((_, i) => i % 3 === c));
+  accessors.push({ bufferView: 0, componentType: 5126, count: cnt, type: "VEC3", min: mm.map((a) => a.reduce((x, y) => Math.min(x, y))), max: mm.map((a) => a.reduce((x, y) => Math.max(x, y))) },
+    { bufferView: 1, componentType: 5126, count: cnt, type: "VEC3" }, { bufferView: 2, componentType: 5126, count: cnt, type: "VEC2" },
+    { bufferView: 3, componentType: 5125, count: idx.length, type: "SCALAR" });
+  return writeGlb({
+    asset: { version: "2.0" }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0, ...node }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 }, indices: 3, material: 0 }] }],
+    materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicRoughnessTexture: { index: 1 }, metallicFactor: 1, roughnessFactor: 0.4 } }],
+    textures: [{ source: 0 }, { source: 1 }], images: [{ bufferView: 4, mimeType: "image/png" }, { bufferView: 5, mimeType: "image/png" }],
+    buffers: [{ byteLength: bin.length }], bufferViews: views, accessors,
+  }, bin);
+}
+
+const pngOf = (g, i) => { const v = g.json.bufferViews[g.json.images[i].bufferView]; return decodePng(g.bin.subarray(v.byteOffset || 0, (v.byteOffset || 0) + v.byteLength)); };
+const trianglesOf = (g) => g.json.accessors[g.json.meshes[0].primitives[0].indices].count / 3;
+
+test("gen.mjs glb --max-tris leaves no old indices or unused vertices behind, so the file shrinks with the mesh", () => {
+  const src = texturedGlb({ n: 24, orphans: 5 });
+  const out = fixGlb(src, { maxTris: 400 });
+  const g = parseGlb(out), p = g.json.meshes[0].primitives[0];
+  assert.ok(trianglesOf(g) < 1152 * 0.7, `simplified: ${trianglesOf(g)} triangles`);
+  assert.ok(out.length < src.length, `file ${src.length} -> ${out.length} bytes`);
+  const idx = readAccessor(g.json, g.bin, p.indices), count = g.json.accessors[p.attributes.POSITION].count;
+  assert.equal(new Set(idx).size, count, "every vertex is used by a triangle, so none were left behind");
+  assert.ok(Math.max(...idx) < count);
+  for (const a of ["POSITION", "NORMAL", "TEXCOORD_0"]) assert.equal(g.json.accessors[p.attributes[a]].count, count, `${a} follows the vertices`);
+  assert.deepEqual([pngOf(g, 0).w, pngOf(g, 1).w], [64, 64], "the textures ride through untouched");
+  assert.ok(g.bin.length - g.json.buffers[0].byteLength < 4, "the buffer's length is its own, short of the chunk's padding by under 4 bytes");
+});
+
+test("gen.mjs glb --max-texture shrinks each texture by area, converting colour through linear light and data maps as they are", () => {
+  const g = parseGlb(fixGlb(texturedGlb({ side: 64 }), { maxTexture: 32 }));
+  assert.deepEqual([pngOf(g, 0).w, pngOf(g, 0).h, pngOf(g, 1).w], [32, 32, 32]);
+  // A one-pixel black/white checkerboard averages to half the light: sRGB 188 for colour, plain 128 for data.
+  const colour = pngOf(g, 0).data, data = pngOf(g, 1).data;
+  assert.ok(Math.abs(colour[4 * 100] - 188) <= 2, `base colour ${colour[4 * 100]}`);
+  assert.ok(Math.abs(data[4 * 100] - 128) <= 1, `metallic-roughness ${data[4 * 100]}`);
+  const same = parseGlb(fixGlb(texturedGlb({ side: 64 }), { maxTexture: 128 }));
+  assert.equal(pngOf(same, 0).w, 64, "a texture already under the limit is left alone");
+});
+
+test("gen.mjs glb --quantize writes 16-bit positions, 8-bit normals and 16-bit UVs that dequantize to the original mesh", () => {
+  const src = texturedGlb({ n: 24 }), plain = parseGlb(src);
+  const out = fixGlb(src, { quantize: true }), g = parseGlb(out), p = g.json.meshes[0].primitives[0];
+  assert.ok(out.length < src.length, `file ${src.length} -> ${out.length} bytes`);
+  assert.ok(g.json.extensionsRequired.includes("KHR_mesh_quantization") && g.json.extensionsUsed.includes("KHR_mesh_quantization"));
+  const [pa, na, ua] = ["POSITION", "NORMAL", "TEXCOORD_0"].map((a) => g.json.accessors[p.attributes[a]]);
+  assert.deepEqual([pa.componentType, pa.normalized, na.componentType, na.normalized, ua.componentType, ua.normalized], [5122, true, 5120, true, 5123, true]);
+  assert.equal(g.json.bufferViews[pa.bufferView].byteStride % 4, 0, "positions pad to 4 bytes");
+  assert.equal(g.json.bufferViews[na.bufferView].byteStride % 4, 0, "normals pad to 4 bytes");
+  // Vertices are renumbered, so compare what each triangle corner points at, old file against new.
+  const node = g.json.nodes[0], idxNew = readAccessor(g.json, g.bin, p.indices), idxOld = readAccessor(plain.json, plain.bin, 3);
+  const Pq = readAccessor(g.json, g.bin, p.attributes.POSITION), Po = readAccessor(plain.json, plain.bin, 0);
+  const Nq = readAccessor(g.json, g.bin, p.attributes.NORMAL), Uq = readAccessor(g.json, g.bin, p.attributes.TEXCOORD_0), Uo = readAccessor(plain.json, plain.bin, 2);
+  assert.equal(idxNew.length, idxOld.length, "the same triangles");
+  let worst = 0, worstUv = 0;
+  for (let k = 0; k < idxNew.length; k++) {
+    for (let c = 0; c < 3; c++) worst = Math.max(worst, Math.abs((Pq[idxNew[k] * 3 + c] / 32767) * node.scale[c] + node.translation[c] - Po[idxOld[k] * 3 + c]));
+    for (let c = 0; c < 2; c++) worstUv = Math.max(worstUv, Math.abs(Uq[idxNew[k] * 2 + c] / 65535 - Uo[idxOld[k] * 2 + c]));
+    assert.ok(Math.abs(Nq[idxNew[k] * 3 + 2] / 127 - 1) < 1e-6 && Nq[idxNew[k] * 3] === 0, "the normal (0,0,1) survives");
+  }
+  assert.ok(worst < 1e-4, `largest position error ${worst}`);
+  assert.ok(worstUv < 1.6e-5, `largest UV error ${worstUv}`);
+});
+
+test("gen.mjs glb --quantize keeps UVs that tile past 1 as floats, and skips a mesh whose node already has a transform", () => {
+  const tiled = parseGlb(fixGlb(texturedGlb({ uvScale: 4 }), { quantize: true }));
+  const p = tiled.json.meshes[0].primitives[0];
+  assert.equal(tiled.json.accessors[p.attributes.TEXCOORD_0].componentType, 5126, "tiling UVs cannot be normalized 16-bit");
+  assert.equal(tiled.json.accessors[p.attributes.POSITION].componentType, 5122, "the rest still quantizes");
+  const moved = parseGlb(fixGlb(texturedGlb({ node: { translation: [1, 2, 3] } }), { quantize: true }));
+  assert.equal(moved.json.accessors[moved.json.meshes[0].primitives[0].attributes.POSITION].componentType, 5126, "a node with its own transform is left in floats");
+  assert.ok(!(moved.json.extensionsRequired || []).includes("KHR_mesh_quantization"));
+});
+
+test("gen.mjs glb repacks a mesh of 200k vertices, quantized or not (a spread of that many values overflows the stack)", () => {
+  const big = texturedGlb({ n: 450, side: 8 });
+  for (const opts of [{ quantize: true }, { maxTexture: 4 }]) {
+    const g = parseGlb(fixGlb(big, opts));
+    const p = g.json.meshes[0].primitives[0];
+    assert.equal(g.json.accessors[p.attributes.POSITION].count, 451 * 451);
+    assert.equal(trianglesOf(g), 450 * 450 * 2);
+    assert.equal(g.json.accessors[p.attributes.POSITION].min.length, 3);
+  }
+});
+
+test("gen.mjs glb takes --max-texture and --quantize from the command line", async () => {
+  const dir = tmp(), src = join(dir, "in.glb"), out = join(dir, "out.glb");
+  writeFileSync(src, texturedGlb({ side: 64 }));
+  await run("node", [join(SKILL, "gen.mjs"), "glb", src, "-o", out, "--max-texture", "32", "--quantize"], { env: process.env });
+  const g = parseGlb(readFileSync(out));
+  assert.equal(pngOf(g, 0).w, 32);
+  assert.equal(g.json.accessors[g.json.meshes[0].primitives[0].attributes.POSITION].componentType, 5122);
+});
+
+test("gen.mjs 3d applies --max-texture and --quantize to the model it gets back, and keeps both off the request", async () => {
+  const ref = encodePng({ w: 8, h: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+  const r = await threeDRun({ ref, args: ["--max-texture", "32", "--quantize"], glb: texturedGlb({ side: 64 }) });
+  const g = parseGlb(readFileSync(r.out));
+  assert.equal(pngOf(g, 0).w, 32);
+  assert.ok(g.json.extensionsRequired.includes("KHR_mesh_quantization"));
+  assert.equal(r.body.max_texture, undefined);
+  assert.equal(r.body.quantize, undefined);
+});
+
+test("gen.mjs 3d prefers TRELLIS.2 over another 3D model, even when the other one is the loaded one", async () => {
+  const ref = encodePng({ w: 8, h: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+  const models = [
+    { id: "org/moss", capabilities: ["image"], state: "ready" },
+    { id: "local/Pixal3D-local", capabilities: ["3d"], state: "ready" },
+    { id: "org/TRELLIS.2-4B-MLX-Serve-8bit", capabilities: ["3d"], state: "unloaded" },
+  ];
+  assert.equal((await threeDRun({ ref, models })).body.model, "org/TRELLIS.2-4B-MLX-Serve-8bit");
+  const only = models.filter((m) => !/TRELLIS/.test(m.id));
+  assert.equal((await threeDRun({ ref, models: only })).body.model, "local/Pixal3D-local", "without TRELLIS.2 the other model serves");
+});
+
+test("gen.mjs 3d asks the server for about three times max_tris faces, so the UV unwrap is not run on 300k faces", async () => {
+  const ref = encodePng({ w: 8, h: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+  const r = await threeDRun({ ref, args: ["--max-tris", "8000"], glb: wedgeGlb(0) });
+  assert.equal(r.body.decimation_target, 24000);
+  const small = await threeDRun({ ref, args: ["--max-tris", "1000"], glb: wedgeGlb(0) });
+  assert.equal(small.body.decimation_target, 10000, "the server's lowest accepted target");
+  const big = await threeDRun({ ref, args: ["--max-tris", "500000"], glb: wedgeGlb(0) });
+  assert.equal(big.body.decimation_target, 300000, "never above the server's default");
+  const none = await threeDRun({ ref });
+  assert.equal(none.body.decimation_target, undefined, "no max_tris, nothing sent");
+});
 
 test("film.mjs init writes a project whose starter timeline checks clean", async () => {
   const dir = join(tmp(), "proj");

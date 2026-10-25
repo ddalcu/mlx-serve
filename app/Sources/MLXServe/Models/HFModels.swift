@@ -58,6 +58,7 @@ let supportedModelTypes: Set<String> = [
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
+    "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
     "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE): an mlx-stream pack (the trunk beside an experts.bin bank)
@@ -87,7 +88,7 @@ let supportedModelTypes: Set<String> = [
 /// architecture" in the Downloaded tab) while still being excluded from
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
 /// Mirrors `model_discovery.isMediaModelType` (Zig).
-private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "qwen_image", "hunyuan3d"]
+private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "qwen_image", "moss_image", "hunyuan3d"]
 // Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
 // a media model missing from this list fails the ARCHITECTURE gate outright,
 // so the browser draws it a red "Unsupported" — which is what happened to
@@ -104,7 +105,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization",
+    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -147,8 +148,8 @@ enum MediaModality: CaseIterable {
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
-            || modelType.hasPrefix("qwen_image") { self = .image; return }
-        if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
+            || modelType.hasPrefix("qwen_image") || modelType == "moss_image" { self = .image; return }
+        if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
         case "acestep", "minimax_music3", "yue2": self = .music
@@ -217,6 +218,7 @@ struct HFConfigMeta: Codable {
 /// served, so their classes deliberately map nowhere.
 private let servedDiffusersClasses: [String: String] = [
     "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
+    "MOSSImagePipeline": "moss_image", // mirrors model_discovery.peekMossImageIndex
 ]
 
 struct HFModel: Identifiable, Codable {

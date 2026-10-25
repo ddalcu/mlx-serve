@@ -30,4 +30,33 @@ final class ServerEnsureChatModelTests: XCTestCase {
             running: true, launchedModelPath: "", chatResident: false,
             selectedModelPath: ""))
     }
+
+    /// #925: with a provider or LAN model picked, the remembered local model is not a load target.
+    @MainActor
+    func testRemoteChatNeverLoadsTheRememberedLocalModel() {
+        let saved = UserDefaults.standard.string(forKey: "lanChatModelId")
+        defer { UserDefaults.standard.set(saved, forKey: "lanChatModelId") }
+        let server = ServerManager()
+        server.status = .running
+        let local = "/models/org/unrelated-local-model"
+        for remote in ["qwen@studio", "/models/qwen@Splash"] {
+            server.lanChatModelId = remote
+            XCTAssertNil(server.localChatLoadPath(selectedPath: local))
+            XCTAssertFalse(server.chatLoadNeeded(selectedModelPath: local))
+        }
+        server.lanChatModelId = nil
+        XCTAssertEqual(server.localChatLoadPath(selectedPath: local), local)
+        XCTAssertNil(server.localChatLoadPath(selectedPath: ""))
+        XCTAssertTrue(server.chatLoadNeeded(selectedModelPath: local))
+    }
+
+    func testComposerLoadProgressFollowsTheChatTargetWhileTheTrayShowsEveryLoad() {
+        for remote in [nil, "qwen@studio"] as [String?] {
+            for apple in [false, true] {
+                XCTAssertEqual(ChatModelSelection.showsLocalLoadProgress(lanChatModelId: remote, apple: apple, chatTargetOnly: true),
+                               remote == nil && !apple)
+                XCTAssertTrue(ChatModelSelection.showsLocalLoadProgress(lanChatModelId: remote, apple: apple, chatTargetOnly: false))
+            }
+        }
+    }
 }

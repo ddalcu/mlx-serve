@@ -7,17 +7,38 @@ agents shipped. Generate assets with `gen.mjs` next to this file (`node gen.mjs 
 
 Write every asset as a job in one `assets.json`, run `node <skill dir>/gen.mjs batch assets.json`,
 and load files through the `manifest.json` it writes. Jobs run one at a time (the server has one
-GPU), unchanged jobs are skipped, and the media models are unloaded at the end so your chat model
-keeps its memory. Never write your own SSE client for this.
+GPU, shared with the chat model you run on), unchanged jobs are skipped, a media model is unloaded
+before the next kind loads, and the last one at the end so your chat model keeps its memory. Run
+the batch in the FOREGROUND and wait for it (no `&` or `nohup`): while it runs your own model cannot be
+loaded, so any request you make to the server in the meantime is refused and ends your session. Never write your
+own SSE client for this.
 
 - Textures that repeat: `"tile": true` (seamless) and `"maps": true` (normal, roughness and AO maps
   beside the colour map). Prompt "seamless tileable texture of ..., top-down, flat even lighting".
 - Leaves, blossoms, sprites: prompt "... on a plain white background, no shadow", then
   `"cutout": true, "trim": true` (add `"holes": true` when background shows through gaps).
 - 3D props: `{"type": "3d", "prompt": "<one object>", "height_m": 1.6, "max_tris": 8000}`
-  generates a reference image, the textured GLB, then scales it to metres with the pivot at the
-  base centre and cuts it to a triangle budget. Load with `GLTFLoader` and add it as is.
-- Post-process files you already have: `gen.mjs maps|tile|cutout|glb` (PNG and GLB, no server).
+  generates a reference image (its plain background is cut to transparency before it is sent: the
+  TRELLIS.2 and Pixal3D backends take the alpha as the subject), the textured GLB, then scales it to
+  metres with the pivot at the base centre and cuts it to a triangle budget. Load with `GLTFLoader` and
+  add it as is. Add `"vehicle": true` to a car: it is turned so its length runs along Z, with the nose at
+  +Z for most cars (a low-tailed one can come out 180 degrees off: check the first one in the scene;
+  without the flag a car keeps the angle of its photo). A car comes out as ONE fused mesh, wheels included,
+  so its wheels do not spin. Cars are the hero asset: `"resolution": 1536, "texture_size": 2048` needs about
+  36 GB of FREE GPU memory (1024 needs about 23 GB, so use 1024 on a Mac whose own chat model shares the GPU).
+  A 400 that names GPU memory means lower the resolution; never unload your own model to make room.
+  Ship the texture at 2048 and 100k or more triangles; shrinking a car's texture to 1024 and simplifying it
+  to 40% (what agents did to keep the file small) was visibly worse. Ask for the size when the car is made
+  (`"decimation_target": 150000, "texture_size": 2048`), then `gen.mjs glb car.glb -o car.glb --quantize` halves the file
+  and changes nothing you can see.
+  A car wants car paint: `"roughness_scale": 0.4, "clearcoat": 1.0` on the job (see media.md; try a second seed if the hood is lumpy), and a three.js
+  `RoomEnvironment` as `scene.environment` to show it.
+  The skill prefers the TRELLIS.2 model when it is installed (`"model"` in a job overrides). `max_tris` also tells the server to keep about three times that many faces
+  before it unwraps and bakes the texture (`decimation_target`; set it yourself to override).
+- Never make vegetation (trees, palms, bushes, hedges, grass) a 3D job: its thin leaf geometry can pin
+  the server's UV unwrap for tens of minutes, and a stuck 3D job blocks every other media job and your
+  own model's reload. Use cutout cards (see Foliage below). Keep 3D jobs to solid objects.
+- Post-process files you already have: `gen.mjs maps|tile|cutout|glb` (PNG and GLB, no server). `glb` also takes `--max-texture 2048` and `--quantize`.
 
 ## Movement and camera
 

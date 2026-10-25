@@ -19,8 +19,11 @@ extern "C" {
 // Unwrap `vertex_count` xyz positions (packed f32) with `index_count` u32
 // indices (triangles). Returns an opaque result handle, or NULL on failure
 // (empty input, AddMesh error, or no atlas produced). Free with uvw_free.
+// `face_material` (index_count / 3 entries, or NULL): a chart never spans two values, and each connected
+// run of one value is its own chart group, which xatlas segments on its own core.
 void *uvw_parametrize(const float *positions, uint32_t vertex_count,
-                      const uint32_t *indices, uint32_t index_count);
+                      const uint32_t *indices, uint32_t index_count,
+                      const uint32_t *face_material);
 
 uint32_t uvw_vertex_count(const void *r);   // output vertex count (>= input; seams duplicate)
 uint32_t uvw_index_count(const void *r);    // == input index_count

@@ -827,8 +827,10 @@ const Attention = struct {
     /// the fused weight is absent or the call is outside it.
     fn fusedHeads(self: *const Attention, x: mlx.mlx_array, cos: ?mlx.mlx_array, sin: ?mlx.mlx_array, s: S) !?Heads {
         const f = if (self.qkvg) |*q| q else return null;
-        const lora = self.wq.lora_count + self.wk.lora_count + self.wv.lora_count + self.gate.lora_count;
-        if (cos == null or lora != 0 or mlx.getShape(x)[0] != 1) return null;
+        // An adapter at a nonzero scale needs the four projections apart; a strength-0 stack keeps the fused bytes.
+        const lora = lora_mod.anyActive(self.wq.lora_refs[0..self.wq.lora_count]) or lora_mod.anyActive(self.wk.lora_refs[0..self.wk.lora_count]) or
+            lora_mod.anyActive(self.wv.lora_refs[0..self.wv.lora_count]) or lora_mod.anyActive(self.gate.lora_refs[0..self.gate.lora_count]);
+        if (cos == null or lora or mlx.getShape(x)[0] != 1) return null;
         const xb = try astype(x, .bfloat16, s); // the projections compute in bf16
         defer _ = mlx.mlx_array_free(xb);
         const y = try w8a8.forward(xb, f, s);
@@ -974,15 +976,15 @@ const SwiGLU = struct {
     }
 
     /// `silu(gate(x)) * up(x)`. With the interleaved weight that is one GEMM; an
-    /// attached adapter needs the two projections apart, so it takes the plain
-    /// GEMM and splits it.
+    /// adapter at a nonzero scale needs the two projections apart, so it takes
+    /// the plain GEMM and splits it (a strength-0 stack keeps the fused bytes).
     fn gateUp(self: *const SwiGLU, x: mlx.mlx_array, s: S) !mlx.mlx_array {
         var g: mlx.mlx_array = undefined;
         var u: mlx.mlx_array = undefined;
         if (self.gu) |*f| {
             const xb = try astype(x, .bfloat16, s);
             defer _ = mlx.mlx_array_free(xb);
-            if (self.gate.lora_count == 0 and self.up.lora_count == 0) return w8a8.forwardSwiglu(xb, f, s);
+            if (!lora_mod.anyActive(self.gate.lora_refs[0..self.gate.lora_count]) and !lora_mod.anyActive(self.up.lora_refs[0..self.up.lora_count])) return w8a8.forwardSwiglu(xb, f, s);
             const pair = try w8a8.forwardPair(xb, f, s);
             g = try self.gate.addLora(pair.gate, xb, s);
             u = self.up.addLora(pair.up, xb, s) catch |e| {

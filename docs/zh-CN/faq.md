@@ -22,7 +22,7 @@
 
 ## mlx-serve 能和 Claude Code 一起用吗？
 
-能 —— 原生支持。mlx-serve 实现了 Anthropic 的 `/v1/messages` 端点，包含流式、工具调用与扩展思考。把 Claude Code 指向它，设置 `ANTHROPIC_BASE_URL=http://localhost:11234`。MLX Core 应用提供一键“启动 Claude Code”按钮，替你配好环境变量，`mlx-serve launch claude` 在终端里做同样的事。其他 Agent 也一样：pi、oh-my-pi、OpenCode、Codex、hermes、aider，以及 Zed 这类编辑器。各自的配置见 [integrations.md](integrations.md)。
+能 —— 原生支持。mlx-serve 实现了 Anthropic 的 `/v1/messages` 端点，包含流式、工具调用与扩展思考。把 Claude Code 指向它，设置 `ANTHROPIC_BASE_URL=http://localhost:11234`。MLX-Serve 应用提供一键“启动 Claude Code”按钮，替你配好环境变量，`mlx-serve launch claude` 在终端里做同样的事。其他 Agent 也一样：pi、oh-my-pi、OpenCode、Codex、hermes、aider，以及 Zed 这类编辑器。各自的配置见 [integrations.md](integrations.md)。
 
 ## 我的多台 Mac 能通过网络共享模型吗？
 
@@ -34,7 +34,7 @@
 
 ## mlx-serve 能在本地运行 DeepSeek V4 Flash 吗？
 
-能，在 128 GB+ 的 Apple Silicon Mac 上。打开 MLX Core 模型浏览器，选 DeepSeek-V4-Flash，点下载。自 v26.7.12 起，safetensors 版本跑在我们自己的 MLX 引擎上，而不是经由 GGUF：284B 参数、13B 激活、1M 上下文，支持聊天、思考、工具调用与流式，M4 Max 上单流解码约 30 tok/s，用 DSpark（`--dspark`，检查点自带的草稿阶段）大约翻倍。`.gguf` 版本仍路由到内置的 [ds4](https://github.com/antirez/ds4) 引擎。Agent 模式与 MCP 工具在 DSV4 上同样可用。它需要检查点的 0731 发行版；更早的预览版会在加载时被拒绝。
+能，在 128 GB+ 的 Apple Silicon Mac 上。打开 MLX-Serve 模型浏览器，选 DeepSeek-V4-Flash，点下载。自 v26.7.12 起，safetensors 版本跑在我们自己的 MLX 引擎上，而不是经由 GGUF：284B 参数、13B 激活、1M 上下文，支持聊天、思考、工具调用与流式，M4 Max 上单流解码约 30 tok/s，用 DSpark（`--dspark`，检查点自带的草稿阶段）大约翻倍。`.gguf` 版本仍路由到内置的 [ds4](https://github.com/antirez/ds4) 引擎。Agent 模式与 MCP 工具在 DSV4 上同样可用。它需要检查点的 0731 发行版；更早的预览版会在加载时被拒绝。
 
 ## 支持哪些模型？
 
@@ -50,7 +50,7 @@
 
 ## 支持工具 / 函数调用吗？
 
-支持，两种 API 接口面都支持。服务器跨架构检测工具调用模式（Hermes XML、Gemma 4 `<|tool_call>`、MiniCPM5 V3 的属性引号式 `<function name="…">` XML、原始 JSON、ChatML），修复常见的 Qwen 3.5/3.6 转义怪癖，并在 SSE 流中输出 OpenAI 风格的 `tool_calls` 增量。MLX Core 应用内置 10 个工具（shell、文件 I/O、搜索、浏览、网页搜索、记忆），并能从精选市场连接 MCP 服务器。
+支持，两种 API 接口面都支持。服务器跨架构检测工具调用模式（Hermes XML、Gemma 4 `<|tool_call>`、MiniCPM5 V3 的属性引号式 `<function name="…">` XML、原始 JSON、ChatML），修复常见的 Qwen 3.5/3.6 转义怪癖，并在 SSE 流中输出 OpenAI 风格的 `tool_calls` 增量。MLX-Serve 应用内置 10 个工具（shell、文件 I/O、搜索、浏览、网页搜索、记忆），并能从精选市场连接 MCP 服务器。
 
 ## 它怎么做到这么小 / 这么快？
 
@@ -76,4 +76,4 @@
 
 ## 怎么更新？
 
-MLX Core 应用通过检查 GitHub releases 源自动更新。CLI：`brew upgrade --cask mlx-serve` 或 `brew upgrade mlx-serve`。
+MLX-Serve 应用通过检查 GitHub releases 源自动更新。CLI：`brew upgrade --cask mlx-serve` 或 `brew upgrade mlx-serve`。

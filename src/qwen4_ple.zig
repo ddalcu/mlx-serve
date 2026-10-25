@@ -55,6 +55,18 @@ pub fn partCount(fmt: Format) usize {
     return if (fmt == .nvfp4) 2 else 3;
 }
 
+/// The width `wcols` u32 words pack `dim` values at: any affine width `mx.quantize` writes
+/// (the table's dim is known, so the words alone decide it), NVFP4 always 4.
+fn packedBits(form: Format, wcols: u32, dim: u32) ?u32 {
+    const total = @as(u64, wcols) * 32;
+    if (dim == 0 or total % dim != 0) return null;
+    return switch (total / dim) {
+        4 => 4,
+        2, 3, 5, 6, 8 => |b| if (form == .affine) @intCast(b) else null,
+        else => null,
+    };
+}
+
 pub fn regionsOverlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) bool {
     return a_start < b_end and b_start < a_end;
 }
@@ -353,7 +365,7 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
             parts[2] = .{ .file = parts[0].file, .off = parts[0].off, .len = 0, .rows = parts[0].rows, .cols = 0 };
         }
         if (parts[0].rows != parts[1].rows or parts[0].rows != parts[2].rows or (form == .affine and parts[1].cols != parts[2].cols)) return error.EmbeddedPleRegion;
-        if (@as(u64, parts[0].cols) * 8 != expected.dim or parts[1].cols == 0 or expected.dim % parts[1].cols != 0) return error.EmbeddedPleGeometry;
+        if (packedBits(form, parts[0].cols, expected.dim) == null or parts[1].cols == 0 or expected.dim % parts[1].cols != 0) return error.EmbeddedPleGeometry;
         const gs = expected.dim / parts[1].cols;
         // The NVFP4 readers (CPU dequant, GPU gather) are written for 16-value groups only.
         if (gs == 0 or gs > 1024 or (form == .nvfp4 and gs != 16) or (i != 0 and (parts[0].cols != wcols or parts[1].cols != scols or gs != group_size))) return error.EmbeddedPleGeometry;
@@ -395,7 +407,7 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
         if (!std.math.isFinite(scale) or scale <= 0) return error.EmbeddedPleWeightScale;
         payload = std.math.add(u64, payload, region.end - region.start) catch return error.EmbeddedPleRegion;
     }
-    return .{ .arena = arena, .files = files.items, .shards = shards, .rows = first, .dim = expected.dim, .bits = 4, .group_size = group_size, .wcols = wcols, .scols = scols, .payload_bytes = payload, .scale = scale, .fmt = form };
+    return .{ .arena = arena, .files = files.items, .shards = shards, .rows = first, .dim = expected.dim, .bits = packedBits(form, wcols, expected.dim).?, .group_size = group_size, .wcols = wcols, .scols = scols, .payload_bytes = payload, .scale = scale, .fmt = form };
 }
 
 pub fn inspectEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedInfo {
@@ -436,6 +448,26 @@ pub fn writeFixture(td: *std.testing.TmpDir, variant: FixtureVariant) !void {
     @memset(data_b[2..18], 0x22);
     try writeSafetensors(td, "a.safetensors", header_a, data_a[0..if (@backingInt(variant) >= @backingInt(FixtureVariant.scale_unit)) 102 else 100]);
     try writeSafetensors(td, "b.safetensors", header_b, &data_b);
+}
+
+/// One affine shard of two rows at dim 32, group 32, packed at `bits`: row 0 mixed codes (values
+/// straddle words at 3/5/6 bits), row 1 all ones, scale 1.0, bias 0.
+pub fn writeAffineFixture(td: *std.testing.TmpDir, bits: u32) !void {
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ prefix ++ "0.weight\":\"a.safetensors\",\"" ++ prefix ++ "0.scales\":\"a.safetensors\",\"" ++ prefix ++ "0.biases\":\"a.safetensors\"}}" });
+    const wbytes = 2 * bits * 4;
+    const header = try std.fmt.allocPrint(a, "{{\"{s}0.weight\":{{\"dtype\":\"U32\",\"shape\":[2,{d}],\"data_offsets\":[0,{d}]}}," ++
+        "\"{s}0.scales\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[{d},{d}]}}," ++
+        "\"{s}0.biases\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[{d},{d}]}}}}", .{ prefix, bits, wbytes, prefix, wbytes, wbytes + 4, prefix, wbytes + 4, wbytes + 8 });
+    defer a.free(header);
+    const data = try a.alloc(u8, wbytes + 8);
+    defer a.free(data);
+    for (data[0 .. wbytes / 2], 0..) |*b, i| b.* = @truncate(i *% 0x9d +% 0x35);
+    @memset(data[wbytes / 2 .. wbytes], 0xff);
+    @memset(data[wbytes..], 0);
+    for (0..2) |r| std.mem.writeInt(u16, data[wbytes + r * 2 ..][0..2], 0x3f80, .little);
+    try writeSafetensors(td, "a.safetensors", header, data);
 }
 
 /// A ModelOpt NVFP4 table under `tensors/`: rows 0-1 in shard 0, row 2 in shard 1, dim 32. Row r's

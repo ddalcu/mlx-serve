@@ -29,6 +29,10 @@ struct Model3DGenView: View {
     @State private var keepResident: Bool = false
     @State private var turntable: Bool = true
     @State private var texture: Bool = false
+    @State private var trellisResolution: Int = 1024
+    @State private var decimationTarget: Int = 300_000
+    @State private var textureSize: Int = 2048
+    @State private var finish: Model3DFinish = .model
     @State private var showAdvanced: Bool = false
 
     @State private var showRAMWarning: Bool = false
@@ -175,7 +179,9 @@ struct Model3DGenView: View {
                               isTargeted: isDropTargeted) { choosePhoto() }
                 // The well says how to add a photo; what is left to say is
                 // which photo works.
-                Text("A single, well-lit photo of one object works best. The subject is auto-cut from its background.")
+                Text(L10n.text(model.family.cutoutKeepsAlpha
+                     ? "A single, well-lit photo of one object works best. A cutout with a transparent background is used as is; otherwise the subject is auto-cut."
+                     : "A single, well-lit photo of one object works best. The subject is auto-cut from its background."))
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             }
         }
@@ -191,22 +197,58 @@ struct Model3DGenView: View {
         VStack(alignment: .leading, spacing: 10) {
             FoldingSectionHeader(title: "Advanced options", isExpanded: $showAdvanced)
             if showAdvanced {
-                intSliderRow("Steps", value: $steps, range: 10...50)
-                sliderRow("Guidance", value: $guidance, range: 1...10, step: 0.5)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Mesh resolution").font(.app(.rowTitle))
-                    Picker("", selection: $resolution) {
-                        Text("128 (fast)").tag(128)
-                        Text("256 (balanced)").tag(256)
-                        Text("384 (fine)").tag(384)
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    Text("Higher = finer mesh, more memory and time.").font(.app(.caption2)).foregroundStyle(.secondary)
+                switch model.family {
+                case .hunyuan3d: hunyuanControls
+                case .trellis2, .pixal3d: cascadeControls
                 }
-                Toggle("Texture (PBR)", isOn: $texture)
-                    .font(.app(.caption))
-                    .help("After the shape stage, paint a full PBR texture (albedo + metallic-roughness) onto the mesh from the same photo. Needs the converted paint weights (~4.6 GB).")
+            }
+        }
+    }
+
+    @ViewBuilder private var hunyuanControls: some View {
+        intSliderRow("Steps", value: $steps, range: 10...50)
+        sliderRow("Guidance", value: $guidance, range: 1...10, step: 0.5)
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Mesh resolution").font(.app(.rowTitle))
+            Picker("", selection: $resolution) {
+                Text("128 (fast)").tag(128)
+                Text("256 (balanced)").tag(256)
+                Text("384 (fine)").tag(384)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            Text("Higher = finer mesh, more memory and time.").font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+        Toggle("Texture (PBR)", isOn: $texture)
+            .font(.app(.caption))
+            .help("After the shape stage, paint a full PBR texture (albedo + metallic-roughness) onto the mesh from the same photo. Needs the converted paint weights (~4.6 GB).")
+    }
+
+    /// TRELLIS.2 and Pixal3D texture every model and run their published recipe, so they have no steps, guidance or paint toggle.
+    @ViewBuilder private var cascadeControls: some View {
+        segmentedRow("Resolution", selection: $trellisResolution,
+                     options: [(1024, "1024"), (1536, "1536")],
+                     note: "1536 gives a finer mesh and needs about 35 GB of memory.")
+        segmentedRow("Faces", selection: $decimationTarget,
+                     options: Model3DGenSettings.faceOptions.map { ($0, $0 >= 1_000_000 ? "\($0 / 1_000_000)M" : "\($0 / 1000)k") },
+                     note: "More faces keep more detail. At 1M faces and above the file passes 60 MB.")
+        segmentedRow("Texture size", selection: $textureSize,
+                     options: [(1024, "1024"), (2048, "2048"), (4096, "4096")], note: nil)
+        segmentedRow("Finish", selection: $finish,
+                     options: Model3DFinish.allCases.map { ($0, L10n.text($0.title)) },
+                     note: "The model decides what is shiny; a finish scales it. A glossier finish shows every bump in the surface.")
+    }
+
+    private func segmentedRow<T: Hashable>(_ label: String, selection: Binding<T>, options: [(T, String)], note: String?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(L10n.text(label)).font(.app(.rowTitle))
+            Picker("", selection: selection) {
+                ForEach(options, id: \.0) { Text($0.1).tag($0.0) }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            if let note {
+                Text(L10n.text(note)).font(.app(.caption2)).foregroundStyle(.secondary)
             }
         }
     }
@@ -397,6 +439,10 @@ struct Model3DGenView: View {
         keepResident = s.keepResident
         turntable = s.turntable
         texture = s.texture
+        trellisResolution = s.trellisResolution
+        decimationTarget = s.decimationTarget
+        textureSize = s.textureSize
+        finish = s.finish
         showAdvanced = s.showAdvanced
         // A photo that has gone since is dropped, as the other panes do.
         photoURL = s.photoPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
@@ -413,6 +459,10 @@ struct Model3DGenView: View {
         s.keepResident = keepResident
         s.turntable = turntable
         s.texture = texture
+        s.trellisResolution = trellisResolution
+        s.decimationTarget = decimationTarget
+        s.textureSize = textureSize
+        s.finish = finish
         s.photoPath = photoURL?.path
         s.showAdvanced = showAdvanced
         return s
@@ -432,11 +482,15 @@ struct Model3DGenView: View {
             octreeResolution: resolution,
             keepResident: keepResident,
             lanModelId: lanModel,
-            texture: texture
+            texture: texture,
+            trellisResolution: trellisResolution,
+            decimationTarget: decimationTarget,
+            textureSize: textureSize,
+            finish: finish
         )
         persist()
         let total = RAMChecker.totalGB
-        let needed = model.approxRAMGB
+        let needed = model.approxRAMGB(trellisResolution: trellisResolution)
         if total < needed {
             ramWarningMessage = "This model needs about \(needed) GB of RAM, but your Mac has \(total) GB total. It may run very slowly or fail. Continue?"
             pendingRequest = req
@@ -660,7 +714,8 @@ enum GLBMeshLoader {
 
     /// Build an SCNMaterial from a glTF PBR material: embedded-PNG baseColor →
     /// diffuse, metallicRoughness → metalness (B) / roughness (G) via SceneKit's
-    /// per-channel texture components. Scoped to what the mlx-serve writer emits.
+    /// per-channel texture components, plus the finish it declares (roughness factor, clearcoat extension).
+    /// Scoped to what the mlx-serve writer emits.
     private static func buildMaterial(gltf: [String: Any], raw: UnsafeRawBufferPointer,
                                       bin: Range<Int>, index: Int) -> SCNMaterial? {
         guard let materials = gltf["materials"] as? [[String: Any]],
@@ -694,11 +749,18 @@ enum GLBMeshLoader {
             // glTF packs G = roughness, B = metallic.
             material.roughness.contents = mr
             material.roughness.textureComponents = .green
+            // glTF multiplies the roughness texture by the material's factor, which is how a finish rides in.
+            material.roughness.intensity = CGFloat(pbr["roughnessFactor"] as? Double ?? 1.0)
             material.metalness.contents = mr
             material.metalness.textureComponents = .blue
         } else {
             material.metalness.contents = pbr["metallicFactor"] as? Double ?? 0.0
             material.roughness.contents = pbr["roughnessFactor"] as? Double ?? 1.0
+        }
+        if let coat = ((materials[index]["extensions"] as? [String: Any])?["KHR_materials_clearcoat"] as? [String: Any])?["clearcoatFactor"] as? Double,
+           coat > 0 {
+            material.clearCoat.contents = coat
+            material.clearCoatRoughness.contents = 0.03
         }
         return material
     }

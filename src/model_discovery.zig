@@ -53,6 +53,7 @@ const supported_model_types = [_][]const u8{
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
+    "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
@@ -98,6 +99,12 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
     // YuE2: the upstream repo has no decoder; only a pack with the folded-in VAE can run.
     if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
+    // MOSS-Image: no root config.json, so model_index.json lands first; every pack names its VAE weights so.
+    if (std.mem.eql(u8, model_type, "moss_image")) return "vae/diffusion_pytorch_model.safetensors";
+    // TRELLIS.2: pipeline.json names the pack, so a pull lands its weights first; the SS decoder sorts last of them.
+    if (std.mem.eql(u8, model_type, "trellis2")) return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors";
+    // Pixal3D ships its decoders in its own ckpts/; the texture decoder sorts last.
+    if (std.mem.eql(u8, model_type, "pixal3d")) return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors";
     return null;
 }
 
@@ -113,6 +120,9 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
         std.mem.startsWith(u8, model_type, "qwen_image") or
+        std.mem.eql(u8, model_type, "moss_image") or
+        std.mem.eql(u8, model_type, "trellis2") or
+        std.mem.eql(u8, model_type, "pixal3d") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "kokoro") or
@@ -197,6 +207,13 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // (the 2.0 family's "QwenImagePipeline" is a different architecture).
         if (peekQwenImage21Index(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "qwen_image21") catch return .missing_or_unparseable };
+        if (peekMossImageIndex(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "moss_image") catch return .missing_or_unparseable };
+        // …and a TRELLIS.2 pack: pipeline.json's `name`, no root config.json; Pixal3D keeps that name.
+        if (peekPixal3dPipeline(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "pixal3d") catch return .missing_or_unparseable };
+        if (peekTrellis2Pipeline(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "trellis2") catch return .missing_or_unparseable };
         // …and a Stable Audio 3 repo: stable-audio-tools' model_config.json.
         if (peekStableAudio3Config(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "stable_audio3") catch return .missing_or_unparseable };
@@ -321,6 +338,64 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
 /// family spells "QwenImagePipeline" — a different architecture, never matched.
 /// Same signature as gen.isQwenImage21Repo, over an already-open Dir.
 pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return modelIndexClassIs(io, allocator, sub, "QwenImage21Pipeline");
+}
+
+/// True when `sub/model_index.json` names the MOSS-Image pipeline (the release's
+/// diffusers tree, as published and as the mlx-community mirror ships it).
+pub fn peekMossImageIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return modelIndexClassIs(io, allocator, sub, "MOSSImagePipeline");
+}
+
+/// True when `sub/pipeline.json` names the TRELLIS.2 image-to-3D pipeline (microsoft/TRELLIS.2-4B as published,
+/// and the MLX packs that keep its layout). Twin of gen.isTrellis2Pack, which delegates here.
+pub fn peekTrellis2Pipeline(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return trellisPipelineKind(io, allocator, sub) == .trellis2;
+}
+
+/// True for TencentARC/Pixal3D's layout: TRELLIS.2's pipeline.json (same `name`) over flows whose own config reads
+/// `"image_attn_mode": "proj"`. Twin of gen.isPixal3dPack, which delegates here.
+pub fn peekPixal3dPipeline(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return trellisPipelineKind(io, allocator, sub) == .pixal3d;
+}
+
+const TrellisKind = enum { trellis2, pixal3d };
+
+fn trellisPipelineKind(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) ?TrellisKind {
+    const pipe = readJsonIn(io, allocator, sub, "pipeline.json") orelse return null;
+    defer pipe.deinit();
+    const name = jsonPath(pipe.value, &.{"name"}) orelse return null;
+    if (name != .string or !std.mem.eql(u8, name.string, "Trellis2ImageTo3DPipeline")) return null;
+    const ss = jsonPath(pipe.value, &.{ "args", "models", "sparse_structure_flow_model" }) orelse return .trellis2;
+    if (ss != .string) return .trellis2;
+    var buf: [512]u8 = undefined;
+    const cfg_path = std.fmt.bufPrint(&buf, "{s}.json", .{ss.string}) catch return .trellis2;
+    const cfg = readJsonIn(io, allocator, sub, cfg_path) orelse return .trellis2;
+    defer cfg.deinit();
+    const mode = jsonPath(cfg.value, &.{ "args", "image_attn_mode" }) orelse return .trellis2;
+    return if (mode == .string and std.mem.eql(u8, mode.string, "proj")) .pixal3d else .trellis2;
+}
+
+fn readJsonIn(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, path: []const u8) ?std.json.Parsed(std.json.Value) {
+    var file = sub.openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return null;
+    defer allocator.free(bytes);
+    return std.json.parseFromSlice(std.json.Value, allocator, bytes, .{ .allocate = .alloc_always }) catch null;
+}
+
+fn jsonPath(v: std.json.Value, keys: []const []const u8) ?std.json.Value {
+    var cur = v;
+    for (keys) |k| {
+        if (cur != .object) return null;
+        cur = cur.object.get(k) orelse return null;
+    }
+    return cur;
+}
+
+fn modelIndexClassIs(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, class_name: []const u8) bool {
     var file = sub.openFile(io, "model_index.json", .{}) catch return false;
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -331,7 +406,7 @@ pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.I
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "QwenImage21Pipeline");
+    return cn == .string and std.mem.eql(u8, cn.string, class_name);
 }
 
 /// True when `sub/model_config.json` is a stable-audio-tools inpainting
@@ -652,14 +727,15 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
-        std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
+        std.mem.startsWith(u8, model_type, "qwen_image") or
+        std.mem.eql(u8, model_type, "moss_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.eql(u8, model_type, "yue2") or
         std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
-    if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.startsWith(u8, model_type, "hunyuan3d") or std.mem.eql(u8, model_type, "trellis2") or std.mem.eql(u8, model_type, "pixal3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
     if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
@@ -1043,6 +1119,9 @@ fn tryAddModel(
             !peekMfluxFlux2(io, allocator, sub) and
             !peekLayaCheckpoint(io, sub) and
             !peekQwenImage21Index(io, allocator, sub) and
+            !peekMossImageIndex(io, allocator, sub) and
+            !peekTrellis2Pipeline(io, allocator, sub) and
+            !peekPixal3dPipeline(io, allocator, sub) and
             !peekStableAudio3Config(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
@@ -1391,7 +1470,9 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // The model card's window, not the trunk's 262144 (model.zig EMBEDDING_GEMMA2_WINDOW).
     const embedding_gemma2_window: u32 = 8192;
     if (embedding_gemma2) meta.max_position_embeddings = if (meta.max_position_embeddings == 0) embedding_gemma2_window else @min(meta.max_position_embeddings, embedding_gemma2_window);
-    meta.has_chat = has_chat_template and !meta.is_encoder;
+    // Their packs ship no template; the loader embeds ours (chat.loadChatConfig).
+    const embeds_template = std.mem.eql(u8, mt, "deepseek_v4") or std.mem.eql(u8, mt, "deepseek_v41");
+    meta.has_chat = (has_chat_template or embeds_template) and !meta.is_encoder;
     meta.has_embedding = meta.is_encoder;
     if (root.get("pooling_mode")) |v| {
         if (v == .string) meta.has_embedding = true;
@@ -1771,6 +1852,84 @@ test "discoverModels finds a Qwen-Image-2.1 repo (model_index.json, no root conf
     try testing.expectEqual(@as(usize, 1), result.models.len);
     try testing.expectEqualStrings("mlx-community/Qwen-Image-2.1-MLX-4bit", result.models[0].id);
     try testing.expectEqualStrings("qwen_image21", result.models[0].model_type);
+}
+
+test "discoverModels finds a MOSS-Image repo by its model_index.json alone" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    // A pull still in progress stays invisible until its VAE weights land.
+    try tmp.dir.createDirPath(io, "me/MOSS-Image-half/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("moss_image", result.models[0].model_type);
+    try testing.expect(isMediaModelType("moss_image"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("moss_image"));
+}
+
+test "discoverModels finds a TRELLIS.2 pack by its pipeline.json alone, once its last weights landed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const pipeline = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{}}";
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-4B/ckpts");
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-4B/microsoft/TRELLIS-image-large/ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/pipeline.json", .data = pipeline });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors", .data = "0123" });
+    // A pull still in progress stays invisible until the SS decoder lands.
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-half/ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-half/pipeline.json", .data = pipeline });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-half/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", .data = "0123456789" });
+    // Another pipeline.json (a different class) is no model.
+    try tmp.dir.createDirPath(io, "me/other");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/other/pipeline.json", .data = "{\"name\":\"SomethingElse\"}" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("trellis2", result.models[0].model_type);
+    try testing.expect(isMediaModelType("trellis2"));
+    try testing.expectEqual(ModelKind.mesh, modelKindFromType("trellis2"));
+}
+
+test "discoverModels tells a Pixal3D pack (TRELLIS.2's pipeline.json, proj flows) from TRELLIS.2, once its last weights landed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const pipeline = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{\"models\":{\"sparse_structure_flow_model\":\"ckpts/ss_flow\"}}}";
+    const proj_dit = "{\"name\":\"SparseStructureFlowModel\",\"args\":{\"image_attn_mode\":\"proj\"}}";
+    for ([_][]const u8{ "me/Pixal3D", "me/Pixal3D-half" }) |d| {
+        var buf: [64]u8 = undefined;
+        try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&buf, "{s}/ckpts", .{d}));
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/pipeline.json", .{d}), .data = pipeline });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/ckpts/ss_flow.json", .{d}), .data = proj_dit });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/ckpts/ss_flow.safetensors", .{d}), .data = "0123456789" });
+    }
+    // Only the complete pack has its texture decoder, the last of its weights.
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/Pixal3D/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("pixal3d", result.models[0].model_type);
+    try testing.expect(isMediaModelType("pixal3d"));
+    try testing.expectEqual(ModelKind.mesh, modelKindFromType("pixal3d"));
 }
 
 test "discoverModels finds a Stable Audio 3 repo (model_config.json, no root config.json)" {
@@ -2209,6 +2368,7 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("minicpmv4_7"));
     try testing.expect(isSupportedModelType("qwen3_asr"));
     try testing.expect(isSupportedModelType("kolibri1"));
+    try testing.expect(isSupportedModelType("flint"));
     try testing.expect(isSupportedModelType("lfm2_moe"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
@@ -2386,6 +2546,12 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         try testing.expect(m.is_encoder);
         try testing.expect(!m.has_chat);
         try testing.expectEqual(@as(u32, 768), m.hidden_size);
+    }
+    // DeepSeek V4/V4.1 packs ship no chat template: the loader embeds ours, so the stub is still chat.
+    for ([_][]const u8{ "deepseek_v4", "deepseek_v41" }) |mt| {
+        var buf: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf, "{{\"model_type\":\"{s}\",\"hidden_size\":5120}}", .{mt});
+        try testing.expect(parseStubMeta(a, json, false).has_chat);
     }
     // A chat gemma3_text WITHOUT the flag stays a chat model.
     {

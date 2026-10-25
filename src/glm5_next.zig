@@ -471,8 +471,9 @@ const HC_PRE_BODY =
 ;
 const HC_DEFER_HVAL = "#define HVAL(k) msv_hc_hval<T, HC, D>((k), y + row * D, post_in + row * HC, comb_in + row * HC * HC, h_in + row * HC * D)\n";
 const HC_PRE_SOURCE = "#define HVAL(k) float(x[row * K + (k)])\n#define STORE_H(k, v)\n#define TAIL4(k) float4(*(const device vec<T, 4>*)(x + row * K + (k)))\n" ++ HC_PRE_BODY;
-// The tail reads the stream the other threadgroups stored, two elements per 32-bit atomic.
-const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) h[row * K + (k)] = T(v)\n#define TAIL4(k) msv_hc_load4<T>(h + row * K, (k))\n" ++ HC_PRE_BODY;
+// Stream pairs cross threadgroups as 32-bit atomics: the even lane stores its odd neighbour's
+// element with its own, and the tail loads two elements per atomic.
+const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) { static_assert(SL % 2 == 0 && TPG % 2 == 0, \"pairs need even k on even lanes\"); const float v1 = simd_shuffle_down((v), 1u); if (((k) & 1) == 0) atomic_store_explicit((device atomic_uint*)(h + row * K + (k)), as_type<uint>(vec<T, 2>(T(v), T(v1))), memory_order_relaxed); }\n#define TAIL4(k) msv_hc_load4<T>(h + row * K, (k))\n" ++ HC_PRE_BODY;
 const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ "const int k = int(thread_position_in_grid.x);\nconst uint row = thread_position_in_grid.y;\nh[row * HC * D + k] = T(HVAL(k));\n";
 var hc_pre_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var hc_pre_defer_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -547,7 +548,7 @@ pub const Pre = struct {
 
 /// Whether `hcPre` serves a [1, R, HC, d] stream, R up to `HC_PRE_MAX_ROWS`.
 pub fn hcRowsServes(s: mlx.mlx_stream, sh: []const c_int, dt: mlx.mlx_dtype, fn_rows: mlx.mlx_array, norm_w: mlx.mlx_array) bool {
-    return mlx.streamIsGpu(s) and sh.len == 4 and sh[0] == 1 and sh[1] >= 1 and sh[1] <= HC_PRE_MAX_ROWS and sh[2] == HC and @rem(sh[3], 4) == 0 and
+    return mlx.streamIsGpu(s) and sh.len == 4 and sh[0] == 1 and sh[1] >= 1 and sh[1] <= HC_PRE_MAX_ROWS and sh[2] == HC and @rem(sh[3], 8) == 0 and
         @divTrunc(sh[3], 4) <= HC_PRE_TPG and @rem(HC * sh[3], HC_PRE_NT) == 0 and (dt == .bfloat16 or dt == .float16) and
         mlx.mlx_array_dtype(norm_w) == dt and mlx.mlx_array_dtype(fn_rows) == .float32;
 }
@@ -2167,6 +2168,7 @@ test "glm5 NAX indexer scores equal relu(q . k) * w summed over heads, causally 
 
 test "glm5 one-token hcPre chain matches collapse, rms_norm and expand" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler(); // the threadgroup probe raises on M1/M2: latch it, never exit
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
@@ -2272,6 +2274,7 @@ test "glm5 one-token hcPre chain matches collapse, rms_norm and expand" {
 
 test "glm5 hcPre over R rows equals R one-row dispatches, up to the widest verify window" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler(); // the threadgroup probe raises on M1/M2: latch it, never exit
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
@@ -2663,6 +2666,7 @@ test "glm5 a pool's completing row carries its pooled key, across a chunk bounda
 
 test "glm5 a deferred expand over R rows rebuilds the materialized stream and feeds the next hcPre, bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler(); // the threadgroup probe raises on M1/M2: latch it, never exit
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
@@ -2729,5 +2733,21 @@ test "glm5 a deferred expand over R rows rebuilds the materialized stream and fe
             if (!std.mem.eql(f32, a, b)) std.debug.print("{d} rows: output {d} differs\n", .{ rows, i });
             try testing.expectEqualSlices(f32, b, a);
         }
+    }
+}
+
+test "hcRowsServes: a width the kernel's pairs cannot split stays on the composed path" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const zeros: [16]u16 = @splat(0);
+    const fz: [MIX * HC * 16]f32 = @splat(0);
+    inline for (.{ .{ 16, true }, .{ 12, false } }) |c| {
+        const d: c_int = c[0];
+        const nw = mlx.mlx_array_new_data(&zeros, &[_]c_int{d}, 1, .float16);
+        defer _ = mlx.mlx_array_free(nw);
+        const fn_rows = mlx.mlx_array_new_data(&fz, &[_]c_int{ MIX, HC * d }, 2, .float32);
+        defer _ = mlx.mlx_array_free(fn_rows);
+        // Each threadgroup's slice (d/4) must be even: the h stores go in bf16/f16 pairs.
+        try testing.expectEqual(c[1], hcRowsServes(s, &.{ 1, 1, HC, d }, .float16, fn_rows, nw));
     }
 }

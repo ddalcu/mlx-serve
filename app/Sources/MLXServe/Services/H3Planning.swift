@@ -285,7 +285,7 @@ enum H3TimeEstimate {
                         steps: Int, fast: Bool, hardware: H3Hardware = .current,
                         promptTokens: Int = 250) -> Double {
         let r = H3Plan.rows(width: width, height: height, frames: frames, promptTokens: promptTokens)
-        let perStep = denseStepSeconds(rows: r) * (fast ? fastFactor(steps: steps) : 1.0)
+        let perStep = denseStepSeconds(rows: r) * model.stepCostScale * (fast ? fastFactor(steps: steps) : 1.0)
         let vae = vaeAnchorSeconds * (Double(width) * Double(height) * Double(frames)) / vaeAnchorPixels
         let anchorSeconds = perStep * Double(steps) + fixedSeconds + vae
         let cores = hardware.gpuCores > 0 ? Double(hardware.gpuCores) : Double(H3Hardware.anchor.gpuCores)
@@ -330,7 +330,7 @@ enum H3TimeEstimate {
                             steps: Int, fast: Bool,
                             history: H3RunHistory = .load()) -> (perStep: Double, tail: Double) {
         let r = H3Plan.rows(width: width, height: height, frames: frames, promptTokens: 250)
-        let perStep = denseStepSeconds(rows: r) * (fast ? fastFactor(steps: steps) : 1.0)
+        let perStep = denseStepSeconds(rows: r) * model.stepCostScale * (fast ? fastFactor(steps: steps) : 1.0)
         let vae = vaeAnchorSeconds * (Double(width) * Double(height) * Double(frames)) / vaeAnchorPixels
         let tail = fixedSeconds + vae
         if history.speedFactor != nil {

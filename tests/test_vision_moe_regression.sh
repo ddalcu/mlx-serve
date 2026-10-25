@@ -12,7 +12,7 @@ set -euo pipefail
 MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}"
 PORT="${2:-8097}"
 BASE="http://127.0.0.1:$PORT"
-BINARY="./zig-out/bin/mlx-serve"
+BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 PASS=0
 FAIL=0
 SKIP=0
@@ -119,9 +119,12 @@ echo ""
 
 # ── Build ──
 
-echo -e "${YELLOW}Building...${NC}"
-{ [ -x ./.zig-toolchain/zig ] && ZIG=./.zig-toolchain/zig || ZIG=zig; "$ZIG" build -Doptimize=ReleaseFast 2>&1; }
-echo ""
+# A run tests the binary it was handed: build only when there is none.
+if [ -z "${SKIP_BUILD:-}" ] && [ ! -x "$BINARY" ]; then
+    echo -e "${YELLOW}Building...${NC}"
+    { [ -x ./.zig-toolchain/zig ] && ZIG=./.zig-toolchain/zig || ZIG=zig; "$ZIG" build -Doptimize=ReleaseFast 2>&1; }
+    echo ""
+fi
 
 # ── Start server ──
 

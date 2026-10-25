@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Client } from "../src/lib/core/client";
 import type { Model } from "../src/lib/core/models";
-import { buildVideoRequest, frameOptions, h3Sizes, sizeLabel, stepsAdvice, VideoController, videoDefaults, videoProfile, videoQuality, videoSize, type VideoInputs } from "../src/lib/state/video-state.svelte";
+import { buildVideoRequest, frameOptions, h3Sizes, qualities, sizeLabel, stepsAdvice, VideoController, videoDefaults, videoProfile, videoQuality, videoSize, type VideoInputs } from "../src/lib/state/video-state.svelte";
 import { MemoryLibrary } from "./support/memory-library";
 
 const model = (id: string, architecture: string): Model => ({ id, capabilities: ["video"], architecture, meta: {} });
@@ -9,6 +9,7 @@ const ltx = model("org/ltx-2.3", "AudioVideo");
 const ltx25 = model("ddalcu/LTX-2.5-MLX-Serve-8bit", "AudioVideo");
 const h3 = model("org/minimax-h3", "minimax_h3");
 const refs = model("ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit", "minimax_h3");
+const omni = model("ddalcu/FastH3-Omni-MLX-Serve-8bit", "minimax_h3");
 const draft = (m: Model, patch: Record<string, unknown> = {}) => ({ ...videoDefaults(m), prompt: "a fox in snow", ...patch });
 /** H3's default canvas is too big for long clips under the 256 MiB raw-frame budget. */
 const small = { width: 768, height: 768 };
@@ -20,7 +21,16 @@ describe("videoProfile", () => {
     expect(videoProfile(ltx)).toMatchObject({ h3: false, audio: true, last: true, turbo: false, chain: false, minFrames: 9, maxFrames: 193, frameStep: 8, decoder: false });
     expect(videoProfile(ltx25)).toMatchObject({ decoder: true });
     expect(videoProfile(h3)).toMatchObject({ h3: true, audio: false, last: true, turbo: true, chain: true, references: false, minFrames: 5, maxFrames: 362, frameStep: 17 });
-    expect(videoProfile(refs)).toMatchObject({ h3: true, references: true, last: false, turbo: false, chain: false });
+    expect(videoProfile(refs)).toMatchObject({ h3: true, references: true, last: false, turbo: false, chain: false, steps: 0, fast: true });
+    expect(videoProfile(omni)).toMatchObject({ h3: true, references: true, last: false, turbo: false, chain: false, steps: 8, fast: false });
+  });
+
+  it("FastH3 Omni sends its trained 8 steps on every tier and never the fast recipe", () => {
+    for (const q of qualities) expect(videoQuality(omni, q).steps).toBe(8);
+    const body = buildVideoRequest(omni, draft(omni, { ...small, frames: 39, steps: 30, best: true }), { images: [img] });
+    expect(body).toMatchObject({ steps: 8, ref_images: ["IMG"] });
+    expect(body).not.toHaveProperty("fast");
+    expect(stepsAdvice(omni, draft(omni))).toBe("");
   });
 
   it("offers nothing for other models", () => {

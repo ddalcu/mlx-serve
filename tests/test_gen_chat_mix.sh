@@ -57,7 +57,8 @@ TMP=$(mktemp -d)
 LOG="$TMP/server.log"
 mkdir -p "$TMP/home"
 # The default cap of 3 resident models would evict the set into churn mid-mix.
-HOME="$TMP/home" "$BIN" --serve --port "$PORT" --log-level debug --max-resident-models "${#MODELS[@]}" >"$LOG" 2>&1 &
+# Interleaving is opt-in on CUDA (off by default there); the mix asserts it engages.
+HOME="$TMP/home" MLX_SERVE_GEN_YIELD=1 "$BIN" --serve --port "$PORT" --log-level debug --max-resident-models "${#MODELS[@]}" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $(jobs -p) 2>/dev/null; wait $SRV 2>/dev/null' EXIT
 for i in $(seq 1 60); do

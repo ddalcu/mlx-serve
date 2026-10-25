@@ -25,7 +25,7 @@ arm() {
   env "$VAR=$val" "$BIN" --model "$MODEL" --serve --port "$PORT" >"$HOME/claude-tmp/prefill-ab/$PORT-${label// /}.log" 2>&1 &
   local pid=$!
   for _ in $(seq 1 900); do
-    curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 1
   done

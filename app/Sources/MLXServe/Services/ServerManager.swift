@@ -164,10 +164,17 @@ class ServerManager: ObservableObject {
         running && launchedModelPath.isEmpty && !chatResident && !selectedModelPath.isEmpty
     }
 
+    /// The local model a chat surface may load or start with: none while chat goes to a provider
+    /// or LAN peer (`lanChatModelId` carries both), whatever local model is remembered underneath.
+    func localChatLoadPath(selectedPath: String) -> String? {
+        lanChatModelId == nil && !selectedPath.isEmpty ? selectedPath : nil
+    }
+
     /// Whether `ensureDefaultChatModel` would load the selected model first.
     func chatLoadNeeded(selectedModelPath: String) -> Bool {
-        Self.shouldEnsureChatDefault(running: status == .running, launchedModelPath: currentModelPath,
-                                     chatResident: residentChatModel != nil, selectedModelPath: selectedModelPath)
+        guard localChatLoadPath(selectedPath: selectedModelPath) != nil else { return false }
+        return Self.shouldEnsureChatDefault(running: status == .running, launchedModelPath: currentModelPath,
+                                            chatResident: residentChatModel != nil, selectedModelPath: selectedModelPath)
     }
 
     /// Called by chat surfaces (chat window / quick launcher via

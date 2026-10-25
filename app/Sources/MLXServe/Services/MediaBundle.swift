@@ -421,6 +421,45 @@ extension MediaBundle {
         )
     }
 
+    /// The 1024 cascade's flows and both decoders, the same files in TRELLIS.2 and Pixal3D packs. The 512 texture
+    /// flow (TRELLIS.2) and the `_mv` flows (Pixal3D's multi-view) are not fetched: a pack without them serves
+    /// 1024 and 1536 from one photo.
+    private static let trellisCascade = [
+        "ss_flow_img_dit_1_3B_64_bf16", "slat_flow_img2shape_dit_1_3B_512_bf16",
+        "slat_flow_img2shape_dit_1_3B_1024_bf16", "slat_flow_imgshape2tex_dit_1_3B_1024_bf16",
+        "shape_dec_next_dc_f16c32_fp16", "tex_dec_next_dc_f16c32_fp16",
+    ].map { "ckpts/\($0).safetensors" }
+
+    /// TRELLIS.2-4B: `pipeline.json` plus the cascade, the sparse-structure decoder from the older TRELLIS repo and
+    /// the DINOv3 encoder, all under the paths the server reads them from.
+    static func trellis2(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        cascade3D(kind: "trellis2", repo: repo, displayName: displayName, sizeGB: sizeGB, files: trellisCascade + [
+            "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors", "dinov3/model.safetensors",
+        ])
+    }
+
+    /// Pixal3D: the same cascade with its sparse-structure decoder in `ckpts/` and NAF's upsampler beside DINOv3.
+    static func pixal3d(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        cascade3D(kind: "pixal3d", repo: repo, displayName: displayName, sizeGB: sizeGB, files: trellisCascade + [
+            "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", "dinov3/model.safetensors", "naf/model.safetensors",
+        ])
+    }
+
+    private static func cascade3D(kind: String, repo: String, displayName: String, sizeGB: Double, files: [String]) -> MediaBundle {
+        MediaBundle(
+            id: "\(kind):\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: Set(files.map { ($0 as NSString).lastPathComponent })),
+                    readyMarkers: ["pipeline.json"] + files
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// ACE-Step music: a flat converted dir — `config.json` +
     /// `model.safetensors` (DiT + condition encoder) + `vae.safetensors`
     /// (Oobleck) + `fsq.safetensors` (cover-mode tokenizer; fetched on demand
@@ -561,6 +600,23 @@ extension MediaBundle {
         )
     }
 
+    /// MOSS-Image: the release's diffusers tree as published (model_index.json
+    /// names the pipeline; the tokenizer has its own subdir).
+    static func mossImage(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "mossimage:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, excludeSubstrings: ["assets/"]),
+                    readyMarkers: ["model_index.json", "transformer", "vae", "text_encoder", "tokenizer", "scheduler"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
     /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
     /// resolves the encoder from this exact path, so a rename here silently
@@ -588,6 +644,8 @@ extension ImageModelPreset {
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .qwenImage21, .qwenImage21Turbo:
             return .qwenImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .mossImage:
+            return .mossImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .flux2Klein9B, .flux2Klein9BBase:
             // The MLX conversions of klein 9B — distilled and base alike —
             // ship no root config.json.
@@ -625,7 +683,11 @@ extension VideoModelPreset {
 
 extension Model3DModelPreset {
     var bundle: MediaBundle {
-        .model3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        switch family {
+        case .hunyuan3d: return .model3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        case .trellis2: return .trellis2(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        case .pixal3d: return .pixal3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        }
     }
 }
 
