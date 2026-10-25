@@ -85,6 +85,19 @@ class ServerManager: ObservableObject {
     @Published var lastError: String = ""
 
     private var process: Process?
+    /// The exact invocation of the current launch, kept so crash recovery can
+    /// relaunch what the server was ACTUALLY started with instead of whatever
+    /// the Settings form holds by the time it dies (#265).
+    private var lastLaunchArgs: [String]?
+    /// When the current process last reached `.running`; nil while starting and
+    /// after an exit. Feeds the crash-streak reset: a run that stayed up is not
+    /// a crash loop.
+    private var runningSince: Date?
+    /// Backoff bookkeeping for automatic restart after an unexpected exit.
+    private var crashRestart = CrashRestartPolicy.standard
+    /// Pending relaunch during a backoff wait. Cancelled by Stop, by a
+    /// user-initiated Start, and on quit.
+    private var crashRestartTask: DispatchWorkItem?
     private var healthTimer: Timer?
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
@@ -136,7 +149,12 @@ class ServerManager: ObservableObject {
     }
 
     func start(modelPath: String, options: ServerOptions) {
-        guard status != .running, status != .starting else { return }
+        // A pending crash-recovery relaunch is a `.starting` pill with no
+        // process behind it, so a manual Start must replace it (with the model
+        // and flags the user just picked) instead of returning at the guard.
+        let awaitingCrashRestart = crashRestartTask != nil
+        cancelCrashRestart(reset: true)
+        guard status != .running, awaitingCrashRestart || status != .starting else { return }
 
         let resolvedModel = Self.launchModelPath(modelPath)
         currentModelPath = resolvedModel
@@ -198,7 +216,9 @@ class ServerManager: ObservableObject {
     /// generates media before any chat server is up. One process hosts
     /// chat + image + audio + video under one memory budget.
     func startHeadless(modelsDir: String, options: ServerOptions) {
-        guard status != .running, status != .starting else { return }
+        let awaitingCrashRestart = crashRestartTask != nil
+        cancelCrashRestart(reset: true)
+        guard status != .running, awaitingCrashRestart || status != .starting else { return }
         currentModelPath = ""
         // `modelsDir` is the caller's primary root; the rest of the library's
         // folders ride along so a headless boot discovers everything the picker
@@ -242,6 +262,7 @@ class ServerManager: ObservableObject {
         proc.executableURL = URL(fileURLWithPath: binaryPath)
         proc.arguments = args
         lastLaunchedOptions = options
+        lastLaunchArgs = args
 
         proc.environment = Self.launchEnvironment()
 
@@ -300,6 +321,7 @@ class ServerManager: ObservableObject {
     private var quitObserver: NSObjectProtocol?
 
     func stop() {
+        cancelCrashRestart(reset: true)
         pollSource?.cancel()
         pollSource = nil
         stopLoadProgressPolling()
@@ -415,17 +437,96 @@ class ServerManager: ObservableObject {
         let shortErr = Self.summarizeCrash(errSnippet, exitCode: exitCode)
         let fullLog = errSnippet.isEmpty ? "(no stderr captured — exit code \(exitCode))" : errSnippet
 
-        if case .running = status {
-            status = .error("Exited unexpectedly")
+        // An exit 0 while nominally running still means something else ended the
+        // process (the app never asks it to exit — `stop()` detaches this
+        // handler), but it is not a crash and calling it one reads as a failure.
+        let cleanExit = exitCode == 0
+        switch status {
+        case .running:
+            if attemptCrashRestart(exitCode: exitCode) { return }
+            let title = cleanExit
+                ? L10n.text("mlx-serve exited")
+                : L10n.text("mlx-serve exited unexpectedly")
+            status = .error(cleanExit ? "Exited" : "Exited unexpectedly")
             lastError = shortErr
-            presentCrashAlert(title: L10n.text("mlx-serve exited unexpectedly"), log: fullLog, exitCode: exitCode)
-        } else if case .starting = status {
+            presentCrashAlert(title: title, log: fullLog, exitCode: exitCode)
+        case .starting where crashRestart.attempts > 0:
+            // The recovery relaunch died before it ever reported healthy. Same
+            // streak, so keep backing off until the budget is gone rather than
+            // treating the first retry as a start failure.
+            if attemptCrashRestart(exitCode: exitCode) { return }
             status = .error("Failed to start")
             lastError = shortErr
             presentCrashAlert(title: L10n.text("mlx-serve failed to start"), log: fullLog, exitCode: exitCode)
-        } else {
+        case .starting:
+            status = .error("Failed to start")
+            lastError = shortErr
+            presentCrashAlert(title: L10n.text("mlx-serve failed to start"), log: fullLog, exitCode: exitCode)
+        default:
             status = .stopped
         }
+    }
+
+    // MARK: - Crash recovery (#265)
+
+    /// Relaunch after an unexpected exit, honoring the user's crash-handling
+    /// setting and `CrashRestartPolicy`. Returns false when the caller should
+    /// fall back to the modal crash alert: mode `.ask`, nothing to replay, or
+    /// the current streak has spent its budget.
+    ///
+    /// The args are REPLAYED, not re-derived: a server that came back with
+    /// flags other than the one that died would be a worse bug than the crash
+    /// it recovered from.
+    private func attemptCrashRestart(exitCode: Int32) -> Bool {
+        let canRelaunch = lastLaunchArgs != nil && lastLaunchedOptions != nil
+        let uptime = runningSince.map { Date().timeIntervalSince($0) }
+        runningSince = nil
+        guard case let .restart(delay) = crashRestart.reaction(
+                  mode: CrashRecoveryMode.current, canRelaunch: canRelaunch, uptime: uptime),
+              let args = lastLaunchArgs, let options = lastLaunchedOptions
+        else { return false }
+
+        // The pill reads "Starting..." for the wait instead of an error the user
+        // does not have to act on, and Stop cancels it like any other start.
+        status = .starting
+        lastError = ""
+        let mode = CrashRecoveryMode.current
+        let attempt = crashRestart.attempts
+        let note = "[recovery] server exited (code \(exitCode)); relaunching in "
+            + "\(String(format: "%.0f", delay))s (attempt \(attempt) of \(crashRestart.budget)). "
+            + "The dead server's output is in the server log."
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.crashRestartTask = nil
+                // Stop, or a manual Start, during the wait wins: only relaunch
+                // from the state the crash left behind.
+                guard self.process == nil, case .starting = self.status else { return }
+                self.launch(args: args, options: options)
+                // `launch()` clears the log first, so this lands above the new
+                // server's own first line.
+                self.logBuffer.append(note + "\n\n")
+                if mode.postsNotification {
+                    CrashRecoveryNotifier.postRestart(exitCode: exitCode, attempt: attempt,
+                                                      budget: self.crashRestart.budget)
+                }
+            }
+        }
+        crashRestartTask?.cancel()
+        crashRestartTask = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        return true
+    }
+
+    /// Drop a pending crash-recovery relaunch. `reset` also clears the streak
+    /// budget, which Stop and a user-initiated Start must do: the next crash is
+    /// a fresh problem, not a continuation of an old loop.
+    private func cancelCrashRestart(reset: Bool) {
+        crashRestartTask?.cancel()
+        crashRestartTask = nil
+        runningSince = nil
+        if reset { crashRestart.reset() }
     }
 
     // MARK: - Server log (throttled)
@@ -600,6 +701,9 @@ class ServerManager: ObservableObject {
     private func transitionToRunning() {
         guard status != .running else { return }
         status = .running
+        // Restarts back off from HERE, not from the launch: a slow model load
+        // must not eat the streak budget of a server that then ran fine.
+        runningSince = Date()
         // A `--model` launch gets here only once loaded; headless leaves the path empty.
         StartupModelChoice.recordLoaded(path: currentModelPath)
         Task { await self.refreshModels() }

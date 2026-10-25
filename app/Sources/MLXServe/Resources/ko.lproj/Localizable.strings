@@ -1299,6 +1299,14 @@
 "Toggle a server on, fill in any required fields, then click Save. Servers spawn lazily the next time you send a message with MCP mode on." = "서버를 켜고 필수 항목을 채운 다음 저장을 클릭하세요. 서버는 MCP 모드가 켜진 상태로 다음에 메시지를 보낼 때 실행됩니다.";
 "trying a different URL or using webSearch" = "다른 URL을 시도하거나 webSearch 사용";
 "mlx-serve exited unexpectedly" = "mlx-serve가 예기치 않게 종료되었습니다";
+"mlx-serve exited" = "mlx-serve가 종료되었습니다";
+"mlx-serve exited; restarting it" = "mlx-serve가 종료되어 다시 시작합니다";
+"Exit code %lld. Relaunch attempt %lld of %lld." = "종료 코드 %lld. 재시작 시도 %lld/%lld.";
+"Ask" = "물어보기";
+"Restart" = "다시 시작";
+"Restart + Notify" = "다시 시작 + 알림";
+"If the server exits on its own" = "서버가 스스로 종료되면";
+"For a crash or an out-of-memory kill while the server is running. Restart brings it back after 1, 2, 4, 8, 16, then 30 seconds, then stops trying so a model that cannot load still shows its error instead of restarting forever. Stop cancels a pending restart." = "서버가 실행 중일 때 충돌하거나 메모리 부족으로 종료된 경우에 적용됩니다. 다시 시작은 1, 2, 4, 8, 16, 30초 간격으로 시도한 뒤 중단하므로, 로드할 수 없는 모델은 무한 재시작 대신 오류를 표시합니다. 중지를 누르면 대기 중인 재시작이 취소됩니다.";
 "Copy the entire log to the clipboard" = "전체 로그를 클립보드에 복사";
 "Double-click to open" = "이중 클릭하여 열기";
 "Loading %@…" = "%@ 로드 중…";
