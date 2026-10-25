@@ -7074,7 +7074,7 @@ pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
 /// of the answer should end.
 pub const LoopStop = struct {
     finish_reason: []const u8 = "stop",
-    /// The `finish_details.type` value. One string for all three tiers: a
+    /// The `finish_details.type` value. One string for every tier: a
     /// client's decision ("this turn is unusable, don't feed it back") is the
     /// same whichever tier convicted, and the tier is in the log.
     finish_details: []const u8 = "repetition_loop",
@@ -7082,7 +7082,7 @@ pub const LoopStop = struct {
     trim_start: usize,
 };
 
-/// Pure decision + trim point. The three tiers live in generate.zig
+/// Pure decision + trim point. The tiers live in generate.zig
 /// (`degenerateTail`); this is where their verdict becomes server behaviour.
 pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
     const d = generate_mod.degenerateTail(generated_ids) orelse return null;

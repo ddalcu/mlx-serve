@@ -942,3 +942,10 @@ Defect: in a Claude Code session on Flint (release agent run) an `Edit` call arr
 Cause: the GLM pair loop takes the key as everything between the `<arg_key>` opener and the next close, so a doubled opener (`<arg_key><arg_key>file_path</arg_key>`) kept the inner opener in the key.
 Fix: the key starts after the LAST opener before its close (`parseHy3ToolCalls`).
 Guard: corpus family `flint`, "a doubled <arg_key> opener keeps the key", and the universal invariant that no parsed argument KEY carries a line break or markup.
+
+## A restatement loop with a fixed head and a reworded tail ran 7k tokens (#846)
+
+Defect: a GLM-5.3-Flash answer restated one paragraph 52 times until the client disconnected, with no `[loop-stop]`.
+Cause: each copy opened with the same ~130-token head and ended with a tail the model reworded. No exact cycle exists, and the tails held the near-repeat novelty at 0.376, inside the healthy band; no novelty bar separates it from procedural code.
+Fix: a fourth tier, `recurring_span`: the last 96 tokens recur verbatim 12 times, carry at least 24 distinct tokens, and the copies cover `near_repeat_min_span` (`recurringSpanStart`). The issue's text, tokenized with the Qwen3.8 tokenizer, is cut at 4,309 tokens; this repo's code, docs and pages do not fire it. Cost: output that repeats one long block across 4k tokens is cut too. `src/fixtures/tool_traffic.jsonl` (the same tool schema on every record) fires at token 17,057; a tool call writing such a file would deliver nothing.
+Guard: `degenerateTail: a fixed head with a reworded tail convicts once its copies cover the span bar` and its acquittal twin (rep bar, span bar, vocabulary floor).
