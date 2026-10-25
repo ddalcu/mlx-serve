@@ -179,6 +179,14 @@ oMLX, by jundot
 Copyright oMLX contributors
 Licensed under the Apache License, Version 2.0.
 
+Used through mlx-stream for MiniMax M3 selected-block attention:
+`src/arch/minimax_m3/kernels/minimax_sparse_partials.metal` and
+`minimax_sparse_combine.metal` and `minimax_q8_partials.metal` adapt the partial-attention and combine kernels
+from `omlx/patches/mlx_vlm_minimax_m3_compat/vendor/mlx_vlm/models/minimax_m3_vl/msa.py`
+at 3df94603c047ec77f5381d11d1d6daff75794870 (Copyright 2025 oMLX contributors).
+The launch wrapper handles a single request and query; these portions remain
+under Apache-2.0.
+
 Used in mlx-serve (`src/transformer.zig`):
 
   * The GatedDeltaNet blocked-sequence prefill kernel, ported from

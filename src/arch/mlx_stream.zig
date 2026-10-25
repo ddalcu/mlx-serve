@@ -1,6 +1,6 @@
 //! The streaming packs on mlx-stream (`lib/mlx-stream`): DeepSeek-V4.1's EXL3 repack (`ModelConfig.dsv41_stream`),
 //! MiMo-V2.6-Flash's prepared MXFP4 pack (`ModelConfig.mimo_stream`), GLM-5.3's pack (`ModelConfig.glm_stream`) and
-//! GLM-5.3-Flash's NVFP4 pack (`ModelConfig.glm5_stream`).
+//! GLM-5.3-Flash's NVFP4 pack (`ModelConfig.glm5_stream`) and MiniMax M3.1 Flash text packs (`ModelConfig.minimax_m3_stream`).
 //! The plugin owns each arch, its kernels and the expert streamer, and loads its own weights; the host parses the
 //! config, renders the template, samples and schedules. The plugin exports one glue surface per arch (`arch`,
 //! `default_context`, `generation_headroom`): the root's for DeepSeek-V4.1, `mimo`'s for MiMo, `glm`'s for GLM-5.3.
@@ -27,7 +27,7 @@ pub fn setForeignBytes(n: u64) void {
 }
 
 /// The plugin's arches this host serves.
-const Kind = enum { dsv41, mimo, glm, glm5 };
+const Kind = enum { dsv41, mimo, glm, glm5, minimax_m3 };
 
 fn Side(comptime k: Kind) type {
     return switch (k) {
@@ -35,10 +35,12 @@ fn Side(comptime k: Kind) type {
         .mimo => plugin.mimo,
         .glm => plugin.glm,
         .glm5 => plugin.glm5_next,
+        .minimax_m3 => plugin.minimax_m3,
     };
 }
 
 fn kindOf(config: *const ModelConfig) Kind {
+    if (config.minimax_m3_stream) return .minimax_m3;
     if (config.glm_stream) return .glm;
     if (config.glm5_stream) return .glm5;
     return if (config.mimo_stream) .mimo else .dsv41;
@@ -52,7 +54,7 @@ fn Bound(comptime k: Kind) type {
 pub const Model = struct {
     gpa: std.mem.Allocator,
     /// The arch's config and module (it keeps references into `weights`).
-    arch: union(Kind) { dsv41: Bound(.dsv41), mimo: Bound(.mimo), glm: Bound(.glm), glm5: Bound(.glm5) },
+    arch: union(Kind) { dsv41: Bound(.dsv41), mimo: Bound(.mimo), glm: Bound(.glm), glm5: Bound(.glm5), minimax_m3: Bound(.minimax_m3) },
     /// The trunk the module binds.
     weights: sdk.Weights,
     /// The request `begin` started: its prompt pass's shape, then its decode handover.
@@ -141,13 +143,21 @@ fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const Mo
         try applyContext(A, arena.allocator(), c, context);
         noteMaxOutput(dir, A.maxOutput(c));
     } else if (comptime @hasDecl(A, "applyLoadFacts")) {
-        f.effective_context = context;
-        try A.applyLoadFacts(c, f);
+        try applyFacts(k, c, config, f, context);
     } else {
         if (context > 0) c.max_context_tokens = @intCast(context);
         c.* = c.withFacts(f);
     }
     return c;
+}
+
+fn applyFacts(comptime k: Kind, c: *Side(k).arch.Config, config: *const ModelConfig, f: *sdk.LoadFacts, context: u64) !void {
+    if (comptime k == .minimax_m3) {
+        const kv = server.configuredKvQuantFor(config);
+        f.kv_quant_bits = if (kv.scheme == .off) 0 else kv.bits;
+    }
+    f.effective_context = context;
+    try Side(k).arch.applyLoadFacts(c, f);
 }
 
 /// The model's model-settings.json entry on an arch's config, when the arch declares `applySettings` (a `void` or an
@@ -483,4 +493,26 @@ test "mlx_stream: an arch that declares applySettings receives the model's entry
     var n: Without.Config = .{};
     try applyEntry(Without, &n, entry);
     try std.testing.expectEqual(@as(i64, 0), n.seen);
+}
+
+test "mlx_stream: MiniMax receives supported dense and int8 KV precision and refuses int4" {
+    var config: ModelConfig = .{ .model_type = "minimax_m3", .minimax_m3_stream = true, .kv_quant_override = .affine(8) };
+    var c: Side(.minimax_m3).arch.Config = .{};
+    var f: sdk.LoadFacts = .{ .wired_margin_bytes = 0 };
+    try applyFacts(.minimax_m3, &c, &config, &f, 4096);
+    try testing.expectEqual(@as(?u8, 8), f.kv_quant_bits);
+    try testing.expectEqual(@as(u8, 8), c.kv_quant_bits);
+    config.kv_quant_override = .affine(4);
+    try testing.expectError(error.MiniMaxKvPrecisionUnsupported, applyFacts(.minimax_m3, &c, &config, &f, 4096));
+    config.kv_quant_override = .dense;
+    try applyFacts(.minimax_m3, &c, &config, &f, 4096);
+    try testing.expectEqual(@as(?u8, 0), f.kv_quant_bits);
+    try testing.expectEqual(@as(u32, 4096), c.context);
+}
+
+test "mlx_stream: MiniMax M3 uses its own arch and keeps generation within the billed context" {
+    try testing.expectEqual(@as(u64, 0), plugin.minimax_m3.generation_headroom);
+    var config: ModelConfig = .{ .model_type = "minimax_m3", .pack_dir = "/packs/minimax-m3", .minimax_m3_stream = true, .ctx_override = 4096 };
+    try testing.expectEqual(Kind.minimax_m3, kindOf(&config));
+    try testing.expectEqual(@as(u32, 4096), contextLength(&config));
 }

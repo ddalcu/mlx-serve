@@ -66,6 +66,7 @@ const supported_model_types = [_][]const u8{
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
     "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE), the mlx-stream pack (experts streamed from experts.bin)
+    "minimax_m3_vl", "minimax_m3", // MiniMax M3.1 Flash, text-only streaming pack
     "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk, text/image/video embeddings)
     "minicpmv4_7", // openbmb MiniCPM-V 4.7 (Qwen3.5 trunk + SigLIP2 tower)
     "qwen3_asr", // Qwen3-ASR speech recognition (qwen3 trunk + audio tower)
@@ -1443,6 +1444,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
+    if (std.mem.eql(u8, mt, "minimax_m3_vl") or std.mem.eql(u8, mt, "minimax_m3")) meta.has_vision = false;
     const nemotron = std.mem.eql(u8, mt, "nemotron_h") or std.mem.eql(u8, mt, "nemotron_h_puzzle") or std.mem.eql(u8, mt, "nemotron_h_omni");
     const radio = nemotron and hasRadioVision(root);
     if (nemotron) meta.has_vision = radio;
@@ -2389,6 +2391,14 @@ test "isSupportedModelType accepts native media archs (image/audio/video)" {
     try testing.expect(isMediaModelType("acestep"));
     try testing.expect(isSupportedModelType("acestep"));
     try testing.expect(!isMediaModelType("gemma4"));
+}
+
+test "MiniMax M3 streaming discovery is text only" {
+    try testing.expect(isSupportedModelType("minimax_m3_vl"));
+    try testing.expect(isSupportedModelType("minimax_m3"));
+    const meta = parseStubMeta(testing.allocator,
+        "{\"model_type\":\"minimax_m3_vl\",\"vision_config\":{},\"video_token_id\":200026}", true);
+    try testing.expect(meta.found and !meta.has_vision and !meta.has_video);
 }
 
 test "isSupportedModelType accepts every served arch spelling (glm5_next)" {

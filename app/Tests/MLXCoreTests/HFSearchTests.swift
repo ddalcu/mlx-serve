@@ -700,6 +700,14 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertTrue(supportedModelTypes.contains("muse_glimmer"))
     }
 
+    func testMiniMaxRequiresPreparedLocalPack() {
+        for type in ["minimax_m3_vl", "minimax_m3"] {
+            XCTAssertTrue(supportedModelTypes.contains(type))
+            let checkpoint = mlx(id: "org/MiniMax-M3", tags: ["mlx", "safetensors", type])
+            XCTAssertFalse(checkpoint.isSupportedArchitecture)
+        }
+    }
+
     func testLfm2VlIsSupported() {
         // LiquidAI LFM2.5-VL ships config.json `model_type: "lfm2_vl"` — with an
         // UNDERSCORE. The app's set carried the hyphenated "lfm2-vl", which the

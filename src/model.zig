@@ -536,6 +536,8 @@ pub const ModelConfig = struct {
     /// bank): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its weights; a `glm5_next` config without the
     /// block is the host's resident arch. Set by `parseConfig`.
     glm5_stream: bool = false,
+    /// MiniMax M3.1 Flash's prepared expert bank, owned by mlx-stream.
+    minimax_m3_stream: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -1268,9 +1270,9 @@ pub const ModelConfig = struct {
     }
 
     /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3
-    /// pack.
+    /// pack, or a MiniMax M3.1 Flash text pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
-        return self.dsv41_stream or self.mimo_stream or self.glm_stream or self.glm5_stream;
+        return self.dsv41_stream or self.mimo_stream or self.glm_stream or self.glm5_stream or self.minimax_m3_stream;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1586,6 +1588,7 @@ pub const ModelConfig = struct {
         if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
         // mimo_v2: the template thinks unless told `enable_thinking` false.
         if (self.isMimo()) return true;
+        if (std.mem.eql(u8, self.model_type, "minimax_m3")) return true;
         // k2_horizon: the template opens a think marker on every assistant
         // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
         if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
@@ -1793,6 +1796,14 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
         config.glm5_stream = true;
+    }
+    if (std.mem.eql(u8, config.model_type, "minimax_m3")) {
+        if (!declaresExpertStreaming(allocator, content)) {
+            log.err("MiniMax M3.1 Flash requires an mlx-stream expert bank; prepare the checkpoint before loading\n", .{});
+            return error.MiniMaxM3NeedsExpertBank;
+        }
+        config.pack_dir = try allocator.dupe(u8, model_dir);
+        config.minimax_m3_stream = true;
     }
     if (config.isGlmMoeDsa()) {
         // No in-tree arch serves the 744B: only an mlx-stream pack (the trunk beside an experts.bin bank) loads.
@@ -4292,6 +4303,17 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
             try parseDsv41Fields(cfg_obj, &config);
         }
+    } else if (std.mem.eql(u8, model_type, "minimax_m3_vl") or std.mem.eql(u8, model_type, "minimax_m3")) {
+        // The plugin validates the architecture and owns all attention, expert and KV state.
+        config.model_type = "minimax_m3";
+        config.has_vision = false;
+        config.has_sliding_window = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.norm_has_offset = true;
+        config.has_qk_norm = true;
+        config.tie_word_embeddings = false;
+        if (jsonField(cfg_obj, "num_local_experts")) |v| config.num_experts = try jsonU32(v);
     } else if (std.mem.eql(u8, model_type, "glm_moe_dsa")) {
         // Z.ai GLM-5.3 (glm_moe_dsa), served only by mlx-stream (`parseConfig`). The
         // host reads the shell fields the common block parsed: vocab, hidden, layers,
@@ -7956,6 +7978,49 @@ test "deepseek_v41 bills its compressed caches per token, the window per slot" {
     // Every layer reads its 128-token window plus top-512 compressed entries.
     try testing.expectEqual(@as(u64, 128 + 512 + 1), config.prefillAttnKeys(1 << 20));
     try testing.expectEqual(@as(u64, 32), config.prefillAttnKeys(32));
+}
+
+const minimax_m3_shell_json =
+    \\{"model_type":"minimax_m3_vl","vision_config":{"hidden_size":1280},
+    \\ "text_config":{"vocab_size":200064,"hidden_size":6144,"intermediate_size":3072,
+    \\ "num_hidden_layers":60,"num_attention_heads":64,"num_key_value_heads":4,"head_dim":128,
+    \\ "num_local_experts":128,"num_experts_per_tok":4,"max_position_embeddings":1048576,
+    \\ "tie_word_embeddings":false,"rope_theta":10000000,"rms_norm_eps":0.000001}}
+;
+
+test "MiniMax M3 streaming shell reads nested geometry without advertising vision" {
+    const config = try parseConfigFromJson(testing.allocator, minimax_m3_shell_json);
+    try testing.expectEqualStrings("minimax_m3", config.model_type);
+    try testing.expectEqual(@as(u32, 6144), config.hidden_size);
+    try testing.expectEqual(@as(u32, 60), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 128), config.num_experts);
+    try testing.expectEqual(@as(u32, 4), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 200064), config.vocab_size);
+    try testing.expect(!config.has_vision and !config.tie_word_embeddings);
+    try testing.expect(config.defaultEnableThinking(false));
+    try testing.expect(!config.supportsBatchedGdnDecode());
+}
+
+test "MiniMax M3 requires an expert pack and leaves weight loading to the plugin" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = minimax_m3_shell_json });
+    try testing.expectError(error.MiniMaxM3NeedsExpertBank, parseConfig(io, testing.allocator, dir));
+    const marked = try std.mem.replaceOwned(u8, testing.allocator, minimax_m3_shell_json,
+        "\"model_type\":\"minimax_m3_vl\",",
+        "\"model_type\":\"minimax_m3_vl\",\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"},");
+    defer testing.allocator.free(marked);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
+    var config = try parseConfig(io, testing.allocator, dir);
+    defer config.deinit(testing.allocator);
+    try testing.expect(config.minimax_m3_stream and config.mlxStream());
+    try testing.expectEqualStrings(dir, config.pack_dir.?);
+    var weights = try loadModelWeights(io, testing.allocator, dir, &config, false);
+    defer weights.deinit();
+    try testing.expectEqual(@as(u32, 0), weights.count());
 }
 
 test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; an upstream MiMo checkpoint is not" {

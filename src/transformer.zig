@@ -17678,6 +17678,7 @@ pub const Transformer = struct {
         if (config.mimo_stream) return initMlxStream(io, allocator, config, s);
         if (config.glm_stream) return initMlxStream(io, allocator, config, s);
         if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
+        if (config.minimax_m3_stream) return initMlxStream(io, allocator, config, s);
         if (config.isDsv41()) return initDsv41(io, allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
