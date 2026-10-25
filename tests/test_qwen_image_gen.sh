@@ -110,8 +110,10 @@ b = base64.b64decode(json.load(open(sys.argv[1]))["data"][0]["b64_json"])
 assert b[:8] == b"\x89PNG\r\n\x1a\n" and struct.unpack(">II", b[16:24]) == (768, 768)
 PY
   png_ok=$?
-  [ "$code" = 200 ] && [ "$png_ok" = 0 ] && grep -q '\[mf-linear\] dq-gemm engaged (rows=' "$LOG" \
-    && pass "Q4 wide GEMM engages at 768x768" || fail "Q4 wide GEMM did not engage"
+  # On NAX with the int8 DiT route (the default past 64 GiB) the packed wide GEMM is replaced by
+  # the int8 GEMM: either engagement line is the 4-bit wide path doing its work.
+  [ "$code" = 200 ] && [ "$png_ok" = 0 ] && grep -qE '\[mf-linear\] dq-gemm engaged \(rows=|\[w8a8\] engaged' "$LOG" \
+    && pass "Q4 wide GEMM (or the int8 route) engages at 768x768" || fail "neither the Q4 wide GEMM nor the int8 route engaged"
 fi
 
 [ "$(gen "$OUT/b.json" '"prompt":"a red fox in the snow","guidance_scale":4,"negative_prompt":"blurry"')" = 200 ] && png_check "$OUT/b.json" \

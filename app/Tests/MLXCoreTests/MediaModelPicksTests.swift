@@ -137,4 +137,17 @@ final class MediaModelPicksTests: XCTestCase {
                                      physicalMemoryBytes: 64 * gb,
                                      capabilityOf: \.capabilityLabel).count, 1)
     }
+
+    /// TRELLIS.2 and Pixal3D tie on RAM; the catalogue order breaks the tie, so TRELLIS.2 (the better car and
+    /// object model in our A/B) leads wherever it fits, and a small Mac keeps Hunyuan3D.
+    func testThe3DCatalogueLeadsWithTRELLIS2WhereItFits() {
+        let big = MediaModelPicks.featured(Model3DModelPreset.all, physicalMemoryBytes: 64 * gb,
+                                           capabilityOf: \.capabilityLabel)
+        XCTAssertEqual(big.first?.preset.id, Model3DModelPreset.trellis2_8bit.id)
+        let small = MediaModelPicks.featured(Model3DModelPreset.all, physicalMemoryBytes: 16 * gb,
+                                             capabilityOf: \.capabilityLabel)
+        XCTAssertEqual(small.first?.preset.id, Model3DModelPreset.hunyuan3d21_8bit.id)
+        XCTAssertEqual(MediaModelPicks.others(Model3DModelPreset.all, featured: big).map(\.id),
+                       [Model3DModelPreset.hunyuan3d21_8bit.id, Model3DModelPreset.pixal3d_8bit.id])
+    }
 }

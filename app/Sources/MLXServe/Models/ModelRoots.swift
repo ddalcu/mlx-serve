@@ -168,3 +168,16 @@ struct ModelRoots {
         return path
     }
 }
+
+struct ModelDiscoveryConfiguration: Equatable {
+    let automaticallyDiscoverModels: Bool
+    let roots: [String]
+
+    static func current() -> ModelDiscoveryConfiguration {
+        let roots = ModelRoots()
+        let automatic = roots.automaticallyDiscoverModels
+        let tools = automatic ? ToolModelRoots.detected() : ToolModelRoots()
+        return ModelDiscoveryConfiguration(automaticallyDiscoverModels: automatic,
+                                           roots: roots.scanRoots(toolRoots: tools))
+    }
+}

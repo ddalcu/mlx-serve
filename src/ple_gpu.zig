@@ -485,6 +485,28 @@ test "ple gpu: a ModelOpt NVFP4 table embeds like the host gather" {
     try expectArmsEqual(tbl, &h, &table, &[_]u32{3}, &ids);
 }
 
+test "ple gpu: an embedded affine table embeds like the host gather at every width" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const h = try qwen4.NgramHash.init(TEST_VOCAB, 2, 1, 2, 2, 1234, 0, TEST_EOS);
+    try testing.expectEqual(@as(u64, 2), h.total_rows);
+    var prng = std.Random.DefaultPrng.init(14);
+    var ids: [256]u32 = undefined;
+    randIds(prng.random(), &ids);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try qwen4_ple.writeAffineFixture(&td, bits);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        var table = try qwen4.NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 2, .dim = 32, .shards = 1 });
+        defer table.close();
+        const tbl = try wrapEmbedded(table.embedded.?);
+        defer tbl.release();
+        try expectArmsEqual(tbl, &h, &table, &[_]u32{3}, &ids);
+    }
+}
+
 test "ple gpu: a declined embedded table keeps the host gather" {
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();

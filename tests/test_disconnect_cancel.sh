@@ -112,6 +112,8 @@ check "follow-up request succeeded" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 # Post-fix: ghost noticed within one keepalive interval (10s) + chunk abort.
 # Pre-fix: the follow-up waits out the ghost's entire remaining prefill+decode.
 check "follow-up completed in <12s (ghost cancelled)" "$([ "$ELAPSED" -lt 12 ] && echo 1 || echo 0)"
+# A follow-up admitted at a chunk boundary can finish before the next liveness probe.
+for _ in $(seq 1 15); do grep -q "client disconnected" "$LOG" && break; sleep 1; done
 grep -q "client disconnected" "$LOG"
 check "server logged the disconnect-cancel" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 

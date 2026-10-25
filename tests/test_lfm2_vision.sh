@@ -27,8 +27,8 @@ SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-for i in $(seq 1 240); do curl -s "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-if ! curl -s "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; tail -20 "$LOG"; exit 1; fi
+for i in $(seq 1 240); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+if ! curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; tail -20 "$LOG"; exit 1; fi
 
 FAIL=0
 ask() { # ask <base64> <prompt> <max_tokens> <mime>

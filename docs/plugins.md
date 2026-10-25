@@ -139,7 +139,7 @@ share code: each serves a different arch, and their kernels are tuned to it.
 
 ## Example: mlx-stream (arch seam)
 
-[mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`; the pin, 7d29eaa, is on the `main` branch of davidtai/mlx-stream) serves
+[mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`) serves
 DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
 prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`) and, as its third,
 GLM-5.3 (`glm_moe_dsa`, the trunk beside an `experts.bin` bank). It owns the model: the arch, its Metal

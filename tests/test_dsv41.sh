@@ -14,6 +14,9 @@
 # by default): its rounds engaged, and a second, serial boot (--no-mtp) keeps
 # the same greedy bytes (the EXL3 repack on mlx-stream drafts with typical
 # acceptance, so there the serial boot must answer without arming DSpark).
+# [9] on a pack with the tower: house.jpeg on the release's 35x53 grid as 230
+# span tokens, the street signs read, a /v1/messages image block, the image
+# turn resumed on a repeat.
 # Hermetic counterparts: the DSV41_TINY fixture tests, `chat: the embedded V4.1
 # template ...`, and the format-corpus "dsv41-dsml" family.
 
@@ -54,7 +57,7 @@ boot() { # extra flags...
     SERVER_PID=$!
     echo "waiting for server (load takes minutes)..."
     for _ in $(seq 1 400); do
-        curl -s -m 2 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && break
+        curl -sf -m 2 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && break
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
         fi
@@ -181,6 +184,62 @@ fi
 # The EXL3 repack runs on mlx-stream.
 if [ -f "$MODEL/experts.bin" ]; then
     check "mlx-stream serves the repack" "$(grep '\[mlx-stream\] loaded' "$LOG" || true)" 'tensors from'
+fi
+
+# [9] Images, on a pack that ships the tower. The grid and token accounting come from the log (a run of
+# pads that missed the splice still answers plausibly); the signs' names only the pixels carry.
+if grep -q "Vision encoder: DeepSeek-V4.1 ViT" "$LOG"; then
+    FIX="$(dirname "$0")/fixtures"
+    img_chat() { # img_chat <file> <mime> <prompt> <max_tokens>
+      python3 - "$1" "$2" "$3" "$4" <<'PY'
+import base64, json, sys
+f, mime, prompt, mt = sys.argv[1:]
+url = "data:%s;base64,%s" % (mime, base64.b64encode(open(f, "rb").read()).decode())
+print(json.dumps({"model": "mlx-serve", "max_tokens": int(mt), "temperature": 0, "enable_thinking": False, "messages": [{"role": "user", "content": [
+    {"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": url}}]}]}))
+PY
+    }
+    content() { python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'; }
+    check "[9] vision advertised" "$(curl -s "http://127.0.0.1:$PORT/v1/models")" '"vision"'
+    HOUSE_REQ=$(img_chat "$FIX/house.jpeg" image/jpeg "What is the main subject of this image? One word." 40)
+    H1=$(post /v1/chat/completions "$HOUSE_REQ")
+    echo "$H1" | content | grep -qiE "house|home|building|cottage" && { echo "PASS: [9] house named"; pass=$((pass+1)); } || { echo "FAIL: [9] house not named: $(echo "$H1" | head -c 300)"; fail=$((fail+1)); }
+    check "[9] reference geometry" "$(cat "$LOG")" "deepseek grid 35x53 (230 tokens, canvas 742x490)"
+    check "[9] every span token reaches the prompt" "$(cat "$LOG")" "230 image + 0 video"
+    # The module keeps ONE conversation's state: the repeat comes right after its first turn.
+    H2=$(post /v1/chat/completions "$HOUSE_REQ")
+    HC=$(echo "$H2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"]["prompt_tokens_details"]["cached_tokens"])')
+    [ "$HC" -gt 0 ] && { echo "PASS: [9] image turn resumed ($HC cached tokens)"; pass=$((pass+1)); } || { echo "FAIL: [9] image turn not resumed ($HC cached)"; fail=$((fail+1)); }
+    # A second image in the NEXT turn keeps the first turn's state: the key covers only the snapshot's rows.
+    H1_TEXT=$(echo "$H1" | content)
+    NEXT_REQ=$(python3 - "$FIX/house.jpeg" "$FIX/robot.png" "$H1_TEXT" <<'PY'
+import base64, json, sys
+a, b, prior = sys.argv[1:]
+url = lambda f, m: "data:%s;base64,%s" % (m, base64.b64encode(open(f, "rb").read()).decode())
+print(json.dumps({"model": "mlx-serve", "max_tokens": 40, "temperature": 0, "enable_thinking": False, "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "What is the main subject of this image? One word."}, {"type": "image_url", "image_url": {"url": url(a, "image/jpeg")}}]},
+    {"role": "assistant", "content": prior},
+    {"role": "user", "content": [{"type": "text", "text": "And this one? One word."}, {"type": "image_url", "image_url": {"url": url(b, "image/png")}}]}]}))
+PY
+    )
+    N1=$(post /v1/chat/completions "$NEXT_REQ")
+    NC=$(echo "$N1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"]["prompt_tokens_details"]["cached_tokens"])')
+    [ "$NC" -gt 200 ] && { echo "PASS: [9] a later image turn resumes the earlier one ($NC cached tokens)"; pass=$((pass+1)); } || { echo "FAIL: [9] a later image turn re-prefilled ($NC cached)"; fail=$((fail+1)); }
+    echo "$N1" | content | grep -qiE "robot|android|cyborg|humanoid|machine" && { echo "PASS: [9] second image answered"; pass=$((pass+1)); } || { echo "FAIL: [9] second image: $(echo "$N1" | head -c 300)"; fail=$((fail+1)); }
+    SIGNS=$(post /v1/chat/completions "$(img_chat "$FIX/street-name-signs.jpg" image/jpeg "Read the street names on the signs. Answer with just the names." 60)" | content)
+    echo "$SIGNS" | grep -qiE "grey fox|waterfall" && { echo "PASS: [9] sign text read ($SIGNS)"; pass=$((pass+1)); } || { echo "FAIL: [9] sign text not read: $SIGNS"; fail=$((fail+1)); }
+    ROBOT=$(python3 - "$FIX/robot.png" <<'PY' | curl -s -m 600 "http://127.0.0.1:$PORT/v1/messages" -H 'Content-Type: application/json' --data-binary @-
+import base64, json, sys
+d = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
+print(json.dumps({"model": "mlx-serve", "max_tokens": 40, "thinking": {"type": "disabled"}, "messages": [{"role": "user", "content": [
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": d}},
+    {"type": "text", "text": "What is in this image? One word."}]}]}))
+PY
+    )
+    echo "$ROBOT" | grep -qiE "robot|android|cyborg|humanoid|machine" && { echo "PASS: [9] /v1/messages image block"; pass=$((pass+1)); } || { echo "FAIL: [9] /v1/messages: $(echo "$ROBOT" | head -c 300)"; fail=$((fail+1)); }
+    refuse "[9] no MLX error" "$(cat "$LOG")" '[mlx]'
+else
+    echo "[9] SKIP images (the pack ships no vision tower)"
 fi
 
 # [8] DSpark: the default boot drafted; a serial boot keeps its greedy bytes.

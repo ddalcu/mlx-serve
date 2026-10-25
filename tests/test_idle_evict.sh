@@ -23,7 +23,9 @@ CYCLES="${IDLE_EVICT_CYCLES:-9}"
 # Measured from cycle 4 — the first concurrent cycles pay a one-time warm-up
 # (prefix cache, MLX buffer pool, the OS returning freed pages lazily) worth
 # hundreds of MB, and on LFM2.5 it takes three to settle. Cycles 4..9 are flat.
-RSS_GROWTH_LIMIT_MB="${IDLE_EVICT_RSS_LIMIT_MB:-40}"
+# Bar: above one ~40 MB step of freed large blocks malloc keeps resident (live heap flat), far
+# below the ~196 MB/cycle orphan.
+RSS_GROWTH_LIMIT_MB="${IDLE_EVICT_RSS_LIMIT_MB:-64}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
 if [ ! -d "$ROOT" ]; then
@@ -69,7 +71,18 @@ chat() {  # prints the HTTP status
 }
 # Resident entries only — /api/ps lists `.ready` models with their bytes.
 resident_count() { curl -fs "$BASE/api/ps" | grep -o '"name"' | wc -l | tr -d ' '; }
-server_rss_mb() { ps -o rss= -p $SERVER_PID | awk '{printf "%d", $1/1024}'; }
+raw_rss_mb() { ps -o rss= -p $SERVER_PID | awk '{printf "%d", $1/1024}'; }
+# Settled: the OS hands an unloaded model's pages back lazily (a read right after
+# eviction can still carry GBs of them), so read until it stops dropping.
+server_rss_mb() {
+    local prev cur; prev=$(raw_rss_mb)
+    for _ in $(seq 1 20); do
+        sleep 0.5; cur=$(raw_rss_mb)
+        [ $((prev - cur)) -le 4 ] && break
+        prev=$cur
+    done
+    echo "$cur"
+}
 
 wait_unloaded() {  # 0 = nothing resident within the timeout
     for _ in $(seq 1 40); do

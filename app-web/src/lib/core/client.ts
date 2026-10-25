@@ -178,7 +178,8 @@ class Client {
           headers,
           signal: controller.signal,
           redirect: "error",
-          credentials: "omit",
+          // A cookie or HTTP Basic login in front of the console must reach the API; another server's origin gets none.
+          credentials: "same-origin",
           cache: "no-store",
         },
       );

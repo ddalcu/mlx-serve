@@ -23,7 +23,7 @@ Generate (picks the model by capability from /v1/models; --model <id> overrides)
   node gen.mjs speech "<text>" -o line.wav [--voice af_heart]
   node gen.mjs music "<prompt>" -o theme.wav [--lyrics lyrics.txt] [--duration 90]
   node gen.mjs sound "<prompt>" -o door.wav [--duration 2]
-  node gen.mjs 3d "<object prompt>" -o lantern.glb [--height 1.6] [--max-tris 8000]
+  node gen.mjs 3d "<object prompt>" -o lantern.glb [--height 1.6] [--max-tris 8000] [--max-texture 2048] [--quantize] [--vehicle] [--roughness-scale 0.5 --clearcoat 0.6] [--resolution 512]
   node gen.mjs 3d ref.png -o lantern.glb          (from an image of one object)
   node gen.mjs batch assets.json [--force] [--keep-loaded]
   node gen.mjs models
@@ -33,8 +33,13 @@ Post-process (PNG and GLB in, PNG and GLB out; no server needed):
   node gen.mjs tile in.png -o out.png [--band 0.25]                -> seamless when repeated
   node gen.mjs cutout in.png -o out.png [--tolerance 40] [--trim] [--holes]
                                     -> plain background made transparent (--holes: enclosed pockets too)
-  node gen.mjs glb in.glb -o out.glb [--height 1.6 | --size 2] [--max-tris 8000]
-                                    -> pivot at the base centre, scaled to metres, fewer triangles
+  node gen.mjs glb in.glb -o out.glb [--height 1.6 | --size 2] [--max-tris 8000] [--max-texture 2048] [--quantize] [--vehicle]
+                                    -> pivot at the base centre, scaled to metres, fewer triangles (a mesh whose UV seams are
+                                       fixed stops short of the target), unused vertices dropped so the file shrinks
+                                       --max-texture 2048: every texture shrunk to at most that many pixels on its long side
+                                       --quantize: 16-bit positions, 8-bit normals, 16-bit UVs (KHR_mesh_quantization: three.js,
+                                       Blender, Godot 4 and glTFast read it); halves the vertex data
+                                       --vehicle: a car turned so its length runs along Z, nose at +Z for most cars (its nose is judged by the lower end; Pixal3D builds it at the photo's angle)
 
 batch file:
   {"out": "public/assets", "jobs": [
@@ -48,7 +53,8 @@ batch file:
     {"type": "video", "id": "storm", "prompt": "...", "first_frame": "storm.png", "width": 1312, "height": 736, "num_frames": 124, "turbo": true}]}
   Paths in jobs (source, first_frame, image_file) are relative to where gen.mjs runs. Jobs run one at a time. Other job fields go to the endpoint as is (steps, voice, lyrics, ...).
   Writes <out>/<id>.png|wav|glb plus <out>/manifest.json; a job whose spec and model did not
-  change is skipped (--force regenerates). Media models are unloaded at the end (--keep-loaded).`;
+  change is skipped (--force regenerates). One media model is loaded at a time: the previous one is
+  unloaded before the next kind loads, and the last one at the end (--keep-loaded keeps it).`;
 
 // ---------- server ----------
 
@@ -70,7 +76,7 @@ const WANTS = {
   video: (m) => has(m, "video"),
 };
 // Several models qualify: a clip is cut in from a still, which is MiniMax-H3's first-frame pack (REF2VA takes no frame).
-const PREFER = { video: /fl2va/i };
+const PREFER = { video: /fl2va/i, "3d": /trellis/i };
 
 let modelList = null;
 export async function listModels() {
@@ -241,6 +247,15 @@ function payload(kind, ev) {
   return Buffer.from(b64, "base64");
 }
 
+// One GPU shared with the chat model the agent runs on: a second media model resident beside the
+// first and a big chat model pushed Metal past its limit mid-job, so one media model at a time.
+let resident = null;
+async function use(model) {
+  if (resident && resident !== model) await unload(resident);
+  resident = model;
+  return model;
+}
+
 export async function unload(model) {
   await fetch(BASE + "/v1/unload-model", {
     method: "POST",
@@ -253,16 +268,15 @@ export async function unload(model) {
 
 // Job fields that steer this script; everything else is forwarded to the endpoint.
 const LOCAL = new Set(["type", "id", "file", "model", "tile", "maps", "cutout", "trim", "holes", "tolerance", "band",
-  "strength", "roughness", "height_m", "size_m", "max_tris", "image_file", "ref_prompt",
+  "strength", "roughness", "height_m", "size_m", "max_tris", "max_texture", "quantize", "vehicle", "image_file", "ref_prompt",
   "source", "source_strength", "source_mode", "first_frame", "last_frame"]);
 
-const REF_SUFFIX = ", a single object, centered, whole object in frame, three-quarter view, plain white background, soft even studio light";
+const REF_SUFFIX = ", a single object, centered, whole object in frame, three-quarter view, plain white background, soft even studio light, no shadow";
 
-async function runJob(job, out, used) {
+async function runJob(job, out) {
   const kind = job.type;
   if (!ENDPOINT[kind]) throw new Error(`job ${job.id}: unknown type "${kind}" (image, speech, music, sound, 3d, video)`);
   const model = await pickModel(kind, job.model);
-  used.add(model);
   const ext = { image: ".png", speech: ".wav", music: ".wav", sound: ".wav", "3d": ".glb", video: ".mp4" }[kind];
   const file = job.file || join(out, job.id + ext);
   mkdirSync(dirname(file), { recursive: true });
@@ -274,22 +288,26 @@ async function runJob(job, out, used) {
   if (kind === "3d") {
     let ref = job.image_file;
     if (!ref) {
-      const imageModel = await pickModel("image");
-      used.add(imageModel);
+      const imageModel = await use(await pickModel("image"));
       ref = file.replace(/\.glb$/, "") + "_ref.png";
       const ev = await generate("image", { model: imageModel, prompt: (job.ref_prompt || job.prompt) + REF_SUFFIX, seed: job.seed ?? 42 });
       writeFileSync(ref, payload("image", ev));
       files.ref = ref;
     }
     delete body.prompt;
-    body.image = readFileSync(ref).toString("base64");
+    body.image = subjectCutout(readFileSync(ref)).toString("base64");
     body.texture ??= true;
+    // TRELLIS.2 and Pixal3D unwrap and bake the mesh they keep: a small target here is much faster than cutting a 300k-face unwrap down afterwards.
+    if (job.max_tris) body.decimation_target ??= Math.min(300000, Math.max(10000, job.max_tris * 3));
+    await use(model);
     let glb = payload("3d", await generate("3d", body));
-    if (job.height_m || job.size_m || job.max_tris) glb = fixGlb(glb, { height: job.height_m, size: job.size_m, maxTris: job.max_tris });
+    if (job.height_m || job.size_m || job.max_tris || job.max_texture || job.quantize || job.vehicle)
+      glb = fixGlb(glb, { height: job.height_m, size: job.size_m, maxTris: job.max_tris, maxTexture: job.max_texture, quantize: job.quantize, vehicle: job.vehicle });
     writeFileSync(file, glb);
     return { model, files };
   }
 
+  await use(model);
   if (kind === "video") {
     // the server's defaults are tiny test sizes; a film wants 16:9 and about five seconds (MiniMax-H3's 17k+5 ladder)
     body.width ??= 1312;
@@ -325,7 +343,6 @@ async function runBatch(specFile, opts) {
   const manifestFile = join(out, "manifest.json");
   const manifest = existsSync(manifestFile) ? JSON.parse(readFileSync(manifestFile, "utf8")) : { assets: {} };
   manifest.generated_by = "mlx-serve gen.mjs";
-  const used = new Set();
   let failed = 0;
   for (const job of spec.jobs || []) {
     if (!job.id || !job.type) throw new Error(`every job needs "id" and "type": ${JSON.stringify(job)}`);
@@ -337,7 +354,7 @@ async function runBatch(specFile, opts) {
       continue;
     }
     try {
-      const r = await runJob({ ...job, model }, out, used);
+      const r = await runJob({ ...job, model }, out);
       const files = Object.fromEntries(Object.entries(r.files).map(([k, f]) => [k, f.startsWith(out) ? f.slice(out.length + 1) : f]));
       manifest.assets[job.id] = { type: job.type, files, model: r.model, prompt: job.prompt ?? job.input, seed: job.seed, hash };
       writeFileSync(manifestFile, JSON.stringify(manifest, null, 2) + "\n");
@@ -346,7 +363,7 @@ async function runBatch(specFile, opts) {
       console.error(`  FAILED ${job.id}: ${e.message}`);
     }
   }
-  if (!opts.keepLoaded) for (const m of used) await unload(m);
+  if (!opts.keepLoaded && resident) await unload(resident);
   console.error(`${(spec.jobs || []).length - failed}/${(spec.jobs || []).length} jobs ok; manifest: ${manifestFile}`);
   if (failed) process.exitCode = 1;
 }
@@ -365,7 +382,7 @@ function crc32(buf) {
 }
 
 /** RGBA image {w, h, data: Uint8Array}. */
-function decodePng(buf) {
+export function decodePng(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error("not a PNG (convert JPEG/WebP to PNG first)");
   let pos = 8, w = 0, h = 0, depth = 0, ctype = 0, interlace = 0, palette = null, trns = null;
   const idat = [];
@@ -404,10 +421,14 @@ function decodePng(buf) {
   return { w, h, data };
 }
 
-/** RGBA 8-bit pixels -> PNG bytes. */
-export function encodePng({ w, h, data }) {
-  const raw = Buffer.alloc((w * 4 + 1) * h);
-  for (let y = 0; y < h; y++) raw.set(data.subarray(y * w * 4, (y + 1) * w * 4), y * (w * 4 + 1) + 1);
+/** RGBA 8-bit pixels -> PNG bytes; `rgb` drops the alpha channel (for an image that is opaque everywhere). */
+export function encodePng({ w, h, data }, { rgb = false } = {}) {
+  const ch = rgb ? 3 : 4, raw = Buffer.alloc((w * ch + 1) * h);
+  for (let y = 0; y < h; y++) {
+    const row = y * (w * ch + 1) + 1;
+    if (!rgb) raw.set(data.subarray(y * w * 4, (y + 1) * w * 4), row);
+    else for (let x = 0; x < w; x++) raw.set(data.subarray((y * w + x) * 4, (y * w + x) * 4 + 3), row + x * 3);
+  }
   const chunk = (type, d) => {
     const head = Buffer.alloc(8);
     head.writeUInt32BE(d.length, 0);
@@ -419,7 +440,7 @@ export function encodePng({ w, h, data }) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(w, 0);
   ihdr.writeUInt32BE(h, 4);
-  ihdr.set([8, 6, 0, 0, 0], 8);
+  ihdr.set([8, rgb ? 2 : 6, 0, 0, 0], 8);
   return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", ihdr),
     chunk("IDAT", deflateSync(raw, { level: 9 })), chunk("IEND", Buffer.alloc(0))]);
 }
@@ -492,6 +513,20 @@ function makeTileable({ w, h, data }, band = 0.25) {
 
 /** Plain background to alpha: flood-fill from the border over pixels near the border colour
  *  (`holes`: enclosed pockets of it too), soften a two-pixel rim and pull the background colour out of it. */
+// TRELLIS.2 and Pixal3D read the alpha as the subject and Hunyuan3D composites it on white itself, so every 3D
+// backend gets a cutout. Anything that is not a PNG, or already has transparency, is the caller's own and goes as is.
+function subjectCutout(file) {
+  if (file.readUInt32BE(0) !== 0x89504e47) return file;
+  let img;
+  try { img = decodePng(file); } catch { return file; } // 16-bit and interlaced PNGs go as they are
+  for (let i = 3; i < img.data.length; i += 4) if (img.data[i] < 255) return file;
+  const cut = cutout(img);
+  // A subject as pale as its background floods away with it: send the photo, not an empty cutout.
+  let kept = 0;
+  for (let i = 3; i < cut.data.length; i += 4) if (cut.data[i] > 127) kept++;
+  return kept * 200 < cut.w * cut.h ? file : encodePng(cut);
+}
+
 function cutout({ w, h, data }, { tolerance = 40, trim = false, holes = false } = {}) {
   const border = [];
   for (let x = 0; x < w; x++) border.push(x, (h - 1) * w + x);
@@ -530,7 +565,7 @@ function cutout({ w, h, data }, { tolerance = 40, trim = false, holes = false } 
 
 // ---------- GLB ----------
 
-function parseGlb(buf) {
+export function parseGlb(buf) {
   if (buf.readUInt32LE(0) !== 0x46546c67) throw new Error("not a GLB file");
   let pos = 12, json = null, bin = Buffer.alloc(0);
   while (pos < buf.length) {
@@ -542,7 +577,7 @@ function parseGlb(buf) {
   return { json, bin };
 }
 
-function writeGlb(json, bin) {
+export function writeGlb(json, bin) {
   const pad = (b, fill) => Buffer.concat([b, Buffer.alloc((4 - (b.length % 4)) % 4, fill)]);
   const j = pad(Buffer.from(JSON.stringify(json)), 0x20), b = pad(bin, 0);
   const head = Buffer.alloc(12), jh = Buffer.alloc(8), bh = Buffer.alloc(8);
@@ -552,12 +587,13 @@ function writeGlb(json, bin) {
   return Buffer.concat([head, jh, j, bh, b]);
 }
 
-/** An accessor's elements as plain numbers, honouring byteStride. */
-function readAccessor(json, bin, index) {
+const WIDTH = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 };
+const COMPONENT = { 5120: ["readInt8", 1], 5121: ["readUInt8", 1], 5122: ["readInt16LE", 2], 5123: ["readUInt16LE", 2], 5125: ["readUInt32LE", 4], 5126: ["readFloatLE", 4] };
+
+/** An accessor's elements as plain numbers (a normalized one as its stored integers), honouring byteStride. */
+export function readAccessor(json, bin, index) {
   const acc = json.accessors[index], view = json.bufferViews[acc.bufferView];
-  const n = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 }[acc.type];
-  const size = { 5126: 4, 5125: 4, 5123: 2, 5121: 1 }[acc.componentType];
-  const read = { 5126: "readFloatLE", 5125: "readUInt32LE", 5123: "readUInt16LE", 5121: "readUInt8" }[acc.componentType];
+  const n = WIDTH[acc.type], [read, size] = COMPONENT[acc.componentType];
   const stride = view.byteStride || n * size, base = (view.byteOffset || 0) + (acc.byteOffset || 0);
   const out = new Float64Array(acc.count * n);
   for (let i = 0; i < acc.count; i++) for (let c = 0; c < n; c++) out[i * n + c] = bin[read](base + i * stride + c * size);
@@ -700,9 +736,199 @@ function simplify(P, I, target) {
 }
 
 /** Scale to metres with the pivot at the base centre, and optionally cut the triangle count. */
-function fixGlb(buf, { height, size, maxTris } = {}) {
-  const { json, bin } = parseGlb(buf);
+/** Turns a car about Y, in its vertex data, so its length runs along Z with the nose on +Z. Pixal3D builds the
+ *  car at the photo's viewing angle, and a car is long and lower at the nose than at the tail. */
+function straightenVehicle(json, bin) {
+  const prims = json.meshes.flatMap((m) => m.primitives).filter((p) => p.attributes.POSITION !== undefined);
+  const pos = prims.map((p) => readAccessor(json, bin, p.attributes.POSITION));
+  let n = 0, cx = 0, cz = 0;
+  for (const v of pos) for (let i = 0; i < v.length; i += 3) { cx += v[i]; cz += v[i + 2]; n++; }
+  cx /= n; cz /= n;
+  let sxx = 0, sxz = 0, szz = 0;
+  for (const v of pos) for (let i = 0; i < v.length; i += 3) { const x = v[i] - cx, z = v[i + 2] - cz; sxx += x * x; sxz += x * z; szz += z * z; }
+  const theta = 0.5 * Math.atan2(2 * sxz, szz - sxx); // principal axis (sin, cos) from +Z toward +X
+  let ax = Math.sin(theta), az = Math.cos(theta), tmin = Infinity, tmax = -Infinity;
+  for (const v of pos) for (let i = 0; i < v.length; i += 3) { const t = (v[i] - cx) * ax + (v[i + 2] - cz) * az; tmin = Math.min(tmin, t); tmax = Math.max(tmax, t); }
+  const end = [0, 0, 0, 0]; // height sum and count at the -axis and +axis quarters
+  for (const v of pos) for (let i = 0; i < v.length; i += 3) {
+    const t = (v[i] - cx) * ax + (v[i + 2] - cz) * az, e = t <= tmin + 0.25 * (tmax - tmin) ? 0 : t >= tmax - 0.25 * (tmax - tmin) ? 2 : -1;
+    if (e >= 0) { end[e] += v[i + 1]; end[e + 1]++; }
+  }
+  if (end[0] / end[1] < end[2] / end[3]) { ax = -ax; az = -az; } // the nose is the lower end
+  const phi = -Math.atan2(ax, az), c = Math.cos(phi), s = Math.sin(phi);
+  const turn = (accessor, bounds) => {
+    const acc = json.accessors[accessor], view = json.bufferViews[acc.bufferView], stride = view.byteStride || 12, base = (view.byteOffset || 0) + (acc.byteOffset || 0);
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < acc.count; i++) {
+      const o = base + i * stride, x = bin.readFloatLE(o), y = bin.readFloatLE(o + 4), z = bin.readFloatLE(o + 8);
+      const r = [x * c + z * s, y, -x * s + z * c];
+      for (let k = 0; k < 3; k++) { bin.writeFloatLE(r[k], o + k * 4); lo[k] = Math.min(lo[k], r[k]); hi[k] = Math.max(hi[k], r[k]); }
+    }
+    if (bounds) { acc.min = lo; acc.max = hi; }
+  };
+  for (const p of prims) {
+    turn(p.attributes.POSITION, true);
+    if (p.attributes.NORMAL !== undefined) turn(p.attributes.NORMAL, false);
+  }
+  console.error(`  turned ${((phi * 180) / Math.PI).toFixed(1)} degrees about Y: length along Z, nose at +Z`);
+}
+
+const SRGB_TO_LINEAR = Float32Array.from({ length: 256 }, (_, i) => { const c = i / 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; });
+const linearToSrgb = (v) => Math.round(255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055));
+
+/** An RGBA image averaged down to nw x nh by area; `srgb` averages the colour channels in linear light. */
+function resizeArea({ w, h, data }, nw, nh, srgb) {
+  const sx = w / nw, sy = h / nh, wide = new Float32Array(nw * h * 4);
+  const value = (i, c) => (srgb && c < 3 ? SRGB_TO_LINEAR[data[i]] : data[i]);
+  for (let y = 0; y < h; y++) for (let x = 0; x < nw; x++) {
+    const x0 = x * sx, x1 = x0 + sx, acc = [0, 0, 0, 0];
+    for (let i = Math.floor(x0); i < Math.min(w, Math.ceil(x1)); i++) {
+      const wt = Math.min(i + 1, x1) - Math.max(i, x0);
+      for (let c = 0; c < 4; c++) acc[c] += wt * value((y * w + i) * 4 + c, c);
+    }
+    for (let c = 0; c < 4; c++) wide[(y * nw + x) * 4 + c] = acc[c] / sx;
+  }
+  const out = new Uint8Array(nw * nh * 4);
+  for (let y = 0; y < nh; y++) for (let x = 0; x < nw; x++) {
+    const y0 = y * sy, y1 = y0 + sy, acc = [0, 0, 0, 0];
+    for (let j = Math.floor(y0); j < Math.min(h, Math.ceil(y1)); j++) {
+      const wt = Math.min(j + 1, y1) - Math.max(j, y0);
+      for (let c = 0; c < 4; c++) acc[c] += wt * wide[(j * nw + x) * 4 + c];
+    }
+    for (let c = 0; c < 4; c++) { const v = acc[c] / sy; out[(y * nw + x) * 4 + c] = srgb && c < 3 ? linearToSrgb(v) : Math.round(v); }
+  }
+  return { w: nw, h: nh, data: out };
+}
+
+/** PNG bytes for every image wider than `maxSide`, by image index. Base colour and emissive go through linear light. */
+function shrinkImages(json, bin, maxSide) {
+  const colour = new Set();
+  for (const m of json.materials || []) for (const t of [m.pbrMetallicRoughness?.baseColorTexture, m.emissiveTexture])
+    if (t) colour.add(json.textures[t.index].source);
+  const out = {};
+  (json.images || []).forEach((im, i) => {
+    if (im.bufferView === undefined) return;
+    const v = json.bufferViews[im.bufferView], at = v.byteOffset || 0;
+    let img;
+    try { img = decodePng(bin.subarray(at, at + v.byteLength)); } catch (e) { console.error(`  texture ${i} left as it is: ${e.message}`); return; }
+    const f = maxSide / Math.max(img.w, img.h);
+    if (f >= 1) return;
+    const small = resizeArea(img, Math.max(1, Math.round(img.w * f)), Math.max(1, Math.round(img.h * f)), colour.has(i));
+    out[i] = encodePng(small, { rgb: small.data.every((b, k) => k % 4 !== 3 || b === 255) });
+    console.error(`  texture ${i}: ${img.w}x${img.h} -> ${small.w}x${small.h}`);
+  });
+  return out;
+}
+
+/** Per-component [min, max] of 3-wide packed values given as `at(i, c)` over n elements (no spread: a mesh has more values than a call stack takes). */
+function range3(n, at) {
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) { const v = at(i, c); if (v < lo[c]) lo[c] = v; if (v > hi[c]) hi[c] = v; }
+  return [lo, hi];
+}
+
+/** Repacks the BIN from scratch: each triangle primitive keeps only the vertices its triangles use (indices go 16-bit
+ *  when they fit), images are copied or replaced by `images[i]`, and everything else in the old BIN is dropped. With
+ *  `quantize`, positions, normals and UVs are stored as normalized integers (KHR_mesh_quantization) where that holds. */
+function rebuildGlb(json, bin, { images = {}, quantize = false } = {}) {
+  const prims = json.meshes.flatMap((m) => m.primitives);
+  if (json.animations || json.skins || json.accessors.some((a) => a.sparse) || prims.some((p) => p.targets || p.indices === undefined || (p.mode ?? 4) !== 4)) {
+    console.error("  repacking skipped: animations, skins, morph targets, sparse accessors and non-triangle primitives stay as they are");
+    return bin;
+  }
+  const parts = [], views = [], accessors = [];
+  let offset = 0;
+  const addView = (buf, extra = {}) => {
+    const pad = (4 - (offset % 4)) % 4;
+    if (pad) parts.push(Buffer.alloc(pad));
+    offset += pad;
+    parts.push(buf);
+    views.push({ buffer: 0, byteOffset: offset, byteLength: buf.length, ...extra });
+    offset += buf.length;
+    return views.length - 1;
+  };
+  // Rows of `elem` bytes, each padded to a multiple of 4 (vertex attributes must be 4-byte aligned).
+  const rows = (n, elem, fill) => {
+    const stride = Math.ceil(elem / 4) * 4, buf = Buffer.alloc(n * stride);
+    for (let i = 0; i < n; i++) fill(buf, i * stride, i);
+    return { buf, stride };
+  };
+  const addAttr = (r, acc) => accessors.push({ bufferView: addView(r.buf, { byteStride: r.stride, target: 34962 }), ...acc }) - 1;
+  json.meshes.forEach((mesh, mi) => {
+    const users = json.nodes.filter((n) => n.mesh === mi), node = users[0];
+    const q = quantize && users.length === 1 && !node.matrix && !node.translation && !node.rotation && !node.scale
+      && mesh.primitives.every((p) => json.accessors[p.attributes.POSITION].componentType === 5126);
+    const used = mesh.primitives.map((p) => {
+      const old = readAccessor(json, bin, p.indices), remap = new Int32Array(json.accessors[p.attributes.POSITION].count).fill(-1), keep = [];
+      const idx = new Uint32Array(old.length);
+      old.forEach((v, k) => { if (remap[v] < 0) { remap[v] = keep.length; keep.push(v); } idx[k] = remap[v]; });
+      return { keep, idx };
+    });
+    let centre, half;
+    if (q) {
+      const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      mesh.primitives.forEach((p, k) => {
+        const P = readAccessor(json, bin, p.attributes.POSITION), keep = used[k].keep;
+        const [l, h] = range3(keep.length, (i, c) => P[keep[i] * 3 + c]);
+        for (let c = 0; c < 3; c++) { lo[c] = Math.min(lo[c], l[c]); hi[c] = Math.max(hi[c], h[c]); }
+      });
+      centre = lo.map((v, c) => (v + hi[c]) / 2);
+      // One scale on every axis, so a renderer's normal matrix needs no correction.
+      half = Math.max(1e-6, ...lo.map((v, c) => (hi[c] - v) / 2));
+      node.translation = centre;
+      node.scale = [half, half, half];
+    }
+    mesh.primitives.forEach((p, k) => {
+      const { keep, idx } = used[k], attrs = {};
+      for (const [name, ai] of Object.entries(p.attributes)) {
+        const acc = json.accessors[ai], n = WIDTH[acc.type], [, size] = COMPONENT[acc.componentType], vals = readAccessor(json, bin, ai);
+        const take = (c, i) => vals[keep[i] * n + c];
+        if (q && name === "POSITION") {
+          const ints = Array.from({ length: keep.length * 3 }, (_, j) => Math.round(((take(j % 3, Math.floor(j / 3)) - centre[j % 3]) / half) * 32767));
+          const r = rows(keep.length, 6, (b, o, i) => { for (let c = 0; c < 3; c++) b.writeInt16LE(ints[i * 3 + c], o + c * 2); });
+          const [min, max] = range3(keep.length, (i, c) => ints[i * 3 + c]);
+          attrs[name] = addAttr(r, { componentType: 5122, normalized: true, count: keep.length, type: "VEC3", min, max });
+        } else if (quantize && name === "NORMAL" && acc.componentType === 5126) {
+          const r = rows(keep.length, 3, (b, o, i) => { for (let c = 0; c < 3; c++) b.writeInt8(Math.max(-127, Math.min(127, Math.round(take(c, i) * 127))), o + c); });
+          attrs[name] = addAttr(r, { componentType: 5120, normalized: true, count: keep.length, type: "VEC3" });
+        } else if (quantize && name.startsWith("TEXCOORD_") && acc.componentType === 5126 && vals.every((v) => v >= 0 && v <= 1)) {
+          const r = rows(keep.length, 4, (b, o, i) => { for (let c = 0; c < 2; c++) b.writeUInt16LE(Math.round(take(c, i) * 65535), o + c * 2); });
+          attrs[name] = addAttr(r, { componentType: 5123, normalized: true, count: keep.length, type: "VEC2" });
+        } else {
+          const [read, ] = COMPONENT[acc.componentType], write = read.replace("read", "write");
+          const r = rows(keep.length, n * size, (b, o, i) => { for (let c = 0; c < n; c++) b[write](take(c, i), o + c * size); });
+          const next = { ...acc, count: keep.length, bufferView: undefined, byteOffset: undefined };
+          delete next.bufferView; delete next.byteOffset;
+          if (name === "POSITION") [next.min, next.max] = range3(keep.length, (i, c) => take(c, i));
+          attrs[name] = addAttr(r, next);
+        }
+      }
+      const wide = keep.length > 65535, ib = Buffer.alloc(idx.length * (wide ? 4 : 2));
+      idx.forEach((v, i) => (wide ? ib.writeUInt32LE(v, i * 4) : ib.writeUInt16LE(v, i * 2)));
+      accessors.push({ bufferView: addView(ib, { target: 34963 }), componentType: wide ? 5125 : 5123, count: idx.length, type: "SCALAR" });
+      p.attributes = attrs;
+      p.indices = accessors.length - 1;
+    });
+  });
+  (json.images || []).forEach((im, i) => {
+    if (im.bufferView === undefined) return;
+    const v = json.bufferViews[im.bufferView], at = v.byteOffset || 0;
+    im.bufferView = addView(images[i] || Buffer.from(bin.subarray(at, at + v.byteLength)));
+  });
+  json.bufferViews = views;
+  json.accessors = accessors;
+  const out = Buffer.concat(parts);
+  json.buffers[0].byteLength = out.length;
+  if (quantize && json.accessors.some((a) => a.componentType === 5122 && a.normalized)) {
+    for (const key of ["extensionsUsed", "extensionsRequired"]) json[key] = [...new Set([...(json[key] || []), "KHR_mesh_quantization"])];
+  }
+  return out;
+}
+
+export function fixGlb(buf, { height, size, maxTris, vehicle, maxTexture, quantize } = {}) {
+  const parsed = parseGlb(buf), json = parsed.json, bin = vehicle ? Buffer.from(parsed.bin) : parsed.bin;
   if ((json.extensionsUsed || []).some((e) => /draco|meshopt/i.test(e))) throw new Error("compressed GLB (Draco/meshopt): decompress it first");
+  if (vehicle) straightenVehicle(json, bin);
   let newBin = bin;
   if (maxTris) {
     const prims = json.meshes.flatMap((m) => m.primitives).filter((p) => (p.mode ?? 4) === 4 && p.indices !== undefined && p.attributes.POSITION !== undefined);
@@ -733,12 +959,17 @@ function fixGlb(buf, { height, size, maxTris } = {}) {
     scene.nodes = [json.nodes.length - 1];
     console.error(`  scaled x${s.toPrecision(3)} to ${((hi[0] - lo[0]) * s).toFixed(2)} x ${((hi[1] - lo[1]) * s).toFixed(2)} x ${((hi[2] - lo[2]) * s).toFixed(2)} m, pivot at the base centre`);
   }
+  if (maxTris || maxTexture || quantize) {
+    const before = newBin.length;
+    newBin = rebuildGlb(json, newBin, { images: maxTexture ? shrinkImages(json, newBin, maxTexture) : {}, quantize });
+    console.error(`  repacked: ${(before / 1e6).toFixed(1)} -> ${(newBin.length / 1e6).toFixed(1)} MB of mesh and textures`);
+  }
   return writeGlb(json, newBin);
 }
 
 // ---------- CLI ----------
 
-const BOOL = new Set(["tile", "maps", "cutout", "trim", "holes", "force", "keep-loaded", "turbo"]);
+const BOOL = new Set(["tile", "maps", "cutout", "trim", "holes", "force", "keep-loaded", "turbo", "vehicle", "quantize"]);
 function parseArgs(argv) {
   const pos = [], opt = {};
   for (let i = 0; i < argv.length; i++) {
@@ -770,7 +1001,7 @@ async function main() {
         first_frame: opt["first-frame"], last_frame: opt["last-frame"], width, height, num_frames: num(opt.frames),
         steps: num(opt.steps), turbo: opt.turbo, seed: num(opt.seed) };
       for (const k of Object.keys(job)) if (job[k] === undefined) delete job[k];
-      const r = await runJob(job, ".", new Set());
+      const r = await runJob(job, ".");
       console.log(r.files.main);
       return;
     }
@@ -784,10 +1015,11 @@ async function main() {
       if (opt.voice) job.voice = opt.voice;
       if (opt.duration) job.duration_seconds = num(opt.duration);
       if (opt.lyrics) job.lyrics = existsSync(opt.lyrics) ? readFileSync(opt.lyrics, "utf8") : opt.lyrics;
-      Object.assign(job, { tile: opt.tile, maps: opt.maps, cutout: opt.cutout, trim: opt.trim, holes: opt.holes, height_m: num(opt.height), size_m: num(opt.size_m), max_tris: num(opt["max-tris"]) });
+      Object.assign(job, { tile: opt.tile, maps: opt.maps, cutout: opt.cutout, trim: opt.trim, holes: opt.holes, height_m: num(opt.height), size_m: num(opt.size_m), max_tris: num(opt["max-tris"]), max_texture: num(opt["max-texture"]), quantize: opt.quantize, vehicle: opt.vehicle,
+        roughness_scale: num(opt["roughness-scale"]), clearcoat: num(opt.clearcoat), resolution: num(opt.resolution) });
       job.file ||= { image: "image.png", "3d": "model.glb" }[cmd] || cmd + ".wav";
       for (const k of Object.keys(job)) if (job[k] === undefined) delete job[k];
-      const r = await runJob(job, ".", new Set());
+      const r = await runJob(job, ".");
       console.log(Object.values(r.files).join("\n"));
       return;
     }
@@ -803,7 +1035,7 @@ async function main() {
       writeFileSync(outFile("_cutout.png"), encodePng(cutout(decodePng(readFileSync(need("a PNG"))), { tolerance: num(opt.tolerance), trim: !!opt.trim, holes: !!opt.holes })));
       return console.log(outFile("_cutout.png"));
     case "glb":
-      writeFileSync(outFile("_fixed.glb"), fixGlb(readFileSync(need("a GLB")), { height: num(opt.height), size: num(opt.size), maxTris: num(opt["max-tris"]) }));
+      writeFileSync(outFile("_fixed.glb"), fixGlb(readFileSync(need("a GLB")), { height: num(opt.height), size: num(opt.size), maxTris: num(opt["max-tris"]), maxTexture: num(opt["max-texture"]), quantize: !!opt.quantize, vehicle: !!opt.vehicle }));
       return console.log(outFile("_fixed.glb"));
     default:
       console.log(HELP);

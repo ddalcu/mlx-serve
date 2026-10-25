@@ -33,7 +33,7 @@
 "The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here." = "已保存的生成策略包含无效或不受支持的字段。原内容会保留；请先修正 model-settings.json，再在此编辑。";
 "Keeps only the k most likely next tokens. Lower values narrow choices; 0 disables this filter." = "仅保留下一步最可能的 k 个 token。较低值缩小候选范围；0 禁用此筛选。";
 "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding." = "1 禁用重复惩罚。非中性惩罚可能禁用投机解码和批量解码。";
-"Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control." = "使用此引擎现有的频率惩罚映射。重复惩罚和频率惩罚共用一个采样器控制项。";
+"Discourage tokens in proportion to how often they already appeared. 0 disables the penalty." = "按 token 已出现的次数成比例降低其概率。0 禁用惩罚。";
 "0 uses remaining context. Context and memory limits still apply." = "0 使用剩余上下文。上下文和内存限制仍然适用。";
 "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. Effort words map against this budget." = "API：reasoning_budget_tokens。-1 表示无限制；0 立即结束思考。推理强度词按此预算换算。";
 "Explicit client thinking or effort wins unless locked." = "未锁定时，以客户端明确指定的思考或努力级别为准。";
@@ -989,6 +989,17 @@
 "Memory: about 1 GB more for a small model, up to 11 GB for a 27B. Disk: roughly as much again for its compiled copy." = "内存：小模型约多占 1 GB，27B 模型最多多占 11 GB。磁盘：编译副本大致再占同样多的空间。";
 "Menu bar" = "菜单栏";
 "Mesh resolution" = "网格分辨率";
+"Faces" = "面数";
+"Texture size" = "贴图尺寸";
+"1536 gives a finer mesh and needs about 35 GB of memory." = "1536 的网格更精细，需要约 35 GB 内存。";
+"More faces keep more detail. At 1M faces and above the file passes 60 MB." = "面数越多，细节越多。1M 面及以上时文件超过 60 MB。";
+"Finish" = "表面质感";
+"As generated" = "模型原样";
+"Satin" = "缎面";
+"Glossy" = "高光";
+"Car paint" = "车漆";
+"The model decides what is shiny; a finish scales it. A glossier finish shows every bump in the surface." = "光泽由模型决定，质感只是整体缩放。越光滑，表面的每个凹凸越明显。";
+"A single, well-lit photo of one object works best. A cutout with a transparent background is used as is; otherwise the subject is auto-cut." = "单张光线良好的单物体照片效果最佳。带透明背景的抠图将原样使用，否则会自动抠出主体。";
 "Messaging" = "消息";
 "Messaging — Telegram bot" = "消息 —— Telegram 机器人";
 "Metrics panel" = "指标面板";
@@ -2215,7 +2226,7 @@
 "How many requests llama.cpp answers at once, each with its own memory." = "llama.cpp 同时回答的请求数，每个请求单独占用内存。";
 "How many tokens to guess ahead for GGUF models with an MTP head; 0 turns it off." = "对带 MTP 头的 GGUF 模型提前预测的 token 数，0 表示关闭。";
 "How much of a prompt llama.cpp reads at a time; larger is faster but uses more memory." = "llama.cpp 每次读取的提示词量，越大越快，但占用更多内存。";
-"Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory." = "从磁盘读取 DeepSeek-V4-Flash，让内存较少的 Mac 也能运行，速度稍慢。";
+"Read a DeepSeek-V4 GGUF from disk so it runs, a bit slower, on Macs with less memory. MLX packs always load fully into memory." = "从磁盘读取 DeepSeek-V4 GGUF，让内存较少的 Mac 也能运行，速度稍慢。MLX 包始终完整载入内存。";
 "Remember recent prompts so repeats start faster; 0 turns it off." = "记住最近的提示词，重复时更快开始，0 表示关闭。";
 "What's new in each version." = "每个版本的新内容。";
 "A star helps other people find mlx-serve." = "点个星标能帮助更多人发现 mlx-serve。";
@@ -2357,6 +2368,17 @@
 "About %@ on this Mac and %@ on %@." = "本机约占用 %@，%@ 在 %@ 上。";
 "A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it." = "配对可运行 MiniMax-H3（视频），或 Qwen3.8-Flash-Next、DeepSeek-V4.1（聊天）。请在两台 Mac 上都下载其中一个。";
 "Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both." = "在 Thunderbolt 配对的两台 Mac 上一起运行；卸载它会同时在两台 Mac 上释放。";
+"1248 × 1248 (square, 1.5 MP)" = "1248 × 1248（方形，150 万像素）";
+"1456 × 1456 (square, 2 MP)" = "1456 × 1456（方形，200 万像素）";
+"1360 × 768 (landscape 16:9)" = "1360 × 768（横版 16:9）";
+"768 × 1360 (portrait 9:16)" = "768 × 1360（竖版 9:16）";
+"1936 × 1088 (landscape 16:9, 2 MP)" = "1936 × 1088（横版 16:9，200 万像素）";
+"1088 × 1936 (portrait 9:16, 2 MP)" = "1088 × 1936（竖版 9:16，200 万像素）";
+"OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)." = "OpenMOSS 的 5B 图像模型——支持长提示词、标签序列，或用 JSON 布局摆放每个物体和每行文字，图中文字支持中英文。未蒸馏：默认 50 步并使用引导，速度较慢。开源（Apache-2.0）。";
+"MOSS-Image quantized to 8-bit for smaller Macs: the same 50-step model at about half the memory, with renders matching bf16. Open (Apache-2.0)." = "为小内存 Mac 量化为 8-bit 的 MOSS-Image：同样是 50 步模型，内存占用约为一半，出图与 bf16 一致。开源（Apache-2.0）。";
+"Handwritten note (Chinese text)" = "手写便签（中文）";
+"Whiteboard (Chinese text)" = "玻璃白板（中文）";
+"Layout poster (1024 × 1024)" = "布局海报（1024 × 1024）";
 
 "Automatically Discover Models" = "自动发现模型";
 

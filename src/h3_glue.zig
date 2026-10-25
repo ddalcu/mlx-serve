@@ -25,7 +25,7 @@ fn eligibleDtype(dt: mlx.mlx_dtype) bool {
     return dt == .bfloat16 or dt == .float16;
 }
 
-fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, src: [*:0]const u8, header: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
+pub fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, src: [*:0]const u8, header: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
     const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
@@ -36,7 +36,7 @@ fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:
 }
 
 /// Runs `kernel`; `outs` receives one handle per declared output.
-fn apply(kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, arrs: []const mlx.mlx_array, outs: []mlx.mlx_array, s: mlx.mlx_stream) !void {
+pub fn apply(kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, arrs: []const mlx.mlx_array, outs: []mlx.mlx_array, s: mlx.mlx_stream) !void {
     const v = mlx.mlx_vector_array_new_data(arrs.ptr, arrs.len);
     defer _ = mlx.mlx_vector_array_free(v);
     var o = mlx.mlx_vector_array_new();

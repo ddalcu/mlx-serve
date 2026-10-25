@@ -347,6 +347,24 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(decoded.resolution, 384)
     }
 
+    func testModel3DTrellis2SettingsRoundTripAndOldBlobsKeepTheDefaults() throws {
+        var s = Model3DGenSettings()
+        s.trellisResolution = 1536
+        s.decimationTarget = 600_000
+        s.textureSize = 4096
+        s.finish = .glossy
+        let decoded = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONEncoder().encode(s))
+        XCTAssertEqual(decoded, s)
+
+        var obj = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(Model3DGenSettings())) as! [String: Any]
+        for key in ["trellisResolution", "decimationTarget", "textureSize", "finish"] { obj.removeValue(forKey: key) }
+        let old = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(old.trellisResolution, 1024)
+        XCTAssertEqual(old.decimationTarget, 300_000)
+        XCTAssertEqual(old.textureSize, 2048)
+        XCTAssertEqual(old.finish, .model)
+    }
+
     func testModel3DResolvesModelByIdAndFallsBack() {
         var s = Model3DGenSettings()
         s.modelId = Model3DModelPreset.hunyuan3d21_8bit.id

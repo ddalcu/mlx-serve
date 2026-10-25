@@ -39,7 +39,7 @@ fn supported(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_
         if (bits != 4 or (group != 32 and group != 16) or bi.ctx != null or mlx.mlx_array_dtype(sc) != .uint8) return false;
     } else {
         if (bi.ctx == null) return false;
-        if (bits != 4 and bits != 8) return false;
+        if (bits != 2 and bits != 3 and bits != 4 and bits != 8) return false;
         if (group != 32 and group != 64 and group != 128) return false;
         if (mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16 or mlx.mlx_array_ndim(bi) != 3) return false;
         if (!std.mem.eql(c_int, mlx.getShape(sc), mlx.getShape(bi))) return false;
@@ -711,6 +711,12 @@ test "segmented NAX sorted gather matches stock across Flash Next and quantizati
         .{ .rows = 2048, .experts = 32, .n = 64, .k = 128, .bits = 8, .group = 32 },
         .{ .rows = 2048, .experts = 32, .n = 96, .k = 256, .bits = 4, .group = 128 },
         .{ .rows = 4096, .experts = 32, .n = 96, .k = 96, .bits = 4, .group = 32 },
+        // DeepSeek-V4.1-Flash iQ-MLX packs: 2/3-bit gate+up and 3-bit down banks at a 2048-row MoE call.
+        .{ .rows = 12288, .experts = 384, .n = 4608, .k = 5120, .bits = 3, .group = 64 },
+        .{ .rows = 12288, .experts = 384, .n = 4608, .k = 5120, .bits = 2, .group = 64 },
+        .{ .rows = 12288, .experts = 384, .n = 5120, .k = 2304, .bits = 3, .group = 64 },
+        .{ .rows = 2048, .experts = 32, .n = 96, .k = 160, .bits = 3, .group = 32 },
+        .{ .rows = 2048, .experts = 32, .n = 96, .k = 160, .bits = 2, .group = 32 },
     };
     for (cases) |case| try testCase(case.rows, case.experts, case.n, case.k, case.bits, case.group, false, s);
 }

@@ -34,8 +34,8 @@ SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 90); do curl -s "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-if ! curl -s "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; cat "$LOG"; exit 1; fi
+for i in $(seq 1 90); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+if ! curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; cat "$LOG"; exit 1; fi
 
 mime_for() {
   case "$1" in

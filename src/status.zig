@@ -127,11 +127,12 @@ pub fn getAppMemFootprintMb() u32 {
 }
 
 /// Bytes the OS will grant a new wiring: free (less speculative — free_count
-/// already contains them and `external` carries them back) plus file-backed,
-/// capped by the RAM outside wired + compressor. 0 on a failed query.
-fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
+/// already contains them and `external` carries them back) plus file-backed plus
+/// purgeable (anonymous caches macOS drops before it compresses anything), capped
+/// by the RAM outside wired + compressor. 0 on a failed query.
+fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, purgeable_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
     if (total_mem == 0) return 0;
-    const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages;
+    const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages +| purgeable_pages;
     const outside: u64 = total_mem -| (wire_pages +| compressor_pages) *| page;
     return @min(reclaimable *| page, outside);
 }
@@ -219,7 +220,7 @@ fn hostAvailableMemBytes() u64 {
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
     if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
-    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.wire_count, vm.compressor_page_count, page);
+    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.purgeable_count, vm.wire_count, vm.compressor_page_count, page);
 }
 
 const MemoryStatusEx = extern struct {
@@ -311,22 +312,26 @@ test "computeAvailableBytes sums the reclaimable classes, capped by wired headro
 
     // free_count already contains speculative, and speculative pages are
     // file-backed inside external — the sum carries them once.
-    try std.testing.expectEqual(@as(u64, 32 * GB), computeAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, 26 * ppg, 83 * ppg, ppg, page));
+    try std.testing.expectEqual(@as(u64, 32 * GB), computeAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, 26 * ppg, 0, 83 * ppg, ppg, page));
 
     // The cap: wired + compressor bound the figure, however the wired pages
     // are counted elsewhere.
-    try std.testing.expectEqual(@as(u64, 6 * GB), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 9 * ppg, ppg, page));
+    try std.testing.expectEqual(@as(u64, 6 * GB), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 0, 9 * ppg, ppg, page));
 
     // #45 OOM guard, in new units: a resident 7 GB model lives in the anonymous
     // set, NOT in wired — it consumed the free/external pages (16 GB box: 9 GB
     // anon + 3 wired + 1 comp), so only 3 GB of reclaimable classes remain.
-    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 3 * ppg, 1 * ppg, page));
+    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 0, 3 * ppg, 1 * ppg, page));
 
     // Saturating: disagreeing counters never underflow; a failed query (total 0)
     // or a box with no headroom (wired + compressor ≥ total) reports 0.
-    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, ppg, 5 * ppg, 4 * ppg, 0, 0, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 1, 1, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 16 * ppg, 0, page));
+    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, ppg, 5 * ppg, 4 * ppg, 0, 0, 0, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 0, 1, 1, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 0, 16 * ppg, 0, page));
+
+    // Purgeable pages are anonymous caches the OS discards before compressing
+    // anything: a laptop's browsers park gigabytes there (#932).
+    try std.testing.expectEqual(@as(u64, 7 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 4 * ppg, 3 * ppg, 1 * ppg, page));
 }
 
 pub fn getSysMemPct() u32 {

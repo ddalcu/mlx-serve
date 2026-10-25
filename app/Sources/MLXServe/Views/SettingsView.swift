@@ -491,12 +491,13 @@ private struct RestartBanner: View {
             Spacer()
             Button {
                 let opts = appState.serverOptions
-                let model = appState.selectedModelPath
+                let target = ServerRestartTarget.resolve(
+                    modelPath: server.localChatLoadPath(selectedPath: appState.selectedModelPath),
+                    modelsDir: downloads.modelsDir)
                 server.stop()
-                if !model.isEmpty {
-                    server.start(modelPath: model, options: opts)
-                } else {
-                    server.startHeadless(modelsDir: downloads.modelsDir, options: opts)
+                switch target {
+                case .model(let path): server.start(modelPath: path, options: opts)
+                case .headless(let root): server.startHeadless(modelsDir: root, options: opts)
                 }
             } label: { Text("Restart Now")
                 .font(.app(.body)) }
@@ -879,7 +880,7 @@ private struct ModelFoldersSectionContent: View {
     /// up the new `--model-dir` set (the banner at the top of Settings says so).
     private func applyFolderChange() {
         downloads.refreshRoots()
-        appState.refreshModels()
+        appState.refreshModels(reloadExternalRoots: true)
         downloadFolderTick += 1
     }
 
@@ -910,7 +911,7 @@ private struct ModelFoldersSectionContent: View {
                             .buttonStyle(.bordered)
                         Button {
                             downloads.customRoot = nil
-                            appState.refreshModels()
+                            appState.refreshModels(reloadExternalRoots: true)
                         } label: { Text("Clear")
                             .font(.app(.body)) }
                         .buttonStyle(.bordered)
@@ -937,7 +938,7 @@ private struct ModelFoldersSectionContent: View {
         }
         if AppActivation.runModal(panel) == .OK, let url = panel.url {
             downloads.customRoot = url.path
-            appState.refreshModels()
+            appState.refreshModels(reloadExternalRoots: true)
         }
     }
 }

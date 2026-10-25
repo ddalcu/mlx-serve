@@ -893,3 +893,12 @@ With "Show scroll bars: Always" (or a mouse attached), the Video prompt's placeh
 
 ## A nested shard the index names was never downloaded, so the folder read "Missing shards" (2026-10-16)
 Defect: `mlx-community/humanizer-12b-OptiQ-4bit` finished downloading and the Models list flagged it "Missing shards". Cause: its `model.safetensors.index.json` names `optiq/optiq_vision.safetensors`, and the downloader (app and `mlx-serve pull`) keeps nested files only from a hand-kept allowlist (`mtp/`, `drafter/`, `engram/`, `optiq/mtp.safetensors`), so each new pack layout was a new miss. `weightDefect` reads the index, so the two disagreed by construction. Fix: the root index is fetched first and any file it names rides along at any depth (`indexedShards`, `Resolved.indexed`); a nested copy no index names (`original/`) stays out. The server only loads top-level shards, so this pack's vision tower is still not used. Guards: `testSelectNeededFilesPullsEveryShardTheIndexNames`, `cli: a nested shard the index names is part of the pack`.
+
+## External model folders on UI hot paths
+
+Computed root detection parsed LM Studio settings during polling and Settings redraws.
+Forwarding refresh progress through AppState also invalidated unrelated views.
+Cache the complete discovery snapshot, including absent tools, and reload only on explicit events.
+Compare stored snapshots for restart decisions; observe refresh progress in My Models alone.
+Revision-check asynchronous root resolution so an older result cannot undo newer settings.
+Guard: `ModelDiscoverySnapshotTests` covers resolver counts, absent roots, moved folders and stale results.

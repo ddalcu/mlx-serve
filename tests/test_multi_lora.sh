@@ -161,13 +161,15 @@ run_matrix() { # <label> <endpoint> <model> <module> <out> <in> <extra-json> [le
   not_noise "$label" "$TMP/$label.plain.json" "baseline"
 
   if [ "$level" = full ]; then
-    # [2] a zero-B adapter attaches and is numerically transparent — proves the
-    # attach path does not disturb the base weights it wraps.
-    code=$(post "$ep" "$TMP/$label.zero.json" "$base,\"lora_paths\":[\"$Z\"]}")
+    # [2] an adapter at strength 0 attaches and is byte-transparent — the attach path
+    # does not disturb the base forward it wraps, fused int8 kernels included (a zero-B
+    # adapter at strength 1 is not that bar: on the NAX int8 route an active adapter
+    # takes the two-GEMM SwiGLU, a rounding-class move from the fused kernel).
+    code=$(post "$ep" "$TMP/$label.zero.json" "$base,\"lora_paths\":[\"$Z\"],\"lora_scales\":[0.0]}")
     if [ "$code" = "200" ] && cmp -s "$TMP/$label.plain.json" "$TMP/$label.zero.json"; then
-      ok "$label" "zero-B adapter is byte-transparent"
+      ok "$label" "strength-0 adapter is byte-transparent"
     else
-      bad "$label" "zero-B adapter changed the output or failed (http $code)"
+      bad "$label" "strength-0 adapter changed the output or failed (http $code)"
     fi
   fi
 

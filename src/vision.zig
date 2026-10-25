@@ -6,6 +6,7 @@ const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const glm_vision = @import("glm_vision.zig");
+const dsv41_vision = @import("dsv41_vision.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const qwen_audio = @import("qwen_audio.zig");
 const radio_vision = @import("radio_vision.zig");
@@ -204,6 +205,7 @@ pub const VisionEncoder = struct {
     lfm2: ?lfm2_vision.Lfm2Vision = null,
     glm: ?glm_vision.GlmVision = null,
     minicpm: ?minicpm_vision.MiniCpmVision = null,
+    dsv41: ?dsv41_vision.Dsv41Vision = null,
     /// Qwen3-ASR: an audio-only tower; every image/video entry point refuses.
     qwen_audio: ?qwen_audio.QwenAudio = null,
     /// Nemotron 3.5 Bolt: RADIO ViT + mlp1 projector. CHW in, not a patch grid.
@@ -217,6 +219,14 @@ pub const VisionEncoder = struct {
         if (config.lfm2_vision) return initLfm2(allocator, config, weights);
         if (config.glm_vision) return initGlm(allocator, config, weights);
         if (config.minicpm_vision) return initMiniCpm(allocator, config, weights);
+        if (config.dsv41_vision) {
+            var enc = patchGridShell(allocator, config);
+            enc.dsv41 = dsv41_vision.Dsv41Vision.init(allocator, config, weights) catch |e| {
+                enc.deinit();
+                return e;
+            };
+            return enc;
+        }
         if (config.qwen_audio) |qa_cfg| {
             var enc = patchGridShell(allocator, config);
             enc.qwen_audio = qwen_audio.QwenAudio.init(allocator, qa_cfg, weights) catch |e| {
@@ -352,6 +362,7 @@ pub const VisionEncoder = struct {
         if (self.lfm2) |*l| l.deinit();
         if (self.glm) |*g| g.deinit();
         if (self.minicpm) |*m| m.deinit();
+        if (self.dsv41) |*d| d.deinit();
         if (self.qwen_audio) |*q| q.deinit();
         if (self.radio) |*r| r.deinit();
         self.allocator.free(self.layers);
@@ -523,6 +534,7 @@ pub const VisionEncoder = struct {
         if (self.lfm2) |*lv| return lv.forward(patches, grid_h, grid_w);
         if (self.glm) |*gv| return gv.forward(patches, grid_h, grid_w);
         if (self.minicpm) |*mv| return mv.forward(patches, grid_h, grid_w);
+        if (self.dsv41) |*dv| return dv.forward(patches, grid_h, grid_w);
         return error.NoPatchGridEncoder;
     }
 

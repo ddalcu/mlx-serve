@@ -1,0 +1,730 @@
+CUDA decode mat-vecs read 16 bytes per load (row_dot): bf16 gemv, mxfp8/mxfp4/nvfp4
+quantized_matmul and the fp expert gather with fewer than 8 rows per expert. Short-N rows split
+over up to 256 threads, and each weight load is shared by up to 8 rows of x. device_info reports
+`integrated`. The arithmetic is in mlx/backend/cuda/device/row_dot_ops.cuh, a JIT header, so a
+cuda_kernel that must match it bit for bit (mlx-serve's moe_cuda.zig) includes the same code.
+The one-row fp quantized_matmul arm runs on integrated GPUs only: on a discrete RTX 5060 Ti the
+stock kernel is faster. fp4 decodes through the cvt instruction where the target has it
+(sm_120a, sm_121a) and through an exact byte-permute table elsewhere (plain sm_120 emulated it).
+The fp modes take the mat-vec through 8 rows on GB10, where one weight read beats the
+tiled kernel (MLX_CUDA_QMV_MAX_ROWS still decides).
+
+Retires when upstream MLX's CUDA gemv and quantized mat-vecs read 16-byte vectors for these
+formats at decode widths. Not reported upstream yet.
+
+diff --git a/docs/src/usage/environment_variables.rst b/docs/src/usage/environment_variables.rst
+index c2012d530..abb05dd42 100644
+--- a/docs/src/usage/environment_variables.rst
++++ b/docs/src/usage/environment_variables.rst
+@@ -180,7 +180,8 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
+    Rows of one batch (``1`` to ``8``) that a CUDA quantized matmul runs through
+    the mat-vec kernel, reading the weights once for all of them. A speculative
+    verify and a batched decode both arrive as those rows. Unset, a GB10
+-   (compute capability 12.1) uses ``6`` and every other GPU uses ``1``.
++   (compute capability 12.1) uses ``8`` for the fp modes and ``6`` for affine,
++   and every other GPU uses ``1``.
+ 
+ .. envvar:: MLX_ENABLE_CACHE_THRASHING_CHECK
+ 
+diff --git a/mlx/backend/cuda/device/row_dot_ops.cuh b/mlx/backend/cuda/device/row_dot_ops.cuh
+new file mode 100644
+index 0000000..afd818a
+--- /dev/null
++++ b/mlx/backend/cuda/device/row_dot_ops.cuh
+@@ -0,0 +1,205 @@
++// Copyright © 2025 Apple Inc.
++
++// row_dot's arithmetic, shared by its kernels and by JIT kernels that must
++// reproduce it bit for bit.
++
++#pragma once
++
++#include "mlx/backend/cuda/device/utils.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_fp4.h>
++#include <cuda_fp8.h>
++
++namespace mlx::core::cu {
++
++enum RowDotFormat : int {
++  kRowDotDense = 0, // weights in the activation dtype
++  kRowDotMxfp8 = 1, // e4m3, one ue8m0 scale per 32
++  kRowDotMxfp4 = 2, // e2m1, one ue8m0 scale per 32
++  kRowDotNvfp4 = 3, // e2m1, one e4m3 scale per 16
++};
++
++__device__ __forceinline__ float2 row_dot_pair(uint32_t v, __nv_bfloat16) {
++  return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&v));
++}
++__device__ __forceinline__ float2 row_dot_pair(uint32_t v, __half) {
++  return __half22float2(*reinterpret_cast<__half2*>(&v));
++}
++
++__device__ __forceinline__ float2 e4m3x2(uint32_t v16) {
++  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(
++      static_cast<__nv_fp8x2_storage_t>(v16 & 0xffff), __NV_E4M3);
++  return __half22float2(*reinterpret_cast<__half2*>(&h));
++}
++
++// 8 e2m1 codes (byte i holds codes 2i, 2i + 1 in its low, high nibble). The
++// fp4 cvt is one instruction only on arch-specific targets (sm_120a, sm_121a);
++// on plain sm_120 cuda_fp4.h emulates it, so there a byte-permute table builds
++// the same fp16 bits: magnitudes from the 8 values' high bytes, sign bits from
++// each code's top bit.
++__device__ __forceinline__ void e2m1x8(uint32_t v, float* out) {
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++#if __CUDA_FP8_INTERNAL_CAN_RELY_ON_PTX_FOR_SHORTTYPESCVT__
++    __half2_raw h = __nv_cvt_fp4x2_to_halfraw2(
++        static_cast<__nv_fp4x2_storage_t>((v >> (8 * i)) & 0xff), __NV_E2M1);
++#else
++    uint32_t mag = __byte_perm(
++        0x3e3c3800, 0x46444240, i < 2 ? v & 0x7777 : (v >> 16) & 0x7777);
++    uint32_t m = __byte_perm(mag, 0, (i & 1) ? 0x3424 : 0x1404);
++    uint32_t s; // prmt selector bit 3 replicates the chosen byte's msb
++    asm("prmt.b32 %0, %1, %2, %3;"
++        : "=r"(s)
++        : "r"(v << 4), "r"(v), "r"(((8 | i) << 4) | ((12 + i) << 12)));
++    uint32_t h = m | (s & 0x80008000);
++#endif
++    float2 f = __half22float2(*reinterpret_cast<__half2*>(&h));
++    out[2 * i] = f.x;
++    out[2 * i + 1] = f.y;
++  }
++}
++
++__device__ __forceinline__ float ue8m0_scale(uint32_t s) {
++  return s == 0 ? __int_as_float(0x00400000) : __int_as_float(s << 23);
++}
++
++__device__ __forceinline__ float e4m3_scale(uint32_t s) {
++  __half_raw h = __nv_cvt_fp8_to_halfraw(
++      static_cast<__nv_fp8_storage_t>(s & 0xff), __NV_E4M3);
++  return __half2float(*reinterpret_cast<__half*>(&h));
++}
++
++// Dot of 8 * n_uint4 activations with weights already in float.
++template <typename T>
++__device__ __forceinline__ float
++dot_x(const T* x, const float* w, int n_uint4) {
++  float a = 0.f, b = 0.f;
++#pragma unroll 4
++  for (int i = 0; i < n_uint4; ++i) {
++    uint4 xv = reinterpret_cast<const uint4*>(x)[i];
++    float2 x0 = row_dot_pair(xv.x, T{});
++    float2 x1 = row_dot_pair(xv.y, T{});
++    float2 x2 = row_dot_pair(xv.z, T{});
++    float2 x3 = row_dot_pair(xv.w, T{});
++    const float* wi = w + 8 * i;
++    a = fmaf(x0.x, wi[0], a);
++    b = fmaf(x0.y, wi[1], b);
++    a = fmaf(x1.x, wi[2], a);
++    b = fmaf(x1.y, wi[3], b);
++    a = fmaf(x2.x, wi[4], a);
++    b = fmaf(x2.y, wi[5], b);
++    a = fmaf(x3.x, wi[6], a);
++    b = fmaf(x3.y, wi[7], b);
++  }
++  return a + b;
++}
++
++// Elements one 16-byte chunk of a weight row holds.
++template <int FMT, typename T>
++constexpr int row_dot_chunk_elems() {
++  return FMT == kRowDotDense ? 16 / sizeof(T) : FMT == kRowDotMxfp8 ? 16 : 32;
++}
++
++// Accumulates chunk `c` of one weight row against `rows` rows of x.
++template <int FMT, int ROWS, typename T>
++__device__ __forceinline__ void row_dot_chunk(
++    uint4 wv,
++    const uint8_t* s_row,
++    int c,
++    const T* x,
++    int64_t k,
++    int rows,
++    float* acc) {
++  constexpr int E = row_dot_chunk_elems<FMT, T>();
++  const T* xc = x + static_cast<int64_t>(c) * E;
++  uint32_t wu[4] = {wv.x, wv.y, wv.z, wv.w};
++  if constexpr (FMT == kRowDotDense) {
++    float w[8];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      float2 p = row_dot_pair(wu[i], T{});
++      w[2 * i] = p.x;
++      w[2 * i + 1] = p.y;
++    }
++#pragma unroll
++    for (int r = 0; r < ROWS; ++r) {
++      if (r < rows) {
++        acc[r] += dot_x(xc + r * k, w, 1);
++      }
++    }
++  } else if constexpr (FMT == kRowDotMxfp8) {
++    // 16 e4m3 = half a 32-wide scale group.
++    float scale = ue8m0_scale(s_row[c >> 1]);
++    float w[16];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      float2 lo = e4m3x2(wu[i]);
++      float2 hi = e4m3x2(wu[i] >> 16);
++      w[4 * i] = lo.x;
++      w[4 * i + 1] = lo.y;
++      w[4 * i + 2] = hi.x;
++      w[4 * i + 3] = hi.y;
++    }
++#pragma unroll
++    for (int r = 0; r < ROWS; ++r) {
++      if (r < rows) {
++        acc[r] += scale * dot_x(xc + r * k, w, 2);
++      }
++    }
++  } else {
++    // 32 e2m1: one ue8m0 group (mxfp4) or two e4m3 groups of 16 (nvfp4).
++    float w[32];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      e2m1x8(wu[i], w + 8 * i);
++    }
++    if constexpr (FMT == kRowDotMxfp4) {
++      float scale = ue8m0_scale(s_row[c]);
++#pragma unroll
++      for (int r = 0; r < ROWS; ++r) {
++        if (r < rows) {
++          acc[r] += scale * dot_x(xc + r * k, w, 4);
++        }
++      }
++    } else {
++      uint32_t s2 = *reinterpret_cast<const uint16_t*>(s_row + 2 * c);
++      float s0 = e4m3_scale(s2);
++      float s1 = e4m3_scale(s2 >> 8);
++#pragma unroll
++      for (int r = 0; r < ROWS; ++r) {
++        if (r < rows) {
++          const T* xr = xc + r * k;
++          acc[r] += s0 * dot_x(xr, w, 2) + s1 * dot_x(xr + 16, w + 16, 2);
++        }
++      }
++    }
++  }
++}
++
++// One thread's share of a weight row: chunks lane, lane + tpr, ..., two loads in flight.
++template <int FMT, int ROWS, typename T>
++__device__ __forceinline__ void row_dot_lane(
++    const uint4* wp,
++    const uint8_t* s_row,
++    const T* x,
++    int64_t k,
++    int rows,
++    int chunks,
++    int lane,
++    int tpr,
++    float* acc) {
++  int c = lane;
++  for (; c + tpr < chunks; c += 2 * tpr) {
++    uint4 a = wp[c];
++    uint4 b = wp[c + tpr];
++    row_dot_chunk<FMT, ROWS>(a, s_row, c, x, k, rows, acc);
++    row_dot_chunk<FMT, ROWS>(b, s_row, c + tpr, x, k, rows, acc);
++  }
++  if (c < chunks) {
++    row_dot_chunk<FMT, ROWS>(wp[c], s_row, c, x, k, rows, acc);
++  }
++}
++
++} // namespace mlx::core::cu
+diff --git a/mlx/backend/cuda/device_info.cpp b/mlx/backend/cuda/device_info.cpp
+index a4a15e2..e58d926 100644
+--- a/mlx/backend/cuda/device_info.cpp
++++ b/mlx/backend/cuda/device_info.cpp
+@@ -150,6 +150,7 @@ device_info_impl(int device_index) {
+       // Compute capability as size_t (to match Metal's variant type)
+       dev.info["compute_capability_major"] = static_cast<size_t>(prop.major);
+       dev.info["compute_capability_minor"] = static_cast<size_t>(prop.minor);
++      dev.info["integrated"] = static_cast<size_t>(prop.integrated);
+ 
+       devices.push_back(std::move(dev));
+     }
+diff --git a/mlx/backend/cuda/gemms/gemv.cu b/mlx/backend/cuda/gemms/gemv.cu
+index e48317d..4573a04 100644
+--- a/mlx/backend/cuda/gemms/gemv.cu
++++ b/mlx/backend/cuda/gemms/gemv.cu
+@@ -1,6 +1,7 @@
+ // Copyright © 2025 Apple Inc.
+ 
+ #include "mlx/backend/cuda/gemms/gemv.h"
++#include "mlx/backend/cuda/gemms/row_dot.cuh"
+ #include "mlx/backend/cuda/kernel_utils.cuh"
+ #include "mlx/dtype_utils.h"
+ 
+@@ -238,6 +239,27 @@ void gemv(
+       vec = gpu_ptr<DataType>(b);
+       rows = M;
+     }
++    if constexpr (sizeof(DataType) == 2) {
++      if (batch_count == 1 && K % 8 == 0 && row_dot_aligned(mat) &&
++          row_dot_aligned(vec)) {
++        launch_row_dot<DataType>(
++            encoder,
++            kRowDotDense,
++            mat,
++            nullptr,
++            vec,
++            gpu_ptr<DataType>(out),
++            rows,
++            K,
++            1,
++            1,
++            nullptr,
++            nullptr,
++            0,
++            0);
++        return;
++      }
++    }
+     uint32_t num_blocks_x = (rows + rows_per_block - 1) / rows_per_block;
+     int n_per_t;
+     if (K % 128 == 0 && is_aligned<4>(mat) && is_aligned<4>(vec)) {
+diff --git a/mlx/backend/cuda/gemms/row_dot.cuh b/mlx/backend/cuda/gemms/row_dot.cuh
+new file mode 100644
+index 0000000..d7dbfd6
+--- /dev/null
++++ b/mlx/backend/cuda/gemms/row_dot.cuh
+@@ -0,0 +1,237 @@
++// Copyright © 2026 Apple Inc.
++
++// Mat-vec over 16-bit, mxfp8, mxfp4 and nvfp4 weight rows with 16-byte loads.
++// A row is split over 8..256 threads, and up to ROWS rows of x share each load.
++
++#pragma once
++
++#include "mlx/backend/cuda/device.h"
++#include "mlx/backend/cuda/device/config.h"
++#include "mlx/backend/cuda/device/row_dot_ops.cuh"
++#include "mlx/backend/cuda/device/utils.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_fp4.h>
++#include <cuda_fp8.h>
++
++#include <algorithm>
++#include <cstdint>
++
++namespace mlx::core::cu {
++
++constexpr int row_dot_threads = 256;
++
++// out[l, m, n] = x[lhs[l], m, :] . W[rhs[l], n, :]; lhs/rhs null = batch 0.
++// Grid: x = row groups, y = groups of ROWS x rows, z = batch.
++template <int FMT, int ROWS, typename T>
++__global__ void __launch_bounds__(row_dot_threads) row_dot_kernel(
++    const uint8_t* w,
++    const uint8_t* scales,
++    const T* x,
++    T* out,
++    int n,
++    int k,
++    int m,
++    int tpr,
++    const uint32_t* lhs_indices,
++    const uint32_t* rhs_indices,
++    int64_t w_batch_bytes,
++    int64_t s_batch_bytes) {
++  constexpr int bits = FMT == kRowDotDense ? 8 * sizeof(T)
++      : FMT == kRowDotMxfp8                ? 8
++                                           : 4;
++  constexpr int group = FMT == kRowDotNvfp4 ? 16 : 32;
++  const int64_t row_bytes = static_cast<int64_t>(k) * bits / 8;
++  const int chunks = static_cast<int>(row_bytes / 16);
++
++  const int rows_per_block = row_dot_threads / tpr;
++  const int r_local = threadIdx.x / tpr;
++  const int lane = threadIdx.x % tpr;
++  const int row = blockIdx.x * rows_per_block + r_local;
++  const bool active = row < n;
++
++  const int l = blockIdx.z;
++  const int64_t x_batch = lhs_indices ? lhs_indices[l] : 0;
++  const int64_t w_batch = rhs_indices ? rhs_indices[l] : 0;
++  const int m0 = blockIdx.y * ROWS;
++  const int rows = min(ROWS, m - m0);
++  x += (x_batch * m + m0) * static_cast<int64_t>(k);
++  out += (static_cast<int64_t>(l) * m + m0) * n;
++
++  float acc[ROWS];
++#pragma unroll
++  for (int r = 0; r < ROWS; ++r) {
++    acc[r] = 0.f;
++  }
++
++  if (active) {
++    const uint8_t* w_row = w + w_batch * w_batch_bytes + row * row_bytes;
++    const uint8_t* s_row = nullptr;
++    if constexpr (FMT != kRowDotDense) {
++      s_row = scales + w_batch * s_batch_bytes +
++          static_cast<int64_t>(row) * (k / group);
++    }
++    const uint4* wp = reinterpret_cast<const uint4*>(w_row);
++    row_dot_lane<FMT, ROWS>(wp, s_row, x, k, rows, chunks, lane, tpr, acc);
++  }
++
++  // Reduce in the warp, then across the warps of one row.
++  const int width = min(tpr, WARP_SIZE);
++#pragma unroll
++  for (int r = 0; r < ROWS; ++r) {
++    for (int off = width / 2; off > 0; off /= 2) {
++      acc[r] += __shfl_xor_sync(0xffffffff, acc[r], off);
++    }
++  }
++  if (tpr > WARP_SIZE) {
++    __shared__ float partial[ROWS][row_dot_threads / WARP_SIZE];
++    const int warp = threadIdx.x / WARP_SIZE;
++    if (threadIdx.x % WARP_SIZE == 0) {
++#pragma unroll
++      for (int r = 0; r < ROWS; ++r) {
++        partial[r][warp] = acc[r];
++      }
++    }
++    __syncthreads();
++    if (lane == 0 && active) {
++      const int warps = tpr / WARP_SIZE;
++#pragma unroll
++      for (int r = 0; r < ROWS; ++r) {
++        float s = 0.f;
++        for (int i = 0; i < warps; ++i) {
++          s += partial[r][warp + i];
++        }
++        if (r < rows) {
++          out[static_cast<int64_t>(r) * n + row] = static_cast<T>(s);
++        }
++      }
++    }
++  } else if (lane == 0 && active) {
++#pragma unroll
++    for (int r = 0; r < ROWS; ++r) {
++      if (r < rows) {
++        out[static_cast<int64_t>(r) * n + row] = static_cast<T>(acc[r]);
++      }
++    }
++  }
++}
++
++// Threads per row: fit short rows, then widen until the grid fills the GPU.
++// `rows` counts every output row of the launch, batches included.
++inline int row_dot_tpr(int chunks, int64_t rows, int num_sms) {
++  int tpr = 32;
++  while (tpr > 8 && 2 * tpr > chunks) {
++    tpr /= 2;
++  }
++  while (tpr < row_dot_threads && 2 * tpr <= chunks &&
++         rows * tpr / row_dot_threads < 4 * num_sms) {
++    tpr *= 2;
++  }
++  return tpr;
++}
++
++inline bool row_dot_aligned(const void* p) {
++  return reinterpret_cast<uintptr_t>(p) % 16 == 0;
++}
++
++inline int row_dot_num_sms(int device) {
++  static int sms = [device] {
++    int v = 0;
++    cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, device);
++    return v > 0 ? v : 1;
++  }();
++  return sms;
++}
++
++inline bool row_dot_integrated(int device) {
++  static bool integrated = [device] {
++    int v = 0;
++    cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, device);
++    return v != 0;
++  }();
++  return integrated;
++}
++
++// Needs 16-byte aligned rows of w and x: k * bits a multiple of 128, and
++// k / group even for nvfp4.
++template <typename T>
++void launch_row_dot(
++    CommandEncoder& encoder,
++    int fmt,
++    const void* w,
++    const void* scales,
++    const T* x,
++    T* out,
++    int n,
++    int k,
++    int m,
++    int batch,
++    const uint32_t* lhs_indices,
++    const uint32_t* rhs_indices,
++    int64_t w_batch_bytes,
++    int64_t s_batch_bytes) {
++  int bits = fmt == kRowDotDense ? 8 * sizeof(T) : fmt == kRowDotMxfp8 ? 8 : 4;
++  int chunks = static_cast<int>(static_cast<int64_t>(k) * bits / 128);
++  int rows_cap = m <= 1 ? 1 : m <= 2 ? 2 : m <= 4 ? 4 : 8;
++  int row_groups = (m + rows_cap - 1) / rows_cap;
++  int tpr = row_dot_tpr(
++      chunks,
++      static_cast<int64_t>(n) * batch * row_groups,
++      row_dot_num_sms(encoder.device().cuda_device()));
++  int rows_per_block = row_dot_threads / tpr;
++  dim3 grid(
++      (n + rows_per_block - 1) / rows_per_block, row_groups, batch);
++  auto wp = static_cast<const uint8_t*>(w);
++  auto sp = static_cast<const uint8_t*>(scales);
++  auto launch = [&]<int FMT>() {
++    auto go = [&]<int ROWS>() {
++      encoder.add_kernel_node(
++          row_dot_kernel<FMT, ROWS, T>,
++          grid,
++          dim3(row_dot_threads),
++          wp,
++          sp,
++          x,
++          out,
++          n,
++          k,
++          m,
++          tpr,
++          lhs_indices,
++          rhs_indices,
++          w_batch_bytes,
++          s_batch_bytes);
++    };
++    switch (rows_cap) {
++      case 1:
++        go.template operator()<1>();
++        break;
++      case 2:
++        go.template operator()<2>();
++        break;
++      case 4:
++        go.template operator()<4>();
++        break;
++      default:
++        go.template operator()<8>();
++        break;
++    }
++  };
++  switch (fmt) {
++    case kRowDotDense:
++      launch.template operator()<kRowDotDense>();
++      break;
++    case kRowDotMxfp8:
++      launch.template operator()<kRowDotMxfp8>();
++      break;
++    case kRowDotMxfp4:
++      launch.template operator()<kRowDotMxfp4>();
++      break;
++    default:
++      launch.template operator()<kRowDotNvfp4>();
++      break;
++  }
++}
++
++} // namespace mlx::core::cu
+diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
+index 0d107a8..9c1d98a 100644
+--- a/mlx/backend/cuda/jit_module.cpp
++++ b/mlx/backend/cuda/jit_module.cpp
+@@ -274,6 +274,7 @@ constexpr const char* g_include_names[] = {
+     INCLUDE_PREFIX "qmm_naive.cuh",
+     INCLUDE_PREFIX "qmm_sm80.cuh",
+     INCLUDE_PREFIX "qmm_sm90.cuh",
++    INCLUDE_PREFIX "row_dot_ops.cuh",
+     INCLUDE_PREFIX "scatter_ops.cuh",
+     INCLUDE_PREFIX "unary_ops.cuh",
+     INCLUDE_PREFIX "ternary_ops.cuh",
+@@ -296,6 +297,7 @@ constexpr const char* g_headers[] = {
+     jit_source_qmm_naive,
+     jit_source_qmm_sm80,
+     jit_source_qmm_sm90,
++    jit_source_row_dot_ops,
+     jit_source_scatter_ops,
+     jit_source_unary_ops,
+     jit_source_ternary_ops,
+diff --git a/mlx/backend/cuda/quantized/qmm/fp_qmv.cu b/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
+index 41de03e..f19c049 100644
+--- a/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
++++ b/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "mlx/backend/common/quantized.h"
+ #include "mlx/backend/cuda/device/utils.cuh"
++#include "mlx/backend/cuda/gemms/row_dot.cuh"
+ #include "mlx/backend/cuda/kernel_utils.cuh"
+ #include "mlx/backend/cuda/quantized/qmm/qmm.h"
+ #include "mlx/backend/cuda/quantized/quantized_utils.h"
+@@ -270,6 +271,33 @@ void fp_qmv(
+            cu::is_aligned<2>(vec_ptr))) {
+         n = 2;
+       }
++      if constexpr (sizeof(T) == 2) {
++        // row_dot pays here on an integrated GPU (GB10); on a discrete card
++        // the stock kernel below is faster, most at small N.
++        if (B == 1 && K % 32 == 0 &&
++            cu::row_dot_integrated(encoder.device().cuda_device()) &&
++            cu::row_dot_aligned(mat_ptr) && cu::row_dot_aligned(vec_ptr)) {
++          int fmt = bits == 8   ? cu::kRowDotMxfp8
++              : group_size == 16 ? cu::kRowDotNvfp4
++                                 : cu::kRowDotMxfp4;
++          cu::launch_row_dot<T>(
++              encoder,
++              fmt,
++              mat_ptr,
++              gpu_ptr<uint8_t>(scales),
++              vec_ptr,
++              gpu_ptr<T>(out),
++              N,
++              K,
++              x.size() / K,
++              1,
++              nullptr,
++              nullptr,
++              0,
++              0);
++          return;
++        }
++      }
+       dispatch_1_2_4(n, [&](auto n) {
+         if (B == 1) {
+           auto kernel =
+diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
+index 728db42..fa2bdb0 100644
+--- a/mlx/backend/cuda/quantized/qmm/qmv.cu
++++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
+@@ -1,6 +1,7 @@
+ // Copyright © 2026 Apple Inc.
+ 
+ #include "mlx/backend/cuda/device/cute_dequant.cuh"
++#include "mlx/backend/cuda/gemms/row_dot.cuh"
+ #include "mlx/backend/cuda/kernel_utils.cuh"
+ #include "mlx/backend/cuda/quantized/qmm/qmm.h"
+ #include "mlx/dtype_utils.h"
+@@ -650,6 +651,47 @@ void gather_qmv(
+   int k = x.shape(-1);
+   int l = out.size() / (m * n);
+ 
++  if (mode != QuantizationMode::Affine && !global_scale &&
++      out.dtype() != float32 && k % 32 == 0 && w.ndim() == 3 &&
++      scales.ndim() == 3 && w.strides(0) == w.shape(1) * w.shape(2) &&
++      scales.strides(0) == scales.shape(1) * scales.shape(2) &&
++      cu::row_dot_aligned(gpu_ptr<void>(x)) &&
++      cu::row_dot_aligned(gpu_ptr<void>(w))) {
++    encoder.set_input_array(x);
++    encoder.set_input_array(w);
++    encoder.set_input_array(scales);
++    encoder.set_input_array(lhs_indices);
++    encoder.set_input_array(rhs_indices);
++    encoder.set_output_array(out);
++    int fmt = mode == QuantizationMode::Mxfp8 ? cu::kRowDotMxfp8
++        : mode == QuantizationMode::Nvfp4     ? cu::kRowDotNvfp4
++                                              : cu::kRowDotMxfp4;
++    int64_t w_batch_bytes = static_cast<int64_t>(n) * k * bits / 8;
++    int64_t s_batch_bytes = static_cast<int64_t>(n) * (k / group_size);
++    auto launch = [&]<typename T>() {
++      cu::launch_row_dot<T>(
++          encoder,
++          fmt,
++          gpu_ptr<void>(w),
++          gpu_ptr<void>(scales),
++          gpu_ptr<T>(x),
++          gpu_ptr<T>(out),
++          n,
++          k,
++          m,
++          l,
++          gpu_ptr<uint32_t>(lhs_indices),
++          gpu_ptr<uint32_t>(rhs_indices),
++          w_batch_bytes,
++          s_batch_bytes);
++    };
++    if (out.dtype() == bfloat16) {
++      launch.template operator()<__nv_bfloat16>();
++    } else {
++      launch.template operator()<__half>();
++    }
++    return;
++  }
+   dispatch_element_types(out.dtype(), tag, [&]<typename T>() {
+     dispatch_quant_types<T>(
+         bits,
+diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
+index 8ed9b72bd..d998e9197 100644
+--- a/mlx/backend/cuda/quantized/quantized.cpp
++++ b/mlx/backend/cuda/quantized/quantized.cpp
+@@ -13,6 +13,20 @@
+ 
+ namespace mlx::core {
+ 
++// The fp modes run row_dot, which shares one weight read across up to 8 rows: on
++// GB10 that beats the tiled kernel through 8 rows. A set MLX_CUDA_QMV_MAX_ROWS
++// still decides.
++int fp_qmv_max_rows(const cu::Device& device) {
++  static const int cap = [&] {
++    const char* env = std::getenv("MLX_CUDA_QMV_MAX_ROWS");
++    bool gb10 = device.compute_capability_major() == 12 &&
++        device.compute_capability_minor() == 1;
++    return (env == nullptr || env[0] == '\0') && gb10 ? 8
++                                                      : qmv_max_rows(device);
++  }();
++  return cap;
++}
++
+ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
+   auto& s = stream();
+@@ -118,9 +132,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+     return;
+   }
+ 
++  const int qmv_rows = mode_ == QuantizationMode::Affine
++      ? qmv_max_rows(encoder.device())
++      : fp_qmv_max_rows(encoder.device());
+   if (can_use_qmm_sm80) {
+-    if (can_use_qmv &&
+-        (M * B == 1 || (B == 1 && M <= qmv_max_rows(encoder.device())))) {
++    if (can_use_qmv && (M * B == 1 || (B == 1 && M <= qmv_rows))) {
+       call_qmv();
+     } else {
+       call_qmm_sm80();
+@@ -129,7 +145,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   }
+ 
+   if (can_use_qmm_naive) {
+-    if (can_use_qmv && (M * B < 8)) {
++    if (can_use_qmv && (M * B < 8 || (B == 1 && M <= qmv_rows))) {
+       call_qmv();
+     } else {
+       call_qmm_naive();
+@@ -272,8 +288,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+     return;
+   }
+ 
++  // Gathered rows on different experts share no weights, so a tile buys nothing
++  // there: the mat-vec takes any batch of few-row gathers (top-k decode).
++  bool gather_rows_few = M < 8;
+   if (can_use_qmm_sm80) {
+-    if (can_use_qmv && (M * B < 8)) {
++    if (can_use_qmv && gather_rows_few) {
+       call_qmv();
+     } else {
+       call_qmm_sm80();
+@@ -282,7 +301,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+   }
+ 
+   if (can_use_qmm_naive) {
+-    if (can_use_qmv && (M * B < 8)) {
++    if (can_use_qmv && gather_rows_few) {
+       call_qmv();
+     } else {
+       call_qmm_naive();

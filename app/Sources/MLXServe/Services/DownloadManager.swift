@@ -77,17 +77,35 @@ class DownloadManager: ObservableObject {
     /// a test driving the download loop against a temp dir must not be steered
     /// by whatever the developer happens to have configured.
     private let pinnedRoot: String?
+    private let rootDefaults: UserDefaults
+    private let toolRootResolver: () -> ToolModelRoots
+    private let huggingFaceRootResolver: () -> String?
+    private let loginShellRootResolver: @Sendable () -> String?
+    private var detectedToolRoots = ToolModelRoots()
+    private var cachedCustomRoot: String?
+    private var discoveryRevision = 0
+    private(set) var discoveryConfiguration = ModelDiscoveryConfiguration(automaticallyDiscoverModels: true, roots: [])
 
     /// `modelsRoot` exists so the download loop can be driven against a temp
     /// dir in tests; the app takes the configured destination. Kept in sync
     /// with the Zig resolver via `ModelRoots`, which is the single source of
     /// truth for both this and what the server is told to scan.
-    init(modelsRoot: String? = nil) {
+    init(modelsRoot: String? = nil, defaults: UserDefaults = .standard,
+         toolRootResolver: @escaping () -> ToolModelRoots = { ToolModelRoots.detected() },
+         huggingFaceRootResolver: @escaping () -> String? = { DownloadManager.huggingFaceRootPath() },
+         loginShellRootResolver: @escaping @Sendable () -> String? = { DownloadManager.loginShellHuggingFaceRoot() }) {
         if modelsRoot == nil { Self.reactivateDownloadFolderAccess() }
-        let root = modelsRoot ?? ModelRoots().downloadRoot
+        rootDefaults = defaults
+        self.toolRootResolver = toolRootResolver
+        self.huggingFaceRootResolver = huggingFaceRootResolver
+        self.loginShellRootResolver = loginShellRootResolver
+        let root = modelsRoot ?? ModelRoots(defaults: defaults).downloadRoot
         try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
         modelsDir = root
         pinnedRoot = modelsRoot
+        let custom = defaults.string(forKey: Self.customRootDefaultsKey) ?? ""
+        _customRoot = Published(initialValue: custom.isEmpty ? nil : custom)
+        reloadDiscoveryRoots()
     }
 
     /// Security-scoped bookmark for the chosen download folder, re-armed at the
@@ -108,16 +126,18 @@ class DownloadManager: ObservableObject {
     func refreshRoots() {
         guard pinnedRoot == nil else { return }
         Self.reactivateDownloadFolderAccess()
-        let root = ModelRoots().downloadRoot
-        guard root != modelsDir else { return }
-        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
-        modelsDir = root
+        let root = ModelRoots(defaults: rootDefaults).downloadRoot
+        if root != modelsDir {
+            try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+            modelsDir = root
+        }
+        reloadDiscoveryRoots()
     }
 
     /// Every folder to scan, download destination first. This is what the
     /// server is handed, one `--model-dir` per entry.
     func scanRoots() -> [String] {
-        ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot))
+        discoveryConfiguration.roots
     }
 
     /// The folders the app owns for READS — where a repo the user already
@@ -138,7 +158,7 @@ class DownloadManager: ObservableObject {
     /// hermetic tests must never resolve into the developer's real library.
     var readRoots: [String] {
         guard pinnedRoot == nil else { return [modelsDir] }
-        return ModelRoots().readRoots(toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot))
+        return discoveryConfiguration.roots
     }
 
     // MARK: - Path resolution
@@ -367,6 +387,9 @@ class DownloadManager: ObservableObject {
         case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
+        case "moss_image": return "vae/diffusion_pytorch_model.safetensors"
+        case "trellis2": return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
+        case "pixal3d": return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"
         default: return nil
         }
     }
@@ -398,6 +421,8 @@ class DownloadManager: ObservableObject {
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
         if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
+        if isPixal3dPipeline(inDir: dir) { return "pixal3d" }
+        if isTrellis2Pipeline(atPath: (dir as NSString).appendingPathComponent("pipeline.json")) { return "trellis2" }
         if qwen3AsrThinker(dir) == "qwen3_forced_aligner" { return "qwen3_forced_aligner" }
         return nil
     }
@@ -409,6 +434,28 @@ class DownloadManager: ObservableObject {
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let map = cfg["auto_map"] as? [String: Any] else { return false }
         return map["AutoModel"] as? String == "modeling_d1.D1Model"
+    }
+
+    /// Microsoft's TRELLIS.2 image-to-3D pack: no root config.json, its `pipeline.json` names the pipeline.
+    /// Twin of `model_discovery.peekTrellis2Pipeline`.
+    nonisolated static func isTrellis2Pipeline(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return cfg["name"] as? String == "Trellis2ImageTo3DPipeline"
+    }
+
+    /// TencentARC's Pixal3D pack: TRELLIS.2's pipeline.json, name and all, over flows whose own config reads
+    /// `"image_attn_mode": "proj"`. Twin of `model_discovery.peekPixal3dPipeline`.
+    nonisolated static func isPixal3dPipeline(inDir dir: String) -> Bool {
+        let pipe = (dir as NSString).appendingPathComponent("pipeline.json")
+        guard isTrellis2Pipeline(atPath: pipe),
+              let data = FileManager.default.contents(atPath: pipe),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = (cfg["args"] as? [String: Any])?["models"] as? [String: Any],
+              let ss = models["sparse_structure_flow_model"] as? String,
+              let flowData = FileManager.default.contents(atPath: (dir as NSString).appendingPathComponent(ss + ".json")),
+              let flow = try? JSONSerialization.jsonObject(with: flowData) as? [String: Any] else { return false }
+        return (flow["args"] as? [String: Any])?["image_attn_mode"] as? String == "proj"
     }
 
     /// A stable-audio-tools inpainting model conditioned on T5Gemma: the
@@ -572,18 +619,29 @@ class DownloadManager: ObservableObject {
     /// to an existing directory.
     private static let customRootDefaultsKey = "customModelPath"
 
-    @Published var customRoot: String? = {
-        let raw = UserDefaults.standard.string(forKey: DownloadManager.customRootDefaultsKey) ?? ""
-        return raw.isEmpty ? nil : raw
-    }() {
+    @Published var customRoot: String? {
         didSet {
             let trimmed = customRoot?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let t = trimmed, !t.isEmpty {
-                UserDefaults.standard.set(t, forKey: Self.customRootDefaultsKey)
+                rootDefaults.set(t, forKey: Self.customRootDefaultsKey)
             } else {
-                UserDefaults.standard.removeObject(forKey: Self.customRootDefaultsKey)
+                rootDefaults.removeObject(forKey: Self.customRootDefaultsKey)
             }
+            reloadDiscoveryRoots()
         }
+    }
+
+    /// Resolve external folders only for startup or an explicit configuration refresh.
+    func reloadDiscoveryRoots() {
+        discoveryRevision &+= 1
+        let roots = ModelRoots(defaults: rootDefaults)
+        let automatic = roots.automaticallyDiscoverModels
+        detectedToolRoots = automatic ? toolRootResolver() : ToolModelRoots()
+        detectedHuggingFaceRoot = automatic ? huggingFaceRootResolver() : nil
+        cachedCustomRoot = resolvedCustomRoot()
+        discoveryConfiguration = ModelDiscoveryConfiguration(
+            automaticallyDiscoverModels: automatic,
+            roots: roots.scanRoots(toolRoots: detectedToolRoots))
     }
 
     /// Canonicalize a directory path for de-duplication against the default
@@ -603,12 +661,7 @@ class DownloadManager: ObservableObject {
         return standardized
     }
 
-    /// Re-read LM Studio settings so a moved folder is picked up by Refresh.
-    /// Reads `~/.lmstudio/settings.json`'s `downloadsFolder` field; falls back to
-    /// `~/.lmstudio/models`. nil if LM Studio isn't installed or the folder is unreachable.
-    var lmStudioRoot: String? {
-        ModelRoots().automaticallyDiscoverModels ? Self.lmStudioRootPath() : nil
-    }
+    var lmStudioRoot: String? { detectedToolRoots.lmStudio }
 
     /// The same resolution, reachable from `nonisolated` code — the launch-flag
     /// builder needs it and cannot touch this `@MainActor` instance.
@@ -640,11 +693,9 @@ class DownloadManager: ObservableObject {
     /// A `var` because the cache is MOVABLE by environment and a Finder-
     /// launched bundle cannot see the environment that moved it — the login
     /// shell is asked off-main at launch (`refreshHuggingFaceRootFromLoginShell`).
-    private var detectedHuggingFaceRoot: String? = DownloadManager.huggingFaceRootPath()
+    private var detectedHuggingFaceRoot: String?
 
-    var huggingFaceRoot: String? {
-        ModelRoots().automaticallyDiscoverModels ? detectedHuggingFaceRoot : nil
-    }
+    var huggingFaceRoot: String? { detectedHuggingFaceRoot }
 
     /// Resolve the hub cache the way `huggingface_hub` itself does:
     /// `HF_HUB_CACHE` > `$HF_HOME/hub` > `$XDG_CACHE_HOME/huggingface/hub` >
@@ -684,11 +735,13 @@ class DownloadManager: ObservableObject {
 
     /// Adopt the login shell's answer. True when the root changed.
     func refreshHuggingFaceRootFromLoginShell() async -> Bool {
-        guard ModelRoots().automaticallyDiscoverModels else { return false }
-        let resolved = await Task.detached(priority: .utility) {
-            DownloadManager.loginShellHuggingFaceRoot()
-        }.value
-        guard resolved != detectedHuggingFaceRoot else { return false }
+        guard discoveryConfiguration.automaticallyDiscoverModels else { return false }
+        let revision = discoveryRevision
+        let resolve = loginShellRootResolver
+        let resolved = await Task.detached(priority: .utility) { resolve() }.value
+        guard revision == discoveryRevision,
+              discoveryConfiguration.automaticallyDiscoverModels,
+              resolved != detectedHuggingFaceRoot else { return false }
         detectedHuggingFaceRoot = resolved
         return true
     }
@@ -2098,11 +2151,9 @@ class DownloadManager: ObservableObject {
             ownedRoots: ownedRoots,
             lmStudioRoot: lmStudioRoot,
             huggingFaceRoot: huggingFaceRoot,
-            customRoot: resolvedCustomRoot(),
-            toolRoots: ModelRoots().automaticallyDiscoverModels
-                ? ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).orderedWithSource
-                    .map { LocalScanInputs.ToolRoot(path: $0.path, source: $0.source) }
-                : [],
+            customRoot: cachedCustomRoot,
+            toolRoots: detectedToolRoots.orderedWithSource
+                .map { LocalScanInputs.ToolRoot(path: $0.path, source: $0.source) },
             inFlightDirs: Set(downloads.filter { $0.value.status == .downloading }
                 .map { (newLayoutDir(for: $0.key) as NSString).standardizingPath })
         )

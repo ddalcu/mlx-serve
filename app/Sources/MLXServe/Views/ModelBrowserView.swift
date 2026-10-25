@@ -81,7 +81,7 @@ struct ModelBrowserPane: View {
         switch section {
         case .recommended: RecommendedPane()
         case .discover:     DiscoverPane()
-        case .myModels:     MyModelsPane(filter: $localFilter)
+        case .myModels:     MyModelsPane(filter: $localFilter, refresher: appState.libraryRefresher)
         case .downloads:    DownloadsPane(items: activeDownloads)
         case .media:        MediaPane()
         }
@@ -743,6 +743,7 @@ private struct DiscoverPane: View {
 /// strict subset of what you could actually load.
 private struct MyModelsPane: View {
     @Binding var filter: String
+    @ObservedObject var refresher: ModelLibraryRefresher
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var downloads: DownloadManager
 
@@ -776,7 +777,7 @@ private struct MyModelsPane: View {
                     appState.refreshModels(reloadExternalRoots: true)
                 } label: {
                     HStack(spacing: 4) {
-                        if appState.isRefreshingModels {
+                        if refresher.isRefreshing {
                             ProgressView().controlSize(.mini).frame(width: 12)
                         } else {
                             Image(systemName: "arrow.clockwise").frame(width: 12)
@@ -784,7 +785,7 @@ private struct MyModelsPane: View {
                         Text("Refresh").font(.app(.body))
                     }
                 }
-                .disabled(appState.isRefreshingModels)
+                .disabled(refresher.isRefreshing)
                 .help("Rescan enabled model folders")
             }
             .padding(8)

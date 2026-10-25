@@ -14,6 +14,7 @@ const log = @import("../log.zig");
 const server = @import("../server.zig");
 const status = @import("../status.zig");
 const model_settings = @import("../model_settings.zig");
+const scheduler = @import("../scheduler.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const plugin = @import("mlx_stream");
 const sdk = plugin.sdk;
@@ -64,15 +65,57 @@ pub const Model = struct {
     sampling: sdk.SamplingParams = .{},
 };
 
-/// The context the load bills: the model's, else the arch's standard request.
+/// The context the load bills: the model's `ctx_size`, else the auto context this pack's preflight chose
+/// (`resolveContext`), else the arch's standard request (a pack no load has billed yet).
 fn billedContext(comptime k: Kind, config: *const ModelConfig) u64 {
     const context = server.manualContext(config);
-    return if (context > 0) context else Side(k).default_context;
+    if (context > 0) return context;
+    return auto_context.get(config.pack_dir.?) orelse Side(k).default_context;
+}
+
+/// The contexts an auto context tries, largest first (the model sets none): the first whose load bill at the fill's
+/// floor rows fits the box wins, so the served context is what memory allows, not the plugin's 16K standard request.
+const auto_context_rungs = [_]u64{ 262144, 131072, 65536, 32768 };
+
+/// The largest rung whose bill fits `avail`; null when none does. `bills.need(rung)` is the bytes the load takes at it.
+fn largestFitting(avail: u64, rungs: []const u64, bills: anytype) ?u64 {
+    for (rungs) |rung| if (bills.need(rung) <= avail) return rung;
+    return null;
+}
+
+/// The context a load of `config` bills, resolved once per pack: the model's `ctx_size`, else the auto rung
+/// (`largestFitting` over the arch's own load bill against the memory available under the GPU ceiling), else the
+/// arch's standard request. Recorded for `contextLength`, which runs on connection threads without an `Io`.
+fn resolveContext(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig) !u64 {
+    const manual = server.manualContext(config);
+    if (manual > 0) return manual;
+    const dir = config.pack_dir.?;
+    if (auto_context.get(dir)) |c| return c;
+    const ceiling = server.staticGpuMemoryCeiling();
+    const avail = if (ceiling > 0) @min(status.getAvailableMemBytes(), ceiling) else status.getAvailableMemBytes();
+    const Bills = struct {
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        config: *const ModelConfig,
+        ceiling: u64,
+        fn need(self: @This(), rung: u64) u64 {
+            const A = Side(k).arch;
+            var f = facts();
+            const c = parse(k, self.gpa, self.io, self.config, &f, rung) catch return std.math.maxInt(u64);
+            defer A.freeConfig(self.gpa, c);
+            const bytes = A.loadBytes(self.gpa, self.io, c, &f, self.ceiling) catch return std.math.maxInt(u64);
+            return scheduler.loadRequirementBytes(bytes);
+        }
+    };
+    const chosen = largestFitting(avail, &auto_context_rungs, Bills{ .gpa = gpa, .io = io, .config = config, .ceiling = ceiling }) orelse Side(k).default_context;
+    log.info("mlx-stream: context {d} tokens (auto: the largest rung whose load fits the {d:.1} GB available; set ctx_size to pin one)\n", .{ chosen, @as(f64, @floatFromInt(avail)) / 1_073_741_824.0 });
+    auto_context.note(dir, chosen);
+    return chosen;
 }
 
 /// The plugin's config of the pack, with the model's context and the load's facts (an arch with `applyLoadFacts`
 /// gets the context stamped on the facts, which its init reads again).
-fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig, f: *sdk.LoadFacts) !*Side(k).arch.Config {
+fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig, f: *sdk.LoadFacts, context: u64) !*Side(k).arch.Config {
     const A = Side(k).arch;
     const dir = config.pack_dir.?;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -94,15 +137,14 @@ fn parse(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: *const Mo
         try applyEntry(A, c, settings.entry(dir) orelse .null);
     }
     if (comptime k == .glm) {
-        // The arch takes the load's facts itself (its `loadBytes` and `init`). The manual context wins over the entry.
-        try applyManualContext(A, arena.allocator(), c, config);
+        // The arch takes the load's facts itself (its `loadBytes` and `init`). The resolved context wins over the entry.
+        try applyContext(A, arena.allocator(), c, context);
         noteMaxOutput(dir, A.maxOutput(c));
     } else if (comptime @hasDecl(A, "applyLoadFacts")) {
-        f.effective_context = billedContext(k, config);
+        f.effective_context = context;
         try A.applyLoadFacts(c, f);
     } else {
-        const context = server.manualContext(config);
-        if (context > 0) c.max_context_tokens = context;
+        if (context > 0) c.max_context_tokens = @intCast(context);
         c.* = c.withFacts(f);
     }
     return c;
@@ -116,21 +158,45 @@ fn applyEntry(comptime A: type, c: *A.Config, entry: std.json.Value) !void {
     if (comptime @typeInfo(R) == .error_union) try A.applySettings(c, entry) else A.applySettings(c, entry);
 }
 
-/// GLM-5.3: the host's manual context after the entry, which it wins over (`server.manualContext`: the entry's
-/// `ctx_size`, else `--ctx-size`).
-fn applyManualContext(comptime A: type, arena: std.mem.Allocator, c: *A.Config, config: *const ModelConfig) !void {
-    const context = server.manualContext(config);
+/// GLM-5.3: the resolved context after the entry, which it wins over (the entry's `ctx_size`, `--ctx-size`, or the
+/// auto rung), as the arch's own `ctx_size` key.
+fn applyContext(comptime A: type, arena: std.mem.Allocator, c: *A.Config, context: u64) !void {
     if (context > 0) try applyEntry(A, c, try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.fmt.allocPrint(arena, "{{\"ctx_size\": {d}}}", .{context}), .{}));
 }
 
-/// GLM-5.3's `maxOutput` per pack, as the pack's last parse read it with the model's settings (the load's preflight and
-/// its open), for `contextLength`. A pthread mutex, not `std.Io.Mutex`: `contextLength` runs on connection threads that
-/// carry no `Io` (log.zig's sink mutex, the same reason).
-const max_output_slots = 4;
-var max_output_mu: std.c.pthread_mutex_t = .{};
-var max_output_keys: [max_output_slots]u64 = @splat(0);
-var max_output_values: [max_output_slots]u64 = @splat(0);
-var max_output_next: usize = 0;
+/// A value per pack as its last load read it (the preflight and the open), for `contextLength`: GLM-5.3's `maxOutput`
+/// and the auto context. A pthread mutex, not `std.Io.Mutex`: `contextLength` runs on connection threads that carry
+/// no `Io` (log.zig's sink mutex, the same reason).
+const PackValues = struct {
+    const slots = 4;
+    mu: std.c.pthread_mutex_t = .{},
+    keys: [slots]u64 = @splat(0),
+    values: [slots]u64 = @splat(0),
+    next: usize = 0,
+
+    fn note(self: *PackValues, dir: []const u8, value: u64) void {
+        const key = packKey(dir);
+        _ = std.c.pthread_mutex_lock(&self.mu);
+        defer _ = std.c.pthread_mutex_unlock(&self.mu);
+        const i = std.mem.indexOfScalar(u64, &self.keys, key) orelse blk: {
+            const at = self.next;
+            self.next = (self.next + 1) % slots;
+            break :blk at;
+        };
+        self.keys[i] = key;
+        self.values[i] = value;
+    }
+
+    fn get(self: *PackValues, dir: []const u8) ?u64 {
+        const key = packKey(dir);
+        _ = std.c.pthread_mutex_lock(&self.mu);
+        defer _ = std.c.pthread_mutex_unlock(&self.mu);
+        const i = std.mem.indexOfScalar(u64, &self.keys, key) orelse return null;
+        return self.values[i];
+    }
+};
+var max_output: PackValues = .{};
+var auto_context: PackValues = .{};
 
 fn packKey(dir: []const u8) u64 {
     return std.hash.Wyhash.hash(0, dir) | 1;
@@ -138,26 +204,13 @@ fn packKey(dir: []const u8) u64 {
 
 /// Records GLM-5.3's `maxOutput` for the pack at `dir`.
 pub fn noteMaxOutput(dir: []const u8, value: u64) void {
-    const key = packKey(dir);
-    _ = std.c.pthread_mutex_lock(&max_output_mu);
-    defer _ = std.c.pthread_mutex_unlock(&max_output_mu);
-    const i = std.mem.indexOfScalar(u64, &max_output_keys, key) orelse blk: {
-        const at = max_output_next;
-        max_output_next = (max_output_next + 1) % max_output_slots;
-        break :blk at;
-    };
-    max_output_keys[i] = key;
-    max_output_values[i] = value;
+    max_output.note(dir, value);
 }
 
 /// The generation past the billed context a GLM-5.3 request of the pack at `dir` may take: the `maxOutput` its last
 /// parse recorded; the arch's default (`glm.generation_headroom`) for a pack not parsed yet.
 fn maxOutputOf(dir: []const u8) u64 {
-    const key = packKey(dir);
-    _ = std.c.pthread_mutex_lock(&max_output_mu);
-    defer _ = std.c.pthread_mutex_unlock(&max_output_mu);
-    const i = std.mem.indexOfScalar(u64, &max_output_keys, key) orelse return plugin.glm.generation_headroom;
-    return max_output_values[i];
+    return max_output.get(dir) orelse plugin.glm.generation_headroom;
 }
 
 /// Sampled before the weights load: the memory already in use, which the plugin's rows fill on top of, and the
@@ -172,7 +225,7 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig)
         inline else => |k| {
             const A = Side(k).arch;
             var f = facts();
-            const c = try parse(k, gpa, io, config, &f);
+            const c = try parse(k, gpa, io, config, &f, try resolveContext(k, gpa, io, config));
             defer A.freeConfig(gpa, c);
             return A.loadBytes(gpa, io, c, &f, server.staticGpuMemoryCeiling());
         },
@@ -199,7 +252,7 @@ fn openArch(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_str
     if (@TypeOf(A.claimProcess) != void) try A.claimProcess();
     errdefer if (@TypeOf(A.releaseProcess) != void) A.releaseProcess();
     var f = facts();
-    const c = try parse(k, gpa, io, config, &f);
+    const c = try parse(k, gpa, io, config, &f, try resolveContext(k, gpa, io, config));
     errdefer A.freeConfig(gpa, c);
     const dir = config.pack_dir.?;
     const m = try gpa.create(Model);
@@ -352,6 +405,37 @@ test "mlx_stream: a GLM-5.3-Flash request spans the billed context (its generati
     try testing.expectEqual(@as(u32, 32768), contextLength(&config));
     config.ctx_override = 0;
     try testing.expectEqual(@as(u32, @intCast(plugin.glm5_next.default_context)), contextLength(&config));
+}
+
+test "mlx_stream: a model that sets no context takes the largest rung whose load fits; none fitting keeps the standard request" {
+    const Bills = struct {
+        per_token: u64,
+        fixed: u64,
+        fn need(self: @This(), rung: u64) u64 {
+            return self.fixed + rung * self.per_token;
+        }
+    };
+    const GB: u64 = 1 << 30;
+    // 200 GB free, 150 GB of residents, 256 KB of bill per token: 131,072 fits (182 GB), 262,144 does not (214 GB).
+    try testing.expectEqual(@as(?u64, 131072), largestFitting(200 * GB, &auto_context_rungs, Bills{ .per_token = 256 << 10, .fixed = 150 * GB }));
+    // Room for everything: the top rung.
+    try testing.expectEqual(@as(?u64, 262144), largestFitting(240 * GB, &auto_context_rungs, Bills{ .per_token = 256 << 10, .fixed = 150 * GB }));
+    // Not even 32,768 fits: the caller falls back to the arch's standard request (the fill refuses by name later).
+    try testing.expectEqual(@as(?u64, null), largestFitting(100 * GB, &auto_context_rungs, Bills{ .per_token = 256 << 10, .fixed = 150 * GB }));
+    // A rung's bill that cannot be computed never fits (the chooser skips it).
+    const Broken = struct {
+        fn need(_: @This(), rung: u64) u64 {
+            return if (rung > 65536) std.math.maxInt(u64) else 1;
+        }
+    };
+    try testing.expectEqual(@as(?u64, 65536), largestFitting(1, &auto_context_rungs, Broken{}));
+    // The recorded auto context is what `contextLength` reads for a model without ctx_size.
+    var config: ModelConfig = .{ .model_type = "deepseek_v41", .pack_dir = "/packs/dsv41-repack", .dsv41_stream = true, .ctx_override = 0 };
+    try testing.expectEqual(@as(u32, @intCast(plugin.default_context + plugin.generation_headroom)), contextLength(&config));
+    auto_context.note("/packs/dsv41-repack", 131072);
+    try testing.expectEqual(@as(u32, 131072 + @as(u32, @intCast(plugin.generation_headroom))), contextLength(&config));
+    config.ctx_override = 40000;
+    try testing.expectEqual(@as(u32, 40000 + @as(u32, @intCast(plugin.generation_headroom))), contextLength(&config));
 }
 
 test "mlx_stream: a GLM-5.3 request spans the billed context and the arch's maxOutput (131,072 by default)" {

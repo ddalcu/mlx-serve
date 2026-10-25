@@ -69,8 +69,8 @@ for spec in "${ARCHS[@]}"; do
   pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
   ./zig-out/bin/mlx-serve --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
   SRV=$!
-  for i in $(seq 1 900); do curl -s "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done  # the 75 GB qwen4 pack loads in minutes
-  if ! curl -s "localhost:$PORT/health" >/dev/null 2>&1; then
+  for i in $(seq 1 900); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done  # the 75 GB qwen4 pack loads in minutes
+  if ! curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then
     RESULTS+=("FAIL $NAME (server never came up)"); FAIL=1; tail -15 "$LOG"; kill "$SRV" 2>/dev/null; continue
   fi
 

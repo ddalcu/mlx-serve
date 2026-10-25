@@ -157,7 +157,7 @@ struct ImageGenView: View {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
         .sheet(isPresented: $showEnhance) {
-            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing), denseText: model.rendersDenseText) }, onApply: { prompt = $0 })
+            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing), denseText: model.rendersDenseText, mossCanvas: model.variant == .mossImage ? .init(width: effectiveSize.width, height: effectiveSize.height) : nil) }, onApply: { prompt = $0 })
                 .environmentObject(appState)
         }
     }
@@ -1093,6 +1093,8 @@ struct ImageGenView: View {
         } else {
             setCanvas(width: model.defaultResolution.width, height: model.defaultResolution.height)
         }
+        guidanceScale = model.defaultGuidance
+        negativePrompt = model.defaultNegativePrompt
         applyQualityDefaults()
     }
 
@@ -1126,7 +1128,7 @@ struct ImageGenView: View {
             // A stack saved on a LoRA-capable model does not ride into one
             // that answers 400 to it (the section is hidden there).
             loras: model.supportsLoRA ? loras : [],
-            guidanceScale: model.supportsGuidance ? guidanceScale : 1.0,
+            guidanceScale: model.supportsGuidance ? guidanceScale : nil,
             negativePrompt: model.supportsGuidance ? negativePrompt : ""
         )
         persist()  // final capture — the agent's generate_image reuses these

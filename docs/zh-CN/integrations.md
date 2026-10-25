@@ -23,7 +23,7 @@ mlx-serve 支持这些标准 API（OpenAI、Anthropic、Ollama、OpenAI Response
 
 有两种方式可以跳过下面所有内容：
 
-- **MLX Core 应用**：菜单栏面板里的 **Code** 按钮会检测你 Mac 上安装的 CLI，并以对接运行中服务器的预设配置启动它们（App Store 版本改为显示可复制的命令，因为它不允许启动其它应用）。
+- **MLX-Serve 应用**：菜单栏面板里的 **Code** 按钮会检测你 Mac 上安装的 CLI，并以对接运行中服务器的预设配置启动它们（App Store 版本改为显示可复制的命令，因为它不允许启动其它应用）。
 - **`mlx-serve launch <agent>`**：在终端里做同一件事，Ollama 风格：
 
 ```bash
@@ -32,7 +32,7 @@ mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # -- 之后的参数全部传给 agent
 ```
 
-如果没有服务器在运行，`launch` 会启动 MLX Core 应用并等待；没装该应用时它会提示你先运行 `mlx-serve serve`。可用参数：`--model`、`--url`、`--port`、`--print`（只写出配置并打印启动脚本，而不真正运行）、`--no-start`。
+如果没有服务器在运行，`launch` 会启动 MLX-Serve 应用并等待；没装该应用时它会提示你先运行 `mlx-serve serve`。可用参数：`--model`、`--url`、`--port`、`--print`（只写出配置并打印启动脚本，而不真正运行）、`--no-start`。
 
 两个启动器都会把配置写进专用的 `~/.mlx-serve/<agent>/` 目录，绝不碰你真正的 Agent 配置（`~/.claude`、`~/.pi`、`~/.omp`、`~/.codex`、`~/.hermes` 还是你的）。Codex 例外：它直接使用你真正的 Codex home，让 MCP 服务器、插件和登录照常工作 —— 见 [Codex](#codex)。
 
@@ -134,7 +134,7 @@ opencode --model mlx/MODEL_ID
 
 OpenCode 2 复用同一份 `OPENCODE_CONFIG_CONTENT` 提供商 JSON，启动器还会写出一个专用配置目录，并注册 mlx-serve 监控插件（侧边栏统计 + 底栏轮次计量，读取 `GET /metrics.json`）。`mlx-serve launch opencode` 会把检测到的 major >= 2 路由到这里（更新的 major 同样使用 v2 profile）；`mlx-serve launch opencode2` 作为强制 v2 的后兼容别名保留——若 `opencode` 就是 v2 可执行文件则用它，否则回退到 PATH 上仍存在的旧 `opencode2`。
 
-**要用 `--metrics` 启动服务器**（`mlx-serve serve --metrics`）。CLI 版服务器默认关闭 metrics，对 `/metrics.json` 返回 503；此时插件会显示 `feed --metrics off` 和一块空白面板，而底栏的轮次计量仍能靠流式响应工作。MLX Core 应用默认启用 metrics。v2 启动会探测该端点，发现它关闭时打印一条警告。
+**要用 `--metrics` 启动服务器**（`mlx-serve serve --metrics`）。CLI 版服务器默认关闭 metrics，对 `/metrics.json` 返回 503；此时插件会显示 `feed --metrics off` 和一块空白面板，而底栏的轮次计量仍能靠流式响应工作。MLX-Serve 应用默认启用 metrics。v2 启动会探测该端点，发现它关闭时打印一条警告。
 
 ```bash
 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
@@ -290,4 +290,4 @@ Continue、Cline、Goose 以及大多数其它工具都有 “OpenAI-compatible�
 
 ## 沙盒中的 Agent
 
-MLX Core 应用也能在 Linux 虚拟机（Agent 沙盒）里运行 pi 和 hermes，并替你注入配置。见 [docs/app.md](app.md)。
+MLX-Serve 应用也能在 Linux 虚拟机（Agent 沙盒）里运行 pi 和 hermes，并替你注入配置。见 [docs/app.md](app.md)。

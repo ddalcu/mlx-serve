@@ -1,6 +1,6 @@
 import { t, N } from "../i18n/i18n";
 import { generateImage } from "../core/images";
-import { fluxResolutions, kreaResolutions, mageFlowResolutions, qwenImageResolutions } from "./image-presets";
+import { fluxResolutions, kreaResolutions, mageFlowResolutions, mossImageResolutions, qwenImageResolutions } from "./image-presets";
 import type { ImageRequest } from "../core/images";
 import type { LibraryInput } from "../core/library";
 import type { Client } from "../core/client";
@@ -8,7 +8,8 @@ import type { Library } from "../core/library";
 import type { Model } from "../core/models";
 import { MediaRun } from "./media-run.svelte";
 export type Canvas = { width: number; height: number; label: string; };
-export type Profile = { family: string; edit: boolean; variation: boolean; guidance: boolean; transparent: boolean; weights: number; fixed: boolean; quality: number[]; defaultSteps: number; alignment: number; min: number; max: number; resolutions: Canvas[]; };
+/** `guidanceDefault`/`negativeDefault`: the server's CFG when omitted, and the tags the authors recommend. */
+export type Profile = { family: string; edit: boolean; variation: boolean; guidance: boolean; guidanceDefault: number; negativeDefault: string; transparent: boolean; weights: number; fixed: boolean; quality: number[]; defaultSteps: number; alignment: number; min: number; max: number; resolutions: Canvas[]; };
 /**
  * Pinned Swift presets win over broad family metadata (notably undistilled base Klein).
  * Unknown architectures retain basic generation only, never guessed controls.
@@ -30,14 +31,17 @@ function imageProfile(model: Model | undefined): Profile | null {
           ? "mage"
           : arch.startsWith("qwen_image")
             ? "qwen"
-            : "";
+            : arch === "moss_image"
+              ? "moss"
+              : "";
   if (!family) return null;
   const mage = family === "mage",
     qwen = family === "qwen",
+    moss = family === "moss",
     flux = family === "flux";
   const quality = mage
     ? [4, 4, 4, 4]
-    : base || qwen
+    : base || qwen || moss
       ? [20, 30, 40, 50]
       : flux
         ? [4, 8, 12, 20]
@@ -45,13 +49,15 @@ function imageProfile(model: Model | undefined): Profile | null {
   return {
     family,
     edit: flux || (mage && /mage-?flow-edit/.test(id)),
-    variation: !mage,
-    guidance: base || qwen,
+    variation: !mage && !moss,
+    guidance: base || qwen || moss,
+    guidanceDefault: moss ? 3 : 1,
+    negativeDefault: moss ? "nsfw, worst quality, bad anatomy, watermark, jpeg artifact" : "",
     transparent: qwen,
     weights: flux ? 3 : family === "krea" ? 12 : 0,
     fixed: mage,
     quality,
-    defaultSteps: quality[qwen ? 2 : 1],
+    defaultSteps: quality[moss ? 3 : qwen ? 2 : 1],
     alignment: flux ? 32 : 16,
     min: 256,
     max: flux ? 1536 : 2048,
@@ -61,23 +67,26 @@ function imageProfile(model: Model | undefined): Profile | null {
         ? mageFlowResolutions
         : qwen
           ? qwenImageResolutions
-          : kreaResolutions,
+          : moss
+            ? mossImageResolutions
+            : kreaResolutions,
   };
 }
 function imageDefaults(model: Model | undefined) {
+  const p = imageProfile(model);
   return {
     model: model?.id ?? "",
     prompt: "",
     width: "1024",
     height: "1024",
-    steps: imageProfile(model)?.defaultSteps ?? 8,
+    steps: p?.defaultSteps ?? 8,
     seed: "",
     mode: "edit",
     strength: 0.6,
     gain: 1,
     weights: "",
-    guidance: 1,
-    negative: "",
+    guidance: p?.guidanceDefault ?? 1,
+    negative: p?.negativeDefault ?? "",
     transparent: false,
     advanced: false,
   };
@@ -213,7 +222,7 @@ function buildImageRequest(model: Model, d: ImageDraft, refs: { base64: string; 
   }
   if (p.guidance) {
     const guidance = bounded(d.guidance, 1, 20, t("Guidance scale"));
-    if (guidance !== 1) request.guidance_scale = guidance;
+    if (guidance !== p.guidanceDefault) request.guidance_scale = guidance;
     if (d.negative.trim()) request.negative_prompt = d.negative.trim();
   }
   if (p.weights) {

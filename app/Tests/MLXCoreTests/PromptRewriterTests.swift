@@ -106,6 +106,22 @@ final class PromptRewriterTests: XCTestCase {
         XCTAssertEqual(r.user(seeingImage: false), PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10).user)
     }
 
+    /// Reference pictures ride along in order, with the rule that ties each to its `<Picture N>`.
+    func testReferencePicturesRideTheRequestInOrderWithTheirRule() {
+        let jpg = Data([0xFF, 0xD8, 0xFF, 9])
+        let r = PromptRewriter.video(text: "<Picture 1> meets <Picture 2>", format: .h3Reference, seconds: 10,
+                                     references: [png, jpg])
+        XCTAssertEqual(r.images, [png, jpg])
+        XCTAssertTrue(r.user(seeingImage: true).contains("<Picture 2>"))
+        XCTAssertFalse(r.user(seeingImage: true).contains("first frame"))
+        XCTAssertEqual(r.user(seeingImage: false), r.user)
+        // A first frame goes ahead of the references, each with its own rule.
+        let both = PromptRewriter.video(text: "x", format: .h3Reference, seconds: 10, firstFrame: png, references: [jpg])
+        XCTAssertEqual(both.images, [png, jpg])
+        XCTAssertTrue(both.user(seeingImage: true).contains("attached picture"))
+        XCTAssertTrue(both.user(seeingImage: true).contains("<Picture 1>"))
+    }
+
     func testNoFirstFrameMeansNoPicture() {
         let r = PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10)
         XCTAssertNil(r.firstFrame)

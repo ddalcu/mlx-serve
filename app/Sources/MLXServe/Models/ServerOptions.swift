@@ -580,10 +580,11 @@ struct ServerOptions: Codable, Equatable {
     ///   ≤18 GB (16 GB Macs): 1   ≤36 GB (24/32 GB): 8   else: uncapped.
     /// Snap points for the model memory cap slider, in GiB. 0 is Auto and is
     /// always first. The ladder stops at the machine's RAM — a cap above it
-    /// can never be reached, so offering it is theatre.
+    /// can never be reached, so offering it is theatre. 224 lets a 256 GB Mac
+    /// hold one 200 GB model and refuse a second one beside it.
     static func residentMemPresets(physicalMemoryBytes: UInt64) -> [Int] {
         let ram = Int(physicalMemoryBytes / 1_073_741_824)
-        return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
+        return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 224, 256, 384, 512]
             .filter { $0 <= max(ram, 8) }
     }
 
@@ -1277,7 +1278,7 @@ extension ServerOptions {
             needsRestart: true),
         "ssdStreaming": .init(
             title: "SSD weight streaming",
-            explainer: "Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory.",
+            explainer: "Read a DeepSeek-V4 GGUF from disk so it runs, a bit slower, on Macs with less memory. MLX packs always load fully into memory.",
             needsRestart: true),
         "tokenizeCacheEntries": .init(
             title: "Tokenize cache entries",

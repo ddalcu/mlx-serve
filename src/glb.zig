@@ -118,6 +118,10 @@ pub const TexturedMesh = struct {
     indices: []const u32, // M*3
     albedo_png: []const u8,
     mr_png: ?[]const u8,
+    /// glTF multiplies the roughness texture by this; 1 keeps what the texture says.
+    roughness_factor: f32 = 1.0,
+    /// KHR_materials_clearcoat strength; 0 writes no extension.
+    clearcoat: f32 = 0,
 };
 
 /// Serialize a textured mesh to GLB: POSITION/NORMAL/TEXCOORD_0 + u32 indices
@@ -166,6 +170,7 @@ pub fn writeGlbTextured(alloc: std.mem.Allocator, tm: *const TexturedMesh) ![]u8
     try json.print(alloc,
         \\{{"asset":{{"version":"2.0","generator":"mlx-serve"}},
     , .{});
+    if (tm.clearcoat > 0) try json.print(alloc, "\"extensionsUsed\":[\"KHR_materials_clearcoat\"],", .{});
     try json.print(alloc,
         \\"buffers":[{{"byteLength":{d}}}],
     , .{bin_len});
@@ -192,20 +197,23 @@ pub fn writeGlbTextured(alloc: std.mem.Allocator, tm: *const TexturedMesh) ![]u8
         COMPONENT_FLOAT, nverts, COMPONENT_FLOAT, nverts,
         COMPONENT_UINT,  nidx,
     });
+    var coat: std.ArrayList(u8) = .empty;
+    defer coat.deinit(alloc);
+    if (tm.clearcoat > 0) try coat.print(alloc, ",\"extensions\":{{\"KHR_materials_clearcoat\":{{\"clearcoatFactor\":{d},\"clearcoatRoughnessFactor\":0.03}}}}", .{tm.clearcoat});
     if (tm.mr_png != null) {
         try json.print(alloc,
             \\"images":[{{"bufferView":4,"mimeType":"image/png"}},{{"bufferView":5,"mimeType":"image/png"}}],"samplers":[{{}}],"textures":[{{"sampler":0,"source":0}},{{"sampler":0,"source":1}}],
         , .{});
         try json.print(alloc,
-            \\"materials":[{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}},"metallicRoughnessTexture":{{"index":1}},"metallicFactor":1.0,"roughnessFactor":1.0}}}}],
-        , .{});
+            \\"materials":[{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}},"metallicRoughnessTexture":{{"index":1}},"metallicFactor":1.0,"roughnessFactor":{d}}}{s}}}],
+        , .{ tm.roughness_factor, coat.items });
     } else {
         try json.print(alloc,
             \\"images":[{{"bufferView":4,"mimeType":"image/png"}}],"samplers":[{{}}],"textures":[{{"sampler":0,"source":0}}],
         , .{});
         try json.print(alloc,
-            \\"materials":[{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}},"metallicFactor":0.0,"roughnessFactor":1.0}}}}],
-        , .{});
+            \\"materials":[{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}},"metallicFactor":0.0,"roughnessFactor":{d}}}{s}}}],
+        , .{ tm.roughness_factor, coat.items });
     }
     try json.print(alloc,
         \\"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"NORMAL":1,"TEXCOORD_0":2}},"indices":3,"material":0,"mode":4}}]}}],
@@ -482,6 +490,46 @@ test "glb: albedo-only textured mesh omits the metallicRoughness texture" {
     // Without an MR texture the factors pin a dielectric look.
     try testing.expectApproxEqAbs(@as(f64, 0.0), jsonNum(mat.get("metallicFactor").?), 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 1.0), jsonNum(mat.get("roughnessFactor").?), 1e-9);
+}
+
+test "glb: a textured mesh carries its finish as a roughness factor and a clearcoat extension" {
+    const a = testing.allocator;
+    const png = @import("png.zig");
+    const rgb = [_]u8{ 200, 10, 10, 200, 10, 10, 200, 10, 10, 200, 10, 10 };
+    const albedo_png = try png.encodeRgb(a, &rgb, 2, 2);
+    defer a.free(albedo_png);
+    const mr_png = try png.encodeRgb(a, &rgb, 2, 2);
+    defer a.free(mr_png);
+    var tm = TexturedMesh{
+        .positions = &[_]f32{ 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0 },
+        .normals = &[_]f32{ 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1 },
+        .uvs = &[_]f32{ 0, 0, 1, 0, 1, 1, 0, 1 },
+        .indices = &[_]u32{ 0, 1, 2, 0, 2, 3 },
+        .albedo_png = albedo_png,
+        .mr_png = mr_png,
+    };
+
+    const plain = try writeGlbTextured(a, &tm);
+    defer a.free(plain);
+    var pj = try std.json.parseFromSlice(std.json.Value, a, plain[20 .. 20 + readU32(plain, 12)], .{});
+    defer pj.deinit();
+    try testing.expect(pj.value.object.get("extensionsUsed") == null);
+    try testing.expect(pj.value.object.get("materials").?.array.items[0].object.get("extensions") == null);
+
+    tm.roughness_factor = 0.4;
+    tm.clearcoat = 0.8;
+    const glb = try writeGlbTextured(a, &tm);
+    defer a.free(glb);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, glb[20 .. 20 + readU32(glb, 12)], .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const mat = root.get("materials").?.array.items[0].object;
+    try testing.expectApproxEqAbs(@as(f64, 0.4), jsonNum(mat.get("pbrMetallicRoughness").?.object.get("roughnessFactor").?), 1e-6);
+    const coat = mat.get("extensions").?.object.get("KHR_materials_clearcoat").?.object;
+    try testing.expectApproxEqAbs(@as(f64, 0.8), jsonNum(coat.get("clearcoatFactor").?), 1e-6);
+    try testing.expectEqualStrings("KHR_materials_clearcoat", root.get("extensionsUsed").?.array.items[0].string);
+    // The container still holds together around the longer JSON.
+    try testing.expectEqual(@as(u32, @intCast(glb.len)), readU32(glb, 8));
 }
 
 test "glb: write textured swift fixture" {

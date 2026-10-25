@@ -372,10 +372,12 @@ worst = min((cos(a, b) for a, b in zip(batch, singles)), default=float("nan")) i
 good = code == 200 and all(finite(v) for v in batch) and worst >= 0.999 and len(ntok["tokens"]) > 600
 print(f"batch {1 if good else 0} worst-cosine={worst:.5f} long-tokens={len(ntok['tokens'])}")
 
-# Matryoshka: the first N components, renormalized.
+# Matryoshka: the first N components, renormalized. The reference is the same input sent
+# alone: a batch-of-3 row differs from its single by ~1e-3 in bf16, which is not truncation.
 code, d256 = embed(short[:1], dimensions=256)
-tn = math.sqrt(sum(x*x for x in vs[0][:256]))
-mrl = code == 200 and len(d256[0]) == 256 and max(abs(a - b / tn) for a, b in zip(d256[0], vs[0][:256])) < 1e-4
+full = embed(short[:1])[1][0]
+tn = math.sqrt(sum(x*x for x in full[:256]))
+mrl = code == 200 and len(d256[0]) == 256 and max(abs(a - b / tn) for a, b in zip(d256[0], full[:256])) < 1e-4
 print(f"dims256 {1 if mrl else 0}")
 
 # Past the trained window: a structured 400 naming the input, never a truncation.

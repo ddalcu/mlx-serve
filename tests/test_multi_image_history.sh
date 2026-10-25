@@ -24,7 +24,7 @@ has() { echo "$1" | grep -ciE "$2" | sed 's/^[1-9][0-9]*$/1/'; }
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 U="http://127.0.0.1:$PORT"
-for _ in $(seq 1 300); do curl -s "$U/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
+for _ in $(seq 1 300); do curl -sf "$U/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
 
 openai_body() { # $1 turns (2 or 3)
   python3 - "$A" "$B" "$1" <<'PY'

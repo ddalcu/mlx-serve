@@ -42,7 +42,7 @@ trap cleanup EXIT
 
 echo "waiting for server..."
 for _ in $(seq 1 120); do
-    curl -s -m 2 "$BASE/health" > /dev/null 2>&1 && break
+    curl -sf -m 2 "$BASE/health" > /dev/null 2>&1 && break
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
     fi
@@ -381,11 +381,12 @@ else
 fi
 
 # [11b] The first request of a burst is admitted alone and arms DFlash; once the
-# others arrive it must yield and decode in the batched group, not tick serial beside it.
+# others reach the crowd threshold (`mtpCrowdThresholdFor`: up to 9 on a dense target)
+# it must yield and decode in the batched group, not tick serial beside it.
 gen "Write a long story about a lighthouse keeper and the winter storms." 200 ", \"enable_drafter\": true" > /dev/null &
 BURST_PIDS="$!"
 sleep 1
-for i in 2 3 4; do
+for i in $(seq 2 10); do
     gen "Write a long story about harbour pilot number $i and the fog." 120 "" > /dev/null &
     BURST_PIDS="$BURST_PIDS $!"
 done

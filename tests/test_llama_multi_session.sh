@@ -31,7 +31,8 @@ set -uo pipefail
 PORT="${PORT:-19107}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 source "$(dirname "$0")/_lib_models.sh"
-MODEL="${LLAMA_GGUF_MODEL:-$(find_model unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-IQ4_NL.gguf)}"
+# A pure-attention GGUF: a recurrent one (Qwen3.5) reports cached_n=0 by design and cannot show the session reuse this script asserts.
+MODEL="${LLAMA_GGUF_MODEL:-$(find_model bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-IQ4_NL.gguf)}"
 BASE="http://127.0.0.1:$PORT"
 
 [ -f "$MODEL" ] || { echo "SKIP: GGUF file missing: $MODEL"; exit 0; }

@@ -57,21 +57,15 @@ final class ModelDiscoveryPolicyTests: XCTestCase {
 
     @MainActor
     func testDisabledDiscoveryCapturesOnlyConfiguredSourcesAndKeepsCustom() throws {
-        let defaults = UserDefaults.standard
-        let keys = [ModelRoots.automaticDiscoveryKey, "customModelPath"]
-        let old = keys.map { defaults.object(forKey: $0) }
-        defer {
-            for (key, value) in zip(keys, old) {
-                if let value { defaults.set(value, forKey: key) }
-                else { defaults.removeObject(forKey: key) }
-            }
-        }
+        let suite = "ModelDiscoveryPolicyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
         let owned = root.appendingPathComponent("owned")
         let custom = root.appendingPathComponent("custom")
         _ = try model("owned/acme/downloaded")
         _ = try model("custom/acme/extra")
         defaults.set(false, forKey: ModelRoots.automaticDiscoveryKey)
-        let manager = DownloadManager(modelsRoot: owned.path)
+        let manager = DownloadManager(modelsRoot: owned.path, defaults: defaults)
         manager.customRoot = custom.path
         let captured = manager.scanInputs()
         XCTAssertNil(captured.lmStudioRoot)
@@ -95,21 +89,21 @@ final class ModelDiscoveryPolicyTests: XCTestCase {
     }
 
     @MainActor
-    func testRunningServerRequiresRestartWhenDiscoveryPolicyChanges() {
-        let defaults = UserDefaults.standard
-        let key = ModelRoots.automaticDiscoveryKey
-        let old = defaults.object(forKey: key)
-        defer {
-            if let old { defaults.set(old, forKey: key) }
-            else { defaults.removeObject(forKey: key) }
-        }
-        defaults.set(true, forKey: key)
+    func testRunningServerRequiresRestartWhenDiscoveryPolicyChanges() throws {
+        let suite = "ModelDiscoveryPolicyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let manager = DownloadManager(modelsRoot: root.path, defaults: defaults,
+            toolRootResolver: { ToolModelRoots() }, huggingFaceRootResolver: { nil })
         let server = ServerManager()
         server.status = .running
         server.lastLaunchedOptions = ServerOptions()
-        server.lastLaunchedAutomaticDiscovery = true
+        server.discoveryConfiguration = manager.discoveryConfiguration
+        server.lastLaunchedDiscoveryConfiguration = manager.discoveryConfiguration
         XCTAssertFalse(server.needsRestartFor(ServerOptions()))
-        defaults.set(false, forKey: key)
+        defaults.set(false, forKey: ModelRoots.automaticDiscoveryKey)
+        manager.reloadDiscoveryRoots()
+        server.discoveryConfiguration = manager.discoveryConfiguration
         XCTAssertTrue(server.needsRestartFor(ServerOptions()))
         server.status = .stopped
         XCTAssertFalse(server.needsRestartFor(ServerOptions()))

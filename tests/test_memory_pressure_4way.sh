@@ -15,7 +15,7 @@ trap cleanup EXIT
 
 MLX_SERVE_GPU_CEILING_MB=$CEILING_MB "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --ctx-size 65536 > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 90); do curl -s -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 90); do curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
 
 python3 - "$PORT" > "$WORK/out.txt" <<'PY'
 import json, sys, threading, urllib.request, urllib.error, uuid
