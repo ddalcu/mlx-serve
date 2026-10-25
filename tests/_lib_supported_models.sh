@@ -64,6 +64,9 @@ for name in candidates(root):
         continue
     if mt not in supported and not mt.startswith("lfm2"):
         continue
+    # Decision packs answer /v1/decisions only: a D1 root names its own class, a Kev pack ships kev_config.json.
+    if (data.get("auto_map") or {}).get("AutoModel") == "modeling_d1.D1Model" or os.path.isfile(os.path.join(root, name, "kev_config.json")):
+        continue
     # If quantized, only affine is supported. Skips nvfp4 / other non-MLX
     # quants — they share the gemma/qwen model_type but use a weight layout
     # mlx-serve's safetensors loader can't decode.

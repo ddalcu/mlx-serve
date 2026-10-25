@@ -40,7 +40,8 @@ The record is `benchmarks.md` plus the saved llmprobe reports under `~/claude-tm
 Rules:
 - **Paste the printed rows into the `Decode tok/s by release` table**, one new column, mode suffix included. A cell that lost its mode suffix is the signal that speculation stopped engaging — chase it before shipping.
 - **`--full`** takes median-of-3 per rung and climbs to 32k/64k; the default is one run per rung to 16k. For a regression CLAIM on a spec cell, sample across runs and boot orders regardless of depth.
-- **The one chart left is `docs/perf-vs-engines.png`**, frozen at the release it was rendered for and named as such in the README caption. There is no longer a script that regenerates it, and `benchmarks.md` no longer carries a cross-engine table (dropped 26.9.2).
+- **The one chart left is `docs/perf-vs-engines.png`**, frozen at the release it was rendered for and named as such in its `docs/performance.md` caption. There is no longer a script that regenerates it, and `benchmarks.md` no longer carries a cross-engine table (dropped 26.9.2).
+- **The README's Speed table quotes `benchmarks.md` only** (one machine, one released column, no other engine): refresh it from the new column when you cut a release.
 
 ## Versioning & Releases
 

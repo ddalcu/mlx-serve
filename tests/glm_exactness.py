@@ -243,12 +243,12 @@ def run(base, label, outdir, greedy_only=False, no_cache=False):
               r["finish"] in ("stop", "length") and r["content"].strip() and r["content"] != base_c, r["content"][:120])
     info("chat repetition_penalty (vLLM spelling) changes the output",
          "yes" if s.chat({**rep, "repetition_penalty": 1.5})["content"] != base_c else "no (field not read)")
-    # The server reads frequency_penalty x as repeat_penalty 1+x: both spellings, same bytes.
+    # frequency_penalty is read on both surfaces (OpenAI's additive penalty, #912).
     cp = {"prompt": "banana banana banana banana banana banana", "max_tokens": 40, "temperature": 0}
     base_t = s.completion(cp)["text"]
     for surface, call, body, base_out, key in (("chat", s.chat, rep, base_c, "content"), ("completions", s.completion, cp, base_t, "text")):
-        f, r = call({**body, "frequency_penalty": 1.5})[key], call({**body, "repeat_penalty": 2.5})[key]
-        check(f"{surface} frequency_penalty=1.5 == repeat_penalty=2.5", f == r and r != base_out, f"freq={f[:80]!r} rep={r[:80]!r} base={base_out[:80]!r}")
+        f = call({**body, "frequency_penalty": 1.5})[key]
+        check(f"{surface} frequency_penalty=1.5: changes the output", f != base_out, f"freq={f[:80]!r} base={base_out[:80]!r}")
     r = s.completion({**cp, "repeat_penalty": 1.5})["text"]
     check("completions repeat_penalty=1.5: changes the output", r != base_t, f"base={base_t!r} pen={r!r}")
     info("completions presence_penalty=1.5 changes the output", "yes" if s.completion({**cp, "presence_penalty": 1.5})["text"] != base_t else "no")

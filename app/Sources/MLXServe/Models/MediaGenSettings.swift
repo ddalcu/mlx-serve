@@ -620,6 +620,13 @@ struct Model3DGenSettings: Codable, Equatable {
     var turntable: Bool = true
     /// P2 paint stage (full PBR texture). Off until validated end to end.
     var texture: Bool = false
+    /// TRELLIS.2: cascade resolution, faces kept, texture side.
+    var trellisResolution: Int = 1024
+    var decimationTarget: Int = 300_000
+    var textureSize: Int = 2048
+    var finish: Model3DFinish = .model
+    /// The face counts the pane offers; a stored value that is none of them snaps to the nearest.
+    static let faceOptions = [100_000, 300_000, 600_000, 1_000_000, 2_000_000]
     /// The draft: the pane unmounts on navigation, so the photo and the
     /// disclosure state live here or are lost on the way to Chat and back.
     var photoPath: String? = nil
@@ -661,6 +668,12 @@ extension Model3DGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turntable) { turntable = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .texture) { texture = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .trellisResolution) { trellisResolution = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .decimationTarget) {
+            decimationTarget = Self.faceOptions.min { abs($0 - v) < abs($1 - v) } ?? v
+        }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .textureSize) { textureSize = v }
+        if let v = try c.decodeIfPresent(Model3DFinish.self, forKey: .finish) { finish = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .photoPath) { photoPath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
     }

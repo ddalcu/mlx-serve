@@ -88,6 +88,15 @@ describe("buildImageRequest", () => {
     expect(buildImageRequest(flux, draft(flux, { guidance: 4, negative: "blur" }), [])).not.toHaveProperty("guidance_scale");
   });
 
+  it("MOSS-Image starts at its authors' CFG 3 and negative tags, and an explicit 1 still reaches the server", () => {
+    const moss = model("mlx-community/MOSS-Image-SFT-bf16", "moss_image");
+    expect(imageProfile(moss)).toMatchObject({ family: "moss", edit: false, variation: false, guidance: true, weights: 0, defaultSteps: 50, alignment: 16, max: 2048 });
+    expect(imageDefaults(moss)).toMatchObject({ guidance: 3, negative: "nsfw, worst quality, bad anatomy, watermark, jpeg artifact" });
+    expect(buildImageRequest(moss, draft(moss), [])).toMatchObject({ negative_prompt: "nsfw, worst quality, bad anatomy, watermark, jpeg artifact" });
+    expect(buildImageRequest(moss, draft(moss), [])).not.toHaveProperty("guidance_scale");
+    expect(buildImageRequest(moss, draft(moss, { guidance: 1 }), [])).toMatchObject({ guidance_scale: 1 });
+  });
+
   it("conditioning gain and layer weights are for the models that tap layers", () => {
     expect(buildImageRequest(flux, draft(flux, { gain: 2, weights: "1, 0.5 2" }), [])).toMatchObject({ cond_gain: 2, cond_weights: [1, 0.5, 2] });
     expect(() => buildImageRequest(flux, draft(flux, { weights: "1 2" }), [])).toThrow(/exactly 3 finite numbers/);

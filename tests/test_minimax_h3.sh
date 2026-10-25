@@ -15,7 +15,7 @@ PORT="${1:-11361}"
 MODEL="${H3_MODEL:-$HOME/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit}"
 [ -f "$MODEL/transformer.safetensors" ] || { echo "SKIP: no MiniMax-H3 pack at $MODEL (set H3_MODEL)"; exit 0; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/zig-out/bin/mlx-serve"
+BIN="${MLX_SERVE_BIN:-$ROOT/zig-out/bin/mlx-serve}"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
 LOG=/tmp/test_minimax_h3_server.log

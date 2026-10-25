@@ -238,6 +238,7 @@ struct TileLoader {
   STEEL_CONST int kWPG = kGV * kBits / 32;
   STEEL_CONST int kBKP = G::kBK + 16 / sizeof(WT);
   static_assert(kWords * 32 == kVPT * kBits, "whole words per thread");
+  static_assert(kBits >= 4 || kVPT % 32 == 0, "2/3-bit values come in 32-value units");
   static_assert(kWPG >= 1 && kNG * kWPG == kWords, "group split");
 
   const device uint32_t* src;
@@ -291,11 +292,16 @@ struct TileLoader {
     }
   }
 
+  // The first value packed in word i: 2 and 3 bits are read in 32-value units of kBits words.
+  METAL_FUNC static int word_col(const short i) {
+    return kBits < 4 ? (i / kBits) * 32 : i * kPer;
+  }
+
   METAL_FUNC void fetch_tail(const int kb, const int k_valid) thread {
     const device uint32_t* ptr = src + kb * (G::kBK * kBits / 32);
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kWords; i++) {
-      if (col + i * kPer < k_valid) {
+      if (col + word_col(i) < k_valid) {
         raw[i] = ptr[i];
       }
     }
@@ -310,6 +316,30 @@ struct TileLoader {
   METAL_FUNC void store_words(threadgroup WT* Ws, const int k_valid) const
       thread {
     threadgroup WT* dst = Ws + row * kBKP + col;
+    if constexpr (kBits < 4) {
+      // mlx packs value i at bit i * kBits: 3-bit values straddle words.
+      STEEL_PRAGMA_UNROLL
+      for (short u = 0; u < kVPT / 32; u++) {
+        if (col + u * 32 < k_valid) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 32; j += 4) {
+            vec<WT, 4> v;
+            STEEL_PRAGMA_UNROLL
+            for (short t = 0; t < 4; t++) {
+              const short bit = (j + t) * kBits;
+              const short wi = u * kBits + (bit >> 5), sh = bit & 31;
+              uint32_t q = raw[wi] >> sh;
+              if (sh + kBits > 32) {
+                q |= raw[wi + 1] << (32 - sh);
+              }
+              v[t] = Q::dq(p[(u * 32) / kGV], q & kMask);
+            }
+            *(threadgroup vec<WT, 4>*)(dst + u * 32 + j) = v;
+          }
+        }
+      }
+      return;
+    }
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kWords; i++) {
       if (col + i * kPer < k_valid) {

@@ -36,6 +36,18 @@ The joint schema head, input encoding and SystemOne response mapping in
 src/clef.zig are adapted from joint_schema_model.py and clef_mlx.py.
 
 --------------------------------------------------------------------------------
+FastVideo
+https://github.com/hao-ai-lab/FastVideo
+Copyright FastVideo contributors
+Licensed under the Apache License, Version 2.0.
+
+The VSA-H3 sparse attention in src/h3_vsa.zig (tile geometry, routing, the
+gate branch and the SIMD-group block-sparse Metal kernel) is ported from
+`fastvideo/mlx_runtime/minimax_h3_vsa.py` and `minimax_h3_vsa_simd.py`, and
+the PDD sampler in src/minimax_h3.zig follows `fastvideo/layers/pdd.py`.
+tests/dump_h3_vsa_fixtures.py executes the reference to validate the port.
+
+--------------------------------------------------------------------------------
 SageAttention
 https://github.com/thu-ml/SageAttention
 Licensed under the Apache License, Version 2.0.
@@ -107,6 +119,20 @@ text-image instructions of `polish_prompt_en` in
 src/examples/tools/prompt_utils_2512.py.
 
 --------------------------------------------------------------------------------
+MOSS-Image
+https://github.com/OpenMOSS/MOSS-Image
+Copyright OpenMOSS
+Licensed under the Apache License, Version 2.0.
+
+src/moss_image.zig ports the MOSS-Image diffusers pipeline
+(pipeline_moss_image.py: the transformer, scheduler and sampling loop) to MLX.
+The image Enhance shape for MOSS-Image (`mossShape` in
+app/Sources/MLXServe/Services/PromptRewriter.swift) is condensed from
+skills/moss-image-prompt-enhancer/SKILL.md, and
+app/Sources/MLXServe/Services/MossLayout.swift ports its
+scripts/compile_prompt.py.
+
+--------------------------------------------------------------------------------
 laya-mlx
 https://github.com/mizorewww/laya-mlx
 Copyright laya-mlx contributors
@@ -175,6 +201,8 @@ Used in mlx-serve (`src/transformer.zig`):
     and `omlx/custom_kernels/nax_tiles.py` at 5dcfe243. Both are MLX's own
     steel NAX attention and tile code (Copyright (c) 2024-25 Apple Inc., MIT);
     the sliding-window bound is ours.
+  * The block-sparse VSA attention (`src/kernels/h3_vsa_nax.metal`): that
+    attention kernel's loop walking each query tile's selected key tiles.
 
 Used in mlx-serve for GLM-5-Next (`src/glm5_next.zig`, `src/dsa_nax.zig`,
 `src/kda_recurrence.zig`, `src/kernels/kda_*.metal`, `src/kernels/glm5_*.metal`),
@@ -226,6 +254,16 @@ Modifications by mlx-serve: `value.cpp` and `value.h` were changed to add
 `jinja_wrapper.*`, `caps.*`, `jinja_string.*` and `log.h` are mlx-serve
 additions providing the C interface the Zig side calls.
 
+
+--------------------------------------------------------------------------------
+NAF (valeoai)
+https://github.com/valeoai/NAF
+Licensed under the Apache License, Version 2.0.
+
+`src/naf.zig` reimplements the released NAF feature upsampler operation for
+operation; Pixal3D conditions its voxels on DINOv3 features upsampled by it.
+The Pixal3D pack we publish on Hugging Face carries the released NAF weights
+with NAF's license beside them.
 
 ================================================================================
 MIT License
@@ -531,6 +569,33 @@ host dispatch; `simd_qmm` gains a 2-3 row `rows` kind; draft trees verify
 through our GDN fold kernel and path attention.
 
 
+--------------------------------------------------------------------------------
+TRELLIS.2 and TRELLIS (Microsoft)
+https://github.com/microsoft/TRELLIS.2
+https://huggingface.co/microsoft/TRELLIS.2-4B
+https://huggingface.co/microsoft/TRELLIS-image-large
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+
+`src/trellis2*.zig` port the TRELLIS.2 image-to-3D pipeline: the sparse-structure,
+shape and texture flow transformers with their sampler recipes, the sparse
+SC-VAE decoders, the dual-grid mesh extraction and the PBR attribute layout;
+the TRELLIS v1 sparse-structure decoder is ported alongside. Written in Zig
+against mlx-c, not shipped as their source. The 8-bit packs we publish on
+Hugging Face repackage the released weights.
+
+--------------------------------------------------------------------------------
+Pixal3D (TencentARC)
+https://github.com/TencentARC/Pixal3D
+https://huggingface.co/TencentARC/Pixal3D
+Copyright (c) 2026 Tencent.
+Licensed under the MIT License.
+
+`src/pixal3d.zig` ports the pixel-aligned conditioning (each voxel projected
+through the camera into the DINOv3 features), the multi-view averaging and the
+per-block feature projection of the Pixal3D flows. The 8-bit pack we publish on
+Hugging Face repackages the released weights.
+
 ================================================================================
 Other licenses
 ================================================================================
@@ -567,6 +632,19 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 --------------------------------------------------------------------------------
+DINOv3 (Meta)
+https://github.com/facebookresearch/dinov3
+https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Licensed under the DINOv3 License (Meta's own agreement, neither MIT nor Apache).
+
+`src/dinov3.zig` implements the ViT-L/16 image encoder the TRELLIS.2 and Pixal3D
+pipelines condition on. The packs we publish on Hugging Face include its weights
+in float16 under that agreement, with its text as `dinov3/LICENSE.md`; mlx-serve
+itself does not redistribute them. The agreement must travel with any copy of
+the weights and restricts some uses (trade-control and military end uses).
+
+--------------------------------------------------------------------------------
 Fast-Quadric-Mesh-Simplification
 https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification
 Copyright (c) 2015-2019 Spacerat and contributors
@@ -575,6 +653,16 @@ Licensed under the MIT License (see lib/fqms/LICENSE).
 `Simplify.h` at 65df07dc, vendored unmodified under `lib/fqms/` with a C shim
 and compiled into the mlx-serve binary: the quadric decimation the Hunyuan3D
 texture stage runs before its UV unwrap.
+
+--------------------------------------------------------------------------------
+xatlas
+https://github.com/jpcy/xatlas
+Copyright (c) 2018-2020 Jonathan Young
+Licensed under the MIT License (see lib/xatlas/LICENSE).
+
+Vendored under `lib/xatlas/` with a C shim and compiled into the mlx-serve
+binary: the UV unwrap of the Hunyuan3D paint stage and of the TRELLIS.2 and
+Pixal3D texture bake.
 
 --------------------------------------------------------------------------------
 Stable Audio 3 (MLX reference implementation)

@@ -33,9 +33,15 @@ export PATH="$PWD/.zig-toolchain:$PATH"
 zig build -Doptimize=ReleaseFast                     # always ReleaseFast; Debug is 2-4x slower
 ```
 
+## Linux and Windows (NVIDIA)
+
+Every release attaches `mlx-serve-linux-x64-cuda13.tar.gz` (RTX 20 to 50 series) and `mlx-serve-linux-arm64-cuda13.tar.gz` (GH200, Jetson Thor, DGX Spark). They need an NVIDIA driver 580 or newer, the CUDA 13 toolkit, cuDNN 9, OpenBLAS/LAPACKE, libwebp and the Avahi dns_sd compat library. Unpack into an empty folder (the tarball has no top-level directory) and run `zig-out/bin/mlx-serve`; it finds its libraries next to itself.
+
+To build on Linux, run `./scripts/build-linux.sh` from a fresh checkout. On Windows, `powershell -File scripts\build-windows.ps1` builds `mlx-serve.exe` into `dist\mlx-serve-windows-x64.zip`; it needs the Visual Studio 2022 C++ tools, CMake, Ninja, Git, the CUDA 13.0 toolkit and cuDNN 9, and running it needs an NVIDIA driver with CUDA 13 and cuDNN 9. Kernels, per-device defaults and memory: [CUDA.md](CUDA.md).
+
 ## Hermetic tests (Linux too)
 
-The server itself is macOS / Apple Silicon only. The per-step preview encoder (`src/preview.zig` + `src/jpeg.zig` + `src/latent_rgb.zig`) links no MLX and no Homebrew webp, so a Linux Cloud Agent can build and run it — on Linux it is the only step `build.zig` registers:
+The per-step preview encoder (`src/preview.zig` + `src/jpeg.zig` + `src/latent_rgb.zig`) links no MLX and no Homebrew webp, so any machine, a Linux Cloud Agent included, can build and run it with no GPU:
 
 ```bash
 ./scripts/fetch-zig.sh

@@ -116,6 +116,28 @@ final class MediaModalityRoutingTests: XCTestCase {
         XCTAssertEqual(MediaModality(modelType: "hunyuan3d_2_1")?.experiment, .model3d)
     }
 
+    func testATrellis2PackIsRecognizedFromPipelineJsonAndRoutesToThe3DPane() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("trellis2-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try #"{"name":"Trellis2ImageTo3DPipeline"}"#
+            .write(to: dir.appendingPathComponent("pipeline.json"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(DownloadManager.markerModelType(inDir: dir.path), "trellis2")
+        XCTAssertTrue(DownloadManager.holdsWeightLayout(dir.path))
+        XCTAssertTrue(isMediaModelType("trellis2"))
+        XCTAssertEqual(MediaModality(modelType: "trellis2"), .mesh)
+        // The structure decoder is the completion marker, as on the server.
+        XCTAssertFalse(DownloadManager.holdsCompleteMediaPack(dir.path))
+        let ckpts = dir.appendingPathComponent("microsoft/TRELLIS-image-large/ckpts")
+        try FileManager.default.createDirectory(at: ckpts, withIntermediateDirectories: true)
+        try Data().write(to: ckpts.appendingPathComponent("ss_dec_conv3d_16l8_fp16.safetensors"))
+        XCTAssertTrue(DownloadManager.holdsCompleteMediaPack(dir.path))
+        // Another pipeline.json is not ours.
+        try #"{"name":"SomethingElse"}"#
+            .write(to: dir.appendingPathComponent("pipeline.json"), atomically: true, encoding: .utf8)
+        XCTAssertNil(DownloadManager.markerModelType(inDir: dir.path))
+    }
+
     func testEveryModalityNamesThePaneItOpens() {
         for m in MediaModality.allCases {
             XCTAssertFalse(m.paneName.isEmpty, "\(m) has no pane name for the Use button")

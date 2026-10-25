@@ -1068,6 +1068,30 @@ test "embedded PLE refuses an NVFP4 table whose group is not 16" {
     try std.testing.expectError(error.EmbeddedPleGeometry, embedded_ple.openEmbedded(path_buf[0..path_len], .{ .rows = 3, .dim = 32, .shards = 2 }));
 }
 
+test "embedded PLE reads the affine width off the shard geometry" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const spec: EmbeddedSpec = .{ .rows = 2, .dim = 32, .shards = 1 };
+    for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try embedded_ple.writeAffineFixture(&td, bits);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        var table = try NgramTable.openEmbedded(path_buf[0..path_len], spec);
+        defer table.close();
+        try std.testing.expectEqual(bits, table.bits);
+        var out: [32]f32 = undefined;
+        table.row(1, &out);
+        for (out) |v| try std.testing.expectEqual(@as(f32, @floatFromInt((@as(u32, 1) << @intCast(bits)) - 1)), v);
+    }
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeAffineFixture(&td, 7);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    try std.testing.expectError(error.EmbeddedPleGeometry, embedded_ple.openEmbedded(path_buf[0..path_len], spec));
+}
+
 test "embedded PLE rows and gathers match the merged table" {
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();

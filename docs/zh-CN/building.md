@@ -33,9 +33,15 @@ export PATH="$PWD/.zig-toolchain:$PATH"
 zig build -Doptimize=ReleaseFast                     # 始终用 ReleaseFast；Debug 慢 2-4 倍
 ```
 
+## Linux 与 Windows（NVIDIA）
+
+每个版本都附带 `mlx-serve-linux-x64-cuda13.tar.gz`（RTX 20 到 50 系列）和 `mlx-serve-linux-arm64-cuda13.tar.gz`（GH200、Jetson Thor、DGX Spark）。它们需要 580 或更新的 NVIDIA 驱动、CUDA 13 工具包、cuDNN 9、OpenBLAS/LAPACKE、libwebp，以及 Avahi 的 dns_sd 兼容库。解压到一个空文件夹（压缩包里没有顶层目录），然后运行 `zig-out/bin/mlx-serve`；它会在自己旁边找到所需的库。
+
+在 Linux 上构建：从全新检出的仓库运行 `./scripts/build-linux.sh`。在 Windows 上，`powershell -File scripts\build-windows.ps1` 会构建 `mlx-serve.exe` 并打包成 `dist\mlx-serve-windows-x64.zip`；构建需要 Visual Studio 2022 C++ 工具、CMake、Ninja、Git、CUDA 13.0 工具包与 cuDNN 9，运行则需要带 CUDA 13 与 cuDNN 9 的 NVIDIA 驱动。kernel、各设备默认值与内存说明见 [CUDA.md](../CUDA.md)（英文）。
+
 ## 封闭式测试（Linux 上也可以）
 
-服务器本身仅限 macOS / Apple Silicon。逐步预览编码器（`src/preview.zig` + `src/jpeg.zig` + `src/latent_rgb.zig`）不链接 MLX，也不链接 Homebrew webp，因此 Linux Cloud Agent 可以构建并运行它 —— 在 Linux 上，它是 `build.zig` 注册的唯一 step：
+逐步预览编码器（`src/preview.zig` + `src/jpeg.zig` + `src/latent_rgb.zig`）不链接 MLX，也不链接 Homebrew webp，因此任何机器（包括 Linux Cloud Agent）都能在没有 GPU 的情况下构建并运行它：
 
 ```bash
 ./scripts/fetch-zig.sh

@@ -195,16 +195,39 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertTrue(VideoGenService.refFrameTimes(count: 0, fps: 24).isEmpty)
     }
 
-    func testRef2vaPresetIsTheOnlyOneAdvertisingReferences() {
+    func testOnlyTheRef2vaFamilyAdvertisesReferences() {
         // The factory takes the flag as a parameter precisely so the two FL2VA
         // presets cannot drift into claiming a capability their DiT lacks.
-        XCTAssertTrue(VideoModelPreset.minimaxH3Ref2VA.supportsReferences)
-        for p in VideoModelPreset.all where p.id != VideoModelPreset.minimaxH3Ref2VA.id {
-            XCTAssertFalse(p.supportsReferences, "\(p.id) must not advertise references")
+        let ref2va: Set<String> = [VideoModelPreset.minimaxH3Ref2VA.id, VideoModelPreset.fastH3Omni.id]
+        for p in VideoModelPreset.all {
+            XCTAssertEqual(p.supportsReferences, ref2va.contains(p.id), "\(p.id)")
         }
         // REF2VA has no first/last-frame conditioning and FL2VA has no
         // references — two checkpoints, not two modes of one.
         XCTAssertTrue(VideoModelPreset.all.contains { $0.id == VideoModelPreset.minimaxH3Ref2VA.id })
+    }
+
+    func testFastH3OmniRunsItsTrainedEightStepsOnly() {
+        // Bar: the server refuses any other count, Turbo and chaining, so the pane offers none of them.
+        let omni = VideoModelPreset.fastH3Omni
+        XCTAssertTrue(VideoModelPreset.all.contains { $0.id == omni.id })
+        XCTAssertEqual(omni.backend, .minimaxH3)
+        XCTAssertEqual(omni.promptFormat, .h3Reference)
+        XCTAssertEqual(omni.fixedSteps, 8)
+        XCTAssertEqual(omni.stepsRange(turbo: false), 8...8)
+        for q in QualityPreset.allCases { XCTAssertEqual(omni.settings(q).steps, 8, "\(q)") }
+        XCTAssertFalse(omni.supportsTurbo)
+        XCTAssertFalse(omni.supportsChainedWindows)
+        XCTAssertFalse(omni.supportsLastFrame)
+        XCTAssertFalse(omni.supportsFastRecipe)
+        XCTAssertNil(VideoModelPreset.minimaxH3Ref2VA.fixedSteps)
+    }
+
+    func testOmnisEstimateReadsItsOwnStepCost() {
+        // Bar: at the same canvas and step count, Omni's sparse-attention step prices below REF2VA's.
+        let omni = H3TimeEstimate.seconds(model: .fastH3Omni, width: 832, height: 480, frames: 243, steps: 8, fast: false, hardware: .anchor)
+        let base = H3TimeEstimate.seconds(model: .minimaxH3Ref2VA, width: 832, height: 480, frames: 243, steps: 8, fast: false, hardware: .anchor)
+        XCTAssertLessThan(omni, base)
     }
 
     func testTurboStepsStayInsideTheDistillationsTrainedRange() {

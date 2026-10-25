@@ -367,6 +367,9 @@ class DownloadManager: ObservableObject {
         case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
+        case "moss_image": return "vae/diffusion_pytorch_model.safetensors"
+        case "trellis2": return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
+        case "pixal3d": return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"
         default: return nil
         }
     }
@@ -398,6 +401,8 @@ class DownloadManager: ObservableObject {
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
         if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
+        if isPixal3dPipeline(inDir: dir) { return "pixal3d" }
+        if isTrellis2Pipeline(atPath: (dir as NSString).appendingPathComponent("pipeline.json")) { return "trellis2" }
         if qwen3AsrThinker(dir) == "qwen3_forced_aligner" { return "qwen3_forced_aligner" }
         return nil
     }
@@ -409,6 +414,28 @@ class DownloadManager: ObservableObject {
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let map = cfg["auto_map"] as? [String: Any] else { return false }
         return map["AutoModel"] as? String == "modeling_d1.D1Model"
+    }
+
+    /// Microsoft's TRELLIS.2 image-to-3D pack: no root config.json, its `pipeline.json` names the pipeline.
+    /// Twin of `model_discovery.peekTrellis2Pipeline`.
+    nonisolated static func isTrellis2Pipeline(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return cfg["name"] as? String == "Trellis2ImageTo3DPipeline"
+    }
+
+    /// TencentARC's Pixal3D pack: TRELLIS.2's pipeline.json, name and all, over flows whose own config reads
+    /// `"image_attn_mode": "proj"`. Twin of `model_discovery.peekPixal3dPipeline`.
+    nonisolated static func isPixal3dPipeline(inDir dir: String) -> Bool {
+        let pipe = (dir as NSString).appendingPathComponent("pipeline.json")
+        guard isTrellis2Pipeline(atPath: pipe),
+              let data = FileManager.default.contents(atPath: pipe),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = (cfg["args"] as? [String: Any])?["models"] as? [String: Any],
+              let ss = models["sparse_structure_flow_model"] as? String,
+              let flowData = FileManager.default.contents(atPath: (dir as NSString).appendingPathComponent(ss + ".json")),
+              let flow = try? JSONSerialization.jsonObject(with: flowData) as? [String: Any] else { return false }
+        return (flow["args"] as? [String: Any])?["image_attn_mode"] as? String == "proj"
     }
 
     /// A stable-audio-tools inpainting model conditioned on T5Gemma: the

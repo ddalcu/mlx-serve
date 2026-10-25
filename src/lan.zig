@@ -364,7 +364,7 @@ const Peer = struct {
     needs_key: bool = false,
     machine: PeerMachine = .{},
 
-    fn deinit(p: *Peer, alloc: std.mem.Allocator) void {
+    pub fn deinit(p: *Peer, alloc: std.mem.Allocator) void {
         freePeerModels(alloc, p.models);
         alloc.free(p.display);
     }
@@ -621,7 +621,7 @@ pub const Lan = struct {
         }
     }
 
-    fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel, needs_key: bool, machine: PeerMachine) void {
+    pub fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel, needs_key: bool, machine: PeerMachine) void {
         const owned = l.alloc.dupe(u8, display) catch {
             freePeerModels(l.alloc, models);
             return;

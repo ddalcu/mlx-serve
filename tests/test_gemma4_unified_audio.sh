@@ -93,7 +93,7 @@ else
     bad "recognizes a spoken word from the audio" "no expected word in: $(echo "$CONTENT" | head -c 200)"
 fi
 assert_contains "audio encode produced soft tokens" "audio soft tokens" "$(cat "$LOG")"
-assert_contains "audio routed through the unified embedder" "0 vision +" "$(cat "$LOG")"
+assert_contains "audio routed through the unified embedder" "0 image + 0 video + " "$(cat "$LOG")"
 
 echo ""
 echo -e "Gemma 4 12B unified audio: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC}"

@@ -26,7 +26,8 @@ struct UvwResult {
 extern "C" {
 
 void *uvw_parametrize(const float *positions, uint32_t vertex_count,
-                      const uint32_t *indices, uint32_t index_count) {
+                      const uint32_t *indices, uint32_t index_count,
+                      const uint32_t *face_material) {
     if (!positions || !indices || vertex_count == 0 || index_count < 3)
         return nullptr;
 
@@ -41,6 +42,7 @@ void *uvw_parametrize(const float *positions, uint32_t vertex_count,
     decl.indexData = indices;
     decl.indexCount = index_count;
     decl.indexFormat = xatlas::IndexFormat::UInt32;
+    decl.faceMaterialData = face_material; // null = the reference's default call
 
     if (xatlas::AddMesh(atlas, decl) != xatlas::AddMeshError::Success) {
         xatlas::Destroy(atlas);

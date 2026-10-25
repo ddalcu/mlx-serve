@@ -27,7 +27,7 @@ run_arm() {
   fi
   local pid=$!
   for _ in $(seq 1 600); do
-    curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 1
   done

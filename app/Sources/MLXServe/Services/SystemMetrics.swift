@@ -193,6 +193,7 @@ enum SystemMetrics {
             freePages: UInt64(stats.free_count),
             speculativePages: UInt64(stats.speculative_count),
             externalPages: UInt64(stats.external_page_count),
+            purgeablePages: UInt64(stats.purgeable_count),
             wirePages: UInt64(stats.wire_count),
             compressorPages: UInt64(stats.compressor_page_count),
             pageSize: UInt64(pageSize)
@@ -204,11 +205,13 @@ enum SystemMetrics {
     /// outside wired + compressed). Returns 0 on a failed query.
     static func computeAvailableForModel(totalBytes: UInt64, freePages: UInt64,
                                          speculativePages: UInt64, externalPages: UInt64,
-                                         wirePages: UInt64, compressorPages: UInt64,
+                                         purgeablePages: UInt64, wirePages: UInt64, compressorPages: UInt64,
                                          pageSize: UInt64) -> UInt64 {
         if totalBytes == 0 { return 0 }
         let freeClean = freePages >= speculativePages ? freePages - speculativePages : 0
-        let (reclaimPages, rpOv) = freeClean.addingReportingOverflow(externalPages)
+        let (filePages, fpOv) = freeClean.addingReportingOverflow(externalPages)
+        let (reclaimPages, ppOv) = filePages.addingReportingOverflow(purgeablePages)
+        let rpOv = fpOv || ppOv
         let (reclaimBytes, rbOv) = reclaimPages.multipliedReportingOverflow(by: pageSize)
         let (nonGrantPages, npOv) = wirePages.addingReportingOverflow(compressorPages)
         let (nonGrantBytes, nbOv) = nonGrantPages.multipliedReportingOverflow(by: pageSize)

@@ -35,8 +35,7 @@ export class Connection {
   #storage: StorageAdapter;
   #options: ClientOptions;
 
-  /** @param pageKey the page's own `?api_key=`, for this origin only */
-  constructor(origin: string, storage: StorageAdapter, options: ClientOptions = {}, pageKey?: string) {
+  constructor(origin: string, storage: StorageAdapter, options: ClientOptions = {}) {
     this.#storage = storage;
     this.#options = options;
     this.origin = origin;
@@ -45,7 +44,6 @@ export class Connection {
       if (id === this.activeId && method === "POST" && CHANGES_MODELS.test(path)) void this.refresh();
     };
     const home = this.store.list().find((s) => s.url === origin)?.id ?? this.store.add({ url: origin, name: "This server" });
-    if (pageKey) this.store.update(home, { apiKey: pageKey });
     const saved = storage.getItem("studio.activeServer");
     this.activeId = saved && this.store.get(saved) ? saved : home;
     this.sync();

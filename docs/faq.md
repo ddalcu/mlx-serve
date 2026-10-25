@@ -22,7 +22,7 @@ Yes. mlx-serve embeds llama.cpp's inference library (`libllama`) inside the same
 
 ## Does mlx-serve work with Claude Code?
 
-Yes — natively. mlx-serve implements Anthropic's `/v1/messages` endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:11234`. The MLX Core app ships a one-click "Launch Claude Code" button that wires up the env vars for you, and `mlx-serve launch claude` does the same from the terminal. Other agents too: pi, oh-my-pi, OpenCode, Codex, hermes, aider, plus editors like Zed. Setup for each is in [integrations.md](integrations.md).
+Yes — natively. mlx-serve implements Anthropic's `/v1/messages` endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:11234`. The MLX-Serve app ships a one-click "Launch Claude Code" button that wires up the env vars for you, and `mlx-serve launch claude` does the same from the terminal. Other agents too: pi, oh-my-pi, OpenCode, Codex, hermes, aider, plus editors like Zed. Setup for each is in [integrations.md](integrations.md).
 
 ## Can my Macs share models over the network?
 
@@ -34,7 +34,7 @@ All work — anything that talks the OpenAI chat-completions or Anthropic Messag
 
 ## Can mlx-serve run DeepSeek V4 Flash locally?
 
-Yes, on 128 GB+ Apple Silicon Macs. Open the MLX Core Model Browser, pick DeepSeek-V4-Flash, hit Download. Since v26.7.12 the safetensors build runs on our own MLX engine rather than through GGUF: 284B with 13B active, 1M context, chat, thinking, tool calls and streaming, about 30 tok/s serial decode on an M4 Max and roughly twice that with DSpark (`--dspark`, the checkpoint's own draft stages). `.gguf` builds still route to the embedded [ds4](https://github.com/antirez/ds4) engine. Agent mode and MCP tools work on DSV4 too. It needs the 0731 release of the checkpoint; the earlier preview is turned away at load.
+Yes, on 128 GB+ Apple Silicon Macs. Open the MLX-Serve Model Browser, pick DeepSeek-V4-Flash, hit Download. Since v26.7.12 the safetensors build runs on our own MLX engine rather than through GGUF: 284B with 13B active, 1M context, chat, thinking, tool calls and streaming, about 30 tok/s serial decode on an M4 Max and roughly twice that with DSpark (`--dspark`, the checkpoint's own draft stages). `.gguf` builds still route to the embedded [ds4](https://github.com/antirez/ds4) engine. Agent mode and MCP tools work on DSV4 too. It needs the 0731 release of the checkpoint; the earlier preview is turned away at load.
 
 ## What models are supported?
 
@@ -50,7 +50,7 @@ Yes — the largest open model mlx-serve runs. The 2-bit mixed-precision build (
 
 ## Does it support tools / function calling?
 
-Yes, on both API surfaces. The server detects tool-call patterns across architectures (Hermes XML, Gemma 4 `<|tool_call>`, MiniCPM5 V3's attribute-quoted `<function name="…">` XML, raw JSON, ChatML), repairs common Qwen 3.5/3.6 escape quirks, and emits OpenAI-style `tool_calls` deltas in the SSE stream. The MLX Core app ships 10 built-in tools (shell, file I/O, search, browse, web search, memory) and connects to MCP servers from a curated marketplace.
+Yes, on both API surfaces. The server detects tool-call patterns across architectures (Hermes XML, Gemma 4 `<|tool_call>`, MiniCPM5 V3's attribute-quoted `<function name="…">` XML, raw JSON, ChatML), repairs common Qwen 3.5/3.6 escape quirks, and emits OpenAI-style `tool_calls` deltas in the SSE stream. The MLX-Serve app ships 10 built-in tools (shell, file I/O, search, browse, web search, memory) and connects to MCP servers from a curated marketplace.
 
 ## How does it stay this small / fast?
 
@@ -76,4 +76,4 @@ Nowhere off your machines. Everything runs locally — no analytics, no telemetr
 
 ## How do I update?
 
-The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew upgrade --cask mlx-serve` or `brew upgrade mlx-serve`.
+The MLX-Serve app self-updates by checking the GitHub releases feed. CLI: `brew upgrade --cask mlx-serve` or `brew upgrade mlx-serve`.

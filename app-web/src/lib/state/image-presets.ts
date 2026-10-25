@@ -411,4 +411,18 @@ const imageTemplates = {
   ],
 };
 
-export { fluxResolutions, kreaResolutions, mageFlowResolutions, qwenImageResolutions, imageTemplates };
+/** MOSS-Image: 1, 1.5 or 2 MP at any aspect, multiples of 16 (its Gradio `fit_size`); twin of the Swift preset. */
+const mossImageResolutions = [
+  { width: 1024, height: 1024, label: N("1024 × 1024 (square)") },
+  { width: 1248, height: 1248, label: N("1248 × 1248 (square, 1.5 MP)") },
+  { width: 1456, height: 1456, label: N("1456 × 1456 (square, 2 MP)") },
+  { width: 832, height: 1248, label: N("832 × 1248 (portrait 2:3)") },
+  { width: 1248, height: 832, label: N("1248 × 832 (landscape 3:2)") },
+  { width: 1360, height: 768, label: N("1360 × 768 (landscape 16:9)") },
+  { width: 768, height: 1360, label: N("768 × 1360 (portrait 9:16)") },
+  { width: 1936, height: 1088, label: N("1936 × 1088 (landscape 16:9, 2 MP)") },
+  { width: 1088, height: 1936, label: N("1088 × 1936 (portrait 9:16, 2 MP)") },
+  { width: 512, height: 512, label: N("512 × 512 (fastest)") },
+];
+
+export { fluxResolutions, kreaResolutions, mageFlowResolutions, mossImageResolutions, qwenImageResolutions, imageTemplates };

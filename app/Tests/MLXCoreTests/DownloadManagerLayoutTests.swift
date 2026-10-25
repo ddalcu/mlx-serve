@@ -384,9 +384,9 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(unknown.isChatPickable)
     }
 
-    func testLfm2MoeAndKolibriAreChatPickable() {
-        // LFM2.5-8B-A1B / 24B-A2B ship "lfm2_moe", Kolibri-1 "kolibri1"; the server serves both.
-        for mt in ["lfm2_moe", "kolibri1"] {
+    func testLfm2MoeKolibriAndFlintAreChatPickable() {
+        // LFM2.5-8B-A1B / 24B-A2B ship "lfm2_moe", Kolibri-1 "kolibri1", Recursive Flint "flint"; the server serves all three.
+        for mt in ["lfm2_moe", "kolibri1", "flint"] {
             let m = LocalModel(
                 id: "test:\(mt)", name: mt, path: "/tmp/\(mt)",
                 sizeFormatted: "1 GB", modelType: mt, source: .custom, kind: .base

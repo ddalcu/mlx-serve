@@ -585,6 +585,8 @@ pub const ModelConfig = struct {
     mtp_greedy_tail_override: ?bool = null,
     /// null = the process default (`MLX_SERVE_BONSAI_INT8_PREFILL`).
     int8_prefill_override: ?bool = null,
+    /// LOSSY MXFP8 copy of a dense head; null = `--lm-head-mxfp8`, else the integrated-CUDA default.
+    lm_head_mxfp8_override: ?bool = null,
     /// The model's `ane` setting: serve it on the Neural Engine; null follows `--ane`.
     ane_override: ?bool = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
@@ -741,6 +743,14 @@ pub const ModelConfig = struct {
     glmv_swiglu_limit: f32 = 10.0,
     glmv_min_image_tokens: u32 = 16,
     glmv_max_image_tokens: u32 = 8000,
+
+    // DeepSeek-V4.1 vision tower (src/dsv41_vision.zig): the release's `vision_config`, on top of the
+    // generic vision_* geometry. `dv_max_wh_ratio` 0 = no cap (the release's null).
+    dsv41_vision: bool = false,
+    dv_downsample: u32 = 3,
+    dv_max_image_tokens: u32 = 1024,
+    dv_min_pixels: u32 = 295936,
+    dv_max_wh_ratio: u32 = 0,
     // MiniCPM-V 4.7 vision (src/minicpm_vision.zig): the SigLIP2 geometry rides the vision_*
     // fields; these are its window merger, slicing and placeholder tokens. The token ids
     // that are not in config.json come from the tokenizer (`populateMiniCpmImageTokens`).
@@ -1393,6 +1403,8 @@ pub const ModelConfig = struct {
         // GLM-5-Next: a batched tick's tokens ride as rows of one window; each slot's KDA state and
         // DSA cache are advanced by its own call (`Transformer.forwardGlmBatchedDecode`).
         if (self.isGlm5()) return true;
+        // Flint: MiMo's shape (sinks, sliding + full attention, row-generic MoE), per-slot views in `lagunaAttnWith`.
+        if (std.mem.eql(u8, self.model_type, "flint")) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
@@ -2716,6 +2728,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 };
             }
         }
+        // Per-weight overrides carry their own mode. An unknown one (EigenLabs' `iq2_xxs` experts) was read
+        // as the top-level affine layout and failed at the FIRST request's matmul; refuse it here, by name.
+        var overrides = q.iterator();
+        while (overrides.next()) |kv| {
+            if (kv.value_ptr.* != .object) continue;
+            const mode = kv.value_ptr.object.get("mode") orelse continue;
+            if (mode != .string) continue;
+            if (QuantMode.fromString(mode.string) == null) {
+                log.err("unsupported quantization mode '{s}' on '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)\n", .{ mode.string, kv.key_ptr.* });
+                return error.UnsupportedQuantMode;
+            }
+        }
         // MLX ships affine kernels only for bits {2,3,4,5,6,8} (ops.cpp
         // rejects the rest at quantize() time, but an ALREADY-quantized
         // checkpoint skips that check and dies at Metal kernel load during
@@ -3975,6 +3999,30 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (config.has_explicit_layer_types) {
             for (0..@min(config.num_hidden_layers, 128)) |i| config.layer_no_rope[i] = config.layer_is_global[i];
         }
+    } else if (std.mem.eql(u8, model_type, "flint")) {
+        // Recursive Flint: the laguna attention arm without the output gate, plus learned
+        // per-head sinks (`self_attn.softmax_offset`); laguna's MoE (sigmoid top-k, renormed,
+        // ungated shared expert, dense `mlp_only_layers`). Reference: recursive-oss/rec rec_mlx/model.py.
+        config.model_type = "flint";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_attn_sinks = true;
+        config.moe_sigmoid_router = true;
+        config.moe_route_norm = true;
+        config.router_scaling_factor = 1.0;
+        config.rope_scaling_factor = 1.0;
+        config.query_pre_attn_scalar = config.head_dim;
+        config.rope_local_base_freq = config.rope_theta;
+        if (jsonField(cfg_obj, "no_rope_layer_indices")) |v| {
+            if (v == .array) for (v.array.items) |item| {
+                const i = try jsonU32(item);
+                if (i < 128) config.layer_no_rope[i] = true;
+            };
+        }
     } else if (std.mem.eql(u8, model_type, "inkling_mm_model")) {
         // Thinking Machines Inkling Small (276B-A12B MoE, natively multimodal;
         // REAP builds prune n_routed_experts). NO RoPE anywhere: position =
@@ -4223,8 +4271,25 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             return if (is_v41) error.UnsupportedDsv41Config else error.UnsupportedDsv4Config;
         }
         if (is_v41) {
-            // Text-only: the vision tower is never loaded.
-            config.has_vision = false;
+            // The release's tower (src/dsv41_vision.zig) splices at `<｜deepseek_image｜>`: a pack
+            // without `vision_config` or the image token serves text.
+            config.dsv41_vision = config.has_vision and config.image_token_id != 0;
+            config.has_vision = config.dsv41_vision;
+            if (config.dsv41_vision) {
+                const vc = jsonField(root, "vision_config").?.object;
+                config.vision_rope_theta = 10000.0;
+                if (jsonField(vc, "rope_theta")) |v| config.vision_rope_theta = try jsonFloat(v);
+                if (jsonField(vc, "downsample_ratio")) |v| config.dv_downsample = try jsonU32(v);
+                if (jsonField(vc, "max_image_tokens")) |v| config.dv_max_image_tokens = try jsonU32(v);
+                if (jsonField(vc, "min_pixels")) |v| config.dv_min_pixels = try jsonU32(v);
+                if (jsonField(vc, "max_wh_ratio")) |v| {
+                    if (v == .integer) config.dv_max_wh_ratio = try jsonU32(v);
+                }
+                // The 2-D rotary splits a head into h and w halves of rotate_half pairs.
+                if (config.vision_num_heads == 0 or config.vision_hidden_size % config.vision_num_heads != 0 or
+                    (config.vision_hidden_size / config.vision_num_heads) % 4 != 0 or config.vision_patch_size == 0 or
+                    config.dv_downsample == 0 or config.dv_max_image_tokens < 4) return error.InvalidConfigField;
+            }
             try parseDsv41Fields(cfg_obj, &config);
         }
     } else if (std.mem.eql(u8, model_type, "glm_moe_dsa")) {
@@ -4919,6 +4984,14 @@ pub const Weights = struct {
         self.dropPrefix(std.fmt.bufPrint(&buf, fmt, .{idx}) catch return);
     }
 
+    /// Hand the map `arr` under `name` (the key is copied), freeing an array it held there.
+    pub fn put(self: *Weights, name: []const u8, arr: mlx.mlx_array) !void {
+        if (self.map.contains(name)) return self.replace(name, arr);
+        const key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key);
+        try self.map.put(key, arr);
+    }
+
     /// Drop `name` and free its array (a loader that copied it elsewhere lets the original go).
     pub fn remove(self: *Weights, name: []const u8) void {
         const kv = self.map.fetchRemove(name) orelse return;
@@ -5153,17 +5226,13 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         .shard => |sh| try config.applyShard(sh),
         .remote => |r| config.dist_dsv41 = .{ .lo = r.start, .hi = r.end, .worker = false },
     };
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainPart(&weights, sp);
     if (config.dist_dsv41) |p| try retainPart(&weights, Dsv41Keep{ .pair = p });
     if (config.dist_shard) |sh| if (sh.rank != 0) try retainPart(&weights, TensorWorker{});
-    if (config.modelopt) {
-        const s = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(s);
-        try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, s, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
-    }
+    if (config.modelopt) try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
     if (config.dist_shard) |sh| try shardExperts(&weights, sh, config.modelopt);
     if (config.isDsv41() and !(if (config.dist_dsv41) |p| p.worker else false)) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
@@ -5181,11 +5250,10 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     return weights;
 }
 
-/// deepseek_v41 serves text only and reads its Engram tables from disk per
-/// lookup (~100 GB a layer), so neither the vision tower nor those tables
-/// enter the weight map.
-fn dsv41DropsKey(key: []const u8) bool {
-    return dsv41VisionKey(key) or std.mem.indexOf(u8, key, ".engram.embed.") != null;
+/// deepseek_v41 reads its Engram tables from disk per lookup (~100 GB a layer), so they never enter
+/// the weight map; the vision tower only when the load asks for it.
+fn dsv41DropsKey(key: []const u8, vision: bool) bool {
+    return (!vision and dsv41VisionKey(key)) or std.mem.indexOf(u8, key, ".engram.embed.") != null;
 }
 
 pub fn dsv41VisionKey(key: []const u8) bool {
@@ -5309,9 +5377,33 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         return error.NoWeightFiles;
     }
 
+    try viewByteAffineWeights(&weights, s);
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
     if (!opts.defer_qwen4_norms) reportF16Narrowing();
     return weights;
+}
+
+/// An affine weight (`.scales` AND `.biases` beside it) stored as uint8 is MLX's packed
+/// uint32 words written byte-wise (Recursive's Flint export); MLX's quantized kernels read
+/// uint32 only. NVFP4/MXFP8/FP8 bytes carry no `.biases` and keep their dtype.
+fn viewByteAffineWeights(weights: *Weights, s: mlx.mlx_stream) !void {
+    var buf: [512]u8 = undefined;
+    var it = weights.map.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        if (!std.mem.endsWith(u8, key, ".weight") or mlx.mlx_array_dtype(e.value_ptr.*) != .uint8) continue;
+        const shape = mlx.getShape(e.value_ptr.*);
+        if (shape.len == 0 or @rem(shape[shape.len - 1], 4) != 0) continue;
+        const base = key[0 .. key.len - ".weight".len];
+        const scales = std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch continue;
+        if (weights.map.get(scales) == null) continue;
+        const biases = std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch continue;
+        if (weights.map.get(biases) == null) continue;
+        var words = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_view(&words, e.value_ptr.*, .uint32, s));
+        _ = mlx.mlx_array_free(e.value_ptr.*);
+        e.value_ptr.* = words;
+    }
 }
 
 /// Whether a just-loaded f16 tensor must be narrowed to the engine's bf16
@@ -5474,7 +5566,7 @@ pub fn loadSafetensorsFile(
 
         const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
         if (foreign or !keepsTensor(key_str, opts) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
-            (opts.dsv41 and dsv41DropsKey(key_str)))
+            (opts.dsv41 and dsv41DropsKey(key_str, opts.vision)))
         {
             _ = mlx.mlx_array_free(value);
             continue;
@@ -5958,6 +6050,54 @@ test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-pa
     // quant side tensors force the mixed-dtype qmm path).
     try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.up_proj.weight").?));
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.down_proj.scales").?));
+}
+
+test "loadWeights reads an affine weight packed as uint8 (Flint's export) as MLX's uint32 words" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        var bytes: [16]u8 = undefined;
+        for (&bytes, 0..) |*b, i| b.* = @intCast(i);
+        const packed_u8 = mlx.mlx_array_new_data(&bytes, &[_]c_int{ 2, 8 }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(packed_u8);
+        const side_data: [2]f32 = .{ 1, 2 };
+        const side_f32 = mlx.mlx_array_new_data(&side_data, &[_]c_int{ 2, 1 }, 2, .float32);
+        defer _ = mlx.mlx_array_free(side_f32);
+        var side = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(side);
+        try mlx.check(mlx.mlx_astype(&side, side_f32, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(side));
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.self_attn.q_proj.weight", packed_u8);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.self_attn.q_proj.scales", side);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.self_attn.q_proj.biases", side);
+        // No biases: a byte format of its own (NVFP4, FP8), never reinterpreted.
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.up_proj.weight", packed_u8);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.up_proj.scales", side);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+    var weights = try loadWeights(io, allocator, dir_path);
+    defer weights.deinit();
+
+    const w = weights.get("model.layers.0.self_attn.q_proj.weight").?;
+    try mlx.check(mlx.mlx_array_eval(w));
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(w));
+    try testing.expectEqualSlices(c_int, &.{ 2, 2 }, mlx.getShape(w));
+    const words = mlx.mlx_array_data_uint32(w).?[0..4];
+    try testing.expectEqual(@as(u32, 0x03020100), words[0]);
+    try testing.expectEqual(@as(u32, 0x0f0e0d0c), words[3]);
+    try testing.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.up_proj.weight").?));
 }
 
 test "loadWeights on a weightless dir (incomplete download) errors clearly, not empty map" {
@@ -6752,6 +6892,53 @@ test "ModelConfig parses kolibri1: logit-bias routing, NoPE on full layers, sand
     try testing.expect(config.isGlobalLayer(3) and !config.isGlobalLayer(0));
     try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 1e-3);
     try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
+}
+
+test "ModelConfig parses flint: sinks, NoPE from no_rope_layer_indices, sigmoid MoE with renorm" {
+    // Trimmed copy of RecursiveSI/flint-int4's config.json: 6 layers keep both dense layers and the full/sliding mix.
+    const json =
+        \\{
+        \\  "model_type": "flint",
+        \\  "hidden_size": 2048,
+        \\  "intermediate_size": 6144,
+        \\  "moe_intermediate_size": 512,
+        \\  "shared_expert_intermediate_size": 1024,
+        \\  "num_hidden_layers": 6,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 4,
+        \\  "head_dim": 128,
+        \\  "num_experts": 256,
+        \\  "num_experts_per_tok": 6,
+        \\  "norm_topk_prob": true,
+        \\  "vocab_size": 150144,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "rope_theta": 10000.0,
+        \\  "sliding_window": 513,
+        \\  "use_sliding_window": true,
+        \\  "layer_types": ["full_attention", "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\  "no_rope_layer_indices": [0, 1, 5],
+        \\  "mlp_only_layers": [0, 1],
+        \\  "router_score_function": "sigmoid",
+        \\  "softmax_type": "learnable",
+        \\  "eos_token_id": [150001, 150003, 150005, 150018],
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"group_size": 64, "bits": 4}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("flint", config.model_type);
+    try testing.expect(config.has_attn_sinks and config.has_qk_norm and !config.laguna_attn_gate);
+    try testing.expect(config.moe_sigmoid_router and !config.moe_logit_select and config.moe_route_norm);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.router_scaling_factor, 1e-6);
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expectEqual(@as(u32, 1024), config.shared_expert_intermediate_size);
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 513), config.sliding_window);
+    try testing.expect(config.isGlobalLayer(0) and !config.isGlobalLayer(2) and config.isGlobalLayer(5));
+    try testing.expect(config.layerSkipsRope(0) and config.layerSkipsRope(5) and !config.layerSkipsRope(2));
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 1e-3);
+    try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
+    try testing.expectEqual(@as(u32, 4), config.num_eos_tokens);
 }
 
 test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softplus gate, YaRN, sigmoid MoE" {
@@ -7702,14 +7889,28 @@ pub const dsv41_release_config =
     \\  "num_nextn_predict_layers": 3, "dspark_block_size": 5, "dspark_noise_token_id": 128799,
     \\  "dspark_target_layer_ids": [37, 38, 39], "dspark_markov_rank": 256,
     \\  "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3},
-    \\ "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32}}
+    \\ "image_token_id": 129264,
+    \\ "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32, "hidden_size": 1024,
+    \\  "num_attention_heads": 16, "intermediate_size": 2816, "patch_size": 14, "rope_theta": 10000,
+    \\  "downsample_ratio": 3, "max_image_tokens": 1024, "min_pixels": 295936, "max_wh_ratio": null}}
 ;
 
 test "ModelConfig parses deepseek_v41 (DeepSeek-V4.1-Flash release)" {
     const config = try parseConfigFromJson(testing.allocator, dsv41_release_config);
     try testing.expectEqualStrings("deepseek_v41", config.model_type);
     try testing.expectEqualStrings("", config.weight_prefix);
-    try testing.expect(!config.has_vision); // the tower is not served
+    try testing.expect(config.has_vision and config.dsv41_vision); // the release's tower, at its own geometry
+    try testing.expectEqual(@as(u32, 129264), config.image_token_id);
+    try testing.expectEqual(@as(u32, 32), config.vision_num_layers);
+    try testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
+    try testing.expectEqual(@as(u32, 16), config.vision_num_heads);
+    try testing.expectEqual(@as(u32, 2816), config.vision_intermediate_size);
+    try testing.expectEqual(@as(u32, 14), config.vision_patch_size);
+    try testing.expectEqual(@as(u32, 3), config.dv_downsample);
+    try testing.expectEqual(@as(u32, 1024), config.dv_max_image_tokens);
+    try testing.expectEqual(@as(u32, 295936), config.dv_min_pixels);
+    try testing.expectEqual(@as(u32, 0), config.dv_max_wh_ratio);
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.vision_rope_theta, 1e-3);
     try testing.expectEqual(@as(u32, 5120), config.hidden_size);
     try testing.expectEqual(@as(u32, 40), config.num_hidden_layers);
     try testing.expectEqual(@as(u32, 512), config.head_dim);
@@ -9120,6 +9321,31 @@ test "parseConfigFromJson explicit affine mode keeps biases" {
     const config = try parseConfigFromJson(testing.allocator, json);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
     try testing.expect(config.quant_mode.hasBiases());
+}
+
+test "parseConfigFromJson refuses an unknown PER-WEIGHT quantization mode by name" {
+    // EigenLabs' Nemotron 3.5 Bolt IQ2: affine at the top, `iq2_xxs` experts underneath. Read as affine the
+    // first request's matmul failed; the load refuses instead.
+    const json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 32, "bits": 8, "mode": "affine",
+        \\    "layers.0.mlp.switch_mlp.fc1": {"group_size": 256, "bits": 2, "mode": "iq2_xxs"}}
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedQuantMode, parseConfigFromJson(testing.allocator, json));
+    // A known per-weight mode beside the top-level one still parses.
+    const ok =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 32, "bits": 8, "mode": "affine",
+        \\    "layers.0.mlp.switch_mlp.fc1": {"group_size": 16, "bits": 4, "mode": "nvfp4"}}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, ok);
+    try testing.expectEqual(QuantMode.affine, config.quant_mode);
 }
 
 test "parseConfigFromJson unknown quantization mode → error" {

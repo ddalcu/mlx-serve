@@ -71,9 +71,9 @@ trap cleanup EXIT
 
 for _ in $(seq 1 90); do
     sleep 1
-    curl -s -m 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+    curl -sf -m 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
 done
-if ! curl -s -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+if ! curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
     echo -e "${RED}FAIL${NC} server did not come up"; tail -20 "$LOG"; exit 1
 fi
 

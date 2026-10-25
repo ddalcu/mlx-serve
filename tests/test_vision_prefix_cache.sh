@@ -27,7 +27,7 @@ check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 U="http://127.0.0.1:$PORT"
-for _ in $(seq 1 600); do curl -s "$U/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
+for _ in $(seq 1 600); do curl -sf "$U/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
 
 mime_for() { case "$1" in *.jpeg|*.jpg) echo image/jpeg;; *.png) echo image/png;; *.webp) echo image/webp;; esac; }
 body() { # $1 image, $2 question

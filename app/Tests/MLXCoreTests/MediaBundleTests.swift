@@ -669,6 +669,39 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
+    func testThePublishedTrellisPacksAreCatalogEntriesThatFetchOnlyWhatTheyServe() {
+        XCTAssertEqual(Model3DModelPreset.trellis2_8bit.repo, "ddalcu/TRELLIS.2-4B-MLX-Serve-8bit")
+        XCTAssertEqual(Model3DModelPreset.pixal3d_8bit.repo, "ddalcu/Pixal3D-MLX-Serve-8bit")
+        for p in [Model3DModelPreset.trellis2_8bit, .pixal3d_8bit] {
+            XCTAssertTrue(Model3DModelPreset.all.contains(p), p.id)
+            XCTAssertFalse(p.isLocalOnly, p.id)
+            XCTAssertEqual(p.bundle.primaryRepo, p.repo)
+            XCTAssertEqual(Set(Model3DModelPreset.all.map(\.id)).count, Model3DModelPreset.all.count)
+        }
+        XCTAssertEqual(Model3DModelPreset.trellis2_8bit.family, .trellis2)
+        XCTAssertEqual(Model3DModelPreset.pixal3d_8bit.family, .pixal3d)
+
+        // Pixal3D: its sparse-structure decoder rides in ckpts/, NAF beside DINOv3. The multi-view models
+        // are not fetched: the pane sends one photo.
+        let comp = Model3DModelPreset.pixal3d_8bit.bundle.components[0]
+        for marker in ["pipeline.json", "dinov3/model.safetensors", "naf/model.safetensors",
+                       "ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
+                       "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+                       "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+                       "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+                       "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+                       "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors",
+                       "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"] {
+            XCTAssertTrue(comp.readyMarkers.contains(marker), "missing readyMarker \(marker)")
+        }
+        XCTAssertFalse(comp.readyMarkers.contains { $0.hasSuffix("_mv.safetensors") })
+        XCTAssertFalse(comp.selection.keepSafetensors?.contains { $0.hasSuffix("_mv.safetensors") } ?? true)
+        // TRELLIS.2 keeps its sparse-structure decoder in the older TRELLIS repo's path, not ckpts/.
+        let t = Model3DModelPreset.trellis2_8bit.bundle.components[0]
+        XCTAssertTrue(t.readyMarkers.contains("microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"))
+        XCTAssertFalse(t.readyMarkers.contains("naf/model.safetensors"))
+    }
+
     func testHunyuanPresetDownloadsFromHF() {
         // Published combined repo — the pane shows the standard download bar,
         // not the "convert locally" hint.

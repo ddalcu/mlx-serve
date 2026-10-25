@@ -290,7 +290,7 @@ enum GenerationField: String, CaseIterable, Identifiable {
         case .topK: description = "Keeps only the k most likely next tokens. Lower values narrow choices; 0 disables this filter."
         case .minP: description = "Minimum probability relative to the most likely token. 0 disables min-p."
         case .repeatPenalty: description = "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding."
-        case .frequencyPenalty: description = "Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control."
+        case .frequencyPenalty: description = "Discourage tokens in proportion to how often they already appeared. 0 disables the penalty."
         case .maxTokens: description = "0 uses remaining context. Context and memory limits still apply."
         case .budget: description = "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. Effort words map against this budget."
         case .thinking: description = "Explicit client thinking or effort wins unless locked."

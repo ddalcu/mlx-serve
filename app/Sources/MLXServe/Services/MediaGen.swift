@@ -163,6 +163,7 @@ enum FluxVariant: String, Hashable, Codable {
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
     case qwenImage21      // Qwen-Image-2.1 block-causal DiT — served by the qwen_image backend; undistilled (40 steps, optional real CFG)
     case qwenImage21Turbo // Qwen-Image-2.1-Turbo — same backend; its pack's 8-sigma grid sets the steps server-side
+    case mossImage        // OpenMOSS MOSS-Image 5B single-stream DiT — served by the moss_image backend; undistilled (50 steps, CFG 3)
 }
 
 struct ImageQualitySettings: Hashable {
@@ -564,6 +565,63 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Qwen-Image 2.1 Turbo quantized to 4-bit for smaller Macs — 8 steps at about half the memory, with some loss of fine detail. Qwen Research License (non-commercial)."
     )
 
+    /// MOSS-Image's card recommends 1, 1.5 or 2 MP at any aspect, multiples
+    /// of 16 (its Gradio grid: `gradio_presets.fit_size`).
+    private static let mossImageResolutions: [ResolutionOption] = [
+        .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        .init(width: 1248, height: 1248, label: "1248 × 1248 (square, 1.5 MP)"),
+        .init(width: 1456, height: 1456, label: "1456 × 1456 (square, 2 MP)"),
+        .init(width: 832,  height: 1248, label: "832 × 1248 (portrait 2:3)"),
+        .init(width: 1248, height: 832,  label: "1248 × 832 (landscape 3:2)"),
+        .init(width: 1360, height: 768,  label: "1360 × 768 (landscape 16:9)"),
+        .init(width: 768,  height: 1360, label: "768 × 1360 (portrait 9:16)"),
+        .init(width: 1936, height: 1088, label: "1936 × 1088 (landscape 16:9, 2 MP)"),
+        .init(width: 1088, height: 1936, label: "1088 × 1936 (portrait 9:16, 2 MP)"),
+        .init(width: 512,  height: 512,  label: "512 × 512 (fastest)"),
+    ]
+
+    private static let mossImageQuality: [QualityPreset: ImageQualitySettings] = [
+        .fast:         .init(steps: 20),
+        .good:         .init(steps: 30),
+        .quality:      .init(steps: 40),
+        .superQuality: .init(steps: 50),
+    ]
+
+    /// MOSS-Image SFT, 8-bit (`tests/convert_moss_image_weights.py`): the DiT
+    /// blocks and the text encoder quantized, renders matching bf16 at the same seed.
+    static let mossImageSFT_8bit = ImageModelPreset(
+        id: "ddalcu/moss-image-sft-8bit",
+        name: "MOSS-Image SFT 8-bit (~15 GB)",
+        variant: .mossImage,
+        configName: "moss_image",
+        repo: "ddalcu/MOSS-Image-SFT-MLX-Serve-8bit",
+        approxDownloadGB: 15,
+        approxRAMGB: 21,
+        resolutions: mossImageResolutions,
+        defaultResolution: mossImageResolutions[0],
+        qualityProfiles: mossImageQuality,
+        defaultQuality: .superQuality,
+        description: "MOSS-Image quantized to 8-bit for smaller Macs: the same 50-step model at about half the memory, with renders matching bf16. Open (Apache-2.0)."
+    )
+
+    /// OpenMOSS MOSS-Image SFT, bf16 (the mlx-community mirror of the release's
+    /// diffusers tree). The Qwen3.5-9B text encoder stays resident beside the
+    /// 5B DiT.
+    static let mossImageSFT_bf16 = ImageModelPreset(
+        id: "mlx-community/moss-image-sft-bf16",
+        name: "MOSS-Image SFT bf16 (~27 GB)",
+        variant: .mossImage,
+        configName: "moss_image",
+        repo: "mlx-community/MOSS-Image-SFT-bf16",
+        approxDownloadGB: 27,
+        approxRAMGB: 33,
+        resolutions: mossImageResolutions,
+        defaultResolution: mossImageResolutions[0],
+        qualityProfiles: mossImageQuality,
+        defaultQuality: .superQuality,
+        description: "OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)."
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
@@ -574,8 +632,10 @@ struct ImageModelPreset: Identifiable, Hashable {
         .qwenImage21_4bit,                             // 10
         .qwenImage21Turbo_4bit,                        // 11
         .krea2Turbo,                                   // 15
+        .mossImageSFT_8bit,                            // 15
         .qwenImage21_8bit,                             // 18
         .qwenImage21Turbo_8bit,                        // 18
+        .mossImageSFT_bf16,                            // 27
     ]
 }
 
@@ -677,6 +737,9 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// reference has no keyframe row to anchor, so on H3 this rides the same
     /// partition complement as Turbo and chaining.
     var supportsLastFrame: Bool = false
+    /// A distilled student's trained step count, the only one the server accepts: the pane shows
+    /// it as a fact instead of a slider. nil = a range to choose from.
+    var fixedSteps: Int? { stepsRange.count == 1 ? stepsRange.lowerBound : nil }
     /// Denoising-step range the Steps slider offers. LTX's is the default; a
     /// backend whose floor is higher declares it, because a slider that goes
     /// somewhere the model does not work is a dead range, not a fast option.
@@ -736,6 +799,9 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// The frame model is not that: rounding 22.8 up to 26 costs a 32 GB Mac
     /// the 4-bit pack it exists for. 0 falls back to `approxRAMGB`.
     var stagedPeakGB: Double = 0
+    /// One denoising step's cost against the dense H3 step the time model is fitted on (FastH3
+    /// Omni's trained sparse attention). Read only by `H3TimeEstimate`.
+    var stepCostScale: Double = 1.0
     /// The pack carries its OWN text encoder. LTX 2.3 borrows the shared
     /// `mlx-community/gemma-3-12b-it-4bit` download (also a chat model, so it
     /// is a separate bundle component); 2.5 ships a Lightricks fine-tune of
@@ -1125,7 +1191,9 @@ struct VideoModelPreset: Identifiable, Hashable {
     private static func minimaxH3Preset(repo: String, name: String,
                                         downloadGB: Int, ramGB: Int, ditGB: Double, stagedGB: Double,
                                         description: String,
-                                        supportsReferences: Bool = false) -> VideoModelPreset {
+                                        supportsReferences: Bool = false,
+                                        trainedSteps: Int? = nil,
+                                        stepCostScale: Double = 1.0) -> VideoModelPreset {
         // The model's own range: MiniMax states 4-15 s at 24 fps, and the
         // reference node's trained range is ~124-362 on the 17k+5 ladder. The
         // SLIDER goes down to the engine's floor anyway and warns below the
@@ -1151,6 +1219,10 @@ struct VideoModelPreset: Identifiable, Hashable {
         // must not silently start one — the user gets there by moving the
         // slider, with the estimate under it saying what it costs.
         let tierMax = 209
+        // A distilled student runs its trained count on every tier; its tiers pick the trained
+        // clip lengths (5, 10, 15 s) instead.
+        let tierSteps = { (full: Int) in trainedSteps ?? full }
+        let tierFrames = { (full: Int, distilled: Int) in trainedSteps == nil ? full : distilled }
         return VideoModelPreset(
             id: repo,
             name: name,
@@ -1169,10 +1241,10 @@ struct VideoModelPreset: Identifiable, Hashable {
             // .good = the eyeballed capstone A/B; .quality = the rap demo's
             // longer 209-frame run.
             qualityProfiles: [
-                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMin),
-                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMin),
-                .quality:      .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMax),
-                .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMax),
+                .fast:         .init(mode: .oneStage, steps: tierSteps(16), cfgScale: 1.0, stgScale: 0.0, numFrames: tierMin),
+                .good:         .init(mode: .oneStage, steps: tierSteps(30), cfgScale: 1.0, stgScale: 0.0, numFrames: tierMin),
+                .quality:      .init(mode: .oneStage, steps: tierSteps(30), cfgScale: 1.0, stgScale: 0.0, numFrames: tierFrames(tierMax, 243)),
+                .superQuality: .init(mode: .oneStage, steps: tierSteps(50), cfgScale: 1.0, stgScale: 0.0, numFrames: tierFrames(tierMax, cap)),
             ],
             defaultQuality: .good,
             maxFrames: cap,
@@ -1188,7 +1260,8 @@ struct VideoModelPreset: Identifiable, Hashable {
             supportsPipelineModes: false,
             supportsAudioInput: false,
             generatesAudio: true,
-            supportsFastRecipe: true,
+            // The server keeps the recipe off on a distilled student: it skips trained steps.
+            supportsFastRecipe: trainedSteps == nil,
             supportsReferences: supportsReferences,
             // Turbo and chaining both ride fl2va machinery (the LoRA is
             // untested on the REF2VA DiT; a reference has no keyframe row to
@@ -1207,14 +1280,16 @@ struct VideoModelPreset: Identifiable, Hashable {
             // fast recipe's warmup and tail windows still cover the whole
             // schedule, so an undistilled run there pays full price per step
             // while looking like the cheap option — which is what the note says.
-            stepsRange: 4...50,
-            stepsHelp: "More steps mean more detail and steadier motion, and cost time in direct proportion. 16 is the fast tier, 30 is the default, 50 is for a final render. Fewer than 16 only works with a distilled few-step adapter.",
-            testedStepsFloor: 16,
+            stepsRange: trainedSteps.map { $0...$0 } ?? 4...50,
+            stepsHelp: trainedSteps.map { "This model is distilled to run exactly \($0) steps; it takes no other count." }
+                ?? "More steps mean more detail and steadier motion, and cost time in direct proportion. 16 is the fast tier, 30 is the default, 50 is for a final render. Fewer than 16 only works with a distilled few-step adapter.",
+            testedStepsFloor: trainedSteps == nil ? 16 : 0,
             testedStepsFloorNote: "Under 16 steps this model needs a distilled few-step adapter — the engine-owned Turbo LoRA, or a community one attached under Style LoRAs. Without one the picture is rough and the soundtrack usually comes out garbled, and the fast recipe means those steps are not much cheaper each.",
             testedFrameFloor: statedMin,
             testedFrameFloorNote: "below MiniMax's stated 4-second minimum. Good for trying a prompt or a step count cheaply; motion and the soundtrack degrade outside the trained range.",
             ditResidentGB: ditGB,
-            stagedPeakGB: stagedGB
+            stagedPeakGB: stagedGB,
+            stepCostScale: stepCostScale
         )
     }
 
@@ -1255,9 +1330,25 @@ struct VideoModelPreset: Identifiable, Hashable {
         supportsReferences: true
     )
 
+    /// FastVideo's 8-step PDD student of REF2VA: the same references and soundtrack in 8 steps
+    /// instead of 30, each a little cheaper for its trained sparse attention. It needs at least one
+    /// image or video reference (no text-only video) and has no Turbo, chaining or fast recipe.
+    static let fastH3Omni: VideoModelPreset = minimaxH3Preset(
+        repo: "ddalcu/FastH3-Omni-MLX-Serve-8bit",
+        name: "FastH3 Omni 8-bit — references + native audio in 8 steps",
+        downloadGB: 71,
+        ramGB: 46,
+        ditGB: 22.07,
+        stagedGB: 40.15,
+        description: "FastVideo's 8-step distillation of MiniMax-H3 REF2VA: video with a matching stereo soundtrack that follows your reference images, clips and audio, several times faster than the full model. Attach at least one image or video and refer to it in the prompt as <Picture 1> or <Video 1>; it cannot generate from text alone. It was trained on 5, 10 and 15 second clips.",
+        supportsReferences: true,
+        trainedSteps: 8,
+        stepCostScale: 0.85
+    )
+
     // 8-bit first: it is the one to reach for on a Mac that can hold it, and
     // the picker features the first entry of each capability group.
-    static let all: [VideoModelPreset] = [.ltx25Q8, .ltx25Q4, .ltx23Q4, .minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA]
+    static let all: [VideoModelPreset] = [.ltx25Q8, .ltx25Q4, .ltx23Q4, .minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA, .fastH3Omni]
 }
 
 // MARK: - Audio presets (TTS / voice cloning)
@@ -1419,9 +1510,18 @@ struct Model3DModelPreset: Identifiable, Hashable {
     let approxRAMGB: Int
     /// Full bundle download size, GB (shape + paint).
     let approxDownloadGB: Double
+    /// Which backend answers `/v1/3d/generations` for this checkpoint; it decides the request fields,
+    /// the pane's controls and how the photo is cut out.
+    var family: Model3DFamily = .hunyuan3d
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    /// The 1536 cascade peaks well above the 1024 one. Pixal3D shares the cascade; its peak is TRELLIS.2's, not
+    /// separately measured.
+    func approxRAMGB(trellisResolution: Int) -> Int {
+        family.hasCascadeControls && trellisResolution >= 1536 ? 35 : approxRAMGB
+    }
 
     /// True when the model has no published HF repo yet and must be converted
     /// locally — the pane shows a "convert locally" hint instead of a download
@@ -1437,8 +1537,74 @@ struct Model3DModelPreset: Identifiable, Hashable {
         approxDownloadGB: 8.5
     )
 
-    /// Catalog. One entry today; grows as more 3D checkpoints convert.
-    static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
+    /// TRELLIS.2-4B, 8-bit. The pane downloads the single-view set: 8.2 GB of the repo's 9.6.
+    static let trellis2_8bit = Model3DModelPreset(
+        id: "trellis2-8bit", name: "TRELLIS.2 (8-bit)", repo: "ddalcu/TRELLIS.2-4B-MLX-Serve-8bit",
+        approxRAMGB: 22, approxDownloadGB: 8.2, family: .trellis2)
+
+    /// Pixal3D, 8-bit. The pane downloads the single-view set: 8.7 GB of the repo's 14.8 (the rest is multi-view).
+    static let pixal3d_8bit = Model3DModelPreset(
+        id: "pixal3d-8bit", name: "Pixal3D (8-bit)", repo: "ddalcu/Pixal3D-MLX-Serve-8bit",
+        approxRAMGB: 22, approxDownloadGB: 8.7, family: .pixal3d)
+
+    /// Family templates for a pack on disk: it joins the picker through `CustomMediaModels`, synthesized from these.
+    static let trellis2Family = Model3DModelPreset(
+        id: "trellis2", name: "TRELLIS.2", repo: "", approxRAMGB: 22, approxDownloadGB: 0, family: .trellis2)
+    static let pixal3dFamily = Model3DModelPreset(
+        id: "pixal3d", name: "Pixal3D", repo: "", approxRAMGB: 22, approxDownloadGB: 0, family: .pixal3d)
+
+    /// Catalog. Order matters: the picker leads with the first of the largest that fits (`MediaModelPicks.featured`).
+    static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit, .trellis2_8bit, .pixal3d_8bit]
+}
+
+/// The 3D backends behind one endpoint. They share `image` and `seed` and nothing else.
+enum Model3DFamily: Hashable {
+    case hunyuan3d, trellis2, pixal3d
+
+    /// Hunyuan3D textures in a separate paint pass; TRELLIS.2 and Pixal3D always texture.
+    var hasPaintStage: Bool { self == .hunyuan3d }
+
+    /// TRELLIS.2 and Pixal3D read the cutout's alpha as the subject (a white background would become part of
+    /// the object); Hunyuan3D composites on white itself.
+    var cutoutKeepsAlpha: Bool { self != .hunyuan3d }
+
+    /// TRELLIS.2 and Pixal3D share one cascade and its request fields: resolution, faces, texture size, finish.
+    var hasCascadeControls: Bool { self != .hunyuan3d }
+}
+
+/// How shiny a TRELLIS.2 or Pixal3D model looks. The model predicts one roughness per texel and its map is
+/// nearly flat (paint, trim and wheels all about 0.58), so a finish scales the whole map and adds a clearcoat
+/// rather than guessing which part is paint. Raw values are what the pane persists.
+enum Model3DFinish: String, CaseIterable, Codable {
+    case model, satin, glossy, carPaint
+
+    /// The server's `roughness_scale`: 1 keeps the model's roughness, below 1 is glossier.
+    var roughnessScale: Double {
+        switch self {
+        case .model: 1.0
+        case .satin: 0.7
+        case .glossy: 0.5
+        case .carPaint: 0.4
+        }
+    }
+
+    /// The server's `clearcoat` strength, 0 for none.
+    var clearcoat: Double {
+        switch self {
+        case .model, .satin: 0
+        case .glossy: 0.5
+        case .carPaint: 1.0
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .model: "As generated"
+        case .satin: "Satin"
+        case .glossy: "Glossy"
+        case .carPaint: "Car paint"
+        }
+    }
 }
 
 /// Which music ENGINE a checkpoint drives. The families share the
@@ -2192,9 +2358,9 @@ struct ImageGenRequest {
     /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
     /// Empty = none. Rows with an empty `path` are dropped before sending.
     var loras: [LoraAdapter] = []
-    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only):
-    /// 1.0 = off, matching the server default.
-    var guidanceScale: Double = 1.0
+    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only);
+    /// nil = the backend's own default (`defaultGuidance`).
+    var guidanceScale: Double? = nil
     /// What to steer AWAY from — only meaningful alongside `guidanceScale`
     /// != 1.0. Empty = the server's own unconditioning (empty-string prompt).
     var negativePrompt: String = ""
@@ -2208,7 +2374,7 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo: return 0
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo, .mossImage: return 0
         default: return 3
         }
     }
@@ -2220,7 +2386,7 @@ extension ImageModelPreset {
         switch variant {
         // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
         // with a ×16 VAE downsample and shares the same clamp server-side.
-        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
+        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo, .mossImage:
             return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
         // widest preset edge.
@@ -2237,7 +2403,7 @@ extension ImageModelPreset {
         switch variant {
         case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
             return true
-        case .krea2Turbo, .mageFlowTurbo:
+        case .krea2Turbo, .mageFlowTurbo, .mossImage:
             return false
         }
     }
@@ -2260,7 +2426,17 @@ extension ImageModelPreset {
     /// Qwen-Image-2.1 is undistilled too: 1.0 (its recommended default) runs
     /// one forward per step, anything else two.
     var supportsGuidance: Bool {
-        variant == .flux2Klein9BBase || variant == .qwenImage21
+        variant == .flux2Klein9BBase || variant == .qwenImage21 || variant == .mossImage
+    }
+
+    /// The server's `guidance_scale` when the request omits it
+    /// (`gen.ImageEngine.defaultGuidance`): MOSS-Image's authors run CFG 3.
+    var defaultGuidance: Double { variant == .mossImage ? 3.0 : 1.0 }
+
+    /// The negative tags MOSS-Image's guide recommends; the pane pre-fills them
+    /// and chat generations send them.
+    var defaultNegativePrompt: String {
+        variant == .mossImage ? "nsfw, worst quality, bad anatomy, watermark, jpeg artifact" : ""
     }
 
     // ── Capability flags: what the Advanced panel is allowed to offer ──
@@ -2273,7 +2449,7 @@ extension ImageModelPreset {
     /// all: sending a source without `mode:"edit"` is a 400.
     var supportsImg2Img: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .mossImage: return false
         default: return true
         }
     }
@@ -2314,6 +2490,7 @@ extension ImageModelPreset {
     /// is to be shown the sentence that does it.
     func promptExamples(editing: Bool) -> [ImagePromptExampleGroup] {
         guard editing && supportsReferenceEdit else {
+            if variant == .mossImage { return ImagePromptExamples.textToImage + [ImagePromptExamples.mossImage] }
             return rendersDenseText ? ImagePromptExamples.textToImage + [ImagePromptExamples.infographics]
                                     : ImagePromptExamples.textToImage
         }
@@ -2602,6 +2779,14 @@ struct Model3DGenRequest {
     /// Run the P2 paint stage (full PBR texture) after shape generation.
     /// Off by default until the paint port is validated end to end.
     var texture: Bool = false
+    /// TRELLIS.2 only: the cascade resolution (1024, or 1536 for a finer mesh).
+    var trellisResolution: Int = 1024
+    /// TRELLIS.2 only: faces kept after decimation.
+    var decimationTarget: Int = 300_000
+    /// TRELLIS.2 only: side of the baked texture, pixels.
+    var textureSize: Int = 2048
+    /// TRELLIS.2 and Pixal3D: how shiny the model looks (`.model` sends nothing).
+    var finish: Model3DFinish = .model
 }
 
 // MARK: - RAM checks
