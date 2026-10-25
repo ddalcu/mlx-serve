@@ -313,6 +313,8 @@ Settings that follow the MODEL instead of the process. The server reads the file
 
 ## Observability (`--metrics`) + optional API key (`--api-key`)
 
+The native app’s Monitoring workspace reads `/metrics.json` and `/v1/models` from the active local endpoint. Its app-lifetime collector keeps 24 hours in Application Support/MLX Core/monitor-history.json, partitioned by endpoint; restart/reset and failed polls break chart continuity. Only the monitoring view observes samples. Storage keeps the eight most recent endpoint histories and rejects archives above 32 MiB. The native reader uses the current JSON contract; missing optional fields remain unknown. Request history describes observations, not completion outcomes, and contains no message content or keys.
+
 Opt-in, performance-safe. Design contract: **zero cost when off** (a single `?*Metrics` null-check per REQUEST at `finishSlot`, never per token), negligible when on (per-request relaxed atomic adds off the decode path + a 2 s gauge sampler thread).
 
 - **Core** (`src/metrics.zig`): lock-free `Counter`/`Gauge`/`Histogram` (all `.monotonic`). `renderPrometheus` emits `vllm:` (standard — drop-in vLLM/Grafana dashboards) + `mlx_serve:` (Apple-specific: GPU%, memory, live tok/s) names; `renderJson` feeds the index panel. `Metrics.recordRequest(outcome, ...)` runs once per slot, on the inference thread, from `scheduler.finishSlot` or the cleanup drain (first one wins; success ⇒ all histograms/counters; `cancelled` ⇒ only `requests_cancelled_total`, including a disconnect mid-decode; `failed` ⇒ only `mlx_serve:request_failed_total`). A request refused before it owns a slot (context overflow, memory preflight) counts in `mlx_serve:request_rejected_total` via `Metrics.recordRejected`.

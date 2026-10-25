@@ -7,6 +7,7 @@
 - **模型浏览器** —— 从 HuggingFace 下载，支持断点续传的多连接传输（每个文件最多 16 个连接），自动发现 LM Studio 已有的模型文件夹（`~/.lmstudio/settings.json`）和你的 Hugging Face 缓存（`HF_HOME` / `HF_HUB_CACHE` 指向哪里就找哪里），这样磁盘上已有的内容不会再下载一遍，GGUF 行会显示一个 RAM 估算的最小–最大区间。多版本仓库让你自己挑量化版本，**设置 ▸ 模型文件夹**决定下载落到哪里。
 - **无需重启即可切换模型** —— 选中一个聊天模型会把它加载进正在运行的服务器并设为默认（通过 API 调用 `POST /v1/load-model`，带上 `"default": true`）。
 - **聊天界面** —— 多会话聊天，带 markdown 渲染。可以随文本一起放入 PDF（由 PDFKit 提取）或图像。
+- **监控** —— 点击“任务”下方的“监控”，查看原生实时指标、图表、会话、请求观测记录和模型状态。应用运行期间持续采集；提供实时、10 分钟、30 分钟、1 小时和 24 小时视图，按服务器在本地保留最多 24 小时历史。需在服务器设置中启用指标。浏览器历史独立保存；不会记录提示词、响应或 API 密钥。
 - **Agent 模式** —— 10 个内置工具（shell、cwd、readFile、writeFile、editFile、searchFiles、listFiles、browse、webSearch、saveMemory），带自动工具调用循环和逐工具审批对话框（**允许** / **拒绝** / **本次会话始终允许**）。
 - **Agents** —— 具名助手，各自拥有性格、音色、模型、工具、工作区和唤醒词，以及各自固定的采样参数（temperature、top-p、top-k、惩罚项、推理预算）。应用会替你写好人设提示词，而且每一种发起对话的方式都能以某个 Agent 运行：聊天标签页、免手操作语音、定时任务、Telegram、快速启动器。
 - **MCP 客户端** —— 精选的 stdio + HTTP MCP 服务器市场（GitHub、Azure DevOps、DBHub、Docker、Kubernetes、Playwright、Slack、Notion、Filesystem、Shell），另外你还可以通过 `~/.mlx-serve/mcp.json` 添加自己的服务器。

@@ -48,6 +48,8 @@ Agent loop: tools → parse → exec → feed back; history builder is budget-aw
 
 ## Rules
 
+- Monitoring owns app-lifetime collection and endpoint-scoped history; only its pane observes sample changes. File I/O stays on the persistence queue; failed polls and counter resets break chart continuity. Guards: `MonitoringTests`, `MonitoringStoreTests`.
+
 - **IME composition and a recovered steering note have separate owners**: keep paused notes in the app-level engine until the composer has committed or cancelled its marked text. Restore after the binding update; neither redraw nor window removal may consume the note. Guards: `SteeringNotesTests`, `ComposerMarkedTextTests`; detail: `../docs/gotchas/app.md`.
 
 - **History images ride every turn where the server preprocesses** (`buildAgentHistory(historyImages:)`, plain chat twin): the server renders each image where it was sent. Gemma's `x-mlx-pixels` stays latest-only: ~9 MB an image against the server's 512 MB body cap. Guard: `AgentHistoryImagesTests`.
