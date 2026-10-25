@@ -116,11 +116,11 @@ pub const Tokenizer = struct {
     /// The special a `TemplateProcessing` post-processor appends after a single sequence
     /// (Qwen3-Embedding's `<|endoftext|>`); `encode` never adds it, a last-token pooler must.
     appended_special: ?u32 = null,
-    /// Decode-only marker aliases (K2-Horizon): the `<ifm|…>` think and tool
+    /// Decode-only marker aliases (K2-Horizon and MiniMax): native think and tool
     /// markers decode as the canonical `<think>` / GLM tag spellings every
     /// downstream parser reads. Encoding keeps the checkpoint's own bytes.
     marker_aliases: ?std.AutoHashMap(u32, []const u8) = null,
-    /// K2 think opener id -> its own closer id (three pairs, one per effort).
+    /// Native think opener id -> its matching native closer id.
     marker_closers: ?std.AutoHashMap(u32, u32) = null,
     /// Byte-to-unicode mapping for byte-level BPE (256 entries, index = byte value)
     byte_to_unicode: [256]u21,
@@ -358,13 +358,10 @@ pub const Tokenizer = struct {
         return self.special_tokens.get(name);
     }
 
-    /// K2-Horizon spells the think block and the GLM tool tags with an `ifm|`
-    /// prefix, one special token each; three think variants (one per effort)
-    /// all read as `<think>`. Installed when the vocabulary carries the family
-    /// marker; false otherwise.
+    /// Native markers decode to the shared parser's spelling; encoding retains
+    /// the checkpoint's bytes, including its matching reasoning closer.
     pub fn installMarkerAliases(self: *Tokenizer) bool {
-        const family_marker = "<ifm|think>";
-        if (self.special_tokens.get(family_marker) == null) return false;
+        if (self.special_tokens.get("<ifm|think>") == null and self.special_tokens.get("<mm:think>") == null) return false;
         var map = std.AutoHashMap(u32, []const u8).init(self.allocator);
         errdefer map.deinit();
         const pairs = [_][2][]const u8{
@@ -375,6 +372,7 @@ pub const Tokenizer = struct {
             .{ "<ifm|tool_call>", "<tool_call>" },      .{ "</ifm|tool_call>", "</tool_call>" },
             .{ "<ifm|arg_key>", "<arg_key>" },          .{ "</ifm|arg_key>", "</arg_key>" },
             .{ "<ifm|arg_value>", "<arg_value>" },      .{ "</ifm|arg_value>", "</arg_value>" },
+            .{ "<mm:think>", "<think>" },              .{ "</mm:think>", "</think>" },
         };
         for (pairs) |pair| {
             if (self.special_tokens.get(pair[0])) |id| map.put(id, pair[1]) catch return false;
@@ -385,6 +383,7 @@ pub const Tokenizer = struct {
             .{ "<ifm|think>", "</ifm|think>" },
             .{ "<ifm|think_fast>", "</ifm|think_fast>" },
             .{ "<ifm|think_faster>", "</ifm|think_faster>" },
+            .{ "<mm:think>", "</mm:think>" },
         }) |pair| {
             const open = self.special_tokens.get(pair[0]) orelse continue;
             const close = self.special_tokens.get(pair[1]) orelse continue;
@@ -395,7 +394,7 @@ pub const Tokenizer = struct {
         return true;
     }
 
-    /// The atomic closer paired with a K2 think opener id; null for every other id.
+    /// The atomic closer paired with a native think opener id.
     pub fn markerCloserFor(self: *const Tokenizer, opener_id: u32) ?u32 {
         const m = self.marker_closers orelse return null;
         return m.get(opener_id);
@@ -1779,7 +1778,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .eos_id = eos_id,
         .parsed_json = parsed,
     };
-    if (built.installMarkerAliases()) log.info("Tokenizer: K2-Horizon markers alias to <think> / GLM tool tags\n", .{});
+    if (built.installMarkerAliases()) log.info("Tokenizer: native markers alias to canonical reasoning / tool tags\n", .{});
     return built;
 }
 
@@ -3339,6 +3338,29 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     try testing.expectEqual(@as(?u32, 5), tok.markerCloserFor(4));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(6));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(1));
+}
+
+test "MiniMax native reasoning decodes canonically and encodes its original markers" {
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    for ([_]struct { text: []const u8, id: u32 }{
+        .{ .text = "<think>", .id = 200050 }, .{ .text = "</think>", .id = 200051 },
+        .{ .text = "<mm:think>", .id = 200059 }, .{ .text = "</mm:think>", .id = 200060 },
+    }) |entry| {
+        try tok.id_to_token.put(entry.id, entry.text);
+        try tok.special_tokens.put(try a.dupe(u8, entry.text), entry.id);
+    }
+    try tok.id_to_token.put(1, "reason");
+    try testing.expect(tok.installMarkerAliases());
+    const decoded = try tok.decode(a, &.{ 200059, 1, 200060 }, false);
+    defer a.free(decoded);
+    try testing.expectEqualStrings("<think>reason</think>", decoded);
+    const encoded = try tok.encode(a, "<mm:think></mm:think>");
+    defer a.free(encoded);
+    try testing.expectEqualSlices(u32, &.{ 200059, 200060 }, encoded);
+    try testing.expectEqual(@as(?u32, 200060), tok.markerCloserFor(200059));
+    try testing.expectEqual(@as(?u32, 200051), tok.specialTokenId("</think>"));
 }
 
 test "tiktoken rank file encodes through the merges it implies" {

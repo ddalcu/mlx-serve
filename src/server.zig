@@ -1320,12 +1320,13 @@ fn thinkBoundBudget(budget: i32) u32 {
 /// allocated; the caller frees it after generation.
 fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?generate_mod.ThinkBound {
     if (!enable_thinking or lm.transformer == null) return null;
+    const opener = tok.specialTokenId("<mm:think>") orelse atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
     const closer = promptOpenerMarkerCloser(allocator, lm, tok, prompt_ids) orelse
+        (if (opener) |id| tok.markerCloserFor(id) else null) orelse
         atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
         if (budget >= 0) log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
         return null;
     };
-    const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
     const opened = promptOpensThink(allocator, lm, tok, prompt_ids);
     if (opener == null and !opened) return null;
 
@@ -1381,6 +1382,10 @@ fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *c
 /// A generated tag needs one unambiguous literal spelling in the template.
 /// Dynamic or conflicting spellings retain the unsupported-format fallback.
 fn templateThinkOpener(template: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, template, "<mm:think>") != null) {
+        if (std.mem.indexOf(u8, template, "<think>") != null or std.mem.indexOf(u8, template, "<think:") != null) return null;
+        return "<mm:think>";
+    }
     var found: ?[]const u8 = null;
     var offset: usize = 0;
     while (std.mem.indexOfPos(u8, template, offset, "<think")) |start| {
@@ -1467,7 +1472,7 @@ fn resolveReasoningProtocol(
             },
             .none => {
                 const opener = templateThinkOpener(template) orelse return false;
-                proto.kind = if (std.mem.eql(u8, opener, rp_mod.BARE_THINK_OPENER)) .bare_think else .suffixed_think;
+                proto.kind = if (std.mem.eql(u8, opener, rp_mod.BARE_THINK_OPENER) or std.mem.eql(u8, opener, "<mm:think>")) .bare_think else .suffixed_think;
                 var closer_buf: [rp_mod.MAX_MARKER_BYTES]u8 = undefined;
                 const close = std.fmt.bufPrint(&closer_buf, "</{s}", .{opener[1..]}) catch return false;
                 if (!proto.setOpener(opener) or !proto.setCloser(close)) return false;
@@ -28017,6 +28022,20 @@ test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expect(templateThinkOpener("<think> <think:opensource>") == null);
     try std.testing.expect(templateThinkOpener("<think:{{ suffix }}>") == null);
     try std.testing.expect(templateThinkOpener("assistant") == null);
+}
+
+test "MiniMax adaptive reasoning resolves its native opener beside thinking instructions" {
+    const template = "{%- set think_begin_token = '<mm:think>' -%}{%- set think_end_token = '</mm:think>' -%}<thinking_instructions>adaptive</thinking_instructions>";
+    const opener = templateThinkOpener(template).?;
+    try std.testing.expectEqualStrings("<mm:think>", opener);
+    var proto = rp_mod.Protocol{ .kind = .bare_think, .opener_atomic = 200059, .closer_atomic = 200060 };
+    try std.testing.expect(proto.setOpener(opener));
+    try std.testing.expect(proto.setCloser("</mm:think>"));
+    var state = proto.startState();
+    _ = rp_mod.observeChoice(&proto, &state, 200059, null);
+    try std.testing.expect(rp_mod.observeReasoningToken(&proto, &state, 200051, null) == null);
+    try std.testing.expect(rp_mod.observeReasoningToken(&proto, &state, 200060, null) != null);
+    try std.testing.expect(templateThinkOpener("<mm:think><think>") == null);
 }
 
 test "defaultPrefixCacheAsk: an unnamed budget holds one session at the working context, never under 2 GB" {
