@@ -593,6 +593,8 @@ pub const Slot = struct {
     /// everything from here on is the loop. Non-streaming responses are cut
     /// here so the client cannot round-trip the loop into the next prompt.
     loop_trim_start: ?usize,
+    /// The output has opened a tool call (`toolCallHoldsCut`); sticky.
+    tool_call_opened: bool = false,
     cancelled: std.atomic.Value(bool),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
@@ -7089,6 +7091,24 @@ pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 
+/// A file written through a tool can repeat one long block, and a cut drops the whole
+/// call: the recurring-span tier abstains once the answer has opened one.
+pub fn spanCutYieldsToToolCall(tier: generate_mod.DegenerateTail.Tier, has_tools: bool, text: []const u8) bool {
+    if (tier != .recurring_span or !has_tools) return false;
+    return chat_mod.trimLeakedToolMarkup(text).len < text.len;
+}
+
+/// `spanCutYieldsToToolCall` over the slot's output; an opened call stays opened.
+fn toolCallHoldsCut(slot: *Slot, gen: *Generator, tier: generate_mod.DegenerateTail.Tier) bool {
+    if (tier != .recurring_span or !slot.has_tools) return false;
+    if (slot.tool_call_opened) return true;
+    const tok = slot.model.tokenizer orelse return false;
+    const text = tok.decode(slot.allocator, gen.generated_ids.items, false) catch return false;
+    defer slot.allocator.free(text);
+    slot.tool_call_opened = spanCutYieldsToToolCall(tier, true, text);
+    return slot.tool_call_opened;
+}
+
 const LoopAction = enum { cut, close_thought };
 
 /// A loop convicted INSIDE an open think block is recoverable once per request:
@@ -9257,7 +9277,8 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
     const loop_guard_start = gen.loopGuardStart();
-    if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+    if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| cut: {
+        if (toolCallHoldsCut(slot, gen, relative_stop.tier)) break :cut;
         if (gen.hasPrePayloadConstraint()) {
             switch (try gen.forceConstraintTransition(slot.allocator)) {
                 .committed => |boundary| {
@@ -11915,6 +11936,29 @@ test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
     try ids.appendSlice(testing.allocator, &cycle);
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
     try testing.expectEqualStrings("stop", reason);
+}
+
+test "a recurring-span cut yields to an open tool call, and only that tier does" {
+    // A tool call writing records that share one long block, past the span bar.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    var value: u32 = 9000;
+    while (ids.items.len < generate_mod.near_repeat_min_span + 400) {
+        for (0..120) |i| try ids.append(testing.allocator, 500 + @as(u32, @intCast(i)));
+        for (0..10) |_| {
+            value += 1;
+            try ids.append(testing.allocator, value);
+        }
+    }
+    const stop = loopStopDecision(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqual(generate_mod.DegenerateTail.Tier.recurring_span, stop.tier);
+
+    const call = "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"content\": \"{\\\"id\\\": 1,";
+    try testing.expect(spanCutYieldsToToolCall(stop.tier, true, call));
+    try testing.expect(!spanCutYieldsToToolCall(stop.tier, true, "The same paragraph again."));
+    try testing.expect(!spanCutYieldsToToolCall(stop.tier, false, call));
+    try testing.expect(!spanCutYieldsToToolCall(.exact_cycle, true, call));
+    try testing.expect(!spanCutYieldsToToolCall(.near_repeat, true, call));
 }
 
 test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {

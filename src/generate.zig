@@ -14789,22 +14789,26 @@ fn halfNovelty(window: []const u32, n: usize) f32 {
     return @as(f32, @floatFromInt(novel)) / @as(f32, @floatFromInt(distinct_second));
 }
 
-// Tier 4 (#846): a restatement loop with a FIXED head and a reworded tail. The
-// tail keeps the novelty ratio in the healthy band, and no novelty bar
-// separates it from procedural code. What the head does, and
-// honest output does not, is recur VERBATIM as a long passage: the span is
-// longer than the long exact tier's reach, and it must carry a real
-// vocabulary, so identical rows of a low-entropy file never count.
+// Tier 4: a long tail span recurring verbatim. It must carry a vocabulary, so
+// identical rows of a low-entropy file never count.
 pub const recurring_span_len: usize = 96;
 pub const recurring_span_reps: usize = 12;
 pub const recurring_span_min_distinct: usize = 24;
+/// The guard runs once per tick, so every tail end one tick can commit is checked.
+pub const recurring_span_reach: usize = MAX_ROUND_DRAFTS + 1;
 
-/// Where a tail span recurring `recurring_span_reps` times begins its SECOND
-/// copy (one copy is kept, as the exact tiers do), or null. The copies must
-/// cover `near_repeat_min_span`: a file that repeats a block ends, a loop does not.
+/// Where a recurring tail span begins its SECOND copy (one copy is kept), or null.
 fn recurringSpanStart(tokens: []const u32) ?usize {
+    var end = tokens.len;
+    while (end + recurring_span_reach > tokens.len and end >= near_repeat_min_span) : (end -= 1) {
+        if (recurringSpanEndingAt(tokens[0..end])) |s| return s;
+    }
+    return null;
+}
+
+/// The copies must cover `near_repeat_min_span`: a file that repeats a block ends, a loop does not.
+fn recurringSpanEndingAt(tokens: []const u32) ?usize {
     const L = recurring_span_len;
-    if (tokens.len < near_repeat_min_span) return null;
     const span = tokens[tokens.len - L ..];
     var distinct = DistinctSet(L * 2){};
     for (span) |t| _ = distinct.insert(t);
@@ -17129,13 +17133,14 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
 }
 
 /// #846's shape: a fixed ~130-token head, then a tail reworded on every copy.
-fn tFixedHeadLoop(al: std.mem.Allocator, ids: *std.ArrayList(u32), n: usize, first_tail: *usize) !void {
+/// Tail lengths step by 8, so a 97-token head makes every copy a multiple of 8 long.
+fn tFixedHeadLoop(al: std.mem.Allocator, ids: *std.ArrayList(u32), n: usize, head_len: usize, first_tail: *usize) !void {
     var rng: u32 = 4242;
     var copies: usize = 0;
     while (ids.items.len < n) : (copies += 1) {
-        for (0..130) |i| try ids.append(al, 2000 + @as(u32, @intCast((i * 7) % 60)));
+        for (0..head_len) |i| try ids.append(al, 2000 + @as(u32, @intCast((i * 7) % 60)));
         rng = rng *% 1664525 +% 1013904223;
-        const tail_len = 20 + (rng >> 16) % 100;
+        const tail_len = 23 + 8 * ((rng >> 16) % 12);
         if (copies == 0) first_tail.* = tail_len;
         for (0..tail_len) |_| {
             rng = rng *% 1664525 +% 1013904223;
@@ -17150,7 +17155,7 @@ test "degenerateTail: a fixed head with a reworded tail convicts once its copies
     defer ids.deinit(al);
     for (0..300) |i| try ids.append(al, @intCast(i)); // an honest prefix
     var first_tail: usize = 0;
-    try tFixedHeadLoop(al, &ids, near_repeat_min_span + 900, &first_tail);
+    try tFixedHeadLoop(al, &ids, near_repeat_min_span + 900, 130, &first_tail);
     // The tails keep every ratio of the near-repeat tier in the healthy band.
     try testing.expect(nearRepeatStart(ids.items) == null);
 
@@ -17166,6 +17171,22 @@ test "degenerateTail: a fixed head with a reworded tail convicts once its copies
         return;
     };
     return error.TestExpectedLoop;
+}
+
+test "degenerateTail: a fixed head convicts when each tick commits several tokens" {
+    // An MTP or DFlash tick commits up to 8 tokens; the guard sees only the tick's last.
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    var first_tail: usize = 0;
+    try tFixedHeadLoop(al, &ids, near_repeat_min_span + 2000, recurring_span_len + 1, &first_tail);
+    for (0..8) |phase| {
+        var n: usize = phase + 1;
+        const convicted = while (n <= ids.items.len) : (n += 8) {
+            if (degenerateTail(ids.items[0..n])) |d| break d.tier == .recurring_span;
+        } else false;
+        try testing.expect(convicted);
+    }
 }
 
 test "degenerateTail: a recurring block acquits below the rep bar, under the span bar, or without a vocabulary" {
