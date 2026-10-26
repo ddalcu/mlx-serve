@@ -380,6 +380,7 @@ enum BenchmarkSettings {
         put("prefill_chunk", settings["prefill_chunk"])
         put("drafter", settings["drafter"])
         put("max_concurrent", settings["max_concurrent"])
+        put("prefill_decode_share", settings["prefill_decode_share"])
         if let mtp = settings["mtp"] as? [String: Any] {
             put("mtp_loaded", mtp["loaded"])
             put("mtp_default_on", mtp["default_on"])
@@ -454,6 +455,7 @@ enum BenchmarkSettings {
         ("mtp_adaptive", "MTP adaptive"), ("mtp_acceptance", "MTP acceptance"),
         ("drafter", "Drafter"), ("pld_default_on", "PLD"), ("pld_draft_len", "PLD draft len"),
         ("pld_key_len", "PLD key len"), ("max_concurrent", "Max concurrent"),
+        ("prefill_decode_share", "Decode share"),
         ("prefix_cache_mem", "Prefix cache"),
     ]
 }

@@ -130,7 +130,7 @@ final class BenchmarkLogicTests: XCTestCase {
            "decode_attn_quant":false,"prefill_chunk":8192,
            "mtp":{"loaded":false,"default_on":false,"acceptance":"exact","acceptance_param":null,"depth":4,"adaptive":true,"max_ctx":0},
            "drafter":"none","pld":{"default_on":true,"draft_len":5,"key_len":3},
-           "max_concurrent":1,"prefix_cache":{"mem_bytes":2147483648,"disk_bytes":0}}}
+           "max_concurrent":1,"prefill_decode_share":0.35,"prefix_cache":{"mem_bytes":2147483648,"disk_bytes":0}}}
         """
         return try! JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
     }
@@ -154,7 +154,20 @@ final class BenchmarkLogicTests: XCTestCase {
         XCTAssertEqual(flat["pld_draft_len"], "5")
         XCTAssertEqual(flat["pld_key_len"], "3")
         XCTAssertEqual(flat["max_concurrent"], "1")
+        XCTAssertEqual(flat["prefill_decode_share"], "0.35")
         XCTAssertEqual(flat["prefix_cache_mem"], "2147483648")
+    }
+
+    /// The decode share changes throughput on a server that also serves other
+    /// traffic, so a row has to carry the number it ran with — and a server
+    /// predating the knob must not invent one.
+    func testEveryRowRecordsTheDecodeShareItRanWith() {
+        XCTAssertEqual(BenchmarkSettings.flatten(props: propsFixture)["prefill_decode_share"], "0.35")
+        var older = propsFixture
+        var settings = older["settings"] as! [String: Any]
+        settings.removeValue(forKey: "prefill_decode_share")
+        older["settings"] = settings
+        XCTAssertNil(BenchmarkSettings.flatten(props: older)["prefill_decode_share"])
     }
 
     func testFlattenOfAServerWithoutSettingsIsEmptyNotACrash() {
