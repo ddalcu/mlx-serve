@@ -404,7 +404,10 @@ enum BenchmarkSettings {
 
     /// What changes a request's speed, so what may not share a median.
     /// Cache size, concurrency and the server version stay out — fragmenting
-    /// by release would leave every cell at n=1 forever.
+    /// by release would leave every cell at n=1 forever. The decode share stays
+    /// out too: it only splits prefill and decode when requests overlap, and a
+    /// ladder sends one request at a time, so the row records it for the reader
+    /// without splitting the cell.
     static func signature(_ s: [String: String]) -> String {
         func flag(_ key: String) -> String {
             switch s[key] { case "true": return "1"; case "false": return "0"; default: return "?" }

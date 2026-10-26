@@ -170,6 +170,20 @@ final class BenchmarkLogicTests: XCTestCase {
         XCTAssertNil(BenchmarkSettings.flatten(props: older)["prefill_decode_share"])
     }
 
+    /// `/props` always prints the share with two decimals (`{d:.2}`), so a
+    /// default run records "0" and a half share records "0.5". Pinned because
+    /// the row keeps whatever the server sent rather than re-formatting it.
+    func testTheDecodeShareKeepsTheServersOwnNumber() {
+        for (wire, recorded) in [("0.00", "0"), ("0.50", "0.5"), ("0.90", "0.9")] {
+            var props = propsFixture
+            var settings = props["settings"] as! [String: Any]
+            settings["prefill_decode_share"] = Double(wire)
+            props["settings"] = settings
+            XCTAssertEqual(BenchmarkSettings.flatten(props: props)["prefill_decode_share"], recorded,
+                           "wire \(wire)")
+        }
+    }
+
     func testFlattenOfAServerWithoutSettingsIsEmptyNotACrash() {
         XCTAssertTrue(BenchmarkSettings.flatten(props: [:]).isEmpty)
         XCTAssertTrue(BenchmarkSettings.flatten(props: ["settings": "junk"]).isEmpty)
