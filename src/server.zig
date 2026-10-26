@@ -24542,6 +24542,38 @@ test "resolveThinking: forced effort outranks unforced thinking defaults" {
     }
 }
 
+test "resolveThinking: the Responses surface takes the model's thinking rules but never an arch default" {
+    // `/v1/responses` calls `resolveThinking(gen, enable, request, false, ...)` —
+    // `false` where chat/completions passes the architecture default. So a
+    // per-model `enable_thinking`/`reasoning_effort` rule reaches Codex too,
+    // while a Responses request that names nothing still never thinks unasked.
+    inline for (.{ false, true }) |word_only| {
+        const none = generation_settings.Profile{};
+        try std.testing.expect(!resolveThinking(none, null, null, false, -1, word_only).enable);
+
+        var on = generation_settings.Profile{};
+        on.set(.enable_thinking, .{ .boolean = true }, false);
+        const from_rule = resolveThinking(on, null, null, false, -1, word_only);
+        try std.testing.expect(from_rule.enable);
+        try std.testing.expect(from_rule.effort == null);
+
+        // The model's effort word is the default request when thinking ends up on.
+        var low = generation_settings.Profile{};
+        low.set(.reasoning_effort, .{ .effort = .low }, false);
+        const from_effort = resolveThinking(low, null, null, false, -1, word_only);
+        try std.testing.expect(from_effort.enable);
+        try std.testing.expectEqualStrings("low", from_effort.effort.?.effort.?);
+
+        // `reasoning: {"effort": "none"}` is the client's explicit OFF and outranks an unforced rule.
+        try std.testing.expect(!resolveThinking(on, false, reasoningEffortFromWord("none", -1, word_only), false, -1, word_only).enable);
+
+        // A forced rule replaces the request's switch, arch default irrelevant.
+        var forced_off = generation_settings.Profile{};
+        forced_off.set(.enable_thinking, .{ .boolean = false }, true);
+        try std.testing.expect(!resolveThinking(forced_off, null, reasoningEffortFromWord("high", -1, word_only), false, -1, word_only).enable);
+    }
+}
+
 test "schema thinking policy defers only a resolved reasoning protocol" {
     const decide = schemaMasksThinking;
     try std.testing.expectEqual(SchemaThinkingPolicy.no_mask, decide(false, false, true, false, true));

@@ -98,7 +98,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 
 CLI flags: `mlx-serve --help` (`printUsage` in `src/main.zig` is the source of truth; `docs/cli.md` for users).
 
-Generation defaults for omitted fields: body > model `generation_defaults` > global `~/.mlx-serve/generation-settings.json` > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off); a rule with `ignore_client` outranks the body. Read per request. Missing generation_config = wild-sampling signature.
+Generation defaults for omitted fields: body > model `generation_defaults` > global `~/.mlx-serve/generation-settings.json` > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off); a rule with `ignore_client` outranks the body. Read per request. Missing generation_config = wild-sampling signature. The `enable_thinking`/`reasoning_effort` rules reach chat/completions, `/v1/messages` AND `/v1/responses` (all through `resolveThinking`); Responses alone passes no arch default, and raw `/v1/completions` ignores them.
 
 ## Building
 
