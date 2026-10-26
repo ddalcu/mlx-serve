@@ -12,6 +12,7 @@ const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weigh
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
+const f16PrefillEnabled = @import("../linear/prefill_dq_gemm.zig").f16PrefillEnabled;
 
 /// Gathered matmul for MoE expert dispatch — handles both quantized and dense bf16.
 /// Quantized (sc.ctx != null): mlx_gather_qmm with transpose_w=true, w stored [E,out,in].
@@ -58,8 +59,36 @@ pub fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, s
                 return;
             }
         };
+        if (sorted) if (try gatherQmmF16(x, w, sc, bi, lhs_idx, rhs_idx, bits, group_size, mode, s)) |out| {
+            _ = mlx.mlx_array_free(res.*);
+            res.* = out;
+            return;
+        };
         try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
     }
+}
+
+/// Sorted (prefill) affine gather_qmm in fp16 for a bf16 activation (`MLX_SERVE_F16_PREFILL=1`);
+/// null when it does not apply.
+fn gatherQmmF16(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!f16PrefillEnabled() or mode != .affine or bi.ctx == null) return null;
+    if (mlx.mlx_array_dtype(x) != .bfloat16) return null;
+    var x16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x16);
+    try mlx.check(mlx.mlx_astype(&x16, x, .float16, s));
+    var sc16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc16);
+    try mlx.check(mlx.mlx_astype(&sc16, sc, .float16, s));
+    var bi16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi16);
+    try mlx.check(mlx.mlx_astype(&bi16, bi, .float16, s));
+    var out16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out16);
+    try mlx.check(mlx.mlx_gather_qmm(&out16, x16, w, sc16, bi16, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), true, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, out16, .bfloat16, s));
+    return out;
 }
 
 // ── tests ──

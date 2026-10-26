@@ -78,6 +78,7 @@ pub fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: 
     if (rows < prefillDqGemmRowFloorNow(bits, n, @intCast(last))) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
+    if (xd == .bfloat16 and f16PrefillEnabled()) return try prefillDqGemmF16(x, w, sc, bi, bits, group_size, mode, s);
 
     var dq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq);
@@ -94,6 +95,37 @@ pub fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: 
 
 /// Test seam: forces the route on/off without the environment.
 pub var prefill_dq_gemm_override: ?bool = null;
+
+// ── FP16 prefill GEMMs for bf16 models (opt-in: MLX_SERVE_F16_PREFILL=1) ──
+// GPUs without fast bf16 math (M1 family) run steel GEMM ~24% and gather_qmm ~19% faster in
+// fp16 (M1 Ultra µbench, Flash-Next shapes). The routed prefill GEMMs cast the bf16
+// activations and the dequantized weight / quant params to fp16, multiply, and return bf16.
+// Decode and verify widths are untouched (they never reach these routes).
+var f16_prefill_env_cached: ?bool = null;
+
+pub fn f16PrefillEnabled() bool {
+    return env.onCached(&f16_prefill_env_cached, .MLX_SERVE_F16_PREFILL);
+}
+
+fn prefillDqGemmF16(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
+    var x16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x16);
+    try mlx.check(mlx.mlx_astype(&x16, x, .float16, s));
+    var dq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq);
+    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float16, .has_value = true }, s));
+    var dq_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq_t);
+    try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
+    var out16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out16);
+    try mlx.check(mlx.mlx_matmul(&out16, x16, dq_t, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, out16, .bfloat16, s));
+    prefill_dq_gemm_engaged += 1;
+    return out;
+}
 
 // ── tests ──
 
