@@ -172,6 +172,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         out.* = Verdict.refuse(.unsupported, "deepseek_v41: its kernels run on Metal only");
         return null;
     };
+    const c = config.of(ctx.parsed);
+    if (c.dsv41_exl3_bank and !exl3Runs(@import("../../mlx/device.zig").deviceGeneration().gen)) {
+        out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack needs an M3 or newer GPU (M1 and M2 refuse its kernels' threadgroup size)");
+        return null;
+    }
     return loadModel(ctx, s) catch |e| {
         // Too little free memory is a refusal the host answers by name, not a fault.
         if (e == error.StreamedRowsDoNotFit) std.log.warn("deepseek_v41: load refused: {t}", .{e}) else std.log.err("deepseek_v41: load failed: {t}", .{e});
@@ -225,7 +230,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.idle = null;
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
-        if (hasExpertsBin(io, dir)) try openBank(m, io, dir, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
+        if (c.dsv41_exl3_bank) try openBank(m, io, dir, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
     }
     errdefer closeBank(m);
     m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
@@ -257,11 +262,10 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin
     mdl.streamed = streamed.exl3Routed(b);
 }
 
-fn hasExpertsBin(io: std.Io, dir: []const u8) bool {
-    var d = std.Io.Dir.openDirAbsolute(io, dir, .{}) catch return false;
-    defer d.close(io);
-    _ = d.statFile(io, "experts.bin", .{}) catch return false;
-    return true;
+/// The EXL3 stream kernels' plans fix threadgroups of up to 1024 threads; M1 and M2 (g13, g14) grant some of them
+/// fewer. Generation 0 is a GPU we cannot name.
+fn exl3Runs(gen: u32) bool {
+    return gen == 0 or gen >= 15;
 }
 
 /// A standard MLX pack's routed experts streamed as downloaded, at the slot rows the `stream_experts` setting names.
@@ -414,6 +418,7 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
 /// The rows of one prompt call: a streamed EXL3 bank's up to `bill.stream_call_rows`; an MLX pack's the most whose pairs
 /// one group's fetch takes (`max_call_ids`).
 fn callRows(m: *const Model, n: usize) usize {
+    if (comptime !build_options.mlx_stream) return n;
     const b = m.bank orelse return n;
     return switch (b) {
         .exl3 => bill_mod.stream_call_rows,
@@ -535,4 +540,9 @@ test {
     _ = bill_mod;
     _ = media;
     _ = @import("contract.zig");
+}
+
+test "deepseek_v41: the streamed EXL3 repack is refused on M1 and M2" {
+    for ([_]struct { gen: u32, runs: bool }{ .{ .gen = 13, .runs = false }, .{ .gen = 14, .runs = false }, .{ .gen = 15, .runs = true }, .{ .gen = 17, .runs = true }, .{ .gen = 0, .runs = true } }) |g|
+        try std.testing.expectEqual(g.runs, exl3Runs(g.gen));
 }

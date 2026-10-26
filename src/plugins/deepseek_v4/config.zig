@@ -112,8 +112,10 @@ pub const Config = struct {
     boi_token_id: u32 = 0,
     eoi_token_id: u32 = 0,
     dsv41_vision: bool = false,
-    /// V4.1's routed experts in an `experts.bin` bank, streamed (`deepseek_v41/plugin.zig`).
+    /// V4.1's routed experts streamed (`deepseek_v41/plugin.zig`): from an `experts.bin` EXL3 bank
+    /// (`dsv41_exl3_bank`), else from the MLX pack's own shards (the `stream_experts` setting).
     dsv41_streamed: bool = false,
+    dsv41_exl3_bank: bool = false,
     dv_downsample: u32 = 3,
     dv_max_image_tokens: u32 = 1024,
     dv_min_pixels: u32 = 295936,
@@ -362,7 +364,7 @@ const gpa = std.heap.c_allocator;
 
 /// Parses config.json (and, for a load, `generation_config.json`) into `out`; `v41` selects the release.
 pub fn parseInto(dir: *const abi.PackDir, config_json: abi.Str, stub: bool, v41: bool, stream_pack: bool, out: *abi.Parsed, extend: ?*const fn (*Config, Json) ParseError!void) abi.Verdict {
-    const streamed = v41 and (stream_pack or dir.has("experts.bin"));
+    const exl3_bank = v41 and dir.has("experts.bin");
     const tree = std.json.parseFromSlice(std.json.Value, gpa, config_json.slice(), .{}) catch
         return abi.Verdict.refuse(.failed, "deepseek: config.json does not parse");
     defer tree.deinit();
@@ -370,7 +372,8 @@ pub fn parseInto(dir: *const abi.PackDir, config_json: abi.Str, stub: bool, v41:
     cfg.* = .{};
     const j = Json.of(tree.value) catch |e| return refuseFree(cfg, e);
     parseShared(cfg, j, v41) catch |e| return refuseFree(cfg, e);
-    cfg.dsv41_streamed = streamed;
+    cfg.dsv41_streamed = exl3_bank or (v41 and stream_pack);
+    cfg.dsv41_exl3_bank = exl3_bank;
     if (extend) |f| f(cfg, j) catch |e| return refuseFree(cfg, e);
     if (!stub) {
         var buf: [64 * 1024]u8 = undefined;

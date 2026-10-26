@@ -193,7 +193,7 @@ test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole"
     const v = parseFiles(&.{ .{ .name = "config.json", .bytes = iq3 }, .{ .name = "experts.bin", .bytes = "" } }, true, &p);
     try testing.expect(v.isOk());
     defer freeParsed(&p);
-    try testing.expect(of(&p).dsv41_streamed and p.caps.whole_prompt_prefill and p.caps.streamed_weights);
+    try testing.expect(of(&p).dsv41_streamed and of(&p).dsv41_exl3_bank and p.caps.whole_prompt_prefill and p.caps.streamed_weights);
     try testing.expect(!p.caps.slot_state and !p.caps.batches_decode);
     var q: abi.Parsed = .{};
     try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &q).isOk());
@@ -214,6 +214,7 @@ test "deepseek_v41 config: stream_experts streams an MLX pack that has no expert
         defer freeParsed(&p);
         try testing.expectEqual(c.streams, of(&p).dsv41_streamed);
         try testing.expectEqual(c.streams, p.caps.whole_prompt_prefill);
+        try testing.expect(!of(&p).dsv41_exl3_bank);
     }
 }
 

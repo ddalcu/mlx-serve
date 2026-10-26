@@ -9,7 +9,7 @@ const Config = @import("config.zig").Config;
 pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !model.ModelConfig {
     var m: model.ModelConfig = .{};
     inline for (@typeInfo(Config).@"struct".field_names) |name| {
-        if (comptime std.mem.eql(u8, name, "gen") or std.mem.eql(u8, name, "dsv41_streamed")) continue;
+        if (comptime std.mem.eql(u8, name, "gen") or std.mem.eql(u8, name, "dsv41_streamed") or std.mem.eql(u8, name, "dsv41_exl3_bank")) continue;
         const src = @field(c, name);
         const Dst = @TypeOf(@field(m, name));
         @field(m, name) = if (@TypeOf(src) == Dst) src else std.meta.stringToEnum(Dst, @tagName(src)).?;
