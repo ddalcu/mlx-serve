@@ -524,6 +524,8 @@
 "Decisions" = "决策";
 "Decode" = "解码";
 "Decode attn quant" = "解码注意力量化";
+"Decode share" = "解码占比";
+"Decode share during prefill" = "预填充期间解码占比";
 "Decode speed" = "解码速度";
 "Deep house" = "深浩室";
 "DeepSeek-V4-Flash (iQ-MLX 3.3 bpw)" = "DeepSeek-V4-Flash（iQ-MLX 3.3 bpw）";
@@ -806,6 +808,7 @@
 "How large each reference image is fed to the model. Maximum detail keeps identity better and is several times slower — every reference token is re-read on every sampling step." = "每张参考图送入模型的尺寸。最高细节能更好地保持人物一致性，但会慢上数倍 —— 每个采样步都要重新读取全部参考 Token。";
 "How many of the steps follow the source. 1 keeps it all the way; lower lets the caption take over for the last steps." = "有多少步跟随源音频。1 表示全程跟随；数值更低时，最后几步由描述文本主导。";
 "How many times this repo has been pulled from HuggingFace" = "该仓库从 HuggingFace 拉取的次数";
+"How much of its time a reply keeps while another prompt is being read. Higher favors replies over prompt speed." = "读取另一条提示词时，回复能保留多少处理时间。数值越高越优先保证回复速度，而非提示词速度。";
 "Hugging Face Cache" = "Hugging Face 缓存";
 "Hunyuan 3 295B-A21B (2-bit)" = "Hunyuan 3 295B-A21B（2-bit）";
 "Hunyuan3D 2.1 has no download yet — convert the weights on-device with tests/convert_hunyuan3d_weights.py (see the repo README). They install to ~/.mlx-serve/models/local/." = "Hunyuan3D 2.1 暂无下载 —— 请用 tests/convert_hunyuan3d_weights.py 在本机转换权重（见仓库 README）。转换结果会安装到 ~/.mlx-serve/models/local/。";

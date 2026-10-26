@@ -1437,6 +1437,9 @@
 "If this is a server, every TCP port it listens on inside the sandbox is auto-mapped to the host — the user reaches it at http://localhost:<port> in their browser. When sharing a URL, ALWAYS use http://localhost:<port>, never a LAN or guest IP address." = "서버인 경우, 샌드박스 안에서 수신하는 모든 TCP 포트가 호스트에 자동으로 매핑됩니다 — 사용자는 브라우저에서 http://localhost:<port>로 접속합니다. URL을 공유할 때는 LAN 또는 게스트 IP 주소가 아니라 항상 http://localhost:<port>를 사용하세요.";
 "%@ has no download yet — convert the weights on-device with the matching script in the repo (see its README). They install to ~/.mlx-serve/models/local/." = "%@은(는) 아직 다운로드할 수 없습니다 — 저장소의 해당 스크립트로 기기에서 가중치를 변환하세요(README 참조). ~/.mlx-serve/models/local/에 설치됩니다.";
 "Max concurrent" = "최대 동시 실행 수";
+"Decode share" = "디코딩 비중";
+"Decode share during prefill" = "프리필 중 디코딩 비중";
+"How much of its time a reply keeps while another prompt is being read. Higher favors replies over prompt speed." = "다른 프롬프트를 읽는 동안 응답이 유지하는 처리 시간 비율입니다. 값이 높을수록 응답 속도를, 낮을수록 프롬프트 속도를 우선합니다.";
 "Unsupported quantization (%@)" = "지원하지 않는 양자화 (%@)";
 "Files" = "파일";
 "Show Details" = "세부사항 보기";
