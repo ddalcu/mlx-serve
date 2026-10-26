@@ -3848,7 +3848,7 @@ pub fn extendAllResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u
 /// What a resume restores: every buffer a later step replaces rather than
 /// appends to is held by reference (a ring's first write after copies it
 /// once), and append-only rows by their count.
-const Snap = struct {
+pub const Snap = struct {
     gen: u64,
     vision_key: u64,
     /// The state's position: `ids.len` on the host; a worker keeps no ids.
@@ -3861,7 +3861,7 @@ const Snap = struct {
 
     const LSnap = struct { win: A, comp_used: usize, idx_used: usize, pend_kv: A, pend_gate: A };
 
-    fn deinit(self: *Snap, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Snap, gpa: std.mem.Allocator) void {
         for (self.layers) |l| for ([_]A{ l.win, l.pend_kv, l.pend_gate }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
@@ -3924,6 +3924,29 @@ pub fn visionKey(rows: ?A, n: usize) !u64 {
     try mlx.check(mlx.mlx_array_eval(f));
     const data = mlx.mlx_array_data_float32(f) orelse return error.NoData;
     return std.hash.Wyhash.hash(0x5e1f, std.mem.sliceAsBytes(data[0..mlx.mlx_array_size(f)]));
+}
+
+/// Takes the module's snapshot off it when it was taken of state `gen` (the plugin keeps it with that state);
+/// null when there is none or it belongs to another state.
+pub fn takeSnap(m: *Dsv41Model, gen: u64) ?Snap {
+    const sn = m.snap orelse return null;
+    if (sn.gen != gen) return null;
+    m.snap = null;
+    return sn;
+}
+
+/// Makes `sn` the module's snapshot and hands back the one it replaces, for the caller to keep or free.
+pub fn swapSnap(m: *Dsv41Model, sn: ?Snap) ?Snap {
+    const old = m.snap;
+    m.snap = sn;
+    return old;
+}
+
+/// How far snapshot `sn` resumes `prompt`: its length when it is a proper prefix with the same images, else 0.
+pub fn snapResumeLen(m: *Dsv41Model, sn: *const Snap, prompt: []const u32, vision_rows: ?A) !usize {
+    if (sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
+    if (sn.vision_key != try visionKey(vision_rows, m.imageRows(sn.ids))) return 0;
+    return sn.ids.len;
 }
 
 fn restore(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {

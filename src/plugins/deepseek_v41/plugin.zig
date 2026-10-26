@@ -84,19 +84,28 @@ pub const Model = struct {
     bank: ?Bank = null,
     bank_context: u64 = 0,
     /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
-    /// other live slot's waits in `parked`. `idle` is the last finished slot's, which the next prompt resumes from.
+    /// other live slot's waits in `parked`. `idle` holds finished conversations, least recently used first, each with
+    /// its resume snapshot: a new prompt resumes the one whose snapshot is the longest prefix of it (`resumePrompt`).
     owner: u32 = 0,
     parked: std.AutoHashMapUnmanaged(u32, Kept) = .empty,
-    idle: ?Kept = null,
+    idle: std.ArrayList(Kept) = .empty,
+    /// How many finished conversations `idle` keeps, and the bytes they may hold beyond the newest one:
+    /// `--prefix-cache-entries` and `--prefix-cache-mem` (`resumeSettings`). 1 keeps only the last one, whose
+    /// snapshot stays on the module.
+    keep_entries: usize = 1,
+    keep_bytes: u64 = std.math.maxInt(u64),
 };
 
 /// A state off the module, with its identity (`Dsv41Model.state_gen`).
 const Kept = struct {
     st: dsv41.State,
     gen: u64,
+    /// The snapshot taken of `st`, which a later prompt resumes from (null: on the module, or none).
+    snap: ?dsv41.Snap = null,
 
-    fn deinit(k: *Kept) void {
+    fn deinit(k: *Kept, a: std.mem.Allocator) void {
         k.st.deinit();
+        if (k.snap) |*sn| sn.deinit(a);
     }
 };
 
@@ -109,9 +118,46 @@ fn park(m: *Model) !void {
     m.owner = 0;
 }
 
-fn keepIdle(m: *Model, k: Kept) void {
-    if (m.idle) |*old| old.deinit();
-    m.idle = k;
+fn keepIdle(m: *Model, k_in: Kept) void {
+    var k = k_in;
+    if (m.keep_entries <= 1) {
+        // One finished conversation: its snapshot stays on the module, as before.
+        for (m.idle.items) |*old| old.deinit(m.mdl.gpa);
+        m.idle.clearRetainingCapacity();
+    } else {
+        k.snap = k.snap orelse dsv41.takeSnap(m.mdl, k.gen);
+        // A state without its snapshot cannot resume anything.
+        if (k.snap == null) return k.deinit(m.mdl.gpa);
+    }
+    m.idle.append(gpa, k) catch return k.deinit(m.mdl.gpa);
+    while (m.idle.items.len > m.keep_entries or (m.idle.items.len > 1 and idleBytes(m) > m.keep_bytes)) {
+        var old = m.idle.orderedRemove(0);
+        old.deinit(m.mdl.gpa);
+    }
+}
+
+fn idleBytes(m: *const Model) u64 {
+    var bytes: u64 = 0;
+    for (m.idle.items) |*k| bytes += dsv41.stateBytes(&k.st);
+    return bytes;
+}
+
+/// The finished conversation a prompt resumes: the last one when only one is kept (its snapshot on the module
+/// decides), else the one whose snapshot is the longest prefix of `prompt`; null when none is.
+fn bestIdle(m: *Model, prompt: []const u32, rows: ?mlx.mlx_array) !?usize {
+    if (m.idle.items.len == 0) return null;
+    if (m.keep_entries <= 1) return m.idle.items.len - 1;
+    var best: ?usize = null;
+    var best_len: usize = 0;
+    for (m.idle.items, 0..) |*k, i| {
+        const sn = &(k.snap orelse continue);
+        const l = try dsv41.snapResumeLen(m.mdl, sn, prompt, rows);
+        if (l > best_len) {
+            best = i;
+            best_len = l;
+        }
+    }
+    return best;
 }
 
 /// Makes `slot`'s state the module's. A slot new here claims an unclaimed state (the prompt `resumePrompt` just
@@ -222,7 +268,10 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.bank = null;
     m.owner = 0;
     m.parked = .empty;
-    m.idle = null;
+    m.idle = .empty;
+    const keep = resumeSettings(ctx.settings_json.slice());
+    m.keep_entries = if (c.dsv41_streamed) 1 else keep.entries;
+    m.keep_bytes = keep.bytes;
     if (c.dsv41_streamed) try openBank(m, io, ctx.model_dir.slice(), ctxSetting(ctx.settings_json.slice()));
     errdefer closeBank(m);
     m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
@@ -271,14 +320,32 @@ fn ctxSetting(settings_json: []const u8) ?u64 {
     return parsed.value.ctx_size;
 }
 
+/// `resume_entries` and `resume_mem` in the load settings (the driver states `--prefix-cache-entries` and
+/// `--prefix-cache-mem` there): how many finished conversations stay resumable and what they may hold. A streamed
+/// pack keeps one.
+const Keep = struct { entries: usize = 1, bytes: u64 = std.math.maxInt(u64) };
+
+fn resumeSettings(settings_json: []const u8) Keep {
+    const none: Keep = .{};
+    if (settings_json.len == 0) return none;
+    const S = struct { resume_entries: ?u32 = null, resume_mem: ?u64 = null };
+    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return none;
+    defer parsed.deinit();
+    return .{
+        .entries = @max(1, parsed.value.resume_entries orelse 1),
+        .bytes = if (parsed.value.resume_mem) |b| (if (b == 0) std.math.maxInt(u64) else b) else std.math.maxInt(u64),
+    };
+}
+
 fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
     closeBank(m);
     if (m.tower) |*t| t.deinit();
     var it = m.parked.valueIterator();
-    while (it.next()) |k| k.deinit();
+    while (it.next()) |k| k.deinit(m.mdl.gpa);
     m.parked.deinit(gpa);
-    if (m.idle) |*k| k.deinit();
+    for (m.idle.items) |*k| k.deinit(m.mdl.gpa);
+    m.idle.deinit(gpa);
     m.mdl.deinit();
     m.weights.deinit();
     gpa.destroy(m);
@@ -412,11 +479,19 @@ pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows
         dsv41.reset(m.mdl, gpa) catch {};
         return 0;
     };
-    if (m.mdl.dec_state == null) if (m.idle) |k| {
-        m.mdl.dec_state = k.st;
-        m.mdl.state_gen = k.gen;
-        m.idle = null;
-    };
+    if (m.mdl.dec_state == null) {
+        const pick = bestIdle(m, prompt.slice(), rows) catch null;
+        if (pick) |i| {
+            const k = m.idle.orderedRemove(i);
+            m.mdl.dec_state = k.st;
+            m.mdl.state_gen = k.gen;
+            // Its snapshot goes on the module for the restore; one left there belonged to no kept state.
+            if (k.snap != null) if (dsv41.swapSnap(m.mdl, k.snap)) |old| {
+                var o = old;
+                o.deinit(m.mdl.gpa);
+            };
+        }
+    }
     return dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
         // A failed reset leaves no state; the forward at position 0 builds one.
         dsv41.reset(m.mdl, gpa) catch {};
@@ -430,7 +505,7 @@ pub fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
     var bytes: u64 = if (m.mdl.dec_state) |*st| dsv41.stateBytes(st) else 0;
     var it = m.parked.valueIterator();
     while (it.next()) |k| bytes += dsv41.stateBytes(&k.st);
-    if (m.idle) |*k| bytes += dsv41.stateBytes(&k.st);
+    bytes += idleBytes(m);
     return bytes;
 }
 
