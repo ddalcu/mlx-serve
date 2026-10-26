@@ -13,6 +13,7 @@ const log = @import("../../../sdk/util/log.zig");
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const intree = @import("intree.zig");
 const outside = @import("../../../host/plugins/loader.zig");
+const model_settings = @import("../../../host/registry/model_settings.zig");
 
 const ModelConfig = model.ModelConfig;
 
@@ -108,11 +109,26 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
     defer a.free(cfg);
     const b = try a.create(Binding);
     b.* = .{ .table = table };
-    if (!table.parse(&pd, .of(cfg), .{}, null, false, &b.parsed).isOk()) {
+    var settings: [48]u8 = undefined;
+    if (!table.parse(&pd, .of(cfg), .of(parseSettings(a, io, &settings, dir)), null, false, &b.parsed).isOk()) {
         a.destroy(b);
         return null;
     }
     return b;
+}
+
+/// The settings a plugin's parse reads: the pack's per-model `stream_experts`, which decides the caps of a pack that
+/// can stream (`buf` holds the text).
+fn parseSettings(a: std.mem.Allocator, io: std.Io, buf: []u8, model_dir: []const u8) []const u8 {
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    var s = model_settings.load(a, io, model_settings.defaultPath(&path));
+    defer s.deinit();
+    var o = s.lookup(a, model_dir);
+    defer o.deinit(a);
+    return switch (o.stream_experts orelse return "") {
+        .on => "{\"stream_experts\":true}",
+        .rows => |n| std.fmt.bufPrint(buf, "{{\"stream_experts\":{d}}}", .{n}) catch "",
+    };
 }
 
 /// `config_json` with the launch's `--config-overrides` merged in, as the legacy parse reads it; in `a`.
@@ -138,7 +154,8 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
         return .{ .declined = if (served.serves(model_type)) "no single claimant" else "type not served" };
     const b = try a.create(Binding);
     b.* = .{ .table = table, .outside = outside.ownerOf(table) != null };
-    const v = table.parse(&dir, abi.Str.of(config_json), .{}, null, false, &b.parsed);
+    var settings: [48]u8 = undefined;
+    const v = table.parse(&dir, abi.Str.of(config_json), .of(parseSettings(a, io, &settings, model_dir)), null, false, &b.parsed);
     if (!v.isOk()) {
         a.destroy(b);
         return .{ .declined = v.why.slice() };

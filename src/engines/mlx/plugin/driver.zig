@@ -212,6 +212,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .stream = .{ .ctx = s.ctx },
         .weights = &src,
         .stream_room = streamRoom(config),
+        .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},
     }, &why) orelse {
         if (why.code == .too_large) {

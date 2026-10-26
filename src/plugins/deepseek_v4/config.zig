@@ -361,8 +361,8 @@ pub fn applyGenerationConfig(c: *Config, bytes: []const u8) void {
 const gpa = std.heap.c_allocator;
 
 /// Parses config.json (and, for a load, `generation_config.json`) into `out`; `v41` selects the release.
-pub fn parseInto(dir: *const abi.PackDir, config_json: abi.Str, stub: bool, v41: bool, out: *abi.Parsed, extend: ?*const fn (*Config, Json) ParseError!void) abi.Verdict {
-    const streamed = v41 and dir.has("experts.bin");
+pub fn parseInto(dir: *const abi.PackDir, config_json: abi.Str, stub: bool, v41: bool, stream_pack: bool, out: *abi.Parsed, extend: ?*const fn (*Config, Json) ParseError!void) abi.Verdict {
+    const streamed = v41 and (stream_pack or dir.has("experts.bin"));
     const tree = std.json.parseFromSlice(std.json.Value, gpa, config_json.slice(), .{}) catch
         return abi.Verdict.refuse(.failed, "deepseek: config.json does not parse");
     defer tree.deinit();
@@ -459,7 +459,7 @@ fn facts(c: *const Config) abi.Parsed {
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
     _ = settings_json;
     _ = span;
-    return parseInto(dir, config_json, stub, false, out, null);
+    return parseInto(dir, config_json, stub, false, false, out, null);
 }
 
 pub fn freeParsed(p: *abi.Parsed) callconv(.c) void {

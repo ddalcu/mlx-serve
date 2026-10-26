@@ -2679,13 +2679,22 @@ fn routed(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts:
     return sc.sum(try sc.astype(try sc.reshape(dn, &.{ ci(L), ci(k), ci(d) }), .float32), 1, false);
 }
 
+/// A slot bank's projection over `in_dim` inputs: MXFP4 when it carries no biases, else the pack's affine width and
+/// group, read off its packed and scale rows.
+fn slotBank(p: streamed.Proj, in_dim: u64) Bank {
+    if (p.biases.ctx == null) return .{ .w = p.w, .s = p.scales, .qp = .{ .bits = 4, .group_size = 32, .mode = .mxfp4 } };
+    const packed_cols: u64 = @intCast(dim(p.w, -1));
+    const scale_cols: u64 = @intCast(dim(p.scales, -1));
+    return .{ .w = p.w, .s = p.scales, .b = p.biases, .qp = .{ .bits = @intCast(packed_cols * 32 / in_dim), .group_size = @intCast(in_dim / scale_cols) } };
+}
+
 /// A streamed bank's slots for one routed call (`sdk/weights/streamed.zig` `fetch`): per bank the source holds (its
 /// prompt rows, its grown rows, its transient rows) the bank's arrays and, over `[L, k]`, each pair's row in it (0 for a
 /// pair another bank serves) and whether it serves the pair (the masks partition the pairs); on the host, each pair's
 /// bank and row (valid until the next fetch).
 const Slots = struct { banks: [3]?Experts = @splat(null), idx: [3]A = @splat(none), mask: [3]A = @splat(none), kind: []const u8 = &.{}, row: []const u32 = &.{} };
 
-fn fetchSlots(sc: *Scope, src: streamed.Routed, li: usize, idx: A) !Slots {
+fn fetchSlots(sc: *Scope, m: *const Dsv41Model, src: streamed.Routed, li: usize, idx: A) !Slots {
     const L = dim(idx, 0);
     const k = dim(idx, 1);
     const n = L * k;
@@ -2713,11 +2722,10 @@ fn fetchSlots(sc: *Scope, src: streamed.Routed, li: usize, idx: A) !Slots {
             any = any or on[i];
         }
         if (!any) continue;
-        const qp: QuantParams = .{ .bits = 4, .group_size = 32, .mode = .mxfp4 };
         out.banks[b] = .{
-            .gate = .{ .w = bk.gate.w, .s = bk.gate.scales, .qp = qp },
-            .up = .{ .w = bk.up.w, .s = bk.up.scales, .qp = qp },
-            .down = .{ .w = bk.down.w, .s = bk.down.scales, .qp = qp },
+            .gate = slotBank(bk.gate, m.cfg.hidden_size),
+            .up = slotBank(bk.up, m.cfg.hidden_size),
+            .down = slotBank(bk.down, m.cfg.moe_intermediate_size),
         };
         out.idx[b] = try sc.keep(mlx.mlx_array_new_data(rows.ptr, &[_]c_int{ ci(L), ci(k) }, 2, .uint32));
         out.mask[b] = try sc.keep(mlx.mlx_array_new_data(on.ptr, &[_]c_int{ ci(L), ci(k) }, 2, .bool_));
@@ -2858,6 +2866,71 @@ fn slotPrefill(sc: *Scope, m: *const Dsv41Model, sl: *const Slots, x: A, wts: A,
     var ar = mlx.mlx_array_new();
     const ident = try sc.res(mlx.mlx_arange(&ar, 0, @floatFromInt(n), 1, .uint32, sc.s), &ar);
     return flatKernel(sc, m.moe_combine_kernel, &.{ try sc.reshape(dn, &.{ ci(n), ci(d) }), ident, try sc.astype(sh, dt) }, &.{ ci(L), ci(d) }, dt, L * d, &.{ .{ .name = "D", .v = ci(d) }, .{ .name = "K", .v = ci(k) } });
+}
+
+/// A prompt call that routes to more experts than one fetch serves (`Routed.decode_ids`): its distinct experts go in
+/// groups of that width, each fetched and run as its own pairs through `slotPrefill`, one pair a row, and evaluated
+/// before the next fetch recycles the transient rows. The pairs' rows then sum per token in f32 with `sh`.
+fn slotWide(sc: *Scope, m: *const Dsv41Model, src: streamed.Routed, li: usize, x: A, idx: A, wts: A, sh: A) !A {
+    const L = dim(x, 0);
+    const k = dim(idx, 1);
+    const d = dim(x, 1);
+    const n = L * k;
+    const dt = mlx.mlx_array_dtype(x);
+    const a = sc.a;
+    var host = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(host);
+    try mlx.check(mlx.mlx_astype(&host, idx, .uint32, sc.s));
+    try mlx.check(mlx.mlx_array_eval(host));
+    const ids = (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n];
+    const width = src.decode_ids;
+    const group_of = try a.alloc(u32, m.cfg.num_experts);
+    defer a.free(group_of);
+    @memset(group_of, std.math.maxInt(u32));
+    var groups: u32 = 0;
+    var in_group: usize = 0;
+    for (ids) |e| if (group_of[e] == std.math.maxInt(u32)) {
+        if (in_group == width) {
+            groups += 1;
+            in_group = 0;
+        }
+        group_of[e] = groups;
+        in_group += 1;
+    };
+    groups += 1;
+    const order = try a.alloc(u32, n);
+    defer a.free(order);
+    const gid = try a.alloc(u32, n);
+    defer a.free(gid);
+    const toks = try a.alloc(u32, n);
+    defer a.free(toks);
+    const flat = try sc.reshape(wts, &.{ci(n)});
+    const inv = try a.alloc(u32, n);
+    defer a.free(inv);
+    const ys = try a.alloc(A, groups);
+    defer a.free(ys);
+    var at: usize = 0;
+    for (0..groups) |g| {
+        const lo = at;
+        for (ids, 0..) |e, i| if (group_of[e] == g) {
+            order[at] = @intCast(i);
+            gid[at] = e;
+            toks[at] = @intCast(i / k);
+            inv[i] = @intCast(at);
+            at += 1;
+        };
+        const cnt = at - lo;
+        const pairs = try sc.keep(mlx.mlx_array_new_data(order[lo..].ptr, &[_]c_int{ci(cnt)}, 1, .uint32));
+        const rows = try sc.keep(mlx.mlx_array_new_data(toks[lo..].ptr, &[_]c_int{ci(cnt)}, 1, .uint32));
+        const routes = try sc.keep(mlx.mlx_array_new_data(gid[lo..].ptr, &[_]c_int{ ci(cnt), 1 }, 2, .uint32));
+        const sl = try fetchSlots(sc, m, src, li, routes);
+        const y = try slotPrefill(sc, m, &sl, try sc.take(x, rows, 0), try sc.reshape(try sc.take(flat, pairs, 0), &.{ ci(cnt), 1 }), try sc.zeros(&.{ ci(cnt), ci(d) }, dt));
+        try evalAll(&.{y});
+        ys[g] = y;
+    }
+    const inv_a = try sc.keep(mlx.mlx_array_new_data(inv.ptr, &[_]c_int{ci(n)}, 1, .uint32));
+    const rows_k = try sc.reshape(try sc.take(try sc.concat(ys, 0), inv_a, 0), &.{ ci(L), ci(k), ci(d) });
+    return sc.astype(try sc.add(try sc.sum(try sc.astype(rows_k, .float32), 1, false), try sc.astype(sh, .float32)), dt);
 }
 
 /// A sorted gather of `b` for rows `idx` (one run per expert) on the NAX port where it serves the bank
@@ -3001,7 +3074,8 @@ fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     // The DSpark stages' experts stay resident.
     if (li < m.n_layers) if (m.streamed) |src| {
         if (src.math == .source) return withShared(sc, m, ly, x, try sc.keep(try src.math.source(src.ctx, @intCast(li), x, r.idx, r.wts).get()));
-        const sl = try fetchSlots(sc, src, li, r.idx);
+        if (dim(r.idx, 0) * dim(r.idx, 1) > src.decode_ids) return slotWide(sc, m, src, li, x, r.idx, r.wts, try shared(sc, m, ly, x));
+        const sl = try fetchSlots(sc, m, src, li, r.idx);
         if (dim(x, 0) > region_rows) return slotPrefill(sc, m, &sl, x, r.wts, try shared(sc, m, ly, x));
         return withShared(sc, m, ly, x, try rowSum(sc, try slotRows(sc, m, &sl, x, r.wts, null)));
     };
@@ -3088,7 +3162,7 @@ const Want = enum { last, all };
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
 /// mix, which the next layer's attention collapses with.
 fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared, ds_main: ?A) !A {
-    if (ds_main == null and sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0))) {
+    if (ds_main == null and sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
         try runRegion(sc, m, li, .attn_in, &.{ x, pre.* }, &a);
         const ao = try attention(sc, m, st, li, a[3], p0, sh, null);
@@ -3098,7 +3172,7 @@ fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: u
             const ro = switch (src.math) {
                 .source => |f| try sc.keep(try f(src.ctx, @intCast(li), p[4], p[5], p[6]).get()),
                 .trunk => blk: {
-                    const sl = try fetchSlots(sc, src, li, p[5]);
+                    const sl = try fetchSlots(sc, m, src, li, p[5]);
                     break :blk try slotRows(sc, m, &sl, p[4], p[6], li);
                 },
             };
@@ -3689,6 +3763,12 @@ const LayerRegions = struct {
     li: usize,
     fns: [std.enums.values(Region).len]mlx.mlx_closure = @splat(.{}),
 };
+
+/// Whether one fetch serves `rows` rows' routes: a bank that returns slots (`.trunk`) takes `Routed.decode_ids` experts a call.
+fn fetchServes(m: *const Dsv41Model, rows: usize) bool {
+    const src = m.streamed orelse return true;
+    return src.math == .source or rows * m.cfg.num_experts_per_tok <= src.decode_ids;
+}
 
 fn compiledAt(m: *const Dsv41Model, rows: usize) bool {
     return rows <= region_rows and m.regions.len > 0 and m.trace == null;

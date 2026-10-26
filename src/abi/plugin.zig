@@ -349,6 +349,8 @@ pub const LoadCtx = extern struct {
     stream_room: u64 = 0,
     /// A two-Mac pair's layers on the other Mac (DeepSeek-V4.1's worker run); `count` 0 = no pair.
     pair_remote: LayerSpan = .{},
+    /// The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned.
+    wired_margin_bytes: u64 = 8 << 30,
 };
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };

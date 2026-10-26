@@ -28,9 +28,22 @@ const float = v4.float;
 const ParseError = v4.ParseError;
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
-    _ = settings_json;
     _ = span;
-    return v4.parseInto(dir, config_json, stub, true, out, &extend);
+    return v4.parseInto(dir, config_json, stub, true, streamsPack(settings_json.slice()), out, &extend);
+}
+
+/// The per-model `stream_experts` setting (`true` or a row count) asks for an MLX pack's routed experts to stream.
+fn streamsPack(settings_json: []const u8) bool {
+    if (settings_json.len == 0) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, settings_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const v = parsed.value.object.get("stream_experts") orelse return false;
+    return switch (v) {
+        .bool => |b| b,
+        .integer => |n| n > 0,
+        else => false,
+    };
 }
 
 /// V4.1's keys past the shared arm. Every compressed layer must find a source of its own ratio at or above it: the
@@ -151,6 +164,12 @@ fn parseFiles(files: []const fixture.File, stub: bool, out: *abi.Parsed) abi.Ver
     return parse(&dir, abi.Str.of(files[0].bytes), .{}, null, stub, out);
 }
 
+fn parseWithSettings(settings: []const u8, out: *abi.Parsed) abi.Verdict {
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = iq3 }} };
+    const dir = mem.packDir();
+    return parse(&dir, abi.Str.of(iq3), abi.Str.of(settings), null, true, out);
+}
+
 const iq3 = @embedFile("../../fixtures/model-configs/deepseek_v41-iq-mlx-3.0bpw.json");
 
 test "deepseek_v41 config: the release pack parses with its sources, Engram, DSpark head and tower" {
@@ -180,6 +199,22 @@ test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole"
     try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &q).isOk());
     defer freeParsed(&q);
     try testing.expect(!of(&q).dsv41_streamed and !q.caps.whole_prompt_prefill);
+}
+
+test "deepseek_v41 config: stream_experts streams an MLX pack that has no experts.bin" {
+    for ([_]struct { settings: []const u8, streams: bool }{
+        .{ .settings = "{\"stream_experts\":true}", .streams = true },
+        .{ .settings = "{\"stream_experts\":160}", .streams = true },
+        .{ .settings = "{\"stream_experts\":0}", .streams = false },
+        .{ .settings = "{\"mtp\":false}", .streams = false },
+        .{ .settings = "", .streams = false },
+    }) |c| {
+        var p: abi.Parsed = .{};
+        try testing.expect(parseWithSettings(c.settings, &p).isOk());
+        defer freeParsed(&p);
+        try testing.expectEqual(c.streams, of(&p).dsv41_streamed);
+        try testing.expectEqual(c.streams, p.caps.whole_prompt_prefill);
+    }
 }
 
 test "deepseek_v41 config: a layer that would read another ratio's cache is refused by name" {

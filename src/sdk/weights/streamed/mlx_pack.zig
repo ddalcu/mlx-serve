@@ -250,16 +250,20 @@ fn routedOf(key: []const u8) ?struct { prefix: []const u8, expert: ?u32, comp: u
     if (std.mem.startsWith(u8, key, "mtp.") or std.mem.indexOf(u8, key, ".mtp.") != null) return null;
     const parts = [_][]const u8{ ".weight", ".scales", ".biases" };
     const projs = [_][]const u8{ ".gate_proj", ".up_proj", ".down_proj" };
+    // DeepSeek V4's spelling of gate, up, down.
+    const v4_projs = [_][]const u8{ ".w1", ".w3", ".w2" };
     var rest = key;
     const part = for (parts, 0..) |p, i| {
         if (std.mem.endsWith(u8, rest, p)) break i;
     } else return null;
     rest = rest[0 .. rest.len - parts[part].len];
-    const proj = for (projs, 0..) |p, i| {
-        if (std.mem.endsWith(u8, rest, p)) break i;
+    const proj, const v4 = for (projs, v4_projs, 0..) |p, q, i| {
+        if (std.mem.endsWith(u8, rest, p)) break .{ i, false };
+        if (std.mem.endsWith(u8, rest, q)) break .{ i, true };
     } else return null;
-    rest = rest[0 .. rest.len - projs[proj].len];
+    rest = rest[0 .. rest.len - (if (v4) v4_projs else projs)[proj].len];
     const comp: u8 = @intCast(proj * 3 + part);
+    if (v4) return if (std.mem.endsWith(u8, rest, ".experts")) .{ .prefix = rest[0 .. rest.len - ".experts".len], .expert = null, .comp = comp } else null;
     if (std.mem.endsWith(u8, rest, ".switch_mlp")) return .{ .prefix = rest[0 .. rest.len - ".switch_mlp".len], .expert = null, .comp = comp };
     const at = std.mem.lastIndexOf(u8, rest, ".experts.") orelse return null;
     const e = std.fmt.parseInt(u32, rest[at + ".experts.".len ..], 10) catch return null;
@@ -383,7 +387,12 @@ test "mlx pack: routed expert names, stacked and per expert; the MTP head's and 
     try testing.expectEqualStrings("model.layers.12.mlp", pe.prefix);
     try testing.expectEqual(@as(?u32, 41), pe.expert);
     try testing.expectEqual(@as(u8, 4), pe.comp);
-    for ([_][]const u8{ "mtp.layers.0.mlp.switch_mlp.gate_proj.weight", "model.layers.0.mlp.shared_expert.gate_proj.weight", "model.layers.0.mlp.gate.weight", "model.layers.0.mlp.switch_mlp.gate_proj.bias" }) |k|
+    const ds = routedOf("language_model.layers.5.ffn.experts.w3.scales").?;
+    try testing.expectEqualStrings("language_model.layers.5.ffn", ds.prefix);
+    try testing.expectEqual(@as(?u32, null), ds.expert);
+    try testing.expectEqual(@as(u8, 4), ds.comp);
+    try testing.expectEqual(@as(u8, 6), routedOf("language_model.layers.5.ffn.experts.w2.weight").?.comp);
+    for ([_][]const u8{ "language_model.layers.5.ffn.shared_experts.w1.weight", "language_model.mtp.0.ffn.experts.w1.weight", "mtp.layers.0.mlp.switch_mlp.gate_proj.weight", "model.layers.0.mlp.shared_expert.gate_proj.weight", "model.layers.0.mlp.gate.weight", "model.layers.0.mlp.switch_mlp.gate_proj.bias" }) |k|
         try testing.expect(routedOf(k) == null);
     try testing.expectEqual(@as(u64, 12), layerNumber("model.layers.12.mlp"));
 }

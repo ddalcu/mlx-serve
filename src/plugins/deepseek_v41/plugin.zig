@@ -148,7 +148,7 @@ fn activateSlot(mp: *anyopaque, slot: u32) callconv(.c) Verdict {
     return .ok;
 }
 
-const Bank = if (build_options.mlx_stream) *streamed.Exl3.Source else void;
+const Bank = if (build_options.mlx_stream) union(enum) { exl3: *streamed.Exl3.Source, pack: streamed.Streamed } else void;
 
 /// The trunk's embedding table or LM head as loaded (borrowed), for the DSpark drafter.
 fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weight) callconv(.c) Verdict {
@@ -223,7 +223,10 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.owner = 0;
     m.parked = .empty;
     m.idle = null;
-    if (c.dsv41_streamed) try openBank(m, io, ctx.model_dir.slice(), ctxSetting(ctx.settings_json.slice()));
+    if (c.dsv41_streamed) {
+        const dir = ctx.model_dir.slice();
+        if (hasExpertsBin(io, dir)) try openBank(m, io, dir, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
+    }
     errdefer closeBank(m);
     m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
     return m;
@@ -232,7 +235,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
 /// The pack's EXL3 bank at the slot rows the box holds beside the residents and a request of the model's `ctx_size`,
 /// else of the largest `bill.stream_context_rungs` rung that keeps `bill.stream_min_rows` rows, else of
 /// `bill.stream_context`.
-fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64) !void {
+fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin: u64) !void {
     if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
     const mdl = m.mdl;
     const gates = try gpa.alloc(streamed.Exl3.Gate, mdl.n_layers);
@@ -242,23 +245,46 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64) !void {
     const c = &m.cfg;
     const geo: streamed.Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(mdl.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
     const context = ctx_size orelse for (bill_mod.stream_context_rungs) |rung| {
-        const at = bill_mod.streamBudget(c, rung);
+        const at = bill_mod.streamBudget(c, rung, wired_margin);
         const fit = streamed.Exl3.billOf(gpa, io, dir, geo, .{ .prompt = at.prompt, .decode = at.decode }) catch continue;
         if (fit.rows.prompt >= bill_mod.stream_min_rows) break rung;
     } else bill_mod.stream_context;
-    const budget = bill_mod.streamBudget(c, context);
+    const budget = bill_mod.streamBudget(c, context, wired_margin);
     const b = try streamed.Exl3.Source.open(gpa, io, dir, m.s, geo, gates, .{ .prompt = budget.prompt, .decode = budget.decode });
     std.log.info("deepseek_v41: streamed experts, {d} prompt / {d} decode slot rows per layer for a {d}-token context ({d} B a row)", .{ b.bill.rows.prompt, b.bill.rows.decode, context, b.bill.row_bytes });
-    m.bank = b;
+    m.bank = .{ .exl3 = b };
     m.bank_context = context;
     mdl.streamed = streamed.exl3Routed(b);
 }
 
+fn hasExpertsBin(io: std.Io, dir: []const u8) bool {
+    var d = std.Io.Dir.openDirAbsolute(io, dir, .{}) catch return false;
+    defer d.close(io);
+    _ = d.statFile(io, "experts.bin", .{}) catch return false;
+    return true;
+}
+
+/// A standard MLX pack's routed experts streamed as downloaded, at the slot rows the `stream_experts` setting names.
+fn openPackBank(m: *Model, dir: []const u8, ctx_size: ?u64, settings_json: []const u8) !void {
+    if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
+    const rows = (streamed.Setting.parse(settings_json) orelse return error.StreamedWeightsUnsupported).slotRows(m.cfg.num_experts);
+    _ = mlx.mlx_synchronize(m.s);
+    var st = try streamed.Streamed.openPack(gpa, dir, m.s, rows);
+    errdefer st.close();
+    m.bank = .{ .pack = st };
+    m.bank_context = ctx_size orelse bill_mod.stream_context_rungs[0];
+    m.mdl.streamed = m.bank.?.pack.routedSource();
+    std.log.info("deepseek_v41: streamed MLX pack experts, {d} slot rows per layer", .{rows});
+}
+
 fn closeBank(m: *Model) void {
     if (comptime !build_options.mlx_stream) return;
-    const b = m.bank orelse return;
+    var b = m.bank orelse return;
     m.mdl.streamed = null;
-    b.deinit();
+    switch (b) {
+        .exl3 => |x| x.deinit(),
+        .pack => |*x| x.close(),
+    }
     m.bank = null;
 }
 
@@ -385,11 +411,21 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
     return o;
 }
 
-/// A prompt from `pos` (0: a new request); a streamed bank's in calls of at most `bill.stream_call_rows`.
+/// The rows of one prompt call: a streamed EXL3 bank's up to `bill.stream_call_rows`; an MLX pack's the most whose pairs
+/// one group's fetch takes (`max_call_ids`).
+fn callRows(m: *const Model, n: usize) usize {
+    const b = m.bank orelse return n;
+    return switch (b) {
+        .exl3 => bill_mod.stream_call_rows,
+        .pack => streamed.max_call_ids / m.cfg.num_experts_per_tok,
+    };
+}
+
+/// A prompt from `pos` (0: a new request), in calls of at most `callRows`.
 fn runPrompt(m: *Model, ids: []const u32, pos: usize, rows: ?dsv41.VisionRows) !mlx.mlx_array {
     const mdl = m.mdl;
     if (pos == 0) try dsv41.reset(mdl, gpa);
-    const call = if (m.bank != null) bill_mod.stream_call_rows else ids.len;
+    const call = callRows(m, ids.len);
     var vr = rows;
     var at: usize = 0;
     while (true) {

@@ -27,16 +27,17 @@ pub const stream_min_rows: u32 = 16;
 pub const stream_call_rows: usize = 16384;
 /// Positions a request generates past its prompt (the decode phase's state).
 pub const stream_generation: u64 = 8192;
-/// What the box keeps unplanned: the host's default wired-limit margin (`--wired-margin-gib`), the stop under the
-/// ceiling, and the host side of the process (its heap and the stream's read buffers).
-pub const stream_margin_bytes: u64 = (8 << 30) + 2_000_000_000 + (1 << 30);
+/// What the box keeps unplanned beside the host's wired-limit margin: the stop under the ceiling, and the host side
+/// of the process (its heap and the stream's read buffers).
+pub const stream_host_bytes: u64 = 2_000_000_000 + (1 << 30);
 
-/// The bytes a streamed bank's slot rows may take in each phase: the GPU working set less `stream_margin_bytes`, the
-/// memory in use now (the residents loaded, every other process) and the phase's working set at `context` positions
-/// (a prompt: one `stream_call_rows` call's; decode: the state at `context + stream_generation`).
-pub fn streamBudget(config: *const cfg_mod.Config, context: u64) struct { prompt: u64, decode: u64 } {
+/// The bytes a streamed bank's slot rows may take in each phase: the GPU working set less `wired_margin` (the host's
+/// `--wired-margin-gib`) and `stream_host_bytes`, the memory in use now (the residents loaded, every other process)
+/// and the phase's working set at `context` positions (a prompt: one `stream_call_rows` call's; decode: the state at
+/// `context + stream_generation`).
+pub fn streamBudget(config: *const cfg_mod.Config, context: u64, wired_margin: u64) struct { prompt: u64, decode: u64 } {
     const in_use = system.getTotalMemBytes() -| system.getAvailableMemBytes();
-    const box = @as(u64, mlx.maxRecommendedWorkingSet()) -| stream_margin_bytes -| in_use;
+    const box = @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| in_use;
     return .{
         .prompt = box -| prefillAt(config, context, stream_call_rows),
         .decode = box -| prefillAt(config, context + stream_generation, 1),

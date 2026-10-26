@@ -135,12 +135,12 @@ pub fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_di
 
 fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
-    const shards = modelDiskBytes(io, model_dir);
+    var shards = modelDiskBytes(io, model_dir);
     // An expert bank's plugin bills its rows (`resident_bytes`).
     if (config.stream_experts_override) |st| if (!config.expert_bank) {
         // The routed experts stay on disk; their slot rows are resident.
         const s = try streamed.Streamed.packBytes(allocator, model_dir, st.slotRows(config.num_experts));
-        return shards -| s.experts +| s.slots;
+        shards = shards -| s.experts +| s.slots;
     };
     const b = config.plugin orelse return shards;
     const f = b.table.weights.resident_bytes orelse return shards;

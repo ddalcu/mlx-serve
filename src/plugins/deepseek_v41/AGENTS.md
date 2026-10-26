@@ -57,10 +57,13 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
 - Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
   grows the rows into what the prompt's working set held.
-- The bank bills its rows at the load (`streamBudget`: the GPU working set less `stream_margin_bytes`, the memory
-  in use, the phase's working set at the context); the context is `ctx_size`, else the largest
-  `stream_context_rungs` rung keeping `stream_min_rows`. The engine's prefill guard leaves the pack to it
-  (`streamed_weights`); a prompt past the billed context is refused by name.
+- The bank bills its rows at the load (`streamBudget`: the GPU working set less the host's wired margin and
+  `stream_host_bytes`, the memory in use, the phase's working set at the context); the context is `ctx_size`, else
+  the largest `stream_context_rungs` rung keeping `stream_min_rows`. The engine's prefill guard leaves the pack to
+  it (`streamed_weights`); a prompt past the billed context is refused by name.
+- A plain MLX pack streams with the per-model `stream_experts` (`openPackBank`, the `trunk` arm): one fetch serves
+  `Routed.decode_ids` experts, so a wider prompt call runs its experts in groups (`slotWide`). Decode is read-bound
+  (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
 
 ## Known issues
 - Prefix cache off (module-owned rings); one resume snapshot per model (a busy server resumes the last armed one).
