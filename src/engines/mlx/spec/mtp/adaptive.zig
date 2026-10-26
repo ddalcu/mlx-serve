@@ -140,12 +140,7 @@ pub fn mtpSerialProbeArm(
     useful: bool,
 ) ?usize {
     if (!solo or !idle or !may_resume or !useful) return null;
-    if (bucket >= round_cost.N_BUCKETS) return null;
-    if (t.serialMsPerTok(bucket) != null) return null;
-    // Bounded retries, not a one-shot flag: an interrupted probe must not burn the bucket's only chance.
-    if (t.serial_probes[bucket] >= round_cost.MAX_SERIAL_PROBES) return null;
-    t.serial_probes[bucket] += 1;
-    return bucket;
+    return if (t.armSerialProbe(bucket)) bucket else null;
 }
 
 /// The standing choice and the streak behind it. Pure.
@@ -319,7 +314,7 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
         const b = self.mtpAdaptiveBucket(kv_len);
         const table_ms_tok = t.msPerTok(m_lo, b);
         const window_ms_tok = self.mtp_price.msPerTok();
-        const serial_ms = t.serialMsPerTok(b);
+        const serial_ms = t.freshSerialMsPerTok(b);
         const vote = mtpAdaptiveVoteFor(table_ms_tok, window_ms_tok, serial_ms, MTP_ADAPTIVE_MARGIN);
         const prev_bucket = self.mtp_adaptive.bucket;
         const prev_arm = self.mtp_adaptive.arm;
@@ -337,13 +332,13 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
             if (stickyOnSerialSwitch(self.mtp)) self.mtp_adaptive.stickSerial();
             return true;
         }
-        // Nothing to decide with: teach the bucket a serial token, once.
+        // Missing or expired serial evidence needs a bounded probe.
         const idle = self.mtp_serial_left == 0 and self.mtp_serial_exit == .none;
         const useful = mtpSerialProbeUseful(window_ms_tok) and mtpSerialProbeEarned(if (self.xfm.qwen4Trunk()) |trunk| trunk.qwen4_mtp != null else false, self.mtp_low_accept);
         if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), useful)) |own| {
             self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
             log.info(
-                "  [mtp] adaptive: bucket {s} has no serial cell -> probing {d} serial tokens\n",
+                "  [mtp] adaptive: bucket {s} has no current serial cell -> probing {d} serial tokens\n",
                 .{ round_cost.bucketName(self.xfm.round_cost.layout, own), MTP_ADAPTIVE_PROBE_TOKENS },
             );
             return true;
@@ -717,4 +712,65 @@ test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first
     try testing.expectEqual(@as(u8, 0), t.serial_probes[b]);
     try testing.expectEqual(@as(?usize, b), G.mtpSerialProbeArm(&t, b, true, true, true, G.mtpSerialProbeUseful(12.5)));
     try testing.expectEqual(@as(u8, 1), t.serial_probes[b]);
+}
+
+test "serial freshness: a stale fast price cannot disable a faster speculative path" {
+    const G = Generator;
+    const kv: u32 = 40_000;
+    var table = round_cost.Table{ .layout = .long };
+    const bucket = table.bucketOf(kv);
+    for (0..round_cost.MIN_SAMPLES) |_| _ = table.observeSerial(kv, 12.0, true, false);
+    for (0..round_cost.SERIAL_REFRESH_ROUNDS + 1) |_| _ = table.observe(2, kv, 60.0, 3.0, true, false);
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(20.0, 20.0, table.freshSerialMsPerTok(bucket), G.MTP_ADAPTIVE_MARGIN));
+    try testing.expectEqual(@as(?usize, bucket), G.mtpSerialProbeArm(&table, bucket, true, true, true, true));
+    for (0..round_cost.MIN_SAMPLES - 1) |_| {
+        _ = table.observeSerial(kv, 30.0, true, false);
+        try testing.expect(table.freshSerialMsPerTok(bucket) == null);
+    }
+    _ = table.observeSerial(kv, 30.0, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 30.0), table.freshSerialMsPerTok(bucket).?, 0.001);
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(20.0, 20.0, table.freshSerialMsPerTok(bucket), G.MTP_ADAPTIVE_MARGIN));
+    try testing.expect(G.mtpSerialProbeArm(&table, bucket, true, true, true, true) == null);
+}
+
+test "serial freshness: probe retries cool down on the shared round clock" {
+    const G = Generator;
+    const kv: u32 = 40_000;
+    var table = round_cost.Table{ .layout = .long };
+    const bucket = table.bucketOf(kv);
+    for (0..round_cost.MAX_SERIAL_PROBES) |_| try testing.expect(G.mtpSerialProbeArm(&table, bucket, true, true, true, true) != null);
+    for (0..1000) |_| try testing.expect(G.mtpSerialProbeArm(&table, bucket, true, true, true, true) == null);
+    for (0..round_cost.SERIAL_REFRESH_ROUNDS) |_| _ = table.observe(2, kv, 60.0, 3.0, true, false);
+    try testing.expect(G.mtpSerialProbeArm(&table, bucket, true, true, true, true) == null);
+    _ = table.observe(2, kv, 60.0, 3.0, true, false);
+    try testing.expectEqual(@as(?usize, bucket), G.mtpSerialProbeArm(&table, bucket, true, true, true, true));
+    try testing.expectEqual(@as(u8, 1), table.serial_probes[bucket]);
+}
+
+test "serial freshness: admission guards do not spend refresh retries" {
+    const G = Generator;
+    var table = round_cost.parse("rc3\ns 5 20.0 1.0 300\n", .long) orelse return error.TestUnexpectedResult;
+    try testing.expect(G.mtpSerialProbeArm(&table, 5, false, true, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&table, 5, true, false, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&table, 5, true, true, false, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&table, 5, true, true, true, false) == null);
+    try testing.expectEqual(@as(u8, 0), table.serial_probes[5]);
+    try testing.expectEqual(@as(?usize, 5), G.mtpSerialProbeArm(&table, 5, true, true, true, true));
+}
+
+test "serial freshness: speculation eventually reopens a mature serial probe" {
+    const kv: u32 = 20000;
+    var table: round_cost.Table = .{ .layout = .long };
+    const bucket = table.bucketOf(kv);
+    for (0..round_cost.MIN_SAMPLES) |_| _ = table.observeSerial(kv, 10, true, false);
+    try testing.expect(mtpSerialProbeArm(&table, bucket, true, true, true, true) == null);
+    for (0..257) |_| _ = table.observe(2, kv, 40, 2, true, false);
+    try testing.expectEqual(@as(?usize, bucket), mtpSerialProbeArm(&table, bucket, true, true, true, true));
+}
+
+test "serial freshness: restored measurements need a probe in this process" {
+    var table: round_cost.Table = .{ .layout = .long };
+    const bucket = table.bucketOf(20000);
+    table.serial[bucket] = .{ .ms = 10, .tok = 1, .n = round_cost.MIN_SAMPLES };
+    try testing.expectEqual(@as(?usize, bucket), mtpSerialProbeArm(&table, bucket, true, true, true, true));
 }
