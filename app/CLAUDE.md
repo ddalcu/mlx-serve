@@ -11,6 +11,8 @@ Compressed rules. Full war stories: `../docs/gotchas/app.md`. Full service contr
 - **An asset dragged out of Finder carries `com.apple.FinderInfo`, and codesign refuses the WHOLE bundle for it** (live 2026-08-09, a screen recording copied off the Desktop): `resource fork, Finder information, or similar detritus not allowed` — reported three minutes into a build, against the BINARY rather than the file that brought the metadata in. build.sh now `xattr -cr`s the staged bundle before signing (fixes the class); `tests/test_resource_xattrs.sh` keeps the checked-in copies clean so it's caught in a second with the file named. It checks ONLY the attributes that actually block signing — `com.apple.macl`/`com.apple.provenance` are added by macOS whenever a sandboxed app touches a file, every existing resource has always carried them, and failing on those would make the guard cry wolf until someone deleted it.
 - Agent Sandbox needs `com.apple.security.virtualization` in BOTH signing branches of build.sh (ad-hoc included) or VZ refuses to boot. `swift build` binaries / xctest can't boot VMs; live guard = `SANDBOX_SMOKE=1 <MLXCore binary>`.
 
+- Settings/body restart predicates compare stored discovery snapshots; folder detection runs only at startup or explicit refresh/configuration changes. Refresh progress is observed by its pane, not forwarded through AppState. Guard: `ModelDiscoverySnapshotTests`.
+
 ## Layout
 
 | Path | Role |
@@ -47,8 +49,6 @@ Compressed rules. Full war stories: `../docs/gotchas/app.md`. Full service contr
 Agent loop: tools → parse → exec → feed back; history builder is budget-aware (pins first user+assistant, truncates, auto-compacts tool results). Tool errors echo sent args + retry hint for self-correction.
 
 ## Rules
-
-- Settings/body restart predicates compare stored discovery snapshots; folder detection runs only at startup or explicit refresh/configuration changes. Refresh progress is observed by its pane, not forwarded through AppState. Guard: `ModelDiscoverySnapshotTests`.
 
 - **IME composition and a recovered steering note have separate owners**: keep paused notes in the app-level engine until the composer has committed or cancelled its marked text. Restore after the binding update; neither redraw nor window removal may consume the note. Guards: `SteeringNotesTests`, `ComposerMarkedTextTests`; detail: `../docs/gotchas/app.md`.
 
