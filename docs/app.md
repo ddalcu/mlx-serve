@@ -4,7 +4,7 @@
 
 Menu-bar app that wraps the server with a full UI. [Download the latest release](https://github.com/ddalcu/mlx-serve/releases/latest) or `brew install --cask mlx-serve`. Since v26.8.4 it is one window with a sidebar, content and detail column: Models, Tasks, Settings and the media generators are modes of the chat window rather than separate windows.
 
-- **Model browser** — download from HuggingFace with resumable multi-connection transfers (up to 16 connections per file). When automatic discovery is enabled, it finds LM Studio's existing model folder (`~/.lmstudio/settings.json`) and your Hugging Face cache (wherever `HF_HOME` / `HF_HUB_CACHE` point) so you don't re-download what's on disk, GGUF rows show a min–max RAM-estimate range. Multi-variant repos let you pick your quant, and **Settings ▸ Model Folders** chooses where downloads land. **Settings ▸ Server ▸ Automatically Discover Models** is on by default; turning it off keeps configured folders and prior MLX-Serve downloads. **My Models ▸ Refresh** re-reads enabled locations, including moved external model folders, and updates the library without changing the download destination during active transfers.
+- **Model browser** — download from HuggingFace with resumable multi-connection transfers (up to 16 connections per file), auto-discovers LM Studio's existing model folder (`~/.lmstudio/settings.json`) and your Hugging Face cache (wherever `HF_HOME` / `HF_HUB_CACHE` point) so you don't re-download what's on disk, GGUF rows show a min–max RAM-estimate range. Multi-variant repos let you pick your quant, and **Settings ▸ Model Folders** chooses where downloads land.
 - **Model switching without a restart** — picking a chat model loads it into the running server and makes it the default (`POST /v1/load-model` with `"default": true` over the API).
 - **Chat interface** — multi-session chat with markdown rendering. Drop in PDFs (PDFKit-extracted) or images alongside text.
 - **Agent mode** — 10 built-in tools (shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory) with automatic tool calling loop and a per-tool approval dialog (**Allow** / **Deny** / **Always allow this session**).
@@ -22,6 +22,12 @@ Menu-bar app that wraps the server with a full UI. [Download the latest release]
 - **Engine-aware Settings window** (Cmd+,) — every server-launch flag and per-request default, with sections that show only the knobs relevant to the engine you've loaded (MLX vs GGUF vs ds4).
 - **Server management** — start/stop, live log buffer, restart-on-flag-change banner.
 - **Image / Video / Music / Speech / 3D generation** — FLUX.2, Krea-2, Mage-Flow, LTX-Video 2.3 / 2.5, MiniMax-H3, ACE-Step, MiniMax Music 3, YuE2, Qwen3-TTS, Kokoro and Hunyuan3D, all native via the mlx-serve zig server.
+
+## Model discovery and refresh
+
+**Settings ▸ Server ▸ Automatically Discover Models** is on by default. When enabled, the model browser finds LM Studio, the Hugging Face cache and other supported apps. Turning it off keeps configured folders and prior MLX-Serve downloads. Restart the server to update its search folders.
+
+**My Models ▸ Refresh** re-reads enabled locations, including moved external model folders, and updates the library without changing the download destination during active transfers.
 
 ## Image / Video / Music / Speech / 3D generation
 

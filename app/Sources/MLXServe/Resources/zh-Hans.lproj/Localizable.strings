@@ -1026,6 +1026,12 @@
 "Mode" = "模式";
 "Model" = "模型";
 "Model Details…" = "模型详情…";
+"Automatically Discover Models" = "自动发现模型";
+
+"Include LM Studio, the Hugging Face cache and other apps. Turn off to use only configured folders and previous MLX-Serve downloads. Restart the server to update its search folders." = "包含 LM Studio、Hugging Face 缓存及其他应用中的模型。关闭后仅使用已配置的文件夹和以前的 MLX-Serve 下载。重启服务器以更新搜索文件夹。";
+
+"Rescan enabled model folders" = "重新扫描已启用的模型文件夹";
+
 "Model Settings" = "模型设置";
 "Model Settings for the selected model (context, KV cache, MTP)" = "所选模型的模型设置（上下文、KV cache、MTP）";
 "Model Settings…" = "模型设置…";
@@ -2379,9 +2385,3 @@
 "Handwritten note (Chinese text)" = "手写便签（中文）";
 "Whiteboard (Chinese text)" = "玻璃白板（中文）";
 "Layout poster (1024 × 1024)" = "布局海报（1024 × 1024）";
-
-"Automatically Discover Models" = "自动发现模型";
-
-"Include LM Studio, the Hugging Face cache and other apps. Turn off to use only configured folders and previous MLX-Serve downloads. Restart the server to update its search folders." = "包含 LM Studio、Hugging Face 缓存及其他应用中的模型。关闭后仅使用已配置的文件夹和以前的 MLX-Serve 下载。重启服务器以更新搜索文件夹。";
-
-"Rescan enabled model folders" = "重新扫描已启用的模型文件夹";
