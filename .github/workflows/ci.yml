@@ -96,6 +96,13 @@ jobs:
       - name: Build mlx-serve (Zig, ReleaseFast)
         run: zig build -Doptimize=ReleaseFast
 
+      # The iPhone app links this slice; nothing else compiles it, so a shared
+      # source that starts importing a module `addIosLib` does not name goes
+      # unnoticed until someone opens Xcode. Skips quietly on a box without the
+      # iOS SDK (the step is simply not registered there).
+      - name: Build iOS static lib (device slice)
+        run: zig build ios-lib --summary all
+
       - name: Build vz-agent guest binary
         run: zig build vz-agent
 

@@ -11,4 +11,3 @@
 * DeepSeek-V4.1 EXL3 repack: move the `lib/mlx-stream` pin from our fork to upstream mlx-stream once it carries the host `sdk/` and the `mlx_host` import.
 * Prefix reuse for DeepSeek-V4 / V4.1: today V4.1 resumes one conversation (`resumePrompt`, the plugin's `restorePrefix`), V4 none.
 * sushi: `trellisAdmitted` checks widths in multiples of 16, the kernels rotate whole 128-wide Hadamard blocks (`format.HAD_DIM`): a bank narrower than a block decodes to garbage. Require multiples of `HAD_DIM` in our fork and upstream.
-* `zig build ios-lib` fails on main (`.default_kv_attn_fused`, a `std.Io` call).

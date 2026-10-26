@@ -699,6 +699,27 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     ios_options.addOption([]const u8, "llama_tag", "unknown");
     ios_options.addOption([]const u8, "git_sha", "");
 
+    // Data-only modules the shared engine sources import as text/tables:
+    // src/lane_qmm.zig reads MLX's steel tile headers, src/launch.zig installs
+    // the embedded agent skill and plugin files. Their contents do not depend
+    // on the target, but they must be named here or the iOS lib fails to
+    // compile ("no module named 'mlx_steel_sources' ... within module 'root'").
+    const mlx_steel_sources = b.createModule(.{
+        .root_source_file = b.path("lib/mlx_steel_sources.zig"),
+        .target = ios_target,
+        .optimize = .ReleaseFast,
+    });
+    const agent_skills = b.createModule(.{
+        .root_source_file = b.path("skills/agent_skills.zig"),
+        .target = ios_target,
+        .optimize = .ReleaseFast,
+    });
+    const opencode2_plugin = b.createModule(.{
+        .root_source_file = b.path("lib/opencode2_plugin.zig"),
+        .target = ios_target,
+        .optimize = .ReleaseFast,
+    });
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/ios_lib.zig"),
         .target = ios_target,
@@ -707,6 +728,9 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = ios_options.createModule() },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
+            .{ .name = "agent_skills", .module = agent_skills },
+            .{ .name = "opencode2_plugin", .module = opencode2_plugin },
         },
     });
     addGgufModule(b, mod, ios_target, .ReleaseFast);
