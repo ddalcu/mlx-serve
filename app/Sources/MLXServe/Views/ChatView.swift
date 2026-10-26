@@ -4224,8 +4224,18 @@ enum ContextMonitor {
 
 /// Animated indicator shown while the model is generating, with live GPU and memory stats.
 struct GeneratingIndicator: View {
-    enum StatusSegment: Equatable {
+    enum StatusSegment: Equatable, Identifiable {
+        enum ID: Hashable { case gpu, memory, activityPhrase, elapsed }
         case gpu, memory, activityPhrase(String), elapsed
+
+        var id: ID {
+            switch self {
+            case .gpu: return .gpu
+            case .memory: return .memory
+            case .activityPhrase: return .activityPhrase
+            case .elapsed: return .elapsed
+            }
+        }
     }
 
     static func statusSegments(showActivityPhrases: Bool, phrase: String) -> [StatusSegment] {
@@ -4248,9 +4258,8 @@ struct GeneratingIndicator: View {
                           outerColor: gpuNSColor, innerColor: memNSColor)
                 .frame(width: 20, height: 20)
 
-            ForEach(Array(Self.statusSegments(showActivityPhrases: showActivityPhrases,
-                                             phrase: whimsy).enumerated()), id: \.offset) { index, segment in
-                if index > 0 {
+            ForEach(Self.statusSegments(showActivityPhrases: showActivityPhrases, phrase: whimsy)) { segment in
+                if segment != .gpu {
                     Text("·")
                         .foregroundStyle(.tertiary)
                 }
