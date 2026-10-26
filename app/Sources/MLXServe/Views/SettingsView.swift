@@ -2543,6 +2543,22 @@ private struct PerformanceSectionContent: View {
                 }
             }
         }
+        if let m = meta["prefillDecodeShare"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.prefillDecodeShare)
+            ) {
+                let share = ServerOptions.normalizedPrefillDecodeShare(appState.serverOptions.prefillDecodeShare)
+                let percent = Int((share * 100).rounded())
+                snappingSlider(
+                    presets: ServerOptions.prefillDecodeSharePresets,
+                    current: percent,
+                    set: { appState.serverOptions.prefillDecodeShare = Double($0) / 100 },
+                    label: share == 0 ? "Default" : "\(percent)%"
+                )
+            }
+        }
         if let m = meta["decodeAttnQuant"] {
             SettingsRow(
                 title: m.title,

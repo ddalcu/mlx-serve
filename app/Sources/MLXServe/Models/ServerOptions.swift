@@ -153,6 +153,9 @@ struct ServerOptions: Codable, Equatable {
     /// forward pass. 1 = serial (default). Hybrid SSM / MoE models clamp to 1
     /// regardless. Pure-attention dense models pick up ~1.6× at 4-way.
     var maxConcurrent: Int = 1
+    /// Target decode wall-time share while other streams prefill. Zero omits the
+    /// flag, preserving the server default or MLX_SERVE_PREFILL_DECODE_SHARE.
+    var prefillDecodeShare: Double = 0
     /// KV-cache quantization scheme. `off` = dense bf16. `int4` / `int8` apply
     /// affine quant.
     var kvQuant: KVQuant = .off
@@ -540,6 +543,7 @@ struct ServerOptions: Codable, Equatable {
         w8a8 == other.w8a8 &&
         aneSlots == other.aneSlots &&
         maxConcurrent == other.maxConcurrent &&
+        prefillDecodeShare == other.prefillDecodeShare &&
         kvQuant == other.kvQuant &&
         hotPrefixCacheEnabled == other.hotPrefixCacheEnabled &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -596,6 +600,13 @@ struct ServerOptions: Codable, Equatable {
     /// Snap points for the idle-eviction slider, in seconds. Off first; every
     /// step is a whole number of minutes or hours so the label never rounds.
     static let idleEvictPresets: [Int] = [0, 300, 600, 900, 1800, 3600, 7200, 14400]
+
+    /// Percentages for the Settings slider. Zero leaves the server in charge.
+    static let prefillDecodeSharePresets: [Int] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+
+    static func normalizedPrefillDecodeShare(_ share: Double) -> Double {
+        share.isFinite ? min(0.9, max(0, share)) : 0
+    }
 
     /// The slider's readout — seconds are the flag's unit, not the reader's.
     static func idleEvictLabel(_ secs: Int) -> String {
@@ -726,6 +737,10 @@ struct ServerOptions: Codable, Equatable {
         // readable in log lines and `ps`. Server defaults are 1 / off / auto.
         if maxConcurrent > 1 {
             args += ["--max-concurrent", "\(maxConcurrent)"]
+        }
+        let decodeShare = Self.normalizedPrefillDecodeShare(prefillDecodeShare)
+        if decodeShare > 0 {
+            args += ["--prefill-decode-share", String(format: "%g", decodeShare)]
         }
         if kvQuant != .off {
             args += ["--kv-quant", kvQuant.cliValue]
@@ -939,6 +954,9 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .w8a8) { w8a8 = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .aneSlots) { aneSlots = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .prefillDecodeShare) {
+            prefillDecodeShare = Self.normalizedPrefillDecodeShare(v)
+        }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         let storedPrefixEntries = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries)
         if let v = try c.decodeIfPresent(Bool.self, forKey: .hotPrefixCacheEnabled) {
@@ -1202,6 +1220,10 @@ extension ServerOptions {
         "maxConcurrent": .init(
             title: "Concurrent requests",
             explainer: "How many requests the server works on at once.",
+            needsRestart: true),
+        "prefillDecodeShare": .init(
+            title: "Decode share during prefill",
+            explainer: "How much of its time a reply keeps while another prompt is being read. Higher favors replies over prompt speed.",
             needsRestart: true),
         "decodeAttnQuant": .init(
             title: "Fast decode for bf16-attention models (recommended)",

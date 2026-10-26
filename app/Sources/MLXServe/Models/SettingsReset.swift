@@ -99,6 +99,7 @@ enum SettingsReset {
             return [
                 f("tokenizeCacheEntries") { $0.tokenizeCacheEntries = $1.tokenizeCacheEntries },
                 f("maxConcurrent") { $0.maxConcurrent = $1.maxConcurrent },
+                f("prefillDecodeShare") { $0.prefillDecodeShare = $1.prefillDecodeShare },
                 f("decodeAttnQuantChoice") { $0.decodeAttnQuantChoice = $1.decodeAttnQuantChoice },
                 f("enablePrefixCacheDisk") { $0.enablePrefixCacheDisk = $1.enablePrefixCacheDisk },
                 f("prefixCacheDisk") { $0.prefixCacheDisk = $1.prefixCacheDisk },
