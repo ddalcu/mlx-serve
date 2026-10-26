@@ -142,7 +142,7 @@ pub const Both = struct {
 
     /// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens equal.
     pub fn expectGreedy(b: *Both) !void {
-        // Off Metal the tiny pack's pipelined generation never completes (MLX's CUDA wait stalls: open issue).
+        // Off Metal the tiny pack's pipelined generation can stall in MLX's CUDA wait; served packs complete.
         if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
         var tokens: [8]u32 = undefined;
         var s: Slot = undefined;
@@ -194,7 +194,7 @@ pub const Both = struct {
 
     /// Two slots prefilled apart, then decoded together: each slot's logits.
     pub fn expectBatched(b: *Both) !void {
-        // Off Metal the tiny pack's pipelined generation never completes (MLX's CUDA wait stalls: open issue).
+        // Off Metal the tiny pack's pipelined generation can stall in MLX's CUDA wait; served packs complete.
         if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
         const a = testing.allocator;
         var slots: [2]Slot = undefined;
@@ -410,7 +410,7 @@ pub fn atGeometry(real: []const u8, fixture_json: []const u8, keep: []const []co
 /// A greedy DFlash run on `xfm` with `dflash.TinyFix`'s assistant (hidden 64, vocab 128, target layers 0 and 2): the
 /// emitted tokens into `tokens` and each round's accepted count into `accepted`.
 pub fn dflashRun(xfm: *Transformer, tokens: []u32, accepted: *std.ArrayList(u32)) !void {
-    // Off Metal the tiny assistant's run never completes (MLX's CUDA wait stalls: open issue).
+    // Off Metal the tiny assistant's run can stall in MLX's CUDA wait; a served DFlash pair completes.
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const dflash_mod = @import("../spec/dflash/dflash.zig");
     const Generator = @import("../generate/generator.zig").Generator;

@@ -272,10 +272,11 @@ pub fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.A
                 s.markError(abi.items(u8, ev.verdict.why));
                 return .go;
             }
-            s.markFinished(if (s.cancelled.load(.acquire)) "cancelled" else switch (ev.reason) {
+            // A cancelled request reads as vLLM's and SGLang's "abort" (OpenAI names none).
+            s.markFinished(if (s.cancelled.load(.acquire)) "abort" else switch (ev.reason) {
                 .stop => "stop",
                 .length => "length",
-                .cancelled, .failed => "cancelled",
+                .cancelled, .failed => "abort",
             });
             return .go;
         },
@@ -340,6 +341,15 @@ test "stream: a failed finish carries its name, the refused bill and the loop cu
     c.cancel();
     try testing.expectEqual(NextResult.done, c.waitNext());
     try testing.expectEqual(abi.Action.stop, send(c, .{ .kind = .tokens }));
+}
+
+test "stream: an engine-cancelled request finishes as \"abort\", vLLM's word, never \"length\"" {
+    const s = try Stream.create(testing.allocator, testing.io);
+    defer s.release();
+    s.engineHolds();
+    _ = send(s, .{ .kind = .finished, .reason = .cancelled });
+    try testing.expectEqual(NextResult.done, s.waitNext());
+    try testing.expectEqualStrings("abort", s.finish_reason);
 }
 
 test "stream: a constraint span is visible with the token that carries it; the loop details ride the finish" {

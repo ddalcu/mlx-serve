@@ -54,8 +54,9 @@ pub const LoraSet = struct {
             return Verdict.refuse(.unsupported, "LoRA(s) have no modules matching this model's DiT — wrong LoRA for this architecture?");
         }
         if (matched != stack.entryCount())
-            log.warn("[lora] attached {d} of {d} adapter module(s); the rest target modules this model does not have\n", .{ matched, stack.entryCount() });
-        log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, stack.count });
+            log.warn("[image] lora: matched {d} module-attachment(s) across {d} adapter(s); {d} of {d} adapter module(s) target modules this model does not have\n", .{ matched, stack.count, stack.entryCount() - matched, stack.entryCount() })
+        else
+            log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, stack.count });
         self.stack = stack;
         self.matched = matched;
         return .ok;

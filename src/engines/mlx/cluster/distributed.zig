@@ -558,6 +558,8 @@ pub const Peer = struct {
 /// deadlocks until Metal's watchdog kills it. Done here, the receive also pairs with the
 /// peer's send even when nobody reads it (a warmup that drops its output).
 fn queuedRecv(link: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32) !mlx.mlx_array {
+    _ = cluster().recvs.fetchAdd(1, .acq_rel);
+    defer _ = cluster().recvs.fetchSub(1, .acq_rel);
     const r = try link.recv(shape, dtype, src);
     errdefer _ = mlx.mlx_array_free(r);
     try evalOne(r);
@@ -597,6 +599,8 @@ const ClusterState = struct {
     worker_copy: std.atomic.Value(i32) = .init(-1),
     /// The worker's compute time for its last step (µs), sent over the bell after each one.
     worker_us: std.atomic.Value(u32) = .init(0),
+    /// Receives from the worker in progress on the inference thread (`queuedRecv`).
+    recvs: std.atomic.Value(u32) = .init(0),
 };
 pub const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
 inline fn cluster() *ClusterState {
@@ -1008,6 +1012,13 @@ fn watchWorker(link: *const Link) void {
     worker_gone.store(true, .release);
     cluster().joined.store(false, .release);
     log.warn("[dist] the worker left; this server restarts to pair again\n", .{});
+    // A receive from the worker, in progress or started later, never returns, and the inference thread with it: its
+    // requests end by name and the process exits for the app (or a supervisor) to pair again.
+    while (cluster().recvs.load(.acquire) == 0) crt.sleepMs(100);
+    log.err("[dist] a step waits on the worker that left; its requests end and this server exits\n", .{});
+    if (@import("../../../host/http/server.zig").launch().global_scheduler) |sch| @import("../scheduler.zig").failInFlight(sch, "DistWorkerLeft");
+    crt.sleepMs(2000);
+    std.process.exit(1);
 }
 
 /// Right after the worker joins, over the bell connection (no MLX off the inference thread):

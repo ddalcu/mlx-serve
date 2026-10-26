@@ -663,6 +663,19 @@ pub fn cancelAllInFlight(self: *Scheduler) void {
     }
 }
 
+/// Ends every request in flight with the error `name`, from any thread: for an inference thread that will never
+/// return from its step (a cluster worker left mid-exchange), so the readers are told before the process exits.
+pub fn failInFlight(self: *Scheduler, name: []const u8) void {
+    self.queue_mu.lockUncancelable(self.io);
+    defer self.queue_mu.unlock(self.io);
+    for (self.pending.items) |slot| slot.markError(name);
+    if (self.boundary_slot) |slot| slot.markError(name);
+    if (self.prefilling_from < self.n_prefilling) {
+        for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| slot.markError(name);
+    }
+    for (self.decoding.items) |slot| slot.markError(name);
+}
+
 /// The media residency bill for an entry, or 0 when it is not a media
 /// model. The backend type must come from the DIRECTORY, never from the
 /// entry's stub config, whose `model_type` is the MODALITY static
@@ -1217,6 +1230,31 @@ test "company: a slot on an engine beside MLX never batches, so it does not coun
     try testing.expect(!hasCompany(&sch));
     sch.in_flight = 2;
     try testing.expect(hasCompany(&sch));
+}
+
+test "failInFlight: a decoding request ends with the error by name" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.boundary_slot = null;
+    sch.prefilling_from = 0;
+    sch.n_prefilling = 0;
+    var slot: Slot = undefined;
+    slot.io = testing.io;
+    slot.allocator = testing.allocator;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.sink = null;
+    try sch.decoding.append(testing.allocator, &slot);
+    defer sch.decoding.deinit(testing.allocator);
+    failInFlight(&sch, "DistWorkerLeft");
+    defer testing.allocator.free(slot.error_code.?);
+    try testing.expectEqualStrings("DistWorkerLeft", slot.error_code.?);
 }
 
 test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancelled too" {
