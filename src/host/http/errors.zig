@@ -31,6 +31,7 @@ pub fn slotFailure(slot: *Stream) anyerror {
     }
     if (slot.errorNameIs("PromptLogprobsUnavailable")) return error.PromptLogprobsUnavailable;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
+    if (slot.errorNameIs("DistWorkerLeft")) return error.DistWorkerLeft;
     return error.GenerationFailed;
 }
 
@@ -126,6 +127,13 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
             .message = engine_requests.refusalMessage(buf),
+        },
+        error.DistWorkerLeft => .{
+            .status_line = "503 Service Unavailable",
+            .code = 503,
+            .openai_type = "server_error",
+            .anthropic_type = "overloaded_error",
+            .message = "the cluster's worker Mac left during this request; the server restarts to pair again",
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -458,6 +466,7 @@ test "mapGenerationError: after a lost GPU context any failure is the named 503"
     _ = mlx.takeError(&stale);
     defer mlx.resetGpuContextLostForTest();
     var buf: [192]u8 = undefined;
+    try t.expectEqual(@as(u32, 503), mapGenerationError(error.DistWorkerLeft, &buf).code);
     try t.expectEqual(@as(u32, 500), mapGenerationError(error.GenerationFailed, &buf).code);
     mlx.latchErrorForTest("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered");
     _ = mlx.takeError(&stale);

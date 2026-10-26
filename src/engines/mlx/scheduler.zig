@@ -665,15 +665,21 @@ pub fn cancelAllInFlight(self: *Scheduler) void {
 
 /// Ends every request in flight with the error `name`, from any thread: for an inference thread that will never
 /// return from its step (a cluster worker left mid-exchange), so the readers are told before the process exits.
+/// The stuck pass never drops its slots' `in_pass`; it is dropped here, or each reader's `complete` waits forever.
 pub fn failInFlight(self: *Scheduler, name: []const u8) void {
     self.queue_mu.lockUncancelable(self.io);
     defer self.queue_mu.unlock(self.io);
-    for (self.pending.items) |slot| slot.markError(name);
-    if (self.boundary_slot) |slot| slot.markError(name);
+    for (self.pending.items) |slot| failSlot(slot, name);
+    if (self.boundary_slot) |slot| failSlot(slot, name);
     if (self.prefilling_from < self.n_prefilling) {
-        for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| slot.markError(name);
+        for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| failSlot(slot, name);
     }
-    for (self.decoding.items) |slot| slot.markError(name);
+    for (self.decoding.items) |slot| failSlot(slot, name);
+}
+
+fn failSlot(slot: *Slot, name: []const u8) void {
+    slot.markError(name);
+    slot.in_pass.store(0, .release);
 }
 
 /// The media residency bill for an entry, or 0 when it is not a media
@@ -1232,7 +1238,7 @@ test "company: a slot on an engine beside MLX never batches, so it does not coun
     try testing.expect(hasCompany(&sch));
 }
 
-test "failInFlight: a decoding request ends with the error by name" {
+test "failInFlight: a decoding request ends with the error by name, its stuck pass released" {
     var sch: Scheduler = undefined;
     sch.io = testing.io;
     sch.queue_mu = .init;
@@ -1250,11 +1256,14 @@ test "failInFlight: a decoding request ends with the error by name" {
     slot.finished = false;
     slot.error_code = null;
     slot.sink = null;
+    slot.in_pass = .init(1);
     try sch.decoding.append(testing.allocator, &slot);
     defer sch.decoding.deinit(testing.allocator);
     failInFlight(&sch, "DistWorkerLeft");
     defer testing.allocator.free(slot.error_code.?);
     try testing.expectEqualStrings("DistWorkerLeft", slot.error_code.?);
+    // The stuck pass's hold is dropped, so the reader's `complete` returns.
+    try testing.expectEqual(@as(u32, 0), slot.in_pass.load(.acquire));
 }
 
 test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancelled too" {
