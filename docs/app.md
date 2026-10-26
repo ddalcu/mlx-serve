@@ -7,7 +7,6 @@ Menu-bar app that wraps the server with a full UI. [Download the latest release]
 - **Model browser** — download from HuggingFace with resumable multi-connection transfers (up to 16 connections per file), auto-discovers LM Studio's existing model folder (`~/.lmstudio/settings.json`) and your Hugging Face cache (wherever `HF_HOME` / `HF_HUB_CACHE` point) so you don't re-download what's on disk, GGUF rows show a min–max RAM-estimate range. Multi-variant repos let you pick your quant, and **Settings ▸ Model Folders** chooses where downloads land.
 - **Model switching without a restart** — picking a chat model loads it into the running server and makes it the default (`POST /v1/load-model` with `"default": true` over the API).
 - **Chat interface** — multi-session chat with markdown rendering. Drop in PDFs (PDFKit-extracted) or images alongside text.
-- **Monitoring** — open **Monitoring** below **Tasks** for native live metrics, charts, sessions, request observations and model status. Collection continues while the app runs; Live, 10m, 30m, 1h and 24h views use a local, per-server history retained for up to 24 hours. Metrics must be enabled in Server settings. Browser history is separate; no prompts, responses or API keys are stored.
 - **Agent mode** — 10 built-in tools (shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory) with automatic tool calling loop and a per-tool approval dialog (**Allow** / **Deny** / **Always allow this session**).
 - **Agents** — named assistants with their own personality, voice, model, tools, workspace and wake phrase, plus their own pinned sampling (temperature, top-p, top-k, penalties, reasoning budget). The app writes the persona prompt for you, and every way of starting a conversation can run as one: chat tabs, hands-free voice, scheduled tasks, Telegram, the Quick Launcher.
 - **MCP client** — curated marketplace of stdio + HTTP MCP servers (GitHub, Azure DevOps, DBHub, Docker, Kubernetes, Playwright, Slack, Notion, Filesystem, Shell) plus your own from `~/.mlx-serve/mcp.json`.
@@ -65,3 +64,7 @@ And it goes well beyond text-to-X:
 Outputs go to `~/.mlx-serve/generations/` under per-modality, per-date folders.
 
 > The app won't let you start a generation if there isn't enough free RAM. If the mlx-serve server is running and competing for memory, you'll be prompted to stop it first.
+
+## Monitoring
+
+- **Monitoring** — open **Monitoring** below **Tasks** for native live metrics, charts, sessions, request observations and model status. Collection continues while the app runs; Live, 10m, 30m, 1h and 24h views use a local, per-server history retained for up to 24 hours. Metrics must be enabled in Server settings. Browser history is separate; no prompts, responses or API keys are stored.
