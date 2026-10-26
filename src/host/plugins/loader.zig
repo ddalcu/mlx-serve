@@ -135,6 +135,7 @@ pub const Opened = union(enum) {
 /// Opens the dylib at `path` (now: every mlx-c symbol it names must exist in this process) and negotiates its
 /// manifest against this build's MLX `host_mlx`. `sha256` is the file's, checked by the caller.
 pub fn open(a: Allocator, path: []const u8, sha256: [Sha256.digest_length * 2]u8, host_mlx: []const u8) !Opened {
+    if (!supported) return .{ .refused = try a.dupe(u8, "does not load: outside plugins are unsupported on this build") };
     const z = try a.dupeSentinel(u8, path, 0);
     defer a.free(z);
     const mode: std.c.RTLD = if (builtin.os.tag == .macos) .{ .NOW = true, .LOCAL = true } else .{ .NOW = true };
@@ -308,6 +309,18 @@ pub fn loadAtStartup(io: std.Io, a: Allocator, builtins: []const sdk_plugin.Entr
 const testing = std.testing;
 const fixture = @import("../../sdk/testing/fixture.zig");
 const model_abi = @import("../../abi/plugin.zig");
+
+test "outside plugins: open refuses unsupported builds before loading a library" {
+    if (supported) return error.SkipZigTest;
+    const result = try open(testing.allocator, "missing.dylib", @splat(0), "pin");
+    switch (result) {
+        .refused => |why| {
+            defer testing.allocator.free(why);
+            try testing.expectEqualStrings("does not load: outside plugins are unsupported on this build", why);
+        },
+        .ok => return error.TestUnexpectedResult,
+    }
+}
 
 test {
     _ = @import("cli.zig");
