@@ -12,6 +12,7 @@ const dsv41 = @import("deepseek_v41.zig");
 const vision = @import("vision.zig");
 const media = @import("media.zig");
 const bill_mod = @import("bill.zig");
+const disk_mod = @import("disk.zig");
 const fixture = @import("../deepseek_v4/fixture.zig");
 const v4plugin = @import("../deepseek_v4/plugin.zig");
 const quant_abi = @import("../../abi/quant.zig");
@@ -94,6 +95,9 @@ pub const Model = struct {
     /// snapshot stays on the module.
     keep_entries: usize = 1,
     keep_bytes: u64 = std.math.maxInt(u64),
+    /// Where conversations evicted from `idle` (and every kept one at unload) go, and come back from
+    /// (`--prefix-cache-disk`); null = off.
+    disk: ?disk_mod.Disk = null,
 };
 
 /// A state off the module, with its identity (`Dsv41Model.state_gen`).
@@ -128,12 +132,44 @@ fn keepIdle(m: *Model, k_in: Kept) void {
         k.snap = k.snap orelse dsv41.takeSnap(m.mdl, k.gen);
         // A state without its snapshot cannot resume anything.
         if (k.snap == null) return k.deinit(m.mdl.gpa);
+        // Evaluated here, on the GPU thread, so a disk write from any thread (the unload) can read it.
+        if (m.disk != null) dsv41.evalKept(&k.st, &k.snap.?) catch |e| std.log.warn("[dsv41-disk] eval failed: {s}", .{@errorName(e)});
     }
     m.idle.append(gpa, k) catch return k.deinit(m.mdl.gpa);
     while (m.idle.items.len > m.keep_entries or (m.idle.items.len > 1 and idleBytes(m) > m.keep_bytes)) {
         var old = m.idle.orderedRemove(0);
+        spill(m, &old);
         old.deinit(m.mdl.gpa);
     }
+}
+
+/// Writes a kept conversation to the disk store, when there is one; a failed write only loses the copy.
+fn spill(m: *Model, k: *const Kept) void {
+    const d = &(m.disk orelse return);
+    const sn = &(k.snap orelse return);
+    if (sn.gen != k.gen) return;
+    d.put(ioOf(), m.mdl, &k.st, sn) catch |e| std.log.warn("[dsv41-disk] write failed: {s}", .{@errorName(e)});
+}
+
+fn ioOf() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// A conversation from the disk store that resumes `prompt`, made the module's state; false when none does.
+fn fromDisk(m: *Model, prompt: []const u32, rows: ?mlx.mlx_array) bool {
+    const d = &(m.disk orelse return false);
+    const i = (d.best(m.mdl, prompt, rows) catch return false) orelse return false;
+    const got = d.take(ioOf(), m.mdl, i, dsv41.diskGen(m.mdl)) catch |e| {
+        std.log.warn("[dsv41-disk] read failed: {s}", .{@errorName(e)});
+        return false;
+    };
+    m.mdl.dec_state = got.st;
+    m.mdl.state_gen = got.snap.gen;
+    if (dsv41.swapSnap(m.mdl, got.snap)) |old| {
+        var o = old;
+        o.deinit(m.mdl.gpa);
+    }
+    return true;
 }
 
 fn idleBytes(m: *const Model) u64 {
@@ -272,6 +308,17 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const keep = resumeSettings(ctx.settings_json.slice());
     m.keep_entries = if (c.dsv41_streamed) 1 else keep.entries;
     m.keep_bytes = keep.bytes;
+    m.disk = null;
+    if (m.keep_entries > 1) {
+        const home = std.c.getenv("HOME");
+        if (home) |h| {
+            var b: [1024]u8 = undefined;
+            if (std.fmt.bufPrint(&b, "{s}/.mlx-serve/dsv41-states", .{std.mem.span(h)})) |base| {
+                const fp = disk_mod.fingerprint(io, ctx.model_dir.slice(), build_options.version ++ "+" ++ build_options.git_sha) catch 0;
+                m.disk = disk_mod.open(io, base, fp, keep.disk);
+            } else |_| {}
+        }
+    }
     if (c.dsv41_streamed) try openBank(m, io, ctx.model_dir.slice(), ctxSetting(ctx.settings_json.slice()));
     errdefer closeBank(m);
     m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
@@ -323,17 +370,18 @@ fn ctxSetting(settings_json: []const u8) ?u64 {
 /// `resume_entries` and `resume_mem` in the load settings (the driver states `--prefix-cache-entries` and
 /// `--prefix-cache-mem` there): how many finished conversations stay resumable and what they may hold. A streamed
 /// pack keeps one.
-const Keep = struct { entries: usize = 1, bytes: u64 = std.math.maxInt(u64) };
+const Keep = struct { entries: usize = 1, bytes: u64 = std.math.maxInt(u64), disk: u64 = 0 };
 
 fn resumeSettings(settings_json: []const u8) Keep {
     const none: Keep = .{};
     if (settings_json.len == 0) return none;
-    const S = struct { resume_entries: ?u32 = null, resume_mem: ?u64 = null };
+    const S = struct { resume_entries: ?u32 = null, resume_mem: ?u64 = null, resume_disk: ?u64 = null };
     const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return none;
     defer parsed.deinit();
     return .{
         .entries = @max(1, parsed.value.resume_entries orelse 1),
         .bytes = if (parsed.value.resume_mem) |b| (if (b == 0) std.math.maxInt(u64) else b) else std.math.maxInt(u64),
+        .disk = parsed.value.resume_disk orelse 0,
     };
 }
 
@@ -344,8 +392,13 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     var it = m.parked.valueIterator();
     while (it.next()) |k| k.deinit(m.mdl.gpa);
     m.parked.deinit(gpa);
-    for (m.idle.items) |*k| k.deinit(m.mdl.gpa);
+    // Every kept conversation goes to disk, so a restart resumes them.
+    for (m.idle.items) |*k| {
+        spill(m, k);
+        k.deinit(m.mdl.gpa);
+    }
     m.idle.deinit(gpa);
+    if (m.disk) |*d| d.deinit();
     m.mdl.deinit();
     m.weights.deinit();
     gpa.destroy(m);
@@ -490,7 +543,7 @@ pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows
                 var o = old;
                 o.deinit(m.mdl.gpa);
             };
-        }
+        } else _ = fromDisk(m, prompt.slice(), rows);
     }
     return dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
         // A failed reset leaves no state; the forward at position 0 builds one.

@@ -492,7 +492,7 @@ pub const Dsv41Model = struct {
     }
 
     /// How many of `ids` are image span positions.
-    fn imageRows(self: *const Dsv41Model, ids: []const u32) usize {
+    pub fn imageRows(self: *const Dsv41Model, ids: []const u32) usize {
         return if (self.cfg.image_token_id == 0) 0 else std.mem.count(u32, ids, &.{self.cfg.image_token_id});
     }
 
@@ -3947,6 +3947,194 @@ pub fn snapResumeLen(m: *Dsv41Model, sn: *const Snap, prompt: []const u32, visio
     if (sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
     if (sn.vision_key != try visionKey(vision_rows, m.imageRows(sn.ids))) return 0;
     return sn.ids.len;
+}
+
+// ── a kept conversation on disk ──────────────────────────────────────────
+
+/// The format of `exportKept`'s file; a file of another format is never read.
+pub const kept_format = "dsv41-kept-1";
+
+fn putArr(map: mlx.mlx_map_string_to_array, comptime fmt: []const u8, args: anytype, x: A) !void {
+    if (x.ctx == null) return;
+    var key: [48]u8 = undefined;
+    const k = try std.fmt.bufPrintSentinel(&key, fmt, args, 0);
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, k.ptr, x));
+}
+
+fn getArr(map: mlx.mlx_map_string_to_array, comptime fmt: []const u8, args: anytype) !?A {
+    var key: [48]u8 = undefined;
+    const k = try std.fmt.bufPrintSentinel(&key, fmt, args, 0);
+    var x = mlx.mlx_array_new();
+    if (mlx.mlx_map_string_to_array_get(&x, map, k.ptr) != 0 or x.ctx == null) {
+        _ = mlx.mlx_array_free(x);
+        return null;
+    }
+    return x;
+}
+
+fn u32Array(xs: []const u32) A {
+    return mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ci(xs.len)}, 1, .uint32);
+}
+
+fn rowsPrefix(r: Rows, n: usize, s: S) !A {
+    if (n == 0) return none;
+    return r.view(n, s);
+}
+
+/// Writes the conversation that state `st` and its snapshot `sn` hold to `path` (safetensors): what a resume of
+/// `sn` restores. The compressed and indexer rows are the state's own up to the snapshot's counts (they are append
+/// only, so the rows below are unchanged); the windows, open groups, DSpark rings and last hidden are the snapshot's.
+pub fn exportKept(m: *Dsv41Model, st: *const State, sn: *const Snap, path: [:0]const u8) !void {
+    // A CPU stream of this thread: the unload that writes every kept conversation runs on the host's thread, which
+    // has no GPU stream, and the state's arrays are already evaluated (shared memory).
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    var made = std.ArrayList(A).empty;
+    defer {
+        for (made.items) |x| _ = mlx.mlx_array_free(x);
+        made.deinit(m.gpa);
+    }
+    for (sn.layers, st.layers, 0..) |l, sl, i| {
+        try putArr(map, "l{d}.win", .{i}, l.win);
+        try putArr(map, "l{d}.pend_kv", .{i}, l.pend_kv);
+        try putArr(map, "l{d}.pend_gate", .{i}, l.pend_gate);
+        if (sl.comp) |r| {
+            const x = try rowsPrefix(r, l.comp_used, s);
+            try made.append(m.gpa, x);
+            try putArr(map, "l{d}.comp", .{i}, x);
+        }
+        if (sl.idx_k) |r| {
+            const x = try rowsPrefix(r, l.idx_used, s);
+            try made.append(m.gpa, x);
+            try putArr(map, "l{d}.idx", .{i}, x);
+        }
+    }
+    for (sn.ds, 0..) |x, k| try putArr(map, "ds{d}", .{k}, x);
+    try putArr(map, "mh", .{}, sn.mh);
+    if (sn.hist.len > 0) {
+        const h = u32Array(sn.hist);
+        try made.append(m.gpa, h);
+        try putArr(map, "hist", .{}, h);
+    }
+    const ids = u32Array(sn.ids);
+    try made.append(m.gpa, ids);
+    try putArr(map, "ids", .{}, ids);
+
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    var b1: [32]u8 = undefined;
+    var b2: [32]u8 = undefined;
+    try mlx.check(mlx.mlx_map_string_to_string_insert(meta, "format", kept_format));
+    try mlx.check(mlx.mlx_map_string_to_string_insert(meta, "n", (try std.fmt.bufPrintSentinel(&b1, "{d}", .{sn.n}, 0)).ptr));
+    try mlx.check(mlx.mlx_map_string_to_string_insert(meta, "vision_key", (try std.fmt.bufPrintSentinel(&b2, "{d}", .{sn.vision_key}, 0)).ptr));
+    try mlx.check(mlx.mlx_save_safetensors(path.ptr, map, meta));
+}
+
+/// A conversation `exportKept` wrote, as a fresh state and its snapshot of identity `gen` (the caller hands out a new
+/// one). The state stands where the snapshot was taken, so a resume of it restores the same rows.
+pub const Imported = struct { st: State, snap: Snap };
+
+pub fn importKept(m: *Dsv41Model, path: [:0]const u8, gen: u64) !Imported {
+    const load_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(load_s);
+    var map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    var meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_load_safetensors(&map, &meta, path.ptr, load_s));
+    var fmt_v: [*:0]const u8 = undefined;
+    if (mlx.mlx_map_string_to_string_get(&fmt_v, meta, "format") != 0 or !std.mem.eql(u8, std.mem.span(fmt_v), kept_format)) return error.Dsv41KeptFormat;
+    var n_v: [*:0]const u8 = undefined;
+    var vk_v: [*:0]const u8 = undefined;
+    if (mlx.mlx_map_string_to_string_get(&n_v, meta, "n") != 0 or mlx.mlx_map_string_to_string_get(&vk_v, meta, "vision_key") != 0) return error.Dsv41KeptFormat;
+    const n = try std.fmt.parseInt(usize, std.mem.span(n_v), 10);
+    const vision_key = try std.fmt.parseInt(u64, std.mem.span(vk_v), 10);
+
+    var st = try initState(m, m.gpa);
+    errdefer st.deinit();
+    const layers = try m.gpa.alloc(Snap.LSnap, st.layers.len);
+    errdefer m.gpa.free(layers);
+    for (st.layers, layers, 0..) |*l, *o, i| {
+        const win = (try getArr(map, "l{d}.win", .{i})) orelse return error.Dsv41KeptFormat;
+        try mlx.check(mlx.mlx_array_eval(win));
+        _ = mlx.mlx_array_free(l.win.buf);
+        l.win.buf = win;
+        if (try getArr(map, "l{d}.pend_kv", .{i})) |x| {
+            try mlx.check(mlx.mlx_array_eval(x));
+            l.pend_kv = x;
+        }
+        if (try getArr(map, "l{d}.pend_gate", .{i})) |x| {
+            try mlx.check(mlx.mlx_array_eval(x));
+            l.pend_gate = x;
+        }
+        if (l.comp) |*r| if (try getArr(map, "l{d}.comp", .{i})) |x| {
+            try mlx.check(mlx.mlx_array_eval(x));
+            r.buf = x;
+            r.used = dim(x, 0);
+            r.cap = r.used;
+        };
+        if (l.idx_k) |*r| if (try getArr(map, "l{d}.idx", .{i})) |x| {
+            try mlx.check(mlx.mlx_array_eval(x));
+            r.buf = x;
+            r.used = dim(x, 0);
+            r.cap = r.used;
+        };
+        o.* = .{
+            .win = ref(l.win.buf),
+            .comp_used = if (l.comp) |r| r.used else 0,
+            .idx_used = if (l.idx_k) |r| r.used else 0,
+            .pend_kv = ref(l.pend_kv),
+            .pend_gate = ref(l.pend_gate),
+        };
+    }
+    for (st.ds, 0..) |*r, k| {
+        const x = (try getArr(map, "ds{d}", .{k})) orelse return error.Dsv41KeptFormat;
+        try mlx.check(mlx.mlx_array_eval(x));
+        _ = mlx.mlx_array_free(r.buf);
+        r.buf = x;
+    }
+    if (try getArr(map, "mh", .{})) |x| {
+        try mlx.check(mlx.mlx_array_eval(x));
+        st.mh = x;
+    }
+    if (try getArr(map, "hist", .{})) |x| {
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_array_eval(x));
+        const d = mlx.mlx_array_data_uint32(x) orelse return error.NoData;
+        try st.hist.appendSlice(m.gpa, d[0..mlx.mlx_array_size(x)]);
+    }
+    const ids_a = (try getArr(map, "ids", .{})) orelse return error.Dsv41KeptFormat;
+    defer _ = mlx.mlx_array_free(ids_a);
+    try mlx.check(mlx.mlx_array_eval(ids_a));
+    const ids_d = mlx.mlx_array_data_uint32(ids_a) orelse return error.NoData;
+    const ids = try m.gpa.dupe(u32, ids_d[0..mlx.mlx_array_size(ids_a)]);
+    errdefer m.gpa.free(ids);
+    st.n = n;
+    const ds = try m.gpa.alloc(A, st.ds.len);
+    errdefer m.gpa.free(ds);
+    for (ds, st.ds) |*o, r| o.* = ref(r.buf);
+    const hist = try m.gpa.dupe(u32, st.hist.items);
+    return .{ .st = st, .snap = .{ .gen = gen, .vision_key = vision_key, .n = n, .ids = ids, .layers = layers, .ds = ds, .mh = ref(st.mh), .hist = hist } };
+}
+
+/// Evaluates every array `exportKept` reads (on the calling thread's streams): a kept conversation is evaluated on
+/// the GPU thread when it is kept, so the unload, on the host's thread, can write it.
+pub fn evalKept(st: *const State, sn: *const Snap) !void {
+    for (sn.layers) |l| for ([_]A{ l.win, l.pend_kv, l.pend_gate }) |x| if (x.ctx != null) try mlx.check(mlx.mlx_array_eval(x));
+    for (st.layers) |l| {
+        if (l.comp) |r| if (r.buf.ctx != null) try mlx.check(mlx.mlx_array_eval(r.buf));
+        if (l.idx_k) |r| if (r.buf.ctx != null) try mlx.check(mlx.mlx_array_eval(r.buf));
+    }
+    for (sn.ds) |x| if (x.ctx != null) try mlx.check(mlx.mlx_array_eval(x));
+    if (sn.mh.ctx != null) try mlx.check(mlx.mlx_array_eval(sn.mh));
+}
+
+/// A new state identity for a conversation brought back from disk.
+pub fn diskGen(m: *Dsv41Model) u64 {
+    m.gens += 1;
+    return m.gens;
 }
 
 fn restore(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {

@@ -137,13 +137,14 @@ pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
 }
 
 /// `loadSettings` plus the hot prefix cache's caps, for a plugin that keeps its own conversations
-/// (`--prefix-cache-entries`, `--prefix-cache-mem`; deepseek_v41's finished states). `buf` holds 192 bytes.
+/// (`--prefix-cache-entries`, `--prefix-cache-mem`, `--prefix-cache-disk`; deepseek_v41's finished states). `buf` holds 224
+/// bytes.
 pub fn loadSettingsForLoad(buf: []u8, config: *const ModelConfig) []const u8 {
     const base = loadSettings(buf[0..96], config);
     const l = http_server.launch();
     const sep: []const u8 = if (base.len > 2) "," else "";
-    const out = std.fmt.bufPrint(buf[96..], "{s}{s}\"resume_entries\":{d},\"resume_mem\":{d}}}", .{
-        base[0 .. base.len - 1], sep, if (l.prefix_cache_ram_enabled) l.prefix_cache_capacity else 0, l.prefix_cache_mem_bytes,
+    const out = std.fmt.bufPrint(buf[96..], "{s}{s}\"resume_entries\":{d},\"resume_mem\":{d},\"resume_disk\":{d}}}", .{
+        base[0 .. base.len - 1], sep, if (l.prefix_cache_ram_enabled) l.prefix_cache_capacity else 0, l.prefix_cache_mem_bytes, l.prefix_cache_disk_bytes,
     }) catch return base;
     return out;
 }
@@ -216,7 +217,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     var why: abi.Verdict = .{};
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
-    var settings_buf: [192]u8 = undefined;
+    var settings_buf: [224]u8 = undefined;
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
