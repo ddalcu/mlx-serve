@@ -4224,6 +4224,25 @@ enum ContextMonitor {
 
 /// Animated indicator shown while the model is generating, with live GPU and memory stats.
 struct GeneratingIndicator: View {
+    enum StatusSegment: Equatable, Identifiable {
+        enum ID: Hashable { case gpu, memory, activityPhrase, elapsed }
+        case gpu, memory, activityPhrase(String), elapsed
+
+        var id: ID {
+            switch self {
+            case .gpu: return .gpu
+            case .memory: return .memory
+            case .activityPhrase: return .activityPhrase
+            case .elapsed: return .elapsed
+            }
+        }
+    }
+
+    static func statusSegments(showActivityPhrases: Bool, phrase: String) -> [StatusSegment] {
+        [.gpu, .memory] + (showActivityPhrases ? [.activityPhrase(phrase)] : []) + [.elapsed]
+    }
+
+    @AppStorage(InterfacePrefKey.showActivityPhrases) private var showActivityPhrases = true
     @State private var gpuPercent: Int = 0
     @State private var memPercent: Int = 0
     @State private var whimsy: String = Self.randomWhimsy()
@@ -4239,24 +4258,29 @@ struct GeneratingIndicator: View {
                           outerColor: gpuNSColor, innerColor: memNSColor)
                 .frame(width: 20, height: 20)
 
-            // Stats + whimsy
-            Text(L10n.format("GPU %lld%%", gpuPercent))
-                .foregroundStyle(gpuColor)
-            Text("·")
-                .foregroundStyle(.tertiary)
-            Text(L10n.format("Mem %lld%%", memPercent))
-                .foregroundStyle(memColor)
-            Text("·")
-                .foregroundStyle(.tertiary)
-            Text(L10n.text(whimsy))
-                .foregroundStyle(.secondary)
-                .transition(.opacity)
-            Text("·")
-                .foregroundStyle(.tertiary)
-            TimelineView(.periodic(from: startDate, by: 1)) { context in
-                Text(Self.formatElapsed(context.date.timeIntervalSince(startDate)))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+            ForEach(Self.statusSegments(showActivityPhrases: showActivityPhrases, phrase: whimsy)) { segment in
+                if segment != .gpu {
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                }
+                switch segment {
+                case .gpu:
+                    Text(L10n.format("GPU %3lld%%", gpuPercent))
+                        .foregroundStyle(gpuColor)
+                case .memory:
+                    Text(L10n.format("Mem %3lld%%", memPercent))
+                        .foregroundStyle(memColor)
+                case .activityPhrase(let phrase):
+                    Text(L10n.text(phrase))
+                        .foregroundStyle(.secondary)
+                        .transition(.opacity)
+                case .elapsed:
+                    TimelineView(.periodic(from: startDate, by: 1)) { context in
+                        Text(Self.formatElapsed(context.date.timeIntervalSince(startDate)))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
             }
         }
         .font(.app(.caption2, weight: .medium, design: .monospaced))
@@ -4292,7 +4316,7 @@ struct GeneratingIndicator: View {
         gpuPercent = Int(SystemMetrics.gpuUtilization())
         memPercent = Int(SystemMetrics.memoryPressure())
         // Rotate whimsy every ~3 seconds
-        if Int(Date().timeIntervalSince(startDate)) % 3 == 0 {
+        if showActivityPhrases && Int(Date().timeIntervalSince(startDate)) % 3 == 0 {
             withAnimation(.easeInOut(duration: 0.3)) {
                 whimsy = Self.randomWhimsy()
             }
