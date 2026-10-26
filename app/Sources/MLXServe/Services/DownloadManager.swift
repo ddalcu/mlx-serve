@@ -77,17 +77,35 @@ class DownloadManager: ObservableObject {
     /// a test driving the download loop against a temp dir must not be steered
     /// by whatever the developer happens to have configured.
     private let pinnedRoot: String?
+    private let rootDefaults: UserDefaults
+    private let toolRootResolver: () -> ToolModelRoots
+    private let huggingFaceRootResolver: () -> String?
+    private let loginShellRootResolver: @Sendable () -> String?
+    private var detectedToolRoots = ToolModelRoots()
+    private var cachedCustomRoot: String?
+    private var discoveryRevision = 0
+    private(set) var discoveryConfiguration = ModelDiscoveryConfiguration(automaticallyDiscoverModels: true, roots: [])
 
     /// `modelsRoot` exists so the download loop can be driven against a temp
     /// dir in tests; the app takes the configured destination. Kept in sync
     /// with the Zig resolver via `ModelRoots`, which is the single source of
     /// truth for both this and what the server is told to scan.
-    init(modelsRoot: String? = nil) {
+    init(modelsRoot: String? = nil, defaults: UserDefaults = .standard,
+         toolRootResolver: @escaping () -> ToolModelRoots = { ToolModelRoots.detected() },
+         huggingFaceRootResolver: @escaping () -> String? = { DownloadManager.huggingFaceRootPath() },
+         loginShellRootResolver: @escaping @Sendable () -> String? = { DownloadManager.loginShellHuggingFaceRoot() }) {
         if modelsRoot == nil { Self.reactivateDownloadFolderAccess() }
-        let root = modelsRoot ?? ModelRoots().downloadRoot
+        rootDefaults = defaults
+        self.toolRootResolver = toolRootResolver
+        self.huggingFaceRootResolver = huggingFaceRootResolver
+        self.loginShellRootResolver = loginShellRootResolver
+        let root = modelsRoot ?? ModelRoots(defaults: defaults).downloadRoot
         try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
         modelsDir = root
         pinnedRoot = modelsRoot
+        let custom = defaults.string(forKey: Self.customRootDefaultsKey) ?? ""
+        _customRoot = Published(initialValue: custom.isEmpty ? nil : custom)
+        reloadDiscoveryRoots()
     }
 
     /// Security-scoped bookmark for the chosen download folder, re-armed at the
@@ -108,16 +126,18 @@ class DownloadManager: ObservableObject {
     func refreshRoots() {
         guard pinnedRoot == nil else { return }
         Self.reactivateDownloadFolderAccess()
-        let root = ModelRoots().downloadRoot
-        guard root != modelsDir else { return }
-        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
-        modelsDir = root
+        let root = ModelRoots(defaults: rootDefaults).downloadRoot
+        if root != modelsDir {
+            try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+            modelsDir = root
+        }
+        reloadDiscoveryRoots()
     }
 
     /// Every folder to scan, download destination first. This is what the
     /// server is handed, one `--model-dir` per entry.
     func scanRoots() -> [String] {
-        ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot))
+        discoveryConfiguration.roots
     }
 
     /// The folders the app owns for READS — where a repo the user already
@@ -138,7 +158,7 @@ class DownloadManager: ObservableObject {
     /// hermetic tests must never resolve into the developer's real library.
     var readRoots: [String] {
         guard pinnedRoot == nil else { return [modelsDir] }
-        return ModelRoots().readRoots(toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot))
+        return discoveryConfiguration.roots
     }
 
     // MARK: - Path resolution
@@ -599,18 +619,29 @@ class DownloadManager: ObservableObject {
     /// to an existing directory.
     private static let customRootDefaultsKey = "customModelPath"
 
-    @Published var customRoot: String? = {
-        let raw = UserDefaults.standard.string(forKey: DownloadManager.customRootDefaultsKey) ?? ""
-        return raw.isEmpty ? nil : raw
-    }() {
+    @Published var customRoot: String? {
         didSet {
             let trimmed = customRoot?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let t = trimmed, !t.isEmpty {
-                UserDefaults.standard.set(t, forKey: Self.customRootDefaultsKey)
+                rootDefaults.set(t, forKey: Self.customRootDefaultsKey)
             } else {
-                UserDefaults.standard.removeObject(forKey: Self.customRootDefaultsKey)
+                rootDefaults.removeObject(forKey: Self.customRootDefaultsKey)
             }
+            reloadDiscoveryRoots()
         }
+    }
+
+    /// Resolve external folders only for startup or an explicit configuration refresh.
+    func reloadDiscoveryRoots() {
+        discoveryRevision &+= 1
+        let roots = ModelRoots(defaults: rootDefaults)
+        let automatic = roots.automaticallyDiscoverModels
+        detectedToolRoots = automatic ? toolRootResolver() : ToolModelRoots()
+        detectedHuggingFaceRoot = automatic ? huggingFaceRootResolver() : nil
+        cachedCustomRoot = resolvedCustomRoot()
+        discoveryConfiguration = ModelDiscoveryConfiguration(
+            automaticallyDiscoverModels: automatic,
+            roots: roots.scanRoots(toolRoots: detectedToolRoots))
     }
 
     /// Canonicalize a directory path for de-duplication against the default
@@ -627,21 +658,10 @@ class DownloadManager: ObservableObject {
         where URL(fileURLWithPath: owned).standardizedFileURL.path == standardized {
             return nil
         }
-        if let lm = lmStudioRoot,
-           URL(fileURLWithPath: lm).standardizedFileURL.path == standardized {
-            return nil
-        }
-        if let hf = huggingFaceRoot,
-           URL(fileURLWithPath: hf).standardizedFileURL.path == standardized {
-            return nil
-        }
         return standardized
     }
 
-    /// LM Studio's downloads root, resolved once at app launch.
-    /// Reads `~/.lmstudio/settings.json`'s `downloadsFolder` field; falls back to
-    /// `~/.lmstudio/models`. nil if LM Studio isn't installed or the folder is unreachable.
-    let lmStudioRoot: String? = DownloadManager.lmStudioRootPath()
+    var lmStudioRoot: String? { detectedToolRoots.lmStudio }
 
     /// The same resolution, reachable from `nonisolated` code — the launch-flag
     /// builder needs it and cannot touch this `@MainActor` instance.
@@ -673,7 +693,9 @@ class DownloadManager: ObservableObject {
     /// A `var` because the cache is MOVABLE by environment and a Finder-
     /// launched bundle cannot see the environment that moved it — the login
     /// shell is asked off-main at launch (`refreshHuggingFaceRootFromLoginShell`).
-    var huggingFaceRoot: String? = DownloadManager.huggingFaceRootPath()
+    private var detectedHuggingFaceRoot: String?
+
+    var huggingFaceRoot: String? { detectedHuggingFaceRoot }
 
     /// Resolve the hub cache the way `huggingface_hub` itself does:
     /// `HF_HUB_CACHE` > `$HF_HOME/hub` > `$XDG_CACHE_HOME/huggingface/hub` >
@@ -713,11 +735,14 @@ class DownloadManager: ObservableObject {
 
     /// Adopt the login shell's answer. True when the root changed.
     func refreshHuggingFaceRootFromLoginShell() async -> Bool {
-        let resolved = await Task.detached(priority: .utility) {
-            DownloadManager.loginShellHuggingFaceRoot()
-        }.value
-        guard resolved != huggingFaceRoot else { return false }
-        huggingFaceRoot = resolved
+        guard discoveryConfiguration.automaticallyDiscoverModels else { return false }
+        let revision = discoveryRevision
+        let resolve = loginShellRootResolver
+        let resolved = await Task.detached(priority: .utility) { resolve() }.value
+        guard revision == discoveryRevision,
+              discoveryConfiguration.automaticallyDiscoverModels,
+              resolved != detectedHuggingFaceRoot else { return false }
+        detectedHuggingFaceRoot = resolved
         return true
     }
 
@@ -2126,8 +2151,8 @@ class DownloadManager: ObservableObject {
             ownedRoots: ownedRoots,
             lmStudioRoot: lmStudioRoot,
             huggingFaceRoot: huggingFaceRoot,
-            customRoot: resolvedCustomRoot(),
-            toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).orderedWithSource
+            customRoot: cachedCustomRoot,
+            toolRoots: detectedToolRoots.orderedWithSource
                 .map { LocalScanInputs.ToolRoot(path: $0.path, source: $0.source) },
             inFlightDirs: Set(downloads.filter { $0.value.status == .downloading }
                 .map { (newLayoutDir(for: $0.key) as NSString).standardizingPath })
@@ -2146,6 +2171,10 @@ class DownloadManager: ObservableObject {
         // The owned roots — download destination + `~/.mlx-serve/models` after
         // the destination moves — so the pre-move library stays in the picker.
         out.append(contentsOf: Self.mlxServeModels(inRoots: inputs.ownedRoots))
+
+        if let root = inputs.customRoot {
+            out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
+        }
 
         // LM Studio — two levels deep: <root>/<publisher>/<repo>/
         if let root = inputs.lmStudioRoot,
@@ -2179,15 +2208,11 @@ class DownloadManager: ObservableObject {
                 atRoot: tool.path, idPrefix: "tool:", source: tool.source))
         }
 
-        // User-configured custom root — same dual-layout scan as the owned
-        // roots. resolvedCustomRoot() handles tilde expansion, existence check,
-        // and dedup against the default roots so a user pointing it at
-        // `~/.mlx-serve/models` doesn't produce duplicate picker entries.
-        if let root = inputs.customRoot {
-            out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
+        var seen = Set<String>()
+        let unique = out.filter {
+            seen.insert(URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL.path).inserted
         }
-
-        return Self.markingInFlight(out, activeDirs: inputs.inFlightDirs)
+        return Self.markingInFlight(unique, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.

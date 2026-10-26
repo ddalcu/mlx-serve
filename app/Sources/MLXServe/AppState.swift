@@ -21,7 +21,7 @@ class AppState: ObservableObject {
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
 
-    private let libraryRefresher = ModelLibraryRefresher()
+    let libraryRefresher = ModelLibraryRefresher()
     /// Chat is answered by Apple's on-device model rather than the server.
     /// Persisted like `selectedModelPath`; the local pick stays set underneath
     /// so turning it off lands back on the model that was chosen before.
@@ -613,6 +613,7 @@ class AppState: ObservableObject {
             .flatMap(UUID.init(uuidString:))
         self.quickLauncherEnabled = UserDefaults.standard.bool(forKey: "quickLauncherEnabled")
         clusterWorker.reconcile(opts)
+        server.discoveryConfiguration = downloads.discoveryConfiguration
         server.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
@@ -799,8 +800,21 @@ class AppState: ObservableObject {
     /// Rescan the model library without blocking the caller: the walk reads every
     /// served root, and this is reached from UI actions. Callers that need the
     /// list caught up observe `localModels`.
-    func refreshModels() {
-        libraryRefresher.refresh(inputs: downloads.scanInputs()) { [weak self] models in
+    func refreshModels(reloadExternalRoots: Bool = false, isBackgroundPoll: Bool = false) {
+        let downloads = downloads
+        let server = server
+        libraryRefresher.refresh(inputs: {
+            if reloadExternalRoots {
+                if !downloads.downloads.values.contains(where: { $0.status == .downloading }) {
+                    downloads.refreshRoots()
+                } else {
+                    downloads.reloadDiscoveryRoots()
+                }
+                server.discoveryConfiguration = downloads.discoveryConfiguration
+                _ = await downloads.refreshHuggingFaceRootFromLoginShell()
+            }
+            return downloads.scanInputs()
+        }, coalescing: isBackgroundPoll) { [weak self] models in
             self?.adoptDiscoveredModels(models)
         }
     }

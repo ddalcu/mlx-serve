@@ -48,6 +48,28 @@ final class ModelRootsTests: XCTestCase {
         XCTAssertFalse(roots.ownedRoots.contains(lms))
     }
 
+    func testAutomaticDiscoveryDefaultsOnAndConfiguredFoldersAlwaysRemain() throws {
+        let roots = ModelRoots(defaults: defaults)
+        let dest = tempDir("dest"), custom = tempDir("custom"), external = tempDir("external")
+        defer { for p in [dest, custom, external] { try? FileManager.default.removeItem(atPath: p) } }
+        roots.configuredDownloadRoot = dest
+        roots.customRoot = custom
+        let tools = ToolModelRoots(lmStudio: external, mtplx: external)
+        XCTAssertTrue(roots.automaticallyDiscoverModels)
+        XCTAssertTrue(roots.scanRoots(toolRoots: tools).contains(external))
+        roots.automaticallyDiscoverModels = false
+        XCTAssertFalse(ModelRoots(defaults: defaults).automaticallyDiscoverModels)
+        let scanned = roots.scanRoots(toolRoots: tools)
+        XCTAssertTrue(scanned.contains(dest))
+        XCTAssertTrue(scanned.contains(custom))
+        XCTAssertFalse(scanned.contains(external))
+        XCTAssertEqual(scanned, roots.readRoots(toolRoots: tools))
+        XCTAssertFalse(roots.ownedRoots.contains(custom))
+        roots.automaticallyDiscoverModels = true
+        let ordered = roots.scanRoots(toolRoots: tools)
+        XCTAssertLessThan(try XCTUnwrap(ordered.firstIndex(of: custom)), try XCTUnwrap(ordered.firstIndex(of: external)))
+    }
+
     // MARK: - The download destination
 
     /// With nothing configured the destination is exactly what it has always

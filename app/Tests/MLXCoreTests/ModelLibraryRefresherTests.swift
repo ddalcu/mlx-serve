@@ -83,14 +83,63 @@ final class ModelLibraryRefresherTests: XCTestCase {
             applied = models.map(\.id)
         }
 
+        XCTAssertTrue(refresher.isRefreshing)
         let secondLanded = await waitUntil { !applied.isEmpty }
         XCTAssertTrue(secondLanded)
         XCTAssertEqual(applied, ["latest"])
+        XCTAssertFalse(refresher.isRefreshing)
 
         // Let the superseded walk finish; its result must still be dropped.
         releaseFirst.signal()
         _ = await waitUntil(timeout: 0.5) { applied != ["latest"] }
         XCTAssertEqual(applied, ["latest"], "a superseded scan must never be applied")
+        XCTAssertFalse(refresher.isRefreshing)
+    }
+
+    @MainActor
+    func testProgressIncludesAsynchronousPreparationAndRefreshSeesAddedModels() async throws {
+        let refresher = ModelLibraryRefresher()
+        let inputs = emptyInputs
+        let before = await refresher.scan(inputs: inputs)
+        XCTAssertTrue(before.isEmpty)
+        var applied: [LocalModel] = []
+        refresher.refresh(inputs: {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            try? self.makeFakeModel(at: (self.tempRoot as NSString).appendingPathComponent("acme/new"))
+            return inputs
+        }) { applied = $0 }
+        XCTAssertTrue(refresher.isRefreshing)
+        let finished = await waitUntil { !refresher.isRefreshing }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(applied.map(\.name), ["acme/new"])
+    }
+
+    @MainActor
+    func testBackgroundPollDoesNotSupersedeAnInFlightScan() async {
+        let refresher = ModelLibraryRefresher()
+        let release = DispatchSemaphore(value: 0)
+        let started = ThreadBox()
+        var applied: [String] = []
+        refresher.refresh(inputs: emptyInputs) { _ in
+            started.value = true
+            _ = release.wait(timeout: .now() + 5)
+            return [fakeModel("in-flight")]
+        } apply: { applied = $0.map(\.id) }
+        let running = await waitUntil { started.value }
+        XCTAssertTrue(running)
+        let inputs = emptyInputs
+        refresher.refresh(inputs: { inputs }, coalescing: true, scan: { _ in [fakeModel("poll")] }) {
+            applied = $0.map(\.id)
+        }
+        release.signal()
+        let finished = await waitUntil { !refresher.isRefreshing }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(applied, ["in-flight"])
+        refresher.refresh(inputs: inputs, scan: { _ in [fakeModel("download-complete")] }) {
+            applied = $0.map(\.id)
+        }
+        let updated = await waitUntil { applied == ["download-complete"] }
+        XCTAssertTrue(updated)
     }
 
     // MARK: - The captured inputs are what the scan reads

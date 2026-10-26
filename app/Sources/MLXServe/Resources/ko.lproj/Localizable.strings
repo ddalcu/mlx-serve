@@ -147,6 +147,12 @@
 "This window: chat, models, tasks and media generation." = "이 윈도우: 채팅, 모델, 작업, 미디어 생성.";
 "Resume listening" = "듣기 재개";
 "Quick Launcher (%@)" = "빠른 실행기(%@)";
+"Automatically Discover Models" = "모델 자동 검색";
+
+"Include LM Studio, the Hugging Face cache and other apps. Turn off to use only configured folders and previous MLX-Serve downloads. Restart the server to update its search folders." = "LM Studio, Hugging Face 캐시 및 다른 앱의 모델을 포함합니다. 끄면 설정한 폴더와 기존 MLX-Serve 다운로드만 사용합니다. 검색 폴더를 적용하려면 서버를 다시 시작하세요.";
+
+"Rescan enabled model folders" = "활성화된 모델 폴더 다시 검색";
+
 "Model Settings" = "모델 설정";
 "Open the Model Browser" = "모델 브라우저 열기";
 "Defocus blur" = "아웃포커스 블러";

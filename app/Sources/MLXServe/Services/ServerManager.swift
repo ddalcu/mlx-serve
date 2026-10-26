@@ -112,6 +112,9 @@ class ServerManager: ObservableObject {
     /// Settings UI compares this against the current options to decide whether
     /// the restart banner should appear.
     @Published var lastLaunchedOptions: ServerOptions?
+    /// Configured discovery roots, independent of the selected model's extra parent.
+    @Published var discoveryConfiguration = ModelDiscoveryConfiguration.current()
+    var lastLaunchedDiscoveryConfiguration: ModelDiscoveryConfiguration?
 
     var baseURL: String { "http://localhost:\(port)" }
 
@@ -132,7 +135,8 @@ class ServerManager: ObservableObject {
     /// apply on the next chat request. Always false for a stopped server.
     func needsRestartFor(_ current: ServerOptions) -> Bool {
         guard let last = liveLaunchedOptions else { return false }
-        return !last.serverLaunchEquals(current)
+        let discoveryChanged = lastLaunchedDiscoveryConfiguration.map { $0 != discoveryConfiguration } ?? false
+        return !last.serverLaunchEquals(current) || discoveryChanged
     }
 
     func start(modelPath: String, options: ServerOptions) {
@@ -148,7 +152,7 @@ class ServerManager: ObservableObject {
         // (`<root>/<org>/<model>`); the selected model still loads via `--model`
         // and dedups against its discovered entry by path. (Was: the selected
         // model's parent dir, which scoped discovery to one org.)
-        args += options.toCLIArgs(modelDirs: Self.launchModelDirs(selectedModel: resolvedModel))
+        args += options.toCLIArgs(modelDirs: Self.launchModelDirs(selectedModel: resolvedModel, roots: discoveryConfiguration.roots))
         launch(args: args, options: options)
     }
 
@@ -203,7 +207,7 @@ class ServerManager: ObservableObject {
         // `modelsDir` is the caller's primary root; the rest of the library's
         // folders ride along so a headless boot discovers everything the picker
         // shows, not just one folder (`launchModelDirs` de-dups).
-        var dirs = ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
+        var dirs = discoveryConfiguration.roots
         if !modelsDir.isEmpty, !dirs.contains(modelsDir) { dirs.insert(modelsDir, at: 0) }
         let args = options.toCLIArgs(modelDirs: Array(dirs.prefix(ModelRoots.serverRootLimit)))
         launch(args: args, options: options)
@@ -242,6 +246,7 @@ class ServerManager: ObservableObject {
         proc.executableURL = URL(fileURLWithPath: binaryPath)
         proc.arguments = args
         lastLaunchedOptions = options
+        lastLaunchedDiscoveryConfiguration = discoveryConfiguration
 
         proc.environment = Self.launchEnvironment()
 
@@ -1138,5 +1143,14 @@ final class LogPoller: ObservableObject {
     deinit {
         // Cancel without touching `self.timer` (deinit is nonisolated).
         timer?.cancel()
+    }
+}
+
+enum ServerRestartTarget: Equatable {
+    case model(String), headless(String)
+
+    static func resolve(modelPath: String?, modelsDir: String) -> ServerRestartTarget {
+        guard let modelPath, !modelPath.isEmpty else { return .headless(modelsDir) }
+        return .model(modelPath)
     }
 }
