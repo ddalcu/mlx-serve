@@ -73,7 +73,7 @@ enum ChatWorkspace: Equatable {
     }
 
     static func modelBrowserEntry(section: ModelBrowserSection? = nil, localModels: [LocalModel]) -> ChatWorkspace {
-        .models(section ?? .defaultSection(hasLocalModels: !localModels.isEmpty))
+        .models(section ?? .defaultSection(hasChatModels: localModels.contains(where: \.isChatPickable)))
     }
 
     /// Whether the "you need a model to chat" gate may cover the window.

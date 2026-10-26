@@ -55,11 +55,11 @@ final class ChatWorkspaceTests: XCTestCase {
         XCTAssertEqual(ChatWorkspace.conversation.section, nil)
     }
 
-    func testMediaOnlyLibraryStillOpensMyModels() {
+    func testMediaOnlyLibraryOpensRecommended() {
         let model = LocalModel(id: "image", name: "FLUX", path: "/fixture/FLUX", sizeFormatted: "1 GB",
                                modelType: "flux", source: .mlxServe, kind: .base)
         XCTAssertFalse(model.isChatPickable)
-        XCTAssertEqual(ChatWorkspace.modelBrowserEntry(localModels: [model]), .models(.myModels))
+        XCTAssertEqual(ChatWorkspace.modelBrowserEntry(localModels: [model]), .models(.recommended))
     }
 
     func testExplicitBrowserDestinationsArePreserved() {

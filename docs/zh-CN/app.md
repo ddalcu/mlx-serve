@@ -4,7 +4,7 @@
 
 菜单栏应用，用完整的 UI 包住服务器。[下载最新版本](https://github.com/ddalcu/mlx-serve/releases/latest)或执行 `brew install --cask mlx-serve`。自 v26.8.4 起，它是一个窗口，含侧边栏、内容列与详情栏：模型、任务、设置以及媒体生成器都是聊天窗口的模式，而不再是独立窗口。
 
-- **模型浏览器** —— 从 HuggingFace 下载，支持断点续传的多连接传输（每个文件最多 16 个连接），自动发现 LM Studio 已有的模型文件夹（`~/.lmstudio/settings.json`）和你的 Hugging Face 缓存（`HF_HOME` / `HF_HUB_CACHE` 指向哪里就找哪里），这样磁盘上已有的内容不会再下载一遍，GGUF 行会显示一个 RAM 估算的最小–最大区间。多版本仓库让你自己挑量化版本，**设置 ▸ 模型文件夹**决定下载落到哪里。 “我的模型”位于侧边栏首位。打开模型浏览器时，本地模型库非空则显示“我的模型”，为空则显示“推荐”；明确选择的目标页面保持不变。
+- **模型浏览器** —— 从 HuggingFace 下载，支持断点续传的多连接传输（每个文件最多 16 个连接），自动发现 LM Studio 已有的模型文件夹（`~/.lmstudio/settings.json`）和你的 Hugging Face 缓存（`HF_HOME` / `HF_HUB_CACHE` 指向哪里就找哪里），这样磁盘上已有的内容不会再下载一遍，GGUF 行会显示一个 RAM 估算的最小–最大区间。多版本仓库让你自己挑量化版本，**设置 ▸ 模型文件夹**决定下载落到哪里。
 - **无需重启即可切换模型** —— 选中一个聊天模型会把它加载进正在运行的服务器并设为默认（通过 API 调用 `POST /v1/load-model`，带上 `"default": true`）。
 - **聊天界面** —— 多会话聊天，带 markdown 渲染。可以随文本一起放入 PDF（由 PDFKit 提取）或图像。
 - **Agent 模式** —— 10 个内置工具（shell、cwd、readFile、writeFile、editFile、searchFiles、listFiles、browse、webSearch、saveMemory），带自动工具调用循环和逐工具审批对话框（**允许** / **拒绝** / **本次会话始终允许**）。
@@ -20,6 +20,7 @@
 - **可编辑的系统提示词 + 持久记忆** —— `~/.mlx-serve/system-prompt.md` 和 `~/.mlx-serve/memory.md`。
 - **基于提示词的技能** —— 把带 YAML frontmatter 的 `.md` 文件放进 `~/.mlx-serve/skills/`，即可教给 Agent 由关键词触发的自定义能力；或者在聊天框里输入 `/` 挑一个技能，在任何聊天中按名字运行它，无论是否处于 Agent 模式。
 - **引擎感知的设置窗口**（Cmd+,）—— 每一项服务器启动参数与每个请求的默认值，分区只显示与你已加载引擎相关的旋钮（MLX vs GGUF vs ds4）。
+- **模型浏览器导航** —— “我的模型”位于侧边栏首位。打开模型浏览器时，如有可用于聊天的本地模型则显示“我的模型”，否则显示“推荐”；明确选择的目标页面保持不变。
 - **服务器管理** —— 启动 / 停止、实时日志缓冲、参数变更后提示重启的横幅。
 - **图像 / 视频 / 音乐 / 语音 / 3D 生成** —— FLUX.2、Krea-2、Mage-Flow、LTX-Video 2.3 / 2.5、MiniMax-H3、ACE-Step、MiniMax Music 3、YuE2、Qwen3-TTS、Kokoro 和 Hunyuan3D，全部通过 mlx-serve zig 服务器原生运行。
 

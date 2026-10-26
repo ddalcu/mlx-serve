@@ -14,8 +14,8 @@ final class ModelBrowserSectionTests: XCTestCase {
 
     func testMyModelsIsFirstAndDefaultDependsOnLibrary() {
         XCTAssertEqual(ModelBrowserSection.allCases, [.myModels, .recommended, .discover, .downloads, .media])
-        XCTAssertEqual(ModelBrowserSection.defaultSection(hasLocalModels: true), .myModels)
-        XCTAssertEqual(ModelBrowserSection.defaultSection(hasLocalModels: false), .recommended)
+        XCTAssertEqual(ModelBrowserSection.defaultSection(hasChatModels: true), .myModels)
+        XCTAssertEqual(ModelBrowserSection.defaultSection(hasChatModels: false), .recommended)
         for section in ModelBrowserSection.allCases {
             XCTAssertEqual(ChatWorkspace.models(section).section, section)
         }

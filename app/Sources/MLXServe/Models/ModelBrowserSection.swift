@@ -13,8 +13,8 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
     /// Media-gen model catalog (image/audio/video/music), grouped by modality.
     case media
 
-    static func defaultSection(hasLocalModels: Bool) -> ModelBrowserSection {
-        hasLocalModels ? .myModels : .recommended
+    static func defaultSection(hasChatModels: Bool) -> ModelBrowserSection {
+        hasChatModels ? .myModels : .recommended
     }
 
     var id: String { rawValue }

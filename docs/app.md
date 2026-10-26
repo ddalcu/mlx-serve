@@ -4,7 +4,7 @@
 
 Menu-bar app that wraps the server with a full UI. [Download the latest release](https://github.com/ddalcu/mlx-serve/releases/latest) or `brew install --cask mlx-serve`. Since v26.8.4 it is one window with a sidebar, content and detail column: Models, Tasks, Settings and the media generators are modes of the chat window rather than separate windows.
 
-- **Model browser** — download from HuggingFace with resumable multi-connection transfers (up to 16 connections per file), auto-discovers LM Studio's existing model folder (`~/.lmstudio/settings.json`) and your Hugging Face cache (wherever `HF_HOME` / `HF_HUB_CACHE` point) so you don't re-download what's on disk, GGUF rows show a min–max RAM-estimate range. Multi-variant repos let you pick your quant, and **Settings ▸ Model Folders** chooses where downloads land. My Models is first in the sidebar. Opening Models shows My Models when the local library is nonempty, or Recommended when it is empty; explicit destinations remain unchanged.
+- **Model browser** — download from HuggingFace with resumable multi-connection transfers (up to 16 connections per file), auto-discovers LM Studio's existing model folder (`~/.lmstudio/settings.json`) and your Hugging Face cache (wherever `HF_HOME` / `HF_HUB_CACHE` point) so you don't re-download what's on disk, GGUF rows show a min–max RAM-estimate range. Multi-variant repos let you pick your quant, and **Settings ▸ Model Folders** chooses where downloads land.
 - **Model switching without a restart** — picking a chat model loads it into the running server and makes it the default (`POST /v1/load-model` with `"default": true` over the API).
 - **Chat interface** — multi-session chat with markdown rendering. Drop in PDFs (PDFKit-extracted) or images alongside text.
 - **Agent mode** — 10 built-in tools (shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory) with automatic tool calling loop and a per-tool approval dialog (**Allow** / **Deny** / **Always allow this session**).
@@ -20,6 +20,7 @@ Menu-bar app that wraps the server with a full UI. [Download the latest release]
 - **Editable system prompt + persistent memory** — `~/.mlx-serve/system-prompt.md` and `~/.mlx-serve/memory.md`.
 - **Prompt-based skills** — drop `.md` files into `~/.mlx-serve/skills/` with YAML frontmatter to teach the agent custom capabilities triggered by keywords, or type `/` in the chat box to pick one and run it by name in any chat, agent mode or not.
 - **Engine-aware Settings window** (Cmd+,) — every server-launch flag and per-request default, with sections that show only the knobs relevant to the engine you've loaded (MLX vs GGUF vs ds4).
+- **Model browser navigation** — My Models is first in the sidebar. Opening Models shows My Models when a local chat-capable model is available, or Recommended otherwise; explicit destinations remain unchanged.
 - **Server management** — start/stop, live log buffer, restart-on-flag-change banner.
 - **Image / Video / Music / Speech / 3D generation** — FLUX.2, Krea-2, Mage-Flow, LTX-Video 2.3 / 2.5, MiniMax-H3, ACE-Step, MiniMax Music 3, YuE2, Qwen3-TTS, Kokoro and Hunyuan3D, all native via the mlx-serve zig server.
 
