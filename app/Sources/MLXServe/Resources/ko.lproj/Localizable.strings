@@ -2356,3 +2356,6 @@
 "Handwritten note (Chinese text)" = "손글씨 메모 (중국어)";
 "Whiteboard (Chinese text)" = "유리 보드 (중국어)";
 "Layout poster (1024 × 1024)" = "레이아웃 포스터 (1024 × 1024)";
+
+"Show Activity Phrases" = "활동 문구 표시";
+"Show rotating activity text while generating. GPU, memory and elapsed time remain visible." = "생성 중에 바뀌는 활동 문구를 표시합니다. GPU, 메모리 및 경과 시간은 계속 표시됩니다.";

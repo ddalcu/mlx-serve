@@ -2979,6 +2979,7 @@ private struct InterfaceSectionContent: View {
     @AppStorage(InterfacePrefKey.textSize) private var textSizeRaw = ChatTextSize.medium.rawValue
     @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
+    @AppStorage(InterfacePrefKey.showActivityPhrases) private var showActivityPhrases = true
     @AppStorage(InterfacePrefKey.terminalTheme) private var terminalThemeId = TerminalTheme.defaultId
     @AppStorage(InterfacePrefKey.terminalBackground) private var terminalBackgroundHex = ""
     @AppStorage(InterfacePrefKey.audioPlayerStyle) private var audioPlayerStyle = AudioPlayerStyle.defaultStyle
@@ -3037,6 +3038,12 @@ private struct InterfaceSectionContent: View {
         }
         SettingsRow(title: "Compact Mode", explainer: "Less space between messages, also on ⌘⌥C.") {
             Toggle("", isOn: $compactMode)
+                .labelsHidden()
+                .toggleStyle(.switch).font(.app(.body))
+        }
+        SettingsRow(title: "Show Activity Phrases",
+                    explainer: "Show rotating activity text while generating. GPU, memory and elapsed time remain visible.") {
+            Toggle("Show Activity Phrases", isOn: $showActivityPhrases)
                 .labelsHidden()
                 .toggleStyle(.switch).font(.app(.body))
         }

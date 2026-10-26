@@ -2379,3 +2379,6 @@
 "Handwritten note (Chinese text)" = "手写便签（中文）";
 "Whiteboard (Chinese text)" = "玻璃白板（中文）";
 "Layout poster (1024 × 1024)" = "布局海报（1024 × 1024）";
+
+"Show Activity Phrases" = "显示活动短语";
+"Show rotating activity text while generating. GPU, memory and elapsed time remain visible." = "生成时显示轮换的活动文字。GPU、内存和已用时间始终可见。";
