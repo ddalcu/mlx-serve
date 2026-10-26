@@ -59,6 +59,11 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
+    // The bank's EXL3 prompt GEMMs are built on MLX's NAX tiles: below the M5 they compute wrong.
+    if (config.of(ctx.parsed).streamed and !@import("../../mlx/device.zig").naxAvailable()) {
+        out.* = Verdict.refuse(.unsupported, "glm5_next: the streamed EXL3 repack needs an M5 or newer GPU (its prompt kernels run on the M5's matrix units)");
+        return null;
+    }
     const mp = host.load(plugin.name, ctx, out) orelse return null;
     if (config.of(ctx.parsed).streamed) openBank(host.of(mp), ctx.model_dir.slice(), ctx.stream_room) catch |e| {
         std.log.err("glm5_next: the streamed bank does not open: {t}", .{e});

@@ -173,7 +173,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     const c = config.of(ctx.parsed);
-    if (c.dsv41_exl3_bank and !exl3Runs(@import("../../mlx/device.zig").deviceGeneration().gen)) {
+    // The EXL3 prompt GEMMs are built on MLX's NAX tiles: below the M5 they compute wrong (f64 self-check, M4).
+    if (c.dsv41_exl3_bank and !@import("../../mlx/device.zig").naxAvailable()) {
         out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack needs an M5 or newer GPU (its prompt kernels run on the M5's matrix units); stream the MLX pack with the stream_experts setting instead");
         return null;
     }
@@ -260,12 +261,6 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin
     m.bank = .{ .exl3 = b };
     m.bank_context = context;
     mdl.streamed = streamed.exl3Routed(b);
-}
-
-/// The EXL3 prompt GEMMs are built on MLX's NAX tiles (g17+: M5); on M4 their f64 self-check misses by 1500x and
-/// M1/M2 also refuse the kernels' 1024-thread groups. Generation 0 is a GPU we cannot name.
-fn exl3Runs(gen: u32) bool {
-    return gen == 0 or gen >= 17;
 }
 
 /// A standard MLX pack's routed experts streamed as downloaded, at the slot rows the `stream_experts` setting names.
@@ -540,9 +535,4 @@ test {
     _ = bill_mod;
     _ = media;
     _ = @import("contract.zig");
-}
-
-test "deepseek_v41: the streamed EXL3 repack is refused below the M5" {
-    for ([_]struct { gen: u32, runs: bool }{ .{ .gen = 13, .runs = false }, .{ .gen = 15, .runs = false }, .{ .gen = 16, .runs = false }, .{ .gen = 17, .runs = true }, .{ .gen = 18, .runs = true }, .{ .gen = 0, .runs = true } }) |g|
-        try std.testing.expectEqual(g.runs, exl3Runs(g.gen));
 }

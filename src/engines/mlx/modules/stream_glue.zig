@@ -241,6 +241,11 @@ pub fn contextLength(config: *const ModelConfig) u32 {
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_stream, config: *const ModelConfig) !*Model {
+    // GLM-5.3's EXL3 prompt GEMMs are built on MLX's NAX tiles: below the M5 they compute wrong.
+    if (!@import("../../../mlx/device.zig").naxAvailable()) {
+        log.err("glm_moe_dsa: the streamed EXL3 repack needs an M5 or newer GPU (its prompt kernels run on the M5's matrix units)\n", .{});
+        return error.Exl3RepackNeedsM5;
+    }
     return switch (kindOf(config)) {
         inline else => |k| openArch(k, gpa, io, s, config),
     };
