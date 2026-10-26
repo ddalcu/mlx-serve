@@ -121,6 +121,8 @@ Feature = unit test that fails without it (+ integration script if HTTP-observab
 
 Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -Dtest-filter="tool traffic"` (the replay is gated behind `-Dslow-tests`; the bare filter compiles and reports success without running it). Full suite: `zig build test -Dslow-tests`. Full matrix: `tests/CLAUDE.md`.
 
+The Swift guest-channel interop tests (`GuestExecInterop`, `MCPGuestBridge`: 14 tests) XCTSkip themselves unless `VZ_AGENT_HOST_BIN` points at a built host binary: `zig build vz-agent-host` then `cd app && VZ_AGENT_HOST_BIN=$PWD/../zig-out/bin/vz-agent-host swift test --filter "GuestExecInterop|MCPGuestBridge"`. CI builds it in the `zig` job and passes it to `swift-app` as an artifact, so a bare `bash app/test.sh` locally is the only place they silently skip.
+
 ## Releases & benchmarking
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).

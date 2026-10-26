@@ -21,7 +21,9 @@ concurrency:
 jobs:
   # The Zig graph and the Swift app share nothing on disk (app/ never reads
   # zig-out), so they run as two jobs on two runners instead of one after the
-  # other (#639).
+  # other (#639). The one thing that crosses over is the vz-agent-host binary,
+  # passed as an artifact: the Swift guest-channel interop tests need it, and
+  # building it here costs one cached link instead of a second MLX stage.
   zig:
     runs-on: macos-26
     timeout-minutes: 90
@@ -97,6 +99,18 @@ jobs:
       - name: Build vz-agent guest binary
         run: zig build vz-agent
 
+      # Consumed by swift-app's guest-channel interop tests (GuestExecInterop,
+      # MCPGuestBridge); without it those 14 tests XCTSkip themselves.
+      - name: Build vz-agent-host
+        run: zig build vz-agent-host
+
+      - name: Upload vz-agent-host
+        uses: actions/upload-artifact@v4
+        with:
+          name: vz-agent-host
+          path: zig-out/bin/vz-agent-host
+          if-no-files-found: error
+
       - name: Smoke test mlx-serve binary
         run: |
           ./zig-out/bin/mlx-serve --version
@@ -141,6 +155,16 @@ jobs:
         id: xcode
         run: echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
 
+      # An artifact carries no exec bit, so restore it before the tests run.
+      - name: Fetch vz-agent-host
+        uses: actions/download-artifact@v4
+        with:
+          name: vz-agent-host
+          path: zig-out/bin
+
+      - name: Make vz-agent-host executable
+        run: chmod +x zig-out/bin/vz-agent-host
+
       # Dependencies (NIO, MCP, SwiftTerm, SwaTex) are most of a cold Swift
       # build and only change with Package.resolved. Our own sources get fresh
       # mtimes from checkout, so MLXCore always recompiles.
@@ -155,6 +179,10 @@ jobs:
       # Debug build only; the release build is release.yml's.
       - name: Build and test Swift app
         working-directory: app
+        env:
+          # Unlocks GuestExecInterop + MCPGuestBridge, which XCTSkip themselves
+          # when this is unset (14 tests).
+          VZ_AGENT_HOST_BIN: ${{ github.workspace }}/zig-out/bin/vz-agent-host
         run: |
           # Catch a drifted SwaTex font-lookup patch here rather than at release
           # time (issue #233). Mirrors app/build.sh.
