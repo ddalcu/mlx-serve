@@ -250,7 +250,8 @@ def main(argv=None):
         sys.stdout.write(md)
     if a.html:
         open(a.html, "w").write(page(ordered, a.old, a.new, a.noise, a.span))
-    return 1 if any(status(r, a.noise) == "regression" for r in ordered) else 0
+    # A noisy cell may hide a regression: it fails the gate until a rerun settles it.
+    return 1 if any(status(r, a.noise) in ("regression", "noisy") for r in ordered) else 0
 
 
 if __name__ == "__main__":
@@ -304,3 +305,14 @@ class Test(unittest.TestCase):
                       "**-9.5%** | ❌ |", text)
         self.assertIn("✅ bytes identical", text)
         self.assertIn("<svg", open(h).read())
+
+    def test_a_noisy_regression_fails_the_gate(self):
+        d = f"{self.tmp.name}/noisy"
+        for name, label, dec in (("baseline.default.r1", "baseline-default", 100), ("final.default.r1", "final-default", 80),
+                                 ("final.default.r2", "final-default", 100)):
+            os.makedirs(f"{d}/perf/q", exist_ok=True)
+            json.dump({"run": {"label": label}, "target": {"model": "Qwen"},
+                       "bench": {"decodeTokPerSec": {"median": dec}, "prefillTokPerSec": {"median": 1000}}},
+                      open(f"{d}/perf/q/{name}.json", "w"))
+        self.assertEqual(status(rows_from_dirs([f"M5={d}"], "baseline", "final")[("M5", "Qwen", "default")], 3), "noisy")
+        self.assertEqual(main(["--old", "a", "--new", "b", "--dir", f"M5={d}", "--md", f"{d}/o.md"]), 1)

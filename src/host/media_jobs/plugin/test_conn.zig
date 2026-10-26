@@ -7,7 +7,7 @@ const sse = @import("../sse.zig");
 const media_progress = @import("../../../sdk/media/progress.zig");
 
 /// The peer a handler sees: loopback, as the app's own client (handlers read it, e.g. LoRA paths are loopback-only).
-const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+pub const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
 
 /// Everything `run` writes to a connection, read off the other end of a socketpair.
 pub fn capture(a: std.mem.Allocator, comptime run: anytype, args: anytype) ![]u8 {

@@ -3467,14 +3467,14 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     return sc.out(logits);
 }
 
-/// Layers [lo, hi) over every span of `sp`, one layer at a time; `held` is every array crossing
-/// layers, evaluated per layer when there are several spans.
 fn monoUs() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1_000_000 + @divTrunc(@as(i64, ts.nsec), 1000);
 }
 
+/// Layers [lo, hi) over every span of `sp`, one layer at a time; `held` is every array crossing
+/// layers, evaluated per layer when there are several spans.
 fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, held: []A, lo: usize, hi: usize) !void {
     const n_spans = sp.xs.len;
     // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.

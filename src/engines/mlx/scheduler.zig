@@ -368,7 +368,7 @@ pub fn deinit(self: *Scheduler) void {
         while (!self.inference_done.load(.acquire)) {
             if (io_util.nowMsMonotonic(self.io) >= until) {
                 log.err("[shutdown] the inference thread is still inside a step after {d} s; exiting without it\n", .{@divTrunc(until - start, 1000)});
-                std.process.exit(0);
+                std.process.exit(1);
             }
             std.Io.sleep(self.io, .fromMilliseconds(20), .real) catch {};
         }

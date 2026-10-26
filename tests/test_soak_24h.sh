@@ -198,31 +198,27 @@ done
 echo
 echo "  duration elapsed; analyzing samples..."
 
-# Need at least 2 samples to compute drift.
 N_SAMPLES=$(tail -n +2 "$SAMPLE_LOG" | wc -l | tr -d ' ')
-if [ "$N_SAMPLES" -lt 2 ]; then
-    echo -e "${YELLOW}WARN${NC} only $N_SAMPLES sample(s) collected; skipping drift check."
-    exit 0
-fi
 
 DRIFT=$(python3 - <<PY
 import csv
 rows = list(csv.DictReader(open("$SAMPLE_LOG")))
-if len(rows) < 2:
-    print("0.0")
+# Baseline: the first sample 3 minutes in, so warm-up (page faults, kernel compiles, the
+# workers' caches and the allocator pool filling) doesn't count as drift. A run with no sample
+# past it (the server died early) has no drift to measure: "short".
+t0 = int(rows[0]['ts']) if rows else 0
+base_idx = next((i for i, r in enumerate(rows) if int(r['ts']) - t0 >= 180), None)
+if base_idx is None or base_idx == len(rows) - 1 or int(rows[base_idx]['rss_kb']) == 0:
+    print("short")
 else:
-    # Baseline: the first sample 3 minutes in, so warm-up (page faults, kernel compiles, the
-    # workers' caches and the allocator pool filling) doesn't count as drift.
-    t0 = int(rows[0]['ts'])
-    base_idx = next((i for i, r in enumerate(rows) if int(r['ts']) - t0 >= 180), len(rows) - 1)
     base = int(rows[base_idx]['rss_kb'])
-    last = int(rows[-1]['rss_kb'])
-    if base == 0:
-        print("0.0")
-    else:
-        print(f"{100.0 * (last - base) / base:.2f}")
+    print(f"{100.0 * (int(rows[-1]['rss_kb']) - base) / base:.2f}")
 PY
 )
+if [ "$DRIFT" = "short" ]; then
+    echo -e "${RED}FAIL${NC} $N_SAMPLES sample(s), none past minute 3 with one after it: the run ended too early to measure drift"
+    exit 1
+fi
 echo "  samples:   $N_SAMPLES"
 echo "  RSS drift: ${DRIFT}% (threshold ${DRIFT_THRESHOLD_PCT}%)"
 

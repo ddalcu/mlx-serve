@@ -309,7 +309,12 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 s.memory_promised = 0;
             }
             if (drop) {
-                if (!s.finished and s.error_code == null and n_cancelled < cancelled.len) {
+                if (!s.finished and s.error_code == null) {
+                    // Past the buffer, the slot stays for the next step's cull to tell.
+                    if (n_cancelled == cancelled.len) {
+                        i += 1;
+                        continue;
+                    }
                     cancelled[n_cancelled] = s;
                     n_cancelled += 1;
                 }

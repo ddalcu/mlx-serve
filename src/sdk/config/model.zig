@@ -988,23 +988,27 @@ pub const ModelConfig = struct {
         return n;
     }
 
-    /// Dense (bf16) KV-cache bytes ONE token occupies across the whole model.
-    /// The uniform `layers × 2 × kv_heads × head_dim` formula is wrong on a
-    /// hybrid MLA arch in both terms: only `attnCacheLayerCount` layers cache
-    /// at all, and MLA's key (nope+rope) is WIDER than its value. Every
-    /// memory estimate that sizes a KV cache reads this one helper so the
-    /// auto-context sizer and the prefill admission guard cannot disagree.
     /// Whether the prefill chunk is resolved per request (by the admission bill) instead of
     /// once at load. qwen4_exp only: a 1M session's load-time reserve pins every ordinary
     /// prompt to a narrow rung.
-    /// The widest prompt chunk the arch's prompt pass gains from (0 = the ladder's): DeepSeek-V4.1 was tuned at 2048,
-    /// and its Engram layer slows per row past 4096 (a 64k prompt took 22% longer at 8192).
-    pub fn prefillChunkMax(self: *const ModelConfig) u32 {
-        return if (self.isDsv41()) 2048 else 0;
-    }
-
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
         return self.longCtxGated();
+    }
+
+    /// V4.1's layers split with a worker Mac: the worker keeps ONE decode state and its exchange names no slot, so the
+    /// model leaves per-slot state and batched decode and serves one request at a time.
+    pub fn pairDsv41(self: *ModelConfig, p: @import("../../plugins/deepseek_v41/deepseek_v41.zig").Pair) void {
+        self.dist_dsv41 = p;
+        if (self.plugin) |b| {
+            b.parsed.caps.slot_state = false;
+            b.parsed.caps.batches_decode = false;
+        }
+    }
+
+    /// The widest prompt chunk the arch's prompt pass gains from (0 = the ladder's): DeepSeek-V4.1 was tuned at 2048,
+    /// and its Engram layer slows per row past 4096.
+    pub fn prefillChunkMax(self: *const ModelConfig) u32 {
+        return if (self.isDsv41()) 2048 else 0;
     }
 
     /// Rows a sliding layer keeps past its window on an arch that caches only the window
@@ -1040,6 +1044,12 @@ pub const ModelConfig = struct {
         return @as(u64, self.layerKVHeads(li)) * (@as(u64, self.layerHeadDim(li)) + self.layerVHeadDim(li)) * 2;
     }
 
+    /// Dense (bf16) KV-cache bytes ONE token occupies across the whole model.
+    /// The uniform `layers × 2 × kv_heads × head_dim` formula is wrong on a
+    /// hybrid MLA arch in both terms: only `attnCacheLayerCount` layers cache
+    /// at all, and MLA's key (nope+rope) is WIDER than its value. Every
+    /// memory estimate that sizes a KV cache reads this one helper so the
+    /// auto-context sizer and the prefill admission guard cannot disagree.
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
         // DeepSeek-V4.1 grows only its KV sources' compressed latents and index
         // keys (bf16); the window is a fixed ring per slot.
@@ -4864,6 +4874,13 @@ const Dsv41Keep = struct {
     }
 };
 
+test "a V4.1 pair serves one request at a time: no per-slot state, no batched decode" {
+    var b: plugin_config.Binding = .{ .table = undefined, .parsed = .{ .caps = .{ .slot_state = true, .batches_decode = true } } };
+    var c: ModelConfig = .{ .plugin = &b };
+    c.pairDsv41(.{ .lo = 20, .hi = 43, .worker = false });
+    try std.testing.expect(c.dist_dsv41 != null and !b.parsed.caps.slot_state and !b.parsed.caps.batches_decode);
+}
+
 test "a DeepSeek-V4.1 pair keeps each Mac's layers under their own numbers" {
     var buf: [512]u8 = undefined;
     const worker: Dsv41Keep = .{ .pair = .{ .lo = 20, .hi = 40, .worker = true } };
@@ -4944,7 +4961,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     if (config.dist_span == null and config.dist_shard == null and config.dist_dsv41 == null) if (try distributed.planFor(model_dir, config)) |part| switch (part) {
         .span => |sp| try config.applyLayerSpan(sp),
         .shard => |sh| try config.applyShard(sh),
-        .remote => |r| config.dist_dsv41 = .{ .lo = r.start, .hi = r.end, .worker = false },
+        .remote => |r| config.pairDsv41(.{ .lo = r.start, .hi = r.end, .worker = false }),
     };
     var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
     errdefer weights.deinit();

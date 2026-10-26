@@ -44,7 +44,6 @@ pub fn decodeRgba(allocator: std.mem.Allocator, encoded: []const u8) ?Rgba {
     return .{ .pix = pix, .w = @intCast(w), .h = @intCast(h) };
 }
 
-/// An img2img request's source (`decodeCover`), with the engagement line its tests read.
 /// The engagement lines of an edit whose backend takes the encoded references as they are (refs[0] = the primary).
 pub fn logByteRefs(refs: []const []const u8) void {
     for (refs, 1..) |r, i| if (i == 1)
@@ -53,6 +52,7 @@ pub fn logByteRefs(refs: []const []const u8) void {
         log.info("[image] edit ref {d}: {d} bytes (byte-based backend)\n", .{ i, r.len });
 }
 
+/// An img2img request's source (`decodeCover`), with the engagement line its tests read.
 pub fn decodeVariation(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32, strength: f32) ?mlx.mlx_array {
     const pix = decodeCover(allocator, encoded, target_h, target_w) orelse return null;
     log.info("[image] img2img: source {d} bytes, strength={d:.2}\n", .{ encoded.len, strength });

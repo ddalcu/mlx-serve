@@ -279,7 +279,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, xfm: *Transformer, model_dir: []co
     const parsed = &xfm.config.plugin.?.parsed;
     const v = hooks.load(b.model, &.{ .model_dir = abi.Str.of(model_dir), .dir = &dir, .parsed = parsed, .stream = .{ .ctx = xfm.s.ctx } });
     if (!v.isOk()) {
-        // A pack that ships no head is not a failed load (26.10.3 said nothing about it).
+        // A pack that ships no head is not a failed load.
         if (std.mem.eql(u8, v.why.slice(), "MissingMtpWeight")) {
             log.debug("[plugin] {s}: no MTP head in this pack\n", .{b.table.name.slice()});
         } else log.warn("[plugin] {s}: MTP head failed to load ({s}) — MTP off\n", .{ b.table.name.slice(), v.why.slice() });
