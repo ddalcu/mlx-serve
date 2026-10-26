@@ -50,6 +50,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).
 
 ## Streamed packs (`experts.bin`)
+- M5 (g17) and newer only, refused by name below (`exl3Runs`): the prompt GEMMs are built on MLX's NAX tiles and
+  miss their f64 self-check on M4; M1/M2 also refuse the kernels' 1024-thread groups. The MLX pack streams anywhere.
 - The routed experts come from `sdk/weights/streamed.zig` `Exl3` (`exl3_source.zig`: the EXL3 lane, event-gated
   waves, the next layer's reads predicted, the wide prompt feed, the decode forms / banked waves / hoist / device
   route); the trunk's own MoE never runs for them (`moe`'s `source` arm; the DSpark stages stay resident).

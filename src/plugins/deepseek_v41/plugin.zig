@@ -174,7 +174,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     const c = config.of(ctx.parsed);
     if (c.dsv41_exl3_bank and !exl3Runs(@import("../../mlx/device.zig").deviceGeneration().gen)) {
-        out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack needs an M3 or newer GPU (M1 and M2 refuse its kernels' threadgroup size)");
+        out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack needs an M5 or newer GPU (its prompt kernels run on the M5's matrix units); stream the MLX pack with the stream_experts setting instead");
         return null;
     }
     return loadModel(ctx, s) catch |e| {
@@ -262,10 +262,10 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin
     mdl.streamed = streamed.exl3Routed(b);
 }
 
-/// The EXL3 stream kernels' plans fix threadgroups of up to 1024 threads; M1 and M2 (g13, g14) grant some of them
-/// fewer. Generation 0 is a GPU we cannot name.
+/// The EXL3 prompt GEMMs are built on MLX's NAX tiles (g17+: M5); on M4 their f64 self-check misses by 1500x and
+/// M1/M2 also refuse the kernels' 1024-thread groups. Generation 0 is a GPU we cannot name.
 fn exl3Runs(gen: u32) bool {
-    return gen == 0 or gen >= 15;
+    return gen == 0 or gen >= 17;
 }
 
 /// A standard MLX pack's routed experts streamed as downloaded, at the slot rows the `stream_experts` setting names.
@@ -542,7 +542,7 @@ test {
     _ = @import("contract.zig");
 }
 
-test "deepseek_v41: the streamed EXL3 repack is refused on M1 and M2" {
-    for ([_]struct { gen: u32, runs: bool }{ .{ .gen = 13, .runs = false }, .{ .gen = 14, .runs = false }, .{ .gen = 15, .runs = true }, .{ .gen = 17, .runs = true }, .{ .gen = 0, .runs = true } }) |g|
+test "deepseek_v41: the streamed EXL3 repack is refused below the M5" {
+    for ([_]struct { gen: u32, runs: bool }{ .{ .gen = 13, .runs = false }, .{ .gen = 15, .runs = false }, .{ .gen = 16, .runs = false }, .{ .gen = 17, .runs = true }, .{ .gen = 18, .runs = true }, .{ .gen = 0, .runs = true } }) |g|
         try std.testing.expectEqual(g.runs, exl3Runs(g.gen));
 }
