@@ -20,6 +20,9 @@
 # Usage: ./tests/test_messages_stream_thinking_tools.sh [model_dir] [port]
 #   model_dir should be a template-opened-think model (Qwen 3.5/3.6).
 #   Default: the model family from the live failure. Starts its own server.
+#   Any template-opened-think family exercises the same gate, so a box without
+#   the Qwen3.6 default does not have to skip: 2026-10-26, Ornith-1.0-9B-4bit-MTP
+#   streamed 41 thinking_deltas on turn 1 and 52 on the tool-call turn 2.
 
 set -u
 
