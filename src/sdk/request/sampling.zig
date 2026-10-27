@@ -39,6 +39,9 @@ pub const SamplingParams = struct {
     /// sampling policy. Null = no suppression (kill switch, no-template
     /// models, every non-suppressing arch).
     suppress_mask: ?mlx.mlx_array = null,
+    /// Read only by `Generator.initWithOptions`, which then wires
+    /// `Transformer.suppress_mask_cjk` instead of `suppress_mask`.
+    suppress_cjk: bool = false,
     /// Seeded draws go through `keyed_sample`: a token's noise is a hash of
     /// (seed, position, id), so a draft shares the draw its verify row makes
     /// (row-exact archs, `ModelConfig.rowExactDecode`).
