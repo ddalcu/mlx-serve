@@ -22,6 +22,7 @@ const spec_gate_threshold = @import("../request_options.zig").spec_gate_threshol
 const resolveKvAttnFused = @import("../request_options.zig").resolveKvAttnFused;
 const parseKvAttnExplicit = @import("../request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("../sampling.zig").resolveSampling;
+const parseSuppressCjk = @import("../sampling.zig").parseSuppressCjk;
 const generationMaxTokens = @import("../sampling.zig").generationMaxTokens;
 const requestProfile = @import("../sampling.zig").requestProfile;
 const defaultEnableMtp = @import("../request_options.zig").defaultEnableMtp;
@@ -361,6 +362,12 @@ fn handleResponsesInner(
         return;
     }
     const root = parsed.value.object;
+    var suppress_cjk = false;
+    if (parseSuppressCjk(root, lm, &suppress_cjk)) |msg| {
+        log.warn("POST /v1/responses -> 400 ({s})\n", .{msg});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    }
 
     // ── input (required) ──
     const input_val = root.get("input") orelse {
@@ -717,6 +724,7 @@ fn handleResponsesInner(
         .presence_penalty = presence_penalty,
         .frequency_penalty = frequency_penalty,
         .seed = seed,
+        .suppress_cjk = suppress_cjk,
     };
     var sc: request_mod.SchemaConstraint = undefined;
     var sc_init = false;

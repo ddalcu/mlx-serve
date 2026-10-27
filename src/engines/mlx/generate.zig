@@ -28,6 +28,7 @@ pub const SamplingParams = @import("sampling/params.zig").SamplingParams;
 pub const buildSuppressMask = @import("sampling/params.zig").buildSuppressMask;
 pub const fillSuppressMask = @import("sampling/params.zig").fillSuppressMask;
 pub const installSuppressMask = @import("sampling/params.zig").installSuppressMask;
+pub const installCjkMask = @import("sampling/params.zig").installCjkMask;
 pub const CommittedArgmax = @import("spec/verify.zig").CommittedArgmax;
 pub const GenerationResult = @import("../../sdk/request/result.zig").GenerationResult;
 pub const tokensPerSec = @import("../../sdk/request/result.zig").tokensPerSec;

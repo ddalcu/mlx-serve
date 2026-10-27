@@ -25,6 +25,7 @@ const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
+const parseSuppressCjk = @import("sampling.zig").parseSuppressCjk;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
 const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
@@ -146,6 +147,12 @@ pub fn handleChatCompletions(
         return;
     }
     const root = parsed.value.object;
+    var suppress_cjk = false;
+    if (parseSuppressCjk(root, lm, &suppress_cjk)) |msg| {
+        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{msg});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    }
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});
@@ -855,6 +862,7 @@ pub fn handleChatCompletions(
         .presence_penalty = presence_penalty,
         .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
+        .suppress_cjk = suppress_cjk,
     };
 
     // Build grammar-constrained sampling state if a JSON schema was supplied.

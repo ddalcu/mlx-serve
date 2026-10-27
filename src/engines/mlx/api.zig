@@ -201,6 +201,7 @@ fn facts(lm: *const LoadedModel, out: *host.Facts) void {
         .video = supportsVideo(lm),
         .batches_decode = if (lm.config) |c| verdict.configBatchesDecode(c) else false,
         .hot_cache_bytes = hotCacheBytes(lm),
+        .suppress_cjk = if (lm.transformer) |t| t.suppress_mask_cjk != null and !t.ownsModuleDecodeState() else false,
     };
 }
 

@@ -82,6 +82,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_hot_switch_state.sh` per-model tokenizer/template/grammar · `test_tokenizer_hf_parity.sh` /tokenize == HF
 - `test_logprobs.sh` logprobs contract · `test_repeat_penalty.sh` penalties on every path · `test_sampling_defaults.py` min_p
 - `test_generation_defaults.py` defaults files + `ignore_client` · `glm_exactness.py` **R** greedy/seed/logprob exactness
+- `test_suppress_cjk.sh` `suppress_cjk` on three surfaces, greedy PLD included
 - `harvest_tool_traffic.py` capture real tool traffic into the replay fixture
 
 **Agents**

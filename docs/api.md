@@ -16,7 +16,9 @@ curl http://localhost:11234/v1/chat/completions \
   }'
 ```
 
-Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `stream_options`, `tools`, `response_format`, `repetition_penalty`, `presence_penalty`, `logprobs` / `top_logprobs`, `reasoning_effort` / `enable_thinking` / `reasoning_budget_tokens`, plus per-request `kv_quant` and `kv_attn_mode` overrides. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models. Usage always carries `prompt_tokens_details.cached_tokens`, and a reply cut short because the model went in circles reports `finish_details: {"type": "repetition_loop"}` beside `finish_reason`.
+Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `stream_options`, `tools`, `response_format`, `repetition_penalty`, `presence_penalty`, `logprobs` / `top_logprobs`, `reasoning_effort` / `enable_thinking` / `reasoning_budget_tokens`, plus per-request `kv_quant`, `kv_attn_mode` and `suppress_cjk`. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models. Usage always carries `prompt_tokens_details.cached_tokens`, and a reply cut short because the model went in circles reports `finish_details: {"type": "repetition_loop"}` beside `finish_reason`.
+
+`"suppress_cjk": true` keeps every token that writes CJK (Han, kana, Hangul, CJK punctuation, fullwidth forms) out of sampling, drafts included, on `/v1/messages` and `/v1/responses` too. A non-boolean is a 400, `null` leaves it off, and a model whose engine samples elsewhere (GGUF, Neural Engine) refuses it by name.
 
 ## POST /v1/messages (Anthropic)
 
