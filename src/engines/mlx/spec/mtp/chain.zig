@@ -329,7 +329,7 @@ pub fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_look
 const LookupProposal = struct { match: mtp_lookup.Match, drafts: u32, external: bool };
 
 /// Keep stock prompt lookup as the incumbent. External history is considered
-/// only when that proposal loses the existing suffix/cost/acceptance gate.
+/// only when that proposal loses the existing suffix/cost/acceptance gate or depth floor.
 fn lookupProposal(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?LookupProposal {
     if (!mtpLookupEnabled() or self.mtp_batch_head) return null;
     if (group_planner.enabled() and self.mtp_planner_owned) return null;
@@ -339,7 +339,8 @@ fn lookupProposal(self: *Generator, allocator: std.mem.Allocator, plan: MtpRound
     const costs = self.mtpLookupCosts(plan.m_lo);
     if (idx.match(t1, lookup_cap)) |got| {
         const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, costs);
-        if (k > 0) return .{ .match = got, .drafts = k, .external = false };
+        if (k > 0 and k >= depth_bounds.floorFor(depth_bounds.active, lookup_cap))
+            return .{ .match = got, .drafts = k, .external = false };
     }
     if (remaining == 0 or idx.toks.items.len + 1 < mtp_lookup.MIN_SUFFIX) return null;
     const got = try @import("../history.zig").match(self, allocator, idx.toks.items, t1, lookup_cap) orelse return null;

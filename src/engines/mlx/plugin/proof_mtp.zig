@@ -411,6 +411,38 @@ test "plugin MTP history: native incumbent wins conflicts; rejected native admit
     }
 }
 
+test "plugin MTP history: a native match below the depth floor permits external continuation" {
+    const a = testing.allocator;
+    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
+    defer corpus.restore();
+    var readonly = history_env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "1");
+    defer readonly.restore();
+    const bounds = depth_bounds.active;
+    depth_bounds.active = .{ .min = 3, .max = 3 };
+    defer depth_bounds.active = bounds;
+    var rig: HistoryRig = undefined;
+    try rig.open();
+    defer rig.close();
+    const query: [17]u32 = @splat(7);
+    const path = try rig.store("depth-floor", &query, history_external[0..3]);
+    defer a.free(path);
+    var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
+    defer store.restore();
+    var gen = try rig.generator(query[0..16]);
+    defer gen.deinit(a);
+    gen.mtp_lookup_streak = true;
+    gen.mtp_round_ema = 0;
+    const idx = try gen.mtpLookupIndex(a);
+    const native = idx.match(7, 3) orelse return error.ExpectedNativeMatch;
+    try testing.expectEqualSlices(u32, &.{7}, native.draft);
+    const plan = gen.mtpRoundPlan();
+    var chain = (try gen.mtpLookupChain(a, plan, 7)) orelse return error.ExpectedHistoryChain;
+    defer chain.deinit(a);
+    try testing.expect(chain.lookup and chain.external_history);
+    try testing.expectEqual(@as(u32, 3), chain.m);
+    try testing.expectEqualSlices(u32, history_external[0..3], chain.drafts);
+}
+
 test "plugin MTP history: durable suffix boundaries obey the stock gate depth and remaining budget" {
     const a = testing.allocator;
     var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
