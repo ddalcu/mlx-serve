@@ -306,7 +306,7 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
-    pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "unreleased", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+    pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
 

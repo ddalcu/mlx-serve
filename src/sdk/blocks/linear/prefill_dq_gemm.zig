@@ -78,17 +78,27 @@ pub fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: 
     if (rows < prefillDqGemmRowFloorNow(bits, n, @intCast(last))) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
-    if (xd == .bfloat16 and f16PrefillEnabled()) return try prefillDqGemmF16(x, w, sc, bi, bits, group_size, mode, s);
+    const cd = prefillComputeDtype(xd, mode, bi.ctx != null);
 
+    var xc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xc);
+    if (cd != xd) try mlx.check(mlx.mlx_astype(&xc, x, cd, s));
     var dq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq);
-    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = xd, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = cd, .has_value = true }, s));
     var dq_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq_t);
     try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
+    try mlx.check(mlx.mlx_matmul(&out, if (cd != xd) xc else x, dq_t, s));
+    if (cd != xd) {
+        var back = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(back);
+        try mlx.check(mlx.mlx_astype(&back, out, xd, s));
+        _ = mlx.mlx_array_free(out);
+        out = back;
+    }
     prefill_dq_gemm_engaged += 1;
     return out;
 }
@@ -96,40 +106,38 @@ pub fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: 
 /// Test seam: forces the route on/off without the environment.
 pub var prefill_dq_gemm_override: ?bool = null;
 
-// ── FP16 prefill GEMMs for bf16 models (opt-in: MLX_SERVE_F16_PREFILL=1) ──
-// GPUs without fast bf16 math (M1 family) run steel GEMM ~24% and gather_qmm ~19% faster in
-// fp16 (M1 Ultra µbench, Flash-Next shapes). The routed prefill GEMMs cast the bf16
-// activations and the dequantized weight / quant params to fp16, multiply, and return bf16.
-// Decode and verify widths are untouched (they never reach these routes).
+// ── FP16 prefill GEMMs for bf16 models (opt-in lever MLX_SERVE_F16_PREFILL) ──
+// GPUs without fast bf16 math run the steel GEMM and gather_qmm faster in fp16. With the lever on,
+// the routed prefill GEMMs (prefillDqGemm here, the sorted affine gather in moe/experts.zig) cast a
+// bf16 activation and the dequantized weight / quant params to fp16, multiply, and cast the result
+// back to bf16. Lossy (fp16 overflows past 65504), hence opt-in. Decode and verify widths never
+// reach these routes.
 var f16_prefill_env_cached: ?bool = null;
 
+/// Test seam: forces the lever on/off without the environment.
+pub var f16_prefill_override: ?bool = null;
+
 pub fn f16PrefillEnabled() bool {
-    return env.onCached(&f16_prefill_env_cached, .MLX_SERVE_F16_PREFILL);
+    return f16_prefill_override orelse env.onCached(&f16_prefill_env_cached, .MLX_SERVE_F16_PREFILL);
 }
 
-fn prefillDqGemmF16(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
-    var x16 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x16);
-    try mlx.check(mlx.mlx_astype(&x16, x, .float16, s));
-    var dq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(dq);
-    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float16, .has_value = true }, s));
-    var dq_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(dq_t);
-    try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
-    var out16 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out16);
-    try mlx.check(mlx.mlx_matmul(&out16, x16, dq_t, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_astype(&out, out16, .bfloat16, s));
-    prefill_dq_gemm_engaged += 1;
-    return out;
+/// Test seam: engagement is counted, never inferred from output equality.
+pub var f16_prefill_engaged: u64 = 0;
+
+/// The dtype a routed prefill GEMM multiplies in for activation dtype `xd`: fp16 for a bf16
+/// activation over an affine pack with biases while the lever is on, else `xd`.
+pub fn prefillComputeDtype(xd: mlx.mlx_dtype, mode: QuantMode, has_biases: bool) mlx.mlx_dtype {
+    if (xd != .bfloat16 or mode != .affine or !has_biases or !f16PrefillEnabled()) return xd;
+    f16_prefill_engaged += 1;
+    return .float16;
 }
 
 // ── tests ──
 
 const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
+const Scope = @import("../../../mlx/scope.zig").Scope;
+const testReadF32 = @import("../../testing/parity.zig").testReadF32;
+const maxAbsDiffF32 = @import("../../testing/parity.zig").maxAbsDiffF32;
 
 test "prefillDqGemmRowFloor: on the Ultra the floor follows min(N, K) from 4096, the rest keep theirs" {
     // M5 Ultra crossovers, stock NAX qmm vs dequant+GEMM: K 640 and 2560 win from 2048
@@ -195,6 +203,135 @@ test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other w
             try testing.expectEqual(bits == 2 and m == 512, y != null);
             try testing.expectEqual(prefill_dq_gemm_engaged, before + @intFromBool(y != null));
         }
+    }
+}
+
+pub const TruthErr = struct { rms: f64, max: f64 };
+
+/// rms and max |y - truth| over an f32 reference (test helper for the fp16 lever arms).
+pub fn testErrVsTruth(y: mlx.mlx_array, truth: mlx.mlx_array, s: mlx.mlx_stream) !TruthErr {
+    const n = mlx.mlx_array_size(truth);
+    if (mlx.mlx_array_size(y) != n) return error.ShapeMismatch;
+    const a = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(a);
+    const b = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(b);
+    try testReadF32(y, a, s);
+    try testReadF32(truth, b, s);
+    var sq: f64 = 0;
+    var max: f64 = 0;
+    for (a, b) |got, want| {
+        const d: f64 = @abs(@as(f64, got) - @as(f64, want));
+        if (!std.math.isFinite(d)) return error.NonFiniteValue;
+        sq += d * d;
+        max = @max(max, d);
+    }
+    return .{ .rms = @sqrt(sq / @as(f64, @floatFromInt(n))), .max = max };
+}
+
+/// An affine 4-bit gs64 pack of a random bf16 weight `shape`: q, scales, biases, and the f32 dequant (the truth's weight).
+pub fn testAffinePack(sc: *Scope, rnd: std.Random, shape: []const c_int) !struct { q: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array, w32: mlx.mlx_array } {
+    const s = sc.s;
+    const wb = try sc.keep(try testRandWeightBf16(rnd, shape, s));
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var q = mlx.mlx_array_new();
+    var scales = mlx.mlx_array_new();
+    var biases = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&q, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&scales, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&biases, triple, 2));
+    _ = try sc.keep(q);
+    _ = try sc.keep(scales);
+    _ = try sc.keep(biases);
+    var w32 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_dequantize(&w32, q, try sc.astype(scales, .float32), try sc.astype(biases, .float32), mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    return .{ .q = q, .scales = scales, .biases = biases, .w32 = try sc.keep(w32) };
+}
+
+test "prefillDqGemm: the fp16 lever on a bf16 activation is no worse than the bf16 arm against f32 truth" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const saved_route = prefill_dq_gemm_override;
+    defer prefill_dq_gemm_override = saved_route;
+    prefill_dq_gemm_override = true;
+    const saved_lever = f16_prefill_override;
+    defer f16_prefill_override = saved_lever;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const s = sc.s;
+    var prng = std.Random.DefaultPrng.init(0xF16);
+    // The base floor: N and K under 4096 keep it on every chip, so this width takes the route.
+    const M: c_int = @intCast(PREFILL_DQ_GEMM_MIN_M);
+    const N: c_int = 256;
+    const K: c_int = 512;
+    const pack = try testAffinePack(&sc, prng.random(), &.{ N, K });
+    // Activations past the weights' range, as a residual stream carries: |x| up to 8.
+    const xr = try sc.keep(try testRandWeightBf16(prng.random(), &.{ 1, M, K }, s));
+    const x = try sc.astype(try sc.mulS(try sc.astype(xr, .float32), 16), .bfloat16);
+    const truth = try sc.matmul(try sc.astype(x, .float32), try sc.transpose(pack.w32, &.{ 1, 0 }));
+
+    var errs: [2]TruthErr = undefined;
+    for ([_]bool{ false, true }, 0..) |lever, i| {
+        f16_prefill_override = lever;
+        const route_before = prefill_dq_gemm_engaged;
+        const lever_before = f16_prefill_engaged;
+        const y = (try prefillDqGemm(x, pack.q, pack.scales, pack.biases, 4, 64, .affine, s)) orelse return error.RouteDeclined;
+        defer _ = mlx.mlx_array_free(y);
+        try testing.expectEqual(route_before + 1, prefill_dq_gemm_engaged);
+        try testing.expectEqual(lever_before + @intFromBool(lever), f16_prefill_engaged);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
+        try testing.expectEqualSlices(c_int, mlx.getShape(truth), mlx.getShape(y));
+        errs[i] = try testErrVsTruth(y, truth, s);
+    }
+    // Both arms round the output to bf16; the fp16 arm must not add error beyond that.
+    try testing.expect(errs[1].rms <= 1.05 * errs[0].rms);
+    try testing.expect(errs[1].max <= 1.05 * errs[0].max);
+}
+
+test "prefillDqGemm: the fp16 lever leaves a non-affine pack and an fp16 activation alone" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const saved_route = prefill_dq_gemm_override;
+    defer prefill_dq_gemm_override = saved_route;
+    prefill_dq_gemm_override = true;
+    const saved_lever = f16_prefill_override;
+    defer f16_prefill_override = saved_lever;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const s = sc.s;
+    var prng = std.Random.DefaultPrng.init(0xF17);
+    const M: c_int = @intCast(PREFILL_DQ_GEMM_MIN_M);
+    const N: c_int = 256;
+    const K: c_int = 512;
+    const wb = try sc.keep(try testRandWeightBf16(prng.random(), &.{ N, K }, s));
+    var pair = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(pair);
+    try mlx.check(mlx.mlx_quantize(&pair, wb, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+    var wq = mlx.mlx_array_new();
+    var wsc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&wq, pair, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&wsc, pair, 1));
+    _ = try sc.keep(wq);
+    _ = try sc.keep(wsc);
+    const pack = try testAffinePack(&sc, prng.random(), &.{ N, K });
+    const xb = try sc.keep(try testRandWeightBf16(prng.random(), &.{ 1, M, K }, s));
+    const xh = try sc.astype(xb, .float16);
+
+    const cases = [_]struct { x: mlx.mlx_array, q: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array, gs: u32, mode: QuantMode }{
+        .{ .x = xb, .q = wq, .scales = wsc, .biases = .{ .ctx = null }, .gs = 16, .mode = .nvfp4 },
+        .{ .x = xh, .q = pack.q, .scales = pack.scales, .biases = pack.biases, .gs = 64, .mode = .affine },
+    };
+    for (cases) |c| {
+        var ys: [2]mlx.mlx_array = undefined;
+        for ([_]bool{ false, true }, 0..) |lever, i| {
+            f16_prefill_override = lever;
+            const lever_before = f16_prefill_engaged;
+            ys[i] = (try prefillDqGemm(c.x, c.q, c.scales, c.biases, 4, c.gs, c.mode, s)) orelse return error.RouteDeclined;
+            _ = try sc.keep(ys[i]);
+            try testing.expectEqual(lever_before, f16_prefill_engaged);
+            try testing.expectEqual(mlx.mlx_array_dtype(c.x), mlx.mlx_array_dtype(ys[i]));
+        }
+        try testing.expectEqual(@as(f32, 0), try maxAbsDiffF32(ys[0], ys[1], s));
     }
 }
 
