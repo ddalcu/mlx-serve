@@ -221,13 +221,9 @@ pub const Scheduler = struct {
     /// after marking the entry `.evicting` + draining its refcount; the
     /// inference thread frees the mlx state (stream-bound, like cleanup).
     unload_queue: std.ArrayList(*UnloadRequest),
-    /// Slots awaiting cleanup. The conn thread queues a slot here in
-    /// `complete()` instead of calling `slot.deinit()` directly — `deinit`
-    /// frees mlx_arrays via refcount-decrement, and the underlying GPU
-    /// memory release races against the inference thread's stream. The
-    /// inference thread drains this queue between ticks where it owns the
-    /// stream binding, so all mlx ops stay on one thread.
-    cleanup_queue: std.ArrayList(*Slot),
+    /// Intrusive FIFO protected by queue_mu: completion cannot fail allocation or
+    /// release GPU state/history leases off-thread. Drained between inference ticks.
+    cleanup_queue: std.DoublyLinkedList,
     /// Metrics sink. Null when --metrics is off. Populated from LoadParams.
     /// Read once per REQUEST in `finishSlot` — never on the per-token path.
     metrics: ?*metrics_mod.Metrics,

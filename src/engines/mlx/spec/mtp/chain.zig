@@ -200,6 +200,8 @@ pub const MtpPreDraft = struct {
     /// Drafts are a context continuation (`mtpLookupChain`): nothing to
     /// build, and no MTP statistics are fed.
     lookup: bool = false,
+    /// Immutable source attribution for this flight, including grouped/clipped chains.
+    external_history: bool = false,
     /// Set when step 0 consumed a padded history append: every draft step sits past its dead rows.
     place: ?HeadPlace = null,
 
@@ -324,37 +326,60 @@ pub fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_look
     return &self.mtp_lookup_idx.?;
 }
 
-/// A chain of the context's continuation after `t1`, or null when the gate
-/// prefers the MTP head. Single-stream rounds only.
-/// How many context-continuation drafts the lookup gate takes after `t1`; 0 = the MTP head.
-pub fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !u32 {
-    if (!mtpLookupEnabled() or self.mtp_batch_head) return 0;
-    if (group_planner.enabled() and self.mtp_planner_owned) return 0;
+const LookupProposal = struct { match: mtp_lookup.Match, drafts: u32, external: bool };
+
+/// Keep stock prompt lookup as the incumbent. External history is considered
+/// only when that proposal loses the existing suffix/cost/acceptance gate.
+fn lookupProposal(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?LookupProposal {
+    if (!mtpLookupEnabled() or self.mtp_batch_head) return null;
+    if (group_planner.enabled() and self.mtp_planner_owned) return null;
     const idx = try self.mtpLookupIndex(allocator);
     const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
     const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
-    const got = idx.match(t1, lookup_cap);
-    return mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
+    const costs = self.mtpLookupCosts(plan.m_lo);
+    if (idx.match(t1, lookup_cap)) |got| {
+        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, costs);
+        if (k > 0) return .{ .match = got, .drafts = k, .external = false };
+    }
+    if (remaining == 0 or idx.toks.items.len + 1 < mtp_lookup.MIN_SUFFIX) return null;
+    const got = try @import("../history.zig").match(self, allocator, idx.toks.items, t1, lookup_cap) orelse return null;
+    const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, costs);
+    if (self.external_history) |request| {
+        request.admission_checks += 1;
+        if (k > 0) request.admitted_checks += 1;
+    }
+    return if (k > 0) .{ .match = got, .drafts = k, .external = true } else null;
+}
+
+/// How many drafts the stock lookup gate takes; zero retains the MTP head.
+pub fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !u32 {
+    return if (try lookupProposal(self, allocator, plan, t1)) |proposal| proposal.drafts else 0;
 }
 
 pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
-    const k = try self.mtpLookupDrafts(allocator, plan, t1);
+    const proposal = try lookupProposal(self, allocator, plan, t1) orelse return null;
+    const k = proposal.drafts;
     const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
-    if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return null;
-    const got = (try self.mtpLookupIndex(allocator)).match(t1, lookup_cap);
+    if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) {
+        if (proposal.external) if (self.external_history) |request| {
+            request.floor_rejections += 1;
+        };
+        return null;
+    }
+    const got = proposal.match;
     const Once = struct {
         var logged = false;
     };
     if (!Once.logged) {
         Once.logged = true;
-        log.info("[mtp] prompt-lookup drafts engaged: k={d} suffix={d}\n", .{ k, got.?.suffix });
+        log.info("[mtp] prompt-lookup drafts engaged: k={d} suffix={d}\n", .{ k, got.suffix });
     }
     // No MTP chain consumes the stash this round; left pending, it would grow
     // across lookup rounds into one oversized head forward.
     try self.mtpApplyStash();
     const drafts = try allocator.alloc(u32, k);
     errdefer allocator.free(drafts);
-    @memcpy(drafts, got.?.draft[0..k]);
+    @memcpy(drafts, got.draft[0..k]);
     const draft_arrs = try allocator.alloc(mlx.mlx_array, k);
     errdefer allocator.free(draft_arrs);
     const one = [_]c_int{1};
@@ -382,6 +407,7 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
         .h_chain = null,
         .m = k,
         .lookup = true,
+        .external_history = proposal.external,
     };
 }
 

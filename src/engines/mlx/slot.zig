@@ -94,6 +94,11 @@ pub const Slot = struct {
     /// released in `complete()`.
     holds_session: bool = false,
 
+    /// Intrusive cleanup handoff: queue_mu protects links; no allocation after submission.
+    cleanup_node: std.DoublyLinkedList.Node = .{},
+    /// Set under queue_mu before waiting for in_pass; duplicate handoffs cannot link twice.
+    cleanup_claimed: bool = false,
+
     // ── Submission data. Owned by the slot, freed in deinit. ──
     prompt_ids: []u32,
     full_prompt: []u32,
@@ -196,6 +201,7 @@ pub const Slot = struct {
     prefill_ns: u64,
     /// The prefill's sampled token, already published; its next push is swallowed.
     early_first: ?u32 = null,
+    history_publication: @import("spec/history_publication.zig").Ledger = .{},
     /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
     /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
     /// that received the tokens; subtracted from this slot's `prefill_ns` so
@@ -391,6 +397,7 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
+        @import("spec/history.zig").publish(self, if (self.state == .errored or self.error_code != null) .failed else .cancelled);
         // A slot freed before its terminator (a cancel pulled into cleanup) still tells its stream it is done.
         if (self.sink != null) self.emitFinished(.cancelled, null);
         if (self.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.markQsaPooledRopeStale();
@@ -492,11 +499,14 @@ pub const Slot = struct {
                 self.state = .errored;
             };
         }
-        self.out_buf.append(self.allocator, t) catch |err| {
-            // Allocation failure: degrade to error.
+        if (self.out_buf.append(self.allocator, t)) |_| {
+            if (@import("spec/history.zig").writes())
+                self.history_publication.emitted(t, if (self.legacy_gen) |*gen| gen.generated_ids.items else &.{});
+        } else |err| {
+            self.history_publication.failedEmission();
             self.error_code = self.allocator.dupe(u8, @errorName(err)) catch null;
             self.state = .errored;
-        };
+        }
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
     }
@@ -527,6 +537,7 @@ pub const Slot = struct {
     /// Inference thread: signal normal completion. Safe to call multiple
     /// times (idempotent on `finished`).
     pub fn markFinished(self: *Slot, reason: []const u8) void {
+        @import("spec/history.zig").publish(self, if (self.state == .errored or self.error_code != null) .failed else if (std.mem.eql(u8, reason, "cancelled")) .cancelled else .completed);
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         if (self.finished) return;
@@ -562,6 +573,7 @@ pub const Slot = struct {
     }
 
     pub fn markError(self: *Slot, name: []const u8) void {
+        // Failure can be signaled off-thread; history stays with the inference owner until cleanup.
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         if (self.error_code != null or self.finished) return;
@@ -604,6 +616,8 @@ pub const Slot = struct {
             .constraint_offset = if (span) |c| c[1] else 0,
         };
         if (sk.event(sk.ctx, @intFromPtr(self), &ev) == .stop) self.cancelled.store(true, .release);
+        if (@import("spec/history.zig").writes())
+            self.history_publication.emitted(t, if (self.legacy_gen) |*gen| gen.generated_ids.items else &.{});
     }
 
     fn emitFinished(self: *Slot, reason: @FieldType(abi.Event, "reason"), failure: ?[]const u8) void {
@@ -705,3 +719,7 @@ pub const Slot = struct {
         self.out_event.set(self.io);
     }
 };
+
+test {
+    _ = @import("history_slot_test.zig");
+}

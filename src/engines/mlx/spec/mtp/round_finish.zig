@@ -494,6 +494,10 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         new_hidden = .{ .ctx = null };
 
         self.mtpRoundAcceptObserve(chain.lookup, m, m);
+        if (chain.external_history) if (self.external_history) |history| {
+            history.rounds += 1;
+            history.accepted += m;
+        };
         self.next_token_id = next_pending;
         self.advanceStep(1 + m);
 
@@ -600,6 +604,10 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     re_new_hidden = .{ .ctx = null };
 
     self.mtpRoundAcceptObserve(chain.lookup, m, accepted);
+    if (chain.external_history) if (self.external_history) |history| {
+        history.rounds += 1;
+        history.accepted += accepted;
+    };
     self.next_token_id = next_pending;
     self.advanceStep(1 + accepted);
 

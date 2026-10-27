@@ -90,6 +90,9 @@ pub const PretokStyle = enum { gpt2, llama3, cased };
 pub const IsolatedRuns = struct { digits: bool = false, cjk: bool = false };
 
 pub const Tokenizer = struct {
+    /// SHA-256 of the exact tokenizer content consumed by the loader.
+    /// Synthetic/stub tokenizers without this identity cannot share token history.
+    content_sha256: ?[32]u8 = null,
     /// Token string -> id
     vocab: std.StringHashMap(u32),
     /// Id -> token string

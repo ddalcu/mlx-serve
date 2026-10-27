@@ -310,6 +310,8 @@ pub const Generator = struct {
     /// Prompt + committed output, indexed up to `mtp_lookup_gen` generated tokens.
     mtp_lookup_idx: ?mtp_lookup.Index = null,
     mtp_lookup_gen: usize = 0,
+    /// Lazily allocated only when external history is configured.
+    external_history: ?*@import("../spec/history.zig").Request = null,
     /// Landed drafts per round, smoothed, for lookup and MTP rounds (`mtp_lookup.gate`).
     mtp_lookup_ema: f32 = @floatFromInt(mtp_lookup.MAX_DRAFT),
     mtp_round_ema: f32 = 0,
@@ -555,6 +557,11 @@ pub const Generator = struct {
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
+        if (self.external_history) |request| {
+            request.deinit();
+            allocator.destroy(request);
+            self.external_history = null;
+        }
         // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
         self.xfm.discardDeferredPle(&self.ctx);
         plugin_settle.release(self.xfm, &self.ctx);

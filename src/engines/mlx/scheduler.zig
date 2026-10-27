@@ -296,7 +296,7 @@ pub fn init(
         .load_queue = std.ArrayList(*LoadRequest).empty,
         .gen_queue = std.ArrayList(*GenRequest).empty,
         .unload_queue = std.ArrayList(*UnloadRequest).empty,
-        .cleanup_queue = std.ArrayList(*Slot).empty,
+        .cleanup_queue = .{},
         .metrics = params.metrics,
         .inflight_generated_tokens = std.atomic.Value(u64).init(0),
         .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
@@ -393,8 +393,10 @@ pub fn deinit(self: *Scheduler) void {
     for (self.decoding.items) |slot| slot.deinit();
     self.decoding.deinit(self.allocator);
     self.offloaded.deinit(self.allocator);
-    for (self.cleanup_queue.items) |slot| slot.deinit();
-    self.cleanup_queue.deinit(self.allocator);
+    while (self.cleanup_queue.popFirst()) |node| {
+        const slot: *Slot = @alignCast(@fieldParentPtr("cleanup_node", node));
+        slot.deinit();
+    }
     // Vision/embed queues should be empty (encodeVision/computeEmbedding
     // block until done) but guard against shutdown-mid-encode by signaling
     // done with an error.
@@ -588,6 +590,11 @@ pub fn complete(self: *Scheduler, slot: *Slot) void {
     slot.cancelled.store(true, .release);
 
     self.queue_mu.lockUncancelable(self.io);
+    if (slot.cleanup_claimed) {
+        self.queue_mu.unlock(self.io);
+        return;
+    }
+    slot.cleanup_claimed = true;
 
     // Remove from pending (rare — only if conn thread cancels before
     // prefill) and from decoding (the common case). After this, only the
@@ -626,14 +633,7 @@ pub fn complete(self: *Scheduler, slot: *Slot) void {
         self.queue_mu.lockUncancelable(self.io);
     }
 
-    self.cleanup_queue.append(self.allocator, slot) catch {
-        // OOM on the cleanup list — fall back to inline deinit. This
-        // races on mlx but is strictly better than the leak; the slot
-        // is no longer referenced from pending/decoding above.
-        self.queue_mu.unlock(self.io);
-        slot.deinit();
-        self.queue_mu.lockUncancelable(self.io);
-    };
+    self.cleanup_queue.append(&slot.cleanup_node);
     if (self.in_flight > 0) self.in_flight -= 1;
     self.queue_cond.broadcast(self.io); // wake inference thread to drain
     self.submit_cond.broadcast(self.io); // wake any blocked submitter
@@ -1257,11 +1257,14 @@ test "failInFlight: a decoding request ends with the error by name, its stuck pa
     slot.error_code = null;
     slot.sink = null;
     slot.in_pass = .init(1);
+    slot.history_publication = .{};
+    slot.legacy_gen = null;
     try sch.decoding.append(testing.allocator, &slot);
     defer sch.decoding.deinit(testing.allocator);
     failInFlight(&sch, "DistWorkerLeft");
     defer testing.allocator.free(slot.error_code.?);
     try testing.expectEqualStrings("DistWorkerLeft", slot.error_code.?);
+    try testing.expect(!slot.history_publication.finalized);
     // The stuck pass's hold is dropped, so the reader's `complete` returns.
     try testing.expectEqual(@as(u32, 0), slot.in_pass.load(.acquire));
 }

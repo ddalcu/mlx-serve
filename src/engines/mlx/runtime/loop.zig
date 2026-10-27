@@ -39,7 +39,7 @@ pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.decoding.items.len > 0 or
         sch.vision_queue.items.len > 0 or
         sch.embed_queue.items.len > 0 or
-        sch.cleanup_queue.items.len > 0 or
+        sch.cleanup_queue.first != null or
         sch.load_queue.items.len > 0 or
         sch.gen_queue.items.len > 0 or
         sch.unload_queue.items.len > 0;
@@ -175,8 +175,9 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
     {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
-        while (cleanup_n < cleanup_batch.len and sch.cleanup_queue.items.len > 0) {
-            cleanup_batch[cleanup_n] = sch.cleanup_queue.orderedRemove(0);
+        while (cleanup_n < cleanup_batch.len) {
+            const node = sch.cleanup_queue.popFirst() orelse break;
+            cleanup_batch[cleanup_n] = @alignCast(@fieldParentPtr("cleanup_node", node));
             cleanup_n += 1;
         }
         while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {

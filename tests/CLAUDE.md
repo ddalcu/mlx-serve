@@ -97,6 +97,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_completions_spec.sh` spec on /v1/completions · `test_tool_call_streaming_spec.sh` call boundaries under PLD
 - `test_mtp_equivalence.sh` MTP engagement + tie-aware equivalence · `test_mtp_adaptive.sh` adaptive serial switch
 - `test_mtp_batched.sh` concurrent MTP at fixed depth · `test_mtp_batch_stops.py` **R** grouped-MTP EOS/cancel
+- `test_token_history.py` **R** overlapping MTP streams persist only emitted prefixes, including reverse finish order
 - `test_dflash.sh` **E**, `test_dflash_company.sh` **E**, `test_dspark_lfm2.sh` **E** DFlash / DSpark · `test_dsv41_speculation.py` **R**
 - `build_mtp_sidecar.py` MTP sidecar from Qwen weights · `record_mtp_accept_traces.py` **R** the MTP replay fixture
 

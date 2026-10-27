@@ -342,7 +342,10 @@ pub fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: 
 
     var special_index = try Tokenizer.SpecialIndex.init(allocator, &special_tokens);
     errdefer special_index.deinit(allocator);
+    var content_sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &content_sha256, .{});
     var built: Tokenizer = .{
+        .content_sha256 = content_sha256,
         .special_index = special_index,
         .vocab = vocab,
         .id_to_token = id_to_token,

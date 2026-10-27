@@ -413,6 +413,8 @@ pub const Transformer = struct {
     /// spans only its own max_tokens. Inference thread only.
     round_cost: round_cost_mod.Table = .{},
     mtp_group_cost: group_cost_mod.Table = .{},
+    /// Inference-thread-owned immutable history snapshots, shared by live slots.
+    token_history: ?@import("spec/token_history.zig").HistoryCache = null,
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
     cost_moe: u8 = 0,
@@ -804,6 +806,7 @@ pub const Transformer = struct {
     pub const createSlidingWindowMask = @import("methods/masks.zig").createSlidingWindowMask;
 
     pub fn deinit(self: *Transformer) void {
+        if (self.token_history) |*history| history.deinit() catch unreachable;
         lane_qmm.release(@intFromPtr(self));
         if (self.ane_prefill) |eng| {
             eng.deinit();
