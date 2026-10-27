@@ -78,6 +78,7 @@ pub fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, s
             try mlx.check(mlx.mlx_astype(&xc, x, cd, s));
             try mlx.check(mlx.mlx_astype(&scc, sc, cd, s));
             try mlx.check(mlx.mlx_astype(&bic, bi, cd, s));
+            pdg.f16_prefill_engaged += 1;
         }
         try mlx.check(mlx.mlx_gather_qmm(res, if (cast) xc else x, w, if (cast) scc else sc, if (cast) bic else bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
         if (cast) {

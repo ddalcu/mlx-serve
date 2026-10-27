@@ -82,7 +82,10 @@ pub fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: 
 
     var xc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(xc);
-    if (cd != xd) try mlx.check(mlx.mlx_astype(&xc, x, cd, s));
+    if (cd != xd) {
+        try mlx.check(mlx.mlx_astype(&xc, x, cd, s));
+        f16_prefill_engaged += 1;
+    }
     var dq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq);
     try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = cd, .has_value = true }, s));
@@ -128,7 +131,6 @@ pub var f16_prefill_engaged: u64 = 0;
 /// activation over an affine pack with biases while the lever is on, else `xd`.
 pub fn prefillComputeDtype(xd: mlx.mlx_dtype, mode: QuantMode, has_biases: bool) mlx.mlx_dtype {
     if (xd != .bfloat16 or mode != .affine or !has_biases or !f16PrefillEnabled()) return xd;
-    f16_prefill_engaged += 1;
     return .float16;
 }
 
