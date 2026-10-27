@@ -11,9 +11,10 @@ output). A report is the old or new release by its `run.label`: `<side>-<arm>`, 
 `target.model`. Repeated reports of one cell take their median; a later `--dir` of the same machine wins
 where it has the new side.
 A `--csv` adds rows measured elsewhere: machine,model,arm,build,decode_old,decode_new,prefill_old,prefill_new,
-agg_old,agg_new,note (empty = not measured).
-Status: every measured delta at or above -noise% = ok; any below = regression; the new side missing = pending; repeated
-reports of a cell more than 2 x noise apart = noisy (rerun before reading it).
+agg_old,agg_new,note (empty = not measured), and an optional spread (% between repeated passes of one side).
+Status: every measured delta at or above -noise% = ok; any below = regression; no old side at all = new (a capability
+the old release lacks); the new side missing = pending; repeated reports of a cell more than 2 x noise apart = noisy
+(rerun before reading it).
 Tests: python3 -m unittest scripts/release_compare.py"""
 import argparse
 import csv
@@ -97,6 +98,7 @@ def rows_from_csv(path):
             for side in ("old", "new"):
                 v = (r.get(f"{key}_{side}") or "").strip()
                 row[f"{key}_{side}"] = float(v) if v else None
+        row["spread"] = float(r.get("spread") or 0)
         rows[(row["machine"], row["model"], row["arm"])] = row
     return rows
 
@@ -108,6 +110,8 @@ def delta(row, key):
 
 def status(row, noise):
     ds = [delta(row, k) for k, _ in METRICS]
+    if all(row[k + "_old"] is None for k, _ in METRICS) and any(row[k + "_new"] is not None for k, _ in METRICS):
+        return "new"
     if all(d is None for d in ds):
         return "pending"
     if row.get("spread", 0.0) > 2 * noise:
@@ -115,7 +119,7 @@ def status(row, noise):
     return "regression" if any(d is not None and d < -noise for d in ds) else "ok"
 
 
-SYMBOL = {"ok": "✅", "regression": "❌", "pending": "⏳", "noisy": "⚠ reps disagree, rerun"}
+SYMBOL = {"ok": "✅", "regression": "❌", "pending": "⏳", "noisy": "⚠ reps disagree, rerun", "new": "🆕 new"}
 
 
 def num(v):
@@ -142,8 +146,8 @@ def markdown(rows, old, new, noise):
         cells.append(SYMBOL[st] + (" " + row["note"] if row["note"] else ""))
         out.append("| " + " | ".join(cells) + " |")
     out.append("")
-    out.append(f"tok/s; Δ = {new} vs {old}; ✅ every Δ ≥ −{noise:g}%, ❌ one below, ⏳ not measured, ⚠ the repeated "
-               f"reports of a cell differ by more than {2 * noise:g}%.")
+    out.append(f"tok/s; Δ = {new} vs {old}; ✅ every Δ ≥ −{noise:g}%, ❌ one below, ⏳ not measured, 🆕 {old} cannot run "
+               f"it, ⚠ the repeated reports of a cell differ by more than {2 * noise:g}%.")
     return "\n".join(out) + "\n"
 
 
@@ -293,6 +297,15 @@ class Test(unittest.TestCase):
         self.assertEqual(status(q2, 3), "noisy")
         self.assertEqual(status(rows[("M5", "Gemma", "nospec")], 3), "pending")
         self.assertEqual(status(rows_from_csv(f"{self.tmp.name}/rows.csv")[("M4", "Flash", "default")], 3), "ok")
+
+    def test_csv_new_and_noisy_rows(self):
+        p = f"{self.tmp.name}/more.csv"
+        open(p, "w").write("machine,model,arm,build,decode_old,decode_new,prefill_old,prefill_new,agg_old,agg_new,note,"
+                           "spread\nM5,Pack,stream,abc,,13.1,,587.3,,9.1,new only,\nM5,Repack,stream,abc,47.7,44.5,825.6,"
+                           "1256.3,32.3,31.2,one pass,11\n")
+        rows = rows_from_csv(p)
+        self.assertEqual(status(rows[("M5", "Pack", "stream")], 3), "new")
+        self.assertEqual(status(rows[("M5", "Repack", "stream")], 3), "noisy")
 
     def test_outputs(self):
         md, h = f"{self.tmp.name}/o.md", f"{self.tmp.name}/o.html"
