@@ -416,8 +416,8 @@ class AppState: ObservableObject {
     }
 
     /// Show the model browser — the ONE way in.
-    func showModels(_ section: ModelBrowserSection = .recommended) {
-        chatWorkspace = .models(section)
+    func showModels(_ section: ModelBrowserSection? = nil) {
+        chatWorkspace = .modelBrowserEntry(section: section, localModels: localModels)
         pendingChatOpenTick += 1
     }
 

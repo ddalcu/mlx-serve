@@ -47,10 +47,25 @@ final class ChatWorkspaceTests: XCTestCase {
             "Cancel still wins — it is the sheet's one door")
     }
 
-    func testEntryLandsOnTheRecommendedSection() {
-        XCTAssertEqual(ChatWorkspace.defaultEntry, .models(.recommended))
-        XCTAssertTrue(ChatWorkspace.defaultEntry.isModels)
+    func testDefaultBrowserEntryDependsOnLocalLibrary() {
+        XCTAssertEqual(ChatWorkspace.modelBrowserEntry(localModels: []), .models(.recommended))
+        let model = LocalModel(id: "local", name: "Qwen", path: "/fixture/Qwen", sizeFormatted: "1 GB",
+                               modelType: "qwen3", source: .mlxServe, kind: .base)
+        XCTAssertEqual(ChatWorkspace.modelBrowserEntry(localModels: [model]), .models(.myModels))
         XCTAssertEqual(ChatWorkspace.conversation.section, nil)
+    }
+
+    func testMediaOnlyLibraryOpensRecommended() {
+        let model = LocalModel(id: "image", name: "FLUX", path: "/fixture/FLUX", sizeFormatted: "1 GB",
+                               modelType: "flux", source: .mlxServe, kind: .base)
+        XCTAssertFalse(model.isChatPickable)
+        XCTAssertEqual(ChatWorkspace.modelBrowserEntry(localModels: [model]), .models(.recommended))
+    }
+
+    func testExplicitBrowserDestinationsArePreserved() {
+        for section in ModelBrowserSection.allCases {
+            XCTAssertEqual(ChatWorkspace.modelBrowserEntry(section: section, localModels: []), .models(section))
+        }
     }
 
     // MARK: - One chokepoint in
