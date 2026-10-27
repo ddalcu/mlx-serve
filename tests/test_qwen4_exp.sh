@@ -20,7 +20,7 @@ BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 LOG="$HOME/claude-tmp/qwen4-live/server-$PORT.log"
 mkdir -p "$(dirname "$LOG")"
 [ -f "$MODEL/config.json" ] || { echo "SKIP: no pack at $MODEL"; exit 0; }
-[ -f "$MODEL/ngram_table.bin" ] || grep -q "ngram_embedding.shards" "$MODEL/model.safetensors.index.json" 2>/dev/null ||
+[ -f "$MODEL/ngram_table.bin" ] || grep -qE 'ngram_embedding\.(shards\.[0-9]+|shard_[0-9]+)\.weight"' "$MODEL/model.safetensors.index.json" 2>/dev/null ||
   { echo "SKIP: pack has no n-gram table (ngram_table.bin or embedded shards)"; exit 0; }
 pass=0; fail=0
 # Tie-aware equivalence (test_mtp_equivalence.sh bar): prints 1 when `other`

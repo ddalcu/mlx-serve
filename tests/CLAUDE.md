@@ -135,7 +135,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_plugin_kit.sh` **H** the kit builds `_example` from itself; `plugin new|check|fixture|install`; a kit-built dylib serves its pack
 
 **Architectures (live)**
-- `test_qwen4_exp.sh` **E** Flash Next · `test_qwen4_mtp_{padded_head,head_persist}.sh` **E** its MTP head
+- `test_qwen4_exp.sh` **E** Flash Next (external PLE or embedded `shards.N` / `shard_N`) · `test_qwen4_mtp_{padded_head,head_persist}.sh` **E** its MTP head
 - `test_qsa_nax_prefill.py` **R** QSA NAX prefill · `qsa_nax_precision.py` float64 QSA kernel oracle
 - `test_dsv4.sh` **E**, `test_dsv41.sh` **E** DeepSeek V4/V4.1 · `test_inkling.sh` **E** · `test_bailing_hybrid.sh` **E** Ling 3.0
 - `test_muse_glimmer.sh` **E**, `test_muse_repetition.sh` **E** Muse · `test_mimo_v2.sh` **E** · `test_glm5_next.sh` **E** · `test_glm53.sh` **E**
