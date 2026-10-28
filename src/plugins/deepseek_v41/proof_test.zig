@@ -292,3 +292,47 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
     defer m.mdl.pair = null;
     try testing.expect(!aux.enabled(t.m));
 }
+
+test "deepseek_v41 slot request: Engram prompt and confidence follow the State across slots" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const a = [_]u32{ 3, 17, 42, 9 };
+    const b = [_]u32{ 5, 8, 13, 21 };
+    for ([_]bool{ false, true }) |legacy| {
+        const t = try Twin.open(files, "");
+        defer t.close();
+        const model: *v41.Model = @ptrCast(@alignCast(t.m));
+        model.cfg.dsv41_streamed = legacy;
+        const aux = v41.table.cache.aux.?;
+        if (legacy) {
+            try testing.expectEqual(@as(u64, 0), v41.resumePrompt(t.m, 1, .of(&a), .{}));
+        } else try testing.expect(aux.begin_prompt(t.m, 1, .of(&a), .{}, 0, true).isOk());
+        model.mdl.dec_state.?.ds_want_conf = true;
+        if (legacy) {
+            try testing.expectEqual(@as(u64, 0), v41.resumePrompt(t.m, 2, .of(&b), .{}));
+        } else try testing.expect(aux.begin_prompt(t.m, 2, .of(&b), .{}, 0, true).isOk());
+        model.mdl.dec_state.?.ds_want_conf = false;
+        try testing.expect(v41.table.activate_slot.?(t.m, 1).isOk());
+        try testing.expectEqualSlices(u32, &a, model.mdl.dec_state.?.prompt);
+        try testing.expect(model.mdl.dec_state.?.ds_want_conf);
+        try testing.expect(v41.table.activate_slot.?(t.m, 2).isOk());
+        try testing.expectEqualSlices(u32, &b, model.mdl.dec_state.?.prompt);
+        try testing.expect(!model.mdl.dec_state.?.ds_want_conf);
+    }
+}
+
+test "deepseek_v41 slot request: a fresh prompt clears confidence requested by the previous turn" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const model: *v41.Model = @ptrCast(@alignCast(t.m));
+    model.cfg.dsv41_streamed = true;
+    _ = v41.resumePrompt(t.m, 1, .of(&.{ 3, 17, 42 }), .{});
+    model.mdl.dec_state.?.ds_want_conf = true;
+    _ = v41.resumePrompt(t.m, 1, .of(&.{ 5, 8, 13 }), .{});
+    try testing.expect(!model.mdl.dec_state.?.ds_want_conf);
+}

@@ -8,6 +8,7 @@ const build_options = @import("build_options");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
+const device = @import("../../mlx/device.zig");
 const dsv41 = @import("deepseek_v41.zig");
 const vision = @import("vision.zig");
 const media = @import("media.zig");
@@ -102,9 +103,11 @@ const Kept = struct {
 
 /// Parks a live slot; excluded configurations retain an unclaimed state for legacy resume.
 fn park(m: *Model) !void {
-    const st = m.mdl.dec_state orelse return;
-    const k: Kept = .{ .st = st, .gen = m.mdl.state_gen };
-    if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
+    const st = if (m.mdl.dec_state) |*st| st else return;
+    if (m.owner != 0) try m.parked.ensureUnusedCapacity(gpa, 1);
+    st.dropAhead();
+    const k: Kept = .{ .st = st.*, .gen = m.mdl.state_gen };
+    if (m.owner != 0) m.parked.putAssumeCapacity(m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
         var orphan = k;
         orphan.deinit();
     }
@@ -125,6 +128,16 @@ fn activate(m: *Model, slot: u32) !void {
         if (auxEnabled(m)) try park(m);
         return;
     }
+    const known = m.parked.contains(slot);
+    const owners = m.parked.count() + @as(usize, @intFromBool(m.owner != 0));
+    if (!known and m.caps.active_slots > 0 and owners >= m.caps.active_slots) return error.ActiveSlotLimit;
+    if (comptime build_options.mlx_stream) if (m.bank) |bank| switch (bank) {
+        .exl3 => |src| {
+            try mlx.check(mlx.mlx_synchronize(m.s));
+            try src.settle();
+        },
+        .pack => {},
+    };
     const mine = m.parked.fetchRemove(slot);
     if (mine == null and m.owner == 0) {
         m.owner = slot;
@@ -162,7 +175,10 @@ fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
 
 fn activateSlot(mp: *anyopaque, slot: u32) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
-    activate(m, slot) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");
+    activate(m, slot) catch |err| return switch (err) {
+        error.ActiveSlotLimit => Verdict.refuse(.too_large, "deepseek_v41: active streamed slot limit reached"),
+        else => Verdict.refuse(.failed, "deepseek_v41: failed to settle or park a slot's state"),
+    };
     return .ok;
 }
 
@@ -191,9 +207,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     const c = config.of(ctx.parsed);
-    // The EXL3 prompt GEMMs are built on MLX's NAX tiles: below the M5 they compute wrong (f64 self-check, M4).
-    if (c.dsv41_exl3_bank and !@import("../../mlx/device.zig").naxAvailable()) {
-        out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack needs an M5 or newer GPU (its prompt kernels run on the M5's matrix units); stream the MLX pack with the stream_experts setting instead");
+    if (c.dsv41_exl3_bank and !exl3GpuAvailable()) {
+        out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack requires an M2 GPU or available M5-class matrix units; stream the MLX pack with the stream_experts setting instead");
         return null;
     }
     return loadModel(ctx, s) catch |e| {
@@ -208,6 +223,17 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+}
+
+fn exl3GpuSupported(arch: []const u8, has_nax: bool) bool {
+    const gpu = device.naxArchGeneration(arch);
+    return (gpu.gen == 14 and !gpu.phone) or (has_nax and device.naxArchSupportedFrom(arch));
+}
+
+fn exl3GpuAvailable() bool {
+    // Read the real architecture: a generation override must never enable an unverified streamed load.
+    var buf: [128]u8 = undefined;
+    return exl3GpuSupported(device.gpuArchitecture(&buf) orelse "", device.naxAvailable());
 }
 
 /// The host's stream when it is a GPU one, else this thread's GPU stream; null off Metal: the module's kernels are
@@ -333,7 +359,15 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (f.capture_layers.len > 0) return Verdict.refuse(.unsupported, "deepseek_v41: no layer capture");
     if (f.mode == .batched_rows) return forwardBatched(m, f, out);
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "deepseek_v41: one slot's rows at a time");
-    if (f.slots.len == 1) activate(m, f.slots.slice()[0]) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");
+    if (f.slots.len == 1) {
+        const activated = activateSlot(mp, f.slots.slice()[0]);
+        if (!activated.isOk()) return activated;
+    }
+    // resumePrompt may adopt idle state; a direct cold forward must free it before allocating a third context.
+    if (m.mdl.dec_state == null and m.caps.active_slots > 0 and m.parked.count() + @as(usize, @intFromBool(m.owner != 0)) >= m.caps.active_slots) {
+        if (m.idle) |*old| old.deinit();
+        m.idle = null;
+    }
     const in = v4plugin.Ids.of(f) catch return Verdict.refuse(.failed, "deepseek_v41: the token ids do not read back");
     defer in.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
@@ -342,7 +376,10 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
-    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
+    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch |err| {
+        std.log.err("deepseek_v41: forward at {d} with {d} rows failed: {s}", .{ pos, in.host.len, if (err == error.EngineFailed) @import("../../sdk/util/err_name.zig").last() else @errorName(err) });
+        return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
+    };
     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
     return .ok;
 }
@@ -703,4 +740,12 @@ test {
     _ = media;
     _ = @import("contract.zig");
     _ = @import("decode/decode.zig");
+}
+
+test "deepseek_v41 streamed EXL3 eligibility: M2 portable or available NAX, other devices refused" {
+    const expect = std.testing.expect;
+    for ([_][]const u8{ "applegpu_g14d", "AppleGPU_G14S", "g14" }) |arch| try expect(exl3GpuSupported(arch, false));
+    for ([_][]const u8{ "", "air64_v27", "applegpu_g14_extra", "g14p", "g13d", "g15d", "g16s", "g17d", "g18d" }) |arch| try expect(!exl3GpuSupported(arch, false));
+    for ([_][]const u8{ "applegpu_g17d", "g18d" }) |arch| try expect(exl3GpuSupported(arch, true));
+    for ([_][]const u8{ "", "air64_v27", "g13d", "g14p", "g15d", "g16s", "g17p" }) |arch| try expect(!exl3GpuSupported(arch, true));
 }

@@ -130,6 +130,7 @@ pub const Loaded = struct {
     model: *anyopaque = undefined,
 
     pub fn open(io: std.Io, a: Allocator, name: []const u8, table: *const model_abi.ModelTable, fx: fixture.Fixture) !Loaded {
+        mlx.installErrorHandler();
         const cfg = fx.file("config.json") orelse return error.FixtureWithoutConfig;
         var self: Loaded = .{ .name = name, .table = table, .staged = try Staged.init(io, a, fx), .stream = mlx.mlx_default_cpu_stream_new() };
         errdefer {

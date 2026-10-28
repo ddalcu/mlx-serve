@@ -2046,6 +2046,51 @@ test "dsv41 kernels: an HCTAPE combine word is judged against its f32 chain, not
 
 // GPU only: DSV41_KERNELS_GPU=1.
 // DSV41_KERNELS_RECEIPT=<path> keeps the per-check JSON lines.
+test "dsv41 portable prefill gpu: all nine DIG tiles pass their numerical plans" {
+    if (env.get(.DSV41_KERNELS_GPU) == null) return error.SkipZigTest;
+    if (@import("mlx_host").naxAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    mlx.installErrorHandler();
+    var diag: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
+    defer reg.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var bound = try reg.bind(s, &diag);
+    defer bound.deinit();
+    var report: Report = .{};
+    defer report.deinit(a);
+    try runSubset(a, &reg, &bound, &xk.portable_prefill_kernels, .full, &report);
+    try mlx.check(mlx.mlx_synchronize(s));
+    const lines = try report.writeJsonLines(a);
+    defer a.free(lines);
+    std.debug.print("{s}", .{lines});
+    if (env.get(.DSV41_KERNELS_RECEIPT)) |path| try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(path), .data = lines });
+    std.debug.print("portable DIG tiles: {d} checks, {d} failures\n", .{ report.results.items.len, report.failures() });
+    try judge(&report, &diag);
+}
+
+test "dsv41 portable prefill gpu: expert source construction subsets compile" {
+    if (env.get(.DSV41_KERNELS_GPU) == null) return error.SkipZigTest;
+    if (@import("mlx_host").naxAvailable()) return error.SkipZigTest;
+    const quant = @import("quant.zig");
+    const a = testing.allocator;
+    mlx.installErrorHandler();
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, null);
+    defer reg.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var bound = try reg.bind(s, null);
+    defer bound.deinit();
+    var report: Report = .{};
+    defer report.deinit(a);
+    inline for (.{ &quant.checked_at_accept, &quant.form_texts, &quant.banked_texts }) |subset|
+        try runSubset(a, &reg, &bound, subset, .compile, &report);
+    try mlx.check(mlx.mlx_synchronize(s));
+    std.debug.print("portable expert construction: {d} checks, {d} failures\n", .{ report.results.items.len, report.failures() });
+    try judge(&report, null);
+}
+
 test "dsv41 kernels gpu: every kernel of record passes its self-check" {
     _ = env.get(.DSV41_KERNELS_GPU) orelse return error.SkipZigTest;
     const a = testing.allocator;

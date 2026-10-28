@@ -9,6 +9,7 @@ const crt = @import("sdk/util/crt.zig");
 const build_options = @import("build_options");
 // pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) and mlx-stream reach these through their host root.
 pub const mlx = @import("mlx/ffi.zig");
+pub const naxAvailable = @import("mlx/device.zig").naxAvailable;
 pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");
 const mlx_gguf = @import("sdk/quant/gguf/claim.zig");

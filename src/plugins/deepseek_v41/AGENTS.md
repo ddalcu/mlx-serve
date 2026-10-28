@@ -22,7 +22,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
 
 ## Facts the table declares
-- `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`,
+- `owns_decode_state`, `slot_state` + `batches_decode` (EXL3: at most two active slots, serial decode; streamed MLX: single-flight): active state in `dec_state`,
   other live slots in `parked`; plain decode batches through `extendBatched`. Each State owns its pending capture.
 - `prefix_cache` for resident packs; `aux.enabled` also excludes Thunderbolt pairs. Snapshots retain every buffer
   and restore only at their exact position; the engine owns finished history. Streamed/paired keep legacy resume.
@@ -43,6 +43,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   reference); the module splices the rows itself; image rows route by `gate.bias_vl` and get no Engram write
   (`Hash.DEAD`).
 - The resume key includes the image rows: a different image at the same tokens is a cold prompt.
+- The State owns its Engram prompt and confidence demand; parking drains its read-ahead before switching owners.
 - DSpark = DFlash + Markov head: `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1`
   DENSE; sampled requests via one-hot acceptance. Per-model `mtp:false` keeps the
   stages off (`mtpSetting`).
@@ -56,13 +57,17 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   measured slower than the pair (their threadgroup shapes differ): keep one dispatch a stage.
 
 ## Streamed packs (`experts.bin`)
-- M5 and newer only (`naxAvailable`), refused by name below, as are GLM-5.3's EXL3 repacks: the prompt GEMMs are built
-  on MLX's NAX tiles and miss their f64 self-check on M4. The MLX pack streams anywhere.
+- EXL3 loads on M2 through the portable DIG tiles, or with available M5-class NAX units. M1, M3/M4, phone-family
+  M2 identifiers and unknown devices remain refused; eligibility reads the real architecture, never a test override.
+  This exception is DeepSeek-specific; other families retain their own EXL3 capability guards.
 - The routed experts come from `sdk/weights/streamed.zig` `Exl3` (`exl3_source.zig`: the EXL3 lane, event-gated
   waves, the next layer's reads predicted, the wide prompt feed, the decode forms / banked waves / hoist / device
   route); the trunk's own MoE never runs for them (`moe`'s `source` arm; the DSpark stages stay resident).
 - The prompt runs in calls of up to `bill.stream_call_rows`, each one MoE call a layer over all its rows
   (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
+- EXL3 admission caps owners at `min(Caps.active_slots, --max-concurrent)`; the plugin also refuses excess claims.
+  Load-time bank sizing reserves two live states with snapshots/backing capacity and one shared workspace.
+  Idle legacy-resume state is adopted or freed before a cold forward could allocate a third context.
 - Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
   grows the rows into what the prompt's working set held.
 - The bank bills its rows at the load (`streamBudget`: the GPU working set less the host's wired margin and
@@ -82,8 +87,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - Kernel contract (`contract.zig`; kernels unchanged): `idx_score` / `idx_tile` score a NaN q.k dot as 0 (relu
   via Metal's max); `rope_tail` fp4 arms and `kv_row` write a NaN in a quantized block as a finite code (max drops
   it, the fp8 encoder saturates it); `moe_gu` / `moe_act` turn a NaN gate sum into the clip limit (Metal's min);
-  `engram` launches 1024 threads at 5120-wide rows where M1/M2 compile it for 928, unprobed: decode-width Engram
-  writes fail on M1/M2.
+  `engram` needs 1024 threads at 5120-wide rows where M1/M2 compile it for 928; `engramFusedAvailable` sends
+  oversized M1/M2 or unknown-device launches through the existing op chain, preserving its reduction order.
 
 ## Fixtures
 - `conformanceFixture`: `fixture.v41Files` (the `tests/dump_dsv41_fixtures.py` pipe layout, 8 layers, no Engram or

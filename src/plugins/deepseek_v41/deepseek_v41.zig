@@ -381,9 +381,6 @@ pub const Dsv41Model = struct {
     hash: ?engram.Hash = null,
     token_map: []u32 = &.{},
     engrams: []EngramLayer = &.{},
-    /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
-    prompt: []u32 = &.{},
-    ahead: ?*engram.Prefetch = null,
     rope_plain: Rope,
     rope_yarn: Rope,
     attn_dec_kernel: mlx.mlx_fast_metal_kernel,
@@ -428,23 +425,14 @@ pub const Dsv41Model = struct {
     state_gen: u64 = 0,
     gens: u64 = 0,
     ds_conf_thr: f32 = -std.math.inf(f32),
-    /// The adaptive verify policy reads each draft's confidence; otherwise only a finite `ds_conf_thr` does.
-    ds_want_conf: bool = false,
     ds_prof: ?dsv4.DsparkProfile = null,
     ds_prof_head_ns: u64 = 0,
     ds_prof_comp_sync_ns: u64 = 0,
     /// The last draft's time, host sync included (`DsparkProfile`).
     ds_draft_ns: u64 = 0,
 
-    fn dropAhead(self: *Dsv41Model) void {
-        if (self.ahead) |a| a.finish();
-        self.ahead = null;
-    }
-
     pub fn deinit(self: *Dsv41Model) void {
         if (self.dec_state) |*st| st.deinit();
-        self.dropAhead();
-        self.gpa.free(self.prompt);
         for (self.engrams) |*e| e.table.close();
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -1771,8 +1759,19 @@ pub const State = struct {
     snap_at: ?usize = null,
     snap_ids: []u32 = &.{},
     snap_vision_key: u64 = 0,
+    /// The request's prompt and its next chunk's Engram read-ahead.
+    prompt: []u32 = &.{},
+    ahead: ?*engram.Prefetch = null,
+    ds_want_conf: bool = false,
+
+    pub fn dropAhead(self: *State) void {
+        if (self.ahead) |a| a.finish();
+        self.ahead = null;
+    }
 
     pub fn deinit(self: *State) void {
+        self.dropAhead();
+        self.gpa.free(self.prompt);
         if (self.snap) |*sn| sn.deinit(self.gpa);
         self.gpa.free(self.snap_ids);
         for (self.layers) |*l| l.deinit();
@@ -3245,10 +3244,34 @@ pub fn engramGateOps(sc: *Scope, m: *const Dsv41Model, qk: A, x: A, kv: A) !A {
     return sc.astype(out, mlx.mlx_array_dtype(x));
 }
 
-/// `engramGateOps` as one kernel (`ENGRAM_SOURCE`), a threadgroup a (row, copy).
+// M1/M2 compile the fused kernel for at most 928 threads; keep MLX's reduction order via the op chain above that.
+fn engramFusedAvailable(width: usize, generation: u32) bool {
+    return generation >= 15 or mlxRowReduceThreads(width) <= 928;
+}
+
+test "dsv41 Engram dispatch avoids unsupported portable threadgroups" {
+    for ([_]u32{ 0, 13, 14 }) |generation| {
+        try testing.expect(!engramFusedAvailable(5120, generation));
+        try testing.expect(engramFusedAvailable(3712, generation));
+        try testing.expect(!engramFusedAvailable(3713, generation));
+    }
+    try testing.expect(engramFusedAvailable(5120, 17));
+    for ([_]usize{ 64, 128, 1024 }) |width| {
+        try testing.expect(engramFusedAvailable(width, 14));
+        try testing.expect(engramFusedAvailable(width, 17));
+    }
+}
+
+test "dsv41 Engram dispatch preserves the M3 and M4 fused path" {
+    try testing.expect(engramFusedAvailable(5120, 15));
+    try testing.expect(engramFusedAvailable(5120, 16));
+}
+
+/// `engramGateOps` as one kernel (`ENGRAM_SOURCE`), a threadgroup a (row, copy), where the device can launch it.
 pub fn engramGate(sc: *Scope, m: *const Dsv41Model, qk: A, x: A, kv: A) !A {
     const c = &m.cfg;
     const d = c.hidden_size;
+    if (!engramFusedAvailable(d, @import("../../mlx/device.zig").deviceGeneration().gen)) return engramGateOps(sc, m, qk, x, kv);
     const tg = mlxRowReduceThreads(d);
     const cst_v = [_]f32{ @floatCast(1.0 / @as(f64, @floatFromInt(d))), c.rms_norm_eps, 1.0 / @sqrt(@as(f32, @floatFromInt(d))) };
     const cst = try sc.keep(mlx.mlx_array_new_data(&cst_v, &[_]c_int{cst_v.len}, 1, .float32));
@@ -3446,37 +3469,37 @@ fn engramIds(m: *const Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []co
 }
 
 /// The Engram rows of `ids` (the chunk at `st.n - ids.len`, whose hash is `rows`) as a prefetch: the one the
-/// previous chunk started for it, or a new one; either way the prompt's next chunk is read behind. `m.ahead`
+/// previous chunk started for it, or a new one; either way the prompt's next chunk is read behind. `st.ahead`
 /// keeps a prefetch that still has a chunk to hand over; the caller finishes the other.
 fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []const *const engram.Table, ids: []const u32, rows: []const u32, span: usize, images: bool) !*engram.Prefetch {
     const hs = &m.hash.?;
     const p0 = st.n;
     const L = ids.len;
     const p1 = p0 + L;
-    const mine = p1 <= m.prompt.len and std.mem.eql(u32, ids, m.prompt[p0..p1]);
-    const adopted: ?*engram.Prefetch = if (m.ahead) |a| if (mine and a.covers(p0, L)) a else null else null;
+    const mine = p1 <= st.prompt.len and std.mem.eql(u32, ids, st.prompt[p0..p1]);
+    const adopted: ?*engram.Prefetch = if (st.ahead) |a| if (mine and a.covers(p0, L)) a else null else null;
     errdefer if (adopted) |a| a.finish();
-    if (m.ahead != null and adopted == null) m.dropAhead();
-    m.ahead = null;
+    if (st.ahead != null and adopted == null) st.dropAhead();
+    st.ahead = null;
 
     // The next chunk is expected as wide as this one; hist already holds this chunk.
-    const w = if (mine) @min(m.prompt.len - p1, L) else 0;
+    const w = if (mine) @min(st.prompt.len - p1, L) else 0;
     const next = try gpa.alloc(u32, if (w > region_rows) w * hs.n_layers * hs.cols() else 0);
     defer gpa.free(next);
     if (next.len > 0) {
         const comp = try gpa.alloc(u32, w);
         defer gpa.free(comp);
-        for (m.prompt[p1..][0..w], comp) |t, *o| o.* = m.compressedId(t, images);
+        for (st.prompt[p1..][0..w], comp) |t, *o| o.* = m.compressedId(t, images);
         hs.rows(st.hist.items, comp, next);
     }
     const ahead_spec: engram.Prefetch.Spec = .{ .at = p1, .len = w, .ids = next };
     if (adopted) |a| {
-        if (next.len > 0) m.ahead = try engram.Prefetch.start(gpa, tables, &.{ahead_spec}, hs.cols(), span);
+        if (next.len > 0) st.ahead = try engram.Prefetch.start(gpa, tables, &.{ahead_spec}, hs.cols(), span);
         return a;
     }
     const cur_spec: engram.Prefetch.Spec = .{ .at = p0, .len = L, .ids = rows };
     const pf = try engram.Prefetch.start(gpa, tables, if (next.len > 0) &.{ cur_spec, ahead_spec } else &.{cur_spec}, hs.cols(), span);
-    if (next.len > 0) m.ahead = pf;
+    if (next.len > 0) st.ahead = pf;
     return pf;
 }
 
@@ -3574,7 +3597,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     defer gpa.free(eng_tables);
     for (eng_tables, m.engrams[0..eng_tables.len]) |*t, *e| t.* = &e.table;
     var prefetch: ?*engram.Prefetch = null;
-    defer if (prefetch) |pf| if (m.ahead != pf) pf.finish();
+    defer if (prefetch) |pf| if (st.ahead != pf) pf.finish();
     if (eng_on and ids == .host) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
     sp.prefetch = prefetch;
 
@@ -4085,6 +4108,11 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision:
 pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     var fresh = try initState(m, gpa);
     if (m.dec_state) |*st| {
+        fresh.prompt = st.prompt;
+        fresh.ahead = st.ahead;
+        fresh.ds_want_conf = st.ds_want_conf;
+        st.prompt = &.{};
+        st.ahead = null;
         fresh.snap_at = st.snap_at;
         fresh.snap_ids = st.snap_ids;
         fresh.snap_vision_key = st.snap_vision_key;
@@ -4221,11 +4249,12 @@ pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize
 
 /// Arms only this live State; candidate identity covers the boundary's ids and image rows.
 pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool) !void {
-    m.dropAhead();
-    m.gpa.free(m.prompt);
-    m.prompt = &.{};
-    m.prompt = try m.gpa.dupe(u32, prompt);
     const st = &m.dec_state.?;
+    st.dropAhead();
+    st.gpa.free(st.prompt);
+    st.prompt = &.{};
+    st.prompt = try st.gpa.dupe(u32, prompt);
+    st.ds_want_conf = false;
     if (st.snap) |*sn| sn.deinit(st.gpa);
     st.snap = null;
     st.gpa.free(st.snap_ids);
@@ -4578,7 +4607,7 @@ fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_l
     const hout = try hcCollapse(&sc, x, pre);
     const logits = try sc.astype(try m.head.apply(&sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
     var cur = try sc.ints(ids[0..1], &.{1});
-    const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
+    const want_conf = st.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     var toks: [16]A = undefined;
     var confs: [16]A = undefined;
     var rows_k: [16]A = undefined;
@@ -5673,16 +5702,22 @@ test "dsv41 bench: one-token FFN as a dependent chain, composed vs kernels (DSV4
 }
 
 test "dsv41 topk: the kernel picks the k largest of each row in index order, ties to the lower index" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
     var m: Dsv41Model = undefined;
     m.topk_kernel = try buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, TOPK_SOURCE, TOPK_HEADER);
     defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
+    m.s = sc.s;
+    m.topk_tg = 1024;
+    try probeTopkThreads(gpa, &m);
+    const granted = m.topk_tg;
     var prng = std.Random.DefaultPrng.init(7);
     const r = prng.random();
-    // The width a small GPU's probe settles on picks what 1024 threads pick.
-    for ([_]usize{ 1024, 256 }) |tg| for ([_][2]usize{ .{ 3, 3 }, .{ 100, 7 }, .{ 4100, 512 }, .{ 8192, 512 }, .{ 70000, 512 }, .{ 600, 600 } }) |nk| {
+    // The probed width and the smaller variant must both match the host selection.
+    for ([_]usize{ granted, @min(granted, 256) }) |tg| for ([_][2]usize{ .{ 3, 3 }, .{ 100, 7 }, .{ 4100, 512 }, .{ 8192, 512 }, .{ 70000, 512 }, .{ 600, 600 } }) |nk| {
         m.topk_tg = tg;
         const n, const k = nk;
         const rows = 2;
@@ -5901,6 +5936,18 @@ test "dsv41 decode attention: the folded inverse rope is ropeTail of the heads, 
 }
 
 test "dsv41 engram: the decode-width kernel writes the op chain's stream bit for bit" {
+    try testEngramGateParity();
+}
+
+test "dsv41 engram: the M2 dispatch fallback writes the op chain's stream bit for bit" {
+    const engram_device = @import("../../mlx/device.zig");
+    const saved = engram_device.device_gen_override;
+    defer engram_device.device_gen_override = saved;
+    engram_device.device_gen_override = .{ .gen = 14, .phone = false };
+    try testEngramGateParity();
+}
+
+fn testEngramGateParity() !void {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -6870,8 +6917,8 @@ test "dsv41 engram: a chunk's rows are read behind the one before it and give th
     for (&logits, 0..) |*out, ahead| {
         _ = try resumePrompt(m, ids, null);
         if (ahead == 0) { // the prompt is unknown: every chunk reads its own rows
-            m.gpa.free(m.prompt);
-            m.prompt = &.{};
+            m.dec_state.?.gpa.free(m.dec_state.?.prompt);
+            m.dec_state.?.prompt = &.{};
         }
         var lo: usize = 0;
         for (cuts, 0..) |hi, c| {
@@ -6879,8 +6926,8 @@ test "dsv41 engram: a chunk's rows are read behind the one before it and give th
             defer _ = mlx.mlx_array_free(l);
             if (c + 1 == cuts.len) out.* = try hostF32(l);
             // After a chunk, the next one's rows are coming; after the last, nothing.
-            try testing.expectEqual(ahead == 1 and c + 1 < cuts.len, m.ahead != null);
-            if (m.ahead) |a| try testing.expect(a.covers(hi, @min(cuts[c + 1] - hi, hi - lo)));
+            try testing.expectEqual(ahead == 1 and c + 1 < cuts.len, m.dec_state.?.ahead != null);
+            if (m.dec_state.?.ahead) |a| try testing.expect(a.covers(hi, @min(cuts[c + 1] - hi, hi - lo)));
             lo = hi;
         }
     }

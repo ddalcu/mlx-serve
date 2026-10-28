@@ -14,6 +14,7 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
 };
 
 pub const model_types = [_][]const u8{"deepseek_v41"};
+pub const stream_active_slots: u8 = 2;
 
 pub const claims = sdk.claimsByType(&model_types);
 
@@ -30,7 +31,14 @@ const ParseError = v4.ParseError;
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
     _ = span;
     const result = v4.parseInto(dir, config_json, stub, true, streamsPack(settings_json.slice()), out, &extend);
-    if (result.isOk()) out.caps.prefix_cache = !of(out).dsv41_streamed;
+    if (result.isOk()) {
+        out.caps.prefix_cache = !of(out).dsv41_streamed;
+        if (of(out).dsv41_exl3_bank) {
+            out.caps.whole_prompt_prefill = false;
+            out.caps.slot_state = true;
+            out.caps.active_slots = stream_active_slots;
+        }
+    }
     return result;
 }
 
@@ -191,13 +199,14 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expectEqual(@as(u32, 3), p.spec.native_stages);
 }
 
-test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole" {
+test "deepseek_v41 config: an experts.bin bank streams with engine prefill boundaries" {
     var p: abi.Parsed = .{};
     const v = parseFiles(&.{ .{ .name = "config.json", .bytes = iq3 }, .{ .name = "experts.bin", .bytes = "" } }, true, &p);
     try testing.expect(v.isOk());
     defer freeParsed(&p);
-    try testing.expect(of(&p).dsv41_streamed and of(&p).dsv41_exl3_bank and p.caps.whole_prompt_prefill and p.caps.streamed_weights);
-    try testing.expect(!p.caps.slot_state and !p.caps.batches_decode);
+    try testing.expect(of(&p).dsv41_streamed and of(&p).dsv41_exl3_bank and !p.caps.whole_prompt_prefill and p.caps.streamed_weights);
+    try testing.expect(p.caps.slot_state and !p.caps.batches_decode);
+    try testing.expectEqual(@as(u8, 2), p.caps.active_slots);
     try testing.expect(!p.caps.prefix_cache);
     var q: abi.Parsed = .{};
     try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &q).isOk());

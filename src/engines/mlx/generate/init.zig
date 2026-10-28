@@ -908,7 +908,7 @@ pub fn initWithOptions(
     }
 
     if (dspark_active) if (intree.dsv41(xfm)) |m41| {
-        m41.ds_want_conf = true;
+        m41.dec_state.?.ds_want_conf = true;
     };
     // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
     // pre-forward the sampled token. The first nextDrafter / nextPld /

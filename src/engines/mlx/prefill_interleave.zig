@@ -262,6 +262,9 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
             .tail = slotUncachedTail(s),
         };
         if (!boundaryEligible(c, x)) continue;
+        const admission = @import("admission/pending.zig");
+        const limit = admission.slotLimit(sch, s);
+        if (limit > 0 and admission.occupiedSlots(sch, s) >= limit) continue;
         _ = s.in_pass.fetchAdd(1, .acq_rel);
         _ = sch.pending.orderedRemove(i);
         sch.boundary_slot = s;

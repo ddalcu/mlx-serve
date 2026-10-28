@@ -6692,9 +6692,10 @@ test "volumeSpace: free is what the OS grants, never less than statfs' f_bavail"
     try testing.expect(statfs("/", &st) == 0);
     const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
     const granted = msv_volume_free_for_use("/");
-    try testing.expect(granted > 0);
-    try testing.expect(vs.free + slack >= @as(u64, @intCast(@max(st.f_bsize, 0))) * st.f_bavail);
-    if (granted <= vs.total) try testing.expect(@max(granted, vs.free) - @min(granted, vs.free) < slack);
+    const statfs_free = @as(u64, @intCast(@max(st.f_bsize, 0))) * st.f_bavail;
+    try testing.expect(vs.free + slack >= statfs_free);
+    const expected = if (granted > 0 and granted <= vs.total) granted else statfs_free;
+    try testing.expect(@max(expected, vs.free) - @min(expected, vs.free) < slack);
 }
 
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {

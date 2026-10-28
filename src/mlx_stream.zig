@@ -38,6 +38,8 @@ pub const bank_source = @import("sdk/weights/streamed/bank_source.zig");
 pub const mlx_pack = @import("sdk/weights/streamed/mlx_pack.zig");
 /// An EXL3 expert bank streamed for a resident trunk (`sdk/weights/streamed.zig` `Exl3`).
 pub const exl3_source = @import("sdk/weights/streamed/exl3_source.zig");
+/// The streamed EXL3 launch contract, shared with the host's kernel-contract tests.
+pub const exl3_kernels = @import("sdk/quant/exl3/stream/kernels.zig");
 /// GLM-5.3-Flash's EXL3 bank for the glm5_next trunk (the stream of record behind `Routed`).
 pub const glm5n_source = @import("sdk/weights/streamed/glm5n_source.zig");
 /// The streamed halves of the dupes parity harnesses (test builds only): each arch's trunk over a pack, for the main

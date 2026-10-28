@@ -722,6 +722,7 @@ pub fn register(set: *kc.Set) !void {
 
 test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte for byte" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
     const gpa = testing.allocator;
     const kn = try Kernels.build();
     defer kn.deinit();
@@ -733,26 +734,33 @@ test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte f
         var c = kit.Case(T).init(gpa, &main_l, .{});
         defer c.deinit();
         try testing.expect(try c.prepare(shape, .random, 7));
-        try c.run();
-        const p = T.planOf(shape);
-        const a = Args{ .x = c.args[0], .cpre = c.args[1], .attn_w = c.args[2], .eps = c.args[3], .fn_w = c.args[5], .scale = c.args[6], .base = c.args[7], .wq = c.args[8], .wsc = c.args[9], .wp = if (v[1] > 0) c.args[10] else null, .cw = if (v[2] > 0) c.args[11] else null };
-        const out = try project(&sc, &kn, p, a, if (v[0]) null else c.args[4]);
-        var theirs: [6]A = undefined;
-        var n: usize = 0;
-        for ([_]?A{ if (v[0]) out.h else null, out.qa, out.kv, out.iw, out.comp, out.z }) |o| if (o) |arr| {
-            theirs[n] = arr;
-            n += 1;
-        };
-        try testing.expectEqualSlices(u8, c.rig.outputBytes(), try c.rig.bytesOf(theirs[0..n]));
-        if (!v[0]) {
-            try c.rig.launch(&stage_l, stageGeometry(p), c.args[0..4]);
-            try testing.expectEqualSlices(u8, c.rig.outputBytes(), try c.rig.bytesOf(&.{try stage(&sc, &kn, p, a)}));
+        launch_case: {
+            c.run() catch |err| {
+                try testing.expectEqual(error.ThreadgroupCap, err);
+                try testing.expect(device.deviceGeneration().gen < first_gen);
+                break :launch_case;
+            };
+            const p = T.planOf(shape);
+            const a = Args{ .x = c.args[0], .cpre = c.args[1], .attn_w = c.args[2], .eps = c.args[3], .fn_w = c.args[5], .scale = c.args[6], .base = c.args[7], .wq = c.args[8], .wsc = c.args[9], .wp = if (v[1] > 0) c.args[10] else null, .cw = if (v[2] > 0) c.args[11] else null };
+            const out = try project(&sc, &kn, p, a, if (v[0]) null else c.args[4]);
+            var theirs: [6]A = undefined;
+            var n: usize = 0;
+            for ([_]?A{ if (v[0]) out.h else null, out.qa, out.kv, out.iw, out.comp, out.z }) |o| if (o) |arr| {
+                theirs[n] = arr;
+                n += 1;
+            };
+            try testing.expectEqualSlices(u8, c.rig.outputBytes(), try c.rig.bytesOf(theirs[0..n]));
+            if (!v[0]) {
+                try c.rig.launch(&stage_l, stageGeometry(p), c.args[0..4]);
+                try testing.expectEqualSlices(u8, c.rig.outputBytes(), try c.rig.bytesOf(&.{try stage(&sc, &kn, p, a)}));
+            }
         }
     }
 }
 
 test "dsv41 dec in_proj: the registered kernels pass the contract's gates 1-4" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
     const gpa = testing.allocator;
     var set = kc.Set.init(gpa);
     defer set.deinit();
@@ -761,7 +769,10 @@ test "dsv41 dec in_proj: the registered kernels pass the contract's gates 1-4" {
     try kit.gates.runAll(gpa, set.kernels.items, 0xc0de, &t);
     std.debug.print("[dec] in_proj contract: {d}/{d} launches pass gates 1-4 (virtual GPU {})\n", .{ t.passed, t.kernels, mlx.virtualGpu() });
     try testing.expectEqual(@as(usize, 0), t.problems());
-    try testing.expectEqual(set.kernels.items.len, t.kernels);
+    try testing.expectEqual(t.kernels, t.passed);
+    try testing.expectEqual(set.kernels.items.len, t.kernels + t.skipped);
+    try testing.expect(t.passed > 0);
+    if (device.deviceGeneration().gen >= first_gen) try testing.expectEqual(@as(usize, 0), t.skipped);
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────
@@ -886,9 +897,22 @@ fn expectLayer(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, 
     defer sc.deinit();
     std.debug.print("[dec] in_proj layer {d} rows {d}\n", .{ li, rows });
 
-    const out = (try run(&sc, k, m, ly, x, cpre)) orelse return error.Declined;
+    const fused = try run(&sc, k, m, ly, x, cpre);
+    try testing.expectEqual(device.deviceGeneration().gen >= first_gen, fused != null);
     const staged = try v41.hcStage(&sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm);
     const tz = try todayStage(&sc, m, x, cpre, ly);
+    const out = fused orelse blk: {
+        // The declined wrapper leaves these same composed projections to the attention path.
+        const qkv = try ly.q_kv.?.apply(&sc, staged.h);
+        break :blk Out{
+            .h = staged.h,
+            .qa = try sc.slice(qkv, 1, 0, m.cfg.dsv4_q_lora_rank),
+            .kv = try sc.slice(qkv, 1, m.cfg.dsv4_q_lora_rank, m.cfg.dsv4_q_lora_rank + m.cfg.head_dim),
+            .iw = if (ly.idx) |*iw| try iw.weights_proj.apply(&sc, staged.h) else null,
+            .comp = if (ly.comp) |*cw| (if (ly.ratio > 1) try v41.denseF32x(&sc, m, &cw.wkv, try asF32(&sc, staged.h)) else try cw.wkv.apply(&sc, staged.h)) else null,
+            .z = tz[1],
+        };
+    };
     const h_chain = try host(staged.h);
     defer testing.allocator.free(h_chain);
     const h_new = try host(out.h);

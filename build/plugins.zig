@@ -60,6 +60,7 @@ pub fn writeUnitRoots(b: *std.Build, groups: []const []const []const u8) []const
             \\//! its plugins' tables for the host to take by symbol. Never edit, never commit.
             \\
             \\comptime {
+            \\    @import("plugin_host_check.zig").reexports(@This());
             \\    @import("sdk/plugin.zig").exportAll(&.{
             \\
         ) catch @panic("OOM");
@@ -74,6 +75,7 @@ pub fn writeUnitRoots(b: *std.Build, groups: []const []const []const u8) []const
             \\// What the absorbed modules read from their host root (`mlx_host`), as `main.zig` declares them.
             \\pub const env = @import("env.zig");
             \\pub const mlx = @import("mlx/ffi.zig");
+            \\pub const naxAvailable = @import("mlx/device.zig").naxAvailable;
             \\pub const io_util = @import("sdk/util/io_util.zig");
             \\pub const shared = @import("sdk/util/shared.zig");
             \\pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");

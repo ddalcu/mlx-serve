@@ -167,7 +167,8 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         var cand_buf: [32]AdmitCand = undefined;
         const n_cands = @min(sch.pending.items.len, cand_buf.len);
         for (sch.pending.items[0..n_cands], 0..) |s, i| {
-            cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
+            const limit = @import("admission/pending.zig").slotLimit(sch, s);
+            cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s), .limit = limit, .occupied = if (limit > 0) @import("admission/pending.zig").occupiedSlots(sch, s) else 0 };
         }
         var admit_idx: [to_prefill.len]usize = undefined;
         const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);

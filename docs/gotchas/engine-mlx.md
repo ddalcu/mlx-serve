@@ -1326,3 +1326,9 @@ write-through and, another day, in `HotPrefixCache.deinit`. Cause: the commit pi
 arrays or filed rows under another prompt. Fix: the target crosses the refresh by id (`indexOfId`); an evicted target is
 a fresh store. Guard: the two `across an SSD-first refresh that evicts` tests, each in both orders.
 
+
+### Native slot switches shared Engram prompt and confidence policy
+DeepSeek-V4.1 parked its State while its Engram prompt, read-ahead and confidence demand stayed on the model.
+Switching back could read another request's prompt and policy. These fields now follow the State; parking drains
+read-ahead after reserving map capacity, and arming a fresh prompt clears confidence demand. Guard: the
+`deepseek_v41 slot request` regressions cover resident auxiliary-cache and legacy streamed configurations.

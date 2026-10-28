@@ -948,6 +948,42 @@ test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" 
     try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false,\"ctx_size\":262144}", loadSettings(&buf, &c));
 }
 
+test "plugin driver: load settings preserve manual context precedence and auto mode" {
+    const state = @import("../../../host/http/server.zig").serverState();
+    const saved = state.server_config.max_context_size;
+    defer state.server_config.max_context_size = saved;
+    var buf: [128]u8 = undefined;
+    var c: ModelConfig = .{};
+    state.server_config.max_context_size = 196608;
+    try std.testing.expectEqualStrings("{\"ctx_size\":196608}", loadSettings(&buf, &c));
+    c.ctx_override = 65536;
+    try std.testing.expectEqualStrings("{\"ctx_size\":65536}", loadSettings(&buf, &c));
+    c.ctx_override = 0;
+    try std.testing.expectEqualStrings("{\"ctx_size\":196608}", loadSettings(&buf, &c));
+    state.server_config.max_context_size = 0;
+    try std.testing.expectEqualStrings("{}", loadSettings(&buf, &c));
+}
+
+test "plugin driver: all load settings and maximum context fit the buffer" {
+    var buf: [128]u8 = undefined;
+    const c: ModelConfig = .{
+        .ctx_override = std.math.maxInt(u32),
+        .lm_head_mxfp8_override = false,
+        .mtp_override = false,
+        .int8_prefill_override = false,
+        .stream_experts_override = .{ .rows = std.math.maxInt(u32) },
+    };
+    const out = loadSettings(&buf, &c);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
+    defer parsed.deinit();
+    const ctx = parsed.value.object.get("ctx_size") orelse return error.ContextMissing;
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(u32)), ctx.integer);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(u32)), parsed.value.object.get("stream_experts").?.integer);
+    try std.testing.expect(!parsed.value.object.get("mtp").?.bool);
+    try std.testing.expect(!parsed.value.object.get("int8_prefill").?.bool);
+    try std.testing.expect(!parsed.value.object.get("lm_head_mxfp8").?.bool);
+}
+
 test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the tower; its trunk stays" {
     var c: ModelConfig = .{ .model_type = "deepseek_v41" };
     for ([_][]const u8{ "vision.patch_embed.proj.weight", "aligner.w1.weight", "image_newline" }) |k| try std.testing.expect(towerKey(&c, k));

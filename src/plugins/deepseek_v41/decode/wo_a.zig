@@ -401,6 +401,7 @@ pub fn register(set: *kc.Set) !void {
     });
     try kit.add(set, WoA, &decl_nax, .{ .nax = true }, .{
         .name = "dsv41 dec wo_a (matrix units)",
+        .nax = true,
         .accum = .f32,
         .depth = depthWoA,
         .ops = 8,

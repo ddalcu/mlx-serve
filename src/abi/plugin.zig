@@ -130,7 +130,10 @@ pub const Caps = packed struct(u64) {
     /// Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`):
     /// requests interleave and batch instead of running single-flight.
     slot_state: bool = false,
-    _: u34 = 0,
+    /// Maximum live request owners, 0 = no plugin limit. Hosts hold excess requests; the plugin also refuses
+    /// excess activation before allocating state, so hosts predating this field remain memory-safe.
+    active_slots: u8 = 0,
+    _: u26 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
