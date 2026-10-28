@@ -240,7 +240,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // (model declares vision in config but the safetensors didn't ship the
     // tower); other errors fail the whole load.
     var vision_ptr: ?*VisionEncoder = null;
-    if (params.load_vision) {
+    // An outside plugin's tower is the plugin's own (`MediaHooks.tower`), not a pack's tensors the engine reads.
+    if (params.load_vision) if (xfm_ptr.plugin) |b| if (params.config.plugin.?.parsed.caps.images and params.config.plugin.?.outside) if (b.table.media) |hooks| {
+        const v = try sch.allocator.create(VisionEncoder);
+        v.* = VisionEncoder.initPlugin(sch.allocator, params.config.*, hooks, b.model);
+        vision_ptr = v;
+    };
+    if (params.load_vision and vision_ptr == null) {
         const v = try sch.allocator.create(VisionEncoder);
         if (VisionEncoder.init(sch.allocator, params.config.*, weights_ptr)) |encoder| {
             v.* = encoder;

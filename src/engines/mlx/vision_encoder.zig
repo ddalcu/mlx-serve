@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const abi = @import("../../abi/plugin.zig");
 const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
@@ -211,6 +212,8 @@ pub const VisionEncoder = struct {
     glm: ?glm_vision.GlmVision = null,
     minicpm: ?minicpm_vision.MiniCpmVision = null,
     dsv41: ?dsv41_vision.Dsv41Vision = null,
+    /// A served outside plugin's tower (`MediaHooks.tower`): it prepared the patch grid and encodes it.
+    plugin: ?struct { hooks: *const abi.MediaHooks, model: *anyopaque } = null,
     /// Qwen3-ASR: an audio-only tower; every image/video entry point refuses.
     qwen_audio: ?qwen_audio.QwenAudio = null,
     /// Nemotron 3.5 Bolt: RADIO ViT + mlp1 projector. CHW in, not a patch grid.
@@ -473,6 +476,13 @@ pub const VisionEncoder = struct {
         };
     }
 
+    /// An outside plugin's tower: the shell the patch-grid path drives, `forwardPatches` calling the plugin.
+    pub fn initPlugin(allocator: std.mem.Allocator, config: ModelConfig, hooks: *const abi.MediaHooks, model: *anyopaque) VisionEncoder {
+        var enc = patchGridShell(allocator, config);
+        enc.plugin = .{ .hooks = hooks, .model = model };
+        return enc;
+    }
+
     fn initQwen(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         const qv = try qwen_vision.QwenVision.init(allocator, .of(&config), weights);
         log.info("Vision encoder: Qwen3-VL ViT (depth={d}, hidden={d}, heads={d}, merge={d}, out_hidden={d})\n", .{
@@ -528,6 +538,16 @@ pub const VisionEncoder = struct {
         if (self.glm) |*gv| return gv.forward(patches, grid_h, grid_w);
         if (self.minicpm) |*mv| return mv.forward(patches, grid_h, grid_w);
         if (self.dsv41) |*dv| return modules.call("dsv41_vision_forward", .{ dv, patches, grid_h, grid_w });
+        if (self.plugin) |p| {
+            const item: abi.MediaItem = .{ .kind = .image, .grid = .{ 1, grid_h, grid_w }, .pixels = .{ .ctx = patches.ctx } };
+            var out: abi.Array = .{};
+            const v = p.hooks.tower(p.model, &item, &out);
+            if (!v.isOk()) {
+                log.err("[plugin] vision tower: {s}\n", .{v.why.slice()});
+                return error.PluginTowerFailed;
+            }
+            return .{ .ctx = out.ctx };
+        }
         return error.NoPatchGridEncoder;
     }
 

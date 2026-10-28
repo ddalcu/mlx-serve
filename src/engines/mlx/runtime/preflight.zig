@@ -144,7 +144,7 @@ fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []con
     };
     const b = config.plugin orelse return shards;
     const f = b.table.weights.resident_bytes orelse return shards;
-    var settings: [96]u8 = undefined;
+    var settings: [128]u8 = undefined;
     var out = shards;
     const v = f(&b.parsed, .of(model_dir), .of(plugin_driver.loadSettings(&settings, config)), shards, &out);
     if (!v.isOk()) {

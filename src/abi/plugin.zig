@@ -409,6 +409,10 @@ pub const Forward = extern struct {
     /// finite: a left-padded prompt's pads masked), summed into every layer's scores (`Caps.prefill_mask`); empty =
     /// none.
     mask_add: Array = .{},
+    /// A native drafter's round (`NativeDrafter.step`): the most drafts it may keep, the tokens still allowed less one.
+    accept_cap: u32 = 0,
+    /// The sampler's suppress mask `[vocab]` (true = never drawn), which a round's greedy accept applies; empty = none.
+    suppress_mask: Array = .{},
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs
@@ -514,6 +518,23 @@ pub const CacheOps = extern struct {
 
 /// The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number
 /// of slots (`.last_row`) or of tokens (`.all_rows`).
+pub const max_round_tokens = 32;
+
+/// What a native drafter's round committed.
+pub const Round = extern struct {
+    /// Tokens committed, `t1` first: `tokens[0..n]`.
+    n: u32 = 0,
+    /// Drafts kept of those verified (`n - 1`).
+    accepted: u32 = 0,
+    /// The trunk's token after them, the next round's `t1`.
+    next_token: u32 = 0,
+    /// Verify rows run, `t1` included, for the engine's stats.
+    rows: u32 = 0,
+    /// The model's position after the round.
+    position: u64 = 0,
+    tokens: [max_round_tokens]u32 = @splat(0),
+};
+
 pub const ForwardOut = extern struct {
     size: u32 = @sizeOf(ForwardOut),
     logits: Array = .{},
@@ -522,6 +543,8 @@ pub const ForwardOut = extern struct {
     captured: ?[*]Array = null,
     /// What each slot of a `defer_host` forward left owed (one value for every slot of the forward).
     owed: Owed = .none,
+    /// `NativeDrafter.step`'s result.
+    round: Round = .{},
 };
 
 // ── Hooks ──
@@ -626,8 +649,17 @@ pub const HeadHooks = extern struct {
 /// A drafter the model carries in its own forward (DSpark); stages and block are `SpecFacts`.
 pub const NativeDrafter = extern struct {
     size: u32 = @sizeOf(NativeDrafter),
+    /// One greedy round on the model's own state: `f.tokens` is the committed token `t1` (not yet in the state, which
+    /// stands at `f.positions[0]`), `f.accept_cap` the most drafts to keep. The model drafts, verifies, keeps the
+    /// drafts its own argmax agrees with (under `f.suppress_mask`), rewinds its state to them and writes `out.round`.
     step: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
-    verify: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
+    /// The first half of a round the engine accepts itself (a sampled request): the model drafts from `t1` and verifies
+    /// the block, leaving the verify open. `out.round.tokens[0..n]` are the verified rows' ids (`t1` first) and
+    /// `out.logits` their logits `[n, vocab]` (f32). Needs `finish`.
+    verify: ?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict = null,
+    /// The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and
+    /// writes the model's position into `out.round.position`.
+    finish: ?*const fn (m: *anyopaque, accepted: u32, out: *ForwardOut) callconv(.c) Verdict = null,
 };
 
 /// A trunk tensor a drafter reads beside the trunk's forward.

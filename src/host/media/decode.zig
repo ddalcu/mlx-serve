@@ -10,6 +10,7 @@ const glm_vision = @import("../../plugins/glm5_next/vision.zig");
 const dsv41_vision = @import("../../plugins/deepseek_v41/vision.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 const log = @import("../../sdk/util/log.zig");
+const plugin_media = @import("plugin_media.zig");
 const stb = @import("stb");
 const webp = @import("webp");
 const testing = std.testing;
@@ -84,6 +85,7 @@ pub fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8, composi
 
 pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const target: u32 = 768; // Gemma 4 default for square images
+    if (vp.mode == .plugin) return plugin_media.prepareImage(allocator, @ptrCast(@alignCast(vp.plugin.?)), encoded);
 
     const src = decodeRgbOwned(allocator, encoded, vp.composite_alpha) orelse return null;
     defer src.deinit(allocator);

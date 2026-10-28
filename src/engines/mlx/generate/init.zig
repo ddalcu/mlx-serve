@@ -52,6 +52,7 @@ const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpoint
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
 const intree = @import("../plugin/intree.zig");
+const plugin_driver = @import("../plugin/driver.zig");
 
 
 pub fn initWithOptions(
@@ -93,7 +94,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
-    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or xfm.mlx_stream_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or xfm.mlx_stream_ext != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
         // checkpoint ships stages and the request is CLEAN (no
@@ -105,9 +106,13 @@ pub fn initWithOptions(
         // traffic that otherwise always ran serial). PLD / drafter / qwen-MTP
         // remain hard-off regardless: their verify forwards go through
         // machinery this arch cannot roll back.
-        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
+        const native = plugin_driver.nativeDrafter(xfm) != null;
+        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else if (native) xfm.config.plugin.?.parsed.spec.native_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
         const dspark_env_off = !dsparkEnabled();
+        // A plugin whose drafter cannot hand the verify back accepts greedily: a sampled request runs serial.
         const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
+            DsparkArm.off
+        else if (native and !plugin_driver.nativeSplit(xfm) and dsparkArmFor(sampling, options.logprobs_n) == .stochastic)
             DsparkArm.off
         else
             dsparkArmFor(sampling, options.logprobs_n);

@@ -115,7 +115,7 @@ fn headMxfp8Setting(config: *const ModelConfig) ?bool {
 }
 
 /// `LoadCtx.settings_json`: the load settings stated for this model (a plugin that serves them reads them): the lossy
-/// `lm_head_mxfp8`, the `mtp` head, the lossy `int8_prefill` and `stream_experts`. `buf` holds 96 bytes.
+/// `lm_head_mxfp8`, the `mtp` head, the lossy `int8_prefill`, `stream_experts` and the model's `ctx_size`. `buf` holds 128 bytes.
 pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeByte('{') catch unreachable;
@@ -131,6 +131,8 @@ pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
             .rows => |n| w.print("\"stream_experts\":{d}", .{n}) catch unreachable,
         }
     }
+    const ctx = @import("../../../host/http/server.zig").manualContext(config);
+    if (ctx > 0) w.print("{s}\"ctx_size\":{d}", .{ if (w.end > 1) "," else "", ctx }) catch unreachable;
     w.writeByte('}') catch unreachable;
     return w.buffered();
 }
@@ -203,7 +205,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     var why: abi.Verdict = .{};
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
-    var settings_buf: [96]u8 = undefined;
+    var settings_buf: [128]u8 = undefined;
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
@@ -490,6 +492,97 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     const out_rows: c_int = if (f.logits == .last_row) 1 else @intCast(rows);
     try mlx.check(mlx.mlx_reshape(&shaped, logits, &[_]c_int{ 1, out_rows, -1 }, 3, xfm.s));
     return shaped;
+}
+
+/// The served model's own block drafter (`SpecHooks.native_drafter`), null without one.
+pub fn nativeDrafter(xfm: *const Transformer) ?*const abi.NativeDrafter {
+    const b = xfm.plugin orelse return null;
+    const spec = b.table.spec orelse return null;
+    if (spec.size < @offsetOf(abi.SpecHooks, "native_drafter") + @sizeOf(?*const abi.NativeDrafter)) return null;
+    return spec.native_drafter;
+}
+
+/// The draft stages of the served model's native drafter (`SpecFacts.native_stages`); 0 without one.
+pub fn nativeStages(xfm: *const Transformer) u32 {
+    if (nativeDrafter(xfm) == null) return 0;
+    return xfm.config.plugin.?.parsed.spec.native_stages;
+}
+
+/// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state and `ctx.cache.step`
+/// move to the round's position.
+pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.Round {
+    const b = xfm.plugin.?;
+    const nd = nativeDrafter(xfm).?;
+    const tokens = [_]u32{t1};
+    const slot_ids = [_]u32{settle.slotId(b, ctx)};
+    const pos = [_]u32{@intCast(ctx.cache.step)};
+    const f: abi.Forward = .{
+        .mode = .decode,
+        .rows = 1,
+        .tokens = .of(&tokens),
+        .slots = .of(&slot_ids),
+        .positions = .of(&pos),
+        .accept_cap = cap,
+        .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
+    };
+    var out: abi.ForwardOut = .{};
+    intree.enter(ctx);
+    const v = nd.step(b.model, &f, &out);
+    intree.leave();
+    if (!v.isOk()) {
+        log.err("[plugin] {s}: draft round failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    if (out.round.n == 0 or out.round.n > abi.max_round_tokens) return error.PluginForwardFailed;
+    ctx.cache.step = @intCast(out.round.position);
+    return out.round;
+}
+
+/// Whether the served drafter lets the engine accept a block itself (`NativeDrafter.verify` and `finish`): a sampled request.
+pub fn nativeSplit(xfm: *const Transformer) bool {
+    const nd = nativeDrafter(xfm) orelse return false;
+    return nd.size >= @offsetOf(abi.NativeDrafter, "finish") + @sizeOf(@TypeOf(nd.finish)) and nd.verify != null and nd.finish != null;
+}
+
+pub const Verified = struct { round: abi.Round, logits: Array };
+
+/// The first half of a native round (`NativeDrafter.verify`): the verified rows' ids and logits `[rows, vocab]`, the
+/// verify left open until `nativeFinish`. The caller frees `logits`.
+pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Verified {
+    const b = xfm.plugin.?;
+    const nd = nativeDrafter(xfm).?;
+    const tokens = [_]u32{t1};
+    const slot_ids = [_]u32{settle.slotId(b, ctx)};
+    const pos = [_]u32{@intCast(ctx.cache.step)};
+    const f: abi.Forward = .{ .mode = .verify, .rows = 1, .tokens = .of(&tokens), .slots = .of(&slot_ids), .positions = .of(&pos), .accept_cap = cap };
+    var out: abi.ForwardOut = .{};
+    intree.enter(ctx);
+    const v = nd.verify.?(b.model, &f, &out);
+    intree.leave();
+    if (!v.isOk() or out.logits.ctx == null) {
+        freeOut(&out, &.{});
+        log.err("[plugin] {s}: draft verify failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    if (out.round.n == 0 or out.round.n > abi.max_round_tokens) {
+        freeOut(&out, &.{});
+        return error.PluginForwardFailed;
+    }
+    return .{ .round = out.round, .logits = .{ .ctx = out.logits.ctx } };
+}
+
+/// The second half (`NativeDrafter.finish`): keeps `accepted` drafts and moves `ctx.cache.step` to the model's position.
+pub fn nativeFinish(xfm: *Transformer, ctx: *ForwardCtx, accepted: u32) !u64 {
+    const b = xfm.plugin.?;
+    const nd = nativeDrafter(xfm).?;
+    var out: abi.ForwardOut = .{};
+    const v = nd.finish.?(b.model, accepted, &out);
+    if (!v.isOk()) {
+        log.err("[plugin] {s}: draft finish failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    ctx.cache.step = @intCast(out.round.position);
+    return out.round.position;
 }
 
 /// Whether an embedding batch may reach the forward padded: the legacy forward and an encoder always, a decoder only
@@ -843,13 +936,16 @@ test "driver: the load settings JSON carries the head and stream_experts setting
 }
 
 test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" {
-    var buf: [96]u8 = undefined;
+    var buf: [128]u8 = undefined;
     var c: ModelConfig = .{};
     try std.testing.expectEqualStrings("{}", loadSettings(&buf, &c));
     c.mtp_override = false;
     try std.testing.expectEqualStrings("{\"mtp\":false}", loadSettings(&buf, &c));
     c.lm_head_mxfp8_override = false;
     try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false}", loadSettings(&buf, &c));
+    // A plugin that sizes memory for a request reads the context the model is set to.
+    c.ctx_override = 262144;
+    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false,\"ctx_size\":262144}", loadSettings(&buf, &c));
 }
 
 test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the tower; its trunk stays" {

@@ -43,6 +43,7 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
         .patch = config.vision_patch_size,
         .max_slices = config.mcv_max_slice_nums,
     };
+    if (config.plugin) |b| if (b.outside and b.table.media != null) return .{ .mode = .plugin, .plugin = b };
     if (config.dsv41_vision) return .{
         .mode = .dsv41,
         .patch = config.vision_patch_size,
