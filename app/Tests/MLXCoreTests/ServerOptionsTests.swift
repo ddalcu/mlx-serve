@@ -6,6 +6,31 @@ import XCTest
 /// A wrong arg here would silently launch the server with the wrong config,
 /// so we lock down the contract.
 final class ServerOptionsTests: XCTestCase {
+    func testLookupHistoryRequiresExplicitStoreAndSurvivesPersistence() throws {
+        let defaults = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertEqual(defaults.lookupStore, "")
+        XCTAssertFalse(defaults.lookupReadOnly)
+        XCTAssertFalse(defaults.toCLIArgs().contains("--lookup-store"))
+        XCTAssertFalse(defaults.toCLIArgs().contains("--lookup-read-only"))
+
+        var options = defaults
+        options.lookupReadOnly = true
+        XCTAssertFalse(options.toCLIArgs().contains("--lookup-read-only"))
+        options.lookupStore = "/private/history with spaces"
+        let restored = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(options))
+        XCTAssertEqual(restored, options)
+        XCTAssertTrue(contains(restored.toCLIArgs(), flag: "--lookup-store", value: options.lookupStore))
+        XCTAssertTrue(restored.toCLIArgs().contains("--lookup-read-only"))
+        XCTAssertFalse(defaults.serverLaunchEquals(restored))
+
+        options.lookupReadOnly = false
+        XCTAssertFalse(options.serverLaunchEquals(restored))
+        XCTAssertFalse(options.toCLIArgs().contains("--lookup-read-only"))
+        let reset = SettingsReset.apply(.specDecode, to: options)
+        XCTAssertEqual(reset.lookupStore, "")
+        XCTAssertFalse(reset.toCLIArgs().contains("--lookup-store"))
+    }
+
     func testDefaultsProduceCanonicalArgs() {
         let opts = ServerOptions()
         let args = opts.toCLIArgs()

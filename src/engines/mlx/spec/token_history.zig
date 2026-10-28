@@ -11,7 +11,6 @@ pub const max_vote_nodes: usize = 128;
 pub const max_depth: usize = 32;
 pub const max_candidates: usize = 64;
 pub const persistent_capacity: usize = 262144;
-pub const corpus_capacity: usize = 16 * 1024 * 1024;
 const magic = "MLXLOOK1";
 const header_size = 40;
 
@@ -29,24 +28,24 @@ pub const Look = struct {
     order: u32,
 };
 
-/// Owned bounded-prefix suffix index. Tokens include document separators.
-/// Borrow only through *const Corpus; the owner must outlive every borrower.
-pub const Corpus = struct {
+/// Owned bounded-prefix suffix index for persistent token history.
+/// Borrow only through *const SuffixIndex; the owner must outlive every borrower.
+pub const SuffixIndex = struct {
     allocator: Allocator,
     tokens: []const u32,
     positions: []const u32,
     max_order: u32,
 
-    pub fn build(allocator: Allocator, ids: []const u32, order: u32) !Corpus {
+    pub fn build(allocator: Allocator, ids: []const u32, order: u32) !SuffixIndex {
         try validateOrder(order);
-        if (ids.len > corpus_capacity) return error.CorpusTooLarge;
+        if (ids.len > persistent_capacity) return error.IndexTooLarge;
         for (ids) |id| if (id > separator) return error.InvalidToken;
         const tokens = try allocator.dupe(u32, ids);
         errdefer allocator.free(tokens);
         return fromOwnedTokens(allocator, tokens, order);
     }
 
-    fn fromOwnedTokens(allocator: Allocator, tokens: []u32, order: u32) !Corpus {
+    fn fromOwnedTokens(allocator: Allocator, tokens: []u32, order: u32) !SuffixIndex {
         const positions = try allocator.alloc(u32, tokens.len);
         errdefer allocator.free(positions);
         for (positions, 0..) |*position, i| position.* = @intCast(i);
@@ -55,13 +54,13 @@ pub const Corpus = struct {
         return .{ .allocator = allocator, .tokens = tokens, .positions = positions, .max_order = order };
     }
 
-    pub fn deinit(self: *Corpus) void {
+    pub fn deinit(self: *SuffixIndex) void {
         self.allocator.free(self.tokens);
         self.allocator.free(self.positions);
         self.* = undefined;
     }
 
-    fn lowerBound(self: *const Corpus, query: []const u32, upper: bool) usize {
+    fn lowerBound(self: *const SuffixIndex, query: []const u32, upper: bool) usize {
         var lo: usize = 0;
         var hi = self.positions.len;
         while (lo < hi) {
@@ -94,13 +93,12 @@ fn compareQuery(tokens: []const u32, start: usize, query: []const u32) std.math.
     return if (available < query.len) .lt else .eq;
 }
 
-/// Request-owned proposal scratch. corpus/persistent are borrowed
-/// immutable indices; their cache leases must outlive this object.
+/// Request-owned proposal scratch. The borrowed immutable persistent index's
+/// cache lease must outlive this object.
 pub const Drafter = struct {
     allocator: Allocator,
     vocab_limit: u32 = separator,
-    corpus: ?*const Corpus = null,
-    persistent: ?*const Corpus = null,
+    persistent: ?*const SuffixIndex = null,
     vote_nodes: [max_vote_nodes]VoteNode = undefined,
     counts: [max_vote_nodes]u32 = undefined,
     node_count: usize = 0,
@@ -139,20 +137,20 @@ pub const Drafter = struct {
         }
     }
 
-    fn collectCorpus(self: *Drafter, corpus: *const Corpus, query: []const u32, depth: usize) void {
-        if (query.len > corpus.max_order) return;
-        const first = corpus.lowerBound(query, false);
-        const end = corpus.lowerBound(query, true);
+    fn collectPersistent(self: *Drafter, index: *const SuffixIndex, query: []const u32, depth: usize) void {
+        if (query.len > index.max_order) return;
+        const first = index.lowerBound(query, false);
+        const end = index.lowerBound(query, true);
         const examined = @min(end - first, max_candidates);
         // Evenly sample an oversized interval rather than biasing its first page.
         for (0..examined) |sample| {
-            const index = first + sample * (end - first) / examined;
-            const start = @as(usize, corpus.positions[index]) + query.len;
+            const position = first + sample * (end - first) / examined;
+            const start = @as(usize, index.positions[position]) + query.len;
             var len: usize = 0;
-            while (len < depth and start + len < corpus.tokens.len) : (len += 1) {
-                if (corpus.tokens[start + len] >= @min(self.vocab_limit, separator)) break;
+            while (len < depth and start + len < index.tokens.len) : (len += 1) {
+                if (index.tokens[start + len] >= @min(self.vocab_limit, separator)) break;
             }
-            self.addContinuation(corpus.tokens[start..][0..len]);
+            self.addContinuation(index.tokens[start..][0..len]);
         }
     }
 
@@ -169,8 +167,7 @@ pub const Drafter = struct {
         if (bounded_depth == 0) order = 0;
         while (order != 0) : (order -= 1) {
             const query = context[context.len - order..];
-            if (self.corpus) |corpus| self.collectCorpus(corpus, query, bounded_depth);
-            if (self.persistent) |persistent| self.collectCorpus(persistent, query, bounded_depth);
+            if (self.persistent) |persistent| self.collectPersistent(persistent, query, bounded_depth);
             // An occurrence without a usable continuation is not evidence.
             if (self.observations != 0) break;
         }
@@ -192,142 +189,10 @@ pub const Drafter = struct {
     }
 };
 
-// NPY header grammar: the three documented dictionary fields, in any order,
-// either quote style, a one-element shape tuple, no Python evaluation.
-// https://numpy.org/doc/stable/reference/generated/numpy.lib.format.html
-const NpyHeader = struct {
-    text: []const u8,
-    cursor: usize = 0,
-    fn spaces(self: *NpyHeader) void {
-        while (self.cursor < self.text.len and std.ascii.isWhitespace(self.text[self.cursor])) self.cursor += 1;
-    }
-    fn take(self: *NpyHeader, byte: u8) !void {
-        self.spaces();
-        if (self.cursor == self.text.len or self.text[self.cursor] != byte) return error.InvalidNpy;
-        self.cursor += 1;
-    }
-    fn quoted(self: *NpyHeader) ![]const u8 {
-        self.spaces();
-        if (self.cursor == self.text.len) return error.InvalidNpy;
-        const quote = self.text[self.cursor];
-        if (quote != '\'' and quote != '"') return error.InvalidNpy;
-        self.cursor += 1;
-        const start = self.cursor;
-        while (self.cursor < self.text.len and self.text[self.cursor] != quote) : (self.cursor += 1) {
-            if (self.text[self.cursor] == '\\' or self.text[self.cursor] < 32) return error.InvalidNpy;
-        }
-        if (self.cursor == self.text.len) return error.InvalidNpy;
-        const result = self.text[start..self.cursor];
-        self.cursor += 1;
-        return result;
-    }
-    fn literal(self: *NpyHeader, value: []const u8) bool {
-        self.spaces();
-        if (!std.mem.startsWith(u8, self.text[self.cursor..], value)) return false;
-        self.cursor += value.len;
-        return true;
-    }
-    fn parse(self: *NpyHeader) !usize {
-        try self.take('{');
-        var seen: u3 = 0;
-        var count: usize = 0;
-        while (true) {
-            const key = try self.quoted();
-            try self.take(':');
-            const bit: u3 = if (std.mem.eql(u8, key, "descr")) 1 else if (std.mem.eql(u8, key, "fortran_order")) 2 else if (std.mem.eql(u8, key, "shape")) 4 else return error.InvalidNpy;
-            if (seen & bit != 0) return error.InvalidNpy;
-            seen |= bit;
-            switch (bit) {
-                1 => if (!std.mem.eql(u8, try self.quoted(), "<i4")) return error.UnsupportedNpyType,
-                2 => if (!self.literal("False") and !self.literal("True")) return error.InvalidNpy,
-                4 => {
-                    try self.take('(');
-                    self.spaces();
-                    const start = self.cursor;
-                    while (self.cursor < self.text.len and std.ascii.isDigit(self.text[self.cursor])) self.cursor += 1;
-                    count = std.fmt.parseInt(usize, self.text[start..self.cursor], 10) catch return error.InvalidNpy;
-                    try self.take(',');
-                    try self.take(')');
-                },
-                else => unreachable,
-            }
-            self.spaces();
-            if (self.cursor < self.text.len and self.text[self.cursor] == ',') {
-                self.cursor += 1;
-                self.spaces();
-                if (self.cursor < self.text.len and self.text[self.cursor] != '}') continue;
-            }
-            try self.take('}');
-            self.spaces();
-            if (seen != 7 or self.cursor != self.text.len) return error.InvalidNpy;
-            return count;
-        }
-    }
-};
-
-const NpyLayout = struct {
-    data_offset: usize,
-    count: usize,
-
-    fn offset(prefix: []const u8) !usize {
-        if (prefix.len < 10 or !std.mem.eql(u8, prefix[0..6], "\x93NUMPY") or prefix[7] != 0) return error.InvalidNpy;
-        const prefix_len: usize = switch (prefix[6]) { 1 => 10, 2, 3 => 12, else => return error.UnsupportedNpyVersion };
-        if (prefix.len < prefix_len) return error.InvalidNpy;
-        const length: usize = if (prefix_len == 10) std.mem.readInt(u16, prefix[8..10], .little) else std.mem.readInt(u32, prefix[8..12], .little);
-        if (length == 0 or length > 65536) return error.InvalidNpy;
-        return prefix_len + length;
-    }
-
-    fn parse(header: []const u8, file_size: u64) !NpyLayout {
-        const end = try offset(header);
-        const prefix_len: usize = if (header[6] == 1) 10 else 12;
-        // Older writers aligned to 16 bytes; current writers align to 64.
-        if (end > header.len or end > file_size or end % 16 != 0 or header[end - 1] != '\n') return error.InvalidNpy;
-        var parser = NpyHeader{ .text = header[prefix_len..end] };
-        const count = try parser.parse();
-        if (count > corpus_capacity or count != (file_size - end) / 4 or (file_size - end) % 4 != 0) return error.InvalidNpy;
-        return .{ .data_offset = end, .count = count };
-    }
-};
-
 fn littleToNative(tokens: []u32) void {
     if (@import("builtin").cpu.arch.endian() == .big) {
         for (tokens) |*token| token.* = @byteSwap(token.*);
     }
-}
-
-/// Reads directly into the retained aligned array, with no whole-file byte
-/// staging allocation. Hashing, when requested, covers header plus raw payload.
-fn readNpy(dir: Dir, io: Io, allocator: Allocator, name: []const u8, expected: ?[]const u8) ![]u32 {
-    const file = try dir.openFile(io, name, .{ .follow_symlinks = false, .allow_directory = false });
-    defer file.close(io);
-    const before = try file.stat(io);
-    if (before.kind != .file or before.nlink != 1) return error.UnsafeFile;
-    if (before.size > corpus_capacity * 4 + 65548) return error.FileTooLarge;
-    var header: [65548]u8 = undefined;
-    if (try file.readPositionalAll(io, header[0..12], 0) != 12) return error.InvalidNpy;
-    const end = try NpyLayout.offset(header[0..12]);
-    if (end < 12 or end > before.size) return error.InvalidNpy;
-    if (try file.readPositionalAll(io, header[12..end], 12) != end - 12) return error.TruncatedFile;
-    const layout = try NpyLayout.parse(header[0..end], before.size);
-    const values = try allocator.alloc(u32, layout.count);
-    errdefer allocator.free(values);
-    const bytes = std.mem.sliceAsBytes(values);
-    if (try file.readPositionalAll(io, bytes, end) != bytes.len) return error.TruncatedFile;
-    if (expected) |text| {
-        const wanted = try decodeDigest(text);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(header[0..end]);
-        hash.update(bytes);
-        var actual: [32]u8 = undefined;
-        hash.final(&actual);
-        if (!std.mem.eql(u8, &wanted, &actual)) return error.FingerprintMismatch;
-    }
-    littleToNative(values);
-    for (values) |value| if (value > std.math.maxInt(i32)) return error.InvalidNpy;
-    if (!Stamp.eql(Stamp.from(before), Stamp.from(try file.stat(io))) or
-        !Stamp.eql(Stamp.from(before), try fileStamp(dir, io, name))) return error.ChangedDuringRead;
-    return values;
 }
 
 const Stamp = struct {
@@ -363,45 +228,7 @@ fn readBounded(dir: Dir, io: Io, allocator: Allocator, name: []const u8, limit: 
     return bytes;
 }
 
-const CorpusStamp = struct {
-    directory: File.INode,
-    metadata: Stamp,
-    tokens: Stamp,
-    positions: Stamp,
-    fn read(io: Io, path: []const u8) !CorpusStamp {
-        const dir = try Dir.cwd().openDir(io, path, .{});
-        defer dir.close(io);
-        return .{
-            .directory = (try dir.stat(io)).inode,
-            .metadata = try fileStamp(dir, io, "meta.json"),
-            .tokens = try fileStamp(dir, io, "tokens.npy"),
-            .positions = try fileStamp(dir, io, "sa.npy"),
-        };
-    }
-    fn eql(a: CorpusStamp, b: CorpusStamp) bool {
-        return a.directory == b.directory and Stamp.eql(a.metadata, b.metadata) and Stamp.eql(a.tokens, b.tokens) and Stamp.eql(a.positions, b.positions);
-    }
-};
-
-const Metadata = struct {
-    tokenizer_sha256: []const u8,
-    max_order: u32,
-    doc_sep: u32,
-    n_tokens: ?usize = null,
-    documents: ?usize = null,
-    tokens_sha256: ?[]const u8 = null,
-    sa_sha256: ?[]const u8 = null,
-};
-
-fn decodeDigest(text: []const u8) ![32]u8 {
-    if (text.len != 64) return error.InvalidFingerprint;
-    var digest: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, text) catch return error.InvalidFingerprint;
-    return digest;
-}
-
-
-fn validateDocuments(tokens: []const u32, require_complete: bool) !usize {
+fn validateDocuments(tokens: []const u32) !usize {
     var documents: usize = 0;
     var length: usize = 0;
     for (tokens) |token| {
@@ -412,48 +239,8 @@ fn validateDocuments(tokens: []const u32, require_complete: bool) !usize {
             length = 0;
         } else length += 1;
     }
-    if (require_complete and length != 0) return error.IncompleteDocument;
+    if (length != 0) return error.IncompleteDocument;
     return documents;
-}
-
-/// Missing corpus directory is optional. A present but malformed corpus errors;
-/// missing tokenizer identity refuses the tier rather than trusting token IDs.
-pub fn openCorpus(io: Io, allocator: Allocator, path: []const u8, tokenizer_sha: ?[32]u8) !?Corpus {
-    const wanted = tokenizer_sha orelse return error.TokenizerRequired;
-    const dir = Dir.cwd().openDir(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer dir.close(io);
-    const before = try CorpusStamp.read(io, path);
-    const metadata_bytes = try readBounded(dir, io, allocator, "meta.json", 65536);
-    defer allocator.free(metadata_bytes);
-    const parsed = try std.json.parseFromSlice(Metadata, allocator, metadata_bytes, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    const metadata = parsed.value;
-    if (metadata.doc_sep != separator) return error.InvalidSeparator;
-    try validateOrder(metadata.max_order);
-    const identity = try decodeDigest(metadata.tokenizer_sha256);
-    if (!std.mem.eql(u8, &wanted, &identity)) return error.TokenizerMismatch;
-    const tokens = try readNpy(dir, io, allocator, "tokens.npy", metadata.tokens_sha256);
-    errdefer allocator.free(tokens);
-    const documents = try validateDocuments(tokens, true);
-    if (metadata.n_tokens) |count| if (tokens.len != count) return error.InvalidMetadata;
-    if (metadata.documents) |count| if (documents != count) return error.InvalidMetadata;
-    const positions = try readNpy(dir, io, allocator, "sa.npy", metadata.sa_sha256);
-    errdefer allocator.free(positions);
-    if (positions.len != tokens.len) return error.InvalidSuffixIndex;
-    const seen = try allocator.alloc(bool, tokens.len);
-    defer allocator.free(seen);
-    @memset(seen, false);
-    const sort = SortContext{ .tokens = tokens, .order = metadata.max_order };
-    for (positions, 0..) |position, i| {
-        if (position >= tokens.len or seen[position]) return error.InvalidSuffixIndex;
-        seen[position] = true;
-        if (i != 0 and sort.less(position, positions[i - 1])) return error.InvalidSuffixIndex;
-    }
-    if (!CorpusStamp.eql(before, try CorpusStamp.read(io, path))) return error.ChangedDuringRead;
-    return .{ .allocator = allocator, .tokens = tokens, .positions = positions, .max_order = metadata.max_order };
 }
 
 const StoreGuard = struct {
@@ -552,7 +339,7 @@ fn readPersistentTokens(guard: *const StoreGuard, file: File, allocator: Allocat
     const bytes = std.mem.sliceAsBytes(tokens);
     if (try file.readPositionalAll(guard.io, bytes, header_size) != bytes.len) return error.TruncatedFile;
     littleToNative(tokens);
-    _ = try validateDocuments(tokens, true);
+    _ = try validateDocuments(tokens);
     if (!Stamp.eql(Stamp.from(before), Stamp.from(try file.stat(guard.io))) or
         !Stamp.eql(Stamp.from(before), try fileStamp(guard.dir, guard.io, "tokens.bin"))) return error.StoreChanged;
     try guard.validate();
@@ -695,26 +482,8 @@ fn appendTransaction(io: Io, allocator: Allocator, path: []const u8, identity: [
     try transaction.append(prompt, output);
 }
 
-const CachedCorpus = struct {
-    index: Corpus,
-    path: []u8,
-    identity: [32]u8,
-    stamp: CorpusStamp,
-    references: usize = 1,
-
-    fn release(self: *CachedCorpus) void {
-        std.debug.assert(self.references != 0);
-        self.references -= 1;
-        if (self.references != 0) return;
-        const allocator = self.index.allocator;
-        allocator.free(self.path);
-        self.index.deinit();
-        allocator.destroy(self);
-    }
-};
-
 const CachedPersistent = struct {
-    index: Corpus,
+    index: SuffixIndex,
     path: []u8,
     identity: [32]u8,
     stamp: Stamp,
@@ -733,12 +502,11 @@ const CachedPersistent = struct {
     }
 };
 
-/// Single-inference-thread ownership: one current snapshot per tier, plus only
+/// Single-inference-thread ownership: one current snapshot, plus only
 /// retired snapshots still leased. Leases are move-only and hold no OS handles.
 /// Configured paths must belong to one shared trust boundary; identity is not ACL.
 pub const HistoryCache = struct {
     allocator: Allocator,
-    corpus_entry: ?*CachedCorpus = null,
     persistent_entry: ?*CachedPersistent = null,
 
     const Snapshot = struct {
@@ -754,47 +522,13 @@ pub const HistoryCache = struct {
 
     /// Borrowers retain their immutable snapshots, even after cache destruction.
     pub fn clear(self: *HistoryCache) !void {
-        if (self.corpus_entry) |entry| entry.release();
         if (self.persistent_entry) |entry| entry.release();
-        self.corpus_entry = null;
         self.persistent_entry = null;
     }
 
     pub fn deinit(self: *HistoryCache) !void {
         try self.clear();
         self.* = undefined;
-    }
-
-    pub fn acquireCorpus(self: *HistoryCache, io: Io, path: []const u8, identity: ?[32]u8) !?CorpusLease {
-        const wanted = identity orelse return error.TokenizerRequired;
-        const stamp = CorpusStamp.read(io, path) catch |err| switch (err) {
-            error.FileNotFound => {
-                // Only an absent directory is optional, not missing corpus files.
-                const dir = Dir.cwd().openDir(io, path, .{}) catch |dir_err| switch (dir_err) {
-                    error.FileNotFound => return null,
-                    else => return dir_err,
-                };
-                dir.close(io);
-                return err;
-            },
-            else => return err,
-        };
-        if (self.corpus_entry) |entry| {
-            if (std.mem.eql(u8, entry.path, path) and std.mem.eql(u8, &entry.identity, &wanted) and CorpusStamp.eql(entry.stamp, stamp)) {
-                entry.references += 1;
-                return .{ .entry = entry };
-            }
-        }
-        var index = (try openCorpus(io, self.allocator, path, wanted)) orelse return null;
-        errdefer index.deinit();
-        const owned_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(owned_path);
-        if (!CorpusStamp.eql(stamp, try CorpusStamp.read(io, path))) return error.ChangedDuringRead;
-        const entry = try self.allocator.create(CachedCorpus);
-        entry.* = .{ .index = index, .path = owned_path, .identity = wanted, .stamp = stamp, .references = 2 };
-        if (self.corpus_entry) |old| old.release();
-        self.corpus_entry = entry;
-        return .{ .entry = entry };
     }
 
     /// Writable validation/recovery and acquisition share one owned token read.
@@ -859,7 +593,7 @@ pub const HistoryCache = struct {
 
     fn adoptPersistent(self: *HistoryCache, path: []const u8, identity: [32]u8, loaded: Snapshot) !PersistentLease {
         // Sorting can be expensive; the validated token copy needs no file lock.
-        const index = Corpus.fromOwnedTokens(self.allocator, loaded.tokens, max_order) catch |err| {
+        const index = SuffixIndex.fromOwnedTokens(self.allocator, loaded.tokens, max_order) catch |err| {
             self.allocator.free(loaded.tokens);
             return err;
         };
@@ -888,23 +622,10 @@ pub const HistoryCache = struct {
     }
 };
 
-pub const CorpusLease = struct {
-    entry: *CachedCorpus,
-
-    pub fn index(self: *const CorpusLease) *const Corpus {
-        return &self.entry.index;
-    }
-
-    pub fn deinit(self: *CorpusLease) void {
-        self.entry.release();
-        self.* = undefined;
-    }
-};
-
 pub const PersistentLease = struct {
     entry: *CachedPersistent,
 
-    pub fn index(self: *const PersistentLease) *const Corpus {
+    pub fn index(self: *const PersistentLease) *const SuffixIndex {
         return &self.entry.index;
     }
 
@@ -916,11 +637,11 @@ pub const PersistentLease = struct {
 
 test "longest usable match wins without crossing a document" {
     const a = std.testing.allocator;
-    var corpus = try Corpus.build(a, &.{ 41, 42, separator, 42, 96, separator }, 5);
-    defer corpus.deinit();
+    var index = try SuffixIndex.build(a, &.{ 41, 42, separator, 42, 96, separator }, 5);
+    defer index.deinit();
     var drafter = Drafter.init(a);
     defer drafter.deinit();
-    drafter.corpus = &corpus;
+    drafter.persistent = &index;
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(a);
     const found = try drafter.look(&.{ 41, 42 }, 6, &out);
@@ -933,15 +654,16 @@ test "longest usable match wins without crossing a document" {
     try std.testing.expectEqual(@as(usize, 0), miss.tokens.len);
 }
 
-test "corpus and persistent votes select a coherent continuation" {
+test "persistent votes select a coherent continuation" {
     const a = std.testing.allocator;
-    var corpus = try Corpus.build(a, &.{ 53, 54, 61, 62, separator, 53, 54, 71, 72, separator }, 4);
-    defer corpus.deinit();
-    var persistent = try Corpus.build(a, &.{ 53, 54, 71, 73, separator }, 4);
+    var persistent = try SuffixIndex.build(a, &.{
+        53, 54, 61, 62, separator,
+        53, 54, 71, 72, separator,
+        53, 54, 71, 73, separator,
+    }, 4);
     defer persistent.deinit();
     var drafter = Drafter.init(a);
     defer drafter.deinit();
-    drafter.corpus = &corpus;
     drafter.persistent = &persistent;
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(a);
@@ -960,11 +682,11 @@ test "proposal capacity keeps parent closure and bounded depth" {
     for (0..max_candidates + 9) |i| {
         try ids.appendSlice(a, &.{ 8, @as(u32, @intCast(i)) + 100, 400, 500, 600, separator });
     }
-    var corpus = try Corpus.build(a, ids.items, 5);
-    defer corpus.deinit();
+    var index = try SuffixIndex.build(a, ids.items, 5);
+    defer index.deinit();
     var drafter = Drafter.init(a);
     defer drafter.deinit();
-    drafter.corpus = &corpus;
+    drafter.persistent = &index;
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(a);
     const found = try drafter.look(&.{8}, max_depth + 10, &out);
@@ -979,132 +701,33 @@ test "proposal capacity keeps parent closure and bounded depth" {
 test "independent index agrees with exhaustive small-document occurrences" {
     const a = std.testing.allocator;
     const ids = [_]u32{ 6, 9, 13, separator, 9, 15, separator, 6, 9, 17, separator };
-    var corpus = try Corpus.build(a, &ids, 3);
-    defer corpus.deinit();
+    var index = try SuffixIndex.build(a, &ids, 3);
+    defer index.deinit();
     var seen: [ids.len]bool = @splat(false);
     const sort = SortContext{ .tokens = &ids, .order = 3 };
-    for (corpus.positions, 0..) |position, i| {
+    for (index.positions, 0..) |position, i| {
         try std.testing.expect(!seen[position]);
         seen[position] = true;
-        if (i > 0) try std.testing.expect(!sort.less(position, corpus.positions[i - 1]));
+        if (i > 0) try std.testing.expect(!sort.less(position, index.positions[i - 1]));
     }
     for ([_][]const u32{ &.{6}, &.{9}, &.{ 6, 9 }, &.{ 9, 13 }, &.{77} }) |query| {
         var expected: usize = 0;
         for (0..ids.len) |position| {
             if (compareQuery(&ids, position, query) == .eq) expected += 1;
         }
-        try std.testing.expectEqual(expected, corpus.lowerBound(query, true) - corpus.lowerBound(query, false));
+        try std.testing.expectEqual(expected, index.lowerBound(query, true) - index.lowerBound(query, false));
     }
-    try std.testing.expectError(error.InvalidOrder, Corpus.build(a, &ids, 0));
-    try std.testing.expectError(error.InvalidToken, Corpus.build(a, &.{separator + 1}, 3));
+    try std.testing.expectError(error.InvalidOrder, SuffixIndex.build(a, &ids, 0));
+    try std.testing.expectError(error.InvalidToken, SuffixIndex.build(a, &.{separator + 1}, 3));
+    const oversized = try a.alloc(u32, persistent_capacity + 1);
+    defer a.free(oversized);
+    try std.testing.expectError(error.IndexTooLarge, SuffixIndex.build(a, oversized, 3));
 }
 
 fn testWrite(dir: Dir, name: []const u8, bytes: []const u8) !void {
     const file = try dir.createFile(std.testing.io, name, .{ .permissions = store_file_permissions });
     defer file.close(std.testing.io);
     try file.writePositionalAll(std.testing.io, bytes, 0);
-}
-
-fn testNpy(allocator: Allocator, values: []const u32, version: u8) ![]u8 {
-    const dictionary = try std.fmt.allocPrint(allocator, "{{'shape': ({d},), \"fortran_order\": False, 'descr': '<i4', }}", .{values.len});
-    defer allocator.free(dictionary);
-    const prefix: usize = if (version == 1) 10 else 12;
-    const data_offset = (prefix + dictionary.len + 1 + 63) / 64 * 64;
-    const bytes = try allocator.alloc(u8, data_offset + values.len * 4);
-    @memset(bytes[0..data_offset], ' ');
-    @memcpy(bytes[0..6], "\x93NUMPY");
-    bytes[6] = version;
-    bytes[7] = 0;
-    if (version == 1)
-        std.mem.writeInt(u16, bytes[8..10], @intCast(data_offset - prefix), .little)
-    else
-        std.mem.writeInt(u32, bytes[8..12], @intCast(data_offset - prefix), .little);
-    @memcpy(bytes[prefix..][0..dictionary.len], dictionary);
-    bytes[data_offset - 1] = '\n';
-    for (values, 0..) |value, i| std.mem.writeInt(u32, bytes[data_offset + i * 4..][0..4], value, .little);
-    return bytes;
-}
-
-fn testCorpusFixture(dir: Dir, ids: []const u32, identity: [32]u8) !void {
-    const a = std.testing.allocator;
-    var corpus = try Corpus.build(a, ids, 4);
-    defer corpus.deinit();
-    const tokens = try testNpy(a, ids, 1);
-    defer a.free(tokens);
-    const positions = try testNpy(a, corpus.positions, 2);
-    defer a.free(positions);
-    try testWrite(dir, "tokens.npy", tokens);
-    try testWrite(dir, "sa.npy", positions);
-    const hex = std.fmt.bytesToHex(identity, .lower);
-    const metadata = try std.fmt.allocPrint(a,
-        "{{\"tokenizer_sha256\":\"{s}\",\"max_order\":4,\"doc_sep\":{d},\"n_tokens\":{d},\"documents\":{d}}}",
-        .{ hex, separator, ids.len, try validateDocuments(ids, true) });
-    defer a.free(metadata);
-    try testWrite(dir, "meta.json", metadata);
-}
-
-test "NPY reads documented versions and rejects inconsistent layout" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    for ([_]u8{ 1, 2, 3 }) |version| {
-        const bytes = try testNpy(a, &.{ 5, 27, 800 }, version);
-        defer a.free(bytes);
-        try testWrite(tmp.dir, "tokens.npy", bytes);
-        const values = try readNpy(tmp.dir, std.testing.io, a, "tokens.npy", null);
-        defer a.free(values);
-        try std.testing.expectEqualSlices(u32, &.{ 5, 27, 800 }, values);
-        try testWrite(tmp.dir, "tokens.npy", bytes[0 .. bytes.len - 1]);
-        try std.testing.expectError(error.InvalidNpy, readNpy(tmp.dir, std.testing.io, a, "tokens.npy", null));
-        const marker = std.mem.indexOf(u8, bytes, "<i4").?;
-        bytes[marker] = '>';
-        try testWrite(tmp.dir, "tokens.npy", bytes);
-        try std.testing.expectError(error.UnsupportedNpyType, readNpy(tmp.dir, std.testing.io, a, "tokens.npy", null));
-    }
-    var parser = NpyHeader{ .text = "{'descr':'<i4','shape':(2,3),'fortran_order':False}\n" };
-    try std.testing.expectError(error.InvalidNpy, parser.parse());
-    var duplicate = NpyHeader{ .text = "{'descr':'<i4','descr':'<i4','shape':(1,),'fortran_order':False}\n" };
-    try std.testing.expectError(error.InvalidNpy, duplicate.parse());
-}
-
-
-test "corpus snapshots share overlap and survive refresh clear and cache teardown" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [Dir.max_path_bytes]u8 = undefined;
-    const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
-    const identity: [32]u8 = @splat(0x2d);
-    try testCorpusFixture(tmp.dir, &.{ 51, 52, separator }, identity);
-    var cache = HistoryCache.init(a);
-    var cache_live = true;
-    defer if (cache_live) cache.deinit() catch unreachable;
-    var first = (try cache.acquireCorpus(io, path, identity)).?;
-    defer first.deinit();
-    var second = (try cache.acquireCorpus(io, path, identity)).?;
-    defer second.deinit();
-    try std.testing.expectEqual(first.index(), second.index());
-    try testCorpusFixture(tmp.dir, &.{ 51, 58, separator }, identity);
-    var changed = (try cache.acquireCorpus(io, path, identity)).?;
-    defer changed.deinit();
-    try std.testing.expectEqualSlices(u32, &.{ 51, 52, separator }, first.index().tokens);
-    try std.testing.expectEqual(@as(u32, 58), changed.index().tokens[1]);
-    try std.testing.expectError(error.TokenizerRequired, cache.acquireCorpus(io, path, null));
-    try std.testing.expectError(error.TokenizerMismatch, cache.acquireCorpus(io, path, @as([32]u8, @splat(0x2e))));
-    var preserved = (try cache.acquireCorpus(io, path, identity)).?;
-    defer preserved.deinit();
-    try std.testing.expectEqual(changed.index(), preserved.index());
-    const malformed = try testNpy(a, &.{ 0, 0, 2 }, 1);
-    defer a.free(malformed);
-    try testWrite(tmp.dir, "sa.npy", malformed);
-    try std.testing.expectError(error.InvalidSuffixIndex, cache.acquireCorpus(io, path, identity));
-    try cache.clear();
-    try std.testing.expect(cache.corpus_entry == null);
-    try std.testing.expectEqual(@as(u32, 52), second.index().tokens[1]);
-    try cache.deinit();
-    cache_live = false;
-    try std.testing.expectEqual(@as(u32, 58), preserved.index().tokens[1]);
 }
 
 test "read-only snapshots preserve bytes metadata and never create absent paths" {
@@ -1192,6 +815,9 @@ test "overlapping persistent leases append B then A against current log and reta
     var preserved = try cache.acquirePersistent(io, path, identity);
     defer preserved.deinit();
     try std.testing.expectEqual(after_a.index(), preserved.index());
+    try cache.clear();
+    try std.testing.expect(cache.persistent_entry == null);
+    try std.testing.expectEqualSlices(u32, &.{ 101, 102, separator }, request_b.index().tokens);
     try cache.deinit();
     cache_live = false;
     try std.testing.expectEqualSlices(u32, &.{ 101, 102, separator }, request_a.index().tokens);
@@ -1391,7 +1017,7 @@ test "whole-document eviction preserves leased snapshots and uses no replacement
     try std.testing.expect(stored.len <= persistent_capacity);
     try std.testing.expectEqual(@as(u32, 200000), stored[0]);
     try std.testing.expectEqualSlices(u32, &.{ 181, 182, 183, separator }, stored[stored.len - 4..]);
-    try std.testing.expectEqual(@as(usize, 2), try validateDocuments(stored, true));
+    try std.testing.expectEqual(@as(usize, 2), try validateDocuments(stored));
     try std.testing.expect((try fileStamp(tmp.dir, io, "tokens.bin")).inode != old_inode);
     try std.testing.expectEqual(lock_inode, (try fileStamp(tmp.dir, io, "store.lock")).inode);
     try std.testing.expectEqual(first.index(), second.index());
@@ -1414,7 +1040,7 @@ test "whole-document eviction preserves leased snapshots and uses no replacement
     defer uncertain.deinit();
     try std.testing.expectEqualSlices(u32, &.{ 181, 182, 183, separator }, uncertain.index().tokens[0..4]);
     try std.testing.expectEqual(@as(u32, 200000), uncertain.index().tokens[4]);
-    try std.testing.expectEqual(@as(usize, 2), try validateDocuments(uncertain.index().tokens, true));
+    try std.testing.expectEqual(@as(usize, 2), try validateDocuments(uncertain.index().tokens));
 }
 
 test "persistent snapshots retain full 8 16 and 64 token match orders" {
@@ -1501,35 +1127,6 @@ test "refresh read and allocation failures retain all live snapshots" {
     var refreshed = try cache.acquirePersistent(io, path, identity);
     defer refreshed.deinit();
     try std.testing.expectEqualSlices(u32, &.{ 221, 222, separator, 223, 224, separator }, refreshed.index().tokens);
-}
-
-test "corpus optional counts and file fingerprints follow host metadata" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [Dir.max_path_bytes]u8 = undefined;
-    const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
-    const identity: [32]u8 = @splat(0x89);
-    try testCorpusFixture(tmp.dir, &.{ 201, 202, separator }, identity);
-    const token_bytes = try readBounded(tmp.dir, io, a, "tokens.npy", 1024);
-    defer a.free(token_bytes);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(token_bytes, &digest, .{});
-    const identity_hex = std.fmt.bytesToHex(identity, .lower);
-    const digest_hex = std.fmt.bytesToHex(digest, .lower);
-    const metadata = try std.fmt.allocPrint(a,
-        "{{\"tokenizer_sha256\":\"{s}\",\"max_order\":4,\"doc_sep\":{d},\"tokens_sha256\":\"{s}\"}}",
-        .{ identity_hex, separator, digest_hex });
-    defer a.free(metadata);
-    try testWrite(tmp.dir, "meta.json", metadata);
-    var corpus = (try openCorpus(io, a, path, identity)).?;
-    defer corpus.deinit();
-    try std.testing.expectEqualSlices(u32, &.{ 201, 202, separator }, corpus.tokens);
-    try std.testing.expectError(error.TokenizerRequired, openCorpus(io, a, path, null));
-    token_bytes[token_bytes.len - 8] ^= 1;
-    try testWrite(tmp.dir, "tokens.npy", token_bytes);
-    try std.testing.expectError(error.FingerprintMismatch, openCorpus(io, a, path, identity));
 }
 
 const TestDirectorySync = struct {

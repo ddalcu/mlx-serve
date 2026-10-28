@@ -91,6 +91,8 @@ struct ServerOptions: Codable, Equatable {
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
     var pldDraftLen: Int = 5
     var pldKeyLen: Int = 3
+    var lookupStore: String = ""        // Empty keeps cross-request token history disabled.
+    var lookupReadOnly: Bool = false
 
     /// Native multi-token prediction (Qwen 3.5/3.6 checkpoints that ship a
     /// trained `mtp/` sidecar head). Default ON, mirroring the server — the head
@@ -530,6 +532,8 @@ struct ServerOptions: Codable, Equatable {
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
+        lookupStore == other.lookupStore &&
+        lookupReadOnly == other.lookupReadOnly &&
         enableMTP == other.enableMTP &&
         mtpDepth == other.mtpDepth &&
         enableDSpark == other.enableDSpark &&
@@ -691,6 +695,10 @@ struct ServerOptions: Codable, Equatable {
         args += [enablePLD ? "--pld" : "--no-pld"]
         args += ["--pld-draft-len", "\(pldDraftLen)"]
         args += ["--pld-key-len", "\(pldKeyLen)"]
+        if !lookupStore.isEmpty {
+            args += ["--lookup-store", lookupStore]
+            if lookupReadOnly { args += ["--lookup-read-only"] }
+        }
         // MTP: the server auto-loads a checkpoint's head (dense or MoE) and
         // defaults depth to auto.
         if !enableMTP {
@@ -905,6 +913,8 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePLD) { enablePLD = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .lookupStore) { lookupStore = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .lookupReadOnly) { lookupReadOnly = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareEnabled) { lanShareEnabled = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareAll) { lanShareAll = v }
         if let v = try c.decodeIfPresent([String].self, forKey: .lanSharedModels) { lanSharedModels = v }
@@ -1198,6 +1208,14 @@ extension ServerOptions {
         "pldKeyLen": .init(
             title: "PLD key length",
             explainer: "How many matching tokens it takes to start a guess.",
+            needsRestart: true),
+        "lookupStore": .init(
+            title: "Private token history directory",
+            explainer: "Optional MTP history shared by all clients of this server. Writes sensitive, reversible prompts and outputs to private disk, without encryption. Leave empty to disable. Use separate directories for separate trust boundaries.",
+            needsRestart: true),
+        "lookupReadOnly": .init(
+            title: "Read history without recording",
+            explainer: "Requires an existing tokenizer-compatible history store. Does not write new turns or enable history without a directory.",
             needsRestart: true),
         "maxConcurrent": .init(
             title: "Concurrent requests",

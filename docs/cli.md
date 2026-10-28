@@ -18,6 +18,8 @@ Outside plugins (dylibs built with the plugin kit, [plugins.md](plugins.md)) loa
 
 `launch` supports claude, pi, omp, opencode, opencode2, codex, hermes, and aider. It reads the running server's model list and real context window, writes the agent's config into a dedicated `~/.mlx-serve/<agent>/` folder (never your real agent config), and starts the agent; codex keeps its settings as `-c` overrides over your own Codex home and gets one written file, `~/.mlx-serve/codex/model-instructions.md`, a current tool-contract prompt for local models (`MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override). If the server is down it starts the MLX Core app first. `--model <id>` picks a model, `--print` shows the launch script instead of running, and anything after `--` goes to the agent (`mlx-serve launch codex -- resume`). `launch opencode` detects the installed OpenCode's version (even `--print` runs `opencode --version` to route) and picks its v1 or v2 integration automatically; `launch opencode2` stays as a compatibility alias that forces the v2 integration, which also installs the mlx-serve monitor plugin and needs the server started with `--metrics`. Full per-agent detail in [integrations.md](integrations.md).
 
+Cross-request token history is disabled by default. Enable it with `mlx-serve serve --lookup-store /private/path`; add `--lookup-read-only` to consume an existing store without writing turns. Token IDs reveal prompt/output content, and private file permissions are not encryption. The app exposes the same settings under **Settings → Speculative Decoding**, persists them and marks changes as requiring restart. `mlx-serve launch <agent>` uses the already-running server or auto-starts the app with its saved settings; it does **not** accept these server flags or reconfigure a running server. Configure and restart the app first, or start `serve` with the flags separately before `launch`. See [token-history lifecycle and privacy](reference.md#cross-request-token-history-for-mtp-opt-in).
+
 Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Models land in a shared `~/.mlx-serve/models` store the MLX-Serve app uses too.
 
 ## Driving the server directly
@@ -63,6 +65,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--pld` / `--no-pld` | on | Prompt Lookup Decoding (model-agnostic spec-decode) |
 | `--pld-draft-len N` | `5` | Max draft tokens per PLD step |
 | `--pld-key-len N` | `3` | N-gram match key length for PLD |
+| `--lookup-store DIR` | disabled | Opt in to cross-request MTP token history. Writes sensitive, reversible prompts and outputs to private disk; use a directory within one trusted deployment |
+| `--lookup-read-only` | off | Read an existing tokenizer-compatible `--lookup-store` without recording new turns; requires an explicit store |
 | `--drafter DIR` | none | Speculative-decoding drafter checkpoint: a Gemma 4 assistant or a DFlash draft companion. Models that ship a `drafter/` subdir (Muse-Glimmer builds) load theirs automatically |
 | `--no-drafter` | off | Never load a drafter, including one shipped inside the checkpoint |
 | `--draft-block-size N` | auto | Drafts per round for the drafter (auto-sized to what this Mac's verify path can use) |

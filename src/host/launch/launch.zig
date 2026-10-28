@@ -1298,6 +1298,10 @@ fn printLaunchUsage() void {
         \\  --print        Write the config files and print the launch script
         \\                 instead of running the agent
         \\  --no-start     Never auto-start the MLX-Serve app when the server is down
+        \\                 Server settings come from the app's saved Settings.
+        \\                 For token history, configure its private directory in
+        \\                 Settings > Speculative Decoding and restart the server,
+        \\                 or start `mlx-serve serve --lookup-store <dir>` first.
         \\
         \\Anything after `--` is passed to the agent, e.g.:
         \\  mlx-serve launch codex -- resume

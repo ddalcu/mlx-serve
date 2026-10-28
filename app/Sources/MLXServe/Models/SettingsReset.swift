@@ -75,6 +75,8 @@ enum SettingsReset {
                 f("enablePLD") { $0.enablePLD = $1.enablePLD },
                 f("pldDraftLen") { $0.pldDraftLen = $1.pldDraftLen },
                 f("pldKeyLen") { $0.pldKeyLen = $1.pldKeyLen },
+                f("lookupStore") { $0.lookupStore = $1.lookupStore },
+                f("lookupReadOnly") { $0.lookupReadOnly = $1.lookupReadOnly },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
                 f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },

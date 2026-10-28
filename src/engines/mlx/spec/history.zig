@@ -1,29 +1,31 @@
 //! External token history supplies proposals to the stock MTP verifier/gate.
 //! No native head policy, numerical mode, or proposal probability is changed.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const tokens = @import("token_history.zig");
 const lookup = @import("mtp_lookup.zig");
 const Generator = @import("../generate/generator.zig").Generator;
 const Transformer = @import("../transformer.zig").Transformer;
 const log = @import("../../../sdk/util/log.zig");
 
-pub fn storePath() ?[]const u8 {
-    const path = env.span(.MLX_SERVE_LOOKUP_STORE) orelse return null;
-    return if (path.len > 0) path else null;
-}
+pub const Config = struct {
+    store: ?[]const u8 = null,
+    read_only: bool = false,
+};
 
-fn corpusPath() ?[]const u8 {
-    const path = env.span(.MLX_SERVE_LOOKUP_CORPUS) orelse return null;
+/// Installed before model loading; the launch arguments outlive the engine.
+pub var config: Config = .{};
+
+pub fn storePath() ?[]const u8 {
+    const path = config.store orelse return null;
     return if (path.len > 0) path else null;
 }
 
 pub fn enabled() bool {
-    return storePath() != null or corpusPath() != null;
+    return storePath() != null;
 }
 
 pub fn writes() bool {
-    return storePath() != null and !env.on(.MLX_SERVE_LOOKUP_READ_ONLY);
+    return enabled() and !config.read_only;
 }
 
 pub fn cache(xfm: *Transformer) *tokens.HistoryCache {
@@ -34,7 +36,6 @@ pub fn cache(xfm: *Transformer) *tokens.HistoryCache {
 pub const Request = struct {
     allocator: std.mem.Allocator,
     drafter: tokens.Drafter,
-    corpus: ?tokens.CorpusLease = null,
     persistent: ?tokens.PersistentLease = null,
     output: std.ArrayList(u32) = .empty,
     query: [tokens.max_order]u32 = undefined,
@@ -57,10 +58,6 @@ pub const Request = struct {
         errdefer self.deinit();
         self.drafter.vocab_limit = @intCast(gen.tok.definedVocabSize());
         const shared = cache(gen.xfm);
-        if (corpusPath()) |path| {
-            self.corpus = try shared.acquireCorpus(gen.timer.io, path, identity);
-            if (self.corpus) |*lease| self.drafter.corpus = lease.index();
-        }
         if (storePath()) |path| {
             self.persistent = if (writes())
                 try shared.acquireWritablePersistent(gen.timer.io, path, identity)
@@ -74,7 +71,6 @@ pub const Request = struct {
     pub fn deinit(self: *Request) void {
         self.drafter.deinit();
         self.output.deinit(self.allocator);
-        if (self.corpus) |*lease| lease.deinit();
         if (self.persistent) |*lease| lease.deinit();
         self.* = undefined;
     }
@@ -151,11 +147,11 @@ test "external history query retains maximum suffix and invalidates changed cont
     const a = std.testing.allocator;
     var ids: [100]u32 = undefined;
     for (&ids, 0..) |*id, i| id.* = @intCast(100 + i);
-    var corpus = try tokens.Corpus.build(a, &ids, tokens.max_order);
-    defer corpus.deinit();
+    var index = try tokens.SuffixIndex.build(a, &ids, tokens.max_order);
+    defer index.deinit();
     var request = Request{ .allocator = a, .drafter = tokens.Drafter.init(a) };
     defer request.deinit();
-    request.drafter.corpus = &corpus;
+    request.drafter.persistent = &index;
     for ([_]usize{ 62, 63, 64, 90 }) |n| {
         const matched = (try request.match(ids[0..n], ids[n], 7)) orelse return error.MissingContinuation;
         try std.testing.expectEqualSlices(u32, ids[n + 1 ..][0..7], matched.draft);
@@ -163,4 +159,23 @@ test "external history query retains maximum suffix and invalidates changed cont
         const repeated = (try request.match(ids[0..n], ids[n], 3)) orelse return error.MissingShortContinuation;
         try std.testing.expectEqualSlices(u32, ids[n + 1 ..][0..3], repeated.draft);
     }
+}
+
+test "external history is disabled without an explicit store" {
+    const saved = config;
+    defer config = saved;
+    config = .{};
+    try std.testing.expect(!enabled());
+    try std.testing.expect(!writes());
+    config = .{ .read_only = true };
+    try std.testing.expect(!enabled());
+    try std.testing.expect(!writes());
+    config = .{ .store = "" };
+    try std.testing.expect(!enabled());
+    try std.testing.expect(!writes());
+    config = .{ .store = "/private/history", .read_only = true };
+    try std.testing.expect(enabled());
+    try std.testing.expect(!writes());
+    config.read_only = false;
+    try std.testing.expect(writes());
 }

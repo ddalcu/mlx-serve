@@ -5,7 +5,7 @@
 - **Model plugins you can build and install.** `mlx-serve plugin new` starts a model or media plugin from the plugin kit, `plugin check` tests it, and `plugin install` adds it after showing its signature; Settings lists installed plugins with a switch each.
 - **DiffusionGemma is no longer supported.**
 - **Codex prompts that fit a local model.** `mlx-serve launch codex` and the app's Codex tab hand codex a current base-instructions file instead of its stale built-in fallback, which names tools the binary no longer declares; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override.
-- **Opt-in MTP token history.** A bounded, tokenizer-bound store can propose continuations from earlier prompts and emitted answers; the current model verifies them, overlapping requests retain independent snapshots while publishing completed turns, and proposals below the minimum depth preserve native predrafting.
+- **Opt-in MTP token history.** `--lookup-store <dir>` (also in app settings) enables a bounded, tokenizer-bound store of earlier prompts and emitted answers; `--lookup-read-only` prevents publication. The current model verifies proposals, overlapping requests retain independent snapshots, and proposals below the minimum depth preserve native predrafting. Disabled by default; stored token IDs are sensitive and reversible.
 
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 

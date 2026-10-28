@@ -276,6 +276,16 @@ Cause: the eligibility probe admitted any nonempty external proposal while chain
 Fix: both callers share floor-filtered proposal selection; an ineligible lookup leaves native predrafting intact.
 Guard: the durable-suffix boundary test checks that three remaining drafts with minimum depth four report zero eligibility.
 
+### History-bearing slot cleanup must stay inference-owned
+Risk: an allocating cleanup list can fail to enqueue and fall back to destroying a slot on the connection thread.
+History publication and immutable-lease release belong to the inference owner, so cleanup uses the slot's embedded
+node instead. `cleanup_claimed` is set under the queue mutex before waiting for an active pass; a duplicate handoff
+while the slot is alive must not relink that node or decrement another request's in-flight count.
+This is an ownership requirement of history teardown, not a claimed reproduced upstream double-completion race.
+Guard: `complete: duplicate handoff` covers pending and decoding lists directly; `history cleanup stays queued`
+covers allocation failure, an active pass, retained leases and the real inference drain. Calling `complete` after
+the owner has drained and destroyed the slot remains invalid.
+
 ### Text-only test sinks must reject non-text events
 Defect: the history Slot observer stopped compiling when the engine ABI added audio events.
 Fix: handle token and terminal events explicitly, permit prefill, and mark every other event invalid while stopping.

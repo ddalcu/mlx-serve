@@ -284,7 +284,7 @@ test "plugin MTP heads: a round opens at head 0, each chained draft runs the nex
     try testing.expectEqual(@as(u32, 0), Heads3.ran[Heads3.n - 1]);
 }
 
-const history_env = @import("../../../env.zig");
+const history = @import("../spec/history.zig");
 const token_history = @import("../spec/token_history.zig");
 const history_trace = @import("../spec/mtp/trace.zig");
 const history_verify = @import("../spec/verify.zig");
@@ -356,10 +356,8 @@ const history_other_query = [_]u32{ 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 
 
 test "plugin MTP history: native incumbent wins conflicts; rejected native admits owned external chain" {
     const a = testing.allocator;
-    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
-    defer corpus.restore();
-    var readonly = history_env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "1");
-    defer readonly.restore();
+    const saved_config = history.config;
+    defer history.config = saved_config;
     const bounds = depth_bounds.active;
     depth_bounds.active = .{};
     defer depth_bounds.active = bounds;
@@ -368,8 +366,7 @@ test "plugin MTP history: native incumbent wins conflicts; rejected native admit
     defer rig.close();
     const path = try rig.store("incumbent", &history_query, &history_external);
     defer a.free(path);
-    var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
-    defer store.restore();
+    history.config = .{ .store = path, .read_only = true };
 
     for ([_]usize{ 16, 7 }) |native_order| {
         var prompt: std.ArrayList(u32) = .empty;
@@ -412,10 +409,8 @@ test "plugin MTP history: native incumbent wins conflicts; rejected native admit
 
 test "plugin MTP history: a native match below the depth floor permits external continuation" {
     const a = testing.allocator;
-    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
-    defer corpus.restore();
-    var readonly = history_env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "1");
-    defer readonly.restore();
+    const saved_config = history.config;
+    defer history.config = saved_config;
     const bounds = depth_bounds.active;
     depth_bounds.active = .{ .min = 3, .max = 3 };
     defer depth_bounds.active = bounds;
@@ -425,8 +420,7 @@ test "plugin MTP history: a native match below the depth floor permits external 
     const query: [17]u32 = @splat(7);
     const path = try rig.store("depth-floor", &query, history_external[0..3]);
     defer a.free(path);
-    var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
-    defer store.restore();
+    history.config = .{ .store = path, .read_only = true };
     var gen = try rig.generator(query[0..16]);
     defer gen.deinit(a);
     gen.mtp_lookup_streak = true;
@@ -444,10 +438,8 @@ test "plugin MTP history: a native match below the depth floor permits external 
 
 test "plugin MTP history: durable suffix boundaries obey the stock gate depth and remaining budget" {
     const a = testing.allocator;
-    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
-    defer corpus.restore();
-    var readonly = history_env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "1");
-    defer readonly.restore();
+    const saved_config = history.config;
+    defer history.config = saved_config;
     const bounds = depth_bounds.active;
     defer depth_bounds.active = bounds;
     var rig: HistoryRig = undefined;
@@ -458,8 +450,7 @@ test "plugin MTP history: durable suffix boundaries obey the stock gate depth an
         var name: [32]u8 = undefined;
         const path = try rig.store(try std.fmt.bufPrint(&name, "suffix-{d}", .{order}), history_query[16 - order ..], &history_external);
         defer a.free(path);
-        var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
-        defer store.restore();
+        history.config = .{ .store = path, .read_only = true };
         var gen = try rig.generator(history_query[0..15]);
         defer gen.deinit(a);
         gen.mtp_lookup_streak = true;
@@ -666,12 +657,9 @@ fn historyFinish(gen: *Generator, st: *Generator.MtpRoundState, expected: ?u32) 
 
 test "plugin MTP history: cold and carried owned proposals verify zero partial full and recover native head state" {
     const a = testing.allocator;
-    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
-    defer corpus.restore();
-    var readonly = history_env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "1");
-    defer readonly.restore();
-    var unset = history_env.override(.MLX_SERVE_LOOKUP_STORE, null);
-    defer unset.restore();
+    const saved_config = history.config;
+    defer history.config = saved_config;
+    history.config = .{};
     const bounds = depth_bounds.active;
     depth_bounds.active = .{ .min = 3, .max = 3 };
     defer depth_bounds.active = bounds;
@@ -708,8 +696,8 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
         const path = try rig.store(try std.fmt.bufPrint(&name, "accept-{d}", .{want_accepted}), &document, proposal[1..]);
         defer a.free(path);
         {
-            var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr);
-            defer store.restore();
+            history.config = .{ .store = path, .read_only = true };
+            defer history.config = .{};
             if (want_accepted != 0) {
                 history_trace.mtp_predraft_override = true;
                 try gen.mtpMaybePreDraft(a);
@@ -745,10 +733,9 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
 
 test "plugin MTP history: disabled source allocates no request through native verification and predraft" {
     const a = testing.allocator;
-    var store = history_env.override(.MLX_SERVE_LOOKUP_STORE, null);
-    defer store.restore();
-    var corpus = history_env.override(.MLX_SERVE_LOOKUP_CORPUS, null);
-    defer corpus.restore();
+    const saved_config = history.config;
+    defer history.config = saved_config;
+    history.config = .{};
     const bounds = depth_bounds.active;
     depth_bounds.active = .{ .min = 3, .max = 3 };
     defer depth_bounds.active = bounds;

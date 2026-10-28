@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Verify durable emitted prefixes when overlapping MTP requests finish B before A.
 
-Use a dedicated server with a fresh MLX_SERVE_LOOKUP_STORE, scratch HOME, native
-MTP, --no-drafter --no-pld --max-concurrent 2 --ctx-size 4096. Tested with
-Qwen3.8-27B. The test neither starts nor stops the caller's server.
+Use a dedicated server with --lookup-store STORE pointing to a fresh private
+directory, scratch HOME, native MTP, --no-drafter --no-pld --max-concurrent 2
+--ctx-size 4096 (not --lookup-read-only). Tested with Qwen3.8-27B. The test
+neither starts nor stops the caller's server.
 
   python3 tests/test_token_history.py PORT --store STORE \
       --tokenizer MODEL/tokenizer.json --server-log LOG [--out DIR]

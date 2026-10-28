@@ -83,6 +83,7 @@ pub fn apply(f: *const host.Flags) void {
     scheduler_mod.skip_mem_preflight = f.skip_mem_preflight;
     if (f.ple_gpu) @import("../../plugins/qwen4_exp/ple_gpu.zig").pleGpu().enabled = true;
     depth_bounds.active = .{ .min = f.mtp_depth_min, .max = f.mtp_depth_max };
+    @import("spec/history.zig").config = .{ .store = f.lookup_store, .read_only = f.lookup_read_only };
     generate_mod.mtp_greedy_tail_default = f.mtp_greedy_tail;
     generate_mod.max_mtp_ctx = f.max_mtp_ctx;
     generate_mod.mtp_history_window_override = f.mtp_history_window;

@@ -574,8 +574,10 @@ fn releaseSessionLocked(self: *Scheduler, slot: *Slot) void {
 }
 
 /// Hand the slot off to the inference thread for cleanup, and notify any
-/// submitter waiting for queue space. Must be called once per slot
-/// returned by `submit`. Safe whether or not the slot finished normally.
+/// submitter waiting for queue space. The submitting caller owns the handoff.
+/// Duplicate calls cannot enqueue twice while the slot is alive; callers must
+/// not access the slot after the inference thread drains it.
+/// Safe whether or not the slot finished normally.
 ///
 /// Why not free here: `slot.deinit()` walks the per-slot KVCache and
 /// calls `mlx_array_free` on each entry. Refcount-shared GPU memory
@@ -1236,6 +1238,60 @@ test "company: a slot on an engine beside MLX never batches, so it does not coun
     try testing.expect(!hasCompany(&sch));
     sch.in_flight = 2;
     try testing.expect(hasCompany(&sch));
+}
+
+test "complete: duplicate handoff removes only its slot and decrements in_flight once" {
+    for ([_]bool{ true, false }) |pending| {
+        var sch: Scheduler = undefined;
+        sch.allocator = testing.allocator;
+        sch.io = testing.io;
+        sch.queue_mu = .init;
+        sch.queue_cond = .init;
+        sch.submit_cond = .init;
+        sch.pending = .empty;
+        defer sch.pending.deinit(testing.allocator);
+        sch.decoding = .empty;
+        defer sch.decoding.deinit(testing.allocator);
+        sch.offloaded = .empty;
+        sch.cleanup_queue = .{};
+        sch.in_flight = 3;
+
+        var slot: Slot = undefined;
+        slot.cancelled = .init(false);
+        slot.cleanup_claimed = false;
+        slot.cleanup_node = .{};
+        slot.holds_session = false;
+        slot.in_pass = .init(0);
+        var pending_neighbor: Slot = undefined;
+        var decoding_neighbor: Slot = undefined;
+        try sch.pending.append(testing.allocator, &pending_neighbor);
+        try sch.decoding.append(testing.allocator, &decoding_neighbor);
+        if (pending) {
+            try sch.pending.append(testing.allocator, &slot);
+        } else {
+            try sch.decoding.append(testing.allocator, &slot);
+        }
+
+        complete(&sch, &slot);
+        try testing.expectEqual(@as(usize, 2), sch.in_flight);
+        // Keep the slot alive until both handoffs return; a drained pointer is not reusable.
+        complete(&sch, &slot);
+        try testing.expectEqual(@as(usize, 2), sch.in_flight);
+        try testing.expect(slot.cancelled.load(.acquire));
+        try testing.expect(slot.cleanup_claimed);
+        try testing.expectEqual(@as(usize, 1), sch.pending.items.len);
+        try testing.expectEqual(&pending_neighbor, sch.pending.items[0]);
+        try testing.expectEqual(@as(usize, 1), sch.decoding.items.len);
+        try testing.expectEqual(&decoding_neighbor, sch.decoding.items[0]);
+        try testing.expectEqual(@as(usize, 0), sch.offloaded.items.len);
+        try testing.expect(sch.cleanup_queue.first == &slot.cleanup_node);
+        try testing.expect(sch.cleanup_queue.last == &slot.cleanup_node);
+        try testing.expect(slot.cleanup_node.prev == null);
+        try testing.expect(slot.cleanup_node.next == null);
+        try testing.expect(sch.cleanup_queue.popFirst() == &slot.cleanup_node);
+        try testing.expect(sch.cleanup_queue.popFirst() == null);
+        try testing.expect(sch.cleanup_queue.last == null);
+    }
 }
 
 test "failInFlight: a decoding request ends with the error by name, its stuck pass released" {

@@ -2,7 +2,6 @@
 const std = @import("std");
 const testing = std.testing;
 const abi = @import("../../abi/engine.zig");
-const env = @import("../../env.zig");
 const Slot = @import("slot.zig").Slot;
 const Transformer = @import("transformer.zig").Transformer;
 const KVCache = @import("transformer.zig").KVCache;
@@ -65,9 +64,7 @@ const Observer = struct {
 const Fixture = struct {
     tmp: testing.TmpDir,
     path: [:0]u8,
-    store_env: @TypeOf(env.override(.MLX_SERVE_LOOKUP_STORE, null)),
-    corpus_env: @TypeOf(env.override(.MLX_SERVE_LOOKUP_CORPUS, null)),
-    readonly_env: @TypeOf(env.override(.MLX_SERVE_LOOKUP_READ_ONLY, null)),
+    saved_config: history.Config,
     tok: Tokenizer,
     xfm: Transformer,
     model: LoadedModel,
@@ -122,9 +119,7 @@ const Fixture = struct {
         self.* = .{
             .tmp = tmp,
             .path = path,
-            .store_env = env.override(.MLX_SERVE_LOOKUP_STORE, path.ptr),
-            .corpus_env = env.override(.MLX_SERVE_LOOKUP_CORPUS, null),
-            .readonly_env = env.override(.MLX_SERVE_LOOKUP_READ_ONLY, "0"),
+            .saved_config = history.config,
             .tok = tok,
             .xfm = xfm,
             .model = .{
@@ -150,6 +145,7 @@ const Fixture = struct {
                 .error_name = null,
             },
         };
+        history.config = .{ .store = path };
         return self;
     }
 
@@ -158,9 +154,7 @@ const Fixture = struct {
         // The CPU shell owns no MLX handles; only its empty cache and history.
         self.xfm.cache.deinit();
         self.tok.deinit();
-        self.readonly_env.restore();
-        self.corpus_env.restore();
-        self.store_env.restore();
+        history.config = self.saved_config;
         testing.allocator.free(self.path);
         self.tmp.cleanup();
         testing.allocator.destroy(self);
@@ -266,6 +260,42 @@ test "history Slot early duplicate publishes delivered sink and non-sink tokens 
         live = false;
         try rig.expectTurn(&.{ 1, 2 }, output);
         if (streaming) try testing.expectEqual(@as(usize, 1), observer.finished);
+    }
+}
+
+test "history Slot disabled and read-only completion leave durable history unchanged" {
+    for ([_]bool{ false, true }) |read_only| {
+        const rig = try Fixture.init();
+        defer rig.deinit();
+        try rig.xfm.token_history.?.appendFinalTurn(testing.io, rig.path, rig.tok.content_sha256.?, &.{12}, &.{13});
+        const before_file = try rig.tmp.dir.openFile(testing.io, "tokens.bin", .{});
+        defer before_file.close(testing.io);
+        var before: [1024]u8 = undefined;
+        const before_len = try before_file.readPositionalAll(testing.io, &before, 0);
+        history.config = if (read_only) .{ .store = rig.path, .read_only = true } else .{};
+        var observer: Observer = .{};
+        const sl = try rig.slot(&.{ 1, 2 }, &observer);
+        var live = true;
+        defer if (live) sl.deinit();
+        const candidate = try history.match(&sl.legacy_gen.?, testing.allocator, &.{12}, 13, 4);
+        if (read_only) {
+            // A separator ends this document; the lease still proves read-only acquisition.
+            try testing.expect(sl.legacy_gen.?.external_history.?.persistent != null);
+        } else try testing.expect(sl.legacy_gen.?.external_history == null);
+        try testing.expect(candidate == null);
+        try commit(sl, &.{3});
+        sl.pushTokenWithLogprob(3, null);
+        sl.markFinished("length");
+        sl.deinit();
+        live = false;
+        try testing.expectEqualSlices(u32, &.{3}, observer.emitted());
+        try testing.expectEqual(@as(usize, 1), observer.finished);
+        const after_file = try rig.tmp.dir.openFile(testing.io, "tokens.bin", .{});
+        defer after_file.close(testing.io);
+        var after: [1024]u8 = undefined;
+        const after_len = try after_file.readPositionalAll(testing.io, &after, 0);
+        try testing.expectEqualSlices(u8, before[0..before_len], after[0..after_len]);
+        try rig.expectDocuments(&.{ 12, 13, storage.separator });
     }
 }
 

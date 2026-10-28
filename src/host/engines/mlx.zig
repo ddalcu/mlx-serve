@@ -151,6 +151,9 @@ pub const Flags = struct {
     mtp_depth_min: u32 = 1,
     mtp_depth_max: u32 = 0,
     mtp_greedy_tail: bool = false,
+    /// Borrowed launch arguments; the caller retains them until shutdown.
+    lookup_store: ?[]const u8 = null,
+    lookup_read_only: bool = false,
     max_mtp_ctx: u32 = 0,
     /// 0 = the full history.
     mtp_history_window: usize = 0,
@@ -160,6 +163,14 @@ pub const Flags = struct {
     prefill_decode_share: f32 = 0,
     mtp_head_kv_quant: bool = false,
     mtp_acceptance: mtp_acceptance.Mode = .exact,
+
+    pub fn validateLookup(self: Flags) !void {
+        if (self.lookup_store) |path| {
+            if (path.len == 0 or std.mem.startsWith(u8, path, "--")) return error.InvalidLookupStore;
+        } else if (self.lookup_read_only) {
+            return error.LookupStoreRequired;
+        }
+    }
 };
 
 extern fn mlx_serve_mlx_api() callconv(.c) *const anyopaque;
@@ -275,4 +286,13 @@ pub const Running = struct {
 
 fn cancelSlot(ctx: *anyopaque) void {
     api().cancel(@ptrCast(@alignCast(ctx)));
+}
+
+test "lookup launch requires an explicit nonempty store" {
+    try (Flags{}).validateLookup();
+    try (Flags{ .lookup_store = "/private/history" }).validateLookup();
+    try (Flags{ .lookup_store = "/private/history", .lookup_read_only = true }).validateLookup();
+    try std.testing.expectError(error.LookupStoreRequired, (Flags{ .lookup_read_only = true }).validateLookup());
+    try std.testing.expectError(error.InvalidLookupStore, (Flags{ .lookup_store = "" }).validateLookup());
+    try std.testing.expectError(error.InvalidLookupStore, (Flags{ .lookup_store = "--lookup-read-only" }).validateLookup());
 }

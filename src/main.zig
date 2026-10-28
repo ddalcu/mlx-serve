@@ -221,6 +221,10 @@ fn printUsage(io: std.Io) void {
         \\  --no-pld            Force-disable Prompt Lookup Decoding.
         \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
         \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
+        \\  --lookup-store <dir> Opt in to private on-disk token history for MTP.
+        \\                        Stores sensitive, reversible prompts and outputs.
+        \\                        Disabled by default; use a directory you trust.
+        \\  --lookup-read-only  Read an existing --lookup-store without writing turns.
         \\  --drafter <dir>     Path to an assistant drafter checkpoint —
         \\                        either a Gemma 4 cross-attention drafter or
         \\                        a DFlash block-drafter (auto-detected from
@@ -851,6 +855,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--pld-key-len") and i + 1 < args.len) {
             i += 1;
             pld_key_len = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--lookup-store") and i + 1 < args.len) {
+            i += 1;
+            engine_flags.lookup_store = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lookup-read-only")) {
+            engine_flags.lookup_read_only = true;
         } else if (std.mem.eql(u8, args[i], "--drafter") and i + 1 < args.len) {
             i += 1;
             drafter_dir = args[i];
@@ -1213,6 +1222,10 @@ pub fn main(init: std.process.Init) !void {
 
     depth_bounds.validate(.{ .min = engine_flags.mtp_depth_min, .max = engine_flags.mtp_depth_max }) catch {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ engine_flags.mtp_depth_min, engine_flags.mtp_depth_max });
+        std.process.exit(1);
+    };
+    engine_flags.validateLookup() catch |err| {
+        log.err("lookup settings: {s}; --lookup-store needs a nonempty directory and --lookup-read-only requires --lookup-store\n", .{@errorName(err)});
         std.process.exit(1);
     };
     mlx_engine.api().configure(&engine_flags);

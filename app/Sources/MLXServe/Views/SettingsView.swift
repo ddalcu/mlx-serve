@@ -2467,6 +2467,21 @@ private struct SpecDecodeSectionContent: View {
                 .disabled(!pldUsable)
             }
         }
+        if let m = meta["lookupStore"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lookupStore)) {
+                TextField("Disabled", text: opts.lookupStore)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 240)
+            }
+        }
+        if let m = meta["lookupReadOnly"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lookupReadOnly)) {
+                Toggle("", isOn: opts.lookupReadOnly)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .disabled(appState.serverOptions.lookupStore.isEmpty)
+            }
+        }
 
         // Native multi-token prediction — the model's OWN trained head, so it's
         // a different mechanism from PLD (which guesses by copying from the
