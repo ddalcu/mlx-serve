@@ -129,4 +129,4 @@ src/plugins/qwen4_exp/qsa/indexer.zig	!deliberately NOT applied	the QSA indexer 
 src/engines/mlx/methods/yarn.zig	constTableAs(self.yarn_mscale.?,	the YaRN mscale table reaches a multiply only through constTableAs
 src/plugins/glm5_next/table_forward.zig	spliceVisionRows(	the GLM-5.3 table forward splices vision rows on prompt chunks
 src/plugins/qwen4_exp/forward.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
-src/sdk/bases/run.zig	spliceVisionRows(	the plugin bases splice vision rows on prompt chunks
+src/sdk/bases/run.zig	spliceRows(	the plugin bases splice vision rows on prompt chunks

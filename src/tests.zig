@@ -59,6 +59,8 @@ test {
     _ = @import("plugins/k2_horizon/proof_test.zig");
     _ = @import("plugins/embedding_gemma2/proof_test.zig");
     _ = @import("plugins/lfm2/proof_test.zig");
+    _ = @import("plugins/lfm3/proof_test.zig");
+    _ = @import("plugins/lfm3/served_test.zig");
     _ = @import("plugins/qwen3/proof_test.zig");
     _ = @import("plugins/prism_hadamard_qwen35/proof_test.zig");
     _ = @import("plugins/mimo_v2/proof_test.zig");
@@ -155,6 +157,7 @@ test {
     _ = @import("plugins/qwen3_asr/forced_align.zig");
     _ = @import("plugins/nemotron_diarization/diarization.zig");
     _ = @import("host/api/audio/transcription.zig");
+    _ = @import("host/api/speech.zig");
     _ = @import("sdk/vision/mrope.zig");
     _ = @import("engines/ane/engine.zig");
     _ = @import("sdk/quant/hadamard/rht.zig");

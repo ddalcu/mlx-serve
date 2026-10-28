@@ -11,7 +11,7 @@ pub const Span = common.Span;
 pub const Str = common.Str;
 pub const Verdict = common.Verdict;
 
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 
 /// The manifest's export name. Unversioned: a dylib built for another manifest version is refused by name, never
 /// reported as "no plugin here".
@@ -72,9 +72,12 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
             if (head.version != model_abi.version) return Verdict.refuse(.unsupported, "model table version is not this host's");
             if (head.size < @sizeOf(model_abi.ModelTable)) return Verdict.refuse(.unsupported, "model table is older than this host's");
             const t: *const model_abi.ModelTable = @ptrCast(@alignCast(m.table));
+            if (nullWord(t, "cache") or nullWord(t, "weights"))
+                return Verdict.refuse(.failed, "model table has no cache or weight hook table: both are required, even empty");
             if (!sized(model_abi.CacheHooks, t.cache) or !sized(model_abi.WeightHooks, t.weights) or
                 !sized(model_abi.SpecHooks, t.spec) or !sized(model_abi.MediaHooks, t.media) or
-                !sized(model_abi.EmbedHooks, t.embed) or !sized(model_abi.DistHooks, t.dist))
+                !sized(model_abi.EmbedHooks, t.embed) or !sized(model_abi.DistHooks, t.dist) or
+                !sized(model_abi.SpeechHooks, t.speech))
                 return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
             if (t.spec) |s| if (!sized(model_abi.HeadHooks, s.head) or !sized(model_abi.NativeDrafter, s.native_drafter))
                 return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
@@ -92,6 +95,13 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
     const t_name: *const Str = @ptrCast(@alignCast(@as([*]const u8, @ptrCast(m.table)) + @sizeOf(Head)));
     if (!std.mem.eql(u8, t_name.slice(), m.name.slice())) return Verdict.refuse(.failed, "plugin table is named otherwise than its manifest");
     return .ok;
+}
+
+/// Whether a required pointer of `t` is null: a C plugin can leave one so, and Zig's non-optional field may not be
+/// tested for null, so the word is read as bytes.
+fn nullWord(t: *const model_abi.ModelTable, comptime field: []const u8) bool {
+    const w: *const usize = @ptrCast(@alignCast(@as([*]const u8, @ptrCast(t)) + @offsetOf(model_abi.ModelTable, field)));
+    return w.* == 0;
 }
 
 /// A plugin name: `[a-z0-9_]`, 1 to 64 bytes (it names a file, a log line and a `/v1/models` badge).
@@ -195,6 +205,20 @@ test "abi dylib: a model table with a hook table older than the host's is refuse
     const spec: model_abi.SpecHooks = .{ .size = 8 };
     t.spec = &spec;
     try testing.expect(!negotiate(&m, pin).isOk());
+}
+
+test "abi dylib: a model table without its cache or weight hook table is refused by name, never read" {
+    const pin = "p";
+    var cache: model_abi.CacheHooks = .{};
+    var weights: model_abi.WeightHooks = .{};
+    const t: model_abi.ModelTable = .{ .name = .of("toy"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .weights = &weights };
+    inline for (.{ "cache", "weights" }) |field| {
+        var raw: [@sizeOf(model_abi.ModelTable)]u8 align(@alignOf(model_abi.ModelTable)) = undefined;
+        @memcpy(&raw, std.mem.asBytes(&t));
+        @memset(raw[@offsetOf(model_abi.ModelTable, field)..][0..@sizeOf(usize)], 0);
+        const m: Manifest = .{ .name = .of("toy"), .kind = .model, .mlx = .of(pin), .table = &raw, .fixture = noFixture, .fixture_free = noFree };
+        try testing.expectEqualStrings("model table has no cache or weight hook table: both are required, even empty", negotiate(&m, pin).why.slice());
+    }
 }
 
 test "abi dylib: plugin names are lower-case words, never paths" {

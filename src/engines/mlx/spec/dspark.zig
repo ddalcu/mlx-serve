@@ -27,6 +27,7 @@ const probsAllPositions = @import("../sampling/spec_sampling.zig").probsAllPosit
 const seedKey = @import("../sampling/lazy.zig").seedKey;
 const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
 const intree = @import("../plugin/intree.zig");
+const abi = @import("../../../abi/plugin.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 
 
@@ -102,7 +103,40 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
         return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
     }
+    if (plugin_driver.nativeDrafter(self.xfm) != null) return nativeRound(self, allocator);
     return modules.call("dspark_round", .{ self, allocator });
+}
+
+/// A sampled round of the served plugin's drafter: the plugin drafts and verifies, the engine accepts under the
+/// request's sampling, the plugin keeps what was accepted.
+fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) !?DrafterStepResult {
+    var v = try plugin_driver.nativeVerify(self.xfm, &self.ctx, self.next_token_id, cap);
+    defer _ = mlx.mlx_array_free(v.logits);
+    const ids = v.round.tokens[0..v.round.n];
+    // A failure below leaves the plugin's verify open, which is the model's, not this request's: close it.
+    var closed = false;
+    errdefer if (!closed) {
+        _ = plugin_driver.nativeFinish(self.xfm, &self.ctx, 0) catch 0;
+    };
+    const verdict = try stochasticVerdict(self, v.logits, ids, self.xfm.config.vocab_size, cap);
+    closed = true;
+    const position = try plugin_driver.nativeFinish(self.xfm, &self.ctx, verdict.accepted);
+    const tokens = try allocator.dupe(u32, ids[0 .. 1 + verdict.accepted]);
+    errdefer allocator.free(tokens);
+    self.dspark_stats.record(v.round.rows -| 1, verdict.accepted);
+    return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = verdict.accepted, .next_token = verdict.next_token }, @intCast(position));
+}
+
+/// One round of the served plugin's own drafter (`NativeDrafter.step`): its tokens and the trunk token after them.
+fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+    try plugin_settle.activate(self.xfm, &self.ctx);
+    const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+    if (self.dspark_stochastic) return nativeSampledRound(self, allocator, @min(cap, abi.max_round_tokens - 1));
+    const r = try plugin_driver.nativeRound(self.xfm, &self.ctx, self.next_token_id, @min(cap, abi.max_round_tokens - 1));
+    const tokens = try allocator.dupe(u32, r.tokens[0..r.n]);
+    errdefer allocator.free(tokens);
+    self.dspark_stats.record(r.rows -| 1, r.accepted);
+    return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = r.accepted, .next_token = r.next_token }, @intCast(r.position));
 }
 
 /// One DSpark round on the DeepSeek-V4/V4.1 module itself (`modules.call`).
@@ -244,16 +278,28 @@ pub fn nextDraw(self: *Generator) SamplingParams {
 /// house partial-accept invariant in sampled form.
 /// `copy`, when set, is the draft instead of the stages' (a one-hot proposal too).
 pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32, copy: ?*const mod.DsparkDraft) !mod.DsparkRound {
-    const s = self.xfm.s;
     var pending = if (copy) |d| try mod.dsparkBeginWith(mdl, allocator, &mdl.dec_state.?, t1, d) else try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
     defer pending.deinit();
-    const b: u32 = @intCast(pending.b);
+    const verdict = try stochasticVerdict(self, pending.vl_g, pending.verify[0 .. pending.b + 1], mdl.vocab, accepted_cap);
+    pending.lapVerify(mdl);
+
+    const round = try mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, verdict.accepted, verdict.next_token);
+    mod.dsparkObserve(mdl, round.phases);
+    return round;
+}
+
+/// The sampled accept of a verify chunk: `verify` is `[t1, drafts...]` and `vl_g` its logits `[rows, vocab]`. Keeps each
+/// draft (a point mass) with the probability the request's filtered density gives it; the token pending after the kept
+/// prefix is the residual sample at the first reject, or the bonus draw from the last row on a full accept.
+fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32) !struct { accepted: u32, next_token: u32 } {
+    const s = self.xfm.s;
+    const b: u32 = @intCast(verify.len - 1);
 
     // Filtered target probs over every verify row: [b+1, V] → [1, b+1, V].
-    const vshape = [_]c_int{ 1, @intCast(pending.b + 1), @intCast(mdl.vocab) };
+    const vshape = [_]c_int{ 1, @intCast(verify.len), @intCast(vocab) };
     var vl3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vl3);
-    try mlx.check(mlx.mlx_reshape(&vl3, pending.vl_g, &vshape, 3, s));
+    try mlx.check(mlx.mlx_reshape(&vl3, vl_g, &vshape, 3, s));
     const sp = self.nextDraw();
     const probs_all = try probsAllPositions(vl3, sp, s);
     defer _ = mlx.mlx_array_free(probs_all);
@@ -288,12 +334,12 @@ pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, com
             _ = mlx.mlx_array_free(arr);
         };
         const idshape = [_]c_int{1};
-        for (0..pending.b) |k| {
-            const idv = [_]i32{@intCast(pending.verify[k + 1])};
+        for (0..b) |k| {
+            const idv = [_]i32{@intCast(verify[k + 1])};
             draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
             n_arrs += 1;
         }
-        var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, sp, s);
+        var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..b], null, b, sp, s);
         defer bg.deinit();
 
         // ONE bounded sync: the accept vector + pre-sampled corrections
@@ -320,11 +366,7 @@ pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, com
         const corr = mlx.mlx_array_data_int32(bg.corr_samples) orelse return error.MlxArrayDataNull;
         next_token = @intCast(corr[accepted]);
     }
-    pending.lapVerify(mdl);
-
-    const round = try mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, accepted, next_token);
-    mod.dsparkObserve(mdl, round.phases);
-    return round;
+    return .{ .accepted = accepted, .next_token = next_token };
 }
 
 // ── tests ──

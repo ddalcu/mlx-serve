@@ -1260,7 +1260,7 @@ fn handleResponsesInner(
         const slot_mrope = mm.mrope;
         mm.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, stream);
+        result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);

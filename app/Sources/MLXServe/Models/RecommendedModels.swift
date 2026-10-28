@@ -63,6 +63,7 @@ private let bytesPerGiB: Double = 1_073_741_824
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
+    case liquid = "Liquid"
     case largest = "Largest models"
 }
 
@@ -180,6 +181,28 @@ struct RecommendedModelPick: Identifiable, Hashable {
 /// The fixed pool of picks the Recommended pane draws from, as static
 /// members on the type itself so the catalogs below can use plain
 /// dot-shorthand (`.gemmaE4B`).
+extension RecommendedModelPick {
+    static let lfm3_1_7b = lfm3(id: "lfm3-1.7b", name: "LFM3 1.7B", tagline: "Tiny and quick",
+        blurb: "Liquid's small text model: answers in a blink, thinks before it answers, and calls tools. A good fit for quick questions on any Mac.",
+        repo: "LiquidAI/LFM3-1.7B-MLX-8bit", sizeGB: 1.9, context: 262_144)
+    static let lfm3Vl2b = lfm3(id: "lfm3-vl-2b", name: "LFM3 VL 2B", tagline: "Sees pictures and video",
+        blurb: "The same small model with eyes: describe a photo, read a screenshot, or ask about a short clip.",
+        repo: "LiquidAI/LFM3-VL-2B-MLX-8bit", sizeGB: 2.2, context: 128_000)
+    static let lfm3Audio2b = lfm3(id: "lfm3-audio-2b", name: "LFM3 Audio 2B", tagline: "Hears and speaks",
+        blurb: "Talk to it and it answers in its own voice: native voice mode, transcription and text to speech in 19 languages, all in one small model.",
+        repo: "LiquidAI/LFM3-Audio-2B-MLX-8bit", sizeGB: 2.5, context: 128_000)
+    static let lfm3Omni2b = lfm3(id: "lfm3-omni-2b", name: "LFM3 Omni 2B", tagline: "Sees, hears and speaks",
+        blurb: "Everything at once: pictures, video and your voice in, text or its own voice out. Native voice mode in a model under 3 GB.",
+        repo: "LiquidAI/LFM3-Omni-2B-MLX-8bit", sizeGB: 2.9, context: 128_000)
+
+    private static func lfm3(id: String, name: String, tagline: String, blurb: String, repo: String,
+                             sizeGB: Double, context: Int) -> RecommendedModelPick {
+        RecommendedModelPick(id: id, name: name, tagline: tagline, blurb: blurb, repoId: repo, sizeGB: sizeGB,
+                             family: .liquid, intelligence: 15, intelligenceIsEstimated: true, speed: 85,
+                             contextTokens: context, activeParamsB: 1.7)
+    }
+}
+
 extension RecommendedModelPick {
     static let gemmaE4B = RecommendedModelPick(
         id: "gemma-4-e4b",
@@ -483,8 +506,13 @@ extension RecommendedModelPick {
 
     /// Every curated pick, across all three sections — the union the score
     /// invariants sweep and the one list a new section can't slip past.
+    /// Liquid LFM3: small and fast, and the two that hear and speak run native voice (the composer's purple
+    /// toggle). One trunk (1.7B active) under all four; speed is estimated from its weight bytes (no M4 Max cell
+    /// yet), intelligence is ours (no Artificial Analysis entry).
+    static let liquidCatalog: [RecommendedModelPick] = [lfm3_1_7b, lfm3Vl2b, lfm3Audio2b, lfm3Omni2b]
+
     static let allCatalogs: [RecommendedModelPick] =
-        gemmaCatalog + qwenCatalog + largestCatalog
+        gemmaCatalog + qwenCatalog + liquidCatalog + largestCatalog
 
     // MARK: - The starter recommendation
 

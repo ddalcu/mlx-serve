@@ -1,4 +1,5 @@
 //! Generator.initWithOptions: the prompt prefill and every spec-decode arm's setup.
+const speech_mod = @import("speech.zig");
 const depth_bounds = @import("../spec/mtp_depth_bounds.zig");
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -52,6 +53,7 @@ const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpoint
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
 const intree = @import("../plugin/intree.zig");
+const plugin_driver = @import("../plugin/driver.zig");
 
 
 pub fn initWithOptions(
@@ -93,7 +95,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
-    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or xfm.mlx_stream_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or xfm.mlx_stream_ext != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
         // checkpoint ships stages and the request is CLEAN (no
@@ -105,9 +107,13 @@ pub fn initWithOptions(
         // traffic that otherwise always ran serial). PLD / drafter / qwen-MTP
         // remain hard-off regardless: their verify forwards go through
         // machinery this arch cannot roll back.
-        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
+        const native = plugin_driver.nativeDrafter(xfm) != null;
+        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else if (native) xfm.config.plugin.?.parsed.spec.native_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
         const dspark_env_off = !dsparkEnabled();
+        // A plugin whose drafter cannot hand the verify back accepts greedily: a sampled request runs serial.
         const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
+            DsparkArm.off
+        else if (native and !plugin_driver.nativeSplit(xfm) and dsparkArmFor(sampling, options.logprobs_n) == .stochastic)
             DsparkArm.off
         else
             dsparkArmFor(sampling, options.logprobs_n);
@@ -741,7 +747,7 @@ pub fn initWithOptions(
     // acceptance-critical), so capture ALL positions and append.
     const drafter_active = options.drafter_enabled and options.drafter != null;
     const pld_active = options.pld_enabled;
-    const need_capture = drafter_active or mtp_active;
+    const need_capture = drafter_active or mtp_active or options.speech != null;
     var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
     var has_captured_hidden = false;
     const last_start_ns = if (trace_enabled) prefill_sw.read() else 0;
@@ -997,6 +1003,41 @@ pub fn initWithOptions(
     // in cache — matches `forwardBatchedDecode`'s expectation and the
     // PLD / drafter init path's invariant. Generator.next's transition
     // shim handles the bootstrap on the first decode tick.
+    if (options.speech) |req| {
+        const b = xfm.plugin orelse return error.SpeechUnsupported;
+        const hooks = b.table.speech orelse return error.SpeechUnsupported;
+        const parsed = &xfm.config.plugin.?.parsed;
+        const st = try allocator.create(speech_mod.State);
+        errdefer allocator.destroy(st);
+        st.* = try speech_mod.State.init(allocator, hooks, b.model, parsed.speech, parsed.placeholder_ids.audio, @intCast(mlx.getShape(logits)[mlx.getShape(logits).len - 1]), xfm.suppress_mask, prompt_ids[prompt_ids.len - 1], req, sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()), s);
+        var gen = Generator{
+            .xfm = xfm,
+            .ctx = ctx,
+            .tok = tok,
+            .next_token_id = 0,
+            .step = 0,
+            .max_tokens = max_tokens,
+            .sampling = sampling,
+            .prompt_tokens = @intCast(prompt_ids.len),
+            .completion_tokens = 0,
+            .finish_reason = "length",
+            .done = false,
+            .eos_token_ids = eos_token_ids,
+            .generated_ids = std.ArrayList(u32).empty,
+            .timeout_ns = 0,
+            .timer = io_util.Stopwatch.init(io),
+            .last_hidden = captured_hidden,
+            .has_last_hidden = true,
+            .prng = std.Random.DefaultPrng.init(0),
+            .prompt_ids_owned = prompt_owned,
+            .prompt_ids_alloc = allocator,
+            .speech = st,
+        };
+        gen.pending_logits = logits;
+        gen.has_pending_logits = true;
+        attachCp(&gen, &ssm_checkpoints, allocator);
+        return gen;
+    }
     if (options.skip_lazy_preforward) {
         const sample_lazy = sampleTokenLazy(logits, sampling, s);
         try mlx.check(mlx.mlx_array_eval(sample_lazy));

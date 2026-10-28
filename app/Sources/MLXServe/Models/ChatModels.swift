@@ -478,6 +478,11 @@ struct ModelInfo {
     /// only BERT entries, loaded or stub). DocumentIndex uses this to pick a
     /// GPU embedder for folder indexing.
     var supportsEmbeddings: Bool = false
+    /// True when the model answers in speech itself (`output_modalities` holds `audio`: LFM3-Audio, Omni). Voice
+    /// mode then sends what the user said and plays what the model says, instead of dictation + a system voice.
+    var speaks: Bool = false
+    /// The voices a model that speaks answers in (`<language>-<female|male>`), as its row lists them.
+    var voices: [String] = []
     /// Raw `capabilities` array as the server sent it ("chat", "vision",
     /// "image", "video", "audio", "embeddings", …). `slotKind` classifies a
     /// registry entry into a tray slot from these.

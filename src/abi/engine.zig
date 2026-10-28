@@ -175,7 +175,7 @@ pub const Stats = extern struct {
 /// before its prefill completes (cancelled, failed) gets `finished` alone.
 pub const Event = extern struct {
     size: u32 = @sizeOf(Event),
-    kind: enum(u8) { prefilled, tokens, finished },
+    kind: enum(u8) { prefilled, tokens, finished, audio },
     cached: u32 = 0, // prefilled: prompt tokens restored from a kept prefix
     tokens: Span(u32) = .{}, // tokens: committed ids in order, valid during the call
     logprobs: Span(Logprob) = .{}, // tokens: one per id when asked for
@@ -190,6 +190,9 @@ pub const Event = extern struct {
     loop_trim_start: u64 = std.math.maxInt(u64), // finished: where a loop-stopped span begins in the generated tokens
     refused_needed: u64 = 0, // finished(failed): bytes the engine's admission needed ...
     refused_available: u64 = 0, // ... and had, when it refused the prefill
+    codes: Span(u32) = .{}, // audio: spoken frames' codes, frame after frame, valid during the call
+    samples: Span(f32) = .{}, // audio: the mono samples those frames made final
+    sample_rate: u32 = 0, // audio
 };
 
 /// Runs on the engine's thread; returns at once. `stop` ends the request as `finished(stop)` after this round:
@@ -368,7 +371,7 @@ test "engine abi: extern layouts are pinned (64-bit)" {
     try expectLayout(Request, 208, .{ .size = 0, .prompt = 8, .media = 24, .max_tokens = 40, .sampling = 48, .eos = 104, .logprobs = 120, .grammar = 128, .think = 136, .tool_gate = 144, .cache = 152, .background = 176, .options_json = 184, .no_drafts = 200, .prompt_logprobs = 201 });
     try expectLayout(Logprob, 24, .{ .token = 0, .logprob = 4, .top = 8 });
     try expectLayout(Stats, 80, .{ .size = 0, .rounds = 8, .drafted = 16, .accepted = 24, .prefill_ns = 32, .decode_ns = 40, .spec_mode = 48, .telemetry_json = 64 });
-    try expectLayout(Event, 160, .{ .size = 0, .kind = 4, .cached = 8, .tokens = 16, .logprobs = 32, .reason = 48, .stats = 56, .verdict = 64, .prompt_tokens = 88, .prompt_logprobs = 96, .constraint_at = 112, .constraint_offset = 116, .finish_details = 120, .loop_trim_start = 136, .refused_needed = 144, .refused_available = 152 });
+    try expectLayout(Event, 200, .{ .size = 0, .kind = 4, .cached = 8, .tokens = 16, .logprobs = 32, .reason = 48, .stats = 56, .verdict = 64, .prompt_tokens = 88, .prompt_logprobs = 96, .constraint_at = 112, .constraint_offset = 116, .finish_details = 120, .loop_trim_start = 136, .refused_needed = 144, .refused_available = 152, .codes = 160, .samples = 176, .sample_rate = 192 });
     try expectLayout(Sink, 16, .{ .ctx = 0, .event = 8 });
     try expectLayout(Status, 32, .{ .size = 0, .running = 4, .waiting = 8, .decode_tps = 16, .prefill_tps = 24 });
     try expectLayout(Memory, 32, .{ .size = 0, .active = 8, .cache = 16, .peak = 24 });

@@ -711,6 +711,8 @@ pub const ModelConfig = struct {
     // DeepSeek-V4.1 vision tower (src/plugins/deepseek_v41/vision.zig): the release's `vision_config`, on top of the
     // generic vision_* geometry. `dv_max_wh_ratio` 0 = no cap (the release's null).
     dsv41_vision: bool = false,
+    /// The serving plugin runs its own towers (`abi.MediaHooks`): the host hands them decoded RGB frames and samples.
+    plugin_media: bool = false,
     dv_downsample: u32 = 3,
     dv_max_image_tokens: u32 = 1024,
     dv_min_pixels: u32 = 295936,
@@ -1212,6 +1214,18 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "glm5_next");
     }
 
+    /// The served model's speech output (`Parsed.speech`); null = it does not speak.
+    pub fn speech(self: *const ModelConfig) ?abi.SpeechFacts {
+        const b = self.plugin orelse return null;
+        return if (b.parsed.speech.codebooks != 0) b.parsed.speech else null;
+    }
+
+    /// A plugin running its own towers whose caps take speech: its `audio_tower.*` loads.
+    pub fn pluginHears(self: *const ModelConfig) bool {
+        const b = self.plugin orelse return false;
+        return self.plugin_media and b.parsed.caps.audio;
+    }
+
     pub fn isDsv41(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
@@ -1701,6 +1715,12 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = parseConfigFromJson(allocator, content) catch |e| {
         const b = binding orelse return e;
         log.info("[plugin] {s}: the legacy parse refused {s} ({s}); the engine config is the plugin's facts\n", .{ b.table.name.slice(), b.parsed.shell.model_type.slice(), @errorName(e) });
+        return plugin_config.adapted(b);
+    };
+    // A type the legacy parse knows only as a llama guess is the plugin's facts alone (the layout, the recurrent
+    // states), never a full-attention llama.
+    if (binding) |b| if (std.mem.eql(u8, config.model_type, "unknown")) {
+        config.deinit(allocator);
         return plugin_config.adapted(b);
     };
     errdefer config.deinit(allocator);
@@ -4963,7 +4983,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         .shard => |sh| try config.applyShard(sh),
         .remote => |r| config.pairDsv41(.{ .lo = r.start, .hi = r.end, .worker = false }),
     };
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null or config.pluginHears(), .keep_f16 = config.actDtype() == .float16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainPart(&weights, sp);

@@ -1687,6 +1687,20 @@ const corpus = [_]Expect{
         .tool_arg_key = "command",
     },
 
+    // ── lfm3 (LFM3) — qwen_xml calls; verbatim from LiquidAI/LFM3-1.7B-MLX-8bit (streamed, thinking on) ──
+    .{
+        .family = "lfm3",
+        .name = "write_file whose content looks like a tag",
+        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\nhello.txt\n</parameter>\n<parameter=content>\nok <done>\n</parameter>\n</function>\n</tool_call>",
+        .thinking = true,
+        .tools_json =
+        \\[{"type":"function","function":{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+        ,
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "ok <done>",
+    },
+
     // ── lfm2 (LFM2.5) — pythonic call expressions ──────────────────────
     // Verbatim from mlx-community/LFM2.5-2.6B-8bit via /v1/completions
     // against its own rendered template. Values are PYTHON

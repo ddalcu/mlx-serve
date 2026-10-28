@@ -72,35 +72,16 @@ final class VoiceActivityTests: XCTestCase {
         XCTAssertTrue(0.2 > t, "normal speech must still clear the bar")
     }
 
-    // MARK: - Finalize decision (silence OR transcript-stall backstop)
+    // MARK: - Finalize decision (silence, or the longest utterance)
 
-    func testSilenceTimeoutFinalizes() {
-        XCTAssertTrue(VoiceActivity.shouldFinalize(
-            silenceElapsed: 1.2, silenceTimeout: 1.1,
-            hasTranscript: false, transcriptStallElapsed: 0.1, stallTimeout: 2.0))
+    func testSilenceEndsTheUtterance() {
+        XCTAssertTrue(VoiceActivity.shouldFinalize(silenceElapsed: 1.2, silenceTimeout: 1.1, speechElapsed: 3, maxUtterance: 30))
+        XCTAssertFalse(VoiceActivity.shouldFinalize(silenceElapsed: 0.4, silenceTimeout: 1.1, speechElapsed: 3, maxUtterance: 30))
     }
 
-    func testTranscriptStallFinalizesEvenWhileRMSSaysSpeech() {
-        // Backstop for anything the energy VAD misclassifies as endless speech:
-        // recognition stopped producing new words 2s ago and we HAVE words →
-        // the user is done talking, finalize regardless of RMS.
-        XCTAssertTrue(VoiceActivity.shouldFinalize(
-            silenceElapsed: 0.0, silenceTimeout: 1.1,
-            hasTranscript: true, transcriptStallElapsed: 2.1, stallTimeout: 2.0))
-    }
-
-    func testStallWithoutTranscriptDoesNotFinalize() {
-        // No words yet → nothing to submit; the stall path must not fire on
-        // ambient noise that never transcribed to anything.
-        XCTAssertFalse(VoiceActivity.shouldFinalize(
-            silenceElapsed: 0.0, silenceTimeout: 1.1,
-            hasTranscript: false, transcriptStallElapsed: 5.0, stallTimeout: 2.0))
-    }
-
-    func testMidUtteranceKeepsListening() {
-        XCTAssertFalse(VoiceActivity.shouldFinalize(
-            silenceElapsed: 0.4, silenceTimeout: 1.1,
-            hasTranscript: true, transcriptStallElapsed: 0.3, stallTimeout: 2.0))
+    /// A room the energy VAD reads as endless speech still hands over what it heard.
+    func testTheLongestUtteranceEndsItEvenMidSpeech() {
+        XCTAssertTrue(VoiceActivity.shouldFinalize(silenceElapsed: 0, silenceTimeout: 1.1, speechElapsed: 30, maxUtterance: 30))
     }
 
     // MARK: - Lazy audio stack (mic prompt must wait for voice-mode enable)

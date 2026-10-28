@@ -254,6 +254,37 @@ pub const PlaceholderIds = extern struct {
     eoa: u32 = 0,
     vision_start: u32 = 0,
     vision_end: u32 = 0,
+    /// A spoken frame of the model's own (`SpeechFacts.frame_token`): a replayed turn's frame rows splice here.
+    speech: u32 = 0,
+};
+
+/// Speech output: each `frame_token` slot is one frame of `codebooks` codes the model's `SpeechHooks.frame` draws from
+/// the trunk's last hidden row; `codebooks` 0 = the model does not speak. A generation starts in text, or in speech
+/// after `audio_start`, or interleaved after `mixed_start`: `interleave_text` text slots, then `interleave_audio`
+/// frames, until `text_end` ends the block's text; a frame of `eos_code` ends the speech.
+pub const SpeechFacts = extern struct {
+    size: u32 = @sizeOf(SpeechFacts),
+    codebooks: u32 = 0,
+    codebook_size: u32 = 0,
+    eos_code: u32 = 0,
+    frame_token: u32 = 0,
+    audio_start: u32 = 0,
+    mixed_start: u32 = 0,
+    text_end: u32 = 0,
+    interleave_text: u32 = 0,
+    interleave_audio: u32 = 0,
+    /// The codec's output: mono samples per second, samples per frame.
+    sample_rate: u32 = 0,
+    frame_samples: u32 = 0,
+    /// The speech sampling a request leaves unset (`top_k` 0 = every code); the penalty reads the last
+    /// `repetition_window` frames.
+    temperature: f32 = 1.0,
+    top_k: u32 = 0,
+    repetition_penalty: f32 = 1.0,
+    repetition_window: u32 = 0,
+    /// The model speaks its reply to a request with tools (its card's tools recipe: no prefill, a call or speech).
+    /// false: such a request answers in text.
+    tools: bool = false,
 };
 
 /// The model's interleaved M-RoPE spectrum, from which the engine builds a prompt chunk's angles off the prompt's
@@ -301,6 +332,7 @@ pub const Parsed = extern struct {
     mrope: MropeFacts = .{},
     /// The plugin's own parsed config, read by its `bill` and `load`.
     private: ?*anyopaque = null,
+    speech: SpeechFacts = .{},
 };
 
 // ── Bill ──
@@ -370,7 +402,7 @@ pub const Forward = extern struct {
     caches: Span(Handle) = .{},
     /// Layers whose hidden rows the forward publishes (DFlash); filled into `ForwardOut.captured`.
     capture_layers: Span(u32) = .{},
-    /// Media rows `[n, hidden]` to splice at the placeholder ids (`Parsed.placeholder_ids`) in token order, from row
+    /// Media rows `[1, n, hidden]` to splice at the placeholder ids (`Parsed.placeholder_ids`) in token order, from row
     /// `media_offset` on (a chunked prefill resumes there).
     media: Array = .{},
     media_offset: u32 = 0,
@@ -409,6 +441,13 @@ pub const Forward = extern struct {
     /// finite: a left-padded prompt's pads masked), summed into every layer's scores (`Caps.prefill_mask`); empty =
     /// none.
     mask_add: Array = .{},
+    /// A native drafter's round (`NativeDrafter.step`): the most drafts it may keep, the tokens still allowed less one.
+    accept_cap: u32 = 0,
+    /// The sampler's suppress mask `[vocab]` (true = never drawn), which a round's greedy accept applies; empty = none.
+    suppress_mask: Array = .{},
+    /// Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`);
+    /// empty = embed the ids.
+    embeds: Array = .{},
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs
@@ -514,6 +553,23 @@ pub const CacheOps = extern struct {
 
 /// The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number
 /// of slots (`.last_row`) or of tokens (`.all_rows`).
+pub const max_round_tokens = 32;
+
+/// What a native drafter's round committed.
+pub const Round = extern struct {
+    /// Tokens committed, `t1` first: `tokens[0..n]`.
+    n: u32 = 0,
+    /// Drafts kept of those verified (`n - 1`).
+    accepted: u32 = 0,
+    /// The trunk's token after them, the next round's `t1`.
+    next_token: u32 = 0,
+    /// Verify rows run, `t1` included, for the engine's stats.
+    rows: u32 = 0,
+    /// The model's position after the round.
+    position: u64 = 0,
+    tokens: [max_round_tokens]u32 = @splat(0),
+};
+
 pub const ForwardOut = extern struct {
     size: u32 = @sizeOf(ForwardOut),
     logits: Array = .{},
@@ -522,6 +578,8 @@ pub const ForwardOut = extern struct {
     captured: ?[*]Array = null,
     /// What each slot of a `defer_host` forward left owed (one value for every slot of the forward).
     owed: Owed = .none,
+    /// `NativeDrafter.step`'s result.
+    round: Round = .{},
 };
 
 // ── Hooks ──
@@ -655,8 +713,17 @@ pub const HeadHooks = extern struct {
 /// A drafter the model carries in its own forward (DSpark); stages and block are `SpecFacts`.
 pub const NativeDrafter = extern struct {
     size: u32 = @sizeOf(NativeDrafter),
+    /// One greedy round on the model's own state: `f.tokens` is the committed token `t1` (not yet in the state, which
+    /// stands at `f.positions[0]`), `f.accept_cap` the most drafts to keep. The model drafts, verifies, keeps the
+    /// drafts its own argmax agrees with (under `f.suppress_mask`), rewinds its state to them and writes `out.round`.
     step: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
-    verify: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
+    /// The first half of a round the engine accepts itself (a sampled request): the model drafts from `t1` and verifies
+    /// the block, leaving the verify open. A `verify` while one is open discards the open one. `out.round.tokens[0..n]` are the verified rows' ids (`t1` first) and
+    /// `out.logits` their logits `[n, vocab]` (f32). Needs `finish`.
+    verify: ?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict = null,
+    /// The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and
+    /// writes the model's position into `out.round.position`.
+    finish: ?*const fn (m: *anyopaque, accepted: u32, out: *ForwardOut) callconv(.c) Verdict = null,
 };
 
 /// A trunk tensor a drafter reads beside the trunk's forward.
@@ -678,6 +745,21 @@ pub const SpecHooks = extern struct {
 
 pub const MediaKind = enum(u8) { image, video, audio };
 
+/// One request's media item as the host decoded it: RGB8 frames (an image is one frame) or mono f32 samples.
+pub const MediaInput = extern struct {
+    size: u32 = @sizeOf(MediaInput),
+    kind: MediaKind = .image,
+    /// Packed RGB8, `frames` frames of `width x height`, frame after frame.
+    rgb: Span(u8) = .{},
+    width: u32 = 0,
+    height: u32 = 0,
+    frames: u32 = 0,
+    /// The rate a video's frames were sampled at; 0 = the client did not say.
+    fps: f32 = 0,
+    samples: Span(f32) = .{},
+    sample_rate: u32 = 0,
+};
+
 /// One prepared media item: its pixels (or samples) as a new reference the host owns, and its row plan.
 pub const MediaItem = extern struct {
     size: u32 = @sizeOf(MediaItem),
@@ -689,19 +771,62 @@ pub const MediaItem = extern struct {
     /// Encoder calls the item takes (crops plus a thumbnail); 1 = a single pass.
     tiles: u32 = 1,
     pixels: Array = .{},
+    /// The pixels as host memory instead of `pixels`: float32 little-endian, `grid[1] * grid[2]` rows of equal width.
+    /// Plugin-owned until the host has copied it and called `free`. `prepare` runs on a connection thread, which never
+    /// calls MLX, so an outside plugin returns its pixels this way.
+    bytes: Span(u8) = .{},
+    free: ?*const fn (item: *MediaItem) callconv(.c) void = null,
+    /// A video's frame rate as prepared and its frames before any padding (its run's timestamps); 0 elsewhere.
+    fps: f32 = 0,
+    frames: u32 = 0,
 };
 
+/// The model's tokenizer, for text inside a placeholder run (a video's timestamps): writes `text`'s ids into `out`
+/// (`cap` entries) and returns their count.
+pub const TextTokens = extern struct {
+    ctx: ?*anyopaque,
+    encode: *const fn (ctx: ?*anyopaque, text: Str, out: [*]u32, cap: u32) callconv(.c) u32,
+};
+
+/// Every hook runs on the inference thread, `tower` in the same encode as the `prepare` that made its item.
 pub const MediaHooks = extern struct {
     size: u32 = @sizeOf(MediaHooks),
-    /// The tower forward: the item's rows.
+    /// The tower forward: the item's rows `[rows, hidden]`.
     tower: *const fn (m: *anyopaque, item: *const MediaItem, out: *Array) callconv(.c) Verdict,
-    /// Decodes and resizes one item's `bytes` within the pixel `budget`.
-    prepare: *const fn (p: *const Parsed, kind: MediaKind, bytes: Str, budget: u64, out: *MediaItem) callconv(.c) Verdict,
-    /// Writes the item's placeholder token run into `out` (`cap` entries); returns its length.
-    placeholder_rows: ?*const fn (p: *const Parsed, item: *const MediaItem, out: [*]u32, cap: u32) callconv(.c) u32 = null,
+    /// Resizes and lays out one decoded input as the model's processor does, within `budget` pixels a frame.
+    prepare: *const fn (p: *const Parsed, in: *const MediaInput, budget: u64, out: *MediaItem) callconv(.c) Verdict,
+    /// Writes the token run replacing the item's one placeholder into `out` (`cap` entries); returns its length,
+    /// 0 when it does not fit. Null: `rows` of the kind's placeholder id.
+    placeholder_rows: ?*const fn (p: *const Parsed, item: *const MediaItem, tok: *const TextTokens, out: [*]u32, cap: u32) callconv(.c) u32 = null,
     /// The M-RoPE table over the expanded prompt `ids`.
     positions: ?*const fn (p: *const Parsed, ids: Span(u32), items: Span(MediaItem), out: *Array) callconv(.c) Verdict = null,
     video_prune: ?*const fn (m: *anyopaque, item: *const MediaItem, rows: Array, out: *Array) callconv(.c) Verdict = null,
+};
+
+/// How one frame samples (`SpeechFacts` holds the defaults). `order` empty = MaskGIT reveals codebooks in a random
+/// order drawn from `key`; else the codebook permutation it reveals in.
+pub const SpeechSampling = extern struct {
+    size: u32 = @sizeOf(SpeechSampling),
+    temperature: f32 = 1.0,
+    top_k: u32 = 0,
+    repetition_penalty: f32 = 1.0,
+    key: u64 = 0,
+    order: Span(u32) = .{},
+};
+
+/// Speech output (`Parsed.speech`); every hook runs on the inference thread.
+pub const SpeechHooks = extern struct {
+    size: u32 = @sizeOf(SpeechHooks),
+    /// One frame's `codebooks` codes into `out` from the trunk's final-normed last row `hidden` `[1, hidden]`;
+    /// `history` = earlier frames' codes, frame after frame, for the penalty. A frame holding `eos_code` is all of it.
+    frame: *const fn (m: *anyopaque, hidden: Array, how: *const SpeechSampling, history: Span(u32), out: [*]u32) callconv(.c) Verdict,
+    /// The input rows `[1, frames, hidden]` of whole frames of `codes` (`Forward.embeds`, a replayed turn's media).
+    frame_rows: *const fn (m: *anyopaque, codes: Span(u32), out: *Array) callconv(.c) Verdict,
+    /// A streaming decode of frames into samples: `push` appends whole frames and writes the samples now final into
+    /// `out` (`cap` at least `frame_samples` per frame pushed, plus one frame), `finish` true also the tail.
+    codec_open: *const fn (m: *anyopaque, out: *Handle) callconv(.c) Verdict,
+    codec_push: *const fn (m: *anyopaque, h: Handle, codes: Span(u32), finish: bool, out: [*]f32, cap: usize, len: *usize) callconv(.c) Verdict,
+    codec_close: *const fn (m: *anyopaque, h: Handle) callconv(.c) void,
 };
 
 pub const EmbedHooks = extern struct {
@@ -769,6 +894,7 @@ pub const ModelTable = extern struct {
     /// `slot`'s arm counters for its request's summary lines (each a full log line), in memory the plugin owns until
     /// the next call on `m`; the counters reset.
     meters: ?*const fn (m: *anyopaque, slot: u32, out: *Str) callconv(.c) void = null,
+    speech: ?*const SpeechHooks = null,
 };
 
 /// The modes a model serves: prefill, decode and verify always; the rest as its caps declare. An encoder (`embed`)
@@ -792,12 +918,12 @@ test "abi plugin: caps fit one word with the generic defaults" {
 }
 
 test "abi plugin: every struct opens with its size, set by default" {
-    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem }) |T| {
+    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem, MediaInput, SpeechFacts, SpeechSampling }) |T| {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
         const v: T = .{};
         try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);
     }
-    inline for (.{ LoadCtx, Forward, Offload, CacheOps, AuxHooks, HeadHooks, NativeDrafter, MediaHooks, DistHooks, ModelTable }) |T|
+    inline for (.{ LoadCtx, Forward, Offload, CacheOps, AuxHooks, HeadHooks, NativeDrafter, MediaHooks, DistHooks, ModelTable, SpeechHooks }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
 }
 

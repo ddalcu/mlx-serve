@@ -75,6 +75,8 @@ The deeper the seam, the less of our stack the model gets for free. Use the shal
 | Format | detection, the JSON a model directory would hold, the tensor map, kernels for its encodings | the arch, KV cache, batching, spec decode, prefix cache | GGUF (`src/sdk/quant/gguf/`) |
 | Weight encoding | config parse and load checks, the matmul over its weights | the arch and everything above it | EXL3 (`src/sdk/quant/exl3/`, from sushi) |
 | Arch | a model's forward, its kernels and decode state, its weight loading and memory bill | HTTP, the template, tool calls, sampling, stops, scheduling, admission | mlx-stream (DeepSeek-V4.1's EXL3 repack, MiMo-V2.6-Flash, GLM-5.3) |
+| Media towers (`abi.MediaHooks`) | `prepare` (a decoded item, RGB8 frames or 16 kHz samples, as its processor lays it out), the tower, the item's placeholder run (text through the tokenizer callback) | decoding, the encoder cache, placeholder expansion, the splice, prefix-cache media keys | LFM3-VL (`src/plugins/lfm3/media.zig`) |
+| Speech output (`abi.SpeechHooks`, `Parsed.speech`) | a frame of codes from the trunk's last hidden row, a frame's input rows (`Forward.embeds`), a streaming codec | the text/speech/interleaved slot machine (`engines/mlx/generate/speech.zig`), sampling windows, `.audio` events, OpenAI `modalities`, `/v1/audio/speech` + transcriptions | LFM3-Audio, Omni (`src/plugins/lfm3/speech.zig`) |
 
 Not a seam: **opaque engines.** ds4 and llama.cpp keep their bridges (`src/engines/ds4/bridge.zig`, `src/engines/llama/bridge.zig`).
 

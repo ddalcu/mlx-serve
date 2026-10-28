@@ -149,6 +149,7 @@ enum SettingsReset {
                 f("voiceCloneLabel") { $0.voiceCloneLabel = $1.voiceCloneLabel },
                 f("voiceEngine") { $0.voiceEngine = $1.voiceEngine },
                 f("kokoroVoice") { $0.kokoroVoice = $1.kokoroVoice },
+                f("lfm3Voice") { $0.lfm3Voice = $1.lfm3Voice },
                 f("wakePhrase") { $0.wakePhrase = $1.wakePhrase },
                 f("transcriptNotesModel") { $0.transcriptNotesModel = $1.transcriptNotesModel },
                 f("transcriptAutoStopMinutes") { $0.transcriptAutoStopMinutes = $1.transcriptAutoStopMinutes },

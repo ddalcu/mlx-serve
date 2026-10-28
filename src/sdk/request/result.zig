@@ -36,6 +36,10 @@ pub const GenerationResult = struct {
     /// (completion cap mid-reasoning), or the boundary fell outside the
     /// emitted (loop-trimmed) tokens.
     constraint_payload_byte: ?usize = null,
+    /// A spoken reply: its mono samples at `sample_rate` and its frames' codes (caller frees both).
+    audio_samples: ?[]f32 = null,
+    audio_codes: ?[]u32 = null,
+    sample_rate: u32 = 0,
 };
 
 /// Throughput in tokens/sec. Returns 0 when no time elapsed so unmeasured paths

@@ -212,7 +212,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        (intree.dsv4(slot.model.transformer.?) != null or intree.dsv41(slot.model.transformer.?) != null or slot.model.transformer.?.mlx_stream_ext != null);
+        (intree.dsv4(slot.model.transformer.?) != null or intree.dsv41(slot.model.transformer.?) != null or plugin_driver.nativeDrafter(slot.model.transformer.?) != null or slot.model.transformer.?.mlx_stream_ext != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -586,6 +586,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // transition shim sync-forwards [t1] on the first decode call.
             // PLD/drafter/MTP init paths already skip preforward unconditionally.
             .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp and !use_dflash,
+            .speech = slot.speech,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,

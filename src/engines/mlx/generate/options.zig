@@ -146,6 +146,8 @@ pub const InitOptions = struct {
     /// behavior to the regular sampling path. Has no effect when
     /// `pld_enabled` or `drafter_enabled` is true.
     skip_lazy_preforward: bool = false,
+    /// A spoken reply (`generate/speech.zig`): the prefill keeps its last row's logits and hidden, nothing sampled.
+    speech: ?@import("speech.zig").Request = null,
     /// Phase 1 (performance-plan): during prefill, capture an SSM
     /// checkpoint every `ssm_checkpoint_stride` tokens. 0 = disabled.
     /// Snapshots land in `Generator.ssm_checkpoints` for the caller to

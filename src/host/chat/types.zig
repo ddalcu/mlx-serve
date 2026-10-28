@@ -40,7 +40,7 @@ pub const VisionPreproc = struct {
     /// `gemma_budget` (Gemma 4's own processor, as EmbeddingGemma 2 uses it: a CHW image of any
     /// aspect ratio sized to `max_tokens` soft tokens), or one of the patch-grid towers
     /// (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio, dsv41 } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio, dsv41, plugin, plugin_rgb } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -64,6 +64,8 @@ pub const VisionPreproc = struct {
     max_frames: u32 = 0,
     /// dsv41: an image wider than this many heights is stretched into the capped canvas (0 = no cap).
     max_wh_ratio: u32 = 0,
+    /// plugin: the served outside plugin (`plugin_config.Binding`) whose media hooks prepare the image.
+    plugin: ?*anyopaque = null,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -83,6 +85,9 @@ pub const VideoData = struct {
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
+    /// A plugin tower's clip (`.plugin_rgb`): `pixels` is `grid_t` RGB8 frames of `grid_w x grid_h`, sampled at `fps`
+    /// (0 = the client did not say).
+    fps: f32 = 0,
 };
 
 /// OpenAI spells the system turn `developer` for reasoning models (pi does

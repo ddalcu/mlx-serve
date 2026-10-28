@@ -97,6 +97,7 @@ pub fn prefillsWholePrompt(self: *const Transformer) bool {
 pub fn dsparkStages(self: *const Transformer) usize {
     if (intree.dsv4(self)) |m| return m.n_mtp;
     if (intree.dsv41(self)) |m| return m.n_mtp;
+    if (plugin_driver.nativeStages(self) > 0) return plugin_driver.nativeStages(self);
     if (self.mlx_stream_ext) |m| return @intFromBool(mlx_stream_mod.blockSize(m) > 0);
     return 0;
 }

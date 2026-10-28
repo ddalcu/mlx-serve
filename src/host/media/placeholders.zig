@@ -129,6 +129,30 @@ pub fn expandMedia(
     return .{ .ids = try ids.toOwnedSlice(allocator), .media = media };
 }
 
+/// Each rendered placeholder replaced by its item's run as the plugin laid it out (`runs[k]`, which holds the rows
+/// the splice fills); the item's span starts at the run's first placeholder.
+pub fn expandRuns(allocator: std.mem.Allocator, prompt_ids: []const u32, items: []const MediaItem, runs: []const []const u32, item_keys: []const u64, mt: MediaTokens) !ExpandedPrompt {
+    if (runs.len != items.len or !placeholdersMatchOf(prompt_ids, items, mt)) return error.MediaPlaceholderMismatch;
+    var ids = std.ArrayList(u32).empty;
+    errdefer ids.deinit(allocator);
+    const media = try allocator.alloc(MediaSpan, items.len);
+    errdefer allocator.free(media);
+    var k: usize = 0;
+    for (prompt_ids) |t| {
+        if (placeholderKindOf(t, mt) == null) {
+            try ids.append(allocator, t);
+            continue;
+        }
+        const run_start = ids.items.len;
+        try ids.appendSlice(allocator, runs[k]);
+        var first = run_start;
+        while (first < ids.items.len and placeholderKindOf(ids.items[first], mt) == null) first += 1;
+        media[k] = .{ .start = @intCast(first), .key = item_keys[k] };
+        k += 1;
+    }
+    return .{ .ids = try ids.toOwnedSlice(allocator), .media = media };
+}
+
 /// What EmbeddingGemma 2's media runs add to a prompt once their placeholders are expanded, from the
 /// preprocessed sizes alone: each image or video FRAME is its soft tokens between `<boi>` and `<eoi>`.
 pub fn mediaRunTokens(items: []const MediaItem, config: *const model_mod.ModelConfig) usize {
@@ -174,6 +198,27 @@ fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: 
 }
 
 // ── tests ──
+
+test "expandRuns: each placeholder becomes its item's plugin run, text around the rows kept, spans at the first row" {
+    const t = testing;
+    const img = [_]chat_mod.ImageData{.{ .pixels = "a", .width = 1, .height = 1 }};
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 2, .grid_h = 1, .grid_w = 1 };
+    var config = model_mod.ModelConfig{};
+    config.image_token_id = 9;
+    config.video_token_id = 10;
+    const items = [_]MediaItem{ .{ .image = &img }, .{ .video = &clip } };
+    // `<|vision_start|>` 7, `<|vision_end|>` 8; the video run opens with a timestamp's text (50, 51).
+    const prompt = [_]u32{ 1, 7, 9, 8, 2, 7, 10, 8 };
+    const runs = [_][]const u32{ &.{ 9, 9, 9 }, &.{ 50, 51, 7, 10, 10, 8 } };
+    const out = try expandRuns(t.allocator, &prompt, &items, &runs, &.{ 11, 12 }, .{ .config = &config });
+    defer t.allocator.free(out.ids);
+    defer t.allocator.free(out.media);
+    try t.expectEqualSlices(u32, &.{ 1, 7, 9, 9, 9, 8, 2, 7, 50, 51, 7, 10, 10, 8, 8 }, out.ids);
+    try t.expectEqual(@as(u32, 2), out.media[0].start);
+    try t.expectEqual(@as(u32, 11), out.media[1].start);
+    try t.expectEqual(@as(u64, 12), out.media[1].key);
+    try t.expectError(error.MediaPlaceholderMismatch, expandRuns(t.allocator, &prompt, &items, runs[0..1], &.{11}, .{ .config = &config }));
+}
 
 test "expandMediaPlaceholders: each rendered placeholder becomes its own item's run" {
     const t = testing;

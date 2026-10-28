@@ -221,6 +221,35 @@ Pure data in `host/api/responses/model.zig`; HTTP/orchestration in `host/http/se
 - **Compaction (`POST /v1/responses/compact`)**: pure data, no LLM call. Synthesizes opaque base64 `encrypted_content` over `{"v":1,"msgs":[...]}`. `appendCompactionInputItem` reconstitutes on round-trip. `model` required (422 on missing). Drops tool calls + images.
 - **WebSocket transport (`ws[s]://host/v1/responses`)**: same endpoint, opt-in via `Upgrade: websocket`. Each text frame is a `response.create`-shaped JSON; SSE events become single WS text frames via `WsBridge` on `Conn.ws_mode`. **No `[DONE]` on success** (`response.completed`/`.failed`/`.incomplete` is the terminator). Sequence numbers reset per response. `WsLocalCache` holds `store: false` responses for the connection lifetime; failed continuations evict the chain root.
 
+## Spoken replies (OpenAI audio out, `/v1/audio/speech`)
+
+A model whose table declares `SpeechHooks` (LFM3-Audio, LFM3-Omni) answers in speech. Its `/v1/models` row carries
+`speech` + `transcription` capabilities, `output_modalities: ["text","audio"]` and `voices` (`<language>-<gender>`,
+`api/speech.zig` `LANGUAGES`; `default` = `american-english-female`).
+
+- **Chat** (`/v1/chat/completions`): `modalities` holding `audio` plus `audio{voice, format}` (`wav` or `pcm16`;
+  `mp3` and others are named 400s; `voice` only `default`: the card's voice-chat recipe names no voice, and a pitch
+  test found one voice whatever the system line asked). The voice-chat recipe goes in as the system line, thinking
+  off, and `<|mixed_start|>` is prefilled, so the model interleaves text and speech slots (`engines/mlx/generate/speech.zig`). Non-stream reply:
+  `message.audio{id, data, expires_at, transcript}`, `content` null; `usage.completion_tokens_details.audio_tokens`.
+  Stream: `delta.audio{id, transcript, data}` (pcm16, 24 kHz mono, base64) as the codec decodes each 4-frame chunk;
+  only `pcm16` streams. With `tools`, a model whose card speaks them (`SpeechFacts.tools`, capability `speech_tools`:
+  LFM3-Audio) runs the card's tools recipe unprefilled, and a reply that never speaks comes back as `tool_calls`;
+  Omni's card answers tools in text, so there it is a named 400 (ask for text, voice it with `/v1/audio/speech`).
+- **History**: an assistant turn `{"audio":{"id"}}` replays as its stored transcript (`Store`, 256 replies x 1 h); an
+  id it does not hold is a named 400 naming it. Known gap: the reference replays the reply's own codes.
+- **`/v1/audio/speech`**: `input`, `voice`, `response_format` `wav|pcm`; the TTS recipe, `<|audio_start|>` prefilled.
+  `stream: true` answers like every TTS backend: one SSE `complete` event with the base64 WAV.
+- **`/v1/audio/transcriptions`** on such a model: the ASR recipe (`Perform ASR in <Language>.` from `language`);
+  `prompt` is a named 400 (the recipe is the prompt).
+- **App**: voice transcribes every utterance with Qwen3-ASR on our server (`VoiceASR`, no Apple dictation; missing =
+  a Download prompt), and the voices offered are Qwen3-TTS (a clone), Kokoro and LFM3 (`LFM3Voice`: the chat model
+  when it speaks, else the Audio pack; the system voice is only the fallback). On a model whose row says
+  `output_modalities` audio the chat's voice button turns purple: the utterance's 16 kHz audio goes to the model
+  (tools or not) and the chosen voice reads its text answer, so every turn has one voice; the app never asks a model
+  for its own speech. In the chat window such a turn is the recording itself (no Qwen3-ASR, a 0.3 s voiced-audio
+  floor); its voice and the tray's are two instances.
+
 ## Generation defaults
 
 `~/.mlx-serve/generation-settings.json` holds global rules, `{"temperature": {"value": 0.8}, "reasoning_budget": {"value": 1024, "ignore_client": true}}`; a model's entry in `model-settings.json` carries the same object under `generation_defaults`, and its `chat_template_kwargs` `enable_thinking`/`reasoning_effort` fill rules it leaves unset. Model rules replace global ones field by field. A rule fills a field the request omits; `ignore_client` makes it replace the request's value. Both files are read per request through `model_settings.Cache` (mtime-checked), so an edit applies to the next request. A malformed profile is logged and ignored, never a refused request.

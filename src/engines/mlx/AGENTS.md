@@ -100,6 +100,8 @@ Attention + KV:
 - **INT4 long-greedy divergence is legit**; byte-stable greedy ⇒ no spec + `--kv-quant off/8`. A prefix-cache HIT is not bit-identical on a HYBRID (≤0.047 nats; GLM-5.3 low-margin tokens move >1 nat with chunk width, numerics not state) ⇒ `--prefix-cache-entries 0`.
 - **SSM/hybrid**: init checks `ssm_state.ctx == null`; param-free RMS norm uses `ones()`; Nemotron dt clip accepts numeric/positive-infinity `time_step_limit` only; restored LiLiCorr without an anchor takes one plain round; PLD snapshots guard each field. Guards: format corpus, LiLiCorr tests.
 - **A GDN trunk's `KVCache.step` is 0 forever**: batched rope offsets read the slot's `moe_seq_offset`, which the batched tick ADVANCES. Bar: `test_batched_equivalence.sh`.
+- **A speech slot is a state machine over `SpeechHooks`** (`generate/speech.zig`, mlx-vlm's `stream_slots`): text slots sample ids, audio slots feed a frame's rows back as `Forward.embeds`; serial (`BatchVerdict.speech`), spec off, the codec streams `.audio` events in 4-frame chunks.
+- **A plugin's towers run through `VisionEncoder.plugin`** (`plugin/media.zig`, set when the table declares `MediaHooks`): the host keeps decoded RGB (`.plugin` mode), each item's run comes back beside its rows (`item_runs`), and a cached item's rows count only while its run is kept.
 - **A model whose per-request state lives OUTSIDE the KVCache needs enabled `CacheHooks.aux` for prefix-cache reuse AND a `Transformer.deinit` arm.** `openDirAbsolute` on an empty/relative path is ReleaseFast UB — guard every site.
 
 Spec decode:

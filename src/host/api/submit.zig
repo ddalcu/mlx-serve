@@ -22,6 +22,7 @@ const loopTrimmedIds = @import("../chat/tools/pipeline.zig").loopTrimmedIds;
 const slotFailure = @import("../http/errors.zig").slotFailure;
 const nonStreamFinishReason = @import("../chat/stops.zig").nonStreamFinishReason;
 const MropeData = @import("../media/encode.zig").MropeData;
+const SpeechRequest = @import("../../sdk/request/speech.zig").Request;
 
 /// Run a non-streaming generation through the scheduler. Returns the same
 /// shape as `generate.generate` so the calling handler's response builder
@@ -59,6 +60,8 @@ pub fn nonStreamingViaScheduler(
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?kv_quant.KVQuantConfig,
     kv_attn_explicit: ?bool,
+    /// A spoken reply (the model's `SpeechFacts`); its samples and codes come back in the result.
+    speech: ?SpeechRequest,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -97,6 +100,7 @@ pub fn nonStreamingViaScheduler(
         .logprobs_n = logprobs_n,
         .prompt_logprobs = prompt_logprobs,
         .kv_quant_config = kv_quant_override,
+        .speech = speech,
     });
     defer running.done();
     const slot = running.stream;
@@ -149,7 +153,13 @@ pub fn nonStreamingViaScheduler(
     // Only reachable non-streaming: a delta cannot be retracted, so a
     // streaming client has already received the tail.
     const emit_ids = loopTrimmedIds(output_ids.items, slot.loop_trim_start);
-    const text = try decodeTokens(allocator, lm, tok, emit_ids, strip_leading);
+    // A spoken reply's text is its transcript: the frame slots and the mode markers are not text.
+    var spoken: std.ArrayList(u32) = .empty;
+    defer spoken.deinit(allocator);
+    if (speech != null) if (lm.config.?.speech()) |f| for (emit_ids) |t| {
+        if (t != f.frame_token and t != f.audio_start and t != f.mixed_start and t != f.text_end) try spoken.append(allocator, t);
+    };
+    const text = try decodeTokens(allocator, lm, tok, if (speech != null) spoken.items else emit_ids, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
 
     // Convert the generator's (token index, byte offset) payload boundary
@@ -184,8 +194,15 @@ pub fn nonStreamingViaScheduler(
     else
         null;
 
+    // A spoken reply's samples and codes leave with the result, as the logprobs do.
+    const audio_samples: ?[]f32 = if (slot.audio_samples.items.len > 0) slot.audio_samples.toOwnedSlice(slot.allocator) catch null else null;
+    const audio_codes: ?[]u32 = if (slot.audio_codes.items.len > 0) slot.audio_codes.toOwnedSlice(slot.allocator) catch null else null;
+
     return .{
         .text = text,
+        .audio_samples = audio_samples,
+        .audio_codes = audio_codes,
+        .sample_rate = slot.sample_rate,
         .token_ids = token_ids,
         .prompt_tokens = slot.prompt_tokens,
         .completion_tokens = slot.completion_tokens,

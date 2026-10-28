@@ -9,7 +9,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../sdk/config/model.zig");
-const ltx_audio = @import("../ltx/audio.zig");
+const mel_bank = @import("../../sdk/media/mel.zig");
 const log = @import("../../sdk/util/log.zig");
 const Scope = @import("../../mlx/scope.zig").Scope;
 
@@ -131,7 +131,7 @@ pub const QwenAudio = struct {
 
     fn buildTables(self: *QwenAudio) !void {
         const a = self.allocator;
-        const fb = try ltx_audio.slaneyMelFilterbank(a, self.cfg.mel_bins, N_FFT, SAMPLE_RATE);
+        const fb = try mel_bank.slaneyMelFilterbank(a, self.cfg.mel_bins, N_FFT, SAMPLE_RATE);
         defer _ = mlx.mlx_array_free(fb);
         self.mel_t = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_transpose_axes(&self.mel_t, fb, &[_]c_int{ 1, 0 }, 2, self.s));
@@ -196,7 +196,7 @@ pub const QwenAudio = struct {
         defer a.free(buf);
         @memset(buf, 0);
         @memcpy(buf[0..pcm.len], pcm);
-        const padded = try ltx_audio.reflectPadCenterF32(a, buf, N_FFT / 2);
+        const padded = try mel_bank.reflectPadCenterF32(a, buf, N_FFT / 2);
         defer a.free(padded);
         // The centered STFT has n/160 + 1 frames; the extractor drops the last.
         const frames = n / HOP;

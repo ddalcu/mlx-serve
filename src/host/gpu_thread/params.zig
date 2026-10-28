@@ -217,6 +217,8 @@ pub const SubmitParams = struct {
     logprobs_n: u32 = 0,
     /// `/v1/completions` echo: score every prompt token (cold prefill, no restore).
     prompt_logprobs: bool = false,
+    /// A spoken reply (the model's `SpeechFacts`); null = text only.
+    speech: ?@import("../../sdk/request/speech.zig").Request = null,
     /// Wave 1.A: per-request override of the process-default KV-cache quant
     /// scheme. When non-null, this slot's KVCache is constructed with this
     /// config instead of `Scheduler.kv_quant_config`. Lets one server host a

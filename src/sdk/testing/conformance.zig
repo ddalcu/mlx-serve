@@ -16,7 +16,7 @@ const fixture = @import("fixture.zig");
 const test_cache = @import("cache_ops.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const Resident = @import("../weights/resident.zig").Resident;
-const loadWeights = @import("../weights/load.zig").loadWeights;
+const loadWeightsOpt = @import("../weights/load.zig").loadWeightsOpt;
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -139,7 +139,9 @@ pub const Loaded = struct {
         try expectOk(name, "parse of its fixture", table.parse(&self.staged.dir, .of(cfg), .{}, null, false, &self.parsed));
         errdefer table.free_parsed(&self.parsed);
         // The engine's loader reads the fixture's tensors, as it does for a served pack.
-        var weights = Resident.adopt(try loadWeights(io, std.heap.c_allocator, self.staged.path));
+        // The towers its parse declares load too, as a served load keeps them.
+        const caps = self.parsed.caps;
+        var weights = Resident.adopt(try loadWeightsOpt(io, std.heap.c_allocator, self.staged.path, .{ .vision = caps.images or caps.video or caps.audio, .audio_tower = caps.audio }));
         defer weights.deinit();
         const src = weights.source();
         var why: Verdict = .{};

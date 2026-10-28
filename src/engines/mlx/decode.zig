@@ -249,6 +249,15 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         return;
     };
 
+    if (gen.speech) |st| {
+        const out = try st.next(gen);
+        if (out.codes.len > 0) slot.emitAudio(out.codes, out.samples, st.machine.f.sample_rate);
+        if (!out.stop) slot.pushTokenWithLogprob(out.token, null);
+        slot.was_pad_only = false;
+        slot.completion_tokens = gen.completion_tokens;
+        if (out.finished) finishSlot(sch, slot, gen.finish_reason);
+        return;
+    }
     if (try loopGuardTick(sch, slot, gen)) return;
     if (Planner.enabled() and slot.planner_force_plain) {
         gen.mtp_hidden_stale = true;
@@ -369,6 +378,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     model.transformer = null;
     var gen: Generator = undefined;
     gen.mtp_planner_owned = false;
+    gen.speech = null;
     gen.generated_ids = .empty;
     gen.loop_guard_start = 0;
     gen.mtp = .{ .qwen4 = &xfm };

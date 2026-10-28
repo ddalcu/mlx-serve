@@ -12,16 +12,14 @@ final class VoiceModeControllerTests: XCTestCase {
     // MARK: Fakes
 
     final class FakeRecognizer: SpeechRecognizing {
-        var partialTranscript = ""
         var level: Float = 0
         var onSpeechStarted: (() -> Void)?
-        var onPartialTranscript: ((String) -> Void)?
         var onFinalTranscript: ((String) -> Void)?
         var onUnrecognizedSpeech: (() -> Void)?
         var onError: ((String) -> Void)?
         var authorized = true
-        /// When set, `preflight()` returns this verbatim so tests can exercise the
-        /// dictation-model-missing path; otherwise it derives from `authorized`.
+        /// When set, `preflight()` returns this verbatim (the speech-model-missing path); otherwise it derives from
+        /// `authorized`.
         var preflightSnapshot: VoicePreflight.Snapshot?
         private(set) var startCount = 0
         private(set) var stopCount = 0
@@ -31,12 +29,13 @@ final class VoiceModeControllerTests: XCTestCase {
         private(set) var events: [String] = []
         func requestAuthorization() async -> Bool { authorized }
         func preflight() async -> VoicePreflight.Snapshot {
-            preflightSnapshot ?? VoicePreflight.Snapshot(
-                micAuthorized: authorized, speechAuthorized: authorized,
-                onDeviceAvailable: true, locale: "en_US")
+            preflightSnapshot ?? VoicePreflight.Snapshot(micAuthorized: authorized, asrReady: true)
         }
         func start() throws { startCount += 1; events.append("start") }
         func stop() { stopCount += 1; events.append("stop") }
+        /// The audio of the utterance being finalized (native voice sends it).
+        var utterancePCM: [Float] = []
+        var wantsWords: (() -> Bool)?
     }
 
     final class FakeSynth: SpeechSynthesizing {
@@ -88,6 +87,7 @@ final class VoiceModeControllerTests: XCTestCase {
             let sessionId: UUID
             let userText: String
             let config: ChatTurnEngine.TurnConfig
+            var audio: [ChatAudio]? = nil
         }
         var isGenerating = false
         private(set) var calls: [Call] = []
@@ -96,7 +96,7 @@ final class VoiceModeControllerTests: XCTestCase {
         func runTurn(sessionId: UUID, userText: String, images: [ChatImage]?, videos: [ChatVideo]?, audio: [ChatAudio]?,
                      config: ChatTurnEngine.TurnConfig,
                      approval: @escaping (APIClient.ToolCall) async -> Bool) {
-            calls.append(Call(sessionId: sessionId, userText: userText, config: config))
+            calls.append(Call(sessionId: sessionId, userText: userText, config: config, audio: audio))
             lastApproval = approval
         }
         func stop() { stopCount += 1 }
@@ -188,103 +188,24 @@ final class VoiceModeControllerTests: XCTestCase {
         XCTAssertEqual(rec.startCount, 0, "mic must NOT open when a prerequisite is missing")
     }
 
-    func testBeginSurfacesDictationIssueWhenOnDeviceModelMissing() async {
-        // Pre-flight catches a model that was never downloaded.
+    func testBeginSurfacesTheSpeechModelIssueWhenQwen3ASRIsMissing() async {
         let (c, rec, _) = make()
-        rec.preflightSnapshot = VoicePreflight.Snapshot(
-            micAuthorized: true, speechAuthorized: true, onDeviceAvailable: false, locale: "en_US")
+        rec.preflightSnapshot = VoicePreflight.Snapshot(micAuthorized: true, asrReady: false)
         let ok = await c.begin()
         XCTAssertFalse(ok)
-        XCTAssertEqual(c.setupIssue, .dictationUnavailable(locale: "en_US"))
-        XCTAssertEqual(rec.startCount, 0)
+        XCTAssertEqual(c.setupIssue, .asrMissing)
+        XCTAssertEqual(rec.startCount, 0, "no mic until there is something to transcribe it")
     }
 
-    func testBeginUsesPreflightLocaleForVoiceSelection() async {
-        UserDefaults.standard.removeObject(forKey: "voiceModeVoiceId")
-        let rec = FakeRecognizer(); let syn = FakeSynth()
-        rec.preflightSnapshot = VoicePreflight.Snapshot(
-            micAuthorized: true, speechAuthorized: true, onDeviceAvailable: true, locale: "ja_JP")
-        let voices = Self.testVoices + [
-            VoiceOption(id: "japanese", name: "Kyoko", language: "ja-JP", quality: 2)
-        ]
-        let controller = VoiceModeController(
-            recognizer: rec, synthesizer: syn, voices: voices)
-
-        _ = await controller.begin()
-
-        XCTAssertEqual(controller.availableVoices.map(\.id), ["japanese"])
-        XCTAssertEqual(controller.selectedVoiceId, "japanese")
-    }
-
-    func testRuntimeDictationIssueUsesPreflightLocale() async {
-        let (controller, recognizer, _) = make()
-        recognizer.preflightSnapshot = VoicePreflight.Snapshot(
-            micAuthorized: true, speechAuthorized: true, onDeviceAvailable: true, locale: "ja_JP")
-        _ = await controller.begin()
-
-        recognizer.onUnrecognizedSpeech?()
-        recognizer.onUnrecognizedSpeech?()
-
-        XCTAssertEqual(controller.setupIssue, .dictationUnavailable(locale: "ja_JP"))
-    }
-
-    /// The Dictation-switch-OFF case the user hit: pre-flight passes (model is
-    /// installed → `supportsOnDeviceRecognition` true), the mic hears speech, but
-    /// recognition returns nothing. Two empty-speech turns → surface the notice.
-    func testRepeatedUnrecognizedSpeechSurfacesDictationNotice() async {
+    /// A cough or a door: the mic heard sound, the speech model heard no words. Back to listening, no notice.
+    func testSoundWithNoWordsGoesBackToListening() async {
         let (c, rec, _) = make()
         _ = await c.begin()
+        rec.onSpeechStarted?()
+        XCTAssertEqual(c.state, .recognizing)
+        rec.onUnrecognizedSpeech?()
+        rec.onUnrecognizedSpeech?()
         XCTAssertEqual(c.state, .listening)
-        XCTAssertNil(c.setupIssue)
-
-        rec.onUnrecognizedSpeech?()            // one stray empty turn → no nag yet
-        XCTAssertNil(c.setupIssue)
-        XCTAssertTrue(c.isActive)
-
-        rec.onUnrecognizedSpeech?()            // second in a row → notice + stop
-        if case .dictationUnavailable = c.setupIssue {} else {
-            XCTFail("expected dictationUnavailable, got \(String(describing: c.setupIssue))")
-        }
-        XCTAssertFalse(c.isActive, "a dead recognizer should stop, not keep a hot mic")
-    }
-
-    /// A successful transcription clears the empty-speech streak so an earlier
-    /// stray miss can't combine with a much-later one to false-trigger.
-    func testSuccessfulTranscriptResetsUnrecognizedStreak() async {
-        let (c, rec, _, _, _) = makeRunnable()
-        _ = await c.begin()
-        rec.onUnrecognizedSpeech?()            // 1
-        rec.onFinalTranscript?("hello there")  // success → reset
-        rec.onUnrecognizedSpeech?()            // 1 again, not 2
-        XCTAssertNil(c.setupIssue)
-    }
-
-    /// The false-positive the user hit: dictation has been transcribing fine,
-    /// then a couple of empty endpoints land back-to-back — a cough, a door, or
-    /// the assistant's own TTS bleeding into the mic crossing the VAD threshold
-    /// with no words. Once recognition has produced text this session, on-device
-    /// dictation is provably installed + on, so "dictation unavailable" is wrong
-    /// and must NEVER surface — and a benign noise burst must not kill the
-    /// working session. (Old behavior: streak went 1→2 and false-tripped.)
-    func testUnrecognizedSpeechNeverNagsAfterSuccessfulTranscript() async {
-        let (c, rec, _, _, _) = makeRunnable()
-        _ = await c.begin()
-        rec.onFinalTranscript?("hello there")  // proves on-device dictation works
-        rec.onUnrecognizedSpeech?()            // noise burst 1
-        rec.onUnrecognizedSpeech?()            // noise burst 2 — old streak would trip here
-        XCTAssertNil(c.setupIssue, "recognition already worked — never claim dictation is unavailable")
-        XCTAssertTrue(c.isActive, "a benign noise burst must not stop a working session")
-    }
-
-    /// Even a partial transcript is proof dictation works — words were detected.
-    /// Words mid-utterance followed by empty endpoints must not surface the
-    /// notice either.
-    func testPartialTranscriptAloneSuppressesDictationNotice() async {
-        let (c, rec, _) = make()
-        _ = await c.begin()
-        rec.onPartialTranscript?("hey lo")     // words detected → dictation is working
-        rec.onUnrecognizedSpeech?()            // 1
-        rec.onUnrecognizedSpeech?()            // 2 — would have tripped the streak
         XCTAssertNil(c.setupIssue)
         XCTAssertTrue(c.isActive)
     }
@@ -350,6 +271,98 @@ final class VoiceModeControllerTests: XCTestCase {
 
         syn.simulateDrain()
         XCTAssertEqual(c.state, .listening)                  // mic reopened for next turn
+    }
+
+    /// A controller whose chat model hears the recording itself (LFM3-Audio / Omni).
+    private func makeHearing() -> (VoiceModeController, FakeRecognizer, FakeSynth, FakeRunner) {
+        let rec = FakeRecognizer(); let syn = FakeSynth(); let runner = FakeRunner()
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, chime: FakeWakeChime())
+        c.requireWakeWord = false
+        c.runner = runner
+        c.turnContext = { (UUID(), nil) }
+        c.modelSpeaks = { true }
+        return (c, rec, syn, runner)
+    }
+
+    /// The model hears the recording, tools or not, and the chosen voice reads its answer: one voice for every turn.
+    func testAModelThatHearsGetsTheRecordingAndTheChosenVoiceReadsTheAnswer() async {
+        for tools in [false, true] {
+            let (c, rec, syn, runner) = makeHearing()
+            c.agentMode = tools
+            rec.utterancePCM = [0.25, -0.5]
+            await beginAndSubmit(c, rec, "what is the capital of france")
+            let call = runner.calls.last
+            XCTAssertEqual(call?.userText, "", "the model hears the audio, not the transcript")
+            let pcm = call?.audio?.first?.pcm ?? Data()
+            XCTAssertEqual(pcm.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }, [0.25, -0.5])
+            c.observeAssistant(messageId: "A", content: "Paris.", generating: false)
+            XCTAssertEqual(syn.enqueued, ["Paris."])
+        }
+    }
+
+    // MARK: Chat-window voice (its own instance: no wake word, the tray yields the mic)
+
+    func testChatVoiceNeedsNoWakeWord() async {
+        let rec = FakeRecognizer(); let runner = FakeRunner()
+        let c = VoiceModeController(recognizer: rec, synthesizer: FakeSynth(), voices: Self.testVoices,
+                                    chime: FakeWakeChime(), chatMode: true)
+        c.requireWakeWord = true
+        c.runner = runner
+        c.turnContext = { (UUID(), nil) }
+        await beginAndSubmit(c, rec, "what time is it")
+        XCTAssertEqual(runner.calls.last?.userText, "what time is it")
+    }
+
+    func testChatVoiceNeverAsksForTheWakeWord() {
+        let c = VoiceModeController(recognizer: FakeRecognizer(), synthesizer: FakeSynth(), voices: Self.testVoices,
+                                    chime: FakeWakeChime(), chatMode: true)
+        c.requireWakeWord = true
+        XCTAssertEqual(c.listeningPrompt, "Listening…")
+    }
+
+    /// The chat window's voice takes the tab's toggles at every turn, as a typed message does: Tools switched on
+    /// after Voice started is on for the next spoken turn.
+    func testChatVoiceReadsTheTabsTogglesEveryTurn() {
+        var s = ChatSession(title: "t")
+        s.mode = .chat
+        XCTAssertFalse(VoiceModeController.chatToggles(s).tools)
+        s.mode = .agent
+        s.useMCP = true
+        s.enableThinking = true
+        s.reasoningEffort = .high
+        let t = VoiceModeController.chatToggles(s)
+        XCTAssertTrue(t.tools && t.mcp && t.thinking)
+        XCTAssertEqual(t.effort, .high)
+    }
+
+    func testChatVoiceStartsInTheSessionItWasTurnedOnIn() async {
+        let (c, _, _, _, _) = makeRunnable()
+        let tab = UUID()
+        _ = await c.begin(session: tab)
+        XCTAssertEqual(c.boundSessionId, tab)
+    }
+
+    /// The tray stays on while the chat window has the mic: it stops listening, and listens again after.
+    func testTheTrayYieldsTheMicWithoutTurningOff() async {
+        let (c, rec, _) = make()
+        _ = await c.begin()
+        XCTAssertEqual(rec.events.last, "start")
+        c.yieldMicrophone(true)
+        XCTAssertEqual(rec.events.last, "stop")
+        XCTAssertTrue(c.isActive)
+        XCTAssertEqual(c.state, .listening)
+        c.yieldMicrophone(false)
+        XCTAssertEqual(rec.events.last, "start")
+        XCTAssertTrue(c.isActive)
+    }
+
+    func testATrayTurnedOnWhileTheChatHasTheMicDoesNotListen() async {
+        let (c, rec, _) = make()
+        c.yieldMicrophone(true)
+        let ok = await c.begin()
+        XCTAssertTrue(ok)
+        XCTAssertTrue(c.isActive)
+        XCTAssertEqual(rec.startCount, 0)
     }
 
     func testSessionRepublishAfterStreamEndsDoesNotRespeakTheAnswer() async {

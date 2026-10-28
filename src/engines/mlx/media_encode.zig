@@ -6,6 +6,9 @@ const generate_mod = @import("generate.zig");
 const model_mod = @import("../../sdk/config/model.zig");
 const vision_mod = @import("vision_encoder.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
+const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
+const plugin_media = @import("plugin/media.zig");
+const abi = @import("../../abi/plugin.zig");
 const model_registry_mod = @import("../../host/registry/registry.zig");
 const log = @import("../../sdk/util/log.zig");
 const VisionEncoder = vision_mod.VisionEncoder;
@@ -41,11 +44,17 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     const epoch = vision_enc.emb_cache.beginRequest();
     for (req.items, req.item_keys, 0..) |item, key, i| {
         var emb: mlx.mlx_array = undefined;
-        if (vision_enc.emb_cache.get(key)) |hit| {
-            emb = hit;
+        var hit = vision_enc.emb_cache.get(key);
+        // A plugin's cached rows expand only beside the run kept for them.
+        if (hit != null and vision_enc.plugin_media != null and vision_enc.plugin_media.?.run(key) == null) {
+            _ = mlx.mlx_array_free(hit.?);
+            hit = null;
+        }
+        if (hit) |h| {
+            emb = h;
             cached += 1;
         } else {
-            emb = encodeVisionItem(req, vision_enc, item) catch |err| {
+            emb = encodePiece(req, vision_enc, item, key) catch |err| {
                 for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
                 finishVisionRequest(sch, req, @errorName(err));
                 return;
@@ -53,6 +62,12 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             vision_enc.emb_cache.put(vision_enc.allocator, key, emb, vision_mod.EmbeddingCache.CAP_BYTES, epoch);
         }
         req.item_tokens[i] = @intCast(mlx.getShape(emb)[1]);
+        if (vision_enc.plugin_media) |*pm| keepRun(req, pm, key, i) catch |err| {
+            _ = mlx.mlx_array_free(emb);
+            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+            finishVisionRequest(sch, req, @errorName(err));
+            return;
+        };
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
             for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
@@ -167,6 +182,27 @@ fn applyRadioVideoEvs(req: *VisionEncodeRequest, vision_enc: *VisionEncoder, com
 
     req.item_keep = keeps;
     masks_live = false;
+}
+
+/// One piece's rows: the plugin's towers where it declares them, else the encoder's own.
+fn encodePiece(req: *VisionEncodeRequest, vision_enc: *VisionEncoder, item: VisionItem, key: u64) !mlx.mlx_array {
+    if (vision_enc.plugin_media) |*pm| return pm.encode(pluginInput(item), key, qwen_vision.ENGINE_MAX_PIXELS, req.model.tokenizer);
+    return encodeVisionItem(req, vision_enc, item);
+}
+
+/// The plugin's decoded input for one piece: RGB8 frames (an image is one) or 16 kHz f32 samples.
+fn pluginInput(item: VisionItem) abi.MediaInput {
+    return switch (item) {
+        .image => |img| .{ .kind = .image, .rgb = .of(img.pixels), .width = img.width, .height = img.height, .frames = 1 },
+        .video => |v| .{ .kind = .video, .rgb = .of(v.pixels), .width = v.grid_w, .height = v.grid_h, .frames = v.grid_t, .fps = v.fps },
+        .audio => |pcm| .{ .kind = .audio, .samples = .of(@as([*]const f32, @ptrCast(@alignCast(pcm.ptr)))[0 .. pcm.len / 4]), .sample_rate = 16000 },
+    };
+}
+
+/// Copies item `i`'s run into the request (`item_runs`, the caller's to free).
+fn keepRun(req: *VisionEncodeRequest, pm: *const plugin_media.PluginMedia, key: u64, i: usize) !void {
+    if (i >= req.item_runs.len) return error.MediaPlaceholderMismatch;
+    req.item_runs[i] = try req.allocator.dupe(u32, pm.run(key) orelse return error.MediaPlaceholderMismatch);
 }
 
 /// `[1, n, hidden]` soft tokens for one item.

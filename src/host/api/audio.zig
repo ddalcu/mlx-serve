@@ -1,5 +1,8 @@
 //! transcriptions, aligner, diarizer companions
 
+const speech_api = @import("speech.zig");
+const wav_mod = @import("../../sdk/media/wav.zig");
+const cachedFormatChat = @import("format.zig").cachedFormatChat;
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const request_mod = @import("../../sdk/request/request.zig");
@@ -28,7 +31,9 @@ const clampMaxTokens = @import("sampling.zig").clampMaxTokens;
 const encodeText = @import("tokenize.zig").encodeText;
 const jsonEscapeOrEmpty = @import("tokenize.zig").jsonEscapeOrEmpty;
 const nonStreamingViaScheduler = @import("submit.zig").nonStreamingViaScheduler;
-const sendResponse = @import("../http/respond.zig").sendResponse;
+const respond = @import("../http/respond.zig");
+const sendResponse = respond.sendResponse;
+const gen = @import("../media_jobs/gen.zig");
 const sendEnsureLoadedError = @import("../http/errors.zig").sendEnsureLoadedError;
 const countRejected = @import("../http/errors.zig").countRejected;
 const contextOverflowMessage = @import("../http/errors.zig").contextOverflowMessage;
@@ -69,6 +74,11 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", transcription_mod.formErrorMessage(err), 400);
         return;
     };
+    // The card's recipe names the language and nothing else: a context prompt has no place in it.
+    if (form.prompt != null and lm.config.?.speech() != null) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "this model's transcription takes no 'prompt': send the language alone", 400);
+        return;
+    }
     const pcm = transcription_mod.decodeWav(allocator, form.file) catch |err| {
         log.warn("POST /v1/audio/transcriptions -> 400 (audio: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "`file` must be a WAV file (16- or 24-bit PCM, or 32-bit float)", 400);
@@ -171,10 +181,12 @@ const Heard = struct { raw: []u8, t: transcription_mod.Transcript };
 fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, form: transcription_mod.Form, pcm: []const f32) !?Heard {
     const config = lm.config.?;
     const tok = lm.tokenizer.?;
-    const prompt_text = try transcription_mod.buildPrompt(allocator, form.prompt, form.language);
-    defer allocator.free(prompt_text);
-    var prompt_ids = try encodeText(allocator, lm, tok, prompt_text, false);
     const audio = chat_mod.AudioData{ .samples = std.mem.sliceAsBytes(pcm) };
+    var prompt_ids = if (config.speech() != null) try speechModelPrompt(allocator, stream, lm, form, &audio) else blk: {
+        const prompt_text = try transcription_mod.buildPrompt(allocator, form.prompt, form.language);
+        defer allocator.free(prompt_text);
+        break :blk try encodeText(allocator, lm, tok, prompt_text, false);
+    };
     var mm = prepareMultimodalItems(allocator, lm, config, &[_]MediaItem{.{ .audio = &audio }}, &prompt_ids) catch |err| {
         allocator.free(prompt_ids);
         const f = multimodalFailure(err);
@@ -201,7 +213,7 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
     const enable_thinking = false;
     const spec = false;
     var timer = Stopwatch.init(stream.io);
-    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, spec, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, stream) catch |err| {
+    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, spec, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, null, stream) catch |err| {
         log.err("  -> {s}\n", .{@errorName(err)});
         sendGenerationError(allocator, stream, err, .openai) catch {};
         return null;
@@ -212,6 +224,94 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
     const t = transcription_mod.splitOutput(raw, form.language);
     log.info("  <- {d}+{d} tokens ({d}ms) [{s}] language={s}\n", .{ result.prompt_tokens, result.completion_tokens, timer.read() / std.time.ns_per_ms, result.finish_reason, t.language orelse "?" });
     return .{ .raw = raw, .t = t };
+}
+
+/// The most speech a `/v1/audio/speech` request may run to, in frames (164 s at 12.5 frames a second).
+const SPEECH_MAX_FRAMES = 2048;
+
+/// `/v1/audio/speech` on a model that speaks (`Parsed.speech`): the card's TTS recipe (`Perform TTS in <language>
+/// using a <gender> voice.`, the turn prefilled with `<|audio_start|>`) over `input`, as WAV or raw 16-bit PCM.
+pub fn handleSpeech(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
+    const config = lm.config.?;
+    const f = config.speech().?;
+    const tok = lm.tokenizer.?;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return refuse(allocator, stream, "Invalid JSON in request body");
+    defer parsed.deinit();
+    if (parsed.value != .object) return refuse(allocator, stream, "Request body must be a JSON object");
+    const root = parsed.value.object;
+    const input = if (root.get("input")) |v| if (v == .string and v.string.len > 0) v.string else null else null;
+    if (input == null) return refuse(allocator, stream, "'input' is a required non-empty string");
+    const voice_id = if (root.get("voice")) |v| if (v == .string) v.string else "" else speech_api.DEFAULT_VOICE;
+    const v = speech_api.voice(voice_id) orelse return refuse(allocator, stream, "'voice' must be one of this model's voices (`<language>-<female|male>`, listed on /v1/models)");
+    const format: speech_api.Format = if (root.get("response_format")) |rf| blk: {
+        if (rf == .string and std.mem.eql(u8, rf.string, "wav")) break :blk .wav;
+        if (rf == .string and std.mem.eql(u8, rf.string, "pcm")) break :blk .pcm16;
+        return refuse(allocator, stream, "'response_format' must be \"wav\" or \"pcm\"");
+    } else .wav;
+    if (root.get("speed")) |sp| if (!(sp == .integer and sp.integer == 1) and !(sp == .float and sp.float == 1.0))
+        return refuse(allocator, stream, "this model speaks at one speed: 'speed' must be 1");
+    if (root.get("instructions") != null) return refuse(allocator, stream, "this model takes no 'instructions': its voice is the 'voice' field");
+    // `stream: true` answers like every TTS backend: one SSE `complete` event carrying the WAV (`gen.sendWavWith`).
+    const want_stream = if (root.get("stream")) |sv| sv == .bool and sv.bool else false;
+    if (want_stream and format != .wav) return refuse(allocator, stream, "a streamed answer is WAV: 'response_format' must be \"wav\"");
+
+    const system = try std.fmt.allocPrint(allocator, "Perform TTS in {s} using a {s} voice.", .{ v.language, v.gender });
+    defer allocator.free(system);
+    const msgs = [_]chat_mod.Message{ .{ .role = "system", .content = system }, .{ .role = "user", .content = input.? } };
+    var prompt_ids = try cachedFormatChat(allocator, stream.io, lm, tok, lm.chat_config.?, &msgs, null, null, false, null, false);
+    prompt_ids = try allocator.realloc(prompt_ids, prompt_ids.len + 1);
+    prompt_ids[prompt_ids.len - 1] = f.audio_start;
+    defer allocator.free(prompt_ids);
+    log.info("POST /v1/audio/speech ({d}b, voice={s}, format={s})\n", .{ input.?.len, voice_id, @tagName(format) });
+
+    const effective_ctx = getEffectiveContextLength(config);
+    if (prompt_ids.len > effective_ctx) {
+        countRejected();
+        var ovf_buf: [160]u8 = undefined;
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
+    }
+    const max_tokens = clampMaxTokens(SPEECH_MAX_FRAMES, prompt_ids.len, effective_ctx);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, max_tokens, config, false, null, lm, false, 0)) return;
+    var timer = Stopwatch.init(stream.io);
+    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = 0 }, config.eosTokenSlice(), 0, false, false, false, false, false, false, getTimeoutNs(), null, &.{}, 0, .{}, 0, false, null, null, .{}, stream) catch |err| {
+        log.err("  -> {s}\n", .{@errorName(err)});
+        sendGenerationError(allocator, stream, err, .openai) catch {};
+        return;
+    };
+    defer allocator.free(result.text);
+    defer allocator.free(result.token_ids);
+    defer if (result.audio_samples) |x| allocator.free(x);
+    defer if (result.audio_codes) |x| allocator.free(x);
+    const samples = result.audio_samples orelse &.{};
+    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] {d:.2} s of speech\n", .{ result.prompt_tokens, result.completion_tokens, timer.read() / std.time.ns_per_ms, result.finish_reason, @as(f64, @floatFromInt(samples.len)) / @as(f64, @floatFromInt(f.sample_rate)) });
+    const bytes = switch (format) {
+        .wav => try wav_mod.encodePcm16Mono(allocator, samples, f.sample_rate),
+        .pcm16 => try speech_api.pcm16(allocator, samples),
+    };
+    defer allocator.free(bytes);
+    if (want_stream) {
+        try respond.sendSseHeaders(stream, "audio.speech", respond.SSE_ALLOW_HEADERS_DEFAULT);
+        return gen.sendWavWith(allocator, stream, bytes, true, "");
+    }
+    try sendResponse(stream, "200 OK", if (format == .wav) "audio/wav" else "audio/pcm", bytes);
+}
+
+fn refuse(allocator: std.mem.Allocator, stream: *Conn, why: []const u8) !void {
+    log.warn("POST /v1/audio/speech -> 400 ({s})\n", .{why});
+    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+}
+
+/// LFM3-Audio's card recipe through its own template: `Perform ASR in <Language>.`, or `Perform ASR.` to let the model
+/// name it, over the clip.
+fn speechModelPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, form: transcription_mod.Form, audio: *const chat_mod.AudioData) ![]u32 {
+    const language = if (form.language) |l| transcription_mod.languageName(l) orelse l else null;
+    const system = if (language) |l| try std.fmt.allocPrint(allocator, "Perform ASR in {s}.", .{l}) else try allocator.dupe(u8, "Perform ASR.");
+    defer allocator.free(system);
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "system", .content = system },
+        .{ .role = "user", .content = "", .audio = (audio)[0..1] },
+    };
+    return cachedFormatChat(allocator, stream.io, lm, lm.tokenizer.?, lm.chat_config.?, &msgs, null, null, false, null, false);
 }
 
 /// The forced aligner a timed transcription uses: its registry id, the

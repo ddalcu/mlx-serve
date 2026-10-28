@@ -18,21 +18,21 @@ final class RecommendedModelsTests: XCTestCase {
     }
 
     /// `allCatalogs` is what the invariant sweeps run over, so it has to BE the
-    /// three sections — a section left out of it is a section with no guards.
-    func testAllCatalogsIsTheUnionOfTheThreeSections() {
+    /// sections — a section left out of it is a section with no guards.
+    func testAllCatalogsIsTheUnionOfTheSections() {
         let union = RecommendedModelPick.gemmaCatalog
             + RecommendedModelPick.qwenCatalog
+            + RecommendedModelPick.liquidCatalog
             + RecommendedModelPick.largestCatalog
         XCTAssertEqual(RecommendedModelPick.allCatalogs, union)
     }
 
     // MARK: - Catalog shape
 
-    /// The pane's whole layout assumes exactly three sections
-    /// (Gemma 4, Qwen, Largest).
-    func testExactlyThreeFamiliesArePresent() {
+    /// The pane draws one section per family (Gemma 4, Qwen, Liquid LFM3, Largest).
+    func testEveryFamilyIsPresent() {
         let families = Set(allRecommended.map(\.family))
-        XCTAssertEqual(families, [.gemma, .qwen, .largest])
+        XCTAssertEqual(families, [.gemma, .qwen, .liquid, .largest])
     }
 
     /// A family catalog can't be empty — a section with zero rows would be a
@@ -176,7 +176,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
         XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b",
-                                   "sushi-2bpw"])
+                                   "sushi-2bpw", "lfm3-1.7b", "lfm3-vl-2b", "lfm3-audio-2b", "lfm3-omni-2b"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
