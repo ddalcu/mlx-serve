@@ -491,6 +491,9 @@ const aux_hooks = abi.AuxHooks{
     .describe = &auxDescribe,
     .prefix_key = &auxPrefixKey,
     .begin_prompt = &auxBeginPrompt,
+    .import_plan = &auxImportPlan,
+    .export_arrays = &auxExportArrays,
+    .import_arrays = &auxImportArrays,
     .reserve = &auxReserve,
     .commit = &auxCommit,
     .snapshot = &auxSnapshot,
@@ -635,6 +638,34 @@ fn auxSerialize(_: *anyopaque, _: abi.Handle, _: [*]u8, _: usize, len: *usize) c
 fn auxDeserialize(_: *anyopaque, _: abi.Str, out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
     return Verdict.refuse(.unsupported, "deepseek_v41: snapshot deserialization is unavailable");
+}
+
+fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdict {
+    out.* = 0;
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    out.* = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
+fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) callconv(.c) Verdict {
+    if (out.size < @sizeOf(abi.AuxExport)) return Verdict.refuse(.unsupported, "deepseek_v41: export storage is too short");
+    out.tensor_len = 0;
+    out.names_len = 0;
+    out.header_len = 0;
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const sn = snapOf(handle) orelse return Verdict.refuse(.failed, "deepseek_v41: no snapshot to export");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    dsv41.exportSnapshot(m.mdl, sn, out) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
+fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
+    out.* = null;
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    out.* = dsv41.importSnapshot(m.mdl, gpa, ids.slice(), header.slice(), arrays.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
 }
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads

@@ -55,6 +55,7 @@ const transformer_mod = @import("../../transformer.zig");
 const model = @import("../../../../sdk/config/model.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const disk_writer = @import("writer.zig");
+pub const module_record = @import("module_record.zig");
 const log = @import("../../../../sdk/util/log.zig");
 
 const KVCache = transformer_mod.KVCache;
@@ -189,16 +190,18 @@ fn testSpaceProbe(path: []const u8) ?VolumeSpace {
 }
 
 pub const IndexEntry = struct {
+    kind: enum { kv, module } = .kv,
+    module: ?module_record.Record = null,
     /// Directory id — the `e<id>` component.
     id: u64,
-    /// Full committed token sequence (prompt ++ generated). Owned.
+    /// Owned IDs: prompt ++ generated for KV, the exact checkpoint boundary for modules.
     tokens: []u32,
     /// KV positions actually persisted (== snapshot `step` at commit; may be
     /// tokens.len - 1 when the final sampled token was never forwarded).
     kv_len: u32,
     has_tools: bool,
     quant: kv_quant.KVQuantConfig,
-    /// Total on-disk bytes (chunks + tokens.bin + meta).
+    /// KV file bill, or a module reservation/committed bill/deferred-cleanup liability.
     bytes: u64,
     /// Per-chunk file sizes recorded at commit (meta.json "chunk_bytes").
     /// The scan validates actual file sizes against these and clamps kv_len
@@ -237,6 +240,8 @@ pub const IndexEntry = struct {
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
     last_used: u64,
 };
+
+const LoadedEntry = struct { e: IndexEntry, mtime: i128 };
 
 /// v4 spec-snapshot metadata for one speculative-side cache (dflash assistant
 /// context or MTP committed history). The tensors live in the entry's ONE
@@ -453,6 +458,25 @@ pub const DiskTier = struct {
     /// red-on-revert guard that a short-prefix restore reads only the chunks
     /// covering the usable prefix, not the whole stored entry. Not persisted.
     chunks_loaded_last: u32 = 0,
+    module_context: ?module_record.Context = null,
+    module_export_losses_total: u64 = 0,
+    pending_module: ?PendingModuleFile = null,
+    module_materialization_bytes: u64 = 0,
+
+    pub const ModuleRegistration = struct {
+        tokens: []const u32,
+        prefix_key: u64,
+        has_tools: bool,
+        quant: kv_quant.KVQuantConfig,
+        media: []const MediaSpan = &.{},
+        header: []const u8,
+        tensors: []const module_record.Tensor,
+    };
+
+    pub const ModuleSlice = enum { progress, busy, done };
+    pub const ModuleCandidate = struct { id: u64, n: u32, prefix_key: u64 };
+    pub const ModuleCancellation = enum { memory_pressure, unload, invalidation, shutdown_expiry, holder_exhaustion };
+    const PendingModuleFile = struct { id: u64, path: []u8, bytes: []u8, meta: bool };
 
     /// Create the tier rooted at `<base>/<fingerprint>` and scan whatever
     /// already exists there. Crash leftovers (no meta.json) are deleted.
@@ -463,6 +487,19 @@ pub const DiskTier = struct {
         fingerprint: []const u8,
         max_bytes: u64,
         chunk_tokens: u32,
+    ) !DiskTier {
+        return initWithModule(allocator, io, base_dir, fingerprint, max_bytes, chunk_tokens, null);
+    }
+
+    /// Supply the loaded module binding and compatibility identity before scanning v10 records.
+    pub fn initWithModule(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        base_dir: []const u8,
+        fingerprint: []const u8,
+        max_bytes: u64,
+        chunk_tokens: u32,
+        context: ?module_record.Context,
     ) !DiskTier {
         if (base_dir.len == 0 or !std.fs.path.isAbsolute(base_dir)) return error.BadDiskCacheDir;
         const root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fingerprint });
@@ -479,6 +516,7 @@ pub const DiskTier = struct {
             .next_id = 1,
             .total_bytes = 0,
             .counter = 0,
+            .module_context = context,
         };
         self.scan() catch |err| {
             log.warn("[disk-cache] scan failed: {s} — starting empty\n", .{@errorName(err)});
@@ -488,21 +526,486 @@ pub const DiskTier = struct {
         return self;
     }
 
+    /// Reserve one immutable identity. A decline never takes the caller's snapshot or tensor references.
+    pub fn registerModule(self: *DiskTier, input: ModuleRegistration) !?u64 {
+        const context = self.module_context orelse return null;
+        if (!self.moduleWriterAvailable() or input.tokens.len < MIN_PERSIST_TOKENS) return null;
+        const n = std.math.cast(u32, input.tokens.len) orelse return null;
+        self.pollModuleWrites();
+        self.cleanupModules();
+        self.refreshDiskBudget();
+        if (self.store_declined) return null;
+        const media_in = spansBelow(input.media, input.tokens.len);
+        const media = try self.allocator.alloc(module_record.Media, media_in.len);
+        defer self.allocator.free(media);
+        for (media_in, media) |sp, *out| out.* = .{ .start = sp.start, .key = @bitCast(sp.key) };
+        var record = try module_record.Record.create(self.allocator, .{
+            .n = n, .prefix_key = @bitCast(input.prefix_key), .has_tools = input.has_tools,
+            .scheme = @tagName(input.quant.scheme), .bits = input.quant.bits, .group_size = input.quant.group_size,
+            .identity = context.identity, .header_bytes = input.header.len, .token_bytes = @as(u64, n) * 4,
+            .tensors = input.tensors, .media = media,
+        }, input.header);
+        var owns_record = true;
+        defer if (owns_record) record.deinit();
+        _ = moduleQuant(record.manifest) catch return null;
+        if (!context.validate(context.user, input.header, &record.manifest)) return null;
+        const bytes = record.manifest.bytes;
+        if (self.max_bytes != 0 and bytes > self.max_bytes) return null;
+        if (!self.makeModuleRoom(bytes)) return null;
+        const tokens = try self.allocator.dupe(u32, input.tokens);
+        errdefer self.allocator.free(tokens);
+        const spans = try self.allocator.dupe(MediaSpan, media_in);
+        errdefer self.allocator.free(spans);
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        const id = self.next_id;
+        self.next_id = try std.math.add(u64, id, 1);
+        record.directory = try std.fmt.allocPrint(record.arena.allocator(), "{s}/e{d}/", .{ self.root, id });
+        try std.Io.Dir.cwd().createDirPath(self.io, record.directory);
+        self.entries.appendAssumeCapacity(.{
+            .kind = .module, .module = record, .id = id, .tokens = tokens, .kv_len = n,
+            .has_tools = input.has_tools, .quant = input.quant, .bytes = bytes,
+            .chunk_bytes = &.{}, .ssm_positions = &.{}, .ssm_bytes = &.{}, .media = spans, .last_used = self.bump(),
+        });
+        owns_record = false;
+        self.total_bytes += bytes;
+        return id;
+    }
+
+    fn moduleWriterAvailable(self: *DiskTier) bool {
+        const w = self.writer orelse return false;
+        w.mutex.lockUncancelable(self.io);
+        defer w.mutex.unlock(self.io);
+        return w.running and !w.deinited;
+    }
+
+    fn moduleIndex(self: *const DiskTier, id: u64) ?usize {
+        const idx = self.indexOfId(id) orelse return null;
+        return if (self.entries.items[idx].kind == .module) idx else null;
+    }
+
+    pub fn moduleState(self: *const DiskTier, id: u64) ?module_record.State {
+        const idx = self.moduleIndex(id) orelse return null;
+        return self.entries.items[idx].module.?.state;
+    }
+
+    /// Null means the next slice is tokens/header, or there are no tensor parts left.
+    pub fn modulePartIndex(self: *const DiskTier, id: u64) ?u32 {
+        const idx = self.moduleIndex(id) orelse return null;
+        const m = &self.entries.items[idx].module.?;
+        if (m.cursor < 2 or m.cursor - 2 >= m.manifest.part_bytes.len) return null;
+        return @intCast(m.cursor - 2);
+    }
+
+    pub fn moduleInventory(self: *const DiskTier, id: u64) ?[]const module_record.Tensor {
+        const idx = self.moduleIndex(id) orelse return null;
+        return self.entries.items[idx].module.?.manifest.tensors;
+    }
+
+    /// Upper bound before building the next file: readback blob plus contiguous/copy scratch.
+    pub fn modulePartStagingBytes(self: *const DiskTier, id: u64) u64 {
+        if (self.pending_module != null) return 0;
+        const idx = self.moduleIndex(id) orelse return 0;
+        const m = &self.entries.items[idx].module.?;
+        if (m.cursor == 0) return m.manifest.token_bytes;
+        if (m.cursor == 1) return m.header.len;
+        const part = m.cursor - 2;
+        if (part >= m.manifest.part_bytes.len) return m.meta.len;
+        var payload: u64 = 0;
+        for (m.manifest.tensors) |t| {
+            if (t.part == part) payload +|= t.bytes;
+        }
+        return m.manifest.part_bytes[part] +| payload *| 2;
+    }
+
+    /// Build or retry exactly one file. Tensor keys/references stay caller-owned; retries ignore
+    /// the tensor list and reuse the tier's single unsent blob without re-materializing arrays.
+    /// `done` here means the caller may submit metadata; only its acceptance releases the source.
+    pub fn stageModulePart(self: *DiskTier, id: u64, tensors: []NamedTensor, s: mlx.mlx_stream) !ModuleSlice {
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
+        _ = self.harvestWriteFailures();
+        const idx = self.moduleIndex(id) orelse return error.DiskCacheModuleMissing;
+        const e = &self.entries.items[idx];
+        const m = &e.module.?;
+        if (e.poisoned) return error.DiskCacheModuleMissing;
+        if (m.state == .submitted or m.state == .committed) return .done;
+        errdefer self.retireModuleEntry(e, .failed, "module staging failed");
+        if (self.pending_module) |pending| {
+            if (pending.id != id) return .busy;
+            if (pending.meta) return .done;
+            return self.trySubmitModuleFile(e);
+        }
+        if (m.cursor >= m.manifest.part_bytes.len + 2) return .done;
+        self.pending_module = blk: {
+            const bytes = try self.encodeModuleFile(e, tensors, s);
+            errdefer self.allocator.free(bytes);
+            const path = try self.moduleFilePath(e, false);
+            break :blk .{ .id = id, .path = path, .bytes = bytes, .meta = false };
+        };
+        return self.trySubmitModuleFile(e);
+    }
+
+    fn encodeModuleFile(self: *DiskTier, e: *IndexEntry, tensors: []NamedTensor, s: mlx.mlx_stream) ![]u8 {
+        const m = &e.module.?;
+        if (m.cursor == 0) {
+            const raw = try self.allocator.alloc(u8, @intCast(m.manifest.token_bytes));
+            for (e.tokens, 0..) |id, i| std.mem.writeInt(u32, raw[i * 4 ..][0..4], id, .little);
+            return raw;
+        }
+        if (m.cursor == 1) return self.allocator.dupe(u8, m.header);
+        const part: u32 = @intCast(m.cursor - 2);
+        try self.validateModuleTensors(m.manifest.tensors, part, tensors);
+        self.module_materialization_bytes = self.modulePartStagingBytes(e.id);
+        defer self.module_materialization_bytes = 0;
+        const bytes = try self.serializeSafetensors(tensors, no_meta, s);
+        errdefer self.allocator.free(bytes);
+        if (bytes.len != m.manifest.part_bytes[part]) return error.BadModulePart;
+        return bytes;
+    }
+
+    fn validateModuleTensors(_: *DiskTier, inventory: []const module_record.Tensor, part: u32, tensors: []const NamedTensor) !void {
+        var ti: usize = 0;
+        for (inventory) |t| {
+            if (t.part != part) continue;
+            if (ti >= tensors.len) return error.BadModulePart;
+            const got = tensors[ti];
+            if (!std.mem.eql(u8, got.key, t.name)) return error.BadModulePart;
+            try validateModuleArray(t, got.arr);
+            ti += 1;
+        }
+        if (ti != tensors.len) return error.BadModulePart;
+    }
+
+    fn validateModuleArray(t: module_record.Tensor, arr: mlx.mlx_array) !void {
+        const dtype = safetensorsDtypeName(mlx.mlx_array_dtype(arr)) orelse return error.BadModulePart;
+        if (!std.mem.eql(u8, dtype, t.dtype)) return error.BadModulePart;
+        const shape = mlx.getShape(arr);
+        if (shape.len != t.shape.len or nbytesOf(arr) != t.bytes) return error.BadModulePart;
+        for (shape, t.shape) |got, want| {
+            if (got < 0 or @as(u64, @intCast(got)) != want) return error.BadModulePart;
+        }
+    }
+
+    fn moduleFilePath(self: *DiskTier, e: *const IndexEntry, meta: bool) ![]u8 {
+        const m = &e.module.?;
+        if (meta) return std.fmt.allocPrint(self.allocator, "{s}meta.json", .{m.directory});
+        if (m.cursor == 0) return std.fmt.allocPrint(self.allocator, "{s}tokens.bin", .{m.directory});
+        if (m.cursor == 1) return std.fmt.allocPrint(self.allocator, "{s}module.header", .{m.directory});
+        return std.fmt.allocPrint(self.allocator, "{s}m{d:0>3}.safetensors", .{ m.directory, m.cursor - 2 });
+    }
+
+    fn trySubmitModuleFile(self: *DiskTier, e: *IndexEntry) !ModuleSlice {
+        const pending = self.pending_module orelse return error.DiskCacheModuleMissing;
+        const w = self.writer orelse return error.WriterStopped;
+        const result = try w.trySubmit(pending.path, pending.bytes);
+        if (result == .busy) return .busy;
+        const m = &e.module.?;
+        m.accepted_bytes += pending.bytes.len;
+        self.bytes_persisted += pending.bytes.len;
+        self.pending_module = null;
+        if (pending.meta) {
+            m.state = .submitted;
+            return .done;
+        }
+        m.state = .exporting;
+        m.cursor += 1;
+        return .progress;
+    }
+
+    pub fn submitModuleMeta(self: *DiskTier, id: u64) !ModuleSlice {
+        _ = self.harvestWriteFailures();
+        const idx = self.moduleIndex(id) orelse return error.DiskCacheModuleMissing;
+        const e = &self.entries.items[idx];
+        const m = &e.module.?;
+        if (e.poisoned) return error.DiskCacheModuleMissing;
+        if (m.state == .submitted or m.state == .committed) return .done;
+        if (m.cursor != m.manifest.part_bytes.len + 2) return error.ModulePartsPending;
+        errdefer self.retireModuleEntry(e, .failed, "module metadata submission failed");
+        if (self.pending_module) |pending| {
+            if (pending.id != id or !pending.meta) return .busy;
+            return self.trySubmitModuleFile(e);
+        }
+        const bytes = try self.allocator.dupe(u8, m.meta);
+        const path = self.moduleFilePath(e, true) catch |err| {
+            self.allocator.free(bytes);
+            return err;
+        };
+        self.pending_module = .{ .id = id, .path = path, .bytes = bytes, .meta = true };
+        return self.trySubmitModuleFile(e);
+    }
+
+    /// Harvest before checking own paths, then harvest again after the nonblocking pending
+    /// check: a failure may have arrived between the first harvest and the final rename.
+    pub fn pollModuleWrites(self: *DiskTier) void {
+        _ = self.harvestWriteFailures();
+        for (self.entries.items) |*e| {
+            if (e.kind != .module or e.module.?.state != .submitted) continue;
+            if (self.entryWritesPending(e.id)) continue;
+            _ = self.harvestWriteFailures();
+            if (e.module.?.state != .submitted) continue;
+            self.validateModuleFiles(e) catch {
+                self.retireModuleEntry(e, .failed, "module publication validation failed");
+                continue;
+            };
+            e.module.?.state = .committed;
+            self.total_bytes = self.total_bytes -| e.bytes;
+            e.bytes = e.module.?.manifest.bytes;
+            self.total_bytes += e.bytes;
+        }
+    }
+
+    pub fn cancelModule(self: *DiskTier, id: u64, reason: ModuleCancellation) void {
+        _ = reason;
+        const idx = self.moduleIndex(id) orelse return;
+        self.retireModuleEntry(&self.entries.items[idx], .cancelled, "module export cancelled");
+    }
+
+    /// Faulty imports and ordinary committed eviction retire an identity without export loss.
+    pub fn retireModule(self: *DiskTier, id: u64) void {
+        const idx = self.moduleIndex(id) orelse return;
+        self.retireModuleEntry(&self.entries.items[idx], .cancelled, "module record retired");
+    }
+
+    fn retireModuleEntry(self: *DiskTier, e: *IndexEntry, state: module_record.State, why: []const u8) void {
+        const m = &e.module.?;
+        if (m.state == .failed or m.state == .cancelled) return;
+        if (m.state != .committed and !m.loss_counted) {
+            self.module_export_losses_total += 1;
+            m.loss_counted = true;
+        }
+        m.state = state;
+        e.poisoned = true;
+        if (self.pending_module) |pending| {
+            if (pending.id == e.id) {
+                self.allocator.free(pending.path);
+                self.allocator.free(pending.bytes);
+                self.pending_module = null;
+            }
+        }
+        if (self.writer) |w| w.discardPrefix(m.directory);
+        // The reservation is released once; accepted remnants remain a separate liability
+        // until deletion succeeds, even when their last write has not finished yet.
+        self.total_bytes -|= e.bytes;
+        e.bytes = m.accepted_bytes;
+        self.total_bytes += e.bytes;
+        log.warn("  [disk-cache] module e{d} {s} ({s})\n", .{ e.id, @tagName(state), why });
+    }
+
+    pub fn cleanupModules(self: *DiskTier) void {
+        _ = self.harvestWriteFailures();
+        var i = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            _ = self.cleanupModuleAt(i);
+        }
+    }
+
+    fn cleanupModuleAt(self: *DiskTier, idx: usize) bool {
+        const e = &self.entries.items[idx];
+        if (e.kind != .module) return false;
+        const m = &e.module.?;
+        if (m.state != .failed and m.state != .cancelled) return false;
+        if (self.writer) |w| {
+            w.discardPrefix(m.directory);
+            if (w.pendingPrefix(m.directory)) return false;
+        }
+        std.Io.Dir.cwd().deleteTree(self.io, m.directory) catch |err| {
+            log.warn("  [disk-cache] module e{d} cleanup deferred ({s})\n", .{ e.id, @errorName(err) });
+            return false;
+        };
+        var removed = self.entries.swapRemove(idx);
+        self.total_bytes -|= removed.bytes;
+        self.freeIndexEntryOwned(&removed);
+        return true;
+    }
+
+    /// Confirmed bytes occupying the volume, excluding unwritten module reservations.
+    pub fn physicalDiskBytes(self: *DiskTier) u64 {
+        var bytes = self.total_bytes;
+        for (self.entries.items) |*e| {
+            if (e.kind != .module) continue;
+            bytes -|= e.bytes;
+            bytes +|= self.modulePhysicalBytes(e.module.?.directory);
+        }
+        return bytes;
+    }
+
+    fn modulePhysicalBytes(self: *DiskTier, directory: []const u8) u64 {
+        var dir = std.Io.Dir.openDirAbsolute(self.io, directory, .{ .iterate = true }) catch return 0;
+        defer dir.close(self.io);
+        var total: u64 = 0;
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const st = dir.statFile(self.io, entry.name, .{}) catch continue;
+            total +|= st.size;
+        }
+        return total;
+    }
+
+    fn diskLruCandidate(self: *const DiskTier) ?usize {
+        var best: ?usize = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.kind == .module and e.module.?.state != .committed) continue;
+            if (best == null or e.last_used < self.entries.items[best.?].last_used) best = i;
+        }
+        return best;
+    }
+
+    fn makeModuleRoom(self: *DiskTier, bytes: u64) bool {
+        if (self.max_bytes == 0) return true;
+        while (bytes > self.max_bytes -| self.total_bytes) {
+            const idx = self.diskLruCandidate() orelse return false;
+            self.removeAt(idx);
+        }
+        return true;
+    }
+
+    /// `out` uses the tier's allocator. Recompute each candidate's key against the live binding.
+    pub fn moduleCandidates(self: *DiskTier, prompt: []const u32, tools: bool, quant: kv_quant.KVQuantConfig, media: []const MediaSpan, out: *std.ArrayList(ModuleCandidate)) !void {
+        out.clearRetainingCapacity();
+        self.pollModuleWrites();
+        for (self.entries.items) |*e| {
+            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
+            const n = e.kv_len;
+            if (n == 0 or n >= prompt.len or e.has_tools != tools or !std.meta.eql(e.quant, quant)) continue;
+            if (mediaSharedBound(e.media, media) < n or !std.mem.eql(u32, e.tokens, prompt[0..n])) continue;
+            try out.append(self.allocator, .{ .id = e.id, .n = n, .prefix_key = @bitCast(e.module.?.manifest.prefix_key) });
+        }
+        std.mem.sort(ModuleCandidate, out.items, {}, struct {
+            fn less(_: void, a: ModuleCandidate, b: ModuleCandidate) bool {
+                return a.n > b.n;
+            }
+        }.less);
+    }
+
+    pub fn readModuleHeader(self: *DiskTier, id: u64) ![]u8 {
+        self.pollModuleWrites();
+        const idx = self.moduleIndex(id) orelse return error.DiskCacheModuleMissing;
+        const e = &self.entries.items[idx];
+        if (e.poisoned or e.module.?.state != .committed) return error.DiskCacheModuleMissing;
+        errdefer self.retireModuleEntry(e, .failed, "module header unreadable");
+        const path = try std.fmt.allocPrint(self.allocator, "{s}module.header", .{e.module.?.directory});
+        defer self.allocator.free(path);
+        const header = readFileAlloc(self.allocator, self.io, path, module_record.MAX_HEADER_BYTES) orelse return error.BadModuleHeader;
+        errdefer self.allocator.free(header);
+        if (!std.mem.eql(u8, header, e.module.?.header)) return error.BadModuleHeader;
+        const context = self.module_context orelse return error.BadModuleHeader;
+        if (!std.mem.eql(u8, context.identity, e.module.?.manifest.identity)) return error.BadModuleHeader;
+        if (!context.validate(context.user, header, &e.module.?.manifest)) return error.BadModuleHeader;
+        return header;
+    }
+
+    /// Validate every descriptor before loading the first tensor. Each CPU-loaded part is
+    /// evaluated before closing its maps; the returned list retains ALL parts for import.
+    pub fn loadModuleParts(self: *DiskTier, id: u64) !std.ArrayList(NamedTensor) {
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
+        self.pollModuleWrites();
+        const idx = self.moduleIndex(id) orelse return error.DiskCacheModuleMissing;
+        const e = &self.entries.items[idx];
+        if (e.poisoned or e.module.?.state != .committed) return error.DiskCacheModuleMissing;
+        errdefer self.retireModuleEntry(e, .failed, "module import read failed");
+        try self.validateModuleFiles(e);
+        var list = std.ArrayList(NamedTensor).empty;
+        errdefer self.freeNamed(&list);
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        for (e.module.?.manifest.part_bytes, 0..) |_, part| try self.loadModulePart(e, @intCast(part), &list, cpu);
+        e.last_used = self.bump();
+        return list;
+    }
+
+    fn loadModulePart(self: *DiskTier, e: *const IndexEntry, part: u32, list: *std.ArrayList(NamedTensor), cpu: mlx.mlx_stream) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}m{d:0>3}.safetensors\x00", .{ e.module.?.directory, part });
+        defer self.allocator.free(path);
+        var map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        var meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try mlx.check(mlx.mlx_load_safetensors(&map, &meta, @ptrCast(path.ptr), cpu));
+        const evals = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(evals);
+        for (e.module.?.manifest.tensors) |t| {
+            if (t.part != part) continue;
+            const key = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{t.name});
+            defer self.allocator.free(key);
+            var arr = mlx.mlx_array_new();
+            {
+                errdefer _ = mlx.mlx_array_free(arr);
+                try mlx.check(mlx.mlx_map_string_to_array_get(&arr, map, @ptrCast(key.ptr)));
+                try validateModuleArray(t, arr);
+                try mlx.check(mlx.mlx_vector_array_append_value(evals, arr));
+                const owned_key = try self.allocator.dupe(u8, t.name);
+                errdefer self.allocator.free(owned_key);
+                try list.append(self.allocator, .{ .key = owned_key, .arr = arr });
+            }
+        }
+        try mlx.check(mlx.mlx_eval(evals));
+    }
+
+    fn validateModuleFiles(self: *DiskTier, e: *const IndexEntry) !void {
+        const m = &e.module.?;
+        const context = self.module_context orelse return error.BadModuleHeader;
+        if (!std.mem.eql(u8, context.identity, m.manifest.identity)) return error.BadModuleHeader;
+        if (!context.validate(context.user, m.header, &m.manifest)) return error.BadModuleHeader;
+        try self.validateModuleSmallFile(m.directory, "meta.json", m.meta);
+        try self.validateModuleSmallFile(m.directory, "module.header", m.header);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}tokens.bin", .{m.directory});
+        defer self.allocator.free(path);
+        if (fileSize(self.io, path) != m.manifest.token_bytes) return error.BadModuleTokens;
+        const raw = readFileAlloc(self.allocator, self.io, path, @intCast(m.manifest.token_bytes)) orelse return error.BadModuleTokens;
+        defer self.allocator.free(raw);
+        if (raw.len != m.manifest.token_bytes) return error.BadModuleTokens;
+        for (e.tokens, 0..) |id, i| {
+            if (std.mem.readInt(u32, raw[i * 4 ..][0..4], .little) != id) return error.BadModuleTokens;
+        }
+        for (m.manifest.part_bytes, 0..) |size, part| try self.validateModulePartFile(m, @intCast(part), size);
+    }
+
+    fn validateModuleSmallFile(self: *DiskTier, directory: []const u8, name: []const u8, want: []const u8) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ directory, name });
+        defer self.allocator.free(path);
+        if (fileSize(self.io, path) != want.len) return error.BadModuleHeader;
+        const bytes = readFileAlloc(self.allocator, self.io, path, want.len) orelse return error.BadModuleHeader;
+        defer self.allocator.free(bytes);
+        if (!std.mem.eql(u8, bytes, want)) return error.BadModuleHeader;
+    }
+
+    fn validateModulePartFile(self: *DiskTier, m: *const module_record.Record, part: u32, want: u64) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}m{d:0>3}.safetensors", .{ m.directory, part });
+        defer self.allocator.free(path);
+        const f = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
+        defer f.close(self.io);
+        const stat = try f.stat(self.io);
+        if (stat.size != want or want < 8) return error.BadModulePart;
+        var rb: [4096]u8 = undefined;
+        var reader = f.reader(self.io, &rb);
+        const len = try reader.interface.takeInt(u64, .little);
+        if (len > module_record.MAX_ENVELOPE_BYTES or len > want - 8) return error.BadModulePart;
+        const header = try self.allocator.alloc(u8, @intCast(len));
+        defer self.allocator.free(header);
+        try reader.interface.readSliceAll(header);
+        try module_record.validatePartHeader(self.allocator, header, want - 8 - len, m.manifest.tensors, part);
+    }
+
     /// Test hook: answer every free-space probe with these numbers. Every SSD-first test must call this.
     pub fn armTestSpace(self: *DiskTier, free: u64, total: u64) void {
         test_space = .{ .free = free, .total = total };
         self.space_probe = testSpaceProbe;
     }
 
-    /// Arm the background writer (both arms; set `ssd_first` first). A spawn failure keeps the
-    /// synchronous path.
+    /// Arm the background writer (both arms; set `ssd_first` first). A spawn failure keeps KV
+    /// synchronous; module persistence requires a running Writer.
     pub fn enableBackgroundWriter(self: *DiskTier) void {
         if (self.writer != null) return;
         const w = self.allocator.create(disk_writer.Writer) catch return;
         w.* = disk_writer.Writer.init(self.allocator, self.io);
         w.start() catch {
             self.allocator.destroy(w);
-            log.warn("[disk-cache] background writer unavailable — writing synchronously\n", .{});
+            if (self.module_context != null) {
+                log.warn("[disk-cache] background writer unavailable — module persistence disabled\n", .{});
+            } else log.warn("[disk-cache] background writer unavailable — writing synchronously\n", .{});
             return;
         };
         self.writer = w;
@@ -534,14 +1037,28 @@ pub const DiskTier = struct {
             if (w.drainUntil(wait)) return 0;
         }
         const dropped = w.queuedBytes();
+        if (self.module_context != null) {
+            for (self.entries.items) |*e| {
+                if (e.kind == .module) {
+                    const state = e.module.?.state;
+                    if (state != .committed) self.cancelModule(e.id, .shutdown_expiry);
+                    continue;
+                }
+                const pre = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, e.id }) catch continue;
+                defer self.allocator.free(pre);
+                w.discardPrefix(pre);
+            }
+            return dropped;
+        }
         w.fence(null);
         return dropped;
     }
 
     /// Host bytes staged for the writer and not yet written. Zero when the writer is not armed.
     pub fn stagedHostBytes(self: *DiskTier) u64 {
-        const w = self.writer orelse return 0;
-        return w.pendingBytes();
+        const queued = if (self.writer) |w| w.pendingBytes() else 0;
+        const unsent: u64 = if (self.pending_module) |p| p.bytes.len else 0;
+        return queued +| unsent +| self.module_materialization_bytes;
     }
 
     /// Background write failures so far.
@@ -554,6 +1071,7 @@ pub const DiskTier = struct {
     /// answers false (its writes were synchronous).
     pub fn entryWritesPending(self: *DiskTier, id: u64) bool {
         const w = self.writer orelse return false;
+        if (self.moduleIndex(id)) |idx| return w.pendingPrefix(self.entries.items[idx].module.?.directory);
         const pre = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, id }) catch return true;
         defer self.allocator.free(pre);
         return w.pendingPrefix(pre);
@@ -611,6 +1129,7 @@ pub const DiskTier = struct {
         _ = self.harvestWriteFailures();
         const media_in = spansBelow(media, tokens.len);
         for (self.entries.items) |*e| {
+            if (e.kind != .kv) continue;
             if (!e.poisoned or e.has_tools != has_tools or !std.meta.eql(e.quant, config)) continue;
             const n = @min(e.tokens.len, tokens.len);
             if (mediaSharedBound(e.media, media_in) >= n and std.mem.eql(u32, e.tokens[0..n], tokens[0..n])) return true;
@@ -620,7 +1139,10 @@ pub const DiskTier = struct {
 
     /// Mark one entry dead; `chunk_bytes` is zeroed so every "is this whole?" reader answers no.
     fn poisonEntry(self: *DiskTier, e: *IndexEntry, err_name: []const u8) void {
-        _ = self;
+        if (e.kind == .module) {
+            self.retireModuleEntry(e, .failed, err_name);
+            return;
+        }
         e.poisoned = true;
         @memset(e.chunk_bytes, 0);
         log.warn("  [disk-cache] e{d} unusable ({s}) — entry invalidated\n", .{ e.id, err_name });
@@ -651,9 +1173,19 @@ pub const DiskTier = struct {
     /// Does the filesystem agree with the index about entry `id`? One stat per chunk; catches
     /// a byte that went missing with no failed write at all.
     pub fn entryWholeOnDisk(self: *DiskTier, id: u64) bool {
+        _ = self.harvestWriteFailures();
+        self.pollModuleWrites();
         for (self.entries.items) |*e| {
             if (e.id != id) continue;
             if (e.poisoned) return false;
+            if (e.kind == .module) {
+                if (e.module.?.state != .committed) return false;
+                self.validateModuleFiles(e) catch {
+                    self.retireModuleEntry(e, .failed, "invalid module files");
+                    return false;
+                };
+                return true;
+            }
             for (e.chunk_bytes, 0..) |want, i| {
                 if (want == 0) return false;
                 const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, id, i }) catch return false;
@@ -664,6 +1196,11 @@ pub const DiskTier = struct {
             return true;
         }
         return false;
+    }
+
+    fn requireKvIndex(self: *const DiskTier, idx: usize) !void {
+        if (idx >= self.entries.items.len) return error.DiskCacheEmptyEntry;
+        if (self.entries.items[idx].kind != .kv) return error.DiskCacheWrongKind;
     }
 
     fn indexOfId(self: *const DiskTier, id: u64) ?usize {
@@ -693,12 +1230,20 @@ pub const DiskTier = struct {
     }
 
     pub fn deinit(self: *DiskTier) void {
+        for (self.entries.items) |*e| {
+            if (e.kind != .module) continue;
+            const state = e.module.?.state;
+            if (state == .registered or state == .exporting) self.cancelModule(e.id, .unload);
+        }
         if (self.base_dir) |b| self.allocator.free(b);
         self.base_dir = null;
         if (self.writer) |w| {
             // Teardown must never block on a paused writer: lift the pause so the queue drains for real.
             w.setPaused(false);
             w.drain();
+            _ = self.harvestWriteFailures();
+            self.pollModuleWrites();
+            self.cleanupModules();
             w.deinit();
             self.allocator.destroy(w);
             self.writer = null;
@@ -714,6 +1259,7 @@ pub const DiskTier = struct {
     /// eviction, invalidation, scan-append failure, extend-replace) must go
     /// through this so a new owned field can't leak on one of them.
     fn freeIndexEntryOwned(self: *DiskTier, e: *IndexEntry) void {
+        if (e.module) |*m| m.deinit();
         self.allocator.free(e.tokens);
         self.allocator.free(e.chunk_bytes);
         self.allocator.free(e.ssm_positions);
@@ -726,7 +1272,7 @@ pub const DiskTier = struct {
     fn refreshDiskBudget(self: *DiskTier) void {
         const vs = self.space_probe(self.root) orelse return;
         // Our own entries are already counted in `used`; add what the tier holds back.
-        const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes, vs.total);
+        const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.physicalDiskBytes(), vs.total);
         if (budget) |b| {
             self.store_declined = false;
             if (b != self.max_bytes) {
@@ -777,6 +1323,7 @@ pub const DiskTier = struct {
         var best_idx: ?usize = null;
         var best_usable: u32 = 0;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.kind != .kv) continue;
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
@@ -817,6 +1364,7 @@ pub const DiskTier = struct {
         var skipped: usize = 0;
         var deepest_skip: ?HybridSkipDiagnosis = null;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.kind != .kv) continue;
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
@@ -849,6 +1397,7 @@ pub const DiskTier = struct {
     /// Views are left empty — identical contract to `KVCache.restore` (the
     /// next `update`/`truncate` rebuilds them). Returns kv_len.
     pub fn restoreInto(self: *DiskTier, cache: *KVCache, idx: usize, s: mlx.mlx_stream) !u32 {
+        try self.requireKvIndex(idx);
         const kv_len = self.entries.items[idx].kv_len;
         try self.restorePrefixInto(cache, idx, kv_len, s);
         return kv_len;
@@ -860,6 +1409,7 @@ pub const DiskTier = struct {
     /// diverged-prefix "hit" that would otherwise read every stored chunk to
     /// serve a few hundred tokens — slower than a cold prefill).
     pub fn restorePrefixInto(self: *DiskTier, cache: *KVCache, idx: usize, limit: u32, s: mlx.mlx_stream) !void {
+        try self.requireKvIndex(idx);
         // Callers swallow a restore failure and prefill cold; the latch it raised must not fail that prefill.
         const had_error = mlx.errorPending();
         errdefer mlx.dropLatchedErrorUnless(had_error);
@@ -887,6 +1437,7 @@ pub const DiskTier = struct {
         cp_pos: u32,
         s: mlx.mlx_stream,
     ) !u32 {
+        try self.requireKvIndex(idx);
         const had_error = mlx.errorPending();
         errdefer mlx.dropLatchedErrorUnless(had_error);
         self.drainEntry(self.entries.items[idx].id);
@@ -972,6 +1523,7 @@ pub const DiskTier = struct {
         floor: u32,
         s: mlx.mlx_stream,
     ) !u32 {
+        try self.requireKvIndex(idx);
         var pos = cp_pos;
         while (true) {
             // A gap fails before the cache or the entries are touched, so the next try starts clean.
@@ -988,6 +1540,7 @@ pub const DiskTier = struct {
     /// null when none qualifies (hybrid KV without SSM state is unusable, so
     /// the caller must skip the entry entirely).
     pub fn highestSsmPosAtOrBelow(self: *const DiskTier, idx: usize, limit: u32) ?u32 {
+        if (idx >= self.entries.items.len or self.entries.items[idx].kind != .kv) return null;
         var best: ?u32 = null;
         for (self.entries.items[idx].ssm_positions) |p| {
             if (p > limit) break; // sorted ascending
@@ -1001,6 +1554,7 @@ pub const DiskTier = struct {
     /// checkpoint position for the hybrid path — the final chunk is sliced
     /// down so KV lands exactly at the checkpoint).
     fn restoreKvInto(self: *DiskTier, cache: *KVCache, e: *const IndexEntry, limit: u32, s: mlx.mlx_stream) !void {
+        if (e.kind != .kv) return error.DiskCacheWrongKind;
         const quant = e.quant;
         if (!std.meta.eql(cache.config, quant)) return error.DiskCacheConfigMismatch;
         if (limit == 0 or limit > e.kv_len) return error.DiskCacheEmptyEntry;
@@ -1413,6 +1967,7 @@ pub const DiskTier = struct {
         var extend_idx: ?usize = null;
         var ssm_only_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.kind != .kv) continue;
             if (e.poisoned) continue; // dead: never superseded, never extended
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
@@ -1711,6 +2266,7 @@ pub const DiskTier = struct {
         const target = persistTargetLen(kv_entries, step, tokens.len);
         if (target == 0) return null;
         for (self.entries.items) |*e| {
+            if (e.kind != .kv) continue;
             if (e.poisoned) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
@@ -1943,6 +2499,7 @@ pub const DiskTier = struct {
         /// clamps as it does today (a mid-block warm clamp declines, head starts blind).
         head_marks: transformer_mod.QsaHeadMarkSet = .{},
     } {
+        if (idx >= self.entries.items.len or self.entries.items[idx].kind != .kv) return null;
         const e = &self.entries.items[idx];
         const meta = (switch (which) {
             .dflash => e.spec_dflash,
@@ -2117,9 +2674,9 @@ pub const DiskTier = struct {
     }
 
     /// One staged tensor on the way to a safetensors file.
-    const NamedTensor = struct { key: []u8, arr: mlx.mlx_array };
+    pub const NamedTensor = struct { key: []u8, arr: mlx.mlx_array };
 
-    fn freeNamed(self: *DiskTier, list: *std.ArrayList(NamedTensor)) void {
+    pub fn freeNamed(self: *DiskTier, list: *std.ArrayList(NamedTensor)) void {
         for (list.items) |*t| {
             self.allocator.free(t.key);
             _ = mlx.mlx_array_free(t.arr);
@@ -2759,12 +3316,11 @@ pub const DiskTier = struct {
     // ── Invalidation (mirrors the RAM cache API) ──
 
     pub fn invalidateAll(self: *DiskTier) void {
-        for (self.entries.items) |*e| {
-            self.deleteEntryDir(e.id);
-            self.freeIndexEntryOwned(e);
+        var i = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            self.removeAt(i);
         }
-        self.entries.clearRetainingCapacity();
-        self.total_bytes = 0;
     }
 
     pub fn invalidateNewest(self: *DiskTier) void {
@@ -2788,6 +3344,11 @@ pub const DiskTier = struct {
     }
 
     fn removeAt(self: *DiskTier, idx: usize) void {
+        if (self.entries.items[idx].kind == .module) {
+            self.retireModuleEntry(&self.entries.items[idx], .cancelled, "module record removed");
+            _ = self.cleanupModuleAt(idx);
+            return;
+        }
         var e = self.entries.swapRemove(idx);
         self.total_bytes -|= self.bytesFreedByRemoving(&e);
         self.deleteEntryDir(e.id);
@@ -2797,6 +3358,7 @@ pub const DiskTier = struct {
     /// Bytes deleting `e`'s directory returns to the volume: its non-chunk files plus every
     /// chunk file nobody else links (`nlink == 1`). The filesystem is the refcount.
     fn bytesFreedByRemoving(self: *DiskTier, e: *const IndexEntry) u64 {
+        if (e.kind == .module) return 0;
         const dir_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, e.id }) catch return e.bytes;
         defer self.allocator.free(dir_abs);
         if (self.writer) |w| w.fence(dir_abs);
@@ -2839,6 +3401,7 @@ pub const DiskTier = struct {
         // pixels, not this commit's state.
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.kind != .kv) continue;
             if (e.poisoned) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
@@ -2927,6 +3490,11 @@ pub const DiskTier = struct {
     }
 
     fn deleteEntryDir(self: *DiskTier, id: u64) void {
+        if (self.moduleIndex(id)) |idx| {
+            self.retireModuleEntry(&self.entries.items[idx], .cancelled, "module directory removed");
+            _ = self.cleanupModuleAt(idx);
+            return;
+        }
         // Epoch fence, the one removal site: staged bytes for this directory are discarded.
         const dir_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, id }) catch null;
         defer if (dir_abs) |da| self.allocator.free(da);
@@ -2940,15 +3508,9 @@ pub const DiskTier = struct {
 
     fn gcToBudget(self: *DiskTier) void {
         if (self.max_bytes == 0) return;
-        while (self.total_bytes > self.max_bytes and self.entries.items.len > 1) {
-            var lru_idx: usize = 0;
-            var lru_used: u64 = std.math.maxInt(u64);
-            for (self.entries.items, 0..) |*e, i| {
-                if (e.last_used < lru_used) {
-                    lru_used = e.last_used;
-                    lru_idx = i;
-                }
-            }
+        while (self.total_bytes > self.max_bytes) {
+            const lru_idx = self.diskLruCandidate() orelse return;
+            if (self.entries.items.len == 1 and self.entries.items[lru_idx].kind == .kv) return;
             const mb = @as(f64, @floatFromInt(self.entries.items[lru_idx].bytes)) / (1024.0 * 1024.0);
             log.info("  [disk-cache] evicted LRU entry (byte budget; {d:.1} MB)\n", .{mb});
             self.removeAt(lru_idx);
@@ -2956,6 +3518,7 @@ pub const DiskTier = struct {
     }
 
     fn writeMeta(self: *DiskTier, e: IndexEntry) !void {
+        if (e.kind != .kv) return error.DiskCacheWrongKind;
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         try self.renderMeta(&buf, e);
@@ -2988,6 +3551,7 @@ pub const DiskTier = struct {
     /// claim: an older reader accepts only 2..4, so stamping v6 unconditionally made a binary
     /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
     fn metaVersionFor(e: IndexEntry) u8 {
+        if (e.kind == .module) return 10;
         // v9 = media-keyed identity: an older reader must NOT load these into
         // token-only matching (it would restore past a placeholder under a
         // possibly different image), so a media entry claims a version the old
@@ -3001,6 +3565,7 @@ pub const DiskTier = struct {
 
     /// The meta.json body; one renderer for the synchronous and the staged path.
     fn renderMeta(self: *DiskTier, out: *std.ArrayList(u8), e: IndexEntry) !void {
+        if (e.kind == .module) return out.appendSlice(self.allocator, e.module.?.meta);
         const a = self.allocator;
         try out.print(
             a,
@@ -3076,7 +3641,7 @@ pub const DiskTier = struct {
             const id = std.fmt.parseInt(u64, dent.name[1..], 10) catch continue;
             // Never reuse an id that has ever existed on disk — even a
             // dropped leftover's delete could fail and leave a dirty dir.
-            if (id >= self.next_id) self.next_id = id + 1;
+            if (id >= self.next_id) self.next_id = id +| 1;
             if (self.loadEntry(id)) |loaded| {
                 pending.append(self.allocator, .{ .e = loaded.e, .mtime = loaded.mtime }) catch {
                     var le = loaded.e;
@@ -3120,6 +3685,10 @@ pub const DiskTier = struct {
     /// Re-bill a scanned entry's chunk files against the inodes already counted this scan: the
     /// first entry to see an inode pays for it.
     fn billChunksOnce(self: *DiskTier, e: *IndexEntry, seen: *std.AutoHashMap(u64, void)) void {
+        if (e.kind == .module) {
+            e.bytes = e.module.?.manifest.bytes;
+            return;
+        }
         var billed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
         for (e.ssm_bytes) |b| billed += b;
         if (e.qsa_history_bytes > 0) {
@@ -3167,7 +3736,54 @@ pub const DiskTier = struct {
         e.bytes = billed;
     }
 
-    fn loadEntry(self: *DiskTier, id: u64) ?struct { e: IndexEntry, mtime: i128 } {
+    fn loadModuleEntry(self: *DiskTier, id: u64, meta: []const u8, mtime: i128) !LoadedEntry {
+        const context = self.module_context orelse return error.BadModuleHeader;
+        const header_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/module.header", .{ self.root, id });
+        defer self.allocator.free(header_path);
+        const header = readFileAlloc(self.allocator, self.io, header_path, module_record.MAX_HEADER_BYTES) orelse return error.BadModuleHeader;
+        defer self.allocator.free(header);
+        var record = try module_record.Record.parse(self.allocator, meta, header);
+        errdefer record.deinit();
+        const m = record.manifest;
+        if (!std.mem.eql(u8, context.identity, m.identity)) return error.BadModuleHeader;
+        if (!context.validate(context.user, header, &m)) return error.BadModuleHeader;
+        const quant = try moduleQuant(m);
+        record.directory = try std.fmt.allocPrint(record.arena.allocator(), "{s}/e{d}/", .{ self.root, id });
+        const path = try std.fmt.allocPrint(self.allocator, "{s}tokens.bin", .{record.directory});
+        defer self.allocator.free(path);
+        if (fileSize(self.io, path) != m.token_bytes) return error.BadModuleTokens;
+        const raw = readFileAlloc(self.allocator, self.io, path, @intCast(m.token_bytes)) orelse return error.BadModuleTokens;
+        defer self.allocator.free(raw);
+        if (raw.len != m.token_bytes) return error.BadModuleTokens;
+        const tokens = try self.allocator.alloc(u32, m.n);
+        errdefer self.allocator.free(tokens);
+        for (tokens, 0..) |*t, i| t.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+        const media = try self.allocator.alloc(MediaSpan, m.media.len);
+        errdefer self.allocator.free(media);
+        for (m.media, media) |sp, *out| out.* = .{ .start = sp.start, .key = @bitCast(sp.key) };
+        const e: IndexEntry = .{
+            .kind = .module, .module = record, .id = id, .tokens = tokens, .kv_len = m.n,
+            .has_tools = m.has_tools, .quant = quant, .bytes = m.bytes, .media = media,
+            .chunk_bytes = &.{}, .ssm_positions = &.{}, .ssm_bytes = &.{}, .last_used = 0,
+        };
+        try self.validateModuleFiles(&e);
+        return .{ .e = e, .mtime = mtime };
+    }
+
+    fn moduleQuant(m: module_record.Envelope) !kv_quant.KVQuantConfig {
+        const scheme = std.meta.stringToEnum(kv_quant.Scheme, m.scheme) orelse return error.BadModuleHeader;
+        if (scheme == .off) {
+            const dense = kv_quant.KVQuantConfig.dense;
+            if (m.bits != dense.bits or m.group_size != dense.group_size) return error.BadModuleHeader;
+            return dense;
+        }
+        if (scheme != .affine or (m.bits != 4 and m.bits != 8) or m.group_size == 0) return error.BadModuleHeader;
+        var quant = kv_quant.KVQuantConfig.affine(m.bits);
+        quant.group_size = m.group_size;
+        return quant;
+    }
+
+    fn loadEntry(self: *DiskTier, id: u64) ?LoadedEntry {
         const meta_path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json", .{ self.root, id }) catch return null;
         defer self.allocator.free(meta_path);
 
@@ -3181,6 +3797,8 @@ pub const DiskTier = struct {
         const obj = parsed.value.object;
 
         const version = jsonU64(obj, "v") orelse return null;
+        if (version == 10) return self.loadModuleEntry(id, content, stat.mtime.nanoseconds) catch null;
+        if (obj.contains("kind")) return null;
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
         // adds optional spec snapshots; v5 the qwen4_exp MTP head's QSA half; v6 inherited
         // chunks. All restore; a lower-version entry just carries none of the newer state.
@@ -3637,6 +4255,7 @@ pub fn defaultBaseDir(allocator: std.mem.Allocator) ![]u8 {
 
 /// Bytes of an entry's files that are never shared: tokens.bin, the SSM checkpoints and the spec sidecar.
 fn nonChunkBytes(e: *const IndexEntry) u64 {
+    if (e.kind == .module) return e.bytes;
     var n: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
     for (e.ssm_bytes) |b| n += b;
     if (!e.inherited_qsa) n += e.qsa_history_bytes;
@@ -8761,4 +9380,449 @@ test "DiskTier: checkpoint thinning never removes the low grid anchors" {
     try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), spread.len);
     try testing.expectEqual(@as(u32, GRID), spread[0]); // index 0 always survived
     try testing.expect(std.mem.indexOfScalar(u32, spread, 2 * GRID) == null);
+}
+
+// ── Module records (CPU tensors and real Writer/filesystem) ──
+
+const ModuleSource = struct {
+    const header = "test-codec-v1";
+    const context: module_record.Context = .{ .identity = "weights:16:42;token-map:builtin", .validate = &validate };
+    const tensors: []const module_record.Tensor = &.{.{ .name = "ring", .dtype = "F32", .shape = &.{4}, .bytes = 16 }};
+
+    fn validate(_: ?*anyopaque, h: []const u8, _: *const module_record.Envelope) bool {
+        return std.mem.eql(u8, h, header);
+    }
+
+    fn init(base: []const u8, fp: []const u8) !DiskTier {
+        var tier = try DiskTier.initWithModule(testing.allocator, testing.io, base, fp, 2 * DISK_STORE_FLOOR, 512, context);
+        tier.armTestSpace(1024 * DISK_STORE_FLOOR, 2048 * DISK_STORE_FLOOR);
+        tier.enableBackgroundWriter();
+        return tier;
+    }
+
+    fn register(tier: *DiskTier, n: u32) !u64 {
+        const ids = try testing.allocator.alloc(u32, n);
+        defer testing.allocator.free(ids);
+        for (ids, 0..) |*id, i| id.* = @intCast(i + 7);
+        return (try tier.registerModule(.{
+            .tokens = ids, .prefix_key = 17, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
+            .header = header, .tensors = tensors,
+        })) orelse error.ModuleRegistrationDeclined;
+    }
+
+    fn submit(tier: *DiskTier, id: u64) !void {
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        try testing.expectEqual(.progress, try tier.stageModulePart(id, &.{}, cpu));
+        try testing.expectEqual(.progress, try tier.stageModulePart(id, &.{}, cpu));
+        const data = [_]f32{ 1.25, -2.5, 3.75, 9 };
+        const shape = [_]c_int{4};
+        var list = std.ArrayList(DiskTier.NamedTensor).empty;
+        defer tier.freeNamed(&list);
+        const key = try testing.allocator.dupe(u8, "ring");
+        const arr = mlx.mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+        list.append(testing.allocator, .{ .key = key, .arr = arr }) catch |err| {
+            testing.allocator.free(key);
+            _ = mlx.mlx_array_free(arr);
+            return err;
+        };
+        try testing.expectEqual(.progress, try tier.stageModulePart(id, list.items, cpu));
+    }
+
+    fn publish(tier: *DiskTier, id: u64) !void {
+        try submit(tier, id);
+        try testing.expectEqual(.done, try tier.submitModuleMeta(id));
+    }
+
+    fn path(tier: *DiskTier, id: u64, file: []const u8) ![]u8 {
+        return std.fmt.allocPrint(testing.allocator, "{s}/e{d}/{s}", .{ tier.root, id, file });
+    }
+};
+
+test "R12 a module part failure retires only its immutable identity" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r12");
+    defer tier.deinit();
+    const bad = try ModuleSource.register(&tier, 512);
+    const good = try ModuleSource.register(&tier, 513);
+    const fail = try std.fmt.allocPrint(testing.allocator, "/e{d}/m000.", .{bad});
+    defer testing.allocator.free(fail);
+    tier.writer.?.setPaused(true);
+    tier.writer.?.injectFailure(fail, .write);
+    try ModuleSource.publish(&tier, bad);
+    try ModuleSource.publish(&tier, good);
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expectEqual(@as(usize, 1), tier.harvestWriteFailures());
+    try testing.expectEqual(.failed, tier.moduleState(bad).?);
+    try testing.expect(!tier.entryWholeOnDisk(bad));
+    try testing.expect(tier.entryWholeOnDisk(good));
+    try testing.expectEqual(@as(u64, 1), tier.module_export_losses_total);
+    try testing.expectEqual(@as(usize, 0), tier.harvestWriteFailures());
+}
+
+test "R13 metadata after a failed part never publishes and restart rejects it" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, testing.io, &buf);
+    var tier = try ModuleSource.init(base, "r13");
+    defer tier.deinit();
+    const id = try ModuleSource.register(&tier, 512);
+    tier.writer.?.setPaused(true);
+    tier.writer.?.injectFailure("m000.", .write);
+    try ModuleSource.publish(&tier, id);
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    const meta = try ModuleSource.path(&tier, id, "meta.json");
+    defer testing.allocator.free(meta);
+    try testing.expect(fileSize(testing.io, meta) != null);
+    try testing.expect(!tier.entryWholeOnDisk(id));
+    try testing.expectEqual(@as(u64, 1), tier.module_export_losses_total);
+    var reopened = try ModuleSource.init(base, "r13");
+    defer reopened.deinit();
+    try testing.expectEqual(@as(usize, 0), reopened.entryCount());
+    try testing.expectEqual(@as(u64, 0), reopened.module_export_losses_total);
+}
+
+test "R14 metadata submission and write failures leave a module unusable" {
+    for ([_]disk_writer.FailAt{ .submit, .write }) |at| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r14");
+        defer tier.deinit();
+        const id = try ModuleSource.register(&tier, 512);
+        try ModuleSource.submit(&tier, id);
+        tier.writer.?.injectFailure("meta.json", at);
+        if (at == .submit) {
+            try testing.expectError(error.InjectedSubmitFailure, tier.submitModuleMeta(id));
+        } else {
+            try testing.expectEqual(.done, try tier.submitModuleMeta(id));
+        }
+        tier.drainWriter();
+        try testing.expect(!tier.entryWholeOnDisk(id));
+        try testing.expectEqual(.failed, tier.moduleState(id).?);
+        try testing.expectEqual(@as(u64, 1), tier.module_export_losses_total);
+    }
+}
+
+test "R15 an empty writer between slices never completes a module export" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r15");
+    defer tier.deinit();
+    const id = try ModuleSource.register(&tier, 512);
+    try testing.expect(!tier.entryWholeOnDisk(id));
+    try ModuleSource.submit(&tier, id);
+    tier.drainWriter();
+    try testing.expect(!tier.entryWritesPending(id));
+    try testing.expect(!tier.entryWholeOnDisk(id));
+    try testing.expectEqual(.exporting, tier.moduleState(id).?);
+    tier.writer.?.setPaused(true);
+    try testing.expectEqual(.done, try tier.submitModuleMeta(id));
+    try testing.expect(!tier.entryWholeOnDisk(id));
+    try testing.expectEqual(.submitted, tier.moduleState(id).?);
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expect(tier.entryWholeOnDisk(id));
+    try testing.expectEqual(.committed, tier.moduleState(id).?);
+}
+
+test "R16 scanning a module crash leftover removes the whole directory" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, testing.io, &buf);
+    var tier = try ModuleSource.init(base, "r16");
+    defer tier.deinit();
+    const id = try ModuleSource.register(&tier, 512);
+    try ModuleSource.submit(&tier, id);
+    tier.drainWriter();
+    var reopened = try ModuleSource.init(base, "r16");
+    defer reopened.deinit();
+    try testing.expectEqual(@as(usize, 0), reopened.entryCount());
+    const part = try ModuleSource.path(&tier, id, "m000.safetensors");
+    defer testing.allocator.free(part);
+    try testing.expect(fileSize(testing.io, part) == null);
+}
+
+test "R17 missing or truncated required module files reject the entire record" {
+    for ([_][]const u8{ "tokens.bin", "module.header", "m000.safetensors", "meta.json" }) |file| {
+        for ([_]bool{ false, true }) |truncate| {
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            var buf: [512]u8 = undefined;
+            const base = try tmpRoot(&tmp, testing.io, &buf);
+            var tier = try ModuleSource.init(base, "r17");
+            defer tier.deinit();
+            const id = try ModuleSource.register(&tier, 512);
+            try ModuleSource.publish(&tier, id);
+            tier.drainWriter();
+            const path = try ModuleSource.path(&tier, id, file);
+            defer testing.allocator.free(path);
+            if (truncate) {
+                const f = try std.Io.Dir.createFileAbsolute(testing.io, path, .{});
+                f.close(testing.io);
+            } else try std.Io.Dir.cwd().deleteFile(testing.io, path);
+            var reopened = try ModuleSource.init(base, "r17");
+            defer reopened.deinit();
+            try testing.expectEqual(@as(usize, 0), reopened.entryCount());
+        }
+    }
+}
+
+test "R18 a v10 module reopens and loads its complete CPU tensor inventory" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, testing.io, &buf);
+    var tier = try ModuleSource.init(base, "r18");
+    defer tier.deinit();
+    const id = try ModuleSource.register(&tier, 512);
+    try ModuleSource.publish(&tier, id);
+    tier.drainWriter();
+    var reopened = try ModuleSource.init(base, "r18");
+    defer reopened.deinit();
+    var prompt: [513]u32 = undefined;
+    for (&prompt, 0..) |*token, i| token.* = @intCast(i + 7);
+    var candidates = std.ArrayList(DiskTier.ModuleCandidate).empty;
+    defer candidates.deinit(testing.allocator);
+    try reopened.moduleCandidates(&prompt, false, kv_quant.KVQuantConfig.dense, &.{}, &candidates);
+    try testing.expectEqual(@as(usize, 1), candidates.items.len);
+    try testing.expectEqual(id, candidates.items[0].id);
+    try testing.expectEqual(@as(u64, 17), candidates.items[0].prefix_key);
+    const header = try reopened.readModuleHeader(id);
+    defer testing.allocator.free(header);
+    try testing.expectEqualStrings(ModuleSource.header, header);
+    var parts = try reopened.loadModuleParts(id);
+    defer reopened.freeNamed(&parts);
+    try testing.expectEqual(@as(usize, 1), parts.items.len);
+    try testing.expectEqualStrings("ring", parts.items[0].key);
+    const data = mlx.mlx_array_data_float32(parts.items[0].arr) orelse return error.NoData;
+    try testing.expectEqualSlices(f32, &.{ 1.25, -2.5, 3.75, 9 }, data[0..4]);
+    try testing.expectEqual(reopened.total_bytes, reopened.physicalDiskBytes());
+}
+
+test "R26 stable module IDs miss after retirement without touching a replacement" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r26");
+    defer tier.deinit();
+    const old = try ModuleSource.register(&tier, 512);
+    try ModuleSource.publish(&tier, old);
+    tier.drainWriter();
+    var prompt: [513]u32 = undefined;
+    for (&prompt, 0..) |*token, i| token.* = @intCast(i + 7);
+    var candidates = std.ArrayList(DiskTier.ModuleCandidate).empty;
+    defer candidates.deinit(testing.allocator);
+    try tier.moduleCandidates(&prompt, false, kv_quant.KVQuantConfig.dense, &.{}, &candidates);
+    try testing.expectEqual(@as(usize, 1), candidates.items.len);
+    const selected = candidates.items[0].id;
+    try testing.expectEqual(old, selected);
+    tier.retireModule(selected);
+    tier.cleanupModules();
+    const replacement = try ModuleSource.register(&tier, 513);
+    try testing.expect(old != replacement);
+    try testing.expectError(error.DiskCacheModuleMissing, tier.readModuleHeader(selected));
+    try testing.expectError(error.DiskCacheModuleMissing, tier.loadModuleParts(selected));
+    try testing.expectEqual(.registered, tier.moduleState(replacement).?);
+    try testing.expectEqual(@as(u64, 0), tier.module_export_losses_total);
+}
+
+test "R31 a newer module checkpoint preserves the older unfinished identity" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r31");
+    defer tier.deinit();
+    const old = try ModuleSource.register(&tier, 512);
+    const newer = try ModuleSource.register(&tier, 513);
+    try testing.expect(old != newer);
+    try testing.expectEqual(.registered, tier.moduleState(old).?);
+    try ModuleSource.publish(&tier, old);
+    try ModuleSource.publish(&tier, newer);
+    tier.drainWriter();
+    try testing.expect(tier.entryWholeOnDisk(old));
+    try testing.expect(tier.entryWholeOnDisk(newer));
+}
+
+test "R32 reservations never credit free space and active exports survive a lower cap" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r32");
+    defer tier.deinit();
+    const id = try ModuleSource.register(&tier, 512);
+    const reserved = tier.total_bytes;
+    try testing.expect(reserved > 0);
+    try testing.expectEqual(@as(u64, 0), tier.physicalDiskBytes());
+    tier.armTestSpace(11 * DISK_STORE_FLOOR - 1, 100 * DISK_STORE_FLOOR);
+    const ids = @as([512]u32, @splat(7));
+    try testing.expect((try tier.registerModule(.{
+        .tokens = &ids, .prefix_key = 18, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
+        .header = ModuleSource.header, .tensors = ModuleSource.tensors,
+    })) == null);
+    try testing.expect(tier.store_declined);
+    tier.max_bytes = reserved - 1;
+    tier.gcToBudget();
+    try testing.expectEqual(.registered, tier.moduleState(id).?);
+    try testing.expectEqual(reserved, tier.total_bytes);
+    tier.armTestSpace(1024 * DISK_STORE_FLOOR, 2048 * DISK_STORE_FLOOR);
+    const committed = try ModuleSource.register(&tier, 513);
+    try ModuleSource.publish(&tier, committed);
+    tier.drainWriter();
+    try testing.expect(tier.entryWholeOnDisk(committed));
+    tier.max_bytes = reserved;
+    tier.gcToBudget();
+    try testing.expectEqual(.registered, tier.moduleState(id).?);
+    try testing.expect(tier.moduleState(committed) == null);
+    try testing.expectEqual(reserved, tier.total_bytes);
+}
+
+test "R33 a module larger than the entire budget declines before registration" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r33");
+    defer tier.deinit();
+    tier.operator_cap = DISK_STORE_FLOOR;
+    const ids = @as([512]u32, @splat(7));
+    try testing.expect((try tier.registerModule(.{
+        .tokens = &ids, .prefix_key = 18, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
+        .header = ModuleSource.header,
+        .tensors = &.{.{ .name = "ring", .dtype = "F32", .shape = &.{DISK_STORE_FLOOR / 4}, .bytes = DISK_STORE_FLOOR }},
+    })) == null);
+    try testing.expectEqual(@as(usize, 0), tier.entryCount());
+    try testing.expectEqual(@as(u64, 0), tier.total_bytes);
+    try testing.expectEqual(@as(u64, 0), tier.module_export_losses_total);
+}
+
+test "R34 a full disk after reservation fails once and cleanup releases remnants" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r34");
+    defer tier.deinit();
+    const id = try ModuleSource.register(&tier, 512);
+    tier.writer.?.setPaused(true);
+    tier.writer.?.injectFailure("m000.", .write);
+    try ModuleSource.publish(&tier, id);
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expect(!tier.entryWholeOnDisk(id));
+    tier.cleanupModules();
+    tier.cleanupModules();
+    try testing.expectEqual(@as(u64, 0), tier.total_bytes);
+    try testing.expectEqual(@as(u64, 1), tier.module_export_losses_total);
+}
+
+test "R36 failed physical deletion retains liability and retries without recounting loss" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, testing.io, &buf);
+    var tier = try ModuleSource.init(base, "r36");
+    defer tier.deinit();
+    const id = try ModuleSource.register(&tier, 512);
+    try ModuleSource.submit(&tier, id);
+    tier.drainWriter();
+    const held = try std.fmt.allocPrint(testing.allocator, "{s}/held", .{base});
+    defer testing.allocator.free(held);
+    try std.Io.Dir.renameAbsolute(tier.root, held, testing.io);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "r36", .data = "blocked" });
+    tier.cancelModule(id, .memory_pressure);
+    const liability = tier.total_bytes;
+    tier.cleanupModules();
+    try testing.expect(liability > 0);
+    try testing.expectEqual(liability, tier.total_bytes);
+    try testing.expectEqual(.cancelled, tier.moduleState(id).?);
+    try testing.expectEqual(@as(u64, 1), tier.module_export_losses_total);
+    try tmp.dir.deleteFile(testing.io, "r36");
+    try std.Io.Dir.renameAbsolute(held, tier.root, testing.io);
+    tier.cleanupModules();
+    try testing.expectEqual(@as(u64, 0), tier.total_bytes);
+    try testing.expectEqual(@as(u64, 1), tier.module_export_losses_total);
+}
+
+test "R41 v10 module records are isolated from every KV entry point" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r41");
+    defer tier.deinit();
+    const id = try ModuleSource.register(&tier, 512);
+    try ModuleSource.publish(&tier, id);
+    tier.drainWriter();
+    const idx = tier.indexOfId(id).?;
+    const ids = tier.entries.items[idx].tokens;
+    const q = kv_quant.KVQuantConfig.dense;
+    try testing.expectEqual(@as(u8, 10), DiskTier.metaVersionFor(tier.entries.items[idx]));
+    try testing.expect(tier.bestMatch(ids, false, q, &.{}) == null);
+    try testing.expect(tier.bestHybridMatch(ids, false, q, 512, &.{}) == null);
+    try testing.expect(tier.chunkShareDonor(ids, 512, false, q, &.{}) == null);
+    try testing.expect(tier.fullPrefixEntryId(&.{}, 512, ids, false, q, &.{}) == null);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    try testing.expectError(error.DiskCacheWrongKind, tier.restoreInto(&cache, idx, cpu));
+    try testing.expectError(error.DiskCacheWrongKind, tier.restorePrefixInto(&cache, idx, 512, cpu));
+    try testing.expectError(error.DiskCacheWrongKind, tier.restoreIntoHybrid(&cache, &.{}, idx, 512, cpu));
+    try testing.expectError(error.DiskCacheWrongKind, tier.restoreIntoHybridCovered(&cache, &.{}, idx, 512, 1, cpu));
+    try testing.expectError(error.DiskCacheWrongKind, tier.restoreKvInto(&cache, &tier.entries.items[idx], 512, cpu));
+    try testing.expect(tier.entryWholeOnDisk(id));
+    _ = try tier.appendCommit(cache.entries, 512, q, ids, false, null, cpu);
+    tier.drainWriter();
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    try testing.expect(tier.entryWholeOnDisk(id));
+}
+
+test "R42 v2 through v9 KV scans retain contiguous chunk salvage" {
+    for (2..10) |v| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(testing.io, "kv/e1");
+        const raw = @as([2400]u8, @splat(0));
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "kv/e1/tokens.bin", .data = &raw });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "kv/e1/c000000.safetensors", .data = "good" });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "kv/e1/c000001.safetensors", .data = "x" });
+        const meta = try std.fmt.allocPrint(testing.allocator,
+            "{{\"v\":{d},\"kv_len\":600,\"tokens\":600,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":64,\"chunk_tokens\":512,\"chunk_bytes\":[4,4]{s}}}",
+            .{ v, if (v == 9) ",\"media\":[[100,2]]" else "" });
+        defer testing.allocator.free(meta);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "kv/e1/meta.json", .data = meta });
+        var buf: [512]u8 = undefined;
+        var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "kv");
+        defer tier.deinit();
+        try testing.expectEqual(@as(usize, 1), tier.entryCount());
+        try testing.expectEqual(@as(u32, 512), tier.entries.items[0].kv_len);
+        try testing.expectEqual(.kv, tier.entries.items[0].kind);
+    }
+}
+
+test "R44 failure attribution overflow retires all unfinished module exports once" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "r44");
+    defer tier.deinit();
+    const a = try ModuleSource.register(&tier, 512);
+    const b = try ModuleSource.register(&tier, 513);
+    tier.writer.?.injectFailure("failure", .write);
+    for (0..disk_writer.MAX_RECORDED_FAILURES + 1) |i| {
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/failure{d}", .{ tier.root, a, i });
+        tier.writer.?.submit(path, try testing.allocator.dupe(u8, "x"));
+    }
+    tier.drainWriter();
+    _ = tier.harvestWriteFailures();
+    try testing.expectEqual(.failed, tier.moduleState(a).?);
+    try testing.expectEqual(.failed, tier.moduleState(b).?);
+    try testing.expectEqual(@as(u64, 2), tier.module_export_losses_total);
+    _ = tier.harvestWriteFailures();
+    try testing.expectEqual(@as(u64, 2), tier.module_export_losses_total);
 }

@@ -40,7 +40,7 @@ Verbatim deep detail: per-file contracts, subsystem designs, API surfaces. Root 
 | `host/api/responses/model.zig` | OpenAI Responses API: parser, envelope, in-memory `ResponseStore`, compaction blob |
 | `host/http/ws.zig` | RFC 6455 WebSocket framing (server-side, generic over `Conn`) |
 | `sdk/spec/pld_index.zig` | PLD n-gram index (`PldLookup.findMatch`, `ngramRepeatScore`) |
-| `engines/mlx/cache/ssd/disk_tier.zig` | Persistent prefix tier (`--prefix-cache-disk`, default OFF): chunked safetensors survive RAM eviction and server restart. `--no-prefix-cache-ram` disables only idle RAM retention when disk is enabled (`--prefix-cache-entries 0` disables both tiers); completed prefixes write through continuously and restore directly into the next request's working KV. Hybrid SSM checkpoints persist beside KV chunks and restore both states at one position. Schemes off/affine, B==1. Guard: `tests/test_prefix_cache_disk.sh` + hermetic DiskTier/HotPrefixCache tests. |
+| `engines/mlx/cache/ssd/disk_tier.zig` | Persistent prefix tier (`--prefix-cache-disk`, default OFF): KV chunks, hybrid SSM checkpoints, and immutable DeepSeek-V4.1 module records survive restart. KV supports SSD-only retention; module records require RAM retention and restore at an exact prompt boundary. See “SSD-first prefix cache” and “Module prefix records” below. Guards: `tests/test_prefix_cache_disk.sh`, `tests/test_module_prefix_cache_disk.sh`, and hermetic DiskTier/HotPrefixCache tests. |
 | `plugins/gemma4/assistant_drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `sdk/spec/mtp/mtp.zig` | Qwen 3.5/3.6 native MTP head (sidecar spec-decode; self-contained — delete this + `Generator.nextMtp` to remove the feature). MLP is a union: dense SwiGLU OR the 35B-A3B MoE layout (`language_model.mtp.` prefix, mlx-lm `switch_mlp` split experts + shared expert + SEG — forwards through the trunk's `moeMLP`); quant params re-solve PER WEIGHT per call (`transformer.affineParamsFromGeometry` — sidecars mix 5/6-bit gs-128 beside 4-bit gs-64). Prefill history is FULL by default (`--mtp-history-window` opts into last-window capture; the A/B showed windowing costs 14 acceptance points at 64K on the stock head) |
 | `host/status.zig` | TUI status bar |
@@ -467,7 +467,7 @@ Perf on a 128 GB M-series (after the 2026-08-01 serial + AR-kernel rounds): seri
 
 **Chat.** Our transcription of the release's `encoding/encoding.py` (`src/fixtures/dsv41_chat_template.jinja`) ALWAYS wins, even over a pack's template: DeepSeek's own merges dicts with `**`, which jinja.cpp cannot parse (the silent-fallback class), and the repack's skips the system turn when tools come without one. `tests/dsv41_template_ab.py` pins it byte-exact against the encoder (jinja2) and dumps the cases the Zig test renders through jinja.cpp. DSML tags carry a LEADING SPACE (`<｜DSML｜ calls>`, `<｜DSML｜ invoke`); the parser takes either spelling. Effort low|medium|high|max → budget 50/62/75/100 (`dsv41EffortFor`, default high); thinking default ON. No generation_config: DeepSeek recommends temperature 1.0, top_p 0.95-1.0, so the V4 wild-signature fix does not apply.
 
-**DSpark**: three stages over their own rings of main-stream KV plus the block's rows (non-causal in the block), the trunk's head over the last stage's norm, the Markov bias chained on the GPU; on whenever the pack ships the stages (`--no-mtp` turns them off); greedy rounds equal serial greedy. The repack's lane (mlx-stream) drafts greedy requests at its typical acceptance and samples sampled ones itself (exact speculative sampling over the request's `SamplingParams`, seeded per request). Serial, single-flight (module-owned state, as V4); the prefix cache stays off, but one conversation resumes: the last prompt's state one token short of its end is kept, and a prompt it prefixes restores it (`resumePrompt`).
+**DSpark**: three stages over their own rings of main-stream KV plus the block's rows (non-causal in the block), the trunk's head over the last stage's norm, the Markov bias chained on the GPU; on whenever the pack ships the stages (`--no-mtp` turns them off); greedy rounds equal serial greedy. The repack's lane (mlx-stream) drafts greedy requests at its typical acceptance and samples sampled ones itself (exact speculative sampling over the request's `SamplingParams`, seeded per request). Resident, unpaired packs retain prompt-boundary snapshots in the engine's RAM prefix cache and can persist them as module records. Streamed, bank-backed, and paired instances retain the legacy resume path.
 
 **Guards.** `tests/dump_dsv41_fixtures.py` runs the reference (torch CPU fp32, PipeNetwork's kernel stub) on a tiny random config covering every feature, for both pack layouts → `DSV41_TINY` tests (~1e-6 prefill/chunked/spans/decode/DSpark; the f32 GEMMs need `MLX_ENABLE_TF32=0` to compare); resume == cold, bit-exact; `tests/test_dsv41.sh` live (needs a pack).
 
@@ -564,10 +564,13 @@ When an entry must go (count cap, byte budget, `evictLruToAdmit`), `lruIndexExcl
 ### SSD-first prefix cache
 
 Qwen4_exp uses SSD-first automatically when its disk tier is enabled. Any MLX
-architecture with a restorable prefix cache uses the same path when
+architecture with a restorable KV prefix cache uses the same path when
 `--no-prefix-cache-ram --prefix-cache-disk <size>` selects SSD-only mode:
 RAM holds model weights plus active requests, while completed reusable prefixes
 remain only on SSD.
+
+DeepSeek-V4.1 module checkpoints use the RAM-backed path described below;
+`--no-prefix-cache-ram` disables their history retention.
 
 At 1M context on a 128 GB M5 Max the budget is weights ~70 GB + one session's
 entry ~24 GB (~24 KB/token: 12.3 KB of 8-bit KV, 3.8 KB of QSA indexer history,
@@ -609,6 +612,103 @@ Protocol per round (`generate.nextDflash`):
 Wiring: `enable_drafter` is the request-level switch for BOTH sidecar kinds (a model loads at most one); priority MTP > dflash > gemma drafter > PLD (`specInitWiring`/`specTickMode`); every existing spec gate (logprobs>0, grammar, vision, hybrid) applies unchanged; `[spec-stats] mode=dflash`. Server-side, every drafter-loaded gate must read `lm.dflash` beside `lm.drafter` — pinned by a source scan in dflash.zig after four per-surface `use_drafter` re-derivations silently decoded serial (live 2026-08-10, the per-site-wiring class).
 
 Muse measurements. 8-bit trunk, same-boot medians, 400-token generations, block 16 (2026-08-10): echo 31.0 tok/s vs PLD 26.2 vs serial 15.6 (1.99x, avg 4.7–6.7 accepted/round vs PLD's 3.23); agent-ish 24.3 vs 18.0 vs 15.9 (1.53x); creative 17.0 vs 16.4 vs 15.7 (+8%) → default-on when the sidecar loads, no runtime acceptance gate needed (unlike the Gemma drafter). 4-bit trunk, 160-token generations, block 5 + trunk draft head (2026-08-10, the shipped defaults): echo 2.19x serial, agent 2.15x, creative 1.68x, 57.9 vs 27.0 tok/s pooled, 2.37 accepted/round — the same stack was 1.01x before the block cap, because a 4-bit serial step halved while a width-16 verify did not. Levers measured and CLOSED: cross-round pre-draft (scheduler gap is 0.01 ms — nothing to overlap), prefill capture cost (−5.2%/+2.3%/+0.3% at 1128/5525/16185 prompt tokens), adaptive block size (every content class peaks at 5 once the draft head is fixed), assistant micro-opts (halving the assistant's read outright is not faster). Full stories: `docs/gotchas/engine-mlx.md`. Parity vs the executable transformers reference (fp32 CPU, `tests/dump_dflash_fixtures.py` → `DFLASH_FIXTURES` env-gated test): encoder cos 0.999994, draft rounds cos ≥ 0.9999 with rms_ratio 1.000.
+
+### Module prefix records
+
+Resident, unpaired DeepSeek-V4.1 packs persist the module's complete checkpoint
+at `prompt.len - 1`. Generated tokens are excluded. The checkpoint contains
+each layer's sliding ring, used compressed KV and index rows, pending compression
+groups, loaded DSpark rings and Markov hidden state, and Engram token history
+when those features are active. Streamed and bank-backed packs and Thunderbolt
+pairs keep their existing legacy resume path.
+
+The disk root is `$HOME/.mlx-serve/kv-cache/<fingerprint>-m<hash>/`. The suffix
+hashes the sorted names, sizes, and modification times of selected pack files,
+including auxiliary weights, Engram files, and the selected token map (or its
+built-in fallback). The existing fingerprint covers the pack directory, config
+stat, overrides, and layout namespace. A pack stat change selects a different
+module root; the previous root remains on disk. KV roots are unchanged.
+Edits that preserve names, sizes, and mtimes are outside this identity check.
+
+Each checkpoint has its own immutable entry directory:
+
+```text
+<fingerprint>-m<hash>/e<id>/
+├── tokens.bin           exact checkpoint token IDs, little-endian u32
+├── module.header        codec version, loaded geometry/settings and inventory
+├── m000.safetensors     named checkpoint tensors
+├── m001.safetensors     further parts, when needed
+└── meta.json            v: 10, kind: "module", submitted last
+```
+
+The envelope records the exact position `n`, prefix key, tools, quant settings,
+covered media keys, pack identity, tensor descriptors and part membership,
+exact file sizes, and encoded byte bill. Both envelope and codec header are
+bounded at 64 KiB. A part groups whole tensors up to 16 MiB of payload; a larger
+tensor occupies a part alone. An unsupported size declines persistence while
+preserving the RAM checkpoint. These records have structural and size checks,
+with no payload checksum or power-loss durability guarantee.
+
+The controls are shared with the prefix cache:
+
+| Control | Module behavior |
+|---|---|
+| `--prefix-cache-disk <size>` | Opts into persistence. `0`/`off` keeps RAM reuse and performs no SSD work. This flag takes a size; `HOME` determines the directory. |
+| `--prefix-cache-entries <n>` | Bounds RAM entries. Zero disables module retention and disk reuse. |
+| `--prefix-cache-mem <size>` | Caps retained RAM state, including detached export sources. |
+| `--no-prefix-cache-ram` | Disables module history even with disk configured; module SSD-only retention is unsupported. |
+| `--shutdown-persist-secs <n>` | Gives SIGTERM persistence a deadline (default 45 seconds); zero disables the shutdown flush. |
+
+A disk restore requires an exact boundary strictly inside the new prompt, matching
+IDs, tools, quant settings, covered media, and a recomputed prefix key. The engine
+validates the envelope, codec header, and file structure, then admits the larger
+of the codec peak and the envelope's load bound before loading tensors. The codec
+compares the loaded inventory before constructing an independent snapshot. Only
+a successful import, restore, and prompt setup reports `n` cached tokens.
+Missing, truncated, or incompatible module files reject the entire record and
+prefill cold; KV's contiguous-chunk salvage remains separate.
+
+The finish path can continue staged work but never starts materializing a module
+part. The idle loop admits that staging memory and exports one file per slice,
+oldest owed source first. Writer backpressure retains the encoded blob for a
+retry and parks on a timed scheduler wait that request arrivals can wake.
+Metadata submission releases the snapshot, but a disk hit waits for its own
+writes to finish and pass validation. Temporary queue emptiness is insufficient.
+
+Consuming a dirty RAM hit or evicting it by count transfers its export into one
+of two pending holders. A newer checkpoint gets a separate identity, so the older
+record can finish even if the new request cancels before commit. If both holders
+are full, the engine restores the hit and cancels that entry's unfinished export.
+Pressure, unload, invalidation, and shutdown expiry can also cancel an export.
+Cancellation retires the identity without fencing inference; physical cleanup
+waits for that identity's outstanding writes.
+
+Shutdown gives caches round-robin slices until the deadline. It can stage module
+parts directly because request work has stopped. It starts no further file after
+expiry and cancels unfinished exports. The summary's `written` counts confirmed
+complete records, and `left (deadline)` includes submitted records still awaiting
+Writer. Writer teardown can still join an in-flight write, so the persistence
+deadline does not impose a hard process-exit bound. A launchd `ExitTimeOut` must
+allow the configured persistence window.
+
+The available measurements distinguish request reuse from export accounting:
+
+| Measurement | Meaning and location |
+|---|---|
+| `usage.prompt_tokens_details.cached_tokens` | Exact successful restore position, or zero on a miss. |
+| `mlx_serve:prefix_cache_tokens_total`, `vllm:prefix_cache_hits_total` | Existing `--metrics` counters include successful module restores. |
+| `[hot-cache] module restored source=ram\|disk id=… position=…` | Restore source, immutable record ID, and exact boundary in the server log. |
+| `module_export_losses_total` | Internal DiskTier counter mirrored by HotPrefixCache; each registered export lost to failure or permitted cancellation increments once. Declines before registration, import failures, committed-record eviction, and ownership moves do not count. It resets on process restart and is not exposed by the HTTP metrics renderer. |
+| `residentBytes`, `stagedHostBytes`, `nextModuleStagingBytes` | Internal accounting includes attached/detached snapshots, Writer bytes, the unaccepted blob, and the next part's materialization scratch. |
+| `[disk-cache] shutdown persist:` | Completed records, deadline/store-declined leftovers, checked-out entries, failures, dropped bytes, and flush duration. |
+
+`DSV41_TEST_MODEL=<resident-pack> bash tests/test_module_prefix_cache_disk.sh`
+checks process controls, exact restart reuse, truncation, pack stat changes,
+immutable older records, shutdown logs, and cancellation. It retains requests,
+responses, logs, and filesystem manifests. Scheduling windows that were not
+observed are reported as SKIP with their hermetic test owners. Optional
+`MODULE_CACHE_KV_MODEL` and `MODULE_CACHE_OLD_BINARY` add KV-reader compatibility
+checks.
 
 ### Ling 3.0 (`bailing_hybrid`)
 

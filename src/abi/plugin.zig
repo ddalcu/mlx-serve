@@ -549,6 +549,29 @@ pub const AuxSnapshotInfo = extern struct {
     prefix_key: u64 = 0,
 };
 
+/// A named array reference. Export transfers the reference to the caller; import borrows it and the name.
+/// As an array element, this layout is frozen for ABI version 1.
+pub const AuxTensor = extern struct {
+    size: u32 = @sizeOf(AuxTensor),
+    name: Str = .{},
+    array: Array = .{},
+};
+
+/// Caller-owned bounded storage. Names and header bytes live in the supplied buffers; each returned tensor owns
+/// a new array reference. Failure releases partial references and leaves the output lengths zero.
+pub const AuxExport = extern struct {
+    size: u32 = @sizeOf(AuxExport),
+    tensors: ?[*]AuxTensor = null,
+    tensor_cap: usize = 0,
+    tensor_len: usize = 0,
+    names: ?[*]u8 = null,
+    names_cap: usize = 0,
+    names_len: usize = 0,
+    header: ?[*]u8 = null,
+    header_cap: usize = 0,
+    header_len: usize = 0,
+};
+
 /// A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache, the SSD tier and restores.
 /// Every call runs on the inference thread, except `free` at process teardown, which runs on the thread tearing the
 /// model down after the inference thread has exited. A snapshot's caller owns it until `free`.
@@ -579,6 +602,15 @@ pub const AuxHooks = extern struct {
     /// Activates `slot`; zero `restored_at` resets it, otherwise verifies its position. Arms that slot's capture
     /// at `prompt.len - 1` only when `capture` is true; media rows are borrowed for this call.
     begin_prompt: *const fn (m: *anyopaque, slot: u32, prompt: Span(u32), media_rows: Array, restored_at: u64, capture: bool) callconv(.c) Verdict,
+    /// Allocation-free validation of the complete header/inventory against the loaded instance. Reports the
+    /// additional simultaneous load/construction/restore peak, including MLX copy scratch. Disk hooks may return
+    /// named `.unsupported` while the instance retains its RAM snapshot capability.
+    import_plan: *const fn (m: *anyopaque, header: Str, out_peak_bytes: *u64) callconv(.c) Verdict,
+    /// Exports used rows, not spare capacity, into caller-owned storage; insufficient capacity is named.
+    export_arrays: *const fn (m: *anyopaque, snap: Handle, out: *AuxExport) callconv(.c) Verdict,
+    /// Borrows all inputs; validates every name/shape/dtype before allocating destination state. Success returns
+    /// an evaluated, independent snapshot with growth headroom; failure frees partial state and leaves out null.
+    import_arrays: *const fn (m: *anyopaque, ids: Span(u32), header: Str, arrays: Span(AuxTensor), out: *Handle) callconv(.c) Verdict,
 };
 
 pub const CacheHooks = extern struct {
@@ -770,6 +802,14 @@ test "abi plugin: every struct opens with its size, set by default" {
     }
     inline for (.{ LoadCtx, Forward, Offload, CacheOps, AuxHooks, HeadHooks, NativeDrafter, MediaHooks, DistHooks, ModelTable }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
+}
+
+test "R46 auxiliary tensor structures start with their size" {
+    inline for (.{ AuxTensor, AuxExport }) |T| {
+        try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
+        const v: T = .{};
+        try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);
+    }
 }
 
 test "abi plugin: auxiliary callbacks are required function pointers" {

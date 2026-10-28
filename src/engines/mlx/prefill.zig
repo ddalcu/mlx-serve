@@ -12,6 +12,7 @@ const kv_disk_cache = @import("cache/ssd/disk_tier.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const plugin_driver = @import("plugin/driver.zig");
+const plugin_abi = @import("../../abi/plugin.zig");
 const plugin_settle = @import("plugin/settle.zig");
 const mlx_stream = @import("modules/stream.zig");
 const Transformer = transformer_mod.Transformer;
@@ -56,16 +57,103 @@ fn beginModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, n: us
     slot.moe_seq_offset = n;
 }
 
-fn restoreModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding) !usize {
+fn restoreModulePrompt(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.ModuleBinding) !usize {
     const id = plugin_settle.slotId(slot.model.transformer.?.plugin.?, &slot.ctx);
-    var n: usize = 0;
-    if (!slot.skip_prefix_cache) if (slot.model.prefix_cache) |hc| {
-        if (hc.findModuleMatch(binding, slot.full_prompt, slot.has_tools, slot.media, slot.vision_embeddings, slot.cache.config)) |match| {
-            n = hc.consumeModule(binding, match.entry_id, id);
-        }
+    const selected = modulePromptMatch(slot, binding);
+    var n = if (selected) |match| restoreModuleMatch(sch, slot, binding, match, id) else 0;
+    slot.cached_tokens = 0;
+    slot.restored_entry = 0;
+    const had_error = mlx.errorPending();
+    beginModulePrompt(slot, binding, n) catch |err| {
+        if (n == 0) return err;
+        mlx.dropLatchedErrorUnless(had_error);
+        if (selected) |match| if (match.source == .disk) slot.model.prefix_cache.?.disk.?.retireModule(match.disk_id);
+        n = 0;
+        try beginModulePrompt(slot, binding, 0);
     };
-    try beginModulePrompt(slot, binding, n);
+    if (n > 0) if (selected) |match| {
+        log.info("[hot-cache] module restored source={s} id={d} position={d}\n", .{ @tagName(match.source), if (match.source == .ram) match.entry_id else match.disk_id, n });
+    };
     return n;
+}
+
+fn modulePromptMatch(slot: *Slot, binding: prefix_cache_mod.ModuleBinding) ?prefix_cache_mod.ModuleMatch {
+    if (slot.skip_prefix_cache) return null;
+    const hc = slot.model.prefix_cache orelse return null;
+    if (!hc.ram_enabled or hc.max_entries == 0) return null;
+    return hc.findModuleMatch(binding, slot.full_prompt, slot.has_tools, slot.media, slot.vision_embeddings, slot.cache.config);
+}
+
+fn restoreModuleMatch(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32) usize {
+    if (match.source == .ram) return slot.model.prefix_cache.?.consumeModule(binding, match.entry_id, id);
+    const restored = restoreDiskModule(sch, slot, binding, match, id) catch |err| {
+        log.warn("[disk-cache] module import id={d} failed: {s}; prefilling cold\n", .{ match.disk_id, @errorName(err) });
+        return 0;
+    };
+    return if (restored) match.n else 0;
+}
+
+const ModuleImportProbe = struct {
+    sch: *Scheduler,
+    cfg: *const model_mod.ModelConfig,
+    peak: u64,
+
+    fn fits(ctx: ?*anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const staged = @import("cache/budget.zig").stagedHostBytes(self.sch);
+        return self.peak <= @import("admission/prefill_chunk.zig").prefillHeadroomNow(self.cfg, staged);
+    }
+};
+
+/// Plan and admit before loading any part. Keep all inputs private until exact restore and prompt setup succeed.
+fn restoreDiskModule(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32) !bool {
+    const hc = slot.model.prefix_cache orelse return false;
+    const d = if (hc.disk) |*disk| disk else return false;
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    errdefer d.retireModule(match.disk_id);
+    const header = try d.readModuleHeader(match.disk_id);
+    defer d.allocator.free(header);
+    var peak: u64 = 0;
+    if (!plugin_driver.auxImportPlan(binding.xfm, header, &peak).isOk()) return error.ModuleImportPlanFailed;
+    const inventory = d.moduleInventory(match.disk_id) orelse return false;
+    peak = try moduleImportPeak(peak, inventory);
+    var probe: ModuleImportProbe = .{ .sch = sch, .cfg = slot.model.config orelse return false, .peak = peak };
+    const admitted = hc.evictLruToAdmit(slot.full_prompt.len, &probe, ModuleImportProbe.fits, false).admitted;
+    publishHotCacheResidency(sch);
+    if (!admitted) {
+        log.info("[disk-cache] module import id={d} skipped: peak {d} bytes does not fit\n", .{ match.disk_id, peak });
+        return false;
+    }
+    try importModuleSnapshot(slot, binding, match, id, d, header);
+    return true;
+}
+
+/// A matching inventory uses the planner's full peak; a mismatching one must be rejected
+/// before destination allocation. Bound its loader overlap, maps and header/name copies too.
+fn moduleImportPeak(planned: u64, inventory: []const kv_disk_cache.module_record.Tensor) !u64 {
+    var loaded: u64 = 0;
+    for (inventory) |tensor| loaded = try std.math.add(u64, loaded, tensor.bytes);
+    const host = try std.math.add(u64, 4 * kv_disk_cache.module_record.MAX_ENVELOPE_BYTES, try std.math.mul(u64, inventory.len, 4096));
+    const load_peak = try std.math.add(u64, host, try std.math.mul(u64, loaded, 3));
+    return @max(planned, load_peak);
+}
+
+fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32, d: *kv_disk_cache.DiskTier, header: []const u8) !void {
+    // Admission can evict and swap-remove disk entries. Re-find the immutable ID.
+    var arrays = try d.loadModuleParts(match.disk_id);
+    defer d.freeNamed(&arrays);
+    const tensors = try d.allocator.alloc(plugin_abi.AuxTensor, arrays.items.len);
+    defer d.allocator.free(tensors);
+    for (arrays.items, tensors) |array, *tensor| tensor.* = .{ .name = .of(array.key), .array = .{ .ctx = array.arr.ctx } };
+    var snapshot: plugin_abi.Handle = null;
+    defer plugin_driver.auxFree(binding.xfm, snapshot);
+    const ids = slot.full_prompt[0..match.n];
+    if (!plugin_driver.auxImportArrays(binding.xfm, ids, header, tensors, &snapshot).isOk()) return error.ModuleImportFailed;
+    var info: plugin_abi.AuxSnapshotInfo = .{};
+    if (!plugin_driver.auxDescribe(binding.xfm, snapshot, &info).isOk()) return error.ModuleImportDescriptionFailed;
+    if (info.n != match.n or info.prefix_key != match.prefix_key or !std.mem.eql(u32, info.ids.slice(), ids)) return error.ModuleImportIdentityMismatch;
+    if (!plugin_driver.auxRestoreAt(binding.xfm, id, snapshot, match.n).isOk()) return error.ModuleRestoreFailed;
 }
 
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
@@ -186,7 +274,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         publishHotCacheResidency(sch);
     };
     if (module_binding) |binding| {
-        hot_matched = @intCast(try restoreModulePrompt(slot, binding));
+        hot_matched = @intCast(try restoreModulePrompt(sch, slot, binding));
         prefill_tokens = slot.full_prompt[hot_matched..];
         hot_checked_out = hot_matched > 0;
         publishHotCacheResidency(sch);
@@ -440,7 +528,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         .sch = sch,
         .cfg = slot.model.config,
         .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
-        .hc = if (slot.model.prefix_cache) |p| p else null,
     };
 
     // Ownership of the restored spec caches transfers AT THE CALL:
@@ -588,6 +675,17 @@ pub fn sumInflightGeneratedTokens(active: anytype) u64 {
 }
 
 // ── tests ──
+
+test "R27 module import admission bounds envelope loads and rejects overflowing bills" {
+    const Tensor = kv_disk_cache.module_record.Tensor;
+    const tensors = [_]Tensor{ .{ .name = "a", .dtype = "F32", .shape = &.{4}, .bytes = 16 }, .{ .name = "b", .dtype = "F32", .shape = &.{8}, .bytes = 32 } };
+    const peak = try moduleImportPeak(100, &tensors);
+    try testing.expect(peak >= 100 + 3 * (16 + 32) + 2 * @sizeOf(plugin_abi.AuxTensor));
+    try testing.expectEqual(@as(u64, 1 << 40), try moduleImportPeak(1 << 40, &tensors));
+    const too_large = [_]Tensor{.{ .name = "a", .dtype = "F32", .shape = &.{1}, .bytes = std.math.maxInt(u64) }};
+    try testing.expectError(error.Overflow, moduleImportPeak(1, &too_large));
+    try testing.expectEqual(std.math.maxInt(u64), try moduleImportPeak(std.math.maxInt(u64), &tensors));
+}
 
 test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/errored" {
     // Lightweight stub carrying exactly the fields the aggregate reads — proves

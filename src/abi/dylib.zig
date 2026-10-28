@@ -203,12 +203,15 @@ test "abi dylib: plugin names are lower-case words, never paths" {
     for ([_][]const u8{ "", "Toy", "a/b", "a.b", "a-b", &long }) |n| try testing.expect(!validName(n));
 }
 
-test "abi dylib: auxiliary tables require the complete tail" {
+test "R46 auxiliary tables require the complete tail" {
     var aux: model_abi.AuxHooks = .{
         .enabled = undefined,
         .describe = undefined,
         .prefix_key = undefined,
         .begin_prompt = undefined,
+        .import_plan = undefined,
+        .export_arrays = undefined,
+        .import_arrays = undefined,
         .reserve = undefined,
         .commit = undefined,
         .snapshot = undefined,
@@ -231,6 +234,9 @@ test "abi dylib: auxiliary tables require the complete tail" {
         @offsetOf(model_abi.AuxHooks, "describe"),
         @offsetOf(model_abi.AuxHooks, "prefix_key"),
         @offsetOf(model_abi.AuxHooks, "begin_prompt"),
+        @offsetOf(model_abi.AuxHooks, "import_plan"),
+        @offsetOf(model_abi.AuxHooks, "export_arrays"),
+        @offsetOf(model_abi.AuxHooks, "import_arrays"),
         @sizeOf(model_abi.AuxHooks) - 1,
     }) |size| {
         aux.size = size;

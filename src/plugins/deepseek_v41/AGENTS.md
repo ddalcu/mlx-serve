@@ -74,7 +74,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
 
 ## Known issues
-- Auxiliary snapshots are RAM-only; serialization and shortened slices return named unsupported verdicts.
+- Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization
+  and shortened slices still return named unsupported verdicts. SSD-only module retention is unsupported.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Prefill compute-bound at ~16 TFLOPS; the MoE at 2048 rows streams each layer's expert bank 4x per 8192 chunk
   (M about 32 per expert): the single biggest inefficiency.
