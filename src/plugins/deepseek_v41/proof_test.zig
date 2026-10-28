@@ -231,7 +231,7 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
     }
 }
 
-test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint, codecs refuse by name" {
+test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -249,16 +249,6 @@ test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint,
         try testing.expect(sn == null);
         v41.table.release_slot.?(t.m, 1);
     }
-    var buf: [1]u8 = undefined;
-    var len: usize = 99;
-    const encoded = aux.serialize(t.m, null, &buf, buf.len, &len);
-    try testing.expectEqual(abi.Verdict.Code.unsupported, encoded.code);
-    try testing.expect(encoded.why.len > 0);
-    try testing.expectEqual(@as(usize, 0), len);
-    var sn: abi.Handle = null;
-    const decoded = aux.deserialize(t.m, .of(&.{}), &sn);
-    try testing.expectEqual(abi.Verdict.Code.unsupported, decoded.code);
-    try testing.expect(decoded.why.len > 0 and sn == null);
 }
 
 test "deepseek_v41 aux: candidate image key ignores later rows and eligibility excludes streamed and paired instances" {
@@ -354,7 +344,7 @@ fn expectInvalidImport(t: *Twin, e: *Exported, ids: []const u32, arrays: []const
     return error.InvalidTensorAccepted;
 }
 
-test "R29 codec rejects duplicate, missing, unexpected and malformed tensors before construction" {
+test "codec rejects duplicate, missing, unexpected and malformed tensors before construction" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -406,7 +396,7 @@ test "R29 codec rejects duplicate, missing, unexpected and malformed tensors bef
     try testing.expectEqual(@as(u64, 0), v41.stateBytes(t.m));
 }
 
-test "R28 codec import unwinds every allocation and checked MLX failure" {
+test "codec import unwinds every allocation and checked MLX failure" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -457,7 +447,7 @@ test "R28 codec import unwinds every allocation and checked MLX failure" {
     try testing.expectEqual(@as(u64, 0), v41.stateBytes(t.m));
 }
 
-test "R43 optional codec failure preserves the original MLX error latch" {
+test "optional codec failure preserves the original MLX error latch" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -537,7 +527,7 @@ fn codecRoundTrip(files: []const sdk.fixture.File, p: []const u32, dspark: bool)
     try testing.expectEqualSlices(f32, cold, warm);
 }
 
-test "R28 codec round trip survives origin destruction at odd and even compressor boundaries with DSpark on and off" {
+test "codec round trip survives origin destruction at odd and even compressor boundaries with DSpark on and off" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -549,7 +539,7 @@ test "R28 codec round trip survives origin destruction at odd and even compresso
     }
 }
 
-test "R19 codec refuses changed loaded settings and invalid IDs before allocating" {
+test "codec refuses changed loaded settings and invalid IDs before allocating" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -589,7 +579,7 @@ test "R19 codec refuses changed loaded settings and invalid IDs before allocatin
     try expectInvalidImport(t, &e, ids[1..], e.arrays());
 }
 
-test "R28 codec export refuses short buffers and unwinds partially created references" {
+test "codec export refuses short buffers and unwinds partially created references" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -637,7 +627,7 @@ test "R28 codec export refuses short buffers and unwinds partially created refer
 
 const engram = @import("engram.zig");
 
-test "R28 codec preserves compressed Engram history including dead sentinels through export, import and restore" {
+test "codec preserves compressed Engram history including dead sentinels through export, import and restore" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

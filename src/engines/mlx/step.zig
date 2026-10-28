@@ -380,7 +380,7 @@ fn slotStateBytes(s: *const Slot) u64 {
 
 // ── tests ──
 
-test "R27 a busy disk retry parks until its bounded timeout or pending work" {
+test "a busy disk retry parks until its bounded timeout or pending work" {
     var sch: Scheduler = undefined;
     sch.io = testing.io;
     sch.queue_mu = .init;

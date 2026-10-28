@@ -502,8 +502,6 @@ const aux_hooks = abi.AuxHooks{
     .handoff = &auxHandoff,
     .free = &auxFree,
     .bytes = &auxBytes,
-    .serialize = &auxSerialize,
-    .deserialize = &auxDeserialize,
 };
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
@@ -628,16 +626,6 @@ fn auxFree(_: *anyopaque, handle: abi.Handle) callconv(.c) void {
 fn auxBytes(_: *anyopaque, handle: abi.Handle) callconv(.c) u64 {
     const sn = snapOf(handle) orelse return 0;
     return sn.bytes();
-}
-
-fn auxSerialize(_: *anyopaque, _: abi.Handle, _: [*]u8, _: usize, len: *usize) callconv(.c) Verdict {
-    len.* = 0;
-    return Verdict.refuse(.unsupported, "deepseek_v41: snapshot serialization is unavailable");
-}
-
-fn auxDeserialize(_: *anyopaque, _: abi.Str, out: *abi.Handle) callconv(.c) Verdict {
-    out.* = null;
-    return Verdict.refuse(.unsupported, "deepseek_v41: snapshot deserialization is unavailable");
 }
 
 fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdict {

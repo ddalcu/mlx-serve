@@ -1014,8 +1014,6 @@ const AuxFake = struct {
         .handoff = undefined,
         .free = &free,
         .bytes = &bytes,
-        .serialize = undefined,
-        .deserialize = undefined,
         .enabled = &enabled,
         .describe = &describe,
         .prefix_key = &prefixKey,
@@ -1031,7 +1029,7 @@ const AuxFake = struct {
     }
 };
 
-test "R46 absent and short auxiliary tables refuse without calling hooks" {
+test "absent and short auxiliary tables refuse without calling hooks" {
     const t = std.testing;
     var fake: AuxFake = .{};
     var cache: abi.CacheHooks = .{};
@@ -1175,7 +1173,7 @@ test "plugin aux: model-local snapshots describe restore and free exactly once" 
     try t.expectEqual(@as(usize, 1), models[1].frees);
 }
 
-test "R46 larger auxiliary tables forward disk hooks through caller storage" {
+test "larger auxiliary tables forward disk hooks through caller storage" {
     const t = std.testing;
     var fake: AuxFake = .{ .disk = true };
     var hooks = AuxFake.hooks;
@@ -1213,7 +1211,7 @@ test "R46 larger auxiliary tables forward disk hooks through caller storage" {
     try t.expectEqual(@as(usize, 3), fake.calls);
 }
 
-test "R46 short auxiliary export storage refuses before its tail or callback" {
+test "short auxiliary export storage refuses before its tail or callback" {
     const t = std.testing;
     var fake: AuxFake = .{ .disk = true };
     const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };
@@ -1229,7 +1227,7 @@ test "R46 short auxiliary export storage refuses before its tail or callback" {
     try t.expectEqual(@as(usize, 0), fake.calls);
 }
 
-test "R46 incompatible auxiliary tensor descriptors refuse before callback" {
+test "incompatible auxiliary tensor descriptors refuse before callback" {
     const t = std.testing;
     var fake: AuxFake = .{ .disk = true };
     const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };
@@ -1249,7 +1247,7 @@ test "R46 incompatible auxiliary tensor descriptors refuse before callback" {
     try t.expectEqual(@as(usize, 0), fake.calls);
 }
 
-test "R46 unsupported disk hooks preserve RAM auxiliary snapshots" {
+test "unsupported disk hooks preserve RAM auxiliary snapshots" {
     const t = std.testing;
     var fake: AuxFake = .{};
     const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };

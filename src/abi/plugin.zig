@@ -590,9 +590,6 @@ pub const AuxHooks = extern struct {
     free: *const fn (m: *anyopaque, snap: Handle) callconv(.c) void,
     /// Resident bytes, including retained buffer capacities; encoded size is a separate quantity.
     bytes: *const fn (m: *anyopaque, snap: Handle) callconv(.c) u64,
-    /// Writes the encoding into `buf` up to `cap`, setting `len`; refuses insufficient capacity by name.
-    serialize: *const fn (m: *anyopaque, snap: Handle, buf: [*]u8, cap: usize, len: *usize) callconv(.c) Verdict,
-    deserialize: *const fn (m: *anyopaque, bytes: Str, out: *Handle) callconv(.c) Verdict,
     /// Whether this loaded instance supports auxiliary caching, including its runtime configuration.
     enabled: *const fn (m: *anyopaque) callconv(.c) bool,
     /// Describes the snapshot's own boundary and identity; `ids` remains borrowed until its `free`.
@@ -804,7 +801,7 @@ test "abi plugin: every struct opens with its size, set by default" {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
 }
 
-test "R46 auxiliary tensor structures start with their size" {
+test "auxiliary tensor structures start with their size" {
     inline for (.{ AuxTensor, AuxExport }) |T| {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
         const v: T = .{};

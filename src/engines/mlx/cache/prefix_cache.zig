@@ -10892,8 +10892,6 @@ const ModuleFake = struct {
         .handoff = undefined,
         .free = &free,
         .bytes = &bytes,
-        .serialize = undefined,
-        .deserialize = undefined,
         .enabled = &on,
         .describe = &describe,
         .prefix_key = &prefixKey,
@@ -11336,7 +11334,7 @@ const ModuleDiskTest = struct {
     }
 };
 
-test "R04 under-floor module commits remain RAM-only" {
+test "under-floor module commits remain RAM-only" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11357,7 +11355,7 @@ test "R04 under-floor module commits remain RAM-only" {
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
 }
 
-test "R05 module registration OOM preserves RAM" {
+test "module registration OOM preserves RAM" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11381,7 +11379,7 @@ test "R05 module registration OOM preserves RAM" {
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
 }
 
-test "R07 replacement and count eviction preserve module exports" {
+test "replacement and count eviction preserve module exports" {
     for ([_]bool{ false, true }) |replacement| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -11414,7 +11412,7 @@ test "R07 replacement and count eviction preserve module exports" {
     }
 }
 
-test "R07 full holders cancel the evicted module export" {
+test "full holders cancel the evicted module export" {
     for ([_]bool{ false, true }) |replacement| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -11445,7 +11443,7 @@ test "R07 full holders cancel the evicted module export" {
     }
 }
 
-test "R08 full holders preserve exact module consumption" {
+test "full holders preserve exact module consumption" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11480,7 +11478,7 @@ test "R08 full holders preserve exact module consumption" {
     for (snaps) |snap| try testing.expectEqual(@as(usize, 1), snap.frees);
 }
 
-test "R11 module failures preserve ownership and error latches" {
+test "module failures preserve ownership and error latches" {
     defer mlx.dropLatchedErrorUnless(false);
     const Case = enum { export_arrays, existing_error, allocation, submit };
     for ([_]Case{ .export_arrays, .existing_error, .allocation, .submit }) |case| {
@@ -11522,7 +11520,7 @@ test "R11 module failures preserve ownership and error latches" {
     }
 }
 
-test "R24 module lookup ranks disk boundaries and prefers RAM ties" {
+test "module lookup ranks disk boundaries and prefers RAM ties" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11560,7 +11558,7 @@ test "R24 module lookup ranks disk boundaries and prefers RAM ties" {
     try testing.expectEqual(snap.key, longer.prefix_key);
 }
 
-test "R35 invalidation retires queued module exports" {
+test "invalidation retires queued module exports" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11591,7 +11589,7 @@ test "R35 invalidation retires queued module exports" {
     try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
 }
 
-test "R37 expired shutdown starts no module files" {
+test "expired shutdown starts no module files" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11616,7 +11614,7 @@ test "R37 expired shutdown starts no module files" {
     try testing.expect(!hc.disk_dirty);
 }
 
-test "R38 shutdown stops after one overdue module file" {
+test "shutdown stops after one overdue module file" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11641,7 +11639,7 @@ test "R38 shutdown stops after one overdue module file" {
     hc.disk.?.writer.?.setPaused(false);
 }
 
-test "R39 busy module slices retain blob and cursor" {
+test "busy module slices retain blob and cursor" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11675,7 +11673,7 @@ test "R39 busy module slices retain blob and cursor" {
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
 }
 
-test "R39 busy module shutdown expires without fencing" {
+test "busy module shutdown expires without fencing" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11705,7 +11703,7 @@ test "R39 busy module shutdown expires without fencing" {
     hc.disk.?.writer.?.setPaused(false);
 }
 
-test "R40 unload frees module snapshots before binding destruction" {
+test "unload frees module snapshots before binding destruction" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11731,7 +11729,7 @@ test "R40 unload frees module snapshots before binding destruction" {
     try testing.expectEqual(@as(usize, 0), reopened.disk.?.entryCount());
 }
 
-test "R47 failed and cancelled requests leave the old module export owed" {
+test "failed and cancelled requests leave the old module export owed" {
     for ([_]bool{ false, true }) |cancelled| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -11769,7 +11767,7 @@ test "R47 failed and cancelled requests leave the old module export owed" {
     }
 }
 
-test "R07 budget shrink cancels pending module sources" {
+test "budget shrink cancels pending module sources" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11790,7 +11788,7 @@ test "R07 budget shrink cancels pending module sources" {
     try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
 }
 
-test "R11 module slices materialize one tensor part" {
+test "module slices materialize one tensor part" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{ .large_export = true };
@@ -11819,7 +11817,7 @@ test "R11 module slices materialize one tensor part" {
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
 }
 
-test "R27 the finish flush never stages a module part" {
+test "the finish flush never stages a module part" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{ .large_export = true };
@@ -11846,7 +11844,7 @@ test "R27 the finish flush never stages a module part" {
     try testing.expectEqual(.progress, hc.flushOwedSlice(cpu));
 }
 
-test "R39 busy tensor retries avoid another readback" {
+test "busy tensor retries avoid another readback" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -11885,7 +11883,7 @@ test "R39 busy tensor retries avoid another readback" {
     try testing.expect(hc.disk.?.entryWholeOnDisk(id));
 }
 
-test "R38 shutdown counts published module records" {
+test "shutdown counts published module records" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};

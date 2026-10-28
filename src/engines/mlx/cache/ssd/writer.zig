@@ -472,7 +472,7 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
 
 const testing = std.testing;
 
-test "R09 a full paused queue returns busy and the caller can retry both buffers" {
+test "a full paused queue returns busy and the caller can retry both buffers" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -515,7 +515,7 @@ test "R09 a full paused queue returns busy and the caller can retry both buffers
     try testing.expectEqual(@as(u64, 2), w.filesWritten());
 }
 
-test "R09 an oversized singleton is accepted and billed at its actual size" {
+test "an oversized singleton is accepted and billed at its actual size" {
     var w = Writer.init(testing.allocator, testing.io);
     w.permit_bytes = 4;
     try w.start();
@@ -540,7 +540,7 @@ test "R09 an oversized singleton is accepted and billed at its actual size" {
     try testing.expectEqual(@as(u64, 1), w.writeErrorCount());
 }
 
-test "R09 in-flight bytes hold the permit even when the queue is empty" {
+test "in-flight bytes hold the permit even when the queue is empty" {
     var w = Writer.init(testing.allocator, testing.io);
     defer w.deinit();
     w.running = true;
@@ -564,7 +564,7 @@ test "R09 in-flight bytes hold the permit even when the queue is empty" {
     try testing.expect(!w.isPending(path));
 }
 
-test "R10 a stopped or deinited writer returns an error with caller ownership" {
+test "a stopped or deinited writer returns an error with caller ownership" {
     var w = Writer.init(testing.allocator, testing.io);
     defer w.deinit();
     const path = try testing.allocator.dupe(u8, "/stopped.bin");
@@ -580,7 +580,7 @@ test "R10 a stopped or deinited writer returns an error with caller ownership" {
     try testing.expectEqualStrings("/stopped.bin", path);
 }
 
-test "R10 injected submission failure leaves both buffers and the queue untouched" {
+test "injected submission failure leaves both buffers and the queue untouched" {
     var w = Writer.init(testing.allocator, testing.io);
     try w.start();
     defer w.deinit();
@@ -598,7 +598,7 @@ test "R10 injected submission failure leaves both buffers and the queue untouche
     try testing.expectEqual(@as(u64, 0), w.files_dropped);
 }
 
-test "R10 queue allocation failure returns OutOfMemory with caller ownership" {
+test "queue allocation failure returns OutOfMemory with caller ownership" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     const a = failing.allocator();
     var w = Writer.init(a, testing.io);
@@ -619,7 +619,7 @@ test "R10 queue allocation failure returns OutOfMemory with caller ownership" {
     try testing.expectEqual(@as(u64, 0), w.files_dropped);
 }
 
-test "R09 prefix cancellation discards queued files without waiting on any in-flight prefix" {
+test "prefix cancellation discards queued files without waiting on any in-flight prefix" {
     const Discard = struct {
         writer: *Writer,
         mutex: std.Io.Mutex = .init,

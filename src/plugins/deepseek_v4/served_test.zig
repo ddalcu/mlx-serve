@@ -186,7 +186,7 @@ test "deepseek_v41 served: two slots decode in one batched tick through the driv
     }
 }
 
-test "R01 deepseek_v41 served: disk-disabled requests retain alternating RAM conversations after slot release" {
+test "deepseek_v41 served: disk-disabled requests retain alternating RAM conversations after slot release" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -362,7 +362,7 @@ fn diskPrompt() [513]u32 {
     return prompt;
 }
 
-test "R25 deepseek_v41 served: disk import restores exact counters and cold-reference logits" {
+test "deepseek_v41 served: disk import restores exact counters and cold-reference logits" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -399,7 +399,7 @@ test "R25 deepseek_v41 served: disk import restores exact counters and cold-refe
     }
 }
 
-test "R02 deepseek_v41 served: entries zero and RAM disabled bypass a valid disk history" {
+test "deepseek_v41 served: entries zero and RAM disabled bypass a valid disk history" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -424,7 +424,7 @@ test "R02 deepseek_v41 served: entries zero and RAM disabled bypass a valid disk
     }
 }
 
-test "R27 deepseek_v41 served: peak refusal precedes tensor loading and preserves the disk record" {
+test "deepseek_v41 served: peak refusal precedes tensor loading and preserves the disk record" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;
     defer scheduler.prefill_admission_fits = old_fits;
@@ -460,7 +460,7 @@ test "R27 deepseek_v41 served: peak refusal precedes tensor loading and preserve
     finish_request.releasePluginSlot(warm);
 }
 
-test "R27 deepseek_v41 served: idle staging pressure cancels its source before materialization" {
+test "deepseek_v41 served: idle staging pressure cancels its source before materialization" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -486,7 +486,7 @@ test "R27 deepseek_v41 served: idle staging pressure cancels its source before m
     try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
 }
 
-test "R03 deepseek_v41 served: unsupported disk hooks preserve RAM reuse" {
+test "deepseek_v41 served: unsupported disk hooks preserve RAM reuse" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -565,15 +565,15 @@ fn expectDiskMedia(appended: bool) !void {
     finish_request.releasePluginSlot(again);
 }
 
-test "R22 deepseek_v41 served: changed covered media rows miss without poisoning disk history" {
+test "deepseek_v41 served: changed covered media rows miss without poisoning disk history" {
     try expectDiskMedia(false);
 }
 
-test "R23 deepseek_v41 served: appended media leaves an exact disk checkpoint eligible" {
+test "deepseek_v41 served: appended media leaves an exact disk checkpoint eligible" {
     try expectDiskMedia(true);
 }
 
-test "R45 deepseek_v41 served: disk imports use their owning model with a foreign cache view" {
+test "deepseek_v41 served: disk imports use their owning model with a foreign cache view" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -602,15 +602,15 @@ test "R45 deepseek_v41 served: disk imports use their owning model with a foreig
     }
 }
 
-test "R30 deepseek_v41 served: failed imported restore resets the prompt and retires only its record" {
+test "deepseek_v41 served: failed imported restore resets the prompt and retires only its record" {
     try expectImportFallback(.restore);
 }
 
-test "R30 deepseek_v41 served: failed restored prompt setup retries cold with zero cached tokens" {
+test "deepseek_v41 served: failed restored prompt setup retries cold with zero cached tokens" {
     try expectImportFallback(.prompt);
 }
 
-test "R25 deepseek_v41 served: failed tensor import releases its inputs and prefills cold" {
+test "deepseek_v41 served: failed tensor import releases its inputs and prefills cold" {
     try expectImportFallback(.arrays);
 }
 

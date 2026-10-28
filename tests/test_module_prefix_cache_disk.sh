@@ -62,6 +62,7 @@ start_server() { # label, HOME, extra flags
     shift 2
     mkdir -p "$CASE_HOME"
     LOGFILE="$OUT/$label.server.log"
+    probe mem-wait --model "$MODEL"
     # Refuse an occupied port; never kill a server owned by another test.
     probe port-free --port "$PORT"
     HOME="$CASE_HOME" "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
@@ -83,7 +84,7 @@ copy_seed() { probe copy-cache --source "$OUT/seed-home" --dest "$1"; }
 
 # ── Tests ──
 
-echo "R02 entries zero and module RAM disabled retain no history"
+echo "entries zero and module RAM disabled retain no history"
 probe fixture --model "$MODEL" --dest "$OUT/pack"
 MODEL="$OUT/pack"
 start_server r02-zero "$OUT/zero-home" --prefix-cache-entries 0
@@ -99,18 +100,18 @@ request --seed "$OUT/cold1.json" --output "$OUT/no-ram2.json"
 probe result "$OUT/no-ram2.json" --cached 0 --cold "$OUT/cold2.json"
 stop_server
 probe disabled --root "$OUT/no-ram-home" --log "$LOGFILE" --reason
-echo "PASS R02"
+echo "PASS: entries zero and module RAM disabled retain no history"
 
-echo "R01 disk disabled preserves exact RAM restore"
+echo "disk disabled preserves exact RAM restore"
 start_server r01 "$OUT/off-home" --prefix-cache-disk off
 request --output "$OUT/off1.json"
 request --seed "$OUT/cold1.json" --output "$OUT/off2.json"
 probe result "$OUT/off2.json" --boundary "$OUT/cold1.json" --cold "$OUT/cold2.json" --log "$LOGFILE" --source ram
 stop_server
 probe disabled --root "$OUT/off-home" --log "$LOGFILE"
-echo "PASS R01"
+echo "PASS: disk disabled preserves exact RAM restore"
 
-echo "R18 R25 clean shutdown publishes v10 and restart restores exact position"
+echo "clean shutdown publishes v10 and restart restores exact position"
 start_server r18-seed "$OUT/seed-home"
 request --output "$OUT/seed1.json"
 probe result "$OUT/seed1.json" --cached 0 --cold "$OUT/cold1.json"
@@ -121,15 +122,15 @@ copy_seed "$OUT/restart-home"
 start_server r25-restart "$OUT/restart-home"
 request --seed "$OUT/cold1.json" --output "$OUT/restart2.json"
 probe result "$OUT/restart2.json" --boundary "$OUT/seed1.json" --cold "$OUT/cold2.json" --log "$LOGFILE" --source disk
-echo "PASS R18 R25"
+echo "PASS: clean shutdown publishes v10 and restart restores exact position"
 
-echo "R31 newer checkpoint preserves the older immutable record"
+echo "newer checkpoint preserves the older immutable record"
 stop_server
 probe preserved --root "$OUT/restart-home" --snapshot "$OUT/seed-records.json"
 probe layout --root "$OUT/restart-home" --boundary "$OUT/restart2.json"
-echo "PASS R31"
+echo "PASS: newer checkpoint preserves the older immutable record"
 
-echo "R17 truncated tensor part rejects the whole record"
+echo "truncated tensor part rejects the whole record"
 copy_seed "$OUT/truncated-home"
 probe truncate --root "$OUT/truncated-home" --boundary "$OUT/seed1.json"
 start_server r17 "$OUT/truncated-home"
@@ -137,9 +138,9 @@ probe dropped --log "$LOGFILE" --snapshot "$OUT/seed-records.json"
 request --seed "$OUT/cold1.json" --output "$OUT/truncated2.json"
 probe result "$OUT/truncated2.json" --cached 0 --cold "$OUT/cold2.json"
 stop_server
-echo "PASS R17"
+echo "PASS: truncated tensor part rejects the whole record"
 
-echo "R19 changed pack stat selects a new module root"
+echo "changed pack stat selects a new module root"
 copy_seed "$OUT/stamp-home"
 if probe touch-pack --pack "$MODEL"; then
     start_server r19 "$OUT/stamp-home"
@@ -148,13 +149,13 @@ if probe touch-pack --pack "$MODEL"; then
     stop_server
     probe changed-root --root "$OUT/stamp-home" --snapshot "$OUT/seed-records.json"
     probe restore-stat --pack "$MODEL"
-    echo "PASS R19"
+    echo "PASS: changed pack stat selects a new module root"
 else
     rc=$?
     [ "$rc" = 77 ] || exit "$rc"
 fi
 
-echo "R16 SIGKILL before metadata leaves no accepted record"
+echo "SIGKILL before metadata leaves no accepted record"
 start_server r16-seed "$OUT/crash-home"
 probe crash-window --pid "$SERVER_PID" --root "$CASE_HOME" --output "$OUT/crash-window.json" &
 WATCH_PID=$!
@@ -168,7 +169,7 @@ if wait "$WATCH_PID"; then
     request --output "$OUT/crash-restart1.json"
     probe result "$OUT/crash-restart1.json" --cached 0 --cold "$OUT/cold1.json"
     stop_server
-    echo "PASS R16"
+    echo "PASS: SIGKILL before metadata leaves no accepted record"
 else
     rc=$?
     WATCH_PID=""
@@ -176,16 +177,16 @@ else
     stop_server
 fi
 
-echo "R37 disabled shutdown persistence; R38 deadline summary is honest"
+echo "disabled shutdown persistence; deadline summary is honest"
 for deadline in 0 1; do
     start_server "r37-r38-$deadline" "$OUT/deadline-$deadline-home" --shutdown-persist-secs "$deadline"
     request --output "$OUT/deadline-$deadline.json"
     stop_server
     probe summary --log "$LOGFILE" --deadline "$deadline" --root "$CASE_HOME"
 done
-echo "PASS R37 R38 shutdown log controls (expiry during a slice remains unit-owned)"
+echo "PASS: shutdown log controls (expiry during a slice remains unit-owned)"
 
-echo "R47 cancelling a continuation preserves the consumed dirty export"
+echo "cancelling a continuation preserves the consumed dirty export"
 start_server r47-seed "$OUT/cancel-home"
 if probe cancel --base "$BASE" --root "$CASE_HOME" --log "$LOGFILE" --output "$OUT/cancel1.json"; then
     probe layout --root "$CASE_HOME" --boundary "$OUT/cancel1.json" --wait 120
@@ -195,7 +196,7 @@ if probe cancel --base "$BASE" --root "$CASE_HOME" --log "$LOGFILE" --output "$O
     request --max-tokens 1 --output "$OUT/cancel-restart1.json"
     probe result "$OUT/cancel-restart1.json" --boundary "$OUT/cancel1.json" --cold "$OUT/cancel1.json" --log "$LOGFILE" --source disk
     stop_server
-    echo "PASS R47"
+    echo "PASS: cancelling a continuation preserves the consumed dirty export"
 else
     rc=$?
     [ "$rc" = 77 ] || exit "$rc"
@@ -203,7 +204,7 @@ else
 fi
 
 if [ -n "${MODULE_CACHE_KV_MODEL:-}" ]; then
-    echo "R42 new reader restores persisted KV and rejects module records in its KV root"
+    echo "new reader restores persisted KV and rejects module records in its KV root"
     MODEL="$MODULE_CACHE_KV_MODEL"
     start_server r42-seed "$OUT/kv-home"
     request --output "$OUT/kv1.json"
@@ -213,21 +214,21 @@ if [ -n "${MODULE_CACHE_KV_MODEL:-}" ]; then
     request --output "$OUT/kv-new.json"
     probe kv-result "$OUT/kv-new.json" --cold "$OUT/kv1.json" --log "$LOGFILE" --injected "$OUT/injected.json"
     stop_server
-    echo "PASS R42 new reader restores KV and rejects a v10 module in its KV root"
+    echo "PASS: new reader restores KV and rejects a v10 module in its KV root"
     if [ -n "${MODULE_CACHE_OLD_BINARY:-}" ]; then
-        echo "R41 older reader rejects v10 without losing its KV restore"
+        echo "older reader rejects v10 without losing its KV restore"
         probe inject-module --root "$OUT/kv-home" --source "$OUT/seed-home" --output "$OUT/injected-old.json"
         BINARY="$MODULE_CACHE_OLD_BINARY"
         start_server r41-old-reader "$OUT/kv-home"
         request --output "$OUT/kv-old.json"
         probe kv-result "$OUT/kv-old.json" --cold "$OUT/kv1.json" --log "$LOGFILE" --injected "$OUT/injected-old.json"
         stop_server
-        echo "PASS R41 older reader rejects v10 and still restores KV"
+        echo "PASS: older reader rejects v10 and still restores KV"
     else
-        echo 'SKIP R41: set MODULE_CACHE_OLD_BINARY to a v2-v9-only reader'
+        echo 'SKIP: set MODULE_CACHE_OLD_BINARY to a v2-v9-only reader'
     fi
 else
-    echo 'SKIP R41 R42: set MODULE_CACHE_KV_MODEL to a small KV-cache pack'
+    echo 'SKIP: set MODULE_CACHE_KV_MODEL to a small KV-cache pack'
 fi
 probe unit-owners
 echo "PASS test_module_prefix_cache_disk (inspect SKIP lines for unobserved branches)"

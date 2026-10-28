@@ -556,7 +556,7 @@ pub fn interleaveDecodeTick(sch: *Scheduler) u64 {
 
 // ── tests ──
 
-test "R03 module disk tiers never arm or execute KV prefill write-through" {
+test "module disk tiers never arm or execute KV prefill write-through" {
     const disk = @import("cache/ssd/disk_tier.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

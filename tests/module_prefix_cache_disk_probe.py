@@ -252,7 +252,7 @@ def fixture(a):
 def touch_pack(a):
     stamp = read(Path(a.pack) / "module-test-fixture.json")
     if stamp is None:
-        print("SKIP R19: no shipped token map and copy-on-write weight clone unavailable")
+        print("SKIP: no shipped token map and copy-on-write weight clone unavailable")
         return 77
     path = Path(a.pack) / stamp["name"]
     require(not path.is_symlink(), "refusing to touch the original pack")
@@ -303,6 +303,23 @@ def port_free(a):
         sock.bind(("127.0.0.1", a.port))
 
 
+def available_bytes():
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True, check=True).stdout
+    page = int(re.search(r"page size of (\d+) bytes", out).group(1))
+    pages = {k: int(v) for k, v in re.findall(r"Pages (free|inactive|speculative|purgeable):\s+(\d+)", out)}
+    return page * sum(pages.values())
+
+
+def mem_wait(a):
+    # A SIGKILLed server's wired weights return to the OS over seconds, not at exit; a restart
+    # inside that window fails its own preflight. Wait for the weights plus headroom to be free.
+    need = sum(p.stat().st_size for p in Path(a.model).glob("*.safetensors")) + (8 << 30)
+    until = time.monotonic() + a.timeout
+    while available_bytes() < need and time.monotonic() < until:
+        time.sleep(1)
+    require(available_bytes() >= need, f"memory not released: {available_bytes() >> 30} GiB free, {need >> 30} GiB needed")
+
+
 def alive(pid):
     try:
         os.kill(pid, 0)
@@ -339,7 +356,7 @@ def crash_window(a):
             print(f"SIGKILL before metadata: {entry}")
             return
         if any((entry / "meta.json").exists() for entry in entries):
-            print("SKIP R16: export completed before the crash window was observed")
+            print("SKIP: export completed before the crash window was observed")
             return 77
         time.sleep(0.002)
     raise AssertionError("no module export observed before crash-window timeout/server exit")
@@ -357,7 +374,7 @@ def summary(a):
     lines = [line for line in log.splitlines() if "[disk-cache] shutdown persist:" in line]
     if a.deadline == 0:
         require(not lines, "disabled shutdown persistence ran a flush")
-        print("R37: disabled deadline produces no shutdown persist invocation")
+        print("disabled deadline produces no shutdown persist invocation")
         return
     require(len(lines) == 1, f"expected one shutdown summary, got {len(lines)}")
     pattern = (r"persist: (\d+) written \([\d.]+ MB\), (\d+) left \(deadline\), "
@@ -376,7 +393,7 @@ def summary(a):
         if left:
             require("module export cancelled" in log, "deadline leftovers lacked a cancellation diagnostic")
         else:
-            print("SKIP R38 mid-slice expiry: export completed within the deadline; unit guard owns the boundary")
+            print("SKIP: mid-slice expiry: export completed within the deadline; unit guard owns the boundary")
 
 
 def cancellation_count(base):
@@ -420,9 +437,9 @@ def cancel(a):
     require(re.search(rf"module restored source=ram id=\d+ position={seed['usage']['prompt_tokens'] - 1}(?:\s|$)", log),
             "cancelled continuation did not consume the previous RAM snapshot")
     if not state.get("dirty"):
-        print("SKIP R47 dirty consumption: old record was already published when continuation streamed")
+        print("SKIP: dirty consumption: old record was already published when continuation streamed")
         return 77
-    print("R47: consumed an unpublished RAM checkpoint, disconnected and observed cancellation")
+    print("consumed an unpublished RAM checkpoint, disconnected and observed cancellation")
 
 
 def inject_module(a):
@@ -451,14 +468,14 @@ def kv_result(a):
 def unit_owners(_):
     print('Unit-owned branches (also cover optional process SKIPs):')
     for filename, name in [
-        ("cache/ssd/disk_tier.zig", "R16 scanning a module crash leftover removes the whole directory"),
-        ("cache/ssd/disk_tier.zig", "R17 missing or truncated required module files reject the entire record"),
-        ("load.zig", "R03 module pack identity follows selected weights and token map precedence"),
-        ("cache/prefix_cache.zig", "R37 expired shutdown starts no module files"),
-        ("cache/prefix_cache.zig", "R38 shutdown stops after one overdue module file"),
-        ("cache/ssd/disk_tier.zig", "R41 v10 module records are isolated from every KV entry point"),
-        ("cache/ssd/disk_tier.zig", "R42 v2 through v9 KV scans retain contiguous chunk salvage"),
-        ("cache/prefix_cache.zig", "R47 failed and cancelled requests leave the old module export owed"),
+        ("cache/ssd/disk_tier.zig", "scanning a module crash leftover removes the whole directory"),
+        ("cache/ssd/disk_tier.zig", "missing or truncated required module files reject the entire record"),
+        ("load.zig", "module pack identity follows selected weights and token map precedence"),
+        ("cache/prefix_cache.zig", "expired shutdown starts no module files"),
+        ("cache/prefix_cache.zig", "shutdown stops after one overdue module file"),
+        ("cache/ssd/disk_tier.zig", "v10 module records are isolated from every KV entry point"),
+        ("cache/ssd/disk_tier.zig", "v2 through v9 KV scans retain contiguous chunk salvage"),
+        ("cache/prefix_cache.zig", "failed and cancelled requests leave the old module export owed"),
     ]:
         print(f'  src/engines/mlx/{filename}: test "{name}"')
 
@@ -480,6 +497,7 @@ def main():
         "dropped": (dropped, "log snapshot", ""),
         "disabled": (disabled, "root log", ""),
         "port-free": (port_free, "", ""),
+        "mem-wait": (mem_wait, "model", ""),
         "stop": (stop, "", ""),
         "crash-window": (crash_window, "root output", ""),
         "crash-scan": (crash_scan, "root log window", ""),
@@ -496,6 +514,7 @@ def main():
         "layout": [("--wait", {"type": float, "default": 0}), ("--only", {"action": "store_true"})],
         "request": [("--max-tokens", {"type": int, "default": 24})],
         "port-free": [("--port", {"required": True, "type": int})],
+        "mem-wait": [("--timeout", {"type": float, "default": 180})],
         "stop": [("--pid", {"required": True, "type": int}), ("--timeout", {"required": True, "type": float})],
         "crash-window": [("--pid", {"required": True, "type": int})],
         "summary": [("--deadline", {"required": True, "type": int})],

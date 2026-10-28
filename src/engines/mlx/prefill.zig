@@ -676,7 +676,7 @@ pub fn sumInflightGeneratedTokens(active: anytype) u64 {
 
 // ── tests ──
 
-test "R27 module import admission bounds envelope loads and rejects overflowing bills" {
+test "module import admission bounds envelope loads and rejects overflowing bills" {
     const Tensor = kv_disk_cache.module_record.Tensor;
     const tensors = [_]Tensor{ .{ .name = "a", .dtype = "F32", .shape = &.{4}, .bytes = 16 }, .{ .name = "b", .dtype = "F32", .shape = &.{8}, .bytes = 32 } };
     const peak = try moduleImportPeak(100, &tensors);

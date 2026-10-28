@@ -203,7 +203,7 @@ test "abi dylib: plugin names are lower-case words, never paths" {
     for ([_][]const u8{ "", "Toy", "a/b", "a.b", "a-b", &long }) |n| try testing.expect(!validName(n));
 }
 
-test "R46 auxiliary tables require the complete tail" {
+test "abi dylib: auxiliary tables require the complete tail" {
     var aux: model_abi.AuxHooks = .{
         .enabled = undefined,
         .describe = undefined,
@@ -220,8 +220,6 @@ test "R46 auxiliary tables require the complete tail" {
         .handoff = undefined,
         .free = undefined,
         .bytes = undefined,
-        .serialize = undefined,
-        .deserialize = undefined,
     };
     var cache: model_abi.CacheHooks = .{ .aux = &aux };
     const weights: model_abi.WeightHooks = .{};

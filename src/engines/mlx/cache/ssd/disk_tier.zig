@@ -9439,7 +9439,7 @@ const ModuleSource = struct {
     }
 };
 
-test "R12 a module part failure retires only its immutable identity" {
+test "a module part failure retires only its immutable identity" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9463,7 +9463,7 @@ test "R12 a module part failure retires only its immutable identity" {
     try testing.expectEqual(@as(usize, 0), tier.harvestWriteFailures());
 }
 
-test "R13 metadata after a failed part never publishes and restart rejects it" {
+test "metadata after a failed part never publishes and restart rejects it" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9487,7 +9487,7 @@ test "R13 metadata after a failed part never publishes and restart rejects it" {
     try testing.expectEqual(@as(u64, 0), reopened.module_export_losses_total);
 }
 
-test "R14 metadata submission and write failures leave a module unusable" {
+test "metadata submission and write failures leave a module unusable" {
     for ([_]disk_writer.FailAt{ .submit, .write }) |at| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -9509,7 +9509,7 @@ test "R14 metadata submission and write failures leave a module unusable" {
     }
 }
 
-test "R15 an empty writer between slices never completes a module export" {
+test "an empty writer between slices never completes a module export" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9532,7 +9532,7 @@ test "R15 an empty writer between slices never completes a module export" {
     try testing.expectEqual(.committed, tier.moduleState(id).?);
 }
 
-test "R16 scanning a module crash leftover removes the whole directory" {
+test "scanning a module crash leftover removes the whole directory" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9550,7 +9550,7 @@ test "R16 scanning a module crash leftover removes the whole directory" {
     try testing.expect(fileSize(testing.io, part) == null);
 }
 
-test "R17 missing or truncated required module files reject the entire record" {
+test "missing or truncated required module files reject the entire record" {
     for ([_][]const u8{ "tokens.bin", "module.header", "m000.safetensors", "meta.json" }) |file| {
         for ([_]bool{ false, true }) |truncate| {
             var tmp = testing.tmpDir(.{ .iterate = true });
@@ -9575,7 +9575,7 @@ test "R17 missing or truncated required module files reject the entire record" {
     }
 }
 
-test "R18 a v10 module reopens and loads its complete CPU tensor inventory" {
+test "a v10 module reopens and loads its complete CPU tensor inventory" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9607,7 +9607,7 @@ test "R18 a v10 module reopens and loads its complete CPU tensor inventory" {
     try testing.expectEqual(reopened.total_bytes, reopened.physicalDiskBytes());
 }
 
-test "R26 stable module IDs miss after retirement without touching a replacement" {
+test "stable module IDs miss after retirement without touching a replacement" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9634,7 +9634,7 @@ test "R26 stable module IDs miss after retirement without touching a replacement
     try testing.expectEqual(@as(u64, 0), tier.module_export_losses_total);
 }
 
-test "R31 a newer module checkpoint preserves the older unfinished identity" {
+test "a newer module checkpoint preserves the older unfinished identity" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9651,7 +9651,7 @@ test "R31 a newer module checkpoint preserves the older unfinished identity" {
     try testing.expect(tier.entryWholeOnDisk(newer));
 }
 
-test "R32 reservations never credit free space and active exports survive a lower cap" {
+test "reservations never credit free space and active exports survive a lower cap" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9684,7 +9684,7 @@ test "R32 reservations never credit free space and active exports survive a lowe
     try testing.expectEqual(reserved, tier.total_bytes);
 }
 
-test "R33 a module larger than the entire budget declines before registration" {
+test "a module larger than the entire budget declines before registration" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9702,7 +9702,7 @@ test "R33 a module larger than the entire budget declines before registration" {
     try testing.expectEqual(@as(u64, 0), tier.module_export_losses_total);
 }
 
-test "R34 a full disk after reservation fails once and cleanup releases remnants" {
+test "a full disk after reservation fails once and cleanup releases remnants" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9721,7 +9721,7 @@ test "R34 a full disk after reservation fails once and cleanup releases remnants
     try testing.expectEqual(@as(u64, 1), tier.module_export_losses_total);
 }
 
-test "R36 failed physical deletion retains liability and retries without recounting loss" {
+test "failed physical deletion retains liability and retries without recounting loss" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9749,7 +9749,7 @@ test "R36 failed physical deletion retains liability and retries without recount
     try testing.expectEqual(@as(u64, 1), tier.module_export_losses_total);
 }
 
-test "R41 v10 module records are isolated from every KV entry point" {
+test "v10 module records are isolated from every KV entry point" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -9782,7 +9782,7 @@ test "R41 v10 module records are isolated from every KV entry point" {
     try testing.expect(tier.entryWholeOnDisk(id));
 }
 
-test "R42 v2 through v9 KV scans retain contiguous chunk salvage" {
+test "v2 through v9 KV scans retain contiguous chunk salvage" {
     for (2..10) |v| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -9805,7 +9805,7 @@ test "R42 v2 through v9 KV scans retain contiguous chunk salvage" {
     }
 }
 
-test "R44 failure attribution overflow retires all unfinished module exports once" {
+test "failure attribution overflow retires all unfinished module exports once" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;

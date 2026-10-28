@@ -299,7 +299,7 @@ fn validateDescriptor(value: std.json.Value, t: Tensor, offset: u64) !void {
 
 const testing = std.testing;
 
-test "R18 module envelopes round-trip an exact encoded footprint" {
+test "module envelopes round-trip an exact encoded footprint" {
     var record = try Record.create(testing.allocator, .{
         .n = 512,
         .prefix_key = @bitCast(@as(u64, 0xfedcba9876543210)),
@@ -323,7 +323,7 @@ test "R18 module envelopes round-trip an exact encoded footprint" {
     try testing.expectEqualSlices(u64, m.part_bytes, reopened.manifest.part_bytes);
 }
 
-test "R17 module inventory rejects duplicate names and invalid dimensions" {
+test "module inventory rejects duplicate names and invalid dimensions" {
     const cases = [_][]const Tensor{
         &.{ .{ .name = "ring", .dtype = "F32", .shape = &.{4}, .bytes = 16 }, .{ .name = "ring", .dtype = "F32", .shape = &.{4}, .bytes = 16 } },
         &.{.{ .name = "ring", .dtype = "F32", .shape = &.{0}, .bytes = 0 }},
@@ -339,7 +339,7 @@ test "R17 module inventory rejects duplicate names and invalid dimensions" {
     }
 }
 
-test "R18 module safetensors validation rejects duplicate keys and bad offsets" {
+test "module safetensors validation rejects duplicate keys and bad offsets" {
     const tensors: []const Tensor = &.{.{ .name = "ring", .dtype = "F32", .shape = &.{4}, .bytes = 16 }};
     const good = "{\"ring\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,16]}}";
     try validatePartHeader(testing.allocator, good, 16, tensors, 0);
@@ -353,7 +353,7 @@ test "R18 module safetensors validation rejects duplicate keys and bad offsets" 
     for (bad) |header| try testing.expectError(error.BadModulePart, validatePartHeader(testing.allocator, header, 16, tensors, 0));
 }
 
-test "R18 pack stat stamps sort loaded files and distinguish token map fallback" {
+test "pack stat stamps sort loaded files and distinguish token map fallback" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.safetensors", .data = "bb" });

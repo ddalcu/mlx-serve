@@ -245,7 +245,7 @@ fn testLayout() Layout {
     return l;
 }
 
-test "R19 codec planning rejects malformed headers, geometry, settings and overflowing boundaries without MLX operations" {
+test "codec planning rejects malformed headers, geometry, settings and overflowing boundaries without MLX operations" {
     const l = testLayout();
     const p = try Plan.init(l, 9, 42);
     var buf: [max_header]u8 = undefined;
@@ -277,7 +277,7 @@ test "R19 codec planning rejects malformed headers, geometry, settings and overf
     try testing.expectError(error.Dsv41CacheGeometry, Plan.init(changed, 9, 0));
 }
 
-test "R19 codec peak includes all inputs, padded destinations, scratch and host storage" {
+test "codec peak includes all inputs, padded destinations, scratch and host storage" {
     const p = try Plan.init(testLayout(), 9, 0);
     // Source buffers grow to 64 rows; rings, pending f32 rows, DSpark and history all coexist.
     const loaded: u64 = 3 * 24 * 64 * 2 + (4 * 64 + 9 * 64 + 4 * 32) * 2 + 2 * 64 * 4 + 2 * 24 * 64 * 2 + 256 * 2 + 9 * 4;

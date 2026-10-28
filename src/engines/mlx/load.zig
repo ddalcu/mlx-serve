@@ -1007,7 +1007,7 @@ fn configuredPackFiles(a: std.mem.Allocator, names: *std.ArrayList([]const u8), 
 
 // ── tests ──
 
-test "R03 module pack identity follows selected weights and token map precedence" {
+test "module pack identity follows selected weights and token map precedence" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = testing.io;

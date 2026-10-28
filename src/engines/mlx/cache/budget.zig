@@ -273,7 +273,7 @@ pub const armShutdownDeadline = @import("../../../host/http/server.zig").armShut
 
 // ── tests ──
 
-test "R45 staged host bytes include every ready model writer regardless of the current cache view" {
+test "staged host bytes include every ready model writer regardless of the current cache view" {
     const disk = @import("ssd/disk_tier.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -305,7 +305,7 @@ test "R45 staged host bytes include every ready model writer regardless of the c
     a.state = .ready;
 }
 
-test "R27 idle flush reports busy while submitted module files await their writer" {
+test "idle flush reports busy while submitted module files await their writer" {
     const disk = @import("ssd/disk_tier.zig");
     const mlx = @import("../../../mlx/ffi.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
