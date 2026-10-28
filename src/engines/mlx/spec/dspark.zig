@@ -113,7 +113,13 @@ fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) 
     var v = try plugin_driver.nativeVerify(self.xfm, &self.ctx, self.next_token_id, cap);
     defer _ = mlx.mlx_array_free(v.logits);
     const ids = v.round.tokens[0..v.round.n];
+    // A failure below leaves the plugin's verify open, which is the model's, not this request's: close it.
+    var closed = false;
+    errdefer if (!closed) {
+        _ = plugin_driver.nativeFinish(self.xfm, &self.ctx, 0) catch 0;
+    };
     const verdict = try stochasticVerdict(self, v.logits, ids, self.xfm.config.vocab_size, cap);
+    closed = true;
     const position = try plugin_driver.nativeFinish(self.xfm, &self.ctx, verdict.accepted);
     const tokens = try allocator.dupe(u32, ids[0 .. 1 + verdict.accepted]);
     errdefer allocator.free(tokens);

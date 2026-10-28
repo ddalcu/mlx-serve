@@ -654,7 +654,7 @@ pub const NativeDrafter = extern struct {
     /// drafts its own argmax agrees with (under `f.suppress_mask`), rewinds its state to them and writes `out.round`.
     step: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
     /// The first half of a round the engine accepts itself (a sampled request): the model drafts from `t1` and verifies
-    /// the block, leaving the verify open. `out.round.tokens[0..n]` are the verified rows' ids (`t1` first) and
+    /// the block, leaving the verify open. A `verify` while one is open discards the open one. `out.round.tokens[0..n]` are the verified rows' ids (`t1` first) and
     /// `out.logits` their logits `[n, vocab]` (f32). Needs `finish`.
     verify: ?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict = null,
     /// The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and
@@ -692,6 +692,11 @@ pub const MediaItem = extern struct {
     /// Encoder calls the item takes (crops plus a thumbnail); 1 = a single pass.
     tiles: u32 = 1,
     pixels: Array = .{},
+    /// The pixels as host memory instead of `pixels`: float32 little-endian, `grid[1] * grid[2]` rows of equal width.
+    /// Plugin-owned until the host has copied it and called `free`. `prepare` runs on a connection thread, which never
+    /// calls MLX, so an outside plugin returns its pixels this way.
+    bytes: Span(u8) = .{},
+    free: ?*const fn (item: *MediaItem) callconv(.c) void = null,
 };
 
 pub const MediaHooks = extern struct {
