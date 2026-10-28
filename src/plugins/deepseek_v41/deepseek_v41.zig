@@ -3653,9 +3653,8 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
 }
 
 fn monoUs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1_000_000 + @divTrunc(@as(i64, ts.nsec), 1000);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).toNanoseconds(), 1000));
 }
 
 /// Layers [lo, hi) over every span of `sp`, one layer at a time; `held` is every array crossing
