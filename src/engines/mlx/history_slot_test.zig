@@ -33,7 +33,6 @@ const Observer = struct {
             if (prior != id) self.invalid = true;
         } else self.id = id;
         switch (ev.kind) {
-            .prefilled => {},
             .tokens => {
                 if (self.finished != 0) self.invalid = true;
                 for (ev.tokens.slice()) |token| {
@@ -49,6 +48,10 @@ const Observer = struct {
             .finished => {
                 self.finished += 1;
                 self.reason = ev.reason;
+            },
+            else => if (ev.kind != .prefilled) {
+                self.invalid = true;
+                return .stop;
             },
         }
         return .go;

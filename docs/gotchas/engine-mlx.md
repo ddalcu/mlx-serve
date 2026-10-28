@@ -276,6 +276,11 @@ Cause: the eligibility probe admitted any nonempty external proposal while chain
 Fix: both callers share floor-filtered proposal selection; an ineligible lookup leaves native predrafting intact.
 Guard: the durable-suffix boundary test checks that three remaining drafts with minimum depth four report zero eligibility.
 
+### Text-only test sinks must reject non-text events
+Defect: the history Slot observer stopped compiling when the engine ABI added audio events.
+Fix: handle token and terminal events explicitly, permit prefill, and mark every other event invalid while stopping.
+Guard: text publication assertions retain the observer's invalid-state check; an audio event cannot silently pass.
+
 ### The EV controller under honest costs
 Defect: two-chunk plans paid a mid-pipeline sync the cost surface could not see, and an EMA dragged cold closed the
 extension horizon forever. Fix: an extension dry-spell gate fed by realized extensions; one extension position stays
