@@ -105,6 +105,7 @@ Attention + KV:
 
 Spec decode:
 - **Verify invariant** (all drafters): `cache.step = prompt_len + emitted`, t1 NOT in cache on entry, verify input `[t1, draft…]`, partial-accept correction from ORIGINAL `verify_logits[accepted]`.
+- **Lookup eligibility includes the depth floor before native predraft disposal**; the probe and chain builder share proposal selection so rejected history cannot discard an already-dispatched native chain.
 - **A capture gate is a promise the forward must keep**: `supportsLayerCapture` said yes while `forwardGlm5With` ignored `capture_layers`, and the first DFlash prefill crashed on an unfilled slot. An arch that passes the gate fills every slot (GLM taps the MEAN of its hyper-connection streams); `dflash.encodeContext` names an unfilled one (`DflashCaptureMissing`). Guard: `glm5_next DFlash capture`.
 - **A sparse target's DFlash is policy-driven** (`engines/mlx/spec/dflash/policy.zig`, GLM): rows follow the selector's calibrated confidence, plain ticks ride the serial pipeline with their taps parked (`dflash_pending`), and the plain cost is the REQUEST's own tick interval — the shared round-cost table's plain cell ran stale-high and the policy never stepped back.
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).

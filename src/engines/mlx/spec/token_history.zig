@@ -686,19 +686,6 @@ const AppendTransaction = struct {
     }
 };
 
-/// Creates an empty private store, or validates an existing compatible one.
-/// Releases the stable lock before returning; builds no suffix index.
-pub fn initializePersistent(io: Io, allocator: Allocator, path: []const u8, identity: [32]u8) !void {
-    var transaction = try AppendTransaction.open(io, allocator, path, identity);
-    defer transaction.deinit();
-}
-
-/// Only the exact final published output belongs here. Both slices form one
-/// document. StoreBusy and durability errors must reach the caller, not be ignored.
-pub fn appendFinalTurn(io: Io, allocator: Allocator, path: []const u8, identity: [32]u8, prompt: []const u32, output: []const u32) !void {
-    try appendTransaction(io, allocator, path, identity, prompt, output);
-}
-
 fn appendTransaction(io: Io, allocator: Allocator, path: []const u8, identity: [32]u8, prompt: []const u32, output: []const u32) !void {
     if (prompt.len >= persistent_capacity or output.len >= persistent_capacity - prompt.len) return error.DocumentTooLarge;
     for (prompt) |token| if (token >= separator) return error.InvalidToken;
@@ -795,7 +782,7 @@ pub const HistoryCache = struct {
         if (self.corpus_entry) |entry| {
             if (std.mem.eql(u8, entry.path, path) and std.mem.eql(u8, &entry.identity, &wanted) and CorpusStamp.eql(entry.stamp, stamp)) {
                 entry.references += 1;
-                return .{ .entry = entry, .cache_hit = true };
+                return .{ .entry = entry };
             }
         }
         var index = (try openCorpus(io, self.allocator, path, wanted)) orelse return null;
@@ -807,7 +794,7 @@ pub const HistoryCache = struct {
         entry.* = .{ .index = index, .path = owned_path, .identity = wanted, .stamp = stamp, .references = 2 };
         if (self.corpus_entry) |old| old.release();
         self.corpus_entry = entry;
-        return .{ .entry = entry, .cache_hit = false };
+        return .{ .entry = entry };
     }
 
     /// Writable validation/recovery and acquisition share one owned token read.
@@ -825,7 +812,7 @@ pub const HistoryCache = struct {
                     entry.directory_inode == transaction.guard.directory_inode)
                 {
                     entry.references += 1;
-                    return .{ .entry = entry, .cache_hit = true };
+                    return .{ .entry = entry };
                 }
             }
             const snapshot: Snapshot = .{
@@ -859,7 +846,7 @@ pub const HistoryCache = struct {
                     entry.directory_inode == guard.directory_inode)
                 {
                     entry.references += 1;
-                    return .{ .entry = entry, .cache_hit = true };
+                    return .{ .entry = entry };
                 }
             }
             const tokens = try readPersistentTokens(&guard, file, self.allocator, identity);
@@ -885,7 +872,7 @@ pub const HistoryCache = struct {
             .lock_stamp = loaded.lock_stamp, .directory_inode = loaded.directory_inode, .references = 2 };
         if (self.persistent_entry) |old| old.release();
         self.persistent_entry = entry;
-        return .{ .entry = entry, .cache_hit = false };
+        return .{ .entry = entry };
     }
 
     pub fn appendFinalTurn(self: *HistoryCache, io: Io, path: []const u8, identity: [32]u8, prompt: []const u32, output: []const u32) !void {
@@ -903,7 +890,6 @@ pub const HistoryCache = struct {
 
 pub const CorpusLease = struct {
     entry: *CachedCorpus,
-    cache_hit: bool,
 
     pub fn index(self: *const CorpusLease) *const Corpus {
         return &self.entry.index;
@@ -917,7 +903,6 @@ pub const CorpusLease = struct {
 
 pub const PersistentLease = struct {
     entry: *CachedPersistent,
-    cache_hit: bool,
 
     pub fn index(self: *const PersistentLease) *const Corpus {
         return &self.entry.index;
@@ -1099,19 +1084,16 @@ test "corpus snapshots share overlap and survive refresh clear and cache teardow
     defer first.deinit();
     var second = (try cache.acquireCorpus(io, path, identity)).?;
     defer second.deinit();
-    try std.testing.expect(!first.cache_hit and second.cache_hit);
     try std.testing.expectEqual(first.index(), second.index());
     try testCorpusFixture(tmp.dir, &.{ 51, 58, separator }, identity);
     var changed = (try cache.acquireCorpus(io, path, identity)).?;
     defer changed.deinit();
-    try std.testing.expect(!changed.cache_hit);
     try std.testing.expectEqualSlices(u32, &.{ 51, 52, separator }, first.index().tokens);
     try std.testing.expectEqual(@as(u32, 58), changed.index().tokens[1]);
     try std.testing.expectError(error.TokenizerRequired, cache.acquireCorpus(io, path, null));
     try std.testing.expectError(error.TokenizerMismatch, cache.acquireCorpus(io, path, @as([32]u8, @splat(0x2e))));
     var preserved = (try cache.acquireCorpus(io, path, identity)).?;
     defer preserved.deinit();
-    try std.testing.expect(preserved.cache_hit);
     try std.testing.expectEqual(changed.index(), preserved.index());
     const malformed = try testNpy(a, &.{ 0, 0, 2 }, 1);
     defer a.free(malformed);
@@ -1137,9 +1119,8 @@ test "read-only snapshots preserve bytes metadata and never create absent paths"
     defer cache.deinit() catch unreachable;
     try std.testing.expectError(error.FileNotFound, cache.acquirePersistent(io, path, identity));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "store.lock", .{}));
-    try initializePersistent(io, a, path, identity);
     {
-        var empty = try cache.acquirePersistent(io, path, identity);
+        var empty = try cache.acquireWritablePersistent(io, path, identity);
         defer empty.deinit();
         try std.testing.expectEqual(@as(usize, 0), empty.index().tokens.len);
         try cache.appendFinalTurn(io, path, identity, &.{81}, &.{ 82, 83 });
@@ -1167,7 +1148,7 @@ test "read-only snapshots preserve bytes metadata and never create absent paths"
     var guard = try StoreGuard.open(io, a, path, false);
     defer guard.deinit();
     try std.testing.expectError(error.StoreBusy, cache.acquirePersistent(io, path, identity));
-    try std.testing.expectError(error.StoreBusy, appendFinalTurn(io, a, path, identity, &.{84}, &.{85}));
+    try std.testing.expectError(error.StoreBusy, appendTransaction(io, a, path, identity, &.{84}, &.{85}));
 }
 
 test "overlapping persistent leases append B then A against current log and retain old queries" {
@@ -1178,7 +1159,7 @@ test "overlapping persistent leases append B then A against current log and reta
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0x47);
-    try appendFinalTurn(io, a, path, identity, &.{101}, &.{102});
+    try appendTransaction(io, a, path, identity, &.{101}, &.{102});
     var cache = HistoryCache.init(a);
     var cache_live = true;
     defer if (cache_live) cache.deinit() catch unreachable;
@@ -1186,7 +1167,6 @@ test "overlapping persistent leases append B then A against current log and reta
     defer request_a.deinit();
     var request_b = try cache.acquirePersistent(io, path, identity);
     defer request_b.deinit();
-    try std.testing.expect(!request_a.cache_hit and request_b.cache_hit);
     try std.testing.expectEqual(request_a.index(), request_b.index());
     try cache.appendFinalTurn(io, path, identity, &.{201}, &.{202});
     try std.testing.expect(cache.persistent_entry == null);
@@ -1197,7 +1177,6 @@ test "overlapping persistent leases append B then A against current log and reta
     try cache.appendFinalTurn(io, path, identity, &.{301}, &.{302});
     var after_a = try cache.acquirePersistent(io, path, identity);
     defer after_a.deinit();
-    try std.testing.expect(!after_a.cache_hit);
     try std.testing.expectEqualSlices(u32, &.{ 101, 102, separator, 201, 202, separator, 301, 302, separator }, after_a.index().tokens);
     var drafter = Drafter.init(a);
     defer drafter.deinit();
@@ -1212,7 +1191,7 @@ test "overlapping persistent leases append B then A against current log and reta
     try std.testing.expectError(error.TokenizerMismatch, cache.acquirePersistent(io, path, @as([32]u8, @splat(0x48))));
     var preserved = try cache.acquirePersistent(io, path, identity);
     defer preserved.deinit();
-    try std.testing.expect(preserved.cache_hit);
+    try std.testing.expectEqual(after_a.index(), preserved.index());
     try cache.deinit();
     cache_live = false;
     try std.testing.expectEqualSlices(u32, &.{ 101, 102, separator }, request_a.index().tokens);
@@ -1227,7 +1206,7 @@ test "terminal append uses only token storage and accepts borrowed prompt and ou
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0x61);
-    try appendFinalTurn(io, a, path, identity, &.{121}, &.{122});
+    try appendTransaction(io, a, path, identity, &.{121}, &.{122});
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
     var lease = try cache.acquirePersistent(io, path, identity);
@@ -1235,11 +1214,10 @@ test "terminal append uses only token storage and accepts borrowed prompt and ou
     const borrowed = lease.index().tokens[0..2];
     // One path allocation and one token allocation; no suffix positions or join.
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
-    try appendFinalTurn(io, failing.allocator(), path, identity, borrowed[0..1], borrowed[1..]);
+    try appendTransaction(io, failing.allocator(), path, identity, borrowed[0..1], borrowed[1..]);
     try std.testing.expectEqualSlices(u32, &.{ 121, 122 }, borrowed);
     var refreshed = try cache.acquirePersistent(io, path, identity);
     defer refreshed.deinit();
-    try std.testing.expect(!refreshed.cache_hit);
     try std.testing.expectEqualSlices(u32, &.{ 121, 122, separator, 121, 122, separator }, refreshed.index().tokens);
 }
 
@@ -1251,17 +1229,17 @@ test "invalid final document and tokenizer leave durable content intact" {
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0x62);
-    try appendFinalTurn(io, a, path, identity, &.{11}, &.{12});
+    try appendTransaction(io, a, path, identity, &.{11}, &.{12});
     const before = try readBounded(tmp.dir, io, a, "tokens.bin", 1024);
     defer a.free(before);
-    try std.testing.expectError(error.InvalidToken, appendFinalTurn(io, a, path, identity, &.{separator}, &.{}));
-    try std.testing.expectError(error.InvalidToken, appendFinalTurn(io, a, path, identity, &.{}, &.{separator + 1}));
+    try std.testing.expectError(error.InvalidToken, appendTransaction(io, a, path, identity, &.{separator}, &.{}));
+    try std.testing.expectError(error.InvalidToken, appendTransaction(io, a, path, identity, &.{}, &.{separator + 1}));
     const oversized = try a.alloc(u32, persistent_capacity);
     defer a.free(oversized);
-    try std.testing.expectError(error.DocumentTooLarge, appendFinalTurn(io, a, path, identity, oversized, &.{}));
-    try std.testing.expectError(error.TokenizerMismatch, appendFinalTurn(io, a, path, @splat(0x63), &.{13}, &.{14}));
-    try std.testing.expectError(error.TokenizerMismatch, initializePersistent(io, a, path, @splat(0x63)));
-    try appendFinalTurn(io, a, path, identity, &.{}, &.{});
+    try std.testing.expectError(error.DocumentTooLarge, appendTransaction(io, a, path, identity, oversized, &.{}));
+    try std.testing.expectError(error.TokenizerMismatch, appendTransaction(io, a, path, @splat(0x63), &.{13}, &.{14}));
+    try std.testing.expectError(error.TokenizerMismatch, AppendTransaction.open(io, a, path, @splat(0x63)));
+    try appendTransaction(io, a, path, identity, &.{}, &.{});
     const after = try readBounded(tmp.dir, io, a, "tokens.bin", 1024);
     defer a.free(after);
     try std.testing.expectEqualSlices(u8, before, after);
@@ -1298,8 +1276,7 @@ test "host log rejects malformed documents headers truncation and wrong identity
     try std.testing.expectError(error.TokenizerMismatch, cache.acquirePersistent(io, path, @as([32]u8, @splat(0x56))));
 }
 
-// Fault injection changes only one real filesystem operation. The first write
-// really reaches the temporary test file; subsequent failure exercises rollback.
+// Rollback must undo a real partial filesystem write when the next write fails.
 const TestPartialWrite = struct {
     var calls: usize = 0;
     fn write(userdata: ?*anyopaque, file: File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) File.WritePositionalError!usize {
@@ -1318,7 +1295,7 @@ test "partial append rolls back while overlapping snapshots remain queryable" {
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0x63);
-    try appendFinalTurn(io, a, path, identity, &.{131}, &.{132});
+    try appendTransaction(io, a, path, identity, &.{131}, &.{132});
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
     var first = try cache.acquirePersistent(io, path, identity);
@@ -1340,7 +1317,7 @@ test "partial append rolls back while overlapping snapshots remain queryable" {
     try std.testing.expectEqualSlices(u8, old_bytes, actual);
     var refreshed = try cache.acquirePersistent(io, path, identity);
     defer refreshed.deinit();
-    try std.testing.expect(!refreshed.cache_hit);
+    try std.testing.expect(first.index() != refreshed.index());
     try cache.appendFinalTurn(io, path, identity, &.{151}, &.{152});
     var final = try cache.acquirePersistent(io, path, identity);
     defer final.deinit();
@@ -1355,7 +1332,7 @@ test "failed rollback drops current cache and closes the writer without freeing 
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0x71);
-    try appendFinalTurn(io, a, path, identity, &.{159}, &.{160});
+    try appendTransaction(io, a, path, identity, &.{159}, &.{160});
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
     var lease = try cache.acquirePersistent(io, path, identity);
@@ -1369,7 +1346,7 @@ test "failed rollback drops current cache and closes the writer without freeing 
     try std.testing.expect(cache.persistent_entry == null);
     try std.testing.expectEqualSlices(u32, &.{ 159, 160, separator }, lease.index().tokens);
     try std.testing.expectError(error.IncompleteDocument, cache.acquirePersistent(io, path, identity));
-    try std.testing.expectError(error.IncompleteDocument, appendFinalTurn(io, a, path, identity, &.{163}, &.{164}));
+    try std.testing.expectError(error.IncompleteDocument, appendTransaction(io, a, path, identity, &.{163}, &.{164}));
     var guard = try StoreGuard.open(io, a, path, false);
     defer guard.deinit();
 }
@@ -1386,7 +1363,7 @@ test "whole-document eviction preserves leased snapshots and uses no replacement
     defer a.free(document);
     for ([_]u32{ 100, 200000 }) |base| {
         for (document, 0..) |*token, i| token.* = base + @as(u32, @intCast(i));
-        try appendFinalTurn(io, a, path, identity, document, &.{});
+        try appendTransaction(io, a, path, identity, document, &.{});
     }
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
@@ -1397,7 +1374,7 @@ test "whole-document eviction preserves leased snapshots and uses no replacement
     const old_inode = (try fileStamp(tmp.dir, io, "tokens.bin")).inode;
     const lock_inode = (try fileStamp(tmp.dir, io, "store.lock")).inode;
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
-    try std.testing.expectError(error.OutOfMemory, appendFinalTurn(io, failing.allocator(), path, identity, &.{181}, &.{ 182, 183 }));
+    try std.testing.expectError(error.OutOfMemory, appendTransaction(io, failing.allocator(), path, identity, &.{181}, &.{ 182, 183 }));
     try std.testing.expectEqual(old_inode, (try fileStamp(tmp.dir, io, "tokens.bin")).inode);
     var vtable = io.vtable.*;
     vtable.fileSync = Io.failingFileSync;
@@ -1407,10 +1384,9 @@ test "whole-document eviction preserves leased snapshots and uses no replacement
     try std.testing.expectEqual(old_inode, (try fileStamp(tmp.dir, io, "tokens.bin")).inode);
     // Replacement writes retained tokens and both slices directly, with no join.
     var bounded = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
-    try appendFinalTurn(io, bounded.allocator(), path, identity, &.{181}, &.{ 182, 183 });
+    try appendTransaction(io, bounded.allocator(), path, identity, &.{181}, &.{ 182, 183 });
     var refreshed = try cache.acquirePersistent(io, path, identity);
     defer refreshed.deinit();
-    try std.testing.expect(!refreshed.cache_hit);
     const stored = refreshed.index().tokens;
     try std.testing.expect(stored.len <= persistent_capacity);
     try std.testing.expectEqual(@as(u32, 200000), stored[0]);
@@ -1451,7 +1427,7 @@ test "persistent snapshots retain full 8 16 and 64 token match orders" {
     const identity: [32]u8 = @splat(0x80);
     var ids: [max_order + 1]u32 = undefined;
     for (&ids, 0..) |*id, i| id.* = @as(u32, @intCast(i)) + 100;
-    try appendFinalTurn(io, a, path, identity, ids[0..max_order], ids[max_order..]);
+    try appendTransaction(io, a, path, identity, ids[0..max_order], ids[max_order..]);
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
     var lease = try cache.acquirePersistent(io, path, identity);
@@ -1477,7 +1453,7 @@ test "same-size external edits refresh current history without mutating old snap
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0x97);
-    try appendFinalTurn(io, a, path, identity, &.{211}, &.{212});
+    try appendTransaction(io, a, path, identity, &.{211}, &.{212});
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
     var lease = try cache.acquirePersistent(io, path, identity);
@@ -1489,7 +1465,6 @@ test "same-size external edits refresh current history without mutating old snap
     try rogue.writePositionalAll(io, &replacement, header_size);
     var changed = try cache.acquirePersistent(io, path, identity);
     defer changed.deinit();
-    try std.testing.expect(!changed.cache_hit);
     try std.testing.expectEqual(@as(u32, 219), changed.index().tokens[0]);
     try std.testing.expectEqual(@as(u32, 211), lease.index().tokens[0]);
 }
@@ -1502,7 +1477,7 @@ test "refresh read and allocation failures retain all live snapshots" {
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     const identity: [32]u8 = @splat(0xa3);
-    try appendFinalTurn(io, a, path, identity, &.{221}, &.{222});
+    try appendTransaction(io, a, path, identity, &.{221}, &.{222});
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
     var first = try cache.acquirePersistent(io, path, identity);
@@ -1513,8 +1488,8 @@ test "refresh read and allocation failures retain all live snapshots" {
     try std.testing.expectError(error.InputOutput, cache.acquirePersistent(failing_io, path, identity));
     var restored = try cache.acquirePersistent(io, path, identity);
     defer restored.deinit();
-    try std.testing.expect(restored.cache_hit);
-    try appendFinalTurn(io, a, path, identity, &.{223}, &.{224});
+    try std.testing.expectEqual(first.index(), restored.index());
+    try appendTransaction(io, a, path, identity, &.{223}, &.{224});
     for (0..5) |allocation| {
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = allocation });
         cache.allocator = failing.allocator();
@@ -1601,8 +1576,7 @@ test "releasing an obsolete lock handle does not unlock its replacement" {
     var path_buffer: [Dir.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
     var first = try StoreGuard.open(io, a, path, false);
-    // An out-of-protocol unlink creates a different lock domain. Validation
-    // rejects it; closing the old handle must not affect the new domain.
+    // Reject a replaced lock domain without disturbing it when the old handle closes.
     try tmp.dir.deleteFile(io, "store.lock");
     var replacement = try StoreGuard.open(io, a, path, false);
     defer replacement.deinit();
@@ -1619,14 +1593,15 @@ test "unsafe hard links are rejected without changing the other inode permission
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         defer a.free(path);
-        try initializePersistent(io, a, path, @splat(3));
+        var transaction = try AppendTransaction.open(io, a, path, @splat(3));
+        transaction.deinit();
         const file = try tmp.dir.openFile(io, name, .{ .mode = .read_write });
         defer file.close(io);
         if (builtin.os.tag != .windows) try file.setPermissions(io, .fromMode(0o640));
         try Dir.hardLink(tmp.dir, name, tmp.dir, "unrelated", io, .{});
         const before = try tmp.dir.statFile(io, "unrelated", .{});
         const expected_error = if (std.mem.eql(u8, name, "store.lock")) error.UnsafeLockFile else error.UnsafeFile;
-        try std.testing.expectError(expected_error, initializePersistent(io, a, path, @splat(3)));
+        try std.testing.expectError(expected_error, AppendTransaction.open(io, a, path, @splat(3)));
         const after = try tmp.dir.statFile(io, "unrelated", .{});
         try std.testing.expectEqual(before.permissions, after.permissions);
     }
@@ -1640,7 +1615,7 @@ test "writable recovery removes abandoned replacement without changing committed
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer a.free(path);
     const identity: [32]u8 = @splat(5);
-    try appendFinalTurn(io, a, path, identity, &.{17}, &.{ 19, 23 });
+    try appendTransaction(io, a, path, identity, &.{17}, &.{ 19, 23 });
     try testWrite(tmp.dir, pending_log, "interrupted replacement");
     var cache = HistoryCache.init(a);
     defer cache.deinit() catch unreachable;
@@ -1672,7 +1647,6 @@ test "writable acquisition creates validates and retains independent snapshots" 
     defer first.deinit();
     var shared = try cache.acquireWritablePersistent(io, path, identity);
     defer shared.deinit();
-    try std.testing.expect(shared.cache_hit);
     try std.testing.expectEqual(first.index(), shared.index());
     try std.testing.expectEqualSlices(u32, &.{ 11, 12, 13, separator }, first.index().tokens);
     try std.testing.expectEqualSlices(u32, &.{}, initial.index().tokens);

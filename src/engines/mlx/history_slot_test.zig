@@ -13,8 +13,7 @@ const history = @import("spec/history.zig");
 const storage = @import("spec/token_history.zig");
 const Stopwatch = @import("../../sdk/util/io_util.zig").Stopwatch;
 
-// The observer copies only events actually delivered by Slot. It neither generates
-// tokens nor calls publication; returning stop models a disconnect during a block.
+// Observe only Slot-delivered tokens; stopping models a disconnect without publishing.
 const Observer = struct {
     tokens: [32]u32 = @splat(0),
     len: usize = 0,
@@ -79,8 +78,7 @@ const Fixture = struct {
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const path = try a.dupeSentinel(u8, path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)], 0);
         errdefer a.free(path);
-        // Use the tokenizer parser's small-vocabulary fixture pattern, not an
-        // identity-only stub. Its input is freed before any request uses it.
+        // Parsed strings and tokenizer identity must outlive the input JSON.
         const json = try a.dupe(u8,
             \\{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7,"i":8,"j":9,"k":10,"l":11,"m":12,"n":13,"o":14,"p":15},"merges":[]},"pre_tokenizer":{"type":"ByteLevel"},"added_tokens":[]}
         );
@@ -89,9 +87,7 @@ const Fixture = struct {
             break :blk try @import("../../sdk/tokenizer/load.zig").parseTokenizerContent(testing.io, a, json);
         };
         errdefer tok.deinit();
-        // Same empty ownership shape as modules/shell.zig, but no scalar MLX
-        // arrays: these tests never forward or sample. Every field read by Slot,
-        // Request and Generator.deinit is initialized, with no undefined object.
+        // Teardown must need no MLX handles when the slot never forwards or samples.
         var xfm: Transformer = .{
             .config = .{ .num_hidden_layers = 0 },
             .cache = try KVCache.init(a, 0),
@@ -116,7 +112,10 @@ const Fixture = struct {
             .prompt_cache = null,
         };
         errdefer xfm.cache.deinit();
-        try storage.initializePersistent(testing.io, a, path, tok.content_sha256.?);
+        xfm.token_history = storage.HistoryCache.init(a);
+        errdefer xfm.token_history.?.deinit() catch unreachable;
+        var initial = try xfm.token_history.?.acquireWritablePersistent(testing.io, path, tok.content_sha256.?);
+        initial.deinit();
         self.* = .{
             .tmp = tmp,
             .path = path,
@@ -377,8 +376,7 @@ test "history Slot generator retry teardown does not publish an attempt" {
     defer sl.deinit();
     _ = try history.match(&sl.legacy_gen.?, testing.allocator, &.{1}, 2, 4);
     try commit(sl, &.{ 5, 6 });
-    // The retry owns internal generated state but emitted no token. This is the
-    // same teardown seam used when a restored prefill is discarded and rebuilt.
+    // Unemitted generated state must not survive retry teardown as durable history.
     sl.legacy_gen.?.deinit(testing.allocator);
     sl.legacy_gen = null;
     try rig.expectDocuments(&.{});
@@ -392,7 +390,7 @@ test "history Slot generator retry teardown does not publish an attempt" {
 test "history overlapping Slots finish B then A without losing turns or replacing A lease" {
     const rig = try Fixture.init();
     defer rig.deinit();
-    try storage.appendFinalTurn(testing.io, testing.allocator, rig.path, rig.tok.content_sha256.?, &.{ 12, 13 }, &.{14});
+    try rig.xfm.token_history.?.appendFinalTurn(testing.io, rig.path, rig.tok.content_sha256.?, &.{ 12, 13 }, &.{14});
     var oa: Observer = .{};
     var ob: Observer = .{};
     const a = try rig.slot(&.{ 1, 2 }, &oa);
@@ -436,7 +434,7 @@ test "history cleanup stays queued without allocation until the inference owner 
     const loop = @import("runtime/loop.zig");
     const rig = try Fixture.init();
     defer rig.deinit();
-    try storage.appendFinalTurn(testing.io, testing.allocator, rig.path, rig.tok.content_sha256.?, &.{12}, &.{13});
+    try rig.xfm.token_history.?.appendFinalTurn(testing.io, rig.path, rig.tok.content_sha256.?, &.{12}, &.{13});
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     var sch: scheduler.Scheduler = undefined;
     sch.allocator = failing.allocator();

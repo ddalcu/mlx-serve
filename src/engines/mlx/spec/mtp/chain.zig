@@ -336,23 +336,27 @@ fn lookupProposal(self: *Generator, allocator: std.mem.Allocator, plan: MtpRound
     const idx = try self.mtpLookupIndex(allocator);
     const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
     const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
+    const floor = depth_bounds.floorFor(depth_bounds.active, lookup_cap);
     const costs = self.mtpLookupCosts(plan.m_lo);
     if (idx.match(t1, lookup_cap)) |got| {
         const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, costs);
-        if (k > 0 and k >= depth_bounds.floorFor(depth_bounds.active, lookup_cap))
+        if (k > 0 and k >= floor)
             return .{ .match = got, .drafts = k, .external = false };
     }
     if (remaining == 0 or idx.toks.items.len + 1 < mtp_lookup.MIN_SUFFIX) return null;
     const got = try @import("../history.zig").match(self, allocator, idx.toks.items, t1, lookup_cap) orelse return null;
     const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, costs);
+    const below_floor = k > 0 and k < floor;
+    const eligible = k > 0 and !below_floor;
     if (self.external_history) |request| {
         request.admission_checks += 1;
-        if (k > 0) request.admitted_checks += 1;
+        if (eligible) request.admitted_checks += 1;
+        if (below_floor) request.floor_rejections += 1;
     }
-    return if (k > 0) .{ .match = got, .drafts = k, .external = true } else null;
+    return if (eligible) .{ .match = got, .drafts = k, .external = true } else null;
 }
 
-/// How many drafts the stock lookup gate takes; zero retains the MTP head.
+/// Zero retains an already-dispatched native predraft.
 pub fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !u32 {
     return if (try lookupProposal(self, allocator, plan, t1)) |proposal| proposal.drafts else 0;
 }
@@ -360,13 +364,6 @@ pub fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: Mtp
 pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
     const proposal = try lookupProposal(self, allocator, plan, t1) orelse return null;
     const k = proposal.drafts;
-    const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
-    if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) {
-        if (proposal.external) if (self.external_history) |request| {
-            request.floor_rejections += 1;
-        };
-        return null;
-    }
     const got = proposal.match;
     const Once = struct {
         var logged = false;

@@ -270,6 +270,12 @@ soon as it is built; on qwen4 a solo greedy round builds the next chain from its
 lands a round later), so the byte bar is a pinned depth. Measured +2.6% greedy on M5 Ultra; host encode bounds what
 overlap can buy.
 
+### Lookup eligibility must precede native predraft disposal
+Defect: a short external-history proposal discarded an already-dispatched native chain, then failed the depth floor.
+Cause: the eligibility probe admitted any nonempty external proposal while chain construction enforced the floor.
+Fix: both callers share floor-filtered proposal selection; an ineligible lookup leaves native predrafting intact.
+Guard: the durable-suffix boundary test checks that three remaining drafts with minimum depth four report zero eligibility.
+
 ### The EV controller under honest costs
 Defect: two-chunk plans paid a mid-pipeline sync the cost surface could not see, and an EMA dragged cold closed the
 extension horizon forever. Fix: an extension dry-spell gate fed by realized extensions; one extension position stays

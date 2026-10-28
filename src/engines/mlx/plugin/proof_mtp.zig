@@ -291,8 +291,7 @@ const history_verify = @import("../spec/verify.zig");
 const HistoryKV = @import("../kv/cache.zig").KVCache;
 const HistorySnapshot = @import("../kv/cache.zig").KVCacheSnapshot;
 
-/// Real served trunk/head and a parsed, tokenizer-bound vocabulary. The tokenizer
-/// parser owns its strings and digest after the temporary JSON buffer disappears.
+/// The served trunk/head use a tokenizer that owns its strings and digest independently of its input buffer.
 const HistoryRig = struct {
     b: proof.Served,
     head: *plugin_head.Head,
@@ -396,7 +395,7 @@ test "plugin MTP history: native incumbent wins conflicts; rejected native admit
         } else {
             const request = gen.external_history.?;
             try testing.expectEqual(@as(u32, 16), request.matched_order);
-            // Change both the candidate and cap in the request's reusable buffer.
+            // An owned chain must survive replacement of the request's borrowed candidate.
             _ = try request.match(history_query[0..15], 47, 1);
             const replacement = (try request.match(history_other_query[0..15], 95, 14)) orelse return error.ExpectedReplacementCandidate;
             try testing.expectEqualSlices(u32, &history_native, replacement.draft);
@@ -488,6 +487,7 @@ test "plugin MTP history: durable suffix boundaries obey the stock gate depth an
         defer budgeted.deinit(a);
         try testing.expectEqual(@as(u32, 3), budgeted.m);
         depth_bounds.active = .{ .min = 4, .max = 5 };
+        try testing.expectEqual(@as(u32, 0), try gen.mtpLookupDrafts(a, plan, 47));
         try testing.expect(try gen.mtpLookupChain(a, plan, 47) == null);
         gen.max_tokens = 1;
         try testing.expectEqual(@as(u32, 0), try gen.mtpLookupDrafts(a, plan, 47));
@@ -501,9 +501,7 @@ test "plugin MTP history: durable suffix boundaries obey the stock gate depth an
     }
 }
 
-/// A forward from a cloned boundary, not a serial-decode oracle. Full verify
-/// comparisons use the identical row geometry; rollback comparisons use the
-/// committed-prefix geometry the dense trunk's restore/re-forward arm uses.
+/// Replay matches verify row geometry or rollback's committed-prefix geometry, not serial decode.
 const HistoryReplay = struct {
     cache: HistoryKV,
     logits: Array,
@@ -693,8 +691,7 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
         var snapshot = try gen.ctx.cache.snapshot();
         defer snapshot.deinit();
         var proposal = [_]u32{ gen.next_token_id, 0, 0, 0 };
-        // Derive each proposal from real target logits at the same four-row
-        // geometry. Corrupt only the requested reject position, never logits.
+        // Acceptance must use real target logits at the same four-row geometry.
         for (0..3) |i| {
             var probe = try HistoryReplay.run(gen.xfm, &snapshot, gen.ctx.moe_seq_offset.*, &proposal, true);
             defer probe.deinit();
@@ -720,8 +717,7 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
                 const carried = gen.mtp_pre_draft orelse return error.ExpectedCarriedHistory;
                 try testing.expect(carried.lookup and carried.external_history);
                 try testing.expectEqualSlices(u32, proposal[1..], carried.drafts);
-                // Another request-local query invalidates/reuses the borrowed
-                // candidate before the carried flight reaches its verifier.
+                // The carried flight must retain its proposal when the borrowed candidate changes.
                 const replacement = (try gen.external_history.?.match(history_other_query[0..15], 95, 3)) orelse return error.ExpectedReplacementCandidate;
                 try testing.expectEqualSlices(u32, history_native[0..3], replacement.draft);
                 try testing.expectEqualSlices(u32, proposal[1..], gen.mtp_pre_draft.?.drafts);
@@ -736,8 +732,7 @@ test "plugin MTP history: cold and carried owned proposals verify zero partial f
             try testing.expectEqual(want_accepted, gen.external_history.?.accepted);
             try testing.expectEqual(@as(u64, 0), gen.mtp_attempted);
         }
-        // Disable only the external source: stock lookup and the actual native
-        // head remain enabled. The short unique prompt has no admitted incumbent.
+        // Disabling external history preserves stock lookup and native-head recovery on a unique prompt.
         var recovery = try historyBegin(&gen);
         defer recovery.deinit(a);
         try testing.expect(!recovery.chain.lookup and !recovery.chain.external_history);
