@@ -1017,8 +1017,15 @@ pub fn handleStreamingGeneration(
 
     const total_prompt = ts.prompt_tokens;
     if (!client_gone) {
+        // Timings ship once: on the usage chunk when one follows, else on the
+        // final chunk (llama.cpp's shape), so proxies that meter rates (llama-swap)
+        // read them without the client opting into usage.
+        const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
+        defer allocator.free(timings_obj);
+        const timings_opt: ?[]const u8 = if (timings_obj.len > 0) timings_obj else null;
+
         // Final chunk with finish_reason
-        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details }, null, null, .{ .logprobs_json = try lps.take() });
+        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details }, null, if (include_usage) null else timings_opt, .{ .logprobs_json = try lps.take() });
 
         // Usage chunk (if requested via stream_options.include_usage). Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
@@ -1029,9 +1036,6 @@ pub fn handleStreamingGeneration(
         if (include_usage) {
             const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
             defer allocator.free(usage_json);
-            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
-            defer allocator.free(timings_obj);
-            const timings_opt: ?[]const u8 = if (timings_obj.len > 0) timings_obj else null;
             try sendSSEUsageChunk(allocator, stream, chat_id, model_name, usage_json, timings_opt);
         }
 

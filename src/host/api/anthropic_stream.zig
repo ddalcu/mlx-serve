@@ -40,6 +40,7 @@ const SSE_ALLOW_HEADERS_ANTHROPIC = @import("../http/respond.zig").SSE_ALLOW_HEA
 const sendSseHeaders = @import("../http/respond.zig").sendSseHeaders;
 const utf8TrailingIncomplete = @import("format.zig").utf8TrailingIncomplete;
 const formatAnthropicUsage = @import("format.zig").formatAnthropicUsage;
+const formatTimingsObject = @import("format.zig").formatTimingsObject;
 const formatPerfBracket = @import("format.zig").formatPerfBracket;
 const jsonEscape = @import("format.zig").jsonEscape;
 const MropeData = @import("../media/encode.zig").MropeData;
@@ -79,13 +80,9 @@ pub fn handleAnthropicStreaming(
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?kv_quant.KVQuantConfig,
     kv_attn_explicit: ?bool,
-    /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
-    /// doesn't currently emit `timings` over SSE (spec doesn't model it),
-    /// but plumbing the value through keeps the signature consistent with
-    /// non-streaming and unblocks a future message_delta extension.
+    /// tokenize_ns from the parent handler, for the `timings` extension on message_delta.
     tokenize_ns: u64,
 ) !void {
-    _ = tokenize_ns; // reserved; see doc comment
     // Vision-array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer.
     var ve_local = vision_embeddings;
@@ -859,7 +856,9 @@ pub fn handleAnthropicStreaming(
         // Cache hits are known after prefill. Cumulative usage replaces the
         // provisional message_start counts with disjoint input buckets.
         {
-            const md = try formatAnthropicMessageDelta(allocator, stop_reason, stop_seq_json, total_prompt, ts.completion_tokens, ts.cached_tokens);
+            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
+            defer allocator.free(timings_obj);
+            const md = try formatAnthropicMessageDelta(allocator, stop_reason, stop_seq_json, total_prompt, ts.completion_tokens, ts.cached_tokens, timings_obj);
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -879,12 +878,15 @@ fn formatAnthropicMessageStart(allocator: std.mem.Allocator, id: i64, model_name
     , .{ id, model_name, prompt_tokens });
 }
 
-fn formatAnthropicMessageDelta(allocator: std.mem.Allocator, stop_reason: []const u8, stop_seq_json: []const u8, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
+/// `timings_obj` (formatTimingsObject; empty = none) rides as a top-level extension, as on the
+/// non-streaming response, so rate-metering proxies (llama-swap) read the streamed surface too.
+fn formatAnthropicMessageDelta(allocator: std.mem.Allocator, stop_reason: []const u8, stop_seq_json: []const u8, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32, timings_obj: []const u8) ![]u8 {
     const usage = try formatAnthropicUsage(allocator, prompt_tokens, completion_tokens, cached_tokens);
     defer allocator.free(usage);
+    const sep: []const u8 = if (timings_obj.len > 0) ",\"timings\":" else "";
     return try std.fmt.allocPrint(allocator,
-        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{s}}}
-    , .{ stop_reason, stop_seq_json, usage });
+        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{s}{s}{s}}}
+    , .{ stop_reason, stop_seq_json, usage, sep, timings_obj });
 }
 
 /// Emit a text_delta event for Anthropic streaming.
@@ -958,7 +960,7 @@ test "Anthropic usage: message_delta overwrites provisional message_start counts
         defer arena.deinit();
         const a = arena.allocator();
         const start = try formatAnthropicMessageStart(a, 1, "mlx-serve", 92934);
-        const delta = try formatAnthropicMessageDelta(a, "end_turn", "null", 92934, 126, cached_tokens);
+        const delta = try formatAnthropicMessageDelta(a, "end_turn", "null", 92934, 126, cached_tokens, "");
         const start_event = try std.json.parseFromSliceLeaky(std.json.Value, a, start, .{});
         const delta_event = try std.json.parseFromSliceLeaky(std.json.Value, a, delta, .{});
         try testing.expectEqualStrings("message_start", start_event.object.get("type").?.string);
@@ -976,4 +978,18 @@ test "Anthropic usage: message_delta overwrites provisional message_start counts
         try testing.expectEqual(@as(i64, @min(cached_tokens, 92934)), cached);
         try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
     }
+}
+
+test "Anthropic streaming: message_delta carries the timings extension when there is one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const timings = try formatTimingsObject(a, 1000, 200, 50, 2 * std.time.ns_per_s, std.time.ns_per_s, 0);
+    const with = try std.json.parseFromSliceLeaky(std.json.Value, a, try formatAnthropicMessageDelta(a, "end_turn", "null", 1000, 50, 200, timings), .{});
+    const t = with.object.get("timings").?.object;
+    try testing.expectEqual(@as(f64, 400), t.get("prompt_per_second").?.float);
+    try testing.expectEqual(@as(f64, 50), t.get("predicted_per_second").?.float);
+    try testing.expect(with.object.get("usage") != null);
+    const without = try std.json.parseFromSliceLeaky(std.json.Value, a, try formatAnthropicMessageDelta(a, "end_turn", "null", 1000, 50, 200, ""), .{});
+    try testing.expect(without.object.get("timings") == null);
 }
