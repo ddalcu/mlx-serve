@@ -51,7 +51,7 @@ cleanup() {
         kill -KILL "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
-    echo "artifacts: $OUT"
+    if [ "$rc" = 0 ]; then rm -rf "$OUT"; else echo "artifacts: $OUT"; fi
     exit "$rc"
 }
 trap cleanup EXIT
