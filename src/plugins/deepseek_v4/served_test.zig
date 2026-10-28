@@ -58,6 +58,7 @@ const Served = struct {
     after_greedy: bool = false,
 
     fn open(table: *const abi.ModelTable, files: []const sdk.fixture.File, tape: []const u8) !*Served {
+        mlx.installErrorHandler();
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const p = try a.create(Served);
@@ -254,7 +255,7 @@ const Requests = struct {
         h.sch.queue_mu = .init;
         h.sch.decoding = .empty;
         h.sch.pending = .empty;
-        h.sch.cleanup_queue = .empty;
+        h.sch.cleanup_queue = .{};
         h.sch.vision_queue = .empty;
         h.sch.embed_queue = .empty;
         h.sch.max_concurrent = 4;
@@ -271,11 +272,14 @@ const Requests = struct {
     }
 
     fn close(h: *Requests) void {
+        while (h.sch.cleanup_queue.popFirst()) |node| {
+            const slot: *RequestSlot = @alignCast(@fieldParentPtr("cleanup_node", node));
+            slot.deinit();
+        }
         h.entry.transformer = null;
         h.entry.config = null;
         h.entry.tokenizer = null;
         h.sch.registry.deinit();
-        h.sch.cleanup_queue.deinit(testing.allocator);
         testing.allocator.free(h.sch.hot_cache_digests);
         h.tok.deinit();
         testing.allocator.destroy(h);
@@ -332,7 +336,7 @@ test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snaps
     defer g.deinit();
     try ops.eval(try g.adopt(try p.xfm.forwardWith(&abandoned.ctx, try g.fromSlice(i32, &.{ 3, 17, 42, 9, 7, 25, 1 }, &.{ 1, 7 }))));
     abandoned.cancelled.store(true, .release);
-    try h.sch.cleanup_queue.append(testing.allocator, abandoned);
+    h.sch.cleanup_queue.append(&abandoned.cleanup_node);
     try testing.expect(@import("../../engines/mlx/runtime/loop.zig").drainSideQueues(&h.sch));
     try testing.expectEqual(@as(usize, 0), h.entry.prefix_cache.?.entries.items.len);
     try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));

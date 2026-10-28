@@ -1070,6 +1070,14 @@ Defect: CI went red with one MLX error and four collateral failures (a later seg
 Metal caps threads per threadgroup per compiled kernel by register use (M1/M2 below 1024 and 512 for this kernel); the
 latch was invisible because logging is off under test. Fix: probe at creation and halve simdgroups in the same
 summation order (`mma_sg`), else decline by name; the test drops its own latch.
+Served fixtures must install `mlx.installErrorHandler()` before loading: otherwise the default C handler exits before
+the probe can catch the capability error. Guard: the `deepseek_v41 served:` cases.
+
+### A partial Scheduler fixture crashed after draining its cleanup queue
+Defect: a cleanup test dereferenced an undefined hot-cache pointer. Cause: draining now also publishes cache residency
+and digests, while the fixture initialized only queues. Initialize the null cache view, empty digest slice, mutex and
+residency counters. Intrusive cleanup nodes belong to their slots: pop and destroy each slot before tearing down the
+borrowed model, rather than deinitializing the queue as an array. Guard: `history cleanup stays queued` and served request teardown.
 
 ### Agents looped once prompt lookup ran under typical acceptance
 Defect: Flash Next agent runs under `--mtp-typical` were loop-cut 11 of 19 times vs 0 of 4. Cause: a lookup draft is a

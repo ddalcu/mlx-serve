@@ -455,6 +455,12 @@ test "history cleanup stays queued without allocation until the inference owner 
     sch.gen_queue = .empty;
     sch.unload_queue = .empty;
     sch.metrics = null;
+    sch.hot_prefix_cache = null;
+    sch.hot_cache_digests = &.{};
+    sch.digest_mu = .init;
+    sch.digest_residency = 0;
+    sch.resident_hot_cache_bytes = .init(0);
+    sch.reclaimable_hot_cache_bytes = .init(0);
     var observers: [18]Observer = @splat(.{});
     var slots: [18]*Slot = undefined;
     var owned: usize = 0;
