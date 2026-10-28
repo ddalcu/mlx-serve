@@ -1,7 +1,8 @@
 #!/bin/bash
 # Integration test: chat completions emit a llama.cpp-style `timings` block
 # alongside `usage`, on both the non-stream JSON body and the final SSE chunk
-# of a streaming response (when stream_options.include_usage is set).
+# of a streaming response: on the usage chunk when stream_options.include_usage
+# is set, else on the finish_reason chunk. Either way, exactly once.
 #
 # Required fields (llama.cpp shape):
 #   prompt_n, prompt_ms, prompt_per_second,
@@ -40,9 +41,9 @@ if [ -z "$RESULT" ]; then
     exit 1
 fi
 
-python3 - <<PY
-import json, sys
-r = json.loads('''$RESULT''')
+RAW="$RESULT" python3 - <<'PY'
+import json, os, sys
+r = json.loads(os.environ["RAW"])
 t = r.get("timings")
 if not isinstance(t, dict):
     print(f"  FAIL: no 'timings' object in response. keys={list(r.keys())}")
@@ -96,9 +97,9 @@ if [ -z "$STREAM" ]; then
     exit 1
 fi
 
-python3 - <<PY
-import json, sys
-raw = '''$STREAM'''
+RAW="$STREAM" python3 - <<'PY'
+import json, os, sys
+raw = os.environ["RAW"]
 chunks = []
 for line in raw.splitlines():
     if not line.startswith("data: "):
@@ -135,6 +136,62 @@ if u.get("prompt_tokens") != t["prompt_n"] or u.get("completion_tokens") != t["p
     sys.exit(1)
 if t["predicted_n"] > 0 and t["predicted_per_second"] <= 0:
     print(f"  FAIL: predicted_n={t['predicted_n']} but predicted_per_second={t['predicted_per_second']}")
+    sys.exit(1)
+n = sum(1 for c in chunks if "timings" in c)
+if n != 1:
+    print(f"  FAIL: timings appears on {n} chunks; expected once, on the usage chunk")
+    sys.exit(1)
+print(f"  PASS  timings={json.dumps(t)}")
+PY
+RC=$?
+[ $RC -ne 0 ] && FAIL=1
+
+# ── Test 3: streaming without include_usage ────────────────────────────────
+echo
+echo "--- Test 3: without include_usage the finish_reason chunk carries 'timings' ---"
+STREAM=$(curl -sN "$BASE/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-serve",
+    "messages": [{"role":"user","content":"Say hi in five words."}],
+    "max_tokens": 16,
+    "temperature": 0.0,
+    "stream": true
+  }')
+if [ -z "$STREAM" ]; then
+    echo "  FAIL: empty stream"
+    exit 1
+fi
+
+RAW="$STREAM" python3 - <<'PY'
+import json, os, sys
+raw = os.environ["RAW"]
+chunks = []
+for line in raw.splitlines():
+    if not line.startswith("data: "):
+        continue
+    payload = line[len("data: "):].strip()
+    if payload == "[DONE]" or not payload:
+        continue
+    try:
+        chunks.append(json.loads(payload))
+    except json.JSONDecodeError:
+        pass
+
+fin = [c for c in chunks if c.get("choices") and c["choices"][0].get("finish_reason")]
+if not fin:
+    print("  FAIL: no finish_reason chunk")
+    sys.exit(1)
+t = fin[-1].get("timings")
+if not isinstance(t, dict) or "predicted_per_second" not in t:
+    print(f"  FAIL: finish_reason chunk has no timings.predicted_per_second. keys={list(fin[-1].keys())}")
+    sys.exit(1)
+if t["predicted_n"] > 0 and t["predicted_per_second"] <= 0:
+    print(f"  FAIL: predicted_n={t['predicted_n']} but predicted_per_second={t['predicted_per_second']}")
+    sys.exit(1)
+n = sum(1 for c in chunks if "timings" in c)
+if n != 1:
+    print(f"  FAIL: timings appears on {n} chunks; expected once")
     sys.exit(1)
 print(f"  PASS  timings={json.dumps(t)}")
 PY
